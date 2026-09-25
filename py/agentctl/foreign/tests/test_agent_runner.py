@@ -15,6 +15,7 @@ from typing import Iterator
 
 import pytest
 
+from agentctl import worker_rpc
 from agentctl.foreign import agent_runner, lib
 
 
@@ -915,9 +916,9 @@ def test_headless_claim_is_quarantined_after_crash_without_replay(
     monkeypatch.setattr(agent_runner, "_run_turn", execute)
     monkeypatch.setattr(os, "replace", replace)
     with pytest.raises(RuntimeError, match="crash"):
-        agent_runner._consume(rec.name, source)
+        agent_runner._consume(rec.name, rec, source)
     monkeypatch.setattr(os, "replace", original_replace)
-    agent_runner._consume(rec.name, source)
+    agent_runner._consume(rec.name, rec, source)
     assert calls == ([] if crash == "before_execution" else [seq])
     assert (lib.failed_dir(rec.name) / source.name).exists()
     error = json.loads((lib.failed_dir(rec.name) / f"{source.name}.error").read_text())
@@ -930,10 +931,58 @@ def test_automation_pause_keeps_request_pending(fake_runner_state: Path, monkeyp
     source = lib.inbox_dir(rec.name) / f"{seq:012d}.json"
     (lib.agent_dir(rec.name) / "automation-paused").touch()
     monkeypatch.setattr(agent_runner, "_run_turn", lambda *_args: pytest.fail("paused intake executed"))
-    agent_runner._consume(rec.name, source)
+    agent_runner._consume(rec.name, rec, source)
     assert source.exists()
     assert not list(lib.inflight_dir(rec.name).iterdir())
     assert lib.status_snapshot(rec.name, run_gc=False).agents[0].automation_paused
+
+
+def test_owner_generation_binds_once_and_rejects_stale_runtime_operations(
+    fake_runner_state: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rec = _install_agy_agent(fake_runner_state, "owned")
+    first = "a" * 32
+    second = "b" * 32
+    assert lib.bind_owner_token(rec.name, first).owner_token == first
+    with pytest.raises(lib.AgentOperationError, match="another session generation") as raised:
+        lib.bind_owner_token(rec.name, second)
+    assert raised.value.code == "owner_token_mismatch"
+    assert lib.read_registry()[rec.name].owner_token == first
+
+    called = False
+
+    def status(*_args: object, **_kwargs: object) -> object:
+        nonlocal called
+        called = True
+        return object()
+
+    monkeypatch.setattr(lib, "status_snapshot", status)
+    with pytest.raises(lib.AgentOperationError, match="another session generation"):
+        worker_rpc.dispatch({
+            "schema": "agentctl-worker-rpc/v2", "action": "status",
+            "name": rec.name, "owner_token": second, "desired_paused": False,
+        })
+    assert not called
+
+
+def test_pause_markers_are_scoped_to_the_owner_generation(
+    fake_runner_state: Path,
+) -> None:
+    rec = _install_agy_agent(fake_runner_state, "pause-generation")
+    current_token = "c" * 32
+    stale_token = "d" * 32
+    current = lib.bind_owner_token(rec.name, current_token)
+    legacy = lib.agent_dir(rec.name) / "automation-paused"
+    legacy.touch()
+
+    lib.reconcile_automation_pause(rec.name, current_token, True)
+    assert not legacy.exists()
+    assert lib.automation_is_paused(current)
+    stale = lib.automation_pause_path(replace(current, owner_token=stale_token))
+    stale.touch()
+    lib.reconcile_automation_pause(rec.name, current_token, False)
+    assert not lib.automation_is_paused(current)
+    assert stale.exists()
 
 
 def test_activated_runner_can_acknowledge_successive_migrations(fake_runner_state: Path) -> None:

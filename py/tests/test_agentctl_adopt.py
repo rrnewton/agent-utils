@@ -1289,7 +1289,8 @@ def test_headless_start_stops_runtime_if_session_is_claimed_by_adopted_agent(
     ) -> dict[str, object]:
         actions.append(action)
         return {"record": {"mode": "headless", "backend": "tmux",
-                           "session_id": "native-session"}, "result": {}}
+                           "session_id": "native-session", "owner_token": record.token},
+                "result": {}}
 
     monkeypatch.setattr(sessions, "_worker", worker)
     with pytest.raises(AgentDeliveryError, match="already registered as 'foreign'"):

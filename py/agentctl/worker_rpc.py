@@ -16,7 +16,7 @@ if __package__ in (None, ""):
 from agentctl.foreign import lib
 from agentctl.jsonx import as_mapping, get_str
 
-_RPC_SCHEMA = "agentctl-worker-rpc/v1"
+_RPC_SCHEMA = "agentctl-worker-rpc/v2"
 
 
 def _optional_text(request: dict[str, object], key: str) -> str | None:
@@ -44,45 +44,81 @@ def _string_array(request: dict[str, object], key: str) -> list[str]:
 
 def dispatch(request: dict[str, object]) -> dict[str, object]:
     """Execute one explicitly supported runtime operation."""
+    if request.get("schema") != _RPC_SCHEMA:
+        raise ValueError("runtime request has an unsupported schema")
     action = get_str(request, "action", "runtime request")
     name = get_str(request, "name", "runtime request")
+    owner_token = get_str(request, "owner_token", "runtime request")
+    paused = request.get("desired_paused")
+    if not isinstance(paused, bool):
+        raise ValueError("desired_paused must be a boolean")
     result: object
     if action == "start":
-        result = lib.bring_up_agent(name, cwd=get_str(request, "cwd", "start"),
-            harness=get_str(request, "harness", "start"),
-            model=_optional_text(request, "model"), brief=_optional_text(request, "brief"),
-            backend=get_str(request, "backend", "start"), mode="headless",
-            harness_args=_string_array(request, "harness_args"))
+        cwd = get_str(request, "cwd", "start")
+        harness = get_str(request, "harness", "start")
+        model = _optional_text(request, "model")
+        backend = get_str(request, "backend", "start")
+        harness_args = _string_array(request, "harness_args")
+        existing = lib.read_registry().get(name)
+        if existing is None:
+            result = lib.bring_up_agent(
+                name, cwd=cwd, harness=harness, model=model,
+                brief=_optional_text(request, "brief"), backend=backend,
+                mode="headless", harness_args=harness_args,
+                owner_token=owner_token,
+            )
+        else:
+            existing = lib.bind_owner_token(name, owner_token)
+            if (
+                existing.cwd != str(Path(cwd).expanduser().resolve())
+                or existing.harness != harness
+                or existing.model != model
+                or existing.backend != backend
+                or existing.mode != lib.HEADLESS_MODE
+                or existing.harness_args != tuple(harness_args)
+            ):
+                raise lib.AgentOperationError(
+                    "owner_launch_mismatch",
+                    f"runtime {name!r} exists for this token with a different launch specification",
+                )
+            result = lib.status_snapshot(name, run_gc=False)
     elif action == "status":
+        lib.reconcile_automation_pause(name, owner_token, paused)
         result = lib.status_snapshot(name, run_gc=False)
     elif action == "send":
+        lib.reconcile_automation_pause(name, owner_token, paused)
         result = lib.send_message_to_agent(name, get_str(request, "text", "send"),
             model=_optional_text(request, "model"))
     elif action == "read":
+        lib.reconcile_automation_pause(name, owner_token, paused)
         result = lib.read_agent_output(name, mode=get_str(request, "mode", "read"),
             since_turn=_optional_int(request, "since_turn"), tail=_optional_int(request, "tail"))
     elif action == "stop":
+        lib.bind_owner_token(name, owner_token)
         result = lib.bring_down_agent(name, archive=True)
     elif action == "reset":
+        lib.reconcile_automation_pause(name, owner_token, paused)
         result = lib.reset_agent_context(name)
     elif action == "migrate":
+        lib.reconcile_automation_pause(name, owner_token, paused)
         mode = _optional_text(request, "mode")
         result = lib.migrate_agent(name, to_backend=get_str(request, "backend", "migrate"),
             to_mode="tui" if mode == "interactive" else mode)
     elif action == "repair":
+        lib.reconcile_automation_pause(name, owner_token, paused)
         result = lib.recreate_window(name)
     elif action in ("pause", "resume"):
-        marker = lib.agent_dir(name) / "automation-paused"
-        if action == "pause":
-            from agentctl.agent import _atomic_json
-            _atomic_json(str(marker), {"paused": True})
-        else:
-            marker.unlink(missing_ok=True)
-        result = {"paused": action == "pause"}
+        lib.reconcile_automation_pause(name, owner_token, paused)
+        result = {"paused": paused}
     else:
         raise ValueError(f"unsupported runtime operation: {action}")
     value: object = asdict(result) if is_dataclass(result) and not isinstance(result, type) else result
     record = lib.read_registry().get(name)
+    if record is not None and record.owner_token != owner_token:
+        raise lib.AgentOperationError(
+            "owner_token_mismatch",
+            f"runtime {name!r} changed session generation during {action}",
+        )
     return {
         "result": value,
         "record": record.to_public_dict() if record is not None else None,
@@ -92,15 +128,19 @@ def dispatch(request: dict[str, object]) -> dict[str, object]:
 def _main() -> int:
     """Exchange exactly one JSON request and response over stdin/stdout."""
     action: str | None = None
+    owner_token: str | None = None
     try:
         request = as_mapping(json.load(sys.stdin), "runtime request")
         raw_action = request.get("action")
         action = raw_action if isinstance(raw_action, str) else None
+        raw_owner_token = request.get("owner_token")
+        owner_token = raw_owner_token if isinstance(raw_owner_token, str) else None
         result = dispatch(request)
     except (lib.AgentOperationError, ValueError, TypeError, OSError) as exc:
         json.dump({
             "schema": _RPC_SCHEMA,
             "action": action,
+            "owner_token": owner_token,
             "ok": False,
             "error": {
                 "code": getattr(exc, "code", "runtime_failure"),
@@ -112,6 +152,7 @@ def _main() -> int:
     json.dump({
         "schema": _RPC_SCHEMA,
         "action": action,
+        "owner_token": owner_token,
         "ok": True,
         "payload": result,
     }, sys.stdout)

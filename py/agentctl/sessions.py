@@ -24,7 +24,7 @@ from agentctl.profiles import (
 )
 from agentctl.subagents import AgentRecord, ManagedAgents, _name
 
-_WORKER_RPC_SCHEMA = "agentctl-worker-rpc/v1"
+_WORKER_RPC_SCHEMA = "agentctl-worker-rpc/v2"
 _RUNNER_LIVENESS_SCHEMA = "agentctl-runner-liveness/v1"
 
 
@@ -83,7 +83,14 @@ class Sessions(ManagedAgents):
             timeout = min(timeout, remaining)
         try:
             completed = subprocess.run(command,
-                input=json.dumps({"action": action, "name": record.name, **options}),
+                input=json.dumps({
+                    "schema": _WORKER_RPC_SCHEMA,
+                    "action": action,
+                    "name": record.name,
+                    "owner_token": record.token,
+                    "desired_paused": record.paused,
+                    **options,
+                }),
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 env=environment, timeout=timeout)
         except subprocess.TimeoutExpired as exc:
@@ -101,6 +108,7 @@ class Sessions(ManagedAgents):
             ) from exc
         if (envelope.get("schema") != _WORKER_RPC_SCHEMA
                 or envelope.get("action") != action
+                or envelope.get("owner_token") != record.token
                 or not isinstance(envelope.get("ok"), bool)):
             raise WorkerRpcError(
                 "invalid-receipt", f"runtime {action} returned an invalid typed envelope",
@@ -227,6 +235,16 @@ class Sessions(ManagedAgents):
                             )
                     record.lifecycle = "running"
                     self._save(record)
+                except WorkerRpcError as exc:
+                    # A transport timeout or malformed/lost receipt says
+                    # nothing about whether the token-bound runtime committed
+                    # startup. Keep the durable intent reconcilable.
+                    record.lifecycle = (
+                        "launch_failed" if exc.kind == "runtime-error" else "starting"
+                    )
+                    record.error = str(exc)
+                    self._save(record)
+                    raise
                 except (HerdrRunError, OSError, ValueError) as exc:
                     record.lifecycle, record.error = "launch_failed", str(exc)
                     self._save(record)
@@ -239,6 +257,10 @@ class Sessions(ManagedAgents):
         value = response.get("record")
         if isinstance(value, dict):
             runtime = as_mapping(value, "runtime record")
+            if runtime.get("owner_token") != record.token:
+                raise AgentDeliveryError(
+                    "worker runtime belongs to another session generation"
+                )
             record.mode = "interactive" if runtime.get("mode") == "tui" else "headless"
             record.backend = str(runtime.get("backend", record.backend))
             session = runtime.get("session_id")
@@ -335,20 +357,20 @@ class Sessions(ManagedAgents):
             result = record.to_document()
             try:
                 response = self._worker(record, "status", _deadline=deadline)
+                self._sync_worker_record(record, response, save=False)
                 observation, observation_error = self._runner_observation(record, response)
                 expected_runtime_home = str(self._directory(record.name) / "runtime")
-                if (record.lifecycle == "running"
+                if (record.lifecycle in ("starting", "running")
                         and record.runtime_ownership == "owned"
                         and record.runtime_home == expected_runtime_home
-                        and record.runner_pid is None
-                        and record.runner_started_at is None
                         and observation is not None and observation[1] is True):
                     record.runner_identity = observation[0]
                     record.runner_pid = observation[0].pid
                     record.runner_started_at = str(observation[0].starttime_ticks)
-                    self._save(record)
-                    result["runner_pid"] = record.runner_pid
-                    result["runner_started_at"] = record.runner_started_at
+                    record.lifecycle = "running"
+                    record.error = None
+                self._save(record)
+                result = record.to_document()
                 result["runtime"] = response.get("result")
                 runtime_record = response.get("record")
                 if isinstance(runtime_record, dict):
@@ -497,11 +519,15 @@ class Sessions(ManagedAgents):
         with self._lock(name):
             record = self._load(name)
             if record.adapter == "turn-runner":
+                # The outer generation owns desired state. Persist intent first;
+                # a lost RPC response is reconciled by the next worker call.
+                record.paused = paused
+                self._save(record)
                 self._worker(record, "pause" if paused else "resume")
             else:
                 self._checked(record)
-            record.paused = paused
-            self._save(record)
+                record.paused = paused
+                self._save(record)
             return {"name": name, "token": record.token, "paused": paused}
 
     def runtime_operation(self, name: str, action: str, **options: object) -> dict[str, object]:

@@ -813,12 +813,12 @@ def _recover_inflight(name: str) -> None:
         _quarantine(name, path, "runner exited after claiming this turn; inspect its transcript before retrying")
 
 
-def _consume(name: str, msg_path: Path) -> None:
+def _consume(name: str, rec: lib.AgentRecord, msg_path: Path) -> None:
     with _intake_lock(name):
         _recover_inflight(name)
         if not msg_path.exists():
             return
-        if (lib.agent_dir(name) / "automation-paused").exists() or lib.migration_pause_path(name).exists():
+        if lib.automation_is_paused(rec) or lib.migration_pause_path(name).exists():
             return
         destination = lib.processed_dir(name) / msg_path.name
         if destination.exists():
@@ -861,6 +861,9 @@ def main() -> int:
                 lib.die(f"worker {name!r} already has a live or unverified runner")
             lib.terminate_active_harness(old)
     _record_runner_pid(name, stage_token)
+    rec = lib.read_registry().get(name)
+    if rec is None:
+        lib.die(f"worker {name!r} disappeared while publishing its runner identity")
     if stage_token is not None:
         while not _STOP_REQUESTED:
             if lib.stop_path(name).exists():
@@ -879,6 +882,13 @@ def main() -> int:
         _recover_inflight(name)
 
     while not _STOP_REQUESTED:
+        # A pre-token runtime may be adopted by the unified registry after it
+        # starts. Refresh only until that one-way generation binding appears.
+        if rec.owner_token is None:
+            current = lib.read_registry().get(name)
+            if current is None:
+                lib.die(f"worker {name!r} disappeared from the registry")
+            rec = current
         if lib.stop_path(name).exists():
             break
         if stage_token is None and lib.migration_pause_path(name).exists():
@@ -887,14 +897,14 @@ def main() -> int:
             )
             time.sleep(0.05)
             continue
-        if (lib.agent_dir(name) / "automation-paused").exists():
+        if lib.automation_is_paused(rec):
             time.sleep(0.05)
             continue
         pending = lib.next_pending_message(name)
         if pending is None:
             time.sleep(0.5)
             continue
-        _consume(name, pending)
+        _consume(name, rec, pending)
 
     _append(name, f"===RUNNER DOWN {name} {lib.now_iso()}===")
     _exit_reason(name, "stop marker or SIGTERM after active runner loop")

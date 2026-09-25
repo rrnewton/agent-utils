@@ -433,6 +433,10 @@ class AgentRecord:
     # Literal non-secret Muse options. Profiles reject credential-shaped
     # arguments before these durable launch settings are recorded.
     harness_args: tuple[str, ...] = ()
+    # Generation token issued by the canonical outer agentctl registry. Direct
+    # users receive a locally generated token. Every private worker RPC is
+    # bound to this value before it may observe or mutate runtime state.
+    owner_token: Optional[str] = None
     # New rows use the complete boot-bound identity.  The two scalar fields
     # above are accepted only while loading legacy rows and are not emitted
     # when this field is present.
@@ -445,6 +449,7 @@ class AgentRecord:
         missing = fields - set(d) - {
             "runner_pid", "runner_started_at", "runner_identity", "backend", "mode",
             "presentation_pane", "codex_bypass_permissions", "harness_args",
+            "owner_token",
         }
         if missing:
             die(f"registry row for {d.get('name')!r} missing keys: {sorted(missing)}")
@@ -505,6 +510,12 @@ class AgentRecord:
                 observed = None
             if observed is not None and str(observed.starttime_ticks) == legacy_started:
                 runner_identity = observed
+        owner_token = d.get("owner_token")
+        if owner_token is not None and (
+            not isinstance(owner_token, str)
+            or re.fullmatch(r"[a-z0-9-]{1,80}", owner_token) is None
+        ):
+            die("registry row has invalid owner_token")
         return AgentRecord(
             name=str(d["name"]),
             harness=str(d["harness"]),
@@ -523,6 +534,7 @@ class AgentRecord:
             presentation_pane=presentation_pane,
             codex_bypass_permissions=bypass,
             harness_args=tuple(raw_harness_args),
+            owner_token=owner_token,
             runner_identity=runner_identity,
         )
 
@@ -891,6 +903,43 @@ def read_registry() -> dict[str, AgentRecord]:
         os.close(fd)
 
 
+def bind_owner_token(name: str, owner_token: str) -> AgentRecord:
+    """Bind or verify the canonical session generation for one runtime row."""
+    valid_name = require_valid_name(name)
+    if re.fullmatch(r"[a-z0-9-]{1,80}", owner_token) is None:
+        raise AgentOperationError("invalid_owner_token", "owner token has an invalid shape")
+    with registry_lock() as agents:
+        rec = agents.get(valid_name)
+        if rec is None:
+            raise AgentOperationError("unknown_agent", f"unknown agent {valid_name!r}")
+        if rec.owner_token is None:
+            rec.owner_token = owner_token
+        elif rec.owner_token != owner_token:
+            raise AgentOperationError(
+                "owner_token_mismatch",
+                f"runtime {valid_name!r} belongs to another session generation",
+            )
+        return dataclasses.replace(rec)
+
+
+def reconcile_automation_pause(name: str, owner_token: str, paused: bool) -> None:
+    """Apply the canonical outer pause intent to one token-bound runtime."""
+    rec = bind_owner_token(name, owner_token)
+    marker = automation_pause_path(rec)
+    if paused:
+        _write_durable_json(marker, {
+            "schema": "agentctl-pause/v1",
+            "owner_token": owner_token,
+            "paused": True,
+        })
+    else:
+        marker.unlink(missing_ok=True)
+    # Once an outer generation owns this runtime, an old unscoped marker can
+    # no longer be authoritative.  A token-specific path makes a late request
+    # from a retired generation harmless to its replacement.
+    (agent_dir(name) / "automation-paused").unlink(missing_ok=True)
+
+
 # --------------------------------------------------------------------------- #
 # Per-agent filesystem layout
 # --------------------------------------------------------------------------- #
@@ -899,6 +948,17 @@ def read_registry() -> dict[str, AgentRecord]:
 def agent_dir(name: str) -> Path:
     """Return the runtime directory for one validated worker name."""
     return STATE / name
+
+
+def automation_pause_path(rec: AgentRecord) -> Path:
+    """Return the pause marker scoped to the runtime's owner generation."""
+    suffix = f".{rec.owner_token}" if rec.owner_token is not None else ""
+    return agent_dir(rec.name) / f"automation-paused{suffix}"
+
+
+def automation_is_paused(rec: AgentRecord) -> bool:
+    """Read pause intent only from the marker belonging to this generation."""
+    return automation_pause_path(rec).exists()
 
 
 def inbox_dir(name: str) -> Path:
@@ -2426,7 +2486,7 @@ def _agent_status(rec: AgentRecord) -> AgentStatus:
         last_message_preview=last_message_preview(rec.name),
         mode=rec.mode,
         presentation_pane=rec.presentation_pane,
-        automation_paused=(agent_dir(rec.name) / "automation-paused").exists(),
+        automation_paused=automation_is_paused(rec),
     )
 
 
@@ -2483,6 +2543,7 @@ def bring_up_agent(
     mode: Optional[str] = None,
     purpose: str = "development",
     harness_args: Sequence[str] = (),
+    owner_token: Optional[str] = None,
 ) -> UpResult:
     """Validate policy and launch a named worker, optionally enqueueing its first task."""
     harness = require_supported_harness(harness)
@@ -2512,6 +2573,10 @@ def bring_up_agent(
             f"{backend} is selected but is not available; check its binary and running server",
         )
     valid_name = require_valid_name(name)
+    if owner_token is None:
+        owner_token = secrets.token_hex(16)
+    elif re.fullmatch(r"[a-z0-9-]{1,80}", owner_token) is None:
+        raise AgentOperationError("invalid_owner_token", "owner token has an invalid shape")
     root = Path(cwd).expanduser().resolve()
     if not root.is_dir():
         raise AgentOperationError("bad_cwd", f"cwd is not a directory: {root}")
@@ -2548,6 +2613,7 @@ def bring_up_agent(
             mode=mode,
             codex_bypass_permissions=bypass_permissions,
             harness_args=tuple(harness_args),
+            owner_token=owner_token,
         )
 
     ensure_agent_dirs(valid_name)

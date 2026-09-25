@@ -62,7 +62,8 @@ def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Sessions, Fa
                     fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             finally:
                 os.close(descriptor)
-        return {"record": {"name": record.name, "mode": "headless", "backend": record.backend,
+        return {"record": {"name": record.name, "owner_token": record.token,
+                "mode": "headless", "backend": record.backend,
                 "session_id": "native-thread", "tmux_target": "workers:worker",
                 "presentation_pane": "w1:headless", **identity},
             "result": {"agents": [{"name": record.name, "status": "idle", "pending": 0,
@@ -294,6 +295,7 @@ def test_cli_headless_muse_profile_reaches_worker_with_exact_structured_argument
                 "mode": "headless", "backend": record.backend,
                 "session_id": "native-thread", "tmux_target": "workers:worker",
                 "presentation_pane": "w1:headless",
+                "owner_token": record.token,
             },
             "result": {
                 "agents": [{
@@ -415,7 +417,9 @@ def test_saved_idle_state_cannot_make_a_dead_or_unverifiable_runner_ready(livene
         row: dict[str, object] = {"name": record.name, "status": "idle", "pending": 0}
         if liveness != "absent":
             row["runner_alive"] = liveness
-        return {"result": {"agents": [row]}, "record": {"session_id": "native-thread"}}
+        return {"result": {"agents": [row]}, "record": {
+            "session_id": "native-thread", "owner_token": record.token,
+        }}
 
     monkeypatch.setattr(sessions, "_worker", status)
     with pytest.raises(AgentDeliveryError, match="not alive|cannot confirm"):
@@ -438,7 +442,7 @@ def test_live_idle_runner_remains_ready_when_only_its_presentation_is_lost(tmp_p
             os.close(descriptor)
         return {"result": {"agents": [{"name": record.name, "status": "idle", "pending": 0,
             "runner_alive": True, "window_alive": False, "presentation_degraded": True}]},
-            "record": {"session_id": "native-thread"}}
+            "record": {"session_id": "native-thread", "owner_token": record.token}}
 
     monkeypatch.setattr(sessions, "_worker", status)
     assert sessions.wait("worker", timeout=0)["token"] == original["token"]
@@ -486,7 +490,9 @@ def test_headless_health_requires_identity_bound_typed_liveness(
             "runner_identity": RUNNER_IDENTITY_JSON,
         }
         return {
-            "record": {**identity, "session_id": "native-thread"},
+            "record": {
+                **identity, "session_id": "native-thread", "owner_token": record.token,
+            },
             "result": {"agents": [{
                 **identity, "status": "dead", "pending": 0,
                 "runner_alive": alive,
@@ -515,15 +521,23 @@ def test_worker_rpc_process_liveness_reaches_health_as_typed_evidence(
     expected_health: str, expected_reason: str,
 ) -> None:
     sessions, _fake, _calls = setup(tmp_path, monkeypatch)
-    sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
+    outer = sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
     inner = worker_lib.AgentRecord(
         name="worker", harness="codex", backend="tmux",
         tmux_target="workers:worker", cwd=str(tmp_path), model=None,
         session_id="native-thread", status="idle", runner_pid=4242,
         runner_started_at="9001", runner_identity=RUNNER_IDENTITY, next_seq=0,
         created_at="2026-09-24T00:00:00+00:00", last_turn_at=None,
+        owner_token=cast(str, outer["token"]),
     )
     monkeypatch.setattr(worker_lib, "read_registry", lambda: {"worker": inner})
+    monkeypatch.setattr(
+        worker_lib, "reconcile_automation_pause",
+        lambda name, owner_token, paused: (
+            None if (name, owner_token, paused) == ("worker", outer["token"], False)
+            else pytest.fail("unexpected pause reconciliation")
+        ),
+    )
     monkeypatch.setattr(worker_lib, "window_exists", lambda _record: True)
     monkeypatch.setattr(worker_lib, "pending_count", lambda _name: 0)
     monkeypatch.setattr(worker_lib, "transcript_path", lambda _name: tmp_path / "turn.log")
@@ -544,7 +558,13 @@ def test_worker_rpc_process_liveness_reaches_health_as_typed_evidence(
 
     def dispatch(record: AgentRecord, action: str, **_: object) -> dict[str, object]:
         assert record.name == "worker" and action == "status"
-        return worker_rpc.dispatch({"action": action, "name": record.name})
+        return worker_rpc.dispatch({
+            "schema": "agentctl-worker-rpc/v2",
+            "action": action,
+            "name": record.name,
+            "owner_token": record.token,
+            "desired_paused": record.paused,
+        })
 
     monkeypatch.setattr(sessions, "_worker", dispatch)
     health = sessions.health(["worker"], checked_at=123.0)
@@ -572,11 +592,12 @@ def test_headless_dead_receipt_for_another_runner_is_unknown(
         return {
             "record": {
                 "name": record.name, "runner_pid": 4242,
-                "runner_started_at": "replacement", "session_id": "native-thread",
+                "runner_started_at": "9002", "session_id": "native-thread",
+                "owner_token": record.token,
             },
             "result": {"agents": [{
                 "name": record.name, "runner_pid": 4242,
-                "runner_started_at": "replacement", "runner_alive": False,
+                "runner_started_at": "9002", "runner_alive": False,
             }]},
         }
 
@@ -606,7 +627,7 @@ def test_headless_boolean_pid_cannot_match_saved_runner_one(
             "name": record.name, "runner_pid": True, "runner_started_at": "9001",
         }
         return {
-            "record": identity,
+            "record": {**identity, "owner_token": record.token},
             "result": {"agents": [{**identity, "runner_alive": False}]},
         }
 
@@ -615,7 +636,7 @@ def test_headless_boolean_pid_cannot_match_saved_runner_one(
     row = cast(list[dict[str, object]], health["sessions"])[0]
     assert row["health"] == "unknown"
     assert row["runtime_state"] == "unknown"
-    assert row["reason_code"] == "runtime-liveness-unconfirmed"
+    assert row["reason_code"] == "runtime-probe-failed"
 
 
 def test_worker_rpc_preserves_typed_remote_error(
@@ -627,7 +648,8 @@ def test_worker_rpc_preserves_typed_remote_error(
         adapter="turn-runner", mode="headless", runtime_home=str(tmp_path / "runtime"),
     )
     response = {
-        "schema": "agentctl-worker-rpc/v1", "action": "status", "ok": False,
+        "schema": "agentctl-worker-rpc/v2", "action": "status",
+        "owner_token": record.token, "ok": False,
         "error": {"code": "unknown_agent", "message": "runner is not alive"},
     }
     monkeypatch.setattr(
@@ -639,6 +661,101 @@ def test_worker_rpc_preserves_typed_remote_error(
     assert raised.value.kind == "runtime-error"
     assert raised.value.remote_code == "unknown_agent"
     assert str(raised.value) == "runner is not alive"
+
+
+def test_worker_rpc_rejects_a_receipt_for_another_owner_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions = Sessions(registry=tmp_path / "registry")
+    record = AgentRecord(
+        "worker", "generation", "codex", str(tmp_path), 1.0,
+        adapter="turn-runner", mode="headless", runtime_home=str(tmp_path / "runtime"),
+    )
+    response = {
+        "schema": "agentctl-worker-rpc/v2", "action": "status",
+        "owner_token": "replacement-generation", "ok": True,
+        "payload": {"record": None, "result": {}},
+    }
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *args, **kwargs: CompletedProcess(args[0], 0, json.dumps(response), ""),
+    )
+    with pytest.raises(WorkerRpcError, match="invalid typed envelope") as raised:
+        sessions._worker(record, "status")
+    assert raised.value.kind == "invalid-receipt"
+
+
+def test_lost_start_receipt_is_reconciled_without_a_second_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions = Sessions(registry=tmp_path / "registry")
+    calls: list[str] = []
+
+    def lost_start(record: AgentRecord, action: str, **_: object) -> dict[str, object]:
+        calls.append(action)
+        raise WorkerRpcError("timeout", "receipt was lost")
+
+    monkeypatch.setattr(sessions, "_worker", lost_start)
+    with pytest.raises(WorkerRpcError, match="receipt was lost"):
+        sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
+    saved = sessions.get("worker")
+    assert saved.lifecycle == "starting"
+    assert calls == ["start"]
+
+    def recovered(record: AgentRecord, action: str, **_: object) -> dict[str, object]:
+        calls.append(action)
+        assert action == "status"
+        identity = {
+            "name": record.name, "runner_pid": 4242, "runner_started_at": "9001",
+            "runner_identity": RUNNER_IDENTITY_JSON,
+        }
+        return {
+            "record": {
+                **identity, "owner_token": record.token, "mode": "headless",
+                "backend": record.backend, "session_id": "native-thread",
+            },
+            "result": {"agents": [{**identity, "runner_alive": True}]},
+        }
+
+    monkeypatch.setattr(sessions, "_worker", recovered)
+    status = sessions.status("worker")
+    assert status["lifecycle"] == "running"
+    assert sessions.get("worker").error is None
+    assert calls == ["start", "status"]
+
+
+def test_lost_pause_receipt_leaves_durable_intent_for_reconciliation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, _fake, _calls = setup(tmp_path, monkeypatch)
+    sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
+
+    def lost_pause(record: AgentRecord, action: str, **_: object) -> dict[str, object]:
+        assert action == "pause" and record.paused
+        raise WorkerRpcError("timeout", "pause receipt was lost")
+
+    monkeypatch.setattr(sessions, "_worker", lost_pause)
+    with pytest.raises(WorkerRpcError, match="pause receipt was lost"):
+        sessions.pause("worker")
+    assert sessions.get("worker").paused
+
+    reconciled: list[bool] = []
+
+    def status(record: AgentRecord, action: str, **_: object) -> dict[str, object]:
+        assert action == "status"
+        reconciled.append(record.paused)
+        identity = {
+            "name": record.name, "runner_pid": 4242, "runner_started_at": "9001",
+            "runner_identity": RUNNER_IDENTITY_JSON,
+        }
+        return {
+            "record": {**identity, "owner_token": record.token},
+            "result": {"agents": [{**identity, "runner_alive": True}]},
+        }
+
+    monkeypatch.setattr(sessions, "_worker", status)
+    sessions.status("worker")
+    assert reconciled == [True]
 
 
 @pytest.mark.parametrize("timeout", [float("nan"), float("inf"), -1.0, 31_536_001.0])
