@@ -18,6 +18,7 @@ import selectors
 import signal
 import shlex
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -502,8 +503,13 @@ def install_validation_exclusion_fixture(
         arguments: Sequence[str],
         *,
         input_data: bytes | None = None,
+        input_limit: int = 1024 * 1024,
         budget: wrkslots._ReadOnlyCommandBudget | None = None,
     ) -> tuple[int, bytes, bytes]:
+        if input_data is not None and len(input_data) > input_limit:
+            raise wrkslots.Refusal(
+                f"privileged read-only census input exceeds {input_limit} bytes"
+            )
         selected_budget = budget or wrkslots._ReadOnlyCommandBudget.start(
             timeout_seconds=60,
             stdout_limit=16 * 1024 * 1024,
@@ -6292,17 +6298,25 @@ def test_batched_lsof_census_attributes_live_process_to_exact_checkout(
         calls.append("all-mount-namespaces")
         return ()
 
-    def links(observed: Sequence[wrkslots._AbsentProcessObservation], targets: Mapping[Path, str], _budget: wrkslots._ReadOnlyCommandBudget) -> tuple[tuple[int, str, str, str], ...]:
+    def identities(
+        observed: Sequence[wrkslots._AbsentProcessObservation],
+        targets: Mapping[Path, str],
+        inodes: Mapping[tuple[int, int], tuple[tuple[str, str], ...]],
+        census_budget: wrkslots._ReadOnlyCommandBudget,
+    ) -> tuple[tuple[tuple[int, str, str, str], ...], dict[int, set[int]]]:
         assert tuple(observed) == processes
         assert targets == {first: str(first), second: str(second)}
+        assert inodes == {}
+        assert census_budget is budget
         calls.append("all-process-paths")
-        return ((4242, str(second), "link", str(second)),)
+        return ((4242, str(second), "link", str(second)),), {}
 
     monkeypatch.setattr(wrkslots, "_selected_tree_inodes", catalog)
     monkeypatch.setattr(wrkslots, "_absent_validate_process_snapshot", snapshot)
     monkeypatch.setattr(wrkslots, "_absent_validate_mount_matches", mounts)
-    monkeypatch.setattr(wrkslots, "_batch_link_matches", links)
-    monkeypatch.setattr(wrkslots, "_batch_inode_matches", lambda *_args: ((), {}))
+    monkeypatch.setattr(
+        wrkslots, "_batch_inode_matches", identities
+    )
     monkeypatch.setattr(wrkslots, "_batch_maps_inode_matches", lambda *_args: ())
     monkeypatch.setattr(wrkslots, "_batch_unix_socket_matches", lambda *_args, **_kwargs: ())
     budget = wrkslots._ReadOnlyCommandBudget.start(
@@ -6677,10 +6691,10 @@ def test_batch_inode_and_maps_census_refuse_incomplete_evidence(
     ):
         monkeypatch.setattr(wrkslots, "_run_root_owned_command", lambda *_a, data=output, **_k: (0, data, b""))
         with pytest.raises(wrkslots.Refusal, match=reason):
-            wrkslots._batch_inode_matches((process,), {}, budget())
+            wrkslots._privileged_inode_matches((process,), {}, budget())
     monkeypatch.setattr(wrkslots, "_run_root_owned_command", lambda *_a, **_k: (1, b"", b"/usr/bin/find: '/proc/4242/fd': Permission denied\n"))
     with pytest.raises(wrkslots.Refusal, match="produced diagnostics"):
-        wrkslots._batch_inode_matches((process,), {}, budget())
+        wrkslots._privileged_inode_matches((process,), {}, budget())
     inodes = {(48, 19): ((str(tmp_path), "selected file"),)}
     def no_fallback(*_args: object, **_kwargs: object) -> tuple[int, bytes, bytes]:
         raise AssertionError("missing descriptor evidence must not use negative lsof")
@@ -6689,7 +6703,7 @@ def test_batch_inode_and_maps_census_refuse_incomplete_evidence(
         diagnostic = f"/usr/bin/find: '/proc/4242/{path}': {error}\n".encode()
         monkeypatch.setattr(wrkslots, "_run_root_owned_command", lambda *_a, data=diagnostic, **_k: (1, b"", data))
         with pytest.raises(wrkslots.Refusal, match="unattributed diagnostics"):
-            wrkslots._batch_inode_matches((process,), inodes, budget())
+            wrkslots._privileged_inode_matches((process,), inodes, budget())
     # A disconnected cwd must not discard that same process's independent FD
     # rows: a socket inode is still needed for namespace attribution.
     def disconnected_cwd(_program: Path, arguments: Sequence[str], **_kwargs: object) -> tuple[int, bytes, bytes]:
@@ -6698,11 +6712,15 @@ def test_batch_inode_and_maps_census_refuse_incomplete_evidence(
         return 1, b"/proc/4242/cwd\x006\x001\x00l\x00", b"/usr/bin/find: '/proc/4242/cwd': Transport endpoint is not connected\n"
     monkeypatch.setattr(wrkslots, "_run_root_owned_command", disconnected_cwd)
     monkeypatch.setattr(wrkslots, "_run_same_uid_command", lambda *_a, **_k: (1, b"", b""))
-    matches, sockets = wrkslots._batch_inode_matches((process,), inodes, budget())
+    matches, sockets = wrkslots._privileged_inode_matches(
+        (process,), inodes, budget()
+    )
     assert not matches and sockets == {123: {4242}}
     # U is a valid anonymous descriptor type, not permission to drop identity.
     monkeypatch.setattr(wrkslots, "_run_root_owned_command", lambda *_a, **_k: (0, b"/proc/4242/fd/4\x0048\x0019\x00U\x00", b""))
-    matches, sockets = wrkslots._batch_inode_matches((process,), inodes, budget())
+    matches, sockets = wrkslots._privileged_inode_matches(
+        (process,), inodes, budget()
+    )
     assert matches and all(row[0] == 4242 and row[2] == "inode" for row in matches)
     assert not sockets
     monkeypatch.setattr(wrkslots, "_run_root_owned_command", lambda *_a, **_k: (0, b"/proc/4242/maps:1-2 r--p 0 broken 19 /outside/file\n", b""))
@@ -6723,6 +6741,414 @@ def test_batch_inode_and_maps_census_refuse_incomplete_evidence(
     monkeypatch.setattr(wrkslots, "_run_root_owned_command", changed_mapping)
     with pytest.raises(wrkslots._ProcessEvidenceChanged, match="mappings changed"):
         wrkslots._batch_map_file_matches({4242: process}, rows, inodes, budget())
+
+
+def test_direct_inode_census_keeps_large_same_uid_fd_population_off_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proc_root = tmp_path / "proc"
+    selected = tmp_path / "selected"
+    outside = tmp_path / "outside"
+    selected.mkdir()
+    outside.mkdir()
+    selected_file = selected / "held"
+    selected_file.write_bytes(b"selected")
+    outside_alias = outside / "alias"
+    os.link(selected_file, outside_alias)
+    unrelated = outside / "unrelated"
+    unrelated.write_bytes(b"unrelated")
+    selected_identity = selected_file.stat()
+    process_count = 32
+    descriptors_per_process = 256
+    processes = tuple(
+        wrkslots._AbsentProcessObservation(pid, pid + 1000, "", "mnt:[1]")
+        for pid in range(1000, 1000 + process_count)
+    )
+    for process in processes:
+        base = proc_root / str(process.pid)
+        (base / "fd").mkdir(parents=True)
+        for name in ("cwd", "root", "exe"):
+            (base / name).symlink_to(outside)
+        for descriptor in range(descriptors_per_process):
+            destination = (
+                outside_alias
+                if process == processes[-1] and descriptor == descriptors_per_process - 1
+                else unrelated
+            )
+            (base / "fd" / str(descriptor)).symlink_to(destination)
+
+    monkeypatch.setattr(
+        wrkslots, "_process_filesystem_uid", lambda _path: os.getuid()
+    )
+    monkeypatch.setattr(
+        wrkslots, "_process_generation_is_current", lambda _process: True
+    )
+    direct = wrkslots._direct_process_identity_matches
+    monkeypatch.setattr(
+        wrkslots,
+        "_direct_process_identity_matches",
+        lambda processes, targets, inodes, budget: direct(
+            processes, targets, inodes, budget, proc_root=proc_root
+        ),
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_run_root_owned_command",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("same-UID descriptors must not cross the output pipe")
+        ),
+    )
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=30,
+        stdout_limit=64,
+        stderr_limit=64,
+        observation_limit=process_count * (descriptors_per_process + 6),
+    )
+    matches, sockets = wrkslots._batch_inode_matches(
+        processes,
+        {selected: str(selected)},
+        {
+            (selected_identity.st_dev, selected_identity.st_ino): (
+                (str(selected), "selected file"),
+            )
+        },
+        budget,
+    )
+
+    assert matches == (
+        (
+            processes[-1].pid,
+            str(selected),
+            "inode",
+            f"{proc_root / str(processes[-1].pid) / 'fd' / str(descriptors_per_process - 1)}=selected file",
+        ),
+    )
+    assert sockets == {}
+    assert budget.stdout_remaining == budget.stderr_remaining == 64
+
+
+def test_direct_inode_census_refuses_instead_of_truncating_observations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proc_root = tmp_path / "proc"
+    base = proc_root / "4242"
+    (base / "fd").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"outside")
+    for name in ("cwd", "root", "exe"):
+        (base / name).symlink_to(tmp_path)
+    for descriptor in range(8):
+        (base / "fd" / str(descriptor)).symlink_to(outside)
+    process = wrkslots._AbsentProcessObservation(4242, 17, "", "mnt:[1]")
+    monkeypatch.setattr(
+        wrkslots, "_process_filesystem_uid", lambda _path: os.getuid()
+    )
+    monkeypatch.setattr(
+        wrkslots, "_process_generation_is_current", lambda _process: True
+    )
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=30,
+        stdout_limit=64,
+        stderr_limit=64,
+        observation_limit=5,
+    )
+
+    with pytest.raises(wrkslots.Refusal, match="operation-wide observation bound"):
+        wrkslots._direct_process_identity_matches(
+            (process,), {}, {}, budget, proc_root=proc_root
+        )
+
+
+@pytest.mark.ordinary_environment
+def test_direct_inode_census_preserves_socket_holder_identity() -> None:
+    pid_dir = Path("/proc") / str(os.getpid())
+    generation = wrkslots._process_start_ticks(pid_dir)
+    namespace = wrkslots._mount_namespace(pid_dir)
+    assert generation is not None and namespace is not None
+    process = wrkslots._AbsentProcessObservation(
+        os.getpid(),
+        generation,
+        "",
+        namespace,
+    )
+    holder = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        identity = os.fstat(holder.fileno())
+        assert stat.S_ISSOCK(identity.st_mode)
+        budget = wrkslots._ReadOnlyCommandBudget.start(
+            timeout_seconds=30, stdout_limit=64, stderr_limit=64
+        )
+
+        links, matches, sockets, fallback = wrkslots._direct_process_identity_matches(
+            (process,), {}, {}, budget
+        )
+
+        assert links == ()
+        assert matches == ()
+        assert fallback == ()
+        assert sockets[identity.st_ino] == {os.getpid()}
+        assert budget.stdout_remaining == budget.stderr_remaining == 64
+    finally:
+        holder.close()
+
+
+def test_batch_inode_census_keeps_protected_process_output_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = wrkslots._AbsentProcessObservation(4242, 17, "", "mnt:[1]")
+    monkeypatch.setattr(
+        wrkslots,
+        "_direct_process_identity_matches",
+        lambda processes, _targets, _inodes, _budget: (
+            (), (), {}, tuple(processes)
+        ),
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_run_root_owned_command",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            wrkslots.Refusal(
+                "privileged read-only census stdout exceeded 512 bytes"
+            )
+        ),
+    )
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=30, stdout_limit=512, stderr_limit=64
+    )
+
+    with pytest.raises(wrkslots.Refusal, match="stdout exceeded 512 bytes"):
+        wrkslots._batch_inode_matches((process,), {}, {}, budget)
+
+
+def test_inode_range_filter_is_bounded_and_covers_every_selected_identity(
+    tmp_path: Path,
+) -> None:
+    selected = {
+        (device % 7 + 1, inode): ()
+        for device, inode in enumerate(range(1, 100_000, 97))
+    }
+    ranges = wrkslots._bounded_inode_ranges(selected)
+
+    assert len(ranges) <= wrkslots._PROCESS_CENSUS_INODE_RANGE_LIMIT
+    assert all(
+        any(first <= inode <= last for first, last in ranges)
+        for _device, inode in selected
+    )
+
+    probe = tmp_path / "probe"
+    probe.write_bytes(b"probe")
+    identity = probe.stat()
+    first = max(1, identity.st_ino - 512)
+    covering = {
+        (identity.st_dev, inode): ()
+        for inode in range(first, identity.st_ino + 513)
+    }
+    returncode, stdout, stderr = wrkslots._run_bounded_read_only_command(
+        (
+            "/usr/bin/find",
+            "-L",
+            str(probe),
+            "-maxdepth",
+            "0",
+            "(",
+            *wrkslots._find_inode_selection(covering),
+            ")",
+            "-printf",
+            "%p\\0",
+        ),
+        stdout_limit=4096,
+    )
+    assert returncode == 0
+    assert stdout == os.fsencode(probe) + b"\0"
+    assert stderr == b""
+
+
+def test_privileged_inode_filter_discards_unrelated_fds_but_not_evidence(
+    tmp_path: Path,
+) -> None:
+    descriptors = tmp_path / "fd"
+    selected = tmp_path / "selected"
+    outside = tmp_path / "outside"
+    descriptors.mkdir()
+    selected.mkdir()
+    outside.mkdir()
+    selected_file = selected / "held"
+    selected_file.write_bytes(b"selected")
+    selected_identity = selected_file.stat()
+    outside_alias = outside / "alias"
+    os.link(selected_file, outside_alias)
+    unrelated = outside / "unrelated"
+    unrelated.write_bytes(b"unrelated")
+    for descriptor in range(4096):
+        (descriptors / f"unrelated-{descriptor}").symlink_to(unrelated)
+    selected_descriptor = descriptors / "selected"
+    selected_descriptor.symlink_to(outside_alias)
+    socket_path = outside / "socket"
+    holder = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    holder.bind(str(socket_path))
+    socket_descriptor = descriptors / "socket"
+    socket_descriptor.symlink_to(socket_path)
+    inodes = {(selected_identity.st_dev, selected_identity.st_ino): ()}
+    command = (
+        "/usr/bin/find",
+        "-L",
+        str(descriptors),
+        "-mindepth",
+        "1",
+        "-maxdepth",
+        "1",
+        "(",
+        *wrkslots._find_inode_selection(inodes),
+        ")",
+        "-printf",
+        "%p\\0%D\\0%i\\0%y\\0",
+    )
+    try:
+        returncode, stdout, stderr = wrkslots._run_bounded_read_only_command(
+            command, stdout_limit=1024
+        )
+        assert returncode == 0
+        assert stderr == b""
+        rows = wrkslots._census_nul_records(stdout, 4, "test inode find")
+        assert {row[0] for row in rows} == {
+            str(selected_descriptor),
+            str(socket_descriptor),
+        }
+
+        # Producer selection is not truncation. Relevant output still refuses
+        # instead of authorizing a clear result from a prefix.
+        for descriptor in range(64):
+            (descriptors / f"selected-{'x' * 40}-{descriptor}").symlink_to(
+                outside_alias
+            )
+        with pytest.raises(wrkslots.Refusal, match="stdout exceeded 1024 bytes"):
+            wrkslots._run_bounded_read_only_command(
+                command, stdout_limit=1024
+            )
+    finally:
+        holder.close()
+
+
+def test_privileged_find_compacts_large_target_set_and_keeps_exact_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = Path("/srv/worktrees/slots")
+    targets = {
+        parent / f"slot-{index:03d}-{'x' * 64}": f"slot-{index:03d}"
+        for index in range(293)
+    }
+    exact_selection = wrkslots._find_link_selection(targets)
+    assert sum(len(os.fsencode(arg)) + 1 for arg in exact_selection) > 48 * 1024
+
+    process = wrkslots._AbsentProcessObservation(123, 17, "/other", "mnt:[123]")
+    selected = next(reversed(targets))
+    unrelated = parent / "not-selected" / "held"
+    evidence = b"".join(
+        (
+            b"/proc/123/fd/8\0",
+            os.fsencode(selected / "held") + b"\0",
+            b"/proc/123/fd/9\0",
+            os.fsencode(unrelated) + b"\0",
+        )
+    )
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        wrkslots, "_process_symlink_roots", lambda _processes: ("/proc/123/fd",)
+    )
+    monkeypatch.setattr(wrkslots, "_process_start_ticks", lambda _path: 17)
+
+    def bounded_find(
+        _program: Path,
+        arguments: Sequence[str],
+        **_kwargs: object,
+    ) -> tuple[int, bytes, bytes]:
+        calls.append(tuple(arguments))
+        assert sum(len(os.fsencode(arg)) + 1 for arg in arguments) < 48 * 1024
+        pairs = tuple(zip(arguments, arguments[1:]))
+        assert ("-lname", str(parent / "*")) in pairs
+        return 0, evidence, b""
+
+    monkeypatch.setattr(wrkslots, "_run_root_owned_command", bounded_find)
+
+    assert wrkslots._absent_validate_find_matches((process,), targets) == (
+        (123, targets[selected], "link", str(selected / "held")),
+    )
+    assert len(calls) == 1
+
+
+def test_compacted_find_selection_is_a_producer_superset(tmp_path: Path) -> None:
+    link_root = tmp_path / "links"
+    link_root.mkdir()
+    parent = Path("/srv/worktrees/slots")
+    targets = {
+        parent / f"slot-{index:03d}-{'x' * 64}": f"slot-{index:03d}"
+        for index in range(293)
+    }
+    selected = next(reversed(targets))
+    selected_link = link_root / "selected"
+    unrelated_link = link_root / "unrelated"
+    selected_link.symlink_to(selected / "held")
+    unrelated_link.symlink_to(parent / "not-selected" / "held")
+    selection = wrkslots._bounded_find_link_selection(targets)
+
+    returncode, stdout, stderr = wrkslots._run_bounded_read_only_command(
+        (
+            "/usr/bin/find",
+            "-P",
+            str(link_root),
+            "-maxdepth",
+            "1",
+            "-type",
+            "l",
+            "(",
+            *selection,
+            ")",
+            "-printf",
+            "%p\\0%l\\0",
+        )
+    )
+
+    assert returncode == 0
+    assert stderr == b""
+    assert {
+        tuple(record)
+        for record in wrkslots._census_nul_records(stdout, 2, "compacted find")
+    } == {
+        (str(selected_link), str(selected / "held")),
+        (str(unrelated_link), str(parent / "not-selected" / "held")),
+    }
+
+
+def test_privileged_find_discards_all_batches_after_process_generation_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = wrkslots._AbsentProcessObservation(123, 17, "/other", "mnt:[123]")
+    target = Path("/srv/worktrees/slots/selected")
+    roots = tuple(
+        f"/proc/123/fd/{index}-{'x' * 1024}" for index in range(100)
+    )
+    generation = 17
+    calls = 0
+    monkeypatch.setattr(wrkslots, "_process_symlink_roots", lambda _processes: roots)
+    monkeypatch.setattr(wrkslots, "_process_start_ticks", lambda _path: generation)
+
+    def mutating_find(
+        _program: Path,
+        _arguments: Sequence[str],
+        **_kwargs: object,
+    ) -> tuple[int, bytes, bytes]:
+        nonlocal calls, generation
+        calls += 1
+        if calls == 1:
+            return 0, b"/proc/123/fd/8\0/srv/worktrees/slots/selected/held\0", b""
+        generation = 18
+        return 0, b"", b""
+
+    monkeypatch.setattr(wrkslots, "_run_root_owned_command", mutating_find)
+
+    with pytest.raises(wrkslots._ProcessEvidenceChanged, match="generation changed"):
+        wrkslots._absent_validate_find_matches((process,), {target: "selected"})
+    assert calls > 1
 
 
 
@@ -6751,7 +7177,7 @@ def test_batch_unix_census_preserves_uncertainty_and_generation_guards(
         wrkslots._batch_unix_socket_matches((process,), {tmp_path: str(tmp_path)}, {}, wrkslots._ReadOnlyCommandBudget.start(timeout_seconds=22, stdout_limit=4096, stderr_limit=4096))
 
 
-def test_batch_unix_census_accepts_current_scale_but_retains_file_bound(
+def test_batch_unix_census_filters_current_scale_at_privileged_producer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     process = wrkslots._AbsentProcessObservation(4242, 17, "", "mnt:[1]")
@@ -6759,15 +7185,32 @@ def test_batch_unix_census_accepts_current_scale_but_retains_file_bound(
     row = b"0: 2 0 0 1 1 123\n"
     contents = header + row * ((5 * 1024 * 1024) // len(row) + 1)
     assert 4 * 1024 * 1024 < len(contents) < wrkslots._UNIX_SOCKET_TABLE_BYTES_LIMIT
+    table = tmp_path / "unix"
+    table.write_bytes(contents)
     monkeypatch.setattr(
         wrkslots, "_batch_network_namespaces", lambda *_args: {4242: "net:[1]"}
     )
     monkeypatch.setattr(wrkslots, "_process_generation_is_current", lambda _p: True)
-    monkeypatch.setattr(
-        wrkslots,
-        "_run_root_owned_command",
-        lambda *_args, **_kwargs: (0, contents, b""),
-    )
+    calls: list[tuple[Path, tuple[str, ...], bytes, int]] = []
+
+    def filtered_root(
+        program: Path,
+        arguments: Sequence[str],
+        *,
+        input_data: bytes | None = None,
+        input_limit: int = 1024 * 1024,
+        budget: wrkslots._ReadOnlyCommandBudget | None = None,
+    ) -> tuple[int, bytes, bytes]:
+        assert input_data is not None
+        calls.append((program, tuple(arguments), input_data, input_limit))
+        return wrkslots._run_bounded_read_only_command(
+            (str(program), *arguments[:-1], str(table)),
+            input_data=input_data,
+            input_limit=input_limit,
+            stdout_limit=wrkslots._PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
+        )
+
+    monkeypatch.setattr(wrkslots, "_run_root_owned_command", filtered_root)
     budget = wrkslots._ReadOnlyCommandBudget.start(
         timeout_seconds=22,
         stdout_limit=wrkslots._PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
@@ -6776,6 +7219,14 @@ def test_batch_unix_census_accepts_current_scale_but_retains_file_bound(
     assert wrkslots._batch_unix_socket_matches(
         (process,), {tmp_path: str(tmp_path)}, {}, budget
     ) == ()
+    assert calls == [
+        (
+            Path("/usr/bin/gawk"),
+            ("--", wrkslots._BATCH_UNIX_AWK, "/proc/4242/net/unix"),
+            f"{tmp_path}\n".encode(),
+            wrkslots._PROCESS_CENSUS_SELECTION_BYTES_LIMIT,
+        )
+    ]
 
     oversized = b"x" * (wrkslots._UNIX_SOCKET_TABLE_BYTES_LIMIT + 1)
     monkeypatch.setattr(
@@ -6787,6 +7238,41 @@ def test_batch_unix_census_accepts_current_scale_but_retains_file_bound(
         wrkslots._batch_unix_socket_matches(
             (process,), {tmp_path: str(tmp_path)}, {}, budget
         )
+
+
+def test_unix_socket_producer_preserves_relevant_rows_and_refuses_truncation(
+    tmp_path: Path,
+) -> None:
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    header = "Num RefCount Protocol Flags Type St Inode Path\n"
+    unrelated = "0: 2 0 0 1 1 123 /outside/socket\n"
+    relevant = f"0: 2 0 0 1 1 456 {selected}/socket\n"
+    table = tmp_path / "unix"
+    table.write_text(header + unrelated * 4096 + relevant, encoding="utf-8")
+    command = ("/usr/bin/gawk", "--", wrkslots._BATCH_UNIX_AWK, str(table))
+    selection = f"{selected}\n".encode()
+
+    returncode, stdout, stderr = wrkslots._run_bounded_read_only_command(
+        command,
+        input_data=selection,
+        input_limit=len(selection),
+        stdout_limit=4096,
+    )
+
+    assert returncode == 0
+    assert stdout == (header + relevant).encode()
+    assert stderr == b""
+
+    table.write_text(header + relevant.rstrip("\n"), encoding="utf-8")
+    returncode, _stdout, stderr = wrkslots._run_bounded_read_only_command(
+        command,
+        input_data=selection,
+        input_limit=len(selection),
+        stdout_limit=4096,
+    )
+    assert returncode == 2
+    assert b"missing final newline" in stderr
 
 
 @pytest.mark.ordinary_environment
@@ -6809,6 +7295,41 @@ def test_batch_maps_filter_preserves_large_inode_strings_and_read_errors(tmp_pat
         input_data=b"i9007199254740992\n", budget=budget(),
     )
     assert rc == 1 and not out and str(path / "missing").encode() in err
+
+
+def test_batch_maps_filter_uses_its_bounded_selection_input_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = wrkslots._AbsentProcessObservation(4242, 17, "", "mnt:[1]")
+    observed: dict[str, object] = {}
+
+    def root_command(
+        program: Path,
+        arguments: Sequence[str],
+        **kwargs: object,
+    ) -> tuple[int, bytes, bytes]:
+        observed.update(program=program, arguments=arguments, **kwargs)
+        return 0, b"", b""
+
+    monkeypatch.setattr(wrkslots, "_run_root_owned_command", root_command)
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=22,
+        stdout_limit=4096,
+        stderr_limit=4096,
+        input_limit=wrkslots._MOUNTINFO_CENSUS_BYTES_LIMIT,
+    )
+    assert (
+        wrkslots._batch_maps_inode_matches(
+            (process,),
+            {tmp_path: str(tmp_path)},
+            {(48, 19): ((str(tmp_path), "selected file"),)},
+            budget,
+        )
+        == ()
+    )
+    assert observed["program"] == Path("/usr/bin/gawk")
+    assert observed["input_limit"] == wrkslots._PROCESS_CENSUS_SELECTION_BYTES_LIMIT
+    assert observed["budget"] is budget
 
 
 def test_batch_network_namespace_links_require_complete_generation_bound_records(
@@ -29641,6 +30162,27 @@ def test_bounded_read_only_command_refuses_output_and_time_overruns() -> None:
             ["/usr/bin/sleep", "1"],
             timeout_seconds=0.01,
             input_data=b"x" * (256 * 1024),
+        )
+
+
+def test_bounded_read_only_command_has_an_explicit_larger_input_ceiling() -> None:
+    payload = b"x" * (1024 * 1024 + 1)
+    returncode, stdout, stderr = wrkslots._run_bounded_read_only_command(
+        ["/usr/bin/cat"],
+        input_data=payload,
+        input_limit=len(payload),
+        stdout_limit=len(payload),
+    )
+    assert returncode == 0
+    assert stdout == payload
+    assert stderr == b""
+
+    with pytest.raises(wrkslots.Refusal, match=f"input exceeds {len(payload) - 1} bytes"):
+        wrkslots._run_bounded_read_only_command(
+            ["/usr/bin/cat"],
+            input_data=payload,
+            input_limit=len(payload) - 1,
+            stdout_limit=len(payload),
         )
 
 

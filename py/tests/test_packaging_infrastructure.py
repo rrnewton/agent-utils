@@ -831,9 +831,9 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
 
     assert ordinary.isdisjoint(mapped)
     assert ordinary | mapped == all_tests
-    assert len(all_tests) == 1139
-    assert len(ordinary) == 282
-    assert len(mapped) == 857
+    assert len(all_tests) == 1143
+    assert len(ordinary) == 283
+    assert len(mapped) == 860
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
@@ -862,6 +862,7 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
         "test_direct_current_frozen_recovery_requires_removal_proof",
         "test_direct_frozen_recovery_preserves_proofless_legacy_schemas",
         "test_direct_historical_projection_cannot_use_batch_only_nonblocking_result",
+        "test_direct_inode_census_preserves_socket_holder_identity",
         "test_frozen_parser_and_consumer_use_exact_real_projection_shape",
         "test_frozen_parser_authority_accepts_real_nested_linked_worktree",
         "test_frozen_parser_failures_preserve_checkout_without_journal",

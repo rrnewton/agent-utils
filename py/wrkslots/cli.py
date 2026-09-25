@@ -358,11 +358,30 @@ _RETAINED_HANDLE_BYTES_LIMIT = 64 * 1024 * 1024
 _RETAINED_HANDLE_CENSUS_SECONDS = 30.0
 _MOUNTINFO_FILE_BYTES_LIMIT = 4 * 1024 * 1024
 _UNIX_SOCKET_TABLE_BYTES_LIMIT = 16 * 1024 * 1024
-# The full identity census must enumerate every descriptor inode and one Unix
-# socket table even though ordinary path links are filtered at the producer.
+# The privileged fallback must enumerate every descriptor inode it cannot read
+# directly, and the census must read one Unix socket table per network namespace.
 # A 2026-09-22 production namespace used about 7.5 MiB for each half. Keep the
 # operation bounded while leaving enough headroom for normal host fluctuation.
 _PROCESS_CENSUS_OUTPUT_BYTES_LIMIT = 64 * 1024 * 1024
+# Leave half of the deliberately conservative 48 KiB command budget for procfs
+# roots. A larger target set is represented by ancestor predicates below; the
+# exact in-process matcher remains the authority for whether emitted evidence
+# belongs to a selected tree.
+_FIND_LINK_SELECTION_BYTES_LIMIT = 24 * 1024
+# Direct procfs observations do not cross a child-process pipe, but they still
+# need a finite operation-wide work bound.  The limit is deliberately separate
+# from the byte budgets: one descriptor can have a tiny textual representation
+# while still costing a syscall and participating in a process-generation race.
+_PROCESS_CENSUS_OBSERVATION_LIMIT = 4 * 1024 * 1024
+# The maps filter receives one exact inode key per selected-tree identity. An
+# eight-tree production cohort used 1,373,358 bytes on 2026-09-24. This remains
+# a per-command ceiling inside the separate operation-wide input budget.
+_PROCESS_CENSUS_SELECTION_BYTES_LIMIT = 16 * 1024 * 1024
+# GNU find cannot consume an inode set on stdin. A bounded set of covering
+# ranges keeps the privileged descriptor producer target-aware without risking
+# false negatives; false-positive rows are rejected by exact device/inode
+# comparison after parsing.
+_PROCESS_CENSUS_INODE_RANGE_LIMIT = 128
 _FILE_HANDLE_BYTES_LIMIT = 128
 _AT_FDCWD = -100
 _AT_SYMLINK_FOLLOW = 0x400
@@ -28373,12 +28392,13 @@ def _recheck_trusted_executable(executable: _TrustedExecutablePath) -> None:
 
 @dataclasses.dataclass
 class _ReadOnlyCommandBudget:
-    """One deadline and byte budget shared by every child in a census."""
+    """One deadline plus byte and direct-observation bounds for a census."""
 
     deadline: float
     stdout_remaining: int
     stderr_remaining: int
     input_remaining: int
+    observations_remaining: int
 
     @classmethod
     def start(
@@ -28388,12 +28408,14 @@ class _ReadOnlyCommandBudget:
         stdout_limit: int,
         stderr_limit: int,
         input_limit: int = 16 * 1024 * 1024,
+        observation_limit: int = _PROCESS_CENSUS_OBSERVATION_LIMIT,
     ) -> "_ReadOnlyCommandBudget":
         return cls(
             deadline=time.monotonic() + timeout_seconds,
             stdout_remaining=stdout_limit,
             stderr_remaining=stderr_limit,
             input_remaining=input_limit,
+            observations_remaining=observation_limit,
         )
 
     def remaining_seconds(self) -> float:
@@ -28413,6 +28435,13 @@ class _ReadOnlyCommandBudget:
         if self.stdout_remaining < 0 or self.stderr_remaining < 0:
             raise Refusal("read-only census exceeded its operation-wide output bound")
 
+    def consume_observation(self) -> None:
+        if self.observations_remaining <= 0:
+            raise Refusal(
+                "read-only census exceeded its operation-wide observation bound"
+            )
+        self.observations_remaining -= 1
+
 
 def _run_bounded_read_only_command(
     command: Sequence[str],
@@ -28420,12 +28449,15 @@ def _run_bounded_read_only_command(
     timeout_seconds: float = 60.0,
     stdout_limit: int = 16 * 1024 * 1024,
     stderr_limit: int = 64 * 1024,
+    input_limit: int = 1024 * 1024,
     env_overrides: Mapping[str, str] | None = None,
     input_data: bytes | None = None,
     trusted_executables: Sequence[_TrustedExecutablePath] = (),
 ) -> tuple[int, bytes, bytes]:
-    if input_data is not None and len(input_data) > 1024 * 1024:
-        raise Refusal("privileged read-only census input exceeds 1 MiB")
+    if input_data is not None and len(input_data) > input_limit:
+        raise Refusal(
+            f"privileged read-only census input exceeds {input_limit} bytes"
+        )
     environment = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
     if env_overrides is not None:
         environment.update(env_overrides)
@@ -28555,6 +28587,7 @@ def _run_root_owned_command(
     arguments: Sequence[str],
     *,
     input_data: bytes | None = None,
+    input_limit: int = 1024 * 1024,
     budget: _ReadOnlyCommandBudget | None = None,
 ) -> tuple[int, bytes, bytes]:
     sudo = _root_owned_executable(Path("/usr/bin/sudo"), "sudo")
@@ -28585,6 +28618,7 @@ def _run_root_owned_command(
         timeout_seconds=selected_budget.remaining_seconds(),
         stdout_limit=stdout_limit,
         stderr_limit=stderr_limit,
+        input_limit=input_limit,
         input_data=input_data,
         trusted_executables=(sudo, executable),
     )
@@ -28682,11 +28716,52 @@ def _find_link_selection(targets: Mapping[Path, str]) -> tuple[str, ...]:
         literal = str(target)
         for character in ("\\", "*", "?", "["):
             literal = literal.replace(character, f"\\{character}")
-        for pattern in (literal, f"{literal}/*", f"{literal} (deleted)"):
+        patterns = (
+            ("/*",)
+            if target == Path("/")
+            else (literal, f"{literal}/*", f"{literal} (deleted)")
+        )
+        for pattern in patterns:
             if tests:
                 tests.append("-o")
             tests.extend(("-lname", pattern))
     return tuple(tests)
+
+
+def _bounded_find_link_selection(
+    targets: Mapping[Path, str],
+    *,
+    budget: int = _FIND_LINK_SELECTION_BYTES_LIMIT,
+) -> tuple[str, ...]:
+    """Return a bounded producer filter that contains every selected tree.
+
+    GNU find has no file-backed form of ``-lname``. Repeating three predicates
+    for every selected tree can therefore exhaust execve's argument space even
+    though the procfs roots themselves are already batched. When that happens,
+    replace the selected paths with lexical ancestors until their expression
+    fits. This only widens the producer filter: each consumer still accepts
+    evidence against the original mapping, so an unrelated sibling can consume
+    the bounded output budget but can never become a live-use match.
+
+    Keeping one expression for the entire operation also means every procfs
+    root is scanned once against one process snapshot. Partitioning the target
+    set would instead rescan mutable descriptors and could miss a link that
+    moved between target partitions.
+    """
+
+    if budget < 1:
+        raise Refusal("privileged find selection has no argv budget")
+    selectors = frozenset(targets)
+    while selectors:
+        selection = _find_link_selection({path: "" for path in selectors})
+        size = sum(len(os.fsencode(argument)) + 1 for argument in selection)
+        if size <= budget:
+            return selection
+        parents = frozenset(path.parent for path in selectors)
+        if parents == selectors:
+            raise Refusal("privileged find selection cannot fit the argv bound")
+        selectors = parents
+    return ()
 
 
 def _pid_from_proc_evidence(path: Path) -> int:
@@ -28955,7 +29030,7 @@ def _absent_validate_find_matches(
     roots = _process_symlink_roots(processes)
     if not roots:
         return ()
-    link_selection = _find_link_selection(targets)
+    link_selection = _bounded_find_link_selection(targets)
     suffix = (
         "-ignore_readdir_race",
         "-maxdepth",
@@ -29166,7 +29241,7 @@ def _same_uid_batched_path_matches(
     matches: list[tuple[int, str, str, str]] = []
     indeterminate = {process.pid: process for process in fallback_processes}
     roots = _process_symlink_roots(direct_processes)
-    link_tests = _find_link_selection(targets)
+    link_tests = _bounded_find_link_selection(targets)
     find_suffix = (
         "-ignore_readdir_race",
         "-maxdepth",
@@ -29384,7 +29459,7 @@ def _batch_link_matches(
 ) -> tuple[tuple[int, str, str, str], ...]:
     # Use the same literal link selection as the existing final same-UID pass.
     # Outside aliases are covered separately by followed device/inode stats.
-    tests = _find_link_selection(targets)
+    tests = _bounded_find_link_selection(targets)
     suffix = ("-ignore_readdir_race", "-maxdepth", "1", "-type", "l",
               "(", *tests, ")", "-printf", "%p\\0%l\\0")
     observed = {process.pid: process for process in processes}
@@ -29400,7 +29475,233 @@ def _batch_link_matches(
     return tuple(matches)
 
 
-def _batch_inode_matches(
+def _direct_process_identity_matches(
+    processes: Sequence[_AbsentProcessObservation],
+    targets: Mapping[Path, str],
+    inodes: Mapping[tuple[int, int], tuple[tuple[str, str], ...]],
+    budget: _ReadOnlyCommandBudget,
+    *,
+    proc_root: Path = Path("/proc"),
+) -> tuple[
+    tuple[tuple[int, str, str, str], ...],
+    tuple[tuple[int, str, str, str], ...],
+    dict[int, set[int]],
+    tuple[_AbsentProcessObservation, ...],
+]:
+    """Read same-UID link and inode evidence without a census output pipe.
+
+    The privileged fallback used to print every descriptor on the host before
+    Python discarded unrelated identities.  Agent workloads can hold enough
+    descriptors for that irrelevant text to exhaust the shared output budget.
+    Procfs applies the target process's filesystem credentials to these links,
+    so directly readable same-UID processes can instead be compared in place.
+    Protected and foreign-UID processes remain assigned to the complete root
+    fallback below; no permission error is interpreted as evidence of absence.
+    """
+
+    link_matches: list[tuple[int, str, str, str]] = []
+    inode_matches: list[tuple[int, str, str, str]] = []
+    sockets: dict[int, set[int]] = {}
+    fallback: list[_AbsentProcessObservation] = []
+    match_cache: dict[Path, tuple[Path, str] | None] = {}
+
+    for process in processes:
+        budget.consume_observation()
+        budget.remaining_seconds()
+        pid_dir = proc_root / str(process.pid)
+        try:
+            filesystem_uid = _process_filesystem_uid(pid_dir)
+        except Refusal:
+            if not _process_generation_is_current(process):
+                continue
+            raise
+        if filesystem_uid is None:
+            if _process_generation_is_current(process):
+                raise _ProcessEvidenceChanged(
+                    f"PID {process.pid} status changed before direct inode census"
+                )
+            continue
+        if filesystem_uid != os.getuid():
+            fallback.append(process)
+            continue
+
+        process_link_matches: list[tuple[int, str, str, str]] = []
+        process_inode_matches: list[tuple[int, str, str, str]] = []
+        process_sockets: set[int] = set()
+        needs_fallback = False
+        vanished = False
+
+        def observe(path: Path, *, transient: bool = False) -> bool:
+            nonlocal vanished
+            budget.consume_observation()
+            budget.remaining_seconds()
+            try:
+                raw_target = os.readlink(path)
+                metadata = path.stat()
+            except FileNotFoundError:
+                if transient:
+                    return False
+                if _process_generation_is_current(process):
+                    raise _ProcessEvidenceChanged(
+                        f"PID {process.pid} proc entries changed during direct inode census"
+                    )
+                vanished = True
+                return False
+            except PermissionError:
+                return True
+            except OSError as exc:
+                # A disconnected cwd is the one stable procfs error for which
+                # the historical lsof fallback is still authoritative.
+                if path.name == "cwd" and exc.errno == errno.ENOTCONN:
+                    return True
+                if not _process_generation_is_current(process):
+                    vanished = True
+                    return False
+                raise Refusal(
+                    f"cannot inspect same-UID process {process.pid} inode "
+                    f"evidence {path}: {exc}"
+                ) from exc
+            if stat.S_ISLNK(metadata.st_mode):
+                if _process_generation_is_current(process):
+                    raise _ProcessEvidenceChanged(
+                        f"PID {process.pid} proc target changed during direct inode census"
+                    )
+                vanished = True
+                return False
+            observed_path = Path(
+                os.path.normpath(raw_target.removesuffix(" (deleted)"))
+            )
+            matched = _matching_absent_validate_target(
+                observed_path, targets, match_cache
+            )
+            if matched is not None:
+                _target, slot = matched
+                process_link_matches.append(
+                    (process.pid, slot, "link", raw_target)
+                )
+            selected = inodes.get((metadata.st_dev, metadata.st_ino), ())
+            for slot, selected_path in selected:
+                process_inode_matches.append(
+                    (process.pid, slot, "inode", f"{path}={selected_path}")
+                )
+            if stat.S_ISSOCK(metadata.st_mode):
+                process_sockets.add(metadata.st_ino)
+            return False
+
+        for name in ("cwd", "root"):
+            needs_fallback = observe(pid_dir / name)
+            if vanished or needs_fallback:
+                break
+        if not vanished and not needs_fallback and not process.kernel_thread:
+            needs_fallback = observe(pid_dir / "exe")
+        if not vanished and not needs_fallback:
+            try:
+                budget.consume_observation()
+                budget.remaining_seconds()
+                with os.scandir(pid_dir / "fd") as descriptors:
+                    for descriptor in descriptors:
+                        if not descriptor.name.isdecimal():
+                            raise Refusal(
+                                f"PID {process.pid} descriptor census returned an "
+                                f"unexpected entry: {descriptor.name!r}"
+                            )
+                        needs_fallback = observe(
+                            Path(descriptor.path), transient=True
+                        )
+                        if needs_fallback:
+                            break
+            except FileNotFoundError:
+                if _process_generation_is_current(process):
+                    raise _ProcessEvidenceChanged(
+                        f"PID {process.pid} fd directory changed during direct inode census"
+                    )
+                vanished = True
+            except PermissionError:
+                needs_fallback = True
+            except OSError as exc:
+                if not _process_generation_is_current(process):
+                    vanished = True
+                else:
+                    raise Refusal(
+                        f"cannot enumerate same-UID process {process.pid} descriptors: {exc}"
+                    ) from exc
+
+        if vanished or not _process_generation_is_current(process):
+            continue
+        if needs_fallback:
+            fallback.append(process)
+            continue
+        link_matches.extend(process_link_matches)
+        inode_matches.extend(process_inode_matches)
+        for inode in process_sockets:
+            sockets.setdefault(inode, set()).add(process.pid)
+
+    return tuple(link_matches), tuple(inode_matches), sockets, tuple(fallback)
+
+
+def _bounded_inode_ranges(
+    inodes: Mapping[tuple[int, int], object],
+) -> tuple[tuple[int, int], ...]:
+    """Cover every selected inode with finitely many producer predicates.
+
+    Device identity is deliberately checked only by the consumer because GNU
+    find has no device-number predicate. Merging the smallest gaps can emit
+    unrelated candidates, but can never omit a selected inode.
+    """
+
+    values = sorted({inode for _device, inode in inodes})
+    if any(inode <= 0 for inode in values):
+        raise Refusal("selected-tree inode census returned an invalid inode identity")
+    if not values:
+        return ()
+    gaps = [
+        (values[index + 1] - values[index], index)
+        for index in range(len(values) - 1)
+        if values[index + 1] > values[index] + 1
+    ]
+    cuts = {
+        index
+        for _gap, index in sorted(gaps, key=lambda item: (-item[0], item[1]))[
+            : _PROCESS_CENSUS_INODE_RANGE_LIMIT - 1
+        ]
+    }
+    ranges: list[tuple[int, int]] = []
+    first = values[0]
+    for index, value in enumerate(values[:-1]):
+        if index in cuts:
+            ranges.append((first, value))
+            first = values[index + 1]
+    ranges.append((first, values[-1]))
+    return tuple(ranges)
+
+
+def _find_inode_selection(
+    inodes: Mapping[tuple[int, int], object],
+) -> tuple[str, ...]:
+    """Select every socket and an over-approximation of selected inodes."""
+
+    tests: list[str] = ["-type", "s"]
+    for first, last in _bounded_inode_ranges(inodes):
+        tests.append("-o")
+        if first == last:
+            tests.extend(("-inum", str(first)))
+        else:
+            tests.extend(
+                (
+                    "(",
+                    "-inum",
+                    f"+{first - 1}",
+                    "-a",
+                    "!",
+                    "-inum",
+                    f"+{last}",
+                    ")",
+                )
+            )
+    return tuple(tests)
+
+
+def _privileged_inode_matches(
     processes: Sequence[_AbsentProcessObservation],
     inodes: Mapping[tuple[int, int], tuple[tuple[str, str], ...]],
     budget: _ReadOnlyCommandBudget,
@@ -29427,7 +29728,15 @@ def _batch_inode_matches(
     targets = {Path(slot): slot for paths in inodes.values() for slot, _name in paths}
     for roots, depths in ((links, ("-maxdepth", "0")),
                            (directories, ("-mindepth", "1", "-maxdepth", "1"))):
-        suffix = ("-ignore_readdir_race", *depths, "-printf", "%p\\0%D\\0%i\\0%y\\0")
+        suffix = (
+            "-ignore_readdir_race",
+            *depths,
+            "(",
+            *_find_inode_selection(inodes),
+            ")",
+            "-printf",
+            "%p\\0%D\\0%i\\0%y\\0",
+        )
         for arguments in _argument_batches(("-L",), roots, suffix):
             batch_pids = {_pid_from_proc_evidence(Path(path))
                           for path in arguments[1:len(arguments) - len(suffix)]}
@@ -29484,6 +29793,35 @@ def _batch_inode_matches(
     return tuple(matches), sockets
 
 
+def _merge_socket_holders(
+    destination: dict[int, set[int]], source: Mapping[int, set[int]]
+) -> None:
+    for inode, pids in source.items():
+        destination.setdefault(inode, set()).update(pids)
+
+
+def _batch_inode_matches(
+    processes: Sequence[_AbsentProcessObservation],
+    targets: Mapping[Path, str],
+    inodes: Mapping[tuple[int, int], tuple[tuple[str, str], ...]],
+    budget: _ReadOnlyCommandBudget,
+) -> tuple[tuple[tuple[int, str, str, str], ...], dict[int, set[int]]]:
+    """Collect complete path/inode/socket evidence with bounded fallback output."""
+
+    direct_links, direct_inodes, sockets, fallback = (
+        _direct_process_identity_matches(processes, targets, inodes, budget)
+    )
+    privileged_links = _batch_link_matches(fallback, targets, budget)
+    privileged_inodes, privileged_sockets = _privileged_inode_matches(
+        fallback, inodes, budget
+    )
+    _merge_socket_holders(sockets, privileged_sockets)
+    return (
+        (*direct_links, *privileged_links, *direct_inodes, *privileged_inodes),
+        sockets,
+    )
+
+
 _BATCH_MAPS_AWK = r'''
 BEGIN {
     while ((r = getline item < "/dev/stdin") > 0) {
@@ -29503,6 +29841,26 @@ BEGIN {
         close(path);
     }
     exit failed;
+}
+'''
+
+
+_BATCH_UNIX_AWK = r'''
+BEGIN {
+    while ((r = getline target < "/dev/stdin") > 0) targets[++count] = target;
+    if (r < 0) { print "Unix socket selection input is unreadable" > "/dev/stderr"; exit 2; }
+    close("/dev/stdin");
+    file = ARGV[1]; rows = 0; truncated = 0;
+    while ((r = getline row < file) > 0) {
+        rows++;
+        if (RT != "\n") truncated = 1;
+        selected = (rows == 1);
+        for (i = 1; !selected && i <= count; i++) selected = index(row, targets[i]) != 0;
+        if (selected) print row;
+    }
+    if (r < 0) { print file ": " ERRNO > "/dev/stderr"; exit 2; }
+    if (truncated) { print file ": missing final newline" > "/dev/stderr"; exit 2; }
+    close(file);
 }
 '''
 
@@ -29530,7 +29888,11 @@ def _batch_maps_inode_matches(
     for arguments in _argument_batches(("--", _BATCH_MAPS_AWK), files, ()):
         batch_pids = {_pid_from_proc_evidence(Path(path)) for path in arguments[2:]}
         rc, stdout, stderr = _run_root_owned_command(
-            Path("/usr/bin/gawk"), arguments, input_data=pattern_input, budget=budget,
+            Path("/usr/bin/gawk"),
+            arguments,
+            input_data=pattern_input,
+            input_limit=_PROCESS_CENSUS_SELECTION_BYTES_LIMIT,
+            budget=budget,
         )
         if rc or stderr:
             if rc != 1 or not stderr:
@@ -29712,12 +30074,26 @@ def _batch_unix_socket_matches(
     unresolved: set[int] = set()
     accounted: set[int] = set()
     selected_representatives: list[_AbsentProcessObservation] = []
+    target_input = ("\n".join(map(str, targets)) + "\n").encode("utf-8")
+    if any("\n" in str(target) or "\0" in str(target) for target in targets):
+        raise Refusal("validation paths containing line or NUL bytes cannot be probed")
     for namespace, representatives in namespaces.items():
         contents: bytes | None = None
         for process in representatives:
             path = Path(f"/proc/{process.pid}/net/unix")
             try:
-                rc, contents, stderr = _run_root_owned_command(Path("/usr/bin/cat"), ("--", str(path)), budget=budget)
+                if selected_has_sockets:
+                    rc, contents, stderr = _run_root_owned_command(
+                        Path("/usr/bin/cat"), ("--", str(path)), budget=budget
+                    )
+                else:
+                    rc, contents, stderr = _run_root_owned_command(
+                        Path("/usr/bin/gawk"),
+                        ("--", _BATCH_UNIX_AWK, str(path)),
+                        input_data=target_input,
+                        input_limit=_PROCESS_CENSUS_SELECTION_BYTES_LIMIT,
+                        budget=budget,
+                    )
                 if rc or stderr or len(contents) > _UNIX_SOCKET_TABLE_BYTES_LIMIT:
                     raise Refusal(f"Unix socket census is incomplete for PID {process.pid}")
                 budget.remaining_seconds()
@@ -29825,8 +30201,9 @@ def _capture_lsof_process_path_census(
         try:
             processes = _absent_validate_process_snapshot(include_owner_cgroups=False)
             mounts = _absent_validate_mount_matches(processes, targets, budget)
-            links = _batch_link_matches(processes, targets, budget)
-            inode_matches, sockets = _batch_inode_matches(processes, inodes, budget)
+            identities, sockets = _batch_inode_matches(
+                processes, targets, inodes, budget
+            )
             maps = _batch_maps_inode_matches(processes, targets, inodes, budget)
             unix = _batch_unix_socket_matches(
                 processes, targets, sockets, budget, selected_has_sockets=has_sockets,
@@ -29839,7 +30216,9 @@ def _capture_lsof_process_path_census(
             raise Refusal("selected census tree identity changed during process census")
         budget.remaining_seconds()
         return _ProcessPathCensus(
-            processes, (*mounts, *links, *inode_matches, *maps, *unix), owner_cgroup_complete=False,
+            processes,
+            (*mounts, *identities, *maps, *unix),
+            owner_cgroup_complete=False,
         )
     raise Refusal("batch process census is indeterminate")
 
