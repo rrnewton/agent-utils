@@ -5801,12 +5801,36 @@ fn a_later_create_of_the_same_slot_closes_a_row_less_recovery_marker() {
             "re-create at {journal_path} left {:?}",
             replayed.pending_operations
         );
-        let (config, evidence) =
-            write_policy_inputs(&scratch, &[record], "2026-09-22T09:40:01+00:00", |_| {});
+        let (config, evidence) = write_policy_inputs(
+            &scratch,
+            std::slice::from_ref(&record),
+            "2026-09-22T09:40:01+00:00",
+            |_| {},
+        );
         let decisions =
             evaluate_policy_at(&events, &config, &evidence, "2026-09-22T09:40:01+00:00")
                 .unwrap_or_else(|error| panic!("evaluate {journal_path}: {error}"));
+        // The re-created slot decides exactly like the same row with no
+        // aborted attempt in its history.
+        let control = Scratch::new();
+        let control_events = control.events();
+        import_log(&control_events, vec![record.clone()], vec![]);
+        let (control_config, control_evidence) =
+            write_policy_inputs(&control, &[record], "2026-09-22T09:40:01+00:00", |_| {});
+        let expected = evaluate_policy_at(
+            &control_events,
+            &control_config,
+            &control_evidence,
+            "2026-09-22T09:40:01+00:00",
+        )
+        .expect("evaluate control");
         assert_eq!(decisions.len(), 1, "{journal_path}");
+        assert_eq!(expected.len(), 1, "control");
+        assert_eq!(decisions[0].verdict, expected[0].verdict, "{journal_path}");
+        assert_eq!(
+            decisions[0].reason_codes, expected[0].reason_codes,
+            "{journal_path}"
+        );
         assert!(
             !decisions[0]
                 .reason_codes
