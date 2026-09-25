@@ -219,8 +219,9 @@ def _read_junit(
 
 
 _NODEID_LINE = re.compile(r"^[^\s].*\.py::")
-_ABSOLUTE_POSIX_PATH = re.compile(r"(?:^|[\s=:\"'(])/(?!/)[^\s,;\")']+")
-_ABSOLUTE_WINDOWS_PATH = re.compile(r"(?:^|[\s=:\"'(])[A-Za-z]:[\\/]")
+_ABSOLUTE_POSIX_PATH = re.compile(r"(?:^|[^\w/:])/(?!/)[^\s,;\")']+")
+_ABSOLUTE_WINDOWS_PATH = re.compile(r"(?:^|[^\w/\\:])[A-Za-z]:[\\/]")
+_FILE_URI = re.compile(r"(?:^|[^\w])file:(?://|/)", re.IGNORECASE)
 
 
 def _collection_arguments(phase: PhaseInput) -> list[str]:
@@ -734,7 +735,11 @@ def _assert_public_provenance(provenance: dict[str, object]) -> None:
     )
     runtime_identities.difference_update({"", "/", "."})
     for field, value in _string_fields(provenance):
-        if _ABSOLUTE_POSIX_PATH.search(value) or _ABSOLUTE_WINDOWS_PATH.search(value):
+        if (
+            _ABSOLUTE_POSIX_PATH.search(value)
+            or _ABSOLUTE_WINDOWS_PATH.search(value)
+            or _FILE_URI.search(value)
+        ):
             raise ValueError(f"provenance field {field} contains an absolute path")
         if any(identity in value for identity in runtime_identities):
             raise ValueError(
@@ -761,6 +766,7 @@ def _privacy_self_test() -> int:
             "before_path": CAPTURE_SNAPSHOT_BEFORE.name,
             "after_path": CAPTURE_SNAPSHOT_AFTER.name,
         },
+        "public_reference": "https://example.com/a/b",
     }
     _assert_public_provenance(provenance)
 
@@ -778,6 +784,11 @@ def _privacy_self_test() -> int:
 
     expect_rejection("python", f"{_public_python_version()}+vendor")
     expect_rejection("absolute_path", "/private/toolchain/python3")
+    expect_rejection("bracketed_path", "[/private/toolchain/python3]")
+    expect_rejection("backtick_path", "`/private/toolchain/python3`")
+    expect_rejection("braced_path", "{/private/toolchain/python3}")
+    expect_rejection("windows_path", r"{C:\private\toolchain\python.exe}")
+    expect_rejection("file_uri", "file:///private/toolchain/python3")
     hostname = socket.gethostname()
     if hostname:
         expect_rejection("hostname", hostname)
