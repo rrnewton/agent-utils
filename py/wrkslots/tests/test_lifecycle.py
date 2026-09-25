@@ -7164,8 +7164,17 @@ def test_privileged_find_discards_all_batches_after_process_generation_changes(
 
     monkeypatch.setattr(wrkslots, "_run_root_owned_command", mutating_find)
 
-    with pytest.raises(wrkslots._ProcessEvidenceChanged, match="generation changed"):
+    # A matched holder that changed identity is a hard refusal, not a retry:
+    # a child forked outside the snapshot can still hold the selected path.
+    with pytest.raises(
+        wrkslots.Refusal,
+        match=(
+            r"^PID 123 identity changed after privileged find matched a selected "
+            r"path; the selected path may still be in use$"
+        ),
+    ) as refused:
         wrkslots._absent_validate_find_matches((process,), {target: "selected"})
+    assert type(refused.value) is wrkslots.Refusal
     assert calls > 1
 
 
