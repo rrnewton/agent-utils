@@ -17,6 +17,7 @@ import pytest
 
 from agentctl import worker_rpc
 from agentctl.client import CustomProcessIdentity
+from agentctl.errors import AgentDeliveryError
 from agentctl.foreign import agent_runner, lib
 
 
@@ -832,15 +833,35 @@ def test_harness_cleanup_refuses_changed_ownership(
     monkeypatch.setattr(lib, "_pidfd_signal", lambda *_args: None)
     monkeypatch.setattr(lib, "_pidfd_live", lambda _descriptor: True)
     monkeypatch.setattr(
-        lib, "_read_process_state_start", lambda _pid: ("T", str(harness.starttime_ticks)),
+        lib, "_read_process_state_group_start",
+        lambda _pid: ("T", harness.pid, str(harness.starttime_ticks)),
     )
-    monkeypatch.setattr(os, "getpgid", lambda pid: pid + 1 if changed == "process_group" else pid)
-    monkeypatch.setattr(os, "killpg", lambda *_args: pytest.fail("changed ownership was signaled"))
-    if changed == "process_group":
-        with pytest.raises(lib.AgentOperationError, match="no longer owns"):
+    monkeypatch.setattr(
+        lib, "_process_group_members",
+        lambda _group: (
+            {harness.pid + 1: str(harness.starttime_ticks)}
+            if changed == "process_group"
+            else {harness.pid: str(harness.starttime_ticks)}
+        ),
+    )
+    monkeypatch.setattr(os, "killpg", lambda *_args: pytest.fail("numeric group was signaled"))
+    if changed in ("started_at", "process_group"):
+        with pytest.raises(lib.AgentOperationError, match="leader"):
             lib.terminate_active_harness(rec)
     else:
         assert not lib.terminate_active_harness(rec)
+
+
+def test_process_stat_parser_ignores_non_utf8_process_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = (
+        b"123 (arbitrary\xff) S 7 8 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 42\n"
+    )
+    monkeypatch.setattr(Path, "read_bytes", lambda _path: raw)
+    assert lib._read_process_state_group_start(123) == ("S", 8, "42")
+    with pytest.raises(ValueError, match="identity"):
+        lib._read_process_state_group_start(124)
 
 
 def test_runner_teardown_keeps_pidfd_authority_through_signal(
@@ -876,7 +897,70 @@ def test_runner_teardown_keeps_pidfd_authority_through_signal(
     assert events == [("signal", signal.SIGTERM), ("close", 77)]
 
 
-def test_harness_group_signal_happens_while_leader_pidfd_is_open(
+def test_token_bound_stop_reconciles_archive_after_lost_receipt(
+    fake_runner_state: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rec = _install_agy_agent(fake_runner_state, "lost-stop")
+    token = lib.read_registry()[rec.name].owner_token
+    assert token is not None
+    monkeypatch.setattr(lib, "window_exists", lambda _rec: False)
+    real_sync = lib._sync_directory
+    interrupted = False
+
+    def lose_receipt_after_archive(path: Path) -> None:
+        nonlocal interrupted
+        if path == lib.ARCHIVE and not interrupted:
+            interrupted = True
+            raise OSError("simulated process loss after archive publication")
+        real_sync(path)
+
+    monkeypatch.setattr(lib, "_sync_directory", lose_receipt_after_archive)
+    with pytest.raises(OSError, match="simulated process loss"):
+        lib.stop_owned_agent(rec.name, token, grace=0)
+
+    destination = lib.ARCHIVE / f"{rec.name}-{token}"
+    assert destination.is_dir()
+    assert not lib.agent_dir(rec.name).exists()
+    assert lib.read_registry()[rec.name].owner_token == token
+
+    reconciled = lib.stop_owned_agent(rec.name, token, grace=0)
+    assert reconciled.archived_to == str(destination)
+    assert reconciled.was_registered
+    assert rec.name not in lib.read_registry()
+
+
+def test_token_bound_stop_never_replaces_a_racing_archive(
+    fake_runner_state: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rec = _install_agy_agent(fake_runner_state, "stop-collision")
+    token = lib.read_registry()[rec.name].owner_token
+    assert token is not None
+    monkeypatch.setattr(lib, "window_exists", lambda _rec: False)
+    real_rename = lib.shared_rename_directory_noreplace_at
+
+    def collide(
+        source_parent: int, source_name: str,
+        destination_parent: int, destination_name: str,
+    ) -> None:
+        os.mkdir(destination_name, mode=0o700, dir_fd=destination_parent)
+        marker = os.open(
+            f"{destination_name}/winner", os.O_CREAT | os.O_WRONLY, 0o600,
+            dir_fd=destination_parent,
+        )
+        os.close(marker)
+        real_rename(source_parent, source_name, destination_parent, destination_name)
+
+    monkeypatch.setattr(lib, "shared_rename_directory_noreplace_at", collide)
+    with pytest.raises(AgentDeliveryError, match="replace existing agent archive"):
+        lib.stop_owned_agent(rec.name, token, grace=0)
+
+    destination = lib.ARCHIVE / f"{rec.name}-{token}"
+    assert (destination / "winner").is_file()
+    assert lib.agent_dir(rec.name).is_dir()
+    assert lib.read_registry()[rec.name].owner_token == token
+
+
+def test_harness_group_teardown_signals_only_pinned_generations_after_final_proof(
     fake_runner_state: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rec = _install_agy_agent(fake_runner_state, "pinned-group")
@@ -898,33 +982,50 @@ def test_harness_group_signal_happens_while_leader_pidfd_is_open(
     monkeypatch.setattr(
         lib, "process_identity_liveness", lambda _identity, **_kwargs: lib.ProcessLiveness.LIVE,
     )
-    monkeypatch.setattr(os, "pidfd_open", lambda pid, flags: 77)
+    monkeypatch.setattr(os, "pidfd_open", lambda pid, flags: 77 if pid == harness.pid else 78)
     monkeypatch.setattr(lib, "_pidfd_live", lambda descriptor: True)
     monkeypatch.setattr(
-        lib, "_read_process_state_start", lambda _pid: ("T", str(harness.starttime_ticks)),
+        lib, "_read_process_state_group_start",
+        lambda pid: (
+            "T", harness.pid,
+            str(harness.starttime_ticks if pid == harness.pid else harness.starttime_ticks + 1),
+        ),
     )
-    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+    scans = 0
+
+    def members(_group: int) -> dict[int, str]:
+        nonlocal scans
+        scans += 1
+        return {
+            harness.pid: str(harness.starttime_ticks),
+            harness.pid + 1: str(harness.starttime_ticks + 1),
+        }
+
+    monkeypatch.setattr(lib, "_process_group_members", members)
+    monkeypatch.setattr(
+        os, "killpg",
+        lambda *_args: pytest.fail("numeric PGID signaling reintroduced after final proof"),
+    )
     monkeypatch.setattr(
         lib, "_pidfd_signal", lambda descriptor, signum: events.append(("pidfd", signum)),
     )
 
-    def kill_group(process_group: int, signum: int) -> None:
-        assert not closed, "pidfd was closed before numeric process-group signal"
-        assert process_group == harness.pid
-        events.append(("group", signum))
-
     def close(descriptor: int) -> None:
         nonlocal closed
-        assert descriptor == 77
-        closed = True
+        assert descriptor in (77, 78)
+        if descriptor == 77:
+            closed = True
         events.append(("close", descriptor))
 
-    monkeypatch.setattr(os, "killpg", kill_group)
     monkeypatch.setattr(os, "close", close)
     assert lib.terminate_active_harness(rec)
+    assert scans == 2
     assert events == [
         ("pidfd", signal.SIGSTOP),
-        ("group", signal.SIGKILL),
+        ("pidfd", signal.SIGSTOP),
+        ("pidfd", signal.SIGKILL),
+        ("pidfd", signal.SIGKILL),
+        ("close", 78),
         ("close", 77),
     ]
 

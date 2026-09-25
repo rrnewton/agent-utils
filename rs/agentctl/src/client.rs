@@ -173,23 +173,30 @@ fn current_boot_uuid() -> Result<String> {
     Ok(value.to_owned())
 }
 
+fn process_stat_fields(pid: u64, value: &[u8]) -> Result<Vec<&str>> {
+    if value.len() > PROC_STAT_BYTES || !value.starts_with(format!("{pid} (").as_bytes()) {
+        return Err(AdapterError::unavailable(format!(
+            "process stat identity changed for pid {pid}"
+        )));
+    }
+    // Linux permits arbitrary bytes in comm. Only the suffix after its final
+    // ')' consists of the ASCII state and numeric fields we consume.
+    let close = value
+        .iter()
+        .rposition(|byte| *byte == b')')
+        .ok_or_else(|| {
+            AdapterError::unavailable(format!("cannot parse process stat for pid {pid}"))
+        })?;
+    let suffix = std::str::from_utf8(&value[close + 1..]).map_err(|_| {
+        AdapterError::unavailable(format!("process stat suffix is invalid for pid {pid}"))
+    })?;
+    Ok(suffix.split_whitespace().collect())
+}
+
 fn process_stat(pid: u64) -> Result<(u64, u64)> {
     let path = PathBuf::from(format!("/proc/{pid}/stat"));
     let value = bounded_file(&path, PROC_STAT_BYTES, "process stat")?;
-    let value = std::str::from_utf8(&value)
-        .map_err(|_| AdapterError::unavailable("Linux process stat is not UTF-8"))?;
-    let close = value.rfind(')').ok_or_else(|| {
-        AdapterError::unavailable(format!("cannot parse process stat for pid {pid}"))
-    })?;
-    let recorded_pid = value[..close]
-        .split_once(" (")
-        .and_then(|(value, _)| value.parse::<u64>().ok())
-        .filter(|value| *value == pid)
-        .ok_or_else(|| {
-            AdapterError::unavailable(format!("process stat identity changed for pid {pid}"))
-        })?;
-    debug_assert_eq!(recorded_pid, pid);
-    let fields = value[close + 1..].split_whitespace().collect::<Vec<_>>();
+    let fields = process_stat_fields(pid, &value)?;
     if fields.len() <= 19 || fields[0] == "Z" {
         return Err(AdapterError::unavailable(format!(
             "process stat for pid {pid} is incomplete or exited"
@@ -463,7 +470,7 @@ fn process_has_no_descendants(pid: u64) -> Result<bool> {
             let process = name
                 .parse::<u64>()
                 .map_err(|_| AdapterError::unavailable("process table contains an invalid pid"))?;
-            let raw = match fs::read_to_string(entry.path().join("stat")) {
+            let raw = match fs::read(entry.path().join("stat")) {
                 Ok(raw) => raw,
                 Err(error)
                     if error.kind() == io::ErrorKind::NotFound
@@ -477,15 +484,7 @@ fn process_has_no_descendants(pid: u64) -> Result<bool> {
                     )))
                 }
             };
-            if raw.len() > 8192 || !raw.starts_with(&format!("{name} (")) {
-                return Err(AdapterError::unavailable(format!(
-                    "process {process} stat is invalid"
-                )));
-            }
-            let close = raw.rfind(')').ok_or_else(|| {
-                AdapterError::unavailable(format!("process {process} stat is invalid"))
-            })?;
-            let fields: Vec<&str> = raw[close + 1..].split_whitespace().collect();
+            let fields = process_stat_fields(process, &raw)?;
             if fields.len() < 2 {
                 return Err(AdapterError::unavailable(format!(
                     "process {process} stat is incomplete"
@@ -653,20 +652,30 @@ pub(crate) fn muse_idle_composer(screen: &str) -> bool {
     muse_composer_regions(screen).is_some_and(|(_, composer)| matches!(composer.trim(), "❯" | "›"))
 }
 
-fn muse_text_visible(screen: &str, text: &str) -> bool {
+fn muse_marked_prompt_count(screen: &str, text: &str) -> usize {
     let wanted = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let rendered = screen.split_whitespace().collect::<Vec<_>>().join(" ");
     if wanted.is_empty() {
-        return false;
+        return 0;
     }
-    if wanted.chars().count() <= 160 {
-        return rendered.contains(&wanted);
-    }
-    let prefix = wanted.chars().take(80).collect::<String>();
-    let mut suffix = wanted.chars().rev().take(80).collect::<Vec<_>>();
-    suffix.reverse();
-    let suffix = suffix.into_iter().collect::<String>();
-    rendered.contains(&prefix) && rendered.contains(&suffix)
+    ["❯", "›"]
+        .iter()
+        .map(|marker| {
+            let needle = format!("{marker} {wanted}");
+            rendered
+                .match_indices(&needle)
+                .filter(|(start, _)| {
+                    let before = &rendered[..*start];
+                    let after = &rendered[*start + needle.len()..];
+                    (before.is_empty() || before.ends_with(' '))
+                        && (after.is_empty()
+                            || ["◆", "❯", "›"]
+                                .iter()
+                                .any(|next| after.starts_with(&format!(" {next} "))))
+                })
+                .count()
+        })
+        .sum()
 }
 
 fn muse_composer_regions(screen: &str) -> Option<(String, String)> {
@@ -713,29 +722,78 @@ fn muse_composer_regions(screen: &str) -> Option<(String, String)> {
 }
 
 pub(crate) fn muse_prompt_in_composer(screen: &str, text: &str) -> bool {
-    muse_composer_regions(screen).is_some_and(|(_, composer)| muse_text_visible(&composer, text))
+    let wanted = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    muse_composer_regions(screen).is_some_and(|(_, composer)| {
+        let rendered = composer.split_whitespace().collect::<Vec<_>>().join(" ");
+        !wanted.is_empty()
+            && ["❯", "›"].iter().any(|marker| {
+                let needle = format!("{marker} {wanted}");
+                rendered == needle || rendered.starts_with(&format!("{needle} "))
+            })
+    })
+}
+
+pub(crate) fn muse_prompt_is_exact_composer(screen: &str, text: &str) -> bool {
+    let wanted = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    muse_composer_regions(screen).is_some_and(|(_, composer)| {
+        let rendered = composer.split_whitespace().collect::<Vec<_>>().join(" ");
+        !wanted.is_empty() && [format!("❯ {wanted}"), format!("› {wanted}")].contains(&rendered)
+    })
+}
+
+pub(crate) fn muse_prompt_in_transcript(screen: &str, text: &str) -> bool {
+    muse_composer_regions(screen)
+        .is_some_and(|(transcript, _)| muse_marked_prompt_count(&transcript, text) > 0)
 }
 
 pub(crate) fn muse_prompt_transcript_count(screen: &str, text: &str) -> usize {
     let Some((transcript, _)) = muse_composer_regions(screen) else {
         return 0;
     };
-    let wanted = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let rendered = transcript.split_whitespace().collect::<Vec<_>>().join(" ");
-    if wanted.is_empty() {
-        return 0;
-    }
-    if wanted.chars().count() <= 160 {
-        return rendered.match_indices(&wanted).count();
-    }
-    let prefix = wanted.chars().take(80).collect::<String>();
-    let mut suffix = wanted.chars().rev().take(80).collect::<Vec<_>>();
-    suffix.reverse();
-    let suffix = suffix.into_iter().collect::<String>();
-    rendered
-        .match_indices(&prefix)
-        .count()
-        .min(rendered.match_indices(&suffix).count())
+    muse_marked_prompt_count(&transcript, text)
+}
+
+pub(crate) fn claude_active_screen(screen: &str) -> bool {
+    let lines = screen.lines().collect::<Vec<_>>();
+    let dividers = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let trimmed = line.trim();
+            (trimmed.chars().count() >= 3
+                && trimmed
+                    .chars()
+                    .all(|value| matches!(value, '─' | '━' | '═')))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let Some((&top, &bottom)) = dividers
+        .get(dividers.len().saturating_sub(2))
+        .zip(dividers.last())
+    else {
+        return false;
+    };
+    let before = lines[top.saturating_sub(12)..top].join(" ");
+    let after = lines[bottom + 1..lines.len().min(bottom + 12)].join(" ");
+    let waiting = before.split("Waiting for ").skip(1).any(|suffix| {
+        let mut fields = suffix.split_whitespace();
+        fields
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|value| value > 0)
+            && matches!(fields.next(), Some("background"))
+            && fields
+                .next()
+                .is_some_and(|value| value.starts_with("agent"))
+            && suffix.contains("to finish")
+    });
+    let fields = after.split_whitespace().collect::<Vec<_>>();
+    let agent_count = fields.windows(3).any(|window| {
+        matches!(window[0], "←" | "<-")
+            && window[1].parse::<u64>().is_ok_and(|value| value >= 2)
+            && window[2].starts_with("agent")
+    });
+    after.contains("esc to interrupt") || (waiting && agent_count)
 }
 #[derive(Debug)]
 pub(crate) struct BoundedOutput {
@@ -2545,19 +2603,33 @@ mod tests {
     static SIGNAL_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn proc_stat_parser_ignores_non_utf8_process_names() {
+        let raw = b"123 (arbitrary\xff) S 7 8 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 42\n";
+        let fields = process_stat_fields(123, raw).unwrap();
+        assert_eq!(fields[0], "S");
+        assert_eq!(fields[1], "7");
+        assert_eq!(fields[2], "8");
+        assert_eq!(fields[19], "42");
+        assert!(process_stat_fields(124, raw).is_err());
+    }
+
+    #[test]
     fn muse_prompt_must_move_from_composer_to_transcript() {
         let prompt = "literal $(unexpanded) delivery\nsecond line";
         let header = "Muse Code 1.3.0\n";
         let divider = "────────────────\n";
         let footer = "watermelon-preview · xhigh · /work/project · Auto-review\n";
         let staged = format!("{header}{divider}❯ {prompt}\n{divider}{footer}");
-        let accepted = format!("{header}❯ {prompt}\nWorking...\n{divider}❯\n{divider}{footer}");
+        let accepted = format!("{header}❯ {prompt}\n◆ Working...\n{divider}❯\n{divider}{footer}");
         let error_redraw = format!("{header}{divider}❯ {prompt}\nError: retry\n{divider}{footer}");
         assert!(muse_prompt_in_composer(&staged, prompt));
         assert_eq!(muse_prompt_transcript_count(&staged, prompt), 0);
+        assert!(!muse_prompt_in_transcript(&staged, prompt));
         assert_eq!(muse_prompt_transcript_count(&accepted, prompt), 1);
+        assert!(muse_prompt_in_transcript(&accepted, prompt));
         assert!(!muse_prompt_in_composer(&accepted, prompt));
         assert!(muse_prompt_in_composer(&error_redraw, prompt));
+        assert!(!muse_prompt_is_exact_composer(&error_redraw, prompt));
         assert_eq!(muse_prompt_transcript_count(&error_redraw, prompt), 0);
         let repeated_staged =
             format!("{header}❯ {prompt}\n◆ prior answer\n{divider}❯ {prompt}\n{divider}{footer}");
@@ -2568,6 +2640,20 @@ mod tests {
             muse_prompt_transcript_count(&cleared_without_submit, prompt),
             1
         );
+        let long_prompt = format!("prefix {}suffix", "middle ".repeat(40));
+        let changed_middle = format!("prefix {}suffix", "changed ".repeat(40));
+        let collapsed = format!(
+            "{header}{divider}❯ [Pasted Content {} chars]\n{divider}{footer}",
+            long_prompt.chars().count()
+        );
+        let deceptive = format!("{header}{divider}❯ {changed_middle}\n{divider}{footer}");
+        let prefixed =
+            format!("{header}❯ {long_prompt} extra\n◆ Working\n{divider}❯\n{divider}{footer}");
+        assert!(!muse_prompt_in_composer(&collapsed, &long_prompt));
+        assert!(!muse_prompt_in_composer(&deceptive, &long_prompt));
+        assert!(!muse_prompt_in_transcript(&prefixed, &long_prompt));
+        let assistant_echo = format!("{header}◆ {long_prompt}\n{divider}❯\n{divider}{footer}");
+        assert!(!muse_prompt_in_transcript(&assistant_echo, &long_prompt));
     }
 
     #[test]
@@ -2588,6 +2674,26 @@ mod tests {
         assert!(!muse_idle_composer(&format!(
             "{divider}❯\n{divider}watermelon-preview · xhigh · /work/project · Auto-review\n"
         )));
+    }
+
+    #[test]
+    fn claude_active_screen_requires_current_activity_controls() {
+        let divider = "─".repeat(40);
+        let screen = format!(
+            "completed output\n✻ Waiting for 1 background agent to finish\n\
+             {divider}\n❯\n{divider}\nauto mode on · ← 2 agents · ↓ to manage\n\
+             ● main\n◯ reviewer Checking tests 8m\n"
+        );
+        assert!(claude_active_screen(&screen));
+        assert!(claude_active_screen(
+            &screen
+                .replace("Waiting", "Waited")
+                .replace("↓ to manage", "esc to interrupt")
+        ));
+        assert!(!claude_active_screen(&screen.replace("Waiting", "Waited")));
+        assert!(!claude_active_screen(
+            &screen.replace("← 2 agents", "← 1 agent")
+        ));
     }
 
     #[cfg(target_os = "linux")]

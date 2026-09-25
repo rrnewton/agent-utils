@@ -551,7 +551,7 @@ def test_worker_rpc_process_liveness_reaches_health_as_typed_evidence(
     monkeypatch.setattr(worker_lib, "_read_process_state_start", read_process)
     if not isinstance(process_observation, BaseException) and process_observation[0] not in ("Z", "X", "x"):
         monkeypatch.setattr(
-            worker_lib.SharedHerdrClient,
+            HerdrClient,
             "_process_identity",
             staticmethod(lambda _pid: (RUNNER_IDENTITY, RUNNER_IDENTITY.pid)),
         )
@@ -756,6 +756,113 @@ def test_lost_pause_receipt_leaves_durable_intent_for_reconciliation(
     monkeypatch.setattr(sessions, "_worker", status)
     sessions.status("worker")
     assert reconciled == [True]
+
+
+def test_lost_stop_receipt_reconciles_inner_and_outer_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, _fake, _calls = setup(tmp_path, monkeypatch)
+    started = sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
+    outer = sessions.get("worker")
+    assert outer.runtime_home is not None
+    runtime = Path(outer.runtime_home)
+    monkeypatch.setattr(worker_lib, "BASE", runtime)
+    monkeypatch.setattr(worker_lib, "STATE", runtime / "state")
+    monkeypatch.setattr(worker_lib, "ARCHIVE", runtime / "state/_archive")
+    monkeypatch.setattr(worker_lib, "REGISTRY", runtime / "registry.json")
+    monkeypatch.setattr(worker_lib, "LOCKFILE", runtime / ".registry.lock")
+    monkeypatch.setattr(worker_lib, "EVENT_LOG", runtime / "state/events.jsonl")
+    monkeypatch.setattr(worker_lib, "EVENT_LOCKFILE", runtime / "state/.events.lock")
+    worker_lib.ensure_agent_dirs("worker")
+    with worker_lib.registry_lock() as agents:
+        agents["worker"] = worker_lib.AgentRecord(
+            name="worker", harness="agy", backend="tmux",
+            tmux_target="subagents:worker", cwd=str(tmp_path), model=None,
+            session_id=None, status="idle", runner_pid=None,
+            runner_started_at=None, next_seq=0, created_at=worker_lib.now_iso(),
+            last_turn_at=None, owner_token=str(started["token"]),
+        )
+    monkeypatch.setattr(worker_lib, "window_exists", lambda _rec: False)
+    attempts = 0
+
+    def worker(record: AgentRecord, action: str, **_: object) -> dict[str, object]:
+        nonlocal attempts
+        assert action == "stop"
+        attempts += 1
+        payload = worker_rpc.dispatch({
+            "schema": "agentctl-worker-rpc/v2", "action": "stop",
+            "name": record.name, "owner_token": record.token,
+            "desired_paused": record.paused,
+        })
+        if attempts == 1:
+            raise WorkerRpcError("timeout", "committed stop receipt was lost")
+        return payload
+
+    monkeypatch.setattr(sessions, "_worker", worker)
+    with pytest.raises(WorkerRpcError, match="receipt was lost"):
+        sessions.stop("worker", expected_token=str(started["token"]))
+    assert sessions.get("worker").lifecycle == "stopping"
+
+    stopped = sessions.stop("worker", expected_token=str(started["token"]))
+    assert attempts == 2
+    assert not (sessions.registry / "worker").exists()
+    assert Path(str(stopped["archive"])).is_dir()
+    runtime_result = cast(
+        dict[str, object], cast(dict[str, object], stopped["runtime"])["result"],
+    )
+    assert str(runtime_result["archived_to"]).startswith(
+        str(stopped["archive"])
+    )
+
+
+def test_lost_outer_stop_receipt_reconciles_exact_archived_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, _fake, _calls = setup(tmp_path, monkeypatch)
+    started = sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
+    token = str(started["token"])
+    publish = sessions._publish_pinned_directory
+    published = False
+
+    def lose_receipt(*args: object, **kwargs: object) -> None:
+        nonlocal published
+        publish(*args, **kwargs)  # type: ignore[arg-type]
+        published = True
+        raise OSError("simulated caller loss after outer archive publication")
+
+    monkeypatch.setattr(sessions, "_publish_pinned_directory", lose_receipt)
+    with pytest.raises(OSError, match="caller loss"):
+        sessions.stop("worker", expected_token=token)
+    assert published
+    assert not (sessions.registry / "worker").exists()
+
+    monkeypatch.setattr(sessions, "_publish_pinned_directory", publish)
+    reconciled = sessions.stop("worker", expected_token=token)
+    destination = sessions.registry / "archive" / f"worker-{token}"
+    assert reconciled["archive"] == str(destination)
+    assert destination.is_dir()
+    assert json.loads((destination / "agent.json").read_text())["lifecycle"] == "stopped"
+
+
+def test_outer_stop_reconciliation_requires_exact_token_and_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, _fake, _calls = setup(tmp_path, monkeypatch)
+    started = sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
+    token = str(started["token"])
+    stopped = sessions.stop("worker", expected_token=token)
+    destination = Path(str(stopped["archive"]))
+
+    with pytest.raises(AgentDeliveryError, match="unknown agent"):
+        sessions.stop("worker")
+    with pytest.raises(AgentDeliveryError, match="inspect archived agent generation"):
+        sessions.stop("worker", expected_token="b" * 32)
+
+    receipt = json.loads((destination / "stop-result.json").read_text())
+    receipt["token"] = "c" * 32
+    (destination / "stop-result.json").write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(AgentDeliveryError, match="does not match"):
+        sessions.stop("worker", expected_token=token)
 
 
 @pytest.mark.parametrize("timeout", [float("nan"), float("inf"), -1.0, 31_536_001.0])

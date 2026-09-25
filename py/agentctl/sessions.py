@@ -1,6 +1,7 @@
 """One registry and lifecycle authority across native terminals and turn runners."""
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -26,6 +27,9 @@ from agentctl.subagents import AgentRecord, ManagedAgents, _name
 
 _WORKER_RPC_SCHEMA = "agentctl-worker-rpc/v2"
 _RUNNER_LIVENESS_SCHEMA = "agentctl-runner-liveness/v1"
+_STOP_RESULT_SCHEMA = "agentctl-session-stop/v1"
+_STOP_RESULT_FILE = "stop-result.json"
+_MAX_STOP_RESULT_BYTES = 1 << 20
 
 
 def _runner_identity(value: object) -> CustomProcessIdentity | None:
@@ -146,6 +150,8 @@ class Sessions(ManagedAgents):
             result.append("terminal-snapshot")
         if record.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
             result.extend(("drain", "goal", "bind-session"))
+        if record.adapter == "herdr-pane" and record.harness == "muse":
+            result.append("reconcile-delivery")
         return result
 
     def start_session(self, name: str, *, cwd: str, mode: str = "interactive",
@@ -485,7 +491,19 @@ class Sessions(ManagedAgents):
         expected_record_sha256: str | None = None,
     ) -> dict[str, object]:
         """Retire a runtime, then archive its canonical identity and artifacts."""
-        record = self._load_expected(name, expected_token)
+        try:
+            record = self._load_expected(name, expected_token)
+        except AgentDeliveryError:
+            # A caller that retained the exact generation token can reconcile a
+            # response lost after the outer archive publication. Never infer a
+            # generation merely from an old archive with the same agent name.
+            if expected_token is None or os.path.lexists(self._directory(name)):
+                raise
+            with self._lock(name):
+                if os.path.lexists(self._directory(name)):
+                    record = self._load_expected(name, expected_token)
+                else:
+                    return self._completed_stop(name, expected_token)
         if record.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
             return self._stop(
                 name, expected_token=record.token,
@@ -498,21 +516,134 @@ class Sessions(ManagedAgents):
                 "legacy adoption recovery is supported only for interactive herdr-foreign records"
             )
         with self._lock(name):
+            if not os.path.lexists(self._directory(name)):
+                if expected_token is None:
+                    raise AgentDeliveryError(
+                        f"agent {name!r} disappeared before stop"
+                    )
+                return self._completed_stop(name, expected_token)
             current = self._load(name)
             if current.token != record.token:
                 raise AgentDeliveryError("session was replaced before stop")
-            result = self._worker(current, "stop")
-            current.lifecycle = "stopped"
-            self._save(current)
-            archive = self.registry / "archive"
-            archive.mkdir(mode=0o700, exist_ok=True)
-            agent._validate_private_directory(str(archive), "agent archive")
-            destination = archive / f"{name}-{current.token}"
-            os.rename(self._directory(name), destination)
-            agent._fsync_dir(str(archive))
-            agent._fsync_dir(str(self.registry))
-            return {"name": name, "archive": str(destination),
-                "runtime": _relocate_receipt_paths(result, self._directory(name), destination)}
+            archive, destination = self._archive_destination(current)
+            with self._pinned_agent_directory(name) as pinned:
+                current_snapshot = self._managed_record_snapshot(
+                    pinned, expected_token=current.token,
+                )
+                if current_snapshot.record.adapter != "turn-runner":
+                    raise AgentDeliveryError(
+                        "session adapter changed before token-bound stop"
+                    )
+                current = current_snapshot.record
+                current.lifecycle = "stopping"
+                current.error = None
+                self._atomic_snapshot_bytes(
+                    pinned,
+                    agent._json_text(current.to_storage_document()).encode("utf-8"),
+                    name="agent.json",
+                )
+                try:
+                    result = self._worker(current, "stop")
+                except WorkerRpcError as exc:
+                    # The inner process may have committed the token-bound stop
+                    # before its receipt was lost. Keep the durable intent so the
+                    # next exact-generation stop can reconcile its terminal archive.
+                    current.error = str(exc)
+                    self._atomic_snapshot_bytes(
+                        pinned,
+                        agent._json_text(current.to_storage_document()).encode("utf-8"),
+                        name="agent.json",
+                    )
+                    raise
+                current.lifecycle = "stopped"
+                current.error = None
+                stopped_bytes = agent._json_text(
+                    current.to_storage_document()
+                ).encode("utf-8")
+                self._atomic_snapshot_bytes(
+                    pinned, stopped_bytes, name="agent.json",
+                )
+                response: dict[str, object] = {
+                    "name": name,
+                    "archive": str(destination),
+                    "runtime": _relocate_receipt_paths(
+                        result, self._directory(name), destination,
+                    ),
+                }
+                receipt: dict[str, object] = {
+                    "schema": _STOP_RESULT_SCHEMA,
+                    "name": name,
+                    "token": current.token,
+                    "record_sha256": hashlib.sha256(stopped_bytes).hexdigest(),
+                    "result": response,
+                }
+                receipt_bytes = agent._json_text(receipt).encode("utf-8")
+                if len(receipt_bytes) > _MAX_STOP_RESULT_BYTES:
+                    raise AgentDeliveryError(
+                        f"stop result exceeds {_MAX_STOP_RESULT_BYTES} bytes"
+                    )
+                self._atomic_snapshot_bytes(
+                    pinned, receipt_bytes, name=_STOP_RESULT_FILE,
+                )
+                self._publish_pinned_directory(
+                    pinned, destination, expected_record=stopped_bytes,
+                )
+                return response
+
+    def _completed_stop(self, name: str, expected_token: str) -> dict[str, object]:
+        """Read the exact terminal receipt for one already-published generation."""
+        _name(name)
+        if not expected_token or any(
+            character not in "0123456789abcdefghijklmnopqrstuvwxyz-"
+            for character in expected_token
+        ) or len(expected_token) > 80:
+            raise AgentDeliveryError("expected token has an invalid shape")
+        archive = self.registry / "archive"
+        destination = archive / f"{name}-{expected_token}"
+        agent._validate_private_directory(str(archive), "agent archive")
+        with self._pinned_agent_directory(
+            name, path=destination, label="archived agent generation",
+        ) as pinned:
+            snapshot = self._managed_record_snapshot(
+                pinned, expected_token=expected_token,
+            )
+            record = snapshot.record
+            if record.lifecycle != "stopped" or record.adapter != "turn-runner":
+                raise AgentDeliveryError(
+                    "archived stop receipt does not match the requested runtime generation"
+                )
+            record_bytes = agent._json_text(
+                record.to_storage_document()
+            ).encode("utf-8")
+            receipt_bytes = self._pinned_artifact_bytes(
+                pinned, name=_STOP_RESULT_FILE, limit=_MAX_STOP_RESULT_BYTES,
+                purpose="session stop result",
+            )
+        try:
+            value = json.loads(
+                receipt_bytes.decode("utf-8"),
+                object_pairs_hook=agent._reject_duplicate_json_keys,
+                parse_constant=agent._reject_json_constant,
+            )
+            agent._validate_json_depth(value)
+        except (UnicodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
+            raise AgentDeliveryError(
+                f"session stop result is invalid: {exc}"
+            ) from exc
+        if not isinstance(value, dict) or set(value) != {
+            "schema", "name", "token", "record_sha256", "result",
+        }:
+            raise AgentDeliveryError("session stop result has an invalid shape")
+        if (value.get("schema") != _STOP_RESULT_SCHEMA
+                or value.get("name") != name or value.get("token") != expected_token
+                or value.get("record_sha256") != hashlib.sha256(record_bytes).hexdigest()):
+            raise AgentDeliveryError(
+                "session stop result does not match the archived generation"
+            )
+        result = as_mapping(value.get("result"), "session stop result payload")
+        if result.get("name") != name or result.get("archive") != str(destination):
+            raise AgentDeliveryError("session stop result payload is inconsistent")
+        return dict(result)
 
     def pause(self, name: str, *, paused: bool = True) -> dict[str, object]:
         """Hand off input after in-flight work; preserve the running conversation."""

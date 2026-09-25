@@ -39,6 +39,7 @@ BASE: Path = Path(os.environ.get(
     str(Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "herdr-agent/foreign"),
 )).expanduser().resolve()
 from agentctl.agent import Target as SharedAgentTarget  # noqa: E402
+from agentctl.agent import _rename_directory_noreplace_at  # noqa: E402
 from agentctl.agent import drain as shared_agent_drain  # noqa: E402
 from agentctl.agent import read as shared_agent_read  # noqa: E402
 from agentctl.agent import send as shared_agent_send  # noqa: E402
@@ -46,6 +47,8 @@ from agentctl.agent import status as shared_agent_status  # noqa: E402
 from agentctl.client import CustomProcessIdentity  # noqa: E402
 from agentctl.client import HerdrClient as SharedHerdrClient  # noqa: E402
 from agentctl.errors import HerdrRunError as SharedHerdrError  # noqa: E402
+
+shared_rename_directory_noreplace_at = _rename_directory_noreplace_at
 
 STATE: Path = BASE / "state"
 ARCHIVE: Path = STATE / "_archive"
@@ -123,6 +126,11 @@ MIGRATION_READY_TIMEOUT_S: float = float(os.environ.get("SUBAGENTS_MIGRATION_REA
 # gc for this long, so `up` immediately followed by `status` cannot self-reap.
 STARTUP_GRACE_S: int = 20
 MAX_RUNTIME_REGISTRY_BYTES: int = 8 << 20
+MAX_STOP_RECEIPT_BYTES: int = 64 << 10
+MAX_PROC_ENTRIES: int = 1 << 20
+MAX_HARNESS_GROUP_MEMBERS: int = 4096
+MAX_HARNESS_FREEZE_ROUNDS: int = 64
+STOP_RECEIPT_SCHEMA: str = "agentctl-stop-receipt/v1"
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _HERDR_TAB_ID_RE = re.compile(r"^w[^:]+:t[0-9]+$")
@@ -1131,6 +1139,19 @@ def _harness_lock(name: str) -> Iterator[None]:
         os.close(fd)
 
 
+@contextlib.contextmanager
+def _stop_lock(name: str) -> Iterator[None]:
+    """Serialize a token-bound stop through its terminal archive receipt."""
+    BASE.mkdir(parents=True, exist_ok=True)
+    path = BASE / f".stop-{require_valid_name(name)}.lock"
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
 def record_active_harness(name: str, runner: RunnerIdentity, harness: RunnerIdentity) -> None:
     """Record an owned harness process group for bounded stop and orphan cleanup."""
     _write_durable_json(agent_dir(name) / "active-harness.json", {
@@ -1181,63 +1202,22 @@ def terminate_active_harness(rec: AgentRecord) -> bool:
             "harness_identity_unknown", "cannot verify active harness before teardown"
         )
     if harness_state is ProcessLiveness.DEAD:
+        if _process_group_members(harness.pid):
+            raise AgentOperationError(
+                "harness_identity_unknown",
+                "recorded harness leader exited while its process group still exists; "
+                "state was preserved instead of signaling a reusable numeric process group",
+            )
         return False
     with _verified_pidfd(harness, "active harness teardown") as descriptor:
         if descriptor is None:
-            return False
-        try:
-            if os.getpgid(harness.pid) != harness.pid:
+            if _process_group_members(harness.pid):
                 raise AgentOperationError(
-                    "harness_identity_changed",
-                    "active harness no longer owns its process group",
+                    "harness_identity_unknown",
+                    "harness leader exited during teardown while its process group still exists",
                 )
-            # Freeze the exact leader through its pidfd before addressing the
-            # process group by numeric PGID. Keeping the pidfd open prevents
-            # that leader generation from being confused with a reused PID;
-            # stopping it also prevents it from forking between proof and kill.
-            _pidfd_signal(descriptor, signal.SIGSTOP)
-            deadline = time.monotonic() + 0.5
-            while True:
-                if not _pidfd_live(descriptor):
-                    return False
-                try:
-                    state, started_at = _read_process_state_start(harness.pid)
-                except (FileNotFoundError, ProcessLookupError):
-                    return False
-                except (OSError, UnicodeError, ValueError) as exc:
-                    raise AgentOperationError(
-                        "harness_identity_unknown",
-                        f"cannot observe stopped harness leader: {exc}",
-                    ) from exc
-                if started_at != str(harness.starttime_ticks):
-                    raise AgentOperationError(
-                        "harness_identity_changed",
-                        "active harness identity changed before group teardown",
-                    )
-                if state in ("T", "t"):
-                    break
-                if time.monotonic() >= deadline:
-                    raise AgentOperationError(
-                        "harness_identity_unknown",
-                        "active harness did not enter a stopped state before group teardown",
-                    )
-                time.sleep(0.01)
-            if os.getpgid(harness.pid) != harness.pid:
-                raise AgentOperationError(
-                    "harness_identity_changed",
-                    "active harness no longer owns its process group",
-                )
-            os.killpg(harness.pid, signal.SIGKILL)
-        except ProcessLookupError:
             return False
-        except BaseException:
-            # Do not strand a proven live process if the group action itself
-            # cannot be completed. This signal is also generation-safe.
-            if _pidfd_live(descriptor):
-                with contextlib.suppress(ProcessLookupError, AgentOperationError):
-                    _pidfd_signal(descriptor, signal.SIGCONT)
-            raise
-        return True
+        return _terminate_pinned_process_group(harness, descriptor)
 
 
 def transcript_path(name: str) -> Path:
@@ -1596,19 +1576,74 @@ def pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
-def _read_process_state_start(pid: int) -> tuple[str, str]:
-    """Read one Linux process state/starttime pair or raise on ambiguity."""
-    text = Path(f"/proc/{pid}/stat").read_text()
+def _read_process_state_group_start(pid: int) -> tuple[str, int, str]:
+    """Read one Linux process state/group/starttime tuple or raise on ambiguity."""
+    raw = Path(f"/proc/{pid}/stat").read_bytes()
+    if len(raw) > 8192 or not raw.startswith(f"{pid} (".encode("ascii")):
+        raise ValueError("process stat has an invalid identity or length")
     try:
-        fields = text.rsplit(")", 1)[1].strip().split()
-    except IndexError as exc:
+        suffix = raw.rsplit(b")", 1)[1].decode("ascii")
+    except (IndexError, UnicodeDecodeError) as exc:
         raise ValueError("process stat has no command terminator") from exc
+    fields = suffix.strip().split()
     if len(fields) <= 19 or fields[0] not in "RSDZTtXxKWPI":
         raise ValueError("process stat is incomplete")
+    process_group = int(fields[2])
+    # Kernel threads can legitimately report process group zero. They never
+    # match a positive owned harness group but must not make a complete /proc
+    # scan fail.
+    if not 0 <= process_group <= 2_147_483_647:
+        raise ValueError("process stat has an invalid process group")
     started_at = fields[19]
     if not started_at.isascii() or not started_at.isdigit() or not started_at.strip("0"):
         raise ValueError("process stat has an invalid start time")
-    return fields[0], started_at
+    return fields[0], process_group, started_at
+
+
+def _read_process_state_start(pid: int) -> tuple[str, str]:
+    """Read one Linux process state/starttime pair or raise on ambiguity."""
+    state, _process_group, started_at = _read_process_state_group_start(pid)
+    return state, started_at
+
+
+def _process_group_members(process_group: int) -> dict[int, str]:
+    """Return a bounded snapshot of live process generations in one group."""
+    members: dict[int, str] = {}
+    inspected = 0
+    try:
+        entries = os.scandir("/proc")
+    except OSError as exc:
+        raise AgentOperationError(
+            "harness_identity_unknown", f"cannot enumerate process group: {exc}",
+        ) from exc
+    with entries:
+        for entry in entries:
+            if not entry.name.isascii() or not entry.name.isdigit():
+                continue
+            inspected += 1
+            if inspected > MAX_PROC_ENTRIES:
+                raise AgentOperationError(
+                    "harness_identity_unknown",
+                    f"process enumeration exceeds {MAX_PROC_ENTRIES} entries",
+                )
+            pid = int(entry.name)
+            try:
+                state, observed_group, started_at = _read_process_state_group_start(pid)
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            except (OSError, UnicodeError, ValueError) as exc:
+                raise AgentOperationError(
+                    "harness_identity_unknown",
+                    f"cannot inspect process {pid} while enumerating harness group: {exc}",
+                ) from exc
+            if observed_group == process_group and state not in ("Z", "X", "x"):
+                members[pid] = started_at
+                if len(members) > MAX_HARNESS_GROUP_MEMBERS:
+                    raise AgentOperationError(
+                        "harness_identity_unknown",
+                        f"harness process group exceeds {MAX_HARNESS_GROUP_MEMBERS} members",
+                    )
+    return members
 
 
 def capture_process_identity(pid: int) -> CustomProcessIdentity:
@@ -1731,6 +1766,168 @@ def _pidfd_signal(descriptor: int, signum: int) -> None:
         raise AgentOperationError(
             "runner_signal_failed", f"cannot signal pinned process: {exc}",
         ) from exc
+
+
+def _open_process_group_member(
+    pid: int, process_group: int, expected_started_at: str,
+) -> int | None:
+    """Pin one process generation that belonged to the group snapshot."""
+    opener = getattr(os, "pidfd_open", None)
+    if opener is None:
+        raise AgentOperationError(
+            "harness_identity_unknown",
+            "safe harness-group teardown requires Linux pidfds",
+        )
+    try:
+        descriptor = cast(int, opener(pid, 0))
+    except ProcessLookupError:
+        return None
+    except OSError as exc:
+        raise AgentOperationError(
+            "harness_identity_unknown",
+            f"cannot pin harness-group process {pid}: {exc}",
+        ) from exc
+    try:
+        if not _pidfd_live(descriptor):
+            os.close(descriptor)
+            return None
+        state, observed_group, started_at = _read_process_state_group_start(pid)
+        if (observed_group != process_group or started_at != expected_started_at
+                or state in ("Z", "X", "x") or not _pidfd_live(descriptor)):
+            os.close(descriptor)
+            return None
+        return descriptor
+    except (FileNotFoundError, ProcessLookupError):
+        os.close(descriptor)
+        return None
+    except (OSError, UnicodeError, ValueError) as exc:
+        os.close(descriptor)
+        raise AgentOperationError(
+            "harness_identity_unknown",
+            f"cannot verify harness-group process {pid}: {exc}",
+        ) from exc
+
+
+def _wait_pinned_process_stopped(
+    pid: int, descriptor: int, process_group: int, started_at: str,
+) -> bool:
+    """Wait briefly for one exact pinned group member to stop or exit."""
+    deadline = time.monotonic() + 0.5
+    while True:
+        if not _pidfd_live(descriptor):
+            return False
+        try:
+            state, observed_group, observed_start = _read_process_state_group_start(pid)
+        except (FileNotFoundError, ProcessLookupError):
+            return False
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise AgentOperationError(
+                "harness_identity_unknown",
+                f"cannot observe stopped harness-group process {pid}: {exc}",
+            ) from exc
+        if observed_group != process_group or observed_start != started_at:
+            raise AgentOperationError(
+                "harness_identity_changed",
+                f"harness-group process {pid} changed identity during teardown",
+            )
+        if state in ("T", "t"):
+            return True
+        if time.monotonic() >= deadline:
+            raise AgentOperationError(
+                "harness_identity_unknown",
+                f"harness-group process {pid} did not stop before teardown",
+            )
+        time.sleep(0.01)
+
+
+def _terminate_pinned_process_group(
+    harness: RunnerIdentity, leader_descriptor: int,
+) -> bool:
+    """Freeze and signal every exact member through pidfds, never a reusable PGID."""
+    process_group = harness.pid
+    pinned: dict[int, tuple[int, str]] = {
+        harness.pid: (leader_descriptor, str(harness.starttime_ticks)),
+    }
+    owned_descriptors: set[int] = set()
+    stopped: set[int] = set()
+    committed = False
+    try:
+        _pidfd_signal(leader_descriptor, signal.SIGSTOP)
+        stopped.add(leader_descriptor)
+        if not _wait_pinned_process_stopped(
+            harness.pid, leader_descriptor, process_group,
+            str(harness.starttime_ticks),
+        ):
+            raise AgentOperationError(
+                "harness_identity_unknown",
+                "harness leader exited before its process group could be frozen",
+            )
+        for _round in range(MAX_HARNESS_FREEZE_ROUNDS):
+            if not _pidfd_live(leader_descriptor):
+                raise AgentOperationError(
+                    "harness_identity_unknown",
+                    "harness leader exited while its process group was frozen",
+                )
+            snapshot = _process_group_members(process_group)
+            if snapshot.get(harness.pid) != str(harness.starttime_ticks):
+                raise AgentOperationError(
+                    "harness_identity_changed",
+                    "harness leader changed while its process group was frozen",
+                )
+            newly_pinned: list[tuple[int, int, str]] = []
+            for pid, started_at in snapshot.items():
+                if pid in pinned:
+                    continue
+                descriptor = _open_process_group_member(
+                    pid, process_group, started_at,
+                )
+                if descriptor is not None:
+                    newly_pinned.append((pid, descriptor, started_at))
+            if not _pidfd_live(leader_descriptor):
+                for _pid, descriptor, _start in newly_pinned:
+                    os.close(descriptor)
+                raise AgentOperationError(
+                    "harness_identity_unknown",
+                    "harness leader exited during process-group enumeration",
+                )
+            for pid, descriptor, started_at in newly_pinned:
+                pinned[pid] = (descriptor, started_at)
+                owned_descriptors.add(descriptor)
+                try:
+                    _pidfd_signal(descriptor, signal.SIGSTOP)
+                except ProcessLookupError:
+                    continue
+                stopped.add(descriptor)
+                _wait_pinned_process_stopped(
+                    pid, descriptor, process_group, started_at,
+                )
+            if not newly_pinned:
+                break
+        else:
+            raise AgentOperationError(
+                "harness_identity_unknown",
+                f"harness group did not stabilize within {MAX_HARNESS_FREEZE_ROUNDS} scans",
+            )
+        # All members capable of forking have been stopped. Signal the exact
+        # pinned generations, not the numeric process-group identifier.
+        for pid, (descriptor, _started_at) in sorted(
+            pinned.items(), key=lambda item: item[0] == harness.pid,
+        ):
+            del pid
+            try:
+                _pidfd_signal(descriptor, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        committed = True
+        return True
+    finally:
+        if not committed:
+            for descriptor in stopped:
+                with contextlib.suppress(ProcessLookupError, AgentOperationError):
+                    if _pidfd_live(descriptor):
+                        _pidfd_signal(descriptor, signal.SIGCONT)
+        for descriptor in owned_descriptors:
+            os.close(descriptor)
 
 
 @contextlib.contextmanager
@@ -2461,20 +2658,127 @@ def terminate_runner(rec: AgentRecord, grace: float = 2.0) -> bool:
 # --------------------------------------------------------------------------- #
 
 
-def archive_state(name: str) -> Optional[Path]:
+def archive_state(name: str, *, destination: Path | None = None) -> Optional[Path]:
     """Move the agent's state dir under state/_archive/ (transcripts kept)."""
     src = agent_dir(name)
     if not src.exists():
         return None
     ARCHIVE.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
-    dest = ARCHIVE / f"{name}-{stamp}"
-    n = 1
-    while dest.exists():
-        dest = ARCHIVE / f"{name}-{stamp}-{n}"
-        n += 1
-    os.replace(src, dest)
+    if destination is None:
+        stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+        dest = ARCHIVE / f"{name}-{stamp}"
+        n = 1
+        while dest.exists():
+            dest = ARCHIVE / f"{name}-{stamp}-{n}"
+            n += 1
+    else:
+        dest = destination
+        if dest.parent != ARCHIVE or os.path.lexists(dest):
+            raise AgentOperationError(
+                "stop_archive_collision",
+                f"token-bound stop archive destination is unavailable: {dest}",
+            )
+    if destination is None:
+        os.replace(src, dest)
+    else:
+        source_parent = os.open(STATE, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        destination_parent = -1
+        try:
+            destination_parent = os.open(
+                ARCHIVE, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+            shared_rename_directory_noreplace_at(
+                source_parent, src.name, destination_parent, dest.name,
+            )
+        finally:
+            if destination_parent >= 0:
+                os.close(destination_parent)
+            os.close(source_parent)
     return dest
+
+
+def _owned_stop_destination(name: str, owner_token: str) -> Path:
+    if re.fullmatch(r"[a-z0-9-]{1,80}", owner_token) is None:
+        raise AgentOperationError("invalid_owner_token", "owner token has an invalid shape")
+    return ARCHIVE / f"{require_valid_name(name)}-{owner_token}"
+
+
+def _owned_stop_receipt(
+    destination: Path, name: str, owner_token: str,
+) -> DownResult:
+    """Validate one terminal archive as the receipt for this exact generation."""
+    path = destination / "stop-receipt.json"
+    try:
+        value = json.loads(_read_bounded_private_text(
+            path, MAX_STOP_RECEIPT_BYTES, "stop receipt",
+        ))
+    except json.JSONDecodeError as exc:
+        raise AgentOperationError(
+            "stop_receipt_invalid", f"stop receipt is not valid JSON: {exc}",
+        ) from exc
+    fields = {
+        "schema", "name", "owner_token", "killed_window", "forced",
+        "unverified_presentation",
+    }
+    if (not isinstance(value, dict) or set(value) != fields
+            or value.get("schema") != STOP_RECEIPT_SCHEMA
+            or value.get("name") != name or value.get("owner_token") != owner_token
+            or not isinstance(value.get("killed_window"), bool)
+            or not isinstance(value.get("forced"), bool)
+            or (value.get("unverified_presentation") is not None
+                and not isinstance(value.get("unverified_presentation"), str))):
+        raise AgentOperationError(
+            "stop_receipt_invalid",
+            f"stop archive does not contain an exact receipt for {name!r}",
+        )
+    with registry_lock() as agents:
+        current = agents.get(name)
+        if current is not None and current.owner_token != owner_token:
+            raise AgentOperationError(
+                "owner_token_mismatch",
+                f"runtime {name!r} belongs to another session generation",
+            )
+        if os.path.lexists(agent_dir(name)) or not destination.is_dir():
+            raise AgentOperationError(
+                "stop_receipt_invalid",
+                f"stop archive state changed while reconciling {name!r}",
+            )
+        agents.pop(name, None)
+    return DownResult(
+        name=name,
+        killed_window=cast(bool, value["killed_window"]),
+        archived_to=str(destination),
+        state_path=None,
+        was_registered=True,
+        forced=cast(bool, value["forced"]),
+        unverified_presentation=cast(Optional[str], value["unverified_presentation"]),
+    )
+
+
+def stop_owned_agent(name: str, owner_token: str, *, grace: float = 10.0) -> DownResult:
+    """Stop or reconcile exactly one outer-session-owned runtime generation."""
+    valid_name = require_valid_name(name)
+    destination = _owned_stop_destination(valid_name, owner_token)
+    with _stop_lock(valid_name):
+        source_exists = os.path.lexists(agent_dir(valid_name))
+        destination_exists = os.path.lexists(destination)
+        if source_exists and destination_exists:
+            raise AgentOperationError(
+                "stop_archive_collision",
+                "both live and terminal state exist for this runtime generation",
+            )
+        if destination_exists:
+            return _owned_stop_receipt(destination, valid_name, owner_token)
+        if not source_exists:
+            raise AgentOperationError(
+                "stop_receipt_missing",
+                f"runtime {valid_name!r} has neither live state nor a terminal receipt",
+            )
+        return bring_down_agent(
+            valid_name, grace=grace, archive=True,
+            expected_owner_token=owner_token,
+            deterministic_archive=destination,
+        )
 
 
 def _write_workspace_loss_snapshot(rec: AgentRecord, workspace_id: str) -> Path:
@@ -3419,7 +3723,9 @@ def read_agent_output(
 
 
 def bring_down_agent(
-    name: str, *, grace: float = 10.0, archive: bool = True, force: bool = False
+    name: str, *, grace: float = 10.0, archive: bool = True, force: bool = False,
+    expected_owner_token: str | None = None,
+    deterministic_archive: Path | None = None,
 ) -> DownResult:
     """Retire an agent, optionally without probing an unavailable backend.
 
@@ -3432,6 +3738,20 @@ def bring_down_agent(
     reg = read_registry()
     rec = reg.get(valid_name)
     was_registered = rec is not None
+    if deterministic_archive is not None and (
+        not archive or expected_owner_token is None or force
+    ):
+        raise AgentOperationError(
+            "invalid_stop_transaction",
+            "deterministic stop archives require a non-forced token-bound archival stop",
+        )
+    if expected_owner_token is not None and (
+        rec is None or rec.owner_token != expected_owner_token
+    ):
+        raise AgentOperationError(
+            "owner_token_mismatch",
+            f"runtime {valid_name!r} does not belong to the requested session generation",
+        )
     if rec is not None:
         if rec.mode == HEADLESS_MODE and (
             rec.runner_identity is not None or rec.runner_pid is not None
@@ -3475,14 +3795,38 @@ def bring_down_agent(
     preview = last_message_preview(valid_name)
     archived_to: Optional[str] = None
     state_path: Optional[str] = None
-    if archive:
+    if archive and deterministic_archive is not None:
+        assert rec is not None and expected_owner_token is not None
+        receipt = {
+            "schema": STOP_RECEIPT_SCHEMA,
+            "name": valid_name,
+            "owner_token": expected_owner_token,
+            "killed_window": killed_window,
+            "forced": False,
+            "unverified_presentation": None,
+        }
+        _write_durable_json(agent_dir(valid_name) / "stop-receipt.json", receipt)
+        ARCHIVE.mkdir(parents=True, exist_ok=True)
+        with registry_lock() as agents:
+            current = agents.get(valid_name)
+            if current is None or current.owner_token != expected_owner_token:
+                raise AgentOperationError(
+                    "owner_token_mismatch",
+                    f"runtime {valid_name!r} changed generation before archival",
+                )
+            dest = archive_state(valid_name, destination=deterministic_archive)
+            archived_to = None if dest is None else str(dest)
+            _sync_directory(ARCHIVE)
+            agents.pop(valid_name)
+    elif archive:
         dest = archive_state(valid_name)
         archived_to = None if dest is None else str(dest)
     else:
         p = agent_dir(valid_name)
         state_path = str(p) if p.exists() else None
-    with registry_lock() as agents:
-        agents.pop(valid_name, None)
+    if deterministic_archive is None:
+        with registry_lock() as agents:
+            agents.pop(valid_name, None)
     if not archive:
         _clear_legacy_sidecars(valid_name)
     if was_registered or killed_window or archived_to is not None or state_path is not None:

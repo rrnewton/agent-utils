@@ -94,8 +94,7 @@ def dispatch(request: dict[str, object]) -> dict[str, object]:
         result = lib.read_agent_output(name, mode=get_str(request, "mode", "read"),
             since_turn=_optional_int(request, "since_turn"), tail=_optional_int(request, "tail"))
     elif action == "stop":
-        lib.bind_owner_token(name, owner_token)
-        result = lib.bring_down_agent(name, archive=True)
+        result = lib.stop_owned_agent(name, owner_token)
     elif action == "reset":
         lib.reconcile_automation_pause(name, owner_token, paused)
         result = lib.reset_agent_context(name)

@@ -93,6 +93,11 @@ enum Commands {
     /// Deliver queued prompts that are known not to have been submitted
     #[command(after_help = "Example: agentctl drain reviewer --ready-timeout 60")]
     Drain(Drain),
+    /// Reconcile one ambiguous Muse prompt from exact transcript evidence
+    #[command(
+        after_help = "Example: agentctl reconcile-delivery reviewer MESSAGE_ID --expected-sha256 SHA256"
+    )]
+    ReconcileDelivery(ReconcileDelivery),
     /// Read visible terminal output and save a bounded snapshot
     #[command(after_help = "Example: agentctl read reviewer --lines 100")]
     Read(Read),
@@ -371,6 +376,17 @@ struct Drain {
     agent: Named,
     #[command(flatten)]
     delivery: Delivery,
+}
+#[derive(Args)]
+struct ReconcileDelivery {
+    #[command(flatten)]
+    agent: Named,
+    /// Exact caller-selected queue message identifier
+    #[arg(value_name = "MESSAGE_ID")]
+    message_id: String,
+    /// Exact lowercase SHA-256 of the retained queue artifact
+    #[arg(long, required = true, value_name = "SHA256")]
+    expected_sha256: String,
 }
 #[derive(Args)]
 struct Read {
@@ -970,6 +986,11 @@ fn run(args: Cli) -> Result<i32, Failure> {
                 76
             });
         }
+        Commands::ReconcileDelivery(value) => json!(manager.reconcile_delivery(
+            &value.agent.name,
+            &value.message_id,
+            &value.expected_sha256,
+        )?),
         Commands::Read(value) => {
             if !matches!(value.output.as_str(), "tail" | "all") || value.since_turn.is_some() {
                 return Err(Failure::Usage("interactive agents expose terminal snapshots; last/since_turn require headless transcripts".to_owned()));
@@ -1158,7 +1179,7 @@ fn add_capabilities(value: &mut serde_json::Value) {
         ) && value["mode"] == "interactive"
             && value["backend"] == "herdr"
         {
-            json!([
+            let mut capabilities = vec![
                 "send",
                 "status",
                 "read",
@@ -1170,8 +1191,12 @@ fn add_capabilities(value: &mut serde_json::Value) {
                 "terminal-snapshot",
                 "drain",
                 "goal",
-                "bind-session"
-            ])
+                "bind-session",
+            ];
+            if value["adapter"] == "herdr-pane" && value["harness"] == "muse" {
+                capabilities.push("reconcile-delivery");
+            }
+            json!(capabilities)
         } else {
             json!(["status"])
         };
@@ -1221,6 +1246,20 @@ mod tests {
         ] {
             assert!(help.contains(required));
         }
+        let parsed = Cli::try_parse_from([
+            "agentctl",
+            "reconcile-delivery",
+            "reviewer",
+            "message-1",
+            "--expected-sha256",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ])
+        .unwrap();
+        let Some(Commands::ReconcileDelivery(reconcile)) = parsed.command else {
+            panic!("expected reconcile-delivery command");
+        };
+        assert_eq!(reconcile.agent.name, "reviewer");
+        assert_eq!(reconcile.message_id, "message-1");
         assert!(Cli::try_parse_from([
             "agentctl",
             "chat",

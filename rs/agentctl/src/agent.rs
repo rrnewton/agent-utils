@@ -27,6 +27,7 @@ use crate::error::{AdapterError, EXIT_BUSY, EXIT_TIMEOUT};
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const MESSAGE_ID_MAX: usize = 255;
+const RECONCILE_ARTIFACT_MAX_BYTES: u64 = 16 << 20;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Identity assertions for one already-running interactive Herdr agent.
@@ -804,6 +805,134 @@ pub fn send<A: AgentApi + ?Sized>(
     )
 }
 
+/// Commit one explicitly selected ambiguous prompt after exact external evidence.
+pub fn reconcile_delivery<F>(
+    root: &Path,
+    message_id: &str,
+    expected_sha256: &str,
+    evidence: F,
+) -> AgentResult<QueueResult>
+where
+    F: FnOnce(&str) -> AgentResult<bool>,
+{
+    validate_message_id(message_id)?;
+    if expected_sha256.len() != 64
+        || !expected_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(AgentError::delivery(
+            "expected-sha256 must be 64 lowercase hexadecimal characters",
+        ));
+    }
+    validate_existing_queue(root)?;
+    let directories = QueueDirectories::new(root);
+    for directory in directories.all() {
+        validate_private_directory(directory, "queue state directory", false)?;
+    }
+    let queue_lock_path = root.join(".delivery.lock");
+    let queue_lock = open_private_lock(&queue_lock_path, "queue delivery lock")?;
+    queue_lock
+        .lock_exclusive()
+        .map_err(|error| io_error("lock queue delivery", &queue_lock_path, error))?;
+    let filename = format!("{message_id}.json");
+    let candidates = [
+        (
+            QueueMessageState::Pending,
+            directories.inbox.join(&filename),
+        ),
+        (
+            QueueMessageState::Inflight,
+            directories.inflight.join(&filename),
+        ),
+        (
+            QueueMessageState::Processed,
+            directories.processed.join(&filename),
+        ),
+        (
+            QueueMessageState::Failed,
+            directories.failed.join(&filename),
+        ),
+    ];
+    let mut locations = candidates
+        .into_iter()
+        .filter(|(_, path)| fs::symlink_metadata(path).is_ok())
+        .collect::<Vec<_>>();
+    if locations.len() != 1 {
+        return Err(AgentError::delivery(format!(
+            "message {message_id} must have exactly one durable queue location"
+        )));
+    }
+    let (state, source) = locations.pop().expect("one queue location");
+    let encoded =
+        read_bytes_with_policy_bounded(&source, false, Some(RECONCILE_ARTIFACT_MAX_BYTES))?;
+    if format!("{:x}", Sha256::digest(&encoded)) != expected_sha256 {
+        return Err(AgentError::delivery(
+            "queued message does not match expected-sha256",
+        ));
+    }
+    let document = serde_json::from_slice::<Value>(&encoded)
+        .map_err(|error| AgentError::delivery(format!("queued message is invalid: {error}")))?;
+    let document = document
+        .as_object()
+        .ok_or_else(|| AgentError::delivery("queued message has an invalid shape"))?;
+    let text = document
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| AgentError::delivery("queued message has no nonempty text"))?;
+    if document.get("id").and_then(Value::as_str) != Some(message_id) {
+        return Err(AgentError::delivery(
+            "queued message does not match its selected identifier",
+        ));
+    }
+    if state == QueueMessageState::Pending {
+        return Err(AgentError::delivery(
+            "pending messages have not crossed the injection barrier",
+        ));
+    }
+    let sidecar = directories.failed.join(format!("{filename}.error"));
+    if state == QueueMessageState::Processed {
+        remove_optional_sidecar(&sidecar, &directories.failed)?;
+        return Ok(QueueResult {
+            message_id: message_id.to_owned(),
+            delivered: vec![message_id.to_owned()],
+            quarantined: Vec::new(),
+            pending: Vec::new(),
+            blocked: None,
+            outcome: QueueOutcome::Delivered,
+        });
+    }
+    if document.get("possibly_submitted") != Some(&Value::Bool(true)) {
+        return Err(AgentError::delivery(
+            "ambiguous artifact lacks the durable injection-barrier marker",
+        ));
+    }
+    if !evidence(text)? {
+        return Err(AgentError::delivery(
+            "live transcript does not contain this exact prompt as a Muse user turn",
+        ));
+    }
+    transition(&source, &directories.processed.join(&filename))?;
+    remove_optional_sidecar(&sidecar, &directories.failed)?;
+    Ok(QueueResult {
+        message_id: message_id.to_owned(),
+        delivered: vec![message_id.to_owned()],
+        quarantined: Vec::new(),
+        pending: Vec::new(),
+        blocked: None,
+        outcome: QueueOutcome::Delivered,
+    })
+}
+
+fn remove_optional_sidecar(path: &Path, parent: &Path) -> AgentResult<()> {
+    match fs::remove_file(path) {
+        Ok(()) => sync_directory(parent),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_error("remove reconciled delivery sidecar", path, error)),
+    }
+}
+
 /// Send one prompt using an injected readiness runtime.
 pub fn send_with_runtime<A: AgentApi + ?Sized>(
     client: &A,
@@ -1296,7 +1425,7 @@ fn bind_queue_with_runtime(
     Ok(())
 }
 
-fn validate_existing_binding(root: &Path, target: &Target) -> AgentResult<()> {
+pub(crate) fn validate_existing_binding(root: &Path, target: &Target) -> AgentResult<()> {
     let binding_path = root.join("target.json");
     let actual = match fs::symlink_metadata(&binding_path) {
         Ok(_) => read_private_json(&binding_path)?,
@@ -1667,6 +1796,17 @@ fn read_json_with_policy_bounded(
     require_private: bool,
     max_bytes: Option<u64>,
 ) -> AgentResult<Value> {
+    let contents = read_bytes_with_policy_bounded(path, require_private, max_bytes)?;
+    serde_json::from_slice(&contents).map_err(|error| {
+        AgentError::delivery(format!("cannot read JSON {}: {error}", path.display()))
+    })
+}
+
+fn read_bytes_with_policy_bounded(
+    path: &Path,
+    require_private: bool,
+    max_bytes: Option<u64>,
+) -> AgentResult<Vec<u8>> {
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -1678,6 +1818,7 @@ fn read_json_with_policy_bounded(
     if !metadata.file_type().is_file()
         || metadata.uid() != unsafe { libc::getuid() }
         || require_private && metadata.permissions().mode() & 0o077 != 0
+        || metadata.nlink() != 1
     {
         return Err(AgentError::delivery(format!(
             "unsafe JSON artifact: {}",
@@ -1690,12 +1831,12 @@ fn read_json_with_policy_bounded(
             path.display()
         )));
     }
-    let mut contents = String::new();
+    let mut contents = Vec::new();
     match max_bytes {
         Some(limit) => {
             Read::by_ref(&mut file)
                 .take(limit.saturating_add(1))
-                .read_to_string(&mut contents)
+                .read_to_end(&mut contents)
                 .map_err(|error| io_error("read JSON", path, error))?;
             if contents.len() as u64 > limit {
                 return Err(AgentError::delivery(format!(
@@ -1705,13 +1846,30 @@ fn read_json_with_policy_bounded(
             }
         }
         None => {
-            file.read_to_string(&mut contents)
+            file.read_to_end(&mut contents)
                 .map_err(|error| io_error("read JSON", path, error))?;
         }
     }
-    serde_json::from_str(&contents).map_err(|error| {
-        AgentError::delivery(format!("cannot read JSON {}: {error}", path.display()))
-    })
+    let final_metadata = file
+        .metadata()
+        .map_err(|error| io_error("reinspect JSON", path, error))?;
+    if final_metadata.dev() != metadata.dev()
+        || final_metadata.ino() != metadata.ino()
+        || final_metadata.len() != contents.len() as u64
+        || final_metadata.mode() != metadata.mode()
+        || final_metadata.uid() != metadata.uid()
+        || final_metadata.nlink() != 1
+        || final_metadata.mtime() != metadata.mtime()
+        || final_metadata.mtime_nsec() != metadata.mtime_nsec()
+        || final_metadata.ctime() != metadata.ctime()
+        || final_metadata.ctime_nsec() != metadata.ctime_nsec()
+    {
+        return Err(AgentError::delivery(format!(
+            "JSON artifact changed while it was read: {}",
+            path.display()
+        )));
+    }
+    Ok(contents)
 }
 
 fn load_message(path: &Path) -> AgentResult<Map<String, Value>> {
@@ -2510,6 +2668,59 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(fake.runs().is_empty());
+    }
+
+    #[test]
+    fn explicit_delivery_reconciliation_is_hash_bound_and_crash_idempotent() {
+        let directory = TestDirectory::new("reconcile-delivery");
+        bind_queue(directory.path(), &target()).unwrap();
+        let identifier = "ambiguous-message";
+        enqueue(directory.path(), "exact prompt", Some(identifier)).unwrap();
+        let inbox = directory.path().join(format!("inbox/{identifier}.json"));
+        let mut document = read_private_json(&inbox).unwrap();
+        document["possibly_submitted"] = json!(true);
+        document["delivery_state"] = json!("inflight");
+        atomic_json(&inbox, &document).unwrap();
+        let failed = directory.path().join(format!("failed/{identifier}.json"));
+        transition(&inbox, &failed).unwrap();
+        let artifact = fs::read(&failed).unwrap();
+        let digest = format!("{:x}", Sha256::digest(&artifact));
+
+        assert!(
+            reconcile_delivery(directory.path(), identifier, &"0".repeat(64), |_| Ok(true),)
+                .unwrap_err()
+                .to_string()
+                .contains("expected-sha256")
+        );
+        assert!(
+            reconcile_delivery(directory.path(), identifier, &digest, |_| Ok(false))
+                .unwrap_err()
+                .to_string()
+                .contains("exact prompt")
+        );
+
+        let sidecar = directory
+            .path()
+            .join(format!("failed/{identifier}.json.error"));
+        fs::create_dir(&sidecar).unwrap();
+        let error = reconcile_delivery(directory.path(), identifier, &digest, |text| {
+            Ok(text == "exact prompt")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("sidecar"));
+        let processed = directory
+            .path()
+            .join(format!("processed/{identifier}.json"));
+        assert_eq!(fs::read(&processed).unwrap(), artifact);
+        fs::remove_dir(&sidecar).unwrap();
+        assert_eq!(
+            reconcile_delivery(directory.path(), identifier, &digest, |_| {
+                panic!("processed reconciliation must not request new evidence")
+            })
+            .unwrap()
+            .outcome,
+            QueueOutcome::Delivered
+        );
     }
 
     #[test]

@@ -209,7 +209,8 @@ def _orientation(harness: Harness, report: Report) -> None:
     _pair(harness, report, case, "primary/version", ("--version",))
     for arguments in ((), ("--help",), ("start", "--help"), ("adopt", "--help"),
                       ("recover-start", "--help"), ("health", "--help"),
-                      ("stop", "--help"), ("send", "--help"), ("goal", "--help")):
+                      ("stop", "--help"), ("send", "--help"),
+                      ("reconcile-delivery", "--help"), ("goal", "--help")):
         for edition, outcome in zip(("python", "rust"), harness.invoke(case, arguments), strict=True):
             report.require(f"primary/help/{arguments}/{edition}",
                            outcome.returncode == 0 and not outcome.stderr and "--registry" in outcome.stdout
@@ -228,7 +229,9 @@ def _orientation(harness: Harness, report: Report) -> None:
                            )) if arguments == ("recover-start", "--help") else True)
                            and (all(option in outcome.stdout for option in (
                                "--watch", "--interval",
-                           )) if arguments == ("health", "--help") else True),
+                           )) if arguments == ("health", "--help") else True)
+                           and ("--expected-sha256" in outcome.stdout
+                                if arguments == ("reconcile-delivery", "--help") else True),
                            f"missing operation help: {outcome!r}")
     for command in ("quickstart", "userguide"):
         for edition, outcome in zip(("python", "rust"), harness.invoke(case, (command,)), strict=True):
@@ -623,6 +626,32 @@ def _profiles(harness: Harness, report: Report) -> None:
                 for root in (case.python_root, case.rust_root)
             ), "Muse draft/error redraw was incorrectly accepted as delivery")
             _change(case, {
+                "custom_post_error": False, "custom_submitted": False,
+                "custom_draft": "",
+            })
+            reconciled: list[Outcome] = []
+            for command, root in (
+                (harness.python, case.python_root),
+                (harness.rust, case.rust_root),
+            ):
+                artifact = root / "registry/worker/queue/failed/muse-error.json"
+                digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+                reconciled.append(harness._invoke_one(command, root, (
+                    "reconcile-delivery", "worker", "muse-error",
+                    "--expected-sha256", digest, *_COMMON,
+                )))
+            report.require(
+                "primary/profile/watermelon/exact-reconciliation",
+                all(outcome.returncode == 0 for outcome in reconciled)
+                and _json(reconciled[0]) == _json(reconciled[1])
+                and all(
+                    (root / "registry/worker/queue/processed/muse-error.json").is_file()
+                    and not (root / "registry/worker/queue/failed/muse-error.json").exists()
+                    for root in (case.python_root, case.rust_root)
+                ),
+                f"exact Muse delivery reconciliation diverged: {reconciled!r}",
+            )
+            _change(case, {
                 "custom_post_error": False, "custom_clear_without_submit": True,
                 "custom_submitted": False, "custom_draft": "",
             })
@@ -680,7 +709,7 @@ def _profiles(harness: Harness, report: Report) -> None:
     configure(permanent)
     outcomes = harness.invoke(permanent, (
         "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
-        "--profile", "watermelon", "--startup-timeout", "0.15", *_COMMON,
+        "--profile", "watermelon", "--startup-timeout", "0.5", *_COMMON,
     ))
     report.require(
         "primary/profile/watermelon/permanent-process-info-retried",

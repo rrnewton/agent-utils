@@ -169,6 +169,16 @@ def parser() -> argparse.ArgumentParser:
     drain = command("drain", "Deliver safely pending interactive requests; never replay uncertain submissions.",
         "agentctl drain reviewer --ready-timeout 0", named=True)
     _delivery(drain)
+    reconcile = command(
+        "reconcile-delivery",
+        "Reconcile one ambiguous Muse message from exact transcript evidence.",
+        "agentctl reconcile-delivery reviewer MESSAGE_ID --expected-sha256 SHA256",
+        named=True,
+    )
+    reconcile.add_argument("message_id", metavar="MESSAGE_ID",
+        help="exact caller-selected queue message identifier")
+    reconcile.add_argument("--expected-sha256", required=True, metavar="SHA256",
+        help="exact lowercase SHA-256 of the retained queue artifact")
     read = command("read", "Read a terminal snapshot or a headless transcript/answer.",
         "agentctl read reviewer --lines 100", named=True)
     read.add_argument("--lines", type=_bounded_uint, default=500, metavar="COUNT", help="maximum tail/snapshot lines (default: 500)")
@@ -405,6 +415,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             outcome = sessions.drain(name, **options)
             print(json.dumps(asdict(outcome), indent=2, sort_keys=True))
             return 75 if outcome.blocked else (76 if outcome.quarantined else 0)
+        elif args.command == "reconcile-delivery":
+            from dataclasses import asdict
+            outcome = sessions.reconcile_delivery(
+                name, args.message_id, args.expected_sha256,
+            )
+            print(json.dumps(asdict(outcome), indent=2, sort_keys=True))
+            return 0
         elif args.command == "goal":
             result = sessions.goal(name, _text(args, optional=True), goal_command=_goal_command(args), **options)
         elif args.command == "bind-session":

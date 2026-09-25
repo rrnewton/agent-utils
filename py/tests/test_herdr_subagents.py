@@ -1,6 +1,7 @@
 """Lifecycle regressions for visible subagents, including failures and ownership changes."""
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import replace
@@ -12,9 +13,12 @@ import pytest
 from agentctl.client import (
     AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, PaneShellProof,
 )
-from agentctl.errors import AgentDeliveryError, AgentPending, HerdrUnavailable
+from agentctl.errors import (
+    AgentDeliveryError, AgentPending, AgentPossiblySubmitted, HerdrUnavailable,
+)
 from agentctl.subagents import ManagedAgents, environment_entries, harness_arguments
 import agentctl.legacy_cli as cli
+import agentctl.cli as unified_cli
 import agentctl.codex_goal as native_goal
 
 
@@ -745,6 +749,26 @@ def test_custom_process_identity_outweighs_a_missing_native_agent_label(
     assert status["probe_error"] is None
 
 
+def test_status_does_not_call_claude_idle_while_background_agent_is_working(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="claude")
+    divider = "─" * 40
+    screen = (
+        "✻ Waiting for 1 background agent to finish\n"
+        f"{divider}\n❯\n{divider}\n"
+        "auto mode on · ← 2 agents · ↓ to manage\n"
+        "● main\n◯ reviewer Checking tests 8m\n"
+    )
+    monkeypatch.setattr(fake, "read", lambda *_args, **_kwargs: screen)
+
+    status = manager.status("worker")
+
+    assert status["agent_status"] == "working"
+    assert status["probe_error"] is None
+
+
 def test_failed_muse_recovery_does_not_report_idle_without_idle_composer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -901,6 +925,82 @@ def test_goal_is_native_submission_with_honest_requested_metadata(tmp_path: Path
     assert manager.goal("worker")["goal"] == "finish the task"
     with pytest.raises(AgentDeliveryError, match="single line"):
         manager.goal("worker", "first\nsecond")
+
+
+def test_collapsed_muse_paste_withholds_enter_then_reconciles_exact_user_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="muse")
+    prompt = "long literal goal " + ("middle " * 180) + "suffix"
+    identifier = "collapsed-goal"
+    pasted = False
+    keys: list[str] = []
+    header = "Muse Code 1.4.0\n"
+    divider = "────────────────\n"
+    footer = "kiki · xhigh · /work · YOLO\n"
+
+    def send_text(_pane: str, text: str) -> None:
+        nonlocal pasted
+        assert prompt in text
+        pasted = True
+
+    def read(_pane: str, *, source: str, lines: int) -> str:
+        assert lines > 0
+        if transcript:
+            return transcript
+        composer = (
+            f"❯ [Pasted Content {len(prompt)} chars]" if pasted else "❯"
+        )
+        return header + divider + composer + "\n" + divider + footer
+
+    transcript = ""
+    monkeypatch.setattr(fake, "send_text", send_text, raising=False)
+    monkeypatch.setattr(fake, "send_keys", lambda _pane, key: keys.append(key))
+    monkeypatch.setattr(fake, "read", read)
+    with pytest.raises(AgentPossiblySubmitted) as raised:
+        manager.send(
+            "worker", prompt, message_id=identifier,
+            ready_timeout=0, working_timeout=0,
+        )
+    assert raised.value.message_id == identifier
+    assert keys == []
+    failed = manager.registry / "worker/queue/failed" / f"{identifier}.json"
+    artifact = failed.read_bytes()
+    digest = hashlib.sha256(artifact).hexdigest()
+
+    # Same-length placeholder and an assistant echo are never sufficient.
+    transcript = header + f"◆ {prompt}\n" + divider + "❯\n" + divider + footer
+    with pytest.raises(AgentDeliveryError, match="exact prompt as a Muse user turn"):
+        manager.reconcile_delivery("worker", identifier, digest)
+    with pytest.raises(AgentDeliveryError, match="expected-sha256"):
+        manager.reconcile_delivery("worker", identifier, "0" * 64)
+
+    # A duplicate copy still in the composer is not accepted as submitted.
+    transcript = (
+        header + f"❯ {prompt}\n◆ Working\n" + divider
+        + f"❯ {prompt}\n" + divider + footer
+    )
+    with pytest.raises(AgentDeliveryError, match="exact prompt as a Muse user turn"):
+        manager.reconcile_delivery("worker", identifier, digest)
+
+    transcript = header + f"❯ {prompt}\n◆ Working\n" + divider + "❯\n" + divider + footer
+    sidecar = Path(str(failed) + ".error")
+    sidecar.unlink()
+    sidecar.mkdir()
+    with pytest.raises(AgentDeliveryError, match="reconciled delivery sidecar"):
+        manager.reconcile_delivery("worker", identifier, digest)
+    processed = manager.registry / "worker/queue/processed" / f"{identifier}.json"
+    assert processed.read_bytes() == artifact
+    assert not failed.exists()
+    sidecar.rmdir()
+    # A retry after the committed rename is idempotent and does not request
+    # new evidence or send terminal input.
+    result = manager.reconcile_delivery("worker", identifier, digest)
+    assert result.outcome == "delivered"
+    assert result.delivered == (identifier,)
+    assert not sidecar.exists()
+    assert keys == []
 
 
 def test_wait_reports_readiness_and_blocked_prompt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1088,6 +1188,17 @@ def test_cli_managed_start_and_message_file(tmp_path: Path, monkeypatch: pytest.
     assert cli.main(["send", "--name", "worker", "--file", str(message), *root]) == 0
     assert fake.submitted == ["line one\nline two"]
     assert cli.main(["stop", "worker", *root]) == 0
+
+
+def test_cli_parses_exact_delivery_reconciliation_authority() -> None:
+    parsed = unified_cli.parser().parse_args([
+        "reconcile-delivery", "worker", "message-1",
+        "--expected-sha256", "0123456789abcdef" * 4,
+    ])
+    assert parsed.command == "reconcile-delivery"
+    assert parsed.name == "worker"
+    assert parsed.message_id == "message-1"
+    assert parsed.expected_sha256 == "0123456789abcdef" * 4
 
 
 def test_trust_prompt_is_not_a_composer_even_when_herdr_reports_idle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

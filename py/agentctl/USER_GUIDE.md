@@ -467,6 +467,23 @@ request ID and artifact path. Preserve that ID and use `drain` for pending
 work. Sending the same task under a new ID creates a second request and can
 duplicate work; it is not a recovery operation.
 
+Muse can collapse a long bracketed paste to a placeholder such as
+`[Pasted Content 1440 chars]`. `agentctl` does not treat the placeholder or its
+character count as evidence and does not press Enter. If a human subsequently
+submits the retained text, reconcile only after the complete prompt is visible
+as a Muse user turn above an empty composer:
+
+```sh
+sha256sum .agentctl/registry/reviewer/queue/failed/MESSAGE_ID.json
+agentctl reconcile-delivery reviewer MESSAGE_ID --expected-sha256 SHA256
+```
+
+Reconciliation never sends terminal input. It binds the selected artifact,
+exact bytes, current pane/process generation, and complete rendered user turn,
+then moves those unchanged bytes to `processed/`. A retry after a crash is
+idempotent. If any proof is absent or the prompt is still in the composer, the
+artifact remains quarantined.
+
 ## Observe and take over
 
 ```sh

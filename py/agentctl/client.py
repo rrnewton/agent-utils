@@ -58,6 +58,20 @@ _BOOT_ID = re.compile(
 )
 
 
+def _process_stat_fields(pid: int, raw: bytes) -> list[str] | None:
+    """Parse only the ASCII suffix of /proc/PID/stat; comm may be arbitrary bytes."""
+    if (not raw or len(raw) > 8192
+            or not raw.startswith(f"{pid} (".encode("ascii"))):
+        return None
+    close = raw.rfind(b")")
+    if close < 0:
+        return None
+    try:
+        return raw[close + 1:].decode("ascii").split()
+    except UnicodeDecodeError:
+        return None
+
+
 def muse_startup_metadata(screen: str) -> tuple[str | None, str | None]:
     """Return a bounded Muse downgrade warning and its explicit effective effort.
 
@@ -100,16 +114,6 @@ def muse_idle_composer(screen: str) -> bool:
     return regions is not None and regions[1].strip() in ("❯", "›")
 
 
-def _muse_text_visible(screen: str, text: str) -> bool:
-    wanted = " ".join(text.split())
-    rendered = " ".join(screen.split())
-    if not wanted:
-        return False
-    if len(wanted) <= 160:
-        return wanted in rendered
-    return wanted[:80] in rendered and wanted[-80:] in rendered
-
-
 def _muse_composer_regions(screen: str) -> tuple[str, str] | None:
     """Split transcript/composer using Muse's ruled editor and status footer."""
     lines = screen.splitlines()
@@ -137,15 +141,57 @@ def _muse_composer_regions(screen: str) -> tuple[str, str] | None:
 
 
 def muse_prompt_in_composer(screen: str, text: str) -> bool:
-    """Require the literal prompt inside Muse's active bottom editor region."""
+    """Conservatively detect a prompt retained in Muse's bottom editor."""
     regions = _muse_composer_regions(screen)
-    return regions is not None and _muse_text_visible(regions[1], text)
+    if regions is None:
+        return False
+    wanted = " ".join(text.split())
+    rendered = " ".join(regions[1].split())
+    return bool(wanted) and any(
+        rendered == (needle := f"{marker} {wanted}")
+        or rendered.startswith(needle + " ")
+        for marker in ("❯", "›")
+    )
+
+
+def muse_prompt_is_exact_composer(screen: str, text: str) -> bool:
+    """Require the entire active Muse editor to be this literal prompt."""
+    regions = _muse_composer_regions(screen)
+    if regions is None:
+        return False
+    wanted = " ".join(text.split())
+    rendered = " ".join(regions[1].split())
+    return bool(wanted) and rendered in (f"❯ {wanted}", f"› {wanted}")
+
+
+def _muse_prompt_transcript_count(transcript: str, text: str) -> int:
+    """Count complete marker-delimited user turns, never prompt prefixes."""
+    wanted = " ".join(text.split())
+    rendered = " ".join(transcript.split())
+    if not wanted:
+        return 0
+    count = 0
+    for marker in ("❯", "›"):
+        needle = f"{marker} {wanted}"
+        start = 0
+        while (found := rendered.find(needle, start)) >= 0:
+            before = rendered[:found]
+            after = rendered[found + len(needle):]
+            if (not before or before.endswith(" ")) and (
+                not after or any(after.startswith(f" {next_marker} ")
+                                 for next_marker in ("◆", "❯", "›"))
+            ):
+                count += 1
+            start = found + len(marker)
+    return count
 
 
 def muse_prompt_in_transcript(screen: str, text: str) -> bool:
-    """Require the literal prompt above Muse's active bottom editor region."""
+    """Require the exact prompt as a user turn above the active Muse editor."""
     regions = _muse_composer_regions(screen)
-    return regions is not None and _muse_text_visible(regions[0], text)
+    if regions is None:
+        return False
+    return _muse_prompt_transcript_count(regions[0], text) > 0
 
 
 def muse_prompt_transcript_count(screen: str, text: str) -> int:
@@ -153,13 +199,28 @@ def muse_prompt_transcript_count(screen: str, text: str) -> int:
     regions = _muse_composer_regions(screen)
     if regions is None:
         return 0
-    wanted = " ".join(text.split())
-    rendered = " ".join(regions[0].split())
-    if not wanted:
-        return 0
-    if len(wanted) <= 160:
-        return rendered.count(wanted)
-    return min(rendered.count(wanted[:80]), rendered.count(wanted[-80:]))
+    return _muse_prompt_transcript_count(regions[0], text)
+
+
+def claude_active_screen(screen: str) -> bool:
+    """Recognize Claude's current activity controls around the live composer."""
+    lines = screen.splitlines()
+    dividers = [
+        index for index, line in enumerate(lines)
+        if len(line.strip()) >= 3 and set(line.strip()) <= {"─", "━", "═"}
+    ]
+    if len(dividers) < 2:
+        return False
+    top, bottom = dividers[-2:]
+    before = " ".join(" ".join(lines[max(0, top - 12):top]).split())
+    after = " ".join(" ".join(lines[bottom + 1:bottom + 12]).split())
+    waiting = re.search(
+        r"Waiting for [1-9][0-9]* background agents? to finish", before,
+    ) is not None
+    count = re.search(r"(?:←|<-)\s*([0-9]+) agents?\b", after)
+    return "esc to interrupt" in after or (
+        waiting and count is not None and int(count.group(1)) >= 2
+    )
 
 
 def _get_process_id(mapping: dict[str, object], key: str, what: str) -> int:
@@ -744,14 +805,11 @@ class HerdrClient:
                 return boot_id if _BOOT_ID.fullmatch(boot_id) is not None else None
 
             def process_stat() -> tuple[int, int] | None:
-                with open(f"/proc/{pid}/stat", encoding="utf-8") as stream:
+                with open(f"/proc/{pid}/stat", "rb") as stream:
                     raw = stream.read(8193)
-                if not raw or len(raw) > 8192:
+                fields = _process_stat_fields(pid, raw)
+                if fields is None:
                     return None
-                close = raw.rfind(")")
-                if not raw.startswith(f"{pid} (") or close < 0:
-                    return None
-                fields = raw[close + 2:].split()
                 if len(fields) <= 19 or fields[0] == "Z":
                     return None
                 pgrp = int(fields[2])
@@ -838,17 +896,15 @@ class HerdrClient:
             for entry in numeric:
                 try:
                     process = int(entry)
-                    with open(f"/proc/{entry}/stat", encoding="utf-8") as stream:
+                    with open(f"/proc/{entry}/stat", "rb") as stream:
                         raw = stream.read(8193)
                 except (FileNotFoundError, ProcessLookupError):
                     continue
                 except (OSError, UnicodeError, ValueError):
                     return None
-                close = raw.rfind(")")
-                if (not raw.startswith(f"{entry} (") or close < 0
-                        or len(raw) > 8192):
+                fields = _process_stat_fields(process, raw)
+                if fields is None:
                     return None
-                fields = raw[close + 2:].split()
                 if len(fields) < 2:
                     return None
                 try:

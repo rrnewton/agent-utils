@@ -7,6 +7,8 @@ working-state confirmation, at-most-once ambiguity quarantine, status, and readi
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import fcntl
 import hashlib
 import json
@@ -30,7 +32,8 @@ from agentctl.errors import (
 )
 
 __all__ = [
-    "Target", "QueueResult", "resolve_target", "enqueue", "drain", "send", "status", "read",
+    "Target", "QueueResult", "resolve_target", "enqueue", "drain", "send",
+    "reconcile_delivery", "status", "read",
     "QUEUE_ERROR_MAX_BYTES", "QUEUE_UPDATE_MAX_BYTES", "QUEUE_ERROR_SIDECAR_MAX_BYTES",
     "queue_artifact_reservation_bytes",
 ]
@@ -48,6 +51,44 @@ class Target:
     expected_cwd: str | None = None
 
 
+def _rename_directory_noreplace_at(
+    source_parent: int,
+    source_name: str,
+    destination_parent: int,
+    destination_name: str,
+) -> None:
+    """Atomically move one directory entry without replacing its destination."""
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as exc:
+        raise AgentDeliveryError(
+            "cannot archive agent: atomic no-replace rename is unavailable"
+        ) from exc
+    renameat2.argtypes = [
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    if renameat2(
+        source_parent,
+        os.fsencode(source_name),
+        destination_parent,
+        os.fsencode(destination_name),
+        1,  # RENAME_NOREPLACE
+    ) == 0:
+        return
+    number = ctypes.get_errno()
+    if number == errno.EEXIST:
+        raise AgentDeliveryError(
+            f"refusing to replace existing agent archive {destination_name}"
+        )
+    if number in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
+        raise AgentDeliveryError(
+            "cannot archive agent: filesystem lacks atomic no-replace rename support"
+        )
+    raise AgentDeliveryError(
+        f"cannot archive agent {source_name} as {destination_name}: {os.strerror(number)}"
+    )
 @dataclass(frozen=True)
 class AtomicWritePolicy:
     """Opt-in, same-filesystem single-slot staging for a bounded state owner."""
@@ -361,6 +402,28 @@ def _read_bounded_queue_json(
     path: str, purpose: str, *, require_private: bool, max_artifact_bytes: int,
 ) -> tuple[object, int]:
     """Read and decode exactly one stable, bounded regular file descriptor."""
+    encoded = _read_bounded_queue_bytes(
+        path, purpose, require_private=require_private,
+        max_artifact_bytes=max_artifact_bytes,
+    )
+    try:
+        decoded = json.loads(
+            encoded.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_json_constant,
+        )
+        _validate_json_depth(decoded)
+        return decoded, len(encoded)
+    except AgentDeliveryError:
+        raise
+    except (UnicodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
+        raise AgentDeliveryError(f"cannot read {purpose} {path}: {exc}") from exc
+
+
+def _read_bounded_queue_bytes(
+    path: str, purpose: str, *, require_private: bool, max_artifact_bytes: int,
+) -> bytes:
+    """Read exact stable bytes from one bounded, owned, unlinked artifact."""
     _validate_artifact_limit(max_artifact_bytes)
     flags = (
         os.O_RDONLY
@@ -409,16 +472,10 @@ def _read_bounded_queue_json(
             or final_metadata.st_ctime_ns != metadata.st_ctime_ns
         ):
             raise AgentDeliveryError(f"{purpose} changed while it was read: {path}")
-        decoded = json.loads(
-            bytes(encoded).decode("utf-8"),
-            object_pairs_hook=_reject_duplicate_json_keys,
-            parse_constant=_reject_json_constant,
-        )
-        _validate_json_depth(decoded)
-        return decoded, len(encoded)
+        return bytes(encoded)
     except AgentDeliveryError:
         raise
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
+    except OSError as exc:
         raise AgentDeliveryError(f"cannot read {purpose} {path}: {exc}") from exc
     finally:
         if descriptor >= 0:
@@ -1637,6 +1694,105 @@ def send(
     with atomic_write_policy(atomic_policy):
         return _send(client, target, root, text, message_id=message_id,
                      atomic_policy=_ACTIVE_ATOMIC_POLICY.get(), **kwargs)
+
+
+def reconcile_delivery(
+    root: str,
+    message_id: str,
+    expected_sha256: str,
+    evidence: Callable[[str], bool],
+    *,
+    max_artifact_bytes: int = 16 << 20,
+) -> QueueResult:
+    """Commit one explicitly selected ambiguous artifact after external proof.
+
+    The directory is the delivery authority. The artifact bytes are moved
+    unchanged from ``failed``/``inflight`` to ``processed`` only after the
+    caller proves that this exact prompt is a user turn in the live transcript.
+    """
+    if _MESSAGE_ID.fullmatch(message_id) is None:
+        raise AgentDeliveryError("message id has an invalid shape")
+    if re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
+        raise AgentDeliveryError("expected-sha256 must be 64 lowercase hexadecimal characters")
+    _validate_artifact_limit(max_artifact_bytes)
+    _validate_existing_queue(root)
+    inbox, inflight, processed, failed = _dirs(root)
+    if not all(os.path.isdir(path) for path in (inbox, inflight, processed, failed)):
+        raise AgentDeliveryError("delivery queue is incomplete")
+    filename = f"{message_id}.json"
+    lock = _open_private_lock(os.path.join(root, ".delivery.lock"), "queue delivery lock")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        locations = [
+            (folder, os.path.join(path, filename))
+            for folder, path in (
+                ("inbox", inbox), ("inflight", inflight),
+                ("processed", processed), ("failed", failed),
+            )
+            if os.path.lexists(os.path.join(path, filename))
+        ]
+        if len(locations) != 1:
+            raise AgentDeliveryError(
+                f"message {message_id} must have exactly one durable queue location"
+            )
+        state, source = locations[0]
+        encoded = _read_bounded_queue_bytes(
+            source, "queued message", require_private=False,
+            max_artifact_bytes=max_artifact_bytes,
+        )
+        if hashlib.sha256(encoded).hexdigest() != expected_sha256:
+            raise AgentDeliveryError("queued message does not match expected-sha256")
+        try:
+            document = json.loads(
+                encoded.decode("utf-8"),
+                object_pairs_hook=_reject_duplicate_json_keys,
+                parse_constant=_reject_json_constant,
+            )
+            _validate_json_depth(document)
+        except (UnicodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
+            raise AgentDeliveryError(f"queued message is invalid: {exc}") from exc
+        if (not isinstance(document, dict) or document.get("id") != message_id
+                or not isinstance(document.get("text"), str) or not document["text"]):
+            raise AgentDeliveryError("queued message does not match its selected identifier")
+        if state == "inbox":
+            raise AgentDeliveryError("pending messages have not crossed the injection barrier")
+        if state == "processed":
+            sidecar = os.path.join(failed, filename + ".error")
+            _remove_optional_delivery_sidecar(sidecar, failed)
+            return QueueResult(
+                message_id, (message_id,), (), (), None, "delivered",
+            )
+        if document.get("possibly_submitted") is not True:
+            raise AgentDeliveryError(
+                "ambiguous artifact lacks the durable injection-barrier marker"
+            )
+        text = str(document["text"])
+        if not evidence(text):
+            raise AgentDeliveryError(
+                "live transcript does not contain this exact prompt as a Muse user turn"
+            )
+        destination = os.path.join(processed, filename)
+        _transition(source, destination, max_artifact_bytes=max_artifact_bytes)
+        sidecar = os.path.join(failed, filename + ".error")
+        _remove_optional_delivery_sidecar(sidecar, failed)
+        return QueueResult(
+            message_id, (message_id,), (), (), None, "delivered",
+        )
+    finally:
+        os.close(lock)
+
+
+def _remove_optional_delivery_sidecar(path: str, parent: str) -> None:
+    """Remove a stale failure detail after the authoritative artifact moved."""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise AgentDeliveryError(
+            f"cannot remove reconciled delivery sidecar {path}: {exc}"
+        ) from exc
+    _fsync_dir(parent)
 
 
 def _send(

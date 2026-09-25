@@ -16,12 +16,14 @@ from pathlib import Path
 
 import agentctl.client as client_module
 from agentctl.client import (
+    claude_active_screen,
     CustomProcessIdentity,
     HerdrClient,
     ProcessInfo,
     muse_idle_composer,
     muse_prompt_in_composer,
     muse_prompt_in_transcript,
+    muse_prompt_is_exact_composer,
     muse_prompt_transcript_count,
     muse_startup_metadata,
 )
@@ -39,6 +41,15 @@ class Runner:
         return subprocess.CompletedProcess(
             command, 0, json.dumps({"result": self.response}), ""
         )
+
+
+def test_proc_stat_parser_ignores_non_utf8_process_names() -> None:
+    raw = b"123 (arbitrary\xff) S 7 8 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 42\n"
+    fields = client_module._process_stat_fields(123, raw)
+    assert fields is not None
+    assert fields[:3] == ["S", "7", "8"]
+    assert fields[19] == "42"
+    assert client_module._process_stat_fields(124, raw) is None
 
 
 @pytest.mark.parametrize(
@@ -192,6 +203,27 @@ def test_current_muse_footer_does_not_turn_a_choice_into_an_idle_composer() -> N
     assert not muse_idle_composer(screen.replace("❯ Yes, continue\n  No, exit", "❯\n  pending text"))
 
 
+def test_claude_active_screen_requires_current_activity_controls() -> None:
+    divider = "─" * 40
+    screen = (
+        "completed output\n✻ Waiting for 1 background agent to finish\n"
+        f"{divider}\n❯\n{divider}\n"
+        "auto mode on · ← 2 agents · ↓ to manage\n"
+        "● main\n◯ reviewer Checking tests 8m\n"
+    )
+    assert claude_active_screen(screen)
+    assert claude_active_screen(screen.replace("Waiting", "Waited").replace(
+        "↓ to manage", "esc to interrupt",
+    ))
+    assert not claude_active_screen(screen.replace("Waiting", "Waited"))
+    assert not claude_active_screen(screen.replace("← 2 agents", "← 1 agent"))
+    assert not claude_active_screen(
+        screen.replace("❯", "old transcript\n❯", 1).replace(
+            "✻ Waiting for 1 background agent to finish\n", "", 1,
+        )
+    )
+
+
 def test_custom_muse_launch_retries_transient_null_process_argv() -> None:
     executable = os.path.realpath("/bin/true")
     process_probes = 0
@@ -256,7 +288,7 @@ def test_muse_prompt_must_move_from_composer_to_transcript() -> None:
     footer = "watermelon-preview · xhigh · /work/project · Auto-review\n"
     staged = header + divider + f"❯ {prompt}\n" + divider + footer
     accepted = (
-        header + f"❯ {prompt}\nWorking...\n" + divider + "❯\n" + divider + footer
+        header + f"❯ {prompt}\n◆ Working...\n" + divider + "❯\n" + divider + footer
     )
     error_redraw = header + divider + f"❯ {prompt}\nError: retry\n" + divider + footer
     assert muse_prompt_in_composer(staged, prompt)
@@ -264,6 +296,7 @@ def test_muse_prompt_must_move_from_composer_to_transcript() -> None:
     assert muse_prompt_in_transcript(accepted, prompt)
     assert not muse_prompt_in_composer(accepted, prompt)
     assert muse_prompt_in_composer(error_redraw, prompt)
+    assert not muse_prompt_is_exact_composer(error_redraw, prompt)
     assert not muse_prompt_in_transcript(error_redraw, prompt)
     repeated_staged = (
         header + f"❯ {prompt}\n◆ prior answer\n" + divider
@@ -274,6 +307,18 @@ def test_muse_prompt_must_move_from_composer_to_transcript() -> None:
     )
     assert muse_prompt_transcript_count(repeated_staged, prompt) == 1
     assert muse_prompt_transcript_count(cleared_without_submit, prompt) == 1
+
+    long_prompt = "prefix " + ("middle " * 40) + "suffix"
+    changed_middle = "prefix " + ("changed " * 40) + "suffix"
+    collapsed = header + divider + f"❯ [Pasted Content {len(long_prompt)} chars]\n" + divider + footer
+    deceptive = header + divider + f"❯ {changed_middle}\n" + divider + footer
+    prefixed = (
+        header + f"❯ {long_prompt} extra\n◆ Working\n"
+        + divider + "❯\n" + divider + footer
+    )
+    assert not muse_prompt_in_composer(collapsed, long_prompt)
+    assert not muse_prompt_in_composer(deceptive, long_prompt)
+    assert not muse_prompt_in_transcript(prefixed, long_prompt)
 
 
 def test_custom_muse_launch_never_accepts_a_trust_prompt() -> None:

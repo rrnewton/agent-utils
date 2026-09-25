@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
-import ctypes
-import errno
 import json
 import math
 import os
@@ -32,8 +30,11 @@ from agentctl.client import (
     HerdrClient,
     Pane,
     PaneShellProof,
+    claude_active_screen,
     muse_idle_composer,
     muse_prompt_in_composer,
+    muse_prompt_in_transcript,
+    muse_prompt_is_exact_composer,
     muse_prompt_transcript_count,
     muse_startup_metadata,
     muse_trust_prompt,
@@ -60,44 +61,7 @@ _SESSION_STORAGE_SCHEMA = "agentctl-session/v2"
 _LAUNCH_SPEC_SCHEMA = "agentctl-launch/v1"
 
 
-def _rename_directory_noreplace_at(
-    source_parent: int,
-    source_name: str,
-    destination_parent: int,
-    destination_name: str,
-) -> None:
-    """Atomically move one entry between pinned directories without replacement."""
-    try:
-        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
-    except AttributeError as exc:
-        raise AgentDeliveryError(
-            "cannot archive agent: atomic no-replace rename is unavailable"
-        ) from exc
-    renameat2.argtypes = [
-        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint,
-    ]
-    renameat2.restype = ctypes.c_int
-    ctypes.set_errno(0)
-    if renameat2(
-        source_parent,
-        os.fsencode(source_name),
-        destination_parent,
-        os.fsencode(destination_name),
-        1,
-    ) == 0:
-        return
-    number = ctypes.get_errno()
-    if number == errno.EEXIST:
-        raise AgentDeliveryError(
-            f"refusing to replace existing agent archive {destination_name}"
-        )
-    if number in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
-        raise AgentDeliveryError(
-            "cannot archive agent: filesystem lacks atomic no-replace rename support"
-        )
-    raise AgentDeliveryError(
-        f"cannot archive agent {source_name} as {destination_name}: {os.strerror(number)}"
-    )
+_rename_directory_noreplace_at = agent._rename_directory_noreplace_at
 
 
 def _fsync_pinned_directory(descriptor: int, label: str) -> None:
@@ -879,18 +843,34 @@ class _WorkspaceClient:
                     self.client.verify_pane_shell_identity(pane_id, identity)
             if self.record.goal_session_id is not None and info.session_value is not None and info.session_value != self.record.goal_session_id:
                 raise HerdrUnavailable(f"agent {self.record.name!r} native session identity changed")
-            if self.check_prompt and info.status in ("idle", "done") and info.agent == "claude":
-                screen = (
-                    self.client.read(
-                        pane_id, source="visible", lines=200,
-                        timeout=self._timeout("pane readiness probe"),
+            if info.status in ("idle", "done") and info.agent == "claude":
+                try:
+                    screen = (
+                        self.client.read(
+                            pane_id, source="visible", lines=200,
+                            timeout=self._timeout("pane readiness probe"),
+                        )
+                        if self.deadline is not None and isinstance(self.client, HerdrClient)
+                        else self.client.read(pane_id, source="visible", lines=200)
                     )
-                    if self.deadline is not None and isinstance(self.client, HerdrClient)
-                    else self.client.read(pane_id, source="visible", lines=200)
-                )
-                if ("Quick safety check: Is this a project you created or one you trust?" in screen
-                    and "No, exit" in screen and "Yes, I trust this folder" in screen):
-                    raise HerdrUnavailable("Claude workspace trust prompt requires human attention; no input was submitted")
+                except HerdrRunError:
+                    if self.check_prompt:
+                        raise
+                else:
+                    if (self.check_prompt
+                            and "Quick safety check: Is this a project you created or one you trust?" in screen
+                            and "No, exit" in screen and "Yes, I trust this folder" in screen):
+                        raise HerdrUnavailable("Claude workspace trust prompt requires human attention; no input was submitted")
+                    if claude_active_screen(screen):
+                        info = AgentPaneInfo(
+                            pane_id=info.pane_id,
+                            workspace_id=info.workspace_id,
+                            cwd=info.cwd,
+                            agent=info.agent,
+                            status="working",
+                            session_agent=info.session_agent,
+                            session_value=info.session_value,
+                        )
             if self.record.adapter == "herdr-pane":
                 if self.deadline is not None and isinstance(self.client, HerdrClient):
                     self.client.verify_custom_harness(
@@ -974,7 +954,7 @@ class _WorkspaceClient:
                 pane_id, self.record.harness, self.record.custom_process_identity
             )
             staged = self.client.read(pane_id, source="visible", lines=200)
-            if staged != before and muse_prompt_in_composer(staged, command):
+            if staged != before and muse_prompt_is_exact_composer(staged, command):
                 break
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         else:
@@ -1112,10 +1092,13 @@ class ManagedAgents:
         return record
 
     @contextmanager
-    def _pinned_agent_directory(self, name: str) -> Iterator[_PinnedAgentDirectory]:
+    def _pinned_agent_directory(
+        self, name: str, *, path: Path | None = None,
+        label: str = "agent directory",
+    ) -> Iterator[_PinnedAgentDirectory]:
         """Hold one private agent-directory inode across proof and publication."""
-        path = self._directory(name)
-        agent._validate_private_directory(str(path), "agent directory")
+        path = self._directory(name) if path is None else path
+        agent._validate_private_directory(str(path), label)
         try:
             before = os.stat(path, follow_symlinks=False)
             if (not stat.S_ISDIR(before.st_mode) or before.st_uid != os.getuid()
@@ -1240,12 +1223,15 @@ class ManagedAgents:
                 or (opened.st_dev, opened.st_ino) != (pinned.device, pinned.inode)):
             raise AgentDeliveryError(f"{label} directory changed")
 
-    def _record_bytes(
-        self, pinned: _PinnedAgentDirectory, *, require_active_name: bool = True,
+    def _pinned_artifact_bytes(
+        self, pinned: _PinnedAgentDirectory, *, name: str, limit: int,
+        purpose: str, require_named_directory: bool = True,
     ) -> bytes:
-        """Read one bounded record relative to the held directory generation."""
-        path = pinned.path / "agent.json"
-        if require_active_name:
+        """Read one bounded private file relative to a pinned directory."""
+        if "/" in name or name in ("", ".", ".."):
+            raise AgentDeliveryError("invalid pinned artifact name")
+        path = pinned.path / name
+        if require_named_directory:
             self._verify_pinned_agent_directory(pinned)
         flags = (
             os.O_RDONLY
@@ -1255,18 +1241,18 @@ class ManagedAgents:
         )
         descriptor = -1
         try:
-            descriptor = os.open("agent.json", flags, dir_fd=pinned.descriptor)
+            descriptor = os.open(name, flags, dir_fd=pinned.descriptor)
             before = os.fstat(descriptor)
             if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
                     or stat.S_IMODE(before.st_mode) & 0o077 or before.st_nlink != 1
-                    or before.st_size > _MAX_AGENT_RECORD_BYTES):
-                raise AgentDeliveryError(f"unsafe agent record for recovery: {path}")
+                    or before.st_size > limit):
+                raise AgentDeliveryError(f"unsafe {purpose}: {path}")
             content = bytearray()
             while True:
-                remaining = _MAX_AGENT_RECORD_BYTES + 1 - len(content)
+                remaining = limit + 1 - len(content)
                 if remaining <= 0:
                     raise AgentDeliveryError(
-                        f"agent record exceeds {_MAX_AGENT_RECORD_BYTES} bytes: {path}"
+                        f"{purpose} exceeds {limit} bytes: {path}"
                     )
                 block = os.read(descriptor, min(64 << 10, remaining))
                 if not block:
@@ -1281,19 +1267,28 @@ class ManagedAgents:
                             before.st_nlink, before.st_size, before.st_mtime_ns,
                             before.st_ctime_ns,
                         )):
-                raise AgentDeliveryError(f"agent record changed while hashing: {path}")
-            if require_active_name:
+                raise AgentDeliveryError(f"{purpose} changed while reading: {path}")
+            if require_named_directory:
                 self._verify_pinned_agent_directory(pinned)
             return bytes(content)
         except AgentDeliveryError:
             raise
         except OSError as exc:
-            raise AgentDeliveryError(f"cannot hash agent record {path}: {exc}") from exc
+            raise AgentDeliveryError(f"cannot read {purpose} {path}: {exc}") from exc
         finally:
             if descriptor >= 0:
                 _close_descriptor(
-                    descriptor, "agent record", primary=sys.exc_info()[1],
+                    descriptor, purpose, primary=sys.exc_info()[1],
                 )
+
+    def _record_bytes(
+        self, pinned: _PinnedAgentDirectory, *, require_active_name: bool = True,
+    ) -> bytes:
+        """Read one bounded record relative to the held directory generation."""
+        return self._pinned_artifact_bytes(
+            pinned, name="agent.json", limit=_MAX_AGENT_RECORD_BYTES,
+            purpose="agent record", require_named_directory=require_active_name,
+        )
 
     def _legacy_record_snapshot(
         self, pinned: _PinnedAgentDirectory, *, expected_token: str,
@@ -2400,6 +2395,47 @@ class ManagedAgents:
             client = cast(HerdrClient, _WorkspaceClient(self.client, record, queue=self._queue(name)))
             return agent.drain(client, record.target(), self._queue(name), **options)  # type: ignore[arg-type]
 
+    def reconcile_delivery(
+        self, name: str, message_id: str, expected_sha256: str,
+    ) -> agent.QueueResult:
+        """Mark one ambiguous Muse prompt delivered from exact transcript evidence."""
+        with self._lock(name):
+            record = self._load(name)
+            self._checked(record)
+            if record.adapter != "herdr-pane" or record.harness != "muse":
+                raise AgentDeliveryError(
+                    "delivery reconciliation currently requires an owned interactive Muse pane"
+                )
+            client = cast(
+                HerdrClient, _WorkspaceClient(self.client, record, queue=self._queue(name)),
+            )
+            if not os.path.lexists(Path(self._queue(name)) / "target.json"):
+                raise AgentDeliveryError(
+                    "delivery reconciliation requires an existing exact queue binding"
+                )
+            agent._validate_existing_binding(self._queue(name), record.target())
+
+            def exact_user_turn(text: str) -> bool:
+                target_lock, pane_id, before = agent._lock_resolved_target(
+                    client, record.target(),
+                )
+                try:
+                    screen = client.read(
+                        pane_id, source="visible", lines=5000,
+                    )
+                    after = agent.resolve_target(client, record.target())
+                    return (
+                        before == after
+                        and muse_prompt_in_transcript(screen, text)
+                        and not muse_prompt_in_composer(screen, text)
+                    )
+                finally:
+                    os.close(target_lock)
+
+            return agent.reconcile_delivery(
+                self._queue(name), message_id, expected_sha256, exact_user_turn,
+            )
+
     def read(self, name: str, *, lines: int = 500) -> str:
         """Read human and coordinator turns together; persist the latest bounded snapshot."""
         with self._lock(name):
@@ -2657,7 +2693,7 @@ class ManagedAgents:
         pinned: _PinnedAgentDirectory, content: bytes, *, name: str = "output.json",
     ) -> _InstalledArtifact:
         """Replace one private snapshot with exact bytes and durable directory metadata."""
-        if name not in {"agent.json", "output.json"}:
+        if name not in {"agent.json", "output.json", "stop-result.json"}:
             raise AgentDeliveryError("unsupported pinned registry artifact name")
         limit = _MAX_AGENT_RECORD_BYTES if name == "agent.json" else _MAX_SNAPSHOT_BYTES
         if len(content) > limit:

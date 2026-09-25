@@ -22,9 +22,10 @@ use sha2::{Digest, Sha256};
 
 use crate::agent::{self, AgentApi, AgentError, DrainOptions, QueueResult, Target};
 use crate::client::{
-    muse_idle_composer, muse_prompt_in_composer, muse_prompt_transcript_count,
-    muse_startup_metadata, muse_trust_prompt, AgentPaneInfo, CustomLaunchObservation,
-    CustomProcessIdentity, HerdrClient, Pane, PaneShellProof,
+    claude_active_screen, muse_idle_composer, muse_prompt_in_composer, muse_prompt_in_transcript,
+    muse_prompt_is_exact_composer, muse_prompt_transcript_count, muse_startup_metadata,
+    muse_trust_prompt, AgentPaneInfo, CustomLaunchObservation, CustomProcessIdentity, HerdrClient,
+    Pane, PaneShellProof,
 };
 
 const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
@@ -1728,165 +1729,16 @@ struct WorkspaceClient<'a, A: ManagedApi + ?Sized> {
 
 impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
     fn panes(&self) -> crate::error::Result<Vec<Pane>> {
-        Ok(self
-            .client
-            .panes()?
-            .into_iter()
-            .filter(|pane| Some(&pane.workspace_id) == self.record.workspace_id.as_ref())
-            .collect())
+        self.panes_with_runtime(&agent::SystemRuntime::default())
     }
     fn pane_info(&self, pane_id: &str) -> crate::error::Result<AgentPaneInfo> {
-        if self.record.adapter == "herdr"
-            && Some(self.client.agent_pane(&self.record.name)?) != self.record.pane_id
-        {
-            return Err(crate::error::AdapterError::unavailable(format!(
-                "agent {:?} no longer owns its recorded pane",
-                self.record.name
-            )));
-        }
-        let mut info = self.client.pane_info(pane_id)?;
-        if Some(&info.workspace_id) != self.record.workspace_id.as_ref() {
-            return Err(crate::error::AdapterError::unavailable(format!(
-                "agent {:?} workspace identity changed",
-                self.record.name
-            )));
-        }
-        if Some(pane_id) == self.record.pane_id.as_deref() {
-            if self.record.adapter == "herdr-foreign" {
-                let identity = self.record.foreign_shell_identity.as_ref().ok_or_else(|| {
-                    crate::error::AdapterError::unavailable(format!(
-                        "adopted agent {:?} has no identity-bound pane shell",
-                        self.record.name
-                    ))
-                })?;
-                self.client.verify_pane_shell_identity(pane_id, identity)?;
-            }
-            if self.record.goal_session_id.is_some()
-                && info.session_value.is_some()
-                && info.session_value != self.record.goal_session_id
-            {
-                return Err(crate::error::AdapterError::unavailable(format!(
-                    "agent {:?} native session identity changed",
-                    self.record.name
-                )));
-            }
-            if self.check_prompt
-                && matches!(info.status.as_str(), "idle" | "done")
-                && info.agent.as_deref() == Some("claude")
-            {
-                let screen = self.client.read(pane_id, "visible", Some(200))?;
-                if screen
-                    .contains("Quick safety check: Is this a project you created or one you trust?")
-                    && screen.contains("No, exit")
-                    && screen.contains("Yes, I trust this folder")
-                {
-                    return Err(crate::error::AdapterError::unavailable("Claude workspace trust prompt requires human attention; no input was submitted"));
-                }
-            }
-            if self.record.adapter == "herdr-pane" {
-                self.client.verify_custom_harness(
-                    pane_id,
-                    &self.record.harness,
-                    self.record.custom_process_identity.as_ref(),
-                )?;
-                let screen = self.client.read(pane_id, "visible", Some(200))?;
-                if muse_trust_prompt(&screen) {
-                    return Err(crate::error::AdapterError::unavailable(
-                        "Muse workspace trust prompt requires human attention; no input was submitted",
-                    ));
-                }
-                // Herdr's native label is advisory for custom harnesses. The
-                // exact executable/process identity above is the ownership
-                // proof and safely bridges a delayed report-agent update.
-                info.agent = Some(self.record.harness.clone());
-                info.status = if muse_idle_composer(&screen) {
-                    "idle".to_owned()
-                } else {
-                    "working".to_owned()
-                };
-            }
-        }
-        Ok(info)
+        self.pane_info_with_runtime(pane_id, &agent::SystemRuntime::default())
     }
     fn workspace_label(&self, workspace_id: &str) -> crate::error::Result<String> {
-        self.client.workspace_label(workspace_id)
+        self.workspace_label_with_runtime(workspace_id, &agent::SystemRuntime::default())
     }
     fn run(&self, pane_id: &str, text: &str) -> crate::error::Result<()> {
-        *self
-            .goal_objective
-            .lock()
-            .expect("goal operation lock poisoned") = None;
-        if let Some(queue) = self.queue {
-            for (identifier, objective) in &self.record.goal_messages {
-                let path = queue.join("inflight").join(format!("{identifier}.json"));
-                if text == format!("/goal {objective}") && fs::symlink_metadata(&path).is_ok() {
-                    let document = agent::read_private_json(&path).map_err(|error| {
-                        crate::error::AdapterError::unavailable(error.to_string())
-                    })?;
-                    if document["text"].as_str() == Some(text) {
-                        *self
-                            .goal_objective
-                            .lock()
-                            .expect("goal operation lock poisoned") = Some(objective.clone());
-                        break;
-                    }
-                }
-            }
-        }
-        if self.record.adapter != "herdr-pane" {
-            return self.client.run(pane_id, text);
-        }
-        if text.contains(['\0', '\u{1b}']) {
-            return Err(crate::error::AdapterError::unavailable(
-                "Muse pane prompts cannot contain NUL or terminal escape characters",
-            ));
-        }
-        let info = self.pane_info(pane_id)?;
-        if info.status != "idle" {
-            return Err(crate::error::AdapterError::unavailable(format!(
-                "custom pane {pane_id} is not at a verified idle Muse composer"
-            )));
-        }
-        let before = self.client.read(pane_id, "visible", Some(200))?;
-        self.client.send_text(
-            pane_id,
-            &format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}"),
-        )?;
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let staged = loop {
-            self.client.verify_custom_harness(
-                pane_id,
-                &self.record.harness,
-                self.record.custom_process_identity.as_ref(),
-            )?;
-            let screen = self.client.read(pane_id, "visible", Some(200))?;
-            if screen != before && muse_prompt_in_composer(&screen, text) {
-                break screen;
-            }
-            if Instant::now() >= deadline {
-                return Err(crate::error::AdapterError::unavailable(
-                    "literal text insertion did not produce exact visible Muse editor evidence; Enter was not sent",
-                ));
-            }
-            std::thread::sleep(
-                Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
-            );
-        };
-        self.client.verify_custom_harness(
-            pane_id,
-            &self.record.harness,
-            self.record.custom_process_identity.as_ref(),
-        )?;
-        self.client.send_keys(pane_id, "Enter")?;
-        *self
-            .custom_submission
-            .lock()
-            .expect("custom submission lock poisoned") = Some(CustomPaneSubmission {
-            prior_transcript_count: muse_prompt_transcript_count(&staged, text),
-            staged_screen: staged,
-            text: text.to_owned(),
-        });
-        Ok(())
+        self.run_with_runtime(pane_id, text, &agent::SystemRuntime::default())
     }
     fn wait_agent_status(
         &self,
@@ -1894,72 +1746,12 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         status: &str,
         timeout_ms: u64,
     ) -> crate::error::Result<()> {
-        if self.record.adapter == "herdr-pane" && status == "working" {
-            let submission = self
-                .custom_submission
-                .lock()
-                .expect("custom submission lock poisoned")
-                .clone()
-                .ok_or_else(|| {
-                    crate::error::AdapterError::unavailable(
-                        "custom pane harness has no pending submission receipt",
-                    )
-                })?;
-            let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-            loop {
-                self.client.verify_custom_harness(
-                    pane_id,
-                    &self.record.harness,
-                    self.record.custom_process_identity.as_ref(),
-                )?;
-                let screen = self.client.read(pane_id, "visible", Some(200))?;
-                if screen != submission.staged_screen
-                    && muse_prompt_transcript_count(&screen, &submission.text)
-                        > submission.prior_transcript_count
-                    && !muse_prompt_in_composer(&screen, &submission.text)
-                {
-                    *self
-                        .custom_submission
-                        .lock()
-                        .expect("custom submission lock poisoned") = None;
-                    return Ok(());
-                }
-                if Instant::now() >= deadline {
-                    return Err(crate::error::AdapterError::unavailable(
-                        "Muse did not show a verified post-Enter screen transition",
-                    ));
-                }
-                std::thread::sleep(
-                    Duration::from_millis(50)
-                        .min(deadline.saturating_duration_since(Instant::now())),
-                );
-            }
-        }
-        let Some(objective) = self
-            .goal_objective
-            .lock()
-            .expect("goal operation lock poisoned")
-            .clone()
-            .filter(|_| status == "working")
-        else {
-            return self.client.wait_agent_status(pane_id, status, timeout_ms);
-        };
-        let start = Instant::now();
-        if self
-            .client
-            .wait_agent_status(pane_id, status, timeout_ms.min(1000))
-            .is_ok()
-        {
-            return Ok(());
-        }
-        self.pane_info(pane_id)?;
-        let screen = self.client.read(pane_id, "visible", Some(200))?;
-        if goal_replacement_selected(&screen, &objective) {
-            self.client.send_keys(pane_id, "Enter")?;
-        }
-        let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.client
-            .wait_agent_status(pane_id, status, timeout_ms.saturating_sub(elapsed).max(1))
+        self.wait_agent_status_with_runtime(
+            pane_id,
+            status,
+            timeout_ms,
+            &agent::SystemRuntime::default(),
+        )
     }
     fn read(
         &self,
@@ -1967,7 +1759,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         source: &str,
         lines: Option<usize>,
     ) -> crate::error::Result<String> {
-        self.client.read(pane_id, source, lines)
+        self.read_with_runtime(pane_id, source, lines, &agent::SystemRuntime::default())
     }
 
     fn panes_with_runtime(
@@ -2025,19 +1817,27 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                     self.record.name
                 )));
             }
-            if self.check_prompt
-                && matches!(info.status.as_str(), "idle" | "done")
+            if matches!(info.status.as_str(), "idle" | "done")
                 && info.agent.as_deref() == Some("claude")
             {
-                let screen =
-                    self.client
-                        .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
-                if screen
-                    .contains("Quick safety check: Is this a project you created or one you trust?")
-                    && screen.contains("No, exit")
-                    && screen.contains("Yes, I trust this folder")
+                match self
+                    .client
+                    .read_with_runtime(pane_id, "visible", Some(200), runtime)
                 {
-                    return Err(crate::error::AdapterError::unavailable("Claude workspace trust prompt requires human attention; no input was submitted"));
+                    Ok(screen) => {
+                        if self.check_prompt
+                            && screen.contains("Quick safety check: Is this a project you created or one you trust?")
+                            && screen.contains("No, exit")
+                            && screen.contains("Yes, I trust this folder")
+                        {
+                            return Err(crate::error::AdapterError::unavailable("Claude workspace trust prompt requires human attention; no input was submitted"));
+                        }
+                        if claude_active_screen(&screen) {
+                            info.status = "working".to_owned();
+                        }
+                    }
+                    Err(error) if self.check_prompt => return Err(error),
+                    Err(_) => {}
                 }
             }
             if self.record.adapter == "herdr-pane" {
@@ -2147,7 +1947,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             let screen = self
                 .client
                 .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
-            if screen != before && muse_prompt_in_composer(&screen, text) {
+            if screen != before && muse_prompt_is_exact_composer(&screen, text) {
                 break screen;
             }
             if Instant::now() >= deadline {
@@ -4529,6 +4329,47 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         )
     }
 
+    /// Reconcile one ambiguous Muse prompt from exact live user-turn evidence.
+    pub fn reconcile_delivery(
+        &self,
+        agent_name: &str,
+        message_id: &str,
+        expected_sha256: &str,
+    ) -> Result<QueueResult> {
+        let _lock = self.lock(agent_name)?;
+        let record = self.load(agent_name)?;
+        record.supported()?;
+        if record.adapter != "herdr-pane" || record.harness != "muse" {
+            return Err(fail(
+                "delivery reconciliation currently requires an owned interactive Muse pane",
+            ));
+        }
+        let queue = self.queue(agent_name)?;
+        let client = WorkspaceClient {
+            client: self.client,
+            record: &record,
+            goal_objective: Mutex::new(None),
+            custom_submission: Mutex::new(None),
+            queue: Some(&queue),
+            check_prompt: true,
+        };
+        let target = record.target()?;
+        if fs::symlink_metadata(queue.join("target.json")).is_err() {
+            return Err(fail(
+                "delivery reconciliation requires an existing exact queue binding",
+            ));
+        }
+        agent::validate_existing_binding(&queue, &target)?;
+        agent::reconcile_delivery(&queue, message_id, expected_sha256, |text| {
+            let (_target_lock, before) = agent::lock_resolved_target(&client, &target)?;
+            let screen = client.read(&before.pane_id, "visible", Some(5000))?;
+            let after = agent::resolve_target(&client, &target)?;
+            Ok(before == after
+                && muse_prompt_in_transcript(&screen, text)
+                && !muse_prompt_in_composer(&screen, text))
+        })
+    }
+
     /// Drain through an injected runtime that can interrupt bounded readiness waits.
     pub(crate) fn drain_with_runtime(
         &self,
@@ -6147,7 +5988,9 @@ mod tests {
                     fail_custom_verify_once: AtomicBool::new(false),
                     custom_verify_calls: AtomicU64::new(0),
                     custom_ready: AtomicBool::new(true),
+                    custom_screen: Mutex::new(None),
                     custom_at_idle_shell: AtomicBool::new(true),
+                    claude_background: AtomicBool::new(false),
                     foreign_shell_identity: Mutex::new(Fake::foreign_shell_identity()),
                     foreign_shell_path: Mutex::new(PathBuf::from("/bin/bash")),
                     replacement_shell_on_read: Mutex::new(None),
@@ -6285,7 +6128,9 @@ mod tests {
         fail_custom_verify_once: AtomicBool,
         custom_verify_calls: AtomicU64,
         custom_ready: AtomicBool,
+        custom_screen: Mutex<Option<String>>,
         custom_at_idle_shell: AtomicBool,
+        claude_background: AtomicBool,
         foreign_shell_identity: Mutex<CustomProcessIdentity>,
         foreign_shell_path: Mutex<PathBuf>,
         replacement_shell_on_read: Mutex<Option<PaneShellProof>>,
@@ -6380,7 +6225,7 @@ mod tests {
                 || pane == "reported";
             let kind = if self.custom_reported.load(Ordering::Relaxed) {
                 "muse"
-            } else if pane == "claude" {
+            } else if pane == "claude" || self.claude_background.load(Ordering::Relaxed) {
                 "claude"
             } else {
                 "codex"
@@ -6448,6 +6293,9 @@ mod tests {
             if self.leave_idle_shell_on_read.swap(false, Ordering::Relaxed) {
                 self.custom_at_idle_shell.store(false, Ordering::Relaxed);
             }
+            if let Some(screen) = self.custom_screen.lock().unwrap().clone() {
+                return Ok(screen);
+            }
             if self
                 .change_foreign_shell_on_read
                 .swap(false, Ordering::Relaxed)
@@ -6511,6 +6359,13 @@ mod tests {
                 } else {
                     Ok("Muse Code\nWorking…\n".to_owned())
                 }
+            } else if self.claude_background.load(Ordering::Relaxed) {
+                Ok("✻ Waiting for 1 background agent to finish\n\
+                     ────────────────────────────────────────\n❯\n\
+                     ────────────────────────────────────────\n\
+                     auto mode on · ← 2 agents · ↓ to manage\n\
+                     ● main\n◯ reviewer Checking tests 8m\n"
+                    .to_owned())
             } else {
                 Ok("visible output".to_owned())
             }
@@ -7167,6 +7022,123 @@ mod tests {
         );
         assert_eq!(status["agent"], "muse", "{status}");
         assert_eq!(status["agent_status"], "idle");
+        assert!(status["probe_error"].is_null());
+    }
+
+    #[test]
+    fn ambiguous_muse_delivery_reconciles_only_an_exact_user_turn() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        manager.drain("worker", DrainOptions::default()).unwrap();
+        let queue = fixture.root.join("registry/worker/queue");
+        let identifier = "collapsed-goal";
+        let prompt = format!("long literal goal {}suffix", "middle ".repeat(180));
+        agent::enqueue(&queue, &prompt, Some(identifier)).unwrap();
+        let inbox = queue.join("inbox").join(format!("{identifier}.json"));
+        let mut document = agent::read_private_json(&inbox).unwrap();
+        document["possibly_submitted"] = json!(true);
+        document["delivery_state"] = json!("inflight");
+        agent::atomic_json(&inbox, &document).unwrap();
+        let failed = queue.join("failed").join(format!("{identifier}.json"));
+        fs::rename(&inbox, &failed).unwrap();
+        agent::sync_directory(&queue.join("inbox")).unwrap();
+        agent::sync_directory(&queue.join("failed")).unwrap();
+        agent::atomic_json(
+            &queue
+                .join("failed")
+                .join(format!("{identifier}.json.error")),
+            &json!({"outcome":"possibly_submitted"}),
+        )
+        .unwrap();
+        let artifact = fs::read(&failed).unwrap();
+        let digest = format!("{:x}", Sha256::digest(&artifact));
+        let header = "Muse Code 1.4.0\n";
+        let divider = "────────────────\n";
+        let footer = "kiki · xhigh · /work · YOLO\n";
+
+        *fixture.client.custom_screen.lock().unwrap() =
+            Some(format!("{header}◆ {prompt}\n{divider}❯\n{divider}{footer}"));
+        assert!(manager
+            .reconcile_delivery("worker", identifier, &digest)
+            .unwrap_err()
+            .to_string()
+            .contains("exact prompt as a Muse user turn"));
+        assert!(manager
+            .reconcile_delivery("worker", identifier, &"0".repeat(64))
+            .unwrap_err()
+            .to_string()
+            .contains("expected-sha256"));
+
+        *fixture.client.custom_screen.lock().unwrap() = Some(format!(
+            "{header}❯ {prompt}\n◆ Working\n{divider}❯ {prompt}\n{divider}{footer}"
+        ));
+        assert!(manager
+            .reconcile_delivery("worker", identifier, &digest)
+            .unwrap_err()
+            .to_string()
+            .contains("exact prompt as a Muse user turn"));
+
+        *fixture.client.custom_screen.lock().unwrap() = Some(format!(
+            "{header}❯ {prompt}\n◆ Working\n{divider}❯\n{divider}{footer}"
+        ));
+        let reconciled = manager
+            .reconcile_delivery("worker", identifier, &digest)
+            .unwrap();
+        assert_eq!(reconciled.outcome, agent::QueueOutcome::Delivered);
+        let processed = queue.join("processed").join(format!("{identifier}.json"));
+        assert_eq!(fs::read(&processed).unwrap(), artifact);
+        assert!(!failed.exists());
+        assert!(!queue
+            .join("failed")
+            .join(format!("{identifier}.json.error"))
+            .exists());
+        assert_eq!(
+            manager
+                .reconcile_delivery("worker", identifier, &digest)
+                .unwrap()
+                .outcome,
+            agent::QueueOutcome::Delivered
+        );
+    }
+
+    #[test]
+    fn status_does_not_call_claude_idle_while_background_agent_is_working() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        fixture
+            .client
+            .claude_background
+            .store(true, Ordering::Relaxed);
+        manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    harness: "claude".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let screen = fixture.client.read("owned", "visible", Some(200)).unwrap();
+        assert!(claude_active_screen(&screen), "{screen:?}");
+        assert_eq!(
+            fixture.client.pane_info("owned").unwrap().agent.as_deref(),
+            Some("claude")
+        );
+        let status = manager.status("worker").unwrap();
+
+        assert_eq!(status["agent_status"], "working");
         assert!(status["probe_error"].is_null());
     }
 
