@@ -78,9 +78,12 @@ fences.
 
 ## Initialize and run
 
-The named agent must already exist in the selected registry. Initialization
-checks the live pane, plugin installation, outbound executable, and complete
-configuration before it creates state:
+The named agent must already exist in the selected registry. Every channel in
+`channel_ids`, and every thread within it, routes to that one agent. To give
+several agents their own conversations, give each agent its own channel, its
+own config, and its own bridge state. Two bridges cannot split one shared
+channel by thread. Initialization checks the live pane, plugin installation,
+outbound executable, and complete configuration before it creates state:
 
 ```sh
 chmod 600 chat.json
