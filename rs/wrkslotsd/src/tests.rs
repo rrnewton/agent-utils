@@ -5955,6 +5955,213 @@ fn create_recovery_marker_closes_only_on_its_bound_journal() {
 }
 
 #[test]
+fn a_later_recovery_keeps_an_open_marker_whose_storage_its_row_does_not_own() {
+    // A recovery marker bound to one journal must survive a later recovery of
+    // the same slot and operation. Through another journal it stays distinct;
+    // through the same journal the new row must own both attempts' storage.
+    let singleton = "ACTIVE.node-a.journal";
+    let create_path = "CREATE.6.node-a.6.slot-a.journal";
+    let agent_record = active_record("slot-a", 1);
+    let validate_record = active_record_for("slot-a", "agent-slot-a", 1, "validate");
+    let imported = imported_active_record("slot-a", "agent-slot-a", 1);
+    let mut wider_import = imported.clone();
+    let mut docs = imported["checkouts"][0].clone();
+    docs["name"] = json!("docs");
+    docs["path"] = json!("worktrees/slots/slot-a/docs");
+    wider_import["checkouts"]
+        .as_array_mut()
+        .expect("imported checkouts")
+        .push(docs);
+    let progress = |operation: &str, path: &str, record: &Value| {
+        (
+            "operation-progress-recorded",
+            json!({
+                "slot": "slot-a",
+                "operation": operation,
+                "journal_path": path,
+                "journal": attempt_journal(operation, record),
+            }),
+        )
+    };
+    let recovery = |operation: &str| {
+        (
+            "recovery-started",
+            recovery_started_payload("slot-a", operation),
+        )
+    };
+    let completed = |operation: &str, path: &str| {
+        (
+            "operation-completed",
+            json!({"slot": "slot-a", "operation": operation, "journal_path": path}),
+        )
+    };
+    let row = |action: &str, record: &Value| {
+        (
+            "active-state-recorded",
+            json!({
+                "action": action,
+                "slot": "slot-a",
+                "previous_revision": 0,
+                "revision": 1,
+                "previous_record_sha256": null,
+                "record": record.clone(),
+                "evidence": {},
+            }),
+        )
+    };
+    let validate_recreate = [
+        progress("create", create_path, &validate_record),
+        recovery("create"),
+        row("slot-created", &validate_record),
+        completed("create", create_path),
+    ];
+    let open_singleton = vec![(PendingOperationKind::Recovery, Some(singleton.to_owned()))];
+    for (case, history, final_record, expected) in [
+        (
+            "legacy singleton marker, then a validate create",
+            [vec![recovery("create")], validate_recreate.to_vec()].concat(),
+            &validate_record,
+            open_singleton.clone(),
+        ),
+        (
+            "agent singleton attempt, then a validate create",
+            [
+                vec![
+                    progress("create", singleton, &agent_record),
+                    recovery("create"),
+                    completed("create", singleton),
+                ],
+                validate_recreate.to_vec(),
+            ]
+            .concat(),
+            &validate_record,
+            open_singleton.clone(),
+        ),
+        (
+            "import recovered again without a checkout",
+            vec![
+                progress("import-existing", singleton, &wider_import),
+                recovery("import-existing"),
+                completed("import-existing", singleton),
+                progress("import-existing", singleton, &imported),
+                recovery("import-existing"),
+                row("slot-imported-by-recovery", &imported),
+                completed("import-existing", singleton),
+            ],
+            &imported,
+            open_singleton.clone(),
+        ),
+        (
+            "import recovered again with the same checkouts",
+            vec![
+                progress("import-existing", singleton, &imported),
+                recovery("import-existing"),
+                completed("import-existing", singleton),
+                progress("import-existing", singleton, &imported),
+                recovery("import-existing"),
+                row("slot-imported-by-recovery", &imported),
+                completed("import-existing", singleton),
+            ],
+            &imported,
+            vec![],
+        ),
+    ] {
+        let scratch = Scratch::new();
+        let events = scratch.events();
+        let mut tip = import_log(&events, vec![], vec![]);
+        for (offset, (kind, payload)) in history.into_iter().enumerate() {
+            tip = append_event(&events, offset as u64 + 2, &tip, kind, payload);
+        }
+        assert_eq!(python_pending_journals(&events), json!({}), "{case}");
+        let pending = replay_stream(&events, None, |_| Ok(()))
+            .unwrap_or_else(|error| panic!("replay {case}: {error}"))
+            .pending_operations
+            .iter()
+            .map(|pending| (pending.kind, pending.journal_path.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(pending, expected, "{case}");
+        let (config, evidence) = write_policy_inputs(
+            &scratch,
+            std::slice::from_ref(final_record),
+            "2026-09-22T09:40:01+00:00",
+            |_| {},
+        );
+        let decisions =
+            evaluate_policy_at(&events, &config, &evidence, "2026-09-22T09:40:01+00:00")
+                .unwrap_or_else(|error| panic!("evaluate {case}: {error}"));
+        assert_eq!(decisions.len(), 1, "{case}");
+        assert_eq!(
+            decisions[0]
+                .reason_codes
+                .iter()
+                .any(|code| code == "RECOVERY_PENDING"),
+            !expected.is_empty(),
+            "{case}: {:?}",
+            decisions[0].reason_codes
+        );
+        if !expected.is_empty() {
+            assert_eq!(decisions[0].verdict, Verdict::Blocked, "{case}");
+        }
+    }
+}
+
+#[test]
+fn a_zero_checkout_import_recovery_closes_its_marker() {
+    // Python's historical import skips checkouts that no longer exist, so an
+    // import can publish a row with no checkouts. That import placed nothing,
+    // and its recovery must close like any other.
+    let scratch = Scratch::new();
+    let events = scratch.events();
+    let journal_path = "ACTIVE.node-a.journal";
+    let mut record = imported_active_record("slot-a", "agent-slot-a", 1);
+    record["checkouts"] = json!([]);
+    let mut tip = import_log(&events, vec![], vec![]);
+    tip = append_event(
+        &events,
+        2,
+        &tip,
+        "operation-progress-recorded",
+        json!({
+            "slot": "slot-a", "operation": "import-existing", "journal_path": journal_path,
+            "journal": attempt_journal("import-existing", &record),
+        }),
+    );
+    tip = append_event(
+        &events,
+        3,
+        &tip,
+        "recovery-started",
+        recovery_started_payload("slot-a", "import-existing"),
+    );
+    tip = append_event(
+        &events,
+        4,
+        &tip,
+        "active-state-recorded",
+        json!({
+            "action": "slot-imported-by-recovery", "slot": "slot-a",
+            "previous_revision": 0, "revision": 1, "previous_record_sha256": null,
+            "record": record, "evidence": {},
+        }),
+    );
+    append_event(
+        &events,
+        5,
+        &tip,
+        "operation-completed",
+        json!({"slot": "slot-a", "operation": "import-existing", "journal_path": journal_path}),
+    );
+    assert_eq!(python_pending_journals(&events), json!({}));
+    let replayed = replay_stream(&events, None, |_| Ok(())).expect("replay");
+    assert_eq!(replayed.active_metadata["slot-a"].checkouts, vec![]);
+    assert!(
+        replayed.pending_operations.is_empty(),
+        "{:?}",
+        replayed.pending_operations
+    );
+}
+
+#[test]
 fn a_later_create_that_does_not_own_the_aborted_storage_keeps_the_recovery_marker() {
     // Python derives the refused slot path from the new create's slot type,
     // so a create of the same slot name under the other slot type proves
