@@ -39,6 +39,25 @@ def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Sessions, Fa
     return sessions, fake, calls
 
 
+def test_cli_list_reports_every_row_and_exits_nonzero_for_malformed_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    sessions.start_session("worker", cwd=str(tmp_path))
+    invalid = sessions.registry / "broken"
+    invalid.mkdir(mode=0o700)
+    (invalid / "agent.json").write_text("{}", encoding="utf-8")
+    (invalid / "agent.json").chmod(0o600)
+    monkeypatch.setattr(cli, "HerdrClient", lambda **_kwargs: cast(HerdrClient, fake))
+
+    assert cli.main(["--registry", str(sessions.registry), "list"]) == 1
+    rows = json.loads(capsys.readouterr().out)
+    assert [row["name"] for row in rows] == ["broken", "worker"]
+    assert rows[0]["record_error"] is True
+    assert rows[1]["agent_status"] == "idle"
+
+
 @pytest.mark.parametrize("first,second", [("interactive", "headless"), ("headless", "interactive"), ("headless", "headless")])
 def test_modes_share_names_and_preserve_the_original_generation(first: str, second: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     sessions, fake, calls = setup(tmp_path, monkeypatch)

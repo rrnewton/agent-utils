@@ -97,64 +97,218 @@ def muse_trust_prompt(screen: str) -> bool:
 
 def muse_idle_composer(screen: str) -> bool:
     """Recognize Muse's idle composer without mistaking a choice prompt for it."""
-    if "Auto-review" not in screen:
+    regions = _muse_composer_regions(screen, require_header=True)
+    return regions is not None and regions[1].strip() in ("❯", "›")
+
+
+def muse_auto_review_idle_composer(screen: str) -> bool:
+    """Require the Auto-review footer on the active empty composer."""
+    regions = _muse_composer_regions(screen, require_header=True)
+    if regions is None or regions[1].strip() not in ("❯", "›"):
         return False
-    return any(line.strip() in ("❯", "›") for line in screen.splitlines())
-
-
-def _muse_text_visible(screen: str, text: str) -> bool:
-    wanted = " ".join(text.split())
-    rendered = " ".join(screen.split())
-    if not wanted:
-        return False
-    if len(wanted) <= 160:
-        return wanted in rendered
-    return wanted[:80] in rendered and wanted[-80:] in rendered
-
-
-def _muse_composer_regions(screen: str) -> tuple[str, str] | None:
-    """Split transcript/composer using Muse's two rules above its status footer."""
     lines = screen.splitlines()
-    footer = next(
-        (index for index in range(len(lines) - 1, -1, -1) if "Auto-review" in lines[index]),
-        None,
-    )
-    if footer is None:
-        return None
     dividers = [
-        index for index, line in enumerate(lines[:footer])
+        index for index, line in enumerate(lines)
+        if len(line.strip()) >= 3 and set(line.strip()) <= {"─", "━", "═"}
+    ]
+    modes = _muse_footer_modes(lines[dividers[-1] + 1:])
+    return modes == ("Auto-review",)
+
+
+def muse_verified_process_idle_composer(screen: str) -> bool:
+    """Recognize an idle editor after exact live-Muse process verification."""
+    regions = _muse_composer_regions(screen, require_header=False)
+    return regions is not None and regions[1].strip() in ("❯", "›")
+
+
+def muse_verified_process_composer(screen: str) -> bool:
+    """Recognize a possibly nonempty editor after live-Muse process verification."""
+    regions = _muse_composer_regions(screen, require_header=False)
+    return regions is not None and _muse_editor_segments(regions[1]) is not None
+
+
+def muse_verified_process_goal_paused(screen: str) -> bool:
+    """Recognize Muse's explicit paused-goal state in a verified UI frame."""
+    if _muse_composer_regions(screen, require_header=False) is None:
+        return False
+    lines = screen.splitlines()
+    bottom = max(
+        index for index, line in enumerate(lines)
+        if len(line.strip()) >= 3 and set(line.strip()) <= {"─", "━", "═"}
+    )
+    return any(line.strip() == "Goal (paused)" for line in lines[bottom + 1:])
+
+
+def _muse_composer_regions(
+    screen: str, *, require_header: bool = True,
+) -> tuple[str, str] | None:
+    """Split transcript/composer using Muse's ruled editor and status footer."""
+    lines = screen.splitlines()
+    dividers = [
+        index for index, line in enumerate(lines)
         if len(line.strip()) >= 3 and set(line.strip()) <= {"─", "━", "═"}
     ]
     if len(dividers) < 2:
         return None
     top, bottom = dividers[-2:]
+    footer = lines[bottom + 1:]
+    versioned_header = any(
+        re.fullmatch(r"Muse Code [0-9]+\.[0-9]+\.[0-9]+", line.strip())
+        for line in lines[:top]
+    )
+
+    if not ((versioned_header or not require_header)
+            and len(_muse_footer_modes(footer)) == 1):
+        return None
     return "\n".join(lines[:top]), "\n".join(lines[top + 1:bottom])
 
 
+def _muse_status_mode(line: str) -> str | None:
+    """Return the explicit mode from one structurally valid Muse footer."""
+    fields = [field.strip() for field in line.split("·")]
+    if (len(fields) not in (3, 4) or not all(fields)
+            or _MUSE_EFFORT.fullmatch(fields[1]) is None):
+        return None
+    if len(fields) == 3:
+        return "standard"
+    return fields[3] if fields[3] in ("YOLO", "Auto-review") else None
+
+
+def _muse_footer_modes(lines: list[str]) -> tuple[str, ...]:
+    """Return all structurally valid footer modes; callers require one authority."""
+    return tuple(
+        mode for line in lines if line.strip()
+        for mode in (_muse_status_mode(line.strip()),) if mode is not None
+    )
+
+
+def _muse_editor_segments(editor: str) -> tuple[str, ...] | None:
+    """Return normalized editor lines after one leading Muse prompt marker."""
+    lines = [" ".join(line.split()) for line in editor.splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return None
+    first = lines[0]
+    marker = next(
+        (candidate for candidate in ("❯", "›")
+         if first == candidate or first.startswith(candidate + " ")),
+        None,
+    )
+    if marker is None:
+        return None
+    initial = first[len(marker):].strip()
+    return tuple(([initial] if initial else []) + lines[1:])
+
+
+def _muse_editor_matches(editor: str, text: str, *, exact: bool) -> bool:
+    """Match a logical prompt against one conservatively rendered Muse editor."""
+    wanted = " ".join(text.split())
+    segments = _muse_editor_segments(editor)
+    if not wanted or segments is None:
+        return False
+    prefixes = {""}
+    previous = ""
+    for index, segment in enumerate(segments):
+        separators = ("",) if index == 0 else ((" ", "") if previous.endswith("-") else (" ",))
+        next_prefixes: set[str] = set()
+        for prefix in prefixes:
+            for separator in separators:
+                rendered = prefix + separator + segment
+                if not exact and (
+                    rendered == wanted or rendered.startswith(wanted + " ")
+                ):
+                    return True
+                if wanted.startswith(rendered):
+                    next_prefixes.add(rendered)
+        if not next_prefixes:
+            return False
+        prefixes = next_prefixes
+        previous = segment
+    return wanted in prefixes
+
+
+def _muse_prompt_in_composer(
+    screen: str, text: str, *, require_header: bool, exact: bool,
+) -> bool:
+    regions = _muse_composer_regions(screen, require_header=require_header)
+    return regions is not None and _muse_editor_matches(
+        regions[1], text, exact=exact,
+    )
+
+
 def muse_prompt_in_composer(screen: str, text: str) -> bool:
-    """Require the literal prompt inside Muse's active bottom editor region."""
-    regions = _muse_composer_regions(screen)
-    return regions is not None and _muse_text_visible(regions[1], text)
+    """Conservatively detect a prompt retained in Muse's bottom editor."""
+    return _muse_prompt_in_composer(
+        screen, text, require_header=True, exact=False,
+    )
+
+
+def muse_verified_process_prompt_in_composer(screen: str, text: str) -> bool:
+    """Detect retained input after exact live-Muse process verification."""
+    return _muse_prompt_in_composer(
+        screen, text, require_header=False, exact=False,
+    )
+
+
+def muse_prompt_is_exact_composer(screen: str, text: str) -> bool:
+    """Require the entire active Muse editor to be this literal prompt."""
+    return _muse_prompt_in_composer(
+        screen, text, require_header=True, exact=True,
+    )
+
+
+def muse_verified_process_prompt_is_exact_composer(screen: str, text: str) -> bool:
+    """Require exact editor text after pinning the live Muse process."""
+    return _muse_prompt_in_composer(
+        screen, text, require_header=False, exact=True,
+    )
+
+
+def _muse_prompt_transcript_count(transcript: str, text: str) -> int:
+    """Count complete marker-delimited user turns, never prompt prefixes."""
+    if not " ".join(text.split()):
+        return 0
+    lines = transcript.splitlines()
+    count = 0
+    index = 0
+    while index < len(lines):
+        stripped = lines[index].strip()
+        if not any(
+            stripped == marker or stripped.startswith(marker + " ")
+            for marker in ("❯", "›")
+        ):
+            index += 1
+            continue
+        end = index + 1
+        while end < len(lines):
+            next_line = lines[end].strip()
+            if any(
+                next_line == marker or next_line.startswith(marker + " ")
+                for marker in ("◆", "❯", "›")
+            ) or re.fullmatch(r"(?:Working|Thinking)(?:\.\.\.|\u2026)", next_line):
+                break
+            end += 1
+        if _muse_editor_matches("\n".join(lines[index:end]), text, exact=True):
+            count += 1
+        index = end
+    return count
 
 
 def muse_prompt_in_transcript(screen: str, text: str) -> bool:
-    """Require the literal prompt above Muse's active bottom editor region."""
-    regions = _muse_composer_regions(screen)
-    return regions is not None and _muse_text_visible(regions[0], text)
+    """Require the exact prompt as a user turn above the active Muse editor."""
+    return muse_prompt_transcript_count(screen, text) > 0
 
 
 def muse_prompt_transcript_count(screen: str, text: str) -> int:
     """Count bounded prompt renderings above the composer for transition proofs."""
-    regions = _muse_composer_regions(screen)
-    if regions is None:
-        return 0
-    wanted = " ".join(text.split())
-    rendered = " ".join(regions[0].split())
-    if not wanted:
-        return 0
-    if len(wanted) <= 160:
-        return rendered.count(wanted)
-    return min(rendered.count(wanted[:80]), rendered.count(wanted[-80:]))
+    regions = _muse_composer_regions(screen, require_header=True)
+    return 0 if regions is None else _muse_prompt_transcript_count(regions[0], text)
+
+
+def muse_verified_process_prompt_transcript_count(screen: str, text: str) -> int:
+    """Count exact user turns after pinning the live Muse process."""
+    regions = _muse_composer_regions(screen, require_header=False)
+    return 0 if regions is None else _muse_prompt_transcript_count(regions[0], text)
 
 
 def _get_process_id(mapping: dict[str, object], key: str, what: str) -> int:

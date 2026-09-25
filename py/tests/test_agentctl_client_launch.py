@@ -19,10 +19,18 @@ from agentctl.client import (
     CustomProcessIdentity,
     HerdrClient,
     ProcessInfo,
+    muse_auto_review_idle_composer,
     muse_prompt_in_composer,
     muse_prompt_in_transcript,
+    muse_prompt_is_exact_composer,
     muse_prompt_transcript_count,
     muse_startup_metadata,
+    muse_verified_process_composer,
+    muse_verified_process_goal_paused,
+    muse_verified_process_idle_composer,
+    muse_verified_process_prompt_in_composer,
+    muse_verified_process_prompt_is_exact_composer,
+    muse_verified_process_prompt_transcript_count,
 )
 from agentctl.errors import HerdrUnavailable
 from agentctl.procstat import parse_process_stat
@@ -164,6 +172,63 @@ def test_custom_muse_launch_uses_literal_shell_quoting_and_exact_pane_report() -
     ]
 
 
+def test_current_muse_yolo_footer_is_an_idle_composer() -> None:
+    screen = (
+        "Muse Code at Meta (https://fb.workplace.com/groups/27315719428107177)\n"
+        "Using AI Gateway (Meta Model API upstream)\n\n"
+        "  Muse Code 1.4.0\n\n"
+        "────────────────\n❯\n"
+        "────────────────\n"
+        "  kiki_gb300_mxfp8_6p2_840_nwr · xhigh · /work/project · YOLO\n"
+    )
+    assert client_module.muse_idle_composer(screen)
+    assert not muse_auto_review_idle_composer(
+        screen.replace("Using AI Gateway", "Auto-review was previously enabled")
+    )
+    ambiguous = screen.replace(
+        "  kiki_gb300_mxfp8_6p2_840_nwr · xhigh · /work/project · YOLO\n",
+        "  kiki · xhigh · /work/project · Auto-review\n"
+        "  kiki_gb300_mxfp8_6p2_840_nwr · xhigh · /work/project · YOLO\n",
+    )
+    assert not client_module.muse_idle_composer(ambiguous)
+    assert not muse_auto_review_idle_composer(ambiguous)
+    choice = screen.replace("❯\n", "❯ Yes, continue\n  No, exit\n")
+    assert not client_module.muse_idle_composer(choice)
+
+
+def test_verified_headerless_muse_composer_distinguishes_buffered_input() -> None:
+    divider = "─" * 40
+    footer = "kiki · xhigh · /work/project · YOLO\n"
+    idle = f"old transcript\n{divider}\n❯\n{divider}\n{footer}"
+    assert not client_module.muse_idle_composer(idle)
+    assert muse_verified_process_idle_composer(idle)
+    assert muse_verified_process_composer(idle)
+
+    prompt = "require the full deterministic-scheduling-review skill"
+    staged = idle.replace("❯\n", f"❯ {prompt}\n")
+    assert not muse_prompt_is_exact_composer(staged, prompt)
+    assert muse_verified_process_prompt_is_exact_composer(staged, prompt)
+    assert muse_verified_process_prompt_in_composer(staged, prompt)
+    accepted = idle.replace(
+        "old transcript\n", f"❯ {prompt}\n◆ Working\n",
+    )
+    assert muse_verified_process_prompt_transcript_count(accepted, prompt) == 1
+
+
+def test_verified_muse_paused_goal_requires_footer_region() -> None:
+    divider = "─" * 40
+    footer = "kiki · xhigh · /work/project · YOLO"
+    paused = (
+        f"Muse Code 1.4.0\n{divider}\n❯\n{divider}\n"
+        f"Goal (paused)\n{footer}\n"
+    )
+    transcript_echo = (
+        f"Muse Code 1.4.0\nGoal (paused)\n{divider}\n❯\n{divider}\n{footer}\n"
+    )
+    assert muse_verified_process_goal_paused(paused)
+    assert not muse_verified_process_goal_paused(transcript_echo)
+
+
 def test_muse_prompt_must_move_from_composer_to_transcript() -> None:
     prompt = "literal $(unexpanded) delivery\nsecond line"
     header = "Muse Code 1.3.0\n"
@@ -173,10 +238,14 @@ def test_muse_prompt_must_move_from_composer_to_transcript() -> None:
     accepted = (
         header + f"❯ {prompt}\nWorking...\n" + divider + "❯\n" + divider + footer
     )
+    accepted_current = (
+        header + f"❯ {prompt}\n◆ Working...\n" + divider + "❯\n" + divider + footer
+    )
     error_redraw = header + divider + f"❯ {prompt}\nError: retry\n" + divider + footer
     assert muse_prompt_in_composer(staged, prompt)
     assert not muse_prompt_in_transcript(staged, prompt)
     assert muse_prompt_in_transcript(accepted, prompt)
+    assert muse_prompt_in_transcript(accepted_current, prompt)
     assert not muse_prompt_in_composer(accepted, prompt)
     assert muse_prompt_in_composer(error_redraw, prompt)
     assert not muse_prompt_in_transcript(error_redraw, prompt)

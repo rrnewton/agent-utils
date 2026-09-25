@@ -7,6 +7,7 @@ harness's permission settings. Coordinators and humans see the same terminal.
 """
 from __future__ import annotations
 
+import copy
 import fcntl
 import hashlib
 import ctypes
@@ -32,11 +33,16 @@ from agentctl.client import (
     HerdrClient,
     Pane,
     PaneShellProof,
+    muse_auto_review_idle_composer,
     muse_idle_composer,
     muse_prompt_in_composer,
+    muse_prompt_is_exact_composer,
     muse_prompt_transcript_count,
     muse_startup_metadata,
     muse_trust_prompt,
+    muse_verified_process_composer,
+    muse_verified_process_goal_paused,
+    muse_verified_process_idle_composer,
 )
 from agentctl.errors import AgentDeliveryError, HerdrRunError, HerdrUnavailable
 from agentctl.profiles import (
@@ -53,6 +59,12 @@ _MAX_U64 = (1 << 64) - 1
 _MAX_AGENT_RECORD_BYTES = 1 << 20
 _MAX_SNAPSHOT_BYTES = 16 << 20
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_NESTED_SESSION_SCHEMAS = frozenset({
+    "agentctl-session/v2", "agentctl-session/v3",
+})
+_NESTED_LAUNCH_SCHEMAS = frozenset({
+    "agentctl-launch/v1", "agentctl-launch/v2",
+})
 
 
 def _rename_directory_noreplace_at(
@@ -226,14 +238,99 @@ class AgentRecord:
     custom_process_identity: CustomProcessIdentity | None = None
     foreign_shell_identity: CustomProcessIdentity | None = None
     _unknown: dict[str, object] = field(default_factory=dict, init=False, repr=False)
+    _nested_storage: dict[str, object] | None = field(
+        default=None, init=False, repr=False,
+    )
+    _session_source: str | None = field(default=None, init=False, repr=False)
 
     def to_document(self) -> dict[str, object]:
-        """Preserve unrecognized fields alongside the known schema, never in a wrapper."""
+        """Serialize in the decoded row's schema without duplicating launch intent."""
+        if self._nested_storage is not None:
+            return self._nested_document()
         document = asdict(self)
         document.pop("_unknown")
+        document.pop("_nested_storage")
+        document.pop("_session_source")
         if self._unknown.keys() & document.keys():
             raise AgentDeliveryError("unknown agent metadata conflicts with a known schema field")
         document.update(self._unknown)
+        return document
+
+    def _nested_document(self) -> dict[str, object]:
+        """Update mutable fields while retaining one canonical nested LaunchSpec."""
+        assert self._nested_storage is not None
+        document = copy.deepcopy(self._nested_storage)
+        launch_value = document.get("launch")
+        if not isinstance(launch_value, dict):  # pragma: no cover - decode invariant
+            raise AgentDeliveryError("nested agent record lost its launch specification")
+        launch = cast(dict[str, object], launch_value)
+        argv = launch.get("argv")
+        projection = {
+            "harness": self.harness,
+            "cwd": self.cwd,
+            "adapter": self.adapter,
+            "mode": self.mode,
+            "backend": self.backend,
+            "model": self.model,
+            "resume": self.resume,
+            "runtime_home": self.runtime_home,
+        }
+        if any(launch.get(key) != value for key, value in projection.items()) or (
+            not isinstance(argv, list) or list(argv[1:]) != self.arguments
+        ):
+            raise AgentDeliveryError(
+                "decoded nested launch intent changed; migrate through a canonical writer"
+            )
+        document.update({
+            "name": self.name,
+            "token": self.token,
+            "created_at": self.created_at,
+            "lifecycle": self.lifecycle,
+            "workspace_id": self.workspace_id,
+            "tab_id": self.tab_id,
+            "pane_id": self.pane_id,
+            "startup_warning": self.startup_warning,
+            "effective_reasoning_effort": self.effective_reasoning_effort,
+            "error": self.error,
+            "paused": self.paused,
+            "pane_reported_by_agentctl": self.pane_reported_by_agentctl,
+            "foreign_shell_identity": (
+                None if self.foreign_shell_identity is None
+                else asdict(self.foreign_shell_identity)
+            ),
+        })
+        custom_identity = (
+            None if self.custom_process_identity is None
+            else asdict(self.custom_process_identity)
+        )
+        if document["schema"] == "agentctl-session/v2":
+            document.update({
+                "session_agent": self.session_agent,
+                "session_value": self.session_value,
+                "goal": self.goal,
+                "goal_delivery": self.goal_delivery,
+                "goal_session_id": self.goal_session_id,
+                "goal_command": self.goal_command,
+                "goal_messages": dict(self.goal_messages),
+                "goal_message_id": self.goal_message_id,
+                "custom_process_identity": custom_identity,
+            })
+        else:
+            document["native_session"] = (
+                None if self.session_value is None else {
+                    "schema": "agentctl-native-session/v1",
+                    "agent": self.session_agent or self.harness,
+                    "value": self.session_value,
+                    "source": self._session_source or "observed",
+                }
+            )
+            document["goal"] = {
+                "schema": "agentctl-goal/v1",
+                "objective": self.goal,
+                "message_id": self.goal_message_id,
+                "native_command": self.goal_command,
+            }
+            document["custom_process_identity"] = custom_identity
         return document
 
     @classmethod
@@ -247,7 +344,26 @@ class AgentRecord:
         """Validate an already identity-bound record value."""
         if not isinstance(value, dict):
             raise AgentDeliveryError(f"invalid agent record: {path}")
-        document = cast(dict[str, object], value)
+        source = cast(dict[str, object], value)
+        nested_storage: dict[str, object] | None = None
+        nested_session_source: str | None = None
+        if source.get("schema") in _NESTED_SESSION_SCHEMAS:
+            nested_storage = copy.deepcopy(source)
+            if source.get("schema") == "agentctl-session/v3":
+                native = source.get("native_session")
+                if isinstance(native, dict):
+                    candidate = native.get("source")
+                    if isinstance(candidate, str):
+                        nested_session_source = candidate
+            else:
+                nested_session_source = (
+                    "observed" if source.get("session_value") is not None
+                    else "asserted" if source.get("goal_session_id") is not None
+                    else None
+                )
+            document = cls._normalize_nested_storage(source, path)
+        else:
+            document = source
         for key in ("name", "token", "harness", "cwd", "lifecycle"):
             if not isinstance(document.get(key), str) or not document[key]:
                 raise AgentDeliveryError(f"invalid agent record field {key}: {path}")
@@ -357,15 +473,232 @@ class AgentRecord:
             raise AgentDeliveryError(f"invalid runtime directory in {path}")
         record = cls(**fields)  # type: ignore[arg-type]
         record._unknown = {key: value for key, value in document.items() if key not in known}
+        record._nested_storage = nested_storage
+        record._session_source = nested_session_source
         return record
+
+    @classmethod
+    def _normalize_nested_storage(
+        cls, document: dict[str, object], path: Path,
+    ) -> dict[str, object]:
+        """Decode v2/v3 rows at the boundary while leaving launch data canonical."""
+        schema = document.get("schema")
+        common = {
+            "schema", "name", "token", "created_at", "lifecycle", "launch",
+            "workspace_id", "tab_id", "pane_id", "startup_warning",
+            "effective_reasoning_effort", "error", "paused",
+            "pane_reported_by_agentctl", "foreign_shell_identity",
+            "runner_identity", "extensions",
+        }
+        expected = (
+            common | {
+                "session_agent", "session_value", "goal", "goal_delivery",
+                "goal_session_id", "goal_command", "goal_messages",
+                "goal_message_id", "custom_process_identity",
+            }
+            if schema == "agentctl-session/v2"
+            else common | {"native_session", "goal", "custom_process_identity"}
+        )
+        if set(document) != expected:
+            raise AgentDeliveryError(f"invalid agent record {schema} fields: {path}")
+        launch_value = document.get("launch")
+        if not isinstance(launch_value, dict):
+            raise AgentDeliveryError(f"invalid agent record launch specification: {path}")
+        launch = cast(dict[str, object], launch_value)
+        launch_fields = {
+            "schema", "harness", "cwd", "adapter", "mode", "backend",
+            "model", "resume", "profile", "argv", "environment_names",
+            "runtime_home", "runtime_ownership", "executable",
+        }
+        if launch.get("schema") == "agentctl-launch/v2":
+            launch_fields.add("permission_mode")
+        elif launch.get("schema") not in _NESTED_LAUNCH_SCHEMAS:
+            raise AgentDeliveryError(f"invalid agent record launch schema: {path}")
+        if set(launch) != launch_fields:
+            raise AgentDeliveryError(f"invalid agent record launch fields: {path}")
+        lifecycle = document.get("lifecycle")
+        if lifecycle not in {
+            "starting", "running", "stopping", "stopped",
+            "launch_failed", "adopt_failed",
+        }:
+            raise AgentDeliveryError(f"invalid agent record lifecycle: {path}")
+        harness = launch.get("harness")
+        cwd = launch.get("cwd")
+        adapter = launch.get("adapter")
+        mode = launch.get("mode")
+        backend = launch.get("backend")
+        ownership = launch.get("runtime_ownership")
+        profile = launch.get("profile")
+        permission_mode = launch.get("permission_mode")
+        if (not isinstance(harness, str) or _KIND.fullmatch(harness) is None
+                or not isinstance(cwd, str) or not Path(cwd).is_absolute()
+                or adapter not in ("herdr", "herdr-pane", "herdr-foreign")
+                or mode != "interactive" or backend != "herdr"
+                or profile is not None
+                    and (not isinstance(profile, str) or not profile or "\0" in profile)
+                or permission_mode is not None
+                or launch.get("runtime_home") is not None):
+            raise AgentDeliveryError(
+                f"invalid nested interactive launch contract: {path}"
+            )
+        if ((adapter == "herdr-foreign" and ownership != "foreign")
+                or (adapter != "herdr-foreign" and ownership != "owned")
+                or (adapter == "herdr-pane" and harness != "muse")):
+            raise AgentDeliveryError(
+                f"inconsistent launch ownership or adapter: {path}"
+            )
+        for field_name in ("model", "resume"):
+            field_value = launch.get(field_name)
+            if (field_value is not None
+                    and (not isinstance(field_value, str)
+                         or not field_value or "\0" in field_value)):
+                raise AgentDeliveryError(
+                    f"invalid agent record launch {field_name}: {path}"
+                )
+        argv = launch.get("argv")
+        environment_names = launch.get("environment_names")
+        if (not isinstance(argv, list)
+                or any(not isinstance(item, str) or not item or "\0" in item for item in argv)
+                or not isinstance(environment_names, list)
+                or any(not isinstance(item, str)
+                       or _ENVIRONMENT_NAME.fullmatch(item) is None
+                       for item in environment_names)):
+            raise AgentDeliveryError(f"invalid agent record launch vector: {path}")
+        executable = launch.get("executable")
+        if executable is not None and (
+            not isinstance(executable, dict)
+            or set(executable) != {"path", "device", "inode"}
+            or not isinstance(executable.get("path"), str)
+            or not os.path.isabs(cast(str, executable["path"]))
+            or any(not isinstance(executable.get(key), int)
+                   or isinstance(executable.get(key), bool)
+                   or cast(int, executable[key]) <= 0
+                   for key in ("device", "inode"))
+        ):
+            raise AgentDeliveryError(
+                f"invalid agent record launch executable identity: {path}"
+            )
+        expected_program = (
+            cast(dict[str, object], executable).get("path")
+            if isinstance(executable, dict) else harness
+        )
+        if ((adapter == "herdr-foreign" and argv)
+                or (adapter != "herdr-foreign"
+                    and (not argv or argv[0] != expected_program))):
+            raise AgentDeliveryError(f"invalid agent record launch argv: {path}")
+        if adapter in ("herdr", "herdr-pane"):
+            try:
+                structured = harness_arguments(
+                    harness,
+                    model=cast(str | None, launch.get("model")),
+                    resume=cast(str | None, launch.get("resume")),
+                )
+            except AgentDeliveryError as exc:
+                raise AgentDeliveryError(
+                    f"invalid nested launch presets in {path}: {exc}"
+                ) from exc
+            if tuple(argv[1:1 + len(structured)]) != structured:
+                raise AgentDeliveryError(
+                    f"nested launch argv contradicts model or resume: {path}"
+                )
+        if document.get("runner_identity") is not None:
+            raise AgentDeliveryError(
+                f"interactive nested record cannot contain runner identity: {path}"
+            )
+        if (adapter == "herdr-pane"
+                and lifecycle in {"running", "stopping", "stopped"}
+                and document.get("custom_process_identity") is None):
+            raise AgentDeliveryError(
+                f"active nested Muse record has no runtime process identity: {path}"
+            )
+        extensions = document.get("extensions")
+        if not isinstance(extensions, dict) or any(
+            not isinstance(key, str) or key in expected or key in launch_fields
+            for key in extensions
+        ):
+            raise AgentDeliveryError(f"invalid agent record extensions: {path}")
+        normalized = {
+            key: value for key, value in document.items()
+            if key not in {"schema", "launch", "extensions", "native_session"}
+        }
+        normalized.update({
+            "schema": 1,
+            "harness": launch.get("harness"),
+            "cwd": launch.get("cwd"),
+            "adapter": launch.get("adapter"),
+            "mode": launch.get("mode"),
+            "backend": launch.get("backend"),
+            "model": launch.get("model"),
+            "resume": launch.get("resume"),
+            "arguments": list(argv[1:]),
+            "runtime_home": launch.get("runtime_home"),
+        })
+        if schema == "agentctl-session/v3":
+            native = document.get("native_session")
+            if native is None:
+                normalized.update({
+                    "session_agent": None,
+                    "session_value": None,
+                    "goal_session_id": None,
+                })
+            elif (isinstance(native, dict)
+                    and set(native) == {"schema", "agent", "value", "source"}
+                    and native.get("schema") == "agentctl-native-session/v1"
+                    and native.get("source") in ("observed", "asserted")
+                    and native.get("agent") == harness
+                    and isinstance(native.get("value"), str)
+                    and bool(native.get("value"))):
+                normalized.update({
+                    "session_agent": native.get("agent"),
+                    "session_value": native.get("value"),
+                    "goal_session_id": native.get("value"),
+                })
+            else:
+                raise AgentDeliveryError(f"invalid agent record native session: {path}")
+            goal = document.get("goal")
+            if (not isinstance(goal, dict)
+                    or set(goal) != {
+                        "schema", "objective", "message_id", "native_command",
+                    }
+                    or goal.get("schema") != "agentctl-goal/v1"):
+                raise AgentDeliveryError(f"invalid agent record goal state: {path}")
+            normalized.update({
+                "goal": goal.get("objective"),
+                "goal_delivery": None,
+                "goal_command": goal.get("native_command"),
+                "goal_messages": {},
+                "goal_message_id": goal.get("message_id"),
+            })
+        else:
+            observed = normalized.get("session_value")
+            asserted = normalized.get("goal_session_id")
+            session_agent = normalized.get("session_agent")
+            if (observed is not None and asserted is not None
+                    and observed != asserted):
+                raise AgentDeliveryError(
+                    f"contradictory native session identities in {path}"
+                )
+            if (observed is not None
+                    and (session_agent != harness
+                         or not isinstance(observed, str) or not observed)):
+                raise AgentDeliveryError(
+                    f"invalid native session identity in {path}"
+                )
+        return normalized
 
     def target(self) -> agent.Target:
         """Pin the exact pane and, when available at launch, its durable session."""
         if not self.pane_id:
             raise AgentDeliveryError(f"agent {self.name!r} has no confirmed pane; inspect its launch error")
         return agent.Target(
-            pane_id=self.pane_id, session_agent=self.session_agent,
-            session_value=self.session_value, expected_agent=self.harness,
+            pane_id=self.pane_id,
+            session_agent=(
+                self.session_agent if self._session_source != "asserted" else None
+            ),
+            session_value=(
+                self.session_value if self._session_source != "asserted" else None
+            ),
+            expected_agent=self.harness,
             expected_cwd=self.cwd,
         )
 
@@ -496,6 +829,7 @@ class _WorkspaceClient:
                 self.client.verify_custom_harness(
                     pane_id, self.record.harness, self.record.custom_process_identity
                 )
+                reported_status = info.status
                 screen = self.client.read(pane_id, source="visible", lines=200)
                 if muse_trust_prompt(screen):
                     raise HerdrUnavailable(
@@ -506,7 +840,23 @@ class _WorkspaceClient:
                     workspace_id=info.workspace_id,
                     cwd=info.cwd,
                     agent=info.agent,
-                    status="idle" if muse_idle_composer(screen) else "working",
+                    status=(
+                        "paused"
+                        if (reported_status in ("idle", "done")
+                            and muse_verified_process_goal_paused(screen))
+                        else "idle"
+                        if (
+                            muse_idle_composer(screen)
+                            or (
+                                reported_status in ("idle", "done")
+                                and muse_verified_process_idle_composer(screen)
+                            )
+                        )
+                        else "staged"
+                        if (reported_status in ("idle", "done")
+                            and muse_verified_process_composer(screen))
+                        else "working"
+                    ),
                     session_agent=info.session_agent,
                     session_value=info.session_value,
                 )
@@ -542,6 +892,12 @@ class _WorkspaceClient:
                 f"custom pane {pane_id} is not at a verified idle Muse composer"
             )
         before = self.client.read(pane_id, source="visible", lines=200)
+        if not muse_auto_review_idle_composer(before):
+            raise HerdrUnavailable(
+                "Muse input requires the legacy reviewed Auto-review composer; "
+                "current YOLO input remains pending until Herdr provides an "
+                "effect-coupled process-generation guard"
+            )
         self.client.send_text(
             pane_id, f"{_BRACKETED_PASTE_START}{command}{_BRACKETED_PASTE_END}"
         )
@@ -552,7 +908,7 @@ class _WorkspaceClient:
                 pane_id, self.record.harness, self.record.custom_process_identity
             )
             staged = self.client.read(pane_id, source="visible", lines=200)
-            if staged != before and muse_prompt_in_composer(staged, command):
+            if staged != before and muse_prompt_is_exact_composer(staged, command):
                 break
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         else:
@@ -564,7 +920,7 @@ class _WorkspaceClient:
         )
         self.client.send_keys(pane_id, "Enter")
         self.custom_submission = (
-            staged, command, muse_prompt_transcript_count(staged, command)
+            staged, command, muse_prompt_transcript_count(staged, command),
         )
 
     def wait_agent_status(self, pane_id: str, status: str, timeout_ms: int) -> None:
@@ -1383,12 +1739,24 @@ class ManagedAgents:
         return result
 
     def list(self) -> list[dict[str, object]]:
-        """List every registered agent; unavailable Herdr is not evidence of death."""
+        """List each row independently; one malformed row cannot hide the fleet."""
         if not self.registry.exists():
             return []
         agent._validate_private_directory(str(self.registry), "agent registry")
-        return [self.status(path.name) for path in sorted(self.registry.iterdir())
-                if _NAME.fullmatch(path.name) and path.name != "archive"]
+        rows: list[dict[str, object]] = []
+        for path in sorted(self.registry.iterdir()):
+            if not _NAME.fullmatch(path.name) or path.name == "archive":
+                continue
+            try:
+                rows.append(self.status(path.name))
+            except HerdrRunError as exc:
+                rows.append({
+                    "name": path.name,
+                    "agent_status": "unknown",
+                    "probe_error": str(exc),
+                    "record_error": True,
+                })
+        return rows
 
     def send(self, name: str, text: str, *, message_id: str | None = None, expected_token: str | None = None, **options: object) -> agent.QueueResult:
         """Serialize against stop, then use the existing durable submission transport."""
@@ -1476,7 +1844,15 @@ class ManagedAgents:
                 # Some Herdr detection sources do not expose session metadata. The
                 # caller explicitly asserts the native session; the independently
                 # verified live name and pane remain the lifecycle authority.
-                record.goal_session_id = session_id
+                if (record._nested_storage is not None
+                        and record._nested_storage.get("schema")
+                        == "agentctl-session/v3"):
+                    record.session_agent = record.harness
+                    record.session_value = session_id
+                    record.goal_session_id = session_id
+                    record._session_source = "asserted"
+                else:
+                    record.goal_session_id = session_id
                 if goal_command is not None:
                     record.goal_command = list(goal_command)
                 self._save(record)

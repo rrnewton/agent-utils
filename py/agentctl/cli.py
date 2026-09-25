@@ -325,6 +325,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 harness=args.harness, session=args.session)
         elif args.command == "list":
             result = sessions.list()
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 1 if any(row.get("record_error") is True for row in result) else 0
         elif args.command == "status":
             result = sessions.status(name)
         elif args.command == "send":

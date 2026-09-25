@@ -13,7 +13,9 @@ from agentctl.client import (
     AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, PaneShellProof,
 )
 from agentctl.errors import AgentDeliveryError, AgentPending, HerdrUnavailable
-from agentctl.subagents import ManagedAgents, environment_entries, harness_arguments
+from agentctl.subagents import (
+    ManagedAgents, _WorkspaceClient, environment_entries, harness_arguments,
+)
 import agentctl.legacy_cli as cli
 import agentctl.codex_goal as native_goal
 
@@ -202,6 +204,54 @@ def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[ManagedAgent
     return ManagedAgents(cast(HerdrClient, fake), tmp_path / "registry"), fake
 
 
+def _nested_v2_record(flat: dict[str, object]) -> dict[str, object]:
+    """Encode one historical flat fixture in the canonical launch-only v2 shape."""
+    arguments = cast(list[str], flat["arguments"])
+    return {
+        "schema": "agentctl-session/v2",
+        "name": flat["name"],
+        "token": flat["token"],
+        "created_at": flat["created_at"],
+        "lifecycle": flat["lifecycle"],
+        "launch": {
+            "schema": "agentctl-launch/v1",
+            "harness": flat["harness"],
+            "cwd": flat["cwd"],
+            "adapter": flat["adapter"],
+            "mode": flat["mode"],
+            "backend": flat["backend"],
+            "model": flat["model"],
+            "resume": flat["resume"],
+            "profile": None,
+            "argv": [flat["harness"], *arguments],
+            "environment_names": [],
+            "runtime_home": flat["runtime_home"],
+            "runtime_ownership": "owned",
+            "executable": None,
+        },
+        "workspace_id": flat["workspace_id"],
+        "tab_id": flat["tab_id"],
+        "pane_id": flat["pane_id"],
+        "session_agent": flat["session_agent"],
+        "session_value": flat["session_value"],
+        "startup_warning": flat["startup_warning"],
+        "effective_reasoning_effort": flat["effective_reasoning_effort"],
+        "error": flat["error"],
+        "goal": flat["goal"],
+        "goal_delivery": flat["goal_delivery"],
+        "goal_session_id": flat["goal_session_id"],
+        "goal_command": flat["goal_command"],
+        "goal_messages": flat["goal_messages"],
+        "goal_message_id": flat["goal_message_id"],
+        "paused": flat["paused"],
+        "pane_reported_by_agentctl": flat["pane_reported_by_agentctl"],
+        "custom_process_identity": flat["custom_process_identity"],
+        "foreign_shell_identity": flat["foreign_shell_identity"],
+        "runner_identity": None,
+        "extensions": {},
+    }
+
+
 def test_named_workers_share_workspace_but_never_reuse_tabs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     first = manager.start("one", cwd=str(tmp_path), harness="codex", brief="start here")
@@ -215,6 +265,279 @@ def test_named_workers_share_workspace_but_never_reuse_tabs(tmp_path: Path, monk
     with pytest.raises(AgentDeliveryError, match="already registered"):
         manager.start("one", cwd=str(tmp_path))
     assert len(fake.launched) == 2
+
+
+def test_launch_only_v2_record_is_read_and_rewritten_without_flat_duplicates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    path = manager.registry / "worker" / "agent.json"
+    nested = _nested_v2_record(json.loads(path.read_text(encoding="utf-8")))
+    path.write_text(json.dumps(nested), encoding="utf-8")
+
+    record = manager.get("worker")
+    assert record.harness == "codex"
+    assert record.arguments == ["--no-alt-screen"]
+    assert manager.status("worker")["launch"] == nested["launch"]
+    assert manager.pause("worker", paused=True)["paused"] is True
+
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["schema"] == "agentctl-session/v2"
+    assert stored["launch"] == nested["launch"]
+    for duplicate in ("harness", "cwd", "adapter", "mode", "backend", "arguments"):
+        assert duplicate not in stored
+
+
+def test_launch_only_v3_record_decodes_nested_goal_and_native_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    path = manager.registry / "worker" / "agent.json"
+    nested = _nested_v2_record(json.loads(path.read_text(encoding="utf-8")))
+    nested["schema"] = "agentctl-session/v3"
+    session_agent = nested.pop("session_agent")
+    session_value = nested.pop("session_value")
+    nested["native_session"] = {
+        "schema": "agentctl-native-session/v1",
+        "agent": session_agent,
+        "value": session_value,
+        "source": "observed",
+    }
+    nested["goal"] = {
+        "schema": "agentctl-goal/v1",
+        "objective": nested.pop("goal"),
+        "message_id": nested.pop("goal_message_id"),
+        "native_command": nested.pop("goal_command"),
+    }
+    for key in ("goal_delivery", "goal_session_id", "goal_messages"):
+        nested.pop(key)
+    path.write_text(json.dumps(nested), encoding="utf-8")
+
+    record = manager.get("worker")
+    assert record.harness == "codex"
+    assert record.session_agent == "codex"
+    assert record.session_value == "session-1"
+    assert record.to_document() == nested
+
+
+@pytest.mark.parametrize("source", ["observed", "asserted"])
+def test_v2_observed_and_asserted_session_fields_round_trip_separately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    path = manager.registry / "worker" / "agent.json"
+    nested = _nested_v2_record(json.loads(path.read_text(encoding="utf-8")))
+    if source == "observed":
+        nested["session_agent"] = "codex"
+        nested["session_value"] = "observed-session"
+        nested["goal_session_id"] = None
+    else:
+        nested["session_agent"] = None
+        nested["session_value"] = None
+        nested["goal_session_id"] = "asserted-session"
+    path.write_text(json.dumps(nested), encoding="utf-8")
+
+    record = manager.get("worker")
+    assert record.to_document() == nested
+    target = record.target()
+    if source == "observed":
+        assert target.session_agent == "codex"
+        assert target.session_value == "observed-session"
+    else:
+        assert target.session_agent is None
+        assert target.session_value is None
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_status"),
+    [("asserted", "idle"), ("observed", "unknown")],
+)
+def test_v3_native_session_source_controls_live_routing_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    source: str, expected_status: str,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    path = manager.registry / "worker" / "agent.json"
+    nested = _nested_v2_record(json.loads(path.read_text(encoding="utf-8")))
+    nested["schema"] = "agentctl-session/v3"
+    nested.pop("session_agent")
+    nested.pop("session_value")
+    nested["native_session"] = {
+        "schema": "agentctl-native-session/v1",
+        "agent": "codex",
+        "value": "asserted-session",
+        "source": source,
+    }
+    nested["goal"] = {
+        "schema": "agentctl-goal/v1",
+        "objective": nested.pop("goal"),
+        "message_id": nested.pop("goal_message_id"),
+        "native_command": nested.pop("goal_command"),
+    }
+    for key in ("goal_delivery", "goal_session_id", "goal_messages"):
+        nested.pop(key)
+    path.write_text(json.dumps(nested), encoding="utf-8")
+    fake.infos["w1:p1"] = replace(
+        fake.infos["w1:p1"], session_agent=None, session_value=None,
+    )
+
+    status = manager.status("worker")
+    assert status["agent_status"] == expected_status
+    if source == "asserted":
+        assert status["probe_error"] is None
+    else:
+        assert "expected exactly one live pane" in str(status["probe_error"])
+
+
+def test_v3_bind_session_persists_one_asserted_native_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    path = manager.registry / "worker" / "agent.json"
+    nested = _nested_v2_record(json.loads(path.read_text(encoding="utf-8")))
+    nested["schema"] = "agentctl-session/v3"
+    nested.pop("session_agent")
+    nested.pop("session_value")
+    nested["native_session"] = None
+    nested["goal"] = {
+        "schema": "agentctl-goal/v1",
+        "objective": nested.pop("goal"),
+        "message_id": nested.pop("goal_message_id"),
+        "native_command": nested.pop("goal_command"),
+    }
+    for key in ("goal_delivery", "goal_session_id", "goal_messages"):
+        nested.pop(key)
+    path.write_text(json.dumps(nested), encoding="utf-8")
+    fake.infos["w1:p1"] = replace(
+        fake.infos["w1:p1"], session_agent=None, session_value=None,
+    )
+
+    assert manager.bind_session("worker", "manual-session")["source"] == "explicit"
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["native_session"] == {
+        "schema": "agentctl-native-session/v1",
+        "agent": "codex",
+        "value": "manual-session",
+        "source": "asserted",
+    }
+    reloaded = manager.get("worker")
+    assert reloaded.target().session_agent is None
+    assert reloaded.target().session_value is None
+
+
+def test_nested_launch_rejects_duplicate_flat_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    path = manager.registry / "worker" / "agent.json"
+    nested = _nested_v2_record(json.loads(path.read_text(encoding="utf-8")))
+    nested["harness"] = "claude"
+    path.write_text(json.dumps(nested), encoding="utf-8")
+    with pytest.raises(AgentDeliveryError, match="agentctl-session/v2 fields"):
+        manager.get("worker")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        (lambda row: row.update(lifecycle="banana"), "lifecycle"),
+        (
+            lambda row: cast(dict[str, object], row["launch"]).update(
+                runtime_ownership="foreign",
+            ),
+            "ownership or adapter",
+        ),
+        (
+            lambda row: cast(dict[str, object], row["launch"]).update(
+                argv=["claude", "--no-alt-screen"],
+            ),
+            "launch argv",
+        ),
+        (
+            lambda row: cast(dict[str, object], row["launch"]).update(
+                profile=17,
+            ),
+            "launch contract",
+        ),
+        (
+            lambda row: row.update(runner_identity={"pid": 1}),
+            "runner identity",
+        ),
+        (
+            lambda row: row.update(session_agent="claude"),
+            "native session identity",
+        ),
+    ],
+)
+def test_nested_launch_rejects_malformed_runtime_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    mutation: Callable[[dict[str, object]], None], error: str,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    path = manager.registry / "worker" / "agent.json"
+    nested = _nested_v2_record(json.loads(path.read_text(encoding="utf-8")))
+    mutation(nested)
+    path.write_text(json.dumps(nested), encoding="utf-8")
+
+    with pytest.raises(AgentDeliveryError, match=error):
+        manager.stop("worker", expected_token=cast(str, nested["token"]))
+    assert fake.closed == []
+
+
+def test_nested_launch_rejects_nonnull_interactive_permission_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    path = manager.registry / "worker" / "agent.json"
+    nested = _nested_v2_record(json.loads(path.read_text(encoding="utf-8")))
+    launch = cast(dict[str, object], nested["launch"])
+    launch["schema"] = "agentctl-launch/v2"
+    launch["permission_mode"] = "bypass"
+    path.write_text(json.dumps(nested), encoding="utf-8")
+    with pytest.raises(AgentDeliveryError, match="launch contract"):
+        manager.get("worker")
+
+
+def test_running_nested_muse_without_process_identity_cannot_close_pane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="muse")
+    path = manager.registry / "worker" / "agent.json"
+    nested = _nested_v2_record(json.loads(path.read_text(encoding="utf-8")))
+    assert nested["custom_process_identity"] is not None
+    nested["custom_process_identity"] = None
+    path.write_text(json.dumps(nested), encoding="utf-8")
+
+    with pytest.raises(AgentDeliveryError, match="no runtime process identity"):
+        manager.stop("worker", expected_token=cast(str, nested["token"]))
+    assert fake.closed == []
+
+
+def test_list_reports_malformed_row_without_hiding_healthy_sessions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    invalid = manager.registry / "broken"
+    invalid.mkdir(mode=0o700)
+    (invalid / "agent.json").write_text("{}", encoding="utf-8")
+    (invalid / "agent.json").chmod(0o600)
+
+    rows = manager.list()
+    assert [row["name"] for row in rows] == ["broken", "worker"]
+    assert rows[0]["record_error"] is True
+    assert rows[0]["agent_status"] == "unknown"
+    assert "invalid agent record field name" in str(rows[0]["probe_error"])
+    assert rows[1]["agent_status"] == "idle"
 
 
 def test_harness_arguments_preserve_literals_without_implicit_permission_changes() -> None:
@@ -512,6 +835,47 @@ def test_busy_delivery_stays_pending_and_can_drain(tmp_path: Path, monkeypatch: 
     fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="done")
     assert len(manager.drain("worker").delivered) == 1
     assert fake.submitted == ["next turn"]
+
+
+def test_verified_muse_yolo_composer_reports_idle_staged_and_paused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="muse")
+    fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="done")
+    divider = "─" * 40
+    footer = "kiki · xhigh · /work · YOLO\n"
+    screen = f"old transcript\n{divider}\n❯\n{divider}\n{footer}"
+    monkeypatch.setattr(fake, "read", lambda *_args, **_kwargs: screen)
+    assert manager.status("worker")["agent_status"] == "idle"
+
+    screen = screen.replace("❯\n", "❯ queued owner prompt\n")
+    assert manager.status("worker")["agent_status"] == "staged"
+
+    screen = screen.replace(
+        "❯ queued owner prompt\n", "❯\n",
+    ).replace(footer, f"Goal (paused)\n{footer}")
+    assert manager.status("worker")["agent_status"] == "paused"
+
+
+def test_yolo_composer_status_is_readable_but_input_requires_process_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="muse")
+    record = manager.get("worker")
+    fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="done")
+    divider = "─" * 40
+    screen = (
+        f"Muse Code 1.4.0\nprior Auto-review note\n{divider}\n❯\n{divider}\n"
+        "kiki · xhigh · /work · YOLO\n"
+    )
+    monkeypatch.setattr(fake, "read", lambda *_args, **_kwargs: screen)
+    client = _WorkspaceClient(cast(HerdrClient, fake), record)
+    assert client.pane_info("w1:p1").status == "idle"
+    with pytest.raises(HerdrUnavailable, match="effect-coupled process-generation"):
+        client.prompt_agent("w1:p1", "must remain pending")
+    assert fake.submitted == []
 
 
 def test_session_replacement_and_extra_panes_refuse_mutation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
