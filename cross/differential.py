@@ -166,6 +166,7 @@ _AMBIENT_CASE_CONTROL_ENV = frozenset(
     {
         "DAGRUN_ADMISSION_BUDGET_BYTES",
         "DAGRUN_ADMISSION_HEADROOM_BYTES",
+        "AGENT_UTILS_VALIDATION_JOBS",
         "DAGRUN_CAPTURE_MAX_BYTES",
         "DAGRUN_CONTAINER_CLASS",
         "DAGRUN_COPIES",
@@ -213,6 +214,52 @@ _TERMINAL_STEP_DURATION_RE = re.compile(
 )
 
 CPU_FOOTPRINT_GUEST = os.path.join(REPO_ROOT, "cross", "cpu_footprint_guest.py")
+
+#: The validation graph uses dagrun's ``jobs_env`` channel to carry the width actually admitted
+#: for this nested harness. A direct invocation has a full-strength width of up to eight;
+#: a larger ambient value cannot make the test more expensive than that authored preference.
+VALIDATION_JOBS_ENV = "AGENT_UTILS_VALIDATION_JOBS"
+DEFAULT_VALIDATION_JOBS = 8
+
+
+def _effective_validation_jobs() -> int:
+    """Return this process's effective whole-core affinity/quota budget."""
+
+    python_root = os.path.join(REPO_ROOT, "py")
+    inserted = python_root not in sys.path
+    if inserted:
+        sys.path.insert(0, python_root)
+    try:
+        from dagrun.profile_enrich import container_core_budget
+
+        return container_core_budget()
+    finally:
+        if inserted:
+            sys.path.remove(python_root)
+
+
+def _validation_jobs(
+    env: Mapping[str, str] | None = None, *, effective_jobs: int | None = None
+) -> int:
+    """Return the portable CPU-bandwidth fixture width admitted by the outer runner."""
+
+    environ = os.environ if env is None else env
+    effective = _effective_validation_jobs() if effective_jobs is None else effective_jobs
+    if effective < 1:
+        raise ValueError(f"effective CPU budget must be positive, got {effective}")
+    raw = environ.get(VALIDATION_JOBS_ENV)
+    if raw is None:
+        return min(effective, DEFAULT_VALIDATION_JOBS)
+    if not raw or not raw.isascii() or not raw.isdecimal():
+        raise ValueError(
+            f"{VALIDATION_JOBS_ENV} must be a positive integer, got {raw!r}"
+        )
+    jobs = int(raw)
+    if jobs < 1:
+        raise ValueError(
+            f"{VALIDATION_JOBS_ENV} must be a positive integer, got {raw!r}"
+        )
+    return min(jobs, effective, DEFAULT_VALIDATION_JOBS)
 
 
 @dataclass(frozen=True)
@@ -7617,32 +7664,58 @@ def compare_jobs_env_width(py: list[str], rs: list[str], rep: Report) -> None:
                 )
 
 
-def compare_boxed_cpu_bandwidth(py: list[str], rs: list[str], rep: Report) -> None:
+def _boxed_cpu_bandwidth_case(
+    validation_jobs: int, *, dag_path: str, delegated: bool
+) -> tuple[dict[str, object], tuple[str, ...], CpuFootprintFacts, tuple[float, ...]]:
+    """Build the width-scaled live fixture and the evidence it must produce."""
+
+    if validation_jobs < 1:
+        raise ValueError("validation_jobs must be positive")
+    dag = _cpu_guest_dag(
+        (validation_jobs, validation_jobs),
+        duration_s=1.75,
+        # At top level the shared run scope is one level above a step. Under the validation
+        # graph, the nested scheduler's run root adds one level and the parent-owned delegated
+        # step is the shared aggregate bandwidth boundary.
+        cgroup_parent_levels=2 if delegated else 1,
+        barrier_participants=2,
+    )
+    args = (
+        "run",
+        "--dag",
+        dag_path,
+        "-s2",
+        f"-j{validation_jobs}",
+        "-q",
+        NOPROF,
+        NOFB,
+    )
+    facts = CpuFootprintFacts(
+        completed_steps=2,
+        workers_per_step=(validation_jobs, validation_jobs),
+        max_live_steps=2,
+        max_live_workers=validation_jobs * 2,
+    )
+    return dag, args, facts, (float(validation_jobs),)
+
+
+def compare_boxed_cpu_bandwidth(
+    py: list[str], rs: list[str], rep: Report, *, validation_jobs: int = DEFAULT_VALIDATION_JOBS
+) -> None:
     """Anchor ``-j`` / ``--max-cpus`` to live quota and aggregate CPU counters."""
 
     with tempfile.TemporaryDirectory(prefix="dagrun-cross-boxed-cpu-") as td:
         dag_path = os.path.join(td, "dag.json")
-        # Each runner-controlled step receives the full per-step ceiling J=8. Both steps must be
-        # live together under -s2, so their sixteen requested workers exceed J in aggregate while
-        # the parent cgroup's long-window CPU bandwidth remains bounded to eight core-equivalents.
-        Path(dag_path).write_text(
-            json.dumps(
-                _cpu_guest_dag(
-                    (8, 8),
-                    duration_s=1.75,
-                    # At top level the shared run scope is one level above a step. Under the
-                    # validation graph, the nested scheduler's run root adds one level and the
-                    # parent-owned delegated step is the shared aggregate bandwidth boundary.
-                    cgroup_parent_levels=2 if _inside_delegated_harness() else 1,
-                    barrier_participants=2,
-                )
-            ),
-            encoding="utf-8",
+        # Each runner-controlled step receives the admitted per-step ceiling J. Both steps must be
+        # live together under -s2, so their 2J requested workers exceed J in aggregate while the
+        # parent cgroup's long-window CPU bandwidth remains bounded to J core-equivalents.
+        dag, args, expected_facts, expected_quota = _boxed_cpu_bandwidth_case(
+            validation_jobs,
+            dag_path=dag_path,
+            delegated=_inside_delegated_harness(),
         )
+        Path(dag_path).write_text(json.dumps(dag), encoding="utf-8")
         logs = {name: os.path.join(td, f"boxed-{name}.jsonl") for name in ("py", "rs")}
-        args = (
-            "run", "--dag", dag_path, "-s2", "-j8", "-q", NOPROF, NOFB,
-        )
         extra = {
             name: {
                 "CPU_FOOTPRINT_OUTPUT": path,
@@ -7690,14 +7763,11 @@ def compare_boxed_cpu_bandwidth(py: list[str], rs: list[str], rep: Report) -> No
                     events, min_window_periods=10, scheduler_slack_usec=100_000
                 )
                 normalized[name] = (
-                    facts.completed_steps == 2,
-                    facts.workers_per_step == (8, 8),
-                    facts.max_live_steps == 2,
-                    facts.max_live_workers == 16,
+                    facts == expected_facts,
                     limits.ok,
                     bandwidth.checkable,
                     bandwidth.ok,
-                    bandwidth.quota_cores == (8.0,),
+                    bandwidth.quota_cores == expected_quota,
                 )
                 details[name] = {
                     "facts": facts,
@@ -7710,7 +7780,7 @@ def compare_boxed_cpu_bandwidth(py: list[str], rs: list[str], rep: Report) -> No
         except (OSError, ValueError) as exc:
             rep.bad("boxed-cpu-bandwidth", f"could not analyze boxed guest evidence: {exc}")
             return
-        expected = (True,) * 8
+        expected = (True,) * 5
         if normalized.get("py") != normalized.get("rs"):
             rep.bad("boxed-cpu-bandwidth", f"normalized={normalized}; details={details}")
         elif normalized.get("py") != expected:
@@ -7795,7 +7865,9 @@ def compare_pin_run(py: list[str], rs: list[str], rep: Report) -> None:
                 rep.bad("pin-run:signal-status", f"py={po}\nrs={ro}")
 
 
-def compare_dagrun(rand_count: int, seed: int) -> int:
+def compare_dagrun(
+    rand_count: int, seed: int, *, validation_jobs: int = DEFAULT_VALIDATION_JOBS
+) -> int:
     tool = "dagrun"
     py = py_command()
     rs = rs_command(tool)
@@ -7846,7 +7918,7 @@ def compare_dagrun(rand_count: int, seed: int) -> int:
     compare_sweep_report_collisions(py, rs, rep)
     compare_args_stress(py, rs, rep)
     compare_run_parallel_limits(py, rs, rep)
-    compare_boxed_cpu_bandwidth(py, rs, rep)
+    compare_boxed_cpu_bandwidth(py, rs, rep, validation_jobs=validation_jobs)
     compare_operator_build_width(py, rs, rep)
     compare_jobs_env_width(py, rs, rep)
     compare_pin_run(py, rs, rep)
@@ -12068,8 +12140,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     tool = str(ns.tool)
     rand_count = int(ns.random)
     seed = int(ns.seed)
+    try:
+        validation_jobs = _validation_jobs() if tool in ("dagrun", "all") else None
+    except ValueError as exc:
+        parser.error(str(exc))
     if tool == "dagrun":
-        return compare_dagrun(rand_count, seed)
+        assert validation_jobs is not None
+        return compare_dagrun(rand_count, seed, validation_jobs=validation_jobs)
     if tool == "cpuset-alloc":
         return compare_cpuset_alloc()
     if tool == "tick-hub":
@@ -12083,7 +12160,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if tool == "agentctl":
         return compare_agentctl(py_command_for(tool), rs_command(tool))
     results = (
-        compare_dagrun(rand_count, seed),
+        compare_dagrun(
+            rand_count,
+            seed,
+            validation_jobs=(
+                validation_jobs if validation_jobs is not None else DEFAULT_VALIDATION_JOBS
+            ),
+        ),
         compare_cpuset_alloc(),
         compare_tick_hub(rand_count, seed),
         compare_pr_landing_planner(rand_count, seed),

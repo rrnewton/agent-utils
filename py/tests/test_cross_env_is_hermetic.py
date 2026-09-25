@@ -118,6 +118,69 @@ def test_explicit_fixture_values_win_after_the_ambient_scrub(
     assert env["DAGRUN_OUTER_MEMORY_MAX_BYTES"] == "200"
 
 
+@pytest.mark.parametrize(
+    ("environment", "expected"),
+    [
+        ({}, 8),
+        ({"AGENT_UTILS_VALIDATION_JOBS": "1"}, 1),
+        ({"AGENT_UTILS_VALIDATION_JOBS": "4"}, 4),
+        ({"AGENT_UTILS_VALIDATION_JOBS": "64"}, 8),
+    ],
+)
+def test_boxed_bandwidth_width_follows_the_outer_validation_budget(
+    environment: dict[str, str], expected: int
+) -> None:
+    assert _differential()._validation_jobs(environment, effective_jobs=16) == expected
+
+
+@pytest.mark.parametrize("value", ("", "0", "-1", "four", " 4", "+4", "٤"))
+def test_invalid_outer_validation_budget_is_refused(value: str) -> None:
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        _differential()._validation_jobs(
+            {"AGENT_UTILS_VALIDATION_JOBS": value}, effective_jobs=16
+        )
+
+
+def test_standalone_validation_width_obeys_effective_affinity_and_quota() -> None:
+    differential = _differential()
+    assert differential._validation_jobs({}, effective_jobs=4) == 4
+    assert differential._validation_jobs({}, effective_jobs=64) == 8
+
+
+def test_dagrun_main_forwards_the_admitted_validation_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    differential = _differential()
+    observed: dict[str, int] = {}
+
+    def compare(_random: int, _seed: int, *, validation_jobs: int = 8) -> int:
+        observed["validation_jobs"] = validation_jobs
+        return 0
+
+    monkeypatch.setenv("AGENT_UTILS_VALIDATION_JOBS", "4")
+    monkeypatch.setattr(differential, "_effective_validation_jobs", lambda: 16)
+    monkeypatch.setattr(differential, "compare_dagrun", compare)
+
+    assert differential.main(["--tool", "dagrun"]) == 0
+    assert observed == {"validation_jobs": 4}
+
+
+def test_boxed_cpu_bandwidth_case_scales_every_width_observable() -> None:
+    differential = _differential()
+    dag, args, expected_facts, expected_quota = differential._boxed_cpu_bandwidth_case(
+        4, dag_path="fixture.json", delegated=True
+    )
+    steps = dag["steps"]
+
+    assert args[args.index("--dag") + 1] == "fixture.json"
+    assert "-j4" in args
+    assert len(steps) == 2
+    assert all(step["hint"]["preferred_inner_jobs"] == 4 for step in steps)
+    assert all("--cgroup-parent-levels 2" in step["cmd"] for step in steps)
+    assert expected_facts == differential.CpuFootprintFacts(2, (4, 4), 2, 8)
+    assert expected_quota == (4.0,)
+
+
 def test_run_output_normalization_removes_only_terminal_elapsed_time() -> None:
     differential = _differential()
     python_output = (

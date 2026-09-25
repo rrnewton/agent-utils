@@ -3,9 +3,10 @@ description: Shipped DAG examples under both implementations
 steps:
   - group: run
     job: python
-    desc: every shipped example runs under Python dagrun
+    desc: every shipped example behaves as documented under Python dagrun
     cmd: python3 scripts/check_dagrun_examples.py --engine python
     jobs_flag: ""
+    jobs_env: AGENT_UTILS_VALIDATION_JOBS
     labels: [validation-cross, component-dagrun]
     delegated_children: true
     timeout: 600
@@ -13,8 +14,8 @@ steps:
     hint: &examples_hint
       est_duration_s: 30
       classification: latency-bound
-      # Example 05 deliberately proves a fixed-width inner job is refused below eight CPUs.
-      # The delegated outer envelope must make that advertised width physically available.
+      # Eight permits every example to run. On a narrower runner jobs_env tells this harness the
+      # honest budget, and example 05 proves its documented fixed-width refusal instead.
       preferred_inner_jobs: 8
       rss_baseline_bytes: 1073741824
       # Example 08 explicitly models a 16 GiB clean-build worker. The parent must delegate that
@@ -24,9 +25,10 @@ steps:
 
   - group: run
     job: rust
-    desc: every shipped example runs under Rust dagrun
+    desc: every shipped example behaves as documented under Rust dagrun
     cmd: python3 scripts/check_dagrun_examples.py --engine rust
     jobs_flag: ""
+    jobs_env: AGENT_UTILS_VALIDATION_JOBS
     labels: [validation-cross, component-dagrun]
     delegated_children: true
     timeout: 600

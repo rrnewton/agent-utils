@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import importlib.util
+import os
 import shlex
 import subprocess
 import sys
 from collections import Counter
 from pathlib import Path
+from types import ModuleType
+
+import pytest
 
 from dagrun.io import dag_from_path
+from dagrun.scheduler import cap_config_max_cpus
 
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
@@ -21,6 +27,17 @@ from dagrun.cli import _select_steps_by_labels  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DOCS_STEP = "repository.docs.embedded-userguides"
 RUST_BUILD_STEP = "repository.build.rust-launchers"
+
+
+def _example_checker() -> ModuleType:
+    spec = importlib.util.spec_from_file_location(
+        "_dagrun_example_checker_under_test", SCRIPTS / "check_dagrun_examples.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _listed(command: str) -> set[str]:
@@ -145,7 +162,7 @@ def test_wrkslots_component_selection_includes_every_lifecycle_shard() -> None:
     assert all("component-wrkslots" in step.labels for step in lifecycle)
 
 
-def test_every_example_runs_under_both_dagrun_engines() -> None:
+def test_every_example_is_validated_under_both_dagrun_engines() -> None:
     config = dag_from_path(REPO_ROOT / "validation.dag.yaml")
     example_steps = [
         step for step in config.steps if "scripts/check_dagrun_examples.py" in step.cmd
@@ -155,6 +172,171 @@ def test_every_example_runs_under_both_dagrun_engines() -> None:
         engine for step in example_steps for engine in _flag_values(step.cmd, "--engine")
     ) == Counter({"python": 1, "rust": 1})
     assert all(step.delegated_children for step in example_steps)
+    assert all(step.jobs_env == "AGENT_UTILS_VALIDATION_JOBS" for step in example_steps)
+
+    differential = config.by_tag()["cross.dagrun.differential"]
+    assert differential.jobs_env == "AGENT_UTILS_VALIDATION_JOBS"
+    assert differential.hint.preferred_inner_jobs == 8
+    assert all(step.hint.preferred_inner_jobs == 8 for step in example_steps)
+
+
+def test_full_validation_graph_can_be_honestly_capped_to_four_cpus() -> None:
+    capped = cap_config_max_cpus(dag_from_path(REPO_ROOT / "validation.dag.yaml"), 4)
+    oversized = [
+        (step.tag, step.hint.preferred_inner_jobs)
+        for step in capped.steps
+        if step.skip_reason is None
+        and step.hint.preferred_inner_jobs is not None
+        and step.hint.preferred_inner_jobs > 4
+    ]
+    assert oversized == []
+
+
+def test_fixed_width_example_has_the_documented_narrow_runner_refusal() -> None:
+    environment = os.environ.copy()
+    python_path = str(REPO_ROOT / "py")
+    inherited = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        os.pathsep.join((python_path, inherited)) if inherited else python_path
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "dagrun",
+            "run",
+            "--dag",
+            "examples/05-inner-jobs.json",
+            "--max-cpus",
+            "4",
+            "--unsafe-no-cgroups",
+            "--no-profile",
+            "--no-profile-feedback",
+        ],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert "cannot lower guest parallelism" in completed.stderr
+    assert "build.app (preferred_inner_jobs=8)" in completed.stderr
+
+
+def test_example_checker_accepts_the_documented_narrow_refusal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    checker = _example_checker()
+    example = tmp_path / "05-inner-jobs.json"
+    example.write_text("{}", encoding="utf-8")
+    calls: list[tuple[list[str], dict[str, object]]] = []
+    profile_widths: list[int] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(
+            argv,
+            2,
+            stdout="",
+            stderr=(
+                "dagrun: run: --max-cpus 4 cannot lower guest parallelism for step(s) "
+                "that offer no width channel: build.app (preferred_inner_jobs=8)"
+            ),
+        )
+
+    def fake_profile(
+        _command: list[str], _environment: dict[str, str], *, validation_jobs: int
+    ) -> None:
+        profile_widths.append(validation_jobs)
+
+    monkeypatch.setenv("AGENT_UTILS_VALIDATION_JOBS", "4")
+    monkeypatch.setattr(checker, "_effective_validation_jobs", lambda: 16)
+    monkeypatch.setattr(checker, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(checker, "_examples", lambda: [example])
+    monkeypatch.setattr(checker, "_engine", lambda _name: (["fake-dagrun"], {}))
+    monkeypatch.setattr(checker.subprocess, "run", fake_run)
+    monkeypatch.setattr(checker, "_profile_smoke", fake_profile)
+
+    assert checker.main(["--engine", "python"]) == 0
+    assert calls[0][0][-2:] == ["--max-cpus", "4"]
+    assert calls[0][1]["capture_output"] is True
+    assert profile_widths == [4]
+
+
+def test_example_checker_runs_fixed_width_example_at_full_strength(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    checker = _example_checker()
+    example = tmp_path / "05-inner-jobs.json"
+    example.write_text("{}", encoding="utf-8")
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setenv("AGENT_UTILS_VALIDATION_JOBS", "8")
+    monkeypatch.setattr(checker, "_effective_validation_jobs", lambda: 16)
+    monkeypatch.setattr(checker, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(checker, "_examples", lambda: [example])
+    monkeypatch.setattr(checker, "_engine", lambda _name: (["fake-dagrun"], {}))
+    monkeypatch.setattr(checker.subprocess, "run", fake_run)
+    monkeypatch.setattr(checker, "_profile_smoke", lambda *args, **kwargs: None)
+
+    assert checker.main(["--engine", "rust"]) == 0
+    assert calls[0][0][-2:] == ["--max-cpus", "8"]
+    assert calls[0][1]["capture_output"] is False
+
+
+def test_example_checker_rejects_a_post_spawn_fixed_width_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    checker = _example_checker()
+    example = tmp_path / "05-inner-jobs.json"
+    example.write_text("{}", encoding="utf-8")
+
+    def fake_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            argv,
+            2,
+            stdout="[build] make -j8 build\n",
+            stderr=(
+                "dagrun: run: --max-cpus 4 cannot lower guest parallelism for step(s) "
+                "that offer no width channel: build.app (preferred_inner_jobs=8)"
+            ),
+        )
+
+    monkeypatch.setenv("AGENT_UTILS_VALIDATION_JOBS", "4")
+    monkeypatch.setattr(checker, "_effective_validation_jobs", lambda: 16)
+    monkeypatch.setattr(checker, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(checker, "_examples", lambda: [example])
+    monkeypatch.setattr(checker, "_engine", lambda _name: (["fake-dagrun"], {}))
+    monkeypatch.setattr(checker.subprocess, "run", fake_run)
+
+    assert checker.main(["--engine", "python"]) == 1
+
+
+def test_example_checker_width_parser_is_strict_and_effective_cap_aware() -> None:
+    checker = _example_checker()
+    assert checker._validation_jobs({}, effective_jobs=4) == 4
+    assert checker._validation_jobs(
+        {"AGENT_UTILS_VALIDATION_JOBS": "3"}, effective_jobs=4
+    ) == 3
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        checker._validation_jobs(
+            {"AGENT_UTILS_VALIDATION_JOBS": "+4"}, effective_jobs=16
+        )
+
+
+def test_example_checker_strips_its_width_control_from_nested_engines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checker = _example_checker()
+    monkeypatch.setenv("AGENT_UTILS_VALIDATION_JOBS", "4")
+    _command, environment = checker._engine("rust")
+    assert "AGENT_UTILS_VALIDATION_JOBS" not in environment
 
 
 def _selected_tags_for_paths(paths: list[str]) -> set[str]:
