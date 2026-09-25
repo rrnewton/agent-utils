@@ -1,0 +1,25 @@
+---
+title: 'gchat-channel-enrollment: preserve runtime space and thread registration'
+status: open
+priority: 0
+issue_type: task
+labels:
+- vibe-talk
+- channels
+depends_on:
+  agent-utils-1: parent-child
+created_at: 2026-09-25T01:32:02.090624506+00:00
+updated_at: 2026-09-25T01:33:45.760944602+00:00
+---
+
+# Description
+
+[gpt-5.6-sol] Verify the runtime Add channel flow against the intended deployment for both whole-space and thread-level sources, including persistence and removal.
+
+# Acceptance Criteria
+
+A space URL and a thread or message URL can each be added from Settings, survive restart, render messages, and be removed without editing configuration or restarting manually.
+
+# Notes
+
+The provider-neutral application registration API and Settings UI already exist. Remaining work is intended-host integration proof for persisted whole-space and thread-level sources.
