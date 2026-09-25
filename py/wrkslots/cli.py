@@ -31561,12 +31561,25 @@ def _direct_process_identity_matches(
                     ) from exc
 
         if vanished or not _process_generation_is_current(process):
-            continue
-        if needs_fallback:
-            fallback.append(process)
+            if process_link_matches or process_inode_matches:
+                # A child forked before the exit, outside the snapshot, can
+                # still hold what this process was seen holding.
+                raise Refusal(
+                    f"PID {process.pid} identity changed after direct census "
+                    "matched a selected path; the selected path may still be "
+                    "in use"
+                )
+            # A socket inode alone names no path. A still-live socket bound
+            # inside a target has no current holder in the namespace table
+            # that lists it, which the Unix association refuses. Recording
+            # this holder would instead make every socket it closed on exit
+            # look unaccounted there.
             continue
         link_matches.extend(process_link_matches)
         inode_matches.extend(process_inode_matches)
+        if needs_fallback:
+            fallback.append(process)
+            continue
         for inode in process_sockets:
             sockets.setdefault(inode, set()).add(process.pid)
 
