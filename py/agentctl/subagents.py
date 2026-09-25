@@ -4655,6 +4655,52 @@ class ManagedAgents:
             "runtime_preserved": True,
         }
 
+    def _complete_ordinary_stopped_custom_publication(
+        self, record: AgentRecord, *, expected_token: str | None,
+        expected_token_explicit: bool,
+    ) -> dict[str, object]:
+        """Archive a post-close stop prefix without ever touching a new pane."""
+        if not expected_token_explicit or expected_token is None:
+            raise AgentDeliveryError(
+                f"recovering stopped custom agent {record.name!r} requires --expected-token"
+            )
+        with self._pinned_agent_directory(record.name) as pinned:
+            snapshot = self._managed_record_snapshot(
+                pinned, expected_token=expected_token,
+            )
+            current = snapshot.record
+            if (current.lifecycle != "stopped"
+                    or current.launch.adapter != "herdr-pane"
+                    or current.launch.harness != "muse"
+                    or current.launch.mode != "interactive"
+                    or current.launch.backend != "herdr"
+                    or current.launch.runtime_ownership != "owned"
+                    or current.pane_id is None):
+                raise AgentDeliveryError(
+                    "ordinary stopped custom publication has inconsistent state"
+                )
+            # This invocation never closes a pane. A matching pane present at
+            # proof time is ambiguous; one appearing afterward is preserved.
+            if any(
+                pane.pane_id == current.pane_id for pane in self.client.panes()
+            ):
+                raise AgentDeliveryError(
+                    "stopped custom runtime still has a pane but no "
+                    "managed-dead retirement receipt; pane was preserved"
+                )
+            _archive, destination = self._archive_destination(current)
+            self._publish_pinned_directory(
+                pinned, destination, expected_record=snapshot.content,
+            )
+        return {
+            "name": current.name,
+            "archive": str(destination),
+            "pane_closed": False,
+            "tab_closed": None,
+            "ordinary_stop_recovered": True,
+            "runtime_preserved": False,
+        }
+
     def _retire_managed_dead_locked(
         self, record: AgentRecord, *, pinned: _PinnedAgentDirectory,
         expected_token: str | None,
@@ -4923,17 +4969,10 @@ class ManagedAgents:
                         record, expected_token=expected_token,
                         expected_token_explicit=expected_token_explicit,
                     )
-                # An ordinary stop writes lifecycle=stopped only after closing
-                # its pane.  A surviving route with no preservation receipt is
-                # ambiguous (deleted/tampered receipt or replacement terminal),
-                # so never fall through to the pane-closing path.
-                if record.pane_id is None or any(
-                    pane.pane_id == record.pane_id for pane in self.client.panes()
-                ):
-                    raise AgentDeliveryError(
-                        "stopped custom runtime still has a pane but no "
-                        "managed-dead retirement receipt; pane was preserved"
-                    )
+                return self._complete_ordinary_stopped_custom_publication(
+                    record, expected_token=expected_token,
+                    expected_token_explicit=expected_token_explicit,
+                )
             if record.launch.adapter == "herdr-foreign":
                 # This registry owns only delivery state.  Revalidate and retain
                 # one final snapshot, but never close, rename, signal, or

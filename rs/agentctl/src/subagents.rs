@@ -7369,6 +7369,59 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .unwrap_or_else(|| Self::managed_dead_result(&final_record.name, &destination)))
     }
 
+    fn complete_ordinary_stopped_custom_publication(
+        &self,
+        record: &AgentRecord,
+        expected_token: Option<&str>,
+    ) -> Result<Value> {
+        let expected_token = expected_token.ok_or_else(|| {
+            fail(format!(
+                "recovering stopped custom agent {:?} requires --expected-token",
+                record.name
+            ))
+        })?;
+        let pinned = self.pinned_agent_directory(&record.name)?;
+        let snapshot = self.managed_record_snapshot(&pinned, expected_token)?;
+        let current = snapshot.record;
+        if current.lifecycle != "stopped"
+            || current.launch.adapter != "herdr-pane"
+            || current.launch.harness != "muse"
+            || current.launch.mode != "interactive"
+            || current.launch.backend != "herdr"
+            || current.launch.runtime_ownership != "owned"
+            || current.pane_id.is_none()
+        {
+            return Err(fail(
+                "ordinary stopped custom publication has inconsistent state",
+            ));
+        }
+        let Some(pane_id) = current.pane_id.as_deref() else {
+            return Err(fail(
+                "ordinary stopped custom publication has no pane identity",
+            ));
+        };
+        if self
+            .client
+            .panes()?
+            .iter()
+            .any(|pane| pane.pane_id == pane_id)
+        {
+            return Err(fail(
+                "stopped custom runtime still has a pane but no managed-dead retirement receipt; pane was preserved",
+            ));
+        }
+        let (_archive, destination) = self.archive_destination(&current)?;
+        self.publish_pinned_directory(&pinned, &destination, &snapshot.content)?;
+        Ok(json!({
+            "name": current.name,
+            "archive": destination,
+            "pane_closed": false,
+            "tab_closed": Value::Null,
+            "ordinary_stop_recovered": true,
+            "runtime_preserved": false,
+        }))
+    }
+
     fn retire_managed_dead_locked_with<AfterWrite, AfterInstall>(
         &self,
         record: &AgentRecord,
@@ -7634,20 +7687,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     options.expected_token.as_deref(),
                 );
             }
-            let pane_id = record
-                .pane_id
-                .as_deref()
-                .ok_or_else(|| fail("stopped custom runtime has no recorded pane identity"))?;
-            if self
-                .client
-                .panes()?
-                .iter()
-                .any(|pane| pane.pane_id == pane_id)
-            {
-                return Err(fail(
-                    "stopped custom runtime still has a pane but no managed-dead retirement receipt; pane was preserved",
-                ));
-            }
+            return self.complete_ordinary_stopped_custom_publication(
+                &record,
+                options.expected_token.as_deref(),
+            );
         }
         if record.launch.adapter == "herdr-foreign" {
             let (live, info, presentation) = self.inspect_foreign(agent_name, &record)?;
@@ -7920,6 +7963,7 @@ mod tests {
                     change_record_token_on_read: AtomicBool::new(false),
                     add_null_shell_identity_on_read: AtomicBool::new(false),
                     replace_record_directory_on_read: AtomicBool::new(false),
+                    replace_after_empty_panes: AtomicBool::new(false),
                     fail_read: AtomicBool::new(false),
                     fail_shell_proof: AtomicBool::new(false),
                     shell_proof_mutation: AtomicU64::new(0),
@@ -8074,6 +8118,7 @@ mod tests {
         change_record_token_on_read: AtomicBool,
         add_null_shell_identity_on_read: AtomicBool,
         replace_record_directory_on_read: AtomicBool,
+        replace_after_empty_panes: AtomicBool,
         fail_read: AtomicBool,
         fail_shell_proof: AtomicBool,
         shell_proof_mutation: AtomicU64,
@@ -8123,7 +8168,17 @@ mod tests {
                     "pane query failed after allocation",
                 ));
             }
-            Ok(self.panes.lock().unwrap().clone())
+            let snapshot = self.panes.lock().unwrap().clone();
+            if snapshot.is_empty()
+                && self
+                    .replace_after_empty_panes
+                    .swap(false, Ordering::Relaxed)
+            {
+                let mut replacement = Fake::pane("owned");
+                replacement.terminal_id = Some("replacement-after-absence".to_owned());
+                self.panes.lock().unwrap().push(replacement);
+            }
+            Ok(snapshot)
         }
         fn pane_info(&self, pane: &str) -> AdapterResult<AgentPaneInfo> {
             self.pane_info_calls.fetch_add(1, Ordering::Relaxed);
@@ -13515,6 +13570,52 @@ mod tests {
         assert_eq!(result["pane_closed"], false);
         assert!(!active.exists());
         assert!(Path::new(result["archive"].as_str().unwrap()).is_dir());
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ordinary_stopped_muse_never_closes_pane_created_after_absence_proof() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        let started = manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let token = started["token"].as_str().unwrap().to_owned();
+        fixture.client.panes.lock().unwrap().clear();
+        let mut record = manager.load("worker").unwrap();
+        record.lifecycle = "stopped".to_owned();
+        manager.save(&record).unwrap();
+        fixture
+            .client
+            .replace_after_empty_panes
+            .store(true, Ordering::Relaxed);
+
+        let result = manager
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(token),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result["ordinary_stop_recovered"], true);
+        assert_eq!(result["pane_closed"], false);
+        assert_eq!(
+            fixture.client.panes.lock().unwrap()[0]
+                .terminal_id
+                .as_deref(),
+            Some("replacement-after-absence")
+        );
         assert!(fixture.client.closed.lock().unwrap().is_empty());
     }
 

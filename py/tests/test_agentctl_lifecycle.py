@@ -563,6 +563,39 @@ def test_stopped_muse_without_retirement_receipt_never_closes_surviving_pane(
     assert (manager.registry / "worker").is_dir()
 
 
+def test_ordinary_stopped_muse_never_closes_pane_created_after_absence_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    _pane, token = _make_owned_muse_dead(manager, fake, tmp_path)
+    replacement = replace(
+        fake.presentations[0], terminal_id="replacement-after-absence",
+    )
+    fake.presentations.clear()
+    record = manager.get("worker")
+    record.lifecycle = "stopped"
+    manager._save(record)
+    original_panes = fake.panes
+    injected = False
+
+    def panes_then_replace() -> tuple[Pane, ...]:
+        nonlocal injected
+        snapshot = original_panes()
+        if not injected:
+            injected = True
+            assert not snapshot
+            fake.presentations.append(replacement)
+        return snapshot
+
+    monkeypatch.setattr(fake, "panes", panes_then_replace)
+    result = manager.stop("worker", expected_token=token)
+
+    assert result["ordinary_stop_recovered"] is True
+    assert result["pane_closed"] is False
+    assert fake.presentations == [replacement]
+    assert fake.closed == []
+
+
 @pytest.mark.parametrize("swap_after", ["agent.json", "managed-dead-retirement.json"])
 def test_owned_dead_muse_archive_receipt_refuses_directory_replacement_between_reads(
     swap_after: str,
