@@ -16,7 +16,7 @@ const STARTTIME_INDEX: usize = 22 - 3;
 
 /// Every state byte Linux has exposed in field 3 of `/proc/PID/stat`.
 ///
-/// `W`, `x`, and `K` are retained for kernels on which those historical states can still be
+/// `W`, `x`, and `K` are retained for kernels on which those states can still be
 /// observed. Accepting arbitrary ASCII here is unsafe: a stray closing parenthesis can otherwise
 /// move a numeric field into the state slot and make a malformed record look structurally valid.
 fn linux_process_state(state: u8) -> bool {

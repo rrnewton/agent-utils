@@ -20,6 +20,8 @@ _PROCESS_STATES = frozenset(
 
 @dataclass(frozen=True)
 class ProcessStat:
+    """Validated process identity fields from one Linux procfs record."""
+
     pid: int
     starttime: int
     ppid: int

@@ -684,7 +684,7 @@ fn proc_descendants(root: u32) -> (Vec<u32>, bool) {
 }
 
 /// A sweep proves emptiness only when every process-table record was readable and no descendant
-/// remains in that snapshot. Whether a PID was newly discovered is irrelevant: a previously
+/// remains in that snapshot. Whether a PID was newly discovered is irrelevant: an already
 /// signalled descendant can remain alive (or unreaped) and must keep the bounded sweep incomplete.
 fn descendant_sweep_proves_empty(descendants: &[u32], snapshot_complete: bool) -> bool {
     snapshot_complete && descendants.is_empty()

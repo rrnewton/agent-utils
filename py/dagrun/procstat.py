@@ -41,7 +41,7 @@ def parse_process_stat(record: bytes | str) -> ProcessStat | None:
 
     ``bytes`` is the production form.  ``str`` remains accepted for synthetic
     callers and is encoded with ``surrogateescape``, which round-trips a procfs
-    record previously decoded that way.  Malformed or truncated records return
+    record decoded that way.  Malformed or truncated records return
     ``None`` rather than supplying a partial process identity.
     """
     try:
