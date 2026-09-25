@@ -1165,7 +1165,9 @@ def _load_unlocked() -> tuple[_RegistryRows, bool]:
     return out, migration_needed
 
 
-def _save_unlocked(agents: dict[str, AgentRecord]) -> None:
+def _registry_payload(
+    agents: dict[str, AgentRecord],
+) -> tuple[list[dict[str, object]], set[str]]:
     payload: list[dict[str, object]] = []
     emitted_current: set[str] = set()
     legacy_documents = (
@@ -1191,9 +1193,14 @@ def _save_unlocked(agents: dict[str, AgentRecord]) -> None:
             )
         payload.append(rec.to_dict())
         emitted_current.add(name)
-    tmp = REGISTRY.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, indent=2) + "\n")
-    os.replace(tmp, REGISTRY)
+    return payload, emitted_current
+
+
+def _save_unlocked(agents: dict[str, AgentRecord]) -> None:
+    payload, emitted_current = _registry_payload(agents)
+    _write_durable_json(
+        REGISTRY, payload, max_bytes=MAX_RUNTIME_REGISTRY_BYTES,
+    )
     # These were compatibility mirrors for writers predating the tagged row.
     # Delete them only after the canonical registry replacement succeeds.
     for name in emitted_current:
@@ -1212,9 +1219,12 @@ def registry_lock() -> Iterator[dict[str, AgentRecord]]:
     fd = os.open(str(LOCKFILE), os.O_CREAT | os.O_RDWR, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        agents, _ = _load_unlocked()
+        agents, migration_needed = _load_unlocked()
+        before = {name: rec.to_dict() for name, rec in agents.items()}
         yield agents
-        _save_unlocked(agents)
+        after = {name: rec.to_dict() for name, rec in agents.items()}
+        if migration_needed or after != before:
+            _save_unlocked(agents)
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
@@ -1241,6 +1251,19 @@ def read_registry() -> dict[str, AgentRecord]:
         agents, migration_needed = _load_unlocked()
         if migration_needed:
             _save_unlocked(agents)
+        return agents
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _read_registry_snapshot() -> dict[str, AgentRecord]:
+    """Read one coherent registry snapshot without migration or publication."""
+    BASE.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(LOCKFILE), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH)
+        agents, _migration_needed = _load_unlocked()
         return agents
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
@@ -1460,14 +1483,14 @@ def verify_runner_generation(
 ) -> AgentRecord:
     """Read and prove one runner generation under the registry lock."""
     valid_name = require_valid_name(name)
-    with registry_lock() as agents:
-        rec = agents.get(valid_name)
-        if rec is None:
-            raise AgentOperationError(
-                "unknown_agent", f"runner started for unknown agent {valid_name!r}",
-            )
-        require_runner_generation(rec, control_generation, launch_fingerprint)
-        return dataclasses.replace(rec)
+    agents = _read_registry_snapshot()
+    rec = agents.get(valid_name)
+    if rec is None:
+        raise AgentOperationError(
+            "unknown_agent", f"runner started for unknown agent {valid_name!r}",
+        )
+    require_runner_generation(rec, control_generation, launch_fingerprint)
+    return dataclasses.replace(rec)
 
 
 def reconcile_automation_pause(rec: AgentRecord, paused: bool) -> None:
@@ -1540,17 +1563,37 @@ def _sync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def _write_durable_json(path: Path, value: object) -> None:
+def _write_durable_json(
+    path: Path, value: object, *, max_bytes: int | None = None,
+) -> None:
+    serialized = (json.dumps(value) + "\n").encode("utf-8")
+    if max_bytes is not None and len(serialized) > max_bytes:
+        raise AgentOperationError(
+            "control_record_invalid",
+            f"{path.name} exceeds {max_bytes} bytes",
+        )
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
+    descriptor: int | None = None
     try:
-        with temporary.open("x") as stream:
-            json.dump(value, stream)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        offset = 0
+        while offset < len(serialized):
+            written = os.write(descriptor, serialized[offset:])
+            if written <= 0:
+                raise OSError("short durable control-record write")
+            offset += written
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
         os.replace(temporary, path)
         _sync_directory(path.parent)
     finally:
+        if descriptor is not None:
+            os.close(descriptor)
         temporary.unlink(missing_ok=True)
 
 

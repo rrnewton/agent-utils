@@ -2447,7 +2447,6 @@ struct CustomPaneSubmission {
     text: String,
     prior_transcript_count: usize,
     prior_active: bool,
-    activity_receipt_allowed: bool,
 }
 
 struct WorkspaceClient<'a, A: ManagedApi + ?Sized> {
@@ -3048,6 +3047,11 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         }
         if self.record.launch.adapter != "herdr-pane" {
             if self.record.launch.harness == "claude" {
+                if text.contains(['\0', '\u{1b}']) {
+                    return Err(crate::error::AdapterError::unavailable(
+                        "Claude pane prompts cannot contain NUL or terminal escape characters",
+                    ));
+                }
                 let before =
                     self.client
                         .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
@@ -3059,38 +3063,55 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                             "Claude editor contains different buffered input; no input was sent",
                         ));
                     }
-                    self.client.run_with_runtime(pane_id, text, runtime)?;
-                    // The native prompt call crossed the sole text-injection
-                    // boundary. Retain its pre-injection baseline even if the
-                    // first screen sample still lags the submitted turn, so a
-                    // later exact transcript can be accepted without retry.
-                    *self
-                        .custom_submission
-                        .lock()
-                        .expect("custom submission lock poisoned") = Some(CustomPaneSubmission {
-                        harness: "claude".to_owned(),
-                        text: text.to_owned(),
-                        prior_transcript_count,
-                        prior_active,
-                        activity_receipt_allowed: false,
-                    });
+                    // The native agent-prompt call combines insertion with an
+                    // opaque submit. A lagging screen cannot prove whether its
+                    // Enter was accepted, so use the explicit text-only pane
+                    // primitive and one separately verified Enter.
+                    self.client.send_text_with_runtime(
+                        pane_id,
+                        &format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}"),
+                        runtime,
+                    )?;
+                    let deadline = runtime.monotonic().saturating_add(Duration::from_secs(2));
+                    loop {
+                        if runtime.cancelled() {
+                            return Err(crate::error::AdapterError::unavailable(
+                                "Herdr control operation was cancelled",
+                            ));
+                        }
+                        let staged = self.client.read_with_runtime(
+                            pane_id,
+                            "visible",
+                            Some(200),
+                            runtime,
+                        )?;
+                        if staged != before && claude_prompt_is_exact_composer(&staged, text) {
+                            break;
+                        }
+                        if runtime.monotonic() >= deadline {
+                            return Err(crate::error::AdapterError::unavailable(
+                                "literal text insertion did not produce exact visible Claude editor evidence; Enter was not sent",
+                            ));
+                        }
+                        runtime.sleep(
+                            Duration::from_millis(50)
+                                .min(deadline.saturating_sub(runtime.monotonic())),
+                        );
+                    }
+                }
+                if self.pane_info_with_runtime(pane_id, runtime)?.status != "staged" {
+                    return Err(crate::error::AdapterError::unavailable(
+                        "Claude staged prompt changed before submission",
+                    ));
                 }
                 let staged =
                     self.client
                         .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
                 if !claude_prompt_is_exact_composer(&staged, text) {
-                    // Preserve Herdr's native transition contract when the
-                    // screen does not prove a staged Claude editor. It never
-                    // authorizes a second input operation.
-                    return Ok(());
-                }
-                if self.pane_info_with_runtime(pane_id, runtime)?.status != "staged" {
                     return Err(crate::error::AdapterError::unavailable(
-                        "Claude staged prompt changed before its submit chord",
+                        "Claude editor changed before submission; Enter was not sent",
                     ));
                 }
-                // One Enter submits the exact verified Claude composer.
-                // Ctrl-S is Claude's stash operation, not a send receipt.
                 self.client
                     .send_keys_with_runtime(pane_id, "Enter", runtime)?;
                 *self
@@ -3101,7 +3122,6 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                     text: text.to_owned(),
                     prior_transcript_count,
                     prior_active,
-                    activity_receipt_allowed: true,
                 });
                 return Ok(());
             }
@@ -3204,7 +3224,6 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             prior_transcript_count: muse_verified_process_prompt_transcript_count(&confirmed, text),
             text: text.to_owned(),
             prior_active: false,
-            activity_receipt_allowed: true,
         });
         Ok(())
     }
@@ -3241,9 +3260,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                             "agent did not show a verified post-submission screen transition",
                         ));
                     }
-                    if self.pane_info_with_runtime(pane_id, &bounded)?.status == status
-                        && submission.activity_receipt_allowed
-                    {
+                    if self.pane_info_with_runtime(pane_id, &bounded)?.status == status {
                         *self
                             .custom_submission
                             .lock()
@@ -3289,7 +3306,6 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                         return Ok(());
                     }
                     if submission.harness == "claude"
-                        && submission.activity_receipt_allowed
                         && !submission.prior_active
                         && !in_composer
                         && claude_active_screen(&screen)
@@ -4209,6 +4225,110 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
 
     fn queue(&self, agent_name: &str) -> Result<PathBuf> {
         Ok(self.directory(agent_name)?.join("queue"))
+    }
+
+    fn with_completion_queue<T>(
+        &self,
+        record: &AgentRecord,
+        operation: impl FnOnce(&Path) -> Result<T>,
+    ) -> Result<T> {
+        let active = self.directory(&record.name)?;
+        match fs::symlink_metadata(&active) {
+            Ok(_) => {
+                let current = self.load(&record.name)?;
+                if current.token == record.token {
+                    let pinned = self.pinned_agent_directory(&record.name)?;
+                    let snapshot = self.managed_record_snapshot(&pinned, &record.token)?;
+                    let queue = pinned.path.join("queue");
+                    agent::validate_existing_queue(&queue)?;
+                    agent::validate_existing_binding(&queue, &snapshot.record.target()?)?;
+                    let result = operation(&queue);
+                    Self::verify_pinned_agent_directory(&pinned)?;
+                    return result;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(fail(format!(
+                    "cannot inspect agent before delivery result publication: {error}"
+                )))
+            }
+        }
+
+        name(&record.name)?;
+        token(&record.token)?;
+        let archive = self
+            .registry
+            .join("archive")
+            .join(format!("{}-{}", record.name, record.token));
+        match fs::symlink_metadata(&archive) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(fail(format!(
+                    "agent {:?} generation changed before delivery result publication",
+                    record.name
+                )))
+            }
+            Err(error) => {
+                return Err(fail(format!(
+                    "cannot inspect delivery completion archive: {error}"
+                )))
+            }
+        }
+        let pinned =
+            Self::pinned_agent_directory_at(&record.name, archive, "terminal agent archive")?;
+        let snapshot = self.managed_record_snapshot(&pinned, &record.token)?;
+        if snapshot.record.lifecycle != "stopped" {
+            return Err(fail(
+                "delivery completion archive does not contain a stopped generation",
+            ));
+        }
+        if self
+            .read_terminal_retirement(&pinned, &snapshot.record, &snapshot.content)?
+            .is_none()
+        {
+            return Err(fail(
+                "delivery completion archive has no terminal retirement receipt",
+            ));
+        }
+        let queue = pinned.path.join("queue");
+        agent::validate_existing_queue(&queue)?;
+        agent::validate_existing_binding(&queue, &snapshot.record.target()?)?;
+        let result = operation(&queue);
+        Self::verify_pinned_agent_directory(&pinned)?;
+        result
+    }
+
+    fn finish_generation_delivery(
+        &self,
+        record: &AgentRecord,
+        identifier: String,
+        drained: QueueResult,
+    ) -> Result<QueueResult> {
+        let _lock = self.lock(&record.name)?;
+        self.finish_generation_delivery_locked(record, identifier, drained)
+    }
+
+    fn finish_generation_delivery_with_runtime(
+        &self,
+        record: &AgentRecord,
+        identifier: String,
+        drained: QueueResult,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> Result<QueueResult> {
+        let _lock = self.lock_with_runtime(&record.name, runtime)?;
+        self.finish_generation_delivery_locked(record, identifier, drained)
+    }
+
+    fn finish_generation_delivery_locked(
+        &self,
+        record: &AgentRecord,
+        identifier: String,
+        drained: QueueResult,
+    ) -> Result<QueueResult> {
+        self.with_completion_queue(record, |completion_queue| {
+            agent::finish_identified_delivery(completion_queue, identifier, drained)
+        })
     }
 
     fn refuse_inflight_delivery(&self, record: &AgentRecord) -> Result<()> {
@@ -5209,7 +5329,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         } else {
             Value::Null
         };
-        result["goal_delivery"] = json!(self.goal_delivery(record)?);
+        result["goal_delivery"] = json!(self.goal_delivery(record, None)?);
         if record.launch.adapter == "turn-runner" {
             result["agent_status"] = json!("unknown");
             result["probe_error"] = json!(
@@ -5896,7 +6016,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             adopted_evidence: Mutex::new(None),
         };
         let drained = agent::drain_existing(&client, &target, &queue, options)?;
-        agent::finish_identified_delivery(&queue, identifier, drained)
+        self.finish_generation_delivery(&record, identifier, drained)
     }
 
     /// Submit through an injected runtime that can interrupt bounded readiness waits.
@@ -5940,7 +6060,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         };
         let drained =
             agent::drain_existing_with_runtime(&client, &target, &queue, options, runtime)?;
-        agent::finish_identified_delivery(&queue, identifier, drained)
+        self.finish_generation_delivery_with_runtime(&record, identifier, drained, runtime)
     }
 
     /// Reconcile one caller-selected durable delivery identifier by exact path lookup.
@@ -6536,7 +6656,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         Ok(json!({"name":agent_name,"session_id":session_id,"source":"explicit"}))
     }
 
-    fn goal_delivery(&self, record: &AgentRecord) -> Result<Option<String>> {
+    fn goal_delivery(
+        &self,
+        record: &AgentRecord,
+        resolved: Option<&str>,
+    ) -> Result<Option<String>> {
+        if let Some(resolved) = resolved {
+            return Ok(Some(resolved.to_owned()));
+        }
         if record.goal_message_id.is_some() {
             return Ok(Some(
                 match self.goal_artifact_state(record, true)? {
@@ -6551,8 +6678,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         Ok(record.legacy_goal_delivery.clone())
     }
 
-    fn goal_result(&self, record: &AgentRecord, command: Option<&[String]>) -> Result<Value> {
-        let mut result = json!({"name":record.name,"goal":record.goal,"delivery":self.goal_delivery(record)?,"source":"requested","native_status":"unverified"});
+    fn goal_result(
+        &self,
+        record: &AgentRecord,
+        command: Option<&[String]>,
+        resolved_delivery: Option<&str>,
+    ) -> Result<Value> {
+        let mut result = json!({"name":record.name,"goal":record.goal,"delivery":self.goal_delivery(record, resolved_delivery)?,"source":"requested","native_status":"unverified"});
         if record.launch.harness != "codex" {
             return Ok(result);
         }
@@ -6595,9 +6727,23 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         goal_command: Option<&[String]>,
     ) -> Result<Value> {
         let Some(text) = text else {
-            let record = self.load(agent_name)?;
-            self.checked(&record)?;
-            return self.goal_result(&record, goal_command);
+            let (record, delivery) = {
+                let _lock = self.lock(agent_name)?;
+                let record = self.load(agent_name)?;
+                self.checked(&record)?;
+                let delivery = if record.goal_message_id.is_some() {
+                    self.goal_delivery(&record, None)?
+                } else {
+                    None
+                };
+                (record, delivery)
+            };
+            let result = self.goal_result(&record, goal_command, delivery.as_deref())?;
+            let _lock = self.lock(agent_name)?;
+            if self.load(agent_name)?.token != record.token {
+                return Err(fail("agent generation changed during goal inspection"));
+            }
+            return Ok(result);
         };
         if text.trim().is_empty() || text.contains(['\n', '\r']) {
             return Err(fail("goal must be a nonempty single line"));
@@ -6640,9 +6786,17 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             adopted_evidence: Mutex::new(None),
         };
         let outcome = agent::drain_existing(&client, &target, &queue, options)
-            .and_then(|drained| agent::finish_identified_delivery(&queue, identifier, drained));
+            .and_then(|drained| self.finish_generation_delivery(&record, identifier, drained));
         match outcome {
-            Ok(_) => self.goal_result(&record, goal_command),
+            Ok(finished) => self.goal_result(
+                &record,
+                goal_command,
+                Some(match finished.outcome {
+                    agent::QueueOutcome::Delivered => "delivered",
+                    agent::QueueOutcome::Pending => "pending",
+                    agent::QueueOutcome::PossiblySubmitted => "possibly_submitted",
+                }),
+            ),
             Err(error) => Err(error),
         }
     }
@@ -9622,6 +9776,11 @@ mod tests {
         }
         fn send_text(&self, _: &str, text: &str) -> AdapterResult<()> {
             self.sent_texts.lock().unwrap().push(text.to_owned());
+            if !self.delay_screen_after_run_once.load(Ordering::Relaxed) {
+                if let Some(screen) = self.screen_after_run.lock().unwrap().take() {
+                    *self.custom_screen.lock().unwrap() = Some(screen);
+                }
+            }
             Ok(())
         }
         fn send_keys(&self, _: &str, key: &str) -> AdapterResult<()> {
@@ -10606,7 +10765,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.outcome, agent::QueueOutcome::Delivered);
-        assert_eq!(*fixture.client.runs.lock().unwrap(), [prompt]);
+        assert!(fixture.client.runs.lock().unwrap().is_empty());
+        assert_eq!(
+            *fixture.client.sent_texts.lock().unwrap(),
+            [format!(
+                "{BRACKETED_PASTE_START}{prompt}{BRACKETED_PASTE_END}"
+            )]
+        );
         assert_eq!(*fixture.client.sent_keys.lock().unwrap(), ["Enter"]);
     }
 
@@ -10646,7 +10811,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.outcome, agent::QueueOutcome::Delivered);
-        assert_eq!(*fixture.client.runs.lock().unwrap(), [prompt]);
+        assert!(fixture.client.runs.lock().unwrap().is_empty());
+        assert_eq!(
+            *fixture.client.sent_texts.lock().unwrap(),
+            [format!(
+                "{BRACKETED_PASTE_START}{prompt}{BRACKETED_PASTE_END}"
+            )]
+        );
         assert_eq!(*fixture.client.sent_keys.lock().unwrap(), ["Enter"]);
         assert_eq!(
             fs::read_dir(fixture.root.join("registry/worker/queue/failed"))
@@ -10696,7 +10867,13 @@ mod tests {
 
         assert!(!fixture.client.custom_native_working.load(Ordering::Relaxed));
         assert_eq!(result.outcome, agent::QueueOutcome::Delivered);
-        assert_eq!(*fixture.client.runs.lock().unwrap(), [prompt]);
+        assert!(fixture.client.runs.lock().unwrap().is_empty());
+        assert_eq!(
+            *fixture.client.sent_texts.lock().unwrap(),
+            [format!(
+                "{BRACKETED_PASTE_START}{prompt}{BRACKETED_PASTE_END}"
+            )]
+        );
         assert_eq!(*fixture.client.sent_keys.lock().unwrap(), ["Enter"]);
         assert_eq!(
             fs::read_dir(fixture.root.join("registry/worker/queue/failed"))
@@ -10733,6 +10910,10 @@ mod tests {
         *fixture.client.custom_screen.lock().unwrap() =
             Some(format!("{divider}\n❯\n{divider}\nauto mode on\n"));
         *fixture.client.screen_after_run.lock().unwrap() = Some(format!(
+            "{divider}\n❯ {prompt}\n  ctrl+x ctrl+s to send now\n\
+             {divider}\nauto mode on\n"
+        ));
+        *fixture.client.screen_after_enter.lock().unwrap() = Some(format!(
             "❯ {prompt}\n● Completed\n{divider}\n❯\n{divider}\nauto mode on\n"
         ));
 
@@ -10742,8 +10923,14 @@ mod tests {
 
         assert!(!fixture.client.custom_native_working.load(Ordering::Relaxed));
         assert_eq!(result.outcome, agent::QueueOutcome::Delivered);
-        assert_eq!(*fixture.client.runs.lock().unwrap(), [prompt]);
-        assert!(fixture.client.sent_keys.lock().unwrap().is_empty());
+        assert!(fixture.client.runs.lock().unwrap().is_empty());
+        assert_eq!(
+            *fixture.client.sent_texts.lock().unwrap(),
+            [format!(
+                "{BRACKETED_PASTE_START}{prompt}{BRACKETED_PASTE_END}"
+            )]
+        );
+        assert_eq!(*fixture.client.sent_keys.lock().unwrap(), ["Enter"]);
         assert_eq!(
             fs::read_dir(fixture.root.join("registry/worker/queue/failed"))
                 .unwrap()
@@ -10779,20 +10966,26 @@ mod tests {
         *fixture.client.custom_screen.lock().unwrap() =
             Some(format!("{divider}\n❯\n{divider}\nauto mode on\n"));
         *fixture.client.screen_after_run.lock().unwrap() = Some(format!(
+            "{divider}\n❯ {prompt}\n  ctrl+x ctrl+s to send now\n\
+             {divider}\nauto mode on\n"
+        ));
+        *fixture.client.screen_after_enter.lock().unwrap() = Some(format!(
             "❯ {prompt}\n● Executing\n{divider}\n❯\n{divider}\nauto mode on\n"
         ));
-        fixture
-            .client
-            .delay_screen_after_run_once
-            .store(true, Ordering::Relaxed);
 
         let result = manager
             .send("worker", prompt, DrainOptions::default())
             .unwrap();
 
         assert_eq!(result.outcome, agent::QueueOutcome::Delivered);
-        assert_eq!(*fixture.client.runs.lock().unwrap(), [prompt]);
-        assert!(fixture.client.sent_keys.lock().unwrap().is_empty());
+        assert!(fixture.client.runs.lock().unwrap().is_empty());
+        assert_eq!(
+            *fixture.client.sent_texts.lock().unwrap(),
+            [format!(
+                "{BRACKETED_PASTE_START}{prompt}{BRACKETED_PASTE_END}"
+            )]
+        );
+        assert_eq!(*fixture.client.sent_keys.lock().unwrap(), ["Enter"]);
         assert_eq!(
             fs::read_dir(fixture.root.join("registry/worker/queue/processed"))
                 .unwrap()
@@ -10802,7 +10995,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_unrelated_activity_does_not_confirm_a_lagging_native_prompt() {
+    fn claude_stale_staged_redraw_never_causes_a_second_enter() {
         let fixture = Fixture::new();
         fixture
             .client
@@ -10828,12 +11021,9 @@ mod tests {
         *fixture.client.custom_screen.lock().unwrap() =
             Some(format!("{divider}\n❯\n{divider}\nauto mode on\n"));
         *fixture.client.screen_after_run.lock().unwrap() = Some(format!(
-            "● Unrelated background agent is still running\n{divider}\n❯\n{divider}\nauto mode on\n"
+            "{divider}\n❯ {prompt}\n  ctrl+x ctrl+s to send now\n\
+             {divider}\nauto mode on\n"
         ));
-        fixture
-            .client
-            .delay_screen_after_run_once
-            .store(true, Ordering::Relaxed);
 
         let error = manager
             .send(
@@ -10850,8 +11040,14 @@ mod tests {
             error.outcome(),
             Some(agent::QueueOutcome::PossiblySubmitted)
         );
-        assert_eq!(*fixture.client.runs.lock().unwrap(), [prompt]);
-        assert!(fixture.client.sent_keys.lock().unwrap().is_empty());
+        assert!(fixture.client.runs.lock().unwrap().is_empty());
+        assert_eq!(
+            *fixture.client.sent_texts.lock().unwrap(),
+            [format!(
+                "{BRACKETED_PASTE_START}{prompt}{BRACKETED_PASTE_END}"
+            )]
+        );
+        assert_eq!(*fixture.client.sent_keys.lock().unwrap(), ["Enter"]);
         assert_eq!(
             fs::read_dir(fixture.root.join("registry/worker/queue/failed"))
                 .unwrap()
@@ -12010,13 +12206,13 @@ mod tests {
         record.goal_message_id = Some(identifier.clone());
         manager.save(&record).unwrap();
         assert_eq!(
-            manager.goal_delivery(&record).unwrap().as_deref(),
+            manager.goal_delivery(&record, None).unwrap().as_deref(),
             Some("pending")
         );
 
         artifact["kind"] = json!("message");
         agent::atomic_json(&artifact_path, &artifact).unwrap();
-        let error = manager.goal_delivery(&record).unwrap_err();
+        let error = manager.goal_delivery(&record, None).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -12027,7 +12223,7 @@ mod tests {
         artifact["kind"] = json!("goal");
         artifact["text"] = json!("/goal forged task");
         agent::atomic_json(&artifact_path, &artifact).unwrap();
-        let error = manager.goal_delivery(&record).unwrap_err();
+        let error = manager.goal_delivery(&record, None).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -16915,6 +17111,213 @@ mod tests {
             assert_eq!(fs::read(new_path).unwrap(), before);
             assert!(fixture.client.runs.lock().unwrap().is_empty());
         });
+    }
+
+    #[test]
+    fn delivery_finish_uses_the_drained_generation_after_name_reuse() {
+        for terminal in ["processed", "failed", "inbox"] {
+            let fixture = Fixture::new();
+            let original = fixture.start(None);
+            let old_token = original["token"].as_str().unwrap().to_owned();
+            let manager = fixture.manager();
+            let record = manager.load("worker").unwrap();
+            let queue = manager.queue("worker").unwrap();
+            let identifier = agent::enqueue_bound(
+                &queue,
+                &record.target().unwrap(),
+                "old generation prompt",
+                Some("same-id"),
+                agent::QueueMessageKind::Message,
+            )
+            .unwrap();
+            let source = queue.join("inbox/same-id.json");
+            if terminal != "inbox" {
+                fs::rename(&source, queue.join(terminal).join("same-id.json")).unwrap();
+            }
+            if terminal == "failed" {
+                let failed = queue.join("failed/same-id.json");
+                let mut document = agent::read_private_json(&failed).unwrap();
+                document["delivery_error"] = json!("old generation ambiguous");
+                agent::atomic_json(&failed, &document).unwrap();
+            }
+            manager
+                .stop_with_options(
+                    "worker",
+                    StopOptions {
+                        expected_token: Some(old_token.clone()),
+                        ..StopOptions::default()
+                    },
+                )
+                .unwrap();
+            manager
+                .start(
+                    "worker",
+                    &fixture.root,
+                    StartOptions {
+                        workspace_id: Some("workspace".to_owned()),
+                        ..StartOptions::default()
+                    },
+                )
+                .unwrap();
+            let replacement = manager.load("worker").unwrap();
+            let replacement_queue = manager.queue("worker").unwrap();
+            agent::enqueue_bound(
+                &replacement_queue,
+                &replacement.target().unwrap(),
+                "replacement generation prompt",
+                Some("same-id"),
+                agent::QueueMessageKind::Message,
+            )
+            .unwrap();
+            let replacement_path = replacement_queue.join("inbox/same-id.json");
+            let replacement_bytes = fs::read(&replacement_path).unwrap();
+            let drained = QueueResult {
+                message_id: identifier.clone(),
+                delivered: (terminal == "processed")
+                    .then(|| identifier.clone())
+                    .into_iter()
+                    .collect(),
+                quarantined: (terminal == "failed")
+                    .then(|| identifier.clone())
+                    .into_iter()
+                    .collect(),
+                pending: (terminal == "inbox")
+                    .then(|| identifier.clone())
+                    .into_iter()
+                    .collect(),
+                blocked: (terminal == "inbox").then(|| "old generation remained busy".to_owned()),
+                outcome: match terminal {
+                    "processed" => agent::QueueOutcome::Delivered,
+                    "failed" => agent::QueueOutcome::PossiblySubmitted,
+                    _ => agent::QueueOutcome::Pending,
+                },
+            };
+            let archive_queue = fixture
+                .root
+                .join(format!("registry/archive/worker-{old_token}/queue"));
+            match terminal {
+                "processed" => {
+                    let finished = manager
+                        .finish_generation_delivery_with_runtime(
+                            &record,
+                            identifier,
+                            drained,
+                            &agent::SystemRuntime::default(),
+                        )
+                        .unwrap();
+                    assert_eq!(finished.outcome, agent::QueueOutcome::Delivered);
+                    assert_eq!(
+                        manager
+                            .goal_delivery(&record, Some(finished.outcome.as_str()))
+                            .unwrap()
+                            .as_deref(),
+                        Some("delivered"),
+                    );
+                }
+                "failed" | "inbox" => {
+                    let error = manager
+                        .finish_generation_delivery(&record, identifier, drained)
+                        .unwrap_err();
+                    let undelivered = error.undelivered().unwrap();
+                    assert_eq!(
+                        undelivered.artifact.parent(),
+                        Some(archive_queue.join(terminal).as_path()),
+                    );
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(fs::read(&replacement_path).unwrap(), replacement_bytes);
+            assert!(archive_queue.join(terminal).join("same-id.json").is_file());
+        }
+    }
+
+    #[test]
+    fn delivery_finish_refuses_an_untrusted_old_generation_archive() {
+        for corruption in ["missing", "token", "receipt"] {
+            let fixture = Fixture::new();
+            let original = fixture.start(None);
+            let old_token = original["token"].as_str().unwrap().to_owned();
+            let manager = fixture.manager();
+            let record = manager.load("worker").unwrap();
+            let queue = manager.queue("worker").unwrap();
+            let identifier = agent::enqueue_bound(
+                &queue,
+                &record.target().unwrap(),
+                "old generation prompt",
+                Some("same-id"),
+                agent::QueueMessageKind::Message,
+            )
+            .unwrap();
+            fs::rename(
+                queue.join("inbox/same-id.json"),
+                queue.join("processed/same-id.json"),
+            )
+            .unwrap();
+            manager
+                .stop_with_options(
+                    "worker",
+                    StopOptions {
+                        expected_token: Some(old_token.clone()),
+                        ..StopOptions::default()
+                    },
+                )
+                .unwrap();
+            manager
+                .start(
+                    "worker",
+                    &fixture.root,
+                    StartOptions {
+                        workspace_id: Some("workspace".to_owned()),
+                        ..StartOptions::default()
+                    },
+                )
+                .unwrap();
+            let replacement = manager.load("worker").unwrap();
+            let replacement_queue = manager.queue("worker").unwrap();
+            agent::enqueue_bound(
+                &replacement_queue,
+                &replacement.target().unwrap(),
+                "replacement generation prompt",
+                Some("same-id"),
+                agent::QueueMessageKind::Message,
+            )
+            .unwrap();
+            let replacement_path = replacement_queue.join("inbox/same-id.json");
+            let replacement_bytes = fs::read(&replacement_path).unwrap();
+            let archive = fixture
+                .root
+                .join(format!("registry/archive/worker-{old_token}"));
+            match corruption {
+                "missing" => fs::rename(
+                    &archive,
+                    archive.with_file_name(format!("worker-{old_token}-displaced")),
+                )
+                .unwrap(),
+                "token" => {
+                    let path = archive.join("agent.json");
+                    let mut document = agent::read_private_json(&path).unwrap();
+                    document["token"] = json!("replacement-token");
+                    agent::atomic_json(&path, &document).unwrap();
+                }
+                "receipt" => fs::remove_file(archive.join(TERMINAL_RETIREMENT_FILE)).unwrap(),
+                _ => unreachable!(),
+            }
+            let drained = QueueResult {
+                message_id: identifier.clone(),
+                delivered: vec![identifier.clone()],
+                quarantined: Vec::new(),
+                pending: Vec::new(),
+                blocked: None,
+                outcome: agent::QueueOutcome::Delivered,
+            };
+
+            let error = manager
+                .finish_generation_delivery(&record, identifier, drained)
+                .unwrap_err();
+
+            assert!(!error.to_string().is_empty());
+            assert_eq!(fs::read(&replacement_path).unwrap(), replacement_bytes);
+        }
     }
 
     #[test]

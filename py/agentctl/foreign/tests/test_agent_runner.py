@@ -1559,6 +1559,25 @@ def test_stale_runner_generation_cannot_mutate_reused_runtime(
     assert lib.REGISTRY.read_bytes() == before
 
 
+def test_runner_generation_reads_do_not_rewrite_the_current_registry(
+    fake_runner_state: Path,
+) -> None:
+    rec = _install_agy_agent(fake_runner_state, "steady-runner")
+    authority = agent_runner._RunnerAuthority.from_record(rec)
+    before = lib.REGISTRY.read_bytes()
+    before_stat = lib.REGISTRY.stat()
+
+    for _ in range(5):
+        observed = authority.load(rec.name)
+        assert observed.control_generation == authority.control_generation
+        assert observed.launch_fingerprint() == authority.launch_fingerprint
+
+    after_stat = lib.REGISTRY.stat()
+    assert lib.REGISTRY.read_bytes() == before
+    assert after_stat.st_ino == before_stat.st_ino
+    assert after_stat.st_mtime_ns == before_stat.st_mtime_ns
+
+
 def test_stale_runner_refuses_before_recreating_generation_state(
     fake_runner_state: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

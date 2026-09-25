@@ -150,6 +150,26 @@ def test_headless_start_binds_first_later_exact_runner_identity(
     assert cast(dict[str, object], status["runtime_liveness"])["runner_alive"] is True
 
 
+def test_steady_headless_status_does_not_rewrite_outer_session_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, _fake, _calls = setup(tmp_path, monkeypatch)
+    sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
+    path = sessions.registry / "worker/agent.json"
+    before = path.read_bytes()
+    before_stat = path.stat()
+
+    for _ in range(3):
+        status = sessions.status("worker")
+        assert status["probe_error"] is None
+        assert cast(dict[str, object], status["runtime_liveness"])["runner_alive"] is True
+
+    after_stat = path.stat()
+    assert path.read_bytes() == before
+    assert after_stat.st_ino == before_stat.st_ino
+    assert after_stat.st_mtime_ns == before_stat.st_mtime_ns
+
+
 def test_sessions_status_and_list_derive_harness_from_v4_launch_only_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

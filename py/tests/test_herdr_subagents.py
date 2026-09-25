@@ -41,6 +41,7 @@ class FakeManagedClient:
         self.environments: list[tuple[str, ...]] = []
         self.closed: list[str] = []
         self.submitted: list[str] = []
+        self.sent_texts: list[str] = []
         self.panes_calls = 0
         self.pane_info_calls = 0
         self.serial = 0
@@ -280,6 +281,10 @@ class FakeManagedClient:
         self.submitted.append(text)
         if self.working_after_prompt:
             self.infos[pane_id] = replace(self.infos[pane_id], status="working")
+
+    def send_text(self, pane_id: str, text: str) -> None:
+        assert pane_id in self.infos
+        self.sent_texts.append(text)
 
     def wait_agent_status(self, pane_id: str, status: str, timeout_ms: int) -> None:
         assert pane_id in self.infos and status == "working" and timeout_ms > 0
@@ -1367,6 +1372,124 @@ def test_readiness_waiter_never_mutates_a_reused_agent_name(
     assert fake.submitted == []
 
 
+@pytest.mark.parametrize(
+    ("terminal", "outcome", "error_type"),
+    (("processed", "delivered", None),
+     ("failed", "possibly_submitted", AgentPossiblySubmitted),
+     ("inbox", "pending", AgentPending)),
+)
+@pytest.mark.parametrize("operation", ("send", "goal"))
+def test_delivery_finish_uses_the_drained_generation_after_name_reuse(
+    terminal: str, outcome: str, error_type: type[Exception] | None,
+    operation: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    original = manager.start("worker", cwd=str(tmp_path), harness="codex")
+    old_token = str(original["token"])
+    replacement_bytes: bytes | None = None
+
+    def replace_before_finish(
+        _client: object, _target: object, root: str, **_options: object,
+    ) -> agent.QueueResult:
+        nonlocal replacement_bytes
+        queue = Path(root)
+        [source] = list((queue / "inbox").glob("*.json"))
+        identifier = source.stem
+        if terminal != "inbox":
+            source.rename(queue / terminal / source.name)
+        if terminal == "failed":
+            failed = queue / "failed" / source.name
+            document = json.loads(failed.read_text(encoding="utf-8"))
+            document["delivery_error"] = "old generation ambiguous"
+            failed.write_text(json.dumps(document), encoding="utf-8")
+        manager.stop("worker", expected_token=old_token)
+        manager.start("worker", cwd=str(tmp_path), harness="codex")
+        replacement_id = agent.enqueue_bound(
+            manager._queue("worker"), manager.get("worker").target(),
+            "replacement generation prompt", message_id=identifier,
+        )
+        replacement = (
+            manager.registry / "worker/queue/inbox" / f"{replacement_id}.json"
+        )
+        replacement_bytes = replacement.read_bytes()
+        return agent.QueueResult(
+            identifier,
+            (identifier,) if terminal == "processed" else (),
+            (identifier,) if terminal == "failed" else (),
+            (identifier,) if terminal == "inbox" else (),
+            "old generation remained busy" if terminal == "inbox" else None,
+            outcome,
+        )
+
+    monkeypatch.setattr(agent, "drain", replace_before_finish)
+    invoke: Callable[[], object] = (
+        (lambda: manager.send("worker", "old generation prompt", message_id="same-id"))
+        if operation == "send"
+        else (lambda: manager.goal("worker", "finish exact old generation work"))
+    )
+    archive_queue = manager.registry / "archive" / f"worker-{old_token}" / "queue"
+    if error_type is None:
+        result = invoke()
+        if operation == "send":
+            assert cast(agent.QueueResult, result).outcome == outcome
+        else:
+            assert cast(dict[str, object], result)["delivery"] == outcome
+    else:
+        with pytest.raises(error_type) as captured:
+            invoke()
+        assert Path(cast(object, captured.value).artifact).parent == archive_queue / terminal
+
+    replacement = manager.registry / "worker/queue/inbox"
+    [replacement_path] = list(replacement.glob("*.json"))
+    assert replacement_path.read_bytes() == replacement_bytes
+    assert len(list((archive_queue / terminal).glob("*.json"))) == 1
+
+
+@pytest.mark.parametrize("corruption", ("missing", "token", "receipt"))
+def test_delivery_finish_refuses_an_untrusted_old_generation_archive(
+    corruption: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    original = manager.start("worker", cwd=str(tmp_path))
+    old_token = str(original["token"])
+    old_record = manager.get("worker")
+    old_queue = Path(manager._queue("worker"))
+    identifier = agent.enqueue_bound(
+        str(old_queue), old_record.target(), "old generation prompt",
+        message_id="same-id",
+    )
+    (old_queue / "inbox/same-id.json").rename(
+        old_queue / "processed/same-id.json"
+    )
+    manager.stop("worker", expected_token=old_token)
+    manager.start("worker", cwd=str(tmp_path))
+    replacement_queue = Path(manager._queue("worker"))
+    agent.enqueue_bound(
+        str(replacement_queue), manager.get("worker").target(),
+        "replacement generation prompt", message_id="same-id",
+    )
+    replacement = replacement_queue / "inbox/same-id.json"
+    replacement_bytes = replacement.read_bytes()
+    archive = manager.registry / "archive" / f"worker-{old_token}"
+    if corruption == "missing":
+        archive.rename(archive.with_name(f"{archive.name}-displaced"))
+    elif corruption == "token":
+        path = archive / "agent.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["token"] = "replacement-token"
+        path.write_text(json.dumps(document), encoding="utf-8")
+    else:
+        (archive / "terminal-retirement.json").unlink()
+    drained = agent.QueueResult(
+        identifier, (identifier,), (), (), None, "delivered",
+    )
+
+    with pytest.raises(AgentDeliveryError):
+        manager._finish_generation_delivery(old_record, identifier, drained)
+
+    assert replacement.read_bytes() == replacement_bytes
+
+
 def test_submission_waiting_for_lifecycle_holds_neither_queue_nor_target_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1644,6 +1767,25 @@ def test_goal_is_native_submission_with_honest_requested_metadata(tmp_path: Path
     assert manager.goal("worker")["goal"] == "finish the task"
     with pytest.raises(AgentDeliveryError, match="single line"):
         manager.goal("worker", "first\nsecond")
+
+
+def test_goal_read_refuses_a_name_reused_during_native_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    started = manager.start("worker", cwd=str(tmp_path))
+
+    def replace_generation(
+        _session: str, _command: object = None,
+    ) -> dict[str, object]:
+        manager.stop("worker", expected_token=str(started["token"]))
+        manager.start("worker", cwd=str(tmp_path))
+        return {"status": "active", "objective": "old objective"}
+
+    monkeypatch.setattr(native_goal, "get_goal", replace_generation)
+
+    with pytest.raises(AgentDeliveryError, match="generation changed"):
+        manager.goal("worker")
 
 
 @pytest.mark.parametrize("tamper", ("kind", "text"))
@@ -1936,8 +2078,10 @@ def test_claude_staged_prompt_uses_enter_once(
 
     def stage(pane: str, text: str) -> None:
         nonlocal state
-        assert pane == "w1:p1" and text == prompt and state == "idle"
-        fake.submitted.append(text)
+        assert pane == "w1:p1"
+        assert text == f"\x1b[200~{prompt}\x1b[201~"
+        assert state == "idle"
+        fake.sent_texts.append(text)
         state = "staged"
 
     def submit(pane: str, keys_value: str) -> None:
@@ -1948,7 +2092,11 @@ def test_claude_staged_prompt_uses_enter_once(
         state = "submitted"
 
     monkeypatch.setattr(fake, "read", screen)
-    monkeypatch.setattr(fake, "prompt_agent", stage)
+    monkeypatch.setattr(fake, "send_text", stage)
+    monkeypatch.setattr(
+        fake, "prompt_agent",
+        lambda *_args: pytest.fail("opaque native prompt must not be used for Claude"),
+    )
     monkeypatch.setattr(fake, "send_keys", submit)
 
     delivered = manager.send(
@@ -1957,7 +2105,8 @@ def test_claude_staged_prompt_uses_enter_once(
     )
 
     assert delivered.outcome == "delivered"
-    assert fake.submitted == [prompt]
+    assert fake.submitted == []
+    assert fake.sent_texts == [f"\x1b[200~{prompt}\x1b[201~"]
     assert keys == ["Enter"]
     assert ("visible", 200) in reads
     assert state == "submitted"
@@ -1995,7 +2144,8 @@ def test_claude_new_active_ui_confirms_submission_when_long_turn_left_history(
 
     def stage(_pane: str, text: str) -> None:
         nonlocal state
-        assert text == prompt and state == "idle"
+        assert text == f"\x1b[200~{prompt}\x1b[201~" and state == "idle"
+        fake.sent_texts.append(text)
         state = "staged"
 
     def submit(_pane: str, keys_value: str) -> None:
@@ -2005,7 +2155,11 @@ def test_claude_new_active_ui_confirms_submission_when_long_turn_left_history(
         state = "submitted"
 
     monkeypatch.setattr(fake, "read", screen)
-    monkeypatch.setattr(fake, "prompt_agent", stage)
+    monkeypatch.setattr(fake, "send_text", stage)
+    monkeypatch.setattr(
+        fake, "prompt_agent",
+        lambda *_args: pytest.fail("opaque native prompt must not be used for Claude"),
+    )
     monkeypatch.setattr(fake, "send_keys", submit)
     fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="idle")
 
@@ -2015,6 +2169,8 @@ def test_claude_new_active_ui_confirms_submission_when_long_turn_left_history(
     )
 
     assert delivered.outcome == "delivered"
+    assert fake.submitted == []
+    assert fake.sent_texts == [f"\x1b[200~{prompt}\x1b[201~"]
     assert keys == ["Enter"]
     assert ("visible", 200) in reads
     assert state == "submitted"
@@ -2027,10 +2183,16 @@ def test_claude_exact_executed_turn_confirms_delivery_while_herdr_stays_idle(
     manager.start("worker", cwd=str(tmp_path), harness="claude")
     prompt = "inspect the exact submitted change and report its evidence"
     divider = "─" * 40
+    state = "idle"
 
     def screen(_pane: str, *, source: str, lines: int) -> str:
         assert source in ("visible", "recent-unwrapped") and lines > 0
-        if fake.submitted:
+        if state == "staged":
+            return (
+                f"{divider}\n❯ {prompt}\n  ctrl+x ctrl+s to send now\n"
+                f"{divider}\nauto mode on\n"
+            )
+        if state == "submitted":
             # The prompt was accepted and its turn already completed. Herdr's
             # advisory status never left idle, reproducing the false quarantine
             # seen in persistent Opus lanes.
@@ -2041,7 +2203,24 @@ def test_claude_exact_executed_turn_confirms_delivery_while_herdr_stays_idle(
             )
         return f"{divider}\n❯\n{divider}\nauto mode on\n"
 
+    def stage(_pane: str, text: str) -> None:
+        nonlocal state
+        assert text == f"\x1b[200~{prompt}\x1b[201~" and state == "idle"
+        fake.sent_texts.append(text)
+        state = "staged"
+
+    def submit(_pane: str, key: str) -> None:
+        nonlocal state
+        assert key == "Enter" and state == "staged"
+        state = "submitted"
+
     monkeypatch.setattr(fake, "read", screen)
+    monkeypatch.setattr(fake, "send_text", stage)
+    monkeypatch.setattr(fake, "send_keys", submit)
+    monkeypatch.setattr(
+        fake, "prompt_agent",
+        lambda *_args: pytest.fail("opaque native prompt must not be used for Claude"),
+    )
     fake.wait_fails = True
     fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="idle")
 
@@ -2051,7 +2230,8 @@ def test_claude_exact_executed_turn_confirms_delivery_while_herdr_stays_idle(
     )
 
     assert result.outcome == "delivered"
-    assert fake.submitted == [prompt]
+    assert fake.submitted == []
+    assert fake.sent_texts == [f"\x1b[200~{prompt}\x1b[201~"]
     queue = manager.registry / "worker" / "queue"
     assert not list((queue / "failed").iterdir())
     assert len(list((queue / "processed").iterdir())) == 1
@@ -2065,23 +2245,49 @@ def test_claude_delayed_exact_turn_reconciles_without_reinjection(
     prompt = "confirm the exact turn after one delayed redraw"
     divider = "─" * 40
     reads: list[tuple[str, int]] = []
+    state = "idle"
+    post_submit_visible_reads = 0
 
     def screen(_pane: str, *, source: str, lines: int) -> str:
+        nonlocal post_submit_visible_reads
         assert source in ("visible", "recent-unwrapped") and lines > 0
         reads.append((source, lines))
         idle = f"{divider}\n❯\n{divider}\nauto mode on\n"
-        if not fake.submitted:
+        if state == "idle":
             return idle
+        if state == "staged":
+            return (
+                f"{divider}\n❯ {prompt}\n  ctrl+x ctrl+s to send now\n"
+                f"{divider}\nauto mode on\n"
+            )
         # The first post-submit visible sample, including pane-info's derived
         # status probe, can lag. Only the deeper history carries the exact turn.
         if source == "visible":
+            post_submit_visible_reads += 1
             return idle
         return (
             f"❯ {prompt}\n● Executing\n{divider}\n❯\n{divider}\n"
             "auto mode on\n"
         )
 
+    def stage(_pane: str, text: str) -> None:
+        nonlocal state
+        assert text == f"\x1b[200~{prompt}\x1b[201~" and state == "idle"
+        fake.sent_texts.append(text)
+        state = "staged"
+
+    def submit(_pane: str, key: str) -> None:
+        nonlocal state
+        assert key == "Enter" and state == "staged"
+        state = "submitted"
+
     monkeypatch.setattr(fake, "read", screen)
+    monkeypatch.setattr(fake, "send_text", stage)
+    monkeypatch.setattr(fake, "send_keys", submit)
+    monkeypatch.setattr(
+        fake, "prompt_agent",
+        lambda *_args: pytest.fail("opaque native prompt must not be used for Claude"),
+    )
     fake.wait_fails = True
     fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="idle")
 
@@ -2091,35 +2297,50 @@ def test_claude_delayed_exact_turn_reconciles_without_reinjection(
     )
 
     assert result.outcome == "delivered"
-    assert fake.submitted == [prompt]
+    assert fake.submitted == []
+    assert fake.sent_texts == [f"\x1b[200~{prompt}\x1b[201~"]
+    assert post_submit_visible_reads > 0
     assert ("recent-unwrapped", 5000) in reads
     assert len(list((manager.registry / "worker/queue/processed").iterdir())) == 1
 
 
-def test_claude_unrelated_activity_does_not_confirm_a_lagging_native_prompt(
+def test_claude_stale_staged_redraw_never_causes_a_second_enter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path), harness="claude")
     prompt = "do not confuse background activity with this exact prompt"
     divider = "─" * 40
-    post_submit_reads = 0
+    state = "idle"
+    keys: list[str] = []
 
     def screen(_pane: str, *, source: str, lines: int) -> str:
-        nonlocal post_submit_reads
         assert source in ("visible", "recent-unwrapped") and lines > 0
-        idle = f"{divider}\n❯\n{divider}\nauto mode on\n"
-        if not fake.submitted:
-            return idle
-        post_submit_reads += 1
-        if post_submit_reads == 1:
-            return idle
+        if state == "idle":
+            return f"{divider}\n❯\n{divider}\nauto mode on\n"
+        # Model a terminal redraw that remains stale after the sole Enter.
         return (
-            "● Unrelated background agent is still running\n"
-            f"{divider}\n❯\n{divider}\nauto mode on\n"
+            f"{divider}\n❯ {prompt}\n  ctrl+x ctrl+s to send now\n"
+            f"{divider}\nauto mode on\n"
         )
 
+    def stage(_pane: str, text: str) -> None:
+        nonlocal state
+        assert text == f"\x1b[200~{prompt}\x1b[201~" and state == "idle"
+        fake.sent_texts.append(text)
+        state = "staged"
+
+    def submit(_pane: str, key: str) -> None:
+        assert key == "Enter"
+        keys.append(key)
+
     monkeypatch.setattr(fake, "read", screen)
+    monkeypatch.setattr(fake, "send_text", stage)
+    monkeypatch.setattr(fake, "send_keys", submit)
+    monkeypatch.setattr(
+        fake, "prompt_agent",
+        lambda *_args: pytest.fail("opaque native prompt must not be used for Claude"),
+    )
     fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="idle")
 
     with pytest.raises(AgentPossiblySubmitted, match="ambiguous outcome"):
@@ -2128,7 +2349,9 @@ def test_claude_unrelated_activity_does_not_confirm_a_lagging_native_prompt(
             ready_timeout=0, working_timeout=0.05,
         )
 
-    assert fake.submitted == [prompt]
+    assert fake.submitted == []
+    assert fake.sent_texts == [f"\x1b[200~{prompt}\x1b[201~"]
+    assert keys == ["Enter"]
     assert fake.closed == []
     queue = manager.registry / "worker/queue"
     assert (queue / "failed/claude-unrelated-activity.json").is_file()

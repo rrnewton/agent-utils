@@ -1267,7 +1267,6 @@ class _CustomPaneSubmission:
     text: str
     prior_transcript_count: int
     prior_active: bool
-    activity_receipt_allowed: bool
 
 
 class _WorkspaceClient:
@@ -1625,6 +1624,10 @@ class _WorkspaceClient:
             if self.record.launch.harness != "claude":
                 self.client.prompt_agent(pane_id, command)
                 return
+            if "\0" in command or "\x1b" in command:
+                raise HerdrUnavailable(
+                    "Claude pane prompts cannot contain NUL or terminal escape characters"
+                )
             before = self.read(pane_id, source="visible", lines=200)
             prior_count = claude_prompt_transcript_count(before, command)
             prior_active = claude_active_screen(before)
@@ -1634,36 +1637,39 @@ class _WorkspaceClient:
                     raise HerdrUnavailable(
                         "Claude editor contains different buffered input; no input was sent"
                     )
-                self.client.prompt_agent(pane_id, command)
-                # The native prompt call crossed the sole text-injection
-                # boundary. Retain its pre-injection baseline even if the
-                # first screen sample still lags the submitted turn; bounded
-                # confirmation can observe a later exact transcript without
-                # ever injecting the prompt again.
-                self.custom_submission = _CustomPaneSubmission(
-                    "claude", command, prior_count, prior_active, False,
+                # Herdr's native ``agent prompt`` combines text insertion with
+                # an opaque submit operation. A delayed screen cannot prove
+                # whether that Enter was accepted, so it cannot safely be
+                # followed by another Enter. Use the explicit pane primitive:
+                # literal text first, exact composer proof, then one Enter.
+                self.client.send_text(
+                    pane_id,
+                    f"{_BRACKETED_PASTE_START}{command}{_BRACKETED_PASTE_END}",
                 )
-            staged = self.read(pane_id, source="visible", lines=200)
-            if not claude_prompt_is_exact_composer(staged, command):
-                # Herdr may have submitted and rendered the turn before this
-                # first read, even while its advisory status remains idle. Keep
-                # the exact pre-injection transcript/activity baseline so the
-                # bounded reconciliation below can prove that one submission
-                # occurred without ever reinjecting the prompt.
-                # An unrecognized screen retains Herdr's native submission and
-                # working-transition contract. It cannot authorize extra input.
-                return
-            # Herdr 0.8 can report agent_prompted after only staging text in
-            # Claude's editor. One Enter submits the exact verified composer;
-            # Ctrl-S is Claude's stash operation, not a submission receipt.
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    staged = self.read(pane_id, source="visible", lines=200)
+                    if (staged != before
+                            and claude_prompt_is_exact_composer(staged, command)):
+                        break
+                    time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                else:
+                    raise HerdrUnavailable(
+                        "literal text insertion did not produce exact visible Claude editor evidence; Enter was not sent"
+                    )
             verified = self.pane_info(pane_id)
             if verified.status != "staged":
                 raise HerdrUnavailable(
-                    "Claude staged prompt changed before its submit chord"
+                    "Claude staged prompt changed before submission"
+                )
+            staged = self.read(pane_id, source="visible", lines=200)
+            if not claude_prompt_is_exact_composer(staged, command):
+                raise HerdrUnavailable(
+                    "Claude editor changed before submission; Enter was not sent"
                 )
             self.client.send_keys(pane_id, "Enter")
             self.custom_submission = _CustomPaneSubmission(
-                "claude", command, prior_count, prior_active, True,
+                "claude", command, prior_count, prior_active,
             )
             return
         if "\0" in command or "\x1b" in command:
@@ -1725,7 +1731,7 @@ class _WorkspaceClient:
         self.custom_submission = _CustomPaneSubmission(
             "muse", command,
             muse_verified_process_prompt_transcript_count(confirmed, command),
-            False, True,
+            False,
         )
 
     def wait_agent_status(self, pane_id: str, status: str, timeout_ms: int) -> None:
@@ -1762,8 +1768,7 @@ class _WorkspaceClient:
             deadline = time.monotonic() + timeout_ms / 1000
             while time.monotonic() < deadline:
                 info = self.pane_info(pane_id)
-                if (info.status == status
-                        and submission.activity_receipt_allowed):
+                if info.status == status:
                     self.custom_submission = None
                     return
                 if harness == "muse":
@@ -1800,7 +1805,6 @@ class _WorkspaceClient:
                     self.custom_submission = None
                     return
                 if (harness == "claude"
-                        and submission.activity_receipt_allowed
                         and not prior_active
                         and not in_composer and claude_active_screen(screen)):
                     # Exact text and one documented submit chord were already
@@ -2462,6 +2466,73 @@ class ManagedAgents:
 
     def _queue(self, name: str) -> str:
         return str(self._directory(name) / "queue")
+
+    @contextmanager
+    def _completion_queue(self, record: AgentRecord) -> Iterator[str]:
+        """Pin the exact active or archived generation that produced a drain result."""
+        active = self._directory(record.name)
+        if os.path.lexists(active):
+            current = self._load(record.name)
+            if current.token == record.token:
+                with self._pinned_agent_directory(record.name) as pinned:
+                    snapshot = self._managed_record_snapshot(
+                        pinned, expected_token=record.token,
+                    )
+                    queue = pinned.path / "queue"
+                    agent._validate_existing_queue(str(queue))
+                    agent._validate_existing_binding(
+                        str(queue), snapshot.record.target(),
+                    )
+                    try:
+                        yield str(queue)
+                    finally:
+                        self._verify_pinned_agent_directory(pinned)
+                return
+
+        _name(record.name)
+        _token(record.token)
+        destination = self.registry / "archive" / f"{record.name}-{record.token}"
+        if not os.path.lexists(destination):
+            raise AgentDeliveryError(
+                f"agent {record.name!r} generation changed before delivery result publication"
+            )
+        with self._pinned_agent_directory(
+            record.name, path=destination, label="terminal agent archive",
+        ) as pinned:
+            snapshot = self._managed_record_snapshot(
+                pinned, expected_token=record.token,
+            )
+            if snapshot.record.lifecycle != "stopped":
+                raise AgentDeliveryError(
+                    "delivery completion archive does not contain a stopped generation"
+                )
+            if self._read_terminal_retirement(
+                pinned, snapshot.record, snapshot.content,
+            ) is None:
+                raise AgentDeliveryError(
+                    "delivery completion archive has no terminal retirement receipt"
+                )
+            queue = pinned.path / "queue"
+            agent._validate_existing_queue(str(queue))
+            agent._validate_existing_binding(
+                str(queue), snapshot.record.target(),
+            )
+            try:
+                yield str(queue)
+            finally:
+                self._verify_pinned_agent_directory(pinned)
+
+    def _finish_generation_delivery(
+        self, record: AgentRecord, identifier: str, drained: agent.QueueResult, *,
+        max_artifact_bytes: int | None = None,
+    ) -> agent.QueueResult:
+        """Publish one result against the generation that performed its drain."""
+        with self._lock(record.name):
+            with self._completion_queue(record) as completion_queue:
+                return agent.finish_identified_delivery(
+                    completion_queue, identifier, drained,
+                    max_artifact_bytes=max_artifact_bytes,
+                )
 
     def _refuse_inflight_delivery(self, record: AgentRecord) -> None:
         """Keep teardown from overtaking an injection or terminal publication."""
@@ -3611,8 +3682,8 @@ class ManagedAgents:
             client, record.target(), self._queue(name),
             require_existing=True, **options,
         )
-        return agent.finish_identified_delivery(
-            self._queue(name), identifier, drained,
+        return self._finish_generation_delivery(
+            record, identifier, drained,
             max_artifact_bytes=cast(int | None, max_artifact_bytes),
         )
 
@@ -3768,7 +3839,11 @@ class ManagedAgents:
                 self._save(record)
                 return {"name": name, "session_id": session_id, "source": "explicit"}
 
-    def _goal_delivery(self, record: AgentRecord) -> str | None:
+    def _goal_delivery(
+        self, record: AgentRecord, *, resolved: str | None = None,
+    ) -> str | None:
+        if resolved is not None:
+            return resolved
         if record.goal_message_id is not None:
             state = self._goal_artifact_state(record, allow_prepared=True)
             return {
@@ -3782,9 +3857,13 @@ class ManagedAgents:
         # writes derive delivery exclusively from the queue artifact location.
         return record.goal_delivery
 
-    def _goal_result(self, record: AgentRecord, command: Sequence[str] | None) -> dict[str, object]:
+    def _goal_result(
+        self, record: AgentRecord, command: Sequence[str] | None, *,
+        resolved_delivery: str | None = None,
+    ) -> dict[str, object]:
         result: dict[str, object] = {"name": record.name, "goal": record.goal,
-            "delivery": self._goal_delivery(record), "source": "requested", "native_status": "unverified"}
+            "delivery": self._goal_delivery(record, resolved=resolved_delivery),
+            "source": "requested", "native_status": "unverified"}
         if record.launch.harness != "codex":
             return result
         session = record.session_value
@@ -5377,9 +5456,23 @@ class ManagedAgents:
         goal instruction. Delivery proves submission, not native goal completion.
         """
         if text is None:
-            record = self._load(name)
-            self._checked(record)
-            return self._goal_result(record, goal_command)
+            with self._lock(name):
+                record = self._load(name)
+                self._checked(record)
+                delivery = (
+                    self._goal_delivery(record)
+                    if record.goal_message_id is not None else None
+                )
+            result = self._goal_result(
+                record, goal_command, resolved_delivery=delivery,
+            )
+            with self._lock(name):
+                current = self._load(name)
+                if current.token != record.token:
+                    raise AgentDeliveryError(
+                        "agent generation changed during goal inspection"
+                    )
+            return result
         if not text.strip() or "\n" in text or "\r" in text:
             raise AgentDeliveryError("goal must be a nonempty single line")
         if "require_existing" in options:
@@ -5410,11 +5503,13 @@ class ManagedAgents:
             client, record.target(), self._queue(name),
             require_existing=True, **options,
         )
-        agent.finish_identified_delivery(
-            self._queue(name), identifier, drained,
+        finished = self._finish_generation_delivery(
+            record, identifier, drained,
             max_artifact_bytes=_MAX_QUEUE_ARTIFACT_BYTES,
         )
-        return self._goal_result(record, goal_command)
+        return self._goal_result(
+            record, goal_command, resolved_delivery=finished.outcome,
+        )
 
     def stop(
         self, name: str, *, expected_token: str | None = None,

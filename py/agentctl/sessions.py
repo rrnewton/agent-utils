@@ -498,6 +498,35 @@ class Sessions(ManagedAgents):
         return evidence
 
     @staticmethod
+    def _worker_record_needs_sync(
+        record: AgentRecord, evidence: WorkerRuntimeEvidence, *,
+        promote_running: bool,
+    ) -> bool:
+        """Whether typed worker evidence changes any derived outer cache."""
+        session_agent = (
+            record.launch.harness if evidence.session_id is not None else None
+        )
+        session_source = "observed" if evidence.session_id is not None else None
+        if (
+            record.session_value != evidence.session_id
+            or record.session_agent != session_agent
+            or record.session_source != session_source
+            or record.pane_id != evidence.pane_id
+        ):
+            return True
+        if evidence.mode == "tui":
+            if record.runner_identity is not None:
+                return True
+        elif (
+            evidence.runner_identity is not None
+            and record.runner_identity != evidence.runner_identity
+        ):
+            return True
+        return promote_running and (
+            record.lifecycle != "running" or record.error is not None
+        )
+
+    @staticmethod
     def _runner_observation(
         record: AgentRecord, response: dict[str, object],
         evidence: WorkerRuntimeEvidence | None = None,
@@ -575,31 +604,18 @@ class Sessions(ManagedAgents):
                 )
                 liveness, liveness_error = self._runner_liveness(record, response)
                 expected_runtime_home = str(self._directory(record.name) / "runtime")
-                first_runner_observation = (
-                    record.lifecycle in ("starting", "running")
-                    and record.runner_identity is None
-                    and observation is not None
-                )
-                live_runtime_observation = (
-                    record.lifecycle == "running"
+                promote_running = (
+                    record.lifecycle == "starting"
                     and observation is not None
                     and observation[1] is True
                 )
-                current_tui = (
-                    record.lifecycle == "running"
-                    and evidence.mode == "tui"
-                )
-                if ((first_runner_observation
-                        or live_runtime_observation or current_tui)
+                if (self._worker_record_needs_sync(
+                        record, evidence, promote_running=promote_running,
+                    )
                         and record.launch.runtime_ownership == "owned"
                         and record.launch.runtime_home == expected_runtime_home):
                     self._sync_worker_record(
-                        record, response,
-                        promote_running=(
-                            record.lifecycle == "starting"
-                            and observation is not None
-                            and observation[1] is True
-                        ),
+                        record, response, promote_running=promote_running,
                     )
                     if evidence.mode == "headless":
                         liveness, liveness_error = self._runner_liveness(

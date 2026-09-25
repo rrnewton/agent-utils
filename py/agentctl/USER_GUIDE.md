@@ -545,11 +545,12 @@ background task remains `working`. Muse's structural `Goal (paused)` footer is
 reported separately as `agent_status: paused` while process health remains
 healthy.
 
-Claude's native prompt API can return success after placing text in its editor
-without submitting it. Agentctl distinguishes that exact staged composer from
-a submitted turn, revalidates the owned pane, and sends one `Enter`. It never
-uses `Ctrl-S`, which is Claude's stash operation, and it never reinjects prompt
-text while reconciling a delayed transcript or stale Herdr status.
+Claude's native prompt API can return success after either staging or submitting
+text, so a later staged-looking redraw cannot safely authorize another key.
+Agentctl therefore uses the pane's text-only primitive for Claude, proves the
+exact staged composer, revalidates the owned pane, and sends one `Enter`. It
+never uses `Ctrl-S`, which is Claude's stash operation, and it never reinjects
+prompt text while reconciling a delayed transcript or stale Herdr status.
 
 A saved `lifecycle: "running"` whose pane has returned to a shell is reported as
 `runtime_state: "dead"`, `health: "unhealthy"`, and exits 1. `list` applies the

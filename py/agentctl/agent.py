@@ -2185,7 +2185,53 @@ def finish_identified_delivery(
     max_artifact_bytes = _effective_artifact_limit(max_artifact_bytes)
     filename = f"{identifier}.json"
     failed_path = os.path.join(root, "failed", filename)
-    if identifier in result.quarantined or os.path.lexists(failed_path):
+    memberships = sum((
+        identifier in result.delivered,
+        identifier in result.quarantined,
+        identifier in result.pending,
+    ))
+    if memberships > 1:
+        raise AgentDeliveryError(
+            f"message {identifier} has contradictory drain result membership"
+        )
+    if identifier in result.quarantined:
+        detail = "unknown delivery failure"
+        try:
+            failed_document = _load(failed_path, max_artifact_bytes=max_artifact_bytes)
+            recorded = failed_document.get("delivery_error")
+            if isinstance(recorded, str):
+                detail = _bounded_error(recorded, max_artifact_bytes)
+        except AgentDeliveryError:
+            pass
+        raise AgentPossiblySubmitted(
+            _bounded_error(
+                f"message {identifier} has an ambiguous outcome after one injection: {detail}; "
+                f"it is retained under {root}/failed",
+                max_artifact_bytes,
+            ),
+            message_id=identifier,
+            artifact=failed_path,
+        )
+    if identifier in result.delivered:
+        return QueueResult(
+            identifier,
+            result.delivered,
+            result.quarantined,
+            result.pending,
+            result.blocked,
+            "delivered",
+        )
+    inbox_path = os.path.join(root, "inbox", filename)
+    if identifier in result.pending:
+        raise AgentPending(
+            _bounded_error(
+                f"message {identifier} remains pending without consuming a retry attempt: {result.blocked}",
+                max_artifact_bytes,
+            ),
+            message_id=identifier,
+            artifact=inbox_path,
+        )
+    if os.path.lexists(failed_path):
         detail = "unknown delivery failure"
         try:
             failed_document = _load(failed_path, max_artifact_bytes=max_artifact_bytes)
@@ -2214,8 +2260,7 @@ def finish_identified_delivery(
             message_id=identifier,
             artifact=inflight_path,
         )
-    inbox_path = os.path.join(root, "inbox", filename)
-    if identifier in result.pending or os.path.lexists(inbox_path):
+    if os.path.lexists(inbox_path):
         raise AgentPending(
             _bounded_error(
                 f"message {identifier} remains pending without consuming a retry attempt: {result.blocked}",
@@ -2225,7 +2270,7 @@ def finish_identified_delivery(
             artifact=inbox_path,
         )
     processed_path = os.path.join(root, "processed", filename)
-    if identifier in result.delivered or os.path.lexists(processed_path):
+    if os.path.lexists(processed_path):
         delivered = result.delivered
         if identifier not in delivered:
             delivered = (*delivered, identifier)

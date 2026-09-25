@@ -1366,7 +1366,63 @@ pub(crate) fn finish_identified_delivery(
 ) -> AgentResult<QueueResult> {
     let filename = format!("{identifier}.json");
     let failed_path = root.join("failed").join(&filename);
-    if result.quarantined.contains(&identifier) || fs::symlink_metadata(&failed_path).is_ok() {
+    let memberships = [
+        result.delivered.contains(&identifier),
+        result.quarantined.contains(&identifier),
+        result.pending.contains(&identifier),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    if memberships > 1 {
+        return Err(AgentError::delivery(format!(
+            "message {identifier} has contradictory drain result membership"
+        )));
+    }
+    if result.quarantined.contains(&identifier) {
+        let detail = load_message(&failed_path)
+            .ok()
+            .and_then(|document| {
+                document
+                    .get("delivery_error")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "unknown delivery failure".to_owned());
+        return Err(AgentError::PossiblySubmitted(UndeliveredMessage {
+            message: format!(
+                "message {identifier} has an ambiguous outcome after one injection: {detail}; it is retained under {}/failed",
+                root.display()
+            ),
+            message_id: identifier,
+            artifact: failed_path,
+        }));
+    }
+    if result.delivered.contains(&identifier) {
+        return Ok(QueueResult {
+            message_id: identifier,
+            delivered: result.delivered,
+            quarantined: result.quarantined,
+            pending: result.pending,
+            blocked: result.blocked,
+            outcome: QueueOutcome::Delivered,
+        });
+    }
+    let inbox_path = root.join("inbox").join(&filename);
+    if result.pending.contains(&identifier) {
+        return Err(AgentError::Pending(UndeliveredMessage {
+            message: format!(
+                "message {identifier} remains pending without consuming a retry attempt: {}",
+                result
+                    .blocked
+                    .as_deref()
+                    .unwrap_or("unknown readiness failure")
+            ),
+            message_id: identifier,
+            artifact: inbox_path,
+        }));
+    }
+    if fs::symlink_metadata(&failed_path).is_ok() {
         let detail = load_message(&failed_path)
             .ok()
             .and_then(|document| {
@@ -1395,8 +1451,7 @@ pub(crate) fn finish_identified_delivery(
             artifact: inflight_path,
         }));
     }
-    let inbox_path = root.join("inbox").join(&filename);
-    if result.pending.contains(&identifier) || fs::symlink_metadata(&inbox_path).is_ok() {
+    if fs::symlink_metadata(&inbox_path).is_ok() {
         return Err(AgentError::Pending(UndeliveredMessage {
             message: format!(
                 "message {identifier} remains pending without consuming a retry attempt: {}",
@@ -1410,7 +1465,7 @@ pub(crate) fn finish_identified_delivery(
         }));
     }
     let processed_path = root.join("processed").join(&filename);
-    if !result.delivered.contains(&identifier) && fs::symlink_metadata(&processed_path).is_err() {
+    if fs::symlink_metadata(&processed_path).is_err() {
         return Err(AgentError::delivery(format!(
             "message {identifier} disappeared without a durable terminal artifact"
         )));
