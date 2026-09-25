@@ -534,6 +534,64 @@ def test_a_stop_signal_to_the_runner_stops_every_shard_group_without_a_grace(
         assert runner._TERMINATE_SECONDS <= elapsed < runner._INTERRUPT_GRACE_SECONDS / 3
 
 
+_IGNORES_SIGTERM = (
+    "import signal, time\n"
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "print('ready', flush=True)\n"
+    "time.sleep(60)\n"
+)
+
+
+@pytest.mark.parametrize("interrupt", ("keyboard", "stop-signal"))
+def test_an_interrupt_inside_the_first_sigkill_sweep_still_kills_every_later_group(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], interrupt: str
+) -> None:
+    """The SIGKILL sweep is one killpg per shard, and Python runs a signal handler between any two
+    bytecodes, so an interrupt can land after the first group's SIGKILL and before the next one's.
+    The kill step must sweep again, not return with a later group never signalled."""
+
+    processes = [
+        subprocess.Popen(
+            (sys.executable, "-c", _IGNORES_SIGTERM),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            start_new_session=True,
+        )
+        for _ in range(2)
+    ]
+    try:
+        for process in processes:
+            assert process.stdout is not None and process.stdout.readline() == b"ready\n"
+        real_killpg = os.killpg
+        kills: list[int] = []
+
+        def killpg(pgid: int, signum: int) -> None:
+            real_killpg(pgid, signum)
+            if signum == signal.SIGKILL:
+                kills.append(pgid)
+                if len(kills) == 1:  # Delivered to the first group; the later one not yet.
+                    if interrupt == "keyboard":
+                        raise KeyboardInterrupt
+                    raise runner._StopSignal(signal.SIGTERM)
+
+        monkeypatch.setattr(runner.os, "killpg", killpg)
+        monkeypatch.setattr(runner, "_TERMINATE_SECONDS", 0.3)
+
+        runner._stop_shards(processes, 0.0, False)
+
+        first, later = (process.pid for process in processes)
+        assert kills[:3] == [first, first, later]
+        assert [process.returncode for process in processes] == [-signal.SIGKILL] * 2
+        assert "still present after SIGKILL" not in capsys.readouterr().out
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            if process.stdout is not None:
+                process.stdout.close()
+
+
 def test_main_runs_ordinary_partition_with_the_unresolved_interpreter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
