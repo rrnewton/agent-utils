@@ -6839,8 +6839,10 @@ function setReadAudioSource(source, announce = true) {
   el("audio-source").title = agent
     ? `${readAloudLabel}. Tap to use device audio.`
     : `Device audio. Tap to use ${agentReadAloud ? agentReadAloud["label"] : "the configured agent"}.`;
-  el("audio-device-icon").hidden = agent;
-  el("audio-agent-icon").hidden = !agent;
+  // The icons are <svg>, and `hidden` reflects only on HTMLElement: assigning `.hidden` here would
+  // set an expando and leave the phone icon showing in agent mode.
+  el("audio-device-icon").toggleAttribute("hidden", agent);
+  el("audio-agent-icon").toggleAttribute("hidden", !agent);
   if (readingMode) {
     setReadState("ready");
     guardQuietly(prepareSpeech)();

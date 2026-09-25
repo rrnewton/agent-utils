@@ -66,7 +66,9 @@ const PAGE_ELEMENTS = new Map(
   [...HTML.matchAll(/<([\w-]+)([^>]*\bid="([^"]+)"[^>]*)>([^<]*)/g)].map((m) => [
     m[3],
     {
-      hidden: /\bhidden\b/.test(m[2]),
+      tag: m[1].toLowerCase(),
+      // The boolean attribute only: `\bhidden\b` also matched `aria-hidden="true"`.
+      hidden: /(?:^|\s)hidden(?=[\s=>/]|$)/.test(m[2]),
       checked: /\bchecked\b/.test(m[2]),
       // The initial state the MARKUP gives the status line, so a test can read it before the page
       // has had any reason to change it.
@@ -628,6 +630,16 @@ class FakeElement {
     this.attributes.delete(name);
   }
 
+  toggleAttribute(name, force) {
+    const on = force === undefined ? !this.attributes.has(name) : Boolean(force);
+    if (on) {
+      this.attributes.set(name, "");
+    } else {
+      this.attributes.delete(name);
+    }
+    return on;
+  }
+
   /**
    * Append, and DETACH from wherever the child was before.
    *
@@ -909,8 +921,17 @@ function openStream() {
 function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   const elements = new Map();
   for (const [id, markup] of PAGE_ELEMENTS) {
-    const element = new FakeElement(id);
-    element.hidden = markup.hidden;
+    const element = new FakeElement(id, markup.tag === "svg" ? "svg" : "");
+    if (markup.tag === "svg") {
+      // SVGElement has no reflecting `hidden` property, so a browser keeps the markup's `hidden`
+      // as an attribute and treats `.hidden = x` as an expando that changes nothing on screen.
+      // Modelled that way so a page assigning `.hidden` to an icon fails here as it does on a phone.
+      if (markup.hidden) {
+        element.setAttribute("hidden", "");
+      }
+    } else {
+      element.hidden = markup.hidden;
+    }
     element.checked = markup.checked;
     element.textContent = markup.text;
     if (markup.state !== undefined) {
@@ -5865,7 +5886,12 @@ test("a configured audio speech backend keeps using server audio even when devic
 });
 
 test("the channel bar switches between configured agent audio and device audio locally", async () => {
+  // Visibility is read from the `hidden` ATTRIBUTE: the icons are <svg>, where `.hidden` is an
+  // expando a browser ignores. Reading the property back passed while a phone showed the phone
+  // icon in both modes.
+  const shown = (id) => !page.el(id).hasAttribute("hidden");
   const page = devicePage();
+  // A label no vendor ships: the agent side is named only by the configured provider profile.
   page.readAloud = { backend: "conversation", label: "Internal voice preview", playback: "audio", local_only: false };
   await signIn(page);
   const rows = await showDiscord(page, [message({ content: "read this locally" })]);
@@ -5874,24 +5900,27 @@ test("the channel bar switches between configured agent audio and device audio l
   assert.equal(toggle.getAttribute("aria-checked"), "true");
   assert.equal(toggle.getAttribute("aria-label"), "Read messages with Internal voice preview");
   assert.equal(toggle.title, "Internal voice preview. Tap to use device audio.");
-  assert.equal(page.el("audio-device-icon").hidden, true);
-  assert.equal(page.el("audio-agent-icon").hidden, false, "agent audio does not show its cloud icon");
+  assert.equal(shown("audio-device-icon"), false, "agent audio still shows the phone icon");
+  assert.equal(shown("audio-agent-icon"), true, "agent audio does not show its cloud icon");
   assert.match(HTML_CODE, /id="audio-device-icon"[^>]*data-icon="device"/);
   assert.match(HTML_CODE, /id="audio-agent-icon"[^>]*data-icon="cloud"/);
+  for (const [where, code] of [["web/voice.js", SCRIPT_CODE], ["web/voice.html", HTML_CODE]]) {
+    assert.doesNotMatch(code, /elevenlabs/i, `${where} names a speech vendor instead of the profile label`);
+  }
   const requests = page.prepareCalls.length;
   await toggle.click();
   assert.equal(toggle.getAttribute("aria-checked"), "false");
   assert.equal(toggle.getAttribute("aria-label"), "Read messages with device audio");
   assert.equal(toggle.title, "Device audio. Tap to use Internal voice preview.");
-  assert.equal(page.el("audio-device-icon").hidden, false, "device speech lost its phone icon");
-  assert.equal(page.el("audio-agent-icon").hidden, true);
+  assert.equal(shown("audio-device-icon"), true, "device speech lost its phone icon");
+  assert.equal(shown("audio-agent-icon"), false, "device speech still shows the cloud icon");
   assert.equal(page.prepareCalls.length, requests, "changing the source issued a network request");
   await toggle.click();
   assert.equal(toggle.getAttribute("aria-checked"), "true");
   assert.equal(toggle.getAttribute("aria-label"), "Read messages with Internal voice preview");
   assert.equal(toggle.title, "Internal voice preview. Tap to use device audio.");
-  assert.equal(page.el("audio-device-icon").hidden, true);
-  assert.equal(page.el("audio-agent-icon").hidden, false, "switching back did not restore the cloud icon");
+  assert.equal(shown("audio-device-icon"), false, "switching back left the phone icon showing");
+  assert.equal(shown("audio-agent-icon"), true, "switching back did not restore the cloud icon");
   assert.equal(page.prepareCalls.length, requests, "switching back issued a network request");
   await toggle.click();
   await readButton(page).click();

@@ -529,6 +529,10 @@ def open_target_page(
 
     source = page.locator("#audio-source")
     if source.is_visible() and source.get_attribute("aria-checked") == "true":
+        if not page.locator("#audio-agent-icon").is_visible():
+            raise HarnessError("agent audio is selected but its cloud icon is not visible", EXIT_BROWSER)
+        if page.locator("#audio-device-icon").is_visible():
+            raise HarnessError("the device icon is visible while agent audio is selected", EXIT_BROWSER)
         source.click()
     if source.is_visible():
         if not page.locator("#audio-device-icon").is_visible():
@@ -556,9 +560,7 @@ def open_target_page(
         )
     text = cast(
         str,
-        row.evaluate(
-            """node => (node.messages || []).map(message => String(message.content || '')).join('\n\n')"""
-        ),
+        row.evaluate(ROW_TEXT_SCRIPT),
     ).strip()
     if len(words(text)) < 3:
         raise HarnessError("the selected row is too short for a language regression", EXIT_BROWSER)
@@ -569,6 +571,15 @@ def open_target_page(
         voice_language=str(details.get("voiceLanguage") or ""),
         voice_name=str(details.get("voiceName") or ""),
     )
+
+
+# Raw: a cooked "\n" would put a line break inside the JavaScript string literal, which Chrome rejects.
+ROW_TEXT_SCRIPT = r"""node => (node.messages || []).map(message => String(message.content || '')).join('\n\n')"""
+
+
+def artifact_paths(out: Path, capture_suffix: str) -> tuple[Path, Path, Path]:
+    # Distinct stems: with --capture-suffix .wav a shared stem would make ffmpeg overwrite its input.
+    return out / f"recording{capture_suffix}", out / "capture.wav", out / "report.json"
 
 
 def self_test() -> int:
@@ -638,13 +649,36 @@ def self_test() -> int:
         failures.append("invalid transcriber output was accepted")
     except HarnessError:
         pass
+    for suffix in (".mp4", ".wav"):
+        capture, wav_path, _ = artifact_paths(Path("out"), suffix)
+        check(capture != wav_path, f"a {suffix} capture shares its path with the converted WAV")
+    try:
+        joined = subprocess.run(
+            [
+                "node",
+                "-e",
+                "process.stdout.write(JSON.stringify(("
+                + ROW_TEXT_SCRIPT
+                + ")({messages: [{content: 'first'}, {content: 'second'}]})))",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        check(
+            joined.returncode == 0 and json.loads(joined.stdout or "null") == "first\n\nsecond",
+            "the row-text script does not evaluate to the joined message text",
+        )
+    except FileNotFoundError:
+        failures.append("node is required to check the row-text script")
 
     if failures:
         print("android device-speech self-test FAILED:", file=sys.stderr)
         for failure in failures:
             print(f"  - {failure}", file=sys.stderr)
         return EXIT_SELF_TEST
-    print("android device-speech self-test: 9 controls passed")
+    print("android device-speech self-test: 12 controls passed")
     return EXIT_OK
 
 
@@ -703,9 +737,7 @@ def main() -> int:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out = args.out or Path(__file__).resolve().parent.parent / "debug" / "android-device-speech" / stamp
     out.mkdir(parents=True, exist_ok=False)
-    capture_path = out / f"capture{args.capture_suffix}"
-    wav_path = out / "capture.wav"
-    report_path = out / "report.json"
+    capture_path, wav_path, report_path = artifact_paths(out, args.capture_suffix)
 
     run(
         [
