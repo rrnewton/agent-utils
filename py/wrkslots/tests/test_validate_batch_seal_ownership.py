@@ -203,3 +203,43 @@ def test_crashed_invocations_seal_waits_for_explicit_recovery(
     assert not target.exists()
     assert not seal.exists()
     assert active_slots(project) == []
+
+
+@pytest.mark.parametrize("failure", ("before-replace", "after-replace"))
+def test_failed_seal_rewrite_still_retires_the_invocations_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: str,
+) -> None:
+    project, target, seal = _prepare(tmp_path, monkeypatch)
+    original = target.stat().st_mode & 0o777
+    real = wrkslots._write_validate_batch_seal_journal
+    writes: list[bytes | None] = []
+
+    def write(config: wrkslots.Config, payload: object) -> None:
+        # The first write publishes the empty seal; the second adds the target
+        # and fails, for example on a full disk.
+        assert isinstance(payload, dict)
+        if not writes:
+            real(config, payload)
+            writes.append(seal.read_bytes())
+            return
+        if failure == "after-replace":
+            real(config, payload)
+        writes.append(seal.read_bytes())
+        raise wrkslots.Refusal("simulated seal write failure")
+
+    monkeypatch.setattr(wrkslots, "_write_validate_batch_seal_journal", write)
+
+    assert remove_completed_validation(project) == 3
+    assert "simulated seal write failure" in capsys.readouterr().err
+
+    assert len(writes) == 2
+    assert (writes[1] == writes[0]) == (failure == "before-replace")
+    assert not seal.exists()
+    assert target.is_dir()
+    assert target.stat().st_mode & 0o777 == original
+    assert [row["slot"] for row in active_slots(project) if isinstance(row, dict)] == [
+        "target"
+    ]
