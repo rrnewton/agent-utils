@@ -88,6 +88,59 @@ pub(crate) struct PendingOperation {
     pub(crate) journal_path: Option<String>,
     pub(crate) journal_sha256: Option<String>,
     pub(crate) event_sha256: String,
+    /// Storage a create or import journal places, carried from the journal to
+    /// the recovery attempt that inherits it.
+    storage: Option<AttemptStorage>,
+}
+
+/// The slot type and checkout paths one create or import attempt placed or
+/// planned. Python derives every checkout path from the slot type's root, so
+/// a slot name alone does not locate an attempt's storage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AttemptStorage {
+    slot_type: String,
+    paths: BTreeSet<String>,
+}
+
+impl AttemptStorage {
+    /// Read the storage an embedded create or import journal describes.
+    /// `None` means the journal does not identify it, so no later row can
+    /// prove that storage owned. Python treats an absent `slot_type` as
+    /// `agent` in both journal kinds.
+    fn from_journal(operation: &str, journal: &Map<String, Value>) -> Option<Self> {
+        let (holder, lists): (&Map<String, Value>, &[(&str, &str)]) = match operation {
+            "create" => (journal, &[("planned", "destination"), ("created", "path")]),
+            "import-existing" => (
+                journal.get("record")?.as_object()?,
+                &[("checkouts", "path")],
+            ),
+            _ => return None,
+        };
+        let slot_type = match holder.get("slot_type") {
+            None => "agent",
+            Some(value) => value.as_str()?,
+        };
+        let mut paths = BTreeSet::new();
+        for (list, field) in lists {
+            for item in holder.get(*list)?.as_array()? {
+                paths.insert(item.as_object()?.get(*field)?.as_str()?.to_owned());
+            }
+        }
+        (!paths.is_empty()).then(|| Self {
+            slot_type: slot_type.to_owned(),
+            paths,
+        })
+    }
+
+    /// Whether `row` now owns every path of this attempt under the same slot
+    /// type.
+    fn owned_by(&self, row: &ActiveRecordMeta) -> bool {
+        row.slot_type == self.slot_type
+            && self
+                .paths
+                .iter()
+                .all(|path| row.checkouts.iter().any(|(_, owned)| owned == path))
+    }
 }
 
 /// Stable classes of unfinished lifecycle work understood by the observer.
@@ -123,7 +176,6 @@ struct State {
     archive_revision: Option<u64>,
     archive_records: Vec<Value>,
     archive_ids: BTreeSet<String>,
-    archived_slots: BTreeSet<String>,
     archived_generations: BTreeMap<String, u64>,
     holds: BTreeMap<String, SlotHold>,
     pending_operations: BTreeMap<String, PendingOperation>,
@@ -137,6 +189,8 @@ struct CompletedOperation {
     /// Event sequence of the completion, so recovery can bind the journal
     /// that completed most recently rather than the path that sorts first.
     sequence: u64,
+    /// Storage of the completed journal, for a recovery that loads it again.
+    storage: Option<AttemptStorage>,
 }
 
 impl CompletedOperation {
@@ -970,6 +1024,7 @@ fn apply_operation_progress(event: &Event, state: &mut State) -> Result<(), Obse
         ));
     }
     let generation = active_generation(state, &slot);
+    let storage = AttemptStorage::from_journal(&operation, journal);
     insert_pending(
         state,
         &journal_path,
@@ -981,6 +1036,7 @@ fn apply_operation_progress(event: &Event, state: &mut State) -> Result<(), Obse
             journal_path: Some(journal_path.clone()),
             journal_sha256: Some(canonical_sha256(&Value::Object(journal.clone()))?),
             event_sha256: event.sha256.clone(),
+            storage,
         },
     );
     Ok(())
@@ -1014,37 +1070,50 @@ fn apply_operation_completed(event: &Event, state: &mut State) -> Result<(), Obs
             "operation-completed has no pending progress or recovery attempt",
         ));
     }
-    match pending_journal {
+    let storage = match pending_journal {
         Some(pending)
             if pending.operation.as_deref() == Some(operation.as_str())
                 && pending.journal_path.as_deref() == Some(journal_path.as_str()) =>
         {
             // The completion closes this physical journal only. Lifecycle
             // attempts have a different terminal condition below.
+            pending.storage
         }
         Some(_) => {
             return Err(ObserverError::invalid(
                 "append-only completion does not match its pending operation",
             ))
         }
-        None => {}
-    }
-    if TERMINAL_COMPLETION_OPERATIONS.contains(&operation.as_str())
-        && state.active_records.contains_key(&slot)
-    {
-        // A create or import completion that leaves an ACTIVE row also ends a
-        // recovery attempt bound to the same journal: the row now owns the
-        // slot's storage. Without a row the completion proves nothing about
-        // storage, because older writers completed such journals while
-        // leaving provisioned worktrees behind, so the marker stays pending.
-        // A recovery bound elsewhere, such as the legacy singleton default,
-        // also stays pending.
+        None => state
+            .completed_operations
+            .get(&journal_path)
+            .filter(|completed| completed.is(&slot, &operation))
+            .and_then(|completed| completed.storage.clone()),
+    };
+    if TERMINAL_COMPLETION_OPERATIONS.contains(&operation.as_str()) {
+        // A create or import completion ends a recovery attempt bound to the
+        // same journal only when an ACTIVE row now owns every checkout path
+        // that attempt placed or planned, under the same slot type. Without
+        // such a row the completion proves nothing about storage: older
+        // writers completed these journals while leaving provisioned
+        // worktrees behind, and a create of the same slot name under another
+        // slot type proves only that its own root was clear. An attempt whose
+        // storage is unknown, or a recovery bound elsewhere such as the legacy
+        // singleton default, stays pending.
         let recovery_key = pending_key(PendingOperationKind::Recovery, &slot, &operation);
-        if state
-            .pending_operations
-            .get(&recovery_key)
-            .is_some_and(|pending| pending.journal_path.as_deref() == Some(journal_path.as_str()))
-        {
+        let closed = state.active_records.get(&slot).is_some_and(|row| {
+            state
+                .pending_operations
+                .get(&recovery_key)
+                .is_some_and(|pending| {
+                    pending.journal_path.as_deref() == Some(journal_path.as_str())
+                        && pending
+                            .storage
+                            .as_ref()
+                            .is_some_and(|storage| storage.owned_by(&row.meta))
+                })
+        });
+        if closed {
             state.pending_operations.remove(&recovery_key);
         }
     }
@@ -1054,6 +1123,7 @@ fn apply_operation_completed(event: &Event, state: &mut State) -> Result<(), Obs
             slot: slot.clone(),
             operation,
             sequence: event.sequence,
+            storage,
         },
     );
     clear_archived_removal_markers(state, &slot);
@@ -1064,8 +1134,8 @@ fn apply_operation_completed(event: &Event, state: &mut State) -> Result<(), Obs
 /// same generation was archived with removed storage and left ACTIVE. Python's
 /// `operation-completed` means only that a journal was cleared: rollback and
 /// late-refusal paths emit it while deliberately retaining the slot. Create and
-/// import completions that leave an ACTIVE row are the exception handled in
-/// `apply_operation_completed`.
+/// import completions that leave an ACTIVE row owning the attempt's storage are
+/// the exception handled in `apply_operation_completed`.
 fn clear_archived_removal_markers(state: &mut State, slot: &str) {
     let Some(generation) = state.archived_generations.get(slot).copied() else {
         return;
@@ -1107,6 +1177,7 @@ fn clear_archived_removal_markers(state: &mut State, slot: &str) {
                         journal_path: Some(journal_path.clone()),
                         journal_sha256: None,
                         event_sha256: pending.event_sha256.clone(),
+                        storage: None,
                     });
                 }
             }
@@ -1233,6 +1304,7 @@ fn apply_reclaim_started(event: &Event, state: &mut State) -> Result<(), Observe
             journal_path: None,
             journal_sha256: None,
             event_sha256: event.sha256.clone(),
+            storage: None,
         },
     );
     Ok(())
@@ -1296,17 +1368,19 @@ fn apply_recovery_started(event: &Event, state: &mut State) -> Result<(), Observ
     // again. Bind the most recent such completion: an older one at another
     // path may since have been reused by a different identity. Only a journal
     // absent from the history is the legacy singleton.
-    let journal_path = pending_journal
-        .and_then(|pending| pending.journal_path.clone())
+    // The attempt inherits the bound journal's storage; the singleton default
+    // has none, so nothing can later prove its storage owned.
+    let (journal_path, storage) = pending_journal
+        .and_then(|pending| Some((pending.journal_path.clone()?, pending.storage.clone())))
         .or_else(|| {
             state
                 .completed_operations
                 .iter()
                 .filter(|(_, completed)| completed.is(slot, operation))
                 .max_by_key(|(_, completed)| completed.sequence)
-                .map(|(path, _)| path.clone())
+                .map(|(path, completed)| (path.clone(), completed.storage.clone()))
         })
-        .unwrap_or_else(|| format!("ACTIVE.{}.journal", event.machine));
+        .unwrap_or_else(|| (format!("ACTIVE.{}.journal", event.machine), None));
     insert_pending(
         state,
         operation,
@@ -1318,6 +1392,7 @@ fn apply_recovery_started(event: &Event, state: &mut State) -> Result<(), Observ
             journal_path: Some(journal_path),
             journal_sha256: None,
             event_sha256: event.sha256.clone(),
+            storage,
         },
     );
     clear_archived_removal_markers(state, slot);
@@ -1373,6 +1448,7 @@ fn apply_retirement_attempted(event: &Event, state: &mut State) -> Result<(), Ob
             journal_path: None,
             journal_sha256: None,
             event_sha256: event.sha256.clone(),
+            storage: None,
         },
     );
     Ok(())
@@ -1819,15 +1895,16 @@ fn insert_archive_record(
             meta.archive_id
         )));
     }
-    if !state.archived_slots.insert(meta.slot.clone()) {
+    if state
+        .archived_generations
+        .insert(meta.slot.clone(), meta.generation)
+        .is_some()
+    {
         return Err(ObserverError::invalid(format!(
             "duplicate archived slot in event log: {}",
             meta.slot
         )));
     }
-    state
-        .archived_generations
-        .insert(meta.slot.clone(), meta.generation);
     state.archive_records.push(record.clone());
     Ok(())
 }
