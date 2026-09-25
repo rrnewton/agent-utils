@@ -16,6 +16,14 @@ Use `npm run test:headed` while iterating. The browser download and `node_module
 are intentionally untracked; this directory does not vendor generated npm or browser
 artifacts.
 
+`make -C py/wrkviz browser` and `benchmark` (and so the repository's `make validate`) first
+run `check-deps.cjs`, which refuses with exit status 2, naming what is missing, unless
+`node_modules/` holds exactly the `@playwright/test` version `package.json` pins. They then run
+`node_modules/.bin/playwright`, never `npx`, which with nothing installed goes to the npm
+registry and can hang for minutes on a host that cannot reach it. On a host that has installed
+these packages before, `npm install --offline --no-audit --no-fund --no-package-lock` installs
+them from the npm cache with no network.
+
 The suite treats DOM observability as a small UI testing contract. A check skips with
 a precise reason until its contract exists, then enforces the behavior. Production UI
 code should expose:

@@ -82,12 +82,19 @@ unit:
 	cd $(REPO_ROOT)/py && $(call BOX,timeline-unit,8G,1800,8) \
 	  $(PYTHON) -m pytest tests -q -k 'timeline or transcript or query or seekable or build_store'
 
+# Both browser targets first refuse to start without the pinned `@playwright/test` installed in
+# $(BROWSER)/node_modules, and then run its own `playwright`, never `npx`: with nothing installed,
+# `npx` asks the npm registry for a download, and an unreachable registry held this step for 481 s
+# before it failed anyway. 256 MiB / 1 min / 1 core: the check reads two small files.
+DEPS = cd $(BROWSER) && $(call BOX,timeline-browser-deps,256M,60,1) node check-deps.cjs
+
 # 6 GiB / 15 min / 4 cores. Chromium is the reason this target is boxed at all: a lost browser
 # holds hundreds of megabytes and a wedged page holds it forever.
 browser:
 	@printf '\n\033[1m==> browser\033[0m\n'
+	$(DEPS)
 	cd $(BROWSER) && $(call BOX,timeline-browser,6G,900,4) \
-	  npx playwright test --reporter=line
+	  ./node_modules/.bin/playwright test --reporter=line
 
 # 6 GiB / 15 min / 4 cores, same reasoning as `browser`. This one is a pass/fail check AND a
 # measurement: it prints the redraw timings it collected and fails if any breaches the budget.
@@ -96,6 +103,7 @@ browser:
 # the box, so `make benchmark` shows its numbers whether it passed or failed.
 benchmark:
 	@printf '\n\033[1m==> benchmark\033[0m\n'
+	$(DEPS)
 	cd $(BROWSER) && $(call BOX,timeline-benchmark,6G,900,4) \
 	  node --test benchmark-budget.test.cjs
 	@printf '\n'; cat $(BROWSER)/benchmark-report.txt
