@@ -438,6 +438,34 @@ def test_live_use_scan_still_refuses_a_namespace_that_mounts_the_slot(
         cli._observe_slot_use_once(slot, proc_root=proc_root)
 
 
+@pytest.mark.skipif(not _lsof_available(), reason="the mount-only scan follows an lsof pass")
+def test_live_use_scan_memo_never_lends_an_answer_to_a_different_table_of_equal_length(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The memo key is the whole table text.  Tables read earlier answer "unused" and differ from
+    the mounting table in one mount point of the same length; a key weaker than the text (its
+    length, a prefix, a line count) would carry that answer over and miss the use."""
+
+    slot = tmp_path / "slot"
+    proc_root = tmp_path / "proc"
+    line = "27 30 259:2 /x {} rw - btrfs /dev/root rw\n"
+    unused = _SHARED_TABLE + line.format(tmp_path / "slox" / "bound")
+    mounting = _SHARED_TABLE + line.format(slot / "bound")
+    assert len(unused) == len(mounting) and unused.count("\n") == mounting.count("\n")
+    for pid in range(100, 160):
+        _fake_mount_process(proc_root, pid, 5000 + pid, unused)
+    _fake_mount_process(proc_root, 200, 6000, mounting)
+    monkeypatch.setattr(cli, "_lsof_slot_use", lambda *_args, **_kwargs: (None, False, 1))
+    parsed = _counting_parses(monkeypatch)
+
+    with pytest.raises(cli.Refusal, match=f"live process 200 uses slot .*mount={slot / 'bound'}"):
+        cli._observe_slot_use_once(slot, proc_root=proc_root)
+    assert parsed == [
+        "process mount evidence for PID 100",
+        "process mount evidence for PID 200",
+    ]
+
+
 @pytest.mark.parametrize("row_count", (64, 128, 256))
 def test_batch_liveness_matches_per_subject_results_with_one_invocation(
     tmp_path: Path,
