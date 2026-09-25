@@ -27,6 +27,9 @@ from agentctl.client import (
     muse_prompt_transcript_count,
     muse_startup_metadata,
     muse_verified_process_idle_composer,
+    muse_verified_process_prompt_in_composer,
+    muse_verified_process_prompt_is_exact_composer,
+    muse_verified_process_prompt_transcript_count,
 )
 from agentctl.errors import HerdrUnavailable
 import pytest
@@ -330,6 +333,16 @@ def test_headerless_muse_composer_requires_verified_process_context() -> None:
     )
     assert not muse_idle_composer(screen)
     assert muse_verified_process_idle_composer(screen)
+    prompt = "require the full deterministic-scheduling-review skill"
+    staged = screen.replace("❯\n", f"❯ {prompt}\n")
+    assert not muse_prompt_is_exact_composer(staged, prompt)
+    assert muse_verified_process_prompt_is_exact_composer(staged, prompt)
+    assert muse_verified_process_prompt_in_composer(staged, prompt)
+    accepted = screen.replace(
+        "old transcript after the version header scrolled away\n",
+        f"❯ {prompt}\n◆ Working\n",
+    )
+    assert muse_verified_process_prompt_transcript_count(accepted, prompt) == 1
 
 
 def test_custom_muse_launch_never_accepts_a_trust_prompt() -> None:

@@ -1438,7 +1438,7 @@ def _load(path: str, *, max_artifact_bytes: int | None = None) -> dict[str, obje
 
 
 def _delivery_attempts(document: dict[str, object], path: str) -> int:
-    """Read the current or legacy attempt count as one strict unsigned 64-bit integer."""
+    """Read the current or older attempt count as one strict unsigned 64-bit integer."""
 
     key = "delivery_attempts" if "delivery_attempts" in document else "tui_delivery_attempts"
     if key not in document:

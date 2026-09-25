@@ -11,7 +11,7 @@ from typing import cast
 import pytest
 
 from agentctl.client import (
-    AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, PaneShellProof,
+    AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, PaneMove, PaneShellProof,
 )
 from agentctl.errors import (
     AgentDeliveryError, AgentPending, AgentPossiblySubmitted, HerdrUnavailable,
@@ -20,6 +20,7 @@ from agentctl.subagents import ManagedAgents, environment_entries, harness_argum
 import agentctl.legacy_cli as cli
 import agentctl.cli as unified_cli
 import agentctl.codex_goal as native_goal
+import agentctl.agent as agent
 
 
 class FakeManagedClient:
@@ -41,6 +42,11 @@ class FakeManagedClient:
         self.custom_dies_during_recovery_commit = False
         self.custom_running = False
         self.custom_ready = True
+        self.fail_after_move = False
+        self.wrong_move_response = False
+        self.move_count = 0
+        self.wait_fails = False
+        self.working_after_prompt = False
         self.custom_at_idle_shell = True
         self.custom_identity = CustomProcessIdentity(
             version=1, boot_id="00000000-0000-0000-0000-000000000000",
@@ -56,8 +62,7 @@ class FakeManagedClient:
         return self.workspace
 
     def workspace_label(self, workspace_id: str) -> str:
-        assert workspace_id == "w1"
-        return "subagents"
+        return "subagents" if workspace_id == "w1" else f"label-{workspace_id}"
 
     def create_workspace(
         self, *, label: str, cwd: str, environment: tuple[str, ...] = (),
@@ -76,7 +81,7 @@ class FakeManagedClient:
         self.environments.append(tuple(environment))
         self.serial += 1
         tab, pane = f"w1:t{self.serial}", f"w1:p{self.serial}"
-        self.presentations.append(Pane(pane, tab, workspace_id))
+        self.presentations.append(Pane(pane, tab, workspace_id, f"term-{self.serial}"))
         self.infos[pane] = AgentPaneInfo(pane, workspace_id, cwd, None, "unknown", None, None)
         return tab
 
@@ -92,6 +97,35 @@ class FakeManagedClient:
             environment=environment,
         )
         return tab, self.presentations[-1].pane_id
+
+    def move_pane_to_new_tab(
+        self, pane_id: str, *, workspace_id: str, label: str,
+    ) -> PaneMove:
+        del label
+        old = next(item for item in self.presentations if item.pane_id == pane_id)
+        self.move_count += 1
+        moved = Pane(
+            f"{workspace_id}:moved", f"{workspace_id}:tab", workspace_id,
+            old.terminal_id,
+        )
+        self.presentations = [
+            moved if item.pane_id == pane_id else item for item in self.presentations
+        ]
+        info = self.infos.pop(pane_id)
+        self.infos[moved.pane_id] = replace(
+            info, pane_id=moved.pane_id, workspace_id=workspace_id,
+        )
+        self.launched = [
+            (name, kind, moved.pane_id if pane == pane_id else pane, arguments)
+            for name, kind, pane, arguments in self.launched
+        ]
+        if self.fail_after_move:
+            self.fail_after_move = False
+            raise HerdrUnavailable("simulated lost pane move response")
+        return PaneMove(
+            "wrong" if self.wrong_move_response else old.pane_id,
+            old.tab_id, old.workspace_id, moved,
+        )
 
     def start_agent(self, name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *, timeout: float) -> None:
         assert timeout > 0
@@ -207,17 +241,23 @@ class FakeManagedClient:
 
     def panes(self, workspace_id: str | None = None) -> tuple[Pane, ...]:
         self.panes_calls += 1
-        del workspace_id
         if self.offline:
             raise HerdrUnavailable("server unavailable")
-        return tuple(self.presentations)
+        return tuple(
+            pane for pane in self.presentations
+            if workspace_id is None or pane.workspace_id == workspace_id
+        )
 
     def prompt_agent(self, pane_id: str, text: str) -> None:
         assert pane_id in self.infos
         self.submitted.append(text)
+        if self.working_after_prompt:
+            self.infos[pane_id] = replace(self.infos[pane_id], status="working")
 
     def wait_agent_status(self, pane_id: str, status: str, timeout_ms: int) -> None:
         assert pane_id in self.infos and status == "working" and timeout_ms > 0
+        if self.wait_fails:
+            raise HerdrUnavailable("simulated lost Herdr status event")
 
     def read(self, pane_id: str, *, source: str, lines: int) -> str:
         assert pane_id in self.infos and lines > 0
@@ -276,6 +316,111 @@ def test_named_workers_share_workspace_but_never_reuse_tabs(tmp_path: Path, monk
     with pytest.raises(AgentDeliveryError, match="already registered"):
         manager.start("one", cwd=str(tmp_path))
     assert len(fake.launched) == 2
+
+
+def test_explicit_workspace_label_never_creates_a_typo_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(fake, "workspace_id_for_label", lambda _label: None)
+    with pytest.raises(AgentDeliveryError, match="does not exist"):
+        manager.start(
+            "worker", cwd=str(tmp_path), harness="codex",
+            workspace_label="misspelled-project",
+        )
+    assert fake.presentations == []
+    assert fake.launched == []
+
+
+def test_relocate_preserves_runtime_and_queue_and_commits_new_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    started = manager.start("worker", cwd=str(tmp_path), harness="codex")
+    queue_root = manager.registry / "worker/queue"
+    queued = agent.enqueue(str(queue_root), "later", message_id="queued")
+    queued_artifact = queue_root / "inbox" / f"{queued}.json"
+    before = queued_artifact.read_bytes()
+    monkeypatch.setattr(fake, "workspace_label", lambda workspace: f"label-{workspace}")
+
+    result = manager.relocate("worker", workspace_id="w2", new_tab=True)
+
+    assert result["workspace_id"] == "w2"
+    assert result["terminal_id"] == "term-1"
+    assert manager.get("worker").pane_id == "w2:moved"
+    assert manager.get("worker").token == started["token"]
+    assert queued_artifact.read_bytes() == before
+    assert not (manager.registry / "worker/relocation.json").exists()
+    assert fake.move_count == 1
+
+
+@pytest.mark.parametrize("lost_response", [True, False])
+def test_relocate_recovers_move_before_registry_commit(
+    lost_response: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    monkeypatch.setattr(fake, "workspace_label", lambda workspace: f"label-{workspace}")
+    fake.fail_after_move = lost_response
+    fake.wrong_move_response = not lost_response
+
+    with pytest.raises(HerdrUnavailable if lost_response else AgentDeliveryError):
+        manager.relocate("worker", workspace_id="w2", new_tab=True)
+    assert (manager.registry / "worker/relocation.json").is_file()
+    fake.wrong_move_response = False
+
+    recovered = manager.relocate("worker", workspace_id="w2", new_tab=True)
+    assert recovered["pane_id"] == "w2:moved"
+    assert fake.move_count == 1
+    assert not (manager.registry / "worker/relocation.json").exists()
+
+
+def test_relocate_reconciles_after_routing_commit_before_journal_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    started = manager.start("worker", cwd=str(tmp_path), harness="codex")
+    manager.relocate("worker", workspace_id="w2", new_tab=True)
+    agent._atomic_json(
+        str(manager.registry / "worker/relocation.json"),
+        {
+            "schema": "agentctl-relocation/v1",
+            "token": started["token"],
+            "terminal_id": "term-1",
+            "old": {"workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1"},
+            "target_workspace_id": "w2",
+            "new_tab": True,
+        },
+    )
+
+    recovered = manager.relocate("worker", workspace_id="w2", new_tab=True)
+    assert recovered["pane_id"] == "w2:moved"
+    assert fake.move_count == 1
+    assert not (manager.registry / "worker/relocation.json").exists()
+
+
+def test_relocate_refuses_multi_pane_tab_and_ambiguous_label_without_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    fake.presentations.append(Pane("sibling", "w1:t1", "w1", "term-sibling"))
+    fake.infos["sibling"] = AgentPaneInfo(
+        "sibling", "w1", str(tmp_path), "codex", "idle",
+        "codex", "sibling-session",
+    )
+    with pytest.raises(AgentDeliveryError, match="multi-pane"):
+        manager.relocate("worker", workspace_id="w2", new_tab=True)
+    assert not (manager.registry / "worker/relocation.json").exists()
+
+    fake.presentations.pop()
+    monkeypatch.setattr(
+        fake, "workspace_id_for_label",
+        lambda _label: (_ for _ in ()).throw(HerdrUnavailable("ambiguous")),
+    )
+    with pytest.raises(HerdrUnavailable, match="ambiguous"):
+        manager.relocate("worker", workspace_label="project", new_tab=True)
+    assert not (manager.registry / "worker/relocation.json").exists()
 
 
 def test_health_isolates_dead_and_malformed_records_and_persists_detection(
@@ -882,6 +1027,23 @@ def test_busy_delivery_stays_pending_and_can_drain(tmp_path: Path, monkeypatch: 
     assert fake.submitted == ["next turn"]
 
 
+def test_lost_native_status_event_reconciles_without_reinjecting_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="claude")
+    fake.wait_fails = True
+    fake.working_after_prompt = True
+
+    result = manager.send("worker", "review this exact change")
+
+    assert result.outcome == "delivered"
+    assert fake.submitted == ["review this exact change"]
+    queue = manager.registry / "worker" / "queue"
+    assert not list((queue / "failed").iterdir())
+    assert len(list((queue / "processed").iterdir())) == 1
+
+
 def test_session_replacement_and_extra_panes_refuse_mutation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path))
@@ -1021,6 +1183,61 @@ def test_collapsed_muse_paste_withholds_enter_then_reconciles_exact_user_turn(
     assert keys == []
 
 
+def test_long_lived_muse_uses_unwrapped_editor_evidence_before_enter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="muse")
+    prompt = (
+        "require the full deterministic-scheduling-review skill and preserve "
+        "the exact wrapped message"
+    )
+    divider = "────────────────\n"
+    footer = "kiki · xhigh · /work · YOLO\n"
+    pasted = False
+    entered = False
+    sources: list[str] = []
+
+    def send_text(_pane: str, text: str) -> None:
+        nonlocal pasted
+        assert prompt in text
+        pasted = True
+
+    def send_keys(_pane: str, key: str) -> None:
+        nonlocal entered
+        assert key == "Enter"
+        entered = True
+
+    def read(_pane: str, *, source: str, lines: int) -> str:
+        sources.append(source)
+        assert lines > 0
+        if source == "visible":
+            # The physical viewport wraps inside the hyphenated word.  Status
+            # uses it only for the current Muse UI; prompt equality must not.
+            editor = (
+                "❯ require the full deterministic-\n"
+                "  scheduling-review skill and preserve the exact wrapped message"
+                if pasted and not entered else "❯"
+            )
+            return "Muse Code 1.4.0\n" + divider + editor + "\n" + divider + footer
+        assert source == "recent-unwrapped"
+        if entered:
+            return f"❯ {prompt}\n◆ Working\n{divider}❯\n{divider}{footer}"
+        editor = f"❯ {prompt}" if pasted else "❯"
+        return f"old transcript\n{divider}{editor}\n{divider}{footer}"
+
+    monkeypatch.setattr(fake, "send_text", send_text, raising=False)
+    monkeypatch.setattr(fake, "send_keys", send_keys)
+    monkeypatch.setattr(fake, "read", read)
+    result = manager.send(
+        "worker", prompt, message_id="wrapped-goal",
+        ready_timeout=0, working_timeout=1,
+    )
+    assert result.outcome == "delivered"
+    assert entered
+    assert "recent-unwrapped" in sources
+
+
 def test_wait_reports_readiness_and_blocked_prompt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path))
@@ -1069,6 +1286,40 @@ def test_agent_record_v2_has_one_tagged_launch_authority(
     ):
         assert duplicate not in stored
     assert manager.get("worker").arguments == started["arguments"]
+
+
+def test_agent_record_v2_reads_profiled_claude_launch_without_flat_harness_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start(
+        "worker", cwd=str(tmp_path), harness="claude", model="opus",
+        launch_profile="claude-opus-55",
+    )
+
+    stored = json.loads(
+        (manager.registry / "worker" / "agent.json").read_text(encoding="utf-8")
+    )
+    assert "harness" not in stored
+    assert stored["launch"] == {
+        "adapter": "herdr",
+        "argv": ["claude", "--model", "opus"],
+        "backend": "herdr",
+        "cwd": str(tmp_path),
+        "environment_names": [],
+        "executable": None,
+        "harness": "claude",
+        "mode": "interactive",
+        "model": "opus",
+        "profile": "claude-opus-55",
+        "resume": None,
+        "runtime_home": None,
+        "runtime_ownership": "owned",
+        "schema": "agentctl-launch/v1",
+    }
+    loaded = manager.get("worker")
+    assert loaded.harness == "claude"
+    assert loaded.launch_profile == "claude-opus-55"
 
 
 @pytest.mark.parametrize("collision,value", (

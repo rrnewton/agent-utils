@@ -19,7 +19,7 @@ from agentctl.client import HerdrClient
 from agentctl.errors import AgentPending, AgentPossiblySubmitted, HerdrRunError
 from agentctl.legacy_cli import _ascii_float, _bounded_uint
 from agentctl.profiles import (
-    load_profiles, validate_raw_harness_arguments,
+    load_project_config, validate_raw_harness_arguments,
 )
 from agentctl.sessions import Sessions
 from agentctl.skill_install import install_skill
@@ -113,7 +113,11 @@ def parser() -> argparse.ArgumentParser:
     start.add_argument("--env", action="append", default=[], type=_environment_entry,
         metavar="KEY=VALUE",
         help="interactive Herdr only: set a literal variable in the created tab; repeat; values are not shown by status")
-    start.add_argument("--workspace-id", metavar="ID", help="interactive only: exact Herdr workspace; default: current workspace or a shared subagents workspace")
+    workspace = start.add_mutually_exclusive_group()
+    workspace.add_argument("--workspace-id", metavar="ID",
+        help="interactive only: exact Herdr workspace; overrides the project default")
+    workspace.add_argument("--workspace-label", metavar="LABEL",
+        help="interactive only: unique Herdr workspace label; overrides the project default")
     first = start.add_mutually_exclusive_group()
     first.add_argument("--brief", metavar="TEXT", help="initial task, submitted after launch")
     first.add_argument("--file", metavar="PATH", help="UTF-8 file containing the initial task")
@@ -145,6 +149,20 @@ def parser() -> argparse.ArgumentParser:
         help="exact registry generation printed by status (required)")
     recover_start.add_argument("--expected-pid", required=True, type=_positive_pid, metavar="PID",
         help="exact live Muse PID whose executable and complete argv must match (required)")
+
+    relocate = command(
+        "relocate",
+        "Move a live one-pane Herdr tab without restarting its agent.",
+        "agentctl relocate reviewer --workspace-label project --new-tab",
+        named=True,
+    )
+    destination = relocate.add_mutually_exclusive_group(required=True)
+    destination.add_argument("--workspace-id", metavar="ID",
+        help="exact existing destination workspace id")
+    destination.add_argument("--workspace-label", metavar="LABEL",
+        help="unique existing destination workspace label")
+    relocate.add_argument("--new-tab", action="store_true", required=True,
+        help="move into a new tab; other relocation layouts are intentionally unsupported")
 
     command("list", "List every session with live health; exit nonzero if any result is non-healthy.", "agentctl list")
     command("capabilities", "Show the adapters and services available in this installation.", "agentctl capabilities")
@@ -296,8 +314,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _serve(args.registry, args.herdr_bin)
     try:
         if args.command == "profiles":
-            path, profiles = load_profiles(args.cwd, absent_ok=True)
-            print(json.dumps({"path": str(path), "profiles": [item.public() for item in profiles.values()]},
+            path, config = load_project_config(args.cwd, absent_ok=True)
+            print(json.dumps({"path": str(path),
+                "default_workspace": (config.default_workspace.public()
+                    if config.default_workspace is not None else None),
+                "profiles": [item.public() for item in config.profiles.values()]},
                 indent=2, sort_keys=True))
             return 0
         if args.command == "skill":
@@ -324,6 +345,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         result: object
         name = getattr(args, "name", "")
         if args.command == "start":
+            _config_path, project_config = load_project_config(
+                args.cwd, absent_ok=True,
+            )
             profile = None
             if args.profile is not None:
                 overlaps = []
@@ -340,9 +364,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     overlaps.append("--env")
                 if overlaps:
                     raise ValueError(f"--profile conflicts with explicit launch settings: {', '.join(overlaps)}")
-                _path, available = load_profiles(args.cwd)
                 try:
-                    profile = available[args.profile]
+                    profile = project_config.profiles[args.profile]
                 except KeyError as exc:
                     raise ValueError(f"unknown profile {args.profile!r}; run agentctl profiles --cwd {args.cwd}") from exc
             harness = profile.harness if profile else (args.harness or "codex")
@@ -358,13 +381,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             harness_args = list(profile.argv) if profile else args.harness_arg
             environment = list(profile.environment) if profile else args.env
+            workspace_id = args.workspace_id
+            workspace_label = args.workspace_label
+            if (mode == "interactive" and workspace_id is None
+                    and workspace_label is None):
+                selector = project_config.default_workspace
+                if selector is not None:
+                    if selector.kind == "id":
+                        workspace_id = selector.value
+                    else:
+                        workspace_label = selector.value
             brief = Path(args.file).read_text(encoding="utf-8") if args.file else args.brief
             result = sessions.start_session(name, cwd=args.cwd, mode=mode, backend=args.backend,
                 harness=harness, model=model, brief=brief, resume=args.resume,
                 reasoning_effort=reasoning_effort, launch_profile=args.profile,
                 harness_args=harness_args,
                 environment=environment,
-                workspace_id=args.workspace_id,
+                workspace_id=workspace_id, workspace_label=workspace_label,
                 startup_timeout=args.startup_timeout, ready_timeout=args.ready_timeout,
                 working_timeout=args.working_timeout, max_attempts=args.max_attempts)
         elif args.command == "adopt":
@@ -374,6 +407,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "recover-start":
             result = sessions.recover_start(
                 name, expected_token=args.expected_token, expected_pid=args.expected_pid,
+            )
+        elif args.command == "relocate":
+            result = sessions.relocate(
+                name, workspace_id=args.workspace_id,
+                workspace_label=args.workspace_label, new_tab=args.new_tab,
             )
         elif args.command == "list":
             rows, healthy = sessions.list_with_health()

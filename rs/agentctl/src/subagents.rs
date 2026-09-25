@@ -22,10 +22,11 @@ use sha2::{Digest, Sha256};
 
 use crate::agent::{self, AgentApi, AgentError, DrainOptions, QueueResult, Target};
 use crate::client::{
-    claude_active_screen, muse_idle_composer, muse_prompt_in_composer, muse_prompt_in_transcript,
-    muse_prompt_is_exact_composer, muse_prompt_transcript_count, muse_startup_metadata,
-    muse_trust_prompt, muse_verified_process_idle_composer, AgentPaneInfo, CustomLaunchObservation,
-    CustomProcessIdentity, HerdrClient, Pane, PaneShellProof,
+    claude_active_screen, muse_idle_composer, muse_startup_metadata, muse_trust_prompt,
+    muse_verified_process_idle_composer, muse_verified_process_prompt_in_composer,
+    muse_verified_process_prompt_is_exact_composer, muse_verified_process_prompt_transcript_count,
+    AgentPaneInfo, CustomLaunchObservation, CustomProcessIdentity, HerdrClient, Pane, PaneMove,
+    PaneShellProof,
 };
 
 const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
@@ -36,6 +37,7 @@ const HEALTH_SCHEMA: &str = "agentctl-health/v1";
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const SESSION_STORAGE_SCHEMA: &str = "agentctl-session/v2";
 const LAUNCH_SPEC_SCHEMA: &str = "agentctl-launch/v1";
+const RELOCATION_SCHEMA: &str = "agentctl-relocation/v1";
 
 fn rename_directory_noreplace_at(
     source_parent: &File,
@@ -585,6 +587,13 @@ pub trait ManagedApi: AgentApi {
         cwd: &str,
         environment: &[String],
     ) -> crate::error::Result<(String, String)>;
+    /// Move one exact pane into a new tab in an existing workspace.
+    fn move_pane_to_new_tab(
+        &self,
+        pane: &str,
+        workspace: &str,
+        label: &str,
+    ) -> crate::error::Result<PaneMove>;
     /// Close exactly one owned pane, preserving any concurrently added siblings.
     fn close_pane(&self, pane: &str) -> crate::error::Result<()>;
     /// Focus an existing pane for direct human interaction.
@@ -871,6 +880,14 @@ impl ManagedApi for HerdrClient {
     ) -> crate::error::Result<(String, String)> {
         HerdrClient::create_tab_with_pane(self, workspace, label, cwd, environment)
     }
+    fn move_pane_to_new_tab(
+        &self,
+        pane: &str,
+        workspace: &str,
+        label: &str,
+    ) -> crate::error::Result<PaneMove> {
+        HerdrClient::move_pane_to_new_tab(self, pane, workspace, label)
+    }
     fn close_pane(&self, pane: &str) -> crate::error::Result<()> {
         HerdrClient::close_pane(self, pane)
     }
@@ -1129,6 +1146,53 @@ struct ManagedRecordSnapshot {
     content: Vec<u8>,
     directory_device: u64,
     directory_inode: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PaneRoute {
+    workspace_id: String,
+    tab_id: String,
+    pane_id: String,
+}
+
+impl PaneRoute {
+    fn from_pane(pane: &Pane) -> Self {
+        Self {
+            workspace_id: pane.workspace_id.clone(),
+            tab_id: pane.tab_id.clone(),
+            pane_id: pane.pane_id.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RelocationJournal {
+    schema: String,
+    token: String,
+    terminal_id: String,
+    old: PaneRoute,
+    target_workspace_id: String,
+    new_tab: bool,
+}
+
+impl RelocationJournal {
+    fn validate(&self, token: &str) -> Result<()> {
+        let valid = |value: &str| !value.is_empty() && !value.contains('\0');
+        if self.schema != RELOCATION_SCHEMA
+            || self.token != token
+            || !self.new_tab
+            || !valid(&self.terminal_id)
+            || !valid(&self.target_workspace_id)
+            || !valid(&self.old.workspace_id)
+            || !valid(&self.old.tab_id)
+            || !valid(&self.old.pane_id)
+        {
+            return Err(fail("invalid relocation journal"));
+        }
+        Ok(())
+    }
 }
 
 impl ManagedRecordSnapshot {
@@ -1927,9 +1991,9 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 "custom pane {pane_id} is not at a verified idle Muse composer"
             )));
         }
-        let before = self
-            .client
-            .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+        let before =
+            self.client
+                .read_with_runtime(pane_id, "recent-unwrapped", Some(200), runtime)?;
         self.client.send_text_with_runtime(
             pane_id,
             &format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}"),
@@ -1948,10 +2012,10 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 self.record.custom_process_identity.as_ref(),
                 runtime,
             )?;
-            let screen = self
-                .client
-                .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
-            if screen != before && muse_prompt_is_exact_composer(&screen, text) {
+            let screen =
+                self.client
+                    .read_with_runtime(pane_id, "recent-unwrapped", Some(200), runtime)?;
+            if screen != before && muse_verified_process_prompt_is_exact_composer(&screen, text) {
                 break screen;
             }
             if Instant::now() >= deadline {
@@ -1975,7 +2039,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             .custom_submission
             .lock()
             .expect("custom submission lock poisoned") = Some(CustomPaneSubmission {
-            prior_transcript_count: muse_prompt_transcript_count(&staged, text),
+            prior_transcript_count: muse_verified_process_prompt_transcript_count(&staged, text),
             staged_screen: staged,
             text: text.to_owned(),
         });
@@ -2013,13 +2077,16 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                     self.record.custom_process_identity.as_ref(),
                     runtime,
                 )?;
-                let screen =
-                    self.client
-                        .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+                let screen = self.client.read_with_runtime(
+                    pane_id,
+                    "recent-unwrapped",
+                    Some(200),
+                    runtime,
+                )?;
                 if screen != submission.staged_screen
-                    && muse_prompt_transcript_count(&screen, &submission.text)
+                    && muse_verified_process_prompt_transcript_count(&screen, &submission.text)
                         > submission.prior_transcript_count
-                    && !muse_prompt_in_composer(&screen, &submission.text)
+                    && !muse_verified_process_prompt_in_composer(&screen, &submission.text)
                 {
                     *self
                         .custom_submission
@@ -2038,40 +2105,55 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 );
             }
         }
-        let Some(objective) = self
+        let objective = self
             .goal_objective
             .lock()
             .expect("goal operation lock poisoned")
             .clone()
-            .filter(|_| status == "working")
-        else {
-            return self
-                .client
-                .wait_agent_status_with_runtime(pane_id, status, timeout_ms, runtime);
-        };
+            .filter(|_| status == "working");
         let start = Instant::now();
-        if self
-            .client
-            .wait_agent_status_with_runtime(pane_id, status, timeout_ms.min(1000), runtime)
-            .is_ok()
-        {
+        let initial_error = match self.client.wait_agent_status_with_runtime(
+            pane_id,
+            status,
+            timeout_ms.min(1000),
+            runtime,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        // Herdr's wait subscription may be installed after the transition it
+        // is waiting for. Reconcile the event failure against the exact owned
+        // pane, without ever running the prompt operation a second time.
+        if self.pane_info_with_runtime(pane_id, runtime)?.status == status {
             return Ok(());
         }
-        self.pane_info_with_runtime(pane_id, runtime)?;
-        let screen = self
-            .client
-            .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
-        if goal_replacement_selected(&screen, &objective) {
-            self.client
-                .send_keys_with_runtime(pane_id, "Enter", runtime)?;
+        if let Some(objective) = objective {
+            let screen = self
+                .client
+                .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+            if goal_replacement_selected(&screen, &objective) {
+                self.client
+                    .send_keys_with_runtime(pane_id, "Enter", runtime)?;
+            }
         }
         let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.client.wait_agent_status_with_runtime(
+        match self.client.wait_agent_status_with_runtime(
             pane_id,
             status,
             timeout_ms.saturating_sub(elapsed).max(1),
             runtime,
-        )
+        ) {
+            Ok(()) => Ok(()),
+            Err(final_error) => {
+                if self.pane_info_with_runtime(pane_id, runtime)?.status == status {
+                    Ok(())
+                } else {
+                    Err(crate::error::AdapterError::unavailable(format!(
+                        "{final_error}; initial status wait also failed: {initial_error}"
+                    )))
+                }
+            }
+        }
     }
 
     fn read_with_runtime(
@@ -2093,6 +2175,8 @@ pub struct StartOptions {
     pub launch_profile: Option<String>,
     /// Existing workspace ID, or the current workspace / shared `subagents` default.
     pub workspace_id: Option<String>,
+    /// Unique workspace label, mutually exclusive with `workspace_id`.
+    pub workspace_label: Option<String>,
     /// Herdr agent kind.
     pub harness: String,
     /// Optional model override for Codex or Claude.
@@ -2116,6 +2200,7 @@ impl Default for StartOptions {
         Self {
             launch_profile: None,
             workspace_id: None,
+            workspace_label: None,
             harness: "codex".to_owned(),
             model: None,
             resume: None,
@@ -3389,22 +3474,50 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     fn create_presentation(&self, record: &mut AgentRecord, options: &StartOptions) -> Result<()> {
+        if options.workspace_id.is_some() && options.workspace_label.is_some() {
+            return Err(fail("workspace id and label are mutually exclusive"));
+        }
+        if options
+            .workspace_id
+            .as_deref()
+            .is_some_and(|value| value.is_empty() || value.contains('\0'))
+            || options
+                .workspace_label
+                .as_deref()
+                .is_some_and(|value| value.is_empty() || value.contains('\0'))
+        {
+            return Err(fail(
+                "workspace id and label must be nonempty and contain no NUL",
+            ));
+        }
+        let environment_workspace = self.inherited_workspace.clone();
+        let may_create_shared_default = options.workspace_id.is_none()
+            && options.workspace_label.is_none()
+            && environment_workspace.is_none();
+        let mut selected_id = options.workspace_id.clone();
+        let mut selected_label = options.workspace_label.clone();
+        if selected_id.is_none() && selected_label.is_none() {
+            selected_id = environment_workspace;
+        }
+        if selected_id.is_none() && selected_label.is_none() {
+            selected_label = Some("subagents".to_owned());
+        }
+        let lock_key = selected_id
+            .as_deref()
+            .or(selected_label.as_deref())
+            .expect("workspace selector");
         let lock = agent::open_private_lock(
-            &agent::target_lock_path("managed-workspace:subagents")?,
+            &agent::target_lock_path(&format!("managed-workspace:{lock_key}"))?,
             "workspace allocation lock",
         )?;
         lock.lock_exclusive()
             .map_err(|error| fail(error.to_string()))?;
-        let selected = options
-            .workspace_id
-            .clone()
-            .filter(|s| !s.is_empty())
-            .or_else(|| self.inherited_workspace.clone());
-        let selected = if let Some(workspace) = selected {
+        let selected = if let Some(workspace) = selected_id {
             self.client.workspace_label(&workspace)?;
             Some(workspace)
         } else {
-            self.client.workspace_id_for_label("subagents")?
+            self.client
+                .workspace_id_for_label(selected_label.as_deref().expect("workspace label"))?
         };
         match selected {
             Some(workspace) => {
@@ -3420,9 +3533,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 self.save(record)?;
             }
             None => {
+                let label = selected_label.as_deref().expect("workspace label");
+                if !may_create_shared_default {
+                    return Err(fail(format!("workspace label {label:?} does not exist")));
+                }
                 let (workspace, tab, pane) =
                     self.client
-                        .create_workspace("subagents", &record.cwd, &options.environment)?;
+                        .create_workspace(label, &record.cwd, &options.environment)?;
                 record.workspace_id = Some(workspace);
                 record.tab_id = Some(tab.clone());
                 record.pane_id = Some(pane);
@@ -4304,6 +4421,236 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         Ok(json!({"name": agent_name, "token": record.token, "paused": paused}))
     }
 
+    fn read_relocation_journal(&self, record: &AgentRecord) -> Result<Option<RelocationJournal>> {
+        let path = self.directory(&record.name)?.join("relocation.json");
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(fail(format!("cannot inspect relocation journal: {error}"))),
+        }
+        let journal: RelocationJournal = serde_json::from_value(agent::read_private_json_bounded(
+            &path,
+            MAX_AGENT_RECORD_BYTES as u64,
+        )?)
+        .map_err(|error| fail(format!("invalid relocation journal: {error}")))?;
+        journal.validate(&record.token)?;
+        Ok(Some(journal))
+    }
+
+    fn finish_relocation(
+        &self,
+        record: &AgentRecord,
+        journal: &RelocationJournal,
+        pane: &Pane,
+    ) -> Result<Value> {
+        if pane.terminal_id.as_deref() != Some(&journal.terminal_id)
+            || pane.workspace_id != journal.target_workspace_id
+        {
+            return Err(fail("relocated pane identity or workspace changed"));
+        }
+        let panes = self.client.panes()?;
+        if panes
+            .iter()
+            .filter(|item| item.tab_id == pane.tab_id)
+            .count()
+            != 1
+        {
+            return Err(fail("relocated destination tab is not a one-pane tab"));
+        }
+        let mut candidate = record.clone();
+        candidate.workspace_id = Some(pane.workspace_id.clone());
+        candidate.tab_id = Some(pane.tab_id.clone());
+        candidate.pane_id = Some(pane.pane_id.clone());
+        self.checked(&candidate)?;
+        self.save(&candidate)?;
+        let persisted = self.load(&record.name)?;
+        if persisted.token != record.token
+            || persisted.workspace_id.as_deref() != Some(&pane.workspace_id)
+            || persisted.tab_id.as_deref() != Some(&pane.tab_id)
+            || persisted.pane_id.as_deref() != Some(&pane.pane_id)
+        {
+            return Err(fail("relocation routing commit did not persist"));
+        }
+        self.checked(&persisted)?;
+        let current = self
+            .client
+            .panes()?
+            .into_iter()
+            .filter(|item| item.terminal_id.as_deref() == Some(&journal.terminal_id))
+            .collect::<Vec<_>>();
+        if current.as_slice() != [pane.clone()] {
+            return Err(fail("relocated terminal changed after routing commit"));
+        }
+        let pinned = self.pinned_agent_directory(&record.name)?;
+        Self::verify_pinned_agent_directory(&pinned)?;
+        Self::unlink_pinned_file(&pinned, "relocation.json")?;
+        Ok(json!({
+            "name": persisted.name,
+            "token": persisted.token,
+            "workspace_id": pane.workspace_id,
+            "tab_id": pane.tab_id,
+            "pane_id": pane.pane_id,
+            "terminal_id": pane.terminal_id,
+            "relocated": true,
+        }))
+    }
+
+    /// Move one live interactive pane through a recoverable routing transaction.
+    pub fn relocate(
+        &self,
+        agent_name: &str,
+        workspace_id: Option<&str>,
+        workspace_label: Option<&str>,
+        new_tab: bool,
+    ) -> Result<Value> {
+        if !new_tab {
+            return Err(fail("relocate currently requires --new-tab"));
+        }
+        if workspace_id.is_some() == workspace_label.is_some() {
+            return Err(fail(
+                "relocate requires exactly one of workspace id or workspace label",
+            ));
+        }
+        let selector = workspace_id
+            .or(workspace_label)
+            .expect("workspace selector");
+        if selector.is_empty() || selector.contains('\0') {
+            return Err(fail(
+                "workspace selector must be nonempty and contain no NUL",
+            ));
+        }
+        let _lock = self.lock(agent_name)?;
+        let record = self.load(agent_name)?;
+        if record.lifecycle != "running"
+            || record.mode != "interactive"
+            || record.backend != "herdr"
+            || record.workspace_id.is_none()
+            || record.tab_id.is_none()
+            || record.pane_id.is_none()
+        {
+            return Err(fail(
+                "relocate requires a running interactive Herdr session with complete routing",
+            ));
+        }
+        let target_workspace = if let Some(workspace) = workspace_id {
+            self.client.workspace_label(workspace)?;
+            workspace.to_owned()
+        } else {
+            self.client
+                .workspace_id_for_label(workspace_label.expect("workspace label"))?
+                .ok_or_else(|| {
+                    fail(format!(
+                        "workspace label {:?} does not exist",
+                        workspace_label.expect("workspace label")
+                    ))
+                })?
+        };
+        let mut journal = self.read_relocation_journal(&record)?;
+        if journal
+            .as_ref()
+            .is_some_and(|value| value.target_workspace_id != target_workspace)
+        {
+            return Err(fail(
+                "unfinished relocation targets another workspace; retry that exact target",
+            ));
+        }
+        if journal.is_none() {
+            if record.workspace_id.as_deref() == Some(&target_workspace) {
+                return Err(fail("agent is already in the requested workspace"));
+            }
+            self.checked(&record)?;
+            let panes = self.client.panes()?;
+            let old = panes
+                .iter()
+                .filter(|pane| record.pane_id.as_deref() == Some(&pane.pane_id))
+                .collect::<Vec<_>>();
+            if old.len() != 1
+                || record.tab_id.as_deref() != Some(&old[0].tab_id)
+                || record.workspace_id.as_deref() != Some(&old[0].workspace_id)
+                || old[0].terminal_id.is_none()
+            {
+                return Err(fail(
+                    "cannot prove the current pane/tab/terminal routing for relocation",
+                ));
+            }
+            if panes
+                .iter()
+                .filter(|pane| record.tab_id.as_deref() == Some(&pane.tab_id))
+                .count()
+                != 1
+            {
+                return Err(fail("relocate refuses a multi-pane source tab"));
+            }
+            let prepared = RelocationJournal {
+                schema: RELOCATION_SCHEMA.to_owned(),
+                token: record.token.clone(),
+                terminal_id: old[0].terminal_id.clone().expect("terminal id"),
+                old: PaneRoute::from_pane(old[0]),
+                target_workspace_id: target_workspace.clone(),
+                new_tab: true,
+            };
+            agent::atomic_json(
+                &self.directory(agent_name)?.join("relocation.json"),
+                &serde_json::to_value(&prepared)
+                    .map_err(|error| fail(format!("cannot encode relocation journal: {error}")))?,
+            )?;
+            journal = Some(prepared);
+        }
+        let journal = journal.expect("prepared relocation");
+        let panes = self.client.panes()?;
+        let current = panes
+            .iter()
+            .filter(|pane| pane.terminal_id.as_deref() == Some(&journal.terminal_id))
+            .collect::<Vec<_>>();
+        if current.len() != 1 {
+            return Err(fail(
+                "cannot uniquely locate the relocation terminal generation",
+            ));
+        }
+        let mut pane = current[0].clone();
+        if PaneRoute::from_pane(&pane) == journal.old {
+            self.checked(&record)?;
+            let fresh_panes = self.client.panes()?;
+            let fresh = fresh_panes
+                .iter()
+                .filter(|item| item.terminal_id.as_deref() == Some(&journal.terminal_id))
+                .collect::<Vec<_>>();
+            if fresh.len() != 1
+                || PaneRoute::from_pane(fresh[0]) != journal.old
+                || fresh_panes
+                    .iter()
+                    .filter(|item| item.tab_id == journal.old.tab_id)
+                    .count()
+                    != 1
+            {
+                return Err(fail("source pane routing changed before relocation"));
+            }
+            pane = fresh[0].clone();
+            let moved =
+                self.client
+                    .move_pane_to_new_tab(&pane.pane_id, &target_workspace, &record.name)?;
+            if (
+                moved.previous_pane_id,
+                moved.previous_tab_id,
+                moved.previous_workspace_id,
+            ) != (
+                journal.old.pane_id.clone(),
+                journal.old.tab_id.clone(),
+                journal.old.workspace_id.clone(),
+            ) {
+                return Err(fail(
+                    "pane move returned a different source routing identity",
+                ));
+            }
+            pane = moved.pane;
+        } else if pane.workspace_id != target_workspace {
+            return Err(fail(
+                "relocation terminal is neither at its old route nor intended destination",
+            ));
+        }
+        self.finish_relocation(&record, &journal, &pane)
+    }
+
     /// Verify the live agent identity, then focus its pane without changing input ownership.
     pub fn attach(&self, agent_name: &str) -> Result<Value> {
         let _lock = self.lock(agent_name)?;
@@ -4366,11 +4713,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         agent::validate_existing_binding(&queue, &target)?;
         agent::reconcile_delivery(&queue, message_id, expected_sha256, |text| {
             let (_target_lock, before) = agent::lock_resolved_target(&client, &target)?;
-            let screen = client.read(&before.pane_id, "visible", Some(5000))?;
+            let screen = client.read(&before.pane_id, "recent-unwrapped", Some(5000))?;
             let after = agent::resolve_target(&client, &target)?;
             Ok(before == after
-                && muse_prompt_in_transcript(&screen, text)
-                && !muse_prompt_in_composer(&screen, text))
+                && muse_verified_process_prompt_transcript_count(&screen, text) > 0
+                && !muse_verified_process_prompt_in_composer(&screen, text))
         })
     }
 
@@ -5993,7 +6340,14 @@ mod tests {
                     custom_verify_calls: AtomicU64::new(0),
                     custom_ready: AtomicBool::new(true),
                     custom_native_working: AtomicBool::new(false),
+                    wait_fails: AtomicBool::new(false),
+                    working_after_run: AtomicBool::new(false),
                     custom_screen: Mutex::new(None),
+                    current_owned_pane: Mutex::new("owned".to_owned()),
+                    move_count: AtomicU64::new(0),
+                    fail_after_move: AtomicBool::new(false),
+                    wrong_move_response: AtomicBool::new(false),
+                    ambiguous_workspace: AtomicBool::new(false),
                     custom_at_idle_shell: AtomicBool::new(true),
                     claude_background: AtomicBool::new(false),
                     foreign_shell_identity: Mutex::new(Fake::foreign_shell_identity()),
@@ -6134,7 +6488,14 @@ mod tests {
         custom_verify_calls: AtomicU64,
         custom_ready: AtomicBool,
         custom_native_working: AtomicBool,
+        wait_fails: AtomicBool,
+        working_after_run: AtomicBool,
         custom_screen: Mutex<Option<String>>,
+        current_owned_pane: Mutex<String>,
+        move_count: AtomicU64,
+        fail_after_move: AtomicBool,
+        wrong_move_response: AtomicBool,
+        ambiguous_workspace: AtomicBool,
         custom_at_idle_shell: AtomicBool,
         claude_background: AtomicBool,
         foreign_shell_identity: Mutex<CustomProcessIdentity>,
@@ -6160,6 +6521,7 @@ mod tests {
                 pane_id: id.to_owned(),
                 tab_id: "tab".to_owned(),
                 workspace_id: "workspace".to_owned(),
+                terminal_id: Some(format!("terminal-{id}")),
             }
         }
 
@@ -6236,14 +6598,17 @@ mod tests {
             } else {
                 "codex"
             };
+            let pane_workspace = self
+                .panes
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|item| item.pane_id == pane)
+                .map(|item| item.workspace_id.clone())
+                .ok_or_else(|| AdapterError::unavailable("missing pane"))?;
             Ok(AgentPaneInfo {
                 pane_id: pane.to_owned(),
-                workspace_id: if pane == "external" {
-                    "other-workspace"
-                } else {
-                    "workspace"
-                }
-                .to_owned(),
+                workspace_id: pane_workspace,
                 cwd: if self.wrong_foreign_cwd.load(Ordering::Relaxed) {
                     self.root.join("other").display().to_string()
                 } else {
@@ -6263,7 +6628,8 @@ mod tests {
                 session_value: report_session.then(|| {
                     if changed_after_save {
                         "replacement-thread"
-                    } else if matches!(pane, "owned" | "claude" | "reported")
+                    } else if pane == *self.current_owned_pane.lock().unwrap()
+                        || matches!(pane, "claude" | "reported")
                         || self.duplicate_session.load(Ordering::Relaxed)
                     {
                         "thread"
@@ -6279,10 +6645,19 @@ mod tests {
         }
         fn run(&self, _: &str, text: &str) -> AdapterResult<()> {
             self.runs.lock().unwrap().push(text.to_owned());
+            if self.working_after_run.load(Ordering::Relaxed) {
+                self.custom_native_working.store(true, Ordering::Relaxed);
+            }
             Ok(())
         }
         fn wait_agent_status(&self, _: &str, _: &str, _: u64) -> AdapterResult<()> {
-            Ok(())
+            if self.wait_fails.load(Ordering::Relaxed) {
+                Err(AdapterError::unavailable(
+                    "simulated lost Herdr status event",
+                ))
+            } else {
+                Ok(())
+            }
         }
         fn read(&self, _: &str, _: &str, _: Option<usize>) -> AdapterResult<String> {
             if self.fail_read.load(Ordering::Relaxed) {
@@ -6384,6 +6759,9 @@ mod tests {
     }
     impl ManagedApi for Fake {
         fn workspace_id_for_label(&self, _: &str) -> AdapterResult<Option<String>> {
+            if self.ambiguous_workspace.load(Ordering::Relaxed) {
+                return Err(AdapterError::unavailable("ambiguous workspace label"));
+            }
             Ok(Some("workspace".to_owned()))
         }
         fn create_workspace(
@@ -6414,6 +6792,43 @@ mod tests {
             self.environments.lock().unwrap().push(environment.to_vec());
             self.panes.lock().unwrap().push(Self::pane("owned"));
             Ok(("tab".to_owned(), "owned".to_owned()))
+        }
+        fn move_pane_to_new_tab(
+            &self,
+            pane: &str,
+            workspace: &str,
+            _: &str,
+        ) -> AdapterResult<PaneMove> {
+            self.move_count.fetch_add(1, Ordering::Relaxed);
+            let mut panes = self.panes.lock().unwrap();
+            let old = panes
+                .iter()
+                .find(|item| item.pane_id == pane)
+                .cloned()
+                .ok_or_else(|| AdapterError::unavailable("missing pane"))?;
+            let moved = Pane {
+                pane_id: format!("{workspace}:moved"),
+                tab_id: format!("{workspace}:tab"),
+                workspace_id: workspace.to_owned(),
+                terminal_id: old.terminal_id.clone(),
+            };
+            *panes.iter_mut().find(|item| item.pane_id == pane).unwrap() = moved.clone();
+            *self.current_owned_pane.lock().unwrap() = moved.pane_id.clone();
+            if self.fail_after_move.swap(false, Ordering::Relaxed) {
+                return Err(AdapterError::unavailable(
+                    "simulated lost pane move response",
+                ));
+            }
+            Ok(PaneMove {
+                previous_pane_id: if self.wrong_move_response.load(Ordering::Relaxed) {
+                    "wrong".to_owned()
+                } else {
+                    old.pane_id
+                },
+                previous_tab_id: old.tab_id,
+                previous_workspace_id: old.workspace_id,
+                pane: moved,
+            })
         }
         fn close_pane(&self, pane: &str) -> AdapterResult<()> {
             if self.fail_close.load(Ordering::Relaxed) {
@@ -6596,7 +7011,7 @@ mod tests {
             Ok(proof)
         }
         fn agent_pane(&self, _: &str) -> AdapterResult<String> {
-            Ok("owned".to_owned())
+            Ok(self.current_owned_pane.lock().unwrap().clone())
         }
         fn report_agent_session(&self, _: &str, _: &str, _: &str, _: &str) -> AdapterResult<()> {
             Ok(())
@@ -6619,6 +7034,160 @@ mod tests {
         let status = fixture.start(Some("initial task".to_owned()));
         assert_eq!(status["lifecycle"], "running");
         assert_eq!(*fixture.client.runs.lock().unwrap(), ["initial task"]);
+    }
+
+    #[test]
+    fn relocation_preserves_generation_and_pending_queue() {
+        let fixture = Fixture::new();
+        let started = fixture.start(None);
+        let queue = fixture.root.join("registry/worker/queue");
+        let identifier = agent::enqueue(&queue, "retained prompt", Some("queued")).unwrap();
+        let artifact = queue.join("inbox").join(format!("{identifier}.json"));
+        let before = fs::read(&artifact).unwrap();
+
+        let moved = fixture
+            .manager()
+            .relocate("worker", Some("destination"), None, true)
+            .unwrap();
+
+        assert_eq!(moved["workspace_id"], "destination");
+        assert_eq!(moved["terminal_id"], "terminal-owned");
+        let persisted = fixture.manager().load("worker").unwrap();
+        assert_eq!(persisted.pane_id.as_deref(), Some("destination:moved"));
+        assert_eq!(persisted.token, started["token"]);
+        assert_eq!(fs::read(&artifact).unwrap(), before);
+        assert!(!fixture
+            .root
+            .join("registry/worker/relocation.json")
+            .exists());
+        assert_eq!(fixture.client.move_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn relocation_reconciles_a_move_with_a_lost_or_wrong_response() {
+        for wrong_response in [false, true] {
+            let fixture = Fixture::new();
+            fixture.start(None);
+            if wrong_response {
+                fixture
+                    .client
+                    .wrong_move_response
+                    .store(true, Ordering::Relaxed);
+            } else {
+                fixture
+                    .client
+                    .fail_after_move
+                    .store(true, Ordering::Relaxed);
+            }
+
+            let error = fixture
+                .manager()
+                .relocate("worker", Some("destination"), None, true)
+                .unwrap_err();
+            if wrong_response {
+                assert!(error.to_string().contains("different source routing"));
+                fixture
+                    .client
+                    .wrong_move_response
+                    .store(false, Ordering::Relaxed);
+            } else {
+                assert!(error.to_string().contains("lost pane move response"));
+            }
+            assert!(fixture
+                .root
+                .join("registry/worker/relocation.json")
+                .is_file());
+
+            let recovered = fixture
+                .manager()
+                .relocate("worker", Some("destination"), None, true)
+                .unwrap();
+            assert_eq!(recovered["pane_id"], "destination:moved");
+            assert_eq!(fixture.client.move_count.load(Ordering::Relaxed), 1);
+            assert!(!fixture
+                .root
+                .join("registry/worker/relocation.json")
+                .exists());
+        }
+    }
+
+    #[test]
+    fn relocation_reconciles_after_routing_commit_before_journal_removal() {
+        let fixture = Fixture::new();
+        let started = fixture.start(None);
+        fixture
+            .manager()
+            .relocate("worker", Some("destination"), None, true)
+            .unwrap();
+        let journal = RelocationJournal {
+            schema: RELOCATION_SCHEMA.to_owned(),
+            token: started["token"].as_str().unwrap().to_owned(),
+            terminal_id: "terminal-owned".to_owned(),
+            old: PaneRoute {
+                workspace_id: "workspace".to_owned(),
+                tab_id: "tab".to_owned(),
+                pane_id: "owned".to_owned(),
+            },
+            target_workspace_id: "destination".to_owned(),
+            new_tab: true,
+        };
+        agent::atomic_json(
+            &fixture.root.join("registry/worker/relocation.json"),
+            &serde_json::to_value(journal).unwrap(),
+        )
+        .unwrap();
+
+        let recovered = fixture
+            .manager()
+            .relocate("worker", Some("destination"), None, true)
+            .unwrap();
+        assert_eq!(recovered["pane_id"], "destination:moved");
+        assert_eq!(fixture.client.move_count.load(Ordering::Relaxed), 1);
+        assert!(!fixture
+            .root
+            .join("registry/worker/relocation.json")
+            .exists());
+    }
+
+    #[test]
+    fn relocation_refuses_multi_pane_and_ambiguous_workspace_before_move() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        fixture.client.panes.lock().unwrap().push(Pane {
+            pane_id: "human".to_owned(),
+            tab_id: "tab".to_owned(),
+            workspace_id: "workspace".to_owned(),
+            terminal_id: Some("terminal-human".to_owned()),
+        });
+        let error = fixture
+            .manager()
+            .relocate("worker", Some("destination"), None, true)
+            .unwrap_err();
+        assert!(error.to_string().contains("multi-pane"));
+        assert!(!fixture
+            .root
+            .join("registry/worker/relocation.json")
+            .exists());
+        fixture
+            .client
+            .panes
+            .lock()
+            .unwrap()
+            .retain(|pane| pane.pane_id != "human");
+        fixture
+            .client
+            .ambiguous_workspace
+            .store(true, Ordering::Relaxed);
+        let error = fixture
+            .manager()
+            .relocate("worker", None, Some("project"), true)
+            .unwrap_err();
+        assert!(error.to_string().contains("ambiguous workspace label"));
+        assert_eq!(fixture.client.move_count.load(Ordering::Relaxed), 0);
+        assert!(!fixture
+            .root
+            .join("registry/worker/relocation.json")
+            .exists());
     }
 
     #[test]
@@ -7062,10 +7631,7 @@ mod tests {
             .client
             .custom_native_working
             .store(true, Ordering::Relaxed);
-        assert_eq!(
-            manager.status("worker").unwrap()["agent_status"],
-            "working"
-        );
+        assert_eq!(manager.status("worker").unwrap()["agent_status"], "working");
     }
 
     #[test]
@@ -7448,6 +8014,30 @@ mod tests {
             fixture.manager().get("worker").unwrap()["arguments"],
             started["arguments"]
         );
+    }
+
+    #[test]
+    fn agent_record_v2_reads_profiled_claude_launch_without_flat_harness_field() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let path = fixture.root.join("registry/worker/agent.json");
+        let mut stored = agent::read_private_json(&path).unwrap();
+        stored["launch"]["harness"] = json!("claude");
+        stored["launch"]["argv"] = json!(["claude", "--model", "opus"]);
+        stored["launch"]["model"] = json!("opus");
+        stored["launch"]["profile"] = json!("claude-opus-55");
+        agent::atomic_json(&path, &stored).unwrap();
+        let stored = agent::read_private_json(&path).unwrap();
+        assert!(stored.get("harness").is_none());
+        assert_eq!(stored["launch"]["harness"], "claude");
+        assert_eq!(stored["launch"]["profile"], "claude-opus-55");
+        assert_eq!(
+            stored["launch"]["argv"],
+            json!(["claude", "--model", "opus"])
+        );
+        let loaded = fixture.manager().load("worker").unwrap();
+        assert_eq!(loaded.harness, "claude");
+        assert_eq!(loaded.launch_profile.as_deref(), Some("claude-opus-55"));
     }
 
     #[test]
@@ -10800,6 +11390,44 @@ mod tests {
             .send_identified("worker", "task", DrainOptions::default(), Some("request-1"))
             .is_err());
         assert_eq!(*fixture.client.runs.lock().unwrap(), ["task"]);
+    }
+
+    #[test]
+    fn lost_native_status_event_reconciles_without_reinjecting_prompt() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        fixture.client.wait_fails.store(true, Ordering::Relaxed);
+        fixture
+            .client
+            .working_after_run
+            .store(true, Ordering::Relaxed);
+
+        let result = fixture
+            .manager()
+            .send(
+                "worker",
+                "review this exact change",
+                DrainOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(result.outcome, agent::QueueOutcome::Delivered);
+        assert_eq!(
+            *fixture.client.runs.lock().unwrap(),
+            ["review this exact change"]
+        );
+        assert_eq!(
+            fs::read_dir(fixture.root.join("registry/worker/queue/processed"))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(
+            fs::read_dir(fixture.root.join("registry/worker/queue/failed"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[test]

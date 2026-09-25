@@ -352,6 +352,7 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
             let options = StartOptions {
                 launch_profile: None,
                 workspace_id: args.workspace_id.clone(),
+                workspace_label: None,
                 harness: args.harness.clone(),
                 model: args.model.clone(),
                 resume: args.resume.clone(),

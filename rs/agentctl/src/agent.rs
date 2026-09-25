@@ -2201,6 +2201,7 @@ mod tests {
                     pane_id: "w1:p1".to_owned(),
                     tab_id: "w1:t1".to_owned(),
                     workspace_id: "w1".to_owned(),
+                    terminal_id: None,
                 }],
                 workspace_label: "acme".to_owned(),
                 state: Mutex::new(FakeState {
@@ -2232,6 +2233,7 @@ mod tests {
                 pane_id: "w1:p2".to_owned(),
                 tab_id: "w1:t1".to_owned(),
                 workspace_id: "w1".to_owned(),
+                terminal_id: None,
             });
             fake.state
                 .lock()

@@ -2886,7 +2886,7 @@ class Bridge:
         return plan, validated_items
 
     def _migrate_reply_outboxes_locked(self) -> None:
-        """Preflight every legacy outbox, then expand with the marker committed last."""
+        """Preflight every older outbox, then expand with the marker committed last."""
         self.validate_request_population()
         self.validate_aux_population()
         request_paths = sorted((self.state / "requests").glob("*.json"))
@@ -3382,7 +3382,7 @@ class Bridge:
         self, record: dict[str, object], answers: list[str],
         items: list[dict[str, object]] | None = None,
     ) -> bool:
-        """Commit legacy occurrences; this explicit recovery path may read history."""
+        """Commit older occurrences; this explicit recovery path may read history."""
         key = get_str(record, "key", "request")
         path = self.state / "requests" / f"{key}.json"
         history = self._all_reply_items(record)

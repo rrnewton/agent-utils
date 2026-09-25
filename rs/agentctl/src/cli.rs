@@ -71,6 +71,11 @@ enum Commands {
         after_help = "Example: agentctl recover-start reviewer --expected-token TOKEN --expected-pid 12345"
     )]
     RecoverStart(RecoverStart),
+    /// Move a live one-pane Herdr tab without restarting its agent
+    #[command(
+        after_help = "Example: agentctl relocate reviewer --workspace-label project --new-tab"
+    )]
+    Relocate(Relocate),
     /// Stop an owned runtime, or safely unregister an adopted one, and archive state
     #[command(after_help = "Example: agentctl stop reviewer")]
     Stop(Stop),
@@ -240,9 +245,12 @@ struct Start {
     /// UTF-8 file containing the initial prompt; conflicts with --brief
     #[arg(long, value_name = "PATH")]
     file: Option<PathBuf>,
-    /// Existing Herdr workspace ID (otherwise HERDR_WORKSPACE_ID or a subagents workspace)
-    #[arg(long, value_name = "ID")]
+    /// Existing Herdr workspace ID; overrides the project default
+    #[arg(long, value_name = "ID", conflicts_with = "workspace_label")]
     workspace_id: Option<String>,
+    /// Unique Herdr workspace label; overrides the project default
+    #[arg(long, value_name = "LABEL", conflicts_with = "workspace_id")]
+    workspace_label: Option<String>,
     /// Seconds to wait for harness startup, greater than zero and at most 300
     #[arg(long, default_value = "30", value_parser = startup_seconds)]
     startup_timeout: f64,
@@ -298,6 +306,31 @@ struct Adopt {
     /// Stable native conversation ID already reported by this exact pane
     #[arg(long, value_name = "ID")]
     session: Option<String>,
+}
+
+#[derive(Args)]
+struct Relocate {
+    #[command(flatten)]
+    agent: Named,
+    /// Exact existing destination workspace id
+    #[arg(
+        long,
+        value_name = "ID",
+        conflicts_with = "workspace_label",
+        required_unless_present = "workspace_label"
+    )]
+    workspace_id: Option<String>,
+    /// Unique existing destination workspace label
+    #[arg(
+        long,
+        value_name = "LABEL",
+        conflicts_with = "workspace_id",
+        required_unless_present = "workspace_id"
+    )]
+    workspace_label: Option<String>,
+    /// Move into a new tab; other relocation layouts are intentionally unsupported
+    #[arg(long, required = true)]
+    new_tab: bool,
 }
 
 #[derive(Args)]
@@ -751,10 +784,11 @@ fn run(args: Cli) -> Result<i32, Failure> {
             return run_chat(args.registry, args.herdr_bin, value);
         }
         Commands::Profiles(value) => {
-            let (path, profiles) = crate::profiles::load_profiles(&value.cwd, true)?;
+            let (path, config) = crate::profiles::load_project_config(&value.cwd, true)?;
             write_json(&json!({
                 "path": path,
-                "profiles": profiles.values().map(crate::profiles::LaunchProfile::public).collect::<Vec<_>>()
+                "default_workspace": config.default_workspace,
+                "profiles": config.profiles.values().map(crate::profiles::LaunchProfile::public).collect::<Vec<_>>()
             }))
             .map_err(Failure::Output)?;
             return Ok(0);
@@ -780,6 +814,7 @@ fn run(args: Cli) -> Result<i32, Failure> {
     let manager = ManagedAgents::new(&client, &args.registry)?;
     let mut result = match command {
         Commands::Start(value) => {
+            let (_, project_config) = crate::profiles::load_project_config(&value.cwd, true)?;
             let launch_profile = value.profile.clone();
             let (harness, mode, model, reasoning_effort, harness_args, environment) =
                 if let Some(profile_name) = value.profile.as_deref() {
@@ -811,8 +846,7 @@ fn run(args: Cli) -> Result<i32, Failure> {
                             overlaps.join(", ")
                         )));
                     }
-                    let (_, profiles) = crate::profiles::load_profiles(&value.cwd, false)?;
-                    let profile = profiles.get(profile_name).ok_or_else(|| {
+                    let profile = project_config.profiles.get(profile_name).ok_or_else(|| {
                         Failure::Usage(format!(
                             "unknown profile {profile_name:?}; run agentctl profiles --cwd {}",
                             value.cwd.display()
@@ -854,9 +888,21 @@ fn run(args: Cli) -> Result<i32, Failure> {
                 ),
                 None => value.brief,
             };
+            let (mut workspace_id, mut workspace_label) =
+                (value.workspace_id, value.workspace_label);
+            if mode == "interactive" && workspace_id.is_none() && workspace_label.is_none() {
+                if let Some(selector) = project_config.default_workspace {
+                    if selector.kind == "id" {
+                        workspace_id = Some(selector.value);
+                    } else {
+                        workspace_label = Some(selector.value);
+                    }
+                }
+            }
             let options = StartOptions {
                 launch_profile,
-                workspace_id: value.workspace_id,
+                workspace_id,
+                workspace_label,
                 harness,
                 model,
                 resume: value.resume,
@@ -890,6 +936,12 @@ fn run(args: Cli) -> Result<i32, Failure> {
         Commands::RecoverStart(value) => {
             manager.recover_start(&value.agent.name, &value.expected_token, value.expected_pid)?
         }
+        Commands::Relocate(value) => manager.relocate(
+            &value.agent.name,
+            value.workspace_id.as_deref(),
+            value.workspace_label.as_deref(),
+            value.new_tab,
+        )?,
         Commands::Stop(value) => {
             if value.recover_legacy_adoption
                 && (value.expected_token.is_none() || value.expected_record_sha256.is_none())
@@ -1192,6 +1244,7 @@ fn add_capabilities(value: &mut serde_json::Value) {
                 "drain",
                 "goal",
                 "bind-session",
+                "relocate",
             ];
             if value["adapter"] == "herdr-pane" && value["harness"] == "muse" {
                 capabilities.push("reconcile-delivery");
@@ -1594,7 +1647,8 @@ mod tests {
                 "terminal-snapshot",
                 "drain",
                 "goal",
-                "bind-session"
+                "bind-session",
+                "relocate"
             ])
         );
     }

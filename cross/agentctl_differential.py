@@ -26,7 +26,7 @@ from herdr_agent_differential import Harness, Outcome, PairCase, Report, _queue_
 _COMMON = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry")
 _GOAL_COMMAND = ("--goal-command-json", '["<HERDR>","goal-rpc"]')
 _CAPABILITIES = ["send", "status", "read", "wait", "stop", "attach", "pause", "resume",
-                 "terminal-snapshot", "drain", "goal", "bind-session"]
+                 "terminal-snapshot", "drain", "goal", "bind-session", "relocate"]
 _SHELL_IDENTITY_FIELDS = {
     "version", "boot_id", "pid", "starttime_ticks",
     "executable_device", "executable_inode",
@@ -208,7 +208,8 @@ def _orientation(harness: Harness, report: Report) -> None:
     case = harness.case("primary-orientation")
     _pair(harness, report, case, "primary/version", ("--version",))
     for arguments in ((), ("--help",), ("start", "--help"), ("adopt", "--help"),
-                      ("recover-start", "--help"), ("health", "--help"),
+                      ("recover-start", "--help"), ("relocate", "--help"),
+                      ("health", "--help"),
                       ("stop", "--help"), ("send", "--help"),
                       ("reconcile-delivery", "--help"), ("goal", "--help")):
         for edition, outcome in zip(("python", "rust"), harness.invoke(case, arguments), strict=True):
@@ -335,6 +336,32 @@ def _lifecycle(harness: Harness, report: Report) -> None:
             and len(list((root / "registry/archive").iterdir())) == 1
                        for root in (case.python_root, case.rust_root)), "owned pane or archival contract diverged")
 
+    lost_event = harness.case("primary-native-lost-status-event")
+    if _start(
+        harness, report, lost_event, "primary/lost-status-event/start",
+        "--harness", "claude",
+    ):
+        _change(lost_event, {"wait_mode": "fail", "working_after_prompt": True})
+        text = "review this exact change"
+        _pair(
+            harness, report, lost_event,
+            "primary/lost-status-event/reconciled",
+            ("send", "worker", text, "--message-id", "lost-event", *_COMMON),
+        )
+        report.require(
+            "primary/lost-status-event/exactly-once",
+            all(_submission_count(root, text) == 1 for root in (
+                lost_event.python_root, lost_event.rust_root,
+            )),
+            "lost status event caused prompt reinjection",
+        )
+        report.require(
+            "primary/lost-status-event/durable",
+            _queue_snapshot(lost_event.python_root, "registry/worker/queue")
+            == _queue_snapshot(lost_event.rust_root, "registry/worker/queue"),
+            "lost-event reconciliation produced different queue state",
+        )
+
     custom = harness.case("primary-existing-native-kind")
     python, _ = _pair(harness, report, custom, "primary/native-kind/start", (
         "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
@@ -354,7 +381,8 @@ def _lifecycle(harness: Harness, report: Report) -> None:
 
 def _profiles(harness: Harness, report: Report) -> None:
     document = {
-        "schema": "agentctl-profiles/v1",
+        "schema": "agentctl-profiles/v2",
+        "default_workspace": {"id": "w1"},
         "profiles": {
             "astra-ultra": {
                 "harness": "codex", "mode": "interactive", "model": "gpt-6-astra",
@@ -366,6 +394,10 @@ def _profiles(harness: Harness, report: Report) -> None:
                 "harness": "codex", "mode": "interactive", "model": "gpt-5.6-sol",
                 "argv": ["--dangerously-enable-internet-mode", "--dangerously-bypass-approvals-and-sandbox"],
                 "env": {"META_CODEX_AI_GATEWAY": "azure-codex-cyber:openai"},
+            },
+            "claude-opus-55": {
+                "harness": "claude", "mode": "interactive", "model": "opus",
+                "argv": [], "env": {},
             },
             "watermelon": {
                 "harness": "muse", "mode": "interactive",
@@ -398,6 +430,7 @@ def _profiles(harness: Harness, report: Report) -> None:
                          "--dangerously-bypass-approvals-and-sandbox"],
         "sol": ["--no-alt-screen", "--model", "gpt-5.6-sol",
                 "--dangerously-enable-internet-mode", "--dangerously-bypass-approvals-and-sandbox"],
+        "claude-opus-55": ["--model", "opus"],
         "watermelon": ["--model", "kiki_gb300_mxfp8_6p2_840_nwr", "--reasoning-effort", "ultra"],
         "muse-literal": ["--trust-workspace", '--meta-tag=literal $(unexpanded) "quotes"',
                          "--meta-tag=repeatable"],
@@ -422,7 +455,10 @@ def _profiles(harness: Harness, report: Report) -> None:
         calls = _state(root).get("process_info_calls")
         return isinstance(calls, int) and not isinstance(calls, bool) and calls >= 1
 
-    for profile in ("astra-ultra", "sol", "watermelon", "muse-literal", "codex-safe-config"):
+    for profile in (
+        "astra-ultra", "sol", "claude-opus-55", "watermelon",
+        "muse-literal", "codex-safe-config",
+    ):
         case = harness.case(f"primary-profile-{profile}")
         configure(case)
         listed = _pair(harness, report, case, f"primary/profile/{profile}/list",
@@ -432,7 +468,8 @@ def _profiles(harness: Harness, report: Report) -> None:
             serialized = json.dumps(public, sort_keys=True)
             report.require(
                 f"primary/profile/{profile}/list-redaction/{edition}",
-                "azure-codex-cyber:openai" not in serialized
+                public.get("default_workspace") == {"id": "w1"}
+                and "azure-codex-cyber:openai" not in serialized
                 and "--dangerously-enable-internet-mode" not in serialized
                 and "private-fixture.png" not in serialized
                 and any(
@@ -445,8 +482,9 @@ def _profiles(harness: Harness, report: Report) -> None:
                 ),
                 f"safe profile metadata disclosed private values or omitted headless Muse: {public!r}",
             )
+        workspace = () if profile == "claude-opus-55" else ("--workspace-id", "w1")
         python, rust = _pair(harness, report, case, f"primary/profile/{profile}/start", (
-            "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+            "start", "worker", "--cwd", "<ROOT>", *workspace,
             "--profile", profile, *_COMMON,
         ))
         status = _json(python)
@@ -614,6 +652,23 @@ def _profiles(harness: Harness, report: Report) -> None:
                                and not list((root / "registry/worker/queue/failed").glob("*.json"))
                                for root in (case.python_root, case.rust_root)),
                            "Muse pane delivery lacked an exact post-Enter receipt")
+            wrapped_prompt = (
+                "Review the timerfd deterministic-\nscheduling change without weakening tests."
+            )
+            _change(case, {"muse_headerless": True})
+            _pair(harness, report, case, "primary/profile/watermelon/headerless-multiline", (
+                "send", "worker", wrapped_prompt, "--message-id", "muse-headerless",
+                *_COMMON,
+            ))
+            report.require(
+                "primary/profile/watermelon/headerless-multiline-receipt",
+                all(
+                    _state(root).get("submitted") == [prompt, wrapped_prompt]
+                    and (root / "registry/worker/queue/processed/muse-headerless.json").is_file()
+                    for root in (case.python_root, case.rust_root)
+                ),
+                "verified long-lived Muse process did not preserve multiline composer input",
+            )
             _change(case, {
                 "custom_post_error": True, "custom_submitted": False, "custom_draft": "",
             })
@@ -1048,6 +1103,24 @@ def _profile_refusals(harness: Harness, report: Report) -> None:
     ), "profile discovery executed Git from caller PATH")
 
     strict_documents = {
+        "v2-missing-default-workspace": json.dumps({
+            "schema": "agentctl-profiles/v2", "profiles": base["profiles"],
+        }),
+        "v1-with-default-workspace": json.dumps({
+            **base, "default_workspace": {"id": "w1"},
+        }),
+        "v2-ambiguous-default-workspace": json.dumps({
+            "schema": "agentctl-profiles/v2", "profiles": base["profiles"],
+            "default_workspace": {"id": "w1", "label": "project"},
+        }),
+        "v2-unknown-default-workspace": json.dumps({
+            "schema": "agentctl-profiles/v2", "profiles": base["profiles"],
+            "default_workspace": {"name": "project"},
+        }),
+        "v2-empty-default-workspace": json.dumps({
+            "schema": "agentctl-profiles/v2", "profiles": base["profiles"],
+            "default_workspace": {"label": ""},
+        }),
         "duplicate-json": (
             '{"schema":"agentctl-profiles/v1","profiles":{'
             '"worker":{"harness":"codex","mode":"interactive"},'
@@ -1265,7 +1338,90 @@ def _handoff_and_pending(harness: Harness, report: Report) -> None:
     report.require("primary/handoff/uncertain-retained", all(
         _state(root).get("submitted") == ["queued before handoff", "uncertain request"]
         and (root / "registry/worker/queue/failed/uncertain.json").exists()
-        for root in (case.python_root, case.rust_root)), "uncertain work was replayed or discarded")
+                   for root in (case.python_root, case.rust_root)), "uncertain work was replayed or discarded")
+
+
+def _relocation(harness: Harness, report: Report) -> None:
+    case = harness.case("primary-relocation")
+    if not _start(harness, report, case, "primary/relocation/start"):
+        return
+    _change(case, {"status": "working"})
+    _pair(harness, report, case, "primary/relocation/queue", (
+        "send", "worker", "preserve across move", "--message-id", "relocate-pending",
+        "--ready-timeout", "0", *_COMMON,
+    ), 75)
+    before = {
+        root: (root / "registry/worker/queue/inbox/relocate-pending.json").read_bytes()
+        for root in (case.python_root, case.rust_root)
+    }
+    python, _ = _pair(harness, report, case, "primary/relocation/move", (
+        "relocate", "worker", "--workspace-id", "w2", "--new-tab", *_COMMON,
+    ))
+    moved = _json(python)
+    report.require(
+        "primary/relocation/identity-and-queue",
+        isinstance(moved, dict)
+        and moved.get("workspace_id") == "w2"
+        and moved.get("pane_id") == "w2:p-moved"
+        and moved.get("terminal_id") == "term-fixture-1"
+        and all(
+            _state(root).get("pane_id") == "w2:p-moved"
+            and (root / "registry/worker/queue/inbox/relocate-pending.json").read_bytes()
+            == before[root]
+            and not (root / "registry/worker/relocation.json").exists()
+            for root in (case.python_root, case.rust_root)
+        ),
+        f"relocation changed generation/queue or lost route: {moved!r}",
+    )
+    _change(case, {"status": "idle"})
+    _pair(harness, report, case, "primary/relocation/drain", (
+        "drain", "worker", *_COMMON,
+    ))
+    report.require(
+        "primary/relocation/queued-delivery",
+        all(_state(root).get("submitted") == ["preserve across move"]
+            for root in (case.python_root, case.rust_root)),
+        "relocation changed or lost queued work",
+    )
+
+    lost = harness.case("primary-relocation-lost-response", {"lose_move_response": True})
+    if not _start(harness, report, lost, "primary/relocation/lost/start"):
+        return
+    _pair(harness, report, lost, "primary/relocation/lost/first", (
+        "relocate", "worker", "--workspace-id", "w2", "--new-tab", *_COMMON,
+    ), 69)
+    _pair(harness, report, lost, "primary/relocation/lost/reconcile", (
+        "relocate", "worker", "--workspace-id", "w2", "--new-tab", *_COMMON,
+    ))
+    report.require(
+        "primary/relocation/lost/exactly-once",
+        all(
+            sum(
+                call[:2] == ["pane", "move"]
+                for call in cast(list[list[str]], _state(root).get("calls", []))
+            ) == 1
+            and not (root / "registry/worker/relocation.json").exists()
+            for root in (lost.python_root, lost.rust_root)
+        ),
+        "lost move response was repeated or not reconciled",
+    )
+
+    multi = harness.case("primary-relocation-multi-pane")
+    if not _start(harness, report, multi, "primary/relocation/multi/start"):
+        return
+    _change(multi, {"extra_pane": True})
+    _pair(harness, report, multi, "primary/relocation/multi/refusal", (
+        "relocate", "worker", "--workspace-id", "w2", "--new-tab", *_COMMON,
+    ), 75)
+    report.require(
+        "primary/relocation/multi/no-side-effect",
+        all(
+            _state(root).get("pane_id", "w1:p1") == "w1:p1"
+            and not (root / "registry/worker/relocation.json").exists()
+            for root in (multi.python_root, multi.rust_root)
+        ),
+        "multi-pane refusal moved the terminal or created a journal",
+    )
 
 
 def _registry_and_interop(harness: Harness, report: Report) -> None:
@@ -2020,6 +2176,16 @@ def _invalid_cli(harness: Harness, report: Report) -> None:
         ("environment-missing-equals", ("start", "worker", "--env", "MISSING_EQUALS")),
         ("environment-empty-name", ("start", "worker", "--env", "=value")),
         ("environment-invalid-name", ("start", "worker", "--env", "BAD-NAME=value")),
+        ("workspace-selector-conflict", (
+            "start", "worker", "--workspace-id", "w1", "--workspace-label", "project",
+        )),
+        ("relocate-missing-new-tab", (
+            "relocate", "worker", "--workspace-id", "w1",
+        )),
+        ("relocate-selector-conflict", (
+            "relocate", "worker", "--workspace-id", "w1",
+            "--workspace-label", "project", "--new-tab",
+        )),
         ("zero-lines", ("read", "worker", "--lines", "0")),
         ("underscore-count", ("read", "worker", "--lines", "1_0")),
         ("unicode-time", ("wait", "worker", "--timeout", "١.0")),
@@ -2059,6 +2225,7 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
             _skill_install(harness, report)
             _profile_refusals(harness, report)
             _handoff_and_pending(harness, report)
+            _relocation(harness, report)
             _registry_and_interop(harness, report)
             _legacy_adopted_registry_and_queue(harness, report)
             _ownership(harness, report)

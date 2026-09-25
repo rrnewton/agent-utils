@@ -19,7 +19,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import cast
 
@@ -33,10 +33,9 @@ from agentctl.client import (
     claude_active_screen,
     muse_idle_composer,
     muse_verified_process_idle_composer,
-    muse_prompt_in_composer,
-    muse_prompt_in_transcript,
-    muse_prompt_is_exact_composer,
-    muse_prompt_transcript_count,
+    muse_verified_process_prompt_in_composer,
+    muse_verified_process_prompt_is_exact_composer,
+    muse_verified_process_prompt_transcript_count,
     muse_startup_metadata,
     muse_trust_prompt,
 )
@@ -60,6 +59,7 @@ _HEALTH_SCHEMA = "agentctl-health/v1"
 _HEALTH_PROBE_SECONDS = 60.0
 _SESSION_STORAGE_SCHEMA = "agentctl-session/v2"
 _LAUNCH_SPEC_SCHEMA = "agentctl-launch/v1"
+_RELOCATION_SCHEMA = "agentctl-relocation/v1"
 
 
 _rename_directory_noreplace_at = agent._rename_directory_noreplace_at
@@ -184,6 +184,7 @@ class LaunchSpec:
         return list(self.argv[1:]) if self.argv else []
 
     def to_document(self) -> dict[str, object]:
+        """Return the one tagged durable representation of this launch intent."""
         executable: dict[str, object] | None = None
         if self.executable is not None:
             path, device, inode = self.executable
@@ -573,7 +574,7 @@ class AgentRecord:
     def _normalize_storage_value(
         cls, document: dict[str, object], path: Path,
     ) -> dict[str, object]:
-        """Translate v2 storage or one legacy v1 row into the in-memory view."""
+        """Translate v2 storage or one supported untagged row into the in-memory view."""
         if document.get("schema") == _SESSION_STORAGE_SCHEMA:
             top_fields = {
                 "schema", "name", "token", "created_at", "lifecycle", "launch",
@@ -725,6 +726,67 @@ class _PinnedAgentDirectory:
     descriptor: int
     device: int
     inode: int
+
+
+@dataclass(frozen=True)
+class _PaneRoute:
+    workspace_id: str
+    tab_id: str
+    pane_id: str
+
+    def to_document(self) -> dict[str, str]:
+        return asdict(self)
+
+    @classmethod
+    def from_document(cls, raw: object, field_name: str) -> _PaneRoute:
+        if not isinstance(raw, dict) or set(raw) != {
+            "workspace_id", "tab_id", "pane_id",
+        }:
+            raise AgentDeliveryError(f"invalid relocation {field_name} route")
+        values = [raw[key] for key in ("workspace_id", "tab_id", "pane_id")]
+        if any(not isinstance(value, str) or not value or "\0" in value
+               for value in values):
+            raise AgentDeliveryError(f"invalid relocation {field_name} route")
+        return cls(*cast(list[str], values))
+
+
+@dataclass(frozen=True)
+class _RelocationJournal:
+    token: str
+    terminal_id: str
+    old: _PaneRoute
+    target_workspace_id: str
+
+    def to_document(self) -> dict[str, object]:
+        return {
+            "schema": _RELOCATION_SCHEMA,
+            "token": self.token,
+            "terminal_id": self.terminal_id,
+            "old": self.old.to_document(),
+            "target_workspace_id": self.target_workspace_id,
+            "new_tab": True,
+        }
+
+    @classmethod
+    def from_document(cls, raw: object) -> _RelocationJournal:
+        expected = {
+            "schema", "token", "terminal_id", "old",
+            "target_workspace_id", "new_tab",
+        }
+        if (not isinstance(raw, dict) or set(raw) != expected
+                or raw.get("schema") != _RELOCATION_SCHEMA
+                or raw.get("new_tab") is not True):
+            raise AgentDeliveryError("invalid relocation journal")
+        token = raw.get("token")
+        terminal_id = raw.get("terminal_id")
+        target = raw.get("target_workspace_id")
+        if any(not isinstance(value, str) or not value or "\0" in value
+               for value in (token, terminal_id, target)):
+            raise AgentDeliveryError("invalid relocation journal identity")
+        return cls(
+            cast(str, token), cast(str, terminal_id),
+            _PaneRoute.from_document(raw.get("old"), "old"), cast(str, target),
+        )
 
 
 @dataclass(frozen=True)
@@ -955,7 +1017,7 @@ class _WorkspaceClient:
             raise HerdrUnavailable(
                 f"custom pane {pane_id} is not at a verified idle Muse composer"
             )
-        before = self.client.read(pane_id, source="visible", lines=200)
+        before = self.client.read(pane_id, source="recent-unwrapped", lines=200)
         self.client.send_text(
             pane_id, f"{_BRACKETED_PASTE_START}{command}{_BRACKETED_PASTE_END}"
         )
@@ -965,8 +1027,11 @@ class _WorkspaceClient:
             self.client.verify_custom_harness(
                 pane_id, self.record.harness, self.record.custom_process_identity
             )
-            staged = self.client.read(pane_id, source="visible", lines=200)
-            if staged != before and muse_prompt_is_exact_composer(staged, command):
+            staged = self.client.read(
+                pane_id, source="recent-unwrapped", lines=200,
+            )
+            if (staged != before
+                    and muse_verified_process_prompt_is_exact_composer(staged, command)):
                 break
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         else:
@@ -978,7 +1043,8 @@ class _WorkspaceClient:
         )
         self.client.send_keys(pane_id, "Enter")
         self.custom_submission = (
-            staged, command, muse_prompt_transcript_count(staged, command)
+            staged, command,
+            muse_verified_process_prompt_transcript_count(staged, command),
         )
 
     def wait_agent_status(self, pane_id: str, status: str, timeout_ms: int) -> None:
@@ -993,30 +1059,48 @@ class _WorkspaceClient:
                 self.client.verify_custom_harness(
                     pane_id, self.record.harness, self.record.custom_process_identity
                 )
-                screen = self.client.read(pane_id, source="visible", lines=200)
+                screen = self.client.read(
+                    pane_id, source="recent-unwrapped", lines=200,
+                )
                 if (screen != staged
-                        and muse_prompt_transcript_count(screen, command) > prior_count
-                        and not muse_prompt_in_composer(screen, command)):
+                        and muse_verified_process_prompt_transcript_count(
+                            screen, command,
+                        ) > prior_count
+                        and not muse_verified_process_prompt_in_composer(
+                            screen, command,
+                        )):
                     self.custom_submission = None
                     return
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
             raise HerdrUnavailable(
                 "Muse did not show a verified post-Enter screen transition"
             )
-        if self.goal_objective is None or status != "working":
-            self.client.wait_agent_status(pane_id, status, timeout_ms)
-            return
         started = time.monotonic()
+        initial_error: HerdrUnavailable | None = None
         try:
             self.client.wait_agent_status(pane_id, status, min(1000, timeout_ms))
             return
-        except HerdrUnavailable:
-            self.pane_info(pane_id)
+        except HerdrUnavailable as exc:
+            # Herdr's wait subscription may be installed after the transition
+            # it is waiting for.  Preserve the event failure, but reconcile it
+            # against the exact currently owned pane before declaring delivery
+            # ambiguous.  This never re-runs the prompt operation.
+            initial_error = exc
+            info = self.pane_info(pane_id)
+            if info.status == status:
+                return
+        if self.goal_objective is not None and status == "working":
             screen = self.client.read(pane_id, source="visible", lines=200)
             if _goal_replacement_selected(screen, self.goal_objective):
                 self.client.send_keys(pane_id, "Enter")
-            remaining = max(1, timeout_ms - int((time.monotonic() - started) * 1000))
+        remaining = max(1, timeout_ms - int((time.monotonic() - started) * 1000))
+        try:
             self.client.wait_agent_status(pane_id, status, remaining)
+            return
+        except HerdrUnavailable as final_error:
+            if self.pane_info(pane_id).status == status:
+                return
+            raise final_error from initial_error
 
     def read(self, pane_id: str, *, source: str, lines: int) -> str:
         if self.deadline is not None and isinstance(self.client, HerdrClient):
@@ -1407,6 +1491,7 @@ class ManagedAgents:
 
     def start(
         self, name: str, *, cwd: str, workspace_id: str | None = None,
+        workspace_label: str | None = None,
         harness: str = "codex", model: str | None = None, resume: str | None = None,
         reasoning_effort: str | None = None,
         harness_args: Sequence[str] = (), environment: Sequence[str] = (),
@@ -1424,6 +1509,13 @@ class ManagedAgents:
         root = str(Path(cwd).expanduser().resolve())
         if not Path(root).is_dir():
             raise AgentDeliveryError(f"cwd is not a directory: {root}")
+        if workspace_id is not None and workspace_label is not None:
+            raise AgentDeliveryError("workspace id and label are mutually exclusive")
+        for value, field in (
+            (workspace_id, "workspace id"), (workspace_label, "workspace label"),
+        ):
+            if value is not None and (not value or "\0" in value):
+                raise AgentDeliveryError(f"{field} must be nonempty and contain no NUL")
         if not math.isfinite(startup_timeout) or not 0 < startup_timeout <= 300:
             raise AgentDeliveryError("startup timeout must be between 0 and 300 seconds")
         if isinstance(harness_args, (str, bytes)) or any(
@@ -1472,7 +1564,9 @@ class ManagedAgents:
                                      runtime_ownership="owned")
                 self._save(record)
                 try:
-                    self._create_presentation(record, workspace_id, environment)
+                    self._create_presentation(
+                        record, workspace_id, workspace_label, environment,
+                    )
                     assert record.pane_id is not None
                     if record.adapter == "herdr-pane":
                         def persist_launch_intent(
@@ -1858,21 +1952,43 @@ class ManagedAgents:
 
     def _create_presentation(
         self, record: AgentRecord, workspace_id: str | None,
+        workspace_label: str | None,
         environment: Sequence[str],
     ) -> None:
         # Independent registries can share the default workspace. Serialize label
         # resolution and creation host-wide, releasing before any harness startup.
-        lock = agent._open_private_lock(agent._target_lock_path("managed-workspace:subagents"), "workspace allocation lock")
+        may_create_shared_default = (
+            workspace_id is None and workspace_label is None
+            and not os.environ.get("HERDR_WORKSPACE_ID")
+        )
+        selected_id = workspace_id
+        selected_label = workspace_label
+        if selected_id is None and selected_label is None:
+            selected_id = os.environ.get("HERDR_WORKSPACE_ID")
+        if selected_label is None and selected_id is None:
+            selected_label = "subagents"
+        lock_key = selected_id or selected_label
+        assert lock_key is not None
+        lock = agent._open_private_lock(
+            agent._target_lock_path(f"managed-workspace:{lock_key}"),
+            "workspace allocation lock",
+        )
         try:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            selected = workspace_id or os.environ.get("HERDR_WORKSPACE_ID")
-            if selected:
+            selected = selected_id
+            if selected is not None:
                 self.client.workspace_label(selected)
             else:
-                selected = self.client.workspace_id_for_label("subagents")
+                assert selected_label is not None
+                selected = self.client.workspace_id_for_label(selected_label)
             if selected is None:
+                assert selected_label is not None
+                if not may_create_shared_default:
+                    raise AgentDeliveryError(
+                        f"workspace label {selected_label!r} does not exist"
+                    )
                 selected, tab, pane = self.client.create_workspace(
-                    label="subagents", cwd=record.cwd, environment=environment
+                    label=selected_label, cwd=record.cwd, environment=environment
                 )
                 record.workspace_id, record.tab_id, record.pane_id = selected, tab, pane
                 self._save(record)
@@ -2433,13 +2549,17 @@ class ManagedAgents:
                 )
                 try:
                     screen = client.read(
-                        pane_id, source="visible", lines=5000,
+                        pane_id, source="recent-unwrapped", lines=5000,
                     )
                     after = agent.resolve_target(client, record.target())
                     return (
                         before == after
-                        and muse_prompt_in_transcript(screen, text)
-                        and not muse_prompt_in_composer(screen, text)
+                        and muse_verified_process_prompt_transcript_count(
+                            screen, text,
+                        ) > 0
+                        and not muse_verified_process_prompt_in_composer(
+                            screen, text,
+                        )
                     )
                 finally:
                     os.close(target_lock)
@@ -3946,6 +4066,181 @@ class ManagedAgents:
             agent._fsync_dir(str(archive))
             agent._fsync_dir(str(self.registry))
             return {"name": name, "archive": str(destination), "pane_closed": bool(owned), "tab_closed": tab_closed}
+
+    def _read_relocation_journal(
+        self, record: AgentRecord,
+    ) -> _RelocationJournal | None:
+        path = self._directory(record.name) / "relocation.json"
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise AgentDeliveryError(f"cannot inspect relocation journal: {exc}") from exc
+        raw = agent._read_queue_json(
+            str(path), "relocation journal", require_private=True,
+            max_artifact_bytes=_MAX_AGENT_RECORD_BYTES,
+        )
+        journal = _RelocationJournal.from_document(raw)
+        if journal.token != record.token:
+            raise AgentDeliveryError("relocation journal belongs to another agent generation")
+        return journal
+
+    def _finish_relocation(
+        self, record: AgentRecord, journal: _RelocationJournal, pane: Pane,
+    ) -> dict[str, object]:
+        if pane.terminal_id != journal.terminal_id:
+            raise AgentDeliveryError("relocated pane terminal identity changed")
+        if pane.workspace_id != journal.target_workspace_id:
+            raise AgentDeliveryError("relocated pane is not in the intended workspace")
+        panes = self.client.panes()
+        if sum(item.tab_id == pane.tab_id for item in panes) != 1:
+            raise AgentDeliveryError("relocated destination tab is not a one-pane tab")
+        candidate = replace(
+            record, workspace_id=pane.workspace_id,
+            tab_id=pane.tab_id, pane_id=pane.pane_id,
+        )
+        self._checked(candidate)
+        self._save(candidate)
+        persisted = self._load_expected(record.name, record.token)
+        if (persisted.workspace_id, persisted.tab_id, persisted.pane_id) != (
+            pane.workspace_id, pane.tab_id, pane.pane_id,
+        ):
+            raise AgentDeliveryError("relocation routing commit did not persist")
+        self._checked(persisted)
+        current = [
+            item for item in self.client.panes()
+            if item.terminal_id == journal.terminal_id
+        ]
+        if len(current) != 1 or current[0] != pane:
+            raise AgentDeliveryError("relocated terminal changed after routing commit")
+        with self._pinned_agent_directory(record.name) as pinned:
+            metadata = os.stat(
+                "relocation.json", dir_fd=pinned.descriptor, follow_symlinks=False,
+            )
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                    or stat.S_IMODE(metadata.st_mode) & 0o077 or metadata.st_nlink != 1):
+                raise AgentDeliveryError("unsafe relocation journal during completion")
+            os.unlink("relocation.json", dir_fd=pinned.descriptor)
+            _fsync_pinned_directory(pinned.descriptor, "agent directory")
+        return {
+            "name": persisted.name,
+            "token": persisted.token,
+            "workspace_id": pane.workspace_id,
+            "tab_id": pane.tab_id,
+            "pane_id": pane.pane_id,
+            "terminal_id": pane.terminal_id,
+            "relocated": True,
+        }
+
+    def relocate(
+        self, name: str, *, workspace_id: str | None = None,
+        workspace_label: str | None = None, new_tab: bool = False,
+    ) -> dict[str, object]:
+        """Move one live interactive pane through a recoverable routing transaction."""
+        if not new_tab:
+            raise AgentDeliveryError("relocate currently requires --new-tab")
+        if (workspace_id is None) == (workspace_label is None):
+            raise AgentDeliveryError(
+                "relocate requires exactly one of workspace id or workspace label"
+            )
+        selector = workspace_id if workspace_id is not None else workspace_label
+        if selector is None or not selector or "\0" in selector:
+            raise AgentDeliveryError("workspace selector must be nonempty and contain no NUL")
+        with self._lock(name):
+            record = self._load(name)
+            if (record.lifecycle != "running" or record.mode != "interactive"
+                    or record.backend != "herdr" or record.pane_id is None
+                    or record.tab_id is None or record.workspace_id is None):
+                raise AgentDeliveryError(
+                    "relocate requires a running interactive Herdr session with complete routing"
+                )
+            target_workspace = workspace_id
+            if target_workspace is not None:
+                self.client.workspace_label(target_workspace)
+            else:
+                assert workspace_label is not None
+                target_workspace = self.client.workspace_id_for_label(workspace_label)
+                if target_workspace is None:
+                    raise AgentDeliveryError(
+                        f"workspace label {workspace_label!r} does not exist"
+                    )
+            assert target_workspace is not None
+            journal = self._read_relocation_journal(record)
+            if journal is not None and journal.target_workspace_id != target_workspace:
+                raise AgentDeliveryError(
+                    "unfinished relocation targets another workspace; retry that exact target"
+                )
+            if journal is None:
+                if target_workspace == record.workspace_id:
+                    raise AgentDeliveryError("agent is already in the requested workspace")
+                self._checked(record)
+                panes = self.client.panes()
+                old = [item for item in panes if item.pane_id == record.pane_id]
+                if (len(old) != 1 or old[0].tab_id != record.tab_id
+                        or old[0].workspace_id != record.workspace_id
+                        or old[0].terminal_id is None):
+                    raise AgentDeliveryError(
+                        "cannot prove the current pane/tab/terminal routing for relocation"
+                    )
+                if sum(item.tab_id == record.tab_id for item in panes) != 1:
+                    raise AgentDeliveryError("relocate refuses a multi-pane source tab")
+                journal = _RelocationJournal(
+                    record.token, old[0].terminal_id,
+                    _PaneRoute(record.workspace_id, record.tab_id, record.pane_id),
+                    target_workspace,
+                )
+                agent._atomic_json(
+                    str(self._directory(name) / "relocation.json"),
+                    journal.to_document(),
+                )
+
+            panes = self.client.panes()
+            current = [
+                item for item in panes if item.terminal_id == journal.terminal_id
+            ]
+            if len(current) != 1:
+                raise AgentDeliveryError(
+                    "cannot uniquely locate the relocation terminal generation"
+                )
+            pane = current[0]
+            old_route = _PaneRoute(
+                pane.workspace_id, pane.tab_id, pane.pane_id,
+            )
+            if old_route == journal.old:
+                self._checked(record)
+                fresh_panes = self.client.panes()
+                fresh = [
+                    item for item in fresh_panes
+                    if item.terminal_id == journal.terminal_id
+                ]
+                if (len(fresh) != 1
+                        or _PaneRoute(
+                            fresh[0].workspace_id, fresh[0].tab_id, fresh[0].pane_id,
+                        ) != journal.old
+                        or sum(item.tab_id == journal.old.tab_id
+                               for item in fresh_panes) != 1):
+                    raise AgentDeliveryError(
+                        "source pane routing changed before relocation"
+                    )
+                pane = fresh[0]
+                moved = self.client.move_pane_to_new_tab(
+                    pane.pane_id, workspace_id=target_workspace, label=record.name,
+                )
+                if (moved.previous_pane_id, moved.previous_tab_id,
+                        moved.previous_workspace_id) != (
+                    journal.old.pane_id, journal.old.tab_id,
+                    journal.old.workspace_id,
+                ):
+                    raise AgentDeliveryError(
+                        "pane move returned a different source routing identity"
+                    )
+                pane = moved.pane
+            elif pane.workspace_id != target_workspace:
+                raise AgentDeliveryError(
+                    "relocation terminal is neither at its old route nor intended destination"
+                )
+            return self._finish_relocation(record, journal, pane)
 
     @staticmethod
     def _require_automation(record: AgentRecord) -> None:

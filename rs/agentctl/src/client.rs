@@ -729,36 +729,60 @@ fn muse_composer_regions(screen: &str, require_header: bool) -> Option<(String, 
     Some((lines[..top].join("\n"), lines[top + 1..bottom].join("\n")))
 }
 
-pub(crate) fn muse_prompt_in_composer(screen: &str, text: &str) -> bool {
+fn muse_prompt_in_composer_context(
+    screen: &str,
+    text: &str,
+    require_header: bool,
+    exact: bool,
+) -> bool {
     let wanted = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    muse_composer_regions(screen, true).is_some_and(|(_, composer)| {
+    muse_composer_regions(screen, require_header).is_some_and(|(_, composer)| {
         let rendered = composer.split_whitespace().collect::<Vec<_>>().join(" ");
         !wanted.is_empty()
             && ["❯", "›"].iter().any(|marker| {
-                let needle = format!("{marker} {wanted}");
-                rendered == needle || rendered.starts_with(&format!("{needle} "))
+                let candidate = format!("{marker} {wanted}");
+                rendered == candidate || (!exact && rendered.starts_with(&format!("{candidate} ")))
             })
     })
 }
 
+#[cfg(test)]
+pub(crate) fn muse_prompt_in_composer(screen: &str, text: &str) -> bool {
+    muse_prompt_in_composer_context(screen, text, true, false)
+}
+
+pub(crate) fn muse_verified_process_prompt_in_composer(screen: &str, text: &str) -> bool {
+    muse_prompt_in_composer_context(screen, text, false, false)
+}
+
+#[cfg(test)]
 pub(crate) fn muse_prompt_is_exact_composer(screen: &str, text: &str) -> bool {
-    let wanted = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    muse_composer_regions(screen, true).is_some_and(|(_, composer)| {
-        let rendered = composer.split_whitespace().collect::<Vec<_>>().join(" ");
-        !wanted.is_empty() && [format!("❯ {wanted}"), format!("› {wanted}")].contains(&rendered)
-    })
+    muse_prompt_in_composer_context(screen, text, true, true)
 }
 
+pub(crate) fn muse_verified_process_prompt_is_exact_composer(screen: &str, text: &str) -> bool {
+    muse_prompt_in_composer_context(screen, text, false, true)
+}
+
+#[cfg(test)]
 pub(crate) fn muse_prompt_in_transcript(screen: &str, text: &str) -> bool {
-    muse_composer_regions(screen, true)
-        .is_some_and(|(transcript, _)| muse_marked_prompt_count(&transcript, text) > 0)
+    muse_prompt_transcript_count(screen, text) > 0
 }
 
-pub(crate) fn muse_prompt_transcript_count(screen: &str, text: &str) -> usize {
-    let Some((transcript, _)) = muse_composer_regions(screen, true) else {
+fn muse_prompt_transcript_count_context(screen: &str, text: &str, require_header: bool) -> usize {
+    let Some((transcript, _)) = muse_composer_regions(screen, require_header) else {
         return 0;
     };
     muse_marked_prompt_count(&transcript, text)
+}
+
+#[cfg(test)]
+pub(crate) fn muse_prompt_transcript_count(screen: &str, text: &str) -> usize {
+    muse_prompt_transcript_count_context(screen, text, true)
+}
+
+pub(crate) fn muse_verified_process_prompt_transcript_count(screen: &str, text: &str) -> usize {
+    muse_prompt_transcript_count_context(screen, text, false)
 }
 
 pub(crate) fn claude_active_screen(screen: &str) -> bool {
@@ -1058,6 +1082,21 @@ pub struct Pane {
     pub tab_id: String,
     /// Herdr workspace identifier.
     pub workspace_id: String,
+    /// Stable terminal identity retained when Herdr reroutes a pane.
+    pub terminal_id: Option<String>,
+}
+
+/// Result of moving one pane while retaining its stable terminal generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaneMove {
+    /// Pane identifier immediately before the move.
+    pub previous_pane_id: String,
+    /// Tab identifier immediately before the move.
+    pub previous_tab_id: String,
+    /// Workspace identifier immediately before the move.
+    pub previous_workspace_id: String,
+    /// The same terminal after Herdr assigned its new route.
+    pub pane: Pane,
 }
 
 /// Identity and readiness fields for one interactive-agent pane.
@@ -1180,6 +1219,58 @@ impl HerdrClient {
             &format!("tab rename {tab_id}"),
         )?;
         Ok(())
+    }
+    /// Move one pane into a new tab without restarting its terminal process.
+    pub fn move_pane_to_new_tab(
+        &self,
+        pane_id: &str,
+        workspace_id: &str,
+        label: &str,
+    ) -> Result<PaneMove> {
+        let result = self.call(
+            &strings(&[
+                "pane",
+                "move",
+                pane_id,
+                "--workspace",
+                workspace_id,
+                "--new-tab",
+                "--label",
+                label,
+                "--no-focus",
+            ]),
+            &format!("pane move {pane_id}"),
+        )?;
+        let moved = required_object(&result, "move_result", "pane move")?;
+        if moved.get("changed").and_then(Value::as_bool) != Some(true) {
+            return Err(AdapterError::unavailable(
+                "pane move did not report changed=true",
+            ));
+        }
+        let pane = required_object(moved, "pane", "pane move")?;
+        let created = required_object(moved, "created_tab", "pane move")?;
+        let pane = Pane {
+            pane_id: required_string(pane, "pane_id", "pane move pane")?,
+            tab_id: required_string(pane, "tab_id", "pane move pane")?,
+            workspace_id: required_string(pane, "workspace_id", "pane move pane")?,
+            terminal_id: Some(required_string(pane, "terminal_id", "pane move pane")?),
+        };
+        if pane.workspace_id != workspace_id
+            || required_string(created, "workspace_id", "pane move created_tab")? != workspace_id
+            || required_string(created, "tab_id", "pane move created_tab")? != pane.tab_id
+            || created.get("pane_count").and_then(Value::as_u64) != Some(1)
+            || required_string(moved, "focused_pane_id", "pane move")? != pane.pane_id
+        {
+            return Err(AdapterError::unavailable(
+                "pane move returned contradictory destination routing",
+            ));
+        }
+        Ok(PaneMove {
+            previous_pane_id: required_string(moved, "previous_pane_id", "pane move")?,
+            previous_tab_id: required_string(moved, "previous_tab_id", "pane move")?,
+            previous_workspace_id: required_string(moved, "previous_workspace_id", "pane move")?,
+            pane,
+        })
     }
     /// Invoke and validate the corresponding Herdr agent-control operation.
     pub fn close_tab(&self, tab_id: &str) -> Result<()> {
@@ -1944,6 +2035,7 @@ impl HerdrClient {
                     pane_id: required_string(pane, "pane_id", "pane list entry")?,
                     tab_id: required_string(pane, "tab_id", "pane list entry")?,
                     workspace_id: required_string(pane, "workspace_id", "pane list entry")?,
+                    terminal_id: optional_string(pane, "terminal_id", "pane list entry")?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2671,6 +2763,21 @@ mod tests {
                       kiki · xhigh · /work/project · YOLO\n";
         assert!(!muse_idle_composer(screen));
         assert!(muse_verified_process_idle_composer(screen));
+        let prompt = "require the full deterministic-scheduling-review skill";
+        let staged = screen.replace("❯\n", &format!("❯ {prompt}\n"));
+        assert!(!muse_prompt_is_exact_composer(&staged, prompt));
+        assert!(muse_verified_process_prompt_is_exact_composer(
+            &staged, prompt
+        ));
+        assert!(muse_verified_process_prompt_in_composer(&staged, prompt));
+        let accepted = screen.replace(
+            "old transcript after the version header scrolled away\n",
+            &format!("❯ {prompt}\n◆ Working\n"),
+        );
+        assert_eq!(
+            muse_verified_process_prompt_transcript_count(&accepted, prompt),
+            1
+        );
     }
 
     #[test]

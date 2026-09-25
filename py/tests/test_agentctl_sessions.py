@@ -269,7 +269,8 @@ def test_cli_headless_muse_profile_reaches_worker_with_exact_structured_argument
     directory.mkdir(mode=0o700)
     config = directory / "profiles.json"
     config.write_text(json.dumps({
-        "schema": "agentctl-profiles/v1",
+        "schema": "agentctl-profiles/v2",
+        "default_workspace": {"id": "wK"},
         "profiles": {
             "watermelon-exec": {
                 "harness": "muse",
@@ -323,6 +324,56 @@ def test_cli_headless_muse_profile_reaches_worker_with_exact_structured_argument
     ]
     assert captured[0]["brief"] == "return PROFILE_OK"
     assert fake.launched == []
+
+
+def test_cli_v2_config_selects_default_workspace_and_exact_opus_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    subprocess.run(["/usr/bin/git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+    directory = tmp_path / ".agentctl"
+    directory.mkdir(mode=0o700)
+    config = directory / "profiles.json"
+    config.write_text(json.dumps({
+        "schema": "agentctl-profiles/v2",
+        "default_workspace": {"id": "wK"},
+        "profiles": {
+            "claude-opus-55": {
+                "harness": "claude", "mode": "interactive", "model": "opus",
+                "argv": [], "env": {},
+            },
+        },
+    }), encoding="utf-8")
+    config.chmod(0o600)
+    fake = FakeManagedClient()
+    monkeypatch.setattr(cli, "HerdrClient", lambda **_kwargs: cast(HerdrClient, fake))
+
+    assert cli.main(["profiles", "--cwd", str(tmp_path)]) == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert listed["default_workspace"] == {"id": "wK"}
+    assert listed["profiles"] == [{
+        "argv_count": 0, "environment": [], "harness": "claude",
+        "mode": "interactive", "model": "opus", "name": "claude-opus-55",
+        "reasoning_effort": None,
+    }]
+
+    monkeypatch.setenv("HERDR_WORKSPACE_ID", "w-env")
+    assert cli.main([
+        "start", "worker", "--cwd", str(tmp_path),
+        "--registry", str(tmp_path / "registry"), "--profile", "claude-opus-55",
+    ]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["workspace_id"] == "wK"
+    assert status["launch_profile"] == "claude-opus-55"
+    assert fake.launched == [("worker", "claude", "w1:p1", ("--model", "opus"))]
+
+    assert cli.main([
+        "start", "override", "--cwd", str(tmp_path),
+        "--registry", str(tmp_path / "registry"), "--profile", "claude-opus-55",
+        "--workspace-id", "w2",
+    ]) == 0
+    overridden = json.loads(capsys.readouterr().out)
+    assert overridden["workspace_id"] == "w2"
 
 
 def test_mcp_routes_into_the_cli_registry_and_honors_its_pause(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

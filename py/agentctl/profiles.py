@@ -17,7 +17,8 @@ from typing import cast
 
 from agentctl.errors import AgentDeliveryError
 
-SCHEMA = "agentctl-profiles/v1"
+SCHEMA = "agentctl-profiles/v2"
+LEGACY_SCHEMA = "agentctl-profiles/v1"
 PROFILE_PATH = Path(".agentctl/profiles.json")
 _NAME = re.compile(r"[a-z][a-z0-9-]{0,31}\Z")
 _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -60,6 +61,26 @@ class LaunchProfile:
             "argv_count": len(self.argv),
             "environment": [entry.partition("=")[0] for entry in self.environment],
         }
+
+
+@dataclass(frozen=True)
+class WorkspaceSelector:
+    """One project-owned default workspace selector."""
+
+    kind: str
+    value: str
+
+    def public(self) -> dict[str, str]:
+        """Return the non-secret wire representation used by profile listing."""
+        return {self.kind: self.value}
+
+
+@dataclass(frozen=True)
+class ProjectConfig:
+    """Canonical project-local launch configuration."""
+
+    profiles: dict[str, LaunchProfile]
+    default_workspace: WorkspaceSelector | None = None
 
 
 def profile_path(cwd: str | Path) -> Path:
@@ -331,15 +352,17 @@ def _profile(name: str, raw: object) -> LaunchProfile:
     return LaunchProfile(name, harness, mode, model, effort, argv, tuple(environment))
 
 
-def load_profiles(cwd: str | Path, *, absent_ok: bool = False) -> tuple[Path, dict[str, LaunchProfile]]:
-    """Load and validate the ignored private profile file for *cwd*."""
+def load_project_config(
+    cwd: str | Path, *, absent_ok: bool = False,
+) -> tuple[Path, ProjectConfig]:
+    """Load the one ignored private launch/workspace config for *cwd*."""
     root = Path(cwd).expanduser().resolve()
     path = profile_path(root)
     try:
         path.lstat()
     except FileNotFoundError:
         if absent_ok:
-            return path, {}
+            return path, ProjectConfig({})
         raise AgentDeliveryError(f"profile config does not exist: {path}") from None
     except OSError as exc:
         raise AgentDeliveryError(f"cannot inspect profile config {path}: {exc}") from exc
@@ -367,13 +390,37 @@ def load_profiles(cwd: str | Path, *, absent_ok: bool = False) -> tuple[Path, di
         raw: object = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_object)
     except (UnicodeError, json.JSONDecodeError, RecursionError, _DuplicateKey) as exc:
         raise AgentDeliveryError(f"cannot read profile config {path}: {exc}") from exc
-    if not isinstance(raw, dict) or set(raw) != {"schema", "profiles"}:
-        raise AgentDeliveryError("profile config must contain exactly schema and profiles")
-    if raw.get("schema") != SCHEMA or not isinstance(raw.get("profiles"), dict):
-        raise AgentDeliveryError(f"profile config must use schema {SCHEMA!r} and an object of profiles")
+    if not isinstance(raw, dict):
+        raise AgentDeliveryError("profile config must be an object")
+    schema = raw.get("schema")
+    expected_keys = (
+        {"schema", "profiles"}
+        if schema == LEGACY_SCHEMA
+        else {"schema", "profiles", "default_workspace"}
+    )
+    if set(raw) != expected_keys or schema not in (LEGACY_SCHEMA, SCHEMA):
+        raise AgentDeliveryError(
+            f"profile config must use schema {LEGACY_SCHEMA!r} or {SCHEMA!r} "
+            "with exactly its documented fields"
+        )
+    if not isinstance(raw.get("profiles"), dict):
+        raise AgentDeliveryError("profile config profiles must be an object")
     profiles = {name: _profile(name, value) for name, value in cast(dict[str, object], raw["profiles"]).items()}
-    return path, dict(sorted(profiles.items()))
-
+    default_workspace: WorkspaceSelector | None = None
+    if schema == SCHEMA:
+        selector = raw.get("default_workspace")
+        if (not isinstance(selector, dict) or len(selector) != 1
+                or next(iter(selector), None) not in ("id", "label")):
+            raise AgentDeliveryError(
+                "default_workspace must contain exactly one of id or label"
+            )
+        kind, raw_value = next(iter(selector.items()))
+        value = _text(raw_value, f"default_workspace.{kind}")
+        assert value is not None
+        if len(value.encode("utf-8")) > 256:
+            raise AgentDeliveryError("default workspace selector exceeds 256 UTF-8 bytes")
+        default_workspace = WorkspaceSelector(kind, value)
+    return path, ProjectConfig(dict(sorted(profiles.items())), default_workspace)
 
 def validate_muse_headless_arguments(
     argv: tuple[str, ...] | list[str], *, profile: str | None = None,

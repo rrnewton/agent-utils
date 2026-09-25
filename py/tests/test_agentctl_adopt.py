@@ -72,7 +72,7 @@ def test_adopted_agent_supports_named_operations_and_preserves_native_identity(
     }
     assert result["capabilities"] == [
         "send", "status", "read", "wait", "stop", "attach", "pause", "resume",
-        "terminal-snapshot", "drain", "goal", "bind-session",
+        "terminal-snapshot", "drain", "goal", "bind-session", "relocate",
     ]
     assert [row["name"] for row in sessions.list()] == ["foreign"]
 

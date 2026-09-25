@@ -34,6 +34,11 @@ while keeping their terminals available for direct inspection.
    agentctl start reviewer --cwd . --profile preferred-reviewer
    ```
 
+   Profile schema v2 can declare one `default_workspace` by exact ID or unique
+   label, so project starts do not silently fall back to the shared
+   `subagents` workspace. Override it per start with `--workspace-id` or
+   `--workspace-label`.
+
    To keep an agent that is already running in Herdr, adopt its exact live
    identity instead. All four assertions are required; adoption changes neither
    the pane nor its process:
@@ -74,6 +79,11 @@ while keeping their terminals available for direct inspection.
    agentctl attach reviewer
    agentctl resume reviewer
    ```
+
+   To preserve a running agent while moving its one-pane tab to another Herdr
+   workspace, use `agentctl relocate reviewer --workspace-label project
+   --new-tab`. Interrupted moves are reconciled by stable terminal and process
+   identity; the queue and goal remain attached to the same session generation.
 
 5. Finish with `agentctl stop reviewer`. This stops a runtime created by
    `agentctl` and archives its session state. For an adopted agent it only

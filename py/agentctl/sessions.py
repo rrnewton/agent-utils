@@ -33,7 +33,7 @@ _MAX_STOP_RESULT_BYTES = 1 << 20
 
 
 def _runner_identity(value: object) -> CustomProcessIdentity | None:
-    """Parse one complete worker process identity; absence is not legacy proof."""
+    """Parse one complete worker process identity; absence proves no prior generation."""
     if not isinstance(value, dict) or set(value) != {
         "version", "boot_id", "pid", "starttime_ticks",
         "executable_device", "executable_inode",
@@ -149,7 +149,7 @@ class Sessions(ManagedAgents):
         else:
             result.append("terminal-snapshot")
         if record.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
-            result.extend(("drain", "goal", "bind-session"))
+            result.extend(("drain", "goal", "bind-session", "relocate"))
         if record.adapter == "herdr-pane" and record.harness == "muse":
             result.append("reconcile-delivery")
         return result
@@ -160,7 +160,9 @@ class Sessions(ManagedAgents):
                       launch_profile: str | None = None,
                       resume: str | None = None, harness_args: Sequence[str] = (),
                       environment: Sequence[str] = (), brief: str | None = None,
-                      workspace_id: str | None = None, startup_timeout: float = 30.0,
+                      workspace_id: str | None = None,
+                      workspace_label: str | None = None,
+                      startup_timeout: float = 30.0,
                       ready_timeout: float = 900.0, working_timeout: float = 30.0,
                       max_attempts: int = 3) -> dict[str, object]:
         """Create a native interactive terminal or a persistent headless runner."""
@@ -173,15 +175,17 @@ class Sessions(ManagedAgents):
                 reasoning_effort=reasoning_effort, resume=resume,
                 launch_profile=launch_profile,
                 harness_args=harness_args, environment=environment, brief=brief,
-                workspace_id=workspace_id, startup_timeout=startup_timeout,
+                workspace_id=workspace_id, workspace_label=workspace_label,
+                startup_timeout=startup_timeout,
                 ready_timeout=ready_timeout, working_timeout=working_timeout,
                 max_attempts=max_attempts,
             )
         if mode != "headless" or backend not in ("herdr", "tmux") or harness not in ("codex", "agy", "muse"):
             raise AgentDeliveryError("headless sessions support codex/agy/muse with herdr/tmux")
-        if resume is not None or workspace_id is not None or environment:
+        if (resume is not None or workspace_id is not None
+                or workspace_label is not None or environment):
             raise AgentDeliveryError(
-                "headless start does not accept resume, workspace-id, or environment"
+                "headless start does not accept resume, workspace selection, or environment"
             )
         if isinstance(harness_args, (str, bytes)) or any(
             not isinstance(item, str) or not item or "\0" in item

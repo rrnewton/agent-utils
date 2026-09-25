@@ -1,6 +1,7 @@
 //! Strict project-local launch profiles.
 use serde::de::{Error as _, MapAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -14,7 +15,8 @@ use std::time::{Duration, Instant};
 
 use crate::agent::AgentError;
 
-pub(crate) const SCHEMA: &str = "agentctl-profiles/v1";
+pub(crate) const SCHEMA: &str = "agentctl-profiles/v2";
+pub(crate) const LEGACY_SCHEMA: &str = "agentctl-profiles/v1";
 const PROFILE_PATH: &str = ".agentctl/profiles.json";
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 const SYSTEM_GIT: &str = "/usr/bin/git";
@@ -32,6 +34,26 @@ pub(crate) struct LaunchProfile {
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) argv: Vec<String>,
     pub(crate) environment: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkspaceSelector {
+    pub(crate) kind: String,
+    pub(crate) value: String,
+}
+
+impl Serialize for WorkspaceSelector {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry(&self.kind, &self.value)?;
+        map.end()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProjectConfig {
+    pub(crate) profiles: BTreeMap<String, LaunchProfile>,
+    pub(crate) default_workspace: Option<WorkspaceSelector>,
 }
 
 #[derive(Debug, Serialize)]
@@ -68,6 +90,15 @@ impl LaunchProfile {
 struct Document {
     schema: String,
     profiles: UniqueMap<RawProfile>,
+    #[serde(default)]
+    default_workspace: Option<RawWorkspaceSelector>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWorkspaceSelector {
+    id: Option<String>,
+    label: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -560,10 +591,10 @@ fn validate(name: String, raw: RawProfile) -> Result<LaunchProfile, AgentError> 
     })
 }
 
-pub(crate) fn load_profiles(
+pub(crate) fn load_project_config(
     cwd: &Path,
     absent_ok: bool,
-) -> Result<(PathBuf, BTreeMap<String, LaunchProfile>), AgentError> {
+) -> Result<(PathBuf, ProjectConfig), AgentError> {
     let cwd = fs::canonicalize(cwd).map_err(|error| {
         fail(format!(
             "cwd is not a directory: {}: {error}",
@@ -574,7 +605,13 @@ pub(crate) fn load_profiles(
     match fs::symlink_metadata(&path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && absent_ok => {
-            return Ok((path, BTreeMap::new()));
+            return Ok((
+                path,
+                ProjectConfig {
+                    profiles: BTreeMap::new(),
+                    default_workspace: None,
+                },
+            ));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(fail(format!(
@@ -659,18 +696,50 @@ pub(crate) fn load_profiles(
             path.display()
         ))
     })?;
-    if document.schema != SCHEMA {
+    if !matches!(document.schema.as_str(), LEGACY_SCHEMA | SCHEMA)
+        || (document.schema == LEGACY_SCHEMA && document.default_workspace.is_some())
+        || (document.schema == SCHEMA && document.default_workspace.is_none())
+    {
         return Err(fail(format!(
-            "profile config must use schema {SCHEMA:?} and an object of profiles"
+            "profile config must use schema {LEGACY_SCHEMA:?} or {SCHEMA:?} with exactly its documented fields"
         )));
     }
+    let default_workspace = match document.default_workspace {
+        Some(raw) => {
+            let (kind, value) = match (raw.id, raw.label) {
+                (Some(value), None) => ("id", value),
+                (None, Some(value)) => ("label", value),
+                _ => {
+                    return Err(fail(
+                        "default_workspace must contain exactly one of id or label",
+                    ));
+                }
+            };
+            if !valid_text(&value) || value.len() > 256 {
+                return Err(fail(
+                    "default workspace selector must be nonempty, NUL-free, and at most 256 UTF-8 bytes",
+                ));
+            }
+            Some(WorkspaceSelector {
+                kind: kind.to_owned(),
+                value,
+            })
+        }
+        None => None,
+    };
     let profiles = document
         .profiles
         .0
         .into_iter()
         .map(|(name, profile)| validate(name.clone(), profile).map(|value| (name, value)))
         .collect::<Result<BTreeMap<_, _>, _>>()?;
-    Ok((path, profiles))
+    Ok((
+        path,
+        ProjectConfig {
+            profiles,
+            default_workspace,
+        },
+    ))
 }
 
 pub(crate) fn reasoning_arguments(

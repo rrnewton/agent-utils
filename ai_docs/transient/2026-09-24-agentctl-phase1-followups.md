@@ -40,6 +40,48 @@ deliberately detection-first: it does not restart a harness or replay input.
   ambiguity is typed `null` and maps to `unknown`. When asynchronous start first
   returns without a PID, the first later exact positive worker receipt is
   persisted only under the same private outer generation lock.
+- The project-local configuration is one strict versioned document containing
+  launch profiles and one optional default Herdr workspace selector. Starts
+  persist only the resolved workspace ID and one normalized launch
+  specification; they do not copy profile policy or workspace labels into a
+  second authority.
+- `relocate` moves one verified one-pane tab through a token-bound intent
+  journal. Recovery finds the same terminal generation at either the old or
+  destination route, revalidates the live harness, commits only the derived
+  route to the existing session record, and removes the journal. Goal and queue
+  state remain name-scoped and are not copied.
+- Long-lived Muse sessions may lose their version banner from the viewport.
+  Once the exact boot/PID/start/image identity has been re-proved, delivery uses
+  Herdr's unwrapped terminal source plus the ruled composer and current footer.
+  If the complete prompt cannot be established, Enter remains withheld and the
+  delivery stays quarantined for explicit reconciliation.
+
+## Canonical fleet snapshot boundary
+
+`agentctl`'s versioned session record is the authority for launch intent,
+runtime identity, route, goal, and queue state. A project integration that maps
+those sessions to an external task system must derive its snapshot from one
+bounded `agentctl list`; it may add only project fields such as agent name,
+display role, and external task ID. It must not copy argv, process identities,
+routes, goals, or lifecycle state into another writable binding file.
+
+The bounded migration is:
+
+1. Keep the old periodic snapshot service disabled while its bindings name
+   terminals that no longer exist.
+2. Configure current agent names and external task IDs in the project-private
+   integration, then prove every name resolves to one healthy current
+   `agentctl` generation.
+3. Generate the external snapshot from that single read. Refuse missing,
+   duplicate, unknown, or unhealthy generations rather than retaining old
+   routes.
+4. Enable periodic publication only after byte-level readback and a restart
+   test. The service publishes observations; it never becomes a launch, goal,
+   or ownership authority.
+
+External task-system lookup belongs in a project-private plugin because it is
+deployment-specific. The normalized session and health snapshot stay in the
+open-source core.
 
 ## Launch-intent gaps
 
@@ -102,16 +144,14 @@ It is not an all-Rust port:
 4. **Sixty-second service proof.** Ship example user service and timer units
    around bounded `health --watch 60`, with explicit registry paths, output
    retention, startup ordering, and no restart authority over agents.
-5. **Long Muse/Claude prompt correctness.** Replace screen-substring acceptance
-   with a bounded identity-bearing submission receipt that cannot confuse
-   wrapped, truncated, repeated, or scrolled prompt text. A real long-prompt
-   reproduction returned exit 76 (`possibly_submitted`) while the complete
-   prompt was still in the Claude composer; one later human Enter submitted it.
-   The state machine must distinguish `composer populated but unsubmitted` from
-   `possibly submitted`, expose a safe explicit Enter-only recovery, keep truly
-   uncertain submissions in quarantine, and test terminal-width and
-   retained-history boundaries. The Phase 1a `recover-start` path deliberately
-   does not enter this delivery state machine and never supplies that Enter.
+5. **Native Muse editor receipt.** The current bounded terminal proof now
+   handles a scrolled-away version banner and physical wrapping after exact
+   process verification, while retaining quarantine and explicit transcript
+   reconciliation for ambiguity. A future Herdr/Muse editor-buffer API could
+   preserve hard-newline distinctions that a rendered terminal necessarily
+   loses; until then failure to establish the complete normalized rendering
+   must continue to withhold Enter. `recover-start` does not enter the delivery
+   state machine and never supplies that Enter.
 6. **Native executable provenance.** Extend Herdr's native start receipt to
    return the exact executable/process generation it launched, then persist it
    with the same strength as the custom Muse path.

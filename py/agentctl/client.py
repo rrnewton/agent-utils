@@ -157,28 +157,50 @@ def _muse_composer_regions(
     return "\n".join(lines[:top]), "\n".join(lines[top + 1:bottom])
 
 
-def muse_prompt_in_composer(screen: str, text: str) -> bool:
-    """Conservatively detect a prompt retained in Muse's bottom editor."""
-    regions = _muse_composer_regions(screen)
+def _muse_prompt_in_composer(
+    screen: str, text: str, *, require_header: bool, exact: bool,
+) -> bool:
+    """Compare one normalized terminal rendering within a verified composer."""
+    regions = _muse_composer_regions(screen, require_header=require_header)
     if regions is None:
         return False
     wanted = " ".join(text.split())
     rendered = " ".join(regions[1].split())
-    return bool(wanted) and any(
-        rendered == (needle := f"{marker} {wanted}")
-        or rendered.startswith(needle + " ")
-        for marker in ("❯", "›")
+    if not wanted:
+        return False
+    candidates = tuple(f"{marker} {wanted}" for marker in ("❯", "›"))
+    return rendered in candidates if exact else any(
+        rendered == candidate or rendered.startswith(candidate + " ")
+        for candidate in candidates
+    )
+
+
+def muse_prompt_in_composer(screen: str, text: str) -> bool:
+    """Conservatively detect a prompt retained in Muse's bottom editor."""
+    return _muse_prompt_in_composer(
+        screen, text, require_header=True, exact=False,
+    )
+
+
+def muse_verified_process_prompt_in_composer(screen: str, text: str) -> bool:
+    """Detect retained input when exact live-process proof supplies the Muse identity."""
+    return _muse_prompt_in_composer(
+        screen, text, require_header=False, exact=False,
     )
 
 
 def muse_prompt_is_exact_composer(screen: str, text: str) -> bool:
     """Require the entire active Muse editor to be this literal prompt."""
-    regions = _muse_composer_regions(screen)
-    if regions is None:
-        return False
-    wanted = " ".join(text.split())
-    rendered = " ".join(regions[1].split())
-    return bool(wanted) and rendered in (f"❯ {wanted}", f"› {wanted}")
+    return _muse_prompt_in_composer(
+        screen, text, require_header=True, exact=True,
+    )
+
+
+def muse_verified_process_prompt_is_exact_composer(screen: str, text: str) -> bool:
+    """Require exact editor text after the caller pins the live Muse process."""
+    return _muse_prompt_in_composer(
+        screen, text, require_header=False, exact=True,
+    )
 
 
 def _muse_prompt_transcript_count(transcript: str, text: str) -> int:
@@ -205,18 +227,30 @@ def _muse_prompt_transcript_count(transcript: str, text: str) -> int:
 
 def muse_prompt_in_transcript(screen: str, text: str) -> bool:
     """Require the exact prompt as a user turn above the active Muse editor."""
-    regions = _muse_composer_regions(screen)
+    return muse_prompt_transcript_count(screen, text) > 0
+
+
+def _muse_prompt_transcript_count_in_screen(
+    screen: str, text: str, *, require_header: bool,
+) -> int:
+    regions = _muse_composer_regions(screen, require_header=require_header)
     if regions is None:
-        return False
-    return _muse_prompt_transcript_count(regions[0], text) > 0
+        return 0
+    return _muse_prompt_transcript_count(regions[0], text)
 
 
 def muse_prompt_transcript_count(screen: str, text: str) -> int:
     """Count bounded prompt renderings above the composer for transition proofs."""
-    regions = _muse_composer_regions(screen)
-    if regions is None:
-        return 0
-    return _muse_prompt_transcript_count(regions[0], text)
+    return _muse_prompt_transcript_count_in_screen(
+        screen, text, require_header=True,
+    )
+
+
+def muse_verified_process_prompt_transcript_count(screen: str, text: str) -> int:
+    """Count exact user turns after the caller pins the live Muse process."""
+    return _muse_prompt_transcript_count_in_screen(
+        screen, text, require_header=False,
+    )
 
 
 def claude_active_screen(screen: str) -> bool:
@@ -257,6 +291,17 @@ class Pane:
     pane_id: str
     tab_id: str
     workspace_id: str
+    terminal_id: str | None = None
+
+
+@dataclass(frozen=True)
+class PaneMove:
+    """One exact Herdr pane move, including its pre-move routing identity."""
+
+    previous_pane_id: str
+    previous_tab_id: str
+    previous_workspace_id: str
+    pane: Pane
 
 
 @dataclass(frozen=True)
@@ -709,6 +754,45 @@ class HerdrClient:
             return tab_id, get_str(pane, "pane_id", "created pane")
         except TypeError as exc:
             raise HerdrUnavailable(f"tab create: invalid allocation identity: {exc}") from exc
+
+    def move_pane_to_new_tab(
+        self, pane_id: str, *, workspace_id: str, label: str,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> PaneMove:
+        """Move one pane without restarting its terminal or foreground process."""
+        result = self._call(
+            [
+                "pane", "move", pane_id, "--workspace", workspace_id,
+                "--new-tab", "--label", label, "--no-focus",
+            ],
+            f"pane move {pane_id}", timeout=timeout,
+        )
+        try:
+            moved = as_mapping(result.get("move_result"), "pane move")
+            if moved.get("changed") is not True:
+                raise TypeError("pane move did not report changed=true")
+            pane = as_mapping(moved.get("pane"), "pane move pane")
+            created = as_mapping(moved.get("created_tab"), "pane move created_tab")
+            parsed = Pane(
+                get_str(pane, "pane_id", "pane move pane"),
+                get_str(pane, "tab_id", "pane move pane"),
+                get_str(pane, "workspace_id", "pane move pane"),
+                get_str(pane, "terminal_id", "pane move pane"),
+            )
+            if (parsed.workspace_id != workspace_id
+                    or get_str(created, "workspace_id", "pane move created_tab") != workspace_id
+                    or get_str(created, "tab_id", "pane move created_tab") != parsed.tab_id
+                    or get_int(created, "pane_count", "pane move created_tab") != 1
+                    or get_str(moved, "focused_pane_id", "pane move") != parsed.pane_id):
+                raise TypeError("pane move returned contradictory destination routing")
+            return PaneMove(
+                get_str(moved, "previous_pane_id", "pane move"),
+                get_str(moved, "previous_tab_id", "pane move"),
+                get_str(moved, "previous_workspace_id", "pane move"),
+                parsed,
+            )
+        except TypeError as exc:
+            raise HerdrUnavailable(f"pane move: invalid Herdr response: {exc}") from exc
 
     def close_tab(self, tab_id: str) -> None:
         """Close one explicitly owned tab, without closing its shared workspace."""
@@ -1392,6 +1476,7 @@ class HerdrClient:
                     pane_id=get_str(pane, "pane_id", "pane list entry"),
                     tab_id=get_str(pane, "tab_id", "pane list entry"),
                     workspace_id=get_str(pane, "workspace_id", "pane list entry"),
+                    terminal_id=opt_str(pane, "terminal_id"),
                 )
                 if workspace_id is not None and parsed.workspace_id != workspace_id:
                     raise HerdrUnavailable(

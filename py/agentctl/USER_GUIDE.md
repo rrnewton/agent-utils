@@ -238,7 +238,8 @@ credential-shaped environment or argument names.
 
 ```json
 {
-  "schema": "agentctl-profiles/v1",
+  "schema": "agentctl-profiles/v2",
+  "default_workspace": {"label": "project"},
   "profiles": {
     "preferred-reviewer": {
       "harness": "muse",
@@ -247,6 +248,13 @@ credential-shaped environment or argument names.
       "reasoning_effort": "high",
       "argv": [],
       "env": {"ROUTING_SELECTOR": "provider-route"}
+    },
+    "claude-opus-55": {
+      "harness": "claude",
+      "mode": "interactive",
+      "model": "opus",
+      "argv": [],
+      "env": {}
     }
   }
 }
@@ -264,6 +272,12 @@ are launch policy and therefore must not contain secrets. Raw Codex
 `-c`/`--config` and `-p`/`--profile` arguments cannot accompany a structured
 model or effort because those opaque settings could override the structured
 selection.
+
+`default_workspace` is the one project-owned destination for starts that omit
+an explicit workspace. It contains exactly one `id` or `label`; labels must
+resolve uniquely. `--workspace-id` and `--workspace-label` override it for one
+start. Version-1 profile files remain readable but have no project workspace
+default.
 
 Interactive profiles support Codex, Claude, and Muse. Headless profiles support
 Codex, AGY, and Muse in installations that include the worker extension.
@@ -308,7 +322,24 @@ agentctl send reviewer 'Focus on cancellation and restart behavior'
 be repeated. `--resume SESSION` resumes an explicitly identified conversation.
 When `--resume` is set, raw Codex `resume` and Claude
 `--resume`/`--continue` selectors are refused before registry state is created.
-Use `--workspace-id` to choose an exact Herdr workspace.
+Use `--workspace-id` to choose an exact Herdr workspace or
+`--workspace-label` to resolve one unique label. If neither is supplied,
+`default_workspace` from the project config applies before the
+`HERDR_WORKSPACE_ID`/`subagents` fallback.
+
+Move a running interactive session without restarting it only through the
+identity-bound relocation transaction:
+
+```sh
+agentctl relocate reviewer --workspace-label project --new-tab
+```
+
+Relocation supports a one-pane source tab. It records the exact session token,
+terminal identity, old route, and intended workspace before asking Herdr to
+move the pane; a retry reconciles an interrupted move by terminal identity.
+The session's launch specification, goal, and queue stay in the same registry
+generation. Ambiguous labels, multi-pane source tabs, changed processes, and
+changed terminals are refused.
 
 Interactive Herdr starts also accept repeatable `--env KEY=VALUE`. Each entry is
 passed as one literal argument to Herdr when it creates the tab, before the

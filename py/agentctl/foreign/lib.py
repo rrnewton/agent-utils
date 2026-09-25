@@ -489,7 +489,7 @@ class AgentRecord:
 
     @staticmethod
     def from_dict(d: dict[str, object]) -> "AgentRecord":
-        """Load a strict current row or normalize one supported legacy row."""
+        """Load a strict current row or normalize one supported untagged row."""
         fields = {f.name for f in dataclasses.fields(AgentRecord)}
         schema = d.get("schema")
         current = schema == RUNTIME_RECORD_SCHEMA
@@ -1001,7 +1001,7 @@ def registry_lock() -> Iterator[dict[str, AgentRecord]]:
 
 
 def read_registry() -> dict[str, AgentRecord]:
-    """Read the registry and migrate legacy rows under the registry lock."""
+    """Read the registry and migrate supported older rows under its lock."""
     BASE.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(LOCKFILE), os.O_CREAT | os.O_RDWR, 0o644)
     try:
