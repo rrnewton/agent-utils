@@ -125,6 +125,18 @@ def muse_verified_process_composer(screen: str) -> bool:
     return regions is not None and _muse_editor_segments(regions[1]) is not None
 
 
+def muse_verified_process_goal_paused(screen: str) -> bool:
+    """Recognize Muse's explicit paused-goal state in a verified UI frame."""
+    if _muse_composer_regions(screen, require_header=False) is None:
+        return False
+    lines = screen.splitlines()
+    bottom = max(
+        index for index, line in enumerate(lines)
+        if len(line.strip()) >= 3 and set(line.strip()) <= {"─", "━", "═"}
+    )
+    return any(line.strip() == "Goal (paused)" for line in lines[bottom + 1:])
+
+
 def _muse_composer_regions(
     screen: str, *, require_header: bool = True,
 ) -> tuple[str, str] | None:
@@ -138,18 +150,22 @@ def _muse_composer_regions(
         return None
     top, bottom = dividers[-2:]
     footer = lines[bottom + 1:]
-    current_status = next((line.strip() for line in footer if line.strip()), "")
-    status_fields = [field.strip() for field in current_status.split("·")]
     versioned_header = any(
         re.fullmatch(r"Muse Code [0-9]+\.[0-9]+\.[0-9]+", line.strip())
         for line in lines[:top]
     )
+    def valid_status(line: str) -> bool:
+        fields = [field.strip() for field in line.split("·")]
+        return (
+            len(fields) in (3, 4)
+            and all(fields)
+            and _MUSE_EFFORT.fullmatch(fields[1]) is not None
+            and (len(fields) == 3 or fields[3] in ("YOLO", "Auto-review"))
+        )
+
     current_footer = (
         (versioned_header or not require_header)
-        and len(status_fields) in (3, 4)
-        and all(status_fields)
-        and _MUSE_EFFORT.fullmatch(status_fields[1]) is not None
-        and (len(status_fields) == 3 or status_fields[3] in ("YOLO", "Auto-review"))
+        and any(valid_status(line.strip()) for line in footer if line.strip())
     )
     if not current_footer:
         return None

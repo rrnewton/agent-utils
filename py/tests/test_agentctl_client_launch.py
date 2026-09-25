@@ -30,6 +30,7 @@ from agentctl.client import (
     muse_prompt_transcript_count,
     muse_startup_metadata,
     muse_verified_process_composer,
+    muse_verified_process_goal_paused,
     muse_verified_process_idle_composer,
     muse_verified_process_prompt_in_composer,
     muse_verified_process_prompt_is_exact_composer,
@@ -201,6 +202,20 @@ def test_current_muse_footer_does_not_turn_a_choice_into_an_idle_composer() -> N
     )
     assert not muse_idle_composer(screen)
     assert not muse_idle_composer(screen.replace("❯ Yes, continue\n  No, exit", "❯\n  pending text"))
+
+
+def test_verified_muse_paused_goal_is_structural_footer_state() -> None:
+    divider = "─" * 40
+    footer = "kiki_gb300_mxfp8_6p2_840_nwr · xhigh · /work/project · YOLO"
+    paused = (
+        f"Muse Code 1.4.0\n{divider}\n❯\n{divider}\n"
+        f"Goal (paused)\n{footer}\n"
+    )
+    transcript_echo = (
+        f"Muse Code 1.4.0\nGoal (paused)\n{divider}\n❯\n{divider}\n{footer}\n"
+    )
+    assert muse_verified_process_goal_paused(paused)
+    assert not muse_verified_process_goal_paused(transcript_echo)
 
 
 def test_claude_active_screen_requires_current_activity_controls() -> None:

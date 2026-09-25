@@ -537,9 +537,19 @@ proves completion of the task.
 `status` preserves the saved record fields, including `lifecycle`, and adds a
 separate `runtime_state`, `health`, reason, and detection timestamps. A saved
 Muse editor containing unsubmitted text is reported as `agent_status: staged`,
-not `working`; drain may press Enter only when that complete buffered text is
-the exact queued message. A real submitted turn or background task remains
-`working`.
+not `working`; drain may press Enter once only when that complete buffered text
+is the exact queued message. If the terminal does not then provide an exact
+submission receipt, the message remains quarantined for reconciliation; a
+stale redraw never authorizes a second Enter. A real submitted turn or
+background task remains `working`. Muse's structural `Goal (paused)` footer is
+reported separately as `agent_status: paused` while process health remains
+healthy.
+
+Claude's native prompt API can return success after placing text in its editor
+without submitting it. Agentctl distinguishes that exact staged composer from
+a submitted turn, revalidates the owned pane, and sends one `Enter`. It never
+uses `Ctrl-S`, which is Claude's stash operation, and it never reinjects prompt
+text while reconciling a delayed transcript or stale Herdr status.
 
 A saved `lifecycle: "running"` whose pane has returned to a shell is reported as
 `runtime_state: "dead"`, `health: "unhealthy"`, and exits 1. `list` applies the
@@ -548,8 +558,9 @@ that needs only the aggregate health document can use `health` directly.
 `health [NAME ...]` checks every requested name independently, or every active
 registry entry when no name is supplied. One malformed or stale record is
 reported as its own `unknown` result and does not suppress later results. A
-lifecycle lock held by `start`, `send`, recovery, or another controller is also
-a bounded `unknown` / `lifecycle-lock-contended` row with `recorded: false`;
+lifecycle lock held by `start`, a short enqueue/injection transition, recovery,
+or another controller is also a bounded `unknown` /
+`lifecycle-lock-contended` row with `recorded: false`;
 the scan continues to later names instead of waiting behind that operation.
 The aggregate exits zero only when every result is `healthy`; confirmed pane or
 expected-harness disappearance is `unhealthy`, while an unavailable Herdr

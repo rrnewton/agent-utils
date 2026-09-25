@@ -19,7 +19,7 @@ import stat
 import tempfile
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -1539,12 +1539,27 @@ def _wait_ready(
         sleep(min(0.25, max(0.0, deadline - monotonic())))
 
 
-def _deliver_one(
+@contextmanager
+def _submission_guard(client: HerdrClient) -> Iterator[None]:
+    """Acquire an adapter's generation guard before queue and pane locks.
+
+    Plain Herdr clients have no registry generation to pin. Registry-backed
+    adapters expose ``acquire_submission_guard``; keeping the hook here makes
+    the irreversible ordering lifecycle -> queue -> target explicit without a
+    second transport implementation.
+    """
+    acquire = getattr(client, "acquire_submission_guard", None)
+    if acquire is None:
+        yield
+        return
+    with acquire():
+        yield
+
+
+def _inject_one(
     client: HerdrClient,
     info: AgentPaneInfo,
     text: str,
-    *,
-    working_timeout: float,
 ) -> None:
     try:
         client.prompt_agent(info.pane_id, text)
@@ -1554,6 +1569,14 @@ def _deliver_one(
         raise _PossiblySubmitted(
             f"pane {info.pane_id} agent-prompt outcome is unknown; prompt may have been submitted: {exc}"
         ) from exc
+
+
+def _confirm_delivery(
+    client: HerdrClient,
+    info: AgentPaneInfo,
+    *,
+    working_timeout: float,
+) -> None:
     try:
         client.wait_agent_status(info.pane_id, "working", max(1, int(working_timeout * 1000)))
     except HerdrUnavailable as exc:
@@ -1617,6 +1640,19 @@ def _drain(
     delivered: list[str] = []
     quarantined: list[str] = []
     blocked: str | None = None
+    pending_snapshot: tuple[str, ...] = ()
+
+    def result() -> QueueResult:
+        outcome = (
+            "pending" if blocked is not None
+            else "possibly_submitted" if quarantined
+            else "delivered"
+        )
+        return QueueResult(
+            "", tuple(delivered), tuple(quarantined), pending_snapshot,
+            blocked, outcome,
+        )
+
     descriptor = _open_private_lock(lock_path, "queue delivery lock")
     recovered = False
     try:
@@ -1624,6 +1660,13 @@ def _drain(
             # The queue lock protects only durable transitions. A busy agent can
             # run for hours; readiness polling must not hide status or block
             # lifecycle inspection for that entire turn.
+            selection_guard = ExitStack()
+            try:
+                selection_guard.enter_context(_submission_guard(client))
+            except (AgentDeliveryError, HerdrUnavailable):
+                if delivered or quarantined:
+                    return result()
+                raise
             fcntl.flock(descriptor, fcntl.LOCK_EX)
             try:
                 if not recovered:
@@ -1686,8 +1729,13 @@ def _drain(
                         break
                     selected = (path, document, attempts, identifier)
                     break
+                pending_snapshot = tuple(
+                    name[:-5] for name in sorted(os.listdir(inbox))
+                    if name.endswith(".json")
+                )
             finally:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
+                selection_guard.close()
 
             if blocked is not None or selected is None:
                 break
@@ -1712,6 +1760,13 @@ def _drain(
                 # definite pre-submission refusal, not a readiness failure.
                 raise
             except (AgentDeliveryError, HerdrUnavailable) as exc:
+                error_guard = ExitStack()
+                try:
+                    error_guard.enter_context(_submission_guard(client))
+                except (AgentDeliveryError, HerdrUnavailable):
+                    if delivered or quarantined:
+                        return result()
+                    raise
                 fcntl.flock(descriptor, fcntl.LOCK_EX)
                 try:
                     if not os.path.lexists(path):
@@ -1735,7 +1790,19 @@ def _drain(
                         )
                 finally:
                     fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    error_guard.close()
                 break
+
+            submission = ExitStack()
+            # Failure here means this client no longer owns the generation.
+            # Do not follow retained pathnames: stop may already have archived
+            # the old directory and reused the name for a new agent.
+            try:
+                submission.enter_context(_submission_guard(client))
+            except (AgentDeliveryError, HerdrUnavailable):
+                if delivered or quarantined:
+                    return result()
+                raise
 
             fcntl.flock(descriptor, fcntl.LOCK_EX)
             target_descriptor = -1
@@ -1781,12 +1848,22 @@ def _drain(
                     inflight_path, document,
                     max_artifact_bytes=max_artifact_bytes,
                 )
+                pending_snapshot = tuple(
+                    name[:-5] for name in sorted(os.listdir(inbox))
+                    if name.endswith(".json")
+                )
                 retained_path = inflight_path
                 try:
                     try:
-                        _deliver_one(
-                            client, info, str(document["text"]),
-                            working_timeout=working_timeout,
+                        try:
+                            _inject_one(client, info, str(document["text"]))
+                        finally:
+                            # Lifecycle identity is needed only through the
+                            # irreversible prompt call. The target/FIFO locks
+                            # continue to serialize its bounded confirmation.
+                            submission.close()
+                        _confirm_delivery(
+                            client, info, working_timeout=working_timeout,
                         )
                     except _PossiblySubmitted as exc:
                         attempts += 1
@@ -1804,15 +1881,19 @@ def _drain(
                         failed_path = os.path.join(
                             failed, os.path.basename(path),
                         )
+                        # Keep the primary artifact in ``inflight`` until its
+                        # complete failure receipt is durable. Stop treats that
+                        # directory as the teardown fence, so it cannot archive
+                        # the generation between the rename and sidecar write.
+                        _failed_metadata(
+                            failed_path, outcome="possibly_submitted", error=str(exc),
+                            max_artifact_bytes=max_artifact_bytes,
+                        )
                         _transition(
                             inflight_path, failed_path,
                             max_artifact_bytes=max_artifact_bytes,
                         )
                         retained_path = failed_path
-                        _failed_metadata(
-                            failed_path, outcome="possibly_submitted", error=str(exc),
-                            max_artifact_bytes=max_artifact_bytes,
-                        )
                         quarantined.append(identifier)
                     else:
                         document["delivery_state"] = "processed"
@@ -1857,14 +1938,13 @@ def _drain(
                 else:
                     raise
             finally:
+                submission.close()
                 if target_descriptor >= 0:
                     os.close(target_descriptor)
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
     finally:
         os.close(descriptor)
-    pending = tuple(name[:-5] for name in sorted(os.listdir(inbox)) if name.endswith(".json"))
-    outcome = "pending" if blocked is not None else ("possibly_submitted" if quarantined else "delivered")
-    return QueueResult("", tuple(delivered), tuple(quarantined), pending, blocked, outcome)
+    return result()
 
 
 def send(

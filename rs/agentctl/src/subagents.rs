@@ -24,10 +24,11 @@ use crate::agent::{self, AgentApi, AgentError, AgentRuntime, DrainOptions, Queue
 use crate::client::{
     claude_active_screen, claude_prompt_is_exact_composer, claude_prompt_transcript_count,
     claude_staged_composer, muse_idle_composer, muse_startup_metadata, muse_trust_prompt,
-    muse_verified_process_composer, muse_verified_process_idle_composer,
-    muse_verified_process_prompt_in_composer, muse_verified_process_prompt_is_exact_composer,
-    muse_verified_process_prompt_transcript_count, AgentPaneInfo, CustomLaunchObservation,
-    CustomProcessIdentity, HerdrClient, Pane, PaneMove, PaneShellProof,
+    muse_verified_process_composer, muse_verified_process_goal_paused,
+    muse_verified_process_idle_composer, muse_verified_process_prompt_in_composer,
+    muse_verified_process_prompt_is_exact_composer, muse_verified_process_prompt_transcript_count,
+    AgentPaneInfo, CustomLaunchObservation, CustomProcessIdentity, HerdrClient, Pane, PaneMove,
+    PaneShellProof,
 };
 use crate::error::AdapterErrorKind;
 
@@ -2382,6 +2383,23 @@ impl AgentRecord {
         Ok(())
     }
 
+    fn same_delivery_identity(&self, other: &Self) -> bool {
+        self.token == other.token
+            && self.launch == other.launch
+            && self.workspace_id == other.workspace_id
+            && self.tab_id == other.tab_id
+            && self.pane_id == other.pane_id
+            && self.session_agent == other.session_agent
+            && self.session_value == other.session_value
+            && self.session_source == other.session_source
+            && self.custom_process_identity == other.custom_process_identity
+            && self.foreign_shell_identity == other.foreign_shell_identity
+            && self.runner_identity == other.runner_identity
+            // Pause/resume changes the right to inject input. A pause that
+            // commits during readiness must invalidate this captured view.
+            && self.paused == other.paused
+    }
+
     fn target(&self) -> Result<Target> {
         self.supported()?;
         if self.pane_id.as_deref().is_none_or(str::is_empty) {
@@ -2429,11 +2447,13 @@ struct CustomPaneSubmission {
     text: String,
     prior_transcript_count: usize,
     prior_active: bool,
+    activity_receipt_allowed: bool,
 }
 
 struct WorkspaceClient<'a, A: ManagedApi + ?Sized> {
     client: &'a A,
     record: &'a AgentRecord,
+    registry: Option<&'a Path>,
     goal_objective: Mutex<Option<String>>,
     custom_submission: Mutex<Option<CustomPaneSubmission>>,
     queue: Option<&'a Path>,
@@ -2522,6 +2542,39 @@ impl agent::AgentRuntime for OperationDeadlineRuntime<'_> {
 }
 
 impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
+    fn submission_guard_with_runtime(
+        &self,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<Option<File>> {
+        let Some(registry) = self.registry else {
+            return Ok(None);
+        };
+        let manager = ManagedAgents {
+            client: self.client,
+            registry: registry.to_path_buf(),
+            inherited_workspace: None,
+        };
+        let lock = manager
+            .lock_with_runtime(&self.record.name, runtime)
+            .map_err(|error| crate::error::AdapterError::unavailable(error.to_string()))?;
+        let current = manager
+            .load(&self.record.name)
+            .map_err(|error| crate::error::AdapterError::unavailable(error.to_string()))?;
+        if current.lifecycle != "running" {
+            return Err(crate::error::AdapterError::unavailable(format!(
+                "agent {:?} is no longer running",
+                self.record.name
+            )));
+        }
+        if !current.same_delivery_identity(self.record) {
+            return Err(crate::error::AdapterError::unavailable(format!(
+                "agent {:?} runtime identity changed before submission",
+                self.record.name
+            )));
+        }
+        Ok(Some(lock))
+    }
+
     fn adopted_evidence_with_runtime(
         &self,
         runtime: &dyn agent::AgentRuntime,
@@ -2558,7 +2611,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 AdoptedRuntimeState::Unknown,
                 "runtime-probe-failed",
                 format!(
-                    "legacy record has no identity-bound pane shell for adopted agent {:?}",
+                    "legacy record has no identity-bound pane shell for adopted agent '{}'",
                     self.record.name
                 ),
                 None,
@@ -2816,6 +2869,13 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         self.read_with_runtime(pane_id, source, lines, &agent::SystemRuntime::default())
     }
 
+    fn acquire_submission_guard_with_runtime(
+        &self,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<Option<File>> {
+        self.submission_guard_with_runtime(runtime)
+    }
+
     fn panes_with_runtime(
         &self,
         runtime: &dyn agent::AgentRuntime,
@@ -2917,7 +2977,11 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 // The exact custom-process proof is authoritative even when
                 // Herdr's advisory agent label has not been published yet.
                 info.agent = Some(self.record.launch.harness.clone());
-                info.status = if muse_idle_composer(&screen)
+                info.status = if matches!(reported_status.as_str(), "idle" | "done")
+                    && muse_verified_process_goal_paused(&screen)
+                {
+                    "paused".to_owned()
+                } else if muse_idle_composer(&screen)
                     || (matches!(reported_status.as_str(), "idle" | "done")
                         && muse_verified_process_idle_composer(&screen))
                 {
@@ -2996,6 +3060,20 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                         ));
                     }
                     self.client.run_with_runtime(pane_id, text, runtime)?;
+                    // The native prompt call crossed the sole text-injection
+                    // boundary. Retain its pre-injection baseline even if the
+                    // first screen sample still lags the submitted turn, so a
+                    // later exact transcript can be accepted without retry.
+                    *self
+                        .custom_submission
+                        .lock()
+                        .expect("custom submission lock poisoned") = Some(CustomPaneSubmission {
+                        harness: "claude".to_owned(),
+                        text: text.to_owned(),
+                        prior_transcript_count,
+                        prior_active,
+                        activity_receipt_allowed: false,
+                    });
                 }
                 let staged =
                     self.client
@@ -3011,8 +3089,10 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                         "Claude staged prompt changed before its submit chord",
                     ));
                 }
+                // One Enter submits the exact verified Claude composer.
+                // Ctrl-S is Claude's stash operation, not a send receipt.
                 self.client
-                    .send_keys_with_runtime(pane_id, "ctrl+x ctrl+s", runtime)?;
+                    .send_keys_with_runtime(pane_id, "Enter", runtime)?;
                 *self
                     .custom_submission
                     .lock()
@@ -3021,6 +3101,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                     text: text.to_owned(),
                     prior_transcript_count,
                     prior_active,
+                    activity_receipt_allowed: true,
                 });
                 return Ok(());
             }
@@ -3123,6 +3204,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             prior_transcript_count: muse_verified_process_prompt_transcript_count(&confirmed, text),
             text: text.to_owned(),
             prior_active: false,
+            activity_receipt_allowed: true,
         });
         Ok(())
     }
@@ -3141,145 +3223,145 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             inner: runtime,
             deadline,
         };
-        let submission = self
-            .custom_submission
-            .lock()
-            .expect("custom submission lock poisoned")
-            .clone();
-        if let ("working", Some(submission)) = (status, submission) {
-            let retry_after = runtime.monotonic().saturating_add(
-                Duration::from_millis(250).min(Duration::from_millis(timeout_ms / 2)),
-            );
-            let mut retried_enter = false;
-            loop {
-                if runtime.cancelled() {
-                    return Err(crate::error::AdapterError::unavailable(
-                        "Herdr control operation was cancelled",
-                    ));
+        let result = (|| -> crate::error::Result<()> {
+            let submission = self
+                .custom_submission
+                .lock()
+                .expect("custom submission lock poisoned")
+                .clone();
+            if let ("working", Some(submission)) = (status, submission) {
+                loop {
+                    if runtime.cancelled() {
+                        return Err(crate::error::AdapterError::unavailable(
+                            "Herdr control operation was cancelled",
+                        ));
+                    }
+                    if bounded.monotonic() >= deadline {
+                        return Err(crate::error::AdapterError::unavailable(
+                            "agent did not show a verified post-submission screen transition",
+                        ));
+                    }
+                    if self.pane_info_with_runtime(pane_id, &bounded)?.status == status
+                        && submission.activity_receipt_allowed
+                    {
+                        *self
+                            .custom_submission
+                            .lock()
+                            .expect("custom submission lock poisoned") = None;
+                        return Ok(());
+                    }
+                    let (screen, transcript_count, in_composer) = if submission.harness == "muse" {
+                        self.client.verify_custom_harness_with_runtime(
+                            pane_id,
+                            &self.record.launch.harness,
+                            self.record.custom_process_identity.as_ref(),
+                            &bounded,
+                        )?;
+                        let screen = self.client.read_with_runtime(
+                            pane_id,
+                            "recent-unwrapped",
+                            Some(5000),
+                            &bounded,
+                        )?;
+                        let count = muse_verified_process_prompt_transcript_count(
+                            &screen,
+                            &submission.text,
+                        );
+                        let retained =
+                            muse_verified_process_prompt_in_composer(&screen, &submission.text);
+                        (screen, count, retained)
+                    } else {
+                        let screen = self.client.read_with_runtime(
+                            pane_id,
+                            "recent-unwrapped",
+                            Some(5000),
+                            &bounded,
+                        )?;
+                        let count = claude_prompt_transcript_count(&screen, &submission.text);
+                        let retained = claude_prompt_is_exact_composer(&screen, &submission.text);
+                        (screen, count, retained)
+                    };
+                    if transcript_count > submission.prior_transcript_count && !in_composer {
+                        *self
+                            .custom_submission
+                            .lock()
+                            .expect("custom submission lock poisoned") = None;
+                        return Ok(());
+                    }
+                    if submission.harness == "claude"
+                        && submission.activity_receipt_allowed
+                        && !submission.prior_active
+                        && !in_composer
+                        && claude_active_screen(&screen)
+                    {
+                        *self
+                            .custom_submission
+                            .lock()
+                            .expect("custom submission lock poisoned") = None;
+                        return Ok(());
+                    }
+                    bounded.sleep(Duration::from_millis(50));
                 }
-                if bounded.monotonic() >= deadline {
-                    return Err(crate::error::AdapterError::unavailable(
-                        "agent did not show a verified post-submission screen transition",
-                    ));
-                }
-                let (screen, transcript_count, in_composer) = if submission.harness == "muse" {
-                    self.client.verify_custom_harness_with_runtime(
-                        pane_id,
-                        &self.record.launch.harness,
-                        self.record.custom_process_identity.as_ref(),
-                        &bounded,
-                    )?;
-                    let screen = self.client.read_with_runtime(
-                        pane_id,
-                        "recent-unwrapped",
-                        Some(200),
-                        &bounded,
-                    )?;
-                    let count =
-                        muse_verified_process_prompt_transcript_count(&screen, &submission.text);
-                    let retained =
-                        muse_verified_process_prompt_in_composer(&screen, &submission.text);
-                    (screen, count, retained)
-                } else {
-                    self.pane_info_with_runtime(pane_id, &bounded)?;
-                    let screen = self.client.read_with_runtime(
-                        pane_id,
-                        "recent-unwrapped",
-                        Some(5000),
-                        &bounded,
-                    )?;
-                    let count = claude_prompt_transcript_count(&screen, &submission.text);
-                    let retained = claude_prompt_is_exact_composer(&screen, &submission.text);
-                    (screen, count, retained)
-                };
-                if transcript_count > submission.prior_transcript_count && !in_composer {
-                    *self
-                        .custom_submission
-                        .lock()
-                        .expect("custom submission lock poisoned") = None;
-                    return Ok(());
-                }
-                if submission.harness == "claude"
-                    && !submission.prior_active
-                    && !in_composer
-                    && claude_active_screen(&screen)
-                {
-                    *self
-                        .custom_submission
-                        .lock()
-                        .expect("custom submission lock poisoned") = None;
-                    return Ok(());
-                }
-                if submission.harness == "muse"
-                    && !retried_enter
-                    && bounded.monotonic() >= retry_after
-                    && transcript_count == submission.prior_transcript_count
-                    && muse_verified_process_prompt_is_exact_composer(&screen, &submission.text)
-                {
-                    self.client.verify_custom_harness_with_runtime(
-                        pane_id,
-                        &self.record.launch.harness,
-                        self.record.custom_process_identity.as_ref(),
-                        &bounded,
-                    )?;
+            }
+            let objective = self
+                .goal_objective
+                .lock()
+                .expect("goal operation lock poisoned")
+                .clone()
+                .filter(|_| status == "working");
+            let start = bounded.monotonic();
+            let initial_error = match self.client.wait_agent_status_with_runtime(
+                pane_id,
+                status,
+                timeout_ms.min(1000),
+                &bounded,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(error) => error,
+            };
+            // Herdr's wait subscription may be installed after the transition it
+            // is waiting for. Reconcile the event failure against the exact owned
+            // pane, without ever running the prompt operation a second time.
+            if self.pane_info_with_runtime(pane_id, &bounded)?.status == status {
+                return Ok(());
+            }
+            if let Some(objective) = objective {
+                let screen =
+                    self.client
+                        .read_with_runtime(pane_id, "visible", Some(200), &bounded)?;
+                if goal_replacement_selected(&screen, &objective) {
                     self.client
                         .send_keys_with_runtime(pane_id, "Enter", &bounded)?;
-                    retried_enter = true;
                 }
-                bounded.sleep(Duration::from_millis(50));
             }
-        }
-        let objective = self
-            .goal_objective
-            .lock()
-            .expect("goal operation lock poisoned")
-            .clone()
-            .filter(|_| status == "working");
-        let start = bounded.monotonic();
-        let initial_error = match self.client.wait_agent_status_with_runtime(
-            pane_id,
-            status,
-            timeout_ms.min(1000),
-            &bounded,
-        ) {
-            Ok(()) => return Ok(()),
-            Err(error) => error,
-        };
-        // Herdr's wait subscription may be installed after the transition it
-        // is waiting for. Reconcile the event failure against the exact owned
-        // pane, without ever running the prompt operation a second time.
-        if self.pane_info_with_runtime(pane_id, &bounded)?.status == status {
-            return Ok(());
-        }
-        if let Some(objective) = objective {
-            let screen = self
+            let elapsed = u64::try_from(bounded.monotonic().saturating_sub(start).as_millis())
+                .unwrap_or(u64::MAX);
+            let remaining = timeout_ms.saturating_sub(elapsed);
+            if remaining == 0 || bounded.cancelled() {
+                return Err(initial_error);
+            }
+            match self
                 .client
-                .read_with_runtime(pane_id, "visible", Some(200), &bounded)?;
-            if goal_replacement_selected(&screen, &objective) {
-                self.client
-                    .send_keys_with_runtime(pane_id, "Enter", &bounded)?;
-            }
-        }
-        let elapsed = u64::try_from(bounded.monotonic().saturating_sub(start).as_millis())
-            .unwrap_or(u64::MAX);
-        let remaining = timeout_ms.saturating_sub(elapsed);
-        if remaining == 0 || bounded.cancelled() {
-            return Err(initial_error);
-        }
-        match self
-            .client
-            .wait_agent_status_with_runtime(pane_id, status, remaining, &bounded)
-        {
-            Ok(()) => Ok(()),
-            Err(final_error) => {
-                if self.pane_info_with_runtime(pane_id, &bounded)?.status == status {
-                    Ok(())
-                } else {
-                    Err(crate::error::AdapterError::unavailable(format!(
-                        "{final_error}; initial status wait also failed: {initial_error}"
-                    )))
+                .wait_agent_status_with_runtime(pane_id, status, remaining, &bounded)
+            {
+                Ok(()) => Ok(()),
+                Err(final_error) => {
+                    if self.pane_info_with_runtime(pane_id, &bounded)?.status == status {
+                        Ok(())
+                    } else {
+                        Err(crate::error::AdapterError::unavailable(format!(
+                            "{final_error}; initial status wait also failed: {initial_error}"
+                        )))
+                    }
                 }
             }
+        })();
+        if result.is_err() && bounded.monotonic() >= deadline {
+            Err(crate::error::AdapterError::unavailable(format!(
+                "agent status confirmation timed out after {timeout_ms}ms"
+            )))
+        } else {
+            result
         }
     }
 
@@ -4129,6 +4211,48 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         Ok(self.directory(agent_name)?.join("queue"))
     }
 
+    fn refuse_inflight_delivery(&self, record: &AgentRecord) -> Result<()> {
+        if !matches!(
+            record.launch.adapter.as_str(),
+            "herdr" | "herdr-pane" | "herdr-foreign"
+        ) {
+            return Ok(());
+        }
+        let queue = self.queue(&record.name)?;
+        match fs::symlink_metadata(&queue) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(fail(format!("cannot inspect delivery queue: {error}"))),
+        }
+        agent::validate_existing_queue(&queue)?;
+        agent::validate_existing_binding(&queue, &record.target()?)?;
+        let inflight = queue.join("inflight");
+        agent::validate_private_directory(&inflight, "queue state directory", false)
+            .map_err(|_| fail("delivery queue is incomplete"))?;
+        let entries = fs::read_dir(&inflight)
+            .map_err(|error| fail(format!("cannot inspect inflight delivery queue: {error}")))?
+            .collect::<io::Result<Vec<_>>>()
+            .map_err(|error| fail(format!("cannot read inflight delivery queue: {error}")))?;
+        let mut identifiers = entries
+            .into_iter()
+            .filter_map(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_suffix(".json"))
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        identifiers.sort();
+        if !identifiers.is_empty() {
+            return Err(fail(format!(
+                "refusing stop while prompt submission is in flight: {}",
+                identifiers.join(", ")
+            )));
+        }
+        Ok(())
+    }
+
     /// Read durable metadata even if Herdr is unreachable.
     pub fn get(&self, agent_name: &str) -> Result<Value> {
         Ok(self.load(agent_name)?.public_value())
@@ -4311,7 +4435,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     .to_owned()
             });
             self.save(&record)?;
-            return Err(fail(format!("launch of {agent_name:?} failed: {error}; record and any created tab retained at {}", directory.display())));
+            return Err(fail(format!("launch of '{agent_name}' failed: {error}; record and any created tab retained at {}", directory.display())));
         }
         drop(identity_lock);
         // Keep this generation's lifecycle lock through startup delivery and returned status.
@@ -4809,6 +4933,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             &WorkspaceClient {
                 client: self.client,
                 record,
+                registry: None,
                 goal_objective: Mutex::new(None),
                 custom_submission: Mutex::new(None),
                 queue: None,
@@ -4969,6 +5094,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             &WorkspaceClient {
                 client: self.client,
                 record,
+                registry: None,
                 goal_objective: Mutex::new(None),
                 custom_submission: Mutex::new(None),
                 queue: None,
@@ -4987,6 +5113,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let client = WorkspaceClient {
             client: self.client,
             record,
+            registry: None,
             goal_objective: Mutex::new(None),
             custom_submission: Mutex::new(None),
             queue: None,
@@ -5034,6 +5161,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             &WorkspaceClient {
                 client: self.client,
                 record: &record,
+                registry: None,
                 goal_objective: Mutex::new(None),
                 custom_submission: Mutex::new(None),
                 queue: None,
@@ -5076,6 +5204,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let client = WorkspaceClient {
             client: self.client,
             record,
+            registry: None,
             goal_objective: Mutex::new(None),
             custom_submission: Mutex::new(None),
             queue: None,
@@ -5720,10 +5849,37 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         options: DrainOptions,
         message_id: Option<&str>,
     ) -> Result<QueueResult> {
-        let _lock = self.lock(agent_name)?;
-        let record = self.load(agent_name)?;
-        self.reconcile_goal_transaction(&record)?;
-        self.send_record(&record, text, options, message_id)
+        let (record, queue, target, identifier) = {
+            let _lock = self.lock(agent_name)?;
+            let record = self.load(agent_name)?;
+            self.reconcile_goal_transaction(&record)?;
+            record.input_allowed()?;
+            if !record.legacy_goal_messages.is_empty() {
+                self.save(&record)?;
+            }
+            let queue = self.queue(&record.name)?;
+            let target = record.target()?;
+            let identifier = agent::enqueue_bound(
+                &queue,
+                &target,
+                text,
+                message_id,
+                agent::QueueMessageKind::Message,
+            )?;
+            (record, queue, target, identifier)
+        };
+        let client = WorkspaceClient {
+            client: self.client,
+            record: &record,
+            registry: Some(&self.registry),
+            goal_objective: Mutex::new(None),
+            custom_submission: Mutex::new(None),
+            queue: Some(&queue),
+            check_prompt: true,
+            adopted_evidence: Mutex::new(None),
+        };
+        let drained = agent::drain_existing(&client, &target, &queue, options)?;
+        agent::finish_identified_delivery(&queue, identifier, drained)
     }
 
     /// Submit through an injected runtime that can interrupt bounded readiness waits.
@@ -5735,32 +5891,39 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         message_id: &str,
         runtime: &dyn agent::AgentRuntime,
     ) -> Result<QueueResult> {
-        let _lock = self.lock_with_runtime(agent_name, runtime)?;
-        let record = self.load(agent_name)?;
-        self.reconcile_goal_transaction(&record)?;
-        record.input_allowed()?;
-        if !record.legacy_goal_messages.is_empty() {
-            self.save(&record)?;
-        }
-        let queue = self.queue(&record.name)?;
+        let (record, queue, target, identifier) = {
+            let _lock = self.lock_with_runtime(agent_name, runtime)?;
+            let record = self.load(agent_name)?;
+            self.reconcile_goal_transaction(&record)?;
+            record.input_allowed()?;
+            if !record.legacy_goal_messages.is_empty() {
+                self.save(&record)?;
+            }
+            let queue = self.queue(&record.name)?;
+            let target = record.target()?;
+            let identifier = agent::enqueue_bound_with_runtime(
+                &queue,
+                &target,
+                text,
+                Some(message_id),
+                agent::QueueMessageKind::Message,
+                runtime,
+            )?;
+            (record, queue, target, identifier)
+        };
         let client = WorkspaceClient {
             client: self.client,
             record: &record,
+            registry: Some(&self.registry),
             goal_objective: Mutex::new(None),
             custom_submission: Mutex::new(None),
             queue: Some(&queue),
             check_prompt: true,
             adopted_evidence: Mutex::new(None),
         };
-        agent::send_identified_with_runtime(
-            &client,
-            &record.target()?,
-            &queue,
-            text,
-            options,
-            runtime,
-            Some(message_id),
-        )
+        let drained =
+            agent::drain_existing_with_runtime(&client, &target, &queue, options, runtime)?;
+        agent::finish_identified_delivery(&queue, identifier, drained)
     }
 
     /// Reconcile one caller-selected durable delivery identifier by exact path lookup.
@@ -5802,6 +5965,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let client = WorkspaceClient {
             client: self.client,
             record,
+            registry: None,
             goal_objective: Mutex::new(None),
             custom_submission: Mutex::new(None),
             queue: Some(&queue),
@@ -6084,27 +6248,30 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
 
     /// Drain only prompts known not to have been injected.
     pub fn drain(&self, agent_name: &str, options: DrainOptions) -> Result<QueueResult> {
-        let _lock = self.lock(agent_name)?;
-        let record = self.load(agent_name)?;
-        self.reconcile_goal_transaction(&record)?;
-        record.input_allowed()?;
-        if !record.legacy_goal_messages.is_empty() {
-            self.save(&record)?;
-        }
-        agent::drain(
-            &WorkspaceClient {
-                client: self.client,
-                record: &record,
-                goal_objective: Mutex::new(None),
-                custom_submission: Mutex::new(None),
-                queue: Some(&self.queue(agent_name)?),
-                check_prompt: true,
-                adopted_evidence: Mutex::new(None),
-            },
-            &record.target()?,
-            &self.queue(agent_name)?,
-            options,
-        )
+        let (record, queue, target) = {
+            let _lock = self.lock(agent_name)?;
+            let record = self.load(agent_name)?;
+            self.reconcile_goal_transaction(&record)?;
+            record.input_allowed()?;
+            if !record.legacy_goal_messages.is_empty() {
+                self.save(&record)?;
+            }
+            let queue = self.queue(agent_name)?;
+            let target = record.target()?;
+            agent::bind_queue_with_runtime(&queue, &target, &agent::SystemRuntime::default())?;
+            (record, queue, target)
+        };
+        let client = WorkspaceClient {
+            client: self.client,
+            record: &record,
+            registry: Some(&self.registry),
+            goal_objective: Mutex::new(None),
+            custom_submission: Mutex::new(None),
+            queue: Some(&queue),
+            check_prompt: true,
+            adopted_evidence: Mutex::new(None),
+        };
+        agent::drain_existing(&client, &target, &queue, options)
     }
 
     /// Reconcile one ambiguous Muse prompt from exact live user-turn evidence.
@@ -6126,6 +6293,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let client = WorkspaceClient {
             client: self.client,
             record: &record,
+            registry: None,
             goal_objective: Mutex::new(None),
             custom_submission: Mutex::new(None),
             queue: Some(&queue),
@@ -6156,28 +6324,29 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         options: DrainOptions,
         runtime: &dyn agent::AgentRuntime,
     ) -> Result<QueueResult> {
-        let _lock = self.lock_with_runtime(agent_name, runtime)?;
-        let record = self.load(agent_name)?;
-        record.input_allowed()?;
-        if !record.legacy_goal_messages.is_empty() {
-            self.save(&record)?;
-        }
-        let queue = self.queue(&record.name)?;
-        agent::drain_with_runtime(
-            &WorkspaceClient {
-                client: self.client,
-                record: &record,
-                goal_objective: Mutex::new(None),
-                custom_submission: Mutex::new(None),
-                queue: Some(&queue),
-                check_prompt: true,
-                adopted_evidence: Mutex::new(None),
-            },
-            &record.target()?,
-            &queue,
-            options,
-            runtime,
-        )
+        let (record, queue, target) = {
+            let _lock = self.lock_with_runtime(agent_name, runtime)?;
+            let record = self.load(agent_name)?;
+            record.input_allowed()?;
+            if !record.legacy_goal_messages.is_empty() {
+                self.save(&record)?;
+            }
+            let queue = self.queue(&record.name)?;
+            let target = record.target()?;
+            agent::bind_queue_with_runtime(&queue, &target, runtime)?;
+            (record, queue, target)
+        };
+        let client = WorkspaceClient {
+            client: self.client,
+            record: &record,
+            registry: Some(&self.registry),
+            goal_objective: Mutex::new(None),
+            custom_submission: Mutex::new(None),
+            queue: Some(&queue),
+            check_prompt: true,
+            adopted_evidence: Mutex::new(None),
+        };
+        agent::drain_existing_with_runtime(&client, &target, &queue, options, runtime)
     }
 
     fn snapshot(&self, record: &AgentRecord, text: &str) -> Result<()> {
@@ -6215,6 +6384,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             &WorkspaceClient {
                 client: self.client,
                 record: &record,
+                registry: None,
                 goal_objective: Mutex::new(None),
                 custom_submission: Mutex::new(None),
                 queue: None,
@@ -6415,36 +6585,45 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         if text.trim().is_empty() || text.contains(['\n', '\r']) {
             return Err(fail("goal must be a nonempty single line"));
         }
-        let _lock = self.lock(agent_name)?;
-        let mut record = self.load(agent_name)?;
-        self.reconcile_goal_transaction(&record)?;
-        record.input_allowed()?;
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| fail(error.to_string()))?
-            .as_nanos();
-        let identifier = format!("{timestamp:020}-{}", std::process::id());
-        self.write_goal_transaction(&record, &identifier, text)?;
-        record.goal = Some(text.to_owned());
-        record.goal_message_id = Some(identifier.clone());
-        self.save(&record)?;
-        let prompt = goal_prompt(&record.launch.harness, text);
-        let queue = self.queue(agent_name)?;
-        agent::enqueue_goal(&queue, &prompt, &identifier)?;
-        self.remove_goal_transaction(&record)?;
+        let (record, queue, target, identifier) = {
+            let _lock = self.lock(agent_name)?;
+            let mut record = self.load(agent_name)?;
+            self.reconcile_goal_transaction(&record)?;
+            record.input_allowed()?;
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| fail(error.to_string()))?
+                .as_nanos();
+            let identifier = format!("{timestamp:020}-{}", std::process::id());
+            self.write_goal_transaction(&record, &identifier, text)?;
+            record.goal = Some(text.to_owned());
+            record.goal_message_id = Some(identifier.clone());
+            self.save(&record)?;
+            let prompt = goal_prompt(&record.launch.harness, text);
+            let queue = self.queue(agent_name)?;
+            let target = record.target()?;
+            agent::enqueue_bound(
+                &queue,
+                &target,
+                &prompt,
+                Some(&identifier),
+                agent::QueueMessageKind::Goal,
+            )?;
+            self.remove_goal_transaction(&record)?;
+            (record, queue, target, identifier)
+        };
         let client = WorkspaceClient {
             client: self.client,
             record: &record,
+            registry: Some(&self.registry),
             goal_objective: Mutex::new(None),
             custom_submission: Mutex::new(None),
             queue: Some(&queue),
             check_prompt: true,
             adopted_evidence: Mutex::new(None),
         };
-        let outcome =
-            agent::drain(&client, &record.target()?, &queue, options).and_then(|drained| {
-                agent::finish_identified_delivery(&queue, identifier.clone(), drained)
-            });
+        let outcome = agent::drain_existing(&client, &target, &queue, options)
+            .and_then(|drained| agent::finish_identified_delivery(&queue, identifier, drained));
         match outcome {
             Ok(_) => self.goal_result(&record, goal_command),
             Err(error) => Err(error),
@@ -8039,7 +8218,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     {
         let expected_token = expected_token.ok_or_else(|| {
             fail(format!(
-                "retiring dead managed agent {:?} requires --expected-token",
+                "retiring dead managed agent '{}' requires --expected-token",
                 record.name
             ))
         })?;
@@ -8273,6 +8452,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "unfinished relocation must be reconciled with agentctl relocate before stop",
             ));
         }
+        self.refuse_inflight_delivery(&record)?;
         if options.recover_legacy_adoption {
             let pane_id = record
                 .pane_id
@@ -8508,7 +8688,7 @@ mod tests {
     use crate::error::{AdapterError, Result as AdapterResult};
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, Condvar};
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     #[derive(Default)]
@@ -8527,6 +8707,60 @@ mod tests {
 
         fn cancelled(&self) -> bool {
             self.cancelled.load(Ordering::SeqCst)
+        }
+    }
+
+    #[derive(Default)]
+    struct BlockingReadinessRuntime {
+        millis: AtomicU64,
+        state: Mutex<(bool, bool)>,
+        changed: Condvar,
+    }
+
+    impl BlockingReadinessRuntime {
+        fn wait_for_sleep(&self, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
+            let mut state = self.state.lock().expect("readiness gate");
+            while !state.0 {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return false;
+                }
+                let (next, timed) = self
+                    .changed
+                    .wait_timeout(state, remaining)
+                    .expect("readiness gate wait");
+                state = next;
+                if timed.timed_out() && !state.0 {
+                    return false;
+                }
+            }
+            true
+        }
+
+        fn release(&self) {
+            let mut state = self.state.lock().expect("readiness gate");
+            state.1 = true;
+            self.changed.notify_all();
+        }
+    }
+
+    impl agent::AgentRuntime for BlockingReadinessRuntime {
+        fn monotonic(&self) -> Duration {
+            Duration::from_millis(self.millis.load(Ordering::SeqCst))
+        }
+
+        fn sleep(&self, duration: Duration) {
+            let mut state = self.state.lock().expect("readiness gate");
+            state.0 = true;
+            self.changed.notify_all();
+            while !state.1 {
+                state = self.changed.wait(state).expect("readiness gate wait");
+            }
+            self.millis.fetch_add(
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+                Ordering::SeqCst,
+            );
         }
     }
     struct Fixture {
@@ -8575,8 +8809,11 @@ mod tests {
                     working_after_run: AtomicBool::new(false),
                     custom_screen: Mutex::new(None),
                     screen_after_run: Mutex::new(None),
+                    delay_screen_after_run_once: AtomicBool::new(false),
+                    truncate_custom_screen_to_requested_lines: AtomicBool::new(false),
                     screen_after_enter: Mutex::new(None),
                     ignore_first_enter: AtomicBool::new(false),
+                    keep_native_idle_after_submit: AtomicBool::new(false),
                     sent_texts: Mutex::new(Vec::new()),
                     sent_keys: Mutex::new(Vec::new()),
                     current_owned_pane: Mutex::new("owned".to_owned()),
@@ -8732,8 +8969,11 @@ mod tests {
         working_after_run: AtomicBool,
         custom_screen: Mutex<Option<String>>,
         screen_after_run: Mutex<Option<String>>,
+        delay_screen_after_run_once: AtomicBool,
+        truncate_custom_screen_to_requested_lines: AtomicBool,
         screen_after_enter: Mutex<Option<String>>,
         ignore_first_enter: AtomicBool,
+        keep_native_idle_after_submit: AtomicBool,
         sent_texts: Mutex<Vec<String>>,
         sent_keys: Mutex<Vec<String>>,
         current_owned_pane: Mutex<String>,
@@ -8929,10 +9169,14 @@ mod tests {
         }
         fn run(&self, _: &str, text: &str) -> AdapterResult<()> {
             self.runs.lock().unwrap().push(text.to_owned());
-            if let Some(screen) = self.screen_after_run.lock().unwrap().take() {
-                *self.custom_screen.lock().unwrap() = Some(screen);
+            if !self.delay_screen_after_run_once.load(Ordering::Relaxed) {
+                if let Some(screen) = self.screen_after_run.lock().unwrap().take() {
+                    *self.custom_screen.lock().unwrap() = Some(screen);
+                }
             }
-            if self.working_after_run.load(Ordering::Relaxed) {
+            if self.working_after_run.load(Ordering::Relaxed)
+                && !self.keep_native_idle_after_submit.load(Ordering::Relaxed)
+            {
                 self.custom_native_working.store(true, Ordering::Relaxed);
             }
             Ok(())
@@ -8946,7 +9190,7 @@ mod tests {
                 Ok(())
             }
         }
-        fn read(&self, _: &str, _: &str, _: Option<usize>) -> AdapterResult<String> {
+        fn read(&self, _: &str, _: &str, lines: Option<usize>) -> AdapterResult<String> {
             if self.fail_read.load(Ordering::Relaxed) {
                 return Err(AdapterError::unavailable("capture failed"));
             }
@@ -8966,7 +9210,25 @@ mod tests {
             if self.leave_idle_shell_on_read.swap(false, Ordering::Relaxed) {
                 self.custom_at_idle_shell.store(false, Ordering::Relaxed);
             }
+            if !self.runs.lock().unwrap().is_empty() {
+                if self
+                    .delay_screen_after_run_once
+                    .swap(false, Ordering::Relaxed)
+                {
+                    // Preserve the pre-submit screen for exactly one sample.
+                } else if let Some(screen) = self.screen_after_run.lock().unwrap().take() {
+                    *self.custom_screen.lock().unwrap() = Some(screen);
+                }
+            }
             if let Some(screen) = self.custom_screen.lock().unwrap().clone() {
+                if self
+                    .truncate_custom_screen_to_requested_lines
+                    .load(Ordering::Relaxed)
+                {
+                    let rows = screen.lines().collect::<Vec<_>>();
+                    let start = rows.len().saturating_sub(lines.unwrap_or(rows.len()));
+                    return Ok(format!("{}\n", rows[start..].join("\n")));
+                }
                 return Ok(screen);
             }
             if self
@@ -9354,7 +9616,9 @@ mod tests {
                 if let Some(screen) = self.screen_after_enter.lock().unwrap().take() {
                     *self.custom_screen.lock().unwrap() = Some(screen);
                 }
-                self.custom_native_working.store(true, Ordering::Relaxed);
+                if !self.keep_native_idle_after_submit.load(Ordering::Relaxed) {
+                    self.custom_native_working.store(true, Ordering::Relaxed);
+                }
             }
             Ok(())
         }
@@ -10172,6 +10436,47 @@ mod tests {
     }
 
     #[test]
+    fn live_muse_paused_goal_is_healthy_but_not_delivery_ready() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let divider = "────────────────────────────────────────";
+        *fixture.client.custom_screen.lock().unwrap() = Some(format!(
+            "Muse Code 1.4.0\n{divider}\n❯\n{divider}\nGoal (paused)\n\
+             kiki · xhigh · /work · YOLO\n"
+        ));
+
+        let (status, healthy) = manager.status_with_health("worker").unwrap();
+        assert!(healthy, "{status}");
+        assert_eq!(status["health"], "healthy");
+        assert_eq!(status["agent_status"], "paused");
+        let error = manager
+            .send(
+                "worker",
+                "continue",
+                DrainOptions {
+                    ready_timeout: Duration::ZERO,
+                    ..DrainOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.outcome(), Some(agent::QueueOutcome::Pending));
+        assert!(error.to_string().contains("last status=paused"));
+        assert!(fixture.client.runs.lock().unwrap().is_empty());
+        assert!(fixture.client.sent_texts.lock().unwrap().is_empty());
+        assert!(fixture.client.sent_keys.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn muse_submits_matching_prebuffered_prompt_once_without_reinjection() {
         let fixture = Fixture::new();
         let manager = fixture.manager();
@@ -10206,7 +10511,50 @@ mod tests {
     }
 
     #[test]
-    fn claude_staged_prompt_uses_exact_submit_chord_once() {
+    fn muse_completed_turn_beyond_200_lines_uses_bounded_deep_history() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let divider = "────────────────────────────────────────";
+        let prompt = "retain exact delivery evidence beyond the visible tail";
+        *fixture.client.custom_screen.lock().unwrap() = Some(format!(
+            "old transcript\n{divider}\n❯ {prompt}\n{divider}\nkiki · xhigh · /work · YOLO\n"
+        ));
+        let output = (0..300)
+            .map(|index| format!("◆ output line {index}\n"))
+            .collect::<String>();
+        *fixture.client.screen_after_enter.lock().unwrap() = Some(format!(
+            "❯ {prompt}\n{output}{divider}\n❯\n{divider}\nkiki · xhigh · /work · YOLO\n"
+        ));
+        fixture
+            .client
+            .keep_native_idle_after_submit
+            .store(true, Ordering::Relaxed);
+        fixture
+            .client
+            .truncate_custom_screen_to_requested_lines
+            .store(true, Ordering::Relaxed);
+
+        let result = manager
+            .send("worker", prompt, DrainOptions::default())
+            .unwrap();
+
+        assert_eq!(result.outcome, agent::QueueOutcome::Delivered);
+        assert!(fixture.client.sent_texts.lock().unwrap().is_empty());
+        assert_eq!(*fixture.client.sent_keys.lock().unwrap(), ["Enter"]);
+    }
+
+    #[test]
+    fn claude_staged_prompt_uses_enter_once() {
         let fixture = Fixture::new();
         fixture
             .client
@@ -10242,7 +10590,7 @@ mod tests {
 
         assert_eq!(result.outcome, agent::QueueOutcome::Delivered);
         assert_eq!(*fixture.client.runs.lock().unwrap(), [prompt]);
-        assert_eq!(*fixture.client.sent_keys.lock().unwrap(), ["ctrl+x ctrl+s"]);
+        assert_eq!(*fixture.client.sent_keys.lock().unwrap(), ["Enter"]);
     }
 
     #[test]
@@ -10281,7 +10629,223 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.outcome, agent::QueueOutcome::Delivered);
-        assert_eq!(*fixture.client.sent_keys.lock().unwrap(), ["ctrl+x ctrl+s"]);
+        assert_eq!(*fixture.client.runs.lock().unwrap(), [prompt]);
+        assert_eq!(*fixture.client.sent_keys.lock().unwrap(), ["Enter"]);
+        assert_eq!(
+            fs::read_dir(fixture.root.join("registry/worker/queue/failed"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn claude_transcript_acceptance_confirms_delivery_while_native_status_stays_idle() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .claude_background
+            .store(true, Ordering::Relaxed);
+        fixture
+            .client
+            .keep_native_idle_after_submit
+            .store(true, Ordering::Relaxed);
+        let manager = fixture.manager();
+        manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    harness: "claude".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let divider = "────────────────────────────────────────";
+        let prompt = "confirm this accepted turn without a native working event";
+        *fixture.client.custom_screen.lock().unwrap() =
+            Some(format!("{divider}\n❯\n{divider}\nauto mode on\n"));
+        *fixture.client.screen_after_run.lock().unwrap() = Some(format!(
+            "{divider}\n❯ {prompt}\n  ctrl+x ctrl+s to send now\n\
+             {divider}\nauto mode on\n"
+        ));
+        *fixture.client.screen_after_enter.lock().unwrap() = Some(format!(
+            "❯ {prompt}\n● Accepted\n{divider}\n❯\n{divider}\nauto mode on\n"
+        ));
+
+        let result = manager
+            .send("worker", prompt, DrainOptions::default())
+            .unwrap();
+
+        assert!(!fixture.client.custom_native_working.load(Ordering::Relaxed));
+        assert_eq!(result.outcome, agent::QueueOutcome::Delivered);
+        assert_eq!(*fixture.client.runs.lock().unwrap(), [prompt]);
+        assert_eq!(*fixture.client.sent_keys.lock().unwrap(), ["Enter"]);
+        assert_eq!(
+            fs::read_dir(fixture.root.join("registry/worker/queue/failed"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn claude_direct_executed_turn_confirms_delivery_while_native_status_stays_idle() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .claude_background
+            .store(true, Ordering::Relaxed);
+        fixture
+            .client
+            .keep_native_idle_after_submit
+            .store(true, Ordering::Relaxed);
+        let manager = fixture.manager();
+        manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    harness: "claude".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let divider = "────────────────────────────────────────";
+        let prompt = "confirm the exact turn that completed before status polling";
+        *fixture.client.custom_screen.lock().unwrap() =
+            Some(format!("{divider}\n❯\n{divider}\nauto mode on\n"));
+        *fixture.client.screen_after_run.lock().unwrap() = Some(format!(
+            "❯ {prompt}\n● Completed\n{divider}\n❯\n{divider}\nauto mode on\n"
+        ));
+
+        let result = manager
+            .send("worker", prompt, DrainOptions::default())
+            .unwrap();
+
+        assert!(!fixture.client.custom_native_working.load(Ordering::Relaxed));
+        assert_eq!(result.outcome, agent::QueueOutcome::Delivered);
+        assert_eq!(*fixture.client.runs.lock().unwrap(), [prompt]);
+        assert!(fixture.client.sent_keys.lock().unwrap().is_empty());
+        assert_eq!(
+            fs::read_dir(fixture.root.join("registry/worker/queue/failed"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn claude_delayed_exact_turn_reconciles_without_reinjection() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .claude_background
+            .store(true, Ordering::Relaxed);
+        fixture
+            .client
+            .keep_native_idle_after_submit
+            .store(true, Ordering::Relaxed);
+        let manager = fixture.manager();
+        manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    harness: "claude".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let divider = "────────────────────────────────────────";
+        let prompt = "confirm the exact turn after one delayed redraw";
+        *fixture.client.custom_screen.lock().unwrap() =
+            Some(format!("{divider}\n❯\n{divider}\nauto mode on\n"));
+        *fixture.client.screen_after_run.lock().unwrap() = Some(format!(
+            "❯ {prompt}\n● Executing\n{divider}\n❯\n{divider}\nauto mode on\n"
+        ));
+        fixture
+            .client
+            .delay_screen_after_run_once
+            .store(true, Ordering::Relaxed);
+
+        let result = manager
+            .send("worker", prompt, DrainOptions::default())
+            .unwrap();
+
+        assert_eq!(result.outcome, agent::QueueOutcome::Delivered);
+        assert_eq!(*fixture.client.runs.lock().unwrap(), [prompt]);
+        assert!(fixture.client.sent_keys.lock().unwrap().is_empty());
+        assert_eq!(
+            fs::read_dir(fixture.root.join("registry/worker/queue/processed"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn claude_unrelated_activity_does_not_confirm_a_lagging_native_prompt() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .claude_background
+            .store(true, Ordering::Relaxed);
+        fixture
+            .client
+            .keep_native_idle_after_submit
+            .store(true, Ordering::Relaxed);
+        let manager = fixture.manager();
+        manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    harness: "claude".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let divider = "────────────────────────────────────────";
+        let prompt = "do not confuse background activity with this exact prompt";
+        *fixture.client.custom_screen.lock().unwrap() =
+            Some(format!("{divider}\n❯\n{divider}\nauto mode on\n"));
+        *fixture.client.screen_after_run.lock().unwrap() = Some(format!(
+            "● Unrelated background agent is still running\n{divider}\n❯\n{divider}\nauto mode on\n"
+        ));
+        fixture
+            .client
+            .delay_screen_after_run_once
+            .store(true, Ordering::Relaxed);
+
+        let error = manager
+            .send(
+                "worker",
+                prompt,
+                DrainOptions {
+                    working_timeout: Duration::from_millis(50),
+                    ..DrainOptions::default()
+                },
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error.outcome(),
+            Some(agent::QueueOutcome::PossiblySubmitted)
+        );
+        assert_eq!(*fixture.client.runs.lock().unwrap(), [prompt]);
+        assert!(fixture.client.sent_keys.lock().unwrap().is_empty());
+        assert_eq!(
+            fs::read_dir(fixture.root.join("registry/worker/queue/failed"))
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .filter(
+                    |entry| entry.path().extension().and_then(|value| value.to_str())
+                        == Some("json")
+                )
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -10318,7 +10882,7 @@ mod tests {
     }
 
     #[test]
-    fn muse_retries_enter_once_only_while_exact_prompt_remains_staged() {
+    fn muse_never_retries_enter_when_the_first_submit_has_no_receipt() {
         let fixture = Fixture::new();
         let manager = fixture.manager();
         manager
@@ -10336,24 +10900,31 @@ mod tests {
         *fixture.client.custom_screen.lock().unwrap() = Some(format!(
             "old transcript\n{divider}\n❯ {prompt}\n{divider}\nkiki · xhigh · /work · YOLO\n"
         ));
-        *fixture.client.screen_after_enter.lock().unwrap() = Some(format!(
-            "❯ {prompt}\n◆ Thinking\n{divider}\n❯\n{divider}\nkiki · xhigh · /work · YOLO\n"
-        ));
+        // A delayed redraw is not proof that the first accepted Enter was
+        // ignored. A second Enter could act on a later dialog or empty prompt.
+        *fixture.client.screen_after_enter.lock().unwrap() = None;
         fixture
             .client
             .ignore_first_enter
             .store(true, Ordering::Relaxed);
 
-        let result = manager
-            .send("worker", prompt, DrainOptions::default())
-            .unwrap();
+        let error = manager
+            .send(
+                "worker",
+                prompt,
+                DrainOptions {
+                    working_timeout: Duration::from_millis(50),
+                    ..DrainOptions::default()
+                },
+            )
+            .unwrap_err();
 
-        assert_eq!(result.outcome, agent::QueueOutcome::Delivered);
-        assert!(fixture.client.sent_texts.lock().unwrap().is_empty());
         assert_eq!(
-            *fixture.client.sent_keys.lock().unwrap(),
-            ["Enter", "Enter"]
+            error.outcome(),
+            Some(agent::QueueOutcome::PossiblySubmitted)
         );
+        assert!(fixture.client.sent_texts.lock().unwrap().is_empty());
+        assert_eq!(*fixture.client.sent_keys.lock().unwrap(), ["Enter"]);
     }
 
     #[test]
@@ -16174,6 +16745,345 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn busy_readiness_does_not_hold_the_lifecycle_lock() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        fixture
+            .client
+            .custom_native_working
+            .store(true, Ordering::SeqCst);
+        let manager = fixture.manager();
+        let runtime = BlockingReadinessRuntime::default();
+        std::thread::scope(|scope| {
+            let sender = scope.spawn(|| {
+                manager.send_identified_with_runtime(
+                    "worker",
+                    "wait for the current turn",
+                    DrainOptions {
+                        ready_timeout: Duration::from_secs(1),
+                        ..DrainOptions::default()
+                    },
+                    "busy-readiness",
+                    &runtime,
+                )
+            });
+            let entered = runtime.wait_for_sleep(Duration::from_secs(5));
+            let status = manager.status_with_health("worker");
+            fixture
+                .client
+                .custom_native_working
+                .store(false, Ordering::SeqCst);
+            runtime.release();
+            let delivered = sender.join().unwrap();
+
+            assert!(entered, "delivery never entered readiness polling");
+            let (status, healthy) = status.expect("health/status must acquire lifecycle lock");
+            assert!(healthy, "{status}");
+            assert_eq!(status["agent_status"], "working");
+            assert_eq!(delivered.unwrap().outcome, agent::QueueOutcome::Delivered);
+        });
+    }
+
+    #[test]
+    fn pause_committed_during_readiness_prevents_prompt_injection() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        fixture
+            .client
+            .custom_native_working
+            .store(true, Ordering::SeqCst);
+        let manager = fixture.manager();
+        let runtime = BlockingReadinessRuntime::default();
+        std::thread::scope(|scope| {
+            let sender = scope.spawn(|| {
+                manager.send_identified_with_runtime(
+                    "worker",
+                    "must remain pending after pause",
+                    DrainOptions {
+                        ready_timeout: Duration::from_secs(1),
+                        ..DrainOptions::default()
+                    },
+                    "pause-race",
+                    &runtime,
+                )
+            });
+            assert!(runtime.wait_for_sleep(Duration::from_secs(5)));
+            assert_eq!(manager.pause("worker", true).unwrap()["paused"], true);
+            fixture
+                .client
+                .custom_native_working
+                .store(false, Ordering::SeqCst);
+            runtime.release();
+            let error = sender.join().unwrap().unwrap_err();
+
+            assert!(error
+                .to_string()
+                .contains("runtime identity changed before submission"));
+            assert!(fixture.client.runs.lock().unwrap().is_empty());
+            assert!(fixture
+                .root
+                .join("registry/worker/queue/inbox/pause-race.json")
+                .is_file());
+        });
+    }
+
+    #[test]
+    fn readiness_waiter_never_mutates_a_reused_agent_name() {
+        let fixture = Fixture::new();
+        let original = fixture.start(None);
+        fixture
+            .client
+            .custom_native_working
+            .store(true, Ordering::SeqCst);
+        let manager = fixture.manager();
+        let runtime = BlockingReadinessRuntime::default();
+        std::thread::scope(|scope| {
+            let sender = scope.spawn(|| {
+                manager.send_identified_with_runtime(
+                    "worker",
+                    "old generation prompt",
+                    DrainOptions {
+                        ready_timeout: Duration::from_secs(1),
+                        ..DrainOptions::default()
+                    },
+                    "old-pending",
+                    &runtime,
+                )
+            });
+            assert!(runtime.wait_for_sleep(Duration::from_secs(5)));
+            manager
+                .stop_with_options(
+                    "worker",
+                    StopOptions {
+                        expected_token: Some(original["token"].as_str().unwrap().to_owned()),
+                        ..StopOptions::default()
+                    },
+                )
+                .unwrap();
+            manager
+                .start(
+                    "worker",
+                    &fixture.root,
+                    StartOptions {
+                        workspace_id: Some("workspace".to_owned()),
+                        ..StartOptions::default()
+                    },
+                )
+                .unwrap();
+            let replacement = manager.load("worker").unwrap();
+            let queue = manager.queue("worker").unwrap();
+            let new_id = agent::enqueue_bound(
+                &queue,
+                &replacement.target().unwrap(),
+                "new generation prompt",
+                Some("new-pending"),
+                agent::QueueMessageKind::Message,
+            )
+            .unwrap();
+            let new_path = queue.join("inbox").join(format!("{new_id}.json"));
+            let before = fs::read(&new_path).unwrap();
+
+            runtime.release();
+            let error = sender.join().unwrap().unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("runtime identity changed before submission"),
+                "{error}"
+            );
+            assert_eq!(fs::read(new_path).unwrap(), before);
+            assert!(fixture.client.runs.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn submission_waiting_for_lifecycle_holds_neither_queue_nor_target_lock() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let manager = fixture.manager();
+        let record = manager.load("worker").unwrap();
+        let queue = manager.queue("worker").unwrap();
+        let target = record.target().unwrap();
+        agent::enqueue_bound(
+            &queue,
+            &target,
+            "respect the canonical lock order",
+            Some("lock-order"),
+            agent::QueueMessageKind::Message,
+        )
+        .unwrap();
+        let lifecycle = manager.lock("worker").unwrap();
+        let runtime = BlockingReadinessRuntime::default();
+        let client = WorkspaceClient {
+            client: &fixture.client,
+            record: &record,
+            registry: Some(&manager.registry),
+            goal_objective: Mutex::new(None),
+            custom_submission: Mutex::new(None),
+            queue: Some(&queue),
+            check_prompt: true,
+            adopted_evidence: Mutex::new(None),
+        };
+        std::thread::scope(|scope| {
+            let sender = scope.spawn(|| {
+                agent::drain_existing_with_runtime(
+                    &client,
+                    &target,
+                    &queue,
+                    DrainOptions::default(),
+                    &runtime,
+                )
+            });
+            let entered = runtime.wait_for_sleep(Duration::from_secs(5));
+            let queue_lock =
+                agent::open_private_lock(&queue.join(".delivery.lock"), "test queue lock").unwrap();
+            let queue_available = FileExt::try_lock_exclusive(&queue_lock).is_ok();
+            if queue_available {
+                FileExt::unlock(&queue_lock).unwrap();
+            }
+            let target_lock_path =
+                agent::target_lock_path(target.pane_id.as_deref().unwrap()).unwrap();
+            let target_lock =
+                agent::open_private_lock(&target_lock_path, "test target lock").unwrap();
+            let target_available = FileExt::try_lock_exclusive(&target_lock).is_ok();
+            if target_available {
+                FileExt::unlock(&target_lock).unwrap();
+            }
+
+            FileExt::unlock(&lifecycle).unwrap();
+            runtime.release();
+            let result = sender.join().unwrap();
+
+            assert!(entered, "delivery never waited for the lifecycle guard");
+            assert!(queue_available, "lifecycle wait held the queue lock");
+            assert!(target_available, "lifecycle wait held the target lock");
+            assert_eq!(result.unwrap().delivered, ["lock-order"]);
+        });
+    }
+
+    #[test]
+    fn generation_change_during_readiness_never_reaches_prompt_transport() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        fixture
+            .client
+            .custom_native_working
+            .store(true, Ordering::SeqCst);
+        let manager = fixture.manager();
+        let runtime = BlockingReadinessRuntime::default();
+        std::thread::scope(|scope| {
+            let sender = scope.spawn(|| {
+                manager.send_identified_with_runtime(
+                    "worker",
+                    "must stay with the original generation",
+                    DrainOptions {
+                        ready_timeout: Duration::from_secs(1),
+                        ..DrainOptions::default()
+                    },
+                    "generation-change",
+                    &runtime,
+                )
+            });
+            let entered = runtime.wait_for_sleep(Duration::from_secs(5));
+            {
+                let _lock = manager.lock("worker").unwrap();
+                let mut replacement = manager.load("worker").unwrap();
+                replacement.token = "replacement-generation".to_owned();
+                manager.save(&replacement).unwrap();
+            }
+            fixture
+                .client
+                .custom_native_working
+                .store(false, Ordering::SeqCst);
+            runtime.release();
+            let error = sender.join().unwrap().unwrap_err();
+
+            assert!(entered, "delivery never entered readiness polling");
+            assert!(error
+                .to_string()
+                .contains("runtime identity changed before submission"));
+            assert!(fixture.client.runs.lock().unwrap().is_empty());
+            assert_eq!(error.outcome(), Some(agent::QueueOutcome::Pending));
+            assert!(fixture
+                .root
+                .join("registry/worker/queue/inbox/generation-change.json")
+                .is_file());
+            assert_eq!(
+                fs::read_dir(fixture.root.join("registry/worker/queue/failed"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn stop_refuses_a_durable_inflight_prompt_before_teardown() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let manager = fixture.manager();
+        let record = manager.load("worker").unwrap();
+        let queue = manager.queue("worker").unwrap();
+        agent::enqueue_bound(
+            &queue,
+            &record.target().unwrap(),
+            "already crossing the barrier",
+            Some("inflight-stop"),
+            agent::QueueMessageKind::Message,
+        )
+        .unwrap();
+        fs::rename(
+            queue.join("inbox/inflight-stop.json"),
+            queue.join("inflight/inflight-stop.json"),
+        )
+        .unwrap();
+
+        let error = manager.stop("worker").unwrap_err();
+        assert!(error.to_string().contains("prompt submission is in flight"));
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert!(fixture.root.join("registry/worker").is_dir());
+    }
+
+    #[test]
+    fn failed_receipt_is_durable_before_inflight_teardown_fence_is_removed() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        fixture.client.wait_fails.store(true, Ordering::Relaxed);
+        let manager = fixture.manager();
+        let record = manager.load("worker").unwrap();
+        let queue = manager.queue("worker").unwrap();
+        agent::enqueue_bound(
+            &queue,
+            &record.target().unwrap(),
+            "cross the prompt barrier once",
+            Some("receipt-failure"),
+            agent::QueueMessageKind::Message,
+        )
+        .unwrap();
+        fs::create_dir(queue.join("failed/receipt-failure.json.error")).unwrap();
+
+        manager
+            .drain(
+                "worker",
+                DrainOptions {
+                    ready_timeout: Duration::ZERO,
+                    working_timeout: Duration::ZERO,
+                    ..DrainOptions::default()
+                },
+            )
+            .unwrap_err();
+
+        assert!(queue.join("inflight/receipt-failure.json").is_file());
+        assert!(!queue.join("failed/receipt-failure.json").exists());
+        let stop_error = manager.stop("worker").unwrap_err();
+        assert!(stop_error
+            .to_string()
+            .contains("prompt submission is in flight"));
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
     }
 
     #[test]

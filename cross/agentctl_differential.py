@@ -47,11 +47,6 @@ def _normalize(value: object) -> object:
                               "launch_executable_device", "launch_executable_inode",
                           } and item is not None
                           else "<ARCHIVE>" if key == "archive"
-                          # Native identity diagnostics use edition-specific quote styles.
-                          else re.sub(r'"([a-z][a-z0-9-]*)"', r"'\1'", item)
-                          if key in {"probe_error", "reason", "health_reason", "last_unhealthy_reason",
-                                     "last_unknown_reason", "blocked", "delivery_error"}
-                          and isinstance(item, str)
                           else _normalize(item))
                 for key, item in value.items()}
     return value
@@ -124,8 +119,8 @@ def _session_storage_shape(root: Path) -> tuple[set[str], set[str], str, str]:
 
 
 def _legacy_session_document(document: object) -> dict[str, object]:
-    """Downgrade one v3 fixture to the last supported flat v1 shape."""
-    if not isinstance(document, dict) or document.get("schema") != "agentctl-session/v3":
+    """Downgrade one current v4 fixture to the last supported flat v1 shape."""
+    if not isinstance(document, dict) or document.get("schema") != "agentctl-session/v4":
         raise AssertionError(f"expected current session storage, got {document!r}")
     launch = document.get("launch")
     goal = document.get("goal")
@@ -137,7 +132,9 @@ def _legacy_session_document(document: object) -> dict[str, object]:
         raise AssertionError(f"invalid current session storage: {document!r}")
     legacy = {
         str(key): value for key, value in document.items()
-        if key not in {"schema", "launch", "goal", "native_session", "extensions"}
+        if key not in {
+            "schema", "launch", "goal", "native_session", "terminal", "extensions",
+        }
     }
     executable = launch.get("executable")
     if executable is None:
@@ -275,7 +272,7 @@ def _lifecycle(harness: Harness, report: Report) -> None:
         report.require(
             f"primary/{kind}/storage-schema",
             shapes[0] == shapes[1]
-            and shapes[0][2:] == ("agentctl-session/v3", "agentctl-launch/v2")
+            and shapes[0][2:] == ("agentctl-session/v4", "agentctl-launch/v2")
             and not {
                 "harness", "cwd", "adapter", "mode", "backend", "model", "resume",
                 "arguments", "launch_argv", "launch_executable", "runtime_home",

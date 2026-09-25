@@ -103,15 +103,11 @@ struct RawWorkspaceSelector {
     label: FieldPresence<String>,
 }
 
+#[derive(Default)]
 enum FieldPresence<T> {
+    #[default]
     Missing,
     Present(T),
-}
-
-impl<T> Default for FieldPresence<T> {
-    fn default() -> Self {
-        Self::Missing
-    }
 }
 
 impl<'de, T: Deserialize<'de>> Deserialize<'de> for FieldPresence<T> {

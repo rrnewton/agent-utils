@@ -60,7 +60,10 @@ deliberately detection-first: it does not restart a harness or replay input.
   Once the exact boot/PID/start/image identity has been re-proved, delivery uses
   Herdr's unwrapped terminal source plus the ruled composer and current footer.
   If the complete prompt cannot be established, Enter remains withheld and the
-  delivery stays quarantined for explicit reconciliation.
+  delivery stays quarantined for explicit reconciliation. Once an exact prompt
+  receives one Enter, a stale composer redraw does not authorize a second
+  Enter: the first key may already have been accepted and a repeated key could
+  act on a later dialog.
 
 ## Canonical fleet snapshot boundary
 
@@ -88,7 +91,7 @@ The state model has one writable owner for each fact:
 
 Session-v1/v2 fields and the old headless presentation/permission files are
 decode-only migration inputs. Any successful current write emits only the
-tagged session-v3/runtime-v2 form and removes superseded sidecars after the
+tagged session-v4/runtime-v3 form and removes superseded sidecars after the
 canonical publication succeeds.
 
 `agentctl`'s versioned session record is the authority for launch intent,
@@ -152,7 +155,7 @@ are not yet a general restart specification:
 ## Python/Rust port status at this base
 
 This branch was rebased onto agent-utils
-`3819a76dfefb7a3395090c4924f9ba52b1bdffa6`; later rebases must update this
+`e6a545e93917bd245b2512b0eed99954798349b7`; later rebases must update this
 provenance before publication.
 It is not an all-Rust port:
 

@@ -1,12 +1,14 @@
 """Lifecycle regressions for visible subagents, including failures and ownership changes."""
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
@@ -21,7 +23,8 @@ from agentctl.errors import (
     RuntimeIdentityMismatch,
 )
 from agentctl.subagents import (
-    ManagedAgents, TerminalState, environment_entries, harness_arguments,
+    AgentRecord, ManagedAgents, TerminalState, environment_entries,
+    harness_arguments,
 )
 import agentctl.legacy_cli as cli
 import agentctl.cli as unified_cli
@@ -1209,6 +1212,31 @@ def test_busy_delivery_stays_pending_and_can_drain(tmp_path: Path, monkeypatch: 
     assert fake.submitted == ["next turn"]
 
 
+def test_live_muse_paused_goal_is_healthy_but_not_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="muse")
+    fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="done")
+    divider = "─" * 40
+
+    def paused_screen(_pane: str, *, source: str, lines: int) -> str:
+        del source, lines
+        return (
+            f"Muse Code 1.4.0\n{divider}\n❯\n{divider}\n"
+            "Goal (paused)\nwatermelon-preview · xhigh · /work · YOLO\n"
+        )
+
+    monkeypatch.setattr(fake, "read", paused_screen)
+    status, healthy = manager.status_with_health("worker")
+    assert healthy is True
+    assert status["health"] == "healthy"
+    assert status["agent_status"] == "paused"
+    with pytest.raises(AgentPending, match="last status=paused"):
+        manager.send("worker", "continue", ready_timeout=0)
+    assert fake.submitted == []
+
+
 def test_busy_drain_does_not_hold_the_lifecycle_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1249,6 +1277,158 @@ def test_busy_drain_does_not_hold_the_lifecycle_lock(
     assert outcome == ["pending"]
 
 
+def test_pause_committed_during_readiness_prevents_prompt_injection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="working")
+    sleeping = threading.Event()
+    release = threading.Event()
+    clock = {"now": 0.0}
+    failures: list[BaseException] = []
+
+    def sleep(_seconds: float) -> None:
+        sleeping.set()
+        assert release.wait(5)
+        clock["now"] = 2.0
+
+    def invoke() -> None:
+        try:
+            manager.send(
+                "worker", "must remain pending after pause",
+                message_id="pause-race", ready_timeout=1,
+                sleep=sleep, monotonic=lambda: clock["now"],
+            )
+        except BaseException as exc:  # captured for deterministic thread assertion
+            failures.append(exc)
+
+    thread = threading.Thread(target=invoke, daemon=True)
+    thread.start()
+    assert sleeping.wait(5)
+    assert manager.pause("worker")["paused"] is True
+    fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="idle")
+    release.set()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    assert len(failures) == 1
+    assert "runtime identity changed before submission" in str(failures[0])
+    assert fake.submitted == []
+    assert (manager.registry / "worker/queue/inbox/pause-race.json").is_file()
+
+
+def test_readiness_waiter_never_mutates_a_reused_agent_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    original = manager.start("worker", cwd=str(tmp_path))
+    fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="working")
+    sleeping = threading.Event()
+    release = threading.Event()
+    clock = {"now": 0.0}
+    failures: list[BaseException] = []
+
+    def sleep(_seconds: float) -> None:
+        sleeping.set()
+        assert release.wait(5)
+        clock["now"] = 2.0
+
+    def invoke() -> None:
+        try:
+            manager.send(
+                "worker", "old generation prompt", message_id="old-pending",
+                ready_timeout=1, sleep=sleep, monotonic=lambda: clock["now"],
+            )
+        except BaseException as exc:  # captured for deterministic thread assertion
+            failures.append(exc)
+
+    thread = threading.Thread(target=invoke, daemon=True)
+    thread.start()
+    assert sleeping.wait(5)
+    manager.stop("worker", expected_token=str(original["token"]))
+    replacement = manager.start("worker", cwd=str(tmp_path))
+    replacement_record = manager.get("worker")
+    assert replacement_record.token == replacement["token"]
+    new_id = agent.enqueue_bound(
+        manager._queue("worker"), replacement_record.target(),
+        "new generation prompt", message_id="new-pending",
+    )
+    new_path = manager.registry / f"worker/queue/inbox/{new_id}.json"
+    before = new_path.read_bytes()
+
+    release.set()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    assert len(failures) == 1
+    assert "replaced" in str(failures[0])
+    assert new_path.read_bytes() == before
+    assert fake.submitted == []
+
+
+def test_submission_waiting_for_lifecycle_holds_neither_queue_nor_target_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    target_lock_path = tmp_path / "target.lock"
+    monkeypatch.setattr(agent, "_target_lock_path", lambda _pane: str(target_lock_path))
+    readiness = threading.Event()
+    release_readiness = threading.Event()
+    guard_attempt = threading.Event()
+    original_info = fake.pane_info
+    original_guard = manager._submission_guard
+    first_probe = True
+
+    def blocking_info(pane_id: str) -> AgentPaneInfo:
+        nonlocal first_probe
+        if first_probe:
+            first_probe = False
+            readiness.set()
+            assert release_readiness.wait(5)
+        return original_info(pane_id)
+
+    @contextmanager
+    def observed_guard(record: AgentRecord) -> Iterator[None]:
+        guard_attempt.set()
+        with original_guard(record):
+            yield
+
+    monkeypatch.setattr(fake, "pane_info", blocking_info)
+    monkeypatch.setattr(manager, "_submission_guard", observed_guard)
+    outcomes: list[str] = []
+
+    def send() -> None:
+        outcomes.append(manager.send(
+            "worker", "ordered injection", message_id="ordered-injection",
+            ready_timeout=1, working_timeout=1,
+        ).outcome)
+
+    thread = threading.Thread(target=send, daemon=True)
+    thread.start()
+    assert readiness.wait(5)
+    with manager._lock("worker"):
+        release_readiness.set()
+        assert guard_attempt.wait(5)
+        queue_lock = agent._open_private_lock(
+            str(manager.registry / "worker/queue/.delivery.lock"),
+            "test queue lock",
+        )
+        target_lock = agent._open_private_lock(
+            str(target_lock_path), "test target lock",
+        )
+        try:
+            fcntl.flock(queue_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(target_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(target_lock)
+            os.close(queue_lock)
+    thread.join(5)
+    assert not thread.is_alive()
+    assert outcomes == ["delivered"]
+
+
 def test_stop_refuses_an_inflight_prompt_before_runtime_teardown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1269,11 +1449,88 @@ def test_stop_refuses_an_inflight_prompt_before_runtime_teardown(
     assert (manager.registry / "worker" / "agent.json").is_file()
 
 
+def test_failed_receipt_is_durable_before_inflight_teardown_fence_is_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    fake.wait_fails = True
+    record = manager.get("worker")
+    agent.enqueue_bound(
+        manager._queue("worker"), record.target(),
+        "cross the prompt barrier once", message_id="receipt-failure",
+    )
+    queue = manager.registry / "worker/queue"
+    # Force the failure-receipt publication itself to fail. The injected
+    # prompt's primary artifact must remain in inflight, where stop sees it.
+    (queue / "failed/receipt-failure.json.error").mkdir()
+
+    with pytest.raises(OSError):
+        manager.drain("worker", ready_timeout=0, working_timeout=0)
+
+    assert (queue / "inflight/receipt-failure.json").is_file()
+    assert not (queue / "failed/receipt-failure.json").exists()
+    with pytest.raises(AgentDeliveryError, match="submission is in flight"):
+        manager.stop("worker")
+    assert fake.closed == []
+
+
+@pytest.mark.parametrize("terminal_state", ["processed", "failed"])
+def test_terminal_delivery_result_survives_concurrent_stop_archive(
+    terminal_state: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    started = manager.start("worker", cwd=str(tmp_path), harness="codex")
+    fake.wait_fails = terminal_state == "failed"
+    transitioned = threading.Event()
+    release = threading.Event()
+    original_transition = agent._transition
+    results: list[agent.QueueResult] = []
+    failures: list[BaseException] = []
+
+    def gated_transition(source: str, destination: str, **kwargs: object) -> None:
+        original_transition(source, destination, **kwargs)
+        if f"/inflight/" in source and f"/{terminal_state}/" in destination:
+            transitioned.set()
+            assert release.wait(5)
+
+    def invoke() -> None:
+        try:
+            results.append(manager.send(
+                "worker", "one exact injected prompt",
+                message_id=f"terminal-{terminal_state}",
+                ready_timeout=0, working_timeout=0,
+            ))
+        except BaseException as exc:  # captured for deterministic thread assertion
+            failures.append(exc)
+
+    monkeypatch.setattr(agent, "_transition", gated_transition)
+    thread = threading.Thread(target=invoke, daemon=True)
+    thread.start()
+    assert transitioned.wait(5)
+    try:
+        stopped = manager.stop("worker", expected_token=str(started["token"]))
+        assert Path(str(stopped["archive"])).is_dir()
+    finally:
+        release.set()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    if terminal_state == "processed":
+        assert failures == []
+        assert [result.outcome for result in results] == ["delivered"]
+    else:
+        assert results == []
+        assert len(failures) == 1
+        assert isinstance(failures[0], AgentPossiblySubmitted)
+    assert not (manager.registry / "worker").exists()
+
+
 def test_lost_native_status_event_reconciles_without_reinjecting_prompt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
-    manager.start("worker", cwd=str(tmp_path), harness="claude")
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
     fake.wait_fails = True
     fake.working_after_prompt = True
 
@@ -1563,7 +1820,55 @@ def test_muse_submits_matching_prebuffered_prompt_once_without_reinjection(
     assert keys == ["Enter"]
 
 
-def test_claude_staged_prompt_uses_exact_submit_chord_once(
+def test_muse_completed_turn_beyond_200_lines_uses_bounded_deep_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="muse")
+    prompt = "retain exact delivery evidence beyond the visible tail"
+    divider = "─" * 40
+    footer = "kiki · xhigh · /work · YOLO\n"
+    submitted = False
+    keys: list[str] = []
+    reads: list[tuple[str, int]] = []
+
+    def read(_pane: str, *, source: str, lines: int) -> str:
+        assert source in ("visible", "recent-unwrapped") and lines > 0
+        reads.append((source, lines))
+        if not submitted:
+            return f"old transcript\n{divider}\n❯ {prompt}\n{divider}\n{footer}"
+        full = (
+            f"❯ {prompt}\n"
+            + "".join(f"◆ output line {index}\n" for index in range(300))
+            + f"{divider}\n❯\n{divider}\n{footer}"
+        )
+        return "\n".join(full.splitlines()[-lines:]) + "\n"
+
+    def send_keys(_pane: str, key: str) -> None:
+        nonlocal submitted
+        assert key == "Enter" and not submitted
+        keys.append(key)
+        submitted = True
+
+    monkeypatch.setattr(fake, "read", read)
+    monkeypatch.setattr(
+        fake, "send_text", lambda *_args, **_kwargs: pytest.fail("must not repaste"),
+        raising=False,
+    )
+    monkeypatch.setattr(fake, "send_keys", send_keys)
+    fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="done")
+
+    result = manager.send(
+        "worker", prompt, message_id="muse-deep-history",
+        ready_timeout=0, working_timeout=1,
+    )
+
+    assert result.outcome == "delivered"
+    assert keys == ["Enter"]
+    assert ("recent-unwrapped", 5000) in reads
+
+
+def test_claude_staged_prompt_uses_enter_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
@@ -1580,6 +1885,8 @@ def test_claude_staged_prompt_uses_exact_submit_chord_once(
         if state == "staged":
             return (
                 f"{divider}\n❯ {prompt}\n"
+                # This observed UI hint identifies the staged composer; the
+                # supported terminal path submits it with one Enter.
                 "  ctrl+x ctrl+s to send now\n"
                 f"{divider}\n⏵⏵ auto mode on · esc to interrupt\n"
             )
@@ -1599,7 +1906,7 @@ def test_claude_staged_prompt_uses_exact_submit_chord_once(
 
     def submit(pane: str, keys_value: str) -> None:
         nonlocal state
-        assert pane == "w1:p1" and keys_value == "ctrl+x ctrl+s"
+        assert pane == "w1:p1" and keys_value == "Enter"
         assert state == "staged"
         keys.append(keys_value)
         state = "submitted"
@@ -1615,8 +1922,9 @@ def test_claude_staged_prompt_uses_exact_submit_chord_once(
 
     assert delivered.outcome == "delivered"
     assert fake.submitted == [prompt]
-    assert keys == ["ctrl+x ctrl+s"]
-    assert ("recent-unwrapped", 5000) in reads
+    assert keys == ["Enter"]
+    assert ("visible", 200) in reads
+    assert state == "submitted"
 
 
 def test_claude_new_active_ui_confirms_submission_when_long_turn_left_history(
@@ -1656,7 +1964,7 @@ def test_claude_new_active_ui_confirms_submission_when_long_turn_left_history(
 
     def submit(_pane: str, keys_value: str) -> None:
         nonlocal state
-        assert keys_value == "ctrl+x ctrl+s" and state == "staged"
+        assert keys_value == "Enter" and state == "staged"
         keys.append(keys_value)
         state = "submitted"
 
@@ -1671,8 +1979,123 @@ def test_claude_new_active_ui_confirms_submission_when_long_turn_left_history(
     )
 
     assert delivered.outcome == "delivered"
-    assert keys == ["ctrl+x ctrl+s"]
+    assert keys == ["Enter"]
+    assert ("visible", 200) in reads
+    assert state == "submitted"
+
+
+def test_claude_exact_executed_turn_confirms_delivery_while_herdr_stays_idle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="claude")
+    prompt = "inspect the exact submitted change and report its evidence"
+    divider = "─" * 40
+
+    def screen(_pane: str, *, source: str, lines: int) -> str:
+        assert source in ("visible", "recent-unwrapped") and lines > 0
+        if fake.submitted:
+            # The prompt was accepted and its turn already completed. Herdr's
+            # advisory status never left idle, reproducing the false quarantine
+            # seen in persistent Opus lanes.
+            return (
+                f"❯ {prompt}\n"
+                f"● Completed the requested review\n{divider}\n❯\n{divider}\n"
+                "auto mode on\n"
+            )
+        return f"{divider}\n❯\n{divider}\nauto mode on\n"
+
+    monkeypatch.setattr(fake, "read", screen)
+    fake.wait_fails = True
+    fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="idle")
+
+    result = manager.send(
+        "worker", prompt, message_id="claude-executed-idle-status",
+        ready_timeout=0, working_timeout=1,
+    )
+
+    assert result.outcome == "delivered"
+    assert fake.submitted == [prompt]
+    queue = manager.registry / "worker" / "queue"
+    assert not list((queue / "failed").iterdir())
+    assert len(list((queue / "processed").iterdir())) == 1
+
+
+def test_claude_delayed_exact_turn_reconciles_without_reinjection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="claude")
+    prompt = "confirm the exact turn after one delayed redraw"
+    divider = "─" * 40
+    reads: list[tuple[str, int]] = []
+
+    def screen(_pane: str, *, source: str, lines: int) -> str:
+        assert source in ("visible", "recent-unwrapped") and lines > 0
+        reads.append((source, lines))
+        idle = f"{divider}\n❯\n{divider}\nauto mode on\n"
+        if not fake.submitted:
+            return idle
+        # The first post-submit visible sample, including pane-info's derived
+        # status probe, can lag. Only the deeper history carries the exact turn.
+        if source == "visible":
+            return idle
+        return (
+            f"❯ {prompt}\n● Executing\n{divider}\n❯\n{divider}\n"
+            "auto mode on\n"
+        )
+
+    monkeypatch.setattr(fake, "read", screen)
+    fake.wait_fails = True
+    fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="idle")
+
+    result = manager.send(
+        "worker", prompt, message_id="claude-delayed-turn",
+        ready_timeout=0, working_timeout=1,
+    )
+
+    assert result.outcome == "delivered"
+    assert fake.submitted == [prompt]
     assert ("recent-unwrapped", 5000) in reads
+    assert len(list((manager.registry / "worker/queue/processed").iterdir())) == 1
+
+
+def test_claude_unrelated_activity_does_not_confirm_a_lagging_native_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="claude")
+    prompt = "do not confuse background activity with this exact prompt"
+    divider = "─" * 40
+    post_submit_reads = 0
+
+    def screen(_pane: str, *, source: str, lines: int) -> str:
+        nonlocal post_submit_reads
+        assert source in ("visible", "recent-unwrapped") and lines > 0
+        idle = f"{divider}\n❯\n{divider}\nauto mode on\n"
+        if not fake.submitted:
+            return idle
+        post_submit_reads += 1
+        if post_submit_reads == 1:
+            return idle
+        return (
+            "● Unrelated background agent is still running\n"
+            f"{divider}\n❯\n{divider}\nauto mode on\n"
+        )
+
+    monkeypatch.setattr(fake, "read", screen)
+    fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="idle")
+
+    with pytest.raises(AgentPossiblySubmitted, match="ambiguous outcome"):
+        manager.send(
+            "worker", prompt, message_id="claude-unrelated-activity",
+            ready_timeout=0, working_timeout=0.05,
+        )
+
+    assert fake.submitted == [prompt]
+    assert fake.closed == []
+    queue = manager.registry / "worker/queue"
+    assert (queue / "failed/claude-unrelated-activity.json").is_file()
 
 
 def test_claude_different_staged_prompt_is_not_overwritten_or_submitted(
@@ -1705,7 +2128,7 @@ def test_claude_different_staged_prompt_is_not_overwritten_or_submitted(
         )
 
 
-def test_muse_retries_enter_once_only_while_exact_prompt_remains_staged(
+def test_muse_never_retries_enter_when_the_first_submit_has_no_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
@@ -1717,8 +2140,8 @@ def test_muse_retries_enter_once_only_while_exact_prompt_remains_staged(
 
     def read(_pane: str, *, source: str, lines: int) -> str:
         assert source in ("visible", "recent-unwrapped") and lines > 0
-        if len(keys) >= 2:
-            return f"❯ {prompt}\n◆ Thinking\n{divider}\n❯\n{divider}\n{footer}"
+        # A delayed redraw is not proof that the first accepted Enter was
+        # ignored. A second Enter could act on a later dialog or empty prompt.
         return f"old transcript\n{divider}\n❯ {prompt}\n{divider}\n{footer}"
 
     monkeypatch.setattr(fake, "read", read)
@@ -1729,13 +2152,13 @@ def test_muse_retries_enter_once_only_while_exact_prompt_remains_staged(
     monkeypatch.setattr(fake, "send_keys", lambda _pane, key: keys.append(key))
     fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="done")
 
-    result = manager.send(
-        "worker", prompt, message_id="second-enter",
-        ready_timeout=0, working_timeout=1,
-    )
+    with pytest.raises(AgentPossiblySubmitted, match="ambiguous outcome"):
+        manager.send(
+            "worker", prompt, message_id="one-enter-only",
+            ready_timeout=0, working_timeout=0.05,
+        )
 
-    assert result.outcome == "delivered"
-    assert keys == ["Enter", "Enter"]
+    assert keys == ["Enter"]
 
 
 def test_muse_refuses_different_prebuffered_prompt_without_terminal_input(
@@ -1837,7 +2260,7 @@ def test_private_state_and_malformed_record_are_rejected(tmp_path: Path, monkeyp
         manager.get("worker")
 
 
-def test_agent_record_v3_has_one_tagged_launch_and_goal_authority(
+def test_agent_record_v4_has_one_tagged_launch_and_goal_authority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, _fake = setup(tmp_path, monkeypatch)
@@ -1903,7 +2326,7 @@ def test_agent_record_v4_requires_exact_terminal_union(
     assert decoded._legacy_terminal_authority is True
 
 
-def test_agent_record_v3_reads_profiled_claude_launch_without_flat_harness_field(
+def test_agent_record_v4_reads_profiled_claude_launch_without_flat_harness_field(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, _fake = setup(tmp_path, monkeypatch)

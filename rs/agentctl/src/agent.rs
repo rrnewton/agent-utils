@@ -366,6 +366,14 @@ pub trait AgentApi: Send + Sync {
         lines: Option<usize>,
     ) -> crate::error::Result<String>;
 
+    /// Acquire an optional owner-generation guard before the durable injection boundary.
+    fn acquire_submission_guard_with_runtime(
+        &self,
+        _runtime: &dyn AgentRuntime,
+    ) -> crate::error::Result<Option<File>> {
+        Ok(None)
+    }
+
     /// Cancellation-aware pane enumeration used by long-running service owners.
     fn panes_with_runtime(&self, runtime: &dyn AgentRuntime) -> crate::error::Result<Vec<Pane>> {
         if runtime.cancelled() {
@@ -618,7 +626,7 @@ pub(crate) fn resolve_target_with_runtime<A: AgentApi + ?Sized>(
         }
         if matches.len() != 1 {
             return Err(AgentError::delivery(format!(
-                "expected exactly one live pane for session {session_value:?}, found {}",
+                "expected exactly one live pane for session '{session_value}', found {}",
                 matches.len()
             )));
         }
@@ -721,6 +729,40 @@ pub(crate) fn enqueue_goal(root: &Path, text: &str, message_id: &str) -> AgentRe
     )
 }
 
+/// Bind one lifecycle-serialized generation's queue and persist a prompt without draining it.
+///
+/// The caller's lifecycle transaction serializes competing managed enqueues. The create-only
+/// artifact and forward-ordered phase lookup preserve duplicate-ID refusal without taking the
+/// delivery lock in the inverse lifecycle -> queue order.
+pub(crate) fn enqueue_bound_with_runtime(
+    root: &Path,
+    target: &Target,
+    text: &str,
+    message_id: Option<&str>,
+    kind: QueueMessageKind,
+    runtime: &dyn AgentRuntime,
+) -> AgentResult<String> {
+    bind_queue_with_runtime(root, target, runtime)?;
+    enqueue_internal(root, text, message_id, false, kind, runtime)
+}
+
+pub(crate) fn enqueue_bound(
+    root: &Path,
+    target: &Target,
+    text: &str,
+    message_id: Option<&str>,
+    kind: QueueMessageKind,
+) -> AgentResult<String> {
+    enqueue_bound_with_runtime(
+        root,
+        target,
+        text,
+        message_id,
+        kind,
+        &SystemRuntime::default(),
+    )
+}
+
 fn enqueue_internal(
     root: &Path,
     text: &str,
@@ -789,83 +831,233 @@ pub fn drain_with_runtime<A: AgentApi + ?Sized>(
     options: DrainOptions,
     runtime: &dyn AgentRuntime,
 ) -> AgentResult<QueueResult> {
-    bind_queue_with_runtime(root, target, runtime)?;
-    let directories = prepare(root)?;
-    let queue_lock_path = root.join(".delivery.lock");
-    let queue_lock = open_private_lock(&queue_lock_path, "queue delivery lock")?;
-    lock_exclusive_with_runtime(&queue_lock, &queue_lock_path, "queue delivery", runtime)?;
-    let mut delivered = Vec::new();
-    let mut quarantined = recover_inflight(&directories)?;
-    let mut blocked = None;
-    let mut target_lock: Option<File> = None;
-    let mut locked_pane_id: Option<String> = None;
-    let mut initial_info: Option<AgentPaneInfo> = None;
-    for path in json_paths(&directories.inbox)? {
-        let (mut document, attempts) = match load_message(&path).and_then(|document| {
-            let attempts = delivery_attempts(&document, &path)?;
-            Ok((document, attempts))
-        }) {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                let identifier = quarantine_raw(
-                    &path,
-                    &directories.failed,
-                    "invalid_message",
-                    &error.to_string(),
-                )?;
-                quarantined.push(identifier);
-                continue;
-            }
-        };
-        let filename_id = message_id_from_path(&path)?;
-        let identifier = document
-            .get("id")
-            .and_then(Value::as_str)
-            .map_or(filename_id.clone(), str::to_owned);
-        if attempts >= options.max_attempts {
-            let detail = format!(
-                "message {identifier} reached the maximum delivery-attempt count ({attempts} >= {}); retained pending",
-                options.max_attempts
-            );
-            document.insert("delivery_state".to_owned(), json!("pending"));
-            document.insert("delivery_error".to_owned(), json!(detail));
-            document.insert("delivery_blocked_at".to_owned(), json!(unix_seconds()));
-            atomic_json(&path, &Value::Object(document))?;
-            blocked = Some(detail);
-            break;
-        }
+    drain_impl(client, target, root, options, runtime, false)
+}
 
-        let readiness = (|| -> AgentResult<AgentPaneInfo> {
-            if target_lock.is_none() {
-                let (lock, info) = lock_resolved_target_with_runtime(client, target, runtime)?;
-                target_lock = Some(lock);
-                locked_pane_id = Some(info.pane_id.clone());
-                initial_info = Some(info);
+/// Drain a queue that was bound while its owning lifecycle generation was locked.
+pub(crate) fn drain_existing_with_runtime<A: AgentApi + ?Sized>(
+    client: &A,
+    target: &Target,
+    root: &Path,
+    options: DrainOptions,
+    runtime: &dyn AgentRuntime,
+) -> AgentResult<QueueResult> {
+    drain_impl(client, target, root, options, runtime, true)
+}
+
+pub(crate) fn drain_existing<A: AgentApi + ?Sized>(
+    client: &A,
+    target: &Target,
+    root: &Path,
+    options: DrainOptions,
+) -> AgentResult<QueueResult> {
+    drain_existing_with_runtime(client, target, root, options, &SystemRuntime::default())
+}
+
+fn drain_impl<A: AgentApi + ?Sized>(
+    client: &A,
+    target: &Target,
+    root: &Path,
+    options: DrainOptions,
+    runtime: &dyn AgentRuntime,
+    require_existing: bool,
+) -> AgentResult<QueueResult> {
+    let directories = if require_existing {
+        validate_existing_queue(root)?;
+        validate_existing_binding(root, target)?;
+        let directories = QueueDirectories::new(root);
+        if directories
+            .all()
+            .iter()
+            .any(|directory| !directory.is_dir())
+        {
+            return Err(AgentError::delivery("delivery queue is incomplete"));
+        }
+        directories
+    } else {
+        bind_queue_with_runtime(root, target, runtime)?;
+        prepare(root)?
+    };
+    let queue_lock_path = root.join(".delivery.lock");
+    let mut delivered = Vec::new();
+    let mut quarantined = Vec::new();
+    let mut blocked = None;
+    let mut pending_snapshot = Vec::new();
+    let mut recovered = false;
+    while blocked.is_none() {
+        let selected = {
+            // Recovery and pending-state writes belong to the captured owner
+            // generation too. Stop/name reuse may happen while readiness is
+            // observed, so path-based state is never touched without this
+            // short generation proof.
+            let _generation = match client.acquire_submission_guard_with_runtime(runtime) {
+                Ok(generation) => generation,
+                Err(_error) if !delivered.is_empty() || !quarantined.is_empty() => {
+                    return Ok(queue_result(
+                        delivered,
+                        quarantined,
+                        pending_snapshot,
+                        blocked,
+                    ));
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let queue_lock = open_private_lock(&queue_lock_path, "queue delivery lock")?;
+            lock_exclusive_with_runtime(&queue_lock, &queue_lock_path, "queue delivery", runtime)?;
+            if !recovered {
+                quarantined.extend(recover_inflight(&directories)?);
+                recovered = true;
             }
+            let selected = match select_pending_head(&directories, &options, &mut quarantined)? {
+                PendingHead::Empty => None,
+                PendingHead::Blocked(detail) => {
+                    blocked = Some(detail);
+                    None
+                }
+                PendingHead::Ready(selected) => Some(selected),
+            };
+            pending_snapshot = identifiers(&directories.inbox)?;
+            selected
+        };
+        let Some(selected) = selected else {
+            break;
+        };
+
+        // A busy agent may remain busy for hours. Neither the FIFO lock nor the
+        // pane lock is held while observing readiness; the exact head and pane
+        // are both re-proved immediately before the durable inflight barrier.
+        let readiness = resolve_target_with_runtime(client, target, runtime).and_then(|initial| {
+            let pane_id = initial.pane_id.clone();
             wait_ready(
                 client,
                 target,
                 options.ready_timeout,
                 runtime,
-                locked_pane_id
-                    .as_deref()
-                    .expect("target lock always records its pane"),
-                initial_info.take(),
+                &pane_id,
+                Some(initial),
             )
-        })();
-        let info = match readiness {
+        });
+        let ready_info = match readiness {
             Ok(info) => info,
             Err(error) => {
-                let detail = error.to_string();
-                document.insert("delivery_state".to_owned(), json!("pending"));
-                document.insert("delivery_error".to_owned(), json!(detail));
-                document.insert("delivery_blocked_at".to_owned(), json!(unix_seconds()));
-                atomic_json(&path, &Value::Object(document))?;
-                blocked = Some(detail);
-                break;
+                let _generation = match client.acquire_submission_guard_with_runtime(runtime) {
+                    Ok(generation) => generation,
+                    Err(_guard_error) if !delivered.is_empty() || !quarantined.is_empty() => {
+                        return Ok(queue_result(
+                            delivered,
+                            quarantined,
+                            pending_snapshot,
+                            blocked,
+                        ));
+                    }
+                    Err(guard_error) => return Err(guard_error.into()),
+                };
+                let queue_lock = open_private_lock(&queue_lock_path, "queue delivery lock")?;
+                lock_exclusive_with_runtime(
+                    &queue_lock,
+                    &queue_lock_path,
+                    "queue delivery",
+                    runtime,
+                )?;
+                match select_pending_head(&directories, &options, &mut quarantined)? {
+                    PendingHead::Ready(current) if current == selected => {
+                        let detail = error.to_string();
+                        publish_pending_error(&selected.path, selected.document, &detail)?;
+                        blocked = Some(detail);
+                    }
+                    PendingHead::Ready(current) if current.path == selected.path => {
+                        return Err(AgentError::delivery(format!(
+                            "queued message {} changed during readiness wait",
+                            selected.path.display()
+                        )));
+                    }
+                    PendingHead::Blocked(detail) => blocked = Some(detail),
+                    PendingHead::Ready(_) | PendingHead::Empty => {}
+                }
+                continue;
             }
         };
 
+        // Registry-backed clients acquire their lifecycle generation first,
+        // establishing the global lifecycle -> queue -> target order. The
+        // guard is released immediately after the irreversible prompt call.
+        // Failure here means this client no longer owns the generation. Do
+        // not follow retained pathnames: stop may already have archived the
+        // old directory and reused the name for a new agent.
+        let submission_guard = match client.acquire_submission_guard_with_runtime(runtime) {
+            Ok(guard) => guard,
+            Err(_error) if !delivered.is_empty() || !quarantined.is_empty() => {
+                return Ok(queue_result(
+                    delivered,
+                    quarantined,
+                    pending_snapshot,
+                    blocked,
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        let queue_lock = open_private_lock(&queue_lock_path, "queue delivery lock")?;
+        lock_exclusive_with_runtime(&queue_lock, &queue_lock_path, "queue delivery", runtime)?;
+        let current = match select_pending_head(&directories, &options, &mut quarantined)? {
+            PendingHead::Ready(current) if current == selected => current,
+            PendingHead::Ready(current) if current.path == selected.path => {
+                return Err(AgentError::delivery(format!(
+                    "queued message {} changed during readiness wait",
+                    selected.path.display()
+                )));
+            }
+            PendingHead::Blocked(detail) => {
+                blocked = Some(detail);
+                continue;
+            }
+            PendingHead::Ready(_) | PendingHead::Empty => continue,
+        };
+        let (target_lock, confirmed) =
+            match lock_resolved_target_with_runtime(client, target, runtime) {
+                Ok(locked) => locked,
+                Err(error) => {
+                    let detail = error.to_string();
+                    publish_pending_error(&current.path, current.document, &detail)?;
+                    blocked = Some(detail);
+                    continue;
+                }
+            };
+        if confirmed.pane_id != ready_info.pane_id {
+            let detail = format!(
+                "target moved from ready pane {:?} to {:?} before submission",
+                ready_info.pane_id, confirmed.pane_id
+            );
+            publish_pending_error(&current.path, current.document, &detail)?;
+            blocked = Some(detail);
+            drop(target_lock);
+            continue;
+        }
+        let confirmed_pane_id = confirmed.pane_id.clone();
+        let info = match wait_ready(
+            client,
+            target,
+            Duration::ZERO,
+            runtime,
+            &confirmed_pane_id,
+            Some(confirmed),
+        ) {
+            Ok(info) => info,
+            Err(error) => {
+                let detail = error.to_string();
+                publish_pending_error(&current.path, current.document, &detail)?;
+                blocked = Some(detail);
+                drop(target_lock);
+                continue;
+            }
+        };
+
+        let PendingDelivery {
+            path,
+            mut document,
+            attempts,
+            identifier,
+        } = current;
         let inflight_path = directories.inflight.join(path.file_name().ok_or_else(|| {
             AgentError::delivery(format!(
                 "queued message has no filename: {}",
@@ -877,14 +1069,13 @@ pub fn drain_with_runtime<A: AgentApi + ?Sized>(
         document.insert("delivery_state".to_owned(), json!("inflight"));
         document.insert("inflight_at".to_owned(), json!(unix_seconds()));
         atomic_json(&inflight_path, &Value::Object(document.clone()))?;
+        pending_snapshot = identifiers(&directories.inbox)?;
 
-        match deliver_one(
-            client,
-            &info,
-            &message_text(&document)?,
-            options.working_timeout,
-            runtime,
-        ) {
+        let injected = inject_one(client, &info, &message_text(&document)?, runtime);
+        drop(submission_guard);
+        let delivered_result = injected
+            .and_then(|()| confirm_delivery(client, &info, options.working_timeout, runtime));
+        match delivered_result {
             Ok(()) => {
                 document.insert("delivery_state".to_owned(), json!("processed"));
                 document.insert("confirmed_at".to_owned(), json!(unix_seconds()));
@@ -909,14 +1100,31 @@ pub fn drain_with_runtime<A: AgentApi + ?Sized>(
                 let failed_path = directories
                     .failed
                     .join(path.file_name().expect("validated queued filename"));
-                transition(&inflight_path, &failed_path)?;
+                // Keep the primary artifact in `inflight` until its complete
+                // failure receipt is durable. Stop treats that directory as
+                // the teardown fence and cannot archive between these writes.
                 failed_metadata(&failed_path, "possibly_submitted", &detail)?;
+                transition(&inflight_path, &failed_path)?;
                 quarantined.push(identifier);
             }
         }
+        drop(target_lock);
     }
 
-    let pending = identifiers(&directories.inbox)?;
+    Ok(queue_result(
+        delivered,
+        quarantined,
+        pending_snapshot,
+        blocked,
+    ))
+}
+
+fn queue_result(
+    delivered: Vec<String>,
+    quarantined: Vec<String>,
+    pending: Vec<String>,
+    blocked: Option<String>,
+) -> QueueResult {
     let outcome = if blocked.is_some() {
         QueueOutcome::Pending
     } else if quarantined.is_empty() {
@@ -924,14 +1132,14 @@ pub fn drain_with_runtime<A: AgentApi + ?Sized>(
     } else {
         QueueOutcome::PossiblySubmitted
     };
-    Ok(QueueResult {
+    QueueResult {
         message_id: String::new(),
         delivered,
         quarantined,
         pending,
         blocked,
         outcome,
-    })
+    }
 }
 
 /// Durably enqueue one prompt, drain its bound FIFO, and require confirmed delivery.
@@ -1121,29 +1329,6 @@ pub fn send_identified<A: AgentApi + ?Sized>(
         &SystemRuntime::default(),
         QueueMessageIntent {
             message_id: Some(message_id),
-            kind: QueueMessageKind::Message,
-        },
-    )
-}
-
-pub(crate) fn send_identified_with_runtime<A: AgentApi + ?Sized>(
-    client: &A,
-    target: &Target,
-    root: &Path,
-    text: &str,
-    options: DrainOptions,
-    runtime: &dyn AgentRuntime,
-    message_id: Option<&str>,
-) -> AgentResult<QueueResult> {
-    send_identified_with_kind(
-        client,
-        target,
-        root,
-        text,
-        options,
-        runtime,
-        QueueMessageIntent {
-            message_id,
             kind: QueueMessageKind::Message,
         },
     )
@@ -1398,11 +1583,10 @@ fn wait_ready<A: AgentApi + ?Sized>(
     }
 }
 
-fn deliver_one<A: AgentApi + ?Sized>(
+fn inject_one<A: AgentApi + ?Sized>(
     client: &A,
     info: &AgentPaneInfo,
     text: &str,
-    working_timeout: Duration,
     runtime: &dyn AgentRuntime,
 ) -> AgentResult<()> {
     client
@@ -1412,7 +1596,15 @@ fn deliver_one<A: AgentApi + ?Sized>(
                 "pane {} agent-prompt outcome is unknown; prompt may have been submitted: {error}",
                 info.pane_id
             ))
-        })?;
+        })
+}
+
+fn confirm_delivery<A: AgentApi + ?Sized>(
+    client: &A,
+    info: &AgentPaneInfo,
+    working_timeout: Duration,
+    runtime: &dyn AgentRuntime,
+) -> AgentResult<()> {
     let Some(chunk) = runtime.delivery_wait_chunk() else {
         let millis = working_timeout.as_millis().clamp(1, u64::MAX.into()) as u64;
         return client
@@ -1458,6 +1650,20 @@ struct QueueDirectories {
     failed: PathBuf,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingDelivery {
+    path: PathBuf,
+    document: Map<String, Value>,
+    attempts: u64,
+    identifier: String,
+}
+
+enum PendingHead {
+    Empty,
+    Blocked(String),
+    Ready(PendingDelivery),
+}
+
 impl QueueDirectories {
     fn new(root: &Path) -> Self {
         Self {
@@ -1471,6 +1677,66 @@ impl QueueDirectories {
     fn all(&self) -> [&Path; 4] {
         [&self.inbox, &self.inflight, &self.processed, &self.failed]
     }
+}
+
+fn publish_pending_error(
+    path: &Path,
+    mut document: Map<String, Value>,
+    detail: &str,
+) -> AgentResult<()> {
+    document.insert("delivery_state".to_owned(), json!("pending"));
+    document.insert("delivery_error".to_owned(), json!(detail));
+    document.insert("delivery_blocked_at".to_owned(), json!(unix_seconds()));
+    atomic_json(path, &Value::Object(document))
+}
+
+fn select_pending_head(
+    directories: &QueueDirectories,
+    options: &DrainOptions,
+    quarantined: &mut Vec<String>,
+) -> AgentResult<PendingHead> {
+    for path in json_paths(&directories.inbox)? {
+        let (document, attempts) = match load_message(&path).and_then(|document| {
+            let attempts = delivery_attempts(&document, &path)?;
+            Ok((document, attempts))
+        }) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                let identifier = quarantine_raw(
+                    &path,
+                    &directories.failed,
+                    "invalid_message",
+                    &error.to_string(),
+                )?;
+                quarantined.push(identifier);
+                continue;
+            }
+        };
+        let filename_id = message_id_from_path(&path)?;
+        let identifier = document
+            .get("id")
+            .and_then(Value::as_str)
+            .map_or(filename_id, str::to_owned);
+        if attempts >= options.max_attempts {
+            let detail = format!(
+                "message {identifier} reached the maximum delivery-attempt count ({attempts} >= {}); retained pending",
+                options.max_attempts
+            );
+            if document.get("delivery_state").and_then(Value::as_str) != Some("pending")
+                || document.get("delivery_error").and_then(Value::as_str) != Some(&detail)
+            {
+                publish_pending_error(&path, document, &detail)?;
+            }
+            return Ok(PendingHead::Blocked(detail));
+        }
+        return Ok(PendingHead::Ready(PendingDelivery {
+            path,
+            document,
+            attempts,
+            identifier,
+        }));
+    }
+    Ok(PendingHead::Empty)
 }
 
 fn prepare(root: &Path) -> AgentResult<QueueDirectories> {
@@ -1590,7 +1856,7 @@ fn bind_queue(root: &Path, target: &Target) -> AgentResult<()> {
     bind_queue_with_runtime(root, target, &SystemRuntime::default())
 }
 
-fn bind_queue_with_runtime(
+pub(crate) fn bind_queue_with_runtime(
     root: &Path,
     target: &Target,
     runtime: &dyn AgentRuntime,
@@ -1691,7 +1957,7 @@ pub(crate) fn relocate_existing_binding(
     atomic_json(&binding_path, &new_expected)
 }
 
-fn validate_existing_queue(root: &Path) -> AgentResult<()> {
+pub(crate) fn validate_existing_queue(root: &Path) -> AgentResult<()> {
     match fs::symlink_metadata(root) {
         Ok(_) => validate_private_directory(root, "queue directory", false)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -2442,6 +2708,8 @@ mod tests {
         state: Mutex<FakeState>,
         run_gate: Option<Arc<RunGate>>,
         cancel_after_run: Option<Arc<AtomicBool>>,
+        guard_calls: AtomicU64,
+        guard_fail_after: Option<u64>,
     }
 
     impl FakeAgent {
@@ -2464,6 +2732,8 @@ mod tests {
                 }),
                 run_gate: None,
                 cancel_after_run: None,
+                guard_calls: AtomicU64::new(0),
+                guard_fail_after: None,
             }
         }
 
@@ -2495,6 +2765,12 @@ mod tests {
             fake
         }
 
+        fn with_guard_failure_after(states: &[&str], successful_calls: u64) -> Self {
+            let mut fake = Self::new(states);
+            fake.guard_fail_after = Some(successful_calls);
+            fake
+        }
+
         fn runs(&self) -> Vec<String> {
             self.state.lock().expect("fake state").runs.clone()
         }
@@ -2505,6 +2781,19 @@ mod tests {
     }
 
     impl AgentApi for FakeAgent {
+        fn acquire_submission_guard_with_runtime(
+            &self,
+            _runtime: &dyn AgentRuntime,
+        ) -> crate::error::Result<Option<File>> {
+            let call = self.guard_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.guard_fail_after.is_some_and(|limit| call >= limit) {
+                return Err(AdapterError::unavailable(
+                    "owner generation retired after terminal delivery transition",
+                ));
+            }
+            Ok(None)
+        }
+
         fn panes(&self) -> crate::error::Result<Vec<Pane>> {
             Ok(self.panes.clone())
         }
@@ -2630,6 +2919,60 @@ mod tests {
         }
 
         fn sleep(&self, duration: Duration) {
+            self.millis.fetch_add(
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+                AtomicOrdering::SeqCst,
+            );
+        }
+    }
+
+    #[derive(Default)]
+    struct BlockingReadinessRuntime {
+        millis: AtomicU64,
+        state: Mutex<(bool, bool)>,
+        changed: Condvar,
+    }
+
+    impl BlockingReadinessRuntime {
+        fn wait_for_sleep(&self, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
+            let mut state = self.state.lock().expect("readiness gate");
+            while !state.0 {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return false;
+                }
+                let (next, timed) = self
+                    .changed
+                    .wait_timeout(state, remaining)
+                    .expect("readiness gate wait");
+                state = next;
+                if timed.timed_out() && !state.0 {
+                    return false;
+                }
+            }
+            true
+        }
+
+        fn release(&self) {
+            let mut state = self.state.lock().expect("readiness gate");
+            state.1 = true;
+            self.changed.notify_all();
+        }
+    }
+
+    impl AgentRuntime for BlockingReadinessRuntime {
+        fn monotonic(&self) -> Duration {
+            Duration::from_millis(self.millis.load(AtomicOrdering::SeqCst))
+        }
+
+        fn sleep(&self, duration: Duration) {
+            let mut state = self.state.lock().expect("readiness gate");
+            state.0 = true;
+            self.changed.notify_all();
+            while !state.1 {
+                state = self.changed.wait(state).expect("readiness gate wait");
+            }
             self.millis.fetch_add(
                 u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
                 AtomicOrdering::SeqCst,
@@ -2857,6 +3200,51 @@ mod tests {
     }
 
     #[test]
+    fn busy_readiness_holds_neither_queue_nor_target_lock() {
+        let directory = TestDirectory::new("busy-lock-lifetime");
+        let fake = FakeAgent::new(&["working"]);
+        let runtime = BlockingReadinessRuntime::default();
+        std::thread::scope(|scope| {
+            let sender = scope.spawn(|| {
+                send_with_runtime(
+                    &fake,
+                    &target(),
+                    directory.path(),
+                    "wait without locks",
+                    DrainOptions {
+                        ready_timeout: Duration::from_millis(250),
+                        ..DrainOptions::default()
+                    },
+                    &runtime,
+                )
+            });
+            let entered = runtime.wait_for_sleep(Duration::from_secs(5));
+
+            let queue_lock =
+                open_private_lock(&directory.path().join(".delivery.lock"), "test queue lock")
+                    .unwrap();
+            let queue_available = FileExt::try_lock_exclusive(&queue_lock).is_ok();
+            if queue_available {
+                FileExt::unlock(&queue_lock).unwrap();
+            }
+            let target_path = target_lock_path("w1:p1").unwrap();
+            let target_lock = open_private_lock(&target_path, "test target lock").unwrap();
+            let target_available = FileExt::try_lock_exclusive(&target_lock).is_ok();
+            if target_available {
+                FileExt::unlock(&target_lock).unwrap();
+            }
+
+            runtime.release();
+            let error = sender.join().unwrap().unwrap_err();
+            assert!(entered, "delivery never entered readiness polling");
+            assert!(queue_available, "readiness wait held the queue lock");
+            assert!(target_available, "readiness wait held the target lock");
+            assert_eq!(error.outcome(), Some(QueueOutcome::Pending));
+            assert!(fake.runs().is_empty());
+        });
+    }
+
+    #[test]
     fn explicit_send_reserves_ids_under_the_delivery_transition_lock() {
         let directory = TestDirectory::new("explicit-send-reservation");
         let fake = FakeAgent::new(&["idle"]);
@@ -2922,6 +3310,41 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(fake.runs().is_empty());
+    }
+
+    #[test]
+    fn terminal_delivery_result_survives_generation_loss_after_transition() {
+        for failed in [false, true] {
+            let directory = TestDirectory::new(if failed {
+                "terminal-failed-generation-loss"
+            } else {
+                "terminal-processed-generation-loss"
+            });
+            let fake = FakeAgent::with_guard_failure_after(&["idle"], 2);
+            fake.state.lock().unwrap().fail_wait = failed;
+
+            let result = send_with_runtime(
+                &fake,
+                &target(),
+                directory.path(),
+                "one exact injected prompt",
+                DrainOptions {
+                    working_timeout: Duration::ZERO,
+                    ..DrainOptions::default()
+                },
+                &FakeRuntime::default(),
+            );
+
+            if failed {
+                let error = result.unwrap_err();
+                assert_eq!(error.outcome(), Some(QueueOutcome::PossiblySubmitted));
+                assert!(!error.safe_to_retry());
+            } else {
+                assert_eq!(result.unwrap().outcome, QueueOutcome::Delivered);
+            }
+            assert_eq!(fake.runs(), ["one exact injected prompt"]);
+            assert_eq!(fake.guard_calls.load(AtomicOrdering::SeqCst), 3);
+        }
     }
 
     #[test]

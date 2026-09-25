@@ -150,6 +150,30 @@ def test_headless_start_binds_first_later_exact_runner_identity(
     assert cast(dict[str, object], status["runtime_liveness"])["runner_alive"] is True
 
 
+def test_sessions_status_and_list_derive_harness_from_v4_launch_only_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, _fake, _calls = setup(tmp_path, monkeypatch)
+    sessions.start_session(
+        "worker", cwd=str(tmp_path), mode="interactive", harness="claude",
+    )
+    path = sessions.registry / "worker/agent.json"
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["schema"] == "agentctl-session/v4"
+    assert stored["launch"]["harness"] == "claude"
+    assert "harness" not in stored
+
+    status, status_healthy = sessions.status_with_health("worker")
+    rows, list_healthy = sessions.list_with_health()
+
+    assert status_healthy is True
+    assert status["harness"] == "claude"
+    assert list_healthy is True
+    assert [(row["name"], row["harness"]) for row in rows] == [
+        ("worker", "claude"),
+    ]
+
+
 @pytest.mark.parametrize("first,second", [("interactive", "headless"), ("headless", "interactive"), ("headless", "headless")])
 def test_modes_share_names_and_preserve_the_original_generation(first: str, second: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     sessions, fake, calls = setup(tmp_path, monkeypatch)

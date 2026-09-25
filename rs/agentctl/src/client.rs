@@ -757,6 +757,25 @@ pub(crate) fn muse_verified_process_composer(screen: &str) -> bool {
         .is_some_and(|(_, composer)| muse_editor_segments(&composer).is_some())
 }
 
+pub(crate) fn muse_verified_process_goal_paused(screen: &str) -> bool {
+    if muse_composer_regions(screen, false).is_none() {
+        return false;
+    }
+    let lines = screen.lines().collect::<Vec<_>>();
+    let Some(bottom) = lines.iter().rposition(|line| {
+        let trimmed = line.trim();
+        trimmed.chars().count() >= 3
+            && trimmed
+                .chars()
+                .all(|value| matches!(value, '─' | '━' | '═'))
+    }) else {
+        return false;
+    };
+    lines[bottom + 1..]
+        .iter()
+        .any(|line| line.trim() == "Goal (paused)")
+}
+
 fn muse_composer_regions(screen: &str, require_header: bool) -> Option<(String, String)> {
     let lines = screen.lines().collect::<Vec<_>>();
     let dividers = lines
@@ -774,12 +793,6 @@ fn muse_composer_regions(screen: &str, require_header: bool) -> Option<(String, 
     let bottom = *dividers.last()?;
     let top = *dividers.get(dividers.len().checked_sub(2)?)?;
     let footer = &lines[bottom + 1..];
-    let status_fields = footer
-        .iter()
-        .find_map(|line| {
-            (!line.trim().is_empty()).then(|| line.split('·').map(str::trim).collect::<Vec<_>>())
-        })
-        .unwrap_or_default();
     let versioned_header = lines[..top].iter().any(|line| {
         line.trim()
             .strip_prefix("Muse Code ")
@@ -792,10 +805,13 @@ fn muse_composer_regions(screen: &str, require_header: bool) -> Option<(String, 
             })
     });
     let current_footer = (!require_header || versioned_header)
-        && matches!(status_fields.len(), 3 | 4)
-        && status_fields.iter().all(|field| !field.is_empty())
-        && muse_effort(status_fields[1])
-        && (status_fields.len() == 3 || matches!(status_fields[3], "YOLO" | "Auto-review"));
+        && footer.iter().any(|line| {
+            let fields = line.split('·').map(str::trim).collect::<Vec<_>>();
+            matches!(fields.len(), 3 | 4)
+                && fields.iter().all(|field| !field.is_empty())
+                && muse_effort(fields[1])
+                && (fields.len() == 3 || matches!(fields[3], "YOLO" | "Auto-review"))
+        });
     if !current_footer {
         return None;
     }
@@ -2037,7 +2053,7 @@ impl HerdrClient {
         };
         if !observed {
             return Err(AdapterError::unavailable(format!(
-                "custom harness {kind:?} is not the foreground process in pane {pane_id}"
+                "custom harness '{kind}' is not the foreground process in pane {pane_id}"
             )));
         }
         Ok(())
@@ -2124,7 +2140,7 @@ impl HerdrClient {
                     format!("; last process probe: {error}")
                 });
             AdapterError::unavailable(format!(
-                "custom harness {kind:?} was not the foreground process in pane {pane_id}{detail}"
+                "custom harness '{kind}' was not the foreground process in pane {pane_id}{detail}"
             ))
         })?;
         // Persist before trust/readiness/report checks. If any later step fails, stop still has
@@ -2134,7 +2150,7 @@ impl HerdrClient {
         while Instant::now() < deadline {
             if !self.recorded_custom_harness_observed(pane_id, &observed, &cancelled)? {
                 return Err(AdapterError::unavailable(format!(
-                    "custom harness {kind:?} identity changed before readiness in pane {pane_id}"
+                    "custom harness '{kind}' identity changed before readiness in pane {pane_id}"
                 )));
             }
             let screen = self.read_with_cancellation(pane_id, "visible", Some(200), &cancelled)?;
@@ -2155,12 +2171,12 @@ impl HerdrClient {
         }
         if !ready {
             return Err(AdapterError::unavailable(format!(
-                "custom harness {kind:?} did not reach a verified idle composer in pane {pane_id}"
+                "custom harness '{kind}' did not reach a verified idle composer in pane {pane_id}"
             )));
         }
         if !self.recorded_custom_harness_observed(pane_id, &observed, &cancelled)? {
             return Err(AdapterError::unavailable(format!(
-                "custom harness {kind:?} identity changed before report in pane {pane_id}"
+                "custom harness '{kind}' identity changed before report in pane {pane_id}"
             )));
         }
         self.call_ok_with_cancellation(
@@ -2243,7 +2259,7 @@ impl HerdrClient {
             .recorded_custom_harness_process(pane_id, identity, &|| false)?
             .ok_or_else(|| {
                 AdapterError::unavailable(format!(
-                    "custom harness {kind:?} is not the foreground process in pane {pane_id}"
+                    "custom harness '{kind}' is not the foreground process in pane {pane_id}"
                 ))
             })?;
         commit()?;
@@ -2253,7 +2269,7 @@ impl HerdrClient {
             .is_none()
         {
             return Err(AdapterError::unavailable(format!(
-                "custom harness {kind:?} changed during state publication in pane {pane_id}"
+                "custom harness '{kind}' changed during state publication in pane {pane_id}"
             )));
         }
         require_live_pidfd(&observed.pidfd, identity.pid)
@@ -2284,13 +2300,13 @@ impl HerdrClient {
     ) -> Result<String> {
         let result = self.call_with_cancellation(
             &strings(&["agent", "get", name]),
-            &format!("agent get {name:?}"),
+            &format!("agent get '{name}'"),
             cancelled,
         )?;
         let info = required_object(&result, "agent", "agent get")?;
         if required_string(info, "name", "agent get")? != name {
             return Err(AdapterError::unavailable(format!(
-                "agent get: returned a different agent name for {name:?}"
+                "agent get: returned a different agent name for '{name}'"
             )));
         }
         required_string(info, "pane_id", "agent get")
@@ -3039,11 +3055,11 @@ mod tests {
             value[closing + 2] = *state;
             assert_eq!(parse_process_stat(&value, 4242).unwrap().state, *state);
         }
-        for state in [b'Q', b'0', b')', b'\x7f'] {
+        for state in b"Q0)\x7f" {
             let mut value =
                 b"4242 (worker) S 7 9 11 0 -1 4194304 1 2 3 4 13 14 15 16 20 0 1 0 22 0 0".to_vec();
             let closing = value.iter().rposition(|byte| *byte == b')').unwrap();
-            value[closing + 2] = state;
+            value[closing + 2] = *state;
             assert!(parse_process_stat(&value, 4242).is_err());
         }
     }
@@ -3206,6 +3222,17 @@ mod tests {
         assert!(!muse_idle_composer(&format!(
             "{divider}❯\n{divider}watermelon-preview · xhigh · /work/project · Auto-review\n"
         )));
+    }
+
+    #[test]
+    fn verified_muse_paused_goal_is_structural_footer_state() {
+        let divider = "─".repeat(40);
+        let footer = "watermelon-preview · xhigh · /work/project · YOLO";
+        let paused = format!("Muse Code 1.4.0\n{divider}\n❯\n{divider}\nGoal (paused)\n{footer}\n");
+        let transcript_echo =
+            format!("Muse Code 1.4.0\nGoal (paused)\n{divider}\n❯\n{divider}\n{footer}\n");
+        assert!(muse_verified_process_goal_paused(&paused));
+        assert!(!muse_verified_process_goal_paused(&transcript_echo));
     }
 
     #[test]

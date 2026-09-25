@@ -18,7 +18,7 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -37,6 +37,7 @@ from agentctl.client import (
     claude_staged_composer,
     muse_idle_composer,
     muse_verified_process_composer,
+    muse_verified_process_goal_paused,
     muse_verified_process_idle_composer,
     muse_verified_process_prompt_in_composer,
     muse_verified_process_prompt_is_exact_composer,
@@ -1260,6 +1261,15 @@ def _goal_prompt(harness: str, objective: str) -> str:
     )
 
 
+@dataclass(frozen=True)
+class _CustomPaneSubmission:
+    harness: str
+    text: str
+    prior_transcript_count: int
+    prior_active: bool
+    activity_receipt_allowed: bool
+
+
 class _WorkspaceClient:
     """Add exact workspace checks to every queue readiness probe, after enqueue."""
 
@@ -1273,11 +1283,19 @@ class _WorkspaceClient:
         self.goal_objective: str | None = None
         self.queue = queue
         self.check_prompt = check_prompt
-        # harness, exact text, prior submitted-turn count, prior active UI.
-        self.custom_submission: tuple[str, str, int, bool] | None = None
+        self.custom_submission: _CustomPaneSubmission | None = None
         self.deadline = deadline
-        self.submission_guard = submission_guard
+        self._submission_guard_factory = submission_guard
         self.adopted_evidence_observation: AdoptedRuntimeEvidence | None = None
+
+    @contextmanager
+    def acquire_submission_guard(self) -> Iterator[None]:
+        """Pin the owner generation before the FIFO and pane lock boundary."""
+        if self._submission_guard_factory is None:
+            yield
+            return
+        with self._submission_guard_factory():
+            yield
 
     def _timeout(self, purpose: str) -> float:
         assert self.deadline is not None
@@ -1547,7 +1565,10 @@ class _WorkspaceClient:
                     # lost report-agent update.
                     agent=self.record.launch.harness,
                     status=(
-                        "idle"
+                        "paused"
+                        if (reported_status in ("idle", "done")
+                            and muse_verified_process_goal_paused(screen))
+                        else "idle"
                         if (
                             muse_idle_composer(screen)
                             or (
@@ -1584,13 +1605,7 @@ class _WorkspaceClient:
         return self.client.workspace_label(workspace_id)
 
     def prompt_agent(self, pane_id: str, command: str) -> None:
-        guard = (
-            nullcontext()
-            if self.submission_guard is None
-            else self.submission_guard()
-        )
-        with guard:
-            self._prompt_agent_under_guard(pane_id, command)
+        self._prompt_agent_under_guard(pane_id, command)
 
     def _prompt_agent_under_guard(self, pane_id: str, command: str) -> None:
         """Cross the injection boundary while the registry generation is pinned."""
@@ -1620,21 +1635,35 @@ class _WorkspaceClient:
                         "Claude editor contains different buffered input; no input was sent"
                     )
                 self.client.prompt_agent(pane_id, command)
+                # The native prompt call crossed the sole text-injection
+                # boundary. Retain its pre-injection baseline even if the
+                # first screen sample still lags the submitted turn; bounded
+                # confirmation can observe a later exact transcript without
+                # ever injecting the prompt again.
+                self.custom_submission = _CustomPaneSubmission(
+                    "claude", command, prior_count, prior_active, False,
+                )
             staged = self.read(pane_id, source="visible", lines=200)
             if not claude_prompt_is_exact_composer(staged, command):
+                # Herdr may have submitted and rendered the turn before this
+                # first read, even while its advisory status remains idle. Keep
+                # the exact pre-injection transcript/activity baseline so the
+                # bounded reconciliation below can prove that one submission
+                # occurred without ever reinjecting the prompt.
                 # An unrecognized screen retains Herdr's native submission and
                 # working-transition contract. It cannot authorize extra input.
                 return
             # Herdr 0.8 can report agent_prompted after only staging text in
-            # Claude's editor. The UI itself names this exact submit chord.
+            # Claude's editor. One Enter submits the exact verified composer;
+            # Ctrl-S is Claude's stash operation, not a submission receipt.
             verified = self.pane_info(pane_id)
             if verified.status != "staged":
                 raise HerdrUnavailable(
                     "Claude staged prompt changed before its submit chord"
                 )
-            self.client.send_keys(pane_id, "ctrl+x ctrl+s")
-            self.custom_submission = (
-                "claude", command, prior_count, prior_active,
+            self.client.send_keys(pane_id, "Enter")
+            self.custom_submission = _CustomPaneSubmission(
+                "claude", command, prior_count, prior_active, True,
             )
             return
         if "\0" in command or "\x1b" in command:
@@ -1693,10 +1722,10 @@ class _WorkspaceClient:
             pane_id, self.record.launch.harness, self.record.custom_process_identity
         )
         self.client.send_keys(pane_id, "Enter")
-        self.custom_submission = (
+        self.custom_submission = _CustomPaneSubmission(
             "muse", command,
             muse_verified_process_prompt_transcript_count(confirmed, command),
-            False,
+            False, True,
         )
 
     def wait_agent_status(self, pane_id: str, status: str, timeout_ms: int) -> None:
@@ -1707,7 +1736,16 @@ class _WorkspaceClient:
             else min(saved_deadline, operation_deadline)
         )
         try:
-            self._wait_agent_status_bounded(pane_id, status, timeout_ms)
+            try:
+                self._wait_agent_status_bounded(pane_id, status, timeout_ms)
+            except RuntimeIdentityMismatch:
+                raise
+            except HerdrUnavailable as exc:
+                if time.monotonic() >= operation_deadline:
+                    raise HerdrUnavailable(
+                        f"agent status confirmation timed out after {timeout_ms}ms"
+                    ) from exc
+                raise
         finally:
             self.deadline = saved_deadline
 
@@ -1716,11 +1754,18 @@ class _WorkspaceClient:
     ) -> None:
         """Reconcile one transition without exceeding its absolute deadline."""
         if self.custom_submission is not None and status == "working":
-            harness, command, prior_count, prior_active = self.custom_submission
+            submission = self.custom_submission
+            harness = submission.harness
+            command = submission.text
+            prior_count = submission.prior_transcript_count
+            prior_active = submission.prior_active
             deadline = time.monotonic() + timeout_ms / 1000
-            retry_after = time.monotonic() + min(0.25, timeout_ms / 2000)
-            retried_enter = False
             while time.monotonic() < deadline:
+                info = self.pane_info(pane_id)
+                if (info.status == status
+                        and submission.activity_receipt_allowed):
+                    self.custom_submission = None
+                    return
                 if harness == "muse":
                     if isinstance(cast(object, self.client), HerdrClient):
                         self.client.verify_custom_harness(
@@ -1734,7 +1779,7 @@ class _WorkspaceClient:
                             self.record.custom_process_identity,
                         )
                     screen = self.read(
-                        pane_id, source="recent-unwrapped", lines=200,
+                        pane_id, source="recent-unwrapped", lines=5000,
                     )
                     transcript_count = muse_verified_process_prompt_transcript_count(
                         screen, command,
@@ -1743,7 +1788,6 @@ class _WorkspaceClient:
                         screen, command,
                     )
                 else:
-                    self.pane_info(pane_id)
                     # Herdr's native status can lag a healthy Claude process.
                     # Bounded terminal history preserves long submitted turns
                     # after they leave the visible viewport.
@@ -1755,36 +1799,15 @@ class _WorkspaceClient:
                 if transcript_count > prior_count and not in_composer:
                     self.custom_submission = None
                     return
-                if (harness == "claude" and not prior_active
+                if (harness == "claude"
+                        and submission.activity_receipt_allowed
+                        and not prior_active
                         and not in_composer and claude_active_screen(screen)):
                     # Exact text and one documented submit chord were already
                     # verified. A newly active UI is a sufficient transition
                     # receipt when the full prompt is outside retained history.
                     self.custom_submission = None
                     return
-                if (harness == "muse" and not retried_enter
-                        and time.monotonic() >= retry_after
-                        and transcript_count == prior_count
-                        and muse_verified_process_prompt_is_exact_composer(
-                            screen, command,
-                        )):
-                    if isinstance(cast(object, self.client), HerdrClient):
-                        self.client.verify_custom_harness(
-                            pane_id, self.record.launch.harness,
-                            self.record.custom_process_identity,
-                            timeout=self._timeout("custom submission retry identity probe"),
-                        )
-                        self.client.send_keys(
-                            pane_id, "Enter",
-                            timeout=self._timeout("custom submission retry"),
-                        )
-                    else:
-                        self.client.verify_custom_harness(
-                            pane_id, self.record.launch.harness,
-                            self.record.custom_process_identity,
-                        )
-                        self.client.send_keys(pane_id, "Enter")
-                    retried_enter = True
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
             raise HerdrUnavailable(
                 "agent did not show a verified post-submission screen transition"
@@ -1876,6 +1899,9 @@ class ManagedAgents:
             record.custom_process_identity,
             record.foreign_shell_identity,
             record.runner_identity,
+            # Pause/resume changes the right to inject input. A pause that
+            # commits during readiness must invalidate this captured view.
+            record.paused,
         )
 
     @contextmanager
