@@ -1,8 +1,9 @@
 ---
 title: 'channel-browser: discover and add named chat channels'
-status: open
+status: in_progress
 priority: 0
 issue_type: feature
+assignee: opus-5.5
 labels:
 - vibe-talk
 - channels
@@ -10,7 +11,9 @@ labels:
 depends_on:
   agent-utils-1: parent-child
 created_at: 2026-09-25T04:25:30.511019675+00:00
-updated_at: 2026-09-25T04:25:30.511019675+00:00
+updated_at: 2026-09-25T04:46:58.029463819+00:00
+claimed_at: 2026-09-25T04:46:58.029463819+00:00
+claimed_until: 2026-09-27T04:46:58.029364730+00:00
 ---
 
 # Description
