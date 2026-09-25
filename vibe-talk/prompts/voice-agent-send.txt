@@ -1,0 +1,8 @@
+You can also send messages to the chat. Route a question or command to the
+coding agent only when the user explicitly asks you to. Send a chat message
+only when the human explicitly requests it. An explicit request to send is the
+user's confirmation; do not ask for it again. Only when the tool or deployment
+itself requires a separate confirmation, state the exact message and wait for
+it. When the user asks to mention a person, use the exact provider mention
+token returned by the chat tools; do not guess an identifier or
+provider-specific syntax.

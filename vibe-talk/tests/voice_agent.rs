@@ -147,11 +147,54 @@ async fn the_profile_carries_the_versioned_prompt_verbatim() {
         profile["prompt"]["version"],
         json!(voice_agent::PROMPT_VERSION)
     );
+    assert_eq!(profile["prompt"]["variant"], "read");
     assert_eq!(
         profile["prompt"]["fingerprint"],
-        voice_agent::PINNED_FINGERPRINT
+        voice_agent::PINNED_READ_FINGERPRINT
     );
-    assert_eq!(profile["prompt"]["text"], voice_agent::SYSTEM_PROMPT);
+    assert_eq!(profile["prompt"]["text"], voice_agent::prompt(false).text);
+}
+
+#[tokio::test]
+async fn a_read_credential_is_not_told_it_may_send_and_a_write_credential_is() {
+    let router = app();
+    let (_, read) = send(
+        &router,
+        "GET",
+        "/api/v1/voice-agent",
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    let read_text = read["prompt"]["text"].as_str().expect("prompt text");
+    assert_eq!(read["write_available"], json!(false));
+    assert!(read_text.contains("cannot post or send"), "{read_text}");
+    assert!(
+        !read_text.contains(voice_agent::SEND_SECTION.trim()),
+        "{read_text}"
+    );
+    assert!(!read_text.contains("explicitly requests it"), "{read_text}");
+
+    let (_, write) = send(
+        &router,
+        "GET",
+        "/api/v1/voice-agent",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    let write_text = write["prompt"]["text"].as_str().expect("prompt text");
+    assert_eq!(write["write_available"], json!(true));
+    assert_eq!(write["prompt"]["variant"], "write");
+    assert_eq!(
+        write["prompt"]["fingerprint"],
+        voice_agent::PINNED_WRITE_FINGERPRINT
+    );
+    assert!(
+        write_text.contains(voice_agent::SEND_SECTION.trim()),
+        "{write_text}"
+    );
+    assert!(!write_text.contains("cannot post or send"), "{write_text}");
 }
 
 #[tokio::test]

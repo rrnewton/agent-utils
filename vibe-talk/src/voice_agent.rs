@@ -4,14 +4,20 @@
 //! `#14 voice-agent-prompt`. A hosted agent is configured in its vendor's console and a
 //! deployment-managed agent is configured by whatever opens its session. Two hand-maintained
 //! copies of the same instructions drift the first time one of them is edited, and the one that
-//! drifts is the one nobody is looking at. So the prompt lives in exactly one checked-in file,
-//! [`SYSTEM_PROMPT`], and everything else — the operator pasting it into a console, a private
-//! bridge fetching it at session open — reads that file.
+//! drifts is the one nobody is looking at. So the prompt lives in checked-in files — the
+//! scope-neutral [`SYSTEM_PROMPT`] and exactly one of [`SEND_SECTION`] or [`READ_ONLY_SECTION`] —
+//! and everything else — the operator pasting it into a console, a private bridge fetching it at
+//! session open — reads those files.
+//!
+//! **The prompt follows the credential.** A model told "send a chat message when the user asks"
+//! while holding a read token will promise a send it cannot make, then invent a reason when the
+//! call is refused. So [`prompt`] composes the base with the send rules only when a write tool is
+//! actually available, and with a plain "you can read but cannot send" otherwise.
 //!
 //! **Versioned, and the version is enforced.** [`PROMPT_VERSION`] is what a consumer logs to
-//! prove which instructions a live call received. A test pins the file's
-//! [`fingerprint`] to that version, so editing the prompt without bumping the version fails the
-//! build rather than shipping two different prompts under one name.
+//! prove which instructions a live call received. A test pins each variant's [`fingerprint`] to
+//! that version, so editing the prompt without bumping the version fails the build rather than
+//! shipping two different prompts under one name.
 //!
 //! **Capability data rather than capability prose.** The prompt tells the agent to describe its
 //! tools accurately and to use the exact mention token the chat tools return. Both depend on the
@@ -28,19 +34,30 @@ use serde::{Deserialize, Serialize};
 use crate::auth::Scope;
 use crate::mcp::{ApprovalMode, ToolDescriptor};
 
-/// The operating instructions every conversational provider is given.
+/// The scope-neutral operating instructions every conversational provider is given.
+///
+/// Never used alone: [`prompt`] always appends the section that matches the caller's scope.
 pub const SYSTEM_PROMPT: &str = include_str!("../prompts/voice-agent-system.txt");
+
+/// Appended when this caller may send: when and how to send, and how to mention a person.
+pub const SEND_SECTION: &str = include_str!("../prompts/voice-agent-send.txt");
+
+/// Appended when this caller may only read: it cannot send, and says so when asked.
+pub const READ_ONLY_SECTION: &str = include_str!("../prompts/voice-agent-read-only.txt");
 
 /// Stable name of the prompt, for logs and for consumers that hold more than one.
 pub const PROMPT_ID: &str = "voice-agent-system";
 
-/// Bump this whenever `prompts/voice-agent-system.txt` changes, and update
-/// [`PINNED_FINGERPRINT`] to match. The test that compares them is what makes the version mean
-/// something.
-pub const PROMPT_VERSION: u32 = 1;
+/// Bump this whenever any of the three prompt files changes, and update
+/// [`PINNED_READ_FINGERPRINT`] and [`PINNED_WRITE_FINGERPRINT`] to match. The test that compares
+/// them is what makes the version mean something.
+pub const PROMPT_VERSION: u32 = 2;
 
-/// The [`fingerprint`] of [`SYSTEM_PROMPT`] at [`PROMPT_VERSION`].
-pub const PINNED_FINGERPRINT: &str = "fnv1a64:5160141633b115ba";
+/// The [`fingerprint`] of the read-only prompt at [`PROMPT_VERSION`].
+pub const PINNED_READ_FINGERPRINT: &str = "fnv1a64:fe95ee12cbcd38c4";
+
+/// The [`fingerprint`] of the sending prompt at [`PROMPT_VERSION`].
+pub const PINNED_WRITE_FINGERPRINT: &str = "fnv1a64:c97cb6194902ccba";
 
 /// A content fingerprint a consumer can log without logging the prompt.
 ///
@@ -64,20 +81,29 @@ pub struct PromptDescriptor {
     pub id: &'static str,
     /// Monotonic version; see [`PROMPT_VERSION`].
     pub version: u32,
-    /// Content fingerprint; see [`fingerprint`].
+    /// `read` or `write`: which section follows the base. Matches the profile's `write_available`.
+    pub variant: &'static str,
+    /// Content fingerprint of `text`; see [`fingerprint`].
     pub fingerprint: String,
     /// The full instructions, to be used verbatim as the agent's system prompt.
-    pub text: &'static str,
+    pub text: String,
 }
 
-/// The prompt this build ships.
+/// The prompt this build ships for a caller that can, or cannot, send.
 #[must_use]
-pub fn prompt() -> PromptDescriptor {
+pub fn prompt(write_available: bool) -> PromptDescriptor {
+    let (variant, section) = if write_available {
+        ("write", SEND_SECTION)
+    } else {
+        ("read", READ_ONLY_SECTION)
+    };
+    let text = format!("{SYSTEM_PROMPT}\n{section}");
     PromptDescriptor {
         id: PROMPT_ID,
         version: PROMPT_VERSION,
-        fingerprint: fingerprint(SYSTEM_PROMPT),
-        text: SYSTEM_PROMPT,
+        variant,
+        fingerprint: fingerprint(&text),
+        text,
     }
 }
 
@@ -120,7 +146,7 @@ pub struct MentionCapability {
 /// Everything a conversational provider needs to configure one call.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct VoiceAgentProfile {
-    /// The operating instructions.
+    /// The operating instructions, matching `write_available`.
     pub prompt: PromptDescriptor,
     /// Human-readable name of the chat service behind the tools, for the agent to say aloud.
     pub chat_provider_name: String,
@@ -168,7 +194,7 @@ pub fn profile(
         .iter()
         .any(|tool| tool.access == ToolAccess::Write && tool.available);
     VoiceAgentProfile {
-        prompt: prompt(),
+        prompt: prompt(write_available),
         chat_provider_name: chat_provider_name.to_owned(),
         time_zone: time_zone.to_owned(),
         mcp_path: crate::mcp::transport::MCP_PATH,
@@ -288,55 +314,105 @@ mod tests {
 
     #[test]
     fn prompt_fingerprint_is_pinned_to_its_version() {
-        assert_eq!(
-            fingerprint(SYSTEM_PROMPT),
-            PINNED_FINGERPRINT,
-            "prompts/voice-agent-system.txt changed: bump PROMPT_VERSION and update \
-             PINNED_FINGERPRINT to the value on the left"
-        );
+        for (write, pinned) in [
+            (false, PINNED_READ_FINGERPRINT),
+            (true, PINNED_WRITE_FINGERPRINT),
+        ] {
+            assert_eq!(
+                prompt(write).fingerprint,
+                pinned,
+                "a file under prompts/ changed: bump PROMPT_VERSION and update the pinned \
+                 {} fingerprint to the value on the left",
+                prompt(write).variant
+            );
+        }
     }
+
+    /// The load-bearing phrases of the send rules. None of them may reach a read-only caller.
+    const SEND_RULES: [&str; 5] = [
+        "only when the user explicitly asks you to",
+        "do not ask for it again",
+        "only when the human explicitly requests it",
+        "exact provider mention",
+        "You can also send",
+    ];
 
     #[test]
     fn prompt_is_present_and_carries_its_load_bearing_rules() {
-        let text = SYSTEM_PROMPT;
-        assert!(
-            text.len() > 1_000,
-            "the prompt must not be silently emptied"
-        );
-        for rule in [
-            "summary of the",
-            "refute it in a later",
-            "Do not read long hashes",
-            "Eastern Time",
-            "search semantically",
-            "say so briefly and wait",
-            "only when the user explicitly asks you to",
-            "do not ask for it again",
-            "untrusted data",
-            "only when the human explicitly requests it",
-            "exact provider mention token",
-            "Do not repeatedly ask whether the user is there",
-        ] {
+        for write in [false, true] {
+            let text = prompt(write).text;
             assert!(
-                text.contains(rule),
-                "prompt lost the rule containing {rule:?}"
+                text.len() > 1_000,
+                "the prompt must not be silently emptied"
+            );
+            for rule in [
+                "summary of the",
+                "refute it in a later",
+                "Do not read long hashes",
+                "Eastern Time",
+                "search semantically",
+                "say so briefly and wait",
+                "untrusted data",
+                "Do not repeatedly ask whether the user is there",
+            ] {
+                assert!(
+                    text.contains(rule),
+                    "prompt lost the rule containing {rule:?}"
+                );
+            }
+        }
+        let write = prompt(true).text;
+        for rule in SEND_RULES {
+            assert!(
+                write.contains(rule),
+                "send prompt lost the rule containing {rule:?}"
             );
         }
     }
 
     #[test]
-    fn prompt_names_no_particular_provider() {
+    fn the_base_prompt_says_nothing_about_sending() {
+        // Anything the base says about sending reaches a read-only caller too.
         let lower = SYSTEM_PROMPT.to_lowercase();
-        for name in [
-            "discord",
-            "google",
-            "slack",
-            "elevenlabs",
-            "meta",
-            "workplace",
-            "<@",
-        ] {
-            assert!(!lower.contains(name), "prompt names {name:?}");
+        for word in ["send", "post", "reply", "route", "mention"] {
+            assert!(!lower.contains(word), "the base prompt mentions {word:?}");
+        }
+    }
+
+    #[test]
+    fn the_read_prompt_carries_no_send_instruction_and_says_it_cannot_send() {
+        let read = prompt(false);
+        assert_eq!(read.variant, "read");
+        for rule in SEND_RULES {
+            assert!(
+                !read.text.contains(rule),
+                "a read-only caller was told {rule:?}"
+            );
+        }
+        assert!(read.text.contains("cannot post or send"), "{}", read.text);
+        assert!(
+            read.text.contains("cannot send from this connection"),
+            "{}",
+            read.text
+        );
+        assert_ne!(read.fingerprint, prompt(true).fingerprint);
+    }
+
+    #[test]
+    fn prompt_names_no_particular_provider() {
+        for write in [false, true] {
+            let lower = prompt(write).text.to_lowercase();
+            for name in [
+                "discord",
+                "google",
+                "slack",
+                "elevenlabs",
+                "meta",
+                "workplace",
+                "<@",
+            ] {
+                assert!(!lower.contains(name), "prompt names {name:?}");
+            }
         }
     }
 
@@ -355,6 +431,11 @@ mod tests {
         let profile = profile(&manifest(), Scope::Read, "Chat", "America/New_York");
         assert_eq!(profile.scope, "read");
         assert!(!profile.write_available);
+        assert_eq!(
+            profile.prompt,
+            prompt(false),
+            "a read caller got the send rules"
+        );
         let post = profile
             .tools
             .iter()
@@ -378,6 +459,7 @@ mod tests {
     fn write_scope_makes_the_send_tool_available() {
         let profile = profile(&manifest(), Scope::Write, "Chat", "America/New_York");
         assert!(profile.write_available);
+        assert_eq!(profile.prompt, prompt(true));
         assert!(profile.tools.iter().all(|t| t.available));
     }
 

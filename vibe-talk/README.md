@@ -1716,10 +1716,16 @@ and the implementation behind a deployment-managed socket belong in deployment c
 private operations documentation.
 
 Both hosted and deployment-managed conversational providers should use the checked-in
-[`prompts/voice-agent-system.txt`](prompts/voice-agent-system.txt) instructions. Keeping the prompt
-beside the protocol makes changes reviewable and prevents one provider from silently receiving a
-different role or chat-sending policy. `GET /api/v1/voice-agent` serves it as data: the prompt
-`id`, `version`, a `fingerprint` of its text, and the text itself, beside the chat provider's
+instructions under [`prompts/`](prompts/): the scope-neutral
+[`voice-agent-system.txt`](prompts/voice-agent-system.txt) followed by exactly one of
+[`voice-agent-send.txt`](prompts/voice-agent-send.txt), for a credential that may post, or
+[`voice-agent-read-only.txt`](prompts/voice-agent-read-only.txt), which tells the agent plainly that
+it can read but cannot send. The prompt follows the credential because an agent told it may send
+while holding a read token promises a send, has it refused, and then invents a reason. Keeping the
+prompt beside the protocol makes changes reviewable and prevents one provider from silently
+receiving a different role or chat-sending policy. `GET /api/v1/voice-agent` serves it as data:
+the prompt `id`, `version`, `variant` (`read` or `write`, always matching `write_available`), a
+`fingerprint` of its text, and the assembled text itself, beside the chat provider's
 display name, the operator's time zone, the MCP path, and every MCP tool with its `access`
 (`read`/`write`), whether it `requires_confirmation`, and whether it is `available` to the
 credential that asked. That answer is derived from the same manifest and the same scope filter as
@@ -1727,8 +1733,8 @@ credential that asked. That answer is derived from the same manifest and the sam
 its to use. A bridge that attaches this server's `/mcp` endpoint to its model should fetch the
 profile with the same credential it gives the MCP client. It may also load the public file at
 deployment time; its endpoint, credentials, and provider-specific tool transport remain outside
-this repository. Changing the prompt text means bumping `PROMPT_VERSION` and the pinned
-fingerprint in `src/voice_agent.rs`, which a unit test enforces.
+this repository. Changing any of the prompt files means bumping `PROMPT_VERSION` and both pinned
+fingerprints in `src/voice_agent.rs`, which a unit test enforces.
 
 **Startup timing.** "It takes a while to start talking" is not actionable; which phase takes the
 while is. For each `vibe-talk-v1` call the page records milliseconds since Start for
@@ -2676,6 +2682,14 @@ shape.
 **A read credential is not shown `post_reply` at all,** and is refused with HTTP `403` plus
 JSON-RPC `-32001` if it calls it anyway. Hiding and enforcing are separate on purpose: hiding a
 tool is never the thing that keeps it from running.
+
+**A channel may be named, but the id is what the model is told to pass.** Every tool's
+`channel_id` is described as "an id from list_channels" and lists the configured choices
+(`post_reply` lists only the writable ones). A model that passes the name it heard anyway —
+the configured label or the operator's alias, matched case-insensitively — reaches that channel;
+a name two channels share reaches neither. Naming only picks from the allowlist and never widens
+it: a read-only channel named by its label is still refused for posting. An `unknown_channel`
+result lists the ids to use instead, so a wrong guess costs one retry rather than the answer.
 
 **Every message a tool renders carries its author's mention token**, written as
 `[id | time | author <@author id>]`, so a model that wants to notify someone copies a working

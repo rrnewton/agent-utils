@@ -294,6 +294,22 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
         .get("channel_id")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let mut args = args;
+    let mut channel = channel;
+    // A channel named by its label or alias is the channel with that id. Resolved once, here,
+    // so every channel tool — and the access log — sees the id. A name that matches nothing is
+    // left as it is, and the allowlist refuses it below exactly as it refuses any other stranger.
+    if let Some(named) = channel.as_deref() {
+        if let Some(id) = ops::channel_named(state, named).await {
+            if let Some(fields) = args.as_object_mut() {
+                fields.insert(
+                    "channel_id".to_owned(),
+                    Value::String(id.as_str().to_owned()),
+                );
+                channel = Some(id.0);
+            }
+        }
+    }
     let text_len = args
         .get("text")
         .and_then(Value::as_str)
@@ -387,12 +403,30 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
                 Some(error.code()),
                 text_len,
             );
-            Outcome::Reply(Box::new(RpcResponse::ok(
-                id,
-                text_result(format!("{}: {error}", error.code()), true),
-            )))
+            let mut text = format!("{}: {error}", error.code());
+            // A model that named a channel wrongly needs the right names to try again, not a
+            // dead end. The REST routes keep the bare refusal; this caller is authenticated and
+            // could list the same channels with `list_channels` anyway, so nothing is disclosed.
+            if matches!(error, OpError::UnknownChannel) {
+                text.push_str(&format!(". {}", channel_choices(state).await));
+            }
+            Outcome::Reply(Box::new(RpcResponse::ok(id, text_result(text, true))))
         }
     }
+}
+
+/// The configured channels, as the ids a channel tool accepts.
+async fn channel_choices(state: &AppState) -> String {
+    let channels = ops::channels(state).await;
+    if channels.is_empty() {
+        return "No channels are configured on this bridge.".to_owned();
+    }
+    let listed = channels
+        .iter()
+        .map(|c| format!("{} (id {})", c.display_name(), c.id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Pass channel_id as one of these ids: {listed}")
 }
 
 async fn list_channels_text(state: &AppState) -> String {
@@ -828,6 +862,82 @@ mod tests {
         assert!(is_error(&outcome), "{:?}", result_text(&outcome));
         assert!(result_text(&outcome).starts_with("unknown_channel"));
         assert!(fake.posted().is_empty(), "{:?}", fake.posted());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_channel_answers_with_the_ids_to_use_instead() {
+        let (state, _fake) = testing::state();
+        let outcome = dispatch(
+            &state,
+            Scope::Read,
+            &call("digest_channel", json!({ "channel_id": "somewhere else" })),
+        )
+        .await;
+        assert!(is_error(&outcome));
+        let text = result_text(&outcome);
+        assert!(text.starts_with("unknown_channel"), "{text}");
+        assert!(
+            text.contains(&format!("build noise (id {READ_CHANNEL})")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("lead team (id {WRITE_CHANNEL})")),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_read_tool_accepts_a_channel_by_its_configured_label() {
+        let (state, fake) = testing::state();
+        fake.seed(
+            &ChannelId(READ_CHANNEL.to_owned()),
+            "lead",
+            "the mac runner is green again",
+        );
+        let window = ops::messages(&state, READ_CHANNEL, None)
+            .await
+            .expect("seeded channel reads");
+        let message = window.messages[0].id.clone();
+        for (tool, extra) in [
+            ("digest_channel", json!({})),
+            ("read_page", json!({})),
+            ("count_messages", json!({})),
+            ("find_message", json!({ "query": "mac runner" })),
+            ("read_message", json!({ "message_id": message.as_str() })),
+        ] {
+            let mut arguments = extra;
+            arguments["channel_id"] = json!("Build Noise");
+            let outcome = dispatch(&state, Scope::Read, &call(tool, arguments)).await;
+            assert!(!is_error(&outcome), "{tool}: {}", result_text(&outcome));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_label_names_the_channel_to_post_to_and_does_not_widen_what_may_be_posted_to() {
+        let (state, fake) = testing::state();
+        let outcome = dispatch(
+            &state,
+            Scope::Write,
+            &call(
+                "post_reply",
+                json!({ "channel_id": "LEAD TEAM", "text": "on it" }),
+            ),
+        )
+        .await;
+        assert!(!is_error(&outcome), "{}", result_text(&outcome));
+        let refused = dispatch(
+            &state,
+            Scope::Write,
+            &call(
+                "post_reply",
+                json!({ "channel_id": "build noise", "text": "hi" }),
+            ),
+        )
+        .await;
+        assert!(result_text(&refused).starts_with("channel_not_writable"));
+        let recorded = fake.posted();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].channel.as_str(), WRITE_CHANNEL);
     }
 
     #[tokio::test]

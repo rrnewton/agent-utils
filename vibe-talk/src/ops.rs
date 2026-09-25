@@ -127,6 +127,33 @@ pub async fn channels(state: &AppState) -> Vec<ChannelInfo> {
         .collect()
 }
 
+/// The configured channel a caller named, by id or by the name it was given.
+///
+/// A model asked about "lead team" passes "lead team", however clearly the tool description
+/// said to pass an id — so an exact id wins, and failing that, a configured label or operator
+/// alias matching case-insensitively (surrounding whitespace ignored) stands in for its id. This
+/// only picks a channel from the allowlist; it never admits one. A name two channels share
+/// names neither, so an ambiguous name resolves to nothing rather than to a guess.
+pub async fn channel_named(state: &AppState, name: &str) -> Option<ChannelId> {
+    let name = name.trim();
+    let channels = channels(state).await;
+    if let Some(exact) = channels.iter().find(|c| c.id.as_str() == name) {
+        return Some(exact.id.clone());
+    }
+    if name.is_empty() {
+        return None;
+    }
+    let same = |candidate: &str| candidate.trim().to_lowercase() == name.to_lowercase();
+    let mut named = channels
+        .iter()
+        .filter(|c| same(&c.label) || c.alias.as_deref().is_some_and(same));
+    let found = named.next()?;
+    if named.next().is_some() {
+        return None;
+    }
+    Some(found.id.clone())
+}
+
 /// The operator's local channel names, by channel id. `#39 channel-alias`.
 ///
 /// **A failure here is not a failure of the operation asking.** An alias is a decoration on a
@@ -1834,6 +1861,42 @@ mod tests {
             window.channel.display_name(),
             "the build channel",
             "a read must come back wearing the name the operator gave it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_channel_is_found_by_id_label_or_alias_but_never_outside_the_allowlist() {
+        let (state, _fake, _store) = testing::state_with_store();
+        let read = Some(crate::model::ChannelId(READ_CHANNEL.to_owned()));
+        assert_eq!(channel_named(&state, READ_CHANNEL).await, read);
+        assert_eq!(channel_named(&state, "build noise").await, read);
+        assert_eq!(channel_named(&state, "  Build NOISE ").await, read);
+        assert_eq!(channel_named(&state, "the build channel").await, None);
+        set_channel_alias(&state, READ_CHANNEL, "The Build Channel")
+            .await
+            .expect("set");
+        assert_eq!(channel_named(&state, "the build channel").await, read);
+        assert_eq!(
+            channel_named(&state, "build noise").await,
+            read,
+            "the configured label still names the channel once it has an alias"
+        );
+        for stranger in ["9999999999", "", "   ", "build", "noise"] {
+            assert_eq!(channel_named(&state, stranger).await, None, "{stranger:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_name_two_channels_answer_to_names_neither() {
+        let (state, _fake, _store) = testing::state_with_store();
+        set_channel_alias(&state, WRITE_CHANNEL, "Build Noise")
+            .await
+            .expect("set");
+        assert_eq!(channel_named(&state, "build noise").await, None);
+        assert_eq!(
+            channel_named(&state, WRITE_CHANNEL).await,
+            Some(crate::model::ChannelId(WRITE_CHANNEL.to_owned())),
+            "an exact id is never ambiguous"
         );
     }
 

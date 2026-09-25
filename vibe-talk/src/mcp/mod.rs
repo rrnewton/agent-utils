@@ -87,6 +87,21 @@ pub fn tool_manifest(channels: &[ChannelInfo]) -> Vec<ToolDescriptor> {
         .map(|c| format!("{} (id {})", c.display_name(), c.id))
         .collect::<Vec<_>>()
         .join(", ");
+    // Every channel tool's `channel_id` says where its value comes from and what the choices
+    // are. Without that a model passes the name it heard, which is how "lead team" came to be
+    // refused as an unknown channel. The name is accepted too (see `ops::channel_named`), but
+    // the id is what the model is told to send, because it is the one that cannot be ambiguous.
+    let channel_arg = serde_json::json!({
+        "type": "string",
+        "description": format!("An id from list_channels. Configured channels: {directory}."),
+    });
+    let writable_arg = serde_json::json!({
+        "type": "string",
+        "description": format!(
+            "An id from list_channels of a channel you may post to. Writable channels: {}.",
+            if writable.is_empty() { "none configured" } else { writable.as_str() }
+        ),
+    });
 
     vec![
         ToolDescriptor {
@@ -122,7 +137,7 @@ pub fn tool_manifest(channels: &[ChannelInfo]) -> Vec<ToolDescriptor> {
             arguments: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "channel_id": { "type": "string" },
+                    "channel_id": channel_arg,
                     "limit": { "type": "integer", "minimum": 1 }
                 },
                 "required": ["channel_id"]
@@ -148,7 +163,7 @@ pub fn tool_manifest(channels: &[ChannelInfo]) -> Vec<ToolDescriptor> {
             arguments: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "channel_id": { "type": "string" },
+                    "channel_id": channel_arg,
                     "limit": { "type": "integer", "minimum": 1 },
                     "before": { "type": "string" },
                     "since": { "type": "string" },
@@ -173,7 +188,7 @@ pub fn tool_manifest(channels: &[ChannelInfo]) -> Vec<ToolDescriptor> {
             arguments: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "channel_id": { "type": "string" },
+                    "channel_id": channel_arg,
                     "since": { "type": "string" },
                     "cap": { "type": "integer", "minimum": 1 }
                 },
@@ -195,7 +210,7 @@ pub fn tool_manifest(channels: &[ChannelInfo]) -> Vec<ToolDescriptor> {
             arguments: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "channel_id": { "type": "string" },
+                    "channel_id": channel_arg,
                     "query": { "type": "string" },
                     "limit": { "type": "integer", "minimum": 1 }
                 },
@@ -220,7 +235,7 @@ pub fn tool_manifest(channels: &[ChannelInfo]) -> Vec<ToolDescriptor> {
             arguments: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "channel_id": { "type": "string" },
+                    "channel_id": channel_arg,
                     "message_id": { "type": "string" }
                 },
                 "required": ["channel_id", "message_id"]
@@ -248,7 +263,7 @@ pub fn tool_manifest(channels: &[ChannelInfo]) -> Vec<ToolDescriptor> {
             arguments: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "channel_id": { "type": "string" },
+                    "channel_id": writable_arg,
                     "text": { "type": "string" },
                     "reply_to": { "type": "string" }
                 },
@@ -269,7 +284,7 @@ pub fn tool_manifest(channels: &[ChannelInfo]) -> Vec<ToolDescriptor> {
             arguments: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "channel_id": { "type": "string" },
+                    "channel_id": channel_arg,
                     "question": { "type": "string" }
                 },
                 "required": ["channel_id", "question"]
@@ -302,6 +317,39 @@ mod tests {
                 added: false,
             },
         ]
+    }
+
+    #[test]
+    fn every_channel_argument_says_to_pass_an_id_from_list_channels_and_lists_them() {
+        let manifest = tool_manifest(&channels());
+        let with_channel: Vec<&ToolDescriptor> = manifest
+            .iter()
+            .filter(|t| t.arguments["properties"].get("channel_id").is_some())
+            .collect();
+        assert!(with_channel.len() >= 6, "{}", with_channel.len());
+        for tool in with_channel {
+            let said = tool.arguments["properties"]["channel_id"]["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{} has an undescribed channel_id", tool.name));
+            assert!(
+                said.starts_with("An id from list_channels"),
+                "{}: {said}",
+                tool.name
+            );
+            assert!(said.contains("lead team (id 111)"), "{}: {said}", tool.name);
+            if tool.name == "post_reply" {
+                assert!(
+                    !said.contains("(id 222)"),
+                    "a read-only channel offered: {said}"
+                );
+            } else {
+                assert!(
+                    said.contains("build noise (id 222)"),
+                    "{}: {said}",
+                    tool.name
+                );
+            }
+        }
     }
 
     #[test]

@@ -452,11 +452,16 @@ this server enforces — and what the step 3 script proves — is different and 
 be a guarantee rather than a setting, give the agent the **read token** and let it be physically
 incapable of posting.
 
-5. Give the agent the canonical system prompt in
-   [`prompts/voice-agent-system.txt`](prompts/voice-agent-system.txt). Paste the whole file into the
-   agent's system-prompt field. That file is provider-neutral so a deployment-managed voice bridge
-   and a hosted agent can use the same reviewed instructions instead of maintaining separate,
-   drifting copies.
+5. Give the agent the canonical system prompt: the whole of
+   [`prompts/voice-agent-system.txt`](prompts/voice-agent-system.txt), then a blank line, then the
+   section that matches the token you gave it —
+   [`prompts/voice-agent-read-only.txt`](prompts/voice-agent-read-only.txt) for the read token,
+   [`prompts/voice-agent-send.txt`](prompts/voice-agent-send.txt) for the write token. Paste that
+   into the agent's system-prompt field. **Match the section to the token**: an agent told it may
+   send while holding a read token promises sends it cannot make. Called with the same token,
+   `GET /api/v1/voice-agent` returns the already-assembled text as `prompt.text`. The files are
+   provider-neutral so a deployment-managed voice bridge and a hosted agent can use the same
+   reviewed instructions instead of maintaining separate, drifting copies.
 
 ## Step 6 — Talk to it
 
