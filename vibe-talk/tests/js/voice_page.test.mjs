@@ -2580,10 +2580,10 @@ test("the controls are built to be tapped, not clicked", () => {
   assert.match(control, /user-select:\s*none/, "a long press would start selecting the label");
 });
 
-test("home-screen identity keeps browser mode for microphone compatibility", () => {
+test("home-screen identity installs standalone where supported and keeps the browser fallback", () => {
   const manifest = JSON.parse(readFileSync(join(WEB, "manifest.webmanifest"), "utf8"));
+  assert.deepStrictEqual(manifest.display_override, ["standalone"]);
   assert.equal(manifest.display, "browser");
-  assert.equal(manifest.display_override, undefined);
   assert.doesNotMatch(HTML_CODE, /apple-mobile-web-app-capable/);
   assert.doesNotMatch(HTML_CODE, /mobile-web-app-capable/);
   // The markup does not declare it, and the prose says why — so the comment must survive too.

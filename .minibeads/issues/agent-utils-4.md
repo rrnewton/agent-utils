@@ -1,8 +1,9 @@
 ---
 title: 'android-pwa-install: make Chrome offer a real app installation'
-status: open
+status: closed
 priority: 1
 issue_type: task
+assignee: gpt-5.6-sol
 labels:
 - vibe-talk
 - pwa
@@ -10,7 +11,10 @@ labels:
 depends_on:
   agent-utils-1: parent-child
 created_at: 2026-09-25T01:32:02.256665735+00:00
-updated_at: 2026-09-25T01:33:45.741826270+00:00
+updated_at: 2026-09-25T03:01:31.512308143+00:00
+closed_at: 2026-09-25T03:01:31.512307222+00:00
+claimed_at: 2026-09-25T02:27:21.662683343+00:00
+claimed_until: 2026-09-27T02:27:21.662543043+00:00
 ---
 
 # Description
