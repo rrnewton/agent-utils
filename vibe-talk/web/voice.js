@@ -203,6 +203,11 @@ const session = {
   waitingForAudioEnd: false,
   typedTurnInFlight: false,
   pendingPrompts: [],
+  // `#15 transcript-dedup`. One row per (turn, role) for the life of the call; see `upsertSpoken`.
+  liveTurns: new Map(),
+  anonTurn: 0,
+  // `#11 voice-connect-latency`. Content-free startup marks; see `markStartup`.
+  timing: null,
 };
 
 // Recording is FIRE-AND-FORGET and gives up after the first failure.
@@ -2736,6 +2741,8 @@ function playPcmBytes(bytes) {
   const now = session.audio.currentTime;
   session.playAt = Math.max(session.playAt, now + 0.05);
   node.start(session.playAt);
+  // Scheduled, not heard yet: the first sound starts when the audio clock reaches `playAt`.
+  markStartup("greeting_audible", Date.now() + (session.playAt - now) * 1000);
   session.playAt += buffer.duration;
   session.playing.push(node);
   node.onended = () => {
@@ -3336,6 +3343,7 @@ async function start(options) {
     return;
   }
   const chat = Boolean(options && options.chat);
+  beginStartupTiming(chat);
   clearError();
   // A new call is a clean slate for all three of these. `hasSuspended` in particular: leaving it
   // set would keep the large control reading "Resume" during and after the call it started.
@@ -3348,11 +3356,14 @@ async function start(options) {
   setState("working");
   setStatus("Asking vibe-talk for a voice session…");
   const minted = await openVoiceSession();
+  markStartup("session_acquired");
   session.protocol = minted.protocol || "unknown";
   session.providerName = String(minted.provider || conversationalVoice.name);
   session.inputRate = minted.input_sample_rate || 16000;
   session.outputRate = minted.output_sample_rate || 16000;
   session.lastTranscriptKey = null;
+  session.liveTurns = new Map();
+  session.anonTurn = 0;
   session.v1Ready = false;
   session.capturePaused = false;
   session.audioSegmentActive = false;
@@ -3388,6 +3399,7 @@ async function start(options) {
     session.stream = await navigator.mediaDevices.getUserMedia(audioConstraints(micSettings()));
     session.audio = new (window.AudioContext || window.webkitAudioContext)();
     await session.audio.resume(); // iOS starts it suspended until a gesture.
+    markStartup("microphone_ready");
   }
 
   setState("working");
@@ -3398,6 +3410,7 @@ async function start(options) {
   renderControls();
 
   socket.onopen = () => {
+    markStartup("socket_open");
     if (session.protocol === "vibe-talk-v1") {
       session.connected = true;
       conversationOpen = true;
@@ -3463,6 +3476,7 @@ async function start(options) {
   socket.onmessage = (event) => {
     if (event.data instanceof ArrayBuffer) {
       if (session.protocol === "vibe-talk-v1" && !session.chat && !session.speakerOff) {
+        markStartup("greeting_audio_received");
         playPcmBytes(new Uint8Array(event.data));
       }
       return;
@@ -3626,9 +3640,211 @@ function handle(socket, message) {
   }
 }
 
+// --- live transcript reconciliation ------------------------------------------------------------
+//
+// `#15 transcript-dedup` and `#12 live-transcript-latency`. A provider that streams speech
+// recognition sends the SAME utterance several times: partial hypotheses that grow and get
+// corrected ("…messages Google Chat." becomes "…messages in Google Chat."), and a final one. The
+// page used to append every frame as a new row and store every one of them, so the record held
+// the same sentence twice with one word different, and the next reader could not tell which was
+// said.
+//
+// So a spoken turn is ONE row, keyed by (turn, role), updated in place as better text arrives,
+// and stored ONCE when the turn ends. The same words said again in a LATER turn are a new key and
+// a new row: repeating yourself is a thing people really do, and the record must keep it.
+
+function tidySpeech(text) {
+  return String(text).replace(/\s+/g, " ").trim();
+}
+
+/** Lower-case words with punctuation removed: what "the same words" means for a hypothesis. */
+function spokenWords(text) {
+  return String(text)
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s\u0027]/gu, " ") // U+0027 keeps contractions whole.
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+/** Does `needle` occur as a contiguous run of whole words in `hay`? */
+function containsWords(hay, needle) {
+  for (let i = 0; i + needle.length <= hay.length; i += 1) {
+    if (needle.every((word, j) => hay[i + j] === word)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Word edit distance from all of `a` to the closest PREFIX of `b`. Zero when `b` merely extends
+ * `a`; small when `b` is `a` with a word corrected, and then possibly extended.
+ */
+function revisionDistance(a, b) {
+  let row = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i += 1) {
+    const next = [i];
+    for (let j = 1; j <= b.length; j += 1) {
+      next[j] = Math.min(row[j] + 1, next[j - 1] + 1, row[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    row = next;
+  }
+  return Math.min(...row);
+}
+
+/**
+ * The best text for a turn, given what it held and a new frame for it.
+ *
+ * Four outcomes. The new frame CONTAINS what was held — a cumulative hypothesis — so it wins. It
+ * is contained BY what was held — a late repeat — so nothing changes. It is a CORRECTION of what
+ * was held, a word or so different over a sentence long enough for that to mean something, so it
+ * replaces it. Otherwise it is the next fragment of the same turn and is appended. Three words is
+ * the floor for a correction because "yes" and "no" differ by one word too.
+ */
+function mergeHypothesis(held, frame) {
+  const before = tidySpeech(held);
+  const after = tidySpeech(frame);
+  if (!before || !after) {
+    return before || after;
+  }
+  const a = spokenWords(before);
+  const b = spokenWords(after);
+  if (containsWords(b, a)) {
+    return after;
+  }
+  if (containsWords(a, b)) {
+    return before;
+  }
+  if (a.length >= 3 && b.length >= 3 && revisionDistance(a, b) <= Math.max(1, Math.floor(a.length / 4))) {
+    return after;
+  }
+  return `${before} ${after}`;
+}
+
+/**
+ * One frame of speech, into the row for its (turn, role).
+ *
+ * A partial frame is the provider's current hypothesis for the segment after everything already
+ * settled, so it REPLACES the previous partial rather than merging with it — that is what makes
+ * a correction mid-sentence harmless. A final frame settles into the turn with `mergeHypothesis`,
+ * which is also what copes with a provider that sends every fragment, and then the whole turn
+ * again, all marked final. A frame without a turn number cannot be matched to anything, so each
+ * final one closes its own row.
+ */
+function upsertSpoken(who, turn, said, final) {
+  const anonymous = turn === undefined || turn === null;
+  const key = anonymous ? `anon:${session.anonTurn}:${who}` : `${turn}:${who}`;
+  // A new turn from a speaker ends that speaker's previous one.
+  for (const [other, entry] of session.liveTurns) {
+    if (other !== key && entry.who === who && !entry.stored) {
+      storeSpoken(entry);
+    }
+  }
+  let entry = session.liveTurns.get(key);
+  if (!entry) {
+    entry = { who, settled: "", pending: "", li: null, atMs: Date.now(), stored: false, echo: false };
+    // A typed prompt reflected back is already on screen; see `isEchoOfTyped`.
+    entry.echo = who === "you" && final && isEchoOfTyped(said);
+    session.liveTurns.set(key, entry);
+  }
+  if (final) {
+    entry.settled = mergeHypothesis(entry.settled, said);
+    entry.pending = "";
+  } else {
+    entry.pending = said;
+  }
+  if (!entry.echo) {
+    const text = spokenText(entry);
+    const pinned = atBottom(el("scroll-area"));
+    if (entry.li) {
+      const li = turnNode(who, text, entry.atMs);
+      entry.li.replaceWith(li);
+      entry.li = li;
+      applySearch();
+      followIfPinned(pinned);
+    } else {
+      entry.li = line(who, text, entry.atMs);
+    }
+  }
+  if (anonymous && final) {
+    storeSpoken(entry);
+    session.anonTurn += 1;
+  }
+}
+
+function spokenText(entry) {
+  return entry.pending ? mergeHypothesis(entry.settled, entry.pending) : entry.settled;
+}
+
+/** Store a turn's best text, once. A late frame for it still corrects the row, not the record. */
+function storeSpoken(entry) {
+  if (entry.stored) {
+    return;
+  }
+  entry.stored = true;
+  if (!entry.echo) {
+    recordTurn(entry.who, spokenText(entry));
+  }
+}
+
+/** The turn is over: everything said in it is as good as it is going to get. */
+function settleSpoken() {
+  for (const entry of session.liveTurns.values()) {
+    storeSpoken(entry);
+  }
+}
+
+// --- startup timing ------------------------------------------------------------------------------
+//
+// `#11 voice-connect-latency`. "It takes a while to start talking" is not actionable; which phase
+// takes the while is. Each mark is milliseconds since the reader pressed Start, and the record
+// holds phase names, the protocol, and integers — nothing said, no identifiers — because the
+// server logs it and a log is the wrong place for a conversation. The server's field allowlist
+// refuses anything else.
+
+function beginStartupTiming(chat) {
+  session.timing = { origin: Date.now(), chat, marks: {}, sent: false };
+}
+
+/** Record a phase the FIRST time it happens in this call. Later occurrences are not startup. */
+function markStartup(phase, atMs) {
+  const timing = session.timing;
+  if (!timing || timing.sent || phase in timing.marks) {
+    return;
+  }
+  timing.marks[phase] = Math.max(0, Math.round((atMs === undefined ? Date.now() : atMs) - timing.origin));
+}
+
+/** Once per call: after the greeting, or at hang-up if the call ended before one. */
+function sendStartupTiming() {
+  const timing = session.timing;
+  if (!timing || timing.sent || session.protocol !== "vibe-talk-v1") {
+    return;
+  }
+  timing.sent = true;
+  const marks = timing.marks;
+  const seconds = (ms) => `${(ms / 1000).toFixed(1)} s`;
+  const shown = [];
+  if (marks.provider_ready !== undefined) {
+    shown.push(`ready ${seconds(marks.provider_ready)}`);
+  }
+  if (marks.greeting_audible !== undefined) {
+    shown.push(`audible ${seconds(marks.greeting_audible)}`);
+  }
+  if (shown.length > 0) {
+    addDetail(shown.join(" · "));
+  }
+  // Diagnostics, not the call: a failure here is not worth a word on the screen.
+  api("/api/v1/voice-timing", {
+    method: "POST",
+    body: { protocol: session.protocol, chat: timing.chat, ...marks },
+  }).catch(() => {});
+}
+
 function handleVibeTalk(message) {
   switch (message.type) {
     case "session_started": {
+      markStartup("provider_ready");
       addDetail(`voice session ${message.session_id || "started"}`);
       session.v1Ready = true;
       if (session.chat) {
@@ -3650,28 +3866,32 @@ function handleVibeTalk(message) {
       );
       if (!session.waitingForGreeting) {
         advanceVibeTalkInput();
+        sendStartupTiming();
       }
       break;
     }
     case "transcript": {
       const who = message.role === "user" ? "you" : "assistant";
       const said = message.text || "";
-      const key = `${message.turn || ""}:${who}:${said}`;
+      // A provider that predates the flag sends only finished text, so absent means final.
+      const final = message.final !== false;
+      const key = `${message.turn ?? ""}:${who}:${final}:${said}`;
       if (!said || key === session.lastTranscriptKey) {
         break;
       }
       session.lastTranscriptKey = key;
-      if (who === "you" && isEchoOfTyped(said)) {
-        break;
+      if (who === "assistant") {
+        markStartup("greeting_text");
       }
-      line(who, said);
-      recordTurn(who, said);
+      upsertSpoken(who, message.turn, said, final);
       break;
     }
     case "error":
       showError(message.message || message.detail || "the voice provider reported an error");
       break;
     case "turn_complete":
+      settleSpoken();
+      sendStartupTiming();
       if (session.waitingForGreeting) {
         session.waitingForGreeting = false;
         session.capturePaused = false;
@@ -3755,6 +3975,10 @@ function startCapture(socket) {
 }
 
 function teardown() {
+  // Before anything is reset: the turn in progress is stored, and a call that ended before its
+  // greeting still reports how far it got.
+  settleSpoken();
+  sendStartupTiming();
   stopPlayback();
   if (session.node) {
     session.node.disconnect();
@@ -3786,6 +4010,9 @@ function teardown() {
   session.inputRate = 16000;
   session.outputRate = 16000;
   session.lastTranscriptKey = null;
+  session.liveTurns = new Map();
+  session.anonTurn = 0;
+  session.timing = null;
   session.muted = false;
   session.v1Ready = false;
   session.capturePaused = false;

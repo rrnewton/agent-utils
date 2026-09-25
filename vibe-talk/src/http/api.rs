@@ -687,6 +687,54 @@ pub async fn voice_session(
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(session)).into_response())
 }
 
+/// `GET /api/v1/voice-agent` — the versioned system prompt and what this caller's agent can do.
+///
+/// Provider-neutral on purpose: a hosted agent's operator reads the same prompt the QUICKSTART
+/// points at, and a deployment-managed bridge fetches it here so the instructions it opens a
+/// session with are the reviewed ones rather than a private copy. The tool list is filtered by the
+/// same rules as the MCP endpoint's `tools/list`, so the two cannot disagree.
+pub async fn voice_agent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let scope = require(&headers, &state, Scope::Read)?;
+    let manifest = crate::mcp::tool_manifest(&ops::channels(&state).await);
+    let profile = crate::voice_agent::profile(
+        &manifest,
+        scope,
+        state.chat.provider_name(),
+        state.config.timezone.name(),
+    );
+    Ok(no_store(Json(profile)))
+}
+
+/// `POST /api/v1/voice-timing` — record one call's startup phases.
+///
+/// The body is a closed set of phase offsets (see [`crate::voice_agent::StartupTiming`]); an
+/// unknown field is refused, so nothing a person said can reach the log through it. It is logged
+/// and not stored: the point is to read the dominant delay off a live deployment, and a durable
+/// record would be one more thing to retain and purge.
+pub async fn voice_timing(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Write)?;
+    let timing: crate::voice_agent::StartupTiming =
+        serde_json::from_slice(&body).map_err(|_| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_timing",
+                "expected a startup timing record with only the documented phase fields",
+            )
+        })?;
+    timing
+        .validate()
+        .map_err(|detail| ApiError::new(StatusCode::BAD_REQUEST, "invalid_timing", detail))?;
+    tracing::info!("voice_startup {}", timing.log_fields());
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
 /// `POST /api/v1/channels/{channel_id}/messages/{message_id}/speak`
 ///
 /// Read a message aloud, and hand back the AUDIO rather than a URL to it.

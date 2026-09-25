@@ -1220,6 +1220,8 @@ its own adapter-only token; every other route uses the read/write tokens describ
 | GET | `/api/v1/diagnostics` | read | re-run the startup checks now, structured, with a remedy on every failure — see above |
 | GET | `/api/v1/agent-tools` | read | the voice agent's tool manifest and approval policy |
 | GET | `/api/v1/voice-session` | **write** | open a browser-ready session through the configured conversational voice provider |
+| GET | `/api/v1/voice-agent` | read | the versioned voice-agent prompt and which MCP tools this credential may call — see "Conversational voice providers" |
+| POST | `/api/v1/voice-timing` | **write** | one call's content-free startup phase offsets, logged as `voice_startup` |
 | GET | `/api/v1/signed-url` | **write** | compatibility endpoint that mints an ElevenLabs signed URL |
 | GET | `/api/v1/channels/{id}/messages?limit=` | read | full scrollback, oldest first |
 | GET | `/api/v1/channels/{id}/messages/{message_id}` | read | one message in full |
@@ -1688,9 +1690,45 @@ it knows no later frame belongs to the interrupted turn. An `error` frame promis
 first output rather than trust every server to answer: read-aloud abandons a session that returns
 no audio within 15 seconds of a prompt and repeats the read once on a fresh one.
 
+A `transcript` frame is `{"type":"transcript","role":"user"|"assistant","text":"…","turn":N,
+"final":true|false}`. `final` is optional and defaults to `true`, so a provider that sends only
+finished text needs no change. A provider that streams recognition should send its current
+hypothesis as `final:false` as soon as it has one, rather than holding text until the turn ends:
+the page shows it immediately and replaces it in place as it improves. The page keeps one row per
+`(turn, role)` — a corrected hypothesis replaces the words it corrects, a fragment is appended, a
+repeat of text already held changes nothing — and stores that row once, when the turn completes.
+The same words in a later turn are a new row. A frame without `turn` cannot be matched and is
+treated as its own turn.
+
 This protocol is deliberately public and provider-neutral. Authentication, endpoint discovery,
 and the implementation behind a deployment-managed socket belong in deployment configuration and
 private operations documentation.
+
+Both hosted and deployment-managed conversational providers should use the checked-in
+[`prompts/voice-agent-system.txt`](prompts/voice-agent-system.txt) instructions. Keeping the prompt
+beside the protocol makes changes reviewable and prevents one provider from silently receiving a
+different role or chat-sending policy. `GET /api/v1/voice-agent` serves it as data: the prompt
+`id`, `version`, a `fingerprint` of its text, and the text itself, beside the chat provider's
+display name, the operator's time zone, the MCP path, and every MCP tool with its `access`
+(`read`/`write`), whether it `requires_confirmation`, and whether it is `available` to the
+credential that asked. That answer is derived from the same manifest and the same scope filter as
+`tools/list`, so the two cannot disagree; a read credential is told that sending exists but is not
+its to use. A bridge that attaches this server's `/mcp` endpoint to its model should fetch the
+profile with the same credential it gives the MCP client. It may also load the public file at
+deployment time; its endpoint, credentials, and provider-specific tool transport remain outside
+this repository. Changing the prompt text means bumping `PROMPT_VERSION` and the pinned
+fingerprint in `src/voice_agent.rs`, which a unit test enforces.
+
+**Startup timing.** "It takes a while to start talking" is not actionable; which phase takes the
+while is. For each `vibe-talk-v1` call the page records milliseconds since Start for
+`session_acquired`, `microphone_ready`, `socket_open`, `provider_ready` (`session_started`),
+`greeting_text`, `greeting_audio_received`, and `greeting_audible` (when the first greeting audio
+is scheduled to sound), shows the ready and audible times in the connection banner, and posts the
+record once to `POST /api/v1/voice-timing` after the greeting — or at hang-up, if the call ended
+first. The server accepts only those field names plus `protocol` and `chat`, refuses anything
+else with 400 `invalid_timing`, and logs one line such as
+`voice_startup protocol=vibe-talk-v1 chat=false session_acquired=40 … greeting_audible=4050
+slowest=provider_ready:2480`. Nothing said and no identifier is in it.
 
 ## Signed conversation URLs
 

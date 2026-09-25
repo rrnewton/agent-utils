@@ -62,3 +62,4 @@ pub mod summary;
 pub mod testing;
 pub mod threads;
 pub mod untrusted;
+pub mod voice_agent;
