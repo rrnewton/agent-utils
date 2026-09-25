@@ -404,6 +404,68 @@ async fn the_web_app_is_served_without_a_token() {
 }
 
 #[tokio::test]
+async fn the_install_manifest_selects_standalone_without_removing_the_browser_fallback() {
+    let harness = harness();
+    let (status, headers, body) = call_bytes(&harness, "GET", "/manifest.webmanifest", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("content-type").and_then(|v| v.to_str().ok()),
+        Some("application/manifest+json; charset=utf-8")
+    );
+    assert_eq!(
+        headers.get("cache-control").and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+
+    let manifest: Value = serde_json::from_slice(&body).expect("valid web app manifest JSON");
+    assert_eq!(
+        manifest["display_override"],
+        serde_json::json!(["standalone"]),
+        "Chrome must see an installable display mode before the compatibility fallback"
+    );
+    assert_eq!(manifest["display"], "browser");
+    assert_eq!(manifest["start_url"], "/voice");
+    assert_eq!(manifest["scope"], "/");
+    assert!(
+        manifest["icons"].as_array().is_some_and(|icons| icons
+            .iter()
+            .any(|icon| icon["sizes"] == "192x192")
+            && icons.iter().any(|icon| icon["sizes"] == "512x512")
+            && icons.iter().any(|icon| icon["purpose"] == "maskable")),
+        "the manifest lost an icon Chrome requires for installation: {manifest}"
+    );
+}
+
+#[tokio::test]
+async fn private_chat_and_api_responses_are_never_cacheable() {
+    let harness = harness();
+    seed_lead_channel(&harness);
+
+    let (status, headers, body) = call_bytes(
+        &harness,
+        "GET",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/messages"),
+        Some(READ_TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(&body).contains("deploy started"),
+        "the cache assertion was not exercised against a response containing chat text"
+    );
+    assert_eq!(headers["cache-control"], "no-store");
+
+    // The edge policy covers failures too: browsers and intermediaries must not retain details
+    // from an expired or mistyped credential, and a future handler cannot forget the header.
+    let (status, headers, _) = call_bytes(&harness, "GET", "/api/v1/channels", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(headers["cache-control"], "no-store");
+
+    let (_, headers, _) = call_bytes(&harness, "GET", "/mcp", None).await;
+    assert_eq!(headers["cache-control"], "no-store");
+}
+
+#[tokio::test]
 async fn the_channel_list_matches_the_configuration() {
     let harness = harness();
     let (status, payload) = call(&harness, "GET", "/api/v1/channels", Some(READ_TOKEN), None).await;

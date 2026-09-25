@@ -21,8 +21,11 @@ See [device speech](README.md#reading-messages-with-a-device-voice) for setup,
 offline-voice considerations, browser limitations, and the opt-in rendered-audio regression check.
 Existing deployments keep ElevenLabs read-aloud unless they select this backend.
 
-For a home-screen shortcut, open `/voice` in Chrome and choose **Add to Home screen**. It uses
-the vibe-talk speech-bubble icon. Remove and re-add an older shortcut if its icon stays blank.
+To install the reader on Android, serve it over HTTPS, open `/voice` in Chrome, then choose
+**Install app** from the browser menu. Chrome opens the installed app in its own window. On iOS,
+Safari's **Add to Home Screen** remains a browser-mode shortcut so microphone handling retains the
+safer browser fallback. The app has no service worker or offline cache; private API responses are
+`Cache-Control: no-store`. Remove and reinstall an older shortcut if its icon stays blank.
 
 Budget about an hour if you do all six, most of it clicking through two dashboards and waiting on
 DNS. Half that if you stop after step 3.

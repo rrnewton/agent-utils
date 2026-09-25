@@ -12,10 +12,11 @@
     <!--
       Deliberately NOT declared here, and this is not an oversight:
 
-        * `apple-mobile-web-app-capable`. The manifest supplies a home-screen name and icon but
-          keeps display: browser; standalone mode has long-standing reports of iOS re-prompting
-          for the microphone (WebKit 185448, 215884). The app-like feel below is built entirely
-          from layout and gesture properties, which need no such declaration.
+        * `apple-mobile-web-app-capable`. Chrome understands the manifest's display_override and
+          installs the page as standalone. Safari currently ignores that member and falls back to
+          display: browser; opting it into standalone separately would restore the long-standing
+          iOS microphone re-prompt risk (WebKit 185448, 215884). The app-like feel below is built
+          entirely from layout and gesture properties, which need no such declaration.
         * Any third-party script, font, or stylesheet. Two local files, no CDN, no build step.
     -->
     <link rel="stylesheet" href="/style.css" />

@@ -57,13 +57,35 @@ partially sent messages retain the remaining text. When delivery is unconfirmed,
 before retrying because the chat service may have received the message. Reopening the app restores
 unfinished sends without sending them again automatically.
 
-## Adding a home-screen icon
+## Installing the reader
 
-Open `/voice` in Chrome on Android and choose **Add to Home screen** from the browser menu.
-The shortcut uses vibe-talk's speech-bubble icon. If an existing shortcut still has a blank or
-generic icon after reloading, remove that shortcut and add it again. The manifest supplies the
-app name and regular and maskable PNG icons; browser display mode preserves the existing voice
-permission behavior. The shortcut requires the server to be reachable.
+Serve vibe-talk over HTTPS, open `/voice` in Chrome on Android, and choose **Install app** from the
+browser menu. The installed app uses vibe-talk's speech-bubble icon and opens in a standalone
+window. If an older shortcut still has a blank or generic icon, remove it and install again.
+
+The manifest asks browsers that support `display_override` (including Chrome Android) for
+`standalone`, while retaining `display: browser` as the standards-defined fallback. Safari on iOS
+currently ignores `display_override`, and this page deliberately does not opt into Apple's
+standalone meta mode: it therefore remains in browser mode, preserving the established microphone
+permission fallback instead of risking repeated prompts after app switches.
+
+Installation does not add offline access. There is no service worker, every app asset is served
+with `Cache-Control: no-store`, and the server applies the same policy centrally to all `/api/`
+and `/mcp` responses, including errors. Chat text, transcripts, minted session URLs, and API
+responses are not placed in a browser-managed offline cache. The installed app still requires the
+server to be reachable.
+
+To ask Chrome's own installability engine about the checked-out page, run:
+
+```sh
+make -C vibe-talk pwa-installability
+```
+
+The check uses Playwright's Chromium by default and prints its version. Set
+`VIBE_TALK_CHROMIUM=/path/to/chrome` to use a particular Chrome build, or run
+`python3 vibe-talk/tests/pwa_installability.py --url https://your-host/voice` to inspect a deployed
+origin. A green result means CDP reports no manifest or installability errors under an Android
+viewport; it is not proof that a physical phone displayed the menu item or launched the app.
 
 ## Reading messages with a device voice
 

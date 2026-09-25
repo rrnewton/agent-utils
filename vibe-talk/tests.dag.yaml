@@ -84,6 +84,20 @@ steps:
       classification: light
       rss_baseline_bytes: 268435456
 
+  # Chrome's own installability verdict. Unlike the fake-DOM suite, this exercises manifest
+  # parsing, icon loading, secure-origin rules and the selected display mode in the browser engine.
+  - group: check
+    job: pwa-installability
+    desc: current Chromium CDP installability check with an Android viewport
+    cmd: cd vibe-talk && python3 tests/pwa_installability.py
+    timeout: 60
+    cpu_timeout: 30
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 5
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # ---- the build everything else needs ----------------------------------------------------------
   - group: build
     job: release
