@@ -5486,14 +5486,7 @@ fn recovery_binds_the_most_recent_completed_journal_path() {
         8,
         &tip,
         "recovery-started",
-        json!({
-            "slot": "slot-a",
-            "operation": "finish",
-            "actor": identity(12),
-            "runner": identity(13),
-            "handoff_writer": null,
-            "coordinator_authorized": true,
-        }),
+        recovery_started_payload("slot-a", "finish"),
     );
     // 4. slot-b reuses the singleton path and completes.
     tip = singleton_finish_progress(&events, 9, &tip, "slot-b");
@@ -5559,7 +5552,8 @@ enum CreateImportOutcome {
     RowDurable,
     /// Recovery publishes the row, then clears the journal.
     RowPublishedByRecovery,
-    /// `--abort-create` / `--abort-import`: no row is ever published.
+    /// `--abort-create` / `--abort-import`, or a writer that completed the
+    /// journal without publishing: no row exists at completion.
     Aborted,
 }
 
@@ -5653,10 +5647,11 @@ fn create_import_recovery_log(
 }
 
 #[test]
-fn completed_create_and_import_recoveries_close_their_recovery_marker() {
-    // Every Python path that completes a create or import journal leaves the
-    // slot's storage either owned by its ACTIVE row or gone, so the matching
-    // completion is terminal for the recovery attempt as well.
+fn completed_create_and_import_recoveries_close_their_marker_only_with_a_row() {
+    // A create or import completion that leaves an ACTIVE row hands the slot's
+    // storage to that row, so it is terminal for the recovery attempt too.
+    // Without a row the completion proves nothing about storage: an older
+    // writer completed a create journal while leaving its worktree behind.
     let create_path = "CREATE.6.node-a.6.slot-a.journal";
     let singleton = "ACTIVE.node-a.journal";
     for (operation, journal_path) in [
@@ -5679,11 +5674,19 @@ fn completed_create_and_import_recoveries_close_their_recovery_marker() {
             );
             let replayed = replay_stream(&events, None, |_| Ok(()))
                 .unwrap_or_else(|error| panic!("replay {case}: {error}"));
-            assert!(
-                replayed.pending_operations.is_empty(),
-                "{case} left {:?}",
-                replayed.pending_operations
-            );
+            let pending = replayed
+                .pending_operations
+                .iter()
+                .map(|pending| (pending.kind, pending.journal_path.as_deref()))
+                .collect::<Vec<_>>();
+            match outcome {
+                CreateImportOutcome::Aborted => assert_eq!(
+                    pending,
+                    [(PendingOperationKind::Recovery, Some(journal_path))],
+                    "{case}"
+                ),
+                _ => assert!(pending.is_empty(), "{case} left {pending:?}"),
+            }
             let records = match outcome {
                 CreateImportOutcome::Aborted => vec![],
                 _ => vec![record],
@@ -5694,10 +5697,17 @@ fn completed_create_and_import_recoveries_close_their_recovery_marker() {
                 evaluate_policy_at(&events, &config, &evidence, "2026-09-22T09:40:01+00:00")
                     .unwrap_or_else(|error| panic!("evaluate {case}: {error}"));
             match outcome {
-                // Abort leaves no ACTIVE row and no operation-owned storage,
-                // so the slot is not an observer subject at all.
+                // No row owns whatever storage the operation may have left,
+                // so the slot stays a blocked observer subject.
                 CreateImportOutcome::Aborted => {
-                    assert!(decisions.is_empty(), "{case}: {decisions:?}")
+                    assert_eq!(decisions.len(), 1, "{case}");
+                    assert_eq!(decisions[0].verdict, Verdict::Blocked, "{case}");
+                    assert_eq!(decisions[0].generation, None, "{case}");
+                    assert_eq!(
+                        decisions[0].reason_codes,
+                        ["ACTIVE_RECORD_MISSING", "RECOVERY_PENDING"],
+                        "{case}"
+                    );
                 }
                 _ => {
                     assert_eq!(decisions.len(), 1, "{case}");
@@ -5893,7 +5903,7 @@ print(json.dumps({
 }
 
 #[test]
-fn real_python_create_and_import_recoveries_leave_no_marker() {
+fn real_python_create_and_import_recoveries_close_their_marker_only_with_a_row() {
     // End-to-end counterpart of the synthetic matrix: histories written by
     // Python's own interrupted create/import and `recover`, not by the test.
     let cases = ["create", "import-existing"]
@@ -5940,11 +5950,26 @@ fn real_python_create_and_import_recoveries_leave_no_marker() {
             .unwrap_or_else(|error| panic!("replay {case}: {error}"));
         let expected_count: u64 = if *mode == "abort" { 0 } else { 1 };
         assert_eq!(replayed.summary.active_count, expected_count, "{case}");
-        assert!(
-            replayed.pending_operations.is_empty(),
-            "{case} left {:?}",
-            replayed.pending_operations
-        );
+        let pending = replayed
+            .pending_operations
+            .iter()
+            .map(|pending| {
+                (
+                    pending.kind,
+                    pending.slot.as_str(),
+                    pending.operation.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if *mode == "abort" {
+            assert_eq!(
+                pending,
+                [(PendingOperationKind::Recovery, "slot01", Some(*operation))],
+                "{case}"
+            );
+        } else {
+            assert!(pending.is_empty(), "{case} left {pending:?}");
+        }
     }
 }
 
