@@ -5748,6 +5748,14 @@ test("the channel bar switches between configured agent audio and device audio l
   assert.equal(page.el("audio-device-icon").hidden, false, "device speech lost its phone icon");
   assert.equal(page.el("audio-agent-icon").hidden, true);
   assert.equal(page.prepareCalls.length, requests, "changing the source issued a network request");
+  await toggle.click();
+  assert.equal(toggle.getAttribute("aria-checked"), "true");
+  assert.equal(toggle.getAttribute("aria-label"), "Read messages with Internal voice preview");
+  assert.equal(toggle.title, "Internal voice preview. Tap to use device audio.");
+  assert.equal(page.el("audio-device-icon").hidden, true);
+  assert.equal(page.el("audio-agent-icon").hidden, false, "switching back did not restore the cloud icon");
+  assert.equal(page.prepareCalls.length, requests, "switching back issued a network request");
+  await toggle.click();
   await readButton(page).click();
   await rows[0].dispatch("click", {});
   await page.settle();
