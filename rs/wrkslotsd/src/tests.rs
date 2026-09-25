@@ -6037,6 +6037,8 @@ fn a_later_recovery_keeps_an_open_marker_whose_storage_its_row_does_not_own() {
             &validate_record,
             open_singleton.clone(),
         ),
+        // A known false blocker: Python's publication check proved the slot
+        // held no `docs` directory, but replay compares paths only.
         (
             "import recovered again without a checkout",
             vec![
