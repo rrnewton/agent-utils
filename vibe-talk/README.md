@@ -917,6 +917,20 @@ this managed flow are unregistered upstream on removal; direct and pre-migration
 Direct Discord deployments keep the existing id, label, default-off explicit writable switch, and must
 leave this setting off.
 
+A registration-capable bridge may also list the channels its account can see, which lets
+Settings offer **Browse channels** (`#19 channel-browser`): a searchable list with one-tap Add and
+the channels already tracked marked as such. The bridge implements `GET /channel-directory` with
+optional `query` (trimmed, at most 100 characters; blank lists everything), `limit` (1 to 50, default
+25) and `cursor` (the opaque `next_cursor` of the previous page of the same query). It answers
+`{"entries":[{"source":"...","name":"...","registered_channel_id":"id-or-null"}],"next_cursor":"...-or-null","truncated":false}`,
+in its own order and never more entries than `limit`. `source` is handed back unchanged as the
+`source` of `POST /channels`; `registered_channel_id` names the bridge's existing registration, if
+any; `truncated` says the bridge stopped listing before the end of what its account can see. A
+malformed answer is refused rather than repaired. `401`/`403` reach the page as a refusal, and
+`404`/`405`/`501` as "this bridge has no directory". vibe-talk probes nothing at startup: it offers
+the list whenever `discord.channel_registration` is on, and a bridge without the route simply
+answers the first read with one of those statuses. Every string the bridge returns is drawn as text.
+
 A compatible provider bridge may separately implement `POST /channels/{id}/read` and opt in with
 `discord.upstream_read_marks = true`. The web app then offers **Mark read through here** on each
 message. That action advances the provider's monotone cursor through the selected message; it does
@@ -1165,6 +1179,7 @@ its own adapter-only token; every other route uses the read/write tokens describ
 | GET | `/healthz` | none | liveness |
 | GET | `/api/v1/channels` | read | configured channels |
 | POST | `/api/v1/channels` | **write** | direct mode: `{id,label,writable}`; managed mode: `{source,label}` — validate and add a tracked channel |
+| GET | `/api/v1/channel-directory?q=&limit=&cursor=` | **write** | managed mode: one page of the channels the bridge can see, each marked `tracked` when already a channel here |
 | DELETE | `/api/v1/channels/{id}` | **write** | remove a channel added in the app; managed mode also unregisters it upstream |
 | GET | `/api/v1/client-config` | read | what the web app needs at startup |
 | POST | `/api/v1/live/events` | ingest | accept one normalized create/update/delete event from an external provider adapter |

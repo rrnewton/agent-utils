@@ -41,6 +41,7 @@ pub mod clock;
 pub mod config;
 pub mod conversation;
 pub mod diagnostics;
+pub mod directory;
 pub mod discord;
 pub mod elevenlabs;
 pub mod http;

@@ -9149,6 +9149,50 @@ let knownChannels = [];
 /** Whether the provider bridge resolves channel links or references into stable channel ids. */
 let channelRegistrationSupported = false;
 
+/** Whether the bridge can list the channels its account sees. `#19 channel-browser`. */
+let channelDiscoverySupported = false;
+/**
+ * The chat backend's own display name from client-config, or "" from an older server. Visible
+ * copy names the service the reader recognises, never the connector that implements it.
+ */
+let chatProviderName = "";
+
+/** The chat service as a noun phrase: its configured name, or a generic one. */
+function chatServiceName() {
+  return chatProviderName || "the chat service";
+}
+
+/** `text` with its first letter capitalised, for a name that opens a sentence. */
+function sentenceStart(text) {
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+/** How long typing pauses before a search is sent, so each keystroke is not its own request. */
+const DIRECTORY_SEARCH_DELAY_MS = 250;
+/** Entries asked for per page. */
+const DIRECTORY_PAGE_SIZE = 25;
+/** The longest label the add form accepts, which a browsed name is cut to. */
+const CHANNEL_LABEL_MAX = 60;
+
+/**
+ * The browse panel's state. `#19 channel-browser`.
+ *
+ * `generation` is what keeps a slow answer from overwriting a newer one: every fresh search takes
+ * a new number, and an answer for an older number is dropped when it arrives. Typing "rel", then
+ * "release", must end showing the "release" results however the two requests race.
+ */
+const channelDirectory = {
+  query: "",
+  entries: [],
+  nextCursor: null,
+  truncated: false,
+  loading: false,
+  failed: false,
+  generation: 0,
+  searchTimer: null,
+  adding: new Set(),
+};
+
 function knownChannel(id) {
   return knownChannels.find((channel) => String(channel.id) === String(id)) || null;
 }
@@ -9261,6 +9305,216 @@ async function addChannel() {
   said.textContent = `Added. "${label}" is now in the channel picker.`;
 }
 
+// --- browsing channels ---------------------------------------------------------------------
+//
+// `#19 channel-browser`. Pasting a link works, but only for someone who already has the link. The
+// bridge can list the channels its account sees, so the page offers that list, searchable, with
+// one tap to add. Adding goes through exactly the same `POST /api/v1/channels` as the form above,
+// so a browsed channel is registered, probed and stored the same way a pasted one is.
+
+/** Whether this directory entry is already a channel in the picker. */
+function directoryEntryTracked(entry) {
+  return (
+    entry.tracked === true ||
+    (entry.channel_id !== null &&
+      entry.channel_id !== undefined &&
+      knownChannel(entry.channel_id) !== null)
+  );
+}
+
+/** Open the browse panel, and read the first page unless it is already showing one. */
+async function openChannelBrowser() {
+  showChannelPanel("browse-channel-fields");
+  el("channel-directory-search").focus();
+  if (channelDirectory.entries.length === 0 || channelDirectory.failed) {
+    await loadChannelDirectory(false);
+  } else {
+    renderChannelDirectory();
+  }
+}
+
+/** Search as the owner types, once the typing pauses. */
+function scheduleDirectorySearch() {
+  if (channelDirectory.searchTimer !== null) clearTimeout(channelDirectory.searchTimer);
+  channelDirectory.searchTimer = setTimeout(() => {
+    channelDirectory.searchTimer = null;
+    searchChannelDirectory();
+  }, DIRECTORY_SEARCH_DELAY_MS);
+}
+
+/** Search now, for the text in the box, unless that is already the search on screen. */
+async function searchChannelDirectory() {
+  if (channelDirectory.searchTimer !== null) {
+    clearTimeout(channelDirectory.searchTimer);
+    channelDirectory.searchTimer = null;
+  }
+  const query = el("channel-directory-search").value.trim();
+  const showing = !channelDirectory.failed && channelDirectory.entries.length > 0;
+  if (query === channelDirectory.query && showing) return;
+  channelDirectory.query = query;
+  await loadChannelDirectory(false);
+}
+
+/**
+ * Read a page of the directory: the first page of the current search, or the next one.
+ *
+ * A failure while showing more keeps the rows already on screen. They are still true, and
+ * throwing away a list the owner was scrolling through because page three failed would be worse
+ * than saying page three failed.
+ */
+async function loadChannelDirectory(more) {
+  const generation = more ? channelDirectory.generation : ++channelDirectory.generation;
+  const cursor = more ? channelDirectory.nextCursor : null;
+  if (more && !cursor) return;
+  channelDirectory.loading = true;
+  channelDirectory.failed = false;
+  if (!more) {
+    channelDirectory.entries = [];
+    channelDirectory.nextCursor = null;
+    channelDirectory.truncated = false;
+  }
+  renderChannelDirectory();
+  const said = el("channel-directory-state");
+  said.textContent = more
+    ? "Loading more channels…"
+    : channelDirectory.query
+      ? `Searching for "${channelDirectory.query}"…`
+      : "Loading channels…";
+  let path = `/api/v1/channel-directory?limit=${DIRECTORY_PAGE_SIZE}`;
+  if (channelDirectory.query) path += `&q=${encodeURIComponent(channelDirectory.query)}`;
+  if (cursor) path += `&cursor=${encodeURIComponent(cursor)}`;
+  let payload = null;
+  try {
+    payload = await api(path);
+  } catch (error) {
+    if (generation !== channelDirectory.generation) return;
+    channelDirectory.loading = false;
+    channelDirectory.failed = true;
+    renderChannelDirectory();
+    said.textContent = directoryFailureSentence(error);
+    // Retrying cannot change a refusal or a missing feature; it can change everything else.
+    el("channel-directory-retry").hidden = directoryFailureIsFinal(error);
+    return;
+  }
+  if (generation !== channelDirectory.generation) return;
+  channelDirectory.loading = false;
+  const entries = Array.isArray(payload && payload.entries) ? payload.entries : [];
+  channelDirectory.entries = more ? [...channelDirectory.entries, ...entries] : entries;
+  channelDirectory.nextCursor =
+    payload && typeof payload.next_cursor === "string" && payload.next_cursor
+      ? payload.next_cursor
+      : null;
+  channelDirectory.truncated = payload !== null && payload.truncated === true;
+  renderChannelDirectory();
+  said.textContent = directorySummary();
+}
+
+/** Whether a failed read is one that trying again cannot fix. */
+function directoryFailureIsFinal(error) {
+  return error.status === 401 || error.status === 403 || error.status === 501;
+}
+
+/** What to say when the directory could not be read, by the kind of failure it was. */
+function directoryFailureSentence(error) {
+  if (error.code === "channel_directory_denied") {
+    return (
+      `${sentenceStart(chatServiceName())} does not allow this app to list channels. ` +
+      "A channel can still be added by pasting its link under Add a channel."
+    );
+  }
+  if (error.status === 401 || error.status === 403) {
+    return "This sign-in cannot browse channels: browsing needs the token that can add channels.";
+  }
+  if (error.status === 501) {
+    return (
+      "This chat connector cannot list channels. " +
+      "A channel can still be added by pasting its link under Add a channel."
+    );
+  }
+  return `Could not load channels. ${error.detail || error.message}`;
+}
+
+/** The standing sentence under the search box once a page has arrived. */
+function directorySummary() {
+  const count = channelDirectory.entries.length;
+  if (count === 0) {
+    return channelDirectory.query
+      ? `No channels match "${channelDirectory.query}".`
+      : `No channels are available in ${chatServiceName()} yet.`;
+  }
+  const shown = `${count} ${count === 1 ? "channel" : "channels"} shown`;
+  if (channelDirectory.nextCursor) return `${shown}. More are available.`;
+  if (channelDirectory.truncated) {
+    return `${shown}. The list stopped early, so search by name to find others.`;
+  }
+  return `${shown}.`;
+}
+
+/** Draw the rows. Every string is text; nothing from the bridge is ever parsed as markup. */
+function renderChannelDirectory() {
+  const rows = channelDirectory.entries.map((entry) => {
+    const row = document.createElement("li");
+    const name = document.createElement("span");
+    name.className = "directory-name";
+    name.textContent = entry.name;
+    row.append(name);
+    if (directoryEntryTracked(entry)) {
+      const tracked = document.createElement("span");
+      tracked.className = "directory-tracked";
+      tracked.textContent = "Already added";
+      row.append(tracked);
+    } else {
+      const add = document.createElement("button");
+      add.type = "button";
+      add.className = "secondary";
+      const adding = channelDirectory.adding.has(entry.source);
+      add.textContent = adding ? "Adding…" : "Add";
+      add.disabled = adding;
+      add.setAttribute("aria-label", `Add ${entry.name}`);
+      add.addEventListener("click", guardQuietly(() => addDirectoryChannel(entry)));
+      row.append(add);
+    }
+    return row;
+  });
+  el("channel-directory-list").replaceChildren(...rows);
+  el("channel-directory-more").hidden = channelDirectory.nextCursor === null;
+  el("channel-directory-more").disabled = channelDirectory.loading;
+  if (!channelDirectory.failed) el("channel-directory-retry").hidden = true;
+}
+
+/** Add one browsed channel through the ordinary add route, and mark it added. */
+async function addDirectoryChannel(entry) {
+  if (directoryEntryTracked(entry) || channelDirectory.adding.has(entry.source)) return;
+  const said = el("channel-directory-state");
+  const label = Array.from(entry.name).slice(0, CHANNEL_LABEL_MAX).join("").trim();
+  channelDirectory.adding.add(entry.source);
+  renderChannelDirectory();
+  said.textContent = `Adding "${entry.name}" and checking that it can be read…`;
+  let payload = null;
+  try {
+    payload = await api("/api/v1/channels", {
+      method: "POST",
+      body: { source: entry.source, label },
+    });
+  } catch (error) {
+    channelDirectory.adding.delete(entry.source);
+    // A conflict means the source is already a channel here, which is the tracked state.
+    if (error.status === 409) entry.tracked = true;
+    renderChannelDirectory();
+    said.textContent =
+      error.status === 409 ? `"${entry.name}" is already in the channel list.` : error.message;
+    return;
+  }
+  channelDirectory.adding.delete(entry.source);
+  knownChannels = payload.channels || knownChannels;
+  fillChannelSelect("discord-channel");
+  fillChannelSelect("settings-channel");
+  entry.tracked = true;
+  entry.channel_id = payload.channel && payload.channel.id ? String(payload.channel.id) : null;
+  renderChannelDirectory();
+  said.textContent = `Added. "${label}" is now in the channel picker.`;
+}
+
 /** Take back a channel that was added here. */
 async function removeChannel() {
   const id = el("settings-channel").value;
@@ -9336,6 +9590,7 @@ function showChannelPanel(which) {
   for (const [panel, opener] of [
     ["rename-fields", "rename-channel"],
     ["add-channel-fields", "open-add-channel"],
+    ["browse-channel-fields", "open-browse-channels"],
   ]) {
     const open = panel === which;
     el(panel).hidden = !open;
@@ -9482,10 +9737,10 @@ function applyClientConfig(config) {
   threadingSupported = config.threading_supported === true;
   // The selected backend owns its display name. An older server leaves it unspecified, so the
   // page stays neutral instead of guessing a platform from channel IDs or deployment details.
-  const providerName =
+  chatProviderName =
     typeof config.chat_provider_name === "string" ? config.chat_provider_name.trim() : "";
   for (const id of ["chat-provider-settings", "chat-provider-help"]) {
-    el(id).textContent = providerName || "Chat";
+    el(id).textContent = chatProviderName || "Chat";
   }
   // WHO THIS BRIDGE IS, from the server, before a single message is drawn.
   //
@@ -9523,9 +9778,12 @@ function applyClientConfig(config) {
   // rule, so the name in the bar and the name in Settings are one answer rather than two.
   knownChannels = config.channels || [];
   channelRegistrationSupported = config.channel_registration_supported === true;
+  channelDiscoverySupported =
+    channelRegistrationSupported && config.channel_discovery_supported === true;
+  el("open-browse-channels").hidden = !channelDiscoverySupported;
   el("new-channel-help").textContent = channelRegistrationSupported
-    ? "Paste a channel link or provider reference. The configured bridge resolves it and checks that it can be read."
-    : `Enter the channel ID supplied by this deployment. The bridge must already have access to the channel in ${providerName || "your chat service"}.`;
+    ? `Paste a channel link or reference from ${chatServiceName()}. The channel is checked before it is added.`
+    : `Enter the channel ID supplied by this deployment. The chat connector must already have access to the channel in ${chatServiceName()}.`;
   el("new-channel-id-label").textContent = channelRegistrationSupported
     ? "Channel link or provider reference"
     : "Channel ID";
@@ -10060,6 +10318,26 @@ el("cancel-add-channel").addEventListener("click", () => {
   showChannelPanel(null);
 });
 el("add-channel").addEventListener("click", guardQuietly(addChannel));
+el("open-browse-channels").addEventListener("click", guardQuietly(openChannelBrowser));
+el("close-browse-channels").addEventListener("click", () => showChannelPanel(null));
+el("channel-directory-search").addEventListener("input", scheduleDirectorySearch);
+el("channel-directory-search").addEventListener("keydown", (event) => {
+  if (event && event.key === "Enter") {
+    if (typeof event.preventDefault === "function") event.preventDefault();
+    guardQuietly(searchChannelDirectory)();
+  }
+});
+el("channel-directory-more").addEventListener(
+  "click",
+  guardQuietly(() => loadChannelDirectory(true))
+);
+el("channel-directory-retry").addEventListener(
+  "click",
+  guardQuietly(() =>
+    // Retry what failed: the next page when rows are already showing, otherwise the first.
+    loadChannelDirectory(channelDirectory.entries.length > 0 && channelDirectory.nextCursor !== null)
+  )
+);
 el("remove-channel").addEventListener("click", guardQuietly(removeChannel));
 el("save-alias").addEventListener("click", guardQuietly(saveAlias));
 el("clear-alias").addEventListener("click", guardQuietly(clearChannelAlias));

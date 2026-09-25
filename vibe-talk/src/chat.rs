@@ -248,6 +248,28 @@ pub trait ChatClient: Send + Sync {
         ))
     }
 
+    /// Whether this provider can list the channels its account can see. `#19 channel-browser`.
+    ///
+    /// False by default: only a registration-capable bridge that answers the directory contract
+    /// offers it, because a listed channel is only useful if it can then be registered.
+    fn supports_channel_discovery(&self) -> bool {
+        false
+    }
+
+    /// Read one page of the channels this provider's account can see.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatError`] when discovery is unsupported, denied, or fails.
+    async fn discover_channels(
+        &self,
+        _request: &crate::directory::DirectoryRequest,
+    ) -> Result<crate::directory::DirectoryPage, ChatError> {
+        Err(ChatError::Refused(
+            "the configured chat provider cannot list its channels".to_owned(),
+        ))
+    }
+
     /// Whether this provider can move its own read cursor forward.
     ///
     /// False by default so existing providers and test doubles do not acquire a write capability

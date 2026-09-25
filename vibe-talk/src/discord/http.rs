@@ -157,14 +157,7 @@ fn parse_registration_identity(value: &serde_json::Value) -> Result<(ChannelId, 
         .get("id")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
-        .filter(|id| {
-            !id.is_empty()
-                && *id != "."
-                && *id != ".."
-                && id.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
-                })
-        })
+        .filter(|id| crate::directory::path_safe_id(id))
         .ok_or_else(|| {
             ChatError::Shape(
                 "channel registration answer has no path-safe string \"id\" field".to_owned(),
@@ -201,6 +194,38 @@ pub fn parse_registered_channel(value: &serde_json::Value) -> Result<RegisteredC
         id,
         created,
         writable,
+    })
+}
+
+/// Build the bridge request that reads one page of the channel directory. `#19 channel-browser`.
+///
+/// # Errors
+///
+/// Returns [`ChatError::Shape`] when the configured API base is not a URL that can take a path.
+pub fn channel_directory_request(
+    api_base: &str,
+    request: &crate::directory::DirectoryRequest,
+) -> Result<PreparedRequest, ChatError> {
+    let mut url = reqwest::Url::parse(api_base.trim_end_matches('/'))
+        .map_err(|_| ChatError::Shape("invalid chat API base".to_owned()))?;
+    url.path_segments_mut()
+        .map_err(|_| ChatError::Shape("chat API base cannot contain path segments".to_owned()))?
+        .pop_if_empty()
+        .push("channel-directory");
+    {
+        let mut query = url.query_pairs_mut();
+        if let Some(text) = request.query.as_deref() {
+            query.append_pair("query", text);
+        }
+        query.append_pair("limit", &request.limit.to_string());
+        if let Some(cursor) = request.cursor.as_deref() {
+            query.append_pair("cursor", cursor);
+        }
+    }
+    Ok(PreparedRequest {
+        method: "GET",
+        url: url.into(),
+        body: None,
     })
 }
 
@@ -728,6 +753,30 @@ impl ChatClient for HttpDiscordClient {
         .map_err(|error| error.with_provider(self.provider_name()))
     }
 
+    fn supports_channel_discovery(&self) -> bool {
+        self.channel_registration
+    }
+
+    async fn discover_channels(
+        &self,
+        request: &crate::directory::DirectoryRequest,
+    ) -> Result<crate::directory::DirectoryPage, ChatError> {
+        async {
+            if !self.channel_registration {
+                return Err(ChatError::Refused(
+                    "channel discovery needs channel registration, which is disabled for this backend"
+                        .to_owned(),
+                ));
+            }
+            let value = self
+                .send(channel_directory_request(&self.api_base, request)?)
+                .await?;
+            crate::directory::parse_directory_page(&value, request.limit)
+        }
+        .await
+        .map_err(|error| error.with_provider(self.provider_name()))
+    }
+
     async fn unregister_channel(&self, channel: &ChannelId) -> Result<(), ChatError> {
         async {
             if !self.channel_registration {
@@ -937,6 +986,39 @@ mod tests {
         )
         .expect("valid bridge post");
         assert_eq!(bridged.body.expect("body")["nonce"], "nonce_ABC-123~");
+    }
+
+    #[test]
+    fn directory_requests_encode_every_opaque_value() {
+        let request = channel_directory_request(
+            "https://bridge.example/v1/",
+            &crate::directory::DirectoryRequest {
+                query: Some("release & ops/2".to_owned()),
+                cursor: Some("a+b/c=".to_owned()),
+                limit: 25,
+            },
+        )
+        .expect("valid request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(
+            request.url,
+            "https://bridge.example/v1/channel-directory?query=release+%26+ops%2F2&limit=25&cursor=a%2Bb%2Fc%3D"
+        );
+        assert_eq!(request.body, None);
+
+        let first = channel_directory_request(
+            "https://bridge.example/v1",
+            &crate::directory::DirectoryRequest {
+                query: None,
+                cursor: None,
+                limit: 10,
+            },
+        )
+        .expect("valid request");
+        assert_eq!(
+            first.url,
+            "https://bridge.example/v1/channel-directory?limit=10"
+        );
     }
 
     #[test]

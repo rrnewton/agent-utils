@@ -38,6 +38,7 @@ use super::ratelimit::{Attempt, Headers, RateLimit, RateLimiter, RetryPolicy};
 use crate::chat::ChatError as DiscordError;
 use crate::chat::{ChatClient, ChatError, ChatIdentity, RegisteredChannel};
 use crate::config::DEFAULT_DISCORD_API_BASE;
+use crate::directory::{DirectoryEntry, DirectoryPage, DirectoryRequest};
 use crate::model::{sort_oldest_first, ChannelId, Message, MessageId, UserId};
 
 /// The bot user id [`FakeDiscord`] answers `GET /users/@me` with.
@@ -77,6 +78,13 @@ struct State {
     registrations_in_flight: usize,
     max_registrations_in_flight: usize,
     unregistration_calls: Vec<ChannelId>,
+    /// The channel directory, when this fake offers one. `#19 channel-browser`.
+    directory: Option<Vec<DirectoryEntry>>,
+    /// A status the next directory read answers with instead of a page.
+    directory_status: Option<(u16, String)>,
+    /// Whether the directory claims to have stopped early.
+    directory_truncated: bool,
+    directory_calls: Vec<DirectoryRequest>,
     upstream_read_marks_enabled: bool,
     upstream_read_marks: Vec<(ChannelId, MessageId)>,
     next_id: u64,
@@ -172,6 +180,28 @@ impl FakeDiscord {
             created,
             writable,
         });
+    }
+
+    /// Offer a channel directory, listed in this order. `#19 channel-browser`.
+    ///
+    /// Filtering is a case-insensitive substring of the name, and cursors are the offset of the next
+    /// entry, which is all a test needs to walk pages. Discovery is only offered with registration,
+    /// as the real bridge client does.
+    pub fn enable_channel_directory(&self, entries: Vec<DirectoryEntry>, truncated: bool) {
+        let mut state = self.lock();
+        state.directory = Some(entries);
+        state.directory_truncated = truncated;
+    }
+
+    /// Answer the next directory read with this HTTP status and body.
+    pub fn fail_next_directory(&self, status: u16, body: &str) {
+        self.lock().directory_status = Some((status, body.to_owned()));
+    }
+
+    /// Directory requests received, in call order.
+    #[must_use]
+    pub fn directory_calls(&self) -> Vec<DirectoryRequest> {
+        self.lock().directory_calls.clone()
     }
 
     /// Delay each managed registration response, allowing concurrency tests to force overlap.
@@ -454,6 +484,56 @@ impl ChatClient for FakeDiscord {
         self.lock().registrations_in_flight -= 1;
         answer.ok_or_else(|| {
             ChatError::Shape("the fake has no channel registration answer".to_owned())
+        })
+    }
+
+    fn supports_channel_discovery(&self) -> bool {
+        let state = self.lock();
+        state.channel_registration_enabled && state.directory.is_some()
+    }
+
+    async fn discover_channels(
+        &self,
+        request: &DirectoryRequest,
+    ) -> Result<DirectoryPage, ChatError> {
+        let mut state = self.lock();
+        state.directory_calls.push(request.clone());
+        if let Some((status, body)) = state.directory_status.take() {
+            return Err(ChatError::Status { status, body });
+        }
+        let Some(directory) = state.directory.as_ref() else {
+            return Err(ChatError::Refused(
+                "the configured chat provider cannot list its channels".to_owned(),
+            ));
+        };
+        let needle = request.query.as_deref().map(str::to_lowercase);
+        let matching: Vec<&DirectoryEntry> = directory
+            .iter()
+            .filter(|entry| {
+                needle
+                    .as_deref()
+                    .is_none_or(|needle| entry.name.to_lowercase().contains(needle))
+            })
+            .collect();
+        let start = match request.cursor.as_deref() {
+            None => 0,
+            Some(cursor) => cursor
+                .strip_prefix("offset:")
+                .and_then(|offset| offset.parse::<usize>().ok())
+                .filter(|offset| *offset <= matching.len())
+                .ok_or_else(|| ChatError::Status {
+                    status: 400,
+                    body: "invalid channel directory cursor".to_owned(),
+                })?,
+        };
+        let end = matching.len().min(start + usize::from(request.limit));
+        Ok(DirectoryPage {
+            entries: matching[start..end]
+                .iter()
+                .map(|entry| (*entry).clone())
+                .collect(),
+            next_cursor: (end < matching.len()).then(|| format!("offset:{end}")),
+            truncated: state.directory_truncated,
         })
     }
 
