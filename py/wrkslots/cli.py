@@ -7115,13 +7115,31 @@ def _completed_create_record(
     )
 
 
+def _scoped_operation_journal_opens(
+    journal: Mapping[str, object], operation: str
+) -> bool:
+    """Return whether progress is the first write of a scoped operation."""
+
+    if operation == "finish":
+        return journal.get("phase") == "prepared"
+    return journal.get("created") == [] and journal.get("hook_progress") == 0
+
+
 def _scoped_operation_journal_completed(
     config: Config,
     path: Path,
     raw: Mapping[str, object],
     operation: str,
 ) -> bool:
-    """Verify event-first provenance for one collision-free journal path."""
+    """Verify event-first provenance for one scoped journal path.
+
+    The path names only the machine and slot, so one path can carry several
+    operations: a rolled-back finish completes while its ACTIVE row remains,
+    and the retry writes the same path again.  Each completion closes an
+    episode, and progress after it opens the next one only at the operation's
+    first phase.  The bytes must equal the latest progress, and completion is
+    that of the latest episode.
+    """
 
     label = f"scoped {operation} journal"
     machine = _as_str(raw["machine"], f"{operation} journal.machine")
@@ -7146,15 +7164,17 @@ def _scoped_operation_journal_completed(
         if event_path != path:
             continue
         if event_kind == "operation-progress-recorded":
-            if completed:
-                raise StateError(f"{label} path was reused after completion")
             assert journal is not None
+            if completed and not _scoped_operation_journal_opens(journal, operation):
+                raise StateError(
+                    f"{label} path was reused after completion without a new "
+                    "operation"
+                )
             recorded = journal
+            completed = False
             continue
         if recorded is None:
             raise StateError(f"scoped {operation} completion has no preceding progress evidence")
-        if completed:
-            continue
         completed = True
     if recorded is None:
         raise StateError(f"{label} has no matching append-only progress evidence")
