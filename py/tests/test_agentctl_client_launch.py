@@ -359,6 +359,39 @@ def test_custom_harness_rejects_matching_report_when_kernel_executable_differs(
 
 
 @pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="Linux pidfd identity required")
+def test_legacy_recovery_uses_basename_only_with_exact_image_and_arguments() -> None:
+    executable = os.path.realpath("/usr/bin/sleep")
+    process = subprocess.Popen([executable, "30"], start_new_session=True)
+    try:
+        observed = HerdrClient._process_identity(process.pid)
+        assert observed is not None
+        identity, process_group, _path = observed
+        response = {"result": {"process_info": {
+            "pane_id": "p1", "shell_pid": 1,
+            "foreground_process_group_id": process_group,
+            "foreground_processes": [{
+                "pid": process.pid, "name": "sleep", "cmdline": f"{executable} 30",
+                "argv": [executable, "30"], "executable": executable,
+            }],
+        }}}
+        client = HerdrClient(
+            herdr_bin="fixture-herdr", run=Runner({"process_info": response["result"]["process_info"]})
+        )
+        assert client.recover_pane_agent(
+            "p1", ("sleep", "30"), identity.executable_device,
+            identity.executable_inode, process.pid,
+        ) == identity
+        with pytest.raises(HerdrUnavailable, match="argv does not exactly match"):
+            client.recover_pane_agent(
+                "p1", ("sleep", "31"), identity.executable_device,
+                identity.executable_inode, process.pid,
+            )
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+
+
+@pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="Linux pidfd identity required")
 def test_recovered_publication_detects_exit_after_commit_through_pinned_pidfd() -> None:
     executable = os.path.realpath("/usr/bin/sleep")
     process = subprocess.Popen([executable, "30"], start_new_session=True)

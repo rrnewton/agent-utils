@@ -1404,6 +1404,8 @@ impl AgentRecord {
                                 | "launch_executable"
                                 | "launch_executable_device"
                                 | "launch_executable_inode"
+                                | "runner_pid"
+                                | "runner_started_at"
                         )
                     {
                         return Err(fail(format!(
@@ -3061,9 +3063,6 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             || record.pane_id.is_none()
             || record.tab_id.is_none()
             || record.workspace_id.is_none()
-            || record.launch_executable.is_none()
-            || record.launch_executable_device.is_none()
-            || record.launch_executable_inode.is_none()
             || record.launch_argv.is_empty()
             || record.session_agent.is_some()
             || record.session_value.is_some()
@@ -3103,15 +3102,32 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "refusing start recovery: live pane identity or agent report changed",
             ));
         }
+        let mut launch_device = record.launch_executable_device;
+        let mut launch_inode = record.launch_executable_inode;
+        if let Some(persisted) = record.custom_process_identity.as_ref() {
+            let recorded_image = (persisted.executable_device, persisted.executable_inode);
+            if launch_device
+                .zip(launch_inode)
+                .is_some_and(|launch_image| launch_image != recorded_image)
+            {
+                return Err(fail(
+                    "refusing start recovery: launch and process executable identities disagree",
+                ));
+            }
+            launch_device = Some(recorded_image.0);
+            launch_inode = Some(recorded_image.1);
+        }
+        let launch_device = launch_device.ok_or_else(|| {
+            fail("start recovery requires a saved launch or process executable identity")
+        })?;
+        let launch_inode = launch_inode.ok_or_else(|| {
+            fail("start recovery requires a saved launch or process executable identity")
+        })?;
         let identity = self.client.recover_pane_agent(
             &pane_id,
             &record.launch_argv,
-            record
-                .launch_executable_device
-                .expect("checked launch executable device"),
-            record
-                .launch_executable_inode
-                .expect("checked launch executable inode"),
+            launch_device,
+            launch_inode,
             expected_pid,
         )?;
         if record
@@ -6620,8 +6636,10 @@ mod tests {
             expected_inode: u64,
             expected_pid: u64,
         ) -> AdapterResult<CustomProcessIdentity> {
-            if expected_argv.first().map(String::as_str) == Some("/opt/agentctl/muse")
-                && expected_device == Self::custom_identity().executable_device
+            if matches!(
+                expected_argv.first().map(String::as_str),
+                Some("/opt/agentctl/muse" | "muse")
+            ) && expected_device == Self::custom_identity().executable_device
                 && expected_inode == Self::custom_identity().executable_inode
                 && expected_pid == Self::custom_identity().pid
                 && self.custom_alive.load(Ordering::Relaxed)
@@ -7032,6 +7050,27 @@ mod tests {
         assert_eq!(partial["custom_process_identity"]["pid"], 4242);
         assert_eq!(partial["pane_reported_by_agentctl"], false);
         fixture.client.custom_alive.store(true, Ordering::Relaxed);
+        // Legacy starts saved the exact observed process but not the launch
+        // executable fields.  Preserve that process identity as the image
+        // authority and reconstruct argv from the legacy arguments.
+        let mut legacy = manager.load("worker").unwrap().public_value();
+        let legacy = legacy.as_object_mut().unwrap();
+        for field in [
+            "launch_profile",
+            "launch_executable",
+            "launch_executable_device",
+            "launch_executable_inode",
+            "launch_argv",
+            "launch_environment_names",
+            "runtime_ownership",
+            "runner_pid",
+            "runner_started_at",
+            "runner_identity",
+        ] {
+            legacy.remove(field);
+        }
+        legacy.insert("schema".to_owned(), json!(1));
+        agent::atomic_json(&path, &Value::Object(legacy.clone())).unwrap();
         let recovered = manager
             .recover_start(
                 "worker",
@@ -7405,6 +7444,8 @@ mod tests {
             "profile",
             "adapter",
             "arguments",
+            "runner_pid",
+            "runner_started_at",
         ] {
             let fixture = Fixture::new();
             fixture.start(None);

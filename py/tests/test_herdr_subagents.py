@@ -125,7 +125,10 @@ class FakeManagedClient:
         expected_inode: int, expected_pid: int,
     ) -> CustomProcessIdentity:
         assert pane_id in self.infos
-        assert tuple(expected_argv) == ("/opt/agentctl/muse", *self.launched[-1][3])
+        assert tuple(expected_argv) in {
+            ("/opt/agentctl/muse", *self.launched[-1][3]),
+            ("muse", *self.launched[-1][3]),
+        }
         if (expected_pid != self.custom_identity.pid
                 or expected_device != self.custom_identity.executable_device
                 or expected_inode != self.custom_identity.executable_inode
@@ -698,6 +701,19 @@ def test_identityless_failed_muse_launch_requires_token_and_exact_pid_to_recover
     assert partially_recovered.pane_reported_by_agentctl is False
 
     fake.custom_running = True
+    # A launch that predated the tagged schema recorded the exact observed
+    # process but not the executable-intent fields.  Its process identity is
+    # sufficient authority for the image; arguments reconstruct argv.
+    legacy = partially_recovered.to_document()
+    for field in (
+        "launch_profile", "launch_executable", "launch_executable_device",
+        "launch_executable_inode", "launch_argv", "launch_environment_names",
+        "runtime_ownership", "runner_pid", "runner_started_at", "runner_identity",
+    ):
+        legacy.pop(field, None)
+    legacy["schema"] = 1
+    path = manager.registry / "worker" / "agent.json"
+    path.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
 
     recovered = manager.recover_start(
         "worker", expected_token=str(started["token"]),

@@ -1627,14 +1627,28 @@ class ManagedAgents:
                     or record.backend != "herdr" or record.runtime_ownership != "owned"
                     or record.pane_id is None
                     or record.tab_id is None or record.workspace_id is None
-                    or record.launch_executable is None
-                    or record.launch_executable_device is None
-                    or record.launch_executable_inode is None
                     or not record.launch_argv
                     or record.session_agent is not None or record.session_value is not None):
                 raise AgentDeliveryError(
                     "start recovery requires a launch_failed Muse interactive Herdr "
                     "record with complete launch intent and pane ownership"
+                )
+            launch_device = record.launch_executable_device
+            launch_inode = record.launch_executable_inode
+            if record.custom_process_identity is not None:
+                recorded_image = (
+                    record.custom_process_identity.executable_device,
+                    record.custom_process_identity.executable_inode,
+                )
+                if (launch_device is not None and launch_inode is not None
+                        and (launch_device, launch_inode) != recorded_image):
+                    raise AgentDeliveryError(
+                        "refusing start recovery: launch and process executable identities disagree"
+                    )
+                launch_device, launch_inode = recorded_image
+            if launch_device is None or launch_inode is None:
+                raise AgentDeliveryError(
+                    "start recovery requires a saved launch or process executable identity"
                 )
             pane_id = record.pane_id
             assert pane_id is not None
@@ -1658,7 +1672,7 @@ class ManagedAgents:
                 )
             identity = self.client.recover_pane_agent(
                 pane_id, record.launch_argv,
-                record.launch_executable_device, record.launch_executable_inode,
+                launch_device, launch_inode,
                 expected_pid,
             )
             if (record.custom_process_identity is not None

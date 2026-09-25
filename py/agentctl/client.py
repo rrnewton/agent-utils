@@ -1205,7 +1205,15 @@ class HerdrClient:
                         f"expected one foreground process with pid {expected_pid}, found {len(matches)}"
                     )
                 raw_argv = as_sequence(matches[0].get("argv"), "foreground process argv")
-                if list(raw_argv) != list(expected_argv):
+                argv_matches = list(raw_argv) == list(expected_argv)
+                legacy_program_matches = (
+                    not os.path.isabs(expected_argv[0])
+                    and "/" not in expected_argv[0]
+                    and isinstance(raw_argv[0], str)
+                    and os.path.basename(raw_argv[0]) == expected_argv[0]
+                    and list(raw_argv[1:]) == list(expected_argv[1:])
+                )
+                if not argv_matches and not legacy_program_matches:
                     raise TypeError(
                         f"pid {expected_pid} argv does not exactly match the recorded launch arguments"
                     )

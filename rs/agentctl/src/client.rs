@@ -7,7 +7,7 @@ use chat_subscription_plugin::process::ProcessPluginChild;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
-use std::ffi::{CStr, OsString};
+use std::ffi::{CStr, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
@@ -1310,7 +1310,19 @@ impl HerdrClient {
                     "foreground process argv is absent or contains a non-string value",
                 )
             })?;
-        if argv != expected_argv.iter().map(String::as_str).collect::<Vec<_>>() {
+        let expected = expected_argv.iter().map(String::as_str).collect::<Vec<_>>();
+        let legacy_program_matches = expected.first().zip(argv.first()).is_some_and(
+            |(expected_program, observed_program)| {
+                !Path::new(expected_program).is_absolute()
+                    && !expected_program.contains('/')
+                    && Path::new(observed_program)
+                        .file_name()
+                        .and_then(OsStr::to_str)
+                        == Some(*expected_program)
+                    && argv.get(1..) == expected.get(1..)
+            },
+        );
+        if argv != expected && !legacy_program_matches {
             return Err(AdapterError::unavailable(format!(
                 "pid {expected_pid} argv does not exactly match the recorded launch arguments"
             )));
@@ -3319,6 +3331,54 @@ mod tests {
             .client()
             .verify_custom_harness("pane", "muse", Some(&identity))
             .expect("verification uses the recorded image, not the replaced pathname");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_recovery_uses_basename_only_with_exact_image_and_arguments() {
+        let herdr = FakeExecutable::new("{}");
+        let harness = herdr.root.join("muse");
+        install_test_elf("/bin/sleep", &harness);
+        let mut process = spawn_test_process(&harness);
+        let pid = process.0.id();
+        herdr.set_response(&process_info_response(pid, &harness));
+        let identity = herdr
+            .client()
+            .custom_harness_observed(
+                "pane",
+                &pin_harness_executable(harness.clone()).unwrap(),
+                &|| false,
+            )
+            .unwrap()
+            .expect("observe process");
+
+        assert_eq!(
+            herdr
+                .client()
+                .recover_pane_agent(
+                    "pane",
+                    &["muse".to_owned(), "30".to_owned()],
+                    identity.executable_device,
+                    identity.executable_inode,
+                    u64::from(pid),
+                )
+                .unwrap(),
+            identity
+        );
+        assert!(herdr
+            .client()
+            .recover_pane_agent(
+                "pane",
+                &["muse".to_owned(), "31".to_owned()],
+                identity.executable_device,
+                identity.executable_inode,
+                u64::from(pid),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("argv does not exactly match"));
+        process.0.kill().unwrap();
+        process.0.wait().unwrap();
     }
 
     #[cfg(target_os = "linux")]
