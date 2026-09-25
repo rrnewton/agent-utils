@@ -5734,7 +5734,8 @@ test("the channel bar switches between configured agent audio and device audio l
   const toggle = page.el("audio-source");
   assert.equal(toggle.hidden, false);
   assert.equal(toggle.getAttribute("aria-checked"), "true");
-  assert.match(toggle.title, /Internal voice preview/);
+  assert.equal(toggle.getAttribute("aria-label"), "Read messages with Internal voice preview");
+  assert.equal(toggle.title, "Internal voice preview. Tap to use device audio.");
   assert.equal(page.el("audio-device-icon").hidden, true);
   assert.equal(page.el("audio-agent-icon").hidden, false, "agent audio does not show its cloud icon");
   assert.match(HTML_CODE, /id="audio-device-icon"[^>]*data-icon="device"/);
@@ -5742,6 +5743,8 @@ test("the channel bar switches between configured agent audio and device audio l
   const requests = page.prepareCalls.length;
   await toggle.click();
   assert.equal(toggle.getAttribute("aria-checked"), "false");
+  assert.equal(toggle.getAttribute("aria-label"), "Read messages with device audio");
+  assert.equal(toggle.title, "Device audio. Tap to use Internal voice preview.");
   assert.equal(page.el("audio-device-icon").hidden, false, "device speech lost its phone icon");
   assert.equal(page.el("audio-agent-icon").hidden, true);
   assert.equal(page.prepareCalls.length, requests, "changing the source issued a network request");
