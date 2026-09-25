@@ -1207,7 +1207,8 @@ class HerdrClient:
                 raw_argv = as_sequence(matches[0].get("argv"), "foreground process argv")
                 argv_matches = list(raw_argv) == list(expected_argv)
                 legacy_program_matches = (
-                    not os.path.isabs(expected_argv[0])
+                    bool(raw_argv)
+                    and not os.path.isabs(expected_argv[0])
                     and "/" not in expected_argv[0]
                     and isinstance(raw_argv[0], str)
                     and os.path.basename(raw_argv[0]) == expected_argv[0]

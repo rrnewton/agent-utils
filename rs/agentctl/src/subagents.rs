@@ -7451,7 +7451,12 @@ mod tests {
             fixture.start(None);
             let path = fixture.root.join("registry/worker/agent.json");
             let mut document = agent::read_private_json(&path).unwrap();
-            document["extensions"][collision] = json!(["replacement"]);
+            document["extensions"][collision] = match collision {
+                "runner_pid" => json!(123),
+                "runner_started_at" => json!("456"),
+                "launch_profile" | "profile" | "adapter" => json!("replacement"),
+                _ => json!(["replacement"]),
+            };
             agent::atomic_json(&path, &document).unwrap();
             assert!(fixture
                 .manager()

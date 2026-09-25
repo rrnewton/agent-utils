@@ -953,18 +953,20 @@ def test_agent_record_v2_has_one_tagged_launch_authority(
     assert manager.get("worker").arguments == started["arguments"]
 
 
-@pytest.mark.parametrize(
-    "collision",
-    ("launch_argv", "launch_profile", "argv", "profile", "adapter", "arguments"),
-)
+@pytest.mark.parametrize("collision,value", (
+    ("launch_argv", ["replacement"]), ("launch_profile", "replacement"),
+    ("argv", ["replacement"]), ("profile", "replacement"),
+    ("adapter", "herdr"), ("arguments", ["replacement"]),
+    ("runner_pid", 123), ("runner_started_at", "456"),
+))
 def test_agent_record_v2_extensions_cannot_shadow_launch_authority(
-    collision: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    collision: str, value: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, _fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path))
     path = manager.registry / "worker" / "agent.json"
     document = json.loads(path.read_text(encoding="utf-8"))
-    document["extensions"][collision] = ["replacement"]
+    document["extensions"][collision] = value
     path.write_text(json.dumps(document), encoding="utf-8")
     with pytest.raises(AgentDeliveryError, match="invalid agent record extensions"):
         manager.get("worker")
