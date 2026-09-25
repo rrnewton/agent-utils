@@ -30179,6 +30179,51 @@ def test_integrated_process_liveness_clear_and_in_use(
         wrkslots._assert_absent_validate_processes_unrelated(rows)
 
 
+def busctl_json(signature: str, data: object) -> bytes:
+    return (
+        json.dumps({"type": signature, "data": data}, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+
+
+def busctl_property_values(
+    properties: Sequence[tuple[str, str]], overrides: Mapping[str, object]
+) -> bytes:
+    defaults: dict[str, object] = {
+        "s": "",
+        "u": 0,
+        "as": [],
+        "a(sb)": [],
+        "a(ssbt)": [],
+        "a(sasbttttuii)": [],
+    }
+    return b"".join(
+        busctl_json(signature, overrides.get(name, defaults[signature]))
+        for name, signature in properties
+    )
+
+
+def busctl_unit_row(
+    unit: str = "unit.service",
+    *,
+    active_state: str = "active",
+    job_id: int = 0,
+) -> list[object]:
+    encoded = unit.replace("-", "_2d").replace(".", "_2e")
+    return [
+        unit,
+        "untrusted description",
+        "loaded",
+        active_state,
+        "running" if active_state == "active" else "dead",
+        "",
+        f"/org/freedesktop/systemd1/unit/{encoded}",
+        job_id,
+        "start" if job_id else "",
+        f"/org/freedesktop/systemd1/job/{job_id}" if job_id else "/",
+    ]
+
+
 def test_user_systemd_uses_validated_bus_and_absolute_binary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -30202,7 +30247,7 @@ def test_user_systemd_uses_validated_bus_and_absolute_binary(
     def bounded(command: list[str], **kwargs: object) -> tuple[int, bytes, bytes]:
         seen["command"] = command
         seen["kwargs"] = kwargs
-        return 0, b"unit.service loaded active running\n", b""
+        return 0, busctl_json("s", "unit.service"), b""
 
     monkeypatch.setattr(wrkslots, "_run_bounded_read_only_command", bounded)
     budget = wrkslots._ReadOnlyCommandBudget.start(
@@ -30210,14 +30255,531 @@ def test_user_systemd_uses_validated_bus_and_absolute_binary(
         stdout_limit=1024 * 1024,
         stderr_limit=64 * 1024,
     )
-    assert "unit.service" in wrkslots._run_user_systemctl(("list-units",), budget)
-    assert seen["command"] == ["/usr/bin/systemctl", "--user", "list-units"]
+    assert b"unit.service" in wrkslots._run_user_busctl(("get-property",), budget)
+    assert seen["command"] == [
+        "/usr/bin/busctl",
+        "--user",
+        "--json=short",
+        "get-property",
+    ]
     kwargs = seen["kwargs"]
     assert isinstance(kwargs, dict)
     assert 0 < kwargs["timeout_seconds"] <= 30
     assert kwargs["stdout_limit"] == 1024 * 1024
     assert kwargs["stderr_limit"] == 64 * 1024
     assert kwargs["env_overrides"] == {"XDG_RUNTIME_DIR": "/run/user/123"}
+
+
+def test_user_systemd_busctl_preserves_multiline_property_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = Path("/absent/target")
+    script = (
+        "\nset -uo pipefail\n"
+        "Id=spoofed.service\n"
+        "ActiveState=inactive\n"
+        "KEY=value\n\n"
+        f"cd {target}\n"
+    )
+    command = ["/bin/bash", ["/bin/bash", "-lc", script], False, 0, 0, 0, 0, 0, 0, 0]
+    row = busctl_unit_row()
+    calls: list[tuple[str, ...]] = []
+
+    def run(arguments: Sequence[str], _budget: object, **_kwargs: object) -> bytes:
+        call = tuple(arguments)
+        calls.append(call)
+        if call[0] == "call" and call[4] == "ListUnitsByPatterns":
+            return busctl_json("a(ssssssouso)", [[row]])
+        if call[0] == "call" and call[4] == "ListJobs":
+            return busctl_json("a(usssoo)", [[]])
+        assert call[0] == "get-property"
+        if call[3] == "org.freedesktop.systemd1.Service":
+            assert call[4:] == tuple(
+                name for name, _signature in wrkslots._USER_SYSTEMD_SERVICE_PROPERTIES
+            )
+            return busctl_property_values(
+                wrkslots._USER_SYSTEMD_SERVICE_PROPERTIES,
+                {
+                    "ControlGroup": "/user.slice/unit.service",
+                    "ExecStart": [command],
+                },
+            )
+        assert call[3] == wrkslots._USER_SYSTEMD_UNIT_INTERFACE
+        return busctl_property_values(
+            wrkslots._USER_SYSTEMD_UNIT_PROPERTIES,
+            {
+                "Id": "unit.service",
+                "LoadState": "loaded",
+                "ActiveState": "active",
+                "SubState": "running",
+            },
+        )
+
+    monkeypatch.setattr(wrkslots, "_run_user_busctl", run)
+    snapshot = wrkslots._user_systemd_snapshot()
+    assert len(snapshot) == 1
+    assert snapshot[0]["Id"] == "unit.service"
+    assert snapshot[0]["ActiveState"] == "active"
+    assert script in snapshot[0]["ExecStart"]
+    assert str(target) in "\n".join(snapshot[0].values())
+    assert sum(call[0] == "get-property" for call in calls) == 2
+
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", lambda: snapshot)
+    with pytest.raises(wrkslots.Refusal, match="unit.service names ownerless"):
+        wrkslots._assert_unregistered_path_systemd_unrelated(target)
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected", "message"),
+    (
+        (busctl_json("s", "value").rstrip(b"\n"), 1, "terminal newline"),
+        (busctl_json("s", "one") + busctl_json("s", "two"), 1, "2 JSON documents"),
+        (b'{"type":"s","type":"u","data":"value"}\n', 1, "duplicate key"),
+        (b'{"type":"s","data":"value","extra":false}\n', 1, "unexpected JSON fields"),
+    ),
+)
+def test_user_systemd_busctl_refuses_ambiguous_or_truncated_json(
+    stdout: bytes, expected: int, message: str
+) -> None:
+    with pytest.raises(wrkslots.Refusal, match=message):
+        wrkslots._user_busctl_json_documents(stdout, expected, "test reply")
+
+
+def test_user_systemd_busctl_refuses_property_signature_or_order_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        wrkslots,
+        "_run_user_busctl",
+        lambda *_args, **_kwargs: busctl_json("u", 0) + busctl_json("s", "group"),
+    )
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=30,
+        stdout_limit=1024 * 1024,
+        stderr_limit=64 * 1024,
+    )
+    with pytest.raises(wrkslots.Refusal, match="ControlGroup.*signature 'u'.*expected 's'"):
+        wrkslots._user_systemd_properties(
+            "/org/freedesktop/systemd1/unit/unit_2eservice",
+            "org.freedesktop.systemd1.Service",
+            (("ControlGroup", "s"), ("MainPID", "u")),
+            budget,
+        )
+
+
+@pytest.mark.parametrize(
+    ("signature", "value", "message"),
+    (
+        ("u", True, "32-bit unsigned"),
+        ("a(ssbt)", [["/source", "/target", False, -1]], "64-bit unsigned"),
+        (
+            "a(sasbttttuii)",
+            [["/bin/true", ["/bin/true"], False, 0, 0, 0, 0, 0, 0]],
+            "Exec command tuple",
+        ),
+    ),
+)
+def test_user_systemd_busctl_refuses_malformed_typed_property_values(
+    signature: str, value: object, message: str
+) -> None:
+    with pytest.raises(wrkslots.Refusal, match=message):
+        wrkslots._user_busctl_typed_value(signature, value, "test property")
+
+
+@pytest.mark.parametrize(
+    ("signature", "rows", "message"),
+    (
+        ("a(ssss)", [busctl_unit_row()], "signature"),
+        (
+            "a(ssssssouso)",
+            [[*busctl_unit_row()[:6], "/wrong/object", *busctl_unit_row()[7:]]],
+            "object path",
+        ),
+        (
+            "a(ssssssouso)",
+            [busctl_unit_row(), busctl_unit_row()],
+            "duplicate identities",
+        ),
+        (
+            "a(ssssssouso)",
+            [[*busctl_unit_row()[:5], "alias.service", *busctl_unit_row()[6:]]],
+            "unresolved unit alias",
+        ),
+    ),
+)
+def test_user_systemd_busctl_refuses_invalid_manager_identity_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    signature: str,
+    rows: list[object],
+    message: str,
+) -> None:
+    monkeypatch.setattr(
+        wrkslots,
+        "_run_user_busctl",
+        lambda *_args, **_kwargs: busctl_json(signature, [rows]),
+    )
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=30,
+        stdout_limit=1024 * 1024,
+        stderr_limit=64 * 1024,
+    )
+    with pytest.raises(wrkslots.Refusal, match=message):
+        wrkslots._user_systemd_units(budget)
+
+
+def test_user_systemd_busctl_refuses_unit_population_instead_of_truncating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = [busctl_unit_row(f"unit-{index}.service") for index in range(4097)]
+    monkeypatch.setattr(
+        wrkslots,
+        "_run_user_busctl",
+        lambda *_args, **_kwargs: busctl_json("a(ssssssouso)", [rows]),
+    )
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=30,
+        stdout_limit=1024 * 1024,
+        stderr_limit=64 * 1024,
+    )
+    with pytest.raises(wrkslots.Refusal, match="unit population exceeds 4096"):
+        wrkslots._user_systemd_units(budget)
+
+
+def test_user_systemd_busctl_retries_inactive_to_active_without_losing_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = Path("/became/active")
+    inactive_row = busctl_unit_row(active_state="inactive")
+    active_row = busctl_unit_row(active_state="active")
+    unit_reads = 0
+    listing_reads = 0
+    service_property_counts: list[int] = []
+
+    def run(arguments: Sequence[str], _budget: object, **_kwargs: object) -> bytes:
+        nonlocal listing_reads, unit_reads
+        call = tuple(arguments)
+        if call[0] == "call" and call[4] == "ListUnitsByPatterns":
+            listing_reads += 1
+            row = inactive_row if listing_reads == 1 else active_row
+            return busctl_json("a(ssssssouso)", [[row]])
+        if call[0] == "call" and call[4] == "ListJobs":
+            return busctl_json("a(usssoo)", [[]])
+        if call[3] == "org.freedesktop.systemd1.Service":
+            requested = call[4:]
+            service_property_counts.append(len(requested))
+            specs = tuple(
+                spec
+                for spec in wrkslots._USER_SYSTEMD_SERVICE_PROPERTIES
+                if spec[0] in requested
+            )
+            return busctl_property_values(
+                specs,
+                {"ControlGroup": "/user.slice/unit.service", "WorkingDirectory": str(target)},
+            )
+        unit_reads += 1
+        return busctl_property_values(
+            wrkslots._USER_SYSTEMD_UNIT_PROPERTIES,
+            {
+                "Id": "unit.service",
+                "LoadState": "loaded",
+                "ActiveState": "active",
+                "SubState": "running",
+            },
+        )
+
+    monkeypatch.setattr(wrkslots, "_run_user_busctl", run)
+    snapshot = wrkslots._user_systemd_snapshot()
+    assert unit_reads == 2
+    assert listing_reads == 3
+    assert service_property_counts == [1, len(wrkslots._USER_SYSTEMD_SERVICE_PROPERTIES)]
+    assert snapshot[0]["ActiveState"] == "active"
+    assert snapshot[0]["WorkingDirectory"] == str(target)
+
+
+def test_user_systemd_busctl_refuses_continuous_state_churn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unit_reads = 0
+    latest_active = "inactive"
+
+    def run(arguments: Sequence[str], _budget: object, **_kwargs: object) -> bytes:
+        nonlocal latest_active, unit_reads
+        call = tuple(arguments)
+        if call[0] == "call" and call[4] == "ListUnitsByPatterns":
+            listed = busctl_unit_row(active_state=latest_active)
+            return busctl_json("a(ssssssouso)", [[listed]])
+        if call[0] == "call" and call[4] == "ListJobs":
+            return busctl_json("a(usssoo)", [[]])
+        if call[3] == "org.freedesktop.systemd1.Service":
+            specs = tuple(
+                spec
+                for spec in wrkslots._USER_SYSTEMD_SERVICE_PROPERTIES
+                if spec[0] in call[4:]
+            )
+            return busctl_property_values(specs, {"ControlGroup": "/unit.service"})
+        unit_reads += 1
+        active = "active" if unit_reads % 2 else "inactive"
+        latest_active = active
+        return busctl_property_values(
+            wrkslots._USER_SYSTEMD_UNIT_PROPERTIES,
+            {
+                "Id": "unit.service",
+                "LoadState": "loaded",
+                "ActiveState": active,
+                "SubState": "running" if active == "active" else "dead",
+            },
+        )
+
+    monkeypatch.setattr(wrkslots, "_run_user_busctl", run)
+    with pytest.raises(wrkslots.Refusal, match="changed during three bounded"):
+        wrkslots._user_systemd_snapshot()
+    assert unit_reads == 3
+
+
+@pytest.mark.parametrize(
+    ("initial_names", "later_names", "expected_names"),
+    (
+        ((), ("first.service",), {"first.service"}),
+        (
+            ("first.service",),
+            ("first.service", "second.service"),
+            {"first.service", "second.service"},
+        ),
+        (("first.service", "second.service"), ("first.service",), {"first.service"}),
+    ),
+)
+def test_user_systemd_busctl_relists_changed_unit_population_before_success(
+    monkeypatch: pytest.MonkeyPatch,
+    initial_names: tuple[str, ...],
+    later_names: tuple[str, ...],
+    expected_names: set[str],
+) -> None:
+    rows = {
+        name: busctl_unit_row(name)
+        for name in {"first.service", "second.service"}
+    }
+    names_by_object = {str(row[6]): name for name, row in rows.items()}
+    listing_reads = 0
+
+    def run(arguments: Sequence[str], _budget: object, **_kwargs: object) -> bytes:
+        nonlocal listing_reads
+        call = tuple(arguments)
+        if call[0] == "call" and call[4] == "ListUnitsByPatterns":
+            listing_reads += 1
+            names = initial_names if listing_reads == 1 else later_names
+            return busctl_json(
+                "a(ssssssouso)", [[list(rows[name]) for name in names]]
+            )
+        if call[0] == "call" and call[4] == "ListJobs":
+            return busctl_json("a(usssoo)", [[]])
+        unit = names_by_object[call[2]]
+        if call[3] == "org.freedesktop.systemd1.Service":
+            specs = tuple(
+                spec
+                for spec in wrkslots._USER_SYSTEMD_SERVICE_PROPERTIES
+                if spec[0] in call[4:]
+            )
+            return busctl_property_values(
+                specs,
+                {
+                    "ControlGroup": f"/user.slice/{unit}",
+                    "WorkingDirectory": f"/work/{unit}",
+                },
+            )
+        return busctl_property_values(
+            wrkslots._USER_SYSTEMD_UNIT_PROPERTIES,
+            {
+                "Id": unit,
+                "LoadState": "loaded",
+                "ActiveState": "active",
+                "SubState": "running",
+            },
+        )
+
+    monkeypatch.setattr(wrkslots, "_run_user_busctl", run)
+    snapshot = wrkslots._user_systemd_snapshot()
+    assert listing_reads == 3
+    assert {unit["Id"] for unit in snapshot} == expected_names
+    if "second.service" in expected_names:
+        second = next(unit for unit in snapshot if unit["Id"] == "second.service")
+        assert second["WorkingDirectory"] == "/work/second.service"
+
+
+def test_user_systemd_busctl_retries_new_job_before_accepting_inactive_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = Path("/queued/target")
+    row_without_job = busctl_unit_row(active_state="inactive")
+    row_with_job = busctl_unit_row(active_state="inactive", job_id=7)
+    object_path = str(row_without_job[6])
+    job = [
+        7,
+        "unit.service",
+        "start",
+        "waiting",
+        "/org/freedesktop/systemd1/job/7",
+        object_path,
+    ]
+    job_reads = 0
+    listing_reads = 0
+    service_property_counts: list[int] = []
+
+    def run(arguments: Sequence[str], _budget: object, **_kwargs: object) -> bytes:
+        nonlocal job_reads, listing_reads
+        call = tuple(arguments)
+        if call[0] == "call" and call[4] == "ListUnitsByPatterns":
+            listing_reads += 1
+            row = row_without_job if listing_reads == 1 else row_with_job
+            return busctl_json("a(ssssssouso)", [[row]])
+        if call[0] == "call" and call[4] == "ListJobs":
+            job_reads += 1
+            return busctl_json("a(usssoo)", [[job]])
+        if call[3] == "org.freedesktop.systemd1.Service":
+            requested = call[4:]
+            service_property_counts.append(len(requested))
+            specs = tuple(
+                spec
+                for spec in wrkslots._USER_SYSTEMD_SERVICE_PROPERTIES
+                if spec[0] in requested
+            )
+            return busctl_property_values(
+                specs,
+                {"ControlGroup": "/unit.service", "WorkingDirectory": str(target)},
+            )
+        return busctl_property_values(
+            wrkslots._USER_SYSTEMD_UNIT_PROPERTIES,
+            {
+                "Id": "unit.service",
+                "LoadState": "loaded",
+                "ActiveState": "inactive",
+                "SubState": "dead",
+            },
+        )
+
+    monkeypatch.setattr(wrkslots, "_run_user_busctl", run)
+    snapshot = wrkslots._user_systemd_snapshot()
+    assert job_reads == 2
+    assert listing_reads == 3
+    assert service_property_counts == [1, len(wrkslots._USER_SYSTEMD_SERVICE_PROPERTIES)]
+    assert snapshot[0]["PendingJob"] == "yes"
+    assert snapshot[0]["WorkingDirectory"] == str(target)
+
+
+def test_user_systemd_busctl_refuses_job_outside_enumerated_unit_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = busctl_unit_row()
+    unit = wrkslots._UserSystemdUnit(
+        str(row[0]),
+        str(row[2]),
+        str(row[3]),
+        str(row[4]),
+        str(row[6]),
+        0,
+        "",
+        "/",
+    )
+    job = [
+        7,
+        "other.service",
+        "start",
+        "waiting",
+        "/org/freedesktop/systemd1/job/7",
+        "/org/freedesktop/systemd1/unit/other_2eservice",
+    ]
+    monkeypatch.setattr(
+        wrkslots,
+        "_run_user_busctl",
+        lambda *_args, **_kwargs: busctl_json("a(usssoo)", [[job]]),
+    )
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=30,
+        stdout_limit=1024 * 1024,
+        stderr_limit=64 * 1024,
+    )
+    with pytest.raises(wrkslots.Refusal, match="does not match the enumerated unit set"):
+        wrkslots._user_systemd_jobs(budget, {unit.unit: unit})
+
+
+def test_user_systemd_busctl_refuses_wrong_job_signature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        wrkslots,
+        "_run_user_busctl",
+        lambda *_args, **_kwargs: busctl_json("a(ss)", [[]]),
+    )
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=30,
+        stdout_limit=1024 * 1024,
+        stderr_limit=64 * 1024,
+    )
+    with pytest.raises(wrkslots.Refusal, match="job listing has signature"):
+        wrkslots._user_systemd_jobs(budget, {})
+
+
+def test_user_systemd_busctl_refuses_object_identity_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = busctl_unit_row()
+
+    def run(arguments: Sequence[str], _budget: object, **_kwargs: object) -> bytes:
+        call = tuple(arguments)
+        if call[0] == "call" and call[4] == "ListUnitsByPatterns":
+            return busctl_json("a(ssssssouso)", [[row]])
+        if call[3] == "org.freedesktop.systemd1.Service":
+            return busctl_property_values(
+                wrkslots._USER_SYSTEMD_SERVICE_PROPERTIES,
+                {"ControlGroup": "/unit.service"},
+            )
+        return busctl_property_values(
+            wrkslots._USER_SYSTEMD_UNIT_PROPERTIES,
+            {
+                "Id": "replacement.service",
+                "LoadState": "loaded",
+                "ActiveState": "active",
+                "SubState": "running",
+            },
+        )
+
+    monkeypatch.setattr(wrkslots, "_run_user_busctl", run)
+    with pytest.raises(wrkslots.Refusal, match="changed identity"):
+        wrkslots._user_systemd_snapshot()
+
+
+def test_user_systemd_raw_listing_has_separate_input_and_projection_budgets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = busctl_json("a(ssssssouso)", [[]])
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(
+        wrkslots,
+        "_user_bus_environment",
+        lambda: {"XDG_RUNTIME_DIR": "/run/user/123"},
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_root_owned_executable",
+        lambda path, _label: wrkslots._TrustedExecutablePath(path, ()),
+    )
+
+    def bounded(_command: list[str], **kwargs: object) -> tuple[int, bytes, bytes]:
+        seen.update(kwargs)
+        return 0, payload, b""
+
+    monkeypatch.setattr(wrkslots, "_run_bounded_read_only_command", bounded)
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=30,
+        stdout_limit=1024,
+        stderr_limit=1024,
+        input_limit=len(payload),
+    )
+    assert wrkslots._run_user_busctl(("call",), budget, raw_listing=True) == payload
+    assert seen["stdout_limit"] == wrkslots._USER_SYSTEMD_LISTING_BYTES_LIMIT
+    assert budget.stdout_remaining == 1024
+    assert budget.input_remaining == 0
+    with pytest.raises(wrkslots.Refusal, match="operation-wide input bound"):
+        wrkslots._run_user_busctl(("call",), budget, raw_listing=True)
 
 
 def test_bounded_read_only_command_refuses_output_and_time_overruns() -> None:

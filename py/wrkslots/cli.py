@@ -382,6 +382,11 @@ _PROCESS_CENSUS_SELECTION_BYTES_LIMIT = 16 * 1024 * 1024
 # false negatives; false-positive rows are rejected by exact device/inode
 # comparison after parsing.
 _PROCESS_CENSUS_INODE_RANGE_LIMIT = 128
+# The systemd manager listing is an input to a stricter, much smaller typed
+# projection.  Bound the raw D-Bus JSON independently so an irrelevant unit
+# description cannot turn that projection into an unbounded memory sink.
+_USER_SYSTEMD_LISTING_BYTES_LIMIT = 4 * 1024 * 1024
+_USER_SYSTEMD_UNIT_LIMIT = 4096
 _FILE_HANDLE_BYTES_LIMIT = 128
 _AT_FDCWD = -100
 _AT_SYMLINK_FOLLOW = 0x400
@@ -765,6 +770,20 @@ class _RetainedValidationHandle:
     pid: int | None
     start_ticks: int | None
     boot_id: str | None
+
+
+@dataclasses.dataclass(frozen=True)
+class _UserSystemdUnit:
+    """One strictly framed manager row used to bind later property reads."""
+
+    unit: str
+    load_state: str
+    active_state: str
+    sub_state: str
+    object_path: str
+    job_id: int
+    job_type: str
+    job_path: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -30487,35 +30506,96 @@ def _assert_absent_validate_processes_unrelated(
     )
 
 
-def _run_user_systemctl(
-    arguments: Sequence[str], budget: _ReadOnlyCommandBudget
-) -> str:
-    systemctl = _root_owned_executable(Path("/usr/bin/systemctl"), "systemctl")
-    stdout_limit = budget.stdout_remaining
+_USER_SYSTEMD_BUS_NAME = "org.freedesktop.systemd1"
+_USER_SYSTEMD_MANAGER_PATH = "/org/freedesktop/systemd1"
+_USER_SYSTEMD_MANAGER_INTERFACE = "org.freedesktop.systemd1.Manager"
+_USER_SYSTEMD_UNIT_INTERFACE = "org.freedesktop.systemd1.Unit"
+_USER_SYSTEMD_SERVICE_PROPERTIES = (
+    ("ControlGroup", "s"),
+    ("MainPID", "u"),
+    ("WorkingDirectory", "s"),
+    ("ExecStart", "a(sasbttttuii)"),
+    ("ExecStartPre", "a(sasbttttuii)"),
+    ("ExecStartPost", "a(sasbttttuii)"),
+    ("ExecReload", "a(sasbttttuii)"),
+    ("ExecStop", "a(sasbttttuii)"),
+    ("ExecStopPost", "a(sasbttttuii)"),
+    ("Environment", "as"),
+    ("EnvironmentFiles", "a(sb)"),
+    ("RootDirectory", "s"),
+    ("RootImage", "s"),
+    ("BindPaths", "a(ssbt)"),
+    ("BindReadOnlyPaths", "a(ssbt)"),
+    ("ReadWritePaths", "as"),
+    ("ReadOnlyPaths", "as"),
+    ("InaccessiblePaths", "as"),
+    ("StandardInput", "s"),
+    ("StandardOutput", "s"),
+    ("StandardError", "s"),
+)
+_USER_SYSTEMD_SCOPE_PROPERTIES = (("ControlGroup", "s"),)
+_USER_SYSTEMD_UNIT_PROPERTIES = (
+    ("Id", "s"),
+    ("LoadState", "s"),
+    ("ActiveState", "s"),
+    ("SubState", "s"),
+    ("RequiresMountsFor", "as"),
+)
+
+
+def _run_user_busctl(
+    arguments: Sequence[str],
+    budget: _ReadOnlyCommandBudget,
+    *,
+    raw_listing: bool = False,
+) -> bytes:
+    """Run one trusted, bounded user-manager D-Bus query.
+
+    A manager listing contains arbitrary descriptions that are not liveness
+    evidence.  Its raw JSON has a separate finite input bound; after strict
+    parsing, the caller charges only the typed unit-identity projection to the
+    shared evidence-output budget.  Property replies are evidence and remain
+    charged byte-for-byte.
+    """
+
+    busctl = _root_owned_executable(Path("/usr/bin/busctl"), "busctl")
+    command = [str(busctl.path), "--user", "--json=short", *arguments]
+    if sum(len(os.fsencode(argument)) + 1 for argument in command) > 64 * 1024:
+        raise Refusal("user-systemd D-Bus command exceeds the 64 KiB argv bound")
+    stdout_limit = (
+        _USER_SYSTEMD_LISTING_BYTES_LIMIT
+        if raw_listing
+        else budget.stdout_remaining
+    )
     stderr_limit = budget.stderr_remaining
     if stdout_limit <= 0 or stderr_limit <= 0:
         raise Refusal("user-systemd census exhausted its operation-wide output bound")
     returncode, stdout, stderr = _run_bounded_read_only_command(
-        [str(systemctl.path), "--user", *arguments],
+        command,
         timeout_seconds=budget.remaining_seconds(),
         stdout_limit=stdout_limit,
         stderr_limit=stderr_limit,
         env_overrides=_user_bus_environment(),
-        trusted_executables=(systemctl,),
+        trusted_executables=(busctl,),
     )
-    budget.consume_output(stdout, stderr)
+    budget.remaining_seconds()
+    if raw_listing:
+        budget.reserve_input(len(stdout))
+        budget.consume_output(b"", stderr)
+    else:
+        budget.consume_output(stdout, stderr)
     if returncode != 0:
         detail = (stderr or stdout).decode("utf-8", errors="replace").strip().splitlines()
-        raise Refusal("cannot enumerate user-systemd state" + (f": {detail[0]}" if detail else ""))
+        raise Refusal(
+            "cannot enumerate user-systemd state"
+            + (f": {detail[0]}" if detail else "")
+        )
     if stderr:
         raise Refusal(
             "cannot enumerate user-systemd state: "
             + stderr.decode("utf-8", errors="replace").splitlines()[0]
         )
-    try:
-        return stdout.decode("utf-8")
-    except UnicodeError as exc:
-        raise Refusal(f"cannot decode user-systemd state: {exc}") from exc
+    return stdout
 
 
 def _user_bus_environment() -> dict[str, str]:
@@ -30555,112 +30635,468 @@ def _user_bus_environment() -> dict[str, str]:
     return result
 
 
+def _user_busctl_json_document(contents: bytes, label: str) -> Mapping[str, object]:
+    try:
+        document = _strict_json_object(contents, label)
+    except (Refusal, StateError) as exc:
+        raise Refusal(f"{label} is not one strict JSON object: {exc}") from exc
+    if set(document) != {"type", "data"}:
+        raise Refusal(f"{label} has unexpected JSON fields")
+    if not isinstance(document["type"], str):
+        raise Refusal(f"{label} has a non-string D-Bus signature")
+    return document
+
+
+def _user_busctl_json_documents(
+    stdout: bytes, expected: int, label: str
+) -> tuple[Mapping[str, object], ...]:
+    # `--json=short` emits exactly one physical line per return value and JSON
+    # escapes every newline inside a D-Bus string.  Requiring its final newline
+    # makes a complete-but-unframed prefix a refusal rather than evidence.
+    if not stdout.endswith(b"\n"):
+        raise Refusal(f"{label} is truncated or lacks its terminal newline")
+    lines = stdout[:-1].split(b"\n")
+    if len(lines) != expected or any(not line for line in lines):
+        raise Refusal(
+            f"{label} returned {len(lines)} JSON documents; expected {expected}"
+        )
+    return tuple(
+        _user_busctl_json_document(line, f"{label} document {index}")
+        for index, line in enumerate(lines, start=1)
+    )
+
+
+def _user_busctl_string(value: object, label: str) -> str:
+    if not isinstance(value, str) or "\0" in value:
+        raise Refusal(f"{label} is not one D-Bus string")
+    return value
+
+
+def _user_busctl_integer(value: object, bits: int, signed: bool, label: str) -> int:
+    minimum = -(1 << (bits - 1)) if signed else 0
+    maximum = (1 << (bits - 1)) - 1 if signed else (1 << bits) - 1
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < minimum
+        or value > maximum
+    ):
+        kind = "signed" if signed else "unsigned"
+        raise Refusal(f"{label} is not one {bits}-bit {kind} D-Bus integer")
+    return value
+
+
+def _user_busctl_typed_value(signature: str, value: object, label: str) -> object:
+    """Validate the complete JSON shape for every property type we consume."""
+
+    if signature == "s":
+        return _user_busctl_string(value, label)
+    if signature == "u":
+        return _user_busctl_integer(value, 32, False, label)
+    if not isinstance(value, list):
+        raise Refusal(f"{label} is not a D-Bus array")
+    if signature == "as":
+        return [
+            _user_busctl_string(item, f"{label}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if signature == "a(sb)":
+        result: list[list[object]] = []
+        for index, item in enumerate(value):
+            if not isinstance(item, list) or len(item) != 2:
+                raise Refusal(f"{label}[{index}] is not one (string, boolean) tuple")
+            name = _user_busctl_string(item[0], f"{label}[{index}][0]")
+            if not isinstance(item[1], bool):
+                raise Refusal(f"{label}[{index}][1] is not one D-Bus boolean")
+            result.append([name, item[1]])
+        return result
+    if signature == "a(ssbt)":
+        result = []
+        for index, item in enumerate(value):
+            if not isinstance(item, list) or len(item) != 4:
+                raise Refusal(f"{label}[{index}] is not one (ssbt) tuple")
+            source = _user_busctl_string(item[0], f"{label}[{index}][0]")
+            target = _user_busctl_string(item[1], f"{label}[{index}][1]")
+            if not isinstance(item[2], bool):
+                raise Refusal(f"{label}[{index}][2] is not one D-Bus boolean")
+            flags = _user_busctl_integer(
+                item[3], 64, False, f"{label}[{index}][3]"
+            )
+            result.append([source, target, item[2], flags])
+        return result
+    if signature == "a(sasbttttuii)":
+        result = []
+        for index, item in enumerate(value):
+            if not isinstance(item, list) or len(item) != 10:
+                raise Refusal(f"{label}[{index}] is not one Exec command tuple")
+            path = _user_busctl_string(item[0], f"{label}[{index}][0]")
+            if not isinstance(item[1], list):
+                raise Refusal(f"{label}[{index}][1] is not an argument array")
+            arguments = [
+                _user_busctl_string(argument, f"{label}[{index}][1][{offset}]")
+                for offset, argument in enumerate(item[1])
+            ]
+            if not isinstance(item[2], bool):
+                raise Refusal(f"{label}[{index}][2] is not one D-Bus boolean")
+            times = [
+                _user_busctl_integer(
+                    item[offset], 64, False, f"{label}[{index}][{offset}]"
+                )
+                for offset in range(3, 7)
+            ]
+            pid = _user_busctl_integer(item[7], 32, False, f"{label}[{index}][7]")
+            code = _user_busctl_integer(item[8], 32, True, f"{label}[{index}][8]")
+            status = _user_busctl_integer(item[9], 32, True, f"{label}[{index}][9]")
+            result.append([path, arguments, item[2], *times, pid, code, status])
+        return result
+    raise AssertionError(f"unsupported user-systemd D-Bus signature {signature}")
+
+
+def _user_busctl_string_evidence(value: object) -> tuple[str, ...]:
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, list):
+        return tuple(
+            text for item in value for text in _user_busctl_string_evidence(item)
+        )
+    return ()
+
+
+def _user_systemd_properties(
+    object_path: str,
+    interface: str,
+    properties: Sequence[tuple[str, str]],
+    budget: _ReadOnlyCommandBudget,
+) -> dict[str, str]:
+    stdout = _run_user_busctl(
+        (
+            "get-property",
+            _USER_SYSTEMD_BUS_NAME,
+            object_path,
+            interface,
+            *(name for name, _signature in properties),
+        ),
+        budget,
+    )
+    documents = _user_busctl_json_documents(
+        stdout, len(properties), f"user-systemd {interface} properties"
+    )
+    result: dict[str, str] = {}
+    for (name, signature), document in zip(properties, documents, strict=True):
+        if document["type"] != signature:
+            raise Refusal(
+                f"user-systemd property {name} has signature {document['type']!r}; "
+                f"expected {signature!r}"
+            )
+        value = _user_busctl_typed_value(
+            signature, document["data"], f"user-systemd property {name}"
+        )
+        if isinstance(value, str):
+            result[name] = value
+        elif isinstance(value, int):
+            result[name] = str(value)
+        else:
+            result[name] = "\n".join(_user_busctl_string_evidence(value))
+    return result
+
+
+def _user_systemd_unit_name(value: object, label: str) -> str:
+    unit = _user_busctl_string(value, label)
+    if (
+        not unit
+        or len(os.fsencode(unit)) > 255
+        or any(character.isspace() for character in unit)
+    ):
+        raise Refusal(f"{label} is not one bounded systemd unit name")
+    return unit
+
+
+def _user_systemd_object_path(value: object, label: str) -> str:
+    path = _user_busctl_string(value, label)
+    if re.fullmatch(r"/org/freedesktop/systemd1/unit/[A-Za-z0-9_]+", path) is None:
+        raise Refusal(f"{label} is not one systemd unit object path")
+    return path
+
+
+def _user_systemd_state(value: object, label: str) -> str:
+    state = _user_busctl_string(value, label)
+    if re.fullmatch(r"[a-z][a-z0-9-]*", state) is None:
+        raise Refusal(f"{label} is not one systemd state")
+    return state
+
+
+def _user_systemd_units(budget: _ReadOnlyCommandBudget) -> tuple[_UserSystemdUnit, ...]:
+    stdout = _run_user_busctl(
+        (
+            "call",
+            _USER_SYSTEMD_BUS_NAME,
+            _USER_SYSTEMD_MANAGER_PATH,
+            _USER_SYSTEMD_MANAGER_INTERFACE,
+            "ListUnitsByPatterns",
+            "asas",
+            "0",
+            "2",
+            "*.service",
+            "*.scope",
+        ),
+        budget,
+        raw_listing=True,
+    )
+    document = _user_busctl_json_documents(
+        stdout, 1, "user-systemd unit listing"
+    )[0]
+    if document["type"] != "a(ssssssouso)":
+        raise Refusal(
+            "user-systemd unit listing has signature "
+            f"{document['type']!r}; expected 'a(ssssssouso)'"
+        )
+    data = document["data"]
+    if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], list):
+        raise Refusal("user-systemd unit listing has an invalid return-value shape")
+    if len(data[0]) > _USER_SYSTEMD_UNIT_LIMIT:
+        raise Refusal(
+            f"user-systemd unit population exceeds {_USER_SYSTEMD_UNIT_LIMIT}"
+        )
+    result: list[_UserSystemdUnit] = []
+    names: set[str] = set()
+    object_paths: set[str] = set()
+    for index, item in enumerate(data[0]):
+        label = f"user-systemd unit listing row {index}"
+        if not isinstance(item, list) or len(item) != 10:
+            raise Refusal(f"{label} is not one ListUnits tuple")
+        unit = _user_systemd_unit_name(item[0], f"{label} name")
+        if not unit.endswith((".service", ".scope")):
+            raise Refusal(f"{label} returned an unexpected unit type")
+        _user_busctl_string(item[1], f"{label} description")
+        load_state = _user_systemd_state(item[2], f"{label} load state")
+        active_state = _user_systemd_state(item[3], f"{label} active state")
+        sub_state = _user_systemd_state(item[4], f"{label} substate")
+        following = _user_busctl_string(item[5], f"{label} following unit")
+        if following:
+            raise Refusal(f"{label} is an unresolved unit alias")
+        object_path = _user_systemd_object_path(item[6], f"{label} object path")
+        job_id = _user_busctl_integer(item[7], 32, False, f"{label} job id")
+        job_type = _user_busctl_string(item[8], f"{label} job type")
+        job_path = _user_busctl_string(item[9], f"{label} job path")
+        if job_id == 0:
+            if job_type or job_path != "/":
+                raise Refusal(f"{label} has inconsistent absent-job fields")
+        elif (
+            re.fullmatch(r"[a-z][a-z0-9-]*", job_type) is None
+            or job_path != f"/org/freedesktop/systemd1/job/{job_id}"
+        ):
+            raise Refusal(f"{label} has inconsistent live-job fields")
+        if unit in names or object_path in object_paths:
+            raise Refusal("user-systemd unit listing has duplicate identities")
+        names.add(unit)
+        object_paths.add(object_path)
+        result.append(
+            _UserSystemdUnit(
+                unit,
+                load_state,
+                active_state,
+                sub_state,
+                object_path,
+                job_id,
+                job_type,
+                job_path,
+            )
+        )
+    projection = json.dumps(
+        [
+            [
+                unit.unit,
+                unit.load_state,
+                unit.active_state,
+                unit.sub_state,
+                unit.object_path,
+                unit.job_id,
+                unit.job_type,
+                unit.job_path,
+            ]
+            for unit in result
+        ],
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("ascii")
+    budget.consume_output(projection, b"")
+    return tuple(result)
+
+
+def _user_systemd_jobs(
+    budget: _ReadOnlyCommandBudget,
+    units: Mapping[str, _UserSystemdUnit],
+) -> dict[str, tuple[int, str, str]]:
+    stdout = _run_user_busctl(
+        (
+            "call",
+            _USER_SYSTEMD_BUS_NAME,
+            _USER_SYSTEMD_MANAGER_PATH,
+            _USER_SYSTEMD_MANAGER_INTERFACE,
+            "ListJobs",
+        ),
+        budget,
+    )
+    document = _user_busctl_json_documents(stdout, 1, "user-systemd job listing")[0]
+    if document["type"] != "a(usssoo)":
+        raise Refusal(
+            "user-systemd job listing has signature "
+            f"{document['type']!r}; expected 'a(usssoo)'"
+        )
+    data = document["data"]
+    if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], list):
+        raise Refusal("user-systemd job listing has an invalid return-value shape")
+    result: dict[str, tuple[int, str, str]] = {}
+    ids: set[int] = set()
+    for index, item in enumerate(data[0]):
+        label = f"user-systemd job listing row {index}"
+        if not isinstance(item, list) or len(item) != 6:
+            raise Refusal(f"{label} is not one ListJobs tuple")
+        job_id = _user_busctl_integer(item[0], 32, False, f"{label} job id")
+        if job_id == 0 or job_id in ids:
+            raise Refusal(f"{label} has a zero or duplicate job id")
+        ids.add(job_id)
+        unit = _user_systemd_unit_name(item[1], f"{label} unit")
+        job_type = _user_systemd_state(item[2], f"{label} job type")
+        _user_systemd_state(item[3], f"{label} job state")
+        job_path = _user_busctl_string(item[4], f"{label} job path")
+        if job_path != f"/org/freedesktop/systemd1/job/{job_id}":
+            raise Refusal(f"{label} has a mismatched job object path")
+        unit_path = _user_systemd_object_path(item[5], f"{label} unit object path")
+        if not unit.endswith((".service", ".scope")):
+            continue
+        listed = units.get(unit)
+        if listed is None or listed.object_path != unit_path or unit in result:
+            raise Refusal(f"{label} does not match the enumerated unit set")
+        result[unit] = (job_id, job_type, job_path)
+    return result
+
+
 def _user_systemd_snapshot() -> tuple[Mapping[str, str], ...]:
     budget = _ReadOnlyCommandBudget.start(
         timeout_seconds=30,
         stdout_limit=1024 * 1024,
         stderr_limit=64 * 1024,
+        input_limit=_USER_SYSTEMD_LISTING_BYTES_LIMIT,
     )
-    listed = _run_user_systemctl(
-        (
-            "list-units",
-            "--all",
-            "--type=service",
-            "--type=scope",
-            "--no-legend",
-            "--plain",
-            "--no-pager",
-        ),
-        budget,
-    )
-    units: list[str] = []
-    for line in listed.splitlines():
-        if not line.strip():
-            continue
-        unit = line.split(maxsplit=1)[0]
-        if not unit.endswith((".service", ".scope")) or any(
-            character.isspace() for character in unit
-        ):
-            raise Refusal(f"cannot parse user-systemd unit listing: {line!r}")
-        units.append(unit)
-    jobs_text = _run_user_systemctl(
-        ("list-jobs", "--all", "--no-legend", "--plain", "--no-pager"),
-        budget,
-    )
-    jobs: set[str] = set()
-    for line in jobs_text.splitlines():
-        if not line.strip() or line.strip() == "No jobs running.":
-            continue
-        fields = line.split()
-        if (
-            len(fields) < 2
-            or not fields[0].isdigit()
-            or not fields[1].endswith((".service", ".scope"))
-        ):
-            raise Refusal(f"cannot parse user-systemd job listing: {line!r}")
-        jobs.add(fields[1])
-    names = tuple(dict.fromkeys((*units, *sorted(jobs))))
-    if not names:
-        return ()
-    properties = (
-        "Id",
-        "LoadState",
-        "ActiveState",
-        "SubState",
-        "MainPID",
-        "ControlGroup",
-        "WorkingDirectory",
-        "ExecStart",
-        "ExecStartPre",
-        "ExecStartPost",
-        "ExecReload",
-        "ExecStop",
-        "ExecStopPost",
-        "Environment",
-        "EnvironmentFiles",
-        "RootDirectory",
-        "RootImage",
-        "BindPaths",
-        "BindReadOnlyPaths",
-        "ReadWritePaths",
-        "ReadOnlyPaths",
-        "InaccessiblePaths",
-        "RequiresMountsFor",
-        "StandardInput",
-        "StandardOutput",
-        "StandardError",
-    )
-    shown = _run_user_systemctl(
-        (
-            "show",
-            *names,
-            *(f"--property={name}" for name in properties),
-            "--no-pager",
-        ),
-        budget,
-    )
-    blocks = [block for block in shown.split("\n\n") if block.strip()]
-    parsed: dict[str, dict[str, str]] = {}
-    for block in blocks:
-        values: dict[str, str] = {}
-        for line in block.splitlines():
-            key, separator, value = line.partition("=")
-            if not separator or key in values:
-                raise Refusal(f"cannot parse user-systemd properties: {line!r}")
-            values[key] = value
-        if "Id" not in values:
-            raise Refusal("user-systemd property block has no unit identity")
-        for name in properties:
-            values.setdefault(name, "")
-        unit = values["Id"]
-        if unit in parsed or unit not in names:
-            raise Refusal(f"user-systemd returned an unexpected unit: {unit!r}")
-        values["PendingJob"] = "yes" if unit in jobs else "no"
-        parsed[unit] = values
-    if set(parsed) != set(names):
-        missing = sorted(set(names) - set(parsed))
-        raise Refusal(f"user-systemd state changed while it was enumerated: {missing[0]}")
-    return tuple(parsed[name] for name in names)
+    selected = _user_systemd_units(budget)
+    property_names = {
+        name
+        for name, _signature in (
+            *_USER_SYSTEMD_SERVICE_PROPERTIES,
+            *_USER_SYSTEMD_UNIT_PROPERTIES,
+        )
+    }
+    for attempt in range(3):
+        selected_by_name = {unit.unit: unit for unit in selected}
+        evidence: dict[str, dict[str, str]] = {}
+        for unit in selected:
+            live = unit.active_state not in {"inactive", "failed"} or unit.job_id != 0
+            if unit.unit.endswith(".service"):
+                properties = (
+                    _USER_SYSTEMD_SERVICE_PROPERTIES
+                    if live
+                    else _USER_SYSTEMD_SCOPE_PROPERTIES
+                )
+                interface = "org.freedesktop.systemd1.Service"
+            else:
+                properties = _USER_SYSTEMD_SCOPE_PROPERTIES
+                interface = "org.freedesktop.systemd1.Scope"
+            evidence[unit.unit] = _user_systemd_properties(
+                unit.object_path, interface, properties, budget
+            )
+
+        current: list[_UserSystemdUnit] = []
+        for unit in selected:
+            values = _user_systemd_properties(
+                unit.object_path,
+                _USER_SYSTEMD_UNIT_INTERFACE,
+                _USER_SYSTEMD_UNIT_PROPERTIES,
+                budget,
+            )
+            if values["Id"] != unit.unit:
+                raise Refusal(
+                    f"user-systemd object {unit.object_path} changed identity from "
+                    f"{unit.unit!r} to {values['Id']!r}"
+                )
+            load_state = _user_systemd_state(
+                values["LoadState"], f"user-systemd unit {unit.unit} load state"
+            )
+            active_state = _user_systemd_state(
+                values["ActiveState"], f"user-systemd unit {unit.unit} active state"
+            )
+            sub_state = _user_systemd_state(
+                values["SubState"], f"user-systemd unit {unit.unit} substate"
+            )
+            evidence[unit.unit]["RequiresMountsFor"] = values["RequiresMountsFor"]
+            current.append(
+                dataclasses.replace(
+                    unit,
+                    load_state=load_state,
+                    active_state=active_state,
+                    sub_state=sub_state,
+                )
+            )
+
+        listed_after = _user_systemd_units(budget)
+        listed_after_by_name = {unit.unit: unit for unit in listed_after}
+        jobs = _user_systemd_jobs(budget, listed_after_by_name)
+        current = [
+            dataclasses.replace(
+                unit,
+                job_id=jobs.get(unit.unit, (0, "", "/"))[0],
+                job_type=jobs.get(unit.unit, (0, "", "/"))[1],
+                job_path=jobs.get(unit.unit, (0, "", "/"))[2],
+            )
+            for unit in current
+        ]
+        listed_jobs = {
+            unit.unit: (unit.job_id, unit.job_type, unit.job_path)
+            for unit in listed_after
+            if unit.job_id != 0
+        }
+        current_by_name = {unit.unit: unit for unit in current}
+        listed_with_jobs = tuple(
+            dataclasses.replace(
+                unit,
+                job_id=jobs.get(unit.unit, (0, "", "/"))[0],
+                job_type=jobs.get(unit.unit, (0, "", "/"))[1],
+                job_path=jobs.get(unit.unit, (0, "", "/"))[2],
+            )
+            for unit in listed_after
+        )
+        listed_with_jobs_by_name = {unit.unit: unit for unit in listed_with_jobs}
+        stable = (
+            listed_jobs == jobs
+            and selected_by_name == current_by_name
+            and current_by_name == listed_with_jobs_by_name
+        )
+        if not stable:
+            if attempt < 2:
+                selected = listed_with_jobs
+                continue
+            raise Refusal(
+                "user-systemd unit population, identity, state, or jobs changed during "
+                "three bounded enumeration attempts"
+            )
+
+        result: list[dict[str, str]] = []
+        for unit in listed_with_jobs:
+            values = {name: "" for name in property_names}
+            values.update(evidence[unit.unit])
+            values.update(
+                {
+                    "Id": unit.unit,
+                    "LoadState": unit.load_state,
+                    "ActiveState": unit.active_state,
+                    "SubState": unit.sub_state,
+                    "PendingJob": "yes" if unit.job_id != 0 else "no",
+                }
+            )
+            result.append(values)
+        return tuple(result)
+    raise AssertionError("bounded user-systemd retry loop did not return or refuse")
 
 
 def _assert_retained_handle_processes_dead(
