@@ -276,6 +276,8 @@ def test_each_wprof_window_is_a_private_separate_recommended_width_trial(
     )
     requests: list[IsolatedTrialRequest] = []
     successful_interrupts: list[float] = []
+    interrupt_observed = threading.Condition()
+    protocol_timeout_s = 10.0
     send_signal = capture._send_pinned_wprof_signal
 
     def observe_signal(
@@ -287,14 +289,17 @@ def test_each_wprof_window_is_a_private_separate_recommended_width_trial(
         sent_at = time.monotonic()
         error = send_signal(config, identity, signal_name, timeout_s)
         if signal_name == "INT" and not error:
-            successful_interrupts.append(sent_at)
+            with interrupt_observed:
+                successful_interrupts.append(sent_at)
+                interrupt_observed.notify_all()
         return error
 
     monkeypatch.setattr(capture, "_send_pinned_wprof_signal", observe_signal)
 
     def run_trial(request: IsolatedTrialRequest) -> IsolatedTrialResult:
         requests.append(request)
-        interrupts_before = len(successful_interrupts)
+        with interrupt_observed:
+            interrupts_before = len(successful_interrupts)
         assert interrupts_before == len(requests) - 1
         assert request.argv_prefix == ()
         assert request.include_in_model is False
@@ -305,16 +310,17 @@ def test_each_wprof_window_is_a_private_separate_recommended_width_trial(
         launched_at = time.monotonic()
         request.notify_guest_launched(request.step, os.getpid(), launched_at)
         # The controller stops wprof at the selected window end while this workload continues.
-        time.sleep(0.09)
-        assert len(successful_interrupts) == interrupts_before + 1
+        # Wait for that protocol event rather than assuming the controller thread will be
+        # scheduled within a fixed 90 ms while the validation DAG is saturating the host.
+        with interrupt_observed:
+            interrupted = interrupt_observed.wait_for(
+                lambda: len(successful_interrupts) == interrupts_before + 1,
+                timeout=protocol_timeout_s,
+            )
+            assert interrupted, "wprof controller did not send its window-ending interrupt"
+            interrupted_at = successful_interrupts[interrupts_before]
         assert request.window is not None
-        assert (
-            successful_interrupts[interrupts_before]
-            >= launched_at + request.window.end_offset_s
-        )
-        # Export finishes during finalization under profiler_exit_grace_s; requiring
-        # its bytes here imposed an additional, implicit ~20 ms export deadline.
-        time.sleep(0.04)
+        assert interrupted_at >= launched_at + request.window.end_offset_s
         return IsolatedTrialResult(returncode=0, wall_s=0.13)
 
     manifest = capture_at_sweet_spot(
