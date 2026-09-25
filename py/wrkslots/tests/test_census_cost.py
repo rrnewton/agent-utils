@@ -308,6 +308,7 @@ def test_batch_liveness_matches_per_subject_results_with_one_invocation(
         calls += 1
         request = json.loads(input_data)
         results = []
+        codes = {"dead": 0, "alive": 1, "unverifiable": 2}
         for index, subject in enumerate(request["subjects"]):
             state = ("dead", "alive", "unverifiable")[index % 3]
             results.append(
@@ -315,7 +316,7 @@ def test_batch_liveness_matches_per_subject_results_with_one_invocation(
                     "subject_id": subject["subject_id"],
                     "agent": subject["agent"],
                     "state": state,
-                    "detail": f"fixture {state}",
+                    "detail": f"fixture {state} agent={subject['agent']} rc={codes[state]}",
                 }
             )
         response = {
@@ -333,10 +334,11 @@ def test_batch_liveness_matches_per_subject_results_with_one_invocation(
     ) -> subprocess.CompletedProcess[str]:
         index = int(command[-1].rsplit("-", 1)[1])
         state = ("dead", "alive", "unverifiable")[index % 3]
+        code = {"dead": 0, "alive": 1, "unverifiable": 2}[state]
         return subprocess.CompletedProcess(
             command,
-            {"dead": 0, "alive": 1, "unverifiable": 2}[state],
-            f"fixture {state}\n",
+            code,
+            f"fixture {state} agent={command[-1]} rc={code}\n",
             "",
         )
 

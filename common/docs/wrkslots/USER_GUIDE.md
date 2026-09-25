@@ -161,7 +161,10 @@ identity fields in the environment. `WRKSLOTS_SLOT_TYPE` and `WRKSLOTS_TASK` let
 command consult validation-run evidence without guessing from a path. Its exit status means:
 
 - `0`: the registered mechanism verified the agent is dead;
-- `1`: the agent is alive;
+- `1`: the agent is alive, but only when standard output and standard error together hold exactly
+  one non-empty line whose only `agent=` token is `agent=<the requested agent>` and whose only `rc=`
+  token is `rc=1`. An uncaught Python exception also exits `1`, so any other output with status `1`,
+  including a traceback, is treated as `2`;
 - `2`: the mechanism cannot determine the answer;
 - anything else: the check failed.
 
