@@ -561,6 +561,8 @@ impl SpeechProvider for HttpElevenLabsClient {
             .boxed();
         Ok(super::SpeechStream {
             content_type,
+            preamble: None,
+            session: None,
             chunks,
         })
     }

@@ -3873,9 +3873,9 @@ function renderControls() {
   // state and left the reader guessing what pressing it would do; "Stop" is the act, and the
   // colour change is what makes starting and ending a session legible at a glance.
   //
-  // The session is VIRTUAL -- each text-to-speech request stands alone and nothing is held open
-  // between them -- but it is a mode the reader turned on, so it needs a visible way out that
-  // looks like a way out.
+  // The session is VIRTUAL from the reader's perspective. The provider transport may be reused
+  // between requests, but reconnects are deliberately invisible; this is still a mode the reader
+  // turned on, so it needs a visible way out that looks like a way out.
   el("read-aloud-label").textContent = readingMode ? "Stop" : "Read";
   el("read-aloud").setAttribute("data-active", readingMode ? "true" : "false");
   // The state the READER cares about, on the control they pressed. Reset to a plain ready when the
@@ -6871,7 +6871,7 @@ async function prepareSpeechNow() {
     return;
   }
   for (const entry of (payload && payload.prepared) || []) {
-    preparedSpeech.set(String(entry.message_id), entry.url);
+    preparedSpeech.set(String(entry.message_id), { url: entry.url });
   }
   const ttl = (payload && payload.expires_in_seconds) || 0;
   preparedUntil = Date.now() + ttl * 1000;
@@ -6922,10 +6922,10 @@ let pendingRead = null;
  * `idle` — the mode is off. `ready` — on, nothing in flight. `working` — a read is being fetched.
  * `failed` — the last attempt did not produce audio.
  *
- * There is deliberately no "connected" state. Each text-to-speech request stands alone and nothing
- * is held open between them, so a connection indicator would be describing a session that does not
- * exist. What the reader can actually be told is whether something is in flight now and whether
- * the last one worked, which is what these four say.
+ * There is deliberately no "connected" state. The provider transport is an implementation detail:
+ * it may be reused, expire, or reconnect without changing the reader's task. What the reader can
+ * actually be told is whether something is in flight now and whether the last one worked, which is
+ * what these four say.
  */
 let readState = "idle";
 
@@ -6953,13 +6953,22 @@ function stopReading() {
     }
     return;
   }
-  const { audio, urls, speechTimer } = nowPlaying;
+  const { audio, urls, speechTimer, players } = nowPlaying;
   nowPlaying = null;
   if (speechTimer !== null && speechTimer !== undefined) clearTimeout(speechTimer);
-  try {
-    audio.pause();
-  } catch (_error) {
-    // A player that will not pause is not a reason to leave the page in a reading state.
+  for (const player of players || [audio]) {
+    try {
+      player.pause();
+      // A paused `<audio>` keeps downloading. Dropping its source closes a streamed response,
+      // which is what tells the server to interrupt the agent instead of generating on for
+      // nobody.
+      if (typeof player.removeAttribute === "function" && typeof player.load === "function") {
+        player.removeAttribute("src");
+        player.load();
+      }
+    } catch (_error) {
+      // A player that will not pause is not a reason to leave the page in a reading state.
+    }
   }
   // The object URL holds the audio alive until it is revoked, and this mode fetches one per
   // message: not revoking is a leak that grows with the length of the backlog. ALL of them on a
@@ -6998,6 +7007,44 @@ async function fetchSpeech(channel, id) {
   return response.blob();
 }
 
+/** Report only clocks for a prepared read. The ticket already authorizes this one observation. */
+function speechTimingNow() {
+  return typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
+}
+
+function speechElapsedMs(start, end) {
+  return Math.max(0, Math.round(end - start));
+}
+
+/**
+ * A fresh opaque id for one tap. The server speaks one read at a time on a shared session: a
+ * request naming a NEW selection interrupts whatever is still being generated, while the parts of
+ * one combined row share an id and play in order.
+ */
+function speechSelection() {
+  const bytes = new Uint8Array(8);
+  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let at = 0; at < bytes.length; at += 1) bytes[at] = Math.floor(Math.random() * 256);
+  }
+  return `tap-${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+
+function reportSpeechPlayback(url, timing) {
+  if (typeof url !== "string" || !url.startsWith("/api/v1/speech/")) return;
+  fetch(`${url}/timing`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(timing),
+    keepalive: true,
+  }).catch(() => {
+    // Telemetry must never turn successful audio into a visible failure.
+  });
+}
+
 /**
  * Read one ROW aloud, and archive everything in it when the audio finishes.
  *
@@ -7007,13 +7054,16 @@ async function fetchSpeech(channel, id) {
  * A COMBINED ROW IS READ WHOLE, in parts, in order. The server speaks one Discord message per
  * request — it reads the message's OWN text and will not be handed a string, which is what stops
  * this route from becoming a way to spend the operator's vendor balance on anything at all — so a
- * row of two messages is two requests played back to back. Both are fetched before either is
- * played: a gap in the middle of what the reader hears as one message, while the second half is
- * synthesised, is exactly the seam this feature exists to remove.
+ * row of two messages is two requests played back to back. Buffered parts are all fetched before
+ * any is played: a gap in the middle of what the reader hears as one message, while the second
+ * half is synthesised, is exactly the seam this feature exists to remove. A streamed part is
+ * requested as soon as the one before it has audio, which queues it behind that part on the
+ * server's session in order, and generation keeps ahead of playback.
  *
  * @param {Array<string>} ids the row's Discord ids, oldest first.
  */
 async function readAloud(ids) {
+  const tapBegan = speechTimingNow();
   const parts = ids.map(String);
   // THE ROW'S IDENTITY is its first message, everywhere: the highlight, the pending mark and the
   // ticket all key on it, so that "which row is speaking" is one question with one answer.
@@ -7056,14 +7106,14 @@ async function readAloud(ids) {
   // there is nothing to fetch and nothing to wait for. The player is handed the URL and the browser
   // starts playing against a response the server is still writing.
   let ready = parts.map((part) => preparedSpeech.get(part));
-  let streamed = ready.every((url) => typeof url === "string" && url.length > 0);
+  let streamed = ready.every((entry) => entry && typeof entry.url === "string" && entry.url.length > 0);
   // Turning Read on starts preparation in the background. A quick row tap joins that same work
   // instead of falling back to a second provider lookup followed by fully buffered synthesis.
   if (!streamed) {
     await prepareSpeech();
     if (ticket !== readingTicket) return;
     ready = parts.map((part) => preparedSpeech.get(part));
-    streamed = ready.every((url) => typeof url === "string" && url.length > 0);
+    streamed = ready.every((entry) => entry && typeof entry.url === "string" && entry.url.length > 0);
   }
   let blobs;
   if (streamed) {
@@ -7098,24 +7148,56 @@ async function readAloud(ids) {
   // to the server and revoking it would be meaningless. Keeping the two apart is what stops the
   // cleanup either leaking blobs or throwing on something it does not own.
   const objectUrls = streamed ? [] : blobs.map((blob) => URL.createObjectURL(blob));
-  const sources = streamed ? ready : objectUrls;
-  const players = sources.map((url) => new Audio(url));
-  nowPlaying = { id, audio: players[0], urls: objectUrls };
-  players.forEach((audio, at) => {
+  const selection = speechSelection();
+  const sources = streamed
+    ? ready.map((entry) => `${entry.url}?selection=${selection}`)
+    : objectUrls;
+  const players = [];
+  const requestBegan = sources.map(() => null);
+  const playInvokedAt = sources.map(() => null);
+  const loadedAt = sources.map(() => null);
+  const timingReported = sources.map(() => false);
+  const startPlayer = (at) => {
+    playInvokedAt[at] = speechTimingNow();
+    return players[at].play();
+  };
+  const addPlayer = (at) => {
+    requestBegan[at] = speechTimingNow();
+    const audio = new Audio(sources[at]);
+    players[at] = audio;
+    audio.addEventListener("loadeddata", () => {
+      if (ticket !== readingTicket || loadedAt[at] !== null) return;
+      loadedAt[at] = speechTimingNow();
+      if (streamed && at + 1 < sources.length && !players[at + 1]) addPlayer(at + 1);
+    });
+    audio.addEventListener("playing", () => {
+      if (ticket !== readingTicket || timingReported[at] || !streamed) return;
+      timingReported[at] = true;
+      const audibleAt = speechTimingNow();
+      const invokedAt = playInvokedAt[at] === null ? audibleAt : playInvokedAt[at];
+      const mediaAt = loadedAt[at] === null ? audibleAt : loadedAt[at];
+      // The bare ticket URL: the selection only routes playback.
+      reportSpeechPlayback(ready[at].url, {
+        tap_to_play_ms: speechElapsedMs(tapBegan, invokedAt),
+        request_to_loaded_ms: speechElapsedMs(requestBegan[at], mediaAt),
+        loaded_to_playing_ms: speechElapsedMs(mediaAt, audibleAt),
+        tap_to_audible_ms: speechElapsedMs(tapBegan, audibleAt),
+      });
+    });
     audio.addEventListener("ended", () => {
       // Only if THIS is still the read in progress. The reader may have tapped another message
       // while this was finishing, and archiving on a stale `ended` would file away the wrong one.
       if (ticket !== readingTicket || nowPlaying === null || nowPlaying.id !== id) {
         return;
       }
-      const next = players[at + 1];
+      const next = players[at + 1] || (at + 1 < sources.length ? addPlayer(at + 1) : null);
       if (next) {
         // Still the same row being read, so nothing on screen changes: only the player does.
         nowPlaying = { ...nowPlaying, audio: next };
         // `play()` answers with a promise a browser is allowed to reject, and this one is not
         // awaited by anybody — an unhandled rejection here would take the next part down silently
         // and leave the row lit with nothing coming.
-        const started = next.play();
+        const started = startPlayer(at + 1);
         if (started && typeof started.catch === "function") {
           started.catch(() => {
             stopReading();
@@ -7136,10 +7218,18 @@ async function readAloud(ids) {
       stopReading();
       setStatus("that message could not be played.");
     });
-  });
+    return audio;
+  };
+  if (streamed) {
+    addPlayer(0);
+  } else {
+    sources.forEach((_source, at) => addPlayer(at));
+  }
+  // The same array the players are added to, so a stop reaches a part requested later.
+  nowPlaying = { id, audio: players[0], urls: objectUrls, players };
   setReadState("ready");
   renderChannelRows();
-  await players[0].play();
+  await startPlayer(0);
 }
 
 /**

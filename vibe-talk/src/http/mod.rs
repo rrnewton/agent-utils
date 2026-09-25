@@ -119,15 +119,21 @@ pub fn router(state: AppState) -> Router {
         // the mode is turned on; `play` is what a tap actually costs, and it is a map lookup and
         // then the vendor's bytes forwarded as they arrive.
         //
-        // `play` is deliberately OUTSIDE the authenticated shape of every other route: it is a GET
-        // with no `Authorization` header, because an `<audio src>` cannot send one and without an
-        // `<audio src>` the browser cannot stream. The ticket in the path is the credential. See
-        // `speech_tickets` for why that is a smaller grant than it looks.
+        // `play` and its timing callback are deliberately OUTSIDE the bearer-authenticated shape
+        // of every other route. An `<audio src>` cannot send an `Authorization` header, so the
+        // random ticket in the path is the intentional capability for both: it grants one already
+        // resolved audio read and the right to append content-free clocks to that same read. A
+        // guessed ticket gets the same 404 from either route. See `speech_tickets` for why that is
+        // a smaller grant than it looks.
         .route(
             "/api/v1/channels/{channel_id}/speech/prepare",
             post(api::prepare_speech),
         )
         .route("/api/v1/speech/{ticket}", get(api::play_speech))
+        .route(
+            "/api/v1/speech/{ticket}/timing",
+            post(api::speech_playback_timing),
+        )
         // Adding a channel from inside the app. WRITE scope, and deliberately NO MCP tool: this
         // widens what the bridge can read, and what it can say. See `api::add_channel`.
         .route("/api/v1/channels", post(api::add_channel))

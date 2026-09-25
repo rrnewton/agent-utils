@@ -1158,6 +1158,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     speakCalls: [],
     /** `#read-aloud-latency`: every prepare request, so "ahead of the tap" is testable. */
     prepareCalls: [],
+    /** Content-free browser playback timing reports, kept apart from synthesis calls. */
+    speechTimingCalls: [],
     /** Make preparing fail, to prove the tap still works by the older, slower route. */
     prepareFails: false,
     /** The full path of each read, so a test can see the pace that travelled with it. */
@@ -1401,6 +1403,16 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         this.paused = true;
       }
 
+      /** How the page drops a source, which closes a streamed response. */
+      removeAttribute(name) {
+        // `url` stays as the record of what this player was asked to read.
+        if (name === "src") this.sourceDropped = true;
+      }
+
+      load() {
+        this.loadCount = (this.loadCount || 0) + 1;
+      }
+
       /** What the browser does when the audio runs out. */
       async end() {
         const fn = this.listeners.get("ended");
@@ -1415,6 +1427,18 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         if (fn) {
           await fn();
         }
+      }
+
+      /** The browser has received enough media to decode its first frame. */
+      async loaded() {
+        const fn = this.listeners.get("loadeddata");
+        if (fn) await fn();
+      }
+
+      /** The browser's closest observable boundary to the first audible sample. */
+      async started() {
+        const fn = this.listeners.get("playing");
+        if (fn) await fn();
       }
     },
     // Real ones. The page decodes the stream's bytes exactly as a browser hands them over, so a
@@ -1577,6 +1601,15 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           })),
           expires_in_seconds: 600,
         });
+      }
+      const speechTiming = /^\/api\/v1\/speech\/([^/]+)\/timing$/.exec(String(path));
+      if (speechTiming) {
+        page.speechTimingCalls.push({
+          ticket: speechTiming[1],
+          timing: JSON.parse((options && options.body) || "{}"),
+          keepalive: options && options.keepalive,
+        });
+        return json(204, {});
       }
       // Read-aloud. Bytes rather than JSON, and RECORDED, so a test can prove which message was
       // sent to the vendor and that a refusal sent none.
@@ -6094,12 +6127,43 @@ test("...so the tap itself fetches NOTHING and plays the prepared URL straight a
     preparedBefore,
     "the tap re-prepared, so the work moved rather than being done ahead of time"
   );
-  assert.equal(
+  assert.match(
     page.players[0].url,
-    "/api/v1/speech/ticket-for-1000000000000000001",
-    "the player was not handed the prepared URL"
+    /^\/api\/v1\/speech\/ticket-for-1000000000000000001\?selection=tap-[0-9a-f]{16}$/,
+    "the player was not handed the prepared URL for this tap"
   );
   assert.equal(page.players[0].playCount, 1, "nothing was played");
+});
+
+test("audible playback reports content-free transfer and browser timing", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
+  const tappedAt = page.clock();
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  page.setClock(tappedAt + 120);
+  await page.players[0].loaded();
+  page.setClock(tappedAt + 155);
+  await page.players[0].started();
+  await page.settle();
+
+  assert.deepEqual(page.speechTimingCalls, [{
+    ticket: "ticket-for-1000000000000000001",
+    timing: {
+      tap_to_play_ms: 0,
+      request_to_loaded_ms: 120,
+      loaded_to_playing_ms: 35,
+      tap_to_audible_ms: 155,
+    },
+    keepalive: true,
+  }]);
+  assert.doesNotMatch(
+    JSON.stringify(page.speechTimingCalls),
+    /message content|api-token|authorization/i,
+    "the playback report carried content or credentials"
+  );
 });
 
 test("...and a message that could not be prepared still reads, by the older slower route", async () => {
@@ -7443,7 +7507,7 @@ const bodyOf = (li) => li.descendants().find((node) => node.hasClass("body"));
  */
 function readAloudMessages(page) {
   return page.players.map((player) => {
-    const prepared = /\/api\/v1\/speech\/ticket-for-(.+)$/.exec(String(player.url || ""));
+    const prepared = /\/api\/v1\/speech\/ticket-for-([^?]+)/.exec(String(player.url || ""));
     if (prepared) {
       return prepared[1];
     }
@@ -15571,6 +15635,82 @@ test("READING A COMBINED ROW ALOUD READS ALL OF IT, and archives it only when th
     { messages: ["1000000000000000001", "1000000000000000002"] },
   ]);
   assert.equal(rowState(page, 0).reading, "false", "the row still claims to be playing");
+});
+
+test("a STREAMED combined row requests each part once the one before has audio, under one selection", async () => {
+  // The server speaks one read at a time on a shared session. Requesting the second part only
+  // after the first has audio queues it behind the first there, in order; sharing the tap's
+  // selection is what tells the server it is a continuation and not a new tap to interrupt for.
+  const page = newPage();
+  await signIn(page);
+  const rows = await inReadingMode(page, splitPost());
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.deepEqual(page.speakCalls, [], "a prepared row fell back to buffered audio");
+  assert.equal(page.players.length, 1, "the second part was requested before the first had audio");
+
+  await page.players[0].loaded();
+  await page.settle();
+  assert.equal(page.players.length, 2, "the second part was never requested");
+  const selection = (url) => new URL(url, "http://page").searchParams.get("selection");
+  assert.match(selection(page.players[0].url), /^tap-[0-9a-f]{16}$/);
+  assert.equal(
+    selection(page.players[1].url),
+    selection(page.players[0].url),
+    "the second part claimed to be a different tap and would interrupt the first"
+  );
+  assert.equal(page.players[1].playCount, 0, "both parts played over each other");
+
+  await page.players[0].end();
+  await page.settle();
+  assert.equal(page.players[1].playCount, 1, "the second part never followed the first");
+  await page.players[1].end();
+  await page.settle();
+  assert.deepEqual(page.dismissCalls, [
+    { messages: ["1000000000000000001", "1000000000000000002"] },
+  ]);
+});
+
+test("stopping a streamed read drops its source, and the next tap is a new selection", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await inReadingMode(page, [
+    message({ id: "1000000000000000001", author_id: "1000000000000000011", content: "first" }),
+    message({ id: "1000000000000000002", author_id: "1000000000000000012", content: "second" }),
+  ]);
+  assert.equal(rows.length, 2, "the fixture was drawn as one row");
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  await rows[1].dispatch("click", {});
+  await page.settle();
+
+  assert.equal(page.players.length, 2);
+  assert.equal(page.players[0].paused, true, "the first read kept playing");
+  assert.equal(
+    page.players[0].sourceDropped,
+    true,
+    "the first read's response stayed open, so the server generates on for nobody"
+  );
+  assert.equal(page.players[0].loadCount, 1);
+  const selection = (url) => new URL(url, "http://page").searchParams.get("selection");
+  assert.notEqual(
+    selection(page.players[1].url),
+    selection(page.players[0].url),
+    "a new tap reused the old selection, so the server would queue it instead of switching"
+  );
+  assert.equal(page.players[1].playCount, 1, "the second row never played");
+
+  await page.players[1].loaded();
+  page.setClock(page.clock() + 10);
+  await page.players[1].started();
+  await page.settle();
+  assert.equal(
+    page.speechTimingCalls.at(-1).ticket,
+    "ticket-for-1000000000000000002",
+    "the timing report was not addressed to the bare ticket"
+  );
 });
 
 test("...and stopping a combined read part-way releases EVERY audio URL it fetched", async () => {

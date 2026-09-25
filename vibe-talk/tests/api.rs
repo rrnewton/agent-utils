@@ -3069,6 +3069,20 @@ async fn preparing_read_aloud_makes_the_tap_cost_no_discord_round_trip() {
     let (status, headers, audio) = call_bytes(&harness, "GET", &url, None).await;
     assert_eq!(status, StatusCode::OK);
     assert!(!audio.is_empty(), "no audio came back");
+    let timing = headers
+        .get("server-timing")
+        .and_then(|value| value.to_str().ok())
+        .expect("the streamed route omitted its provider timing");
+    for phase in [
+        "message_prepare;dur=",
+        "request_connect;dur=",
+        "session_start;dur=",
+        "yield;dur=",
+        "first_audio;dur=",
+        "request_to_first_audio;dur=",
+    ] {
+        assert!(timing.contains(phase), "missing {phase} from {timing}");
+    }
     assert_eq!(
         harness.discord.fetch_count(),
         before,
@@ -3079,6 +3093,23 @@ async fn preparing_read_aloud_makes_the_tap_cost_no_discord_round_trip() {
         Some("no-store"),
         "one person's message must not sit in a shared cache"
     );
+
+    // Deliberately NO bearer token: the unguessable speech ticket is the narrow capability for
+    // both playback and its content-free timing callback.
+    let (status, body) = call(
+        &harness,
+        "POST",
+        &format!("{url}/timing"),
+        None,
+        Some(serde_json::json!({
+            "tap_to_play_ms": 4,
+            "request_to_loaded_ms": 17,
+            "loaded_to_playing_ms": 3,
+            "tap_to_audible_ms": 24
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
 }
 
 /// The play URL carries its own authority, because an `<audio src>` cannot carry a header.
@@ -3087,7 +3118,7 @@ async fn preparing_read_aloud_makes_the_tap_cost_no_discord_round_trip() {
 /// does not is what stops the feature being a hole. `prepare`, which is an ordinary authenticated
 /// route, still refuses an anonymous caller — otherwise anyone could mint their own.
 #[tokio::test]
-async fn a_speech_ticket_plays_without_a_header_and_a_wrong_one_does_not() {
+async fn a_speech_ticket_plays_and_reports_timing_without_a_header_and_a_wrong_one_does_not() {
     let (harness, _store, ids) = todo_harness();
 
     // Minting is authenticated. This is the door; the ticket is only the key it hands out.
@@ -3125,6 +3156,23 @@ async fn a_speech_ticket_plays_without_a_header_and_a_wrong_one_does_not() {
     );
     assert!(!audio.is_empty());
 
+    // The timing callback carries the SAME ticket and no bearer header. It cannot choose text or
+    // mint authority; it can only append bounded clocks to the read that ticket already names.
+    let (status, body) = call(
+        &harness,
+        "POST",
+        &format!("{url}/timing"),
+        None,
+        Some(serde_json::json!({
+            "tap_to_play_ms": 1,
+            "request_to_loaded_ms": 2,
+            "loaded_to_playing_ms": 3,
+            "tap_to_audible_ms": 6
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
     // A ticket nobody minted is not playable, however well-formed it looks.
     let (status, body) = call(
         &harness,
@@ -3132,6 +3180,22 @@ async fn a_speech_ticket_plays_without_a_header_and_a_wrong_one_does_not() {
         "/api/v1/speech/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         None,
         None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], "unknown_speech_ticket");
+
+    let (status, body) = call(
+        &harness,
+        "POST",
+        "/api/v1/speech/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/timing",
+        None,
+        Some(serde_json::json!({
+            "tap_to_play_ms": 1,
+            "request_to_loaded_ms": 2,
+            "loaded_to_playing_ms": 3,
+            "tap_to_audible_ms": 6
+        })),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");

@@ -9,6 +9,7 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, AuthError, Scope};
@@ -2452,6 +2453,7 @@ pub async fn prepare_speech(
     Json(request): Json<PrepareSpeechRequest>,
 ) -> Result<Json<PrepareSpeechResponse>, ApiError> {
     require(&headers, &state, Scope::Read)?;
+    let preparation_began = std::time::Instant::now();
     if state.speech.describe().playback == crate::speech::Playback::Browser {
         return Err(SpeechError::BrowserPlaybackRequired.into());
     }
@@ -2478,7 +2480,7 @@ pub async fn prepare_speech(
         ops::messages(&state, &channel_id, request.limit).await?
     };
     let now = jiff::Timestamp::now().as_millisecond();
-    let mut prepared = Vec::new();
+    let mut resolved = Vec::new();
     for id in &request.ids {
         // Silently absent rather than a 404 for the batch. The page sends what it has on screen,
         // and a row that scrolled out from under the request is not an error the reader did
@@ -2490,24 +2492,46 @@ pub async fn prepare_speech(
         if said.trim().is_empty() {
             continue;
         }
+        resolved.push((message.id.0.clone(), said));
+    }
+    // Stop this clock BEFORE provider warm-up. These are disjoint phases: message preparation is
+    // lookup plus normalization; provider connection/readiness are carried by the warmed stream.
+    let preparation_ms = u64::try_from(preparation_began.elapsed().as_millis()).unwrap_or(u64::MAX);
+    // Best effort: a provider can move transport establishment and session readiness ahead of
+    // the tap. Failure still belongs to the actual playback request, where it is actionable.
+    let _ = state.speech.warm_up().await;
+    let mut prepared = Vec::new();
+    for (message_id, said) in resolved {
         let ticket = state.speech_tickets.mint(crate::speech_tickets::Prepared {
             channel: window.channel.id.0.clone(),
-            message: message.id.0.clone(),
+            message: message_id.clone(),
             said,
             speed: crate::speech::clamp_speed(request.speed),
+            observation: crate::speech_tickets::fresh_observation(),
+            preparation_ms,
         });
         prepared.push(PreparedSpeech {
-            message_id: message.id.0.clone(),
+            message_id,
             url: format!("/api/v1/speech/{ticket}"),
         });
     }
-    // Best effort: warming reusable provider resources makes the first tap fast; a warm-up
-    // failure leaves the actual playback request to report the provider's actionable error.
-    let _ = state.speech.warm_up().await;
     Ok(Json(PrepareSpeechResponse {
         prepared,
         expires_in_seconds: crate::speech_tickets::TICKET_TTL.as_secs(),
     }))
+}
+
+/// Query parameters for playing a prepared message.
+#[derive(Debug, Default, Deserialize)]
+pub struct PlayQuery {
+    /// Opaque id the page gives one tap. A request naming a different selection from the read in
+    /// progress interrupts it; parts of one selection play in order. Letters, digits, `-` and `_`,
+    /// at most 64. Omitted, the read queues behind whatever is playing.
+    pub selection: Option<String>,
+}
+
+fn millis(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// `GET /api/v1/speech/{ticket}` — the whole of the tap.
@@ -2524,7 +2548,20 @@ pub async fn prepare_speech(
 pub async fn play_speech(
     State(state): State<AppState>,
     Path(ticket): Path<String>,
+    Query(query): Query<PlayQuery>,
 ) -> Result<Response, ApiError> {
+    let selection = query.selection.as_deref();
+    if selection.is_some_and(|selection| {
+        selection.is_empty()
+            || selection.len() > 64
+            || !selection
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    }) {
+        return Err(ApiError::bad_request(
+            "selection must be 1 to 64 letters, digits, '-' or '_'",
+        ));
+    }
     let Some(prepared) = state.speech_tickets.claim(&ticket) else {
         // The SAME answer for expired and never-existed. Distinguishing them would let a caller
         // probe for the difference, and neither is something the reader can act on differently.
@@ -2534,21 +2571,89 @@ pub async fn play_speech(
             "that speech ticket is unknown or has expired; turn read-aloud on again",
         ));
     };
-    let began = std::time::Instant::now();
-    let stream = state
+    let requested = std::time::Instant::now();
+    let mut stream = state
         .speech
-        .speak_stream(&prepared.said, prepared.speed)
+        .speak_stream_for_selection(&prepared.said, prepared.speed, selection)
         .await?;
-    // TIME TO FIRST BYTE, which is now the number that matters. The old measurement timed the whole
-    // generation because the reader waited for the whole generation; they no longer do.
+    let first_audio = match stream.chunks.next().await {
+        Some(Ok(chunk)) => chunk,
+        Some(Err(error)) => return Err(error.into()),
+        None => {
+            return Err(SpeechError::Backend {
+                code: "speech_no_audio",
+                detail: "the speech provider completed without returning audio".to_owned(),
+            }
+            .into())
+        }
+    };
+    let request_to_first_audio = requested.elapsed();
+    let session = stream.session;
+    let (request_connection, request_session_start, yielded) =
+        session.map_or(Default::default(), |session| {
+            (
+                session.waited.connection,
+                session.waited.start,
+                session.yielded,
+            )
+        });
+    let server_timing = crate::speech_tickets::ServerTiming {
+        request_to_first_audio_ms: millis(request_to_first_audio),
+        request_connection_ms: millis(request_connection),
+        request_session_start_ms: millis(request_session_start),
+        yield_ms: millis(yielded),
+        // A remainder rather than a separate stopwatch, so the four phases sum exactly.
+        first_audio_ms: millis(
+            request_to_first_audio
+                .saturating_sub(request_connection)
+                .saturating_sub(request_session_start)
+                .saturating_sub(yielded),
+        ),
+        session,
+    };
+    state
+        .speech_tickets
+        .record_server_timing(&ticket, server_timing);
     tracing::info!(
-        message = %prepared.message,
-        channel = %prepared.channel,
-        characters = prepared.said.chars().count(),
-        vendor_ttfb_ms = %began.elapsed().as_millis(),
-        "started streaming a message aloud"
+        observation = prepared.observation,
+        message_preparation_ms = prepared.preparation_ms,
+        session = session.map(|session| session.generation),
+        turn = session.map(|session| session.turn),
+        session_reused = session.map(|session| session.reused),
+        retried = session.map(|session| session.retried),
+        session_connection_ms = session.map(|session| millis(session.setup.connection)),
+        session_start_ms = session.map(|session| millis(session.setup.start)),
+        request_connection_ms = server_timing.request_connection_ms,
+        request_session_start_ms = server_timing.request_session_start_ms,
+        yield_ms = server_timing.yield_ms,
+        first_audio_ms = server_timing.first_audio_ms,
+        request_to_first_audio_ms = server_timing.request_to_first_audio_ms,
+        "read-aloud audio reached the server"
     );
-    let body = axum::body::Body::from_stream(stream.chunks);
+    let mut timing = format!(
+        "message_prepare;dur={}, request_connect;dur={}, session_start;dur={}, yield;dur={}, first_audio;dur={}, request_to_first_audio;dur={}",
+        prepared.preparation_ms,
+        server_timing.request_connection_ms,
+        server_timing.request_session_start_ms,
+        server_timing.yield_ms,
+        server_timing.first_audio_ms,
+        server_timing.request_to_first_audio_ms,
+    );
+    if let Some(session) = session {
+        use std::fmt::Write as _;
+        let _ = write!(
+            timing,
+            ", session;desc=\"generation={} turn={} reused={}\"",
+            session.generation, session.turn, session.reused
+        );
+    }
+    let prefix = stream
+        .preamble
+        .into_iter()
+        .map(Ok::<_, SpeechError>)
+        .chain(std::iter::once(Ok(first_audio)));
+    let body =
+        axum::body::Body::from_stream(futures_util::stream::iter(prefix).chain(stream.chunks));
     Ok((
         [
             (header::CONTENT_TYPE, stream.content_type.as_str()),
@@ -2556,10 +2661,85 @@ pub async fn play_speech(
             // There is no length to seek within and none is claimed. A browser told it may range
             // over a stream that cannot will ask for one and stall.
             (header::ACCEPT_RANGES, "none"),
+            (
+                header::HeaderName::from_static("server-timing"),
+                timing.as_str(),
+            ),
         ],
         body,
     )
         .into_response())
+}
+
+/// Browser-side milestones for one prepared audio element. Durations contain no page or message
+/// content and are capped before logging so malformed clients cannot create absurd observations.
+#[derive(Debug, Deserialize)]
+pub struct SpeechPlaybackTiming {
+    /// Tap until `play()` was invoked, including any preparation join.
+    pub tap_to_play_ms: u64,
+    /// Audio-source creation until the browser had the first media frame (`loadeddata`).
+    pub request_to_loaded_ms: u64,
+    /// First media frame until the `playing` event, our closest browser-visible audible boundary.
+    pub loaded_to_playing_ms: u64,
+    /// Tap until `playing`, measured directly rather than reconstructed.
+    pub tap_to_audible_ms: u64,
+}
+
+/// Record the browser half of an already-authorized read-aloud observation.
+///
+/// There is intentionally no bearer header: the random ticket is the same narrow capability the
+/// audio element used for playback. The report adds only bounded durations and cannot select text.
+pub async fn speech_playback_timing(
+    State(state): State<AppState>,
+    Path(ticket): Path<String>,
+    Json(timing): Json<SpeechPlaybackTiming>,
+) -> Result<StatusCode, ApiError> {
+    const MAX_TIMING_MS: u64 = 10 * 60 * 1_000;
+    if [
+        timing.tap_to_play_ms,
+        timing.request_to_loaded_ms,
+        timing.loaded_to_playing_ms,
+        timing.tap_to_audible_ms,
+    ]
+    .into_iter()
+    .any(|value| value > MAX_TIMING_MS)
+    {
+        return Err(ApiError::bad_request(
+            "read-aloud timing values must be at most 600000 milliseconds",
+        ));
+    }
+    let Some((prepared, server)) = state.speech_tickets.observed_timing(&ticket) else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unknown_speech_ticket",
+            "that speech timing ticket is unknown, expired, or has not produced audio",
+        ));
+    };
+    // `loadeddata` happens after the server had its first audio chunk AND that chunk crossed the
+    // network into the browser's decoder. Both intervals start at the same request, so what is
+    // left after removing the server's share is delivery plus browser buffering — without having
+    // to compare the host's clock with the phone's.
+    let transfer_ms = timing
+        .request_to_loaded_ms
+        .saturating_sub(server.request_to_first_audio_ms);
+    tracing::info!(
+        observation = prepared.observation,
+        message_preparation_ms = prepared.preparation_ms,
+        session = server.session.map(|session| session.generation),
+        turn = server.session.map(|session| session.turn),
+        session_reused = server.session.map(|session| session.reused),
+        request_connection_ms = server.request_connection_ms,
+        request_session_start_ms = server.request_session_start_ms,
+        yield_ms = server.yield_ms,
+        first_audio_ms = server.first_audio_ms,
+        request_to_first_audio_ms = server.request_to_first_audio_ms,
+        transfer_ms,
+        browser_playback_ms = timing.loaded_to_playing_ms,
+        tap_to_play_ms = timing.tap_to_play_ms,
+        tap_to_audible_ms = timing.tap_to_audible_ms,
+        "read-aloud reached audible playback"
+    );
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug)]

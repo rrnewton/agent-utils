@@ -308,6 +308,8 @@ pub trait SpeechProvider: Send + Sync {
         let spoken = self.speak(config, text, speed).await?;
         Ok(SpeechStream {
             content_type: spoken.content_type,
+            preamble: None,
+            session: None,
             chunks: Box::pin(futures_util::stream::once(async move {
                 Ok(bytes::Bytes::from(spoken.audio))
             })),

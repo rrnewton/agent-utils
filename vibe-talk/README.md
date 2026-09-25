@@ -1677,6 +1677,17 @@ sends `audio_end`, waits for `turn_complete`, and then sends the prompt; after t
 `turn_complete`, it sends a fresh `audio_start` before resuming microphone frames. Server output is
 `transcript`, `turn_complete`, `error`, or binary PCM. `quit` ends the session.
 
+A client may send `{"type":"interrupt"}` at any time after `session_started`. During a turn, the
+server stops the response, drops that turn's remaining PCM and transcripts (including any already
+queued), and answers with exactly one `{"type":"turn_complete","turn":N,"interrupted":true}`; the
+next prompt on the same socket is turn N+1. When nothing is running, `interrupt` is ignored.
+Either way, every accepted prompt receives exactly one `turn_complete`, so a client that waits for
+it knows no later frame belongs to the interrupted turn. An `error` frame promises no following
+`turn_complete`, so a client should treat it as the end of the session. A server that predates
+`interrupt` answers it with an `error` frame. A client should still bound its wait for a prompt's
+first output rather than trust every server to answer: read-aloud abandons a session that returns
+no audio within 15 seconds of a prompt and repeats the read once on a fresh one.
+
 This protocol is deliberately public and provider-neutral. Authentication, endpoint discovery,
 and the implementation behind a deployment-managed socket belong in deployment configuration and
 private operations documentation.
