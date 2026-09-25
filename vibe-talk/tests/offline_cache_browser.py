@@ -24,6 +24,10 @@ Opening a thread whose title is longer than the screen, with a long unbroken tok
 in its reply, leaves the page no wider than the viewport and no shown part of the main screen past
 its right edge; on a phone the title is ellipsised instead (`#36 thread-view-phone-overflow`).
 
+Last, a fresh page signed in with a read-scope token reads the channel without a single 4xx answer
+or console error: the stored-conversation routes are write-scope, answered 403 here as the server
+answers them, and the page must not ask (`#38 read-token-conversation-probe`).
+
 Pass --screenshots DIR to keep a PNG of each step for review.
 """
 
@@ -48,6 +52,8 @@ if TYPE_CHECKING:
 
 WEB_ROOT = Path(__file__).resolve().parents[1] / "web"
 TOKEN = "write-token-browser-cache-check"
+READ_TOKEN = "read-token-browser-cache-check"
+SCOPES = {f"Bearer {TOKEN}": "write", f"Bearer {READ_TOKEN}": "read"}
 CHANNEL = {"id": "1110000000000000001", "label": "lead team", "writable": True}
 CACHE_KEY = "vibe-talk.voice.message-cache"
 EPOCH = datetime(2026, 1, 5, 9, 0, tzinfo=timezone.utc)
@@ -105,8 +111,9 @@ class FakeApi:
         with self.lock:
             return [r for r in self.requests if "/timeline?" in r or "/page" in r]
 
-    def client_config(self) -> Json:
+    def client_config(self, scope: str) -> Json:
         return {
+            "token_scope": scope,
             "version": "browser-check",
             "chat_provider_name": "Discord",
             "channels": [CHANNEL],
@@ -145,10 +152,19 @@ def handler_for(api: FakeApi) -> type[BaseHTTPRequestHandler]:
                 return
             with api.lock:
                 api.requests.append(f"GET {self.path}")
-            if self.headers.get("Authorization") != f"Bearer {TOKEN}":
+            scope = SCOPES.get(self.headers.get("Authorization") or "")
+            if scope is None:
                 self.json(401, {"error": "unauthorized", "detail": "unknown token"})
             elif path == "/api/v1/client-config":
-                self.json(200, api.client_config())
+                self.json(200, api.client_config(scope))
+            elif path in ("/api/v1/conversations", "/api/v1/transcript"):
+                # Write-scope routes, refused to a read token as the server refuses them.
+                if scope != "write":
+                    self.json(403, {"error": "forbidden", "detail": "this token may read but not post"})
+                elif path == "/api/v1/conversations":
+                    self.json(200, {"conversations": []})
+                else:
+                    self.json(200, {"turns": [], "has_more": False, "next_before": None})
             elif path.endswith("/timeline"):
                 api.timeline_gate.wait(20)
                 self.json(200, api.timeline(parse_qs(parts.query)))
@@ -348,7 +364,8 @@ def main() -> int:
                   " one newest-page read, local view switches, offline and failed states, the pill"
                   " clear of the tabs and the header with #scroll-area unmoved, a scrolled reader"
                   " held in place as it and the error panel come and go, no Cache Storage or"
-                  " service worker, a long thread title ellipsised within the viewport, sign-out clears")
+                  " service worker, a long thread title ellipsised within the viewport, sign-out clears,"
+                  " a read-scope token reads with no refused request or console error")
     return 0
 
 
@@ -382,6 +399,14 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             page.clock.install()
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
+            # Everything the browser itself calls an error, and every refused answer: a 4xx logs a
+            # console error however the page handles it, so the only fix is not to ask.
+            console_errors: list[str] = []
+            page.on("console", lambda entry: console_errors.append(entry.text) if entry.type == "error" else None)
+            refused: list[str] = []
+            page.on("response", lambda answer: refused.append(
+                f"{answer.status} {answer.request.method} {urlsplit(answer.url).path}")
+                if answer.status >= 400 else None)
 
             def shot(name: str) -> None:
                 if args.screenshots:
@@ -595,6 +620,30 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                   "signing out left the snapshot on the device")
             check(rows() == [], f"signing out left rows on the screen: {rows()}")
             shot("7-signed-out")
+
+            # 8. A fresh page and a READ-scope token: it reads the channel and asks for nothing it
+            # cannot have. Reloaded first, so the stored record has not been looked for yet.
+            page.reload(wait_until="load")
+            console_errors.clear()
+            refused.clear()
+            page.fill("#api-token", READ_TOKEN)
+            page.click("#save-token")
+            page.click("#view-switch")
+            wait_rows(["200", "201", "203"], "a read-scope token did not read the channel")
+            def storage_state() -> str:
+                return str(page.evaluate("() => document.getElementById('storage-state').textContent"))
+
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not refused and "write-scope token" not in storage_state():
+                page.wait_for_timeout(50)
+            page.wait_for_timeout(300)
+            shot("8-read-scope")
+            check(not refused, f"{label}, read-scope token: the page was refused {refused}")
+            check(not console_errors, f"{label}, read-scope token: console errors {console_errors}")
+            check("write-scope token" in storage_state(),
+                  f"{label}, read-scope token: Settings says {storage_state()!r} about the stored record")
+            check(bool(page.evaluate("() => document.getElementById('error-wrap').hidden")),
+                  f"{label}, read-scope token: the error panel is up")
 
             desktop = bool(page.evaluate("() => matchMedia('(min-width: 900px) and (pointer: fine)').matches"))
             check(desktop != mobile, f"{label}: the page chose the wrong layout regime")

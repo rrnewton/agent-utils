@@ -462,10 +462,13 @@ Then open `http://<host>:8080/`, go to **Settings**, paste one of **this deploym
 tokens into **vibe-talk API token**, and press Save. Not the bot token and not the ElevenLabs key:
 neither is ever entered into the page. `VIBE_TALK_READ_TOKEN` is enough to read, search and
 listen; `VIBE_TALK_WRITE_TOKEN` is what replying from the page needs, and what `/voice` needs to
-start a conversation at all. The page cannot tell you which one you pasted — `/api/v1/client-config`
-answers both identically — so a read token loads the whole interface and then fails at the first
-write, which is why both refusals now name the scope. It is stored per browser **and per
-hostname**, so a second URL onto the same deployment asks again.
+start a conversation at all. `/api/v1/client-config` accepts both, so a read token loads the whole
+interface and then fails at the first write, which is why both refusals now name the scope. Its
+`token_scope` field (`read` or `write`) names the scope of the token that asked — nothing the caller
+did not already hold — and the page uses it only to skip what a read token cannot have: with one,
+Settings says stored conversations need the write-scope token rather than asking for them and
+logging a 403. It is stored per browser **and per hostname**, so a second URL onto the same
+deployment asks again.
 
 ### Podman
 
@@ -1223,7 +1226,7 @@ its own adapter-only token; every other route uses the read/write tokens describ
 | POST | `/api/v1/channels` | **write** | direct mode: `{id,label,writable}`; managed mode: `{source,label}` — validate and add a tracked channel |
 | GET | `/api/v1/channel-directory?q=&limit=&cursor=` | **write** | managed mode: one page of the channels the bridge can see, each marked `tracked` when already a channel here |
 | DELETE | `/api/v1/channels/{id}` | **write** | remove a channel added in the app; managed mode also unregisters it upstream |
-| GET | `/api/v1/client-config` | read | what the web app needs at startup |
+| GET | `/api/v1/client-config` | read | what the web app needs at startup, including the caller's own `token_scope` |
 | POST | `/api/v1/live/events` | ingest | accept one normalized create/update/delete event from an external provider adapter |
 | GET | `/api/v1/diagnostics` | read | re-run the startup checks now, structured, with a remedy on every failure — see above |
 | GET | `/api/v1/agent-tools` | read | the voice agent's tool manifest and approval policy |

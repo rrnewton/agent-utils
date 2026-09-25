@@ -117,7 +117,7 @@ steps:
   # and a scrolled reader held in place as the pill comes and goes.
   - group: check
     job: offline-cache-browser
-    desc: saved-message snapshot in current Chromium at 412x915 and 360x800 Android viewports and a 1280x800 desk
+    desc: saved-message snapshot and a read-scope sign-in in current Chromium at 412x915 and 360x800 Android viewports and a 1280x800 desk
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/offline_cache_browser.py
     jobs_flag: ""

@@ -1571,6 +1571,29 @@ async fn the_page_size_is_this_servers_business_and_not_the_callers() {
 }
 
 #[tokio::test]
+async fn client_config_names_the_callers_scope_so_the_page_can_skip_write_only_reads() {
+    // `#38 read-token-conversation-probe`. The page cannot tell its token's scope any other way,
+    // and a read-scope page that probed the stored record earned a 403 on every load. The field
+    // must agree with what the conversation routes actually do for the same token, so both are
+    // asserted together: the report is not allowed to drift from the enforcement.
+    let (harness, _store) = store_harness();
+    for (token, scope, listing) in [
+        (READ_TOKEN, "read", StatusCode::FORBIDDEN),
+        (WRITE_TOKEN, "write", StatusCode::OK),
+    ] {
+        let (status, config) =
+            call(&harness, "GET", "/api/v1/client-config", Some(token), None).await;
+        assert_eq!(status, StatusCode::OK, "{config}");
+        assert_eq!(config["token_scope"], scope, "{config}");
+        let (status, payload) =
+            call(&harness, "GET", "/api/v1/conversations", Some(token), None).await;
+        assert_eq!(status, listing, "{scope}: {payload}");
+    }
+    let (status, _) = call(&harness, "GET", "/api/v1/client-config", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn the_read_token_cannot_reach_a_transcript_or_move_a_mark() {
     // Asserted, not assumed. A transcript is the owner's own speech plus channel text read aloud
     // to him, and the read token is the one that gets pasted into an agent platform.

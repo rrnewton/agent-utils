@@ -248,10 +248,12 @@ function signedOutByRename() {
  * 403 is not a bad token — it is the right token with the wrong scope, and the two are fixed
  * differently: one is a typo, the other is a different string in the same config file. The
  * server's own taxonomy already separates them (`forbidden`, "this token may read but not post"),
- * and this is the one place the difference is expensive, because `/api/v1/client-config` answers
- * a read-scope token exactly as it answers a write-scope one. So a read token signs in cleanly
- * and fails only at the first thing that writes, which is minting a conversation. Calling that
- * "refused" sends the owner hunting for a typo in a token that is not wrong.
+ * and this is the one place the difference is expensive, because `/api/v1/client-config` accepts
+ * a read-scope token just as it accepts a write-scope one. So a read token signs in cleanly and
+ * fails only at the first thing that writes, which is minting a conversation. Calling that
+ * "refused" sends the owner hunting for a typo in a token that is not wrong. (It does now say
+ * which scope it saw — `tokenScope` — but only so the page stops asking for what a read token
+ * cannot have; reading channels with one is supported.)
  */
 function refusalSentence(error) {
   return error && error.status === 403
@@ -2541,8 +2543,21 @@ function forgetTranscriptWalk() {
  */
 let restoredStoredConversation = false;
 
+/** What Settings says about the stored record when the saved token is read-scope. */
+const READ_SCOPE_STORAGE_STATE =
+  "Stored conversations need the write-scope token; this one may read channels only.";
+
 async function loadStoredConversation() {
   if (restoredStoredConversation) {
+    return;
+  }
+  // `#38 read-token-conversation-probe`. Stored conversations are write-scope by design, so a
+  // read-scope page asking for them could only earn a 403 — and a console error on every load of
+  // an otherwise working page. Say why there is nothing here instead of asking. The once-flag is
+  // deliberately NOT set: saving the write-scope token afterwards signs in again, and then the
+  // record is restored as usual.
+  if (tokenScope === "read") {
+    setStorageState(READ_SCOPE_STORAGE_STATE);
     return;
   }
   restoredStoredConversation = true;
@@ -2661,6 +2676,11 @@ function maybeLoadOlderTurns() {
 
 /** Erase every stored conversation. Leaves the screen exactly as it is, and says so. */
 async function forgetConversations() {
+  if (tokenScope === "read") {
+    // The server would refuse it; say so without asking and earning the 403.
+    setStorageState(`Nothing was erased: ${READ_SCOPE_STORAGE_STATE}`);
+    return;
+  }
   try {
     const result = await api("/api/v1/conversations", { method: "DELETE" });
     const count = (result && result.forgotten) || 0;
@@ -9933,6 +9953,11 @@ let liveDelivery = "off";
 
 /** Whether the selected provider can move its own read cursor. Default-off for older servers. */
 let upstreamReadMarkSupported = false;
+/**
+ * `read` or `write`: the scope the server saw on the saved token. Null from an older server that
+ * does not say, which keeps the old behaviour of asking and reading the refusal.
+ */
+let tokenScope = null;
 /** The channel the stream is following, or null when nothing is attached. */
 let liveChannel = null;
 /**
@@ -11206,6 +11231,7 @@ function applyClientConfig(config) {
       : "off";
   renderLiveState();
   upstreamReadMarkSupported = config.upstream_read_mark_supported === true;
+  tokenScope = ["read", "write"].includes(config.token_scope) ? config.token_scope : null;
   // `#46 conversation-replay`. What the SERVER permits, which is not the same as what the reader
   // has asked for — and the screen has to be able to say which of the two is stopping it.
   resumeAllowed = config.replay_enabled === true;

@@ -1054,6 +1054,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         speech_prep_enabled: page.speechPrepEnabled,
         self_author_id: page.selfAuthorId,
         owner_author_id: page.ownerAuthorId,
+        token_scope: page.tokenScope,
       }),
     /**
      * The channels this server is configured for, as the server would serialize them.
@@ -1103,6 +1104,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     addChannelConflict: false,
     /** Whether the provider can move its own read cursor. Default false, like production. */
     upstreamReadMarkSupported: false,
+    /** The scope the server reports for the saved token; `undefined` plays an older server. */
+    tokenScope: "write",
     /** Every explicit provider read-boundary request. Separate from local Done/archive calls. */
     upstreamReadCalls: [],
     /** Channel route used by every provider read-boundary request. */
@@ -13188,6 +13191,59 @@ test("a reload puts the stored conversation back, with its OWN timestamps", asyn
     at(lines[1]),
     "two turns a minute apart must not share one timestamp"
   );
+});
+
+test("a READ-scope page never asks for the stored record, and restores it once the write token is saved", async () => {
+  // `#38 read-token-conversation-probe`. The conversation routes are write-scope on the server, so
+  // a read-scope page that asked for them got a 403 — and a console error — on every load of an
+  // otherwise working page. The fixture here does NOT refuse, deliberately: a page that asked
+  // anyway would then restore the conversation, and the assertions below would catch it.
+  const page = newPage();
+  page.storedTurns.set("conv_earlier", [
+    { speaker: "you", text: "what happened overnight", at_ms: 1_700_000_000_000 },
+  ]);
+  page.tokenScope = "read";
+  await signIn(page);
+  await page.settle();
+
+  const asked = page.requests.filter((r) => /\/api\/v1\/(conversations|transcript)/.test(r));
+  assert.deepEqual(asked, [], `a read-scope page asked for the stored record: ${asked.join(", ")}`);
+  assert.match(page.el("storage-state").textContent, /write-scope token/);
+  assert.equal(page.el("error").hidden, true, `a read token raised an error: ${page.el("error").textContent}`);
+
+  // Forget is the one other thing Settings offers against the record. Same refusal, same reason.
+  await page.el("forget-conversations").click();
+  await page.settle();
+  assert.deepEqual(
+    page.requests.filter((r) => r.includes("/api/v1/conversations")),
+    [],
+    "Forget asked the server for something a read token cannot have"
+  );
+  assert.equal(page.storedTurns.size, 1);
+  assert.match(page.el("storage-state").textContent, /Nothing was erased: .*write-scope token/);
+
+  // The once-flag must not have been spent on the read token: saving the write one restores.
+  page.tokenScope = "write";
+  await signIn(page);
+  await page.settle();
+  const lines = page.el("transcript").children.filter((li) => li.className !== "seam");
+  assert.equal(lines.length, 1, `the write token did not restore the record: ${page.renderedText()}`);
+  assert.match(page.el("storage-state").textContent, /1 conversation stored/);
+});
+
+test("a server that does not report a scope keeps the old behaviour and asks", async () => {
+  // Older servers omit `token_scope`. Skipping on a missing field would silently lose the record
+  // for every write-scope reader of such a server; asking is what they did before `#38`.
+  const page = newPage();
+  page.storedTurns.set("conv_earlier", [
+    { speaker: "you", text: "what happened overnight", at_ms: 1_700_000_000_000 },
+  ]);
+  page.tokenScope = undefined;
+  await signIn(page);
+  await page.settle();
+  assert.ok(page.requests.includes("GET /api/v1/conversations"), page.requests.join(", "));
+  const lines = page.el("transcript").children.filter((li) => li.className !== "seam");
+  assert.equal(lines.length, 1);
 });
 
 test("a restored NOTE is labelled as one, and is not put in the assistant's mouth", async () => {

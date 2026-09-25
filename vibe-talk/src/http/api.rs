@@ -583,6 +583,13 @@ pub struct ClientConfigResponse {
     /// the data would tell the operator the feature was off every time the channel was plain prose.
     /// They are flipping this switch to compare two runs; guessing is exactly what they cannot do.
     pub speech_prep_enabled: bool,
+    /// The scope of the token that asked: `read` or `write`.
+    ///
+    /// The caller's own scope, so it discloses nothing it did not already hold. The page needs it
+    /// to avoid asking for what this token cannot have: stored conversations are write-only (see
+    /// the conversation routes), and a read-scope page that probed them anyway got a 403 and a
+    /// console error on every load. `#38 read-token-conversation-probe`.
+    pub token_scope: &'static str,
 }
 
 /// `GET /api/v1/client-config`
@@ -590,7 +597,7 @@ pub async fn client_config(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<ClientConfigResponse>, ApiError> {
-    require(&headers, &state, Scope::Read)?;
+    let scope = require(&headers, &state, Scope::Read)?;
     Ok(Json(ClientConfigResponse {
         chat_provider_name: state.chat.provider_name().to_owned(),
         channels: ops::channels(&state).await,
@@ -616,6 +623,10 @@ pub async fn client_config(
             state.config.discord.bot_token.expose(),
         ),
         owner_author_id: state.config.discord.owner_user_id.clone(),
+        token_scope: match scope {
+            Scope::Read => "read",
+            Scope::Write => "write",
+        },
     }))
 }
 
