@@ -1,6 +1,6 @@
 ---
 title: 'gchat-deployment-handoff: reproduce the mobile reader on the intended host'
-status: open
+status: closed
 priority: 0
 issue_type: task
 labels:
@@ -9,7 +9,7 @@ labels:
 depends_on:
   agent-utils-1: parent-child
 created_at: 2026-09-25T01:32:01.933921963+00:00
-updated_at: 2026-09-25T01:33:45.758377897+00:00
+updated_at: 2026-09-25T04:16:00.000000000+00:00
 ---
 
 # Description
@@ -23,3 +23,5 @@ Managed mobile Chrome opens the deployed URL; real chat rows render; push is con
 # Notes
 
 A prototype was validated on a temporary source host and then deliberately stopped and disabled after discovering it was the wrong machine. Reproduce it on the intended host from the private handoff; do not copy host-specific configuration into this repository.
+
+[gpt-5.6-sol] Completed the intended-host handoff. Mobile Playwright reached the public `/voice` page, rendered real provider rows, observed connected push delivery with no periodic history reads, and verified all bounded user services across restarts. Provider-specific evidence and the voice-worker MCP contract are retained outside this repository.
