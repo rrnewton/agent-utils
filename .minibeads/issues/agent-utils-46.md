@@ -1,6 +1,6 @@
 ---
 title: 'abort-create-census-cost: recover --abort-create spends two minutes in a host-wide mount scan, and unit tests pay it'
-status: in_progress
+status: closed
 priority: 1
 issue_type: bug
 assignee: opus-5.5/abort-create-census-cost
@@ -9,7 +9,8 @@ labels:
 - validation
 - performance
 created_at: 2026-09-26T06:56:28.757636169+00:00
-updated_at: 2026-09-26T06:56:28.761904124+00:00
+updated_at: 2026-09-26T07:41:36.611508000+00:00
+closed_at: 2026-09-26T07:41:36.611508000+00:00
 ---
 
 # Description
