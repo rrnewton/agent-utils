@@ -283,8 +283,14 @@ When the recorded remote cannot accept a salvage ref, an operator may explicitly
 local custody by adding `--salvage-archive-root ABSOLUTE_PATH` to `remove`. There is no default: the
 directory must already exist, must be owned by the current user, must not be group/world writable,
 must have no symlink component, and must be separate from the managed project tree. Wrkslots still
-tries the recorded remote first. Only after that push attempt refuses does it
-write one self-contained Git bundle per affected repository under the supplied root. Each bundle has
+tries the recorded remote first. Only after that push attempt refuses, or after the initial fetch
+never reaches the remote at all, does it write one self-contained Git bundle per affected repository
+under the supplied root. A fetch counts as never reaching the remote only when Git reports a proxy
+`CONNECT` refusal, an unresolved host, or a refused, timed-out, or unreachable connection, and names
+nothing about the remote's identity. A fetch that reports failed authentication, a host key or
+certificate problem, an HTTP error answer, or a missing repository still refuses, even when outage
+text appears beside it. Before archiving after such an outage, wrkslots checks again that the
+checkout's remote URL still matches the recorded one. Each bundle has
 a schema-1 JSON receipt binding the machine, slot generation, checkout and repository identities,
 remote URL digest, source and salvage commits, status digest, archive ref, byte count, and SHA-256.
 Wrkslots clones the bundle into a fresh empty bare repository, resolves the exact archive ref, and

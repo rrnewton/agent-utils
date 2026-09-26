@@ -437,6 +437,10 @@ class _LockBusy(Refusal):
     """A bounded lock wait elapsed without acquiring the requested lock."""
 
 
+class _RemoteTransportUnavailable(Refusal):
+    """A Git network command never reached the remote, and nothing named its identity."""
+
+
 class _RetirementDeferred(Refusal):
     """A queue candidate changed before its exact guarded attempt began."""
 
@@ -8324,6 +8328,43 @@ def _with_proxy(command: Sequence[str], env: Mapping[str, str]) -> list[str]:
     return [str(Path(wrapper).absolute()), *command] if wrapper is not None else list(command)
 
 
+# Git and its transports print these when no connection to the remote was made.
+_REMOTE_TRANSPORT_UNAVAILABLE = re.compile(
+    r"CONNECT tunnel failed, response \d{3}"
+    r"|Received HTTP code \d{3} from proxy after CONNECT"
+    r"|Could not resolve (?:host|proxy|hostname)\b"
+    r"|Failed to connect to \S+ port \d+"
+    r"|Connection refused"
+    r"|Connection timed out"
+    r"|Network is unreachable",
+    re.IGNORECASE,
+)
+# Any of these means the remote, or something claiming to be it, answered or
+# was refused on identity. A command that prints one is not an outage.
+_REMOTE_AUTHORITY_FAILURE = re.compile(
+    r"Authentication failed"
+    r"|could not read (?:Username|Password)"
+    r"|Invalid username or password"
+    r"|Permission denied \("
+    r"|Host key verification failed"
+    r"|REMOTE HOST IDENTIFICATION HAS CHANGED"
+    r"|certificate"
+    r"|The requested URL returned error"
+    r"|Repository not found"
+    r"|does not appear to be a git repository",
+    re.IGNORECASE,
+)
+
+
+def _remote_transport_unavailable(output: str) -> bool:
+    """Return whether failed Git network output shows only an absent connection."""
+
+    return bool(
+        _REMOTE_TRANSPORT_UNAVAILABLE.search(output)
+        and not _REMOTE_AUTHORITY_FAILURE.search(output)
+    )
+
+
 def _local_remote_url_path(repository: Path, url: str) -> Path | None:
     """Return a conservative local path for a Git remote URL, if it has one."""
 
@@ -8445,10 +8486,14 @@ class _GitVcs:
             raise Refusal(f"cannot execute Git: {exc}") from exc
         if check and completed.returncode != 0:
             detail = (completed.stderr or completed.stdout).strip()
-            raise Refusal(
-                f"Git refused in {repository}: git {' '.join(args)}"
-                + (f": {detail}" if detail else "")
+            message = f"Git refused in {repository}: git {' '.join(args)}" + (
+                f": {detail}" if detail else ""
             )
+            if network_operation and _remote_transport_unavailable(
+                completed.stderr + "\n" + completed.stdout
+            ):
+                raise _RemoteTransportUnavailable(message)
+            raise Refusal(message)
         return completed
 
     def repository_root(self, repository: Path) -> Path:
@@ -12171,9 +12216,21 @@ def _salvage_one_checkout(
         if prepared is None
         else prepared
     )
-    vcs.fetch_remote(
-        path, checkout.remote, checkout.landed_ref, facts.remote_authority
-    )
+    try:
+        vcs.fetch_remote(
+            path, checkout.remote, checkout.landed_ref, facts.remote_authority
+        )
+    except _RemoteTransportUnavailable as exc:
+        if archive_root is None:
+            raise
+        # With no connection there is no remote answer to publish to or to
+        # trust, so archive locally. The recorded remote binding is still
+        # rechecked, and every other fetch refusal, including authentication,
+        # host identity, and inventory disagreement, still refuses.
+        vcs.assert_remote_authority(path, checkout.remote, facts.remote_authority)
+        return _archive_salvage_locally(
+            config, record, checkout, path, facts, archive_root, exc, vcs
+        )
     vcs.assert_remote_authority(path, checkout.remote, facts.remote_authority)
     containing = vcs.remote_refs_containing(path, checkout.remote, facts.head)
     if not facts.dirty and containing:

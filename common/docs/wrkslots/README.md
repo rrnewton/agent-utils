@@ -101,8 +101,10 @@ wrkslots remove slot01 --coordinator-authorized \
 This opt-in fallback writes a separate self-contained Git bundle and schema-1 receipt for each
 affected top-level or initialized nested repository. Wrkslots verifies the SHA-256, exact archive
 ref, complete restoration into an empty bare repository, and full object connectivity before the
-ordinary path fence may remove anything. A failed push is recorded as `archived-local`, never as
-remote `salvaged`; omission of the option leaves the slot untouched.
+ordinary path fence may remove anything. A failed push, or an initial fetch that never reached the
+remote because of a network outage, is recorded as `archived-local`, never as remote `salvaged`;
+an authentication or remote-identity failure still refuses, and omission of the option leaves the
+slot untouched.
 
 For initialized nested repositories, a later source-checkout switch between recognized GitHub
 HTTPS and SSH spellings does not block cleanup when both URLs still name the same owner and
