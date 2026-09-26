@@ -1,14 +1,15 @@
 ---
 title: 'post-gate-scope-first: refuse a read token with 403 before parsing a post-proposal body'
-status: open
+status: in_progress
 priority: 3
 issue_type: bug
+assignee: opus-5.5/post-gate-scope-first
 labels:
 - vibe-talk
 depends_on:
   agent-utils-34: discovered-from
 created_at: 2026-09-26T01:43:29.872090323+00:00
-updated_at: 2026-09-26T01:43:36.310173397+00:00
+updated_at: 2026-09-26T01:46:47.702913445+00:00
 ---
 
 # Description

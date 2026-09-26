@@ -199,6 +199,28 @@ fn require(headers: &HeaderMap, state: &AppState, scope: Scope) -> Result<Scope,
     Ok(auth::authorize(header, &state.config.auth, scope)?)
 }
 
+/// The write scope, taken from the `Authorization` header and nothing else.
+///
+/// `#41 post-gate-scope-first`. Axum runs extractors in argument order, and `Json`, `Query` and
+/// `Path` each refuse a malformed request with their own 4xx. A handler that checked scope in its
+/// body therefore told a read-scope or anonymous caller "your JSON is malformed" (422) before it
+/// could say "you may not do this at all" (403/401). Taken as the first extractor after `State`,
+/// this answers the scope question first, so a caller without write scope gets the same refusal
+/// whatever it sent — and learns nothing about what these routes would accept.
+pub struct WriteScope;
+
+impl axum::extract::FromRequestParts<AppState> for WriteScope {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        require(&parts.headers, state, Scope::Write)?;
+        Ok(Self)
+    }
+}
+
 fn require_ingest(headers: &HeaderMap, state: &AppState) -> Result<(), ApiError> {
     let configured = state.config.ingest.token.as_ref().ok_or_else(|| {
         ApiError::new(
@@ -1214,11 +1236,10 @@ pub struct PartialReplyResponse {
 /// `POST /api/v1/channels/{channel_id}/reply` — the only route that speaks in the owner's name.
 pub async fn reply(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
     Path(channel_id): Path<String>,
     Json(request): Json<ReplyRequest>,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     match ops::reply_scoped(
         &state,
         &channel_id,
@@ -1364,10 +1385,9 @@ async fn pending_view(
 /// backed by, for a caller that speaks REST rather than MCP.
 pub async fn propose_post(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
     Json(request): Json<ProposeRequest>,
 ) -> Result<Json<ProposedResponse>, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     let (channel, proposal) = ops::propose_reply(
         &state,
         &request.channel_id,
@@ -1389,10 +1409,9 @@ pub async fn propose_post(
 /// — or until `wait` seconds pass.
 pub async fn pending_post(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
     Query(query): Query<PendingQuery>,
 ) -> Result<Json<crate::contract::PendingPostResponse>, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     let proposal = match query.wait {
         None | Some(0) => state.post_gate.pending(),
         Some(seconds) => {
@@ -1410,10 +1429,9 @@ pub async fn pending_post(
 /// gate accepted answers like the reply route: 207 with the unsent remainder when part went out.
 pub async fn commit_post(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
     Json(request): Json<CommitRequest>,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     let restated = crate::post_gate::Binding {
         channel_id: request.channel_id,
         text: request.text,
@@ -1448,10 +1466,9 @@ pub async fn commit_post(
 /// `POST /api/v1/post-proposals/cancel` — withdraw the pending proposal without posting it.
 pub async fn cancel_post(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
     Json(request): Json<CancelRequest>,
 ) -> Result<StatusCode, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     ops::cancel_proposal(&state, &request.handle)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1466,11 +1483,10 @@ pub struct AskRequest {
 /// `POST /api/v1/channels/{channel_id}/ask` — the slow-path seam. Not implemented in v0.
 pub async fn ask(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
     Path(channel_id): Path<String>,
     Json(request): Json<AskRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     let info = state.channel(&channel_id).ok_or(OpError::UnknownChannel)?;
     match state.agent.ask(&info.id, &request.question).await {
         Ok(answer) => Ok(Json(serde_json::json!({ "answer": answer }))),

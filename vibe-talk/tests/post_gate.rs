@@ -48,35 +48,21 @@ async fn send(
     token: &str,
     body: Option<Value>,
 ) -> (StatusCode, Value) {
-    let builder = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("authorization", format!("Bearer {token}"));
-    let request = match body {
-        Some(json) => builder
-            .header("content-type", "application/json")
-            .header("accept", "application/json, text/event-stream")
-            .body(Body::from(json.to_string()))
-            .expect("request"),
-        None => builder.body(Body::empty()).expect("request"),
-    };
-    let response = harness
-        .router
-        .clone()
-        .oneshot(request)
-        .await
-        .expect("router responds");
-    let status = response.status();
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .expect("body")
-        .to_bytes();
-    (
-        status,
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-    )
+    match body {
+        Some(json) => {
+            let json = json.to_string();
+            send_raw(
+                harness,
+                method,
+                uri,
+                Some(token),
+                Some("application/json"),
+                &json,
+            )
+            .await
+        }
+        None => send_raw(harness, method, uri, Some(token), None, "").await,
+    }
 }
 
 /// The model's side: `post_reply` over MCP. Returns the tool result's text.
@@ -528,6 +514,212 @@ async fn the_read_token_can_neither_propose_see_nor_confirm() {
     // The refusals left the proposal where it was.
     let (status, body) = commit(&harness, restated(&proposal)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A request as a careless or hostile caller might send it: any token or none, any content type or
+/// none, and a body that need not be JSON at all.
+async fn send_raw(
+    harness: &Harness,
+    method: &str,
+    uri: &str,
+    token: Option<&str>,
+    content_type: Option<&str>,
+    body: &str,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("accept", "application/json, text/event-stream");
+    if let Some(token) = token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    if let Some(content_type) = content_type {
+        builder = builder.header("content-type", content_type);
+    }
+    let request = builder.body(Body::from(body.to_owned())).expect("request");
+    let response = harness
+        .router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("router responds");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn a_caller_without_write_scope_is_refused_before_its_request_is_parsed() {
+    // `#41 post-gate-scope-first`. Every route that proposes, confirms, withdraws, reads a
+    // proposal, or posts must answer a read token 403 and an anonymous caller 401 — the SAME
+    // answer a well-formed request gets — however malformed the request is. Parsing first used to
+    // answer 422 or 400 instead, which told a caller with no business here what the route accepts.
+    let harness = harness();
+    let proposal = propose(&harness, "on my way").await;
+    let reply = format!("/api/v1/channels/{WRITE_CHANNEL}/reply");
+    let ask = format!("/api/v1/channels/{WRITE_CHANNEL}/ask");
+    let well_formed_proposal = json!({ "channel_id": WRITE_CHANNEL, "text": "hi" }).to_string();
+    let well_formed_commit = restated(&proposal).to_string();
+    let well_formed_cancel = json!({ "handle": proposal["handle"] }).to_string();
+    let well_formed_reply = json!({ "text": "hi" }).to_string();
+    let well_formed_ask = json!({ "question": "why?" }).to_string();
+    // (method, route, a well-formed request, malformed variants of the same route)
+    let routes: [(&str, &str, &str, &[&str]); 5] = [
+        (
+            "POST",
+            "/api/v1/post-proposals",
+            &well_formed_proposal,
+            &["{}", "not json", "{\"text\": 7}"],
+        ),
+        (
+            "POST",
+            "/api/v1/post-proposals/commit",
+            &well_formed_commit,
+            &[
+                "{}",
+                "not json",
+                "{\"handle\": \"x\", \"confirmed_by\": \"the_model\"}",
+            ],
+        ),
+        (
+            "POST",
+            "/api/v1/post-proposals/cancel",
+            &well_formed_cancel,
+            &["{}", "[]"],
+        ),
+        ("POST", &reply, &well_formed_reply, &["{}", "not json"]),
+        ("POST", &ask, &well_formed_ask, &["{}"]),
+    ];
+    for (token, refused) in [
+        (Some(READ_TOKEN), StatusCode::FORBIDDEN),
+        (None, StatusCode::UNAUTHORIZED),
+    ] {
+        for (method, uri, well_formed, malformed) in &routes {
+            let expected = send_raw(
+                &harness,
+                method,
+                uri,
+                token,
+                Some("application/json"),
+                well_formed,
+            )
+            .await;
+            assert_eq!(expected.0, refused, "{method} {uri}: {}", expected.1);
+            let mut variants: Vec<(Option<&str>, &str)> = malformed
+                .iter()
+                .map(|body| (Some("application/json"), *body))
+                .collect();
+            // No content type, and the wrong one, are refused by `Json` too when it goes first.
+            variants.push((None, well_formed));
+            variants.push((Some("text/plain"), well_formed));
+            for (content_type, body) in variants {
+                let answer = send_raw(&harness, method, uri, token, content_type, body).await;
+                assert_eq!(
+                    answer, expected,
+                    "{method} {uri} with {content_type:?} {body:?} was not refused like a \
+                     well-formed request"
+                );
+            }
+        }
+        // So is a channel id that does not decode: `Path` refuses `%FF` with 400 when it goes first.
+        for (uri, well_formed) in [
+            ("/api/v1/channels/%FF/reply", &well_formed_reply),
+            ("/api/v1/channels/%FF/ask", &well_formed_ask),
+        ] {
+            let decodable = uri.replace("%FF", WRITE_CHANNEL);
+            let expected = send_raw(
+                &harness,
+                "POST",
+                &decodable,
+                token,
+                Some("application/json"),
+                well_formed,
+            )
+            .await;
+            let answer = send_raw(
+                &harness,
+                "POST",
+                uri,
+                token,
+                Some("application/json"),
+                well_formed,
+            )
+            .await;
+            assert_eq!(
+                answer, expected,
+                "POST {uri} was not refused like {decodable}"
+            );
+        }
+        // The long poll's query is parsed too, and must not be first either.
+        for uri in [
+            "/api/v1/post-proposals",
+            "/api/v1/post-proposals?wait=soon",
+            "/api/v1/post-proposals?wait=5&seen=latest",
+        ] {
+            let (status, answer) = send_raw(&harness, "GET", uri, token, None, "").await;
+            assert_eq!(status, refused, "GET {uri}: {answer}");
+            assert!(
+                !answer.to_string().contains("on my way"),
+                "GET {uri}: {answer}"
+            );
+        }
+    }
+    assert!(harness.discord.posted().is_empty());
+
+    // The write token still gets the parser's answer, so the check did not simply swallow
+    // malformed requests: they are refused for what they are, and nothing is spent or posted.
+    // Exact statuses, so a mistyped route answering 404 or 405 cannot pass for a parser's refusal.
+    for uri in [
+        "/api/v1/post-proposals",
+        "/api/v1/post-proposals/commit",
+        "/api/v1/post-proposals/cancel",
+        reply.as_str(),
+        ask.as_str(),
+    ] {
+        for (body, parsed) in [
+            ("{}", StatusCode::UNPROCESSABLE_ENTITY),
+            ("not json", StatusCode::BAD_REQUEST),
+        ] {
+            let (status, answer) = send_raw(
+                &harness,
+                "POST",
+                uri,
+                Some(WRITE_TOKEN),
+                Some("application/json"),
+                body,
+            )
+            .await;
+            assert_eq!(
+                status, parsed,
+                "POST {uri} {body:?} with the write token: {answer}"
+            );
+        }
+    }
+    let (status, answer) = send_raw(
+        &harness,
+        "GET",
+        "/api/v1/post-proposals?wait=soon",
+        Some(WRITE_TOKEN),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert!(harness.discord.posted().is_empty());
+    let (status, body) = commit(&harness, restated(&proposal)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the refusals disturbed the proposal: {body}"
+    );
 }
 
 #[tokio::test]

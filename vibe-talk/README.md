@@ -2821,6 +2821,9 @@ The mechanics, all over the write-scope REST routes in the table above:
   and must match all three exactly.
 * **Refusals are specific:** `proposal_unknown` (404), `proposal_expired` (410), and
   `proposal_used`, `proposal_superseded` or `proposal_mismatch` (409). None of them posts.
+* **Scope is checked before the request is read.** On these routes, the reply route and `ask`, a
+  read token gets 403 and no token gets 401 whatever body, content type, query or channel id it
+  sends, so a caller without write scope learns nothing about what they accept.
 * **The log is content-free.** One `post_gate` line per step — `proposed`, `committed`, `failed`,
   `refused`, `cancelled`, `superseded`, `expired` — with a serial, channel id, text length, refusal
   code and `confirmed_by`. Never a word of the text, never the handle.
