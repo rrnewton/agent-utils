@@ -614,9 +614,9 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     assert ordinary | mapped == all_tests
     # Exact totals intentionally make every lifecycle-test addition account for
     # its execution partition; changing only collection cannot satisfy this gate.
-    assert len(all_tests) == 1217
+    assert len(all_tests) == 1223
     assert len(ordinary) == 322
-    assert len(mapped) == 895
+    assert len(mapped) == 901
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
