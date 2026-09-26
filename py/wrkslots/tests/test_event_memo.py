@@ -88,6 +88,13 @@ def _dead_validate_batch(
     prepare_dead_validate_slots(project, slots)
     proofs = {slot: prepare_validation_removal_proof(project, slot) for slot in slots}
     stub_validate_batch_censuses(monkeypatch)
+    # These tests count parses and folds; the batch's evidence deadline has its
+    # own tests.  Under a loaded gate a four-slot batch outlived that
+    # wall-clock bound and retained its last slot, failing a count assertion
+    # for a reason that had nothing to do with counting.  The lifted bound
+    # stays well inside the component step's budget, so a real hang still
+    # fails here by name rather than timing out the whole suite.
+    monkeypatch.setattr(cli, "_VALIDATE_REMOVE_BATCH_CENSUS_SECONDS", 120.0)
     argv = [
         "--project-root",
         str(project),
