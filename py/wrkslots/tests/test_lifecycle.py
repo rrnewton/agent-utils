@@ -26603,6 +26603,11 @@ def test_clean_caches_replays_each_machine_log_once_and_reports_outside_locks(
         machine: str,
         slots: AbstractSet[str],
     ) -> dict[str, dict[str, object]]:
+        # Holds decide HELD rows, so they are resolved under the same locks
+        # that read control-plane state, in the report as well.
+        with pytest.raises(wrkslots.Refusal):
+            with wrkslots._mutation_locks(config, 0):
+                pass
         replays.append((machine, frozenset(slots)))
         return replay(events, machine, slots)
 
