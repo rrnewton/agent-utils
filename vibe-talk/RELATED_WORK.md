@@ -100,8 +100,8 @@ of the backlog, which is precisely the thing that does not work.
 
 [Happy](https://github.com/slopus/happy) (`slopus/happy`, MIT) is a mobile, web, and desktop client
 for Claude Code and Codex with an embedded ElevenLabs voice agent. It is actively maintained — at
-review time `origin/main` was at `eb980a5c`, dated 2026-08-10. A checkout is already present on this
-host at `~/work/happy-dev/happy-monorepo`, and the owner maintains a fork at `rrnewton/happy-devbox`.
+review time `origin/main` was at `eb980a5c`, dated 2026-08-10. This review read a local checkout of
+that revision, and the owner maintains a fork at `rrnewton/happy-devbox`.
 
 Its voice design is documented in-repo at
 [`docs/voice-architecture.md`](https://github.com/slopus/happy/blob/main/docs/voice-architecture.md)

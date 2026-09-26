@@ -700,7 +700,7 @@ nothing and creates nothing, so enabling it cannot change the deployed build.
 ```ini
 [Unit]
 Description=vibe-talk web app origin
-Documentation=file:///home/newton/work/agent-utils/vibe-talk/README.md
+Documentation=https://github.com/rrnewton/agent-utils/blob/main/vibe-talk/README.md
 After=network-online.target
 Wants=network-online.target
 
