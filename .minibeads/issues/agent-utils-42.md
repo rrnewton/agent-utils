@@ -1,6 +1,6 @@
 ---
 title: 'api-scope-first: check scope before parsing on every /api route'
-status: in_progress
+status: closed
 priority: 3
 issue_type: bug
 assignee: opus-5.5/api-scope-first
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-41: discovered-from
 created_at: 2026-09-26T01:56:37.351739869+00:00
-updated_at: 2026-09-26T02:06:04.674588537+00:00
+updated_at: 2026-09-26T02:57:13.850411608+00:00
+closed_at: 2026-09-26T02:57:13.850411508+00:00
 ---
 
 # Description
