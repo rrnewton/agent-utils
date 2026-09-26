@@ -8339,20 +8339,24 @@ _REMOTE_TRANSPORT_UNAVAILABLE = re.compile(
     r"|Network is unreachable",
     re.IGNORECASE,
 )
-# Any of these means the remote, or something claiming to be it, answered or
-# was refused on identity. A command that prints one is not an outage.
+# Any of these means the remote, or something claiming to be it, answered, or
+# the caller or the remote was refused on identity. A command that prints one is
+# not an outage. Git relays every server message with a ``remote:`` prefix, so
+# server text that merely mentions a connection failure also vetoes.
 _REMOTE_AUTHORITY_FAILURE = re.compile(
-    r"Authentication failed"
+    r"^remote:"
+    r"|remote error:"
+    r"|Authentication failed"
+    r"|Proxy Authentication Required"
+    r"|(?:response|HTTP code) 407\b"
     r"|could not read (?:Username|Password)"
-    r"|Invalid username or password"
     r"|Permission denied \("
     r"|Host key verification failed"
     r"|REMOTE HOST IDENTIFICATION HAS CHANGED"
     r"|certificate"
     r"|The requested URL returned error"
-    r"|Repository not found"
     r"|does not appear to be a git repository",
-    re.IGNORECASE,
+    re.IGNORECASE | re.MULTILINE,
 )
 
 
@@ -8485,7 +8489,15 @@ class _GitVcs:
         except OSError as exc:
             raise Refusal(f"cannot execute Git: {exc}") from exc
         if check and completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout).strip()
+            detail = (
+                "\n".join(
+                    text.strip()
+                    for text in (completed.stderr, completed.stdout)
+                    if text.strip()
+                )
+                if network_operation
+                else (completed.stderr or completed.stdout).strip()
+            )
             message = f"Git refused in {repository}: git {' '.join(args)}" + (
                 f": {detail}" if detail else ""
             )
@@ -9194,6 +9206,39 @@ class _GitVcs:
                 "GIT_OBJECT_DIRECTORY": str(objects),
                 _NETWORK_CONFIG_SHA256_ENV: config_digest,
             }
+
+    def confirm_remote_unreachable(
+        self, checkout: Path, remote: str, authority: _RemoteAuthority
+    ) -> _RemoteTransportUnavailable:
+        """Ask the recorded URL again, without redirects, and return the outage.
+
+        An HTTP remote that redirects elsewhere reports the other host's
+        connection failure as its own. Asked without following redirects, the
+        same remote answers with its redirect instead, which refuses.
+        """
+
+        with self._isolated_remote(checkout, remote, authority) as (
+            isolated,
+            object_env,
+        ):
+            try:
+                self._ls_remote_inventory(
+                    isolated,
+                    authority.url,
+                    heads_only=True,
+                    env_overrides={
+                        **object_env,
+                        "GIT_CONFIG_COUNT": "1",
+                        "GIT_CONFIG_KEY_0": "http.followRedirects",
+                        "GIT_CONFIG_VALUE_0": "false",
+                    },
+                )
+            except _RemoteTransportUnavailable as exc:
+                return exc
+        raise Refusal(
+            f"remote {remote!r} answered when asked again without redirects after its "
+            "fetch failed; preserve the checkout and rerun remove"
+        )
 
     def remote_url_sha256(self, checkout: Path, remote: str) -> str:
         return self.remote_authority(checkout, remote).sha256
@@ -11772,7 +11817,7 @@ def _archive_salvage_locally(
     remote_failure: Refusal,
     vcs: _GitVcs,
 ) -> dict[str, object]:
-    """Create and read back a self-contained bundle after remote salvage refused."""
+    """Create and read back a self-contained bundle after remote salvage did not complete."""
     checked_root = _local_salvage_archive_root(config, str(archive_root))
     assert checked_root is not None
     bundle, receipt_path, archive_ref = _local_salvage_paths(
@@ -11864,7 +11909,7 @@ def _archive_salvage_locally(
     receipt_sha256 = hashlib.sha256(contents).hexdigest()
     _interrupt_for_test("after-local-salvage-archive")
     print(
-        f"WARNING: remote salvage refused for checkout {checkout.name}; "
+        f"WARNING: remote salvage did not complete for checkout {checkout.name}; "
         f"using verified local archive {bundle}",
         file=sys.stderr,
     )
@@ -12224,9 +12269,12 @@ def _salvage_one_checkout(
         if archive_root is None:
             raise
         # With no connection there is no remote answer to publish to or to
-        # trust, so archive locally. The recorded remote binding is still
-        # rechecked, and every other fetch refusal, including authentication,
-        # host identity, and inventory disagreement, still refuses.
+        # trust, so archive locally. The outage must repeat when the recorded
+        # URL is asked again without redirects, which also rechecks the
+        # recorded remote binding. Every other fetch refusal, including
+        # authentication, host identity, and inventory disagreement, still
+        # refuses, and so does a remote that answers the second time.
+        vcs.confirm_remote_unreachable(path, checkout.remote, facts.remote_authority)
         vcs.assert_remote_authority(path, checkout.remote, facts.remote_authority)
         return _archive_salvage_locally(
             config, record, checkout, path, facts, archive_root, exc, vcs
