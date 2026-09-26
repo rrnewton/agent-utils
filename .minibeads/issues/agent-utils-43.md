@@ -1,6 +1,6 @@
 ---
 title: 'replay-burst-double-read: one reload issues two identical newest-page reads'
-status: in_progress
+status: closed
 priority: 3
 issue_type: bug
 assignee: opus-5.5/replay-burst-double-read
@@ -10,7 +10,8 @@ labels:
 depends_on:
   agent-utils-18: discovered-from
 created_at: 2026-09-26T02:46:20.582224194+00:00
-updated_at: 2026-09-26T02:46:20.582224194+00:00
+updated_at: 2026-09-26T04:17:56.962152793+00:00
+closed_at: 2026-09-26T04:17:56.962152673+00:00
 claimed_at: 2026-09-26T02:46:20.582224194+00:00
 claimed_until: 2026-09-28T02:46:20.585820967+00:00
 ---
