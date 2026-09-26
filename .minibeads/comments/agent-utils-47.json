@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-47-c13c6e42c66",
+    "issue_id": "agent-utils-47",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] First triage step done: the extra length comes from the provider's own generation, not from a stall in transport. Content-free, from the provider's per-response timing:\n- The stalled control generated 4,697 tokens over 134 s and produced 165 s of audio.\n- The two post-cut reads of the same message each generated about 2,050 tokens over about 55 s and produced 68 s of audio.\n- A stalled read of the other long message generated 7,263 tokens over 140 s.\n- On the stalled control, tokens never paused for more than 0.57 s and audio chunks never for more than 4.9 s.\n\nSo during the roughly 75 s stretch with no transcript, the provider keeps generating output that becomes audio but no transcript text. The bridge forwards it faithfully.\n\nNext steps:\n1. Measure audio energy over that stretch, to tell silence or filler from speech that has no transcript.\n2. Take the timings to the provider side.\n\nNo bridge change is indicated so far.",
+    "created_at": "2026-09-26T09:38:34.029760707Z",
+    "updated_at": "2026-09-26T09:38:34.029760707Z"
+  }
+]
