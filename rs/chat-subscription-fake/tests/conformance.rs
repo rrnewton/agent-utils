@@ -611,13 +611,16 @@ fn graceful_close_admitted_before_host_next_retains_full_close_cleanup_budget() 
     fs::create_dir(&root).expect("create queued graceful-close fixture directory");
     let entered_marker = root.join("entered");
     let close_marker = root.join("closed");
-    let child = spawn_blocking_close_with_delay(&entered_marker, &close_marker, Some(350));
+    let child = spawn_blocking_close_with_delay(&entered_marker, &close_marker, Some(1_000));
     let process_id = child.id();
+    // The 1 s cleanup outlasts the grace, and any other phase deadline plus the grace, so only
+    // the Close budget lets it finish. That budget must cover the cleanup plus whatever
+    // scheduling stall delays the plugin's exit, so it leaves more than a second to spare.
     let selected_timeouts = ProcessPhaseTimeouts::new(
         Duration::from_millis(500),
         Duration::from_millis(500),
         Duration::from_millis(500),
-        Duration::from_millis(500),
+        Duration::from_millis(2_000),
         Duration::from_millis(200),
     )
     .expect("queued Close deadlines");
@@ -645,7 +648,7 @@ fn graceful_close_admitted_before_host_next_retains_full_close_cleanup_budget() 
         "queued graceful plugin exited with {status}"
     );
     assert!(
-        started.elapsed() >= Duration::from_millis(350),
+        started.elapsed() >= Duration::from_millis(1_000),
         "fixture did not exercise semantic Close cleanup"
     );
     assert_eq!(
