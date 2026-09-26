@@ -1,6 +1,6 @@
 ---
 title: 'post-gate-scope-first: refuse a read token with 403 before parsing a post-proposal body'
-status: in_progress
+status: closed
 priority: 3
 issue_type: bug
 assignee: opus-5.5/post-gate-scope-first
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-34: discovered-from
 created_at: 2026-09-26T01:43:29.872090323+00:00
-updated_at: 2026-09-26T01:46:47.702913445+00:00
+updated_at: 2026-09-26T02:05:58.175307278+00:00
+closed_at: 2026-09-26T02:05:58.175307138+00:00
 ---
 
 # Description
