@@ -16,6 +16,12 @@ for themselves.
 A third isolates runner authority inherited when this suite is itself one delegated validation
 node. Ordinary CLI unit cases still model fresh top-level invocations; the real nesting smokes
 explicitly restore the captured authority to their subprocesses.
+
+A fourth gives every test a private agentctl target-lock root. The production root is one
+host-wide directory per user, and fixture panes such as ``w1:p1`` are real pane identities, so a
+live agent or another checkout's validation holding the same pane (or the subagent workspace
+allocation lock) would otherwise stall an unrelated test. In-process code only; a test that runs
+agentctl as a subprocess still reaches the host root.
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ from pathlib import Path
 
 import pytest
 
+from agentctl import agent as agentctl_agent
 from dagrun.cli import PROFILE_DIR_ENV
 from dagrun.sizing import BUILD_JOBS_ENV, OPERATOR_BUILD_JOBS_ENV
 
@@ -62,6 +69,26 @@ def _no_ambient_runner_authority(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     for name in _RUNNER_AUTHORITY_ENV:
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _private_agentctl_target_locks(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resolve agentctl target locks under a per-test root, keeping the production lock name.
+
+    Queues and pane/session aliases in one test still share the real flock and the production
+    pane-identity hash, so the serialization contract is intact.
+    """
+    # Allocated here, before the test body runs: tests that forbid directory scans and random
+    # temporaries while they write must not see a lock lookup do either.
+    lock_root = tmp_path_factory.mktemp("agentctl-target-locks")
+    lock_root.chmod(0o700)
+
+    def isolated_path(pane_id: str) -> str:
+        return str(lock_root / agentctl_agent._target_lock_name(pane_id))
+
+    monkeypatch.setattr(agentctl_agent, "_target_lock_path", isolated_path)
 
 
 @pytest.fixture(autouse=True)

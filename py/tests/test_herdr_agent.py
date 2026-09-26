@@ -21,23 +21,6 @@ from agentctl.client import AgentPaneInfo, HerdrClient, Pane
 from agentctl.errors import AgentDeliveryError, AgentPending, AgentPossiblySubmitted, HerdrUnavailable
 
 
-@pytest.fixture(autouse=True)
-def isolated_fake_target_locks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep independent fake servers from contending with another pytest process.
-
-    Queues and pane/session aliases in one test still share the real flock and
-    the production pane-identity hash, so the serialization contract is intact.
-    """
-    lock_root = tmp_path / "fake-target-locks"
-    lock_root.mkdir(mode=0o700)
-    canonical_path = agent_api._target_lock_path
-
-    def isolated_path(pane_id: str) -> str:
-        return str(lock_root / Path(canonical_path(pane_id)).name)
-
-    monkeypatch.setattr(agent_api, "_target_lock_path", isolated_path)
-
-
 def test_agent_cli_version(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as exc_info:
         agent_cli.main(["--version"])

@@ -1324,11 +1324,48 @@ pub(crate) fn validate_target_authority(target: &Target) -> AgentResult<()> {
 }
 
 pub(crate) fn target_lock_path(pane_id: &str) -> AgentResult<PathBuf> {
-    let root = Path::new("/tmp").join(format!("herdr-agent-target-locks-{}", unsafe {
-        libc::getuid()
-    }));
+    let root = target_lock_root();
     create_private_directory(&root, "host-wide target lock directory", false, false)?;
     Ok(root.join(format!("{}.lock", pane_lock_digest(pane_id))))
+}
+
+/// The directory every agentctl process for this user serialises pane delivery in.
+fn host_target_lock_root() -> PathBuf {
+    Path::new("/tmp").join(format!("herdr-agent-target-locks-{}", unsafe {
+        libc::getuid()
+    }))
+}
+
+#[cfg(not(test))]
+fn target_lock_root() -> PathBuf {
+    host_target_lock_root()
+}
+
+/// Unit tests lock a root private to this test process. The fixture panes (`w1:p1`) are
+/// real pane identities, so on the host root any concurrent holder (another checkout's
+/// validation, or a live agent on that pane) stalls them. Within one process the tests still
+/// share one root, so concurrent senders keep exercising the real cross-queue flock.
+#[cfg(test)]
+fn target_lock_root() -> PathBuf {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    extern "C" fn remove_root() {
+        if let Some(root) = ROOT.get() {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+    ROOT.get_or_init(|| {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let root = std::env::temp_dir().join(format!(
+            "agentctl-test-target-locks-{}-{}-{nanos}",
+            unsafe { libc::getuid() },
+            std::process::id()
+        ));
+        unsafe { libc::atexit(remove_root) };
+        root
+    })
+    .clone()
 }
 
 pub(crate) fn lock_resolved_target<A: AgentApi + ?Sized>(
@@ -2378,6 +2415,26 @@ mod tests {
     }
 
     #[test]
+    fn unit_test_target_locks_live_outside_the_host_wide_root() {
+        // Only the root differs: the same pane digest a live agent or a real
+        // agentctl binary locks on the host resolves to a private file here, so
+        // neither can stall these tests and these tests never touch the host lock.
+        let host = host_target_lock_root();
+        assert_eq!(
+            host,
+            PathBuf::from(format!("/tmp/herdr-agent-target-locks-{}", unsafe {
+                libc::getuid()
+            }))
+        );
+        let isolated = target_lock_path("w1:p1").expect("isolated target lock path");
+        assert!(!isolated.starts_with(&host), "{}", isolated.display());
+        assert_eq!(
+            isolated.file_name().and_then(|name| name.to_str()),
+            Some(format!("{}.lock", pane_lock_digest("w1:p1")).as_str())
+        );
+    }
+
+    #[test]
     fn explicit_send_reserves_ids_under_the_delivery_transition_lock() {
         let directory = TestDirectory::new("explicit-send-reservation");
         let fake = FakeAgent::new(&["idle"]);
@@ -2492,7 +2549,7 @@ mod tests {
         let lock_paths = [
             directory.path().join(".binding.lock"),
             directory.path().join(".delivery.lock"),
-            target_lock_path("w1:p1").expect("target lock path"),
+            target_lock_path("cancel-lock-contention").expect("target lock path"),
         ];
         for path in lock_paths {
             if let Some(parent) = path.parent() {

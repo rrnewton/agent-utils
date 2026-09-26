@@ -1193,16 +1193,20 @@ def _binding(target: Target) -> dict[str, object]:
     return identity
 
 
-def _target_lock_path(pane_id: str) -> str:
-    """Return the fixed host-wide lock path for one resolved live pane."""
+def _target_lock_name(pane_id: str) -> str:
+    """Return the lock file name for one resolved live pane, independent of its directory."""
     identity: dict[str, object] = {"kind": "pane", "pane_id": pane_id}
     # ``ensure_ascii=False`` pins the command's UTF-8 lock encoding for every resolved pane id.
     encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-    digest = hashlib.sha256(encoded).hexdigest()
+    return f"{hashlib.sha256(encoded).hexdigest()}.lock"
+
+
+def _target_lock_path(pane_id: str) -> str:
+    """Return the fixed host-wide lock path for one resolved live pane."""
     lock_root = os.path.join("/tmp", f"herdr-agent-target-locks-{os.getuid()}")
     os.makedirs(lock_root, mode=0o700, exist_ok=True)
     _validate_private_directory(lock_root, "host-wide target lock directory")
-    return os.path.join(lock_root, f"{digest}.lock")
+    return os.path.join(lock_root, _target_lock_name(pane_id))
 
 
 def _lock_resolved_target(
