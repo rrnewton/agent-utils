@@ -1,6 +1,6 @@
 ---
 title: 'thread-scope-main-view: a route bound to one thread shows only its root'
-status: in_progress
+status: closed
 priority: 2
 issue_type: bug
 assignee: opus-5.5/thread-scope-main-view
@@ -10,7 +10,8 @@ labels:
 depends_on:
   agent-utils-42: discovered-from
 created_at: 2026-09-26T03:34:56.981071572+00:00
-updated_at: 2026-09-26T03:34:56.981071572+00:00
+updated_at: 2026-09-26T04:20:40.962507278+00:00
+closed_at: 2026-09-26T04:20:40.962507148+00:00
 claimed_at: 2026-09-26T03:34:56.981071572+00:00
 claimed_until: 2026-09-28T03:34:56.983895250+00:00
 ---
