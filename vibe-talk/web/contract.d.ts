@@ -568,7 +568,9 @@ declare namespace VibeTalk {
      */
     returned: number;
     /**
-     * The selected thread, for the thread view.
+     * The selected thread, for the thread view. Outside it, the one thread a channel registered as
+     * a single conversation is scoped to: that channel has no child threads (`has_threads` is
+     * false), and its main view carries the conversation's replies as well as its root.
      */
     thread: ThreadSummary | null;
     /**

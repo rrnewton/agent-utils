@@ -117,7 +117,9 @@ pub struct TimelinePage {
     pub messages: Vec<Message>,
     /// Summaries for the threads view, ordered by last activity oldest first.
     pub threads: Vec<ThreadSummary>,
-    /// The selected thread, for the thread view.
+    /// The selected thread, for the thread view. Outside it, the one thread a channel registered as
+    /// a single conversation is scoped to: that channel has no child threads (`has_threads` is
+    /// false), and its main view carries the conversation's replies as well as its root.
     pub thread: Option<ThreadSummary>,
     /// Whether accessible threads exist in this channel.
     pub has_threads: bool,

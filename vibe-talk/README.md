@@ -922,7 +922,11 @@ claiming global chronology or exact counts; a cap or provider failure must repor
 of returning a plausible but incomplete flattened page. A notice can explain registration scope.
 A registration narrowed to one conversation names that conversation as `thread` in main, flat,
 and threads responses. Such a channel has no child threads, so vibe-talk reports no thread
-navigation for it and never lists the conversation as a child of itself.
+navigation for it and never lists the conversation as a child of itself. Its Main is the whole
+conversation: the page draws every message it is served there, the root and its replies in time
+order, keeps the replies through a walk back and a reload from the device, and offers no replies
+button on the root, which would only open what Main already shows. A channel with child threads
+keeps a Main of roots and unthreaded messages.
 
 The native backend includes accessible active and archived threads. It bounds discovery at 256
 threads and 100 pages per archived collection, retains pagination inventories for five minutes,

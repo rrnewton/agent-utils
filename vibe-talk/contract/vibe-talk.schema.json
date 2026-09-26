@@ -654,7 +654,7 @@
               "type": "null"
             }
           ],
-          "description": "The selected thread, for the thread view."
+          "description": "The selected thread, for the thread view. Outside it, the one thread a channel registered as\na single conversation is scoped to: that channel has no child threads (`has_threads` is\nfalse), and its main view carries the conversation's replies as well as its root."
         },
         "threads": {
           "description": "Summaries for the threads view, ordered by last activity oldest first.",

@@ -5155,7 +5155,10 @@ function validCacheEntry(entry) {
       !cachedWireRowsValid(entry.messages, "Message") ||
       !cachedWireRowsValid(entry.threads, "ThreadSummary") ||
       !Array.isArray(entry.dismissed)) return false;
-  if (entry.mode === "timeline") return coverageValid(entry.views) && typeof entry.hasThreads === "boolean";
+  if (entry.mode === "timeline") {
+    return coverageValid(entry.views) && typeof entry.hasThreads === "boolean" &&
+      (entry.scope === undefined || entry.scope === null || typeof entry.scope === "string");
+  }
   return entry.mode === "page" && Number.isFinite(entry.savedAt) && typeof entry.more === "boolean";
 }
 
@@ -5208,7 +5211,7 @@ function trimCanonField(entry, field, limit) {
   for (const [key, cover] of Object.entries(entry.views)) {
     const { view, thread } = viewOfKey(key);
     if ((field === "threads") !== (view === "threads")) continue;
-    if (field === "messages" && !removed.some((message) => inView(message, view, thread))) continue;
+    if (field === "messages" && !removed.some((message) => inView(message, view, thread, entry.scope || null))) continue;
     cover.more = true;
     if (Number.isFinite(cut)) cover.floor = cover.floor === null ? cut : Math.max(cover.floor, cut);
   }
@@ -5324,7 +5327,10 @@ function saveCacheChannels() {
 let channelCanon = emptyCanon();
 
 function emptyCanon(channel = "") {
-  return { channel: String(channel), messages: [], threads: [], views: new Map(), dismissed: new Set(), hasThreads: false };
+  return {
+    channel: String(channel), messages: [], threads: [], views: new Map(), dismissed: new Set(), hasThreads: false,
+    scope: null,
+  };
 }
 
 const viewKey = (view = channelView, thread = selectedThreadId) => (view === "thread" ? `thread:${thread}` : view);
@@ -5335,12 +5341,18 @@ function viewOfKey(key) {
 
 const timeOf = (item, field) => Date.parse(item && item[field]);
 
-/** Whether `message` belongs in `view`: the same rule the server's timeline applies. */
-function inView(message, view, thread) {
+/**
+ * Whether `message` belongs in `view`: the same rule the server's timeline applies.
+ *
+ * `scope` is the one thread a channel registered as a single conversation is: its Main is that
+ * whole conversation, root and replies, so a reply in it is a Main row. A channel with child
+ * threads has no scope, and its Main keeps only roots and unthreaded messages.
+ */
+function inView(message, view, thread, scope = channelCanon.scope) {
   const id = threadOf(message);
   if (view === "flat") return true;
   if (view === "thread") return id === thread;
-  return !id || message.thread.is_root === true;
+  return !id || message.thread.is_root === true || id === scope;
 }
 
 /** Stable by time when every row has one; otherwise in the order given, which is the server's. */
@@ -5404,6 +5416,8 @@ function foldTimelinePage(payload, older, view = channelView, thread = selectedT
   const channel = String(el("discord-channel").value);
   if (channelCanon.channel !== channel) loadCanon(channel);
   const hasMore = payload.has_more === true;
+  // Outside the thread view a page names a thread only when the channel IS that one thread.
+  if (view !== "thread") channelCanon.scope = payload.thread ? String(payload.thread.id) : null;
   if (view === "threads") {
     mergeIntoCanon("threads", payload.threads || [], older, hasMore, () => true);
   } else {
@@ -5459,6 +5473,7 @@ function loadCanon(channel) {
   channelCanon.messages = entry.messages;
   channelCanon.threads = entry.threads;
   channelCanon.hasThreads = entry.hasThreads;
+  channelCanon.scope = entry.scope || null;
   channelCanon.dismissed = new Set(entry.dismissed.map(String));
   for (const [key, cover] of Object.entries(entry.views)) {
     channelCanon.views.set(key, { ...cover, live: false, cursor: null });
@@ -5538,6 +5553,7 @@ function saveChannelScope() {
       threads: channelCanon.threads.slice(),
       views,
       hasThreads: channelCanon.hasThreads,
+      scope: channelCanon.scope,
       dismissed: [...channelCanon.dismissed].filter((id) => held.has(id)),
     };
   } else {
@@ -5983,7 +5999,8 @@ function renderChannelLoading(loading) {
 
 function addThreadDecoration(meta, message, row) {
   const id = threadOf(message);
-  if (!threadingSupported || !id || channelView === "thread") return;
+  // The scope is the channel itself: its root opens nothing it is not already showing.
+  if (!threadingSupported || !id || channelView === "thread" || id === channelCanon.scope) return;
   if (channelView === "flat") {
     const badge = document.createElement("button");
     badge.className = "thread-badge";
@@ -6330,7 +6347,8 @@ function renderOutgoingMessages() {
     const meta = document.createElement("div");
     meta.className = "meta";
     meta.textContent = entry.replyTo ? "You · Reply" : "You";
-    if (entry.threadId && channelView !== "thread") {
+    // Never for the scope: a reply in a single-conversation channel is on Main already.
+    if (entry.threadId && channelView !== "thread" && entry.threadId !== channelCanon.scope) {
       const thread = document.createElement("button");
       thread.className = "thread-badge";
       thread.setAttribute("type", "button");
@@ -9871,7 +9889,7 @@ function appendChannelRow(message) {
     const id = threadOf(message);
     if (channelView === "threads" ||
         (channelView === "thread" && id !== selectedThreadId) ||
-        (channelView === "main" && id && !message.thread.is_root)) {
+        (channelView === "main" && !inView(message, "main", null))) {
       // Not this view's row, but the store has it, and so will the next start.
       saveChannelScope();
       return;

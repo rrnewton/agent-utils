@@ -19815,3 +19815,157 @@ test("a read out before the attach does not answer for a tail removal of a messa
   assert.equal(change.reads(), 2, "the page holding the message answered for its removal");
   assert.deepStrictEqual(shownIds(change.page), ["900"], "the tail removal was lost");
 });
+
+// --- a channel registered as one conversation ----------------------------------------------------
+//
+// `#44 thread-scope-main-view`. A source registered as ONE conversation is served with `thread`
+// naming it outside the thread view and `has_threads` false. Its Main is that whole conversation,
+// root and replies: a Main that kept only roots drew one row of a conversation the server served
+// in full. Each test compares the drawn ids with the page the server served.
+
+/** The scoped conversation: a root and its replies, each from a different author so none join. */
+function scopedData() {
+  const scope = { id: "spaces/B/threads/linked", root_message_id: "301", is_root: true,
+    reply_count: 3, reply_count_exact: true };
+  const reply = { ...scope, is_root: false };
+  const by = (n) => ({ author: `person ${n}`, author_id: `100000000000000010${n}`, author_is_bot: false });
+  const messages = [
+    message({ id: "301", content: "the linked conversation", thread: scope, ...by(1) }),
+    message({ id: "302", content: "a first answer", thread: reply, ...by(2) }),
+    message({ id: "303", content: "a second answer", thread: reply, ...by(3) }),
+    message({ id: "304", content: "a third answer", thread: reply, ...by(4) }),
+  ];
+  const summary = { id: scope.id, root: messages[0], title: "Linked", reply_count: 3,
+    reply_count_exact: true, updated_at: messages[3].timestamp };
+  return { scope, messages, summary };
+}
+
+/** Serve `p` as the scoped route does: every message on Main, the scope in `thread`, no threads. */
+function serveScoped(p, summary) {
+  p.threadingSupported = true;
+  p.threads = [];
+  p.timeline = async (path) => {
+    const view = new URL(path, "http://fixture.test").searchParams.get("view");
+    return json(200, timelineAnswer({ view, messages: view === "threads" ? [] : p.messages, thread: summary }));
+  };
+}
+
+async function scopedPage(served) {
+  const page = newPage();
+  const data = scopedData();
+  serveScoped(page, data.summary);
+  await signIn(page);
+  await showDiscord(page, served ? served(data) : data.messages.slice(0, 3));
+  return { page, data };
+}
+
+test("a channel registered as one conversation draws every message it is served on Main", async () => {
+  const { page, data } = await scopedPage();
+  assert.deepStrictEqual(shownIds(page), data.messages.slice(0, 3).map((m) => m.id),
+    "Main dropped the replies the server served");
+  assert.equal(page.el("channel-view-tabs").hidden, true, "a single conversation offered view tabs");
+  assert.equal(page.el("channel-navigation").hidden, true, "a single conversation offered navigation");
+  assert.equal(threadButton(page.el("discord-log").children[0]), undefined,
+    "the conversation offered itself as its own thread");
+  assert.equal(savedScopes(page)[scopeKey(CHANNEL.id)].scope, data.scope.id, "the scope was not saved");
+});
+
+test("a pending reply in a scoped channel offers no thread for the scope", async () => {
+  const { page } = await scopedPage();
+  const finish = delayedReply(page);
+  await replyButton(page.el("discord-log").children[1]).click();
+  await page.el("reply-text").setValue("answering in the conversation");
+  const sending = page.el("reply-send").click();
+  await page.settle();
+  assert.equal(outgoingRows(page).length, 1, "the pending reply had no receipt");
+  assert.equal(threadBadge(outgoingRows(page)[0]), undefined, "the pending reply offered the scope as a thread");
+  finish(errorResponse(502, "chat_error", "the provider returned HTTP 502"));
+  await sending;
+  await page.settle();
+});
+
+test("a reload of a scoped channel paints every held row from the device, with no read", async () => {
+  const { page: first, data } = await scopedPage();
+  const held = data.messages.slice(0, 3).map((m) => m.id);
+  const page = reloadPage(first.storage, (p) => {
+    serveScoped(p, data.summary);
+    p.timeline = offline;
+  });
+  assert.deepStrictEqual(shownIds(page), held, "the saved replies were not drawn on reload");
+  assert.equal(page.timelineCalls.length, 0, "the saved rows waited for a read");
+
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), held, "offline, entering the channel dropped saved replies");
+  assert.equal(threadButton(page.el("discord-log").children[0]), undefined);
+});
+
+test("a live reply in a scoped channel appears on Main once", async () => {
+  const { page, data } = await scopedPage();
+  const reply = data.messages[3];
+  page.messages = data.messages;
+  const reads = gate(page.timeline);
+  page.timeline = reads.respond;
+  const before = page.timelineCalls.length;
+  await deliver(page, page.stream(), sseMessage(reply));
+  assert.deepStrictEqual(shownIds(page), data.messages.map((m) => m.id), "the live reply waited for a read");
+  reads.open();
+  await page.settle();
+  await page.settle();
+  assert.equal(page.timelineCalls.length, before + 1, "the live reply's read did not run");
+  assert.deepStrictEqual(shownIds(page), data.messages.map((m) => m.id), "the read drew the live reply twice");
+});
+
+test("walking back through a scoped channel keeps the replies of every page", async () => {
+  const page = newPage();
+  const data = scopedData();
+  serveScoped(page, data.summary);
+  page.timeline = async (path) => {
+    const before = new URL(path, "http://fixture.test").searchParams.get("before");
+    return json(200, timelineAnswer({
+      messages: before ? data.messages.slice(0, 2) : data.messages.slice(2),
+      thread: data.summary, has_more: !before, next_before: before ? null : "older:cursor",
+    }));
+  };
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  assert.deepStrictEqual(shownIds(page), ["303", "304"]);
+  await page.el("load-older").click();
+  await page.settle();
+  assert.equal(new URL(page.timelineCalls.at(-1), "http://fixture.test").searchParams.get("before"), "older:cursor");
+  assert.deepStrictEqual(shownIds(page), data.messages.map((m) => m.id), "an older page lost its reply");
+});
+
+test("an unthreaded channel is unchanged by the scope rule", async () => {
+  const page = newPage();
+  page.threadingSupported = true;
+  await signIn(page);
+  const served = [message({ id: "401", content: "one" }), message({ id: "402", content: "two" })];
+  await showDiscord(page, served);
+  assert.deepStrictEqual(shownIds(page), ["401", "402"]);
+  assert.equal(page.el("channel-view-tabs").hidden, true);
+  assert.equal(savedScopes(page)[scopeKey(CHANNEL.id)].scope, null, "an unscoped channel saved a scope");
+});
+
+test("a channel with child threads keeps a root-only Main, even after visiting a thread", async () => {
+  const page = await threadPage();
+  const data = threadData();
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "Main is not the served root-only page");
+  assert.equal(page.el("channel-view-tabs").hidden, false, "a threaded channel lost its tabs");
+  assert.ok(threadButton(page.el("discord-log").children[1]), "a thread root lost its replies button");
+
+  // A thread page names its thread too: that must not make the channel look scoped to it.
+  await threadButton(page.el("discord-log").children[1]).click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["201", "202"]);
+  await page.el("thread-back").click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "visiting a thread put its reply on Main");
+
+  const reply = message({ id: "205", content: "a later answer", thread: { ...data.messages[2].thread } });
+  page.messages = [...page.messages, reply];
+  await deliver(page, page.stream(), sseMessage(reply));
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "a live reply reached a threaded Main");
+  assert.equal(savedScopes(page)[scopeKey(CHANNEL.id)].scope, null);
+});
