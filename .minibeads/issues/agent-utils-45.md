@@ -1,6 +1,6 @@
 ---
 title: 'validation-host-isolation: tests share host-global locks and guard roots, so validate-all fails at random'
-status: in_progress
+status: closed
 priority: 1
 issue_type: bug
 assignee: opus-5.5/validation-host-isolation
@@ -9,7 +9,8 @@ labels:
 - wrkslots
 - validation
 created_at: 2026-09-26T04:56:31.551575650+00:00
-updated_at: 2026-09-26T04:56:53.462319738+00:00
+updated_at: 2026-09-26T06:27:30.792557000+00:00
+closed_at: 2026-09-26T06:27:30.792557000+00:00
 ---
 
 # Description
