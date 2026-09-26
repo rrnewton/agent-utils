@@ -1,13 +1,14 @@
 ---
 title: 'read-aloud-cut-truncation: a completed read after an interrupt must play in full'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - audio
 created_at: 2026-09-25T20:04:57.111438436+00:00
-updated_at: 2026-09-25T20:48:54.555924000+00:00
+updated_at: 2026-09-26T09:35:28.957363313+00:00
+closed_at: 2026-09-26T09:35:28.957363213+00:00
 ---
 
 # Description
