@@ -307,6 +307,91 @@ def test_a_mount_view_that_moves_during_the_census_discards_it(
     assert cli._absent_validate_mount_matches(processes, {Path("/slot"): "slot"}, _budget()) == ()
 
 
+def test_a_reader_that_moved_and_exited_cannot_stand_for_its_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 101 reads for the view it shared with 102, but its table came from a view
+    # it moved to first; it then exits, so only 102 is left showing the view.
+    processes = (
+        cli._AbsentProcessObservation(101, 1, "", "mnt:[7]"),
+        cli._AbsentProcessObservation(102, 1, "", "mnt:[7]"),
+    )
+    reader_after: dict[int, tuple[str, str]] = {}
+    listings: list[tuple[int, ...]] = []
+    reads: list[int] = []
+
+    def keys(
+        observed: Sequence[cli._AbsentProcessObservation], _budget: cli._ReadOnlyCommandBudget,
+    ) -> dict[int, tuple[str, str]]:
+        listings.append(tuple(process.pid for process in observed))
+        if len(listings) == 1:
+            return {101: ("mnt:[7]", "/"), 102: ("mnt:[7]", "/")}
+        return {**reader_after, 102: ("mnt:[7]", "/")}
+
+    def mountinfo(
+        pid: int, _budget: cli._ReadOnlyCommandBudget,
+        _cache: dict[str, tuple[tuple[str, str], ...]] | None = None,
+    ) -> tuple[tuple[str, str], ...]:
+        reads.append(pid)
+        return ()
+
+    monkeypatch.setattr(cli, "_mount_view_keys", keys)
+    monkeypatch.setattr(cli, "_mountinfo_path_references", mountinfo)
+    monkeypatch.setattr(cli, "_process_start_ticks", lambda _path: 1)
+    monkeypatch.setattr(
+        cli, "_process_observation_is_active", lambda process: process.pid != 101
+    )
+
+    with pytest.raises(cli._ProcessEvidenceChanged, match="PID 101 mount view changed"):
+        cli._absent_validate_mount_matches(processes, {Path("/slot"): "slot"}, _budget())
+    assert reads == [101]
+    assert listings == [(101, 102), (101, 102)]
+
+    # The same exit is harmless when the reader still showed the view after
+    # its read: that table was the view's, and it names no target.
+    listings.clear()
+    reads.clear()
+    reader_after[101] = ("mnt:[7]", "/")
+    assert cli._absent_validate_mount_matches(processes, {Path("/slot"): "slot"}, _budget()) == ()
+    assert reads == [101]
+
+
+def test_each_distinct_mount_view_reads_its_own_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 103 differs from 101 only in its root and 104 only in its namespace;
+    # each must read its own table, while 102 relies on 101's.
+    processes = tuple(
+        cli._AbsentProcessObservation(pid, 1, "", "mnt:[7]") for pid in (101, 102, 103, 104)
+    )
+    views = {
+        101: ("mnt:[7]", "/"),
+        102: ("mnt:[7]", "/"),
+        103: ("mnt:[7]", "/chroot"),
+        104: ("mnt:[8]", "/"),
+    }
+    reads: list[int] = []
+
+    def mountinfo(
+        pid: int, _budget: cli._ReadOnlyCommandBudget,
+        _cache: dict[str, tuple[tuple[str, str], ...]] | None = None,
+    ) -> tuple[tuple[str, str], ...]:
+        reads.append(pid)
+        return (("/slot/work", "/slot/work"),) if pid in (103, 104) else ()
+
+    monkeypatch.setattr(cli, "_mount_view_keys", lambda observed, _budget: {
+        process.pid: views[process.pid] for process in observed
+    })
+    monkeypatch.setattr(cli, "_mountinfo_path_references", mountinfo)
+    monkeypatch.setattr(cli, "_process_start_ticks", lambda _path: 1)
+
+    matches = cli._absent_validate_mount_matches(processes, {Path("/slot"): "slot"}, _budget())
+    assert reads == [101, 103, 104]
+    assert [(pid, slot, kind) for pid, slot, kind, _detail in matches] == [
+        (103, "slot", "mount"), (104, "slot", "mount"),
+    ]
+
+
 def test_privileged_mount_views_come_from_the_real_unfollowed_find(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

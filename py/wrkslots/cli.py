@@ -30937,6 +30937,7 @@ def _absent_validate_mount_matches(
     target_names = _target_names(targets)
     match_cache: dict[str, tuple[Path, str] | None] = {}
     mountinfo_cache: dict[str, tuple[tuple[str, str], ...]] = {}
+    readers: set[int] = set()
     for representatives in groups.values():
         selected: _AbsentProcessObservation | None = None
         references: tuple[tuple[str, str], ...] = ()
@@ -30953,6 +30954,7 @@ def _absent_validate_mount_matches(
                 continue
             selected = process
             references = candidate_references
+            readers.add(process.pid)
             break
         if selected is None:
             for process, failure in failures:
@@ -30974,8 +30976,12 @@ def _absent_validate_mount_matches(
     ]
     after = _mount_view_keys(shared, selected_budget)
     for process in shared:
+        # The table read for a group stands for its view only if the reader
+        # still showed that view afterwards. A reader that moved and then
+        # exited leaves nothing to show which view its table came from, so it
+        # is never excused as released, unlike a member that read nothing.
         if after.get(process.pid) != views[process.pid] and (
-            _process_observation_is_active(process)
+            process.pid in readers or _process_observation_is_active(process)
         ):
             raise _ProcessEvidenceChanged(
                 f"PID {process.pid} mount view changed during mount census"
@@ -30993,7 +30999,11 @@ def _mount_view_keys(
     """Return the mount namespace and root of each process whose view is readable.
 
     Processes with one view read one mount table: /proc/PID/mountinfo lists
-    that namespace's mounts as seen from that root, so both are the key. A
+    that namespace's mounts as seen from that root, so the key pairs the two.
+    The root link is a path string, not a mount identity: a root whose mount
+    was lazily detached reads as "/", and a chroot into a directory that was
+    later mounted over reads the same as one made after, so such a process
+    shares a key with processes whose tables differ from its own. A
     process whose view cannot be read now is absent and remains its own group,
     which reads its own table exactly as before. This process cannot read the
     namespace link of another user's process, so without a privileged listing

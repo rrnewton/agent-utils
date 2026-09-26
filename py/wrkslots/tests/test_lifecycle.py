@@ -1787,6 +1787,17 @@ def rebind_validation_removal_artifact(
     )
 
 
+def require_census_budget(budget: object) -> None:
+    assert isinstance(budget, wrkslots._ReadOnlyCommandBudget)
+
+
+def empty_process_path_census(
+    _paths: Sequence[Path], *, budget: wrkslots._ReadOnlyCommandBudget
+) -> wrkslots._ProcessPathCensus:
+    require_census_budget(budget)
+    return wrkslots._ProcessPathCensus((), ())
+
+
 def stub_validate_batch_censuses(
     monkeypatch: pytest.MonkeyPatch,
     privileged: Callable[[Sequence[Path]], wrkslots._ProcessPathCensus] | None = None,
@@ -1796,10 +1807,10 @@ def stub_validate_batch_censuses(
     def shared(
         paths: Sequence[Path],
         *,
-        budget: wrkslots._ReadOnlyCommandBudget | None = None,
+        budget: wrkslots._ReadOnlyCommandBudget,
         include_owner_cgroups: bool = True,
     ) -> wrkslots._ProcessPathCensus:
-        del budget
+        require_census_budget(budget)
         result = (privileged or empty)(paths)
         return replace(result, owner_cgroup_complete=include_owner_cgroups)
 
@@ -14239,7 +14250,10 @@ def test_validate_batch_is_bounded_before_process_census(
     project, _repository, _remote = make_project(tmp_path)
     called = False
 
-    def census(_paths: list[Path]) -> wrkslots._ProcessPathCensus:
+    def census(
+        _paths: list[Path], *, budget: wrkslots._ReadOnlyCommandBudget
+    ) -> wrkslots._ProcessPathCensus:
+        require_census_budget(budget)
         nonlocal called
         called = True
         return wrkslots._ProcessPathCensus((), ())
@@ -25371,7 +25385,7 @@ def test_audit_blocks_exact_validation_batch_seal_target(
     monkeypatch.setattr(
         wrkslots,
         "_capture_process_path_census",
-        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+        empty_process_path_census,
     )
     interrupted = raw_command(
         project,
@@ -25434,7 +25448,7 @@ def test_audit_reports_unattributable_validation_batch_seal_as_unknown(
     monkeypatch.setattr(
         wrkslots,
         "_capture_process_path_census",
-        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+        empty_process_path_census,
     )
     interrupted = raw_command(
         project,
@@ -26240,7 +26254,7 @@ def test_audit_reports_deletable_blocked_held_and_the_leak_invariant(
     monkeypatch.setattr(
         wrkslots,
         "_capture_process_path_census",
-        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+        empty_process_path_census,
     )
 
     audit_code = wrkslots.main(
@@ -26354,7 +26368,7 @@ def test_audit_partial_cache_census_cannot_upgrade_deletion_eligibility(
     monkeypatch.setattr(
         wrkslots,
         "_capture_process_path_census",
-        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+        empty_process_path_census,
     )
     state_path = tmp_path / "bounded-cache-census.json"
 
@@ -26451,7 +26465,7 @@ def test_audit_default_cache_setup_failure_preserves_lifecycle_rows(
     set_liveness(project, "dead")
     monkeypatch.setattr(
         wrkslots, "_capture_process_path_census",
-        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+        empty_process_path_census,
     )
     cache_home = tmp_path / "unavailable-cache-home"
     monkeypatch.setenv("XDG_CACHE_HOME", str(cache_home))
@@ -26534,7 +26548,7 @@ def test_audit_cache_ancestor_swap_stays_blocked(
     monkeypatch.setattr(
         wrkslots,
         "_capture_process_path_census",
-        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+        empty_process_path_census,
     )
     original_identity = wrkslots._audit_cache_root_identity
     preserved = tmp_path / "build-preserved"
@@ -26598,7 +26612,7 @@ def test_audit_invokes_configured_batch_liveness_protocol(
     monkeypatch.setattr(
         wrkslots,
         "_capture_process_path_census",
-        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+        empty_process_path_census,
     )
 
     assert (
@@ -26676,7 +26690,7 @@ def test_audit_blocks_agent_slot_when_submodule_remote_differs_from_source(
     monkeypatch.setattr(
         wrkslots,
         "_capture_process_path_census",
-        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+        empty_process_path_census,
     )
 
     audit_code = wrkslots.main(
@@ -26752,7 +26766,7 @@ def test_audit_treats_validate_checkout_contents_as_disposable(
     monkeypatch.setattr(
         wrkslots,
         "_capture_process_path_census",
-        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+        empty_process_path_census,
     )
 
     audit_code = wrkslots.main(
@@ -26803,7 +26817,10 @@ def test_audit_uses_one_process_path_census_for_all_rows(
     in_use = checkout(project, slot="in-use", slot_type="validate")
     calls: list[tuple[Path, ...]] = []
 
-    def census(paths: list[Path]) -> wrkslots._ProcessPathCensus:
+    def census(
+        paths: list[Path], *, budget: wrkslots._ReadOnlyCommandBudget
+    ) -> wrkslots._ProcessPathCensus:
+        require_census_budget(budget)
         calls.append(tuple(paths))
         return wrkslots._ProcessPathCensus(
             (), ((12345, str(in_use.parent), "link", str(in_use)),)
@@ -26838,7 +26855,10 @@ def test_audit_keeps_genuinely_indeterminate_census_out_of_deletable_and_running
     prepare_dead_validate_slots(project, ("slot01",))
     expire_heartbeat(project)
 
-    def unreadable(_paths: Sequence[Path]) -> wrkslots._ProcessPathCensus:
+    def unreadable(
+        _paths: Sequence[Path], *, budget: wrkslots._ReadOnlyCommandBudget
+    ) -> wrkslots._ProcessPathCensus:
+        require_census_budget(budget)
         raise wrkslots.Refusal(
             "mount evidence is indeterminate for live PID 123: Permission denied"
         )
@@ -26872,7 +26892,10 @@ def test_audit_keeps_oversized_relevant_census_unknown(
     prepare_dead_validate_slots(project, ("slot01",))
     expire_heartbeat(project)
 
-    def oversized(_paths: Sequence[Path]) -> wrkslots._ProcessPathCensus:
+    def oversized(
+        _paths: Sequence[Path], *, budget: wrkslots._ReadOnlyCommandBudget
+    ) -> wrkslots._ProcessPathCensus:
+        require_census_budget(budget)
         raise wrkslots.Refusal(
             "privileged read-only census stdout exceeded 16777216 bytes"
         )
@@ -27000,7 +27023,7 @@ def test_audit_reuses_one_git_worktree_list_for_shared_repository(
     monkeypatch.setattr(
         wrkslots,
         "_capture_process_path_census",
-        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+        empty_process_path_census,
     )
 
     assert (
@@ -27053,7 +27076,7 @@ def test_audit_does_not_replay_event_log_per_record(
     monkeypatch.setattr(
         wrkslots,
         "_capture_process_path_census",
-        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+        empty_process_path_census,
     )
 
     assert (
@@ -30424,14 +30447,34 @@ def test_mount_namespace_reselects_after_representative_generation_changes(
         inspected.append(pid)
         return ((str(target), str(target)),) if pid == 123 else ()
 
+    listings: list[tuple[int, ...]] = []
+
+    def views(
+        observed: Sequence[wrkslots._AbsentProcessObservation],
+        _budget: wrkslots._ReadOnlyCommandBudget,
+    ) -> dict[int, tuple[str, str]]:
+        # One shared view, so 124 reads for the group once 123 is gone; the
+        # second listing no longer shows the ended generation.
+        listings.append(tuple(process.pid for process in observed))
+        return {
+            process.pid: ("mnt:[4026531841]", "/other")
+            for process in observed
+            if len(listings) == 1 or process.pid != 123
+        }
+
+    monkeypatch.setattr(wrkslots, "_mount_view_keys", views)
     monkeypatch.setattr(wrkslots, "_mountinfo_path_references", mountinfo)
     monkeypatch.setattr(
         wrkslots,
         "_process_start_ticks",
         lambda path: None if path.name == "123" else 18,
     )
+    monkeypatch.setattr(
+        wrkslots, "_process_observation_is_active", lambda process: process.pid != 123
+    )
     assert wrkslots._absent_validate_mount_match(processes, {target: "gone"}) is None
     assert inspected == [123, 124]
+    assert listings == [(123, 124), (123, 124)]
 
 
 def process_census_status_samples(
@@ -30622,9 +30665,15 @@ def test_process_census_reopened_ordinary_state_reader_composes_with_liveness(
     monkeypatch: pytest.MonkeyPatch, state: str,
 ) -> None:
     pid_dir = Path("/proc/123")
-    reads = process_census_status_samples(
-        monkeypatch, pid_dir, [ProcessLookupError(errno.ESRCH, "old inode"), f"State:\t{state}\n"],
-    )
+    active = state in {"R", "S"}
+    samples: list[str | BaseException] = [
+        ProcessLookupError(errno.ESRCH, "old inode"), f"State:\t{state}\n",
+    ]
+    if not active:
+        # A terminal entry is asked whether it is a leader whose threads still
+        # run. This one names another thread group, so it has none to stand for.
+        samples.append(f"State:\t{state}\nTgid:\t456\n")
+    reads = process_census_status_samples(monkeypatch, pid_dir, samples)
     stat_reads: list[Path] = []
 
     def read_stat(path: Path) -> wrkslots._ProcessStat:
@@ -30632,12 +30681,11 @@ def test_process_census_reopened_ordinary_state_reader_composes_with_liveness(
         return wrkslots._ProcessStat(17, 0)
 
     monkeypatch.setattr(wrkslots, "_read_process_stat", read_stat)
-    active = state in {"R", "S"}
     assert wrkslots._process_observation_is_active(
         wrkslots._AbsentProcessObservation(123, 17, "", "pid:123"),
     ) is active
     assert stat_reads == [pid_dir] * (2 if active else 1)
-    assert reads == [pid_dir / "status"] * 2
+    assert reads == [pid_dir / "status"] * len(samples)
 
 
 @pytest.mark.parametrize("state", ("R", "S", "D", "T", "t", "X", "Z", "P", "I", "K", "W", "x"))
@@ -30721,7 +30769,9 @@ def test_process_census_terminal_snapshot_binds_generation(
     pid_dir = proc_root / "123"
     pid_dir.mkdir(parents=True)
     if status_present:
-        (pid_dir / "status").write_text("State:\tZ (zombie)\n")
+        (pid_dir / "status").write_text("State:\tZ (zombie)\nTgid:\t123\n")
+        # A zombie leader whose thread list names only itself holds nothing.
+        (pid_dir / "task" / "123").mkdir(parents=True)
     stats: list[wrkslots._ProcessStat | None] = [wrkslots._ProcessStat(17, 0)]
     stats.append(None if new_generation is None else wrkslots._ProcessStat(new_generation, 0))
     if not status_present and new_generation is None:
@@ -30912,6 +30962,17 @@ def test_process_census_preflight_keeps_vanished_identity_in_every_observer(
 
     def run(command: Sequence[str], **_kwargs: object) -> tuple[int, bytes, bytes]:
         nonlocal reused
+        if "/usr/bin/find" in command and "/proc/123/ns/mnt" in command:
+            # The protected mount view listing: the vanished generation lists
+            # nothing and so reads its own table, as 124 reads its own view's.
+            calls.append("views")
+            assert "/proc/124/ns/mnt" in command and "/proc/124/root" in command
+            return (
+                1,
+                os.fsencode("/proc/124/ns/mnt\0mnt:[4026531841]\0/proc/124/root\0/\0"),
+                b"/usr/bin/find: '/proc/123/ns/mnt': No such file or directory\n"
+                b"/usr/bin/find: '/proc/123/root': No such file or directory\n",
+            )
         if "/usr/bin/find" in command:
             calls.append("find")
             assert "/proc/123/root" in command and "/proc/124/root" in command
@@ -30970,7 +31031,7 @@ def test_process_census_preflight_keeps_vanished_identity_in_every_observer(
         # evidence against its slot rather than discarding every slot's census.
         census = capture()
         assert census.processes == processes
-        assert calls == ["snapshot", "find", "maps", "mount:123", "mount:124"]
+        assert calls == ["snapshot", "find", "maps", "views", "mount:123", "mount:124"]
         assert [(pid, slot) for pid, slot, _kind, _detail in census.matches] == [(123, str(target))]
         assert census.matches[0][3].endswith("(holder generation ended during census)")
         with pytest.raises(wrkslots.Refusal, match="live process 123"):
@@ -30984,7 +31045,7 @@ def test_process_census_preflight_keeps_vanished_identity_in_every_observer(
     else:
         census = capture()
         assert census.processes == processes
-        assert calls == ["snapshot", "find", "maps", "mount:123", "mount:124"]
+        assert calls == ["snapshot", "find", "maps", "views", "mount:123", "mount:124"]
         if evidence.startswith("live"):
             with pytest.raises(wrkslots.Refusal, match="live process 124"):
                 census.assert_slot_unused(target, None, ignore_current_process=False)
