@@ -378,6 +378,12 @@ _AT_SYMLINK_FOLLOW = 0x400
 # headroom while retaining the independent 4 MiB per-file and 60 second bounds.
 _MOUNTINFO_CENSUS_BYTES_LIMIT = 256 * 1024 * 1024
 _ABSENT_PROCESS_CENSUS_SECONDS = 60.0
+# Descriptor-heavy daemons and tree walkers close some descriptor during almost
+# every full-host link pass: on 2026-09-25, with about 4,600 processes, three
+# consecutive whole-census attempts each lost one, while 200 lone rescans of the
+# busiest such process lost none.  Each process whose descriptors moved gets at
+# most this many lone rescans before its whole attempt is discarded.
+_CHURNING_PROCESS_RESCANS = 3
 # lsof recursively walks every process and mount on large shared hosts. Keep
 # that work finite without treating a slow or wedged census as proof of absence.
 _LSOF_CENSUS_SECONDS = 300.0
@@ -31289,22 +31295,34 @@ def _process_observation_is_active(process: _AbsentProcessObservation) -> bool:
     return after is not None and after.start_ticks == process.start_ticks
 
 
-def _assert_process_observations_active(
+def _observable_process_generations(
     processes: Sequence[_AbsentProcessObservation],
     budget: _ReadOnlyCommandBudget,
-) -> None:
+) -> tuple[_AbsentProcessObservation, ...]:
+    """Return the snapshotted identities that path observers must still inspect.
+
+    At host scale some snapshotted process becomes a zombie, or has its PID
+    reused, within a fraction of a second of almost every snapshot (three of
+    three attempts on 2026-09-25, about 4,600 processes).  Such an obsolete
+    identity is omitted here, exactly as a fresh selection omits proven terminal
+    generations, so it never reaches a path observer.  The caller still keeps it
+    in the census's process tuple, where it remains owner-cgroup evidence.
+    """
+
+    observable: list[_AbsentProcessObservation] = []
     for process in processes:
         budget.remaining_seconds()
         # Retain vanished identities in the original tuple: every downstream
         # observer must still establish absence or reject stale/reused evidence.
         if _read_process_stat(Path("/proc") / str(process.pid)) is None:
+            observable.append(process)
             continue
-        # A present but obsolete identity invalidates this whole attempt. Fresh
-        # selection omits proven terminal generations, including protected links.
-        if not _process_observation_is_active(process):
-            raise _ProcessEvidenceChanged(
-                f"PID {process.pid} exited or changed before process path census"
-            )
+        if _process_observation_is_active(process):
+            observable.append(process)
+    # Observers of an empty selection run no command, so no later reader would
+    # notice a deadline that expired during this pass.
+    budget.remaining_seconds()
+    return tuple(observable)
 
 
 def _allow_only_vanished_process_diagnostics(
@@ -31313,10 +31331,30 @@ def _allow_only_vanished_process_diagnostics(
     stderr: bytes,
     processes: Mapping[int, _AbsentProcessObservation],
 ) -> None:
+    moved = _moved_process_diagnostics(program, returncode, stderr, processes)
+    # The enclosing bounded retry discards this entire incomplete census.
+    if moved:
+        raise _ProcessEvidenceChanged(
+            f"privileged {program} census produced diagnostics: {list(moved.values())[-1]}"
+        )
+
+
+def _moved_process_diagnostics(
+    program: str,
+    returncode: int,
+    stderr: bytes,
+    processes: Mapping[int, _AbsentProcessObservation],
+) -> dict[int, str]:
+    """Return the last vanished-path diagnostic of each still-active process.
+
+    Any other diagnostic, or one naming an unselected PID, is a hard refusal.
+    A vanished path of an exited or zombie generation is complete evidence.
+    """
+
     if returncode == 0 and not stderr:
-        return
+        return {}
     if program == "grep" and returncode == 1 and not stderr:
-        return
+        return {}
     expected_error = 1 if program == "find" else 2
     if returncode != expected_error:
         raise Refusal(f"privileged {program} census refused with exit {returncode}")
@@ -31330,21 +31368,76 @@ def _allow_only_vanished_process_diagnostics(
     except UnicodeError as exc:
         raise Refusal(f"privileged {program} census diagnostics are undecodable") from exc
     pattern = _FIND_MISSING_RE if program == "find" else _GREP_MISSING_RE
-    changed_diagnostic: str | None = None
+    moved: dict[int, str] = {}
     for line in lines:
         match = pattern.fullmatch(line)
         process = processes.get(int(match.group("pid"))) if match else None
         if process is None:
             raise Refusal(f"privileged {program} census produced diagnostics: {line}")
         if _process_observation_is_active(process):
-            changed_diagnostic = line
+            moved.pop(process.pid, None)
+            moved[process.pid] = line
     # Validate every diagnostic before classifying motion: an earlier vanished
     # FD must not hide a later permission, malformed, or unknown-path refusal.
-    # The enclosing bounded retry discards this entire incomplete census.
-    if changed_diagnostic is not None:
-        raise _ProcessEvidenceChanged(
-            f"privileged {program} census produced diagnostics: {changed_diagnostic}"
+    return moved
+
+
+def _complete_privileged_link_find(
+    roots_by_pid: Mapping[int, Sequence[str]],
+    suffix: Sequence[str],
+    observed: Mapping[int, _AbsentProcessObservation],
+    budget: _ReadOnlyCommandBudget | None,
+) -> bytes:
+    """Run the privileged unfollowed /proc link find to one complete listing per process.
+
+    A descriptor closed between readdir and readlink leaves only its own
+    process's listing incomplete.  Rescan that process alone, at most
+    ``_CHURNING_PROCESS_RESCANS`` times, until one pass over its roots is free of
+    diagnostics.  Listings of different processes were never simultaneous: one
+    full pass already takes seconds.  Every record any pass emitted is retained,
+    so positive holder evidence is never discarded.  A process that never lists
+    completely still discards the whole attempt through _ProcessEvidenceChanged.
+    """
+
+    chunks: list[bytes] = []
+    moved: dict[int, str] = {}
+    roots = tuple(root for pid_roots in roots_by_pid.values() for root in pid_roots)
+    for arguments in _argument_batches(("-P",), roots, suffix):
+        batch_pids = {
+            _pid_from_proc_evidence(Path(argument))
+            for argument in arguments[1 : len(arguments) - len(suffix)]
+        }
+        batch_processes = {
+            pid: observed[pid] for pid in batch_pids if pid in observed
+        }
+        returncode, stdout, stderr = _run_root_owned_command(
+            Path("/usr/bin/find"), arguments, budget=budget
         )
+        moved.update(
+            _moved_process_diagnostics("find", returncode, stderr, batch_processes)
+        )
+        chunks.append(stdout)
+    for pid, diagnostic in sorted(moved.items()):
+        for _rescan in range(_CHURNING_PROCESS_RESCANS):
+            still_moving: dict[int, str] = {}
+            for arguments in _argument_batches(("-P",), roots_by_pid[pid], suffix):
+                returncode, stdout, stderr = _run_root_owned_command(
+                    Path("/usr/bin/find"), arguments, budget=budget
+                )
+                still_moving.update(
+                    _moved_process_diagnostics(
+                        "find", returncode, stderr, {pid: observed[pid]}
+                    )
+                )
+                chunks.append(stdout)
+            if pid not in still_moving:
+                break
+            diagnostic = still_moving[pid]
+        else:
+            raise _ProcessEvidenceChanged(
+                f"privileged find census produced diagnostics: {diagnostic}"
+            )
+    return b"".join(chunks)
 
 
 def _same_uid_indeterminate_processes(
@@ -31353,7 +31446,12 @@ def _same_uid_indeterminate_processes(
     stderr: bytes,
     processes: Mapping[int, _AbsentProcessObservation],
 ) -> tuple[_AbsentProcessObservation, ...]:
-    """Return stable protected PIDs that require fresh privileged evidence."""
+    """Return stable protected PIDs that require fresh privileged evidence.
+
+    A vanished path of a still-active process leaves only that process's
+    readable listing incomplete, so it also takes the privileged route, which
+    retains this pass's records and completes or refuses that listing itself.
+    """
 
     if returncode == 0 and not stderr:
         return ()
@@ -31375,7 +31473,6 @@ def _same_uid_indeterminate_processes(
         _FIND_PERMISSION_RE if program == "find" else _GREP_PERMISSION_RE
     )
     indeterminate: dict[int, _AbsentProcessObservation] = {}
-    changed_diagnostic: str | None = None
     for line in lines:
         missing = missing_pattern.fullmatch(line)
         if missing is not None:
@@ -31385,7 +31482,7 @@ def _same_uid_indeterminate_processes(
                     f"same-UID {program} census produced diagnostics: {line}"
                 )
             if _process_observation_is_active(process):
-                changed_diagnostic = line
+                indeterminate[process.pid] = process
             continue
         denied = permission_pattern.fullmatch(line)
         process = (
@@ -31396,11 +31493,22 @@ def _same_uid_indeterminate_processes(
         if not _process_observation_is_active(process):
             continue
         indeterminate[process.pid] = process
-    if changed_diagnostic is not None:
-        raise _ProcessEvidenceChanged(
-            f"same-UID {program} census produced diagnostics: {changed_diagnostic}"
-        )
     return tuple(indeterminate.values())
+
+
+def _holder_detail(process: _AbsentProcessObservation, detail: str) -> str:
+    """Describe one selected-path record, keeping it when its holder has since ended.
+
+    The record proves that the snapshotted PID held a selected path when it was
+    read.  If that generation exited, or its PID was reused, the record is still
+    kept as positive evidence against that path alone: discarding the attempt
+    instead would let short-lived processes in any one live slot prevent every
+    other slot's census from ever completing.
+    """
+
+    if _process_generation_is_current(process):
+        return detail
+    return f"{detail} (holder generation ended during census)"
 
 
 def _parse_find_path_matches(
@@ -31429,12 +31537,8 @@ def _parse_find_path_matches(
         matched = _matching_absent_validate_target(observed, targets, match_cache)
         if matched is None:
             continue
-        if not _process_generation_is_current(process):
-            raise _ProcessEvidenceChanged(
-                f"PID {pid} generation changed during {census} find census"
-            )
         _target, slot = matched
-        match = (pid, slot, "link", raw_target)
+        match = (pid, slot, "link", _holder_detail(process, raw_target))
         matches.append(match)
         if match_sink is not None:
             match_sink.append(match)
@@ -31473,12 +31577,8 @@ def _parse_maps_path_matches(
         process = processes.get(pid)
         if process is None:
             raise Refusal(f"{census} grep census returned an unexpected PID: {pid}")
-        if not _process_generation_is_current(process):
-            raise _ProcessEvidenceChanged(
-                f"PID {pid} generation changed during {census} maps census"
-            )
         _target, slot = matched
-        match = (pid, slot, "map", str(observed))
+        match = (pid, slot, "map", _holder_detail(process, str(observed)))
         matches.append(match)
         if match_sink is not None:
             match_sink.append(match)
@@ -31516,22 +31616,14 @@ def _absent_validate_find_matches(
         "%p\\0%l\\0",
     )
     observed_by_pid = {process.pid: process for process in processes}
-    chunks: list[bytes] = []
-    for arguments in _argument_batches(("-P",), roots, suffix):
-        batch_pids = {
-            _pid_from_proc_evidence(Path(argument))
-            for argument in arguments[1 : len(arguments) - len(suffix)]
-        }
-        batch_processes = {
-            pid: observed_by_pid[pid] for pid in batch_pids if pid in observed_by_pid
-        }
-        returncode, stdout, stderr = _run_root_owned_command(
-            Path("/usr/bin/find"), arguments, budget=budget
-        )
-        _allow_only_vanished_process_diagnostics("find", returncode, stderr, batch_processes)
-        chunks.append(stdout)
+    roots_by_pid = {
+        process.pid: _process_symlink_roots((process,)) for process in processes
+    }
+    output = _complete_privileged_link_find(
+        roots_by_pid, suffix, observed_by_pid, budget
+    )
     return _parse_find_path_matches(
-        b"".join(chunks), observed_by_pid, targets, census="privileged"
+        output, observed_by_pid, targets, census="privileged"
     )
 
 
@@ -31616,12 +31708,8 @@ def _parse_compact_maps_path_matches(
         process = processes.get(pid)
         if process is None:
             raise Refusal(f"{census} compact maps census returned an unexpected PID: {pid}")
-        if not _process_generation_is_current(process):
-            raise _ProcessEvidenceChanged(
-                f"PID {pid} generation changed during {census} maps census"
-            )
         _target, slot = matched
-        matches.append((pid, slot, "map", str(observed)))
+        matches.append((pid, slot, "map", _holder_detail(process, str(observed))))
     return tuple(matches)
 
 
@@ -31882,9 +31970,9 @@ def _capture_same_uid_process_path_census(
         budget.remaining_seconds()
         try:
             processes = _same_uid_process_observations(budget)
-            _assert_process_observations_active(processes, budget)
+            observable = _observable_process_generations(processes, budget)
             direct_matches, indeterminate = _same_uid_batched_path_matches(
-                processes, targets, budget
+                observable, targets, budget
             )
             privileged_matches = (
                 *_absent_validate_find_matches(indeterminate, targets, budget),
@@ -31893,7 +31981,7 @@ def _capture_same_uid_process_path_census(
             # Reject volatile path motion before spending the shared mountinfo
             # input budget. An accepted attempt still completes every observer.
             matches = (
-                *_absent_validate_mount_matches(processes, targets, budget),
+                *_absent_validate_mount_matches(observable, targets, budget),
                 *direct_matches,
                 *privileged_matches,
             )
@@ -32159,16 +32247,9 @@ def _batch_link_matches(
     suffix = ("-ignore_readdir_race", "-maxdepth", "1", "-type", "l",
               "(", *tests, ")", "-printf", "%p\\0%l\\0")
     observed = {process.pid: process for process in processes}
-    matches: list[tuple[int, str, str, str]] = []
-    for arguments in _argument_batches(("-P",), _process_symlink_roots(processes), suffix):
-        pids = {_pid_from_proc_evidence(Path(path))
-                for path in arguments[1:len(arguments) - len(suffix)]}
-        rc, stdout, stderr = _run_root_owned_command(Path("/usr/bin/find"), arguments, budget=budget)
-        _allow_only_vanished_process_diagnostics(
-            "find", rc, stderr, {pid: observed[pid] for pid in pids},
-        )
-        matches.extend(_parse_find_path_matches(stdout, observed, targets, census="privileged"))
-    return tuple(matches)
+    roots = {process.pid: _process_symlink_roots((process,)) for process in processes}
+    output = _complete_privileged_link_find(roots, suffix, observed, budget)
+    return _parse_find_path_matches(output, observed, targets, census="privileged")
 
 
 def _batch_inode_matches(
@@ -32756,15 +32837,17 @@ def _capture_process_path_census(
                     include_owner_cgroups=False
                 )
             )
-            _assert_process_observations_active(processes, selected_budget)
+            observable = _observable_process_generations(
+                processes, selected_budget
+            )
             path_matches = (
-                *_absent_validate_find_matches(processes, targets, selected_budget),
-                *_absent_validate_maps_matches(processes, targets, selected_budget),
+                *_absent_validate_find_matches(observable, targets, selected_budget),
+                *_absent_validate_maps_matches(observable, targets, selected_budget),
             )
             # A failed path observation discards the whole attempt without
             # first rereading every mount table. Budgets never reset on retry.
             mount_matches = _absent_validate_mount_matches(
-                processes, targets, selected_budget
+                observable, targets, selected_budget
             )
         except _ProcessEvidenceChanged:
             if attempt < 2:

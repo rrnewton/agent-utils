@@ -30820,7 +30820,7 @@ def test_process_census_unknown_identity_refuses_without_retry(
 
 @pytest.mark.parametrize("lane", ("privileged", "same-uid"))
 @pytest.mark.parametrize("scenario", ("once", "persistent", "deadline", "between-pids"))
-def test_process_census_preflight_discards_attempt_with_shared_bounds(
+def test_process_census_preflight_withholds_obsolete_identity_with_shared_bounds(
     monkeypatch: pytest.MonkeyPatch, lane: str, scenario: str,
 ) -> None:
     process = wrkslots._AbsentProcessObservation(123, 17, "", "pid:123")
@@ -30873,15 +30873,18 @@ def test_process_census_preflight_discards_attempt_with_shared_bounds(
             return wrkslots._capture_process_path_census((Path("/fixture/slot"),), budget=budget)
         return wrkslots._capture_same_uid_process_path_census((Path("/fixture/slot"),), budget=budget)
 
-    if scenario == "once":
+    if scenario in {"once", "persistent"}:
+        # An obsolete identity no longer discards the attempt: at host scale
+        # some process becomes one after almost every snapshot.  It reaches no
+        # path observer, yet stays in the census as owner-cgroup evidence.
         census = capture()
-        assert census.processes == ()
+        assert census.processes == (process,)
         assert census.matches == ()
-        assert calls == ["snapshot", "identity", "snapshot", "find", "maps", "mount"]
+        assert calls == ["snapshot", "identity", "find", "maps", "mount"]
     else:
-        with pytest.raises(wrkslots.Refusal, match="three liveness attempts" if scenario == "persistent" else "operation-wide time bound"):
+        with pytest.raises(wrkslots.Refusal, match="operation-wide time bound"):
             capture()
-        assert calls == ["snapshot", "identity"] * (3 if scenario == "persistent" else 1)
+        assert calls == ["snapshot", "identity"]
 
 
 @pytest.mark.parametrize("lane", ("privileged", "same-uid"))
@@ -30963,10 +30966,16 @@ def test_process_census_preflight_keeps_vanished_identity_in_every_observer(
         return wrkslots._capture_same_uid_process_path_census((target,), budget=budget)
 
     if evidence.startswith("stale"):
-        with pytest.raises(wrkslots.Refusal, match="three liveness attempts"):
-            capture()
-        first = ["snapshot", "find"] + (["maps"] if evidence == "stale-map" else [])
-        assert calls == [*first, "snapshot", "snapshot"]
+        # A holder that ends during the census is retained as positive
+        # evidence against its slot rather than discarding every slot's census.
+        census = capture()
+        assert census.processes == processes
+        assert calls == ["snapshot", "find", "maps", "mount:123", "mount:124"]
+        assert [(pid, slot) for pid, slot, _kind, _detail in census.matches] == [(123, str(target))]
+        assert census.matches[0][3].endswith("(holder generation ended during census)")
+        with pytest.raises(wrkslots.Refusal, match="live process 123"):
+            census.assert_slot_unused(target, None, ignore_current_process=False)
+        census.assert_slot_unused(Path("/fixture/other-slot"), None, ignore_current_process=False)
     elif evidence == "mixed":
         with pytest.raises(wrkslots.Refusal, match="Permission denied") as refused:
             capture()
@@ -31056,9 +31065,17 @@ def test_process_census_live_protected_identity_reaches_trusted_readers(
         census.assert_slot_unused(target, None, ignore_current_process=False)
 
 
-def test_process_census_retries_when_mountinfo_owner_becomes_a_zombie(
-    monkeypatch: pytest.MonkeyPatch,
+def test_process_census_withholds_a_zombie_from_path_observers_yet_keeps_its_cgroup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A zombie is omitted from path observation, never from owner evidence.
+
+    This used to retry the whole census until the zombie left the snapshot.
+    At host scale some snapshotted process becomes obsolete after almost every
+    snapshot, so that retry never completed.  Omitting it from the observers is
+    what a fresh selection would do; keeping it in the census is what makes a
+    parent that spawned a child and exited still refuse through its cgroup.
+    """
     read_fd, release_fd = os.pipe()
     pid = os.fork()
     if pid == 0:
@@ -31071,10 +31088,11 @@ def test_process_census_retries_when_mountinfo_owner_becomes_a_zombie(
     try:
         generation = wrkslots._read_process_stat(Path("/proc") / str(pid))
         assert generation is not None
+        # The child shares this test's cgroup, which the live owner below records.
         process = wrkslots._AbsentProcessObservation(
             pid,
             generation.start_ticks,
-            "/fixture",
+            wrkslots._read_process_cgroup(Path("/proc") / str(pid)),
             "mnt:[fixture]",
         )
         os.close(release_fd)
@@ -31082,23 +31100,39 @@ def test_process_census_retries_when_mountinfo_owner_becomes_a_zombie(
         os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
         assert wrkslots._process_is_zombie(Path("/proc") / str(pid))
 
-        snapshots = iter(((process,), ()))
+        snapshots = iter(((process,),))
+        observed: list[tuple[str, tuple[wrkslots._AbsentProcessObservation, ...]]] = []
+
+        def observer(name: str) -> Callable[[Sequence[wrkslots._AbsentProcessObservation], object, object], tuple[()]]:
+            def observe(processes: Sequence[wrkslots._AbsentProcessObservation], _targets: object, _budget: object) -> tuple[()]:
+                observed.append((name, tuple(processes)))
+                return ()
+            return observe
+
         monkeypatch.setattr(
             wrkslots, "_absent_validate_process_snapshot", lambda: next(snapshots)
         )
-        monkeypatch.setattr(
-            wrkslots, "_absent_validate_find_matches", lambda *_args: ()
-        )
-        monkeypatch.setattr(
-            wrkslots, "_absent_validate_maps_matches", lambda *_args: ()
-        )
+        monkeypatch.setattr(wrkslots, "_absent_validate_find_matches", observer("find"))
+        monkeypatch.setattr(wrkslots, "_absent_validate_maps_matches", observer("maps"))
+        monkeypatch.setattr(wrkslots, "_absent_validate_mount_matches", observer("mount"))
 
         census = wrkslots._capture_process_path_census(
             (Path("/fixture/slot-a"), Path("/fixture/slot-b"))
         )
 
-        assert census.processes == ()
+        assert census.processes == (process,)
         assert census.matches == ()
+        assert observed == [("find", ()), ("maps", ()), ("mount", ())]
+
+        project, _repository, _remote = make_project(tmp_path)
+        prepare_dead_validate_slots(project, ("slot01",))
+        config = wrkslots._load_config(str(project), "testhost")
+        record = wrkslots._find_record(wrkslots._load_active(config), "slot01")
+        slot = wrkslots._slot_directory(config, "slot01", "validate")
+        live_owner = wrkslots._read_process_identity(os.getpid())
+        assert live_owner.cgroup_path == process.cgroup_path
+        with pytest.raises(wrkslots.Refusal, match=f"live process {pid} remains in recorded owner cgroup"):
+            census.assert_slot_unused(slot, replace(record, owner=live_owner))
     finally:
         if release_fd >= 0:
             os.close(release_fd)
@@ -31612,6 +31646,7 @@ def missing_path_census_control(
     target = Path("/absent/validate/census-control")
     process = wrkslots._AbsentProcessObservation(123, 17, "/other", "mnt:[123]")
     calls: list[str] = []
+    privileged_finds: list[Sequence[str]] = []
     now = 0.0
     monkeypatch.setattr(time, "monotonic", lambda: now)
     budget = wrkslots._ReadOnlyCommandBudget.start(
@@ -31645,6 +31680,12 @@ def missing_path_census_control(
             return (0, b"", b"")
         if scenario == "once" and calls.count("snapshot") > 1:
             return (0, b"", b"")
+        if scenario.startswith("rescan") and "/usr/bin/sudo" in command:
+            privileged_finds.append(command)
+            if len(privileged_finds) > 1:
+                if scenario == "rescan":
+                    return (0, b"", b"")
+                return (1, b"", b"/usr/bin/find: '/proc/123/fd': Permission denied\n")
         diagnostic = b"/usr/bin/find: '/proc/123/fd/399': No such file or directory\n"
         if scenario == "unknown":
             diagnostic = diagnostic.replace(b"/123/", b"/124/")
@@ -31658,7 +31699,7 @@ def missing_path_census_control(
             return (0, b"/proc/123/fd/7\0", b"")
         elif scenario == "time":
             now = 6.0
-        # Partial find output cannot survive into the accepted attempt.
+        # Partial find output is retained within an attempt, never across one.
         partial = b"/proc/123/fd/7\0" + os.fsencode(target / "partial") + b"\0"
         return (1, partial, diagnostic)
 
@@ -31688,7 +31729,10 @@ def test_missing_path_census_discards_attempt_before_complete_reobservation(
 ) -> None:
     capture, calls = missing_path_census_control(monkeypatch, lane, "once")
     census = capture()
-    assert calls == ["snapshot", "find", "snapshot", "find", "maps", "mount"]
+    # A same-UID diagnostic sends the process to the privileged lister, whose
+    # rescans of that process run out before the attempt is discarded.
+    first = ["find", "find", "find", "find"] if lane == "privileged" else ["find", "maps", "find", "find", "find", "find"]
+    assert calls == ["snapshot", *first, "snapshot", "find", "maps", "mount"]
     assert len(census.processes) == 1
     assert census.matches == ()
     assert census.owner_cgroup_complete is (lane == "privileged")
@@ -31702,7 +31746,73 @@ def test_missing_path_census_refuses_after_three_complete_attempts(
     with pytest.raises(wrkslots.Refusal, match="three liveness attempts") as refused:
         capture()
     assert not isinstance(refused.value, wrkslots._ProcessEvidenceChanged)
-    assert calls == ["snapshot", "find"] * 3
+    attempt = ["find"] * 4 if lane == "privileged" else ["find", "maps", "find", "find", "find", "find"]
+    assert calls == ["snapshot", *attempt] * 3
+
+
+@pytest.mark.parametrize("lane", ("privileged", "same-uid"))
+def test_missing_path_census_rescans_only_until_the_moved_process_lists_completely(
+    monkeypatch: pytest.MonkeyPatch, lane: str,
+) -> None:
+    capture, calls = missing_path_census_control(monkeypatch, lane, "rescan")
+    census = capture()
+    first = ["find", "find"] if lane == "privileged" else ["find", "maps", "find", "find", "maps"]
+    if lane == "privileged":
+        first.append("maps")
+    assert calls == ["snapshot", *first, "mount"]
+    target = Path("/absent/validate/census-control")
+    # The incomplete pass's record is positive evidence and survives the rescan.
+    assert (123, str(target), "link", str(target / "partial")) in census.matches
+    with pytest.raises(wrkslots.Refusal, match="live process 123 uses slot"):
+        census.assert_slot_unused(target, None, ignore_current_process=False)
+
+
+@pytest.mark.parametrize("outcome", ("settles", "exhausted"))
+def test_privileged_link_find_rescans_only_the_moved_process(
+    monkeypatch: pytest.MonkeyPatch, outcome: str,
+) -> None:
+    observed = {
+        pid: wrkslots._AbsentProcessObservation(pid, 17, "/other", f"mnt:[{pid}]")
+        for pid in (123, 124)
+    }
+    roots_by_pid = {pid: wrkslots._process_symlink_roots((process,)) for pid, process in observed.items()}
+    commands: list[tuple[str, ...]] = []
+    monkeypatch.setattr(wrkslots, "_process_observation_is_active", lambda _process: True)
+
+    def run(program: Path, arguments: Sequence[str], **_kwargs: object) -> tuple[int, bytes, bytes]:
+        assert program == Path("/usr/bin/find")
+        commands.append(tuple(arguments))
+        moved = len(commands) == 1 or outcome == "exhausted"
+        record = f"/proc/123/fd/{len(commands)}\0/fixture/slot/{len(commands)}\0".encode()
+        if moved:
+            return (1, record, b"/usr/bin/find: '/proc/123/fd/9': No such file or directory\n")
+        return (0, record, b"")
+
+    monkeypatch.setattr(wrkslots, "_run_root_owned_command", run)
+    suffix = ("-lname", "/fixture/slot*", "-printf", "%p\\0%l\\0")
+    if outcome == "exhausted":
+        with pytest.raises(wrkslots._ProcessEvidenceChanged, match="/proc/123/fd/9"):
+            wrkslots._complete_privileged_link_find(roots_by_pid, suffix, observed, None)
+        assert len(commands) == 1 + wrkslots._CHURNING_PROCESS_RESCANS
+    else:
+        output = wrkslots._complete_privileged_link_find(roots_by_pid, suffix, observed, None)
+        assert len(commands) == 2
+        # The incomplete pass's record is kept alongside the rescan's.
+        assert output == b"/proc/123/fd/1\0/fixture/slot/1\0/proc/123/fd/2\0/fixture/slot/2\0"
+    assert "/proc/124/fd" in commands[0]
+    for rescan in commands[1:]:
+        assert [argument for argument in rescan if argument.startswith("/proc/")] == list(roots_by_pid[123])
+
+
+@pytest.mark.parametrize("lane", ("privileged", "same-uid"))
+def test_missing_path_census_rescan_keeps_hard_refusals(
+    monkeypatch: pytest.MonkeyPatch, lane: str,
+) -> None:
+    capture, calls = missing_path_census_control(monkeypatch, lane, "rescan-permission")
+    with pytest.raises(wrkslots.Refusal, match="Permission denied") as refused:
+        capture()
+    assert not isinstance(refused.value, wrkslots._ProcessEvidenceChanged)
+    assert calls.count("snapshot") == 1
 
 
 @pytest.mark.parametrize("lane", ("privileged", "same-uid"))
@@ -31716,9 +31826,13 @@ def test_missing_path_census_preserves_shared_attempt_budgets(
     assert not isinstance(refused.value, wrkslots._ProcessEvidenceChanged)
     if bound == "time":
         assert calls == ["snapshot", "find"]
-    else:
+    elif lane == "privileged":
         # The second real command wrapper exhausts the shared maps-selection input.
         assert calls == ["snapshot", "find", "maps", "snapshot", "find"]
+    else:
+        # The same-UID maps diagnostic routes the process to the privileged
+        # lister, whose selection input exhausts the same shared bound.
+        assert calls == ["snapshot", "find", "maps", "find"]
 
 
 @pytest.mark.parametrize("lane", ("privileged", "same-uid"))
