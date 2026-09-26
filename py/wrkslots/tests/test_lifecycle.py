@@ -595,6 +595,27 @@ def validation_exclusion_guard_identities(
     return result
 
 
+def attributable_validation_exclusion_guards(
+    identities: Mapping[Path, tuple[int, int, int, int, int]],
+    fixture_root: Path,
+    produced_names: AbstractSet[str],
+) -> dict[Path, tuple[int, int, int, int, int]]:
+    """Keep only guards this fixture's own commands could have created.
+
+    The fixture root is private to one project, so everything in it counts. The
+    observed production roots are shared host directories: other lifecycle shards,
+    other checkouts' validation and real operators create guards there too. A guard
+    name embeds a fresh fenced-path token, so a guard in a shared root is ours only
+    if this interpreter produced its exact name.
+    """
+
+    return {
+        guard: identity
+        for guard, identity in identities.items()
+        if guard.parent == fixture_root or guard.name in produced_names
+    }
+
+
 def install_validation_exclusion_fixture(
     project: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -634,6 +655,14 @@ def install_validation_exclusion_fixture(
     setup_complete = False
     observed_roots: tuple[Path, ...] = (root,)
     guards_before: dict[Path, tuple[int, int, int, int, int]] = {}
+    produced_names: set[str] = set()
+
+    def own_guards(
+        identities: Mapping[Path, tuple[int, int, int, int, int]],
+    ) -> dict[Path, tuple[int, int, int, int, int]]:
+        return attributable_validation_exclusion_guards(
+            identities, root, produced_names
+        )
 
     def remove_empty_fixture_root() -> None:
         if not root.exists():
@@ -657,8 +686,8 @@ def install_validation_exclusion_fixture(
     def restore_created_guard() -> None:
         try:
             if setup_complete:
-                guards_during_teardown = validation_exclusion_guard_identities(
-                    observed_roots
+                guards_during_teardown = own_guards(
+                    validation_exclusion_guard_identities(observed_roots)
                 )
                 created = set(guards_during_teardown).difference(guards_before)
                 assert all(guard.parent == root for guard in created)
@@ -690,10 +719,9 @@ def install_validation_exclusion_fixture(
                         config, journal_value
                     )
                     assert "exclusion" not in restored
-                assert (
+                assert own_guards(
                     validation_exclusion_guard_identities(observed_roots)
-                    == guards_before
-                )
+                ) == own_guards(guards_before)
             remove_empty_fixture_root()
         finally:
             _MAPPED_VALIDATION_EXCLUSION_PROJECTS.discard(project)
@@ -753,7 +781,17 @@ def install_validation_exclusion_fixture(
         selected_budget.consume_output(completed.stdout, completed.stderr)
         return completed.returncode, completed.stdout, completed.stderr
 
+    produce_name = wrkslots._ownerless_validation_exclusion_name
+
+    def record_produced_name(config: wrkslots.Config, fenced: Path) -> str:
+        name = produce_name(config, fenced)
+        produced_names.add(name)
+        return name
+
     monkeypatch.setattr(wrkslots, "_OWNERLESS_VALIDATION_EXCLUSION_ROOTS", (root,))
+    monkeypatch.setattr(
+        wrkslots, "_ownerless_validation_exclusion_name", record_produced_name
+    )
     monkeypatch.setattr(
         wrkslots, "_self_mountinfo_records", lambda: tuple(deduplicated.values())
     )
@@ -5794,6 +5832,95 @@ def test_validation_exclusion_fixture_is_selected_only_in_process(
     assert root not in production_roots
     assert selected == root
     assert alias == fenced
+
+
+def test_validation_exclusion_guard_attribution_ignores_foreign_names(
+    tmp_path: Path,
+) -> None:
+    fixture_root = tmp_path / "fixture-root"
+    shared_root = tmp_path / "shared-root"
+    ours = f"{_VALIDATION_EXCLUSION_GUARD_PREFIX}{'a' * 32}.{'b' * 16}"
+    foreign = f"{_VALIDATION_EXCLUSION_GUARD_PREFIX}{'c' * 32}.{'d' * 16}"
+    identities = {
+        fixture_root / foreign: (1, 1, 0o700, 0, 0),
+        shared_root / ours: (1, 2, 0o700, 0, 0),
+        shared_root / foreign: (1, 3, 0o700, 0, 0),
+    }
+    assert attributable_validation_exclusion_guards(
+        identities, fixture_root, {ours}
+    ) == {
+        fixture_root / foreign: (1, 1, 0o700, 0, 0),
+        shared_root / ours: (1, 2, 0o700, 0, 0),
+    }
+
+
+def test_validation_exclusion_fixture_ignores_foreign_guard_across_teardown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    """A concurrent shard's guard in an observed shared root is not this fixture's."""
+
+    project, _repository, _remote = make_project(tmp_path)
+    shared_root = Path(
+        tempfile.mkdtemp(prefix=".wrkslots-foreign-guard-root.", dir="/tmp")
+    )
+    foreign = shared_root / f"{_VALIDATION_EXCLUSION_GUARD_PREFIX}foreign-{os.getpid()}"
+
+    def remove_shared_root() -> None:
+        with contextlib.suppress(FileNotFoundError):
+            foreign.rmdir()
+        shared_root.rmdir()
+
+    # Finalizers run in reverse order, so this runs after the fixture's teardown.
+    request.addfinalizer(remove_shared_root)
+    monkeypatch.setattr(
+        wrkslots, "_OWNERLESS_VALIDATION_EXCLUSION_ROOTS", (shared_root,)
+    )
+    install_validation_exclusion_fixture(project, monkeypatch, request)
+    foreign.mkdir()
+
+
+def test_validation_exclusion_fixture_rejects_own_guard_in_shared_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Attribution by name still fails teardown on this fixture's misplaced guard."""
+
+    project, _repository, _remote = make_project(tmp_path)
+    shared_root = Path(
+        tempfile.mkdtemp(prefix=".wrkslots-misplaced-guard-root.", dir="/tmp")
+    )
+    finalizers: list[Callable[[], object]] = []
+
+    class CollectingRequest:
+        def addfinalizer(self, finalizer: Callable[[], object]) -> None:
+            finalizers.append(finalizer)
+
+    misplaced: Path | None = None
+    try:
+        monkeypatch.setattr(
+            wrkslots, "_OWNERLESS_VALIDATION_EXCLUSION_ROOTS", (shared_root,)
+        )
+        install_validation_exclusion_fixture(
+            project, monkeypatch, cast(pytest.FixtureRequest, CollectingRequest())
+        )
+        assert len(finalizers) == 1
+        config = wrkslots._load_config(str(project), "testhost")
+        name = wrkslots._ownerless_validation_exclusion_name(
+            config, tmp_path / f"fenced.{os.urandom(16).hex()}"
+        )
+        misplaced = shared_root / name
+        misplaced.mkdir()
+        with pytest.raises(AssertionError):
+            finalizers[0]()
+        misplaced.rmdir()
+        misplaced = None
+        finalizers[0]()
+    finally:
+        if misplaced is not None:
+            misplaced.rmdir()
+        shared_root.rmdir()
 
 
 @pytest.mark.mapped_root_namespace
@@ -36429,3 +36556,51 @@ def test_current_incomplete_frozen_binds_initial_facts_to_recursive_snapshot(
     assert changed
     assert row["blocks_entry"] is True, row
     assert checkout.is_dir()
+
+
+def test_git_branch_probes_distinguish_refusals_from_git_failure(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    git(repository, "init", "--quiet", "--initial-branch=main")
+    git(
+        repository,
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@example.invalid",
+        "commit",
+        "--quiet",
+        "--allow-empty",
+        "-m",
+        "base",
+    )
+    vcs = wrkslots._GitVcs()
+    assert vcs.branch(repository) == "main"
+
+    detached = tmp_path / "detached"
+    git(repository, "worktree", "add", "--quiet", "--detach", str(detached))
+    with pytest.raises(wrkslots.Refusal) as refusal:
+        vcs.branch(detached)
+    assert str(refusal.value) == (
+        f"checkout must be on its registered branch, not detached: {detached}"
+    )
+
+    broken = tmp_path / "broken"
+    git(repository, "worktree", "add", "--quiet", "-b", "broken", str(broken))
+    (broken / ".git").write_text(
+        f"gitdir: {tmp_path / 'vanished-worktree-metadata'}\n", encoding="utf-8"
+    )
+    with pytest.raises(wrkslots.Refusal) as refusal:
+        vcs.branch(broken)
+    message = str(refusal.value)
+    assert message.startswith(
+        f"cannot read the branch of checkout {broken}: "
+        "git symbolic-ref failed (exit 128): fatal: "
+    ), message
+    assert "not detached" not in message
+
+    vcs.check_branch_name(repository, "feature/valid")
+    for invalid in ("foo.lock", "x/.y", "a@{b"):
+        with pytest.raises(wrkslots.Refusal) as refusal:
+            vcs.check_branch_name(repository, invalid)
+        assert str(refusal.value) == f"invalid Git branch name {invalid!r}"

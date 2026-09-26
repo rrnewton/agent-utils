@@ -8683,6 +8683,18 @@ def _github_credential_helper_args(env: Mapping[str, str]) -> tuple[str, ...]:
     )
 
 
+def _git_failure_detail(result: subprocess.CompletedProcess[str]) -> str:
+    """Name a Git probe's exit status and diagnostic, for a refusal that cannot classify it."""
+
+    status = (
+        f"signal {-result.returncode}"
+        if result.returncode < 0
+        else f"exit {result.returncode}"
+    )
+    detail = (result.stderr or result.stdout).strip()
+    return f" ({status})" + (f": {detail}" if detail else "")
+
+
 class _GitVcs:
     """The small Git boundary used by slot operations."""
 
@@ -8922,15 +8934,23 @@ class _GitVcs:
     def check_branch_name(self, repository: Path, branch: str) -> None:
         _validate_ref(branch, "branch")
         result = self._run(repository, ["check-ref-format", "--branch", branch], check=False)
-        if result.returncode != 0:
+        if result.returncode == 0:
+            return
+        # Git dies (exit 128) for an invalid name and for a real failure alike; only its
+        # message, stable under LC_ALL=C, tells them apart.
+        if result.returncode == 128 and "is not a valid branch name" in result.stderr:
             raise Refusal(f"invalid Git branch name {branch!r}")
+        raise Refusal(f"cannot check Git branch name {branch!r}" + _git_failure_detail(result))
 
     def branch_exists(self, repository: Path, branch: str) -> bool:
         result = self._run(
             repository, ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], check=False
         )
         if result.returncode not in (0, 1):
-            raise Refusal(f"cannot determine whether branch {branch!r} exists in {repository}")
+            raise Refusal(
+                f"cannot determine whether branch {branch!r} exists in {repository}"
+                + _git_failure_detail(result)
+            )
         return result.returncode == 0
 
     def add_worktree(
@@ -9018,8 +9038,15 @@ class _GitVcs:
 
     def branch(self, checkout: Path) -> str:
         result = self._run(checkout, ["symbolic-ref", "--quiet", "--short", "HEAD"], check=False)
-        if result.returncode != 0:
+        # With --quiet, a detached HEAD is exactly exit 1 with no diagnostic. Anything else
+        # (a fatal error, a signal, a vanished `.git`) is a Git failure, not a branch state.
+        if result.returncode == 1 and not result.stdout and not result.stderr:
             raise Refusal(f"checkout must be on its registered branch, not detached: {checkout}")
+        if result.returncode != 0:
+            raise Refusal(
+                f"cannot read the branch of checkout {checkout}: git symbolic-ref failed"
+                + _git_failure_detail(result)
+            )
         branch = result.stdout.strip()
         _validate_ref(branch, "branch")
         return branch
@@ -9311,7 +9338,10 @@ class _GitVcs:
             check=False,
         )
         if result.returncode not in (0, 1):
-            raise Refusal(f"cannot determine whether remote {remote!r} has a push URL")
+            raise Refusal(
+                f"cannot determine whether remote {remote!r} has a push URL"
+                + _git_failure_detail(result)
+            )
         values = result.stdout.split("\0")
         if values and values[-1] == "":
             values.pop()
@@ -9517,7 +9547,9 @@ class _GitVcs:
             checkout, ["show-ref", "--verify", "--quiet", ref], check=False
         )
         if result.returncode not in (0, 1):
-            raise Refusal(f"cannot determine whether ref {ref} exists")
+            raise Refusal(
+                f"cannot determine whether ref {ref} exists" + _git_failure_detail(result)
+            )
         return result.returncode == 0
 
     def commit_paths(self, checkout: Path, commit: str) -> tuple[str, ...]:
@@ -9548,6 +9580,7 @@ class _GitVcs:
         if result.returncode not in (0, 1):
             raise Refusal(
                 f"cannot compare checkout HEAD {ancestor} with landed ref {descendant}"
+                + _git_failure_detail(result)
             )
         return result.returncode == 0
 
@@ -12263,7 +12296,10 @@ def _salvage_candidate(
             path, ["symbolic-ref", "--quiet", "--short", "HEAD"], check=False
         )
         if branch_result.returncode not in (0, 1):
-            raise Refusal(f"cannot determine branch state for checkout {checkout.name}")
+            raise Refusal(
+                f"cannot determine branch state for checkout {checkout.name}"
+                + _git_failure_detail(branch_result)
+            )
     else:
         branch = vcs.branch(path)
         if branch != checkout.branch:
