@@ -244,7 +244,9 @@ def test_unselected_rows_fail_closed_and_are_never_planned(
     assert rows["charlie"]["cache_status"] == "uninspected"
     assert rows["charlie"]["cache_bytes"] is None
     assert rows["stray"]["verdict"] == "BLOCKED"
-    assert rows["stray"]["reasons"][-1] == UNINSPECTED
+    stray_reasons = rows["stray"]["reasons"]
+    assert isinstance(stray_reasons, list)
+    assert stray_reasons[-1] == UNINSPECTED
     assert rows["stray"]["cache_status"] == "uninspected"
     assert rows["stray"]["cache_bytes"] is None
     assert not any(
@@ -474,10 +476,12 @@ def test_selected_nested_git_is_still_refused(
     assert rows["alpha"]["cache_status"] == "error"
     assert rows["alpha"]["cache_bytes"] is None
     assert "nested Git metadata" in str(rows["alpha"]["cache_error"])
+    alpha_reasons = rows["alpha"]["reasons"]
+    assert isinstance(alpha_reasons, list)
     assert any(
         str(reason).startswith("cache inspection failed:")
         and "nested Git metadata" in str(reason)
-        for reason in rows["alpha"]["reasons"]
+        for reason in alpha_reasons
     )
     assert nested.is_dir()
     assert rows["bravo"]["verdict"] == "DELETABLE"

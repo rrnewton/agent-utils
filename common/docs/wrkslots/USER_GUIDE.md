@@ -156,6 +156,17 @@ outside the selection report `cache_bytes: null`, `cache_status: "uninspected"` 
 `cache inspection not performed: slot is outside the --cache-census-only selection`. They are never
 `DELETABLE`.
 
+A `.git` entry inside a configured cache refuses cache inspection and cleanup by default. The one
+exception is completed validation removal (`remove --validate-complete` and
+`remove-validate-batch`), and audit applies the same rule to validation rows so that `DELETABLE`
+predicts that removal. There a nested repository is accepted only when it is self-contained: a real
+directory on the cache's filesystem with no `commondir`, `worktrees`, `modules` or
+`config.worktree` entry, no `objects/info/alternates` and no symlinked object storage, and a
+regular `config` of at most 64 KiB that sets no `core.worktree` and includes no other
+configuration. Anything else, including anything unreadable, still refuses with the reason. The
+repository's contents are not examined, because the rest of a validation checkout is deleted with
+`git worktree remove --force`.
+
 ## Time-to-live and process evidence
 
 `init --heartbeat-ttl-seconds SECONDS` records the default copied into every new slot. `heartbeat`

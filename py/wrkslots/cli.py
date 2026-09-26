@@ -671,6 +671,8 @@ class CacheDirectory:
     checkout_device: int
     checkout_inode: int
     checkout_mount_id: int
+    # How a traversal treats a nested ``.git``: see _assert_nested_git_permitted.
+    nested_git: str = "refuse"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -15689,13 +15691,165 @@ def _directory_names(directory_fd: int, path: Path) -> list[str]:
         os.close(scan_fd)
 
 
+_NESTED_GIT_REFUSE = "refuse"
+_NESTED_GIT_SELF_CONTAINED = "self-contained"
+_NESTED_GIT_ANY = "any"
+_NESTED_GIT_POLICIES = frozenset(
+    {_NESTED_GIT_REFUSE, _NESTED_GIT_SELF_CONTAINED, _NESTED_GIT_ANY}
+)
+_NESTED_GIT_CONFIG_BYTES_LIMIT = 64 * 1024
+_NESTED_GIT_LINK_ENTRIES = (
+    ("commondir", "a commondir names another repository"),
+    ("worktrees", "it registers linked worktrees"),
+    ("modules", "it holds submodule repositories"),
+    ("config.worktree", "it has per-worktree configuration"),
+)
+
+
+def _nested_git_config_links_elsewhere(data: bytes) -> bool:
+    """Whether Git configuration may place work or settings outside its directory.
+
+    Deliberately conservative: anything this reader cannot classify counts as a link.
+    """
+
+    section = b""
+    for raw in data.split(b"\n"):
+        line = raw.strip()
+        if line.endswith(b"\\"):
+            return True
+        while line.startswith(b"["):
+            end = line.find(b"]")
+            if end < 0:
+                return True
+            section = re.split(rb'[\s".]', line[1:end].strip(), maxsplit=1)[0].lower()
+            line = line[end + 1 :].strip()
+        if not line or line[:1] in {b"#", b";"}:
+            continue
+        if section in {b"include", b"includeif"}:
+            return True
+        if section == b"core" and line.split(b"=", 1)[0].strip().lower() == b"worktree":
+            return True
+    return False
+
+
+def _nested_git_entry_exists(directory_fd: int, name: str, path: Path) -> bool:
+    try:
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise Refusal(f"cannot inspect nested Git metadata {path / name}: {exc}") from exc
+    return True
+
+
+def _open_nested_git_directory(directory_fd: int, name: str, path: Path) -> int | None:
+    """Open a real subdirectory, None when absent, refusing any other entry type."""
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        return os.open(name, flags, dir_fd=directory_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise Refusal(
+            "cache directory contains nested Git metadata that is not self-contained "
+            f"({name} is not a real directory): {path / name}: {exc}"
+        ) from exc
+
+
+def _assert_nested_git_permitted(directory_fd: int, path: Path, policy: str) -> None:
+    """Apply one cache traversal's policy to the ``.git`` entry of ``path``.
+
+    ``refuse`` is the default everywhere. ``any`` belongs only to deleting a
+    whole authorized validation payload, which contains its checkout's own
+    ``.git``. ``self-contained`` is what completed validation removal applies to
+    its configured caches, and what audit applies to validation records so that
+    it predicts that removal. The rest of such a checkout is deleted by ``git
+    worktree remove --force`` with no Git check at all, so the contents of a
+    nested repository are not the question. What still matters is whether
+    deleting it reaches beyond the cache: an administrative directory that lives
+    elsewhere, linked worktrees or submodules whose work trees may live
+    elsewhere, a configured work tree or included configuration, or objects
+    borrowed from elsewhere. Any of those, or anything unreadable, refuses.
+    """
+
+    target = path / ".git"
+    if policy not in _NESTED_GIT_POLICIES:
+        raise StateError(f"unknown nested Git policy {policy!r}")
+    if policy == _NESTED_GIT_ANY:
+        return
+    if policy == _NESTED_GIT_REFUSE:
+        raise Refusal(f"cache directory contains nested Git metadata: {target}")
+
+    def refuse(detail: str) -> Refusal:
+        return Refusal(
+            "cache directory contains nested Git metadata that is not self-contained "
+            f"({detail}): {target}"
+        )
+
+    try:
+        entry = os.stat(".git", dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise Refusal(f"cannot inspect nested Git metadata {target}: {exc}") from exc
+    if not stat.S_ISDIR(entry.st_mode):
+        raise refuse("it is not a real directory")
+    git_fd = _open_nested_git_directory(directory_fd, ".git", path)
+    if git_fd is None:
+        raise Refusal(f"nested Git metadata changed during inspection: {target}")
+    try:
+        opened = os.fstat(git_fd)
+        if (opened.st_dev, opened.st_ino) != (entry.st_dev, entry.st_ino):
+            raise Refusal(f"nested Git metadata changed during inspection: {target}")
+        if opened.st_dev != os.fstat(directory_fd).st_dev:
+            raise refuse("it is on another filesystem")
+        for name, detail in _NESTED_GIT_LINK_ENTRIES:
+            if _nested_git_entry_exists(git_fd, name, target):
+                raise refuse(detail)
+        objects_fd = _open_nested_git_directory(git_fd, "objects", target)
+        if objects_fd is not None:
+            try:
+                info_fd = _open_nested_git_directory(objects_fd, "info", target / "objects")
+                if info_fd is not None:
+                    try:
+                        if _nested_git_entry_exists(
+                            info_fd, "alternates", target / "objects" / "info"
+                        ):
+                            raise refuse("it borrows objects through alternates")
+                    finally:
+                        os.close(info_fd)
+            finally:
+                os.close(objects_fd)
+        try:
+            config_fd = os.open(
+                "config",
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=git_fd,
+            )
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise refuse(f"its config cannot be read as a regular file: {exc}") from exc
+        try:
+            if not stat.S_ISREG(os.fstat(config_fd).st_mode):
+                raise refuse("its config is not a regular file")
+            data = os.read(config_fd, _NESTED_GIT_CONFIG_BYTES_LIMIT + 1)
+        finally:
+            os.close(config_fd)
+        if len(data) > _NESTED_GIT_CONFIG_BYTES_LIMIT:
+            raise refuse("its config exceeds the inspection bound")
+        if _nested_git_config_links_elsewhere(data):
+            raise refuse("its config sets a work tree or includes other configuration")
+    finally:
+        os.close(git_fd)
+
+
 def _allocated_open_directory(
     directory_fd: int,
     path: Path,
     device: int,
     mount_id: int,
     *,
-    allow_git_metadata: bool = False,
+    nested_git: str = _NESTED_GIT_REFUSE,
 ) -> int:
     try:
         metadata = os.fstat(directory_fd)
@@ -15706,8 +15860,8 @@ def _allocated_open_directory(
         total = metadata.st_blocks * 512
         names = _directory_names(directory_fd, path)
         for name in names:
-            if name == ".git" and not allow_git_metadata:
-                raise Refusal(f"cache directory contains nested Git metadata: {path / name}")
+            if name == ".git":
+                _assert_nested_git_permitted(directory_fd, path, nested_git)
             try:
                 child = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             except FileNotFoundError:
@@ -15733,7 +15887,7 @@ def _allocated_open_directory(
                     path / name,
                     device,
                     mount_id,
-                    allow_git_metadata=allow_git_metadata,
+                    nested_git=nested_git,
                 )
             finally:
                 os.close(child_fd)
@@ -15751,7 +15905,9 @@ def _allocated_cache_bytes(config: Config, cache: CacheDirectory) -> int:
     try:
         device = os.fstat(cache_fd).st_dev
         mount_id = _fd_mount_id(cache_fd, str(path))
-        return _allocated_open_directory(cache_fd, path, device, mount_id)
+        return _allocated_open_directory(
+            cache_fd, path, device, mount_id, nested_git=cache.nested_git
+        )
     finally:
         os.close(cache_fd)
         os.close(parent_fd)
@@ -16640,11 +16796,14 @@ def _audit_cache_root_identity(
 def _audit_cache_root_key(
     cache: CacheDirectory, identity: Sequence[int]
 ) -> str:
-    value = {
+    value: dict[str, object] = {
         "path": str(cache.path),
         "checkout_root": str(cache.checkout_root),
         "identity": list(identity),
     }
+    if cache.nested_git != _NESTED_GIT_REFUSE:
+        # Progress made under one nested-Git policy never resumes under another.
+        value["nested_git"] = cache.nested_git
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -17525,9 +17684,9 @@ def _resume_audit_cache_root_unbounded(
                     if name in {".", ".."}:
                         continue
                     if name == ".git":
-                        raise Refusal(
-                            f"cache directory contains nested Git metadata: "
-                            f"{cache.path / relative / name}"
+                        _audit_cache_check_deadline(deadline)
+                        _assert_nested_git_permitted(
+                            fd, cache.path / relative, cache.nested_git
                         )
                     try:
                         _audit_cache_check_deadline(deadline)
@@ -17996,7 +18155,7 @@ def _clear_open_directory(
     device: int,
     mount_id: int,
     *,
-    allow_git_metadata: bool = False,
+    nested_git: str = _NESTED_GIT_REFUSE,
 ) -> int:
     metadata = os.fstat(directory_fd)
     if metadata.st_dev != device:
@@ -18006,8 +18165,8 @@ def _clear_open_directory(
     total = metadata.st_blocks * 512
     names = _directory_names(directory_fd, path)
     for name in names:
-        if name == ".git" and not allow_git_metadata:
-            raise Refusal(f"cache directory contains nested Git metadata: {path / name}")
+        if name == ".git":
+            _assert_nested_git_permitted(directory_fd, path, nested_git)
         try:
             child = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         except FileNotFoundError:
@@ -18031,7 +18190,7 @@ def _clear_open_directory(
                     path / name,
                     device,
                     mount_id,
-                    allow_git_metadata=allow_git_metadata,
+                    nested_git=nested_git,
                 )
             finally:
                 os.close(child_fd)
@@ -18080,10 +18239,14 @@ def _remove_cache_directory(
         return 0
     parent_fd, cache_fd, name = opened
     try:
+        # Completed validation removal permits only self-contained nested
+        # repositories here, exactly what audit predicts for validation rows.
         original, _mount_id, size = _clear_bound_cache_directory(
             cache_fd,
             path,
-            allow_git_metadata=allow_git_metadata,
+            nested_git=(
+                _NESTED_GIT_SELF_CONTAINED if allow_git_metadata else _NESTED_GIT_REFUSE
+            ),
             expected_identity=expected_identity,
             expected_stable_identity=expected_stable_identity,
         )
@@ -18118,7 +18281,7 @@ def _clear_bound_cache_directory(
     directory_fd: int,
     path: Path,
     *,
-    allow_git_metadata: bool,
+    nested_git: str,
     expected_identity: tuple[int, int, int] | None,
     expected_stable_identity: _PrivateCleanupIdentity | None,
 ) -> tuple[os.stat_result, int, int]:
@@ -18147,14 +18310,14 @@ def _clear_bound_cache_directory(
         path,
         original.st_dev,
         mount_id,
-        allow_git_metadata=allow_git_metadata,
+        nested_git=nested_git,
     )
     size = _clear_open_directory(
         directory_fd,
         path,
         original.st_dev,
         mount_id,
-        allow_git_metadata=allow_git_metadata,
+        nested_git=nested_git,
     )
     return original, mount_id, size
 
@@ -18319,6 +18482,24 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
     return 0
 
 
+def _audit_record_cache_directories(
+    config: Config, record: ActiveRecord, *, vcs: _GitVcs
+) -> tuple[CacheDirectory, ...]:
+    """Plan a record's caches under the nested-Git policy its removal applies.
+
+    Audit judges a validation row by completed validation removal, which is
+    what remove-validate-batch performs; every other record keeps the default.
+    """
+
+    caches = _cache_directories(config, record.checkouts, vcs=vcs)
+    if record.slot_type != "validate":
+        return caches
+    return tuple(
+        dataclasses.replace(cache, nested_git=_NESTED_GIT_SELF_CONTAINED)
+        for cache in caches
+    )
+
+
 def _audit_record(
     config: Config,
     record: ActiveRecord,
@@ -18350,8 +18531,8 @@ def _audit_record(
         try:
             cache_bytes = sum(
                 _allocated_cache_bytes(config, cache)
-                for cache in _cache_directories(
-                    config, record.checkouts, vcs=selected_vcs
+                for cache in _audit_record_cache_directories(
+                    config, record, vcs=selected_vcs
                 )
             )
         except Refusal as exc:
@@ -18657,8 +18838,8 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                 uninspected_cache_subjects.add(subject)
                 continue
             try:
-                cache_planned[subject] = _cache_directories(
-                    config, record.checkouts, vcs=audit_vcs
+                cache_planned[subject] = _audit_record_cache_directories(
+                    config, record, vcs=audit_vcs
                 )
             except Refusal as exc:
                 cache_planned[subject] = ()
@@ -28821,7 +29002,7 @@ def _remove_excluded_validation_tree(
     _original, _mount_id, size = _clear_bound_cache_directory(
         exclusion.payload_fd,
         exclusion.payload,
-        allow_git_metadata=True,
+        nested_git=_NESTED_GIT_ANY,
         expected_identity=authorization.identity,
         expected_stable_identity=authorization.stable_identity,
     )
