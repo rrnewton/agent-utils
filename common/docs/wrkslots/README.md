@@ -102,11 +102,11 @@ This opt-in fallback writes a separate self-contained Git bundle and schema-1 re
 affected top-level or initialized nested repository. Wrkslots verifies the SHA-256, exact archive
 ref, complete restoration into an empty bare repository, and full object connectivity before the
 ordinary path fence may remove anything. A refused salvage push of any kind, or an initial fetch
-whose transport failed before any answer from the remote and failed the same way when retried
-without redirects, is recorded as `archived-local`, never as remote `salvaged`. A fetch failure
-that carries any message from the remote, an HTTP error, a proxy authentication demand, or an
-authentication, host-key, or certificate problem still refuses, and omission of the option leaves
-the slot untouched. Over SSH, Git passes the server's own error text through without marking it, so
+that Git reports as a transport failure and that fails the same way when retried without
+redirects, is recorded as `archived-local`, never as remote `salvaged`. A fetch failure that
+carries a relayed `remote:` line, a `remote error:` packet, an HTTP error, a proxy authentication
+demand, a missing repository, or an authentication, host-key, or certificate problem still
+refuses, and omission of the option leaves the slot untouched. Over SSH, Git passes the server's own error text through without marking it, so
 a server message that reports a connection failure and names no refusal wrkslots recognises can
 still be read as a transport failure; the result is verified local custody, never publication.
 

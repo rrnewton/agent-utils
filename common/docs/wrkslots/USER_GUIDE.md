@@ -287,7 +287,7 @@ tries the recorded remote first. Only after a salvage push refuses, for any reas
 initial fetch fails in the transport, does it write one self-contained Git bundle per affected
 repository under the supplied root. A fetch failure counts as a transport failure only when Git's
 combined output reports a proxy `CONNECT` refusal, an unresolved host, or a refused, timed-out, or
-unreachable connection, and reports nothing that could have come from the remote. Any line Git
+unreachable connection, and reports none of the refusals listed next. Any line Git
 relays from the server (`remote:`), a `remote error:` packet, an HTTP error answer, a proxy `407`
 authentication demand, failed authentication, a host key or certificate problem, or a missing
 repository still refuses, even when outage text appears beside it. Because a redirect can make Git
