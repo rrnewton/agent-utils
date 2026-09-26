@@ -16,6 +16,10 @@ Examples::
 Pytest always runs from ``py/`` with that workspace's configuration.  Arguments after ``--`` are
 passed to pytest before the manifest's explicit file list.  A shard uses
 ``scripts/run_pytest_shard.py`` so parameterized cases from one test function remain together.
+
+This module is also loaded into that pytest as a plugin, which prints each failing test's node ID
+the moment it fails.  Pytest's own list of failures comes only in its final summary, so a suite
+killed at its timeout used to leave nothing but an ``F`` in a row of dots.
 """
 
 from __future__ import annotations
@@ -23,16 +27,47 @@ from __future__ import annotations
 import argparse
 import json
 import shlex
+import os
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PY_ROOT = REPO_ROOT / "py"
+SCRIPTS_ROOT = Path(__file__).resolve().parent
+#: Loaded with ``-p``; the shard runner already has this directory on ``sys.path``.
+FAILURE_IDENTITY_PLUGIN = Path(__file__).stem
+#: ``python -m pytest``, plus this directory at the END of ``sys.path`` so the plugin can be
+#: imported without shadowing anything the tests import, and without changing the environment
+#: the tests inherit.  ``-c`` would leave ``''`` first on ``sys.path``, which follows a test's
+#: ``chdir``; ``-m`` puts the absolute starting directory there, and so does this.
+_PYTEST_WITH_SCRIPTS = (
+    "import os, sys; sys.path[0] = os.getcwd(); sys.path.append(sys.argv.pop(1)); "
+    "import pytest; raise SystemExit(pytest.main(sys.argv[1:]))"
+)
+FAILURE_IDENTITY_PREFIX = "component-tests: FAILED"
+
+
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    """Name a failing test now, not in a summary a timeout may never let pytest print."""
+
+    if report.failed:
+        # The newline ends a row of progress dots when stderr shares a log with stdout.
+        print(
+            f"\n{FAILURE_IDENTITY_PREFIX} {report.nodeid} ({report.when})",
+            file=sys.stderr,
+            flush=True,
+        )
 DEFAULT_MANIFEST = REPO_ROOT / "validation" / "components.json"
 EXPECTED_COMPONENTS = frozenset(
     {
@@ -447,22 +482,88 @@ def _parse_shard(value: str) -> str:
     return f"{index}/{count}"
 
 
+def _pytest_command(pytest_args: Sequence[str], shard: str | None) -> list[str]:
+    base_args = ["-p", FAILURE_IDENTITY_PLUGIN, *pytest_args]
+    if shard is None:
+        return [sys.executable, "-c", _PYTEST_WITH_SCRIPTS, str(SCRIPTS_ROOT), *base_args]
+    return [
+        sys.executable,
+        str(SCRIPTS_ROOT / "run_pytest_shard.py"),
+        "--shard",
+        shard,
+        "--",
+        *base_args,
+    ]
+
+
+def _failure_identity_before_kill(*, plugin: bool) -> str:
+    """Run a suite that fails and then hangs; kill it; return everything it printed.
+
+    The hanging test announces itself through a file, and pytest reports one test before it
+    sets up the next, so by the time the file exists the failure has been reported -- the
+    kill needs no timing guess.
+    """
+
+    with tempfile.TemporaryDirectory(prefix="agent-utils-failure-identity-") as raw:
+        root = Path(raw)
+        started = root / "hang-started"
+        (root / "test_identity.py").write_text(
+            "import pathlib, time\n"
+            "def test_fails_first():\n"
+            "    assert False\n"
+            "def test_then_hangs():\n"
+            f"    pathlib.Path({str(started)!r}).touch()\n"
+            "    time.sleep(120)\n",
+            encoding="utf-8",
+        )
+        (root / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+        command = _pytest_command(["-q", "-p", "no:cacheprovider", "test_identity.py"], None)
+        if not plugin:
+            command.remove("-p")
+            command.remove(FAILURE_IDENTITY_PLUGIN)
+        output = root / "output"
+        with output.open("wb") as sink:
+            process = subprocess.Popen(
+                command, cwd=root, stdout=sink, stderr=subprocess.STDOUT, start_new_session=True
+            )
+            try:
+                deadline = time.monotonic() + 45
+                while not started.exists():
+                    if process.poll() is not None:
+                        raise AssertionError(
+                            "failure-identity fixture exited before hanging: "
+                            + output.read_text(encoding="utf-8", errors="replace")
+                        )
+                    if time.monotonic() > deadline:
+                        raise AssertionError("failure-identity fixture never reached its hang")
+                    time.sleep(0.05)
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+        return output.read_text(encoding="utf-8", errors="replace")
+
+
+def _exercise_failure_identity() -> None:
+    """A failing node ID must survive the suite being killed before its summary."""
+
+    expected = f"{FAILURE_IDENTITY_PREFIX} test_identity.py::test_fails_first (call)"
+    reported = _failure_identity_before_kill(plugin=True)
+    if expected not in reported:
+        raise AssertionError(f"failing node ID was not printed before the kill: {reported!r}")
+    # The control: pytest alone names nothing before its summary, so the check above can fail.
+    unreported = _failure_identity_before_kill(plugin=False)
+    if "test_fails_first" in unreported:
+        raise AssertionError(f"control without the plugin named the failure: {unreported!r}")
+
+
 def _run_component(
     name: str, component: Component, shard: str | None, pytest_args: Sequence[str]
 ) -> int:
     test_files = [str((REPO_ROOT / path).relative_to(PY_ROOT)) for path in component.test_files]
-    base_args = ["-c", "pyproject.toml", "--rootdir=.", *pytest_args, *test_files]
-    if shard is None:
-        command = [sys.executable, "-m", "pytest", *base_args]
-    else:
-        command = [
-            sys.executable,
-            str(REPO_ROOT / "scripts" / "run_pytest_shard.py"),
-            "--shard",
-            shard,
-            "--",
-            *base_args,
-        ]
+    command = _pytest_command(
+        ["-c", "pyproject.toml", "--rootdir=.", *pytest_args, *test_files], shard
+    )
 
     print(
         f"component-tests: {name}: files={len(test_files)}, shard={shard or 'all'}",
@@ -506,6 +607,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error("--self-test does not accept --shard or pytest arguments")
         discovered = _discover_test_files()
         _exercise_inventory_guards(manifest, discovered)
+        _exercise_failure_identity()
         mapped = sum(len(component.test_files) for component in manifest.components.values())
         print(
             "run_component_tests --self-test: PASSED "
