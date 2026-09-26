@@ -26564,6 +26564,161 @@ def test_clean_caches_reports_and_reclaims_across_machine_shards(
     assert not (checkout(project, "slot02") / "target").exists()
 
 
+@pytest.mark.parametrize("delete", (False, True))
+def test_clean_caches_replays_each_machine_log_once_and_reports_outside_locks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    delete: bool,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path, cache_globs=("target",))
+    for slot, machine in (
+        ("slot01", "testhost"),
+        ("slot02", "testhost"),
+        ("slot03", "otherhost"),
+    ):
+        assert create(
+            project,
+            slot=slot,
+            agent=f"codex-{slot}",
+            branch=f"codex/{slot}",
+            machine=machine,
+        ).returncode == 0
+        artifact = checkout(project, slot) / "target" / "artifact"
+        artifact.parent.mkdir()
+        artifact.write_bytes(slot.encode())
+    held = command(project, "hold", "slot02", "--reason", "retain")
+    assert held.returncode == 0, held.stderr
+    config = wrkslots._load_config(str(project), None)
+
+    def reject_per_slot_replay(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("clean-caches replayed the event log for one slot")
+
+    monkeypatch.setattr(wrkslots, "_load_hold", reject_per_slot_replay)
+    replays: list[tuple[str, frozenset[str]]] = []
+    replay = wrkslots._holds_from_events
+
+    def count_replay(
+        events: Sequence[Mapping[str, object]],
+        machine: str,
+        slots: AbstractSet[str],
+    ) -> dict[str, dict[str, object]]:
+        # Holds decide HELD rows, so they are resolved under the same locks
+        # that read control-plane state, in the report as well.
+        with pytest.raises(wrkslots.Refusal):
+            with wrkslots._mutation_locks(config, 0):
+                pass
+        replays.append((machine, frozenset(slots)))
+        return replay(events, machine, slots)
+
+    monkeypatch.setattr(wrkslots, "_holds_from_events", count_replay)
+    lock_free_during_measurement: list[bool] = []
+    measured = wrkslots._allocated_cache_bytes
+
+    def probe_locks(config: wrkslots.Config, cache: wrkslots.CacheDirectory) -> int:
+        try:
+            with wrkslots._mutation_locks(config, 0):
+                lock_free_during_measurement.append(True)
+        except wrkslots.Refusal:
+            lock_free_during_measurement.append(False)
+        return measured(config, cache)
+
+    monkeypatch.setattr(wrkslots, "_allocated_cache_bytes", probe_locks)
+
+    result = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "clean-caches",
+            *(("--only", "slot01") if delete else ()),
+            "--format",
+            "json",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert result == 0, captured.err
+    rows = {row["slot"]: row for row in json.loads(captured.out)["slots"]}
+    if delete:
+        assert set(rows) == {"slot01"}
+        assert rows["slot01"]["action"] == "REMOVED"
+        assert replays == [("testhost", frozenset({"slot01"}))]
+        # Deletion measures and removes under the same locks that planned it.
+        assert lock_free_during_measurement == [False]
+        assert not (checkout(project, "slot01") / "target").exists()
+    else:
+        assert {slot: row["action"] for slot, row in rows.items()} == {
+            "slot01": "REPORT",
+            "slot02": "HELD",
+            "slot03": "REPORT",
+        }
+        assert rows["slot02"]["hold_reason"] == "retain"
+        assert rows["slot02"]["paths"] == []
+        assert sorted(replays) == [
+            ("otherhost", frozenset({"slot03"})),
+            ("testhost", frozenset({"slot01", "slot02"})),
+        ]
+        assert lock_free_during_measurement == [True, True]
+        assert (checkout(project, "slot01") / "target").is_dir()
+    assert (checkout(project, "slot02") / "target").is_dir()
+    assert (checkout(project, "slot03") / "target").is_dir()
+    assert wrkslots._load_config(str(project), None) == config
+
+
+def test_clean_caches_report_blocks_a_slot_that_vanishes_after_the_locks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path, cache_globs=("target",))
+    assert create(project).returncode == 0
+    assert create(
+        project, slot="slot02", agent="codex-2", branch="codex/two"
+    ).returncode == 0
+    enumerate_directories = wrkslots._cache_slot_directories
+
+    def vanish(
+        config: wrkslots.Config,
+        cache_slot: wrkslots.CacheSlot,
+        *,
+        vcs: wrkslots._GitVcs | None = None,
+    ) -> tuple[wrkslots.CacheDirectory, ...]:
+        if cache_slot.slot == "slot02":
+            raise FileNotFoundError(2, "No such file or directory", "slot02")
+        return enumerate_directories(config, cache_slot, vcs=vcs)
+
+    monkeypatch.setattr(wrkslots, "_cache_slot_directories", vanish)
+
+    result = wrkslots.main(
+        ["--project-root", str(project), "clean-caches", "--format", "json"]
+    )
+    captured = capsys.readouterr()
+
+    assert result == 0, captured.err
+    rows = {row["slot"]: row for row in json.loads(captured.out)["slots"]}
+    assert rows["slot01"]["action"] == "REPORT"
+    assert rows["slot02"]["action"] == "BLOCKED"
+    assert "No such file or directory" in rows["slot02"]["cache_error"]
+    assert rows["slot02"]["paths"] == []
+
+    selected = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "clean-caches",
+            "--only",
+            "slot02",
+            "--format",
+            "json",
+        ]
+    )
+    refused = capsys.readouterr()
+
+    assert selected == 3
+    assert "cannot clean selected slot slot02" in refused.err
+    assert "No such file or directory" in refused.err
+
+
 def test_clean_caches_report_keeps_unregistered_failures_visible_as_blocked(
     tmp_path: Path,
 ) -> None:
