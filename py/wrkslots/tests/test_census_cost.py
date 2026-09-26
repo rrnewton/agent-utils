@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import shutil
 import subprocess
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -203,6 +204,83 @@ def test_target_match_cache_agrees_with_the_uncached_walk() -> None:
         assert cli._matching_absent_validate_target(probe, targets, cache) == uncached
 
 
+_PATH_EDGE_CASES = (
+    "/", "//", "///", "////", "/.", "/./", "/..", "//.", "/a", "/a/", "/a//b", "/a/./b",
+    "/a/.", "/a/..", "/a/../b", "//a", "//a/b", "///a", "/a/b/", "/.a", "/a./b", "/...",
+    "", ".", "a", "a/b", "./a", "a/", "/a b", "/a\tb", "/a\nb", "/\udcff",
+)
+
+
+def _random_paths(count: int) -> list[str]:
+    generator = random.Random(20260926)
+    alphabet = ["/", "/", "/", ".", "..", "a", "b", "slot", " ", "x/"]
+    return [
+        "".join(generator.choice(alphabet) for _ in range(generator.randint(0, 9)))
+        for _ in range(count)
+    ]
+
+
+def test_normalized_path_string_is_exactly_the_path_normal_form() -> None:
+    """The fast path must never return a string that `PurePosixPath` would change."""
+
+    for raw in (*_PATH_EDGE_CASES, *_random_paths(20_000)):
+        assert cli._normalized_posix_path(raw) == str(PurePosixPath(raw)), repr(raw)
+
+
+def test_target_name_match_agrees_with_the_path_ancestor_walk() -> None:
+    """The string matcher is only a cheaper route to the Path matcher's answer.
+
+    Covers nested targets (the deepest must win), sibling prefixes that are not
+    ancestors, the root itself as a target, and the POSIX-distinct ``//`` root,
+    which must not fall under ``/``.
+    """
+
+    target_sets = (
+        {Path("/slots/one"): "one", Path("/slots/one/inner"): "inner", Path("/slots/two"): "two"},
+        {Path("/"): "root", Path("/slots"): "slots"},
+        {Path("//"): "double", Path("//slots"): "double-slots"},
+        {Path("/a b"): "space", Path("/a"): "a"},
+    )
+    probes = sorted(
+        {
+            str(PurePosixPath(raw))
+            for raw in (
+                *_PATH_EDGE_CASES,
+                *_random_paths(5_000),
+                "/slots", "/slots/one", "/slots/one/", "/slots/one/x", "/slots/oneself",
+                "/slots/one/inner", "/slots/one/inner/deep", "/slots/one/innerx",
+                "/slots/two/x", "/slots/two-x", "//slots/one", "//slots", "//slots/x",
+                "/a b/c", "/a bc", "/ab",
+            )
+            if raw.startswith("/")
+        }
+    )
+    for targets in target_sets:
+        names = cli._target_names(targets)
+        cache: dict[str, tuple[Path, str] | None] = {}
+        for probe in probes:
+            expected = cli._matching_absent_validate_target(Path(probe), targets)
+            assert cli._matching_absent_validate_target_name(probe, names) == expected, (
+                targets, probe,
+            )
+            assert cli._matching_absent_validate_target_name(probe, names, cache) == expected
+            assert cli._matching_absent_validate_target_name(probe, names, cache) == expected
+
+
+def test_parsed_mount_references_are_the_path_normal_form() -> None:
+    table = (
+        "24 30 0:22 / /proc rw,nosuid - proc proc rw\n"
+        "26 30 259:2 /slots//one/ /mnt/./x rw - btrfs /dev/one rw\n"
+        "27 30 259:2 /a\\040b/ /mnt/y\\040(deleted) rw - tmpfs none rw\n"
+    )
+    references = cli._parse_mountinfo_paths(table, "probe")
+    assert references == (
+        ("/", "/"), ("/proc", "/proc"),
+        ("/slots/one", "/slots//one/"), ("/mnt/x", "/mnt/./x"), ("/dev/one", "/dev/one"),
+        ("/a b", "/a\\040b/"), ("/mnt/y", "/mnt/y\\040(deleted)"),
+    )
+
+
 def test_target_match_cache_remembers_a_negative_answer() -> None:
     """A stored `None` is a real answer.
 
@@ -240,7 +318,7 @@ def test_mountinfo_parse_cache_agrees_with_the_uncached_parse() -> None:
         "25 30 0:5 / /dev rw,nosuid - devtmpfs devtmpfs rw\n"
         "26 30 259:2 /slots/validate-fresh-one /mnt/x rw - btrfs /dev/one rw\n"
     )
-    cache: dict[str, tuple[tuple[Path, str], ...]] = {}
+    cache: dict[str, tuple[tuple[str, str], ...]] = {}
 
     uncached = cli._parse_mountinfo_paths(table, "probe")
     cached = cli._parse_mountinfo_paths(table, "probe", cache)
@@ -259,7 +337,7 @@ def test_mountinfo_parse_cache_reuses_one_parse_across_identical_tables() -> Non
 
     table = "24 30 0:22 / /proc rw,nosuid - proc proc rw\n"
     other = "24 30 0:22 / /sys rw,nosuid - sysfs sysfs rw\n"
-    cache: dict[str, tuple[tuple[Path, str], ...]] = {}
+    cache: dict[str, tuple[tuple[str, str], ...]] = {}
 
     for pid in range(50):
         cli._parse_mountinfo_paths(table, f"mount evidence for PID {pid}", cache)
@@ -278,7 +356,7 @@ def test_mountinfo_parse_cache_never_stores_a_refusal(
     """
 
     malformed = "this line has no field separator\n"
-    cache: dict[str, tuple[tuple[Path, str], ...]] = {}
+    cache: dict[str, tuple[tuple[str, str], ...]] = {}
 
     with pytest.raises(cli.Refusal, match="PID 11"):
         cli._parse_mountinfo_paths(malformed, "mount evidence for PID 11", cache)
@@ -314,8 +392,8 @@ def _counting_parses(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     def counting(
         text: str,
         label: str,
-        cache: dict[str, tuple[tuple[Path, str], ...]] | None = None,
-    ) -> tuple[tuple[Path, str], ...]:
+        cache: dict[str, tuple[tuple[str, str], ...]] | None = None,
+    ) -> tuple[tuple[str, str], ...]:
         parsed.append(label)
         return original(text, label, cache)
 

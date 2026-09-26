@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import configparser
 import contextlib
 import ctypes
@@ -34,7 +35,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence, Set as AbstractSet
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from wrkslots import __version__
 
@@ -10167,12 +10168,38 @@ def _process_uses_slot(pid_dir: Path, slot_path: Path) -> list[str]:
     return uses
 
 
+def _normalized_posix_path(raw: str) -> str:
+    """Return exactly ``str(PurePosixPath(raw))``, without building the object.
+
+    The mount census normalizes every path in every distinct mount table on the
+    box, and nearly all of them are already in normal form.  Those are returned
+    as they are; anything that could change -- a repeated or trailing slash, a
+    ``.`` component, a relative path -- goes through ``PurePosixPath`` itself, so
+    the rules stay the standard library's rather than a copy of them.
+    """
+
+    if raw == "/" or (
+        raw.startswith("/")
+        and "//" not in raw
+        and "/./" not in raw
+        and not raw.endswith(("/", "/."))
+    ):
+        return raw
+    return str(PurePosixPath(raw))
+
+
 def _parse_mountinfo_paths(
     text: str,
     label: str,
-    cache: dict[str, tuple[tuple[Path, str], ...]] | None = None,
-) -> tuple[tuple[Path, str], ...]:
+    cache: dict[str, tuple[tuple[str, str], ...]] | None = None,
+) -> tuple[tuple[str, str], ...]:
     """Parse one process's mount table into the absolute paths it references.
+
+    Each reference is ``(normalized path, raw field)``, the path being exactly
+    what ``str(Path(field))`` would give.  It stays a string: measured
+    2026-09-26 over this host's 188 distinct tables (51,848 lines), building and
+    matching `Path` objects cost 0.78 s against 0.23 s for the same answers from
+    strings, inside the 22-second removal census.
 
     ``cache`` is keyed on the mount table TEXT, which is what the result depends
     on; ``label`` only names the PID in a refusal.  A census reads one table per
@@ -10190,7 +10217,7 @@ def _parse_mountinfo_paths(
         cached = cache.get(text)
         if cached is not None:
             return cached
-    references: list[tuple[Path, str]] = []
+    references: list[tuple[str, str]] = []
     for line in text.splitlines():
         left, separator, right = line.partition(" - ")
         if not separator:
@@ -10200,14 +10227,14 @@ def _parse_mountinfo_paths(
         if len(left_fields) < 5 or len(right_fields) < 2:
             raise Refusal(f"{label} is incomplete")
         for raw in (left_fields[3], left_fields[4], right_fields[1]):
-            candidate = Path(
+            candidate = _normalized_posix_path(
                 raw.replace("\\040", " ")
                 .replace("\\011", "\t")
                 .replace("\\012", "\n")
                 .replace("\\134", "\\")
                 .removesuffix(" (deleted)")
             )
-            if candidate.is_absolute():
+            if candidate.startswith("/"):
                 references.append((candidate, raw))
     parsed = tuple(references)
     if cache is not None:
@@ -10254,10 +10281,11 @@ def _process_mounts_slot(
         if cached is not None:
             return list(cached)
     uses: tuple[str, ...] = ()
+    slot_names = _target_names({slot_path: str(slot_path)})
     for candidate, _raw in _parse_mountinfo_paths(
         mountinfo, f"process mount evidence for PID {pid_dir.name}"
     ):
-        if _path_is_within(candidate, slot_path):
+        if _matching_absent_validate_target_name(candidate, slot_names) is not None:
             uses = (f"mount={candidate}",)
             break
     if results is not None:
@@ -18457,7 +18485,8 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         if records:
             try:
                 process_census = _capture_process_path_census(
-                    [_slot_directory(config, record.slot, record.slot_type) for record in records]
+                    [_slot_directory(config, record.slot, record.slot_type) for record in records],
+                    budget=_absent_process_census_budget(),
                 )
             except Refusal as exc:
                 process_census_error = f"process/path census failed: {exc}"
@@ -27009,7 +27038,9 @@ def _validation_checkout_facts(
     if batch_cleanup is None:
         if standalone:
             census = _capture_process_path_census(
-                (checkout,), include_owner_cgroups=False
+                (checkout,),
+                budget=_absent_process_census_budget(),
+                include_owner_cgroups=False,
             )
             _assert_slot_unused(
                 checkout,
@@ -30586,6 +30617,62 @@ def _matching_absent_validate_target(
     return matched
 
 
+_TargetNames = tuple[tuple[str, str, Path, str], ...]
+
+
+def _target_names(targets: Mapping[Path, str]) -> _TargetNames:
+    """Prepare ``targets`` for `_matching_absent_validate_target_name`.
+
+    Each entry is ``(name, descendant prefix, target, slot)``, deepest first, so
+    that the first hit is the nearest enclosing target -- the one the ancestor
+    walk in `_matching_absent_validate_target` reaches first.
+    """
+
+    names = []
+    for target, slot in targets.items():
+        name = str(target)
+        prefix = name if name.endswith("/") else f"{name}/"
+        names.append((name, prefix, target, slot))
+    return tuple(sorted(names, key=lambda entry: len(entry[0]), reverse=True))
+
+
+def _posix_root(normalized: str) -> str:
+    if normalized.startswith("//"):
+        return "//"
+    return "/" if normalized.startswith("/") else ""
+
+
+def _matching_absent_validate_target_name(
+    observed: str,
+    targets: _TargetNames,
+    cache: dict[str, tuple[Path, str] | None] | None = None,
+) -> tuple[Path, str] | None:
+    """`_matching_absent_validate_target` for an already-normalized path string.
+
+    ``observed`` must be ``str(Path(x))`` for some ``x``, which is what
+    `_parse_mountinfo_paths` produces.  Then ``Path(observed)`` or one of its
+    parents equals a target exactly when ``observed`` is that target's name, or
+    extends its name by a path separator under the same root.  The root check is
+    what keeps ``//x``, which POSIX leaves distinct, from lying under ``/``.
+    """
+
+    if cache is not None:
+        try:
+            return cache[observed]
+        except KeyError:
+            pass
+    matched: tuple[Path, str] | None = None
+    for name, prefix, target, slot in targets:
+        if observed == name or (
+            observed.startswith(prefix) and _posix_root(observed) == _posix_root(name)
+        ):
+            matched = (target, slot)
+            break
+    if cache is not None:
+        cache[observed] = matched
+    return matched
+
+
 def _cgroup_matches(recorded: str, observed: str) -> bool:
     prefix = recorded.rstrip("/") or "/"
     descendant_prefix = prefix if prefix == "/" else f"{prefix}/"
@@ -30677,6 +30764,66 @@ def _process_generation_is_terminal(pid_dir: Path, generation: _ProcessStat) -> 
     return True
 
 
+def _zombie_leader_thread_dirs(pid_dir: Path) -> tuple[Path, ...]:
+    """Return the top-level proc entries of the other threads of a zombie leader.
+
+    A thread-group leader that calls pthread_exit becomes a zombie while its
+    other threads keep running. The leader's own cwd, root, exe, fd, maps and
+    mountinfo then read as absent or EINVAL, although the surviving threads
+    still share and use them; each survivor exposes all of them at /proc/TID,
+    which proc readdir never lists (measured 2026-09-26, Linux 7.1). A caller
+    that treats the zombie leader as terminal must observe these instead. Only
+    a leader can have them: /proc/TID/task of an ordinary thread names its whole
+    group, so a non-leader returns nothing rather than its leader and siblings.
+
+    This covers threads that outlive their leader, not threads of a LIVE leader
+    that called unshare(CLONE_FILES or CLONE_FS): their private descriptor table
+    or cwd is visible only under /proc/PID/task/TID, which no census here walks.
+    """
+
+    try:
+        status = _read_process_status(pid_dir)
+    except FileNotFoundError:
+        return ()
+    except (OSError, UnicodeError) as exc:
+        raise Refusal(
+            f"thread group is indeterminate because {pid_dir / 'status'} is unreadable: {exc}"
+        ) from exc
+    tgids = [line.split() for line in status.splitlines() if line.startswith("Tgid:")]
+    if len(tgids) != 1 or len(tgids[0]) != 2 or not tgids[0][1].isdecimal():
+        raise Refusal(f"thread group is invalid for PID {pid_dir.name}")
+    if tgids[0][1] != pid_dir.name:
+        return ()
+    try:
+        names = [entry.name for entry in os.scandir(pid_dir / "task")]
+    except FileNotFoundError:
+        return ()
+    except OSError as exc:
+        if exc.errno in (errno.ESRCH, errno.ENOENT):
+            return ()
+        raise Refusal(
+            f"thread group is indeterminate because {pid_dir / 'task'} is unreadable: {exc}"
+        ) from exc
+    if not all(name.isdecimal() for name in names):
+        raise Refusal(f"thread group listing is invalid for PID {pid_dir.name}")
+    return tuple(
+        pid_dir.parent / name
+        for name in sorted(names, key=int)
+        if name != pid_dir.name
+    )
+
+
+def _zombie_leader_has_live_threads(pid_dir: Path) -> bool:
+    """Whether a zombie leader's threads still run, and so still hold its files."""
+
+    for thread_dir in _zombie_leader_thread_dirs(pid_dir):
+        if _read_process_stat(thread_dir) is None:
+            continue
+        if not _process_is_zombie(thread_dir):
+            return True
+    return False
+
+
 def _absent_validate_process_snapshot(
     proc_root: Path = Path("/proc"),
     *,
@@ -30690,11 +30837,15 @@ def _absent_validate_process_snapshot(
     except OSError as exc:
         raise Refusal(f"cannot enumerate live processes: {exc}") from exc
     observations: list[_AbsentProcessObservation] = []
-    for pid_dir in pid_dirs:
+    # Live threads of a zombie leader are observed in their leader's place.
+    pending = collections.deque(pid_dirs)
+    while pending:
+        pid_dir = pending.popleft()
         generation = _read_process_stat(pid_dir)
         if generation is None:
             continue
         if _process_generation_is_terminal(pid_dir, generation):
+            pending.extendleft(reversed(_zombie_leader_thread_dirs(pid_dir)))
             continue
         try:
             if _process_uid(pid_dir) is None:
@@ -30707,6 +30858,7 @@ def _absent_validate_process_snapshot(
             raise
         if mount_namespace is None:
             if _process_is_zombie(pid_dir):
+                pending.extendleft(reversed(_zombie_leader_thread_dirs(pid_dir)))
                 continue
             if _process_start_ticks(pid_dir) is None:
                 continue
@@ -30733,8 +30885,8 @@ def _absent_validate_process_snapshot(
 def _mountinfo_path_references(
     pid: int,
     budget: _ReadOnlyCommandBudget,
-    cache: dict[str, tuple[tuple[Path, str], ...]] | None = None,
-) -> tuple[tuple[Path, str], ...]:
+    cache: dict[str, tuple[tuple[str, str], ...]] | None = None,
+) -> tuple[tuple[str, str], ...]:
     path = Path("/proc") / str(pid) / "mountinfo"
     try:
         budget.remaining_seconds()
@@ -30773,19 +30925,21 @@ def _absent_validate_mount_matches(
         stderr_limit=64 * 1024,
         input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
     )
-    namespaces: dict[str, list[_AbsentProcessObservation]] = {}
+    views = _mount_view_keys(processes, selected_budget)
+    groups: dict[tuple[str, ...], list[_AbsentProcessObservation]] = {}
     for process in processes:
-        namespaces.setdefault(process.mount_namespace, []).append(process)
+        view = views.get(process.pid)
+        key = ("view", *view) if view is not None else ("pid", str(process.pid))
+        groups.setdefault(key, []).append(process)
     matches: list[tuple[int, str, str, str]] = []
-    # One memo for this census. Nearly every process on a fleet host has its own
-    # mount namespace -- 3,363 namespaces across 3,638 processes, measured
-    # 2026-09-17 -- and they mount the same handful of paths, so the references
-    # repeat about 311 times each.
-    match_cache: dict[Path, tuple[Path, str] | None] = {}
-    mountinfo_cache: dict[str, tuple[tuple[Path, str], ...]] = {}
-    for representatives in namespaces.values():
+    # One memo for this census. The mount tables of distinct views still share
+    # the same handful of paths, so their references repeat many times over.
+    target_names = _target_names(targets)
+    match_cache: dict[str, tuple[Path, str] | None] = {}
+    mountinfo_cache: dict[str, tuple[tuple[str, str], ...]] = {}
+    for representatives in groups.values():
         selected: _AbsentProcessObservation | None = None
-        references: tuple[tuple[Path, str], ...] = ()
+        references: tuple[tuple[str, str], ...] = ()
         failures: list[tuple[_AbsentProcessObservation, Refusal]] = []
         for process in representatives:
             try:
@@ -30806,18 +30960,137 @@ def _absent_validate_mount_matches(
                     raise failure
             continue
         for observed, detail in references:
-            matched = _matching_absent_validate_target(observed, targets, match_cache)
+            matched = _matching_absent_validate_target_name(
+                observed, target_names, match_cache
+            )
             if matched is not None:
                 _target, slot = matched
                 matches.append((selected.pid, slot, "mount", detail))
+    shared = [
+        process
+        for key, members in groups.items()
+        if key[0] == "view" and len(members) > 1
+        for process in members
+    ]
+    after = _mount_view_keys(shared, selected_budget)
+    for process in shared:
+        if after.get(process.pid) != views[process.pid] and (
+            _process_observation_is_active(process)
+        ):
+            raise _ProcessEvidenceChanged(
+                f"PID {process.pid} mount view changed during mount census"
+            )
     return tuple(matches)
+
+
+_MOUNT_NAMESPACE_LINK_RE = re.compile(r"mnt:\[[0-9]+\]")
+
+
+def _mount_view_keys(
+    processes: Sequence[_AbsentProcessObservation],
+    budget: _ReadOnlyCommandBudget,
+) -> dict[int, tuple[str, str]]:
+    """Return the mount namespace and root of each process whose view is readable.
+
+    Processes with one view read one mount table: /proc/PID/mountinfo lists
+    that namespace's mounts as seen from that root, so both are the key. A
+    process whose view cannot be read now is absent and remains its own group,
+    which reads its own table exactly as before. This process cannot read the
+    namespace link of another user's process, so without a privileged listing
+    every such process was its own group: 4,446 processes on 2026-09-26 showed
+    only 193 distinct views and 193 distinct tables of about 60 KB each, and
+    reading all 4,446 took most of the removal census bound. The mount census
+    reads these keys again after the tables and refuses a view that moved.
+    That second listing cannot see a process that left a view and returned to
+    it between the two listings; the single-table read it replaced had the same
+    blind spot for a process that switched views and back around its own read.
+    """
+
+    views: dict[int, tuple[str, str]] = {}
+    protected: dict[int, _AbsentProcessObservation] = {}
+    for process in processes:
+        budget.remaining_seconds()
+        if process.mount_namespace.startswith("pid:"):
+            protected[process.pid] = process
+            continue
+        base = Path("/proc") / str(process.pid)
+        try:
+            namespace = os.readlink(base / "ns" / "mnt")
+            root = os.readlink(base / "root")
+        except OSError:
+            continue
+        if _MOUNT_NAMESPACE_LINK_RE.fullmatch(namespace) and root.startswith("/"):
+            views[process.pid] = (namespace, root)
+    if protected:
+        views.update(_privileged_mount_view_keys(protected, budget))
+    return views
+
+
+def _privileged_mount_view_keys(
+    observed: Mapping[int, _AbsentProcessObservation],
+    budget: _ReadOnlyCommandBudget,
+) -> dict[int, tuple[str, str]]:
+    """List protected mount namespace and root links with one unfollowed find."""
+
+    roots = [
+        str(Path("/proc") / str(pid) / name)
+        for pid in sorted(observed)
+        for name in ("ns/mnt", "root")
+    ]
+    suffix = ("-maxdepth", "0", "-printf", "%p\\0%l\\0")
+    links: dict[int, dict[str, str]] = {}
+    vanished: set[int] = set()
+    for arguments in _argument_batches(("-P",), roots, suffix):
+        batch_pids = {
+            _pid_from_proc_evidence(Path(argument))
+            for argument in arguments[1 : len(arguments) - len(suffix)]
+        }
+        returncode, stdout, stderr = _run_root_owned_command(
+            Path("/usr/bin/find"), arguments, budget=budget
+        )
+        # Refuses any diagnostic other than a vanished path of this batch. A
+        # vanished PID, active or not, is left out of the views below and so
+        # keeps its own group, which reads (or refuses) its own table.
+        _moved_process_diagnostics(
+            "find", returncode, stderr,
+            {pid: observed[pid] for pid in batch_pids},
+        )
+        vanished.update(
+            int(match.group("pid"))
+            for line in stderr.decode("ascii").splitlines()
+            if (match := _FIND_MISSING_RE.fullmatch(line)) is not None
+        )
+        for name, target in _census_nul_records(stdout, 2, "mount view find"):
+            record = re.fullmatch(r"/proc/([0-9]+)/(ns/mnt|root)", name)
+            if record is None or int(record[1]) not in batch_pids:
+                raise Refusal(f"mount view find returned an unexpected path: {name}")
+            entry = links.setdefault(int(record[1]), {})
+            if record[2] in entry:
+                raise Refusal(f"mount view find repeated {name}")
+            entry[record[2]] = target
+    views: dict[int, tuple[str, str]] = {}
+    for pid, entry in links.items():
+        # GNU find still prints an empty target for a link it could not read.
+        # Such a process's view is unknown, so it keeps its own group.
+        if pid in vanished:
+            continue
+        namespace, root = entry.get("ns/mnt"), entry.get("root")
+        if (
+            namespace is None
+            or root is None
+            or _MOUNT_NAMESPACE_LINK_RE.fullmatch(namespace) is None
+            or not root.startswith("/")
+        ):
+            raise Refusal(f"mount view find returned an incomplete view for PID {pid}")
+        views[pid] = (namespace, root)
+    return views
 
 
 def _mountinfo_path_references_with_retry(
     process: _AbsentProcessObservation,
     budget: _ReadOnlyCommandBudget,
-    cache: dict[str, tuple[tuple[Path, str], ...]] | None = None,
-) -> tuple[tuple[Path, str], ...]:
+    cache: dict[str, tuple[tuple[str, str], ...]] | None = None,
+) -> tuple[tuple[str, str], ...]:
     """Retry one stable procfs EINVAL; persistent errors remain refusals."""
 
     for attempt in range(2):
@@ -31283,13 +31556,24 @@ def _process_generation_is_current(process: _AbsentProcessObservation) -> bool:
 
 
 def _process_observation_is_active(process: _AbsentProcessObservation) -> bool:
-    """Return whether the observed generation still names a non-zombie process."""
+    """Return whether the observed generation still names a non-zombie process.
+
+    A leader that became a zombie while its other threads still run has not
+    released its files: that evidence changed, and a fresh snapshot observes
+    the threads in its place.
+    """
 
     pid_dir = Path("/proc") / str(process.pid)
     before = _read_process_stat(pid_dir)
     if before is None or before.start_ticks != process.start_ticks:
         return False
     if _process_is_zombie(pid_dir):
+        if _zombie_leader_has_live_threads(pid_dir):
+            current = _read_process_stat(pid_dir)
+            if current is not None and current.start_ticks == process.start_ticks:
+                raise _ProcessEvidenceChanged(
+                    f"PID {process.pid} exited as leader while its threads still run"
+                )
         return False
     after = _read_process_stat(pid_dir)
     return after is not None and after.start_ticks == process.start_ticks
@@ -31307,6 +31591,16 @@ def _observable_process_generations(
     identity is omitted here, exactly as a fresh selection omits proven terminal
     generations, so it never reaches a path observer.  The caller still keeps it
     in the census's process tuple, where it remains owner-cgroup evidence.
+
+    PID reuse means only that the observed generation exited.  The process now
+    holding that PID was not in the snapshot; like every process started after
+    it, this census neither observes it nor declares it unused, and none of the
+    old identity's evidence is attributed to it.  Later processes are the
+    subject of the caller's later fresh snapshots, never of this one.  An
+    identity whose PID is simply absent stays in the selection, because each
+    observer must itself prove that absence.  A zombie leader whose threads
+    still run is not terminal: _process_observation_is_active discards the
+    attempt so that a fresh snapshot observes those threads instead.
     """
 
     observable: list[_AbsentProcessObservation] = []
@@ -31771,12 +32065,16 @@ def _same_uid_process_observations(
     except OSError as exc:
         raise Refusal(f"cannot enumerate live processes: {exc}") from exc
     observations: list[_AbsentProcessObservation] = []
-    for pid_dir in pid_dirs:
+    # Live threads of a zombie leader are observed in their leader's place.
+    pending = collections.deque(pid_dirs)
+    while pending:
+        pid_dir = pending.popleft()
         budget.remaining_seconds()
         generation = _read_process_stat(pid_dir)
         if generation is None:
             continue
         if _process_generation_is_terminal(pid_dir, generation):
+            pending.extendleft(reversed(_zombie_leader_thread_dirs(pid_dir)))
             continue
         filesystem_uid = _process_filesystem_uid(pid_dir)
         if filesystem_uid is None or filesystem_uid != os.getuid():
@@ -31791,7 +32089,10 @@ def _same_uid_process_observations(
                 continue
             raise
         if mount_namespace is None:
-            if _process_is_zombie(pid_dir) or _process_start_ticks(pid_dir) is None:
+            if _process_is_zombie(pid_dir):
+                pending.extendleft(reversed(_zombie_leader_thread_dirs(pid_dir)))
+                continue
+            if _process_start_ticks(pid_dir) is None:
                 continue
             raise Refusal(f"mount namespace is indeterminate for live PID {pid_dir.name}")
         current_generation = _read_process_stat(pid_dir)
@@ -31840,10 +32141,16 @@ def _same_uid_direct_path_processes(
                     f"PID {process.pid} generation changed before same-UID path census"
                 )
             indeterminate.append(process)
-        except FileNotFoundError as exc:
-            raise _ProcessEvidenceChanged(
-                f"PID {process.pid} proc entries changed before same-UID path census"
-            ) from exc
+        except FileNotFoundError:
+            # An exited or zombie generation has released every path, so its
+            # vanished entries are complete evidence. At host scale some such
+            # exit lands in this window on nearly every attempt (four of four
+            # same-UID censuses refused here on 2026-09-26). A still-active
+            # generation's listing is incomplete and takes the privileged
+            # route, which completes or refuses it, as a vanished path in the
+            # batched listing already does.
+            if _process_observation_is_active(process):
+                indeterminate.append(process)
         except OSError as exc:
             if not _process_generation_is_current(process):
                 raise _ProcessEvidenceChanged(
@@ -32018,6 +32325,10 @@ def _excluded_same_uid_live_processes(
                 f"PID {process.pid} generation changed after validation exclusion"
             )
         if _process_generation_is_terminal(pid_dir, before):
+            if _zombie_leader_has_live_threads(pid_dir):
+                raise _ProcessEvidenceChanged(
+                    f"PID {process.pid} exited as leader while its threads still run"
+                )
             continue
         after = _read_process_stat(pid_dir)
         if after is None:
@@ -32810,23 +33121,36 @@ class _FinishContext:
     live_use_recheck: _LiveUseRecheckBudget | None = None
 
 
-def _capture_process_path_census(
-    slot_paths: Sequence[Path],
-    *,
-    budget: _ReadOnlyCommandBudget | None = None,
-    include_owner_cgroups: bool = True,
-) -> _ProcessPathCensus:
-    targets = {path: str(path) for path in slot_paths}
-    if not targets:
-        return _ProcessPathCensus(
-            (), (), owner_cgroup_complete=include_owner_cgroups
-        )
-    selected_budget = budget or _ReadOnlyCommandBudget.start(
+def _absent_process_census_budget() -> _ReadOnlyCommandBudget:
+    """Start the bound of one standalone census that has no enclosing operation."""
+
+    return _ReadOnlyCommandBudget.start(
         timeout_seconds=_ABSENT_PROCESS_CENSUS_SECONDS,
         stdout_limit=_PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
         stderr_limit=64 * 1024,
         input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
     )
+
+
+def _capture_process_path_census(
+    slot_paths: Sequence[Path],
+    *,
+    budget: _ReadOnlyCommandBudget,
+    include_owner_cgroups: bool = True,
+) -> _ProcessPathCensus:
+    """Census every process for use of slot_paths within the caller's bound.
+
+    The budget is required: a removal draws its census, rollback reserve and
+    later same-UID rechecks from one operation-wide deadline, and a default
+    would let a caller silently start a fresh, larger one instead.
+    """
+
+    targets = {path: str(path) for path in slot_paths}
+    if not targets:
+        return _ProcessPathCensus(
+            (), (), owner_cgroup_complete=include_owner_cgroups
+        )
+    selected_budget = budget
     for attempt in range(3):
         selected_budget.remaining_seconds()
         try:

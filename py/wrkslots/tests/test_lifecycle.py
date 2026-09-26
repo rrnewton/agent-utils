@@ -30419,10 +30419,10 @@ def test_mount_namespace_reselects_after_representative_generation_changes(
     def mountinfo(
         pid: int,
         _budget: wrkslots._ReadOnlyCommandBudget,
-        _cache: dict[str, tuple[tuple[Path, str], ...]] | None = None,
-    ) -> tuple[tuple[Path, str], ...]:
+        _cache: dict[str, tuple[tuple[str, str], ...]] | None = None,
+    ) -> tuple[tuple[str, str], ...]:
         inspected.append(pid)
-        return ((target, str(target)),) if pid == 123 else ()
+        return ((str(target), str(target)),) if pid == 123 else ()
 
     monkeypatch.setattr(wrkslots, "_mountinfo_path_references", mountinfo)
     monkeypatch.setattr(
@@ -30937,8 +30937,8 @@ def test_process_census_preflight_keeps_vanished_identity_in_every_observer(
 
     def mountinfo(
         pid: int, _budget: wrkslots._ReadOnlyCommandBudget,
-        _cache: dict[str, tuple[tuple[Path, str], ...]] | None = None,
-    ) -> tuple[tuple[Path, str], ...]:
+        _cache: dict[str, tuple[tuple[str, str], ...]] | None = None,
+    ) -> tuple[tuple[str, str], ...]:
         calls.append(f"mount:{pid}")
         if pid == 123:
             try:
@@ -30946,7 +30946,7 @@ def test_process_census_preflight_keeps_vanished_identity_in_every_observer(
             except FileNotFoundError as exc:
                 raise wrkslots.Refusal("mount evidence disappeared") from exc
         assert pid == 124
-        return ((target, str(target)),) if evidence == "live-mount" else ()
+        return ((str(target), str(target)),) if evidence == "live-mount" else ()
 
     monkeypatch.setattr(wrkslots, "_read_process_stat", read_stat)
     monkeypatch.setattr(wrkslots, "_process_is_zombie", lambda _path: False)
@@ -31117,7 +31117,8 @@ def test_process_census_withholds_a_zombie_from_path_observers_yet_keeps_its_cgr
         monkeypatch.setattr(wrkslots, "_absent_validate_mount_matches", observer("mount"))
 
         census = wrkslots._capture_process_path_census(
-            (Path("/fixture/slot-a"), Path("/fixture/slot-b"))
+            (Path("/fixture/slot-a"), Path("/fixture/slot-b")),
+            budget=wrkslots._absent_process_census_budget(),
         )
 
         assert census.processes == (process,)
@@ -31167,8 +31168,8 @@ def test_mountinfo_census_refuses_genuinely_unreadable_live_process(
         def unreadable(
             _pid: int,
             _budget: wrkslots._ReadOnlyCommandBudget,
-            _cache: dict[str, tuple[tuple[Path, str], ...]] | None = None,
-        ) -> tuple[tuple[Path, str], ...]:
+            _cache: dict[str, tuple[tuple[str, str], ...]] | None = None,
+        ) -> tuple[tuple[str, str], ...]:
             try:
                 raise PermissionError(errno.EACCES, "fixture denies mount evidence")
             except PermissionError as cause:
@@ -31202,8 +31203,8 @@ def test_mountinfo_census_retries_only_transient_stable_einval(
     def mountinfo(
         _pid: int,
         _budget: wrkslots._ReadOnlyCommandBudget,
-        _cache: dict[str, tuple[tuple[Path, str], ...]] | None = None,
-    ) -> tuple[tuple[Path, str], ...]:
+        _cache: dict[str, tuple[tuple[str, str], ...]] | None = None,
+    ) -> tuple[tuple[str, str], ...]:
         nonlocal calls
         calls += 1
         if persistent or calls == 1:
@@ -31211,7 +31212,7 @@ def test_mountinfo_census_retries_only_transient_stable_einval(
                 raise OSError(errno.EINVAL, "transient procfs state")
             except OSError as cause:
                 raise wrkslots.Refusal("cannot read mountinfo") from cause
-        return ((target, str(target)),)
+        return ((str(target), str(target)),)
 
     monkeypatch.setattr(wrkslots, "_mountinfo_path_references", mountinfo)
     monkeypatch.setattr(wrkslots, "_process_start_ticks", lambda _path: 17)
@@ -31594,7 +31595,9 @@ def test_process_path_census_collects_every_target_once(
     monkeypatch.setattr(wrkslots, "_absent_validate_find_matches", find_matches)
     monkeypatch.setattr(wrkslots, "_absent_validate_maps_matches", maps_matches)
 
-    census = wrkslots._capture_process_path_census((first, second))
+    census = wrkslots._capture_process_path_census(
+        (first, second), budget=wrkslots._absent_process_census_budget()
+    )
 
     assert calls == ["find", "maps", "mount"]
     assert census.processes == (process,)
