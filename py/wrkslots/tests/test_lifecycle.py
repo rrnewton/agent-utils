@@ -530,6 +530,7 @@ def command(
     *args: str,
     machine: str | None = None,
     env: dict[str, str] | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     command_args = list(args)
     if command_args and command_args[0] in {"create", "register", "import-existing"}:
@@ -540,7 +541,7 @@ def command(
     if command_args and command_args[0] in {"remove", "recover"}:
         if "--coordinator-authorized" not in command_args:
             command_args.append("--coordinator-authorized")
-    return raw_command(project, *command_args, machine=machine, env=env)
+    return raw_command(project, *command_args, machine=machine, env=env, timeout=timeout)
 
 
 def raw_command(
@@ -548,6 +549,7 @@ def raw_command(
     *args: str,
     machine: str | None = None,
     env: dict[str, str] | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     argv = [sys.executable, "-m", "wrkslots", "--project-root", str(project)]
     if machine is not None:
@@ -560,6 +562,7 @@ def raw_command(
         capture_output=True,
         check=False,
         env=process_env,
+        timeout=timeout,
     )
 
 
@@ -25570,9 +25573,24 @@ def test_failed_post_provision_hook_is_loud_and_recovery_resumes_hooks(
     assert attempts.read_text(encoding="utf-8") == "first\nsecond\nsecond\n"
 
 
+# Measured 2026-09-26 on a host with 4,300 processes: 8 s once the census walks
+# each distinct mount table once, 41 s before; a gate that timed out spent over
+# 40 s of CPU in one such abort.  This is a coarse backstop with room for a
+# loaded gate; the deterministic guard is the work count in test_census_cost.py.
+REAL_CENSUS_ABORT_SECONDS = 60
+
+
 def test_failed_post_provision_hook_can_be_explicitly_aborted(
     tmp_path: Path,
 ) -> None:
+    """The deliberate `--abort-create` through the real host-wide slot-use census.
+
+    Tests of the create journal stub that census; this one keeps it, under a
+    bound, so a census that again costs minutes per abort fails here by name
+    rather than by timing out the whole component step.  The bound kills only
+    the wrkslots process, not any helper it has started.
+    """
+
     project, repository, _remote = make_project(
         tmp_path,
         worktrees_directory="worktrees/slots",
@@ -25591,6 +25609,7 @@ def test_failed_post_provision_hook_can_be_explicitly_aborted(
         "--coordinator-pid",
         str(os.getpid()),
         "--abort-create",
+        timeout=REAL_CENSUS_ABORT_SECONDS,
     )
 
     assert aborted.returncode == 0, aborted.stderr
@@ -32978,7 +32997,7 @@ def test_final_slot_scan_uses_filesystem_uid_for_private_fence(
         ),
     )
 
-    def uses(process: Path, _slot: Path) -> list[str]:
+    def uses(process: Path, _slot: Path, **_kw: object) -> list[str]:
         inspected.append(process)
         return ["cwd=/private/fence"]
 
@@ -33017,7 +33036,7 @@ def test_final_slot_scan_does_not_use_stale_census_for_indeterminate_current_uid
     monkeypatch.setattr(
         wrkslots,
         "_process_uses_slot",
-        lambda _process, _slot: (_ for _ in ()).throw(
+        lambda _process, _slot, **_kw: (_ for _ in ()).throw(
             wrkslots.Refusal("fresh process evidence is unreadable")
         ),
     )

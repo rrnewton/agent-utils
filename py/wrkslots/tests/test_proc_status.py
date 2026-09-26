@@ -256,7 +256,9 @@ def test_direct_census_refuses_a_live_holder_after_fresh_status(
         monkeypatch, pid_dir,
         [ProcessLookupError(errno.ESRCH, "old inode"), f"Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n"],
     )
-    monkeypatch.setattr(cli, "_process_uses_slot", lambda _pid, _slot: [f"cwd={slot}"])
+    monkeypatch.setattr(
+        cli, "_process_uses_slot", lambda _pid, _slot, **_kw: [f"cwd={slot}"]
+    )
     with pytest.raises(cli.Refusal, match="live process .* uses slot"):
         cli._assert_slot_unused(slot, use_lsof=False, proc_root=proc_root)
     assert len(calls) == 2
@@ -410,7 +412,7 @@ def test_reclaim_restarts_proc_after_exact_proc_generation_exits(
                 child.stdin.close()
             return real_generation
 
-        def transient_use(_pid_dir: Path, _slot: Path) -> list[str]:
+        def transient_use(_pid_dir: Path, _slot: Path, **_kw: object) -> list[str]:
             nonlocal use_reads
             use_reads += 1
             return [f"cwd={slot}"] if use_reads == 1 else []
@@ -797,7 +799,7 @@ def test_reclaim_never_retries_incomplete_proc_evidence(
     monkeypatch.setattr(
         cli,
         "_process_uses_slot",
-        lambda _pid, _slot: (_ for _ in ()).throw(
+        lambda _pid, _slot, **_kw: (_ for _ in ()).throw(
             cli.Refusal("fixture proc evidence is incomplete")
         ),
     )
@@ -853,7 +855,7 @@ def test_reclaim_keeps_first_proc_holder_refusal_when_later_evidence_is_incomple
     monkeypatch.setattr(
         cli,
         "_process_uses_slot",
-        lambda pid_dir, _slot: (
+        lambda pid_dir, _slot, **_kw: (
             [f"cwd={slot}"] if int(pid_dir.name) == holder_pid else []
         ),
     )
@@ -903,7 +905,7 @@ def test_reclaim_never_retries_before_an_unbound_second_proc_holder(
         cli, "_process_uids", lambda _path: (uid, uid, uid, uid)
     )
     monkeypatch.setattr(
-        cli, "_process_uses_slot", lambda _pid, _slot: [f"cwd={slot}"]
+        cli, "_process_uses_slot", lambda _pid, _slot, **_kw: [f"cwd={slot}"]
     )
     opened: list[int] = []
 
@@ -958,7 +960,9 @@ def test_reclaim_fallback_exit_restarts_the_original_proc_census(
             uid = os.getuid()
             return uid, uid, uid, uid
 
-        def indeterminate_then_clear(_pid_dir: Path, _slot: Path) -> list[str]:
+        def indeterminate_then_clear(
+            _pid_dir: Path, _slot: Path, **_kw: object
+        ) -> list[str]:
             nonlocal proc_reads
             proc_reads += 1
             if proc_reads == 1:

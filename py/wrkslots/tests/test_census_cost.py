@@ -1669,3 +1669,274 @@ def test_batch_provider_malformed_fields_cap_shared_parser_diagnostic(
     assert all(char.isprintable() for char in detail)
     assert len(detail.encode("utf-8")) <= 4096
     assert sum(len(value.encode("utf-8")) for value in details) <= 256 * 4096
+
+
+@pytest.mark.parametrize(
+    ("candidate", "parent"),
+    (
+        ("/a/b", "/a/b"),
+        ("/a/b/c", "/a/b"),
+        ("/a/bc", "/a/b"),
+        ("/a/b", "/a/bc"),
+        ("/a", "/a/b"),
+        ("/a/b", "/"),
+        ("/", "/"),
+        ("/", "/a"),
+        ("/a/../b", "/a"),
+        ("//a/b", "/a"),
+        ("/a/b", "//a"),
+        ("//a/b", "//a"),
+        ("a/b", "a"),
+        ("a/b", "."),
+        ("a/b", "/"),
+        ("/a/b", "a"),
+        ("ab", "a"),
+    ),
+)
+def test_path_containment_keeps_component_boundaries(candidate: str, parent: str) -> None:
+    """The string comparison must answer exactly what `relative_to` answered."""
+
+    try:
+        Path(candidate).relative_to(Path(parent))
+        expected = True
+    except ValueError:
+        expected = False
+
+    assert cli._path_is_within(Path(candidate), Path(parent)) is expected
+
+
+def test_path_containment_rejects_a_sibling_that_shares_a_prefix() -> None:
+    assert cli._path_is_within(Path("/a/b"), Path("/a/b"))
+    assert cli._path_is_within(Path("/a/b/c"), Path("/a/b"))
+    assert not cli._path_is_within(Path("/a/bc"), Path("/a/b"))
+    assert cli._path_is_within(Path("/anything"), Path("/"))
+
+
+def _mount_table(name: str, lines: int, *, last: str | None = None) -> str:
+    rows = [
+        f"{index} 1 0:{index} / /{name}/m{index} rw - tmpfs {name}{index} rw"
+        for index in range(lines)
+    ]
+    if last is not None:
+        rows[-1] = f"{lines} 1 0:{lines} / {last} rw - tmpfs {name}-last rw"
+    return "".join(f"{row}\n" for row in rows)
+
+
+def _fake_process(
+    proc_root: Path,
+    pid: int,
+    mountinfo: str,
+    *,
+    namespace: str | None = None,
+    root: str | None = None,
+) -> Path:
+    pid_dir = proc_root / str(pid)
+    pid_dir.mkdir(parents=True)
+    uid = os.getuid()
+    (pid_dir / "status").write_text(f"Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n", encoding="ascii")
+    (pid_dir / "mountinfo").write_text(mountinfo, encoding="utf-8")
+    if namespace is not None:
+        (pid_dir / "ns").mkdir()
+        (pid_dir / "ns" / "mnt").symlink_to(namespace)
+    if root is not None:
+        (pid_dir / "root").symlink_to(root)
+    return pid_dir
+
+
+class _CensusWork:
+    """Counts the census's path comparisons, table parses, and table reads."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.comparisons = 0
+        self.parses = 0
+        self.reads: list[str] = []
+        within = cli._path_is_within
+        parse = cli._parse_mountinfo_paths
+        read = cli._read_process_mountinfo
+
+        def counted_within(candidate: Path, parent: Path) -> bool:
+            self.comparisons += 1
+            return within(candidate, parent)
+
+        def counted_parse(
+            text: str,
+            label: str,
+            cache: dict[str, tuple[tuple[Path, str], ...]] | None = None,
+        ) -> tuple[tuple[Path, str], ...]:
+            self.parses += 1
+            return parse(text, label, cache)
+
+        def counted_read(pid_dir: Path) -> str | None:
+            self.reads.append(pid_dir.name)
+            return read(pid_dir)
+
+        monkeypatch.setattr(cli, "_path_is_within", counted_within)
+        monkeypatch.setattr(cli, "_parse_mountinfo_paths", counted_parse)
+        monkeypatch.setattr(cli, "_read_process_mountinfo", counted_read)
+
+
+# Well above any real PID, so the fixture never collides with this process.
+FIRST_FAKE_PID = 10_000_000
+
+
+@pytest.mark.parametrize("processes", (60, 180))
+def test_process_census_walks_each_distinct_mount_table_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, processes: int
+) -> None:
+    """N processes listing 3 distinct M-line tables cost 3 walks, not N.
+
+    This is the shape that timed out `recover --abort-create` on a fleet host:
+    thousands of processes, nearly one mount namespace each, few distinct
+    tables. Without the memo this census makes N x 2M comparisons (7,200 and
+    21,600 here); with it the count is fixed by the distinct tables, whatever N.
+    """
+
+    lines = 20
+    slot = tmp_path / "slot"
+    proc_root = tmp_path / "proc"
+    tables = [_mount_table(name, lines) for name in ("red", "green", "blue")]
+    for index in range(processes):
+        _fake_process(proc_root, FIRST_FAKE_PID + index, tables[index % 3])
+    work = _CensusWork(monkeypatch)
+
+    cli._assert_slot_unused(slot, use_lsof=False, proc_root=proc_root)
+
+    # One check of the current directory, then two absolute paths per line.
+    assert work.comparisons == 1 + 3 * 2 * lines
+    assert work.parses == 3
+    assert len(work.reads) == processes
+
+    # Equivalence: a later process whose table references the slot is still found.
+    user = FIRST_FAKE_PID + processes
+    _fake_process(proc_root, user, _mount_table("user", lines, last=f"{slot}/cache"))
+    with pytest.raises(cli.Refusal, match=rf"live process {user} uses slot .*: mount={slot}/cache"):
+        cli._assert_slot_unused(slot, use_lsof=False, proc_root=proc_root)
+
+
+def test_mount_verdicts_read_every_table_but_parse_each_distinct_one_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slot = tmp_path / "slot"
+    proc_root = tmp_path / "proc"
+    clean = _mount_table("host", 10)
+    shared = [
+        _fake_process(proc_root, FIRST_FAKE_PID + index, clean, namespace="mnt:[1]", root="/")
+        for index in range(5)
+    ]
+    work = _CensusWork(monkeypatch)
+    verdicts = cli._MountTableVerdicts(slot)
+
+    assert all(verdicts.uses(pid_dir) == [] for pid_dir in shared)
+    assert work.reads == [pid_dir.name for pid_dir in shared]
+    assert work.parses == 1
+    assert work.comparisons == 2 * 10
+
+
+@pytest.mark.parametrize("root", ("/jail", "/"))
+def test_mount_verdicts_never_let_one_process_answer_for_its_namespace(
+    tmp_path: Path, root: str
+) -> None:
+    """Sharing a namespace, or even a rendered root, is not sharing a table.
+
+    A chroot sees only the mounts below its root, and a root the reader cannot
+    reach -- a chroot in a lazily unmounted tree -- renders as ``/``.  Keyed on
+    either, the first (short, clean) table would stand in for a later process
+    that really does mount the slot.
+    """
+
+    slot = tmp_path / "slot"
+    proc_root = tmp_path / "proc"
+    jailed = _fake_process(proc_root, FIRST_FAKE_PID, "", namespace="mnt:[1]", root=root)
+    host = _fake_process(
+        proc_root,
+        FIRST_FAKE_PID + 1,
+        _mount_table("host", 4, last=str(slot)),
+        namespace="mnt:[1]",
+        root="/",
+    )
+    verdicts = cli._MountTableVerdicts(slot)
+
+    assert verdicts.uses(jailed) == []
+    assert verdicts.uses(host) == [f"mount={slot}"]
+
+
+def test_mount_verdicts_match_processes_without_a_namespace_on_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A process whose namespace is unreadable is still read, and still shares."""
+
+    slot = tmp_path / "slot"
+    proc_root = tmp_path / "proc"
+    clean = _mount_table("host", 10)
+    using = _mount_table("host", 10, last=f"{slot}/x")
+    protected = [
+        _fake_process(proc_root, FIRST_FAKE_PID + index, clean) for index in range(4)
+    ]
+    user = _fake_process(proc_root, FIRST_FAKE_PID + 4, using)
+    work = _CensusWork(monkeypatch)
+    verdicts = cli._MountTableVerdicts(slot)
+
+    for pid_dir in protected:
+        assert verdicts.uses(pid_dir) == []
+    assert verdicts.uses(user) == [f"mount={slot}/x"]
+    assert len(work.reads) == 5
+    assert work.parses == 2
+
+
+def test_mount_verdicts_refuse_a_malformed_table_for_each_process(
+    tmp_path: Path,
+) -> None:
+    slot = tmp_path / "slot"
+    proc_root = tmp_path / "proc"
+    malformed = "this line has no field separator\n"
+    first = _fake_process(proc_root, FIRST_FAKE_PID, malformed)
+    second = _fake_process(proc_root, FIRST_FAKE_PID + 1, malformed)
+    verdicts = cli._MountTableVerdicts(slot)
+
+    with pytest.raises(cli.Refusal, match=f"PID {first.name}"):
+        verdicts.uses(first)
+    with pytest.raises(cli.Refusal, match=f"PID {second.name}"):
+        verdicts.uses(second)
+
+
+@pytest.mark.skipif(
+    not any(
+        Path(candidate).is_file() and os.access(candidate, os.X_OK)
+        for candidate in ("/usr/bin/lsof", "/usr/sbin/lsof")
+    ),
+    reason="the lsof branch needs lsof",
+)
+def test_lsof_census_walks_each_distinct_mount_table_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The branch taken after lsof proves direct use absent shares the memo."""
+
+    lines = 20
+    slot = tmp_path / "slot"
+    proc_root = tmp_path / "proc"
+    tables = [_mount_table(name, lines) for name in ("red", "green")]
+    for index in range(40):
+        _fake_process(
+            proc_root,
+            FIRST_FAKE_PID + index,
+            tables[index % 2],
+            namespace=f"mnt:[{index}]",
+            root="/",
+        )
+    monkeypatch.setattr(cli, "_lsof_slot_use", lambda _lsof, _slot: (None, False, 1))
+    work = _CensusWork(monkeypatch)
+
+    cli._assert_slot_unused(slot, proc_root=proc_root)
+
+    assert work.comparisons == 1 + 2 * 2 * lines
+    assert work.parses == 2
+
+    # The user shares a namespace with a clean process already inspected, so
+    # skipping repeat namespaces in the loop itself would miss it.
+    user = FIRST_FAKE_PID + 40
+    _fake_process(
+        proc_root, user, _mount_table("user", lines, last=str(slot)),
+        namespace="mnt:[0]", root="/",
+    )
+    with pytest.raises(cli.Refusal, match=rf"live process {user} uses slot"):
+        cli._assert_slot_unused(slot, proc_root=proc_root)

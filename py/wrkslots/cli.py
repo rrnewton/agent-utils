@@ -2452,11 +2452,27 @@ def _assert_no_mountinfo_crossing(root: Path, path: Path, label: str) -> None:
 
 
 def _path_is_within(candidate: Path, parent: Path) -> bool:
-    try:
-        candidate.relative_to(parent)
-        return True
-    except ValueError:
-        return False
+    """Whether ``candidate`` is ``parent`` or lies lexically below it.
+
+    The answer is exactly whether ``candidate.relative_to(parent)`` succeeds,
+    but for the common case of two ordinary absolute paths it compares strings:
+    a slot-use census asks this for every path in every mount table it walks,
+    and `relative_to` built and compared so many intermediate `Path` objects
+    that it was measured, 2026-09-24, at 103 s of a 119 s `recover
+    --abort-create`.  The separator keeps component boundaries, so ``/a/bc`` is
+    not within ``/a/b``.  Relative paths and POSIX's distinct leading ``//``
+    keep pathlib's own rules.
+    """
+
+    child = str(candidate)
+    base = str(parent)
+    if child[:1] != "/" or base[:1] != "/" or child[:2] == "//" or base[:2] == "//":
+        try:
+            candidate.relative_to(parent)
+            return True
+        except ValueError:
+            return False
+    return base == "/" or child == base or child.startswith(base + "/")
 
 
 def _fd_mount_id(fd: int, label: str) -> int:
@@ -10847,7 +10863,12 @@ def _link_target(path: Path) -> Path | None:
     return Path(os.path.normpath(str(target)))
 
 
-def _process_uses_slot(pid_dir: Path, slot_path: Path) -> list[str]:
+def _process_uses_slot(
+    pid_dir: Path,
+    slot_path: Path,
+    *,
+    mount_verdicts: _MountTableVerdicts | None = None,
+) -> list[str]:
     uses: list[str] = []
     for name in ("cwd", "root", "exe"):
         target = _link_target(pid_dir / name)
@@ -10893,7 +10914,10 @@ def _process_uses_slot(pid_dir: Path, slot_path: Path) -> list[str]:
                 if mapped.is_absolute() and _path_is_within(mapped, slot_path):
                     uses.append(f"map={mapped}")
                     break
-    uses.extend(_process_mounts_slot(pid_dir, slot_path))
+    if mount_verdicts is None:
+        uses.extend(_process_mounts_slot(pid_dir, slot_path))
+    else:
+        uses.extend(mount_verdicts.uses(pid_dir))
     return uses
 
 
@@ -10945,24 +10969,83 @@ def _parse_mountinfo_paths(
     return parsed
 
 
-def _process_mounts_slot(pid_dir: Path, slot_path: Path) -> list[str]:
+def _read_process_mountinfo(pid_dir: Path) -> str | None:
+    """Return one process's mount table, or None once the process is gone."""
+
     mountinfo_path = pid_dir / "mountinfo"
     try:
-        mountinfo = mountinfo_path.read_text(encoding="utf-8", errors="surrogateescape")
+        return mountinfo_path.read_text(encoding="utf-8", errors="surrogateescape")
     except FileNotFoundError:
-        return []
+        return None
     except OSError as exc:
         if exc.errno in (errno.ENOENT, errno.ESRCH, errno.EINVAL):
-            return []
+            return None
         raise Refusal(
             f"process use is indeterminate because {mountinfo_path} is unreadable: {exc}"
         ) from exc
-    for candidate, _raw in _parse_mountinfo_paths(
-        mountinfo, f"process mount evidence for PID {pid_dir.name}"
-    ):
+
+
+def _mountinfo_uses_slot(mountinfo: str, slot_path: Path, label: str) -> tuple[str, ...]:
+    for candidate, _raw in _parse_mountinfo_paths(mountinfo, label):
         if _path_is_within(candidate, slot_path):
-            return [f"mount={candidate}"]
-    return []
+            return (f"mount={candidate}",)
+    return ()
+
+
+def _process_mounts_slot(pid_dir: Path, slot_path: Path) -> list[str]:
+    mountinfo = _read_process_mountinfo(pid_dir)
+    if mountinfo is None:
+        return []
+    return list(
+        _mountinfo_uses_slot(
+            mountinfo, slot_path, f"process mount evidence for PID {pid_dir.name}"
+        )
+    )
+
+
+class _MountTableVerdicts:
+    """One census's memo of whether each mount table it reads references a slot.
+
+    A census over thousands of processes used to parse and walk one mount table
+    per mount namespace, and a fleet host has nearly one namespace per process
+    listing a handful of distinct tables (measured 2026-09-17: 3,363 namespaces
+    across 3,638 processes).  The verdict depends only on the table and the
+    slot, so it is computed once per distinct table and keyed on a digest of
+    the table's content, which holds a few bytes per table rather than the
+    tables themselves.
+
+    Every process's table is still read.  A shared mount namespace is not a
+    shared table: the kernel lists only the mounts below a process's root, and
+    neither a namespace identity nor a root's rendered path identifies that
+    root -- a root the reader cannot reach, such as a chroot in a lazily
+    unmounted tree, renders as ``/``.  Keying on content is sound for every
+    process, including one whose namespace is unreadable.  Only a successful
+    verdict is stored: a malformed table refuses for every process that lists
+    it, naming that process.
+    """
+
+    def __init__(self, slot_path: Path) -> None:
+        self.slot_path = slot_path
+        self._by_table: dict[bytes, tuple[str, ...]] = {}
+
+    def uses(self, pid_dir: Path) -> list[str]:
+        """Return ``pid_dir``'s mount uses of the slot, as `_process_mounts_slot`."""
+
+        mountinfo = _read_process_mountinfo(pid_dir)
+        if mountinfo is None:
+            return []
+        digest = hashlib.sha256(
+            mountinfo.encode("utf-8", errors="surrogateescape")
+        ).digest()
+        verdict = self._by_table.get(digest)
+        if verdict is None:
+            verdict = _mountinfo_uses_slot(
+                mountinfo,
+                self.slot_path,
+                f"process mount evidence for PID {pid_dir.name}",
+            )
+            self._by_table[digest] = verdict
+        return list(verdict)
 
 
 def _mount_namespace(pid_dir: Path) -> str | None:
@@ -11519,7 +11602,7 @@ def _observe_slot_use_once(
                 break
             invoking_ancestry.add(ancestor)
             ancestor = _read_process_parent(ancestor)
-    inspected_mount_namespaces: set[str] = set()
+    mount_verdicts = _MountTableVerdicts(slot_path)
     indeterminate_use: Refusal | None = None
     reported_use: _LiveUseObservation | None = None
     reported_use_recheckable = True
@@ -11575,13 +11658,14 @@ def _observe_slot_use_once(
         try:
             if direct_use_proven_absent:
                 mount_namespace = _mount_namespace(pid_dir)
-                if mount_namespace is None or mount_namespace in inspected_mount_namespaces:
+                if mount_namespace is None:
                     uses = []
                 else:
-                    uses = _process_mounts_slot(pid_dir, slot_path)
-                    inspected_mount_namespaces.add(mount_namespace)
+                    uses = mount_verdicts.uses(pid_dir)
             else:
-                uses = _process_uses_slot(pid_dir, slot_path)
+                uses = _process_uses_slot(
+                    pid_dir, slot_path, mount_verdicts=mount_verdicts
+                )
         except Refusal as exc:
             if indeterminate_use is None:
                 indeterminate_use = exc
