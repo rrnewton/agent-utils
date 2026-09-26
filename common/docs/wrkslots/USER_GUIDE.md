@@ -256,6 +256,13 @@ may be repeated, emits rows only for the named slots, and refuses if any name ca
 the default; `--format json` emits the same typed actions, paths, allocated-byte counts, and total
 removed bytes for automation.
 
+Every form takes the exclusive project locks while it reads control-plane state and resolves holds,
+replaying each machine's event log once for all of that machine's slots. The read-only report then
+releases those locks before it measures cache trees, so a long walk does not block other slot
+mutations. Its rows are a snapshot: a slot that changes or disappears during the walk reports
+`BLOCKED` with its error, and a hold placed after the locks were released is not reflected. `--only`
+and `--yes` keep the locks through measurement and removal.
+
 ```sh
 wrkslots clean-caches --format json
 wrkslots clean-caches --only slot01 --only slot02 --format json

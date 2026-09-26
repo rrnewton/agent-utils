@@ -18974,6 +18974,31 @@ def _clear_bound_cache_directory(
     return original, mount_id, size
 
 
+def _cache_slot_holds(
+    config: Config, cache_slots: Mapping[str, CacheSlot]
+) -> dict[str, dict[str, object] | None]:
+    """Resolve every cache slot's hold while replaying each machine log once.
+
+    Loading the hold slot by slot replayed the whole append-only log for each
+    slot, so a report's journal reads grew with slots times log size.
+    """
+
+    by_machine: dict[str, set[str]] = {}
+    for slot, cache_slot in cache_slots.items():
+        by_machine.setdefault(cache_slot.machine or config.machine, set()).add(slot)
+    holds: dict[str, dict[str, object] | None] = {}
+    for machine, slots in sorted(by_machine.items()):
+        events = _load_events(config, machine)
+        if events:
+            replayed = _holds_from_events(events, machine, slots)
+            holds.update((slot, replayed.get(slot)) for slot in slots)
+        else:
+            holds.update(
+                (slot, _load_hold_snapshot(config, slot, machine)) for slot in slots
+            )
+    return holds
+
+
 def _cmd_clean_caches(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     if not config.cache_globs and not config.repo_cache_globs:
@@ -18981,7 +19006,8 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
     only = tuple(args.only or ())
     for slot in only:
         _validate_name(slot, "slot")
-    with _mutation_locks(config, args.wait_lock):
+    with contextlib.ExitStack() as locks:
+        locks.enter_context(_mutation_locks(config, args.wait_lock))
         _refuse_partial_state(config)
         states, _archives = _validate_global_state(config)
         requested = set(only)
@@ -19052,9 +19078,15 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
             for slot, error in sorted(malformed_slots.items())
         ]
         plans: dict[str, tuple[CacheDirectory, ...]] = {}
+        holds = _cache_slot_holds(config, cache_slots)
+        if not selected:
+            # A report deletes nothing, and every deletion reacquires these
+            # locks and replans its slots. Measuring hundreds of cache trees
+            # must not block every other slot mutation for the whole walk.
+            locks.close()
         for slot in sorted(cache_slots):
             cache_slot = cache_slots[slot]
-            hold = _load_hold(config, slot, cache_slot.machine)
+            hold = holds[slot]
             directories: tuple[CacheDirectory, ...]
             cache_error: str | None = None
             policy_note = (
@@ -19073,7 +19105,7 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
                     cache_bytes = sum(
                         _allocated_cache_bytes(config, cache) for cache in directories
                     )
-                except Refusal as exc:
+                except (Refusal, OSError) as exc:
                     if slot in selected:
                         raise Refusal(
                             f"cannot clean selected slot {slot}: {exc}"
