@@ -27393,6 +27393,7 @@ def test_audit_reports_deletable_blocked_held_and_the_leak_invariant(
         "registry",
         "liveness",
         "process-census",
+        "cache-planning",
         "cache-census",
         "registered-rows",
         "storage",

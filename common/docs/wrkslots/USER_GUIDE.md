@@ -158,8 +158,17 @@ Audit may update only its regenerable, project-keyed cache-accounting census bel
 managed project supplied with `--cache-census-state`); it does not change a
 registry, worktree, hold, journal, handoff, or Git repository. `--cache-work-limit`
 (default 100000 work units) and `--cache-wall-seconds` (default 5 seconds) bound the
-cache binding and traversal phase, not the end-to-end audit: registry/cache planning,
-bounded state decoding/authentication, and persistence occur outside that allowance.
+cache binding and traversal phase, not the end-to-end audit: registry reading, bounded
+state decoding/authentication, and persistence occur outside that allowance.
+The same two values separately bound cache-glob planning, which expands each subject's
+cache globs before the census: every directory listing is one work unit, and the time
+spent walking is charged. Each subject may use an equal share of what earlier subjects
+left, so with many subjects a share can be small. Git observations made while planning
+are not charged. The planning time bound is checked between directory listings, not
+enforced by a worker, so a listing that blocks is not interrupted. A subject whose
+planning exhausts its share reports `cache_status: "error"` with null bytes; its
+retained census progress is not carried forward. A checkout whose ignored tree needs
+more listings than its share reports that error on every audit at the same limits.
 Root binding and traversal run in isolated workers with the remaining deadline
 enforced even if a filesystem operation blocks. Expiry starts no further work and cancels
 the worker, with at most one additional second allowed for reaping it.
@@ -193,8 +202,8 @@ first key writes remain in one private pending file that a later census can rebu
 only a complete, synced key is published atomically. Unsafe pending files and malformed
 published keys remain refusals. Invalid
 explicit state-path arguments remain CLI refusals. JSON reports typed CPU seconds, wall
-seconds, and work counters for the registry, liveness, process-census, cache-census,
-registered-row, and storage phases.
+seconds, and work counters for the registry, liveness, process-census, cache-planning,
+cache-census, registered-row, and storage phases.
 
 ## Time-to-live and process evidence
 

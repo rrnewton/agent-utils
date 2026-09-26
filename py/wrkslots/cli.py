@@ -15984,6 +15984,153 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
     return 3 if could_not_determine else 0
 
 
+class _CachePlanExhausted(Refusal):
+    """Cache-glob planning spent its allowance; the subject's total is unknown."""
+
+
+@dataclasses.dataclass
+class _CachePlanBudget:
+    """One audit subject's share of cache-glob expansion.
+
+    One work unit is one directory listing, and ``seconds`` bounds the time
+    spent walking directories. Planning precedes the cache census, so this
+    allowance is separate from the census's own. Git observations are not
+    charged: their cost follows each checkout's index, not its ignored trees.
+    """
+
+    work: _AuditWorkBudget
+    seconds: float
+    wall_seconds: float
+    spent: float = 0.0
+
+    def check(self, walking: float = 0.0) -> None:
+        if self.spent + walking >= self.seconds:
+            raise _CachePlanExhausted(
+                "cache planning exhausted this subject's share of the fixed wall "
+                f"allowance of {self.wall_seconds:g} seconds; no cache total can be "
+                "published within this allowance"
+            )
+        if self.work.remaining <= 0:
+            raise _CachePlanExhausted(
+                "cache planning exhausted this subject's share of "
+                f"{self.work.limit} directory listings; no cache total can be "
+                "published within this allowance"
+            )
+
+    def debit(self, walking: float) -> None:
+        self.check(walking)
+        self.work.debit()
+
+
+def _expand_cache_globs(
+    root: Path,
+    cache_globs: Sequence[str],
+    budget: _CachePlanBudget | None = None,
+) -> tuple[tuple[str, tuple[Path, ...]], ...]:
+    """Expand validated cache globs below ``root`` in one directory walk.
+
+    Each pattern yields the paths Python 3.12 ``Path.glob`` yields for it: a
+    non-final component matches an entry that is a directory after following
+    symlinks, a final component matches any entry, ``**`` matches the
+    directory itself and every descendant reached without following a
+    symlink, and an unreadable directory contributes nothing. Every directory
+    is listed at most once for all patterns together, and each listing is
+    debited from ``budget`` together with the time this walk has taken.
+
+    The order matches ``Path.glob`` only for a pattern without ``**``, or with
+    one ``**`` directly before the final component and only literal
+    components before it. For other shapes the same paths may come in a
+    different order, so a caller that stops at the first unsafe path may name
+    a different one than ``Path.glob`` would. The time bound is cooperative:
+    it is checked between listings, so a listing that blocks is not
+    interrupted.
+    """
+
+    started = time.monotonic()
+    try:
+        return _expand_cache_globs_walk(root, cache_globs, budget, started)
+    finally:
+        if budget is not None:
+            budget.spent += time.monotonic() - started
+
+
+def _expand_cache_globs_walk(
+    root: Path,
+    cache_globs: Sequence[str],
+    budget: _CachePlanBudget | None,
+    started: float,
+) -> tuple[tuple[str, tuple[Path, ...]], ...]:
+    parts = tuple(_glob_pattern_parts(pattern) for pattern in cache_globs)
+    # Ordered by (the sequence in which this walk reaches the directory that
+    # yields the path, the entry's position in that directory's listing).
+    # That is Path.glob's order only for the shapes the docstring names: a
+    # wildcard before '**' makes Path.glob finish each match's subtree first.
+    matches: tuple[list[tuple[tuple[int, int], Path]], ...] = tuple([] for _ in parts)
+
+    def closure(positions: set[tuple[int, int]]) -> set[tuple[int, int]]:
+        # '**' may match no component: also try whatever follows the run of it.
+        closed = set(positions)
+        for index, position in positions:
+            pattern = parts[index]
+            while position < len(pattern) and pattern[position] == "**":
+                position += 1
+                closed.add((index, position))
+        return closed
+
+    reached = 0
+    pending = [(root, reached, closure({(index, 0) for index in range(len(parts))}))]
+    while pending:
+        directory, sequence, positions = pending.pop()
+        for index, position in positions:
+            if position == len(parts[index]):
+                matches[index].append(((sequence, -1), directory))
+        if all(position == len(parts[index]) for index, position in positions):
+            continue
+        if budget is not None:
+            budget.debit(time.monotonic() - started)
+        try:
+            with os.scandir(directory) as listing:
+                entries = list(listing)
+        except OSError:
+            continue
+        children: list[tuple[Path, int, set[tuple[int, int]]]] = []
+        for entry_index, entry in enumerate(entries):
+            child = directory / entry.name
+            advanced: set[tuple[int, int]] = set()
+            for index, position in positions:
+                pattern = parts[index]
+                if position == len(pattern):
+                    continue
+                part = pattern[position]
+                if part == "**":
+                    try:
+                        descend = entry.is_dir(follow_symlinks=False)
+                    except OSError:
+                        descend = False
+                    if descend:
+                        advanced.add((index, position))
+                elif fnmatch.fnmatchcase(entry.name, part):
+                    if position + 1 == len(pattern):
+                        matches[index].append(((sequence, entry_index), child))
+                        continue
+                    try:
+                        directory_entry = entry.is_dir()
+                    except OSError:
+                        directory_entry = False
+                    if directory_entry:
+                        advanced.add((index, position + 1))
+            if advanced:
+                reached += 1
+                children.append((child, reached, closure(advanced)))
+        # Depth first with siblings in listing order, as Path.walk visits them;
+        # a directory's children are all reached when it is visited.
+        pending.extend(reversed(children))
+    return tuple(
+        (pattern, tuple(path for _order, path in sorted(found, key=lambda item: item[0])))
+        for pattern, found in zip(cache_globs, matches)
+    )
+
+
 def _cache_directories_for_path(
     config: Config,
     checkout_path: Path,
@@ -15991,8 +16138,13 @@ def _cache_directories_for_path(
     vcs: _GitVcs,
     cache_globs: Sequence[str],
     source_repository: Path | None = None,
+    *,
+    budget: _CachePlanBudget | None = None,
 ) -> tuple[CacheDirectory, ...]:
     candidates: set[Path] = set()
+    if budget is not None:
+        # Do not start this checkout's Git observations after the allowance.
+        budget.check()
     if not checkout_path.is_dir() or checkout_path.is_symlink():
         raise Refusal(f"checkout is missing or unsafe for cache inspection: {checkout_path}")
     checkout_identity = _open_directory_identity(checkout_path, "checkout")
@@ -16006,9 +16158,12 @@ def _cache_directories_for_path(
     _assert_cache_policy_untracked_path(
         config, checkout_name, checkout_path, vcs, cache_globs
     )
-    for pattern in cache_globs:
+    try:
+        expanded = _expand_cache_globs(checkout_path, cache_globs, budget)
+    except (OSError, ValueError) as exc:
+        raise Refusal(f"cannot expand cache globs in {checkout_path}: {exc}") from exc
+    for pattern, matches in expanded:
         try:
-            matches = checkout_path.glob(pattern)
             for candidate in matches:
                 absolute = candidate.absolute()
                 if not _path_is_within(absolute, checkout_path) or absolute == checkout_path:
@@ -16049,7 +16204,11 @@ def _cache_directories_for_path(
 
 
 def _cache_directories_for_checkout(
-    config: Config, checkout: Checkout, *, vcs: _GitVcs | None = None
+    config: Config,
+    checkout: Checkout,
+    *,
+    vcs: _GitVcs | None = None,
+    budget: _CachePlanBudget | None = None,
 ) -> tuple[CacheDirectory, ...]:
     checkout_path = _stored_path(config, checkout.path, "checkout path")
     selected_vcs = vcs or _GitVcs()
@@ -16061,6 +16220,7 @@ def _cache_directories_for_checkout(
         selected_vcs,
         _cache_globs_for(config, checkout.name),
         repository,
+        budget=budget,
     )
 
 
@@ -16091,11 +16251,14 @@ def _cache_directories(
     checkouts: Sequence[Checkout],
     *,
     vcs: _GitVcs | None = None,
+    budget: _CachePlanBudget | None = None,
 ) -> tuple[CacheDirectory, ...]:
     return tuple(
         path
         for checkout in checkouts
-        for path in _cache_directories_for_checkout(config, checkout, vcs=vcs)
+        for path in _cache_directories_for_checkout(
+            config, checkout, vcs=vcs, budget=budget
+        )
     )
 
 
@@ -16104,10 +16267,13 @@ def _cache_slot_directories(
     cache_slot: CacheSlot,
     *,
     vcs: _GitVcs | None = None,
+    budget: _CachePlanBudget | None = None,
 ) -> tuple[CacheDirectory, ...]:
+    if budget is not None:
+        budget.check()
     selected_vcs = vcs or _GitVcs()
     registered = _cache_directories(
-        config, cache_slot.checkouts, vcs=selected_vcs
+        config, cache_slot.checkouts, vcs=selected_vcs, budget=budget
     )
     roots = (
         _unregistered_cache_roots(config, cache_slot.slot)
@@ -16129,6 +16295,7 @@ def _cache_slot_directories(
                 label,
                 selected_vcs,
                 config.cache_globs,
+                budget=budget,
             )
         )
     return (*registered, *unregistered)
@@ -19273,35 +19440,61 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         cache_errors: dict[str, str] = {}
         record_cache_subjects: dict[tuple[str, str, int], str] = {}
         unregistered_cache_subjects: dict[tuple[str, str], str] = {}
+        plan_targets: list[tuple[str, Sequence[Checkout] | CacheSlot]] = []
         for record in records:
             subject = f"record:{record.machine}:{record.slot}:{record.generation}"
             record_cache_subjects[(record.machine, record.slot, record.generation)] = subject
-            try:
-                cache_planned[subject] = _cache_directories(
-                    config, record.checkouts, vcs=audit_vcs
-                )
-            except Refusal as exc:
-                cache_planned[subject] = ()
-                cache_errors[subject] = str(exc)
+            plan_targets.append((subject, record.checkouts))
         for slot_type, slot in sorted(on_disk - registered):
             subject = f"unregistered:{slot_type}:{slot}"
             unregistered_cache_subjects[(slot_type, slot)] = subject
             if slot_type != "agent":
                 cache_planned[subject] = ()
                 continue
-            try:
-                journal_slot = journal_slots.get(slot)
-                unregistered = (
+            journal_slot = journal_slots.get(slot)
+            plan_targets.append(
+                (
+                    subject,
                     journal_slot
                     if journal_slot is not None
-                    else CacheSlot(slot, config.machine, (), "unregistered")
+                    else CacheSlot(slot, config.machine, (), "unregistered"),
                 )
-                cache_planned[subject] = _cache_slot_directories(
-                    config, unregistered, vcs=audit_vcs
+            )
+        # Recursive cache globs can reach arbitrarily large ignored trees. Each
+        # subject may use an equal share of what earlier subjects left, so an
+        # expensive subject exhausts only its own planning, never a cheap peer's.
+        plan_started = metrics.start()
+        plan_seconds = args.cache_wall_seconds
+        plan_work = _AuditWorkBudget(args.cache_work_limit)
+        plan_exhausted = 0
+        for position, (subject, target) in enumerate(plan_targets):
+            remaining_subjects = len(plan_targets) - position
+            share = _CachePlanBudget(
+                _AuditWorkBudget(plan_work.remaining // remaining_subjects),
+                plan_seconds / remaining_subjects,
+                args.cache_wall_seconds,
+            )
+            try:
+                cache_planned[subject] = (
+                    _cache_slot_directories(config, target, vcs=audit_vcs, budget=share)
+                    if isinstance(target, CacheSlot)
+                    else _cache_directories(config, target, vcs=audit_vcs, budget=share)
                 )
             except Refusal as exc:
                 cache_planned[subject] = ()
                 cache_errors[subject] = str(exc)
+                plan_exhausted += isinstance(exc, _CachePlanExhausted)
+            plan_work.consumed += share.work.consumed
+            plan_seconds = max(0.0, plan_seconds - share.spent)
+        metrics.finish(
+            "cache-planning",
+            plan_started,
+            {
+                "directories_listed": plan_work.consumed,
+                "exhausted_subjects": plan_exhausted,
+                "subjects": len(plan_targets),
+            },
+        )
         cache_started = metrics.start()
         cache_state_path = None
         cache_storage_error = None
@@ -35637,8 +35830,9 @@ usage or audit gate unknown, 3 fail-closed refusal.
         default=_AUDIT_CACHE_WORK_LIMIT,
         metavar="ENTRIES",
         help=(
-            "maximum cache traversal work units per invocation; oversized subject "
-            f"finalization reports null/error (default: {_AUDIT_CACHE_WORK_LIMIT})"
+            "maximum cache traversal work units per invocation, and separately the "
+            "maximum directory listings for cache-glob planning; oversized subject "
+            f"planning or finalization reports null/error (default: {_AUDIT_CACHE_WORK_LIMIT})"
         ),
     )
     audit.add_argument(
@@ -35647,8 +35841,10 @@ usage or audit gate unknown, 3 fail-closed refusal.
         default=_AUDIT_CACHE_WALL_SECONDS,
         metavar="SECONDS",
         help=(
-            "cache binding/traversal wall budget in seconds, excluding planning and state I/O; "
-            "unfinished work is null/partial, a full finalization timeout is null/error "
+            "cache binding/traversal wall budget in seconds, and separately the budget for "
+            "walking directories to expand cache globs, excluding Git observations and "
+            "state I/O; unfinished work is null/partial, "
+            "a planning or full finalization timeout is null/error "
             f"(default: {_AUDIT_CACHE_WALL_SECONDS:g})"
         ),
     )

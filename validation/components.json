@@ -271,6 +271,7 @@
       "reverse_dependencies": [],
       "test_files": [
         "py/tests/test_wrkslotsd_source_contract.py",
+        "py/wrkslots/tests/test_cache_plan_budget.py",
         "py/wrkslots/tests/test_census_binding_deadline.py",
         "py/wrkslots/tests/test_census_cost.py",
         "py/wrkslots/tests/test_census_explicit_path.py",

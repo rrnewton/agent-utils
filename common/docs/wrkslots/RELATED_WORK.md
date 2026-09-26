@@ -176,41 +176,42 @@ because current creates complete only at their scoped path; an aborted import-ex
 create rather than a re-import of the same checkouts, because the completion's operation differs;
 and a create or import marker still open when the slot is archived, because archive evidence clears
 only finish attempts. The enumeration of `py/wrkslots/cli.py` below supports the row-present cases
-for histories written by that code. Line numbers are at `aa68c18`, "wrkslots: check task scopes
-before create recovery provisions".
+for histories written by that code. Line numbers are at the commit "wrkslots: bound audit cache-glob
+planning"; later commits move them.
 
-- `_clear_journal` (5472) is the only writer of `operation-completed` (5483). Every
-  `_write_event_file` and `writer.append` call passes a literal kind. The other occurrences, at 5558
-  and 7128, are readers. The append happens before the journal is unlinked, with the test
-  interrupt `after-operation-completed` at 5490 between them.
-- Create journals come only from `_create_journal_payload` (kind `create`, 13197). Import journals
-  come only from `_import_journal_payload` (kind `import-existing`, 14182).
-- `_recover_create` and `_recover_import_existing` are dispatched at 32143 and 32154, after
-  `recovery-started` is appended at 32079.
+- `_clear_journal` (5754) is the only writer of `operation-completed` (5765). Every
+  `_write_event_file` and `writer.append` call passes a literal kind. The other occurrences, at 5840
+  and 7453, are readers. The append happens before the journal is unlinked, with the test
+  interrupt `after-operation-completed` at 5772 between them.
+- Create journals come only from `_create_journal_payload` (kind `create`, 13808). Import journals
+  come only from `_import_journal_payload` (kind `import-existing`, 14826).
+- `_recover_create` and `_recover_import_existing` are dispatched at 35298 and 35309, after
+  `recovery-started` is appended at 35234.
 
 The eight `_clear_journal` calls on a create or import journal, and the state each leaves:
 
 | Call site | Line | Storage and ACTIVE state when the journal completes |
 | --- | --- | --- |
-| `_cmd_create` | 13500 | `_write_active_state(action="slot-created")` (13491) runs first, so the new ACTIVE row owns the storage |
-| `_recover_create` | 22424 | The ACTIVE row is already durable and must match the journal exactly. Every checkout HEAD is verified first, and `--abort-create` is refused (22387) |
-| `_recover_create` | 22543 | Recovery provisions and runs hooks, then publishes the row with `action="slot-created-by-recovery"` (22535) |
-| `_abort_create` | 22152 | Called at 22428 only when there is no ACTIVE row. It removes caches and worktrees, deletes branches at their expected heads, and removes the slot directory. Any unexpected state raises before the clear, so neither storage nor a row remains. The marker stays open because a completion without a row cannot distinguish this from an older writer that left storage |
-| `_publish_import` | 14224 | `_write_active_state(action="slot-imported")` (14214) runs first |
-| `_recover_import_existing` | 22582 | The row is already durable and matches exactly, and `_verify_import_record` passes. `--abort-import` is refused (22579) |
-| `_recover_import_existing` | 22588 | `--abort-import` with no row. An import publishes rows only for checkouts that already exist, so it changes no files and owns no provisional storage. The checkout was never registered and has no row, so the recovery marker stays open and the slot remains blocked rather than leaving the observer |
-| `_recover_import_existing` | 22612 | Recovery publishes the row with `action="slot-imported-by-recovery"` (22603) |
+| `_cmd_create` | 14144 | `_write_active_state(action="slot-created")` (14135) runs first, so the new ACTIVE row owns the storage |
+| `_recover_create` | 24388 | The ACTIVE row is already durable and must match the journal exactly. Every checkout HEAD is verified first, and `--abort-create` is refused (24351) |
+| `_recover_create` | 24507 | Recovery provisions and runs hooks, then publishes the row with `action="slot-created-by-recovery"` (24499) |
+| `_abort_create` | 24116 | Called at 24392 only when there is no ACTIVE row. It removes caches and worktrees, deletes branches at their expected heads, and removes the slot directory. Any unexpected state raises before the clear, so neither storage nor a row remains. The marker stays open because a completion without a row cannot distinguish this from an older writer that left storage |
+| `_publish_import` | 14868 | `_write_active_state(action="slot-imported")` (14858) runs first |
+| `_recover_import_existing` | 24546 | The row is already durable and matches exactly, and `_verify_import_record` passes. `--abort-import` is refused (24543) |
+| `_recover_import_existing` | 24552 | `--abort-import` with no row. An import publishes rows only for checkouts that already exist, so it changes no files and owns no provisional storage. The checkout was never registered and has no row, so the recovery marker stays open and the slot remains blocked rather than leaving the observer |
+| `_recover_import_existing` | 24576 | Recovery publishes the row with `action="slot-imported-by-recovery"` (24567) |
 
 The checks that run after these clears never undo them. They are `_validate_global_state` and
 `_assert_only_slot_changed`, in `_cmd_create`, in `_cmd_import_existing`, and after recovery
-dispatch (32281). They only read state, so a refusal there leaves the slot in the state the table
+dispatch (35436). They only read state, so a refusal there leaves the slot in the state the table
 records. A recovery refused before its clear appends no completion, which leaves both the journal
 marker and the recovery marker open.
 
-Finish is different. `_rollback_path_fence` (20375) and the refusal rollback in `_begin_finish`
-(20917) complete a finish journal while retaining the slot. `_rollback_validation_fence` (25466,
-called from `_recover_ownerless_validation` at 26597, 26685, and 26753) does the same for an
-ownerless validation. Those operations therefore keep the archived-removal rule above.
+Finish is different. `_rollback_path_fence` (21556) and the two refusal rollbacks in
+`_begin_finish` (22104 for a private finish, 22126 otherwise) complete a finish journal while
+retaining the slot. `_rollback_validation_fence` (27417, called from
+`_recover_ownerless_validation` at 28548, 28636, and 28704) does the same for an ownerless
+validation. Those operations therefore keep the archived-removal rule above.
 For a pre-event-log finish journal, recovery can import snapshots that are already at any side of
 the archive/ACTIVE publication boundary. Once those snapshots prove physical removal, the observer
 retains a synthetic legacy-journal cleanup marker until an `operation-completed` at that journal's
