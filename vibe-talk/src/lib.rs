@@ -50,6 +50,7 @@ pub mod live;
 pub mod mcp;
 pub mod model;
 pub mod ops;
+pub mod post_gate;
 pub mod probe;
 pub mod replay;
 pub mod retrieval;

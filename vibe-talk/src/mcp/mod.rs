@@ -246,8 +246,12 @@ pub fn tool_manifest(channels: &[ChannelInfo]) -> Vec<ToolDescriptor> {
         ToolDescriptor {
             name: "post_reply",
             description: format!(
-                "Post a message to a channel AS THE OWNER'S BOT. Always read the exact text back \
-                 and get a spoken yes before calling this. To notify someone, include the \
+                "Propose a message to post to a channel AS THE OWNER'S BOT. This does NOT send \
+                 it: the answer is a proposal that the speaker confirms outside your tools, by \
+                 tapping Send on the voice page (or, through a voice bridge that accepts it, \
+                 their own spoken yes). Read the exact proposed text back to the speaker and ask \
+                 them to tap Send. Calling this again replaces the proposal; \
+                 never call it again as the confirmation. To notify someone, include the \
                  <@author id> token exactly as it appeared beside their name in a message you \
                  read — writing @their-name is plain text and notifies nobody, and there is no \
                  way to look up a person who has not posted. Writable channels: {}.",
@@ -258,7 +262,9 @@ pub fn tool_manifest(channels: &[ChannelInfo]) -> Vec<ToolDescriptor> {
                 }
             ),
             method: "POST",
-            path: "/api/v1/channels/{channel_id}/reply",
+            // The PROPOSING route, not the reply route. `#34 voice-chat-write-confirm`: a
+            // consumer that maps tools onto REST routes must land on the gate too.
+            path: "/api/v1/post-proposals",
             approval: ApprovalMode::RequiresApproval,
             arguments: serde_json::json!({
                 "type": "object",
@@ -477,6 +483,36 @@ mod tests {
                 tool.name
             );
         }
+    }
+
+    #[test]
+    fn no_tool_reaches_a_route_that_posts_or_confirms() {
+        // `#34 voice-chat-write-confirm`. The gate holds only while every way a model can act
+        // ends at a proposal. A tool backed by the commit route would let a model confirm its own
+        // post; one backed by the reply route would skip the proposal entirely; one backed by
+        // cancel would let it withdraw what the speaker is looking at. Documented seams included:
+        // a manifest entry is what a consumer generates its configuration from.
+        for tool in tool_manifest(&channels()) {
+            for forbidden in ["/reply", "/post-proposals/commit", "/post-proposals/cancel"] {
+                assert!(
+                    !tool.path.ends_with(forbidden),
+                    "{} is backed by {}, which a model must never reach",
+                    tool.name,
+                    tool.path
+                );
+            }
+        }
+        let manifest = tool_manifest(&channels());
+        let post = manifest
+            .iter()
+            .find(|t| t.name == "post_reply")
+            .expect("post_reply is offered");
+        assert_eq!((post.method, post.path), ("POST", "/api/v1/post-proposals"));
+        assert!(
+            post.description.contains("does NOT send"),
+            "{}",
+            post.description
+        );
     }
 
     #[test]

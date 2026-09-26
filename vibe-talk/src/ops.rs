@@ -740,6 +740,207 @@ pub async fn resolve(
     Ok((info, resolution, searched))
 }
 
+/// Propose a post for confirmation, and post nothing. **Write scope.** `#34
+/// voice-chat-write-confirm`: what MCP's `post_reply` does.
+///
+/// The same fences [`reply`] applies — allowlisted, writable, not empty — are applied NOW, so a
+/// proposal the owner is asked to confirm is one that could actually be sent. Whatever proposal
+/// was pending is superseded, and says so in the log.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`], [`OpError::ChannelNotWritable`], or [`OpError::Chat`] for an empty
+/// message. Nothing is recorded when any of them applies.
+pub async fn propose_reply(
+    state: &AppState,
+    channel_id: &str,
+    text: &str,
+    reply_to: Option<&str>,
+) -> Result<(ChannelInfo, crate::post_gate::Proposal), OpError> {
+    let info = allowed(state, channel_id).await?;
+    if !info.writable {
+        return Err(OpError::ChannelNotWritable);
+    }
+    if crate::discord::split::split_for_discord(text).is_empty() {
+        return Err(OpError::Chat(ChatError::Refused(
+            "message content is empty".to_owned(),
+        )));
+    }
+    let (proposal, displaced) = state.post_gate.propose(crate::post_gate::Binding {
+        channel_id: info.id.as_str().to_owned(),
+        text: text.to_owned(),
+        reply_to: reply_to.map(str::to_owned),
+    });
+    if let Some(crate::post_gate::Displaced { proposal: old, why }) = displaced {
+        log_gate_step(
+            if why == crate::post_gate::Refusal::Expired {
+                "expired"
+            } else {
+                "superseded"
+            },
+            &old,
+            None,
+            None,
+        );
+    }
+    log_gate_step("proposed", &proposal, None, None);
+    Ok((info, proposal))
+}
+
+/// What a proposing caller is told: MCP's `post_reply` answer, and the `result` of
+/// `POST /api/v1/post-proposals`, so a consumer that maps the tool onto the REST route hands its
+/// model the same words.
+///
+/// It says NOT SENT first, gives the exact text to read back, and says the confirmation is not the
+/// caller's to give. The handle is deliberately absent: a model has no route that could spend it,
+/// and there is no reason to put a capability where it can be repeated.
+#[must_use]
+pub fn proposal_notice(info: &ChannelInfo, proposal: &crate::post_gate::Proposal) -> String {
+    let seconds = proposal.expires_in_ms(tokio::time::Instant::now()) / 1000;
+    let target = match &proposal.binding.reply_to {
+        Some(message) => format!(" as a reply to message {message}"),
+        None => String::new(),
+    };
+    format!(
+        "NOT SENT. Proposal {serial} is waiting for the speaker's confirmation.\n\
+         Channel: {channel} (id {id}){target}\n\
+         Exact text: {text}\n\
+         Read that exact text back to the speaker, then ask them to tap Send on the voice page to \
+         post it. You cannot send it yourself, and nothing you say or call confirms it; a voice \
+         bridge that accepts a spoken confirmation may send it on the speaker's own yes instead. \
+         Do not call post_reply again to confirm; calling it again replaces this proposal with a \
+         new one. If the speaker wants different words, call post_reply with the new text. The \
+         proposal lapses in {seconds} seconds.",
+        serial = proposal.serial,
+        channel = info.display_name(),
+        id = info.id,
+        text = proposal.binding.text,
+    )
+}
+
+/// Who confirmed a proposal, as a commit names it. Recorded, not trusted: both are write-scope
+/// application callers, and this says which path the owner's confirmation took.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfirmedBy {
+    /// The owner tapped Send on the voice page.
+    Ui,
+    /// A bridge attributed a separate, final user turn to the speaker as a yes. Only meaningful
+    /// after a read-back that finished normally: a yes following a barge-in, or reaching a model
+    /// session that never saw the proposal, is not agreement to text the speaker heard. That rule
+    /// is the bridge's to keep; this server cannot observe it.
+    SpeakerTurn,
+}
+
+impl ConfirmedBy {
+    /// The word a log line carries.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ui => "ui",
+            Self::SpeakerTurn => "speaker_turn",
+        }
+    }
+}
+
+/// Why a commit posted nothing, or posted only part.
+#[derive(Debug)]
+pub enum CommitError {
+    /// The gate refused the handle; nothing was sent.
+    Refused(crate::post_gate::Refusal),
+    /// The gate accepted it and the post itself then failed. The handle is spent either way: a
+    /// failure after acceptance may have delivered part, and a retry must be a new proposal.
+    Post(OpError),
+}
+
+/// Spend a proposal and post it, once. **Write scope**, and reachable only from the application
+/// route — never from a tool.
+///
+/// # Errors
+///
+/// [`CommitError::Refused`] when the handle is unknown, expired, spent, superseded, or restated
+/// differently; [`CommitError::Post`] when the post that followed failed.
+pub async fn commit_proposal(
+    state: &AppState,
+    handle: &str,
+    restated: &crate::post_gate::Binding,
+    confirmed_by: ConfirmedBy,
+) -> Result<(u64, Message, Vec<Message>), CommitError> {
+    let proposal = match state.post_gate.take(handle, restated) {
+        Ok(proposal) => proposal,
+        Err((why, proposal)) => {
+            match proposal {
+                Some(proposal) => {
+                    log_gate_step("refused", &proposal, Some(why.code()), Some(confirmed_by));
+                }
+                None => crate::access::post_gate(
+                    "refused",
+                    None,
+                    Some(restated.channel_id.as_str()),
+                    Some(restated.text.chars().count()),
+                    Some(why.code()),
+                    Some(confirmed_by.as_str()),
+                ),
+            }
+            return Err(CommitError::Refused(why));
+        }
+    };
+    let binding = &proposal.binding;
+    match reply(
+        state,
+        &binding.channel_id,
+        &binding.text,
+        binding.reply_to.as_deref(),
+    )
+    .await
+    {
+        Ok((_channel, posted, parts)) => {
+            log_gate_step("committed", &proposal, None, Some(confirmed_by));
+            Ok((proposal.serial, posted, parts))
+        }
+        Err(error) => {
+            log_gate_step("failed", &proposal, Some(error.code()), Some(confirmed_by));
+            Err(CommitError::Post(error))
+        }
+    }
+}
+
+/// Withdraw a proposal without posting it. **Write scope.**
+///
+/// # Errors
+///
+/// The [`crate::post_gate::Refusal`] saying why there was nothing to cancel.
+pub fn cancel_proposal(state: &AppState, handle: &str) -> Result<(), crate::post_gate::Refusal> {
+    match state.post_gate.cancel(handle) {
+        Ok(proposal) => {
+            log_gate_step("cancelled", &proposal, None, None);
+            Ok(())
+        }
+        Err(why) => {
+            crate::access::post_gate("refused", None, None, None, Some(why.code()), None);
+            Err(why)
+        }
+    }
+}
+
+fn log_gate_step(
+    event: &str,
+    proposal: &crate::post_gate::Proposal,
+    reason: Option<&str>,
+    confirmed_by: Option<ConfirmedBy>,
+) {
+    crate::access::post_gate(
+        event,
+        Some(proposal.serial),
+        Some(proposal.binding.channel_id.as_str()),
+        Some(proposal.binding.text.chars().count()),
+        reason,
+        confirmed_by.map(ConfirmedBy::as_str),
+    );
+}
+
 /// Post a message as the bot. **Write scope**, and the only operation that speaks in the owner's
 /// name.
 ///

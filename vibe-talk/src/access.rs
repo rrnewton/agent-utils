@@ -193,6 +193,33 @@ pub fn tool_call(
     );
 }
 
+/// One line for one step of a post proposal's life: proposed, committed, refused, cancelled,
+/// superseded, or expired. `#34 voice-chat-write-confirm`.
+///
+/// The serial correlates the steps of one proposal. The handle is deliberately absent — it is a
+/// capability — and so is every word of the text: a length answers "was it the message that was
+/// read back?" well enough without copying it. `confirmed_by` is the confirming party the commit
+/// named (`ui` or `speaker_turn`), `-` for any step that is not a commit.
+pub fn post_gate(
+    event: &str,
+    serial: Option<u64>,
+    channel: Option<&str>,
+    text_len: Option<usize>,
+    reason: Option<&str>,
+    confirmed_by: Option<&str>,
+) {
+    tracing::info!(
+        target: "vibe_talk::access",
+        event,
+        proposal = serial.map_or(-1_i64, |n| i64::try_from(n).unwrap_or(i64::MAX)),
+        channel = channel.unwrap_or("-"),
+        text_len = text_len.map_or(-1_i64, |n| i64::try_from(n).unwrap_or(i64::MAX)),
+        reason = reason.unwrap_or("-"),
+        confirmed_by = confirmed_by.unwrap_or("-"),
+        "post_gate"
+    );
+}
+
 /// The arguments of a tool call, at DEBUG.
 ///
 /// This is the one line that can carry channel text — `post_reply` puts the message the owner is

@@ -91,6 +91,15 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/channels/{channel_id}/resolve", post(api::resolve))
         .route("/api/v1/channels/{channel_id}/reply", post(api::reply))
         .route("/api/v1/channels/{channel_id}/ask", post(api::ask))
+        // `#34 voice-chat-write-confirm`. WRITE scope, all of them, and NO tool reaches the last
+        // two: `post_reply` proposes through the first, and only the person the bot speaks for —
+        // the voice page's Send, or a bridge's attributed yes — commits. See `api::commit_post`.
+        .route(
+            "/api/v1/post-proposals",
+            get(api::pending_post).post(api::propose_post),
+        )
+        .route("/api/v1/post-proposals/commit", post(api::commit_post))
+        .route("/api/v1/post-proposals/cancel", post(api::cancel_post))
         .route("/api/v1/channels/{channel_id}/stream", get(api::stream))
         // Durable state. The conversation routes all require the WRITE scope, reads included —
         // see the block comment above them in `api` for why a transcript is more sensitive than

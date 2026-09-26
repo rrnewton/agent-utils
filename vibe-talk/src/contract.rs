@@ -134,6 +134,48 @@ pub struct TimelineResponse {
     pub untrusted_content_notice: &'static str,
 }
 
+/// A post waiting for the owner's confirmation. `#34 voice-chat-write-confirm`.
+///
+/// Everything the confirmation has to show — the exact text, where it goes, what it answers — and
+/// the handle that commits exactly this. The handle is a capability: it is handed only to a
+/// write-scope caller of the proposal routes, never to a model, and a commit must restate the
+/// channel, text, and reply target it was issued for.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PendingPost {
+    /// Correlates this proposal's steps in the access log. Increases with every proposal.
+    pub serial: u64,
+    /// The single-use confirmation handle.
+    pub handle: String,
+    /// The channel it would be posted to.
+    pub channel_id: ChannelId,
+    /// That channel's name as the owner knows it, alias included.
+    pub channel_name: String,
+    /// The exact text that would be posted.
+    pub text: String,
+    /// The message it would reply to, when any.
+    pub reply_to: Option<MessageId>,
+    /// Milliseconds until the handle expires.
+    pub expires_in_ms: u64,
+}
+
+/// The post waiting for confirmation, or `null` when none is.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PendingPostResponse {
+    /// The pending proposal. At most one exists: a new proposal supersedes the old.
+    pub proposal: Option<PendingPost>,
+}
+
+/// A confirmed proposal, posted.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CommittedPostResponse {
+    /// Which proposal this was.
+    pub serial: u64,
+    /// The FIRST message as the chat service accepted it.
+    pub posted: Message,
+    /// Every part, in order. One element for a message that fitted.
+    pub parts: Vec<Message>,
+}
+
 /// The scope of the credential that made a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -295,6 +337,8 @@ fn roots(generator: &mut schemars::SchemaGenerator) -> Vec<schemars::Schema> {
         generator.subschema_for::<ClientConfigResponse>(),
         generator.subschema_for::<crate::conversation::VoiceSession>(),
         generator.subschema_for::<TimelineResponse>(),
+        generator.subschema_for::<PendingPostResponse>(),
+        generator.subschema_for::<CommittedPostResponse>(),
         generator.subschema_for::<LiveMessageEvent<'static>>(),
         generator.subschema_for::<LiveDeleteEvent>(),
         generator.subschema_for::<LiveResetEvent>(),

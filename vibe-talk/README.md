@@ -653,7 +653,8 @@ What it asserts, in this order:
 | 3 | read token calling `post_reply` by name → **HTTP 403**, JSON-RPC **-32001** |
 | 4 | a channel outside the allowlist → refused with `unknown_channel` |
 | 5 | read token `digest_channel` → your **real messages**, non-empty |
-| 6 | write token `post_reply` → accepted, and the message is then **read back out of Discord** |
+| 6 | write token `post_reply` → **NOT SENT**, a proposal; the script then confirms it over `/api/v1/post-proposals/commit`, as the voice page's Send does |
+| 7 | the confirmed message is **read back out of Discord** |
 
 It exits non-zero on the **first** failure and names the check that failed; there is no partial
 pass and no check that can silently no-op. Failures carry the likely cause — an empty digest, for
@@ -1195,6 +1196,8 @@ have spoken.
 INFO vibe_talk::access: request method="POST" path="/mcp" credential="write" status=200 millis=12
 INFO vibe_talk::access: mcp rpc_method="tools/call" credential="write" is_notification=false
 INFO vibe_talk::access: tool tool="post_reply" channel="123…" credential="write" outcome="ok" reason="-" text_len=48
+INFO vibe_talk::access: post_gate event="proposed" proposal=4 channel="123…" text_len=48 reason="-" confirmed_by="-"
+INFO vibe_talk::access: post_gate event="committed" proposal=4 channel="123…" text_len=48 reason="-" confirmed_by="ui"
 ```
 
 Filter for just these: `RUST_LOG=vibe_talk::access=info`. Three lines answer the question that
@@ -1245,6 +1248,10 @@ its own adapter-only token; every other route uses the read/write tokens describ
 | POST | `/api/v1/channels/{id}/resolve` | read | **semantic random access** |
 | POST | `/api/v1/channels/{id}/reply` | **write** | `{text, thread_id?, reply_to?}` — post to the channel or selected thread; quoting a message is optional |
 | POST | `/api/v1/channels/{id}/ask` | **write** | slow path — answers 501 in v0 |
+| GET | `/api/v1/post-proposals?wait=&seen=` | **write** | the one post waiting for the owner's confirmation, or `null`; `wait` (seconds, at most 25) holds the request until it changes from serial `seen` — see "Posting is two-phase" |
+| POST | `/api/v1/post-proposals` | **write** | `{channel_id, text, reply_to?}` — propose a post, as `post_reply` does; supersedes any pending one; answers `{sent: false, serial, result}`, where `result` is `post_reply`'s sentence, and no handle |
+| POST | `/api/v1/post-proposals/commit` | **write** | `{handle, channel_id, text, reply_to, confirmed_by}` — confirm and post it, once |
+| POST | `/api/v1/post-proposals/cancel` | **write** | `{handle}` — withdraw it; `204` |
 | GET | `/api/v1/channels/{id}/stream` | read | **Server-Sent Events**: messages as they arrive — see "Live push" |
 | GET | `/api/v1/conversations` | **write** | stored `/voice` transcripts, most recent first |
 | DELETE | `/api/v1/conversations` | **write** | erase every stored transcript |
@@ -2763,7 +2770,7 @@ endpoint should have.
 | `count_messages` | read | automatic | How many, up to a cost ceiling — "at least N" when the ceiling stops it. |
 | `find_message` | read | automatic | Describe a message in your own words, get it back in full. |
 | `read_message` | read | automatic | One known message by id. |
-| `post_reply` | **write** | **requires approval** | Posts as the bot. |
+| `post_reply` | **write** | **requires approval** | *Proposes* a post as the bot. Nothing is sent until the owner confirms it outside the model's tools. |
 
 They are deliberately thin. With a real model in the loop the model should compose, not consume
 pre-chewed operations, so there is no "summarize and reply" tool and no batching helper.
@@ -2776,6 +2783,68 @@ shape.
 **A read credential is not shown `post_reply` at all,** and is refused with HTTP `403` plus
 JSON-RPC `-32001` if it calls it anyway. Hiding and enforcing are separate on purpose: hiding a
 tool is never the thing that keeps it from running.
+
+### Posting is two-phase
+
+`#34 voice-chat-write-confirm`. A per-tool approval setting is a promise the voice provider makes,
+and a bridge that has no such setting would leave the decision to post entirely to the model — the
+same model that has just read other people's messages, any of which may be written to talk it into
+something. So `post_reply` **never sends**. It leaves one pending proposal on this server and
+answers `NOT SENT`, with the channel and the exact text to read back. The owner confirms it outside
+anything a model can call:
+
+* **on the voice page**, where a card shows the server's own copy — channel, reply target, text —
+  with **Send** and **Don't send**; or
+* **by a spoken yes that the voice bridge attributes to the owner**, which the bridge turns into a
+  commit naming `confirmed_by: "speaker_turn"`. Nothing in this repository does that: on the voice
+  page a spoken yes sends nothing, and the model is told to ask for a tap on Send.
+
+The card is built so that a tap confirms only what the owner read. When a newer proposal replaces
+the text, Send is held for two seconds and the card says the text changed, so a tap already on its
+way does not land on the new words. A draft whose card was showing when a call ended is not offered
+again in the next call on the same page; it lapses on the server. The page remembers that only
+until it is reloaded, so a new call from a reloaded page within the 120 seconds shows it again.
+
+The mechanics, all over the write-scope REST routes in the table above:
+
+* **One proposal at a time.** A new one supersedes the old, so a correction ("no, say tomorrow")
+  replaces the draft rather than queueing a second post.
+* **The handle is a capability.** 128 random bits, returned only by `GET /api/v1/post-proposals`.
+  It is never in the tool's answer to the model, the answer of the REST route that proposes, a path,
+  or a log line.
+* **Single use, short-lived.** It lapses 120 seconds after the proposal. Every commit that reaches
+  the gate with a pending handle spends it — one that restates the wrong text burns it rather than
+  inviting a retry, and so does a confirmed post that then fails to send. A request too malformed to
+  parse (a missing field, an unknown `confirmed_by`) is refused before it reaches the gate, and
+  spends nothing.
+* **Bound to what was read back.** A commit restates the channel, the text, and the reply target,
+  and must match all three exactly.
+* **Refusals are specific:** `proposal_unknown` (404), `proposal_expired` (410), and
+  `proposal_used`, `proposal_superseded` or `proposal_mismatch` (409). None of them posts.
+* **The log is content-free.** One `post_gate` line per step — `proposed`, `committed`, `failed`,
+  `refused`, `cancelled`, `superseded`, `expired` — with a serial, channel id, text length, refusal
+  code and `confirmed_by`. Never a word of the text, never the handle.
+
+**A bridge that commits on a spoken yes must only do so for a yes the owner could have meant.**
+Two cases break that, and the bridge — not the model — has to rule them out:
+
+* **An interrupted read-back.** A barge-in can cut the response after `post_reply` has run but
+  before the text was spoken. The proposal is still pending, and the next user turn may be "stop"
+  or something unrelated, not agreement to text the owner never heard. Commit only after a
+  read-back that finished normally, following the proposal; otherwise cancel it, or let it lapse.
+* **A replacement model session.** A bridge that reopens a session after a cut and seeds it with
+  earlier user turns only gives the new model no knowledge that a proposal is pending, so a yes
+  reaching it has no context at all.
+
+**The gate binds the model, not the write credential.** `confirmed_by` is recorded, not verified:
+any holder of the write token can commit, naming either path, and `POST /api/v1/channels/{id}/reply`
+still posts directly for the application callers that use it. That is the point of the design —
+the model's tools reach only the proposing half — and also its limit: it holds only while nothing
+model-driven can make arbitrary HTTP calls with the write token. A voice bridge is given write scope
+only on those terms.
+
+The read-scope tool list is unchanged by this: a read credential still sees the six read tools and
+nothing that proposes, commits, or cancels.
 
 **A channel may be named, but the id is what the model is told to pass.** Every tool's
 `channel_id` is described as "an id from list_channels" and lists the configured choices
@@ -2845,14 +2914,16 @@ A starting system prompt for the agent — triage rather than transcription, whi
 reason a digest exists — is in [`QUICKSTART.md`](QUICKSTART.md) under step 5.
 
 **Which token you give it decides the ceiling.** With the read token the agent physically cannot
-post — `post_reply` is not even listed for it. With the write token it can, subject to the
-approval prompt. The conservative first deployment is the read token.
+post — `post_reply` is not even listed for it. With the write token it can *propose*, and a
+proposal posts only when the owner confirms it — see "Posting is two-phase". The conservative
+first deployment is the read token.
 
 **Say this plainly: the per-tool approval setting is enforced on ElevenLabs' side, and this server
 cannot verify it.** Nothing here can tell whether you configured approval correctly, or
-whether it was later changed. What this server enforces is the scope split and the allowlist:
-a read token cannot post, and no token can reach a channel outside the configuration. Do not
-mistake the approval prompt for a guarantee we implement.
+whether it was later changed. What this server enforces is the scope split, the allowlist, and the
+confirmation step: a read token cannot post, `post_reply` never sends by itself, and no token can
+reach a channel outside the configuration. Do not mistake the approval prompt for a guarantee we
+implement; the confirmation step is the one we do.
 
 Verify the public endpoint before pointing an agent at it — same script, public URL:
 
@@ -3043,6 +3114,9 @@ makes it, not the voice agent, the real security boundary of the whole design.
   agent cannot post. The server refuses to start if the two tokens are equal or shorter than 24
   characters. Over MCP the read token is not even shown `post_reply` in `tools/list`, and is
   refused with `403` if it calls it by name anyway.
+* **The model cannot post by itself.** Even with the write token, `post_reply` only proposes; the
+  post happens when the owner confirms it through a route no MCP tool reaches. See "Posting is
+  two-phase".
 * **Configured channels are an allowlist.** A channel absent from the configuration answers 404
   even to the write token, however many channels the bot happens to be in. Each channel is
   additionally `writable` or not, defaulting to not. **Both front doors share one implementation**

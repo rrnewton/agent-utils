@@ -1,8 +1,9 @@
 ---
 title: 'voice-chat-write-confirm: let a voice agent post only after a confirmed read-back'
-status: open
+status: in_progress
 priority: 1
 issue_type: feature
+assignee: opus-5.5/voice-chat-write-confirm
 labels:
 - vibe-talk
 - voice
@@ -10,8 +11,10 @@ labels:
 depends_on:
   agent-utils-1: parent-child
   agent-utils-13: discovered-from
-created_at: 2026-09-25T18:27:30.000000000+00:00
-updated_at: 2026-09-25T18:27:30.000000000+00:00
+created_at: 2026-09-25T18:27:30+00:00
+updated_at: 2026-09-26T00:32:25.878995986+00:00
+claimed_at: 2026-09-26T00:32:25.878995986+00:00
+claimed_until: 2026-09-27T00:32:25.878867824+00:00
 ---
 
 # Description

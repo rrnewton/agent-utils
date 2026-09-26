@@ -78,7 +78,7 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
  *   | "help-link-reading-width" | "help-link-resuming" | "help-link-speech-prep"
  *   | "help-link-storage" | "jump-marker" | "jump-newest" | "load-older" | "load-older-turns"
  *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings"
- *   | "prompts-open" | "read-aloud" | "read-new" | "read-speed" | "remove-channel"
+ *   | "post-confirm-cancel" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-new" | "read-speed" | "remove-channel"
  *   | "rename-channel" | "reply-cancel" | "reply-send" | "save-alias" | "save-token"
  *   | "search-toggle" | "send-text" | "speaker" | "summarise" | "talk" | "text-entry"
  *   | "thread-back" | "todo-filter" | "undo-dismiss" | "view-switch"} id
@@ -2475,6 +2475,244 @@ async function apiDecoded(type, path, options) {
   }
 }
 
+// --- confirming a post the assistant proposed ----------------------------------------------------
+//
+// `#34 voice-chat-write-confirm`. The voice agent's `post_reply` tool never sends. It leaves ONE
+// pending proposal on the server — channel, reply target, exact text — and the owner confirms it
+// outside the model's tools: by tapping Send here, or by a spoken yes that the voice bridge
+// attributes to them. Everything a model can reach is the proposing half, so a model talked into
+// posting by a message it read can at worst put a card on this screen.
+//
+// The card shows the SERVER's copy, fetched from `/api/v1/post-proposals`, never anything the
+// agent said. Send restates that copy with the handle, and the server refuses unless all of it
+// still matches, so what the owner read is what gets posted. The handle travels only on those two
+// requests: it is not in the tool's answer, the transcript, or any log.
+//
+// Watched only during a write-scope call. A read-scope token cannot see proposals at all, and
+// outside a call there is no agent to propose one.
+const POST_WATCH_WAIT_SECONDS = 25;
+const POST_WATCH_RETRY_MS = 3000;
+const POST_EXPIRY_TICK_MS = 1000;
+// How long Send stays disabled after the card's text is replaced by a newer proposal, so that a tap
+// already on its way lands on nothing rather than on words the owner has not read.
+const POST_CHANGE_HOLD_MS = 2000;
+
+const postWatch = {
+  // Bumped to stop a loop: a loop whose generation is no longer current returns at its next await.
+  generation: 0,
+  running: false,
+  /** @type {AbortController | null} */
+  controller: null,
+  /** @type {VibeTalk.PendingPost | null} */
+  shown: null,
+  // The serial of the last proposal the server reported, shown or not: the long poll's `seen`.
+  /** @type {number | null} */
+  received: null,
+  // The handle pending when the last call ended. The next call does not offer it: a draft from a
+  // conversation that is over is not something to confirm in a new one.
+  /** @type {string | null} */
+  ignored: null,
+  // When the shown proposal lapses, fixed once when it first appears so a re-render cannot extend it.
+  deadline: 0,
+  tick: null,
+  // Set while Send is held after a replacement; `changed` marks the card until it is settled.
+  hold: null,
+  changed: false,
+  busy: false,
+};
+
+// What a refused confirmation means, per code. Every one of them says that THIS tap posted nothing,
+// because that is the question the owner has at that moment.
+const POST_REFUSALS = {
+  proposal_expired: "That proposal lapsed before Send reached the server. Nothing was posted.",
+  proposal_superseded:
+    "The assistant replaced that proposal with a newer one before Send arrived. Nothing was posted from that card.",
+  proposal_used:
+    "That proposal had already been settled — confirmed, withdrawn, or refused. This tap posted nothing.",
+  proposal_mismatch: "The server's proposal did not match this card, so nothing was posted.",
+  proposal_unknown: "The server holds no such proposal (it may have restarted). Nothing was posted.",
+};
+
+function startPostWatch() {
+  if (tokenScope !== "write" || postWatch.running) return;
+  postWatch.running = true;
+  postWatch.generation += 1;
+  void watchPostProposals(postWatch.generation);
+}
+
+function stopPostWatch() {
+  postWatch.running = false;
+  postWatch.generation += 1;
+  if (postWatch.controller) postWatch.controller.abort();
+  postWatch.controller = null;
+  // The proposal itself is left to lapse on the server. Hanging up is not a decision about it, and
+  // a card with no call behind it would be a Send button for a conversation that is over — so is
+  // offering the same draft again when the next call opens.
+  if (postWatch.shown) postWatch.ignored = postWatch.shown.handle;
+  showPostProposal(null);
+}
+
+async function watchPostProposals(generation) {
+  // The first read does not wait, so a proposal already pending when the call opened is shown now.
+  let waitSeconds = 0;
+  while (postWatch.generation === generation) {
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    postWatch.controller = controller;
+    const seen = postWatch.received === null ? "" : `&seen=${postWatch.received}`;
+    const path = waitSeconds === 0
+      ? "/api/v1/post-proposals"
+      : `/api/v1/post-proposals?wait=${waitSeconds}${seen}`;
+    try {
+      const answer = await apiDecoded(
+        "PendingPostResponse", path, controller ? { signal: controller.signal } : undefined
+      );
+      if (postWatch.generation !== generation) return;
+      const proposal = answer.proposal;
+      postWatch.received = proposal ? proposal.serial : null;
+      showPostProposal(proposal && proposal.handle === postWatch.ignored ? null : proposal);
+      waitSeconds = POST_WATCH_WAIT_SECONDS;
+    } catch (error) {
+      if (postWatch.generation !== generation) return;
+      // A token that cannot see proposals will not start seeing them by asking again.
+      if (error.refused) {
+        postWatch.running = false;
+        return;
+      }
+      waitSeconds = 0;
+      await new Promise((resolve) => setTimeout(resolve, POST_WATCH_RETRY_MS));
+    }
+  }
+}
+
+/** @param {VibeTalk.PendingPost | null} proposal */
+function showPostProposal(proposal) {
+  if (postWatch.tick !== null) {
+    clearTimeout(postWatch.tick);
+    postWatch.tick = null;
+  }
+  const previous = postWatch.shown;
+  postWatch.shown = proposal;
+  if (!proposal) {
+    if (postWatch.hold !== null) clearTimeout(postWatch.hold);
+    postWatch.hold = null;
+    postWatch.changed = false;
+    el("post-confirm").hidden = true;
+    return;
+  }
+  if (!previous || previous.handle !== proposal.handle) {
+    postWatch.deadline = Date.now() + proposal.expires_in_ms;
+    // Replacing words the owner may be about to confirm: hold Send long enough for a tap aimed at
+    // the old text to miss, and say that the text changed.
+    if (previous) {
+      if (postWatch.hold !== null) clearTimeout(postWatch.hold);
+      postWatch.changed = true;
+      postWatch.hold = setTimeout(() => {
+        postWatch.hold = null;
+        if (postWatch.shown) showPostProposal(postWatch.shown);
+      }, POST_CHANGE_HOLD_MS);
+    }
+  }
+  el("post-confirm-where").textContent = proposal.reply_to
+    ? `To ${proposal.channel_name}, as a reply to message ${proposal.reply_to}`
+    : `To ${proposal.channel_name}`;
+  // Verbatim, as text. It is the one thing on the card the owner is confirming, so nothing is
+  // shortened or reformatted — except a sign-in token, which is never put on screen and never sent.
+  const shown = redact(proposal.text);
+  el("post-confirm-text").textContent = shown;
+  el("post-confirm-send").disabled =
+    postWatch.busy || postWatch.hold !== null || shown !== proposal.text;
+  el("post-confirm-cancel").disabled = postWatch.busy;
+  renderPostExpiry();
+  el("post-confirm").hidden = false;
+}
+
+function renderPostExpiry() {
+  const proposal = postWatch.shown;
+  if (!proposal) return;
+  if (redact(proposal.text) !== proposal.text) {
+    el("post-confirm-expiry").textContent =
+      "This text contains your sign-in token, so this page will not send it. Tap Don't send.";
+    return;
+  }
+  const seconds = Math.max(0, Math.ceil((postWatch.deadline - Date.now()) / 1000));
+  if (seconds === 0) {
+    el("post-confirm-send").disabled = true;
+    el("post-confirm-expiry").textContent = "This proposal has lapsed. Nothing was posted.";
+    return;
+  }
+  const changed = postWatch.changed ? "The assistant changed the text — read it again. " : "";
+  el("post-confirm-expiry").textContent =
+    `${changed}Nothing is posted until you confirm. Lapses in ${seconds} s.`;
+  postWatch.tick = setTimeout(() => {
+    postWatch.tick = null;
+    renderPostExpiry();
+  }, POST_EXPIRY_TICK_MS);
+}
+
+async function sendPostProposal() {
+  const proposal = postWatch.shown;
+  if (!proposal || postWatch.busy || postWatch.hold !== null) return;
+  if (redact(proposal.text) !== proposal.text) return;
+  postWatch.busy = true;
+  el("post-confirm-send").disabled = true;
+  el("post-confirm-cancel").disabled = true;
+  try {
+    const answer = await api("/api/v1/post-proposals/commit", {
+      method: "POST",
+      body: {
+        handle: proposal.handle,
+        channel_id: proposal.channel_id,
+        text: proposal.text,
+        reply_to: proposal.reply_to,
+        confirmed_by: "ui",
+      },
+    });
+    settlePostCard(proposal);
+    if (answer && answer.error === "partially_posted") {
+      // A failed first part is reported the same way, as a partial send of nothing.
+      const detail = redact(answer.detail || "the rest was not sent");
+      showError(Number(answer.posted) === 0
+        ? `Nothing was posted to ${proposal.channel_name}: ${detail}`
+        : `Only part of the message reached ${proposal.channel_name}: ${detail}`);
+    } else if (VibeTalkContract.is("CommittedPostResponse", answer)) {
+      setStatus(`Posted to ${proposal.channel_name}.`);
+    } else {
+      showError("vibe-talk accepted the post but did not say what it posted. Check the channel.");
+    }
+  } catch (error) {
+    // A request that never arrived spent nothing, so the card stays for another try. Anything the
+    // server answered spent the proposal, whatever the answer was.
+    if (!error.network) settlePostCard(proposal);
+    showError(POST_REFUSALS[error.code] || error.message);
+  } finally {
+    postWatch.busy = false;
+    if (postWatch.shown) showPostProposal(postWatch.shown);
+  }
+}
+
+async function cancelPostProposal() {
+  const proposal = postWatch.shown;
+  if (!proposal || postWatch.busy) return;
+  postWatch.busy = true;
+  try {
+    await api("/api/v1/post-proposals/cancel", { method: "POST", body: { handle: proposal.handle } });
+    settlePostCard(proposal);
+    setStatus("Not sent.");
+  } catch (error) {
+    // Already settled is still "not sent from this card" — the watch shows whatever came next.
+    if (!error.network) settlePostCard(proposal);
+    if (error.network) showError(error.message);
+  } finally {
+    postWatch.busy = false;
+    if (postWatch.shown) showPostProposal(postWatch.shown);
+  }
+}
+
+/** Take a settled proposal off the card, unless the watch has already put a newer one there. */
+function settlePostCard(proposal) {
+  if (postWatch.shown && postWatch.shown.serial === proposal.serial) showPostProposal(null);
+}
+
 // --- the durable transcript --------------------------------------------------------------------
 //
 // `#48 transcript-storage`. Everything on this screen used to live only in the DOM: a reload, a
@@ -3609,6 +3847,7 @@ async function start(options) {
     if (session.protocol === "vibe-talk-v1") {
       session.connected = true;
       conversationOpen = true;
+      startPostWatch();
       session.conversationId = conversationIdFrom(null);
       setState("live");
       setStatus("Opening the voice session…");
@@ -3648,6 +3887,7 @@ async function start(options) {
     }
     session.connected = true;
     conversationOpen = true;
+    startPostWatch();
     // A mute engaged during the CONNECT WINDOW could not be announced when it happened. The socket
     // is assigned before it is open, deliberately — that is what makes the talk control mute
     // rather than dial a second call — but `sendClientEvent` refuses a socket the page is not yet
@@ -4463,6 +4703,7 @@ function teardown() {
   // Before anything is reset: the turn in progress is stored, and a call that ended before its
   // greeting still reports how far it got.
   settleSpoken();
+  stopPostWatch();
   sendStartupTiming();
   stopPlayback();
   if (session.node) {
@@ -12046,6 +12287,8 @@ el("compose-text").addEventListener("keydown", (event) => {
 });
 el("dismiss-banner").addEventListener("click", dismissBanner);
 el("dismiss-status").addEventListener("click", dismissStatus);
+el("post-confirm-send").addEventListener("click", sendPostProposal);
+el("post-confirm-cancel").addEventListener("click", cancelPostProposal);
 el("open-settings").addEventListener("click", () => showScreen("settings"));
 el("dismiss-error").addEventListener("click", clearError);
 el("audio-source").addEventListener("click", () =>

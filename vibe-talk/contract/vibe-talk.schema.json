@@ -167,6 +167,34 @@
       ],
       "type": "object"
     },
+    "CommittedPostResponse": {
+      "description": "A confirmed proposal, posted.",
+      "properties": {
+        "parts": {
+          "description": "Every part, in order. One element for a message that fitted.",
+          "items": {
+            "$ref": "#/$defs/Message"
+          },
+          "type": "array"
+        },
+        "posted": {
+          "$ref": "#/$defs/Message",
+          "description": "The FIRST message as the chat service accepted it."
+        },
+        "serial": {
+          "description": "Which proposal this was.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "serial",
+        "posted",
+        "parts"
+      ],
+      "type": "object"
+    },
     "Description": {
       "description": "Public capabilities of the selected read-aloud provider; never contains credentials.",
       "properties": {
@@ -409,6 +437,80 @@
         "is_root",
         "reply_count",
         "reply_count_exact"
+      ],
+      "type": "object"
+    },
+    "PendingPost": {
+      "description": "A post waiting for the owner's confirmation. `#34 voice-chat-write-confirm`.\n\nEverything the confirmation has to show — the exact text, where it goes, what it answers — and\nthe handle that commits exactly this. The handle is a capability: it is handed only to a\nwrite-scope caller of the proposal routes, never to a model, and a commit must restate the\nchannel, text, and reply target it was issued for.",
+      "properties": {
+        "channel_id": {
+          "$ref": "#/$defs/ChannelId",
+          "description": "The channel it would be posted to."
+        },
+        "channel_name": {
+          "description": "That channel's name as the owner knows it, alias included.",
+          "type": "string"
+        },
+        "expires_in_ms": {
+          "description": "Milliseconds until the handle expires.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "handle": {
+          "description": "The single-use confirmation handle.",
+          "type": "string"
+        },
+        "reply_to": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MessageId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The message it would reply to, when any."
+        },
+        "serial": {
+          "description": "Correlates this proposal's steps in the access log. Increases with every proposal.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "text": {
+          "description": "The exact text that would be posted.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "serial",
+        "handle",
+        "channel_id",
+        "channel_name",
+        "text",
+        "reply_to",
+        "expires_in_ms"
+      ],
+      "type": "object"
+    },
+    "PendingPostResponse": {
+      "description": "The post waiting for confirmation, or `null` when none is.",
+      "properties": {
+        "proposal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PendingPost"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The pending proposal. At most one exists: a new proposal supersedes the old."
+        }
+      },
+      "required": [
+        "proposal"
       ],
       "type": "object"
     },
@@ -926,6 +1028,12 @@
     },
     {
       "$ref": "#/$defs/TimelineResponse"
+    },
+    {
+      "$ref": "#/$defs/PendingPostResponse"
+    },
+    {
+      "$ref": "#/$defs/CommittedPostResponse"
     },
     {
       "$ref": "#/$defs/LiveMessageEvent"

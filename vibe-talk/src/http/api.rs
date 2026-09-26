@@ -1250,6 +1250,212 @@ pub async fn reply(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// `#34 voice-chat-write-confirm`: the post gate's application routes.
+//
+// A model's `post_reply` only PROPOSES; these are how the person it speaks for sees the proposal
+// and sends or withdraws it. All four need the WRITE token, and NONE of them is a tool — the commit
+// in particular must stay out of the manifest, because a model that could reach it would be
+// confirming its own post. The handle travels in request bodies, never in a path, so the access
+// log's path field cannot hold it. See `crate::post_gate`.
+// ---------------------------------------------------------------------------------------------
+
+/// The longest a proposal long-poll may hang, in seconds. Under the usual 30-second proxy idle
+/// timeout, so a wait ends in an answer rather than in a proxy's 504.
+pub const PROPOSAL_WAIT_MAX_SECONDS: u64 = 25;
+
+/// A request to propose a post. The same fields as `post_reply`'s arguments.
+#[derive(Debug, Deserialize)]
+pub struct ProposeRequest {
+    /// The channel to post to.
+    pub channel_id: String,
+    /// The exact text.
+    pub text: String,
+    /// The message it answers, when any.
+    pub reply_to: Option<String>,
+}
+
+/// What `POST /api/v1/post-proposals` answers. It carries no handle: the proposing caller may be
+/// a model's tool, and the handle is the owner's to spend, through `GET` and the commit route.
+#[derive(Debug, Serialize)]
+pub struct ProposedResponse {
+    /// Always `false`: proposing posts nothing.
+    pub sent: bool,
+    /// The proposal's number, as `GET /api/v1/post-proposals` will report it.
+    pub serial: u64,
+    /// The sentence MCP's `post_reply` answers with, for a caller that relays it to a model.
+    pub result: String,
+}
+
+/// Query of the proposal long-poll.
+#[derive(Debug, Deserialize)]
+pub struct PendingQuery {
+    /// Seconds to wait for a change, at most [`PROPOSAL_WAIT_MAX_SECONDS`]. Absent answers at once.
+    pub wait: Option<u64>,
+    /// The serial the caller already shows, so the wait ends when the pending proposal differs.
+    /// Absent means the caller shows none.
+    pub seen: Option<u64>,
+}
+
+/// A commit: the handle, the binding restated, and who confirmed it.
+#[derive(Debug, Deserialize)]
+pub struct CommitRequest {
+    /// The proposal's handle.
+    pub handle: String,
+    /// The channel, exactly as proposed.
+    pub channel_id: String,
+    /// The text, exactly as proposed.
+    pub text: String,
+    /// The reply target, exactly as proposed.
+    pub reply_to: Option<String>,
+    /// Which confirmation this is.
+    pub confirmed_by: ops::ConfirmedBy,
+}
+
+/// A cancel: only the handle.
+#[derive(Debug, Deserialize)]
+pub struct CancelRequest {
+    /// The proposal's handle.
+    pub handle: String,
+}
+
+impl From<crate::post_gate::Refusal> for ApiError {
+    fn from(value: crate::post_gate::Refusal) -> Self {
+        use crate::post_gate::Refusal;
+        let status = match value {
+            Refusal::Unknown => StatusCode::NOT_FOUND,
+            Refusal::Expired => StatusCode::GONE,
+            Refusal::Used | Refusal::Superseded | Refusal::Mismatch => StatusCode::CONFLICT,
+        };
+        Self::new(status, value.code(), value.sentence())
+    }
+}
+
+async fn pending_view(
+    state: &AppState,
+    proposal: Option<crate::post_gate::Proposal>,
+) -> crate::contract::PendingPostResponse {
+    let Some(proposal) = proposal else {
+        return crate::contract::PendingPostResponse { proposal: None };
+    };
+    let channel_id = ChannelId(proposal.binding.channel_id.clone());
+    let channel_name = ops::channels(state)
+        .await
+        .into_iter()
+        .find(|channel| channel.id == channel_id)
+        .map_or_else(
+            || proposal.binding.channel_id.clone(),
+            |channel| channel.display_name().to_owned(),
+        );
+    crate::contract::PendingPostResponse {
+        proposal: Some(crate::contract::PendingPost {
+            serial: proposal.serial,
+            expires_in_ms: proposal.expires_in_ms(tokio::time::Instant::now()),
+            handle: proposal.handle,
+            channel_id,
+            channel_name,
+            text: proposal.binding.text,
+            reply_to: proposal.binding.reply_to.map(MessageId),
+        }),
+    }
+}
+
+/// `POST /api/v1/post-proposals` — propose a post, and post nothing. The route `post_reply` is
+/// backed by, for a caller that speaks REST rather than MCP.
+pub async fn propose_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ProposeRequest>,
+) -> Result<Json<ProposedResponse>, ApiError> {
+    require(&headers, &state, Scope::Write)?;
+    let (channel, proposal) = ops::propose_reply(
+        &state,
+        &request.channel_id,
+        &request.text,
+        request.reply_to.as_deref(),
+    )
+    .await?;
+    Ok(Json(ProposedResponse {
+        sent: false,
+        serial: proposal.serial,
+        result: ops::proposal_notice(&channel, &proposal),
+    }))
+}
+
+/// `GET /api/v1/post-proposals` — the post waiting for confirmation, long-polled.
+///
+/// Without `wait` it answers at once. With it, the answer waits until the pending proposal is no
+/// longer the one numbered `seen` — a new one, or none because it was sent, cancelled, or expired
+/// — or until `wait` seconds pass.
+pub async fn pending_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<PendingQuery>,
+) -> Result<Json<crate::contract::PendingPostResponse>, ApiError> {
+    require(&headers, &state, Scope::Write)?;
+    let proposal = match query.wait {
+        None | Some(0) => state.post_gate.pending(),
+        Some(seconds) => {
+            let wait = std::time::Duration::from_secs(seconds.min(PROPOSAL_WAIT_MAX_SECONDS));
+            state.post_gate.wait_for_change(query.seen, wait).await
+        }
+    };
+    Ok(Json(pending_view(&state, proposal).await))
+}
+
+/// `POST /api/v1/post-proposals/commit` — the owner confirmed; post it, once.
+///
+/// Refused, posting nothing, with `proposal_unknown` (404), `proposal_expired` (410), or
+/// `proposal_used`, `proposal_superseded`, `proposal_mismatch` (409). A post that fails after the
+/// gate accepted answers like the reply route: 207 with the unsent remainder when part went out.
+pub async fn commit_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CommitRequest>,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Write)?;
+    let restated = crate::post_gate::Binding {
+        channel_id: request.channel_id,
+        text: request.text,
+        reply_to: request.reply_to,
+    };
+    match ops::commit_proposal(&state, &request.handle, &restated, request.confirmed_by).await {
+        Ok((serial, posted, parts)) => Ok(Json(crate::contract::CommittedPostResponse {
+            serial,
+            posted,
+            parts,
+        })
+        .into_response()),
+        Err(ops::CommitError::Refused(why)) => Err(why.into()),
+        Err(ops::CommitError::Post(OpError::PartiallyPosted {
+            posted,
+            unsent,
+            cause,
+        })) => Ok((
+            StatusCode::MULTI_STATUS,
+            Json(PartialReplyResponse {
+                error: "partially_posted",
+                detail: cause,
+                posted,
+                unsent,
+            }),
+        )
+            .into_response()),
+        Err(ops::CommitError::Post(other)) => Err(other.into()),
+    }
+}
+
+/// `POST /api/v1/post-proposals/cancel` — withdraw the pending proposal without posting it.
+pub async fn cancel_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CancelRequest>,
+) -> Result<StatusCode, ApiError> {
+    require(&headers, &state, Scope::Write)?;
+    ops::cancel_proposal(&state, &request.handle)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// A slow-path question for the coding agents.
 #[derive(Debug, Deserialize)]
 pub struct AskRequest {

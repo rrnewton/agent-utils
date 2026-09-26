@@ -143,6 +143,20 @@ for tool in tools:
     print(tool["name"])
 '
 
+# The commit body for the pending proposal in $BODY, restating exactly what the server holds. Fails
+# unless that proposal is the one carrying this run's nonce, so a stale one is never confirmed.
+PY_COMMIT_BODY='
+import json, sys
+try:
+    pending = json.load(sys.stdin)["proposal"]
+except Exception:
+    sys.exit(1)
+if not pending or sys.argv[1] not in pending["text"]:
+    sys.exit(1)
+keys = ("handle", "channel_id", "text", "reply_to")
+print(json.dumps({**{k: pending[k] for k in keys}, "confirmed_by": "ui"}))
+'
+
 PY_TOOL_TEXT='
 import json, sys
 try:
@@ -291,12 +305,30 @@ else
     nonce="gtverify-$(date +%s)-$$"
     tool_call "$WRITE_TOKEN" post_reply \
         "{\"channel_id\":\"$CHANNEL\",\"text\":\"vibe-talk deployment check $nonce — this message was posted by the verification script and can be deleted.\"}"
-    [ "$STATUS" = "200" ] || fail "check 6 (post): post_reply returned HTTP $STATUS, expected 200. Body was: $BODY"
+    [ "$STATUS" = "200" ] || fail "check 6 (propose): post_reply returned HTTP $STATUS, expected 200. Body was: $BODY"
     is_error="$(jget result.isError)"
-    posted="$(tool_text)"
-    [ "$is_error" = "false" ] || fail "check 6 (post): the post was refused. The server said: $posted
-If this mentions channel_not_writable, that channel is configured 'ro' — change it to 'rw'. If it mentions Discord, the bot most likely lacks Send Messages in that channel."
-    ok "post_reply accepted: $(head -n1 <<<"$posted" | cut -c1-100)"
+    proposed="$(tool_text)"
+    [ "$is_error" = "false" ] || fail "check 6 (propose): the proposal was refused. The server said: $proposed
+If this mentions channel_not_writable, that channel is configured 'ro' — change it to 'rw'."
+    # `#34 voice-chat-write-confirm`: the model-facing tool only PROPOSES. A server that posted
+    # here would be one whose agent can speak in your name without you.
+    case "$proposed" in
+        "NOT SENT."*) ;;
+        *) fail "check 6 (propose): post_reply did not say NOT SENT. This server lets the model post without a separate confirmation. It said: $proposed" ;;
+    esac
+    ok "post_reply proposed and did not send: $(head -n1 <<<"$proposed" | cut -c1-100)"
+
+    # The confirming half, as the voice page's Send does it: read the server's copy of the pending
+    # proposal and restate it with its handle. This script is the confirming party here — running
+    # it with a write token and without --skip-post is the decision to post.
+    checking "the proposal is confirmed outside the model's tools, and only then posted"
+    request GET /api/v1/post-proposals "$WRITE_TOKEN"
+    [ "$STATUS" = "200" ] || fail "check 6 (pending): GET /api/v1/post-proposals returned $STATUS, expected 200. Body was: $BODY"
+    commit="$(python3 -c "$PY_COMMIT_BODY" "$nonce" <<<"$BODY")" \
+        || fail "check 6 (pending): the pending proposal is not the one this script just made. Body was: $BODY"
+    request POST /api/v1/post-proposals/commit "$WRITE_TOKEN" "$commit"
+    [ "$STATUS" = "200" ] || fail "check 6 (commit): confirming the proposal returned HTTP $STATUS, expected 200. If this is 502, the bot most likely lacks Send Messages in that channel. Body was: $BODY"
+    ok "confirmed proposal $(jget serial) posted as message $(jget posted.id)"
 
     # Reading it back is what proves it reached Discord rather than being accepted and dropped.
     checking "the posted message is readable back out of Discord"
@@ -305,7 +337,7 @@ If this mentions channel_not_writable, that channel is configured 'ro' — chang
     found="$(tool_text)"
     case "$found" in
         *"$nonce"*) ;;
-        *) fail "check 7 (read-back): the message this script just posted could not be read back out of channel $CHANNEL. post_reply reported success, so it was accepted — but it is not in the window this server fetches. Look at the channel in Discord yourself before trusting the write path. find_message said: $found" ;;
+        *) fail "check 7 (read-back): the message this script just posted could not be read back out of channel $CHANNEL. the confirmed commit reported success, so it was accepted — but it is not in the window this server fetches. Look at the channel in Discord yourself before trusting the write path. find_message said: $found" ;;
     esac
     ok "the posted message came back out of Discord (nonce $nonce)"
     echo ""
@@ -332,7 +364,10 @@ echo ""
 echo "PASSED — $checks_run checks against $URL"
 echo ""
 echo "What this did NOT check, and cannot:"
-echo "  * Fine-Grained Tool Approval. That is enforced inside ElevenLabs; nothing here can see it."
-echo "    What this proved is the half we do enforce: the read token cannot post, and no token can"
-echo "    reach a channel outside the allowlist."
+echo "  * Who confirms a proposal in your deployment. This server refuses to let post_reply send and"
+echo "    holds each proposal for a separate confirmation (the voice page's Send, or a spoken yes the"
+echo "    voice bridge attributes to you); this script confirmed its own. Whether your bridge only"
+echo "    confirms on a real yes is a property of the bridge, and nothing here can see it."
+echo "    What this proved is the half we do enforce: the read token cannot post, post_reply does not"
+echo "    send, and no token can reach a channel outside the allowlist."
 echo "  * TLS, if you pointed this at http://. A tunnel gives you TLS; it does not authorize anyone."

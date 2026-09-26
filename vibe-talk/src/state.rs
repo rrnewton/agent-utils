@@ -92,6 +92,10 @@ pub struct AppState {
     /// sides ensures concurrent requests cannot observe the same channel as absent and then undo
     /// one another's upstream registration during compensation.
     pub channel_registration_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The one post a voice agent has proposed and nobody has confirmed yet. `#34
+    /// voice-chat-write-confirm`: over MCP, `post_reply` records a proposal here and posts nothing;
+    /// only the commit route, which no tool reaches, can spend it. See [`crate::post_gate`].
+    pub post_gate: Arc<crate::post_gate::PostGate>,
     /// Caps the lines `POST /api/v1/voice-health` writes, across every caller. Per process rather
     /// than per call because the server has no call id to count by, by design.
     pub voice_health_budget: Arc<crate::voice_health::LogBudget>,

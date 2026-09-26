@@ -132,6 +132,35 @@
       "version": "0.0.0"
     }
   ],
+  "CommittedPostResponse": [
+    {
+      "parts": [
+        {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": false,
+          "channel_id": "100",
+          "content": "hello",
+          "id": "300",
+          "reply_to": null,
+          "spoken_time": "",
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        }
+      ],
+      "posted": {
+        "author": "someone",
+        "author_id": "7",
+        "author_is_bot": false,
+        "channel_id": "100",
+        "content": "hello",
+        "id": "300",
+        "reply_to": null,
+        "spoken_time": "",
+        "timestamp": "2026-09-25T12:00:00+00:00"
+      },
+      "serial": 3
+    }
+  ],
   "LiveDeleteEvent": [
     {
       "channel_id": "100",
@@ -217,6 +246,33 @@
         "root_message_id": "200"
       },
       "timestamp": "2026-09-25T12:00:00+00:00"
+    }
+  ],
+  "PendingPostResponse": [
+    {
+      "proposal": {
+        "channel_id": "111",
+        "channel_name": "lead team",
+        "expires_in_ms": 120000,
+        "handle": "AAAAAAAAAAAAAAAAAAAAAA",
+        "reply_to": "300",
+        "serial": 3,
+        "text": "on my way"
+      }
+    },
+    {
+      "proposal": {
+        "channel_id": "111",
+        "channel_name": "lead team",
+        "expires_in_ms": 1,
+        "handle": "BBBBBBBBBBBBBBBBBBBBBB",
+        "reply_to": null,
+        "serial": 4,
+        "text": "on my way"
+      }
+    },
+    {
+      "proposal": null
     }
   ],
   "ThreadSummary": [

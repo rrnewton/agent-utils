@@ -113,6 +113,55 @@ fn call(tool: &str, arguments: Value) -> Value {
     })
 }
 
+/// Stand in for the speaker's tap on Send: fetch the pending proposal with the write token and
+/// commit it exactly as proposed. `#34 voice-chat-write-confirm` — `post_reply` only proposes.
+async fn confirm_pending(harness: &Harness) {
+    let request = |method: &str, uri: &str, body: Option<Value>| {
+        let builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {WRITE_TOKEN}"));
+        match body {
+            Some(json) => builder
+                .header("content-type", "application/json")
+                .body(Body::from(json.to_string()))
+                .expect("request"),
+            None => builder.body(Body::empty()).expect("request"),
+        }
+    };
+    let response = harness
+        .router
+        .clone()
+        .oneshot(request("GET", "/api/v1/post-proposals", None))
+        .await
+        .expect("router responds");
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let pending: Value = serde_json::from_slice(&bytes).expect("json");
+    let proposal = &pending["proposal"];
+    let response = harness
+        .router
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/api/v1/post-proposals/commit",
+            Some(json!({
+                "handle": proposal["handle"],
+                "channel_id": proposal["channel_id"],
+                "text": proposal["text"],
+                "reply_to": proposal["reply_to"],
+                "confirmed_by": "ui",
+            })),
+        ))
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::OK, "{pending}");
+}
+
 fn tool_text(response: &Value) -> String {
     response["result"]["content"][0]["text"]
         .as_str()
@@ -316,7 +365,7 @@ async fn the_owners_stored_transcript_is_not_reachable_by_a_model() {
 }
 
 #[tokio::test]
-async fn the_write_token_can_post_and_it_lands_in_the_channel_that_was_named() {
+async fn the_write_token_proposes_and_a_confirmed_post_lands_in_the_channel_that_was_named() {
     let harness = harness();
     let (status, body) = rpc(
         &harness,
@@ -329,6 +378,8 @@ async fn the_write_token_can_post_and_it_lands_in_the_channel_that_was_named() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["result"]["isError"], false, "{body}");
+    assert!(harness.discord.posted().is_empty(), "a proposal posted");
+    confirm_pending(&harness).await;
     let posted = harness.discord.posted();
     assert_eq!(posted.len(), 1, "{posted:?}");
     assert_eq!(posted[0].channel.as_str(), WRITE_CHANNEL);
@@ -1059,6 +1110,7 @@ async fn every_tool_result_carries_a_usable_mention_and_a_reply_built_from_it_pi
         response["result"]["isError"], false,
         "the post failed: {response}"
     );
+    confirm_pending(&harness).await;
     let posted = harness.discord.posted();
     assert_eq!(posted.len(), 1);
     assert!(

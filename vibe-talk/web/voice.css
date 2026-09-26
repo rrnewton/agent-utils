@@ -2006,6 +2006,47 @@ body {
   box-shadow: 0 0 0 2px var(--warn);
 }
 
+/* ---------------------------------------------------------------- the post confirmation --- */
+/*
+ * `#34 voice-chat-write-confirm`. An overlay at the TOP of the body area, for the reason
+ * #status-line is one: a card that appeared as a grid row would push the transcript down under the
+ * reader's thumb at the moment they are listening to the read-back. Unlike the status pill it is
+ * a real target — Send and Don't send are the whole point — so it takes its own taps.
+ */
+#post-confirm {
+  position: absolute;
+  z-index: 6;
+  inset-inline: 0;
+  top: 0.5rem;
+  max-width: calc(100% - 1.5rem);
+  margin: 0 auto;
+  padding: 0.75rem calc(0.75rem + env(safe-area-inset-right)) 0.75rem
+    calc(0.75rem + env(safe-area-inset-left));
+  border-color: var(--accent);
+  box-shadow: 0 2px 12px rgb(0 0 0 / 45%);
+}
+
+#post-confirm h2 {
+  margin: 0 0 0.35rem;
+  font-size: 1rem;
+}
+
+#post-confirm p {
+  margin: 0.35rem 0;
+}
+
+/* The words that will be posted, verbatim. Kept as the owner's line breaks and wrapped anywhere,
+   because a long URL that ran off the card would be text the owner confirmed without seeing. */
+#post-confirm-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 40vh;
+  overflow-y: auto;
+  padding: 0.5rem;
+  border-left: 3px solid var(--accent);
+  background: var(--bg);
+}
+
 /* ----------------------------------------------------------------------- the control bar --- */
 /*
  * `#58 control-bar`. The strip carrying the gear, the Voice/Discord switch, and — from `#59` and

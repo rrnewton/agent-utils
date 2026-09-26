@@ -14,9 +14,9 @@ use std::path::PathBuf;
 
 use serde_json::{json, Value};
 use vibe_talk::contract::{
-    ApiErrorBody, ClientConfigResponse, LiveDeleteEvent, LiveDelivery, LiveMessageEvent,
-    LiveResetEvent, TimelineResponse, TokenScope, TranscriptRole, VibeTalkV1ClientFrame,
-    VibeTalkV1ServerFrame,
+    ApiErrorBody, ClientConfigResponse, CommittedPostResponse, LiveDeleteEvent, LiveDelivery,
+    LiveMessageEvent, LiveResetEvent, PendingPost, PendingPostResponse, TimelineResponse,
+    TokenScope, TranscriptRole, VibeTalkV1ClientFrame, VibeTalkV1ServerFrame,
 };
 use vibe_talk::conversation::{VoiceDescription, VoiceSession};
 use vibe_talk::model::{ChannelId, ChannelInfo, Message, MessageId, UserId};
@@ -187,6 +187,36 @@ fn samples() -> Value {
                 output_sample_rate: 24_000,
             }),
         ],
+        "PendingPostResponse": [
+            to(&PendingPostResponse {
+                proposal: Some(PendingPost {
+                    serial: 3,
+                    handle: "AAAAAAAAAAAAAAAAAAAAAA".into(),
+                    channel_id: ChannelId("111".into()),
+                    channel_name: "lead team".into(),
+                    text: "on my way".into(),
+                    reply_to: Some(MessageId("300".into())),
+                    expires_in_ms: 120_000,
+                }),
+            }),
+            to(&PendingPostResponse {
+                proposal: Some(PendingPost {
+                    serial: 4,
+                    handle: "BBBBBBBBBBBBBBBBBBBBBB".into(),
+                    channel_id: ChannelId("111".into()),
+                    channel_name: "lead team".into(),
+                    text: "on my way".into(),
+                    reply_to: None,
+                    expires_in_ms: 1,
+                }),
+            }),
+            to(&PendingPostResponse { proposal: None }),
+        ],
+        "CommittedPostResponse": [to(&CommittedPostResponse {
+            serial: 3,
+            posted: plain.clone(),
+            parts: vec![plain.clone()],
+        })],
         "TimelineResponse": [
             to(&timeline(TimelineView::Main, TimelinePage {
                 messages: vec![plain.clone(), threaded.clone()],

@@ -270,8 +270,9 @@ It reads the two tokens out of the environment you just exported. It checks, in 
 unauthenticated call is refused with 401 and told nothing; that the read token can list tools and
 is **not** offered `post_reply`; that the read token is refused with 403 if it calls `post_reply`
 anyway; that a channel outside your allowlist is refused; that the read token gets your **real
-messages** back; and that the write token can post a message and that the message can then be read
-back out of Discord.
+messages** back; that the write token's `post_reply` only *proposes* (it must answer `NOT SENT`);
+and that once the script confirms that proposal, as the voice page's Send button does, the message
+can be read back out of Discord.
 
 It exits non-zero on the first failure and names the check that failed. There is no partial pass.
 If the digest comes back empty rather than refused, it says so and points you at the Message
@@ -447,10 +448,12 @@ That table is the whole policy: **reading is automatic while you are driving, po
 
 **Be clear about who enforces that.** Fine-Grained Tool Approval runs on **ElevenLabs' side**.
 This server cannot see it, cannot verify you set it, and cannot tell if it is changed later. What
-this server enforces — and what the step 3 script proves — is different and narrower: a read token
-**cannot** post, and no token can reach a channel outside your allowlist. If you want approval to
-be a guarantee rather than a setting, give the agent the **read token** and let it be physically
-incapable of posting.
+this server enforces — and what the step 3 script proves — is different: a read token **cannot**
+post, no token can reach a channel outside your allowlist, and even with the write token
+`post_reply` never sends by itself. It proposes, and the post happens only when you tap **Send** on
+the card the voice page shows (or give a spoken yes that a voice bridge attributes to you — see
+"Posting is two-phase" in the README). If you want posting off entirely, give the agent the
+**read token** and let it be physically incapable of proposing at all.
 
 5. Give the agent the canonical system prompt: the whole of
    [`prompts/voice-agent-system.txt`](prompts/voice-agent-system.txt), then a blank line, then the
@@ -471,9 +474,11 @@ Open the agent in ElevenLabs and start a conversation. Ask, roughly in this orde
 2. *"What's been happening in lead team?"* — exercises `digest_channel`; this is the real feature.
 3. *"Read me the one about the mac runner."* — exercises `find_message`; this is the feature that
    makes it more than a text-to-speech bot.
-4. *"Reply saying I'll look at it tonight."* — exercises `post_reply`. **It must ask you first.**
-   If it posts without asking, stop, and fix the approval setting in step 5 — or switch the agent
-   to the read token, which removes the capability rather than gating it.
+4. *"Reply saying I'll look at it tonight."* — exercises `post_reply`. **It must read the exact
+   text back, and nothing is posted until you confirm** — on the voice page, a card appears with
+   that text and a Send button. If a message appears in the channel before you confirm, stop: the
+   server is not the one this guide describes. Switching the agent to the read token removes the
+   capability rather than gating it.
 
 Barge-in is native, so you can interrupt it mid-sentence without a button. That is not the
 same as pausing: mute is what pauses, and it is this page's own doing — it withholds your audio,

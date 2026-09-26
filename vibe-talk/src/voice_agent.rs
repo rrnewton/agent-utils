@@ -51,13 +51,13 @@ pub const PROMPT_ID: &str = "voice-agent-system";
 /// Bump this whenever any of the three prompt files changes, and update
 /// [`PINNED_READ_FINGERPRINT`] and [`PINNED_WRITE_FINGERPRINT`] to match. The test that compares
 /// them is what makes the version mean something.
-pub const PROMPT_VERSION: u32 = 2;
+pub const PROMPT_VERSION: u32 = 3;
 
 /// The [`fingerprint`] of the read-only prompt at [`PROMPT_VERSION`].
 pub const PINNED_READ_FINGERPRINT: &str = "fnv1a64:fe95ee12cbcd38c4";
 
 /// The [`fingerprint`] of the sending prompt at [`PROMPT_VERSION`].
-pub const PINNED_WRITE_FINGERPRINT: &str = "fnv1a64:c97cb6194902ccba";
+pub const PINNED_WRITE_FINGERPRINT: &str = "fnv1a64:bcdb8d700cbea99d";
 
 /// A content fingerprint a consumer can log without logging the prompt.
 ///
@@ -331,7 +331,7 @@ mod tests {
     /// The load-bearing phrases of the send rules. None of them may reach a read-only caller.
     const SEND_RULES: [&str; 5] = [
         "only when the user explicitly asks you to",
-        "do not ask for it again",
+        "outside your tools",
         "only when the human explicitly requests it",
         "exact provider mention",
         "You can also send",

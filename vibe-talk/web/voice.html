@@ -142,6 +142,25 @@
         <button id="dismiss-status" class="chip" type="button" aria-label="Dismiss">×</button>
       </div>
 
+      <!--
+        `#34 voice-chat-write-confirm`. The voice agent's `post_reply` does not send: it PROPOSES,
+        and this card is one of the two ways the owner confirms. It shows exactly what the server
+        will post — channel, reply target, text — because that is what Send commits, and nothing
+        the agent says can change it once it is on screen. It appears only during a write-scope
+        call, and it is an overlay for the same reason #status-line is: appearing must not move the
+        transcript under the reader's thumb.
+      -->
+      <section id="post-confirm" class="panel" role="alertdialog" aria-labelledby="post-confirm-title" hidden>
+        <h2 id="post-confirm-title">Post this as your bot?</h2>
+        <p id="post-confirm-where"></p>
+        <p id="post-confirm-text"></p>
+        <p id="post-confirm-expiry" class="hint"></p>
+        <div class="row">
+          <button id="post-confirm-cancel" class="secondary" type="button">Don't send</button>
+          <button id="post-confirm-send" type="button">Send</button>
+        </div>
+      </section>
+
       <div id="screens">
         <!-- ------------------------------------------------------------------ sign-in screen -->
         <section id="screen-signin" class="screen">

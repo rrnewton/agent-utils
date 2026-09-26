@@ -635,3 +635,160 @@ async fn throttled_health_records_are_announced_once_per_window() {
         .count();
     assert_eq!(written, 30);
 }
+
+/// One JSON request, answering with its status and body.
+async fn json_call(
+    harness: &Harness,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", format!("Bearer {WRITE_TOKEN}"))
+        .header("accept", "application/json, text/event-stream");
+    let request = match body {
+        Some(json) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(json.to_string()))
+            .expect("request"),
+        None => builder.body(Body::empty()).expect("request"),
+    };
+    let response = harness
+        .router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("router responds");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn the_post_gate_logs_every_step_without_a_word_of_the_message_or_its_handle() {
+    // `#34 voice-chat-write-confirm`, rule 4: refusals and commits are logged, and nothing said
+    // is. The handle is a capability, so it is kept out of the log as firmly as the text.
+    const SECRET: &str = "the vault code is 4417 and nobody may read it";
+    let capture = LogCapture::info_only();
+    let harness = harness();
+    let mut handles = Vec::new();
+    let propose = || async {
+        let status = rpc(
+            &harness,
+            Some(WRITE_TOKEN),
+            tools_call(
+                "post_reply",
+                json!({ "channel_id": WRITE_CHANNEL, "text": SECRET }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_status, body) = json_call(&harness, "GET", "/api/v1/post-proposals", None).await;
+        body["proposal"].clone()
+    };
+    let restated = |proposal: &Value, text: &str, confirmed_by: &str| {
+        json!({
+            "handle": proposal["handle"],
+            "channel_id": proposal["channel_id"],
+            "text": text,
+            "reply_to": proposal["reply_to"],
+            "confirmed_by": confirmed_by,
+        })
+    };
+    let first = propose().await;
+    let edited = format!("{SECRET}!");
+    let (status, _) = json_call(
+        &harness,
+        "POST",
+        "/api/v1/post-proposals/commit",
+        Some(restated(&first, &edited, "ui")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let second = propose().await;
+    let third = propose().await;
+    let (status, _) = json_call(
+        &harness,
+        "POST",
+        "/api/v1/post-proposals/cancel",
+        Some(json!({ "handle": third["handle"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let fourth = propose().await;
+    let (status, _) = json_call(
+        &harness,
+        "POST",
+        "/api/v1/post-proposals/commit",
+        Some(restated(&fourth, SECRET, "speaker_turn")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(harness.discord.posted().len(), 1);
+    // A handle the server never issued is refused, logged, and kept out of the log too: a guess
+    // at a capability is not something to write down either.
+    let guessed = "gUeSsEd-handle-0123456";
+    let (status, _) = json_call(
+        &harness,
+        "POST",
+        "/api/v1/post-proposals/commit",
+        Some(json!({
+            "handle": guessed,
+            "channel_id": WRITE_CHANNEL,
+            "text": SECRET,
+            "reply_to": null,
+            "confirmed_by": "ui",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(harness.discord.posted().len(), 1);
+    handles.push(guessed.to_owned());
+    for proposal in [&first, &second, &third, &fourth] {
+        handles.push(proposal["handle"].as_str().expect("a handle").to_owned());
+    }
+
+    let gate_lines = capture
+        .access_lines()
+        .into_iter()
+        .filter(|line| line.contains("post_gate"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for step in [
+        "event=\"proposed\"",
+        "event=\"refused\"",
+        "event=\"superseded\"",
+        "event=\"cancelled\"",
+        "event=\"committed\"",
+        "reason=\"proposal_mismatch\"",
+        "reason=\"proposal_unknown\"",
+        "confirmed_by=\"speaker_turn\"",
+    ] {
+        assert!(gate_lines.contains(step), "no {step} in:\n{gate_lines}");
+    }
+    assert!(
+        gate_lines.contains(&format!("text_len={}", SECRET.chars().count())),
+        "{gate_lines}"
+    );
+    let everything = capture.text();
+    assert!(
+        !everything.contains("vault code"),
+        "message text reached the INFO log:\n{everything}"
+    );
+    for handle in &handles {
+        assert!(
+            !everything.contains(handle.as_str()),
+            "a handle reached the log:\n{everything}"
+        );
+    }
+}

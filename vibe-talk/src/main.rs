@@ -497,6 +497,7 @@ async fn main() -> anyhow::Result<()> {
         channel_registration_lock: Arc::new(tokio::sync::Mutex::new(())),
         voice_health_budget: Arc::new(vibe_talk::voice_health::LogBudget::new()),
         speech_tickets: Arc::new(vibe_talk::speech_tickets::SpeechTickets::new()),
+        post_gate: Arc::new(vibe_talk::post_gate::PostGate::new()),
         live: Arc::clone(&live),
         summarizer,
         summary_version: summary_version.into(),

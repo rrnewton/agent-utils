@@ -260,6 +260,7 @@ fn state_pieces_with(
         channel_registration_lock: Arc::new(tokio::sync::Mutex::new(())),
         voice_health_budget: Arc::new(crate::voice_health::LogBudget::new()),
         speech_tickets: Arc::new(crate::speech_tickets::SpeechTickets::new()),
+        post_gate: Arc::new(crate::post_gate::PostGate::new()),
         spoken_names: Arc::new(crate::speakable::SharedNames::new()),
         live: Arc::new(crate::live::LiveHub::new()),
         summarizer: Arc::clone(&summarizer),

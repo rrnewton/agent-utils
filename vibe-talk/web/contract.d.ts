@@ -182,6 +182,24 @@ declare namespace VibeTalk {
   }
 
   /**
+   * A confirmed proposal, posted.
+   */
+  interface CommittedPostResponse {
+    /**
+     * Every part, in order. One element for a message that fitted.
+     */
+    parts: Message[];
+    /**
+     * The FIRST message as the chat service accepted it.
+     */
+    posted: Message;
+    /**
+     * Which proposal this was.
+     */
+    serial: number;
+  }
+
+  /**
    * Public capabilities of the selected read-aloud provider; never contains credentials.
    */
   interface Description {
@@ -412,6 +430,55 @@ declare namespace VibeTalk {
      * The original channel message, if this provider exposes one.
      */
     root_message_id: MessageId | null;
+  }
+
+  /**
+   * A post waiting for the owner's confirmation. `#34 voice-chat-write-confirm`.
+   *
+   * Everything the confirmation has to show — the exact text, where it goes, what it answers — and
+   * the handle that commits exactly this. The handle is a capability: it is handed only to a
+   * write-scope caller of the proposal routes, never to a model, and a commit must restate the
+   * channel, text, and reply target it was issued for.
+   */
+  interface PendingPost {
+    /**
+     * The channel it would be posted to.
+     */
+    channel_id: ChannelId;
+    /**
+     * That channel's name as the owner knows it, alias included.
+     */
+    channel_name: string;
+    /**
+     * Milliseconds until the handle expires.
+     */
+    expires_in_ms: number;
+    /**
+     * The single-use confirmation handle.
+     */
+    handle: string;
+    /**
+     * The message it would reply to, when any.
+     */
+    reply_to: MessageId | null;
+    /**
+     * Correlates this proposal's steps in the access log. Increases with every proposal.
+     */
+    serial: number;
+    /**
+     * The exact text that would be posted.
+     */
+    text: string;
+  }
+
+  /**
+   * The post waiting for confirmation, or `null` when none is.
+   */
+  interface PendingPostResponse {
+    /**
+     * The pending proposal. At most one exists: a new proposal supersedes the old.
+     */
+    proposal: PendingPost | null;
   }
 
   /**
@@ -664,6 +731,8 @@ declare namespace VibeTalk {
     ClientConfigResponse: ClientConfigResponse;
     VoiceSession: VoiceSession;
     TimelineResponse: TimelineResponse;
+    PendingPostResponse: PendingPostResponse;
+    CommittedPostResponse: CommittedPostResponse;
     LiveMessageEvent: LiveMessageEvent;
     LiveDeleteEvent: LiveDeleteEvent;
     LiveResetEvent: LiveResetEvent;

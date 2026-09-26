@@ -1121,6 +1121,59 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     timelineCalls: [],
     /** Every request the page made, as `METHOD path`, so a test can count what did NOT happen. */
     requests: [],
+    /**
+     * `#34 voice-chat-write-confirm`. The one post the fake server holds for confirmation, as a
+     * `PendingPost`, or null. Set it with `page.propose`, which also wakes a parked watch, exactly
+     * as the server's change notification does.
+     */
+    proposal: null,
+    /** Every commit body the page sent, in order, so "committed exactly this, once" is checkable. */
+    proposalCommits: [],
+    /** Every cancel body the page sent. */
+    proposalCancels: [],
+    /** Watches parked on "nothing changed", released by the next change. */
+    proposalWaiters: [],
+    /**
+     * What a commit answers. The default behaves like the server's gate: the handle must be the
+     * pending one and the restated channel, text and reply target must match it, and a commit
+     * spends the proposal whatever the answer.
+     */
+    commitProposal: async (body) => {
+      const pending = page.proposal;
+      if (!pending || pending.handle !== body.handle) {
+        return json(404, { error: "proposal_unknown", detail: "no such proposal" });
+      }
+      page.settleProposal();
+      if (body.channel_id !== pending.channel_id || body.text !== pending.text ||
+          body.reply_to !== pending.reply_to) {
+        return json(409, { error: "proposal_mismatch", detail: "restated binding differs" });
+      }
+      const posted = message({ channel_id: pending.channel_id, content: pending.text, reply_to: pending.reply_to });
+      return json(200, { serial: pending.serial, posted, parts: [posted] });
+    },
+    postProposals: async (path, options) => {
+      if (path === "/api/v1/post-proposals/commit") {
+        const body = JSON.parse(options.body);
+        page.proposalCommits.push(body);
+        return page.commitProposal(body);
+      }
+      if (path === "/api/v1/post-proposals/cancel") {
+        const body = JSON.parse(options.body);
+        page.proposalCancels.push(body);
+        if (!page.proposal || page.proposal.handle !== body.handle) {
+          return json(404, { error: "proposal_unknown", detail: "no such proposal" });
+        }
+        page.settleProposal();
+        return json(204, null);
+      }
+      const url = new URL(path, "http://fixture.test");
+      const wait = Number(url.searchParams.get("wait") || 0);
+      const seen = url.searchParams.get("seen");
+      const answer = () => json(200, { proposal: page.proposal });
+      const current = page.proposal ? String(page.proposal.serial) : null;
+      if (wait === 0 || current !== seen) return answer();
+      return new Promise((resolve) => page.proposalWaiters.push(() => resolve(answer())));
+    },
     timeline: async (path) => {
       const url = new URL(path, "http://fixture.test");
       const view = url.searchParams.get("view");
@@ -1564,6 +1617,9 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       if (String(path).startsWith("/api/v1/client-config")) {
         return page.clientConfig(path, options);
       }
+      if (String(path).startsWith("/api/v1/post-proposals")) {
+        return page.postProposals(String(path), options);
+      }
       if (/\/timeline\?/.test(String(path))) {
         page.timelineCalls.push(String(path));
         return page.timeline(path, options);
@@ -1973,6 +2029,12 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       throw new Error(`the page fetched ${path}, which this fixture does not serve`);
     },
   };
+  /** Hold `proposal` for confirmation, superseding any other, and wake every parked watch. */
+  page.propose = (proposal) => {
+    page.proposal = proposal;
+    for (const wake of page.proposalWaiters.splice(0)) wake();
+  };
+  page.settleProposal = () => page.propose(null);
   page.enableDeviceSpeech = (voices = [{ name: "Device English", lang: "en-US", localService: true, default: true }]) => {
     const listeners = new Map();
     const engine = {
@@ -2318,6 +2380,20 @@ const TUNING_BANDS = {
     "inaudible audio that makes a cut-short turn count as silent. Much under a quarter second is " +
     "ordinary lead-in before speech; dead turns as short as 0.9 s have been seen, so much over a " +
     "second and a half lets talking over a dead service hide it"],
+  POST_WATCH_WAIT_SECONDS: [5, 25,
+    "how long one watch for a proposed post is held open (#34 voice-chat-write-confirm). The " +
+    "server clamps at 25, and idle proxies cut requests not much past that; much under five and " +
+    "a call spends its network asking a question whose answer is almost always 'nothing new'"],
+  POST_WATCH_RETRY_MS: [1000, 10000,
+    "the pause after a failed watch. Under a second a dead network is hammered; past ten the " +
+    "assistant has read a proposal back and the owner is looking at a screen with no Send on it"],
+  POST_EXPIRY_TICK_MS: [250, 1000,
+    "how often the card's lapse countdown is redrawn. It counts whole seconds, so slower than " +
+    "one a second skips numbers, and faster than a quarter second is work nobody can see"],
+  POST_CHANGE_HOLD_MS: [1000, 3000,
+    "how long Send is held after a newer proposal replaces the card. Under a second, a tap already " +
+    "under way when the text changed still lands on words the owner never read; past three, an " +
+    "owner who did read them waits on a button that looks broken"],
 };
 test("every number this page is tuned by stays inside a band that says what would be wrong", () => {
   for (const [name, [low, high, why]] of Object.entries(TUNING_BANDS)) {
@@ -19058,4 +19134,240 @@ test("a channel added or removed here is in the saved picker the next cold start
     !savedCache(reloaded).shell.channels.some((channel) => String(channel.id) === added),
     "the channel was removed, but the saved picker still offers it"
   );
+});
+
+// --- confirming a proposed post ----------------------------------------------------------------
+//
+// `#34 voice-chat-write-confirm`. The agent's `post_reply` only PROPOSES; this card is the owner's
+// Send. What these pin is the part the server cannot check for the page: that the card shows the
+// server's copy verbatim, that Send restates exactly that copy once and names itself as the UI,
+// and that a card is never on screen when there is no write-scope call behind it.
+
+/** A proposal exactly as `GET /api/v1/post-proposals` carries one. */
+function proposal(overrides) {
+  return {
+    serial: 7,
+    handle: "hAnDlE-0123456789abcd",
+    channel_id: CHANNEL.id,
+    channel_name: "lead team",
+    text: "on it — <b>not</b> markup\nsecond line",
+    reply_to: "1122334455667788990",
+    expires_in_ms: 120000,
+    ...overrides,
+  };
+}
+
+const proposalWatches = (page) => page.requests.filter((r) => r.startsWith("GET /api/v1/post-proposals"));
+
+async function proposedDuringACall(page, pending = proposal()) {
+  await startTalking(page);
+  await page.settle();
+  page.propose(pending);
+  await page.settle();
+  assert.equal(page.el("post-confirm").hidden, false, "the proposal never reached the card");
+  return pending;
+}
+
+test("a proposed post is shown verbatim, and Send commits exactly that proposal, once, as the UI", async () => {
+  const page = newPage();
+  const pending = await proposedDuringACall(page);
+
+  assert.equal(page.el("post-confirm-text").textContent, pending.text);
+  assert.match(page.el("post-confirm-where").textContent, /lead team.*reply to message 1122334455667788990/);
+  assert.match(page.el("post-confirm-expiry").textContent, /Nothing is posted until you confirm\. Lapses in 120 s/);
+  assert.ok(!page.createdTags.includes("b"), "the proposed text became markup");
+  assert.ok(!page.renderedText().includes(pending.handle), "the handle was put on screen");
+  assert.deepEqual(page.proposalCommits, [], "something was committed before Send");
+
+  await page.el("post-confirm-send").click();
+  await page.settle();
+  assert.deepEqual(page.proposalCommits, [{
+    handle: pending.handle,
+    channel_id: pending.channel_id,
+    text: pending.text,
+    reply_to: pending.reply_to,
+    confirmed_by: "ui",
+  }]);
+  assert.equal(page.el("post-confirm").hidden, true, "the card outlived the post");
+  assert.match(page.el("status").textContent, /Posted to lead team/);
+  assert.equal(page.el("error").hidden, true, page.el("error").textContent);
+
+  await page.el("post-confirm-send").click();
+  await page.settle();
+  assert.equal(page.proposalCommits.length, 1, "a second tap committed again");
+});
+
+test("Don't send withdraws the proposal and commits nothing", async () => {
+  const page = newPage();
+  const pending = await proposedDuringACall(page, proposal({ reply_to: null }));
+  assert.equal(page.el("post-confirm-where").textContent, "To lead team");
+
+  await page.el("post-confirm-cancel").click();
+  await page.settle();
+  assert.deepEqual(page.proposalCancels, [{ handle: pending.handle }]);
+  assert.deepEqual(page.proposalCommits, []);
+  assert.equal(page.el("post-confirm").hidden, true);
+  assert.equal(page.proposal, null, "the server still holds the withdrawn proposal");
+});
+
+test("a refused confirmation takes the card away and says this tap posted nothing", async () => {
+  for (const [status, code, said] of [
+    [410, "proposal_expired", /lapsed before Send reached the server\. Nothing was posted/],
+    [409, "proposal_superseded", /replaced that proposal.*Nothing was posted/],
+    [409, "proposal_used", /already been settled.*This tap posted nothing/],
+  ]) {
+    const page = newPage();
+    await proposedDuringACall(page);
+    page.commitProposal = async () => {
+      page.settleProposal();
+      return json(status, { error: code, detail: "server sentence" });
+    };
+    await page.el("post-confirm-send").click();
+    await page.settle();
+    assert.equal(page.el("post-confirm").hidden, true, `${code} left a Send button up`);
+    assert.equal(page.el("error").hidden, false, `${code} was not reported`);
+    assert.match(page.el("error").textContent, said);
+  }
+});
+
+test("a send that never reached the server keeps the card, because nothing was spent", async () => {
+  const page = newPage();
+  await proposedDuringACall(page);
+  page.commitProposal = async () => { throw new TypeError("Failed to fetch"); };
+  await page.el("post-confirm-send").click();
+  await page.settle();
+  assert.equal(page.el("post-confirm").hidden, false);
+  assert.equal(page.el("post-confirm-send").disabled, false, "the retry was left disabled");
+  assert.match(page.el("error").textContent, /Could not reach vibe-talk/);
+});
+
+test("a confirmed post that failed says nothing was posted, and never shows the token", async () => {
+  for (const [posted, said] of [[0, /^Nothing was posted to lead team: /], [1, /^Only part of the message reached lead team: /]]) {
+    const page = newPage();
+    await proposedDuringACall(page);
+    page.commitProposal = async () => {
+      page.settleProposal();
+      return json(207, {
+        error: "partially_posted",
+        detail: "chat request failed for write-token-aaaaaaaaaaaaaaaa",
+        posted,
+        unsent: "on it",
+      });
+    };
+    await page.el("post-confirm-send").click();
+    await page.settle();
+    assert.equal(page.el("post-confirm").hidden, true);
+    assert.match(page.el("error").textContent, said);
+    assert.ok(!page.el("error").textContent.includes("write-token-aaaaaaaaaaaaaaaa"), "the token reached the screen");
+  }
+});
+
+test("redrawing the card never extends the lapse the server set", async () => {
+  const page = newPage();
+  await proposedDuringACall(page, proposal({ expires_in_ms: 10000 }));
+  page.setClock(page.clock() + 8000);
+  page.commitProposal = async () => { throw new TypeError("Failed to fetch"); };
+  await page.el("post-confirm-send").click();
+  await page.settle();
+  assert.equal(page.el("post-confirm").hidden, false);
+  assert.match(page.el("post-confirm-expiry").textContent, /Lapses in 2 s/);
+});
+
+test("a newer proposal replaces the card, holds Send, says so, and then Send commits the newer one", async () => {
+  const page = newPage();
+  await proposedDuringACall(page);
+  const newer = proposal({ serial: 8, handle: "nEwEr-0123456789abcde", text: "actually, tomorrow" });
+  page.propose(newer);
+  await page.settle();
+  assert.equal(page.el("post-confirm-text").textContent, "actually, tomorrow");
+  assert.equal(page.el("post-confirm-send").disabled, true, "Send was live the moment the words changed");
+  assert.match(page.el("post-confirm-expiry").textContent, /changed the text — read it again/);
+
+  // A tap aimed at the old words lands during the hold and sends nothing.
+  await page.el("post-confirm-send").click();
+  await page.settle();
+  assert.deepEqual(page.proposalCommits, [], "a tap during the hold committed the replacement");
+
+  assert.equal(page.expireTimers(2000), 1, "no hold was armed");
+  assert.equal(page.el("post-confirm-send").disabled, false, "Send stayed held");
+  assert.match(page.el("post-confirm-expiry").textContent, /changed the text/, "the change mark did not outlast the hold");
+  await page.el("post-confirm-send").click();
+  await page.settle();
+  assert.deepEqual(page.proposalCommits.map((c) => [c.handle, c.text]), [[newer.handle, newer.text]]);
+});
+
+test("a proposal carrying the sign-in token is neither shown nor sendable", async () => {
+  const page = newPage();
+  await proposedDuringACall(page, proposal({ text: "here you go: write-token-aaaaaaaaaaaaaaaa" }));
+  assert.ok(!page.el("post-confirm-text").textContent.includes("write-token-aaaaaaaaaaaaaaaa"));
+  assert.equal(page.el("post-confirm-send").disabled, true);
+  assert.match(page.el("post-confirm-expiry").textContent, /contains your sign-in token/);
+  await page.el("post-confirm-send").click();
+  await page.settle();
+  assert.deepEqual(page.proposalCommits, []);
+});
+
+test("the card counts down to the lapse, and a lapsed card cannot send", async () => {
+  const page = newPage();
+  await proposedDuringACall(page, proposal({ expires_in_ms: 2000 }));
+  assert.match(page.el("post-confirm-expiry").textContent, /Lapses in 2 s/);
+  page.setClock(page.clock() + 1000);
+  assert.equal(page.expireTimers(1000), 1, "no countdown tick was armed");
+  assert.match(page.el("post-confirm-expiry").textContent, /Lapses in 1 s/);
+  page.setClock(page.clock() + 1000);
+  page.expireTimers(1000);
+  assert.match(page.el("post-confirm-expiry").textContent, /lapsed\. Nothing was posted/);
+  assert.equal(page.el("post-confirm-send").disabled, true);
+  assert.equal(page.expireTimers(1000), 0, "the countdown kept ticking past the lapse");
+});
+
+test("a read-scope call never asks about proposals", async () => {
+  const page = newPage();
+  page.tokenScope = "read";
+  await startTalking(page);
+  await page.settle();
+  page.propose(proposal());
+  await page.settle();
+  assert.deepEqual(proposalWatches(page), []);
+  assert.equal(page.el("post-confirm").hidden, true);
+});
+
+test("no proposal is watched for outside a call, and hanging up takes the card away", async () => {
+  const page = newPage();
+  await signIn(page);
+  await page.settle();
+  assert.deepEqual(proposalWatches(page), [], "an idle page watched for proposals");
+
+  await proposedDuringACall(page);
+  await page.el("hang-up").click();
+  await page.settle();
+  assert.equal(page.el("post-confirm").hidden, true, "a Send button outlived the call");
+  const asked = proposalWatches(page).length;
+  page.propose(proposal({ serial: 9, handle: "lAtEr-0123456789abcde" }));
+  await page.settle();
+  assert.equal(page.el("post-confirm").hidden, true, "a proposal reached the card after hang-up");
+  assert.equal(proposalWatches(page).length, asked, "the watch kept asking after hang-up");
+});
+
+test("a draft left pending by the last call is not offered in the next one", async () => {
+  const page = newPage();
+  const stale = await proposedDuringACall(page);
+  await page.el("hang-up").click();
+  await page.settle();
+  assert.equal(page.proposal, stale, "hanging up is not a decision about the proposal");
+
+  await page.el("talk").click();
+  assert.equal(page.sockets.length, 2, "the second call did not open a new socket");
+  page.sockets[1].onopen();
+  await page.settle();
+  assert.equal(state(page), "live");
+  assert.ok(proposalWatches(page).length > 2, "the second call never looked for proposals");
+  assert.equal(page.el("post-confirm").hidden, true, "the last call's draft came back with a live Send");
+
+  const fresh = proposal({ serial: 8, handle: "fReSh-0123456789abcde", text: "a new call's draft" });
+  page.propose(fresh);
+  await page.settle();
+  assert.equal(page.el("post-confirm").hidden, false, "the new call's own proposal was hidden");
+  assert.equal(page.el("post-confirm-text").textContent, fresh.text);
+  assert.equal(page.el("post-confirm-send").disabled, false, "a first card in a call was held");
 });
