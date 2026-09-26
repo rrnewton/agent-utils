@@ -2493,8 +2493,8 @@ async function apiDecoded(type, path, options) {
 const POST_WATCH_WAIT_SECONDS = 25;
 const POST_WATCH_RETRY_MS = 3000;
 const POST_EXPIRY_TICK_MS = 1000;
-// How long Send stays disabled after the card's text is replaced by a newer proposal, so that a tap
-// already on its way lands on nothing rather than on words the owner has not read.
+// How long Send stays disabled after a card appears or its text is replaced by a newer proposal, so
+// that a tap already on its way lands on nothing rather than on words the owner has not read.
 const POST_CHANGE_HOLD_MS = 2000;
 
 const postWatch = {
@@ -2515,7 +2515,7 @@ const postWatch = {
   // When the shown proposal lapses, fixed once when it first appears so a re-render cannot extend it.
   deadline: 0,
   tick: null,
-  // Set while Send is held after a replacement; `changed` marks the card until it is settled.
+  // Set while Send is held after a card appears; `changed` marks a replacement until it is settled.
   hold: null,
   changed: false,
   busy: false,
@@ -2601,16 +2601,14 @@ function showPostProposal(proposal) {
   }
   if (!previous || previous.handle !== proposal.handle) {
     postWatch.deadline = Date.now() + proposal.expires_in_ms;
-    // Replacing words the owner may be about to confirm: hold Send long enough for a tap aimed at
-    // the old text to miss, and say that the text changed.
-    if (previous) {
-      if (postWatch.hold !== null) clearTimeout(postWatch.hold);
-      postWatch.changed = true;
-      postWatch.hold = setTimeout(() => {
-        postWatch.hold = null;
-        if (postWatch.shown) showPostProposal(postWatch.shown);
-      }, POST_CHANGE_HOLD_MS);
-    }
+    // Words the owner may be about to confirm appeared under a tap aimed at whatever was there
+    // before, a row or the old text: hold Send long enough for it to miss, and say if it changed.
+    if (postWatch.hold !== null) clearTimeout(postWatch.hold);
+    postWatch.changed = Boolean(previous);
+    postWatch.hold = setTimeout(() => {
+      postWatch.hold = null;
+      if (postWatch.shown) showPostProposal(postWatch.shown);
+    }, POST_CHANGE_HOLD_MS);
   }
   el("post-confirm-where").textContent = proposal.reply_to
     ? `To ${proposal.channel_name}, as a reply to message ${proposal.reply_to}`
@@ -8279,7 +8277,8 @@ function streamingPlayer(url, context) {
       fail();
       return;
     }
-    if (!loaded) {
+    // A body that stops inside a frame was cut short, or disagrees with its own format.
+    if (!loaded || carry.length > 0) {
       fail();
       return;
     }

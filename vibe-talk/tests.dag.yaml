@@ -160,6 +160,22 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#49 post-confirmation-card-hold` in the browser engine: a real touch on Send the moment a first
+  # card appears in a typed call commits nothing, and Send enables itself after the hold.
+  - group: check
+    job: post-confirm-browser
+    desc: a tap on a just-shown post-confirmation card's Send commits nothing in current Chromium
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/post_confirm_browser.py
+    jobs_flag: ""
+    timeout: 60
+    cpu_timeout: 30
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 5
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # ---- the build everything else needs ----------------------------------------------------------
   - group: build
     job: release

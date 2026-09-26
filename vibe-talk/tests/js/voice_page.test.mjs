@@ -2391,9 +2391,9 @@ const TUNING_BANDS = {
     "how often the card's lapse countdown is redrawn. It counts whole seconds, so slower than " +
     "one a second skips numbers, and faster than a quarter second is work nobody can see"],
   POST_CHANGE_HOLD_MS: [1000, 3000,
-    "how long Send is held after a newer proposal replaces the card. Under a second, a tap already " +
-    "under way when the text changed still lands on words the owner never read; past three, an " +
-    "owner who did read them waits on a button that looks broken"],
+    "how long Send is held after a card appears or a newer proposal replaces it. Under a second, " +
+    "a tap already under way when the text appeared still lands on words the owner never read; " +
+    "past three, an owner who did read them waits on a button that looks broken"],
 };
 test("every number this page is tuned by stays inside a band that says what would be wrong", () => {
   for (const [name, [low, high, why]] of Object.entries(TUNING_BANDS)) {
@@ -16872,6 +16872,39 @@ test("a streamed read CUT OFF part-way, or refused, says so and archives nothing
   assert.deepEqual(page.dismissCalls, [], "a read nobody heard to the end was archived");
 });
 
+test("a streamed read that ENDS PART-WAY through a sample did not arrive whole, and archives nothing", async () => {
+  // `#50 stream-trailing-byte`. A frame is two bytes a channel; a body that stops inside one was
+  // cut short, or its length disagrees with its format, whatever the transport said about the end.
+  const endings = [
+    ["whole stereo frames", 2, pcm(1, 2, 3, 4), true],
+    ["an odd trailing byte", 1, joined(pcm(1, 2, 3), new Uint8Array([7])), false],
+    ["half a stereo frame", 2, pcm(1, 2, 3, 4, 5), false],
+    ["a stereo frame short by one byte", 2, joined(pcm(1, 2, 3, 4, 5), new Uint8Array([7])), false],
+  ];
+  for (const [ending, channels, samples, whole] of endings) {
+    const page = newPage();
+    page.enableStreamedAudio();
+    await signIn(page);
+    const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
+    await rows[0].dispatch("click", {});
+    await page.settle();
+    page.audioStreams[0].controller.bytes(joined(wavHeader(24000, channels), samples));
+    await page.settle();
+    page.audioStreams[0].controller.drop();
+    await page.settle();
+    for (const source of page.audio.sources) source.onended();
+    await page.settle();
+    if (whole) {
+      assert.deepEqual(page.dismissCalls, [{ messages: ["1000000000000000001"] }], `${ending} was not archived`);
+      continue;
+    }
+    assert.equal(page.audio.sources[0].halted, true, `${ending} played on`);
+    assert.match(page.el("status").textContent, /could not be played/, `${ending} passed as a clean end`);
+    assert.equal(rowState(page, 0).reading, "false", `${ending} left the row looking like it is speaking`);
+    assert.deepEqual(page.dismissCalls, [], `${ending} was archived as heard`);
+  }
+});
+
 test("a streamed COMBINED row fetches its next part on the first part's audio and plays it after", async () => {
   const page = newPage();
   page.enableStreamedAudio();
@@ -19169,6 +19202,8 @@ async function proposedDuringACall(page, pending = proposal()) {
   page.propose(pending);
   await page.settle();
   assert.equal(page.el("post-confirm").hidden, false, "the proposal never reached the card");
+  // Every card opens with Send held; what these tests pin comes after it.
+  assert.equal(page.expireTimers(2000), 1, "the first card held nothing");
   return pending;
 }
 
@@ -19277,6 +19312,31 @@ test("redrawing the card never extends the lapse the server set", async () => {
   assert.match(page.el("post-confirm-expiry").textContent, /Lapses in 2 s/);
 });
 
+test("a card that appears where none was shown holds Send too, without saying the text changed", async () => {
+  // `#49 post-confirmation-card-hold`. A tap on its way to what was under that spot, a row or the
+  // transcript, must not land on a Send the owner has not yet seen.
+  const page = newPage();
+  await startTalking(page);
+  await page.settle();
+  const pending = proposal();
+  page.propose(pending);
+  await page.settle();
+  assert.equal(page.el("post-confirm").hidden, false, "the proposal never reached the card");
+  assert.equal(page.el("post-confirm-send").disabled, true, "Send was live on the card's first frame");
+  assert.equal(page.el("post-confirm-cancel").disabled, false, "Don't send was held with it");
+  assert.doesNotMatch(page.el("post-confirm-expiry").textContent, /changed the text/, "a first card said it changed");
+
+  await page.el("post-confirm-send").click();
+  await page.settle();
+  assert.deepEqual(page.proposalCommits, [], "a tap during the hold committed the card");
+
+  assert.equal(page.expireTimers(2000), 1, "no hold was armed");
+  assert.equal(page.el("post-confirm-send").disabled, false, "Send stayed held");
+  await page.el("post-confirm-send").click();
+  await page.settle();
+  assert.deepEqual(page.proposalCommits.map((c) => c.handle), [pending.handle]);
+});
+
 test("a newer proposal replaces the card, holds Send, says so, and then Send commits the newer one", async () => {
   const page = newPage();
   await proposedDuringACall(page);
@@ -19373,7 +19433,9 @@ test("a draft left pending by the last call is not offered in the next one", asy
   await page.settle();
   assert.equal(page.el("post-confirm").hidden, false, "the new call's own proposal was hidden");
   assert.equal(page.el("post-confirm-text").textContent, fresh.text);
-  assert.equal(page.el("post-confirm-send").disabled, false, "a first card in a call was held");
+  assert.equal(page.el("post-confirm-send").disabled, true, "a first card in a call was not held");
+  assert.equal(page.expireTimers(2000), 1, "no hold was armed");
+  assert.equal(page.el("post-confirm-send").disabled, false, "Send stayed held");
 });
 
 // --- a reload's replay burst ----------------------------------------------------------------------

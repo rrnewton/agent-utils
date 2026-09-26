@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability offline-cache-browser read-aloud-browser android-speech-self-test container-smoke clean
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability offline-cache-browser read-aloud-browser post-confirm-browser android-speech-self-test container-smoke clean
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -118,6 +118,12 @@ offline-cache-browser:
 # WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep PNGs.
 read-aloud-browser:
 	python3 tests/read_aloud_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#49 post-confirmation-card-hold` in a real Chromium: a real touch on Send the moment a first
+# post-confirmation card appears commits nothing, and Send enables itself after the hold. Pass
+# WEB_ROOT=dir to run it against another copy of the page.
+post-confirm-browser:
+	python3 tests/post_confirm_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT))
 
 # The physical-device run is opt-in, but its signal/language evaluator has offline negative
 # controls. Keep those controls in the ordinary gate so a broken harness cannot silently bless a
