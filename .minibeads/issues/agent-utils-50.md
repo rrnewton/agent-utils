@@ -1,15 +1,16 @@
 ---
 title: 'stream-trailing-byte: do not silently drop a partial final sample in read-aloud streaming'
-status: open
+status: in_progress
 priority: 2
 issue_type: bug
+assignee: opus-5.5/stream-trailing-byte
 labels:
 - vibe-talk
 - audio
 depends_on:
   agent-utils-1: parent-child
 created_at: 2026-09-26T10:29:04.019315230+00:00
-updated_at: 2026-09-26T10:29:04.019315230+00:00
+updated_at: 2026-09-26T10:37:37.315836586+00:00
 ---
 
 # Description

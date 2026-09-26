@@ -1,15 +1,16 @@
 ---
 title: 'post-confirmation-card-hold: hold Send when a confirmation card appears where none was shown'
-status: open
+status: in_progress
 priority: 2
 issue_type: bug
+assignee: opus-5.5/post-confirmation-card-hold
 labels:
 - vibe-talk
 - ui
 depends_on:
   agent-utils-1: parent-child
 created_at: 2026-09-26T10:29:04.019315230+00:00
-updated_at: 2026-09-26T10:29:04.019315230+00:00
+updated_at: 2026-09-26T10:37:37.315836586+00:00
 ---
 
 # Description
