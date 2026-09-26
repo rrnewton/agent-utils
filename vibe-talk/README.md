@@ -1637,13 +1637,17 @@ allowlist gets `404 unknown_channel`, never a `200` that streams nothing — on 
 are indistinguishable forever.
 
 * Every event carries `id: <message id>` and `event: message`, and a payload of
-  `{message, self_posted, replayed, untrusted_content_notice}`. The notice is the same one
-  `/messages` carries: a pushed message is third-party text exactly as a fetched one is.
+  `{message, self_posted, replayed, from_tail, untrusted_content_notice}`. The notice is the same
+  one `/messages` carries: a pushed message is third-party text exactly as a fetched one is.
 * **`replayed` says whether the event came out of the tail or off the wire just now**, because on
   the wire those are otherwise identical. Every attach that carries no `Last-Event-ID` — a fresh
   sign-in, a channel change, the reconnect after an `event: reset` — is handed the whole tail, and
   a page that could not tell would announce up to two hundred old messages to a live conversation
-  as news. See "What the page does with it".
+  as news. An adapter's catch-up is `replayed` too. See "What the page does with it".
+* **`from_tail` says the event was published before this stream attached**, so any channel read
+  begun after the stream's response arrived has already seen it. An adapter's catch-up arriving
+  after the attach is `replayed` without being `from_tail`: it may be newer than every read the
+  page has made.
 * **Reconnection.** The browser sends `Last-Event-ID`; the server replays only what came after it,
   from a bounded tail of the last 200 published messages per channel. The receiver is attached
   *before* the tail is read, under one lock, so nothing can slip between the two.
@@ -1667,6 +1671,24 @@ exact thing `/api/v1/signed-url`'s `no-store` and the page's `redact()` exist to
 Arriving messages are rendered by the same element construction as fetched ones, de-duplicated
 against the rows actually on screen, and — in either of the two speaking modes — **spoken** into a
 live conversation as a `user_message`.
+
+**A replay costs a read only when no read has seen it.** On a threaded channel a live message
+re-reads the active view, because the server owns thread membership and counts. A replayed message
+does not when the store already holds it: the replayed copy is the message as first published, so
+the store's copy is at least as new and is kept, and a row the to-do filter hid stays hidden. Nor
+does it when a read that post-dates the message has landed: for a message `from_tail`, any read
+begun after the attach; for an adapter's catch-up, only one begun after it arrived. A read that
+failed saw nothing. Otherwise the message waits for the next read to land. With none on the wire,
+the channel pane starts one, which merges it and the rest of its burst; the voice pane starts none,
+because entering the channel reads it. A read already out when the burst arrives — a channel change
+reads before its stream attaches — is asked, when it lands, which of the burst its page contains,
+and one more read follows only for the rest. A reply in another thread is never on the main view's
+page, so it costs that one more read. A failed read queues nothing: what waited on it waits for the
+poll's read. A warm reload replaying its tail makes no channel read on the voice pane and only its
+entry read on the channel pane. An edit or removal from the tail waits the same way, for a read
+begun after the attach, because a page's copy of a message says nothing about which edit it has
+seen. The un-threaded channel view still re-reads for a replayed message that arrives during a
+read, as it does for a live one.
 
 **`user_message`, not `contextual_update`, and that is the substance of the feature.** A
 contextual update injects text into the agent's context *without consuming a turn*: the agent

@@ -230,6 +230,10 @@
           "$ref": "#/$defs/ChannelId",
           "description": "Channel the message was removed from."
         },
+        "from_tail": {
+          "description": "Whether it was published before this stream attached; see [`LiveMessageEvent::from_tail`].",
+          "type": "boolean"
+        },
         "message_id": {
           "$ref": "#/$defs/MessageId",
           "description": "The message that was removed."
@@ -242,7 +246,8 @@
       "required": [
         "channel_id",
         "message_id",
-        "replayed"
+        "replayed",
+        "from_tail"
       ],
       "type": "object"
     },
@@ -269,6 +274,10 @@
     "LiveMessageEvent": {
       "description": "The data of a live stream `message` or `message_update` event.",
       "properties": {
+        "from_tail": {
+          "description": "Whether it was published before this stream attached and is re-sent from the replay tail.\nAny channel read begun after the stream's response arrived has already seen it. An\nadapter's catch-up arriving after the attach is `replayed` but not from the tail: it may be\nnewer than every read the page has made.",
+          "type": "boolean"
+        },
         "message": {
           "$ref": "#/$defs/Message",
           "description": "The message as it now stands. UNTRUSTED: written by whoever is in the channel."
@@ -289,6 +298,7 @@
       "required": [
         "message",
         "replayed",
+        "from_tail",
         "self_posted",
         "untrusted_content_notice"
       ],

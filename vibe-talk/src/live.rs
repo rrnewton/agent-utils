@@ -433,7 +433,7 @@ pub fn events(
     })
 }
 
-fn message_event(live: &LiveMessage, replayed: bool) -> axum::response::sse::Event {
+fn message_event(live: &LiveMessage, from_tail: bool) -> axum::response::sse::Event {
     let event = axum::response::sse::Event::default()
         .id(&live.event_id)
         .event(match live.kind {
@@ -445,18 +445,22 @@ fn message_event(live: &LiveMessage, replayed: bool) -> axum::response::sse::Eve
     // adapter's classification into the wire's existing `replayed` flag ensures the browser may
     // render it but never announce it to a live voice conversation as something that just
     // happened.
-    let replayed = replayed || live.historical;
+    // `from_tail` keeps the other half apart, because the page's reads depend on it: only an event
+    // from the tail is one every read begun after the attach has already seen.
+    let replayed = from_tail || live.historical;
     let encoded = match live.kind {
         LiveKind::Create | LiveKind::Update => event.json_data(LiveMessageEvent {
             message: &live.message,
             self_posted: live.self_posted,
             replayed,
+            from_tail,
             untrusted_content_notice: crate::untrusted::NOTICE,
         }),
         LiveKind::Delete => event.json_data(LiveDeleteEvent {
             channel_id: live.message.channel_id.clone(),
             message_id: live.message.id.clone(),
             replayed,
+            from_tail,
         }),
     };
     // A `Message` is plain data and cannot fail to serialize. If that ever stops being true,

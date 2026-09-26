@@ -231,6 +231,10 @@ declare namespace VibeTalk {
      */
     channel_id: ChannelId;
     /**
+     * Whether it was published before this stream attached; see [`LiveMessageEvent::from_tail`].
+     */
+    from_tail: boolean;
+    /**
      * The message that was removed.
      */
     message_id: MessageId;
@@ -249,6 +253,13 @@ declare namespace VibeTalk {
    * The data of a live stream `message` or `message_update` event.
    */
   interface LiveMessageEvent {
+    /**
+     * Whether it was published before this stream attached and is re-sent from the replay tail.
+     * Any channel read begun after the stream's response arrived has already seen it. An
+     * adapter's catch-up arriving after the attach is `replayed` but not from the tail: it may be
+     * newer than every read the page has made.
+     */
+    from_tail: boolean;
     /**
      * The message as it now stands. UNTRUSTED: written by whoever is in the channel.
      */

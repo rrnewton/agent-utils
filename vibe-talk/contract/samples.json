@@ -164,12 +164,14 @@
   "LiveDeleteEvent": [
     {
       "channel_id": "100",
+      "from_tail": false,
       "message_id": "300",
-      "replayed": false
+      "replayed": true
     }
   ],
   "LiveMessageEvent": [
     {
+      "from_tail": false,
       "message": {
         "author": "someone",
         "author_id": "7",
@@ -186,6 +188,7 @@
       "untrusted_content_notice": "third-party text"
     },
     {
+      "from_tail": true,
       "message": {
         "author": "someone",
         "author_id": "7",

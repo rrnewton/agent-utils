@@ -6110,11 +6110,15 @@ async function loadTimeline(options) {
     return;
   }
   discordFetchInFlight = true;
+  const read = ++timelineReadsStarted;
   const area = el("scroll-area");
   const position = channelReadPosition(area);
   renderChannelLoading(true);
+  /** @type {VibeTalk.TimelineResponse | null} */
+  let landed = null;
   try {
     const payload = await apiDecoded("TimelineResponse", timelinePath());
+    landed = payload;
     if (generation !== discordLoadGeneration || context !== channelContextKey()) {
       foldLateTimelinePage(payload, { context, channel, view, thread, canon });
       return;
@@ -6147,6 +6151,7 @@ async function loadTimeline(options) {
       throw error;
     }
   } finally {
+    settleReplays(read, landed);
     await finishDiscordLoad();
   }
 }
@@ -10298,6 +10303,14 @@ let discordFetchInFlight = false;
 // channel switch cannot be swallowed by a refresh of the channel the reader just left.
 let discordLoadGeneration = 0;
 let discordQueuedLoad = null;
+// How many timeline reads have gone on the wire, the newest of them that landed, that count when
+// the live stream last attached, and the replayed events waiting on a read that may not have seen
+// them, each with the count as it stood when the server had it. A read begun after that answers
+// for it once it lands: one that failed saw nothing. `#43 replay-burst-double-read`.
+let timelineReadsStarted = 0;
+let timelineReadsLanded = 0;
+let liveAttachReads = 0;
+const replaysAwaitingRead = new Map();
 
 /** Remember the newest read requested while another channel read is in flight. */
 function queueDiscordLoad(options) {
@@ -10890,6 +10903,9 @@ async function readChannelStream(channelId, generation) {
     throw new Error("this browser cannot read a streaming response");
   }
   const reader = body.getReader();
+  // The server subscribed this stream before it answered, so its replay tail is everything a read
+  // begun from here on will see.
+  liveAttachReads = timelineReadsStarted;
   liveAttached = true;
   renderLiveState();
   const decoder = new TextDecoder();
@@ -10975,6 +10991,17 @@ function onStreamFrame(frame) {
     return; // a frame this page cannot read is not a reason to tear the stream down.
   }
   if (frame.event === "message_update" || frame.event === "message_delete") {
+    // An edit or removal out of the replay tail is on every page read begun after the attach, so
+    // it waits for such a read rather than making its own. The page's copy of the message says
+    // nothing about which edit it has seen, so no page can answer for it sooner.
+    // `#43 replay-burst-double-read`.
+    if (threadingSupported && payload && payload.from_tail === true) {
+      const message = payload.message || {};
+      const id = frame.event === "message_update" ? message.id : payload.message_id;
+      const channel = frame.event === "message_update" ? message.channel_id : payload.channel_id;
+      awaitReplayRead(`${frame.event}:${id}`, String(channel), liveAttachReads);
+      return;
+    }
     // A fetched row may combine several messages and the update may change whether they still
     // combine. Re-reading the authoritative page is safer than trying to patch that derived DOM
     // structure in place, and `keepPosition` preserves where the reader was.
@@ -10991,7 +11018,7 @@ function onStreamFrame(frame) {
     refreshAfterLiveMutation();
     return;
   }
-  receiveLiveMessage(payload.message, payload.self_posted, payload.replayed);
+  receiveLiveMessage(payload.message, payload.self_posted, payload.replayed, payload.from_tail);
 }
 
 let liveMutationRefreshRunning = false;
@@ -11030,7 +11057,7 @@ function refreshAfterLiveMutation() {
  * when it mattered — after a refresh, which is the moment a replayed message is most likely to
  * arrive twice.
  */
-function receiveLiveMessage(message, selfPosted, replayed) {
+function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
   observeOutgoingMessages([message]);
   // The other free way to learn which account is ours: the server marks what IT posted, so the
   // author of a self-posted message is this bridge by construction. Done before the channel guard
@@ -11051,12 +11078,21 @@ function receiveLiveMessage(message, selfPosted, replayed) {
     if (!discordQueuedLoad) queueDiscordLoad({ keepPosition: true });
   }
   if (threadingSupported) {
-    appendChannelRow(message);
+    // A replayed copy is from when it was published, so the store's copy is at least as new — its
+    // reply count, its edits — and is the one kept. Asked before the row is folded in, which would
+    // make every message look already held. A held message is already in the view drawn from the
+    // store, or deliberately not when the to-do filter hides it, so it is not appended again.
+    const held = replayed ? heldMessage(message.id) : null;
+    if (!held) appendChannelRow(message);
     renderOutgoingMessages();
     relayToAgent(message, selfPosted, replayed);
     // The server owns thread membership, counts and activity ordering. Re-read the active
     // context instead of dropping a reply from another thread into the visible conversation.
-    guardQuietly(() => loadDiscord({ keepPosition: true }))();
+    if (!replayed) guardQuietly(() => loadDiscord({ keepPosition: true }))();
+    else if (!held) {
+      awaitReplayRead(String(message.id), String(message.channel_id),
+        fromTail ? liveAttachReads : timelineReadsStarted);
+    }
     return;
   }
   const list = el("discord-log");
@@ -11085,6 +11121,78 @@ function receiveLiveMessage(message, selfPosted, replayed) {
   // reader is looking at it, it gets a summary. `#49 cached-summaries`.
   requestVisibleSummaries();
   relayToAgent(message, selfPosted, replayed);
+}
+
+/**
+ * The store's copy of a message in the selected channel, or null.
+ *
+ * `#43 replay-burst-double-read`. A replayed message the store holds needs no read. The replayed
+ * copy is the message as first published, and every later change to it reaches the store as an
+ * edit event or a read, so the store's copy is at least as new. The stream replays its tail in a
+ * burst on every reload, so re-reading for each frame cost a warm reload two identical reads of the
+ * newest page — one of them on the voice pane, where nothing refreshes a channel nobody is looking
+ * at.
+ */
+function heldMessage(id) {
+  const channel = String(el("discord-channel").value);
+  if (channelCanon.channel !== channel) loadCanon(channel);
+  return channelCanon.messages.find((held) => String(held.id) === String(id)) || null;
+}
+
+/**
+ * One read merges a replayed event the store cannot answer for, and the rest of its burst.
+ *
+ * The server had an event from the replay tail before the stream attached, so any read begun after
+ * the attach has seen it, even a reply in a thread the view does not show. The adapter's catch-up
+ * is replayed too but may arrive after every read the page has made, so it is only known to be
+ * seen by a read begun after it arrived. `arrivedAfter` is the read count at that point. When such
+ * a read has landed there is nothing to do. Otherwise the event waits under `key` for the next read
+ * to land, and `settleReplays` decides then; with none on the wire and the channel on screen, it
+ * starts one. The voice pane starts none: entering the channel reads it, and that read answers for
+ * everything waiting. A LIVE frame is not asked about: it is newer than any read on the wire, so it
+ * always re-reads, as `refreshAfterLiveMutation` explains.
+ *
+ * @param {string} key the id of a new message, which a landed page holding it answers for; an
+ *   edit or removal is keyed by its event and id, which no page's message id can match, because
+ *   a page's copy says nothing about which edit it has seen
+ * @param {string} channel
+ * @param {number} arrivedAfter
+ */
+function awaitReplayRead(key, channel, arrivedAfter) {
+  if (timelineReadsLanded > arrivedAfter) return;
+  replaysAwaitingRead.set(key, { channel, arrivedAfter });
+  if (!discordFetchInFlight && currentView === "discord") guardQuietly(() => loadDiscord({ keepPosition: true }))();
+}
+
+/**
+ * Timeline read number `read` has landed with `page`, or with null if it failed: forget the
+ * replayed events it answers for, and queue one more read if any arrived while it was out and its
+ * page did not have them. Asked of the page, not the store, which the frame itself has already put
+ * the message in. A read that started after an event arrived answers for it even when its page
+ * lacks it — a reply in another thread is not on the main view's page — so no event can cost more
+ * than that one read. A read that failed answers for nothing and queues nothing: the event waits
+ * for the next read, the poll's or the one entering the channel makes, so a server that keeps
+ * failing is not asked again for every frame.
+ *
+ * @param {number} read
+ * @param {VibeTalk.TimelineResponse | null} page
+ */
+function settleReplays(read, page) {
+  const channel = String(el("discord-channel").value);
+  if (page) timelineReadsLanded = Math.max(timelineReadsLanded, read);
+  const onPage = new Set([
+    ...((page && page.messages) || []).map((message) => String(message.id)),
+    ...((page && page.threads) || []).map((thread) => String(thread.root && thread.root.id)),
+  ]);
+  for (const [key, waiting] of replaysAwaitingRead) {
+    if (waiting.channel !== channel ||
+        (page && (waiting.arrivedAfter < read || onPage.has(key)))) {
+      replaysAwaitingRead.delete(key);
+    }
+  }
+  if (page && replaysAwaitingRead.size && currentView === "discord" && !discordQueuedLoad) {
+    queueDiscordLoad({ keepPosition: true });
+  }
 }
 
 // `canSendText` and `sendClientEvent` used to be defined a second time HERE, shadowing the pair

@@ -241,12 +241,14 @@ fn samples() -> Value {
             to(&LiveMessageEvent {
                 message: &plain,
                 replayed: false,
+                from_tail: false,
                 self_posted: false,
                 untrusted_content_notice: "third-party text",
             }),
             to(&LiveMessageEvent {
                 message: &threaded,
                 replayed: true,
+                from_tail: true,
                 self_posted: true,
                 untrusted_content_notice: "third-party text",
             }),
@@ -254,7 +256,8 @@ fn samples() -> Value {
         "LiveDeleteEvent": [to(&LiveDeleteEvent {
             channel_id: ChannelId("100".into()),
             message_id: MessageId("300".into()),
-            replayed: false,
+            replayed: true,
+            from_tail: false,
         })],
         "LiveResetEvent": [to(&LiveResetEvent { missed: 12, detail: "re-read" })],
         "VibeTalkV1ServerFrame": [

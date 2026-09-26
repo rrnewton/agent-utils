@@ -450,7 +450,9 @@ async fn historical_push_is_replayed_on_the_wire_and_mutations_are_typed() {
 
     let text = read_events(&mut body, 3).await;
     assert!(text.contains("id: push:opaque-create\nevent: message"));
-    assert!(text.contains("\"replayed\":true"));
+    // History, but newer than the attach: not from the tail, so the page cannot assume that a read
+    // it already made has seen it.
+    assert!(text.contains("\"replayed\":true,\"from_tail\":false"));
     assert!(text.contains("id: push:opaque-update\nevent: message_update"));
     assert!(text.contains("id: push:opaque-delete\nevent: message_delete"));
     assert!(text.contains("\"message_id\":\"10\""));

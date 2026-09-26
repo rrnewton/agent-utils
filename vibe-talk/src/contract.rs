@@ -215,6 +215,11 @@ pub struct LiveMessageEvent<'a> {
     /// Whether it was classified as history — a replay or a catch-up — rather than news. The page
     /// may render such a message but must not announce it to a live conversation.
     pub replayed: bool,
+    /// Whether it was published before this stream attached and is re-sent from the replay tail.
+    /// Any channel read begun after the stream's response arrived has already seen it. An
+    /// adapter's catch-up arriving after the attach is `replayed` but not from the tail: it may be
+    /// newer than every read the page has made.
+    pub from_tail: bool,
     /// Whether THIS SERVER posted it; the page must not relay these into a live conversation.
     pub self_posted: bool,
     /// Standing reminder that the content is third-party text.
@@ -230,6 +235,8 @@ pub struct LiveDeleteEvent {
     pub message_id: MessageId,
     /// Whether it was classified as history rather than news.
     pub replayed: bool,
+    /// Whether it was published before this stream attached; see [`LiveMessageEvent::from_tail`].
+    pub from_tail: bool,
 }
 
 /// The data of a live stream `reset` event: the subscriber fell behind the replay tail.

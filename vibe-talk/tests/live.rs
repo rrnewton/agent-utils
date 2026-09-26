@@ -433,6 +433,10 @@ async fn a_replayed_message_is_labelled_as_replayed_and_a_live_one_is_not() {
         "a message out of the replay tail must say so, or the page relays stale channel text into \
          a paid conversation as news: {tail:?}"
     );
+    assert_eq!(
+        held["from_tail"], true,
+        "the page skips a read only for what every read after the attach has seen: {tail:?}"
+    );
 
     harness
         .discord
@@ -446,6 +450,7 @@ async fn a_replayed_message_is_labelled_as_replayed_and_a_live_one_is_not() {
         "and a message that really did just arrive must NOT be marked replayed, or the feature \
          relays nothing at all: {live:?}"
     );
+    assert_eq!(arrived["from_tail"], false, "{live:?}");
 }
 
 #[tokio::test]
