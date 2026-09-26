@@ -325,7 +325,7 @@ impl PostGate {
         let now = Instant::now();
         let mut inner = self.lock();
         let lapsed = inner.expire(now);
-        if !inner.pending.as_ref().is_some_and(|p| p.handle == handle) {
+        if inner.pending.as_ref().is_none_or(|p| p.handle != handle) {
             let why = inner.refusal_for(handle);
             drop(inner);
             if lapsed.is_some() {
