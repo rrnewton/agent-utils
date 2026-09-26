@@ -2821,9 +2821,10 @@ The mechanics, all over the write-scope REST routes in the table above:
   and must match all three exactly.
 * **Refusals are specific:** `proposal_unknown` (404), `proposal_expired` (410), and
   `proposal_used`, `proposal_superseded` or `proposal_mismatch` (409). None of them posts.
-* **Scope is checked before the request is read.** On these routes, the reply route and `ask`, a
-  read token gets 403 and no token gets 401 whatever body, content type, query or channel id it
-  sends, so a caller without write scope learns nothing about what they accept.
+* **Scope is checked before the request is read**, here as on every `/api/` route (see
+  "Security"): a read token gets 403 and no token gets 401 whatever body, content type, query or
+  channel id it sends, so the parsers tell a caller without write scope nothing about what they
+  accept.
 * **The log is content-free.** One `post_gate` line per step — `proposed`, `committed`, `failed`,
   `refused`, `cancelled`, `superseded`, `expired` — with a serial, channel id, text length, refusal
   code and `confirmed_by`. Never a word of the text, never the handle.
@@ -3113,6 +3114,16 @@ makes it, not the voice agent, the real security boundary of the whole design.
   `{"error":"unauthorized"}` — a test asserts that body names no tool, no channel, no protocol
   revision, and not even the service. An unauthenticated caller learns only that something is
   listening.
+* **Every `/api/` route checks the credential before it reads the request.** The scope — or, on
+  the two read-aloud playback routes, the ticket in the path — is settled before the path
+  parameters, query or body are parsed, so a caller without it gets the same `401`, `403` or `404`
+  whatever path parameters, query or body it sends, and the parsers tell it nothing about what the
+  route accepts. A caller who holds the credential is still told exactly what is wrong with a
+  malformed request. `tests/scope_first.rs` keeps an inventory of every route, checked against the
+  router's source and against the methods the router actually answers, so a new route cannot
+  quietly skip this. Routing does not answer first either: without a token, an unknown `/api/`
+  path or an unserved method gets the same `401` as a real route, not a `404` or a `405` that
+  would map the API. With a valid token, routing answers exactly as before.
 * **Reading and posting use different tokens.** The token you put on your phone and in the voice
   agent cannot post. The server refuses to start if the two tokens are equal or shorter than 24
   characters. Over MCP the read token is not even shown `post_reply` in `tools/list`, and is

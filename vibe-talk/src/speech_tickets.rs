@@ -174,6 +174,17 @@ impl SpeechTickets {
         Some(entry.prepared.clone())
     }
 
+    /// Whether this ticket is live: known and unexpired. The same test as [`Self::claim`], without
+    /// the copy and without dropping an expired entry, for checking the credential before the rest
+    /// of a request is read.
+    #[must_use]
+    pub fn knows(&self, ticket: &str) -> bool {
+        self.held.lock().is_ok_and(|held| {
+            held.get(ticket)
+                .is_some_and(|entry| Instant::now().duration_since(entry.minted) < TICKET_TTL)
+        })
+    }
+
     /// Attach the provider phases measured by the streaming handler to this observation.
     pub fn record_server_timing(&self, ticket: &str, timing: ServerTiming) {
         if let Ok(mut held) = self.held.lock() {

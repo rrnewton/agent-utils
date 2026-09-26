@@ -206,7 +206,7 @@ fn require(headers: &HeaderMap, state: &AppState, scope: Scope) -> Result<Scope,
 /// body therefore told a read-scope or anonymous caller "your JSON is malformed" (422) before it
 /// could say "you may not do this at all" (403/401). Taken as the first extractor after `State`,
 /// this answers the scope question first, so a caller without write scope gets the same refusal
-/// whatever it sent — and learns nothing about what these routes would accept.
+/// whatever it sent, and the parsers tell it nothing about what these routes accept.
 pub struct WriteScope;
 
 impl axum::extract::FromRequestParts<AppState> for WriteScope {
@@ -219,6 +219,65 @@ impl axum::extract::FromRequestParts<AppState> for WriteScope {
         require(&parts.headers, state, Scope::Write)?;
         Ok(Self)
     }
+}
+
+/// The read scope, taken from the `Authorization` header and nothing else, carrying the scope the
+/// credential actually holds — a write token passes too, and a handler may still tell them apart.
+///
+/// `#42 api-scope-first`. The same argument as [`WriteScope`], for every route a read token may
+/// use: taken straight after `State`, it answers 401 before `Path`, `Query` or `Json` can answer
+/// 400 or 422, so the parsers tell an anonymous caller nothing about what the route accepts.
+pub struct ReadScope(pub Scope);
+
+impl axum::extract::FromRequestParts<AppState> for ReadScope {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(require(&parts.headers, state, Scope::Read)?))
+    }
+}
+
+/// The speech ticket in the path, checked before anything else in the request is read.
+///
+/// `#42 api-scope-first`. On the two ticket routes the ticket IS the credential — it stands in for
+/// the bearer token an `<audio src>` cannot send — so it is checked first for the same reason the
+/// scopes are: a caller without a live ticket gets the same 404 whatever query or body it sent. A
+/// ticket that does not even decode is just another unknown one.
+pub struct SpeechTicket(pub String);
+
+impl axum::extract::FromRequestParts<AppState> for SpeechTicket {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let Ok(Path(ticket)) =
+            <Path<String> as axum::extract::FromRequestParts<AppState>>::from_request_parts(
+                parts, state,
+            )
+            .await
+        else {
+            return Err(unknown_speech_ticket());
+        };
+        if !state.speech_tickets.knows(&ticket) {
+            return Err(unknown_speech_ticket());
+        }
+        Ok(Self(ticket))
+    }
+}
+
+/// The SAME answer for expired and never-existed. Distinguishing them would let a caller probe for
+/// the difference, and neither is something the reader can act on differently.
+fn unknown_speech_ticket() -> ApiError {
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        "unknown_speech_ticket",
+        "that speech ticket is unknown or has expired; turn read-aloud on again",
+    )
 }
 
 fn require_ingest(headers: &HeaderMap, state: &AppState) -> Result<(), ApiError> {
@@ -456,9 +515,8 @@ pub struct ChannelsResponse {
 /// `GET /api/v1/channels`
 pub async fn list_channels(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: ReadScope,
 ) -> Result<Json<ChannelsResponse>, ApiError> {
-    require(&headers, &state, Scope::Read)?;
     Ok(Json(ChannelsResponse {
         channels: ops::channels(&state).await,
     }))
@@ -498,11 +556,10 @@ pub const ALIAS_NOTICE: &str = "A channel alias is vibe-talk's own name for the 
 /// name it cannot find there. The model is handed the alias and cannot choose it.
 pub async fn set_alias(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
     Path(channel_id): Path<String>,
     Json(request): Json<SetAliasRequest>,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     let channel = ops::set_channel_alias(&state, &channel_id, &request.alias).await?;
     Ok(no_store(Json(AliasResponse {
         channel,
@@ -513,10 +570,9 @@ pub async fn set_alias(
 /// `DELETE /api/v1/channels/{channel_id}/alias` — go back to the configured label.
 pub async fn clear_alias(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
     Path(channel_id): Path<String>,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     let channel = ops::clear_channel_alias(&state, &channel_id).await?;
     Ok(no_store(Json(AliasResponse {
         channel,
@@ -527,9 +583,8 @@ pub async fn clear_alias(
 /// `GET /api/v1/agent-tools` — the voice agent's tool manifest.
 pub async fn agent_tools(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: ReadScope,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require(&headers, &state, Scope::Read)?;
     let manifest = crate::mcp::tool_manifest(&ops::channels(&state).await);
     Ok(Json(serde_json::json!({ "tools": manifest })))
 }
@@ -537,9 +592,8 @@ pub async fn agent_tools(
 /// `GET /api/v1/client-config`
 pub async fn client_config(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    ReadScope(scope): ReadScope,
 ) -> Result<Json<ClientConfigResponse>, ApiError> {
-    let scope = require(&headers, &state, Scope::Read)?;
     Ok(Json(ClientConfigResponse {
         chat_provider_name: state.chat.provider_name().to_owned(),
         channels: ops::channels(&state).await,
@@ -591,9 +645,8 @@ pub async fn client_config(
 /// neither a proxy nor a browser should keep it.
 pub async fn diagnostics(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: ReadScope,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Read)?;
     let report = crate::diagnostics::run(&state).await;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(report)).into_response())
 }
@@ -613,9 +666,8 @@ pub async fn diagnostics(
 /// minutes; it must not sit in a proxy or a browser cache.
 pub async fn signed_url(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     let minted: SignedUrl = state
         .elevenlabs
         .signed_url(&state.config.elevenlabs)
@@ -630,9 +682,8 @@ pub async fn signed_url(
 /// short-lived bearer URL, and a generic route must honor the strictest provider it can select.
 pub async fn voice_session(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     let session: VoiceSession = state.conversation.open_session().await?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(session)).into_response())
 }
@@ -645,9 +696,8 @@ pub async fn voice_session(
 /// same rules as the MCP endpoint's `tools/list`, so the two cannot disagree.
 pub async fn voice_agent(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    ReadScope(scope): ReadScope,
 ) -> Result<Response, ApiError> {
-    let scope = require(&headers, &state, Scope::Read)?;
     let manifest = crate::mcp::tool_manifest(&ops::channels(&state).await);
     let profile = crate::voice_agent::profile(
         &manifest,
@@ -665,11 +715,9 @@ pub async fn voice_agent(
 /// and not stored: the point is to read the dominant delay off a live deployment, and a durable
 /// record would be one more thing to retain and purge.
 pub async fn voice_timing(
-    State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     let timing: crate::voice_agent::StartupTiming =
         serde_json::from_slice(&body).map_err(|_| {
             ApiError::new(
@@ -693,10 +741,9 @@ pub async fn voice_timing(
 /// shared [`crate::voice_health::LogBudget`] is what bounds a page that does not.
 pub async fn voice_health(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     let report: crate::voice_health::HealthReport =
         serde_json::from_slice(&body).map_err(|_| {
             ApiError::new(
@@ -746,11 +793,10 @@ pub async fn voice_health(
 /// balance on arbitrary strings.
 pub async fn speak(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: ReadScope,
     Path((channel_id, message_id)): Path<(String, String)>,
     Query(query): Query<SpeakQuery>,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Read)?;
     // TIMED IN THREE PARTS, because "reading a message aloud is slow" has three candidate causes
     // and they are fixed by completely different work. Looking up the message is a round trip to
     // DISCORD — this route asks for a whole window and finds one message in it. Generating the
@@ -876,11 +922,10 @@ pub struct MessagesResponse {
 /// `GET /api/v1/channels/{channel_id}/messages`
 pub async fn messages(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: ReadScope,
     Path(channel_id): Path<String>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<MessagesResponse>, ApiError> {
-    require(&headers, &state, Scope::Read)?;
     let window = ops::messages(&state, &channel_id, query.limit).await?;
     let dismissed = ops::dismissed_within(&state, &window.channel.id, &window.messages).await?;
     Ok(Json(MessagesResponse {
@@ -934,11 +979,10 @@ pub struct PageResponse {
 /// `GET /api/v1/channels/{channel_id}/page`
 pub async fn page(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: ReadScope,
     Path(channel_id): Path<String>,
     Query(query): Query<PageQuery>,
 ) -> Result<Json<PageResponse>, ApiError> {
-    require(&headers, &state, Scope::Read)?;
     let step = ops::page(
         &state,
         &channel_id,
@@ -981,11 +1025,10 @@ pub struct TimelineQuery {
 /// `GET /api/v1/channels/{channel_id}/timeline` — all views share one allowlist boundary.
 pub async fn timeline(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: ReadScope,
     Path(channel_id): Path<String>,
     Query(query): Query<TimelineQuery>,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Read)?;
     if (query.view == crate::threads::TimelineView::Thread) != query.thread_id.is_some() {
         return Err(ApiError::bad_request(
             "thread_id is required exactly when view=thread",
@@ -1056,11 +1099,10 @@ pub struct CountResponse {
 /// `GET /api/v1/channels/{channel_id}/count`
 pub async fn count(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: ReadScope,
     Path(channel_id): Path<String>,
     Query(query): Query<CountQuery>,
 ) -> Result<Json<CountResponse>, ApiError> {
-    require(&headers, &state, Scope::Read)?;
     let tally = ops::count(&state, &channel_id, query.since.as_deref(), query.cap).await?;
     Ok(Json(CountResponse {
         channel: tally.channel,
@@ -1089,11 +1131,10 @@ pub struct MessageResponse {
 /// rather than silently returning something else.
 pub async fn message_by_id(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: ReadScope,
     Path((channel_id, message_id)): Path<(String, String)>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<MessageResponse>, ApiError> {
-    require(&headers, &state, Scope::Read)?;
     let (channel, message) = ops::message_by_id_scoped(
         &state,
         &channel_id,
@@ -1126,11 +1167,10 @@ pub struct DigestResponse {
 /// `GET /api/v1/channels/{channel_id}/digest`
 pub async fn digest(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: ReadScope,
     Path(channel_id): Path<String>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<DigestResponse>, ApiError> {
-    require(&headers, &state, Scope::Read)?;
     let (channel, entries, complete) =
         ops::digest(&state, &channel_id, query.limit, query.width).await?;
     Ok(Json(DigestResponse {
@@ -1171,11 +1211,10 @@ pub struct ResolveResponse {
 /// `POST /api/v1/channels/{channel_id}/resolve` — semantic random access.
 pub async fn resolve(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: ReadScope,
     Path(channel_id): Path<String>,
     Json(request): Json<ResolveRequest>,
 ) -> Result<Json<ResolveResponse>, ApiError> {
-    require(&headers, &state, Scope::Read)?;
     let (channel, resolution, searched) = ops::resolve(
         &state,
         &channel_id,
@@ -1528,10 +1567,10 @@ pub async fn ask(
 /// that rather than leaving it to be misread as an instant request.
 pub async fn stream(
     State(state): State<AppState>,
+    _scope: ReadScope,
     headers: HeaderMap,
     Path(channel_id): Path<String>,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Read)?;
     let after = headers
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())
@@ -2014,9 +2053,8 @@ pub struct ConversationsResponse {
 /// `GET /api/v1/conversations`
 pub async fn list_conversations(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     let conversations = state.store.conversations().await?;
     Ok(no_store(Json(ConversationsResponse {
         conversations,
@@ -2038,10 +2076,9 @@ pub struct ConversationResponse {
 /// `GET /api/v1/conversations/{conversation_id}`
 pub async fn conversation(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
     Path(conversation_id): Path<String>,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     let id = ConversationId::parse(&conversation_id)?;
     let turns = state.store.turns(&id).await?;
     Ok(no_store(Json(ConversationResponse {
@@ -2107,10 +2144,9 @@ pub struct TranscriptResponse {
 /// a long call they are a suffix of one.
 pub async fn transcript(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
     Query(query): Query<TranscriptQuery>,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     // Parsed, never trusted, and a bad one is refused rather than quietly treated as "start from
     // the newest": silently rewinding a walk puts the reader somewhere other than where they were
     // with nothing on screen saying so.
@@ -2186,10 +2222,9 @@ pub struct ReplayResponse {
 /// was never stored, and the page would say the wrong one of those two things.
 pub async fn replay(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
     Path(conversation_id): Path<String>,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     let id = ConversationId::parse(&conversation_id)?;
     let settings = &state.config.replay;
     // Not fetched at all when resuming is off. The point of the setting is that prior conversation
@@ -2235,11 +2270,10 @@ pub struct AppendTurnResponse {
 /// `POST /api/v1/conversations/{conversation_id}/turns`
 pub async fn append_turn(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
     Path(conversation_id): Path<String>,
     Json(request): Json<AppendTurnRequest>,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     let id = ConversationId::parse(&conversation_id)?;
     let turn = Turn::now(request.speaker, request.text);
     state.store.append_turn(&id, &turn).await?;
@@ -2249,10 +2283,9 @@ pub async fn append_turn(
 /// `DELETE /api/v1/conversations/{conversation_id}`
 pub async fn forget_conversation(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
     Path(conversation_id): Path<String>,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     let id = ConversationId::parse(&conversation_id)?;
     state.store.forget_conversation(&id).await?;
     Ok(no_store(Json(serde_json::json!({ "forgotten": 1 }))))
@@ -2261,9 +2294,8 @@ pub async fn forget_conversation(
 /// `DELETE /api/v1/conversations`
 pub async fn forget_conversations(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     let forgotten = state.store.forget_all_conversations().await?;
     Ok(no_store(Json(
         serde_json::json!({ "forgotten": forgotten }),
@@ -2284,9 +2316,8 @@ pub async fn forget_conversations(
 /// is not an erase, it is a claim in a document.
 pub async fn purge_storage(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     state.store.purge_everything().await?;
     Ok(no_store(Json(serde_json::json!({
         "purged": ["conversations", "read_marks", "summaries", "dismissals"],
@@ -2306,11 +2337,7 @@ pub struct InboxResponse {
 }
 
 /// `GET /api/v1/inbox`
-pub async fn inbox(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Read)?;
+pub async fn inbox(State(state): State<AppState>, _scope: ReadScope) -> Result<Response, ApiError> {
     let channels = ops::inbox(&state).await?;
     Ok(no_store(Json(InboxResponse {
         channels,
@@ -2357,11 +2384,10 @@ pub const UPSTREAM_READ_NOTICE: &str = "The source chat provider's read cursor w
 /// `POST /api/v1/channels/{channel_id}/upstream-read`
 pub async fn mark_read_upstream(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
     Path(channel_id): Path<String>,
     Json(request): Json<MarkReadRequest>,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     let channel = state.channel(&channel_id).ok_or(OpError::UnknownChannel)?;
     let through = MessageId(request.message_id);
     if let Some(thread_id) = request.thread_id.as_deref() {
@@ -2379,11 +2405,10 @@ pub async fn mark_read_upstream(
 /// `POST /api/v1/channels/{channel_id}/read`
 pub async fn mark_read(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
     Path(channel_id): Path<String>,
     Json(request): Json<MarkReadRequest>,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     let (channel, mark) = ops::mark_read(
         &state,
         &channel_id,
@@ -2400,10 +2425,9 @@ pub async fn mark_read(
 /// `DELETE /api/v1/channels/{channel_id}/read`
 pub async fn forget_read_mark(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
     Path(channel_id): Path<String>,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     let channel = ops::forget_read_mark(&state, &channel_id).await?;
     Ok(no_store(Json(serde_json::json!({
         "channel": channel,
@@ -2428,11 +2452,10 @@ pub struct TodoResponse {
 /// `GET /api/v1/channels/{channel_id}/todo`
 pub async fn todo(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: ReadScope,
     Path(channel_id): Path<String>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Read)?;
     let todo = ops::todo(&state, &channel_id, query.limit).await?;
     Ok(no_store(Json(TodoResponse {
         todo,
@@ -2501,11 +2524,10 @@ const NAMES_NEITHER: &str = "send `messages` or `through`; an empty request woul
 /// `POST /api/v1/channels/{channel_id}/dismiss`
 pub async fn dismiss(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
     Path(channel_id): Path<String>,
     Json(request): Json<DismissRequest>,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     let change = match (request.through, request.messages.is_empty()) {
         (Some(_), false) => return Err(ApiError::bad_request(NAMES_BOTH_WAYS)),
         (Some(through), true) => {
@@ -2529,11 +2551,10 @@ pub async fn dismiss(
 /// `POST /api/v1/channels/{channel_id}/restore`
 pub async fn restore(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
     Path(channel_id): Path<String>,
     Json(request): Json<DismissRequest>,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     if request.messages.is_empty() {
         return Err(ApiError::bad_request(
             "send the `messages` an earlier dismissal reported; restoring nothing is not an undo",
@@ -2582,13 +2603,12 @@ pub struct MessageSummaryResponse {
 /// `GET /api/v1/channels/{channel_id}/messages/{message_id}/summary`
 pub async fn message_summary(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    ReadScope(caller): ReadScope,
     Path((channel_id, message_id)): Path<(String, String)>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<MessageSummaryResponse>, ApiError> {
     // The granted scope, not the required one: a read token may be served FROM the cache but
     // never writes to it. See `ops::summarize_message`.
-    let caller = require(&headers, &state, Scope::Read)?;
     // Empty segments dropped rather than rejected: `with=` and a trailing comma both mean "no
     // others", and refusing them would turn a harmless way of writing the URL into a 400.
     let also: Vec<String> = query
@@ -2678,11 +2698,10 @@ pub struct PrepareSpeechResponse {
 /// that the audio request then reuses.
 pub async fn prepare_speech(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: ReadScope,
     Path(channel_id): Path<String>,
     Json(request): Json<PrepareSpeechRequest>,
 ) -> Result<Json<PrepareSpeechResponse>, ApiError> {
-    require(&headers, &state, Scope::Read)?;
     let preparation_began = std::time::Instant::now();
     if state.speech.describe().playback == crate::speech::Playback::Browser {
         return Err(SpeechError::BrowserPlaybackRequired.into());
@@ -2777,7 +2796,7 @@ fn millis(duration: std::time::Duration) -> u64 {
 /// message being generated slightly early.
 pub async fn play_speech(
     State(state): State<AppState>,
-    Path(ticket): Path<String>,
+    SpeechTicket(ticket): SpeechTicket,
     Query(query): Query<PlayQuery>,
 ) -> Result<Response, ApiError> {
     let selection = query.selection.as_deref();
@@ -2792,14 +2811,9 @@ pub async fn play_speech(
             "selection must be 1 to 64 letters, digits, '-' or '_'",
         ));
     }
+    // `SpeechTicket` found it live a moment ago, but it can lapse in between.
     let Some(prepared) = state.speech_tickets.claim(&ticket) else {
-        // The SAME answer for expired and never-existed. Distinguishing them would let a caller
-        // probe for the difference, and neither is something the reader can act on differently.
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            "unknown_speech_ticket",
-            "that speech ticket is unknown or has expired; turn read-aloud on again",
-        ));
+        return Err(unknown_speech_ticket());
     };
     let requested = std::time::Instant::now();
     let mut stream = state
@@ -2921,7 +2935,7 @@ pub struct SpeechPlaybackTiming {
 /// audio element used for playback. The report adds only bounded durations and cannot select text.
 pub async fn speech_playback_timing(
     State(state): State<AppState>,
-    Path(ticket): Path<String>,
+    SpeechTicket(ticket): SpeechTicket,
     Json(timing): Json<SpeechPlaybackTiming>,
 ) -> Result<StatusCode, ApiError> {
     const MAX_TIMING_MS: u64 = 10 * 60 * 1_000;
@@ -3050,14 +3064,13 @@ pub struct ChannelDirectoryResponse {
 /// bridge's existing registration for it, or the source itself, is a channel in this app's list.
 pub async fn channel_directory(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
     Query(query): Query<ChannelDirectoryQuery>,
 ) -> Result<Response, ApiError> {
     use crate::directory::{
         DirectoryRequest, DEFAULT_LIMIT, MAX_LIMIT, MAX_QUERY_CHARS, MAX_TOKEN_BYTES,
     };
 
-    require(&headers, &state, Scope::Write)?;
     if !state.chat.supports_channel_discovery() {
         return Err(ApiError::new(
             StatusCode::NOT_IMPLEMENTED,
@@ -3210,10 +3223,9 @@ pub struct AddChannelResponse {
 /// same failure.
 pub async fn add_channel(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
     Json(request): Json<AddChannelRequest>,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     let label = request.label.trim();
     if label.is_empty() {
         return Err(ApiError::new(
@@ -3450,10 +3462,9 @@ async fn rollback_registration(
 /// worse than refusing, because the reader would believe it had gone.
 pub async fn remove_channel(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _scope: WriteScope,
     Path(channel_id): Path<String>,
 ) -> Result<Response, ApiError> {
-    require(&headers, &state, Scope::Write)?;
     let _managed_lifecycle = state.channel_registration_lock.lock().await;
     if state
         .config
