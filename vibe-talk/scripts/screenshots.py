@@ -1733,6 +1733,18 @@ def _forget_cached_summaries(driver: Driver, state: str) -> None:
         ) from error
 
 
+# A real summary on THE probed row, not the placeholder shown while its request is in flight -- and
+# not a summary on any other row. The log keeps other rows' summaries (a cached one from an earlier
+# profile, one that simply finished first), and a wait that accepted any of them measured the probe
+# while it still read `summarising…`: the same height as the clamp, and a failure blamed on the page.
+# Shared by the act's wait and the scene's expectation so the two cannot drift apart again.
+SUMMARY_PROBE_SUMMARISED = (
+    "(() => { const text = document.querySelector('#summary-probe .summary-text'); "
+    "return text !== null && (text.textContent || '').length > 0 "
+    "&& !/^summarising/.test(text.textContent); })()"
+)
+
+
 def _act_summary_mode(driver: Driver) -> None:
     """`#49 cached-summaries`: the channel with the collapsed rows summarised instead of clipped."""
     # A WORKING summariser: canned prose, no tool calls, no bridge traffic. Stated here rather than
@@ -1753,12 +1765,8 @@ def _act_summary_mode(driver: Driver) -> None:
     # Through the DOM rather than by clicking: the chip floats over the bottom corner of the list
     # and a real click would scroll it into view, which moves the thing being photographed.
     driver.js("(() => { document.getElementById('summarise').click(); })()")
-    # For a REAL summary, not for the placeholder the row shows while the request is in flight.
-    driver.page.wait_for_function(
-        "() => [...document.querySelectorAll('#discord-log .summary-text')]"
-        ".some((n) => (n.textContent || '').length > 0 && !/^summarising/.test(n.textContent))",
-        timeout=20_000,
-    )
+    # For a REAL summary on the probed row itself; see SUMMARY_PROBE_SUMMARISED.
+    driver.page.wait_for_function(f"() => {SUMMARY_PROBE_SUMMARISED}", timeout=20_000)
     driver.settle(300)
     driver.js(
         "(() => { window.__summarisedHeight = "
@@ -3257,9 +3265,8 @@ SCENES: tuple[Scene, ...] = (
                 "window.__summarisedHeight > 0 && window.__summarisedHeight < window.__foldedHeight",
             ),
             (
-                "a real summary is on screen, not the placeholder shown while it is fetched",
-                "[...document.querySelectorAll('#discord-log .summary-text')]"
-                ".some((n) => (n.textContent || '').length > 0 && !/^summarising/.test(n.textContent))",
+                "the probed row shows a real summary, not the placeholder shown while it is fetched",
+                SUMMARY_PROBE_SUMMARISED,
             ),
             (
                 "the message it summarises is not also on screen underneath it",
@@ -4152,6 +4159,26 @@ def check_scene_storage_isolation_controls() -> list[str]:
     return []
 
 
+# The predicate the summarised state used to wait on, kept verbatim so the control below can prove it
+# still tells a scoped wait from this one. It accepts ANY row's finished summary, which is how the
+# probe got measured while it still read `summarising…`.
+ANY_ROW_SUMMARISED = (
+    "[...document.querySelectorAll('#discord-log .summary-text')]"
+    ".some((n) => (n.textContent || '').length > 0 && !/^summarising/.test(n.textContent))"
+)
+
+
+def summary_wait_scope_problem(predicate: str) -> str | None:
+    """Why `predicate` cannot say the PROBED row is summarised, or None if it can."""
+    if "querySelector('#summary-probe .summary-text')" not in predicate:
+        return "it does not read the summary of #summary-probe, the row whose height is compared"
+    if "querySelectorAll" in predicate:
+        return "it also looks at other rows, whose summaries say nothing about the probe"
+    if "!/^summarising/.test(" not in predicate or ".length > 0" not in predicate:
+        return "it does not rule out the empty and `summarising…` states the probe starts in"
+    return None
+
+
 def check_summary_scene_controls() -> list[str]:
     """The two summary states share a vendor and a cache, and both sharings can go quietly wrong.
 
@@ -4172,6 +4199,31 @@ def check_summary_scene_controls() -> list[str]:
             "ANSWERS. It would then inherit whichever scenario ran last -- and the state after it "
             "deliberately wedges the same mock, so on every profile but the first this state would "
             "photograph a failure under the name of a success."
+        )
+
+    scope_problem = summary_wait_scope_problem(SUMMARY_PROBE_SUMMARISED)
+    if scope_problem is not None:
+        problems.append(
+            f"32-channel-summarised cannot tell when the probed row is summarised: {scope_problem}. "
+            "The wait can then end while the probe still reads `summarising…` -- another row's "
+            "cached summary was enough, once -- and the height comparison fails against the "
+            "placeholder, intermittently, blaming the page."
+        )
+    if summary_wait_scope_problem(ANY_ROW_SUMMARISED) is None:
+        problems.append(
+            "the summary-wait scope check accepts the any-row predicate that raced, so it cannot "
+            "tell a scoped wait from the one that measured the placeholder."
+        )
+    if "wait_for_function(f\"() => {SUMMARY_PROBE_SUMMARISED}\"" not in summarised:
+        problems.append(
+            "32-channel-summarised no longer waits on SUMMARY_PROBE_SUMMARISED before measuring "
+            "the probe, so its height can be read while the row still shows the placeholder."
+        )
+    summarised_scene = next(scene for scene in SCENES if scene.name == "32-channel-summarised")
+    if SUMMARY_PROBE_SUMMARISED not in (expression for _label, expression in summarised_scene.expect):
+        problems.append(
+            "32-channel-summarised no longer EXPECTS a real summary on the probed row, so a "
+            "photograph of the probe mid-request would be certified as the summarised state."
         )
 
     failed = inspect.getsource(_act_summary_failed)
@@ -4446,6 +4498,7 @@ SELF_TEST_CHECKS = (
     "a desktop-only scene names profiles that exist",
     "every state that exists on only some devices is still restricted to them",
     "the summarised state resets the offline vendor rather than inheriting a wedged one",
+    "the summarised state waits for and expects the PROBED row's summary, not any row's",
     "the failed-summary state clears the cache, so its request really reaches the summariser",
     "the failed-summary state wedges the vendor, so the failure it photographs is real",
     "the failed-summary state runs last, because it empties the store on its way in",
