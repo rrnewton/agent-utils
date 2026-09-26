@@ -106,7 +106,9 @@ whose transport failed before any answer from the remote and failed the same way
 without redirects, is recorded as `archived-local`, never as remote `salvaged`. A fetch failure
 that carries any message from the remote, an HTTP error, a proxy authentication demand, or an
 authentication, host-key, or certificate problem still refuses, and omission of the option leaves
-the slot untouched.
+the slot untouched. Over SSH, Git passes the server's own error text through without marking it, so
+a server message that reports a connection failure and names no refusal wrkslots recognises can
+still be read as a transport failure; the result is verified local custody, never publication.
 
 For initialized nested repositories, a later source-checkout switch between recognized GitHub
 HTTPS and SSH spellings does not block cleanup when both URLs still name the same owner and

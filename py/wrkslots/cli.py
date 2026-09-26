@@ -8341,8 +8341,10 @@ _REMOTE_TRANSPORT_UNAVAILABLE = re.compile(
 )
 # Any of these means the remote, or something claiming to be it, answered, or
 # the caller or the remote was refused on identity. A command that prints one is
-# not an outage. Git relays every server message with a ``remote:`` prefix, so
-# server text that merely mentions a connection failure also vetoes.
+# not an outage. Git relays server messages over HTTP and during a pack transfer
+# with a ``remote:`` prefix, so such text that merely mentions a connection
+# failure also vetoes. Over SSH the server's stderr arrives unprefixed, so the
+# forms a server prints there are listed on their own.
 _REMOTE_AUTHORITY_FAILURE = re.compile(
     r"^remote:"
     r"|remote error:"
@@ -8350,11 +8352,13 @@ _REMOTE_AUTHORITY_FAILURE = re.compile(
     r"|Proxy Authentication Required"
     r"|(?:response|HTTP code) 407\b"
     r"|could not read (?:Username|Password)"
+    r"|Invalid username or password"
     r"|Permission denied \("
     r"|Host key verification failed"
     r"|REMOTE HOST IDENTIFICATION HAS CHANGED"
     r"|certificate"
     r"|The requested URL returned error"
+    r"|Repository not found"
     r"|does not appear to be a git repository",
     re.IGNORECASE | re.MULTILINE,
 )

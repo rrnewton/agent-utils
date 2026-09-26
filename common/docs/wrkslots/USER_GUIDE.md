@@ -293,7 +293,11 @@ authentication demand, failed authentication, a host key or certificate problem,
 repository still refuses, even when outage text appears beside it. Because a redirect can make Git
 report the redirect target's connection failure, wrkslots then asks the recorded remote once more
 with HTTP redirects disabled; the checkout is archived only if that attempt fails in the transport
-too. Finally it checks again that the checkout's remote URL still matches the recorded one. A
+too. Over SSH, Git passes the server's own error text through without a `remote:` prefix and
+redirects do not apply, so a server message that reports a connection failure and names none of the
+refusals above can still be read as a transport failure; wrkslots then keeps the work in verified
+local custody rather than publishing it anywhere. Finally it checks again that the checkout's
+remote URL still matches the recorded one. A
 transport failure can also happen after an earlier network step succeeded, so an archive records
 that the remote could not be used at that moment, not that it was never reached. Each bundle has
 a schema-1 JSON receipt binding the machine, slot generation, checkout and repository identities,

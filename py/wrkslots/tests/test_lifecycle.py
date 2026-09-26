@@ -13436,6 +13436,9 @@ def test_remote_transport_classification_requires_an_outage(
         "fatal: unable to access 'https://x/': SSL certificate problem: unable to get local issuer",
         "fatal: unable to access 'https://x/': The requested URL returned error: 401",
         "remote: Repository not found.",
+        # Over SSH, Git passes the server's stderr through without a prefix.
+        "ERROR: Repository not found.",
+        "Invalid username or password.",
         "fatal: '/srv/product.git' does not appear to be a git repository",
         "fatal: remote error: Connection refused",
         "remote: Connection timed out talking to backend",
