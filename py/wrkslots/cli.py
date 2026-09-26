@@ -404,6 +404,14 @@ _AUDIT_CACHE_KEY_BYTES = 32
 _AUDIT_CACHE_STATE_BYTES_LIMIT = 64 * 1024 * 1024
 _AUDIT_CACHE_WORK_LIMIT = 100_000
 _AUDIT_CACHE_WALL_SECONDS = 5.0
+# `audit --cache-census-only` names exact active lifecycle identities. The bound
+# keeps a scoped census small enough to review by eye; it is not a work bound.
+_AUDIT_CACHE_SELECTION_LIMIT = 8
+_AUDIT_CACHE_SELECTION_GENERATION_RE = re.compile(r"[1-9][0-9]{0,17}")
+_AUDIT_CACHE_UNINSPECTED_REASON = (
+    "cache inspection not performed: slot is outside the --cache-census-only "
+    "selection"
+)
 _SUBMODULE_ADMIN_METADATA_BYTES_LIMIT = 16 * 1024 * 1024
 _SUBMODULE_ADMIN_METADATA_ENTRY_LIMIT = 4096
 _POST_EXCLUSION_SNAPSHOT_RETRY_LIMIT = 16
@@ -15952,6 +15960,87 @@ def _open_or_create_absolute_directory_nofollow(path: Path, label: str) -> int:
     return fd
 
 
+def _parse_audit_cache_selection(
+    raw: Sequence[str] | None,
+) -> tuple[tuple[str, str, int], ...]:
+    """Parse `--cache-census-only MACHINE:SLOT=GENERATION` without binding it."""
+
+    if not raw:
+        return ()
+    if len(raw) > _AUDIT_CACHE_SELECTION_LIMIT:
+        raise Refusal(
+            f"--cache-census-only accepts at most {_AUDIT_CACHE_SELECTION_LIMIT} "
+            f"identities; got {len(raw)}"
+        )
+    selection: list[tuple[str, str, int]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in raw:
+        identity, separator, generation_text = item.rpartition("=")
+        machine, colon, slot = identity.partition(":")
+        if (
+            not separator
+            or not colon
+            or not NAME_RE.fullmatch(machine)
+            or not NAME_RE.fullmatch(slot)
+            or not _AUDIT_CACHE_SELECTION_GENERATION_RE.fullmatch(generation_text)
+        ):
+            raise Refusal(
+                f"invalid --cache-census-only {item!r}; expected "
+                "MACHINE:SLOT=GENERATION with 1-64 letters, digits, '.', '_', or '-' "
+                "in each name and a positive decimal generation"
+            )
+        if (machine, slot) in seen:
+            raise Refusal(
+                f"duplicate --cache-census-only identity for {machine}:{slot}"
+            )
+        seen.add((machine, slot))
+        selection.append((machine, slot, int(generation_text)))
+    return tuple(selection)
+
+
+def _bind_audit_cache_selection(
+    selection: Sequence[tuple[str, str, int]],
+    records: Sequence[ActiveRecord],
+) -> frozenset[str]:
+    """Bind each selector to exactly one active row with the same generation."""
+
+    subjects: set[str] = set()
+    for machine, slot, generation in selection:
+        matches = [
+            record
+            for record in records
+            if record.machine == machine and record.slot == slot
+        ]
+        if not matches:
+            raise Refusal(
+                f"--cache-census-only {machine}:{slot}={generation} is not an active "
+                "registry row"
+            )
+        if len(matches) != 1:
+            raise StateError(
+                f"active registry holds {len(matches)} rows for {machine}:{slot}"
+            )
+        if matches[0].generation != generation:
+            raise Refusal(
+                f"--cache-census-only {machine}:{slot}={generation} does not match "
+                f"the active generation {matches[0].generation}"
+            )
+        subjects.add(f"record:{machine}:{slot}:{generation}")
+    return frozenset(subjects)
+
+
+def _audit_cache_default_state_candidate(config: Config) -> Path | None:
+    """Name the default state path without creating anything, or None if unusable."""
+
+    cache_home = Path(
+        os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))
+    ).expanduser()
+    if not cache_home.is_absolute():
+        return None
+    project = hashlib.sha256(str(config.root).encode("utf-8")).hexdigest()
+    return cache_home / "wrkslots" / "audit-cache" / f"{project}.json"
+
+
 def _audit_cache_state_path(config: Config, explicit: str | None) -> Path:
     if explicit is not None:
         candidate = Path(explicit)
@@ -18372,6 +18461,8 @@ def _audit_record(
         # evidence.  Keep the row out of DELETABLE until the same resumable
         # census reaches and verifies every entry.
         reasons.append("cache inspection incomplete: bounded census is partial")
+    elif cache_status == "uninspected":
+        reasons.append(_AUDIT_CACHE_UNINSPECTED_REASON)
     return (
         {
             "slot": record.slot,
@@ -18436,13 +18527,44 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         raise Refusal("--cache-work-limit must be positive")
     if not (math.isfinite(args.cache_wall_seconds) and args.cache_wall_seconds > 0):
         raise Refusal("--cache-wall-seconds must be finite and positive")
+    cache_selection = _parse_audit_cache_selection(args.cache_census_only)
+    if cache_selection:
+        if args.cache_census_state is None:
+            raise Refusal(
+                "--cache-census-only requires an explicit --cache-census-state path"
+            )
+        if args.gate:
+            raise Refusal(
+                "--cache-census-only reports a scoped cache census, not a fleet "
+                "gate; run --gate without it"
+            )
     config = _load_config(args.project_root, args.machine)
+    if cache_selection:
+        # A scoped census retains only its selected roots, so sharing the
+        # project-keyed default state would discard the unscoped census's
+        # progress. The explicit path must also pass the ordinary outside-tree
+        # checks even when the selected rows plan no cache directories.
+        scoped_state = _audit_cache_state_path(config, args.cache_census_state)
+        default_state = _audit_cache_default_state_candidate(config)
+        if default_state is not None and (
+            scoped_state == default_state
+            or os.path.realpath(scoped_state) == os.path.realpath(default_state)
+        ):
+            raise Refusal(
+                "--cache-census-only must not use the default audit cache census "
+                f"state path: {default_state}"
+            )
     metrics = _AuditMetrics()
     with _locked(config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock):
         registry_started = metrics.start()
         _refuse_partial_state(config, allow_validate_batch_seals=True)
         states, _archives = _validate_global_state(config)
         records = [record for state in states for record in state.slots]
+        selected_cache_subjects = (
+            _bind_audit_cache_selection(cache_selection, records)
+            if cache_selection
+            else None
+        )
         event_logs = {
             state.machine: _load_events(config, state.machine) for state in states
         }
@@ -18524,9 +18646,16 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         cache_errors: dict[str, str] = {}
         record_cache_subjects: dict[tuple[str, str, int], str] = {}
         unregistered_cache_subjects: dict[tuple[str, str], str] = {}
+        uninspected_cache_subjects: set[str] = set()
         for record in records:
             subject = f"record:{record.machine}:{record.slot}:{record.generation}"
             record_cache_subjects[(record.machine, record.slot, record.generation)] = subject
+            if (
+                selected_cache_subjects is not None
+                and subject not in selected_cache_subjects
+            ):
+                uninspected_cache_subjects.add(subject)
+                continue
             try:
                 cache_planned[subject] = _cache_directories(
                     config, record.checkouts, vcs=audit_vcs
@@ -18537,6 +18666,9 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         for slot_type, slot in sorted(on_disk - registered):
             subject = f"unregistered:{slot_type}:{slot}"
             unregistered_cache_subjects[(slot_type, slot)] = subject
+            if selected_cache_subjects is not None:
+                uninspected_cache_subjects.add(subject)
+                continue
             if slot_type != "agent":
                 cache_planned[subject] = ()
                 continue
@@ -18575,6 +18707,10 @@ def _cmd_audit(args: argparse.Namespace) -> int:
             wall_seconds=args.cache_wall_seconds,
             storage_error=cache_storage_error,
         )
+        # Unselected subjects were never planned. They carry no byte count and
+        # an explicit status, never the empty plan's zero-byte "complete".
+        for subject in uninspected_cache_subjects:
+            cache_measurements[subject] = _AuditCacheMeasurement(None, "uninspected")
         metrics.finish("cache-census", cache_started, cache_work)
         records_started = metrics.start()
         for record in records:
@@ -18640,6 +18776,11 @@ def _cmd_audit(args: argparse.Namespace) -> int:
             cache_measurement = cache_measurements[
                 unregistered_cache_subjects[(slot_type, slot)]
             ]
+            uninspected_reason = (
+                [_AUDIT_CACHE_UNINSPECTED_REASON]
+                if cache_measurement.status == "uninspected"
+                else []
+            )
             rows.append(
                 {
                     "slot": slot,
@@ -18671,7 +18812,8 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                                     "import it"
                                 )
                             )
-                        )
+                        ),
+                        *uninspected_reason,
                     ],
                     "owner_state": (
                         journal_slot.state
@@ -18792,7 +18934,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                 row["owner_state"] not in ("live", "dead")
                     or row["liveness_state"] not in ("alive", "dead")
                     or row["cache_error"] is not None
-                    or row.get("cache_status") == "partial"
+                    or row.get("cache_status") in ("partial", "uninspected")
                     or any(
                     token in str(reason).lower()
                     for reason in _as_list(row["reasons"], "audit row.reasons")
@@ -35538,6 +35680,23 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "cache binding/traversal wall budget in seconds, excluding planning and state I/O; "
             "unfinished work is null/partial, a full finalization timeout is null/error "
             f"(default: {_AUDIT_CACHE_WALL_SECONDS:g})"
+        ),
+    )
+    audit.add_argument(
+        "--cache-census-only",
+        action="append",
+        metavar="MACHINE:SLOT=GENERATION",
+        help=(
+            "repeatable; limit cache-census planning to these exact active registry "
+            f"rows (at most {_AUDIT_CACHE_SELECTION_LIMIT}). Each must name an "
+            "active row with exactly that machine, slot and generation, or the audit "
+            "refuses. Requires --cache-census-state with a path other than the "
+            "default; cannot be combined with --gate. Every other lifecycle check "
+            "still runs for every row; rows outside the selection report "
+            "cache_status \"uninspected\" with null bytes and are never DELETABLE "
+            "(default: no selection; every row's caches are planned). Example: "
+            "--cache-census-only host1:validate-a=1 --cache-census-only "
+            "host1:validate-b=1"
         ),
     )
     audit.add_argument(

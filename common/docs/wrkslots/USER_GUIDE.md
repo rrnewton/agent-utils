@@ -144,6 +144,18 @@ explicit state-path arguments remain CLI refusals. JSON reports typed CPU second
 seconds, and work counters for the registry, liveness, process-census, cache-census,
 registered-row, and storage phases.
 
+`--cache-census-only MACHINE:SLOT=GENERATION` (repeatable, at most 8) limits cache-census
+planning to those exact active registry rows, so that large subjects can finish within the
+64 MiB state limit and the usual work and wall budgets. Every selector
+must name exactly one active row with that machine, slot and generation. A malformed, duplicate,
+unknown or mismatched selector refuses the whole audit, as do more than 8 selectors. The option
+requires an explicit `--cache-census-state` other than the default project-keyed path, so a scoped
+census never overwrites the unscoped one, and it cannot be combined with `--gate`. Registry,
+liveness, process/path, Git, handoff, hold and generation checks still run for every row. Rows
+outside the selection report `cache_bytes: null`, `cache_status: "uninspected"` and the reason
+`cache inspection not performed: slot is outside the --cache-census-only selection`. They are never
+`DELETABLE`.
+
 ## Time-to-live and process evidence
 
 `init --heartbeat-ttl-seconds SECONDS` records the default copied into every new slot. `heartbeat`
