@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -13,7 +14,6 @@ from wrkslots import cli as wrkslots
 from wrkslots.tests.test_lifecycle import (
     active_slots,
     allow_test_host_for_absent_validate_recovery,
-    command,
     create,
     make_project,
     mark_owner_dead,
@@ -222,9 +222,9 @@ def test_create_retried_after_abort_recovers_its_interruption(
     interrupt = {"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
     first = create(project, env=interrupt)
     assert first.returncode == 86, first.stderr
-    aborted = command(
-        project, "recover", "--coordinator-pid", str(os.getpid()), "--abort-create"
-    )
+    # The journal retry is the subject, not the host-wide slot-use census; that
+    # census has its own deliberate abort test in test_lifecycle.py.
+    aborted = _abort_create(project)
     assert aborted.returncode == 0, aborted.stderr
     assert active_slots(project) == []
     assert not journal.exists()
@@ -233,8 +233,14 @@ def test_create_retried_after_abort_recovers_its_interruption(
     assert retried.returncode == 86, retried.stderr
     assert journal.is_file()
 
-    recovered = command(
-        project, "recover", "--coordinator-pid", str(os.getpid()), "--slot", "slot01"
+    recovered = raw_command_with_census_authority_stub(
+        project,
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
     )
 
     assert recovered.returncode == 0, recovered.stderr
@@ -242,6 +248,24 @@ def test_create_retried_after_abort_recovers_its_interruption(
         "slot01"
     ]
     assert not journal.exists()
+
+
+def _abort_create(project: Path) -> subprocess.CompletedProcess[str]:
+    """Abort the interrupted create under the census authority stub.
+
+    That stub replaces the host-wide slot-use censuses with a cwd scan and pins
+    the frozen-validation authority and ownerless-exclusion root; none of those
+    is what a journal test asserts.
+    """
+
+    return raw_command_with_census_authority_stub(
+        project,
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--abort-create",
+    )
 
 
 def _episode_events(
@@ -382,8 +406,9 @@ def test_scoped_finish_episodes_bind_the_latest_operation(
 def aborted_create(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> tuple[wrkslots.Config, Path, list[Mapping[str, object]], dict[str, object]]:
-    # One interrupted and aborted create; its abort runs the host-wide slot-use
-    # census, which is too slow to repeat for every shape.
+    # One interrupted and aborted create, shared by every shape.  The journal is
+    # the subject, so the abort stubs the host-wide slot-use census, which has
+    # its own deliberate abort test in test_lifecycle.py.
     project, _repository, _remote = make_project(tmp_path_factory.mktemp("create"))
     config = wrkslots._load_config(str(project), "testhost")
     path = wrkslots._create_journal_path(config, "slot01")
@@ -391,9 +416,7 @@ def aborted_create(
         project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
     )
     assert interrupted.returncode == 86, interrupted.stderr
-    aborted = command(
-        project, "recover", "--coordinator-pid", str(os.getpid()), "--abort-create"
-    )
+    aborted = _abort_create(project)
     assert aborted.returncode == 0, aborted.stderr
     history, first = _episode_events(config, path)
     return config, path, history, first
