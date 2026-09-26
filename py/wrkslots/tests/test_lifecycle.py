@@ -21503,6 +21503,9 @@ def test_remove_treats_a_crashed_liveness_probe_as_unverifiable(tmp_path: Path) 
         pytest.param(b"alive agent={agent}\n", b"", "unverifiable", id="no-rc"),
         pytest.param(b"alive agent={agent} rc=0\n", b"", "unverifiable", id="wrong-rc"),
         pytest.param(b"alive agent={agent} rc=1 rc=1\n", b"", "unverifiable", id="two-rcs"),
+        pytest.param(
+            b"alive agent={agent} ", b"rc=1\n", "unverifiable", id="split-across-streams"
+        ),
         pytest.param(b"", b"", "unverifiable", id="no-output"),
         pytest.param(b"\xff\xfe agent\n", b"\x80", "unverifiable", id="non-utf8"),
     ],
@@ -21530,6 +21533,73 @@ def test_registered_liveness_exit_1_needs_one_bound_verdict_line(
             "registered liveness command exited 1 without a single output line "
             f"binding agent={record.agent} to rc=1: "
         )
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr", "expected", "kept"),
+    [
+        pytest.param(
+            b"",
+            b"\x1b]0;title\x07\x00"
+            + b"A" * 200_000
+            + b"\nTraceback (most recent call last):\nValueError: \x1b[2Jthe cause\n",
+            "unverifiable",
+            "2Jthe cause",
+            id="traceback",
+        ),
+        pytest.param(
+            b"\x1b[31malive\x00 agent={agent} rc=1 " + b"x" * 10_000 + b"\n",
+            b"",
+            "alive",
+            "alive agent=",
+            id="alive",
+        ),
+    ],
+)
+def test_registered_liveness_exit_1_details_are_printable_and_bounded(
+    tmp_path: Path, stdout: bytes, stderr: bytes, expected: str, kept: str
+) -> None:
+    """Terminal controls never reach a refusal, and a long line cannot hide the cause."""
+
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._load_active(config).slots[0]
+    agent = record.agent.encode("utf-8")
+    write_liveness_output(
+        project, stdout.replace(b"{agent}", agent), stderr.replace(b"{agent}", agent), 1
+    )
+
+    state, detail = wrkslots._registered_liveness_state(config, record)
+
+    assert state == expected, detail
+    assert kept in detail
+    assert all(char.isprintable() for char in detail)
+    prefix = (
+        "registered liveness command exited 1 without a single output line "
+        f"binding agent={record.agent} to rc=1: "
+    )
+    assert len(detail.removeprefix(prefix).encode("utf-8")) <= 4096
+
+
+@pytest.mark.parametrize(("status", "expected"), [(0, "dead"), (2, "unverifiable")])
+def test_registered_liveness_decodes_other_statuses_with_replacement(
+    tmp_path: Path, status: int, expected: str
+) -> None:
+    """Undecodable output is detail only; the exit status still decides."""
+
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._load_active(config).slots[0]
+    write_liveness_output(project, b"", b"comm \xff\xfe\n", status)
+
+    state, detail = wrkslots._registered_liveness_state(config, record)
+
+    assert state == expected, detail
+    assert "\ufffd" in detail
 
 
 def set_owner_to_machine_init(project: Path, machine: str = "testhost") -> None:
