@@ -30980,9 +30980,13 @@ def _absent_validate_mount_matches(
         # still showed that view afterwards. A reader that moved and then
         # exited leaves nothing to show which view its table came from, so it
         # is never excused as released, unlike a member that read nothing.
-        if after.get(process.pid) != views[process.pid] and (
-            process.pid in readers or _process_observation_is_active(process)
-        ):
+        # Its generation is checked after the listing, because a PID reused
+        # inside the old view would otherwise show that view in the reader's
+        # place.
+        moved = after.get(process.pid) != views[process.pid]
+        if process.pid in readers:
+            moved = moved or not _process_generation_is_current(process)
+        if moved and (process.pid in readers or _process_observation_is_active(process)):
             raise _ProcessEvidenceChanged(
                 f"PID {process.pid} mount view changed during mount census"
             )
