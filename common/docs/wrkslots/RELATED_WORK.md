@@ -26,17 +26,206 @@ worktree-manager mechanics and own only this cross-harness evidence and recovery
 ### Current implementation and migration boundary
 
 The migration is staged. Python `wrkslots` remains the lifecycle authority. The current Rust
-`wrkslotsd` component is only a read-only observer of the hash-linked event log and a builder of a
-disposable SQLite index. It has no daemon or socket behavior and performs no lease management,
-cleanup, rescue, deletion, or repository mutation. The reconciliation daemon and lifecycle actions
-discussed below are roadmap, not behavior shipped in the current Rust component. Its fail-closed
+`wrkslotsd` component is a read-only observer of the hash-linked event log, a builder of a
+disposable SQLite index, and a diagnostic shadow policy evaluator. Its `explain` and
+`plan` commands reconstruct and self-consistency-check decisions from the captured inputs; they
+also reject evidence that has aged out, and cannot apply a plan. The disposable index is not an
+authenticated store: a coordinated same-UID rewrite of every bound input and projection can stay
+self-consistent, and this phase does not compare it atomically with the live `EVENTS` directory.
+Rebuild from trusted event/config/evidence inputs before treating its output as current. Once an
+index holds policy evidence, a plain `rebuild` without `--config`/`--evidence` is refused rather
+than discarding that evidence high-water mark; to return to a policy-free index, delete the
+disposable index file and rebuild. It has no
+daemon or socket behavior and performs no lease management, cleanup, rescue, deletion, or
+repository mutation. It also has no repository-discovery inventory beyond its supplied event and
+evidence inputs. The reconciliation daemon and lifecycle actions discussed below are roadmap,
+not behavior shipped in the current Rust component. Its fail-closed
 input boundary accepts at most 16 MiB per event and 127 nested JSON containers, Unicode scalar
 strings, exact signed/unsigned 64-bit integers, and finite binary64 floats; Python remains
-authoritative for its broader JSON input domain. Rust also rejects unknown event kinds, non-array
-imported holds, and non-object state evidence even where the current Python reader ignores those
-values; the Python writer emits the stricter shape. The CLI renders active and archive revisions as
+authoritative for its broader JSON input domain. Rust also rejects unknown event kinds, malformed
+or generation-mismatched hold transitions, and non-object state evidence even where the current
+Python reader ignores some of those values; the Python writer emits the stricter shape. Replay
+likewise refuses operation progress that reuses a pending journal path for a different slot or
+operation, where the Python reader overwrites the older marker, and an `operation-completed` with no
+pending progress, recovery attempt, or identical earlier completion, which the Python reader
+ignores. Either history fails the whole replay, so no decision is derived from a history in which
+an older operation's blocker could silently disappear. When recovery starts for an operation whose
+journal is no longer pending, the attempt is bound to that operation's completed journal path if
+the history records one: completion is logged before the journal file is unlinked, so an
+interrupted cleanup leaves a completed journal for recovery to load again. The CLI renders active and archive revisions as
 decimal JSON strings so all `u64` values remain exact. First index publication requires a filesystem
-that supports Linux `renameat2(RENAME_NOREPLACE)`.
+that supports Linux `renameat2(RENAME_NOREPLACE)`. The candidate can diagnose a generation-bound
+task-scope claim, census freshness, heartbeat and minimum-stale boundaries, holds and operation
+markers, reported process use, and reported checkout `(device, inode, mount-id)` identities. It
+does not yet independently reread `/proc/<pid>/stat`, the current boot ID, the systemd invocation
+link, or cgroup existence at evaluation/read time. It also has no fresh TaskGraph claim document
+bound to repository, task, owner, and lifecycle attempt. Every otherwise unblocked scoped row
+therefore includes `TASK_SCOPE_RUNTIME_UNVERIFIED` and `TASKGRAPH_CLAIM_UNVERIFIED` and remains
+`UNKNOWN`; legacy rows remain `UNKNOWN` as well. No current input can produce `ELIGIBLE`.
+
+The policy JSON is a narrow evaluator configuration, not the project's authoritative
+`.wrkslots.yml`. This slice does not compare checkout/repository paths, layout defaults, or landed
+refs against that originating registry; it does not enumerate Git registrations from repositories
+that are absent from the supplied rows; and it does not discover initialized nested repositories.
+Those configuration-coupled and repository-coupled checks remain with Python `wrkslots`. The
+evidence JSON is caller-supplied and no shipped collector authenticates or independently rechecks
+its claims, which is why digest binding and freshness alone do not remove the runtime gate.
+
+The policy file is strict JSON with `schema: 1`, the event-log `machine`,
+`minimum_stale_seconds`, `max_plan_slots`, `evidence_max_age_seconds`,
+`maximum_census_seconds`, and `maximum_future_skew_seconds`. The evidence file is strict JSON with
+`schema: 1`, that same `machine`, the exact `event_tip_sha256`, RFC 3339
+`census_started_at`/`observed_at` bounds, the observing `boot_id`, and one row per observed slot.
+Each row binds `slot`, `generation`, and `active_record_sha256`; identifies and classifies the
+recorded scope when present; records journal and process-use state; and lists each checkout's name,
+path, directory/symlink/mount checks, device, inode, and mount ID. Unknown fields, duplicate rows,
+incomplete present identities, unbound extra slots, stale or future evidence, overlong census
+windows, a census beginning before its bound event-tip timestamp beyond configured skew, and
+evidence for another event tip are refused. Heartbeat age is evaluated at the earlier of census
+start and evaluation time, so a future-skewed census cannot make a live heartbeat look old.
+Conversely, a heartbeat later than that instant has a negative age and still counts as within its
+TTL and minimum stale age, so a heartbeat written after the census began cannot drop those
+blockers either; a lead beyond `maximum_future_skew_seconds` additionally records
+`CLOCK_BEFORE_HEARTBEAT`. Heartbeats and the event-tip timestamp are parsed with the same
+CPython `datetime.fromisoformat` grammar that replay accepts, not only RFC 3339. That includes
+CPython's offset rule: an offset whose whole-second part is zero is UTC and its fractional seconds
+are discarded, so `+00.5`, `-00:00:00.5`, and `+00:00,9` all mean `+00:00`, while `-00:00:01.5`
+keeps its fraction. A heartbeat that still cannot be aged is `BLOCKED` with
+`HEARTBEAT_TIMESTAMP_UNSUPPORTED`, a record with no heartbeat is `BLOCKED` with
+`ACTIVE_HEARTBEAT_MISSING` (either may be recent), and a missing TTL records
+`ACTIVE_HEARTBEAT_TTL_MISSING` without skipping the minimum-stale check. Missing evidence for an
+active slot adds a digest-bound `EVIDENCE_MISSING` reason; the heartbeat and minimum-stale blockers
+are still evaluated because they depend only on the record and the census clock. The SQLite index retains canonical policy inputs and the
+evaluation instant; `explain` and `plan` replay the indexed event chain, compare active/archive/hold
+projections, re-evaluate every decision, reject evidence that is stale at read time, and reject
+incomplete coverage or any changed field. Open progress, reclaim, recovery, and retirement markers
+block their slot; an absent-journal census alongside an open marker also records an unknown
+evidence conflict while preserving the stronger blocker.
+If an interrupted operation has no ACTIVE row, the observer still emits one `BLOCKED` decision for
+its slot so both `explain` and `plan` expose the open marker. Such a pending-only decision has null
+generation, active-record, and heartbeat fields when the event history does not provide them; it
+cannot be mistaken for a reclaim candidate and does not require an invented evidence-census row.
+This remains true for a plain rebuild without optional policy inputs; that decision also carries
+`POLICY_INPUTS_MISSING` and null policy/evidence bindings.
+
+The index is disposable and derived: rebuild it after upgrading the observer. `INDEX_SCHEMA`
+versions only the table layout, so a change to replay or policy semantics does not bump it. Bumping
+it would not produce a clearer refusal: readers would report only `unsupported derived index schema
+N`, and `rebuild` deliberately refuses to overwrite an index whose schema it does not recognize, so
+the operator would have to delete the file by hand. Keeping the schema also keeps the evidence
+high-water check in force across the upgrade. Old stored results cannot be served under new
+semantics, because every read replays the indexed event chain again. Without policy inputs, `explain`
+and `plan` derive their decisions from that replay and do not read the stored ones. With policy
+inputs, a stored decision that the new code would not produce is refused as `indexed policy decision
+differs from canonical re-evaluation` or `indexed policy decisions do not exactly cover replayed
+active and pending state`. In both cases the remedy is `wrkslotsd rebuild` over the same index path,
+using the same or newer evidence.
+
+This marker treatment is deliberately stricter than the current Python audit, not a parity claim.
+Python records `reclaim-started`, `recovery-started`, and `retirement-attempted` as attempt evidence
+but has no separate abort event when a checked operation refuses. The Rust shadow therefore keeps
+such an attempt blocked until the append-only history contains both the exact-generation archive
+record with `physical_storage: removed` and removal of that generation from ACTIVE. Python's
+`operation-completed` records only journal cleanup. Finish and ownerless-cleanup rollbacks and late
+refusals emit it while retaining the slot, so for those operations it does not clear reclaim,
+recovery, or retirement markers. Until a future producer adds an explicit terminal outcome for
+non-removing operations, those attempts remain a rollout blocker; the observer can explain them but
+cannot clear or override them.
+
+Replay does not yet model the episode identity that Python binds to each scoped journal. Python
+refuses a history in which progress on a scoped journal path changes the `fenced` name or create
+`operation_id` of the episode it continues, or reopens the path with the identity of a completed
+operation. Rust replay checks only the machine, slot, and operation kind of each progress journal,
+so it accepts such a history. This slice cannot emit `ELIGIBLE`, so the gap cannot clear a slot
+today; replay must refuse these histories as Python does before any phase makes eligibility
+actionable.
+
+Create and import-existing are the exception, but only when the completion leaves an ACTIVE row that
+owns the attempt's storage. A create journal records its slot type and every checkout path it plans,
+and an import journal carries its whole row. Such a completion closes the `recovery-started` marker
+for the same slot and operation when that marker is bound to the completed journal path and the
+ACTIVE row has the attempt's slot type and owns every one of those checkout paths. Each journal a
+recovery binds has its own marker, so a later recovery through another journal leaves an open marker
+in place. Recovering the same journal again adds that attempt's storage to what its marker requires,
+and attempts under different slot types then require storage no row can own. An import that recorded
+no checkouts, which a historical import of a slot whose checkouts are all missing publishes, owns
+nothing and needs only the slot type. A marker bound to another path stays open, such as the default
+for a journal that predates the event log, and so does one whose journal does not identify its
+storage, including a create journal that names no path. A completion that leaves no such row also
+leaves the marker open. The current abort paths below leave no provisional storage, but replay reads
+histories written by every past writer, and a production history contains a create journal completed
+after `recovery-started` with no row ever published while its provisioned worktree, holding commits
+beyond the recorded start point, remained on disk. Such a slot therefore stays `BLOCKED` with
+`ACTIVE_RECORD_MISSING` and `RECOVERY_PENDING` instead of disappearing from the observer. The cost
+is a blocker for a slot that current code aborted cleanly. After an aborted create it ends only when
+a later create of the same slot at the same journal path publishes a row of the same slot type that
+owns every checkout path the aborted attempt planned. `_cmd_create` refuses an existing slot path,
+and Python derives that path from the slot type's root, so such a create proves that the aborted
+attempt left no slot directory. A create of the same slot name under the other slot type proves only
+that its own root was clear, and it leaves the marker open. The path check is stricter than that
+proof: a nested re-create that plans fewer checkouts than the aborted attempt leaves the marker
+open, although the refused slot directory held all of them. So does a re-import through the same
+journal that records fewer checkouts than an aborted import, although Python publishes an import
+only when the slot directory holds exactly the row's checkouts. Replay compares checkout paths
+rather than deriving each slot directory from the checkout names, so these are false blockers and
+never false clearances. The proof does not extend to branches or caches outside the slot path that
+an older writer may have left. Some of these blockers are permanent, because no event that current
+writers append can close them and phase 1 has no operator acknowledgment event: a marker whose
+journal does not identify its storage; a create marker bound to the legacy singleton journal,
+because current creates complete only at their scoped path; an aborted import-existing followed by a
+create rather than a re-import of the same checkouts, because the completion's operation differs;
+and a create or import marker still open when the slot is archived, because archive evidence clears
+only finish attempts. The enumeration of `py/wrkslots/cli.py` below supports the row-present cases
+for histories written by that code. Line numbers are at `aa68c18`, "wrkslots: check task scopes
+before create recovery provisions".
+
+- `_clear_journal` (5472) is the only writer of `operation-completed` (5483). Every
+  `_write_event_file` and `writer.append` call passes a literal kind. The other occurrences, at 5558
+  and 7128, are readers. The append happens before the journal is unlinked, with the test
+  interrupt `after-operation-completed` at 5490 between them.
+- Create journals come only from `_create_journal_payload` (kind `create`, 13197). Import journals
+  come only from `_import_journal_payload` (kind `import-existing`, 14182).
+- `_recover_create` and `_recover_import_existing` are dispatched at 32143 and 32154, after
+  `recovery-started` is appended at 32079.
+
+The eight `_clear_journal` calls on a create or import journal, and the state each leaves:
+
+| Call site | Line | Storage and ACTIVE state when the journal completes |
+| --- | --- | --- |
+| `_cmd_create` | 13500 | `_write_active_state(action="slot-created")` (13491) runs first, so the new ACTIVE row owns the storage |
+| `_recover_create` | 22424 | The ACTIVE row is already durable and must match the journal exactly. Every checkout HEAD is verified first, and `--abort-create` is refused (22387) |
+| `_recover_create` | 22543 | Recovery provisions and runs hooks, then publishes the row with `action="slot-created-by-recovery"` (22535) |
+| `_abort_create` | 22152 | Called at 22428 only when there is no ACTIVE row. It removes caches and worktrees, deletes branches at their expected heads, and removes the slot directory. Any unexpected state raises before the clear, so neither storage nor a row remains. The marker stays open because a completion without a row cannot distinguish this from an older writer that left storage |
+| `_publish_import` | 14224 | `_write_active_state(action="slot-imported")` (14214) runs first |
+| `_recover_import_existing` | 22582 | The row is already durable and matches exactly, and `_verify_import_record` passes. `--abort-import` is refused (22579) |
+| `_recover_import_existing` | 22588 | `--abort-import` with no row. An import publishes rows only for checkouts that already exist, so it changes no files and owns no provisional storage. The checkout was never registered and has no row, so the recovery marker stays open and the slot remains blocked rather than leaving the observer |
+| `_recover_import_existing` | 22612 | Recovery publishes the row with `action="slot-imported-by-recovery"` (22603) |
+
+The checks that run after these clears never undo them. They are `_validate_global_state` and
+`_assert_only_slot_changed`, in `_cmd_create`, in `_cmd_import_existing`, and after recovery
+dispatch (32281). They only read state, so a refusal there leaves the slot in the state the table
+records. A recovery refused before its clear appends no completion, which leaves both the journal
+marker and the recovery marker open.
+
+Finish is different. `_rollback_path_fence` (20375) and the refusal rollback in `_begin_finish`
+(20917) complete a finish journal while retaining the slot. `_rollback_validation_fence` (25466,
+called from `_recover_ownerless_validation` at 26597, 26685, and 26753) does the same for an
+ownerless validation. Those operations therefore keep the archived-removal rule above.
+For a pre-event-log finish journal, recovery can import snapshots that are already at any side of
+the archive/ACTIVE publication boundary. Once those snapshots prove physical removal, the observer
+retains a synthetic legacy-journal cleanup marker until an `operation-completed` at that journal's
+path; this keeps the interrupted operation visible without leaving a false recovery blocker after
+completion. A completion at another journal path, such as a later scoped finish, leaves it pending.
+
+Python `clean-caches --only SLOT` limits cache-directory traversal and scoped-journal checkout/Git
+inspection to the named slot. It reads each complete bounded unselected scoped journal and verifies
+both its shape and its exact append-only progress provenance without inspecting its checkouts. It still
+performs global control-plane discovery, validates every active record path, and replays every
+authoritative `EVENTS.<machine>` shard before mutation. That replay is intentional with the current
+format: event filenames contain only sequence numbers, and event-first journal publication means a
+slot can exist only in an event when the process stops. Eliminating unselected-shard replay safely
+requires a trusted locator that is bound to every shard's count and terminal digest (and that also
+indexes pending operations); compatibility `ACTIVE`/`ARCHIVED` snapshots are not such an authority.
 
 ## Capability comparison
 

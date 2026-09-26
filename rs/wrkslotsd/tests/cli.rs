@@ -101,12 +101,37 @@ fn binary_rebuild_status_help_and_failure_contracts() {
     assert!(status.status.success());
     assert_eq!(status.stdout, rebuilt.stdout);
 
+    let explained = Command::new(env!("CARGO_BIN_EXE_wrkslotsd"))
+        .args(["explain", "--index"])
+        .arg(&index)
+        .args(["--slot", "slot-a"])
+        .output()
+        .expect("run explain for unknown slot");
+    assert_eq!(explained.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&explained.stderr).contains("unknown active or pending slot"));
+
+    let plan = Command::new(env!("CARGO_BIN_EXE_wrkslotsd"))
+        .args(["plan", "--index"])
+        .arg(&index)
+        .output()
+        .expect("run plan");
+    assert!(plan.status.success());
+    let plan: Value = serde_json::from_slice(&plan.stdout).expect("plan JSON");
+    assert_eq!(plan["eligible"], json!([]));
+    assert_eq!(plan["unknown"], json!([]));
+
     let help = Command::new(env!("CARGO_BIN_EXE_wrkslotsd"))
         .arg("--help")
         .output()
         .expect("run help");
     assert!(help.status.success());
-    assert!(String::from_utf8_lossy(&help.stdout).contains("renameat2(RENAME_NOREPLACE)"));
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("renameat2(RENAME_NOREPLACE)"));
+    assert!(help.contains("cannot emit actionable eligibility"));
+    assert!(help.contains("TaskGraph claim ownership"));
+    for command in ["rebuild", "status", "explain", "plan"] {
+        assert!(help.contains(command));
+    }
 
     let failure = Command::new(env!("CARGO_BIN_EXE_wrkslotsd"))
         .args(["status", "--index"])

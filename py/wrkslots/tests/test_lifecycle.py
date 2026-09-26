@@ -26,6 +26,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import unicodedata
 from collections.abc import Callable, Iterator, Mapping, Sequence, Set as AbstractSet
 from dataclasses import replace
 from pathlib import Path
@@ -43,6 +44,211 @@ from wrkslots import cli as wrkslots  # noqa: E402
 
 
 SYSTEM_GIT = Path("/usr/bin/git")
+
+
+def test_task_scope_identity_round_trips_and_legacy_rows_remain_readable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    invocation_directory = tmp_path / "systemd-units"
+    invocation_directory.mkdir()
+    (invocation_directory / "invocation:wrkslots-worker.scope").symlink_to("a" * 32)
+    monkeypatch.setattr(
+        wrkslots, "_systemd_invocation_directory", lambda: invocation_directory
+    )
+    worker_cgroup = (
+        f"{wrkslots._systemd_user_manager_cgroup()}/app.slice/wrkslots-worker.scope"
+    )
+    owner = wrkslots.ProcessIdentity(
+        pid=123,
+        start_ticks=456,
+        boot_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        host_id="host-a",
+        cgroup_path=worker_cgroup,
+    )
+    checkout = wrkslots.Checkout(
+        name="source",
+        path="worktrees/slots/slot01/source",
+        repository=".",
+        branch="topic",
+        start_point="1" * 40,
+        remote="origin",
+        remote_url_sha256="2" * 64,
+        landed_ref="refs/remotes/origin/main",
+        head="3" * 40,
+    )
+    scope = wrkslots._task_scope_from_args(
+        argparse.Namespace(
+            task_scope_unit="wrkslots-worker.scope",
+            task_scope_invocation_id="a" * 32,
+        ),
+        owner,
+    )
+    assert scope is not None
+    record = wrkslots.ActiveRecord(
+        slot="slot01",
+        agent="worker",
+        task="task",
+        purpose="test task scope",
+        slot_type="agent",
+        machine="testhost",
+        generation=1,
+        created_at="2026-09-22T00:00:00+00:00",
+        heartbeat_at="2026-09-22T00:00:00+00:00",
+        heartbeat_ttl_seconds=600,
+        owner=owner,
+        coordinator_lease=replace(owner, pid=124, start_ticks=457),
+        coordinator_recovery_note=None,
+        handoff=None,
+        checkouts=(checkout,),
+        task_scope=scope,
+    )
+    encoded = wrkslots._record_to_obj(record)
+    assert encoded["task_scope"] == {
+        "unit": "wrkslots-worker.scope",
+        "invocation_id": "a" * 32,
+        "cgroup_path": worker_cgroup,
+        "boot_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "leader_pid": 123,
+        "leader_start_ticks": 456,
+        "verification": "systemd-runtime-invocation-symlink-v1",
+    }
+    assert wrkslots._record_from_obj(encoded, "record") == record
+
+    legacy = dict(encoded)
+    del legacy["task_scope"]
+    assert wrkslots._record_from_obj(legacy, "legacy record").task_scope is None
+
+    malformed = dict(encoded)
+    malformed["task_scope"] = None
+    with pytest.raises(wrkslots.StateError, match="task_scope"):
+        wrkslots._record_from_obj(malformed, "malformed record")
+    mismatched_owner = json.loads(json.dumps(encoded))
+    mismatched_owner["task_scope"]["leader_pid"] = 999
+    with pytest.raises(wrkslots.StateError, match="does not match.*owner"):
+        wrkslots._record_from_obj(mismatched_owner, "mismatched-owner record")
+    ownerless_scope = json.loads(json.dumps(encoded))
+    ownerless_scope["owner"] = None
+    with pytest.raises(wrkslots.StateError, match="no bound owner"):
+        wrkslots._record_from_obj(ownerless_scope, "ownerless-scope record")
+    with pytest.raises(wrkslots.Refusal, match="supplied together"):
+        wrkslots._task_scope_from_args(
+            argparse.Namespace(
+                task_scope_unit="wrkslots-worker.scope",
+                task_scope_invocation_id=None,
+            ),
+            owner,
+        )
+
+    # A same-named unit outside this user's manager cannot borrow the
+    # identity of the invocation link read from that manager.
+    for foreign_cgroup in (
+        "/user.slice/wrkslots-worker.scope",
+        "/system.slice/wrkslots-worker.scope",
+        "/user.slice/user-999999.slice/user@999999.service/app.slice/wrkslots-worker.scope",
+        f"{wrkslots._systemd_user_manager_cgroup()}-x/wrkslots-worker.scope",
+    ):
+        with pytest.raises(wrkslots.Refusal, match="not under the systemd user manager"):
+            wrkslots._task_scope_from_args(
+                argparse.Namespace(
+                    task_scope_unit="wrkslots-worker.scope",
+                    task_scope_invocation_id="a" * 32,
+                ),
+                replace(owner, cgroup_path=foreign_cgroup),
+            )
+
+    # A same-named cgroup inside a delegated service subtree was not placed by
+    # the manager, so it cannot borrow the link either; nested slices can.
+    manager = wrkslots._systemd_user_manager_cgroup()
+    for delegated_cgroup in (
+        f"{manager}/app.slice/delegated.service/wrkslots-worker.scope",
+        f"{manager}/app.slice/app-x.slice/other.scope/wrkslots-worker.scope",
+        f"{manager}/init.scope/wrkslots-worker.scope",
+    ):
+        with pytest.raises(wrkslots.Refusal, match="every component between them"):
+            wrkslots._task_scope_from_args(
+                argparse.Namespace(
+                    task_scope_unit="wrkslots-worker.scope",
+                    task_scope_invocation_id="a" * 32,
+                ),
+                replace(owner, cgroup_path=delegated_cgroup),
+            )
+    nested_slice_owner = replace(
+        owner,
+        cgroup_path=f"{manager}/app.slice/app-x.slice/wrkslots-worker.scope",
+    )
+    nested_scope = wrkslots._task_scope_from_args(
+        argparse.Namespace(
+            task_scope_unit="wrkslots-worker.scope",
+            task_scope_invocation_id="a" * 32,
+        ),
+        nested_slice_owner,
+    )
+    assert nested_scope is not None
+    assert nested_scope.cgroup_path == nested_slice_owner.cgroup_path
+
+    (invocation_directory / "invocation:wrkslots-worker.scope").unlink()
+    (invocation_directory / "invocation:wrkslots-worker.scope").symlink_to("b" * 32)
+    with pytest.raises(wrkslots.Refusal, match="does not match"):
+        wrkslots._task_scope_from_args(
+            argparse.Namespace(
+                task_scope_unit="wrkslots-worker.scope",
+                task_scope_invocation_id="a" * 32,
+            ),
+            owner,
+        )
+
+    (invocation_directory / "invocation:wrkslots-worker.scope").unlink()
+    (invocation_directory / "invocation:wrkslots-worker.scope").write_text(
+        "a" * 32, encoding="ascii"
+    )
+    with pytest.raises(wrkslots.Refusal, match="not a systemd runtime symlink"):
+        wrkslots._task_scope_from_args(
+            argparse.Namespace(
+                task_scope_unit="wrkslots-worker.scope",
+                task_scope_invocation_id="a" * 32,
+            ),
+            owner,
+        )
+
+    non_integer = dict(encoded["task_scope"])
+    non_integer["leader_pid"] = "123"
+    with pytest.raises(wrkslots.StateError, match="leader_pid"):
+        wrkslots._task_scope_from_obj(non_integer, "non-integer scope")
+
+    wrong_cgroup = dict(encoded["task_scope"])
+    wrong_cgroup["cgroup_path"] = "/user.slice/prefix-wrkslots-worker.scope"
+    with pytest.raises(wrkslots.StateError, match="cgroup path"):
+        wrkslots._task_scope_from_obj(wrong_cgroup, "wrong-cgroup scope")
+
+    for codepoint in range(0x1C, 0x20):
+        control = chr(codepoint)
+        invalid_control = dict(encoded["task_scope"])
+        invalid_control["unit"] = f"wrkslots-{control}.scope"
+        invalid_control["cgroup_path"] = f"/user.slice/wrkslots-{control}.scope"
+        with pytest.raises(wrkslots.StateError, match="task-scoped systemd unit"):
+            wrkslots._task_scope_from_obj(
+                invalid_control, f"U+{codepoint:04X} scope"
+            )
+
+    for codepoint in range(sys.maxunicode + 1):
+        control = chr(codepoint)
+        if unicodedata.category(control) != "Cf":
+            continue
+        invalid_format = dict(encoded["task_scope"])
+        invalid_format["unit"] = f"wrkslots-{control}.scope"
+        invalid_format["cgroup_path"] = f"/user.slice/wrkslots-{control}.scope"
+        with pytest.raises(wrkslots.StateError, match="task-scoped systemd unit"):
+            wrkslots._task_scope_from_obj(
+                invalid_format, f"U+{codepoint:04X} format-control scope"
+            )
+
+    visible_unicode = dict(encoded["task_scope"])
+    visible_unicode["unit"] = "wrkslots-é.scope"
+    visible_unicode["cgroup_path"] = "/user.slice/wrkslots-é.scope"
+    assert (
+        wrkslots._task_scope_from_obj(visible_unicode, "visible Unicode scope").unit
+        == "wrkslots-é.scope"
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -7788,6 +7994,42 @@ def test_recover_ownerless_validate_checkout_requires_explicit_authority(
     assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
 
+def test_recover_ownerless_validate_checkout_refuses_abort_import(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "review-checkout"
+    target.parent.mkdir(parents=True)
+    git(repository, "worktree", "add", "--detach", str(target), "origin/main")
+    record = prepare_terminal_validation_record(project, target, field="checkout")
+
+    refused = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--abort-import",
+        "--ownerless-validate-checkout",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+        "--repository",
+        repository.relative_to(project).as_posix(),
+    )
+
+    assert refused.returncode == 3
+    assert (
+        "--abort-import applies only to an interrupted import-existing journal"
+        in refused.stderr
+    )
+    assert target.is_dir()
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+
+
 def test_recover_ownerless_validate_checkout_preserves_clean_terminal_worktree(
     tmp_path: Path,
 ) -> None:
@@ -10242,6 +10484,27 @@ def test_create_help_marks_runtime_mandatory_options_required(tmp_path: Path) ->
     assert "[--coordinator-authorized]" not in usage
 
 
+def test_task_scope_and_selective_cache_contracts_are_in_cli_help(tmp_path: Path) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+
+    create_help = raw_command(project, "create", "--help")
+    assert create_help.returncode == 0
+    normalized_create = " ".join(create_help.stdout.split())
+    assert "--task-scope-unit UNIT.scope" in normalized_create
+    assert "runtime invocation symlink must match" in normalized_create
+    assert "/run/user/$UID/systemd/units/invocation:UNIT.scope" in normalized_create
+
+    cache_help = raw_command(project, "clean-caches", "--help")
+    assert cache_help.returncode == 0
+    normalized_cache = " ".join(cache_help.stdout.split())
+    assert "--only SLOT" in normalized_cache
+    assert "emit only its row" in normalized_cache
+    assert (
+        "global authority/path and complete bounded journal shape/provenance checks still run"
+        in normalized_cache
+    )
+
+
 def test_existing_unregistered_flag_retains_and_warns_without_treating_path_free(
     tmp_path: Path,
 ) -> None:
@@ -10677,6 +10940,651 @@ def test_interrupted_create_requires_and_supports_recovery(tmp_path: Path) -> No
     assert recovered.returncode == 0, recovered.stderr
     assert len(active_slots(project)) == 2
     assert not journal.exists()
+
+
+def test_create_recovery_refuses_task_scope_that_does_not_match_owner(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    interrupted = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    journal = create_journal_path(project)
+    raw = wrkslots._as_mapping(
+        json.loads(journal.read_text(encoding="utf-8")), "test create journal"
+    )
+    owner = wrkslots._identity_from_obj(raw["owner"], "test create owner")
+    assert owner is not None
+    changed = dict(raw)
+    changed["task_scope"] = {
+        "unit": "forged.scope",
+        "invocation_id": "a" * 32,
+        "cgroup_path": "/user.slice/forged.scope",
+        "boot_id": owner.boot_id,
+        "leader_pid": owner.pid + 1,
+        "leader_start_ticks": owner.start_ticks,
+        "verification": "systemd-runtime-invocation-symlink-v1",
+    }
+    # Append matching progress evidence so recovery reaches semantic journal
+    # validation instead of rejecting only a disk/event digest mismatch.
+    wrkslots._write_journal(config, changed, journal_path=journal)
+    before = journal.read_bytes()
+
+    recovered = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+    )
+
+    assert recovered.returncode == 3
+    assert "task_scope does not match its bound owner process" in recovered.stderr
+    assert journal.read_bytes() == before
+    assert active_slots(project) == []
+
+
+def _attach_task_scope_to_interrupted_journal(
+    project: Path, journal: Path
+) -> wrkslots.TaskScopeIdentity:
+    """Model a scope identity that an earlier process durably verified."""
+
+    config = wrkslots._load_config(str(project), "testhost")
+    raw: object = json.loads(journal.read_text(encoding="utf-8"))
+    assert isinstance(raw, dict)
+    container: object = raw if raw["kind"] == "create" else raw["record"]
+    assert isinstance(container, dict)
+    owner = container["owner"]
+    assert isinstance(owner, dict)
+    unit = "wrkslots-recovery.scope"
+    cgroup_path = f"{wrkslots._systemd_user_manager_cgroup()}/app.slice/{unit}"
+    owner["cgroup_path"] = cgroup_path
+    scope = {
+        "unit": unit,
+        "invocation_id": "a" * 32,
+        "cgroup_path": cgroup_path,
+        "boot_id": owner["boot_id"],
+        "leader_pid": owner["pid"],
+        "leader_start_ticks": owner["start_ticks"],
+        "verification": "systemd-runtime-invocation-symlink-v1",
+    }
+    container["task_scope"] = scope
+    wrkslots._write_journal(config, raw, journal_path=journal)
+    return wrkslots._task_scope_from_obj(scope, "test recovery scope")
+
+
+@pytest.mark.parametrize("operation", ("create", "import-existing"))
+@pytest.mark.parametrize(
+    "runtime_link", ("stable", "missing", "retargeted", "raced", "aba")
+)
+def test_create_and_import_recovery_revalidate_task_scope_at_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    operation: str,
+    runtime_link: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    if operation == "create":
+        interrupted = create(
+            project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+        )
+        journal = create_journal_path(project)
+    else:
+        tree = checkout(project)
+        tree.parent.mkdir()
+        git(
+            repository,
+            "worktree",
+            "add",
+            "-b",
+            "codex/imported",
+            str(tree),
+            "origin/main",
+        )
+        interrupted = command(
+            project,
+            "import-existing",
+            "slot01",
+            "--agent",
+            "codex-1",
+            "--task",
+            "task-import",
+            "--purpose",
+            "interrupted scoped import",
+            "--repo",
+            "product=repo",
+            "--apply",
+            "--verified-live",
+            "--owner-pid",
+            str(os.getpid()),
+            "--coordinator-pid",
+            str(os.getpid()),
+            env={"WRKSLOTS_TEST_INTERRUPT": "after-import-journal"},
+        )
+        journal = control_directory(project) / "ACTIVE.testhost.journal"
+    assert interrupted.returncode == 86, interrupted.stderr
+    assert active_slots(project) == []
+    expected_scope = _attach_task_scope_to_interrupted_journal(project, journal)
+    journal_before = journal.read_bytes()
+
+    invocation_directory = tmp_path / "systemd-units"
+    invocation_directory.mkdir()
+    invocation_link = invocation_directory / f"invocation:{expected_scope.unit}"
+    invocation_link.symlink_to(expected_scope.invocation_id)
+    monkeypatch.setattr(
+        wrkslots, "_systemd_invocation_directory", lambda: invocation_directory
+    )
+    aba_identity: tuple[int, int] | None = None
+    original_readlink = os.readlink
+    if runtime_link == "missing":
+        invocation_link.unlink()
+    elif runtime_link == "retargeted":
+        invocation_link.unlink()
+        invocation_link.symlink_to("b" * 32)
+    elif runtime_link == "raced":
+        def replace_after_readlink(
+            path: os.PathLike[str] | str,
+            *,
+            dir_fd: int | None = None,
+        ) -> str:
+            target = os.fsdecode(original_readlink(path, dir_fd=dir_fd))
+            if path == "":
+                invocation_link.unlink()
+                invocation_link.symlink_to("b" * 32)
+            return target
+
+        monkeypatch.setattr(os, "readlink", replace_after_readlink)
+    elif runtime_link == "aba":
+        invocation_link.unlink()
+        invocation_link.symlink_to("b" * 32)
+        before = invocation_link.lstat()
+        aba_identity = (before.st_dev, before.st_ino)
+        expected_during_read = invocation_directory / "expected-during-read"
+        expected_during_read.symlink_to(expected_scope.invocation_id)
+        saved_wrong_link = invocation_directory / "saved-wrong-link"
+
+        def aba_readlink(
+            path: os.PathLike[str] | str,
+            *,
+            dir_fd: int | None = None,
+        ) -> str:
+            if path != "" and Path(path) != invocation_link:
+                return os.fsdecode(original_readlink(path, dir_fd=dir_fd))
+            os.replace(invocation_link, saved_wrong_link)
+            os.replace(expected_during_read, invocation_link)
+            try:
+                return os.fsdecode(original_readlink(path, dir_fd=dir_fd))
+            finally:
+                os.replace(invocation_link, expected_during_read)
+                os.replace(saved_wrong_link, invocation_link)
+
+        monkeypatch.setattr(os, "readlink", aba_readlink)
+
+    original_verify = wrkslots._verify_task_scope_invocation
+    verification_calls: list[wrkslots.TaskScopeIdentity] = []
+
+    def counted_verify(scope: wrkslots.TaskScopeIdentity) -> None:
+        verification_calls.append(scope)
+        original_verify(scope)
+
+    monkeypatch.setattr(wrkslots, "_verify_task_scope_invocation", counted_verify)
+    original_slot_free = wrkslots._assert_agent_and_slot_free
+    provisioning_started: list[str] = []
+
+    def recorded_slot_free(
+        config: wrkslots.Config,
+        slot: str,
+        agent: str,
+        slot_type: str,
+        *,
+        enforce_cap: bool = True,
+    ) -> None:
+        provisioning_started.append(slot)
+        original_slot_free(config, slot, agent, slot_type, enforce_cap=enforce_cap)
+
+    monkeypatch.setattr(wrkslots, "_assert_agent_and_slot_free", recorded_slot_free)
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    # Create recovery checks once before provisioning and hooks, then again
+    # immediately before publication; a failing check stops at the first.
+    if operation == "create" and runtime_link == "stable":
+        assert verification_calls == [expected_scope, expected_scope]
+    else:
+        assert verification_calls == [expected_scope]
+    if operation == "create":
+        assert provisioning_started == ([] if runtime_link != "stable" else ["slot01"])
+    if runtime_link == "stable":
+        assert rc == 0, captured.err
+        assert len(active_slots(project)) == 1
+        assert not journal.exists()
+    else:
+        assert rc == 3
+        assert (
+            "cannot verify task scope invocation" in captured.err
+            if runtime_link == "missing"
+            else "task scope invocation does not match" in captured.err
+        )
+        assert (
+            "--abort-create" if operation == "create" else "--abort-import"
+        ) in captured.err
+        assert active_slots(project) == []
+        assert journal.read_bytes() == journal_before
+        if runtime_link == "aba":
+            after = invocation_link.lstat()
+            assert (after.st_dev, after.st_ino) == aba_identity
+            assert os.fsdecode(original_readlink(invocation_link)) == "b" * 32
+
+
+def test_create_recovery_refuses_at_publication_when_scope_ends_during_provisioning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    interrupted = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    journal = create_journal_path(project)
+    expected_scope = _attach_task_scope_to_interrupted_journal(project, journal)
+    journal_before = journal.read_bytes()
+    invocation_directory = tmp_path / "systemd-units"
+    invocation_directory.mkdir()
+    invocation_link = invocation_directory / f"invocation:{expected_scope.unit}"
+    invocation_link.symlink_to(expected_scope.invocation_id)
+    monkeypatch.setattr(
+        wrkslots, "_systemd_invocation_directory", lambda: invocation_directory
+    )
+    original_verify = wrkslots._verify_task_scope_invocation
+    verification_calls: list[wrkslots.TaskScopeIdentity] = []
+
+    def verify_then_end_scope(scope: wrkslots.TaskScopeIdentity) -> None:
+        verification_calls.append(scope)
+        original_verify(scope)
+        # The check before provisioning passes; the scope then ends while
+        # provisioning and hooks run, so only the publication recheck sees it.
+        if len(verification_calls) == 1:
+            invocation_link.unlink()
+            invocation_link.symlink_to("b" * 32)
+
+    monkeypatch.setattr(wrkslots, "_verify_task_scope_invocation", verify_then_end_scope)
+    original_slot_free = wrkslots._assert_agent_and_slot_free
+    provisioning_started: list[str] = []
+
+    def recorded_slot_free(
+        config: wrkslots.Config,
+        slot: str,
+        agent: str,
+        slot_type: str,
+        *,
+        enforce_cap: bool = True,
+    ) -> None:
+        provisioning_started.append(slot)
+        original_slot_free(config, slot, agent, slot_type, enforce_cap=enforce_cap)
+
+    monkeypatch.setattr(wrkslots, "_assert_agent_and_slot_free", recorded_slot_free)
+    recover_argv = [
+        "--project-root",
+        str(project),
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ]
+    rc = wrkslots.main(recover_argv)
+    captured = capsys.readouterr()
+
+    assert rc == 3
+    assert verification_calls == [expected_scope, expected_scope]
+    assert provisioning_started == ["slot01"]
+    assert "task scope invocation does not match" in captured.err
+    assert "--abort-create" in captured.err
+    assert active_slots(project) == []
+    assert journal.read_bytes() == journal_before
+    assert checkout(project).is_dir()
+
+    aborted = wrkslots.main([*recover_argv, "--slot", "slot01", "--abort-create"])
+    captured = capsys.readouterr()
+    assert aborted == 0, captured.err
+    assert not journal.exists()
+    assert active_slots(project) == []
+    assert not checkout(project).exists()
+    assert verification_calls == [expected_scope, expected_scope]
+
+
+def _interrupt_scoped_import(project: Path, repository: Path) -> Path:
+    tree = checkout(project)
+    tree.parent.mkdir()
+    git(repository, "worktree", "add", "-b", "codex/imported", str(tree), "origin/main")
+    interrupted = command(
+        project,
+        "import-existing",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--task",
+        "task-import",
+        "--purpose",
+        "interrupted scoped import",
+        "--repo",
+        "product=repo",
+        "--apply",
+        "--verified-live",
+        "--owner-pid",
+        str(os.getpid()),
+        "--coordinator-pid",
+        str(os.getpid()),
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-import-journal"},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    return control_directory(project) / "ACTIVE.testhost.journal"
+
+
+def test_abort_import_discards_an_import_whose_task_scope_ended(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    journal = _interrupt_scoped_import(project, repository)
+    expected_scope = _attach_task_scope_to_interrupted_journal(project, journal)
+    journal_before = journal.read_bytes()
+    tree = checkout(project)
+    head_before = git(tree, "rev-parse", "HEAD").stdout
+    invocation_directory = tmp_path / "systemd-units"
+    invocation_directory.mkdir()
+    # The scope ended and systemd started a new invocation under the same name.
+    (invocation_directory / f"invocation:{expected_scope.unit}").symlink_to("b" * 32)
+    monkeypatch.setattr(
+        wrkslots, "_systemd_invocation_directory", lambda: invocation_directory
+    )
+    recover_argv = [
+        "--project-root",
+        str(project),
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ]
+
+    refused = wrkslots.main(recover_argv)
+    captured = capsys.readouterr()
+    assert refused == 3
+    assert "task scope invocation does not match" in captured.err
+    assert "wrkslots recover --coordinator-pid PID --abort-import" in captured.err
+    assert journal.read_bytes() == journal_before
+    blocked = command(project, "create", "slot02", "--agent", "codex-2", "--task",
+                      "task-slot02", "--purpose", "blocked by the import journal",
+                      "--owner-pid", str(os.getpid()), "--coordinator-pid",
+                      str(os.getpid()), "--repo", "product=repo")
+    assert blocked.returncode == 3
+
+    aborted = wrkslots.main([*recover_argv, "--abort-import"])
+    captured = capsys.readouterr()
+    assert aborted == 0, captured.err
+    assert "aborted interrupted import slot=slot01" in captured.out
+    assert not journal.exists()
+    assert active_slots(project) == []
+    assert tree.is_dir()
+    assert git(tree, "rev-parse", "HEAD").stdout == head_before
+    assert git(tree, "status", "--porcelain").stdout == ""
+    config = wrkslots._load_config(str(project), "testhost")
+    events = wrkslots._load_events(config)
+    assert [event["kind"] for event in events[-2:]] == [
+        "recovery-started",
+        "operation-completed",
+    ]
+    payload = events[-1]["payload"]
+    assert isinstance(payload, dict)
+    assert (payload["slot"], payload["operation"]) == ("slot01", "import-existing")
+
+    reimported = command(
+        project,
+        "import-existing",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--task",
+        "task-import",
+        "--purpose",
+        "import again after abort",
+        "--repo",
+        "product=repo",
+        "--apply",
+        "--verified-live",
+        "--owner-pid",
+        str(os.getpid()),
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+    assert reimported.returncode == 0, reimported.stderr
+    assert len(active_slots(project)) == 1
+
+
+def test_abort_import_refuses_other_journals_and_durable_imports(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    interrupted = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    create_journal = create_journal_path(project)
+    before = create_journal.read_bytes()
+    refused = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-import",
+    )
+    assert refused.returncode == 3
+    assert "--abort-import applies only to import-existing journals" in refused.stderr
+    assert create_journal.read_bytes() == before
+    assert checkout(project).is_dir()
+    combined = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-import",
+        "--abort-create",
+    )
+    assert combined.returncode == 2
+    assert "not allowed with argument" in combined.stderr
+    aborted_create = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+    assert aborted_create.returncode == 0, aborted_create.stderr
+
+    tree = checkout(project)
+    tree.parent.mkdir()
+    git(repository, "worktree", "add", "-b", "codex/imported", str(tree), "origin/main")
+    durable = command(
+        project,
+        "import-existing",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--task",
+        "task-import",
+        "--purpose",
+        "durable import",
+        "--repo",
+        "product=repo",
+        "--apply",
+        "--verified-live",
+        "--owner-pid",
+        str(os.getpid()),
+        "--coordinator-pid",
+        str(os.getpid()),
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-import-active-write"},
+    )
+    assert durable.returncode == 86, durable.stderr
+    import_journal = control_directory(project) / "ACTIVE.testhost.journal"
+    before = import_journal.read_bytes()
+    refused = command(
+        project, "recover", "--coordinator-pid", str(os.getpid()), "--abort-import"
+    )
+    assert refused.returncode == 3
+    assert "cannot abort import for slot slot01" in refused.stderr
+    assert import_journal.read_bytes() == before
+    assert len(active_slots(project)) == 1
+    recovered = command(project, "recover", "--coordinator-pid", str(os.getpid()))
+    assert recovered.returncode == 0, recovered.stderr
+    assert not import_journal.exists()
+    assert len(active_slots(project)) == 1
+
+
+@pytest.mark.parametrize(
+    ("operation", "verifications"),
+    (("create", 2), ("register", 2), ("import-existing", 3), ("adopt", 2)),
+)
+@pytest.mark.parametrize("runtime_link", ("stable", "retargeted-before-publication"))
+def test_live_task_scope_is_rechecked_immediately_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    operation: str,
+    verifications: int,
+    runtime_link: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    if operation in {"register", "import-existing"}:
+        tree = checkout(project)
+        tree.parent.mkdir()
+        git(repository, "worktree", "add", "-b", "codex/imported", str(tree), "origin/main")
+    elif operation == "adopt":
+        made = create(project, bind_owner=False)
+        assert made.returncode == 0, made.stderr
+    unit = "wrkslots-live.scope"
+    scope_cgroup = f"{wrkslots._systemd_user_manager_cgroup()}/app.slice/{unit}"
+    monkeypatch.setattr(wrkslots, "_read_process_cgroup", lambda _pid_dir: scope_cgroup)
+    invocation_directory = tmp_path / "systemd-units"
+    invocation_directory.mkdir()
+    invocation_link = invocation_directory / f"invocation:{unit}"
+    invocation_link.symlink_to("a" * 32)
+    monkeypatch.setattr(
+        wrkslots, "_systemd_invocation_directory", lambda: invocation_directory
+    )
+    original_verify = wrkslots._verify_task_scope_invocation
+    verification_calls: list[str] = []
+
+    def verify_then_retarget(scope: wrkslots.TaskScopeIdentity) -> None:
+        verification_calls.append(scope.invocation_id)
+        original_verify(scope)
+        # Everything up to the final check passes; only the recheck that sits
+        # immediately before publication can observe this replacement.
+        if (
+            runtime_link != "stable"
+            and len(verification_calls) == verifications - 1
+        ):
+            invocation_link.unlink()
+            invocation_link.symlink_to("b" * 32)
+
+    monkeypatch.setattr(wrkslots, "_verify_task_scope_invocation", verify_then_retarget)
+    pid = str(os.getpid())
+    scope_args = ["--task-scope-unit", unit, "--task-scope-invocation-id", "a" * 32]
+    identity_args = ["--agent", "codex-1", "--task", "task-slot01", "--purpose", "scoped"]
+    if operation == "create":
+        argv = ["create", "slot01", "--slot-type", "agent", "--coordinator-authorized",
+                *identity_args, "--owner-pid", pid, "--coordinator-pid", pid,
+                "--repo", "product=repo", "--branch", "product=codex/task"]
+    elif operation == "register":
+        argv = ["register", "slot01", "--slot-type", "agent", "--coordinator-authorized",
+                *identity_args, "--owner-pid", pid, "--coordinator-pid", pid,
+                "--verified-live", "--repo", "product=repo"]
+    elif operation == "import-existing":
+        argv = ["import-existing", "slot01", "--slot-type", "agent",
+                "--coordinator-authorized", *identity_args, "--repo", "product=repo",
+                "--apply", "--verified-live", "--owner-pid", pid,
+                "--coordinator-pid", pid]
+    else:
+        argv = ["adopt", "slot01", "--agent", "codex-1", "--owner-pid", pid,
+                "--expected-generation", "1"]
+
+    rc = wrkslots.main(["--project-root", str(project), *argv, *scope_args])
+    captured = capsys.readouterr()
+
+    assert verification_calls == ["a" * 32] * verifications
+    rows = active_slots(project)
+    if runtime_link == "stable":
+        assert rc == 0, captured.err
+        assert len(rows) == 1
+        row = rows[0]
+        assert isinstance(row, dict)
+        assert row["task_scope"]["unit"] == unit
+        assert row["task_scope"]["invocation_id"] == "a" * 32
+        assert row["task_scope"]["cgroup_path"] == scope_cgroup
+        if operation == "adopt":
+            # Adopt by the same owner rebinds the row to a newer invocation.
+            invocation_link.unlink()
+            invocation_link.symlink_to("c" * 32)
+            monkeypatch.setattr(wrkslots, "_verify_task_scope_invocation", original_verify)
+            rebound = wrkslots.main(
+                [
+                    "--project-root",
+                    str(project),
+                    "adopt",
+                    "slot01",
+                    "--agent",
+                    "codex-1",
+                    "--owner-pid",
+                    pid,
+                    "--expected-generation",
+                    str(row["generation"]),
+                    "--task-scope-unit",
+                    unit,
+                    "--task-scope-invocation-id",
+                    "c" * 32,
+                ]
+            )
+            captured = capsys.readouterr()
+            assert rebound == 0, captured.err
+            rebound_row = active_slots(project)[0]
+            assert isinstance(rebound_row, dict)
+            assert rebound_row["task_scope"]["invocation_id"] == "c" * 32
+        return
+    assert rc == 3
+    assert "task scope invocation does not match" in captured.err
+    if operation == "adopt":
+        assert len(rows) == 1
+        row = rows[0]
+        assert isinstance(row, dict)
+        assert row["owner"] is None
+        assert "task_scope" not in row
+    else:
+        assert rows == []
+    if operation == "create":
+        assert "--abort-create" in captured.err
+        assert create_journal_path(project).exists()
+    elif operation == "import-existing":
+        assert "--abort-import" in captured.err
+        assert (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
 
 def test_live_dirty_legacy_create_stays_exact_while_unrelated_creates_succeed(
@@ -21810,6 +22718,80 @@ def test_import_existing_is_dry_run_then_registers_verified_live_slot(
     assert tree.is_dir()
 
 
+@pytest.mark.parametrize(
+    ("mode", "scope_arguments", "message"),
+    (
+        (
+            "live",
+            ("--task-scope-unit", "wrkslots-import.scope"),
+            "must be supplied together",
+        ),
+        (
+            "live",
+            ("--task-scope-invocation-id", "a" * 32),
+            "must be supplied together",
+        ),
+        (
+            "historical",
+            (
+                "--task-scope-unit",
+                "wrkslots-import.scope",
+                "--task-scope-invocation-id",
+                "a" * 32,
+            ),
+            "available only for a live import",
+        ),
+    ),
+)
+def test_import_dry_run_refuses_inapplicable_task_scope_options(
+    tmp_path: Path,
+    mode: str,
+    scope_arguments: tuple[str, ...],
+    message: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    tree = checkout(project)
+    tree.parent.mkdir()
+    git(repository, "worktree", "add", "-b", "codex/imported", str(tree), "origin/main")
+    if mode == "live":
+        arguments = (
+            "import-existing",
+            "slot01",
+            "--agent",
+            "codex-1",
+            "--task",
+            "task-import",
+            "--purpose",
+            "validate task scope options during dry run",
+            "--repo",
+            "product=repo",
+            *scope_arguments,
+        )
+    else:
+        assert mode == "historical"
+        source = write_historical_state(project, "slot01")
+        arguments = (
+            "import-existing",
+            "slot01",
+            "--from-state-file",
+            source.name,
+            "--source-host-id",
+            wrkslots._host_id(),
+            "--repo",
+            "product=repo",
+            *scope_arguments,
+        )
+
+    refused = command(project, *arguments)
+
+    assert refused.returncode == 3
+    assert message in refused.stderr
+    assert refused.stdout == ""
+    assert active_slots(project) == []
+    assert tree.is_dir()
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+
+
 def test_import_existing_registers_coordinator_child_using_the_slot(
     tmp_path: Path,
 ) -> None:
@@ -25401,7 +26383,7 @@ def test_clean_caches_reports_then_cleans_only_explicit_or_all_slots(
         row["slot"]: row for row in json.loads(explicit.stdout)["slots"]
     }
     assert explicit_rows["slot01"]["action"] == "REMOVED"
-    assert explicit_rows["slot02"]["action"] == "REPORT"
+    assert set(explicit_rows) == {"slot01"}
     assert not (first / "target").exists()
     assert not (first / "node_modules").exists()
     assert (second / "target").is_dir()
@@ -25582,7 +26564,7 @@ def test_clean_caches_reports_and_reclaims_across_machine_shards(
     assert not (checkout(project, "slot02") / "target").exists()
 
 
-def test_clean_caches_only_isolated_from_an_unselected_malformed_leak(
+def test_clean_caches_report_keeps_unregistered_failures_visible_as_blocked(
     tmp_path: Path,
 ) -> None:
     project, _repository, _remote = make_project(tmp_path, cache_globs=("target",))
@@ -25598,20 +26580,467 @@ def test_clean_caches_only_isolated_from_an_unselected_malformed_leak(
     invalid_name.mkdir()
     (invalid_name / "note").write_text("also not a checkout\n", encoding="utf-8")
 
-    cleaned = command(project, "clean-caches", "--only", "slot01", "--format", "json")
+    report = command(project, "clean-caches", "--format", "json")
 
-    assert cleaned.returncode == 0, cleaned.stderr
-    rows = {row["slot"]: row for row in json.loads(cleaned.stdout)["slots"]}
-    assert rows["slot01"]["action"] == "REMOVED"
+    assert report.returncode == 0, report.stderr
+    rows = {row["slot"]: row for row in json.loads(report.stdout)["slots"]}
+    assert rows["slot01"]["action"] == "REPORT"
     assert rows["junk"]["action"] == "BLOCKED"
     assert rows["junk"]["cache_error"]
     assert rows["bad slot"]["action"] == "BLOCKED"
-    assert not (tree / "target").exists()
+    assert rows["bad slot"]["cache_error"]
+    assert artifact.is_file()
     assert (junk / "note").is_file()
+    assert (invalid_name / "note").is_file()
 
+
+@pytest.mark.parametrize("physical_journal", (True, False))
+def test_clean_caches_only_does_not_traverse_unselected_journal_targets_or_cache_trees(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    physical_journal: bool,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path, cache_globs=("target",))
+    assert create(project).returncode == 0
+    assert create(
+        project, slot="slot02", agent="codex-2", branch="codex/two"
+    ).returncode == 0
+    interrupted = create(
+        project,
+        slot="slot03",
+        agent="codex-3",
+        branch="codex/three",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    tree = checkout(project)
+    artifact = tree / "target" / "artifact"
     artifact.parent.mkdir()
-    artifact.write_bytes(b"cache again")
+    artifact.write_bytes(b"cache")
+    unselected_artifact = checkout(project, "slot02") / "target" / "artifact"
+    unselected_artifact.parent.mkdir()
+    unselected_artifact.write_bytes(b"unselected cache")
+    junk = project / "worktrees" / "junk"
+    junk.mkdir()
+    (junk / "note").write_text("not a checkout\n", encoding="utf-8")
+    invalid_name = project / "worktrees" / "bad slot"
+    invalid_name.mkdir()
+    (invalid_name / "note").write_text("also not a checkout\n", encoding="utf-8")
+    config = wrkslots._load_config(str(project), None)
+    unselected_journal = wrkslots._create_journal_path(config, "slot03")
+    assert unselected_journal.is_file()
+    if not physical_journal:
+        unselected_journal.unlink()
+
+    measured = wrkslots._allocated_cache_bytes
+    enumerate_directories = wrkslots._cache_slot_directories
+    validate_record_paths = wrkslots._assert_record_paths
+    validated_records: set[str] = set()
+
+    def record_global_path_validation(
+        config: wrkslots.Config,
+        record: wrkslots.ActiveRecord,
+        *,
+        require_repository: bool = True,
+    ) -> None:
+        validated_records.add(record.slot)
+        validate_record_paths(
+            config, record, require_repository=require_repository
+        )
+
+    monkeypatch.setattr(wrkslots, "_assert_record_paths", record_global_path_validation)
+
+    def reject_unselected_scan(
+        config: wrkslots.Config, cache: wrkslots.CacheDirectory
+    ) -> int:
+        assert "slot02" not in cache.path.parts
+        assert "slot03" not in cache.path.parts
+        assert "junk" not in cache.path.parts
+        assert "bad slot" not in cache.path.parts
+        return measured(config, cache)
+
+    monkeypatch.setattr(wrkslots, "_allocated_cache_bytes", reject_unselected_scan)
+
+    def reject_unselected_directory_scan(
+        config: wrkslots.Config,
+        cache_slot: wrkslots.CacheSlot,
+        *,
+        vcs: wrkslots._GitVcs | None = None,
+    ) -> tuple[wrkslots.CacheDirectory, ...]:
+        assert cache_slot.slot == "slot01"
+        return enumerate_directories(config, cache_slot, vcs=vcs)
+
+    monkeypatch.setattr(
+        wrkslots, "_cache_slot_directories", reject_unselected_directory_scan
+    )
+
+    def reject_journal_target_traversal(
+        _config: wrkslots.Config,
+        journal: wrkslots._ValidatedCacheJournal,
+    ) -> wrkslots.CacheSlot:
+        raise AssertionError(
+            f"unselected journal reached target traversal: {journal.path}"
+        )
+
+    monkeypatch.setattr(
+        wrkslots,
+        "_cache_slot_for_validated_journal",
+        reject_journal_target_traversal,
+    )
+
+    result = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "clean-caches",
+            "--only",
+            "slot01",
+            "--format",
+            "json",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert result == 0, captured.err
+    rows = {row["slot"]: row for row in json.loads(captured.out)["slots"]}
+    assert set(rows) == {"slot01"}
+    assert rows["slot01"]["action"] == "REMOVED"
+    assert {"slot01", "slot02"} <= validated_records
+    assert not (tree / "target").exists()
+    assert unselected_artifact.is_file()
+    assert (junk / "note").is_file()
+    if physical_journal:
+        assert json.loads(unselected_journal.read_text(encoding="utf-8"))["slot"] == "slot03"
+    else:
+        assert not unselected_journal.exists()
+        assert unselected_journal in wrkslots._pending_operations_from_events(
+            config, "testhost"
+        )
+
+
+def test_clean_caches_only_does_not_inspect_unselected_legacy_journal_target(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path, cache_globs=("target",))
+    assert create(project).returncode == 0
+    interrupted = create(
+        project,
+        slot="slot02",
+        agent="codex-2",
+        branch="codex/two",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+
+    config = wrkslots._load_config(str(project), "testhost")
+    legacy = wrkslots._journal_path(config, "testhost")
+    os.replace(create_journal_path(project, "slot02"), legacy)
+    shutil.rmtree(wrkslots._event_directory(config, "testhost"))
+    legacy_before = legacy.read_bytes()
+    legacy_inode = legacy.stat(follow_symlinks=False).st_ino
+
+    selected_artifact = checkout(project) / "target" / "artifact"
+    selected_artifact.parent.mkdir()
+    selected_artifact.write_bytes(b"selected cache")
+    unselected_checkout = checkout(project, "slot02")
+    assert unselected_checkout.absolute() in wrkslots._GitVcs().listed_worktrees(
+        repository
+    )
+    shutil.rmtree(unselected_checkout)
+    assert unselected_checkout.absolute() in wrkslots._GitVcs().listed_worktrees(
+        repository
+    )
+    with pytest.raises(
+        wrkslots.Refusal,
+        match="journaled checkout product is missing but Git still registers it",
+    ):
+        wrkslots._journal_cache_slot(config, legacy)
+
+    cleaned = command(
+        project, "clean-caches", "--only", "slot01", "--format", "json"
+    )
+
+    assert cleaned.returncode == 0, cleaned.stderr
+    rows = {row["slot"]: row for row in json.loads(cleaned.stdout)["slots"]}
+    assert set(rows) == {"slot01"}
+    assert rows["slot01"]["action"] == "REMOVED"
+    assert not selected_artifact.parent.exists()
+    assert not unselected_checkout.exists()
+    assert unselected_checkout.absolute() in wrkslots._GitVcs().listed_worktrees(
+        repository
+    )
+    assert legacy.read_bytes() == legacy_before
+    assert legacy.stat(follow_symlinks=False).st_ino == legacy_inode
+
+
+@pytest.mark.parametrize(
+    ("damage", "message"),
+    (
+        ("malformed-shape", "create journal has invalid fields"),
+        (
+            "provenance",
+            "standalone recovery journal differs from append-only operation evidence",
+        ),
+    ),
+)
+def test_clean_caches_only_refuses_invalid_unselected_legacy_journal(
+    tmp_path: Path,
+    damage: str,
+    message: str,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path, cache_globs=("target",))
+    assert create(project).returncode == 0
+    interrupted = create(
+        project,
+        slot="slot02",
+        agent="codex-2",
+        branch="codex/two",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    legacy = install_legacy_create_journal_with_matching_event(project, "slot02")
+    raw = json.loads(legacy.read_text(encoding="utf-8"))
+    if damage == "malformed-shape":
+        del raw["purpose"]
+    else:
+        assert damage == "provenance"
+        raw["purpose"] = "tampered purpose"
+    legacy.write_text(json.dumps(raw) + "\n", encoding="utf-8")
+    artifact = checkout(project) / "target" / "artifact"
+    artifact.parent.mkdir()
+    artifact.write_bytes(b"selected cache")
+
+    refused = command(project, "clean-caches", "--only", "slot01")
+
+    assert refused.returncode == 3
+    assert message in refused.stderr
+    assert artifact.is_file()
+    assert legacy.is_file()
+
+
+@pytest.mark.parametrize(
+    ("damage", "message"),
+    (
+        ("filename-identity", "filename does not match"),
+        ("malformed-shape", "create journal has invalid fields"),
+        ("provenance", "differs from append-only progress evidence"),
+    ),
+)
+def test_clean_caches_only_refuses_invalid_unselected_scoped_journal(
+    tmp_path: Path, damage: str, message: str
+) -> None:
+    project, _repository, _remote = make_project(tmp_path, cache_globs=("target",))
+    assert create(project).returncode == 0
+    interrupted = create(
+        project,
+        slot="slot02",
+        agent="codex-2",
+        branch="codex/two",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    artifact = checkout(project) / "target" / "artifact"
+    artifact.parent.mkdir()
+    artifact.write_bytes(b"cache")
+    config = wrkslots._load_config(str(project), None)
+    unselected_journal = wrkslots._create_journal_path(config, "slot02")
+    raw = json.loads(unselected_journal.read_text(encoding="utf-8"))
+    if damage == "filename-identity":
+        raw["slot"] = "different-slot"
+    elif damage == "malformed-shape":
+        del raw["purpose"]
+    else:
+        assert damage == "provenance"
+        raw["purpose"] = "tampered purpose"
+    unselected_journal.write_text(json.dumps(raw) + "\n", encoding="utf-8")
+
+    refused = command(project, "clean-caches", "--only", "slot01")
+
+    assert refused.returncode == 3
+    assert message in refused.stderr
+    assert artifact.is_file()
+
+
+def test_clean_caches_only_refuses_malformed_event_only_unselected_journal(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path, cache_globs=("target",))
+    assert create(project).returncode == 0
+    interrupted = create(
+        project,
+        slot="slot02",
+        agent="codex-2",
+        branch="codex/two",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    artifact = checkout(project) / "target" / "artifact"
+    artifact.parent.mkdir()
+    artifact.write_bytes(b"cache")
+    config = wrkslots._load_config(str(project), None)
+    journal = wrkslots._create_journal_path(config, "slot02")
+    raw = json.loads(journal.read_text(encoding="utf-8"))
+    del raw["purpose"]
+    wrkslots._write_event_file(
+        config,
+        "testhost",
+        "operation-progress-recorded",
+        {
+            "slot": "slot02",
+            "operation": "create",
+            "journal_path": journal.name,
+            "journal": raw,
+        },
+    )
+    journal.unlink()
+
+    refused = command(project, "clean-caches", "--only", "slot01")
+
+    assert refused.returncode == 3
+    assert "create journal has invalid fields" in refused.stderr
+    assert artifact.is_file()
+    assert not journal.exists()
+
+
+def test_clean_caches_only_keeps_duplicate_unselected_journal_gate(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path, cache_globs=("target",))
+    assert create(project).returncode == 0
+    interrupted = create(
+        project,
+        slot="slot02",
+        agent="codex-2",
+        branch="codex/two",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    artifact = checkout(project) / "target" / "artifact"
+    artifact.parent.mkdir()
+    artifact.write_bytes(b"cache")
+    config = wrkslots._load_config(str(project), "testhost")
+    first_journal = wrkslots._create_journal_path(config, "slot02", "testhost")
+    other_machine = "otherhost"
+    other_config = wrkslots._load_config(str(project), other_machine)
+    raw = json.loads(first_journal.read_text(encoding="utf-8"))
+    raw["machine"] = other_machine
+    other_journal = wrkslots._create_journal_path(
+        other_config, "slot02", other_machine
+    )
+    wrkslots._atomic_write_json(
+        wrkslots._active_path(other_config, other_machine),
+        wrkslots._active_to_obj(wrkslots.ActiveState(other_machine, 0, ())),
+    )
+    wrkslots._atomic_write_json(
+        wrkslots._archive_path(other_config, other_machine),
+        wrkslots._archive_to_obj(wrkslots.ArchiveState(other_machine, 0, ())),
+    )
+    wrkslots._ensure_event_log(
+        other_config, other_machine, require_repository=False
+    )
+    wrkslots._write_event_file(
+        other_config,
+        other_machine,
+        "operation-progress-recorded",
+        {
+            "slot": "slot02",
+            "operation": "create",
+            "journal_path": other_journal.name,
+            "journal": raw,
+        },
+    )
+    other_journal.write_text(json.dumps(raw) + "\n", encoding="utf-8")
+
+    refused = command(project, "clean-caches", "--only", "slot01")
+
+    assert refused.returncode == 3
+    assert "slot 'slot02' has recovery journals on both" in refused.stderr
+    assert "testhost" in refused.stderr
+    assert "otherhost" in refused.stderr
+    assert artifact.is_file()
+
+
+@pytest.mark.parametrize(
+    ("damage", "message"),
+    (
+        ("malformed-shape", "finish journal has invalid fields"),
+        ("provenance", "differs from append-only progress evidence"),
+    ),
+)
+def test_clean_caches_only_refuses_invalid_unselected_scoped_finish_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    damage: str,
+    message: str,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path, cache_globs=("target",))
+    assert create(project).returncode == 0
+    made = create(project, slot="other", slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    artifact = checkout(project) / "target" / "artifact"
+    artifact.parent.mkdir()
+    artifact.write_bytes(b"cache")
+    mark_owner_dead(project, slot="other")
+    set_liveness(project, "dead")
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None)
+    # Removal now reaches the validate-batch census boundaries; keep this
+    # journal test isolated from host process churn and sudo policy.
+    stub_validate_batch_censuses(monkeypatch)
+    monkeypatch.setattr(
+        wrkslots, "_interrupt_for_test", interrupt_after_finish_journal
+    )
+    with pytest.raises(_FinishInterrupted):
+        remove_completed_validation(project, "other")
+    journal = finish_journal_path(project, "other")
+    raw = json.loads(journal.read_text(encoding="utf-8"))
+    if damage == "malformed-shape":
+        del raw["archive_id"]
+    else:
+        assert damage == "provenance"
+        raw["fenced"] = "tampered fence"
+    journal.write_text(json.dumps(raw) + "\n", encoding="utf-8")
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    capsys.readouterr()
+    only = ["--project-root", str(project), "clean-caches", "--only", "slot01"]
+
+    # The interrupted removal leaves its validation-batch seal, which refuses
+    # every clean first.
+    seal = wrkslots._validate_batch_seal_journal_path(
+        wrkslots._load_config(str(project), "testhost")
+    )
+    assert seal.is_file()
+    assert wrkslots.main(only) == 3
+    sealed = capsys.readouterr()
+    assert "interrupted validation-batch seal recorded" in sealed.err
+    assert artifact.is_file()
+
+    # Without the seal the damaged finish journal must refuse on its own.
+    seal.unlink()
+    result = wrkslots.main(only)
+    captured = capsys.readouterr()
+
+    assert result == 3
+    assert message in captured.err
+    assert artifact.is_file()
+    assert journal.is_file()
+
+
+def test_clean_caches_bulk_refuses_malformed_unregistered_directory(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path, cache_globs=("target",))
+    assert create(project).returncode == 0
+    artifact = checkout(project) / "target" / "artifact"
+    artifact.parent.mkdir()
+    artifact.write_bytes(b"cache")
+    invalid_name = project / "worktrees" / "bad slot"
+    invalid_name.mkdir()
+    (invalid_name / "note").write_text("not a checkout\n", encoding="utf-8")
+
     bulk = command(project, "clean-caches", "--yes")
+
     assert bulk.returncode == 3
     assert "malformed unregistered directory" in bulk.stderr
     assert artifact.is_file()
@@ -34017,6 +35446,225 @@ def test_stale_row_with_no_named_slot_still_refuses(tmp_path: Path) -> None:
 
     with pytest.raises(wrkslots.Refusal, match="slot directory is missing or unsafe"):
         wrkslots._assert_registry_storage_consistent(config, [state])
+
+
+def _project_with_unrelated_rows(
+    parent: Path, unrelated: int, *, target_row: bool
+) -> tuple[Path, Path]:
+    parent.mkdir()
+    project, repository, _remote = make_project(parent)
+    if target_row:
+        made = create(project, bind_owner=False)
+        assert made.returncode == 0, made.stderr
+    for index in range(unrelated):
+        made = create(
+            project,
+            slot=f"other{index:02d}",
+            agent=f"codex-other-{index}",
+            branch=f"codex/other-{index}",
+        )
+        assert made.returncode == 0, made.stderr
+    return project, repository
+
+
+def _record_git_cwds(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    cwds: list[Path] = []
+    original_run = wrkslots._GitVcs._run
+
+    def recorded_run(
+        repository: Path,
+        args: Sequence[str],
+        *,
+        check: bool = True,
+        input_text: str | None = None,
+        env_overrides: Mapping[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        cwds.append(Path(repository).absolute())
+        return original_run(
+            repository,
+            args,
+            check=check,
+            input_text=input_text,
+            env_overrides=env_overrides,
+        )
+
+    monkeypatch.setattr(wrkslots._GitVcs, "_run", staticmethod(recorded_run))
+    return cwds
+
+
+def _unrelated_slot_roots(project: Path, unrelated: int) -> list[Path]:
+    return [
+        (slots_directory(project) / f"other{index:02d}").absolute()
+        for index in range(unrelated)
+    ]
+
+
+def test_scoped_registry_check_git_work_does_not_grow_with_unrelated_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rows a command does not name cost no per-checkout Git process.
+
+    Callers run this check while holding the mutation locks. Measured
+    2026-09-25 on a 305-row registry, verifying every row ran 1,720 Git
+    processes and held the locks for 67.6 seconds; each row's worktree root,
+    common directory and HEAD were probed although only the named slot can
+    refuse the command.
+    """
+
+    counts: dict[int, int] = {}
+    cwds = _record_git_cwds(monkeypatch)
+    for unrelated in (1, 4):
+        project, _repository = _project_with_unrelated_rows(
+            tmp_path / f"unrelated-{unrelated}", unrelated, target_row=True
+        )
+        config = wrkslots._load_config(str(project), "testhost")
+        state = wrkslots._load_active(config)
+        cwds.clear()
+        findings = wrkslots._assert_registry_storage_consistent(
+            config, [state], target_slot="slot01"
+        )
+        assert findings == wrkslots.RegistryStorageFindings()
+        counts[unrelated] = len(cwds)
+        for root in _unrelated_slot_roots(project, unrelated):
+            assert not any(
+                cwd == root or root in cwd.parents for cwd in cwds
+            ), (root, cwds)
+        # The named slot still receives the full identity verification.
+        assert checkout(project).absolute() in cwds
+    assert counts[1] == counts[4], counts
+
+
+@pytest.mark.parametrize("operation", ("register", "adopt"))
+def test_register_and_adopt_git_work_under_locks_does_not_grow_with_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    operation: str,
+) -> None:
+    """The mutation locks are not held for Git work on unrelated rows."""
+
+    counts: dict[int, int] = {}
+    cwds = _record_git_cwds(monkeypatch)
+    under_locks: list[Path] = []
+    held = False
+    original_locks = wrkslots._mutation_locks
+
+    @contextlib.contextmanager
+    def observed_locks(
+        config: wrkslots.Config,
+        wait_seconds: float,
+        *,
+        deadline: float | None = None,
+    ) -> Iterator[None]:
+        nonlocal held
+        with original_locks(config, wait_seconds, deadline=deadline):
+            start = len(cwds)
+            held = True
+            try:
+                yield
+            finally:
+                held = False
+                under_locks.extend(cwds[start:])
+
+    monkeypatch.setattr(wrkslots, "_mutation_locks", observed_locks)
+    for unrelated in (1, 4):
+        project, repository = _project_with_unrelated_rows(
+            tmp_path / f"unrelated-{unrelated}",
+            unrelated,
+            target_row=operation == "adopt",
+        )
+        if operation == "register":
+            tree = checkout(project)
+            tree.parent.mkdir()
+            git(repository, "worktree", "add", "-b", "codex/imported", str(tree), "origin/main")
+        cwds.clear()
+        under_locks.clear()
+        pid = str(os.getpid())
+        if operation == "register":
+            argv = ["register", "slot01", "--slot-type", "agent",
+                    "--coordinator-authorized", "--agent", "codex-1", "--task",
+                    "task-slot01", "--purpose", "lock hold", "--owner-pid", pid,
+                    "--coordinator-pid", pid, "--verified-live", "--repo",
+                    "product=repo"]
+        else:
+            argv = ["adopt", "slot01", "--agent", "codex-1", "--owner-pid", pid,
+                    "--expected-generation", "1"]
+        rc = wrkslots.main(["--project-root", str(project), *argv])
+        captured = capsys.readouterr()
+        assert rc == 0, captured.err
+        assert not held
+        assert under_locks
+        counts[unrelated] = len(under_locks)
+        for root in _unrelated_slot_roots(project, unrelated):
+            assert not any(
+                cwd == root or root in cwd.parents for cwd in under_locks
+            ), (root, under_locks)
+    assert counts[1] == counts[4], counts
+
+
+def test_scoped_registry_check_still_names_an_unregistered_unrelated_checkout(
+    tmp_path: Path,
+) -> None:
+    """The cheaper check for unrelated rows still reads Git's worktree list."""
+
+    project, repository, _remote = make_project(tmp_path)
+    first = create(project, slot="slot01", agent="codex-1", branch="codex/one")
+    assert first.returncode == 0, first.stderr
+    second = create(project, slot="slot02", agent="codex-2", branch="codex/two")
+    assert second.returncode == 0, second.stderr
+    unregistered = checkout(project, "slot02")
+    administration = Path(
+        git(unregistered, "rev-parse", "--absolute-git-dir").stdout.strip()
+    )
+    shutil.rmtree(administration)
+    assert unregistered.absolute() not in wrkslots._GitVcs().listed_worktrees(repository)
+
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+    findings = wrkslots._assert_registry_storage_consistent(
+        config, [state], target_slot="slot01"
+    )
+    assert findings.stale == ("agent:slot02",), findings.stale
+    with pytest.raises(wrkslots.Refusal):
+        wrkslots._assert_registry_storage_consistent(
+            config, [state], target_slot="slot02"
+        )
+    with pytest.raises(wrkslots.Refusal):
+        wrkslots._assert_registry_storage_consistent(config, [state])
+
+
+def test_named_slot_identity_defect_still_refuses_when_git_lists_it(
+    tmp_path: Path,
+) -> None:
+    """A listed checkout whose own Git identity is broken still refuses its command.
+
+    The worktree list alone cannot see this defect, so it is the case that shows
+    the named slot and unscoped callers keep the full per-checkout verification.
+    An unrelated row with this defect is no longer named in the warning;
+    ``wrkslots audit`` reports it.
+    """
+
+    project, repository, _remote = make_project(tmp_path)
+    first = create(project, slot="slot01", agent="codex-1", branch="codex/one")
+    assert first.returncode == 0, first.stderr
+    second = create(project, slot="slot02", agent="codex-2", branch="codex/two")
+    assert second.returncode == 0, second.stderr
+    broken = checkout(project, "slot02")
+    (broken / ".git").write_text("gitdir: /nonexistent/wrkslots-test\n", encoding="utf-8")
+    assert broken.absolute() in wrkslots._GitVcs().listed_worktrees(repository)
+
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+    with pytest.raises(wrkslots.Refusal):
+        wrkslots._assert_registry_storage_consistent(
+            config, [state], target_slot="slot02"
+        )
+    with pytest.raises(wrkslots.Refusal):
+        wrkslots._assert_registry_storage_consistent(config, [state])
+    findings = wrkslots._assert_registry_storage_consistent(
+        config, [state], target_slot="slot01"
+    )
+    assert findings.stale == (), findings.stale
 
 
 def _reference_glob_matches_path(pattern: str, path: str) -> bool:

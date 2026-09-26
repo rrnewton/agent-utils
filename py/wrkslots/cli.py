@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import urllib.parse
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence, Set as AbstractSet
@@ -54,6 +55,7 @@ _VALIDATE_BATCH_SEAL_SCHEMA = 1
 _VALIDATION_REMOVAL_PROOF_SCHEMA = 1
 _VALIDATION_REMOVAL_PROOF_BYTES_LIMIT = 64 * 1024
 _VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT = 16 * 1024 * 1024
+_JOURNAL_BYTES_LIMIT = 16 * 1024 * 1024
 _NETWORK_CONFIG_SHA256_ENV = "WRKSLOTS_NETWORK_CONFIG_SHA256"
 _NETWORK_CONFIG_BYTES_LIMIT = 1024 * 1024
 _LOCAL_SALVAGE_RECEIPT_SCHEMA = 1
@@ -180,6 +182,7 @@ _CREATE_JOURNAL_REQUIRED = frozenset(
 _CREATE_JOURNAL_OPTIONAL = frozenset(
     {
         "slot_type",
+        "task_scope",
         "post_provision_hooks",
         "hook_progress",
         "hook_failure",
@@ -481,6 +484,19 @@ class ProcessIdentity:
 
 
 @dataclasses.dataclass(frozen=True)
+class TaskScopeIdentity:
+    """Exact transient systemd scope generation that owns one agent task."""
+
+    unit: str
+    invocation_id: str
+    cgroup_path: str
+    boot_id: str
+    leader_pid: int
+    leader_start_ticks: int
+    verification: str
+
+
+@dataclasses.dataclass(frozen=True)
 class Checkout:
     """Durable Git identity and publication evidence for one checkout."""
 
@@ -553,6 +569,7 @@ class ActiveRecord:
     checkouts: tuple[Checkout, ...]
     layout: str | None = None
     import_source: _ImportSource | None = None
+    task_scope: TaskScopeIdentity | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -664,6 +681,16 @@ class CacheSlot:
     machine: str
     checkouts: tuple[Checkout, ...]
     state: str = "active"
+
+
+@dataclasses.dataclass(frozen=True)
+class _ValidatedCacheJournal:
+    """A fully validated journal whose target has not been inspected."""
+
+    path: Path
+    raw: Mapping[str, object]
+    machine: str
+    slot: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4103,6 +4130,221 @@ def _checkout_from_obj(value: object, label: str) -> Checkout:
     return checkout
 
 
+def _task_scope_to_obj(scope: TaskScopeIdentity | None) -> dict[str, object] | None:
+    if scope is None:
+        return None
+    return {
+        "unit": scope.unit,
+        "invocation_id": scope.invocation_id,
+        "cgroup_path": scope.cgroup_path,
+        "boot_id": scope.boot_id,
+        "leader_pid": scope.leader_pid,
+        "leader_start_ticks": scope.leader_start_ticks,
+        "verification": scope.verification,
+    }
+
+
+def _task_scope_from_obj(value: object, label: str) -> TaskScopeIdentity:
+    raw = _as_mapping(value, label)
+    _exact_keys(
+        raw,
+        {
+            "unit",
+            "invocation_id",
+            "cgroup_path",
+            "boot_id",
+            "leader_pid",
+            "leader_start_ticks",
+            "verification",
+        },
+        set(),
+        label,
+    )
+    scope = TaskScopeIdentity(
+        unit=_as_str(raw["unit"], f"{label}.unit"),
+        invocation_id=_as_str(raw["invocation_id"], f"{label}.invocation_id"),
+        cgroup_path=_as_str(raw["cgroup_path"], f"{label}.cgroup_path"),
+        boot_id=_as_str(raw["boot_id"], f"{label}.boot_id"),
+        leader_pid=_as_int(raw["leader_pid"], f"{label}.leader_pid", minimum=1),
+        leader_start_ticks=_as_int(
+            raw["leader_start_ticks"], f"{label}.leader_start_ticks", minimum=1
+        ),
+        verification=_as_str(raw["verification"], f"{label}.verification"),
+    )
+    if (
+        not scope.unit.endswith(".scope")
+        or "/" in scope.unit
+        or any(
+            character.isspace()
+            or unicodedata.category(character) in {"Cc", "Cf"}
+            for character in scope.unit
+        )
+    ):
+        raise StateError(f"{label}.unit is not a task-scoped systemd unit")
+    if re.fullmatch(r"[0-9a-f]{32}", scope.invocation_id) is None:
+        raise StateError(
+            f"{label}.invocation_id is not a canonical systemd invocation ID"
+        )
+    if (
+        not scope.cgroup_path.startswith("/")
+        or not scope.cgroup_path.endswith(f"/{scope.unit}")
+        or "/../" in scope.cgroup_path
+        or re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            scope.boot_id,
+        )
+        is None
+    ):
+        raise StateError(f"{label} has an invalid cgroup path or boot ID")
+    if scope.verification != "systemd-runtime-invocation-symlink-v1":
+        raise StateError(f"{label}.verification is unsupported")
+    return scope
+
+
+def _assert_task_scope_matches_owner(
+    scope: TaskScopeIdentity | None,
+    owner: ProcessIdentity | None,
+    label: str,
+) -> None:
+    if scope is None:
+        return
+    if owner is None:
+        raise StateError(f"{label} has no bound owner process")
+    if (
+        scope.leader_pid,
+        scope.leader_start_ticks,
+        scope.boot_id,
+        scope.cgroup_path,
+    ) != (
+        owner.pid,
+        owner.start_ticks,
+        owner.boot_id,
+        owner.cgroup_path,
+    ):
+        raise StateError(f"{label} does not match its bound owner process")
+
+
+def _systemd_invocation_directory() -> Path:
+    return Path("/run/user") / str(os.getuid()) / "systemd" / "units"
+
+
+def _systemd_user_manager_cgroup() -> str:
+    uid = os.getuid()
+    return f"/user.slice/user-{uid}.slice/user@{uid}.service"
+
+
+def _verify_task_scope_invocation(scope: TaskScopeIdentity) -> None:
+    # The invocation link comes from this user's manager, so a same-named unit
+    # under another manager or the system manager must not borrow its identity.
+    manager = _systemd_user_manager_cgroup()
+    if not scope.cgroup_path.startswith(f"{manager}/"):
+        raise Refusal(
+            f"task scope cgroup {scope.cgroup_path} is not under the systemd user "
+            f"manager {manager} whose invocation link is verified"
+        )
+    # The manager places a scope only inside slices, so a same-named cgroup made
+    # inside a delegated service subtree cannot borrow the real scope's link.
+    parents = scope.cgroup_path.removeprefix(f"{manager}/").split("/")[:-1]
+    if any(not parent.endswith(".slice") for parent in parents):
+        raise Refusal(
+            f"task scope cgroup {scope.cgroup_path} is not a scope placed by the systemd "
+            f"user manager {manager}: every component between them must be a slice"
+        )
+    path = _systemd_invocation_directory() / f"invocation:{scope.unit}"
+    flags = os.O_PATH | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISLNK(opened.st_mode):
+                raise Refusal(
+                    f"task scope invocation is not a systemd runtime symlink: {path}"
+                )
+            # Linux readlinkat(2) with an empty path reads the symlink pinned by
+            # O_PATH|O_NOFOLLOW. A pathname read can be fooled by B -> A -> B
+            # replacement while two surrounding lstat calls observe B twice.
+            target = os.readlink("", dir_fd=descriptor)
+        finally:
+            os.close(descriptor)
+        after = path.lstat()
+    except Refusal:
+        raise
+    except OSError as exc:
+        raise Refusal(
+            f"cannot verify task scope invocation through systemd runtime link {path}: {exc}"
+        ) from exc
+    if (
+        not stat.S_ISLNK(after.st_mode)
+        or (opened.st_dev, opened.st_ino) != (after.st_dev, after.st_ino)
+        or re.fullmatch(r"[0-9a-f]{32}", target) is None
+        or target != scope.invocation_id
+    ):
+        raise Refusal(
+            f"task scope invocation does not match the stable systemd runtime link {path}"
+        )
+
+
+_CREATE_SCOPE_REMEDY = (
+    "the create journal is preserved and no ACTIVE row was published; run "
+    "'wrkslots recover --coordinator-pid PID --slot SLOT --abort-create' to remove its "
+    "unchanged provisional worktrees, then create the slot again from a live task scope"
+)
+_IMPORT_SCOPE_REMEDY = (
+    "the import journal is preserved and no ACTIVE row was published; run "
+    "'wrkslots recover --coordinator-pid PID --abort-import' to discard it, then "
+    "import the slot again from a live task scope"
+)
+
+
+def _verify_task_scope_before_publication(
+    scope: TaskScopeIdentity, remedy: str
+) -> None:
+    try:
+        _verify_task_scope_invocation(scope)
+    except Refusal as exc:
+        raise Refusal(str(exc), remedy=remedy) from exc
+
+
+def _task_scope_arguments(args: argparse.Namespace) -> tuple[str, str] | None:
+    unit = getattr(args, "task_scope_unit", None)
+    invocation_id = getattr(args, "task_scope_invocation_id", None)
+    if (unit is None) != (invocation_id is None):
+        raise Refusal(
+            "--task-scope-unit and --task-scope-invocation-id must be supplied together"
+    )
+    if unit is None:
+        return None
+    assert invocation_id is not None
+    return unit, invocation_id
+
+
+def _task_scope_from_args(
+    args: argparse.Namespace, owner: ProcessIdentity | None
+) -> TaskScopeIdentity | None:
+    selected = _task_scope_arguments(args)
+    if selected is None:
+        return None
+    if owner is None:
+        raise Refusal("task scope identity requires a live --owner-pid")
+    unit, invocation_id = selected
+    scope = _task_scope_from_obj(
+        {
+            "unit": unit,
+            "invocation_id": invocation_id,
+            "cgroup_path": owner.cgroup_path,
+            "boot_id": owner.boot_id,
+            "leader_pid": owner.pid,
+            "leader_start_ticks": owner.start_ticks,
+            "verification": "systemd-runtime-invocation-symlink-v1",
+        },
+        "task scope",
+    )
+    _verify_task_scope_invocation(scope)
+    return scope
+
+
 def _record_to_obj(record: ActiveRecord) -> dict[str, object]:
     value: dict[str, object] = {
         "slot": record.slot,
@@ -4125,6 +4367,8 @@ def _record_to_obj(record: ActiveRecord) -> dict[str, object]:
         value["layout"] = record.layout
     if record.import_source is not None:
         value["import_source"] = _import_source_to_obj(record.import_source)
+    if record.task_scope is not None:
+        value["task_scope"] = _task_scope_to_obj(record.task_scope)
     return value
 
 
@@ -4146,7 +4390,12 @@ def _record_from_obj(value: object, label: str) -> ActiveRecord:
         "handoff",
         "checkouts",
     }
-    _exact_keys(raw, required_fields, {"slot_type", "layout", "import_source"}, label)
+    _exact_keys(
+        raw,
+        required_fields,
+        {"slot_type", "layout", "import_source", "task_scope"},
+        label,
+    )
     checkouts = tuple(
         _checkout_from_obj(item, f"{label}.checkouts[{index}]")
         for index, item in enumerate(_as_list(raw["checkouts"], f"{label}.checkouts"))
@@ -4189,6 +4438,11 @@ def _record_from_obj(value: object, label: str) -> ActiveRecord:
         import_source=_import_source_from_obj(
             raw.get("import_source"), f"{label}.import_source"
         ),
+        task_scope=(
+            None
+            if "task_scope" not in raw
+            else _task_scope_from_obj(raw["task_scope"], f"{label}.task_scope")
+        ),
     )
     _validate_name(record.slot, "slot")
     _validate_name(record.agent, "agent")
@@ -4209,6 +4463,7 @@ def _record_from_obj(value: object, label: str) -> ActiveRecord:
         )
     if record.coordinator_recovery_note is not None and record.owner is not None:
         raise StateError(f"{label} has coordinator recovery evidence for a bound owner")
+    _assert_task_scope_matches_owner(record.task_scope, record.owner, f"{label}.task_scope")
     names = [item.name for item in record.checkouts]
     if len(names) != len(set(names)):
         raise StateError(f"{label} has duplicate checkout names")
@@ -6465,6 +6720,8 @@ def _registry_storage_inconsistencies(
     *,
     tolerate_unavailable_repositories: bool = False,
     additional_repositories: Sequence[Path] = (),
+    vcs: _GitVcs | None = None,
+    verify_row_identity: bool = True,
 ) -> tuple[StorageInconsistency, ...]:
     """Describe storage drift without weakening authoritative state validation.
 
@@ -6509,7 +6766,7 @@ def _registry_storage_inconsistencies(
         slot_type: {record.slot for record in records if record.slot_type == slot_type}
         for slot_type in SLOT_TYPES
     }
-    vcs = _GitVcs()
+    vcs = _GitVcs() if vcs is None else vcs
     listed_by_repository: dict[Path, set[Path]] = {}
     common_by_repository: dict[Path, Path] = {}
     listed_by_common: dict[Path, set[Path]] = {}
@@ -6654,6 +6911,8 @@ def _registry_storage_inconsistencies(
                     machine=record.machine,
                     checkout=checkout.name,
                 )
+                continue
+            if not verify_row_identity:
                 continue
             try:
                 checkout_root, checkout_common, _head = vcs.worktree_identity(path)
@@ -6848,7 +7107,13 @@ def _validate_journal_shape(
             "create journal.heartbeat_ttl_seconds",
             minimum=1,
         )
-        _identity_from_obj(raw["owner"], "create journal.owner")
+        owner = _identity_from_obj(raw["owner"], "create journal.owner")
+        task_scope = (
+            None
+            if "task_scope" not in raw
+            else _task_scope_from_obj(raw["task_scope"], "create journal.task_scope")
+        )
+        _assert_task_scope_matches_owner(task_scope, owner, "create journal.task_scope")
         if (
             _identity_from_obj(
                 raw["coordinator_lease"], "create journal.coordinator_lease"
@@ -7089,6 +7354,12 @@ def _completed_create_record(
     if heartbeat_ttl_seconds != config.heartbeat_ttl_seconds:
         raise StateError("create journal heartbeat TTL differs from configuration")
     owner = _identity_from_obj(raw["owner"], "create journal.owner")
+    task_scope = (
+        None
+        if "task_scope" not in raw
+        else _task_scope_from_obj(raw["task_scope"], "create journal.task_scope")
+    )
+    _assert_task_scope_matches_owner(task_scope, owner, "create journal.task_scope")
     coordinator = _identity_from_obj(
         raw["coordinator_lease"], "create journal.coordinator_lease"
     )
@@ -7118,6 +7389,7 @@ def _completed_create_record(
         coordinator_recovery_note=None,
         handoff=None,
         checkouts=created,
+        task_scope=task_scope,
     )
 
 
@@ -7878,6 +8150,31 @@ def _assert_record_storage_consistent(
         verifier.verify_existing_worktree(repository, path)
 
 
+def _assert_record_registered(
+    config: Config,
+    record: ActiveRecord,
+    vcs: _GitVcs,
+) -> None:
+    """Check a row that a command does not name, without per-checkout Git probes.
+
+    The outcome only decides whether the row is named in an advisory warning,
+    so this reads the slot directory and each repository's worktree list, which
+    a memoizing verifier lists once per repository. It omits the worktree-root,
+    common-directory and HEAD probes, three Git processes per checkout, that
+    kept the mutation locks held for tens of seconds on a large registry.
+    ``wrkslots audit`` still runs those probes for every row.
+    """
+
+    _assert_slot_contents(config, record)
+    for checkout in record.checkouts:
+        path = _stored_path(config, checkout.path, "checkout path")
+        _relative, repository = _stored_repository_path(config, checkout.repository)
+        if path.is_symlink() or not path.is_dir():
+            raise Refusal(f"checkout path is missing or not a real directory: {path}")
+        if path.absolute() not in vcs.listed_worktrees(repository):
+            raise Refusal(f"Git does not list {path} as a worktree of {repository}")
+
+
 def _assert_target_record_storage_consistent(
     config: Config,
     states: Sequence[ActiveState],
@@ -8046,11 +8343,19 @@ def _assert_registry_storage_consistent(
     # ⚠️ WITH NO TARGET SCOPE THIS STILL RAISES, DELIBERATELY. Ownerless
     # validation recovery supplies an explicit scope because its exact path is
     # checked independently below; a bare recovery command still raises.
+    #
+    # Callers hold the mutation locks here, so the Git work must not grow with
+    # the number of rows the command does not name. One memoizing verifier lists
+    # each repository's worktrees once, and a row outside the scope gets only the
+    # checks that decide whether the warning names it.
     stale: list[str] = []
-    vcs = _GitVcs()
+    vcs = _AuditGitVcs()
     for record in records:
         try:
-            _assert_record_storage_consistent(config, record, vcs=vcs)
+            if scope_to_target and record.slot != target_slot:
+                _assert_record_registered(config, record, vcs)
+            else:
+                _assert_record_storage_consistent(config, record, vcs=vcs)
         except Refusal:
             if not scope_to_target or record.slot == target_slot:
                 raise
@@ -8075,9 +8380,13 @@ def _assert_registry_storage_consistent(
         unexpected.extend(
             f"{slot_type}:{slot}" for slot in sorted(actual_slots - expected_slots[slot_type])
         )
+    # Only registration findings are used, and they depend on the worktree lists
+    # alone, so the per-checkout identity probes are skipped.
     registration_findings = tuple(
         item
-        for item in _registry_storage_inconsistencies(config, states)
+        for item in _registry_storage_inconsistencies(
+            config, states, vcs=vcs, verify_row_identity=False
+        )
         if item.kind == "git-registration-without-row"
     )
     # ⚠️ THE SAME SCOPING THE `stale` LOOP ABOVE ALREADY APPLIES, AND IT WAS
@@ -13484,6 +13793,7 @@ def _create_journal_payload(
     config: Config,
     args: argparse.Namespace,
     owner: ProcessIdentity | None,
+    task_scope: TaskScopeIdentity | None,
     coordinator_lease: ProcessIdentity,
     plan: Sequence[PlannedCheckout],
     created: Sequence[Checkout],
@@ -13493,7 +13803,7 @@ def _create_journal_payload(
     hook_progress: int,
     operation_id: str,
 ) -> dict[str, object]:
-    return {
+    value: dict[str, object] = {
         "schema": SCHEMA,
         "kind": "create",
         "machine": config.machine,
@@ -13515,6 +13825,9 @@ def _create_journal_payload(
         "failure_policy": "leave-for-inspection",
         "operation_id": operation_id,
     }
+    if task_scope is not None:
+        value["task_scope"] = _task_scope_to_obj(task_scope)
+    return value
 
 
 def _run_post_provision_hooks(
@@ -13609,6 +13922,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         if args.owner_pid is not None
         else None
     )
+    task_scope = _task_scope_from_args(args, owner)
     coordinator_lease = _read_process_identity(args.coordinator_pid)
     _assert_create_owner_authorized(owner, coordinator_lease)
     vcs = _GitVcs()
@@ -13705,6 +14019,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 config,
                 args,
                 owner,
+                task_scope,
                 coordinator_lease,
                 plan,
                 created,
@@ -13740,6 +14055,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                     config,
                     args,
                     owner,
+                    task_scope,
                     coordinator_lease,
                     plan,
                     created,
@@ -13755,6 +14071,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             config,
             args,
             owner,
+            task_scope,
             coordinator_lease,
             plan,
             created,
@@ -13780,6 +14097,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 config,
                 args,
                 owner,
+                task_scope,
                 coordinator_lease,
                 plan,
                 created,
@@ -13790,6 +14108,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             ),
             journal_path=journal_path,
         )
+        if task_scope is not None:
+            _verify_task_scope_before_publication(task_scope, _CREATE_SCOPE_REMEDY)
         record = ActiveRecord(
             slot=args.slot,
             agent=args.agent,
@@ -13806,6 +14126,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             coordinator_recovery_note=None,
             handoff=None,
             checkouts=tuple(created),
+            task_scope=task_scope,
         )
         state = _append_record(state, record)
         _write_active_state(
@@ -14389,6 +14710,7 @@ def _register_existing(
         raise Refusal("task and purpose must be non-empty")
     if not args.verified_live:
         raise Refusal("registration requires --verified-live and a live --owner-pid")
+    task_scope = _task_scope_from_args(args, owner)
     vcs = _GitVcs()
     checkouts = _existing_checkouts(config, args, vcs)
     slot_path = _assert_slot_contents(
@@ -14423,6 +14745,8 @@ def _register_existing(
     _assert_registration_owner_authorized(
         confirmed_owner, confirmed_coordinator, slot_path
     )
+    if task_scope is not None:
+        _verify_task_scope_invocation(task_scope)
     now = _utc_now()
     return ActiveRecord(
         slot=args.slot,
@@ -14440,6 +14764,7 @@ def _register_existing(
         coordinator_recovery_note=None,
         handoff=None,
         checkouts=checkouts,
+        task_scope=task_scope,
     )
 
 
@@ -14525,6 +14850,8 @@ def _publish_import(
     _write_journal(config, journal)
     _interrupt_for_test("after-import-journal")
     _verify_import_record(config, record, _GitVcs())
+    if record.task_scope is not None:
+        _verify_task_scope_before_publication(record.task_scope, _IMPORT_SCOPE_REMEDY)
     _write_active_state(
         config,
         _append_record(state, record),
@@ -14550,6 +14877,12 @@ def _cmd_import_existing(args: argparse.Namespace) -> int:
     )
     vcs = _GitVcs()
     _validate_name(args.slot, "slot")
+    task_scope_arguments = _task_scope_arguments(args)
+    if args.from_state_file is not None and task_scope_arguments is not None:
+        raise Refusal(
+            "task scope identity is available only for a live import, not "
+            "--from-state-file"
+        )
     historical = (
         None
         if args.from_state_file is None
@@ -14740,6 +15073,7 @@ def _cmd_adopt(args: argparse.Namespace) -> int:
     _validate_name(args.slot, "slot")
     _validate_name(args.agent, "agent")
     owner = _capture_caller_process(args.owner_pid, "owner")
+    task_scope = _task_scope_from_args(args, owner)
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config)
         _assert_no_journal(config)
@@ -14753,13 +15087,15 @@ def _cmd_adopt(args: argparse.Namespace) -> int:
             raise Refusal(
                 f"ownership mismatch for slot {args.slot}: expected {record.agent}, got {args.agent}"
             )
-        if record.owner == owner:
+        if record.owner == owner and (
+            task_scope is None or record.task_scope == task_scope
+        ):
             print(
                 f"already adopted slot={record.slot} agent={record.agent} "
                 f"generation={record.generation}"
             )
             return 0
-        if record.owner is not None:
+        if record.owner is not None and record.owner != owner:
             state_name, detail = _process_state(record.owner)
             raise Refusal(
                 f"slot {record.slot} already has a {state_name} historical owner: {detail}; "
@@ -14769,11 +15105,14 @@ def _cmd_adopt(args: argparse.Namespace) -> int:
         if confirmed_owner != owner:
             raise Refusal("owner process generation changed during adopt")
         _assert_caller_process(confirmed_owner, "owner")
+        if task_scope is not None:
+            _verify_task_scope_invocation(task_scope)
         now = _utc_now()
         adopted = dataclasses.replace(
             record,
             owner=owner,
             heartbeat_at=now,
+            task_scope=task_scope if task_scope is not None else record.task_scope,
         )
         _write_active_state(
             config,
@@ -15795,11 +16134,18 @@ def _cache_slot_directories(
     return (*registered, *unregistered)
 
 
-def _journal_cache_slot(config: Config, path: Path) -> CacheSlot:
+def _validated_cache_journal(
+    config: Config,
+    path: Path,
+    states: Sequence[ActiveState] | None = None,
+) -> _ValidatedCacheJournal:
+    """Read and provenance-check a cache journal without inspecting its targets."""
+
     if path.exists() or path.is_symlink():
-        raw = _as_mapping(
-            _read_json(path, "cache recovery journal"), "cache recovery journal"
+        contents, _file_identity = _read_regular_file_identity(
+            path, "cache recovery journal", _JOURNAL_BYTES_LIMIT
         )
+        raw = _strict_json_object(contents, "cache recovery journal")
     else:
         pending = _pending_journal_for_path(config, path)
         if pending is None:
@@ -15807,16 +16153,27 @@ def _journal_cache_slot(config: Config, path: Path) -> CacheSlot:
                 f"journal has neither standalone nor append-only evidence: {path}"
             )
         raw = pending
-    _validate_journal_provenance(config, path, raw)
-    selected_machine = _as_str(
-        raw.get("machine"), "cache recovery journal.machine"
-    )
-    if _as_int(raw.get("schema"), "cache recovery journal.schema") != SCHEMA:
-        raise StateError("unsupported cache recovery journal schema")
-    kind = _as_str(raw.get("kind"), "cache recovery journal.kind")
+    _validate_journal_provenance(config, path, raw, states)
+    machine = _as_str(raw.get("machine"), "cache recovery journal.machine")
     slot = _validate_name(
         _as_str(raw.get("slot"), "cache recovery journal.slot"), "slot"
     )
+    kind = _as_str(raw.get("kind"), "cache recovery journal.kind")
+    if kind not in {"create", "import-existing", "finish"}:
+        raise StateError(f"unsupported cache recovery journal kind {kind!r}")
+    return _ValidatedCacheJournal(path, raw, machine, slot)
+
+
+def _cache_slot_for_validated_journal(
+    config: Config,
+    journal: _ValidatedCacheJournal,
+) -> CacheSlot:
+    """Inspect the checkout and Git targets of one already-validated journal."""
+
+    raw = journal.raw
+    selected_machine = journal.machine
+    kind = _as_str(raw.get("kind"), "cache recovery journal.kind")
+    slot = journal.slot
     if kind == "create":
         slot_type = _as_str(
             raw.get("slot_type", "agent"), "cache recovery journal.slot_type"
@@ -15888,20 +16245,41 @@ def _journal_cache_slot(config: Config, path: Path) -> CacheSlot:
     )
 
 
-def _all_journal_cache_slots(config: Config) -> tuple[CacheSlot, ...]:
-    slots: list[CacheSlot] = []
+def _journal_cache_slot(
+    config: Config,
+    path: Path,
+    states: Sequence[ActiveState] | None = None,
+) -> CacheSlot:
+    journal = _validated_cache_journal(config, path, states)
+    return _cache_slot_for_validated_journal(config, journal)
+
+
+def _all_journal_cache_slots(
+    config: Config,
+    requested: AbstractSet[str] | None = None,
+    states: Sequence[ActiveState] | None = None,
+) -> tuple[CacheSlot, ...]:
+    journals = tuple(
+        _validated_cache_journal(config, path, states)
+        for path in _outstanding_journals(config)
+    )
     seen: dict[str, str] = {}
-    for path in _outstanding_journals(config):
-        cache_slot = _journal_cache_slot(config, path)
-        previous = seen.get(cache_slot.slot)
+    for journal in journals:
+        previous = seen.get(journal.slot)
         if previous is not None:
             raise StateError(
-                f"slot {cache_slot.slot!r} has recovery journals on both "
-                f"{previous} and {cache_slot.machine}"
+                f"slot {journal.slot!r} has recovery journals on both "
+                f"{previous} and {journal.machine}"
             )
-        seen[cache_slot.slot] = cache_slot.machine
-        slots.append(cache_slot)
-    return tuple(slots)
+        seen[journal.slot] = journal.machine
+    # Journal parsing, shape/provenance validation, and duplicate detection
+    # are global control-plane gates. Checkout, Git, and cache target
+    # inspection is intentionally limited to the requested slots.
+    return tuple(
+        _cache_slot_for_validated_journal(config, journal)
+        for journal in journals
+        if not requested or journal.slot in requested
+    )
 
 
 def _open_parent_directory(
@@ -18439,22 +18817,33 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config)
         states, _archives = _validate_global_state(config)
+        requested = set(only)
         cache_slots = {
             record.slot: CacheSlot(record.slot, record.machine, record.checkouts)
             for state in states
             for record in state.slots
+            if not requested or record.slot in requested
         }
         registered_slots = {
             record.slot for candidate in states for record in candidate.slots
         }
-        journal_slots = _all_journal_cache_slots(config)
+        journal_slots = _all_journal_cache_slots(
+            config, requested if requested else None, states
+        )
         registered_slots.update(slot.slot for slot in journal_slots)
         for journal_slot in journal_slots:
-            cache_slots[journal_slot.slot] = journal_slot
+            if not requested or journal_slot.slot in requested:
+                cache_slots[journal_slot.slot] = journal_slot
         malformed_slots: dict[str, str] = {}
-        for entry in sorted(config.worktrees.iterdir(), key=lambda path: path.name):
+        entries = (
+            (config.worktrees / slot for slot in sorted(requested - set(cache_slots)))
+            if requested
+            else sorted(config.worktrees.iterdir(), key=lambda path: path.name)
+        )
+        for entry in entries:
             if (
-                not entry.is_dir()
+                not entry.exists()
+                or not entry.is_dir()
                 or entry.is_symlink()
                 or entry.name.startswith("EVENTS.")
                 or entry == _validate_slots_directory(config)
@@ -18481,10 +18870,10 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
             raise Refusal(f"unknown slot(s) for cache cleanup: {', '.join(unknown)}")
         selected = set(cache_slots) if args.yes else set(only)
         rows: list[dict[str, object]] = [
-                {
-                    "slot": slot,
-                    "machine": None,
-                    "cache_bytes": 0,
+            {
+                "slot": slot,
+                "machine": None,
+                "cache_bytes": 0,
                 "action": "BLOCKED",
                 "paths": [],
                 "hold_reason": None,
@@ -18811,7 +19200,9 @@ def _cmd_audit(args: argparse.Namespace) -> int:
             for machine, slot, generation, path in seal_targets
         }
         represented_seals: set[tuple[str, str, int]] = set()
-        journal_slots = {slot.slot: slot for slot in _all_journal_cache_slots(config)}
+        journal_slots = {
+            slot.slot: slot for slot in _all_journal_cache_slots(config, states=states)
+        }
         metrics.finish(
             "registry",
             registry_started,
@@ -23749,6 +24140,12 @@ def _recover_create(
     if heartbeat_ttl_seconds != config.heartbeat_ttl_seconds:
         raise StateError("create journal heartbeat TTL differs from configuration")
     owner = _identity_from_obj(raw["owner"], "create journal.owner")
+    task_scope = (
+        None
+        if "task_scope" not in raw
+        else _task_scope_from_obj(raw["task_scope"], "create journal.task_scope")
+    )
+    _assert_task_scope_matches_owner(task_scope, owner, "create journal.task_scope")
     coordinator_lease = _identity_from_obj(
         raw["coordinator_lease"], "create journal.coordinator_lease"
     )
@@ -23780,6 +24177,7 @@ def _recover_create(
             coordinator_recovery_note=None,
             handoff=None,
             checkouts=recorded_created,
+            task_scope=task_scope,
         )
         if len(recorded_created) != len(plan) or _record_to_obj(
             existing_record
@@ -23800,6 +24198,10 @@ def _recover_create(
     if abort_create:
         _abort_create(config, path, slot, slot_type, plan, recorded_created)
         return
+    if task_scope is not None:
+        # Refuse before provisioning or hooks run for an owner whose scope has
+        # ended: hooks that dirty a tree would also make --abort-create refuse.
+        _verify_task_scope_before_publication(task_scope, _CREATE_SCOPE_REMEDY)
     _assert_agent_and_slot_free(config, slot, agent, slot_type)
     slot_path = _slot_directory(config, slot, slot_type)
     if slot_path.exists() and (not slot_path.is_dir() or slot_path.is_symlink()):
@@ -23894,7 +24296,10 @@ def _recover_create(
         coordinator_recovery_note=None,
         handoff=None,
         checkouts=tuple(created),
+        task_scope=task_scope,
     )
+    if record.task_scope is not None:
+        _verify_task_scope_before_publication(record.task_scope, _CREATE_SCOPE_REMEDY)
     _write_active_state(
         config,
         _append_record(state, record),
@@ -23916,6 +24321,8 @@ def _recover_import_existing(
     raw: Mapping[str, object],
     state: ActiveState,
     recovery_actor: ProcessIdentity,
+    *,
+    abort_import: bool = False,
 ) -> None:
     _exact_keys(
         raw,
@@ -23938,14 +24345,29 @@ def _recover_import_existing(
             raise StateError(
                 f"import journal for slot {slot} does not match its durable ACTIVE row"
             )
+        if abort_import:
+            raise Refusal(
+                f"cannot abort import for slot {slot}: its ACTIVE row is already durable"
+            )
         _verify_import_record(config, existing, _GitVcs())
         _clear_journal(config, raw)
         print(f"recovered import: active state was durable; cleared journal for {slot}")
+        return
+    if abort_import:
+        # An import only publishes a row for checkouts that already exist, so
+        # discarding the unpublished journal leaves every file untouched.
+        _clear_journal(config, raw)
+        print(
+            f"aborted interrupted import slot={slot}; no ACTIVE row was published "
+            "and no files were changed"
+        )
         return
     _assert_agent_and_slot_free(
         config, slot, record.agent, record.slot_type, enforce_cap=False
     )
     _verify_import_record(config, record, _GitVcs())
+    if record.task_scope is not None:
+        _verify_task_scope_before_publication(record.task_scope, _IMPORT_SCOPE_REMEDY)
     _write_active_state(
         config,
         _append_record(state, record),
@@ -34093,6 +34515,7 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
                 recovery_note=None,
                 retry_running_hook=False,
                 abort_create=False,
+                abort_import=False,
             )
             if frozen:
                 item_args.legacy_validate_checkout = None
@@ -34466,6 +34889,11 @@ def _cmd_recover(
             )
         if requested_ownerless:
             _require_coordinator_authorized(args, "ownerless validation cleanup")
+            if args.abort_import:
+                raise Refusal(
+                    "--abort-import applies only to an interrupted import-existing "
+                    "journal and cannot be combined with validation cleanup flags"
+                )
             if sum(
                 value is not None
                 for value in (
@@ -34577,6 +35005,11 @@ def _cmd_recover(
                 )
             path, raw = _load_journal(config, selected_path=selected_path)
         kind_hint = _as_str(raw.get("kind"), "journal.kind")
+        if args.abort_import and kind_hint != "import-existing":
+            raise Refusal(
+                f"--abort-import applies only to import-existing journals; the "
+                f"recorded journal is {kind_hint!r}"
+            )
         if kind_hint == "finish":
             recovery_states, recovery_archives = (
                 _validate_global_state_for_finish_recovery(config, raw)
@@ -34685,7 +35118,14 @@ def _cmd_recover(
                 raise Refusal(
                     "--retry-running-hook and --abort-create apply only to create journals"
                 )
-            _recover_import_existing(config, path, raw, state, coordinator)
+            _recover_import_existing(
+                config,
+                path,
+                raw,
+                state,
+                coordinator,
+                abort_import=args.abort_import,
+            )
         elif kind == "finish":
             if args.retry_running_hook or args.abort_create:
                 raise Refusal(
@@ -34837,6 +35277,27 @@ def _add_repo_options(parser: argparse.ArgumentParser) -> None:
         help=(
             "expected fetch URL for the selected remote; when omitted, record the "
             "configured URL (repeat once per applicable checkout)"
+        ),
+    )
+
+
+def _add_task_scope_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--task-scope-unit",
+        metavar="UNIT.scope",
+        help=(
+            "exact transient systemd scope containing --owner-pid; requires "
+            "--task-scope-invocation-id; the owner cgroup must end in /UNIT.scope and "
+            "the runtime invocation symlink must match before the row is written"
+        ),
+    )
+    parser.add_argument(
+        "--task-scope-invocation-id",
+        metavar="HEX32",
+        help=(
+            "lowercase 32-hex systemd InvocationID for --task-scope-unit; both "
+            "scope options must be supplied together and are verified through "
+            "/run/user/$UID/systemd/units/invocation:UNIT.scope"
         ),
     )
 
@@ -35276,6 +35737,7 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "unless the owner is in this command's ancestry"
         ),
     )
+    _add_task_scope_options(create)
     _add_repo_options(create)
     create.add_argument(
         "--branch",
@@ -35372,6 +35834,7 @@ usage or audit gate unknown, 3 fail-closed refusal.
         required=True,
         help="confirm that the named worktrees are currently owned and in use",
     )
+    _add_task_scope_options(register)
     _add_repo_options(register)
     register.set_defaults(handler=_cmd_register)
 
@@ -35464,6 +35927,7 @@ usage or audit gate unknown, 3 fail-closed refusal.
         action="store_true",
         help="write the verified row instead of only printing it",
     )
+    _add_task_scope_options(import_existing)
     _add_repo_options(import_existing)
     import_existing.set_defaults(handler=_cmd_import_existing)
 
@@ -35498,6 +35962,7 @@ usage or audit gate unknown, 3 fail-closed refusal.
         metavar="N",
         help="current slot generation; refuses stale callers",
     )
+    _add_task_scope_options(adopt)
     adopt.set_defaults(handler=_cmd_adopt)
 
     recover_unbound = subparsers.add_parser(
@@ -35685,18 +36150,35 @@ usage or audit gate unknown, 3 fail-closed refusal.
     clean_caches = subparsers.add_parser(
         "clean-caches",
         description=(
-            "report or remove configured regenerable cache directories without source/liveness gates"
+            "report or remove configured regenerable cache directories without source/liveness "
+            "gates. --only still replays global authority, checks every active record path, and "
+            "validates the complete shape and append-only provenance of unselected scoped "
+            "journals, but skips their checkout, Git, and cache traversal"
         ),
         help="report or remove configured regenerable cache directories",
     )
     selection = clean_caches.add_mutually_exclusive_group()
-    selection.add_argument("--only", action="append", metavar="SLOT")
+    selection.add_argument(
+        "--only",
+        action="append",
+        metavar="SLOT",
+        help=(
+            "remove caches only for this slot and emit only its row (repeatable); mutually "
+            "exclusive with --yes, while global authority/path and complete bounded journal "
+            "shape/provenance checks still run"
+        ),
+    )
     selection.add_argument(
         "--yes",
         action="store_true",
         help="remove configured caches from every unheld active or unregistered slot",
     )
-    clean_caches.add_argument("--format", choices=("human", "json"), default="human")
+    clean_caches.add_argument(
+        "--format",
+        choices=("human", "json"),
+        default="human",
+        help="report format (default: human)",
+    )
     clean_caches.set_defaults(handler=_cmd_clean_caches)
 
     finish = subparsers.add_parser(
@@ -36228,6 +36710,14 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--abort-create",
         action="store_true",
         help="after inspection, remove an incomplete create's unchanged worktrees and branches",
+    )
+    create_recovery.add_argument(
+        "--abort-import",
+        action="store_true",
+        help=(
+            "discard an interrupted import-existing journal whose ACTIVE row was never "
+            "published; no files are changed"
+        ),
     )
     recover.set_defaults(handler=_cmd_recover)
     return parser

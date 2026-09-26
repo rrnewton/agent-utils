@@ -77,6 +77,53 @@ Omitting `--owner-pid` also requires an invoking coordinator; the owner then imm
 again before publishing the row. If either identity changes during provisioning, creation
 refuses publication and retains the recovery journal.
 
+When the owner runs in a dedicated transient systemd scope, `create`, `register`, `adopt`, and the
+live form of `import-existing` can record that stronger boundary. Pass both
+`--task-scope-unit UNIT.scope` and `--task-scope-invocation-id HEX32`, or neither. The owner PID is
+required, its recorded cgroup path must lie under the invoking user's systemd manager
+(`/user.slice/user-$UID.slice/user@$UID.service/`), every path component between the manager and the
+scope must be a `.slice` (a scope inside another unit's delegated subtree is refused), the path must
+end in that exact scope unit, and `HEX32` is the lowercase 32-hex `InvocationID` reported by
+systemd. When the arguments are parsed and again immediately before publishing the row, wrkslots
+reads `/run/user/$UID/systemd/units/invocation:UNIT.scope` without following a replacement and
+requires its stable symlink target to equal `HEX32`. It then records the scope unit, invocation ID,
+cgroup path, boot ID, and owner PID/start-time generation together. If a crash leaves a create or
+live import journal, recovery repeats this link check immediately before it would publish the ACTIVE
+row, and create recovery also checks it before provisioning any worktree or running hooks; a
+missing, replaced, or retargeted link refuses publication and leaves the journal for inspection.
+When the scope has really ended, discard the unpublished operation instead:
+`recover --slot SLOT --abort-create` removes a create's unchanged provisional worktrees, and
+`recover --abort-import` discards an import journal, which never changed any files. For example,
+after placing the owner inside `agent-slot01.scope`:
+
+```sh
+TASK_SCOPE_UNIT=agent-slot01.scope
+TASK_SCOPE_INVOCATION_ID="$(systemctl --user show \
+  --property=InvocationID --value "$TASK_SCOPE_UNIT")"
+wrkslots create slot01 --slot-type agent --coordinator-authorized \
+  --agent codex-1 --task task-123 --purpose "fix parser" \
+  --coordinator-pid "$COORDINATOR_PID" --owner-pid "$OWNER_PID" \
+  --task-scope-unit "$TASK_SCOPE_UNIT" \
+  --task-scope-invocation-id "$TASK_SCOPE_INVOCATION_ID" \
+  --repo product=product --branch product=codex/fix-parser
+```
+
+These options describe a live scope; they do not apply to a `--from-state-file` import. The
+`wrkslotsd` shadow observer accepts the recorded identity only as a captured claim: it does not reread
+`/proc/<pid>/stat`, the current boot ID, the systemd invocation link, or cgroup existence at
+evaluation/read time, and it has no fresh repository/task/owner/attempt-bound TaskGraph claim input.
+It therefore classifies every otherwise unblocked row as `UNKNOWN`; rows without task-scope identity
+remain readable and are also `UNKNOWN`. `wrkslotsd plan` is diagnostic and
+cannot authorize automatic reclaim. Its `--config` input is a separate shadow-policy document, not
+`.wrkslots.yml`; Python remains authoritative for registry-dependent path/layout/landed-ref checks,
+Git-registration discovery, and initialized nested-repository inspection.
+An append-only interrupted operation remains visible as a `BLOCKED` decision even when no ACTIVE
+row was ever published; unavailable generation, active-record digest, and heartbeat fields are
+reported as null instead of being invented. A plain rebuild without `--config`/`--evidence` also
+reports this blocker and adds `POLICY_INPUTS_MISSING`. Once an index holds policy evidence, a plain
+rebuild of that index is refused rather than discarding the evidence; delete the disposable index
+file first to rebuild it without policy inputs.
+
 `--coordinator-authorized` on `remove` and `read-handoff` is optional provenance. It is required
 when `recover` starts a new cleanup for an unregistered validation path, because that operation has
 no ACTIVE row naming who allocated it. Resuming the durable journal does not require the original
@@ -185,6 +232,47 @@ A slot imported from an older state file with no recorded owner identity cannot 
 owner-death condition, even after its heartbeat expires. `recover-unbound-owner` can record what was
 inspected but does not turn unavailable process evidence into proof of death. Preserve such a slot
 and name it in the migration remainder rather than inventing an owner.
+
+## Reclaim configured caches
+
+`clean-caches` operates only on directories selected by the configured global or per-repository
+cache globs. It removes those regenerable directories, not a checkout or slot, and therefore does
+not require the slot owner or registered liveness source to be dead. A hold still protects the
+selected slot and reports `HELD` without deleting its caches.
+
+With neither selector, the command is a read-only report over all visible registered, journaled, and
+unregistered slots. `--only SLOT` is a destructive selector even though it does not use `--yes`; it
+may be repeated, emits rows only for the named slots, and refuses if any name cannot be attributed.
+`--yes` instead selects every unheld slot. The two selectors are mutually exclusive. Human output is
+the default; `--format json` emits the same typed actions, paths, allocated-byte counts, and total
+removed bytes for automation.
+
+```sh
+wrkslots clean-caches --format json
+wrkslots clean-caches --only slot01 --only slot02 --format json
+wrkslots clean-caches --yes --format json
+```
+
+Targeting is narrow at the storage layer, but authority checking remains global. Before mutation,
+`--only` still checks partial control-plane writes and replays every authoritative
+`EVENTS.<machine>` shard so an event-only slot or recovery operation cannot be hidden by a stale
+compatibility view. It then avoids checkout, Git, and cache-tree traversal for unselected slots. A
+global validation runs `_assert_record_paths` for every active row, including unselected rows, so
+stored paths cannot escape their managed roots. A scoped `CREATE.*.journal` or
+`FINISH.*.journal` carries its length-framed machine and slot in the filename; wrkslots still reads
+the complete bounded journal, validates its shape, and requires an exact match with append-only
+progress evidence before skipping its checkout, Git, and cache inspection. An unscoped compatibility
+`ACTIVE.<machine>.journal` does not carry a slot, so wrkslots performs the ordinary bounded journal
+read and validation to discover its target before deciding whether it is selected. A malformed or
+ambiguous journal cannot be attributed safely and therefore refuses.
+
+The report is bounded by the configured project and the repositories named by readable rows; the
+configuration is not a host-wide Git-worktree registry. Cache globs are operator declarations, not
+automatic proof that matching bytes are regenerable. Tracked overlap, unsafe paths, and nested Git
+metadata under a selected cache root refuse cleanup. In report-only mode, malformed or otherwise
+uninspectable unregistered directories remain visible as `BLOCKED` rows. With `--only`, unselected
+rows are intentionally omitted from output and their cache trees are not traversed; global event,
+active-record path, and complete bounded journal/provenance checks still run.
 
 ## Handoffs and retirement
 

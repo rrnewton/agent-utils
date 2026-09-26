@@ -32,7 +32,7 @@ def _read_only_audit_fixture(
     monkeypatch.setattr(cli, "_refuse_partial_state", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cli, "_validate_global_state", lambda *_args: ((), ()))
     monkeypatch.setattr(cli, "_audit_validate_batch_seal_evidence", lambda *_args: ((), ()))
-    monkeypatch.setattr(cli, "_all_journal_cache_slots", lambda *_args: ())
+    monkeypatch.setattr(cli, "_all_journal_cache_slots", lambda *_args, **_kwargs: ())
     monkeypatch.setattr(cli, "_cache_slot_directories", lambda *_args, **_kwargs: (directory,))
     return config, cache, artifact
 
