@@ -13,9 +13,9 @@ import json
 import os
 import shutil
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import cast
+from typing import TypeVar, cast
 
 import pytest
 
@@ -28,6 +28,8 @@ from wrkslots.tests.test_lifecycle import (
     prepare_validation_removal_proof,
     stub_validate_batch_censuses,
 )
+
+T = TypeVar("T")
 
 
 class _Work:
@@ -392,26 +394,160 @@ def test_resumed_replay_rechecks_records_that_exist_only_in_the_import(
     assert warm == cold
 
 
-def test_required_recheck_refuses_the_first_record_in_log_order(
-    tmp_path: Path,
+def _append_active_record(
+    config: cli.Config, record: cli.ActiveRecord, previous: cli.ActiveRecord | None
 ) -> None:
+    state = cli._load_active(config, require_repository=False)
+    cli._event_writer(config, config.machine).append(
+        "active-state-recorded",
+        {
+            "action": "memo-test",
+            "slot": record.slot,
+            "previous_revision": state.revision,
+            "revision": state.revision + 1,
+            "previous_record_sha256": None
+            if previous is None
+            else cli._event_digest(cli._record_to_obj(previous)),
+            "record": cli._record_to_obj(record),
+            "evidence": {},
+        },
+    )
+
+
+@pytest.mark.parametrize("require_repository", (False, True))
+def test_refused_resumed_replay_leaves_the_remembered_fold_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, require_repository: bool
+) -> None:
+    """A replay that folds part of a suffix and then refuses must not alter the fold.
+
+    The retry resumes from the same remembered prefix and refolds the suffix,
+    so an event already applied to a shared fold would no longer match, or
+    would be applied twice.
+    """
+
+    project, repository, _remote = make_project(tmp_path)
+    prepare_dead_validate_slots(project, ("memo",))
+    config = cli._load_config(str(project), "testhost")
+    other = repository.with_name("other")
+    other.mkdir()
+    _replace_with_symlink(other)
+    work = _Work(monkeypatch)
+
+    def replay() -> tuple[str, str]:
+        try:
+            states = cli._states_from_events(
+                config, config.machine, require_repository=require_repository
+            )
+        except cli.Refusal as exc:
+            return "refused", str(exc)
+        return "ok", repr(states)
+
+    def cold(action: Callable[[], T]) -> T:
+        memo_stack = list(cli._ACTIVE_EVENT_MEMO)
+        cli._ACTIVE_EVENT_MEMO.clear()
+        work.counting = False
+        try:
+            return action()
+        finally:
+            work.counting = True
+            cli._ACTIVE_EVENT_MEMO.extend(memo_stack)
+
+    def replace_path(checkout: cli.Checkout, slot: str) -> cli.Checkout:
+        return dataclasses.replace(checkout, path=checkout.path.replace("/memo", f"/{slot}"))
+
+    def append_suffix() -> None:
+        # The first suffix event changes a record the fold already holds, the
+        # second archives a slot, and the third adds a slot whose repository
+        # crosses a symlink.
+        record = next(item for item in cli._load_active(config).slots if item.slot == "memo")
+        changed = dataclasses.replace(record, heartbeat_at="2030-01-01T00:00:00+00:00")
+        _append_active_record(config, changed, record)
+        checkout = record.checkouts[0]
+        finished_at = "2030-01-01T00:00:01+00:00"
+        archived = replace_path(checkout, "memo-archived")
+        cli._append_archive_once(
+            config,
+            cli._load_archive(config),
+            {
+                "archive_id": f"{config.machine}:memo-archived:1:{finished_at}",
+                "slot": "memo-archived",
+                "agent": record.agent,
+                "task": record.task,
+                "purpose": record.purpose,
+                "slot_type": record.slot_type,
+                "machine": config.machine,
+                "generation": 1,
+                "created_at": record.created_at,
+                "finished_at": finished_at,
+                "mode": "remove",
+                "actor": "coordinator",
+                "physical_storage": "removed",
+                "validation": ["memo-test"],
+                "limitations": [],
+                "continuation": "none",
+                "checkouts": [cli._checkout_to_obj(archived)],
+            },
+            require_repository=False,
+        )
+        added = dataclasses.replace(
+            record,
+            slot="memo-other",
+            checkouts=(
+                dataclasses.replace(replace_path(checkout, "memo-other"), repository="other"),
+            ),
+        )
+        _append_active_record(config, added, None)
+
+    with cli._event_memo_scope():
+        assert replay()[0] == "ok"
+        cold(append_suffix)
+        work.folded.clear()
+
+        refused = replay()
+        assert refused == cold(replay)
+        assert refused[0] == "refused" and refused[1].endswith(
+            f"crosses a symlink: {other}"
+        )
+        other.unlink()
+        other.with_name("other-real").rename(other)
+        retried = replay()
+
+        assert work.folded == [3, 3]
+        assert retried == cold(replay)
+        assert retried[0] == "ok"
+        archive = cli._load_archive(config).records
+        assert [item["slot"] for item in archive].count("memo-archived") == 1
+
+
+@pytest.mark.parametrize(
+    ("escaped", "refused"),
+    ((("memo-b", "memo-a"), "memo-a"), (("memo-b",), "memo-b")),
+)
+def test_required_recheck_refuses_the_first_record_in_log_order(
+    tmp_path: Path, escaped: tuple[str, ...], refused: str
+) -> None:
+    """Every record is rechecked, and the first failing one in log order refuses."""
+
     project, _repository, _remote = make_project(tmp_path)
     prepare_dead_validate_slots(project, ("memo-a", "memo-b"))
     config = cli._load_config(str(project), "testhost")
 
     with cli._event_memo_scope():
         assert cli._states_from_events(config, config.machine) is not None
-        for slot in ("memo-b", "memo-a"):
+        for slot in escaped:
             _replace_with_symlink(cli._slot_directory(config, slot, "validate"))
         warm, cold = _warm_and_cold_refusals(config, True)
 
-    assert "memo-a" in cold and "memo-b" not in cold
+    assert cold.endswith(f"crosses a symlink: {cli._slot_directory(config, refused, 'validate')}")
     assert warm == cold
 
 
+@pytest.mark.parametrize("both", (True, False))
 def test_unrequired_recheck_refuses_the_first_repository_in_log_order(
-    tmp_path: Path,
+    tmp_path: Path, both: bool
 ) -> None:
+    """Every repository is rechecked, and the first failing one in log order refuses."""
+
     project, other, _checkout = prepare_cross_repository_target(tmp_path)
     config = cli._load_config(str(project), "testhost")
     repositories = [
@@ -426,10 +562,11 @@ def test_unrequired_recheck_refuses_the_first_repository_in_log_order(
             config, config.machine, require_repository=False
         ) is not None
         _replace_with_symlink(other)
-        _replace_with_symlink(project / "repo")
+        if both:
+            _replace_with_symlink(project / "repo")
         warm, cold = _warm_and_cold_refusals(config, False)
 
-    assert cold.endswith(f"crosses a symlink: {project / 'repo'}")
+    assert cold.endswith(f"crosses a symlink: {project / 'repo' if both else other}")
     assert warm == cold
 
 
