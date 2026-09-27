@@ -1260,6 +1260,44 @@ class HerdrClient:
             raise HerdrUnavailable(f"pane list: invalid Herdr response: {exc}") from exc
         return tuple(out)
 
+    def move_pane_to_new_tab(
+        self, pane_id: str, *, workspace_id: str, tab_label: str,
+    ) -> Pane:
+        """Move one pane into a fresh labelled tab without stealing focus."""
+        result = self._call(
+            [
+                "pane", "move", pane_id, "--new-tab", "--workspace",
+                workspace_id, "--label", tab_label, "--no-focus",
+            ],
+            f"pane move {pane_id}",
+        )
+        try:
+            moved = as_mapping(result.get("move_result"), "pane move")
+            if moved.get("changed") is not True:
+                raise HerdrUnavailable(
+                    "pane move: Herdr reported that no move occurred"
+                )
+            if get_str(moved, "previous_pane_id", "pane move") != pane_id:
+                raise HerdrUnavailable(
+                    "pane move: previous pane identity did not match the request"
+                )
+            raw = as_mapping(moved.get("pane"), "pane move")
+            pane = Pane(
+                pane_id=get_str(raw, "pane_id", "pane move"),
+                tab_id=get_str(raw, "tab_id", "pane move"),
+                workspace_id=get_str(raw, "workspace_id", "pane move"),
+            )
+        except TypeError as exc:
+            raise HerdrUnavailable(
+                f"pane move: invalid Herdr response: {exc}"
+            ) from exc
+        if pane.workspace_id != workspace_id:
+            raise HerdrUnavailable(
+                f"pane move: returned workspace {pane.workspace_id!r}, "
+                f"expected {workspace_id!r}"
+            )
+        return pane
+
     def pane_exists(self, pane_id: str) -> bool:
         """Is this pane id still live? Used to invalidate a cached id rather than trust it."""
         try:

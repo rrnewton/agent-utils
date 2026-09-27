@@ -33,6 +33,15 @@ while keeping their terminals available for direct inspection.
    agentctl start reviewer --cwd . --profile preferred-reviewer
    ```
 
+   An optional top-level `"workspace": "project-agents"` setting makes that
+   Herdr workspace label authoritative for starts and automated input. Status
+   and stop remain available for diagnosis and retirement.
+   Move an existing owned native agent into it without restarting the process:
+
+   ```sh
+   agentctl move reviewer
+   ```
+
    To keep an agent that is already running in Herdr, adopt its exact live
    identity instead. All four assertions are required; adoption changes neither
    the pane nor its process:

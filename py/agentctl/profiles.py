@@ -11,6 +11,7 @@ import os
 import re
 import stat
 import subprocess
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -331,15 +332,34 @@ def _profile(name: str, raw: object) -> LaunchProfile:
     return LaunchProfile(name, harness, mode, model, effort, argv, tuple(environment))
 
 
-def load_profiles(cwd: str | Path, *, absent_ok: bool = False) -> tuple[Path, dict[str, LaunchProfile]]:
-    """Load and validate the ignored private profile file for *cwd*."""
+def _workspace(value: object) -> str | None:
+    if value is None:
+        return None
+    try:
+        encoded_length = len(value.encode()) if isinstance(value, str) else 0
+    except UnicodeEncodeError:
+        encoded_length = 129
+    if (not isinstance(value, str) or not value or encoded_length > 128
+            or value.strip() != value
+            or any(unicodedata.category(character) == "Cc" for character in value)):
+        raise AgentDeliveryError(
+            "profile config workspace must be 1-128 bytes, have no surrounding "
+            "whitespace, and contain no control characters"
+        )
+    return value
+
+
+def load_configuration(
+    cwd: str | Path, *, absent_ok: bool = False,
+) -> tuple[Path, dict[str, LaunchProfile], str | None]:
+    """Load the ignored private project configuration for *cwd*."""
     root = Path(cwd).expanduser().resolve()
     path = profile_path(root)
     try:
         path.lstat()
     except FileNotFoundError:
         if absent_ok:
-            return path, {}
+            return path, {}, None
         raise AgentDeliveryError(f"profile config does not exist: {path}") from None
     except OSError as exc:
         raise AgentDeliveryError(f"cannot inspect profile config {path}: {exc}") from exc
@@ -367,12 +387,59 @@ def load_profiles(cwd: str | Path, *, absent_ok: bool = False) -> tuple[Path, di
         raw: object = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_object)
     except (UnicodeError, json.JSONDecodeError, RecursionError, _DuplicateKey) as exc:
         raise AgentDeliveryError(f"cannot read profile config {path}: {exc}") from exc
-    if not isinstance(raw, dict) or set(raw) != {"schema", "profiles"}:
-        raise AgentDeliveryError("profile config must contain exactly schema and profiles")
+    if (not isinstance(raw, dict)
+            or not {"schema", "profiles"}.issubset(raw)
+            or set(raw) - {"schema", "profiles", "workspace"}):
+        raise AgentDeliveryError(
+            "profile config must contain schema and profiles, with optional workspace"
+        )
     if raw.get("schema") != SCHEMA or not isinstance(raw.get("profiles"), dict):
         raise AgentDeliveryError(f"profile config must use schema {SCHEMA!r} and an object of profiles")
     profiles = {name: _profile(name, value) for name, value in cast(dict[str, object], raw["profiles"]).items()}
-    return path, dict(sorted(profiles.items()))
+    return path, dict(sorted(profiles.items())), _workspace(raw.get("workspace"))
+
+
+def load_profiles(cwd: str | Path, *, absent_ok: bool = False) -> tuple[Path, dict[str, LaunchProfile]]:
+    """Load and validate the ignored private profile file for *cwd*."""
+    path, profiles, _project_workspace = load_configuration(cwd, absent_ok=absent_ok)
+    return path, profiles
+
+
+def workspace_for_registry(registry: str | Path) -> str | None:
+    """Read only workspace policy for a conventional project registry.
+
+    Profile validation belongs to ``profiles`` and ``start --profile``.  A typo
+    in an unrelated launch profile must not disable ordinary managed-agent
+    operations that only need the optional placement label.
+    """
+    root = Path(registry).expanduser().resolve()
+    if root.name != ".agentctl":
+        return None
+    project = root.parent
+    path = profile_path(project)
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise AgentDeliveryError(f"cannot inspect profile config {path}: {exc}") from exc
+    descriptor = _open_private_regular_file(path)
+    try:
+        _require_ignored(project, path)
+        data = os.read(descriptor, _MAX_CONFIG_BYTES + 1)
+    finally:
+        os.close(descriptor)
+    if len(data) > _MAX_CONFIG_BYTES:
+        raise AgentDeliveryError(
+            f"profile config exceeds {_MAX_CONFIG_BYTES} bytes: {path}"
+        )
+    try:
+        raw: object = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_object)
+    except (UnicodeError, json.JSONDecodeError, RecursionError, _DuplicateKey) as exc:
+        raise AgentDeliveryError(f"cannot read profile config {path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise AgentDeliveryError("profile config must be an object")
+    return _workspace(raw.get("workspace"))
 
 
 def validate_muse_headless_arguments(

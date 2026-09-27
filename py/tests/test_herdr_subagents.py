@@ -9,6 +9,7 @@ from typing import cast
 
 import pytest
 
+from agentctl import agent as delivery
 from agentctl.client import (
     AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, PaneShellProof,
 )
@@ -26,6 +27,8 @@ class FakeManagedClient:
         self.infos: dict[str, AgentPaneInfo] = {}
         self.presentations: list[Pane] = []
         self.launched: list[tuple[str, str, str, tuple[str, ...]]] = []
+        self.moved_named_panes: dict[str, str] = {}
+        self.moves: list[tuple[str, str, str]] = []
         self.environments: list[tuple[str, ...]] = []
         self.closed: list[str] = []
         self.submitted: list[str] = []
@@ -48,10 +51,14 @@ class FakeManagedClient:
         )
 
     def workspace_id_for_label(self, label: str) -> str | None:
+        if label == "project-agents":
+            return "w-project"
         assert label == "subagents"
         return self.workspace
 
     def workspace_label(self, workspace_id: str) -> str:
+        if workspace_id == "w-project":
+            return "project-agents"
         assert workspace_id == "w1"
         return "subagents"
 
@@ -145,6 +152,8 @@ class FakeManagedClient:
         )
 
     def agent_pane(self, name: str) -> str:
+        if name in self.moved_named_panes:
+            return self.moved_named_panes[name]
         matches = [entry[2] for entry in self.launched if entry[0] == name]
         if self.offline or not matches:
             raise HerdrUnavailable("server unavailable or named agent missing")
@@ -158,10 +167,31 @@ class FakeManagedClient:
 
     def panes(self, workspace_id: str | None = None) -> tuple[Pane, ...]:
         self.panes_calls += 1
-        del workspace_id
         if self.offline:
             raise HerdrUnavailable("server unavailable")
-        return tuple(self.presentations)
+        return tuple(
+            pane for pane in self.presentations
+            if workspace_id is None or pane.workspace_id == workspace_id
+        )
+
+    def move_pane_to_new_tab(
+        self, pane_id: str, *, workspace_id: str, tab_label: str,
+    ) -> Pane:
+        source = next(
+            (pane for pane in self.presentations if pane.pane_id == pane_id), None
+        )
+        if source is None:
+            raise HerdrUnavailable("missing source pane")
+        self.presentations.remove(source)
+        moved = Pane("w-project:p1", "w-project:t1", workspace_id)
+        self.presentations.append(moved)
+        old = self.infos.pop(pane_id)
+        self.infos[moved.pane_id] = replace(
+            old, pane_id=moved.pane_id, workspace_id=workspace_id,
+        )
+        self.moved_named_panes[tab_label] = moved.pane_id
+        self.moves.append((pane_id, workspace_id, tab_label))
+        return moved
 
     def prompt_agent(self, pane_id: str, text: str) -> None:
         assert pane_id in self.infos
@@ -265,6 +295,475 @@ def test_named_workers_share_workspace_but_never_reuse_tabs(tmp_path: Path, monk
     with pytest.raises(AgentDeliveryError, match="already registered"):
         manager.start("one", cwd=str(tmp_path))
     assert len(fake.launched) == 2
+
+
+def test_project_workspace_selects_destination_and_rejects_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.project_workspace = "project-agents"
+    status = manager.start("worker", cwd=str(tmp_path), harness="codex")
+    assert status["workspace_id"] == "w-project"
+    assert status["agent_status"] == "idle"
+    assert fake.presentations[0].workspace_id == "w-project"
+
+    rejected, rejected_fake = setup(tmp_path / "mismatch", monkeypatch)
+    rejected.project_workspace = "project-agents"
+    with pytest.raises(AgentDeliveryError, match="project configuration requires"):
+        rejected.start(
+            "worker", cwd=str(tmp_path), harness="codex", workspace_id="w1",
+        )
+    assert rejected_fake.launched == []
+    assert rejected_fake.presentations == []
+
+
+@pytest.mark.parametrize("project_workspace", [None, "project-agents"])
+def test_managed_legacy_workspace_binding_is_accepted_without_rewrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    project_workspace: str | None,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.project_workspace = project_workspace
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    record = manager.get("worker")
+    record.session_agent = record.session_value = None
+    manager._save(record)
+    assert record.pane_id is not None
+    fake.infos[record.pane_id] = replace(
+        fake.infos[record.pane_id], session_agent=None, session_value=None,
+    )
+    manager.send("worker", "create binding")
+    target = manager.registry / "worker" / "queue" / "target.json"
+    document = json.loads(target.read_text(encoding="utf-8"))
+    document["expected_workspace"] = "legacy-project"
+    target.write_text(json.dumps(document, sort_keys=True) + "\n", encoding="utf-8")
+    before = target.read_bytes()
+
+    assert manager.status("worker")["agent_status"] == "idle"
+    manager.send("worker", "legacy compatible")
+    assert fake.submitted[-1] == "legacy compatible"
+    assert target.read_bytes() == before
+    manager.drain("worker")
+    assert target.read_bytes() == before
+    manager.goal("worker", "legacy compatible goal")
+    assert fake.submitted[-1] == "/goal legacy compatible goal"
+    assert target.read_bytes() == before
+
+
+def test_legacy_cli_workspace_pin_is_exact(tmp_path: Path) -> None:
+    queue = tmp_path / "queue"
+    pinned = delivery.Target(
+        pane_id="w1:p1", expected_agent="codex",
+        expected_workspace="legacy-project", expected_cwd=str(tmp_path),
+    )
+    delivery._bind_queue(str(queue), pinned)
+    unpinned = replace(pinned, expected_workspace=None)
+    with pytest.raises(AgentDeliveryError, match="refusing different target"):
+        delivery._validate_existing_binding(str(queue), unpinned)
+
+
+def test_move_preserves_process_and_commits_new_herdr_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    manager.send("worker", "establish queue binding")
+    manager.project_workspace = "project-agents"
+
+    launches = list(fake.launched)
+    moved = manager.move_to_project_workspace("worker")
+    assert moved["moved"] is True
+    assert moved["recovered"] is False
+    assert moved["previous_pane_id"] == "w1:p1"
+    assert moved["pane_id"] == "w-project:p1"
+    assert moved["tab_id"] == "w-project:t1"
+    assert moved["workspace_id"] == "w-project"
+    assert moved["agent_status"] == "idle"
+    assert fake.moves == [("w1:p1", "w-project", "worker")]
+    assert fake.launched == launches
+
+    record = manager.get("worker")
+    assert record.pane_id == "w-project:p1"
+    assert record.tab_id == "w-project:t1"
+    assert record.workspace_id == "w-project"
+    assert manager.read("worker", lines=10) == "human and coordinator transcript\n"
+
+    already_there = manager.move_to_project_workspace("worker")
+    assert already_there["moved"] is False
+    assert fake.moves == [("w1:p1", "w-project", "worker")]
+
+
+def test_move_recovers_only_with_durable_intent_and_rebinds_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    sessionless = manager.get("worker")
+    sessionless.session_agent = sessionless.session_value = None
+    manager._save(sessionless)
+    assert sessionless.pane_id is not None
+    fake.infos[sessionless.pane_id] = replace(
+        fake.infos[sessionless.pane_id], session_agent=None, session_value=None,
+    )
+    manager.send("worker", "before move")
+    manager.project_workspace = "project-agents"
+    record = manager.get("worker")
+
+    fake.move_pane_to_new_tab(
+        record.pane_id or "", workspace_id="w-project", tab_label="worker",
+    )
+    with pytest.raises(AgentDeliveryError, match="no durable move intent"):
+        manager.move_to_project_workspace("worker")
+
+    manager._write_move_intent(record, "w-project")
+    pending = manager.status("worker")
+    assert pending["move_pending"] is True
+    assert pending["probe_error"] == (
+        "move of 'worker' is incomplete; rerun `agentctl move worker`"
+    )
+    with pytest.raises(AgentDeliveryError, match="move is incomplete"):
+        manager.stop("worker")
+    replacement = replace(record.target(), pane_id="w-project:p1")
+    delivery._atomic_json(
+        str(manager.registry / "worker" / "queue" / "target.json"),
+        delivery._binding(replacement),
+    )
+    recovered = manager.move_to_project_workspace("worker")
+    assert recovered["recovered"] is True
+    manager.send("worker", "after recovery")
+    assert fake.submitted[-1] == "after recovery"
+    assert not (manager.registry / "worker" / "move.json").exists()
+
+
+def test_stale_completed_move_intent_is_row_local_and_rerun_clears_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    before = manager.get("worker")
+    manager.project_workspace = "project-agents"
+    manager.move_to_project_workspace("worker")
+    manager._write_move_intent(before, "w-project")
+
+    status = manager.status("worker")
+    assert status["move_pending"] is True
+    assert status["probe_error"] == (
+        "move of 'worker' is incomplete; rerun `agentctl move worker`"
+    )
+    rows = manager.list()
+    assert len(rows) == 1
+    assert rows[0]["name"] == "worker"
+    assert "rerun `agentctl move worker`" in str(rows[0]["probe_error"])
+
+    repeated = manager.move_to_project_workspace("worker")
+    assert repeated["moved"] is False
+    assert not (manager.registry / "worker" / "move.json").exists()
+
+    delivery._atomic_json(str(manager.registry / "worker" / "move.json"), {})
+    invalid = manager.status("worker")
+    assert invalid["agent_status"] == "unknown"
+    assert "rerun `agentctl move worker`" in str(invalid["probe_error"])
+    assert len(manager.list()) == 1
+
+
+def test_pending_move_can_finish_after_workspace_policy_is_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    record = manager.get("worker")
+    manager.project_workspace = "project-agents"
+    manager._write_move_intent(record, "w-project")
+    manager.project_workspace = None
+
+    moved = manager.move_to_project_workspace("worker")
+    assert moved["workspace_id"] == "w-project"
+    assert fake.moves == [("w1:p1", "w-project", "worker")]
+    assert not (manager.registry / "worker" / "move.json").exists()
+    assert manager.stop("worker")["pane_closed"] is True
+
+
+def test_queue_rebind_is_idempotent_and_refuses_unrelated_identity(
+    tmp_path: Path,
+) -> None:
+    queue = tmp_path / "queue"
+    previous = delivery.Target(
+        pane_id="w1:p1", expected_agent="codex",
+        expected_workspace="old-label", expected_cwd=str(tmp_path),
+    )
+    replacement = delivery.Target(
+        pane_id="w2:p2", expected_agent="codex",
+        expected_workspace="new-label", expected_cwd=str(tmp_path),
+    )
+    delivery._bind_queue(str(queue), previous)
+    delivery.rebind_queue(str(queue), previous, replacement)
+    delivery.rebind_queue(str(queue), previous, replacement)
+    stored = json.loads((queue / "target.json").read_text(encoding="utf-8"))
+    assert stored["pane_id"] == "w2:p2"
+    stored["pane_id"] = "foreign"
+    (queue / "target.json").write_text(json.dumps(stored), encoding="utf-8")
+    with pytest.raises(AgentDeliveryError, match="refusing move"):
+        delivery.rebind_queue(str(queue), previous, replacement)
+
+
+def test_move_preflights_binding_and_preserves_queued_states(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    manager.send("worker", "bind queue")
+    queue = manager.registry / "worker" / "queue"
+    target = queue / "target.json"
+    document = json.loads(target.read_text(encoding="utf-8"))
+    document.update({"kind": "pane", "pane_id": "foreign", "value": None})
+    document.pop("agent", None)
+    target.write_text(json.dumps(document), encoding="utf-8")
+    manager.project_workspace = "project-agents"
+    with pytest.raises(AgentDeliveryError, match="refusing move"):
+        manager.move_to_project_workspace("worker")
+    assert fake.moves == []
+
+    # Restore the canonical binding through an ordinary send, then pin queue
+    # artifacts that a move must neither replay nor discard.
+    target.unlink()
+    manager.project_workspace = None
+    manager.send("worker", "restore binding")
+    for state in ("inbox", "inflight", "processed", "failed"):
+        directory = queue / state
+        directory.mkdir(mode=0o700, exist_ok=True)
+        (directory / f"{state}.json").write_text("{}", encoding="utf-8")
+        (directory / f"{state}.json").chmod(0o600)
+    manager.project_workspace = "project-agents"
+    manager.move_to_project_workspace("worker")
+    for state in ("inbox", "inflight", "processed", "failed"):
+        assert (queue / state / f"{state}.json").exists()
+
+
+def test_pane_binding_follows_move_and_sends_to_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    record = manager.get("worker")
+    record.session_agent = record.session_value = None
+    manager._save(record)
+    fake.infos[record.pane_id or ""] = replace(
+        fake.infos[record.pane_id or ""], session_agent=None, session_value=None,
+    )
+    manager.send("worker", "bind pane")
+    manager.project_workspace = "project-agents"
+    manager.move_to_project_workspace("worker")
+    manager.send("worker", "replacement pane")
+    assert fake.submitted[-1] == "replacement pane"
+
+
+def test_move_refuses_sibling_tab_before_touching_herdr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    fake.presentations.append(Pane("w1:sibling", "w1:t1", "w1"))
+    fake.infos["w1:sibling"] = AgentPaneInfo(
+        "w1:sibling", "w1", str(tmp_path), "codex", "idle", "codex", "other",
+    )
+    manager.project_workspace = "project-agents"
+    with pytest.raises(AgentDeliveryError, match="tab contains another pane"):
+        manager.move_to_project_workspace("worker")
+    assert fake.moves == []
+
+
+def test_move_refuses_name_and_final_presentation_mismatches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path / "name", monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    manager.project_workspace = "project-agents"
+    original = fake.move_pane_to_new_tab
+
+    def lose_name(pane_id: str, *, workspace_id: str, tab_label: str) -> Pane:
+        moved = original(pane_id, workspace_id=workspace_id, tab_label=tab_label)
+        fake.moved_named_panes[tab_label] = "missing"
+        return moved
+
+    monkeypatch.setattr(fake, "move_pane_to_new_tab", lose_name)
+    with pytest.raises(AgentDeliveryError, match="managed name did not follow"):
+        manager.move_to_project_workspace("worker")
+    assert (manager.registry / "worker" / "move.json").exists()
+
+    presentation, presentation_fake = setup(tmp_path / "presentation", monkeypatch)
+    presentation.start("worker", cwd=str(tmp_path))
+    presentation.project_workspace = "project-agents"
+    presentation_original = presentation_fake.move_pane_to_new_tab
+
+    def wrong_result(pane_id: str, *, workspace_id: str, tab_label: str) -> Pane:
+        moved = presentation_original(
+            pane_id, workspace_id=workspace_id, tab_label=tab_label,
+        )
+        return Pane(moved.pane_id, "reported-wrong-tab", moved.workspace_id)
+
+    monkeypatch.setattr(presentation_fake, "move_pane_to_new_tab", wrong_result)
+    with pytest.raises(AgentDeliveryError, match="final presentation verification failed"):
+        presentation.move_to_project_workspace("worker")
+    assert (presentation.registry / "worker" / "move.json").exists()
+
+
+def test_failed_pre_herdr_move_clears_intent_and_cannot_authorize_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    manager.project_workspace = "project-agents"
+
+    def refuse(*args: object, **kwargs: object) -> Pane:
+        del args, kwargs
+        raise HerdrUnavailable("move refused before mutation")
+
+    monkeypatch.setattr(fake, "move_pane_to_new_tab", refuse)
+    with pytest.raises(HerdrUnavailable, match="before mutation"):
+        manager.move_to_project_workspace("worker")
+    assert not (manager.registry / "worker" / "move.json").exists()
+
+    fake.presentations = [Pane("replacement", "other", "w-project")]
+    fake.infos["replacement"] = replace(
+        next(iter(fake.infos.values())), pane_id="replacement", workspace_id="w-project",
+    )
+    fake.moved_named_panes["worker"] = "replacement"
+    with pytest.raises(AgentDeliveryError, match="no durable move intent"):
+        manager.move_to_project_workspace("worker")
+
+
+def test_move_refuses_false_recovery_and_unsupported_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path / "both", monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    manager.project_workspace = "project-agents"
+    record = manager.get("worker")
+    manager._write_move_intent(record, "w-project")
+    fake.presentations.append(Pane("replacement", "other", "w-project"))
+    fake.infos["replacement"] = replace(
+        fake.infos[record.pane_id or ""], pane_id="replacement", workspace_id="w-project",
+    )
+    fake.moved_named_panes["worker"] = "replacement"
+    with pytest.raises(AgentDeliveryError, match="both recorded and named panes are live"):
+        manager.move_to_project_workspace("worker")
+
+    no_policy, _ = setup(tmp_path / "none", monkeypatch)
+    no_policy.start("worker", cwd=str(tmp_path))
+    with pytest.raises(AgentDeliveryError, match="requires a workspace field"):
+        no_policy.move_to_project_workspace("worker")
+
+    adopted, adopted_fake = setup(tmp_path / "adopt", monkeypatch)
+    adopted_fake.workspace = "w1"
+    adopted_fake.presentations.append(Pane("w1:p1", "w1:t1", "w1"))
+    adopted_fake.infos["w1:p1"] = AgentPaneInfo(
+        "w1:p1", "w1", str(tmp_path), "codex", "idle", None, None,
+    )
+    adopted.adopt(
+        "foreign", pane_id="w1:p1", expected_workspace="subagents",
+        expected_cwd=str(tmp_path), harness="codex",
+    )
+    adopted.project_workspace = "project-agents"
+    with pytest.raises(AgentDeliveryError, match="supports only"):
+        adopted.move_to_project_workspace("foreign")
+
+    custom, _ = setup(tmp_path / "custom", monkeypatch)
+    custom.start("worker", cwd=str(tmp_path), harness="muse")
+    custom.project_workspace = "project-agents"
+    with pytest.raises(AgentDeliveryError, match="supports only"):
+        custom.move_to_project_workspace("worker")
+
+    mismatch, _ = setup(tmp_path / "adopt-mismatch", monkeypatch)
+    mismatch.project_workspace = "project-agents"
+    with pytest.raises(AgentDeliveryError, match="does not match project workspace"):
+        mismatch.adopt(
+            "foreign", pane_id="w1:p1", expected_workspace="subagents",
+            expected_cwd=str(tmp_path), harness="codex",
+        )
+
+
+def test_policy_does_not_block_status_stop_or_existing_queue_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    manager.send("worker", "before policy")
+    manager.project_workspace = "project-agents"
+    assert manager.status("worker")["agent_status"] == "idle"
+    stopped = manager.stop("worker")
+    assert stopped["pane_closed"] is True
+
+    adopted, adopted_fake = setup(tmp_path / "adopted", monkeypatch)
+    adopted_fake.workspace = "w1"
+    adopted_fake.presentations.append(Pane("w1:p1", "w1:t1", "w1"))
+    adopted_fake.infos["w1:p1"] = AgentPaneInfo(
+        "w1:p1", "w1", str(tmp_path), "codex", "idle", "codex", "foreign",
+    )
+    adopted.adopt(
+        "foreign", pane_id="w1:p1", expected_workspace="subagents",
+        expected_cwd=str(tmp_path), harness="codex", session="foreign",
+    )
+    adopted.project_workspace = "project-agents"
+    assert adopted.stop("foreign")["runtime_preserved"] is True
+
+
+def test_policy_changes_never_become_queue_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original, fake = setup(tmp_path / "owned", monkeypatch)
+    original.start("worker", cwd=str(tmp_path))
+    original.send("worker", "before policy")
+    policy = ManagedAgents(cast(HerdrClient, fake), original.registry)
+    policy.project_workspace = "project-agents"
+    policy.move_to_project_workspace("worker")
+    original.send("worker", "stale manager")
+    policy.project_workspace = None
+    policy.send("worker", "removed policy")
+    assert fake.submitted[-2:] == ["stale manager", "removed policy"]
+
+    adopted, adopted_fake = setup(tmp_path / "adopted-in-place", monkeypatch)
+    adopted_fake.presentations.append(Pane("w-project:p1", "w-project:t1", "w-project"))
+    adopted_fake.infos["w-project:p1"] = AgentPaneInfo(
+        "w-project:p1", "w-project", str(tmp_path), "codex", "idle", None, None,
+    )
+    adopted.project_workspace = "project-agents"
+    adopted.adopt(
+        "foreign", pane_id="w-project:p1", expected_workspace="project-agents",
+        expected_cwd=str(tmp_path), harness="codex",
+    )
+    adopted.send("foreign", "adopted in place")
+    assert adopted_fake.submitted[-1] == "adopted in place"
+
+
+def test_workspace_identity_guard_and_policy_override_inherited_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HERDR_WORKSPACE_ID", "w1")
+    manager, fake = setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERDR_WORKSPACE_ID", "w1")
+    manager.project_workspace = "project-agents"
+    status = manager.start("worker", cwd=str(tmp_path))
+    assert status["workspace_id"] == "w-project"
+    pane = status["pane_id"]
+    assert isinstance(pane, str)
+    manager.project_workspace = None
+    fake.infos[pane] = replace(fake.infos[pane], workspace_id="w1")
+    with pytest.raises(HerdrUnavailable, match="workspace identity changed"):
+        manager.read("worker")
+
+
+def test_project_policy_blocks_control_until_misplaced_agent_is_moved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    manager.project_workspace = "project-agents"
+    with pytest.raises(
+        AgentDeliveryError,
+        match=r"refusing pane w1:p1: workspace is 'subagents', expected 'project-agents'",
+    ):
+        manager.read("worker", lines=10)
+    assert fake.moves == []
 
 
 def test_launch_only_v2_record_is_read_and_rewritten_without_flat_duplicates(

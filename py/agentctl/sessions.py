@@ -62,6 +62,8 @@ class Sessions(ManagedAgents):
             result.append("terminal-snapshot")
         if record.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
             result.extend(("drain", "goal", "bind-session"))
+        if record.adapter == "herdr":
+            result.append("move")
         return result
 
     def start_session(self, name: str, *, cwd: str, mode: str = "interactive",

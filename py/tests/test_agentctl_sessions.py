@@ -16,7 +16,9 @@ import pytest
 from agentctl import cli, mcp
 from agentctl.client import HerdrClient, Pane
 from agentctl.errors import AgentDeliveryError
-from agentctl.profiles import validate_muse_headless_arguments
+from agentctl.profiles import (
+    load_configuration, validate_muse_headless_arguments, workspace_for_registry,
+)
 from agentctl.sessions import Sessions
 from agentctl.subagents import AgentRecord
 from .test_herdr_subagents import FakeManagedClient
@@ -37,6 +39,42 @@ def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Sessions, Fa
 
     monkeypatch.setattr(sessions, "_worker", worker)
     return sessions, fake, calls
+
+
+def _write_project_configuration(tmp_path: Path, workspace: object) -> Path:
+    subprocess.run(["/usr/bin/git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+    directory = tmp_path / ".agentctl"
+    directory.mkdir(mode=0o700)
+    path = directory / "profiles.json"
+    path.write_text(json.dumps({
+        "schema": "agentctl-profiles/v1",
+        "workspace": workspace,
+        "profiles": {},
+    }), encoding="utf-8")
+    path.chmod(0o600)
+    return path
+
+
+def test_project_configuration_exposes_a_bounded_workspace_policy(tmp_path: Path) -> None:
+    _write_project_configuration(tmp_path, "project-agents")
+    path, profiles, workspace = load_configuration(tmp_path)
+    assert path == tmp_path / ".agentctl/profiles.json"
+    assert profiles == {}
+    assert workspace == "project-agents"
+    assert workspace_for_registry(tmp_path / ".agentctl") == "project-agents"
+    assert workspace_for_registry(tmp_path / "unrelated-registry") is None
+
+
+@pytest.mark.parametrize(
+    "workspace", ["", " leading", "trailing ", "line\nfeed", "tab\tlabel", "x" * 129],
+)
+def test_project_configuration_rejects_ambiguous_workspace_labels(
+    tmp_path: Path, workspace: str,
+) -> None:
+    _write_project_configuration(tmp_path, workspace)
+    with pytest.raises(AgentDeliveryError, match="workspace must be"):
+        load_configuration(tmp_path)
 
 
 def test_cli_list_reports_every_row_and_exits_nonzero_for_malformed_record(

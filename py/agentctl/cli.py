@@ -18,7 +18,7 @@ from agentctl.client import HerdrClient
 from agentctl.errors import AgentPending, AgentPossiblySubmitted, HerdrRunError
 from agentctl.legacy_cli import _ascii_float, _bounded_uint
 from agentctl.profiles import (
-    load_profiles, validate_raw_harness_arguments,
+    load_configuration, load_profiles, validate_raw_harness_arguments,
 )
 from agentctl.sessions import Sessions
 from agentctl.skill_install import install_skill
@@ -103,7 +103,8 @@ def parser() -> argparse.ArgumentParser:
     start.add_argument("--env", action="append", default=[], type=_environment_entry,
         metavar="KEY=VALUE",
         help="interactive Herdr only: set a literal variable in the created tab; repeat; values are not shown by status")
-    start.add_argument("--workspace-id", metavar="ID", help="interactive only: exact Herdr workspace; default: current workspace or a shared subagents workspace")
+    start.add_argument("--workspace-id", metavar="ID",
+        help="interactive only: exact Herdr workspace; default: configured project workspace, else HERDR_WORKSPACE_ID, else shared subagents; an explicit ID must match configured policy")
     first = start.add_mutually_exclusive_group()
     first.add_argument("--brief", metavar="TEXT", help="initial task, submitted after launch")
     first.add_argument("--file", metavar="PATH", help="UTF-8 file containing the initial task")
@@ -124,6 +125,9 @@ def parser() -> argparse.ArgumentParser:
         help="expected live harness kind, for example codex or claude; muse is refused (required)")
     adopt.add_argument("--session", metavar="ID",
         help="optional stable native conversation ID already reported by this exact pane")
+
+    command("move", "Move a running owned native Herdr agent into an existing workspace required by project configuration; adopted, custom-pane, and multi-pane tabs are refused.",
+        "agentctl move reviewer", named=True)
 
     command("list", "List every registered session, including unavailable and failed launches.", "agentctl list")
     command("capabilities", "Show the adapters and services available in this installation.", "agentctl capabilities")
@@ -254,8 +258,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _serve(args.registry, args.herdr_bin)
     try:
         if args.command == "profiles":
-            path, profiles = load_profiles(args.cwd, absent_ok=True)
-            print(json.dumps({"path": str(path), "profiles": [item.public() for item in profiles.values()]},
+            path, profiles, workspace = load_configuration(args.cwd, absent_ok=True)
+            print(json.dumps({"path": str(path), "workspace": workspace,
+                "profiles": [item.public() for item in profiles.values()]},
                 indent=2, sort_keys=True))
             return 0
         if args.command == "skill":
@@ -323,6 +328,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = sessions.adopt(name, pane_id=args.pane,
                 expected_workspace=args.workspace, expected_cwd=args.cwd,
                 harness=args.harness, session=args.session)
+        elif args.command == "move":
+            result = sessions.move_to_project_workspace(name)
         elif args.command == "list":
             result = sessions.list()
             print(json.dumps(result, indent=2, sort_keys=True))

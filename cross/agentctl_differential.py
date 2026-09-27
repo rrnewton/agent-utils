@@ -26,6 +26,7 @@ _COMMON = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry")
 _GOAL_COMMAND = ("--goal-command-json", '["<HERDR>","goal-rpc"]')
 _CAPABILITIES = ["send", "status", "read", "wait", "stop", "attach", "pause", "resume",
                  "terminal-snapshot", "drain", "goal", "bind-session"]
+_OWNED_CAPABILITIES = [*_CAPABILITIES, "move"]
 _SHELL_IDENTITY_FIELDS = {
     "version", "boot_id", "pid", "starttime_ticks",
     "executable_device", "executable_inode",
@@ -198,7 +199,8 @@ def _lifecycle(harness: Harness, report: Report) -> None:
         report.require(f"primary/{kind}/metadata-contract", isinstance(status, dict)
                        and all(status.get(key) == value for key, value in {
                            "name": "worker", "adapter": "herdr", "mode": "interactive", "backend": "herdr",
-                           "paused": False, "runtime_home": None, "capabilities": _CAPABILITIES,
+                           "paused": False, "runtime_home": None,
+                           "capabilities": _OWNED_CAPABILITIES,
                            "pane_id": "w1:p1", "session_value": "session-1", "lifecycle": "running",
                        }.items()), f"missing canonical identity: {status!r}")
         report.require(f"primary/{kind}/environment-not-in-status",
@@ -768,6 +770,159 @@ def _profile_refusals(harness: Harness, report: Report) -> None:
         not (root / "hostile-git-executed").exists()
         for root in (hostile_path.python_root, hostile_path.rust_root)
     ), "profile discovery executed Git from caller PATH")
+
+
+def _workspace_policy(harness: Harness, report: Report) -> None:
+    """Pin the paired CLI surface for the optional project workspace key."""
+    base = {"schema": "agentctl-profiles/v1", "profiles": {
+        "worker": {"harness": "codex", "mode": "interactive", "argv": [], "env": {}}
+    }}
+    documents: dict[str, object] = {
+        "valid": {"schema": "agentctl-profiles/v1", "profiles": {}, "workspace": "project"},
+        "null": {"schema": "agentctl-profiles/v1", "profiles": {}, "workspace": None},
+        "invalid": {"schema": "agentctl-profiles/v1", "profiles": {}, "workspace": " bad "},
+    }
+    for label, document in documents.items():
+        case = harness.case(f"primary-workspace-{label}")
+        for root in (case.python_root, case.rust_root):
+            subprocess.run(["/usr/bin/git", "init", "-q", str(root)], check=True)
+            (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+            directory = root / ".agentctl"
+            directory.mkdir(mode=0o700)
+            config = directory / "profiles.json"
+            config.write_text(json.dumps(document), encoding="utf-8")
+            config.chmod(0o600)
+        _pair(
+            harness, report, case, f"primary/workspace/{label}/profiles",
+            ("profiles", "--cwd", "<ROOT>"), 75 if label == "invalid" else 0,
+        )
+
+    malformed = harness.case("primary-workspace-malformed-unrelated-profile")
+    for root in (malformed.python_root, malformed.rust_root):
+        subprocess.run(["/usr/bin/git", "init", "-q", str(root)], check=True)
+        (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+        directory = root / ".agentctl"
+        directory.mkdir(mode=0o700)
+        config = directory / "profiles.json"
+        config.write_text(json.dumps({
+            "schema": "agentctl-profiles/v1", "workspace": "project",
+            "profiles": {"broken": {"harness": "codex"}},
+        }), encoding="utf-8")
+        config.chmod(0o600)
+    _pair(harness, report, malformed, "primary/workspace/malformed/list", (
+        "list", "--herdr-bin", "<HERDR>", "--registry", "<ROOT>/.agentctl",
+    ))
+
+    duplicate_workspace = harness.case("primary-workspace-duplicate-key")
+    for root in (duplicate_workspace.python_root, duplicate_workspace.rust_root):
+        subprocess.run(["/usr/bin/git", "init", "-q", str(root)], check=True)
+        (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+        directory = root / ".agentctl"
+        directory.mkdir(mode=0o700)
+        config = directory / "profiles.json"
+        config.write_text(
+            '{"schema":"agentctl-profiles/v1","workspace":"first",'
+            '"workspace":"second","profiles":{"broken":{"harness":"codex"}}}',
+            encoding="utf-8",
+        )
+        config.chmod(0o600)
+    _pair(
+        harness, report, duplicate_workspace,
+        "primary/workspace/duplicate-workspace-key",
+        ("profiles", "--cwd", "<ROOT>"),
+        75,
+    )
+
+    mismatch = harness.case("primary-workspace-explicit-mismatch")
+    for root in (mismatch.python_root, mismatch.rust_root):
+        subprocess.run(["/usr/bin/git", "init", "-q", str(root)], check=True)
+        (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+        directory = root / ".agentctl"
+        directory.mkdir(mode=0o700)
+        config = directory / "profiles.json"
+        config.write_text(json.dumps({
+            "schema": "agentctl-profiles/v1",
+            "profiles": {"broken": {"harness": "codex"}},
+            "workspace": "required-label",
+        }), encoding="utf-8")
+        config.chmod(0o600)
+    outcomes = harness.invoke(mismatch, (
+        "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+        "--herdr-bin", "<HERDR>", "--registry", "<ROOT>/.agentctl",
+    ))
+    report.require(
+        "primary/workspace/explicit-mismatch",
+        all(outcome.returncode == 75 and "project configuration requires" in outcome.stderr
+            for outcome in outcomes)
+        and all(not (root / ".agentctl/worker").exists()
+                for root in (mismatch.python_root, mismatch.rust_root)),
+        f"workspace mismatch diverged or allocated a record: {outcomes!r}",
+    )
+
+    retirement = harness.case("primary-workspace-retirement")
+    for root in (retirement.python_root, retirement.rust_root):
+        subprocess.run(["/usr/bin/git", "init", "-q", str(root)], check=True)
+        (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+        (root / ".agentctl").mkdir(mode=0o700)
+    common = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/.agentctl")
+    _pair(harness, report, retirement, "primary/workspace/retirement/start", (
+        "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1", *common,
+    ))
+    for root in (retirement.python_root, retirement.rust_root):
+        config = root / ".agentctl/profiles.json"
+        config.write_text(json.dumps({
+            "schema": "agentctl-profiles/v1",
+            "profiles": {"broken": {"harness": "codex"}},
+            "workspace": "required-label",
+        }), encoding="utf-8")
+        config.chmod(0o600)
+    _pair(harness, report, retirement, "primary/workspace/retirement/status", (
+        "status", "worker", *common,
+    ))
+    _pair(harness, report, retirement, "primary/workspace/retirement/attach", (
+        "attach", "worker", *common,
+    ))
+    _pair(harness, report, retirement, "primary/workspace/retirement/goal-query", (
+        "goal", "worker", *common,
+    ))
+    _pair(harness, report, retirement, "primary/workspace/retirement/wait", (
+        "wait", "worker", "--timeout", "0", *common,
+    ))
+    _pair(harness, report, retirement, "primary/workspace/retirement/stop", (
+        "stop", "worker", *common,
+    ))
+
+    move = harness.case("primary-workspace-move")
+    for root in (move.python_root, move.rust_root):
+        subprocess.run(["/usr/bin/git", "init", "-q", str(root)], check=True)
+        (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+        (root / ".agentctl").mkdir(mode=0o700)
+    move_common = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/.agentctl")
+    _pair(harness, report, move, "primary/workspace/move/start", (
+        "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+        *move_common,
+    ))
+    for root in (move.python_root, move.rust_root):
+        config = root / ".agentctl/profiles.json"
+        config.write_text(json.dumps({
+            "schema": "agentctl-profiles/v1",
+            "workspace": "project-agents",
+            "profiles": {},
+        }), encoding="utf-8")
+        config.chmod(0o600)
+    _pair(harness, report, move, "primary/workspace/move/command", (
+        "move", "worker", *move_common,
+    ))
+    _pair(harness, report, move, "primary/workspace/move/status", (
+        "status", "worker", *move_common,
+    ))
+    report.require(
+        "primary/workspace/move/identity",
+        all(_state(root).get("pane_id") == "w-project:p1"
+            and _state(root).get("workspace_id") == "w-project"
+            for root in (move.python_root, move.rust_root)),
+        "move did not commit the destination Herdr identity",
+    )
 
     strict_documents = {
         "duplicate-json": (
@@ -1710,6 +1865,7 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
             _orientation(harness, report)
             _lifecycle(harness, report)
             _profiles(harness, report)
+            _workspace_policy(harness, report)
             _skill_install(harness, report)
             _profile_refusals(harness, report)
             _handoff_and_pending(harness, report)

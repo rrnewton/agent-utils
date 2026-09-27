@@ -621,7 +621,44 @@ pub fn drain_with_runtime<A: AgentApi + ?Sized>(
     options: DrainOptions,
     runtime: &dyn AgentRuntime,
 ) -> AgentResult<QueueResult> {
-    bind_queue_with_runtime(root, target, runtime)?;
+    drain_with_runtime_binding(client, target, root, options, runtime, false)
+}
+
+pub(crate) fn drain_managed<A: AgentApi + ?Sized>(
+    client: &A,
+    target: &Target,
+    root: &Path,
+    options: DrainOptions,
+) -> AgentResult<QueueResult> {
+    drain_with_runtime_binding(
+        client,
+        target,
+        root,
+        options,
+        &SystemRuntime::default(),
+        true,
+    )
+}
+
+pub(crate) fn drain_managed_with_runtime<A: AgentApi + ?Sized>(
+    client: &A,
+    target: &Target,
+    root: &Path,
+    options: DrainOptions,
+    runtime: &dyn AgentRuntime,
+) -> AgentResult<QueueResult> {
+    drain_with_runtime_binding(client, target, root, options, runtime, true)
+}
+
+fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
+    client: &A,
+    target: &Target,
+    root: &Path,
+    options: DrainOptions,
+    runtime: &dyn AgentRuntime,
+    allow_legacy_workspace_binding: bool,
+) -> AgentResult<QueueResult> {
+    bind_queue_with_runtime(root, target, runtime, allow_legacy_workspace_binding)?;
     let directories = prepare(root)?;
     let queue_lock_path = root.join(".delivery.lock");
     let queue_lock = open_private_lock(&queue_lock_path, "queue delivery lock")?;
@@ -825,12 +862,97 @@ pub(crate) fn send_identified_with_runtime<A: AgentApi + ?Sized>(
     runtime: &dyn AgentRuntime,
     message_id: Option<&str>,
 ) -> AgentResult<QueueResult> {
-    bind_queue_with_runtime(root, target, runtime)?;
+    send_identified_with_runtime_binding(
+        client,
+        target,
+        root,
+        text,
+        options,
+        message_id,
+        (runtime, false),
+    )
+}
+
+pub(crate) fn send_managed<A: AgentApi + ?Sized>(
+    client: &A,
+    target: &Target,
+    root: &Path,
+    text: &str,
+    options: DrainOptions,
+) -> AgentResult<QueueResult> {
+    send_identified_with_runtime_binding(
+        client,
+        target,
+        root,
+        text,
+        options,
+        None,
+        (&SystemRuntime::default(), true),
+    )
+}
+
+pub(crate) fn send_identified_managed<A: AgentApi + ?Sized>(
+    client: &A,
+    target: &Target,
+    root: &Path,
+    text: &str,
+    options: DrainOptions,
+    message_id: &str,
+) -> AgentResult<QueueResult> {
+    send_identified_with_runtime_binding(
+        client,
+        target,
+        root,
+        text,
+        options,
+        Some(message_id),
+        (&SystemRuntime::default(), true),
+    )
+}
+
+pub(crate) fn send_identified_managed_with_runtime<A: AgentApi + ?Sized>(
+    client: &A,
+    target: &Target,
+    root: &Path,
+    text: &str,
+    options: DrainOptions,
+    runtime: &dyn AgentRuntime,
+    message_id: Option<&str>,
+) -> AgentResult<QueueResult> {
+    send_identified_with_runtime_binding(
+        client,
+        target,
+        root,
+        text,
+        options,
+        message_id,
+        (runtime, true),
+    )
+}
+
+fn send_identified_with_runtime_binding<A: AgentApi + ?Sized>(
+    client: &A,
+    target: &Target,
+    root: &Path,
+    text: &str,
+    options: DrainOptions,
+    message_id: Option<&str>,
+    runtime_and_binding_mode: (&dyn AgentRuntime, bool),
+) -> AgentResult<QueueResult> {
+    let (runtime, allow_legacy_workspace_binding) = runtime_and_binding_mode;
+    bind_queue_with_runtime(root, target, runtime, allow_legacy_workspace_binding)?;
     // Explicit IDs serialize their cross-directory check against delivery transitions. Generated
     // identifiers plus no-replace creation need not wait behind a long-running drain. The drain and terminal-artifact inspection below resolve any message
     // consumed by another sender between these phases.
     let identifier = enqueue_internal(root, text, message_id, message_id.is_some(), runtime)?;
-    let result = drain_with_runtime(client, target, root, options, runtime)?;
+    let result = drain_with_runtime_binding(
+        client,
+        target,
+        root,
+        options,
+        runtime,
+        allow_legacy_workspace_binding,
+    )?;
     let filename = format!("{identifier}.json");
     let failed_path = root.join("failed").join(&filename);
     if result.quarantined.contains(&identifier) || fs::symlink_metadata(&failed_path).is_ok() {
@@ -902,8 +1024,25 @@ pub fn status<A: AgentApi + ?Sized>(
     target: &Target,
     root: &Path,
 ) -> AgentResult<QueueStatus> {
+    status_with_binding_mode(client, target, root, false)
+}
+
+pub(crate) fn status_managed<A: AgentApi + ?Sized>(
+    client: &A,
+    target: &Target,
+    root: &Path,
+) -> AgentResult<QueueStatus> {
+    status_with_binding_mode(client, target, root, true)
+}
+
+fn status_with_binding_mode<A: AgentApi + ?Sized>(
+    client: &A,
+    target: &Target,
+    root: &Path,
+    allow_legacy_workspace_binding: bool,
+) -> AgentResult<QueueStatus> {
     validate_existing_queue(root)?;
-    validate_existing_binding(root, target)?;
+    validate_existing_binding(root, target, allow_legacy_workspace_binding)?;
     let info = resolve_target(client, target)?;
     let directories = QueueDirectories::new(root);
     Ok(QueueStatus {
@@ -1225,15 +1364,47 @@ fn binding(target: &Target) -> AgentResult<Value> {
     }
 }
 
+fn same_binding_identity(left: &Value, right: &Value) -> bool {
+    left == right
+}
+
+fn binding_identity_matches(
+    actual: &Value,
+    expected: &Value,
+    allow_legacy_workspace_binding: bool,
+) -> bool {
+    if same_binding_identity(actual, expected) {
+        return true;
+    }
+    let (Some(mut compatible), Some(expected)) =
+        (actual.as_object().cloned(), expected.as_object())
+    else {
+        return false;
+    };
+    if !allow_legacy_workspace_binding
+        || !expected
+            .get("expected_workspace")
+            .is_some_and(Value::is_null)
+        || !compatible
+            .get("expected_workspace")
+            .is_some_and(Value::is_string)
+    {
+        return false;
+    }
+    compatible.insert("expected_workspace".to_owned(), Value::Null);
+    &compatible == expected
+}
+
 #[cfg(test)]
 fn bind_queue(root: &Path, target: &Target) -> AgentResult<()> {
-    bind_queue_with_runtime(root, target, &SystemRuntime::default())
+    bind_queue_with_runtime(root, target, &SystemRuntime::default(), false)
 }
 
 fn bind_queue_with_runtime(
     root: &Path,
     target: &Target,
     runtime: &dyn AgentRuntime,
+    allow_legacy_workspace_binding: bool,
 ) -> AgentResult<()> {
     validate_target_authority(target)?;
     prepare(root)?;
@@ -1245,7 +1416,7 @@ fn bind_queue_with_runtime(
     match fs::symlink_metadata(&binding_path) {
         Ok(_) => {
             let actual = read_private_json(&binding_path)?;
-            if actual != expected {
+            if !binding_identity_matches(&actual, &expected, allow_legacy_workspace_binding) {
                 return Err(AgentError::delivery(format!(
                     "queue {} is bound to {actual}, refusing different target {expected}",
                     root.display()
@@ -1266,7 +1437,123 @@ fn bind_queue_with_runtime(
     Ok(())
 }
 
-fn validate_existing_binding(root: &Path, target: &Target) -> AgentResult<()> {
+/// Replace one queue's exact target binding after a verified pane move.
+///
+/// Delivery is excluded while the binding changes. The old binding must be
+/// byte-semantically identical to `previous`; accepting `replacement` makes
+/// recovery idempotent when the binding commit succeeded but the surrounding
+/// agent-record commit did not.
+#[cfg(test)]
+pub(crate) fn rebind_queue(
+    root: &Path,
+    previous: &Target,
+    replacement: &Target,
+) -> AgentResult<()> {
+    validate_target_authority(previous)?;
+    validate_target_authority(replacement)?;
+    prepare(root)?;
+
+    let delivery_path = root.join(".delivery.lock");
+    let delivery = open_private_lock(&delivery_path, "queue delivery lock")?;
+    lock_exclusive_with_runtime(
+        &delivery,
+        &delivery_path,
+        "queue delivery",
+        &SystemRuntime::default(),
+    )?;
+
+    let binding_lock_path = root.join(".binding.lock");
+    let binding_lock = open_private_lock(&binding_lock_path, "queue binding lock")?;
+    lock_exclusive_with_runtime(
+        &binding_lock,
+        &binding_lock_path,
+        "queue binding",
+        &SystemRuntime::default(),
+    )?;
+
+    let path = root.join("target.json");
+    let old = binding(previous)?;
+    let new = binding(replacement)?;
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let actual = read_private_json(&path)?;
+            if !same_binding_identity(&actual, &old) && !same_binding_identity(&actual, &new) {
+                return Err(AgentError::delivery(format!(
+                    "queue {} is bound to {actual}, refusing move from {old} to {new}",
+                    root.display()
+                )));
+            }
+            if actual != new {
+                atomic_json(&path, &new)?;
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => atomic_json(&path, &new)?,
+        Err(error) => return Err(io_error("inspect queue target binding", &path, error)),
+    }
+    Ok(())
+}
+
+pub(crate) fn rebind_queue_after<T, F>(
+    root: &Path,
+    previous: &Target,
+    already_replacement: Option<&Target>,
+    allow_legacy_workspace_binding: bool,
+    operation: F,
+) -> AgentResult<T>
+where
+    F: FnOnce() -> AgentResult<(Target, T)>,
+{
+    validate_target_authority(previous)?;
+    prepare(root)?;
+    let delivery_path = root.join(".delivery.lock");
+    let delivery = open_private_lock(&delivery_path, "queue delivery lock")?;
+    lock_exclusive_with_runtime(
+        &delivery,
+        &delivery_path,
+        "queue delivery",
+        &SystemRuntime::default(),
+    )?;
+    let binding_lock_path = root.join(".binding.lock");
+    let binding_lock = open_private_lock(&binding_lock_path, "queue binding lock")?;
+    lock_exclusive_with_runtime(
+        &binding_lock,
+        &binding_lock_path,
+        "queue binding",
+        &SystemRuntime::default(),
+    )?;
+    let path = root.join("target.json");
+    let old = binding(previous)?;
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let actual = read_private_json(&path)?;
+            let replacement_allowed = already_replacement
+                .map(binding)
+                .transpose()?
+                .as_ref()
+                .is_some_and(|replacement| same_binding_identity(&actual, replacement));
+            if !binding_identity_matches(&actual, &old, allow_legacy_workspace_binding)
+                && !replacement_allowed
+            {
+                return Err(AgentError::delivery(format!(
+                    "queue {} is bound to {actual}, refusing move from {old}",
+                    root.display()
+                )));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error("inspect queue target binding", &path, error)),
+    }
+    let (replacement, result) = operation()?;
+    validate_target_authority(&replacement)?;
+    atomic_json(&path, &binding(&replacement)?)?;
+    Ok(result)
+}
+
+fn validate_existing_binding(
+    root: &Path,
+    target: &Target,
+    allow_legacy_workspace_binding: bool,
+) -> AgentResult<()> {
     let binding_path = root.join("target.json");
     let actual = match fs::symlink_metadata(&binding_path) {
         Ok(_) => read_private_json(&binding_path)?,
@@ -1280,7 +1567,7 @@ fn validate_existing_binding(root: &Path, target: &Target) -> AgentResult<()> {
         }
     };
     let expected = binding(target)?;
-    if actual != expected {
+    if !binding_identity_matches(&actual, &expected, allow_legacy_workspace_binding) {
         return Err(AgentError::delivery(format!(
             "queue {} is bound to {actual}, refusing different target {expected}",
             root.display()
@@ -2471,6 +2758,47 @@ mod tests {
             assert!(error.to_string().contains("already exists"));
         });
         assert!(fake.runs().is_empty());
+    }
+
+    #[test]
+    fn queue_rebind_is_idempotent_and_refuses_unrelated_identity() {
+        let directory = TestDirectory::new("queue-rebind");
+        let mut previous = target();
+        previous.session_agent = None;
+        previous.session_value = None;
+        previous.expected_workspace = Some("old-label".to_owned());
+        bind_queue(directory.path(), &previous).unwrap();
+        let mut replacement = previous.clone();
+        replacement.pane_id = Some("w2:p2".to_owned());
+        replacement.expected_workspace = Some("new-label".to_owned());
+        rebind_queue(directory.path(), &previous, &replacement).unwrap();
+        rebind_queue(directory.path(), &previous, &replacement).unwrap();
+        assert_eq!(
+            read_private_json(&directory.path().join("target.json")).unwrap(),
+            binding(&replacement).unwrap()
+        );
+        atomic_json(
+            &directory.path().join("target.json"),
+            &json!({
+                "kind": "pane", "pane_id": "foreign", "expected_agent": "codex",
+                "expected_workspace": null, "expected_cwd": "/work/mtg",
+            }),
+        )
+        .unwrap();
+        let error = rebind_queue(directory.path(), &previous, &replacement).unwrap_err();
+        assert!(error.to_string().contains("refusing move"));
+    }
+
+    #[test]
+    fn legacy_cli_workspace_pin_is_exact() {
+        let directory = TestDirectory::new("legacy-workspace-pin");
+        let mut pinned = target();
+        pinned.expected_workspace = Some("legacy-project".to_owned());
+        bind_queue(directory.path(), &pinned).unwrap();
+        let mut unpinned = pinned;
+        unpinned.expected_workspace = None;
+        let error = validate_existing_binding(directory.path(), &unpinned, false).unwrap_err();
+        assert!(error.to_string().contains("refusing different target"));
     }
 
     #[test]

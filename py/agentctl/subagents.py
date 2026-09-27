@@ -22,7 +22,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import cast
 
@@ -48,6 +48,7 @@ from agentctl.errors import AgentDeliveryError, HerdrRunError, HerdrUnavailable
 from agentctl.profiles import (
     reasoning_arguments,
     validate_structured_harness_argument_conflicts,
+    workspace_for_registry,
 )
 
 _NAME = re.compile(r"[a-z][a-z0-9-]{0,31}\Z")
@@ -686,7 +687,7 @@ class AgentRecord:
                 )
         return normalized
 
-    def target(self) -> agent.Target:
+    def target(self, expected_workspace: str | None = None) -> agent.Target:
         """Pin the exact pane and, when available at launch, its durable session."""
         if not self.pane_id:
             raise AgentDeliveryError(f"agent {self.name!r} has no confirmed pane; inspect its launch error")
@@ -700,6 +701,7 @@ class AgentRecord:
             ),
             expected_agent=self.harness,
             expected_cwd=self.cwd,
+            expected_workspace=expected_workspace,
         )
 
 
@@ -798,11 +800,16 @@ def _goal_replacement_selected(screen: str, objective: str) -> bool:
 class _WorkspaceClient:
     """Add exact workspace checks to every queue readiness probe, after enqueue."""
 
-    def __init__(self, client: HerdrClient, record: AgentRecord, *, queue: str | None = None, check_prompt: bool = True) -> None:
+    def __init__(
+        self, client: HerdrClient, record: AgentRecord, *,
+        queue: str | None = None, check_prompt: bool = True,
+        expected_workspace: str | None = None,
+    ) -> None:
         self.client, self.record = client, record
         self.goal_objective: str | None = None
         self.queue = queue
         self.check_prompt = check_prompt
+        self.expected_workspace = expected_workspace
         self.custom_submission: tuple[str, str, int] | None = None
 
     def pane_info(self, pane_id: str) -> AgentPaneInfo:
@@ -817,6 +824,14 @@ class _WorkspaceClient:
         info = self.client.pane_info(pane_id)
         if info.workspace_id != self.record.workspace_id:
             raise HerdrUnavailable(f"agent {self.record.name!r} workspace identity changed")
+        if (self.expected_workspace is not None
+                and self.client.workspace_label(info.workspace_id)
+                != self.expected_workspace):
+            raise HerdrUnavailable(
+                f"refusing pane {pane_id}: workspace is "
+                f"{self.client.workspace_label(info.workspace_id)!r}, expected "
+                f"{self.expected_workspace!r}"
+            )
         if pane_id == self.record.pane_id:
             if self.record.goal_session_id is not None and info.session_value is not None and info.session_value != self.record.goal_session_id:
                 raise HerdrUnavailable(f"agent {self.record.name!r} native session identity changed")
@@ -970,6 +985,19 @@ class ManagedAgents:
     def __init__(self, client: HerdrClient, registry: str | Path = ".herdr-agents") -> None:
         self.client = client
         self.registry = Path(os.path.abspath(registry))
+        # Tests may set this explicit override. Production policy is read for
+        # each operation that needs it, so a long-running manager cannot retain
+        # a stale placement label.
+        self.project_workspace: str | None = None
+
+    def _project_workspace(self) -> str | None:
+        return self.project_workspace or workspace_for_registry(self.registry)
+
+    def _target(self, record: AgentRecord) -> agent.Target:
+        return record.target()
+
+    def _policy_target(self, record: AgentRecord) -> agent.Target:
+        return record.target(self._project_workspace())
 
     def _prepare(self) -> None:
         self.registry.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1280,6 +1308,136 @@ class ManagedAgents:
     def _queue(self, name: str) -> str:
         return str(self._directory(name) / "queue")
 
+    def _move_intent_path(self, name: str) -> Path:
+        return self._directory(name) / "move.json"
+
+    def _write_move_intent(self, record: AgentRecord, destination: str) -> None:
+        agent._atomic_json(
+            str(self._move_intent_path(record.name)),
+            {
+                "schema": "agentctl-move/v1",
+                "token": record.token,
+                "source_pane_id": record.pane_id,
+                "source_tab_id": record.tab_id,
+                "source_workspace_id": record.workspace_id,
+                "destination_workspace_id": destination,
+                "harness": record.harness,
+                "cwd": record.cwd,
+                "session_agent": record.session_agent,
+                "session_value": record.session_value,
+            },
+        )
+
+    def _require_move_intent(self, record: AgentRecord, destination: str) -> None:
+        actual = self._read_move_intent(record)
+        if actual is None:
+            raise AgentDeliveryError(
+                f"refusing to recover move of {record.name!r}: no durable move intent"
+            )
+        expected = {
+            "schema": "agentctl-move/v1",
+            "token": record.token,
+            "source_pane_id": record.pane_id,
+            "source_tab_id": record.tab_id,
+            "source_workspace_id": record.workspace_id,
+            "destination_workspace_id": destination,
+            "harness": record.harness,
+            "cwd": record.cwd,
+            "session_agent": record.session_agent,
+            "session_value": record.session_value,
+        }
+        if actual != expected:
+            raise AgentDeliveryError(
+                f"refusing to recover move of {record.name!r}: durable move intent "
+                f"changed; rerun `agentctl move {record.name}`"
+            )
+
+    def _read_move_intent(self, record: AgentRecord) -> dict[str, object] | None:
+        """Read and validate the record-independent authority in a move intent."""
+        path = self._move_intent_path(record.name)
+        if not path.exists():
+            return None
+        try:
+            actual = agent._read_queue_json(
+                str(path), "move intent", require_private=True,
+            )
+        except HerdrRunError as exc:
+            raise AgentDeliveryError(
+                f"move of {record.name!r} has an unreadable durable intent; "
+                f"rerun `agentctl move {record.name}`: {exc}"
+            ) from exc
+        invariant = {
+            "schema": "agentctl-move/v1",
+            "token": record.token,
+            "harness": record.harness,
+            "cwd": record.cwd,
+            "session_agent": record.session_agent,
+            "session_value": record.session_value,
+        }
+        if (not isinstance(actual, dict)
+                or any(actual.get(key) != value for key, value in invariant.items())
+                or not all(isinstance(actual.get(key), str) for key in (
+                    "source_pane_id", "source_tab_id", "source_workspace_id",
+                    "destination_workspace_id",
+                ))):
+            raise AgentDeliveryError(
+                f"move of {record.name!r} has an invalid durable intent; "
+                f"rerun `agentctl move {record.name}`"
+            )
+        return actual
+
+    def _pending_move_destination(self, record: AgentRecord) -> str | None:
+        """Return a valid pending destination, refusing ambiguous intent state."""
+        actual = self._read_move_intent(record)
+        if actual is None:
+            return None
+        destination = cast(str, actual["destination_workspace_id"])
+        expected = {
+            "schema": "agentctl-move/v1",
+            "token": record.token,
+            "source_pane_id": record.pane_id,
+            "source_tab_id": record.tab_id,
+            "source_workspace_id": record.workspace_id,
+            "destination_workspace_id": destination,
+            "harness": record.harness,
+            "cwd": record.cwd,
+            "session_agent": record.session_agent,
+            "session_value": record.session_value,
+        }
+        completed = (record.workspace_id == destination
+                     and actual["source_workspace_id"] != destination)
+        if actual != expected and not completed:
+            raise AgentDeliveryError(
+                f"move of {record.name!r} has a durable intent that does not match "
+                f"its record; rerun `agentctl move {record.name}`"
+            )
+        return destination
+
+    def _source_unchanged_after_failed_move(self, record: AgentRecord) -> bool:
+        """Prove a failed Herdr move made no externally visible placement change."""
+        if record.pane_id is None or self.client.agent_pane(record.name) != record.pane_id:
+            return False
+        presentations = [
+            pane for pane in self.client.panes()
+            if pane.pane_id == record.pane_id
+        ]
+        if (len(presentations) != 1
+                or presentations[0].tab_id != record.tab_id
+                or presentations[0].workspace_id != record.workspace_id):
+            return False
+        info = self.client.pane_info(record.pane_id)
+        return (info.pane_id == record.pane_id
+                and info.workspace_id == record.workspace_id
+                and os.path.realpath(info.cwd) == os.path.realpath(record.cwd))
+
+    def _clear_move_intent(self, name: str) -> None:
+        path = self._move_intent_path(name)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return
+        agent._fsync_dir(str(path.parent))
+
     def get(self, name: str) -> AgentRecord:
         """Read durable metadata without requiring Herdr to be reachable."""
         return self._load(name)
@@ -1343,6 +1501,14 @@ class ManagedAgents:
         environment = environment_entries(environment)
         if brief is not None and not brief:
             raise AgentDeliveryError("brief must not be empty")
+        project_workspace = self._project_workspace()
+        if project_workspace is not None and workspace_id is not None:
+            actual_label = self.client.workspace_label(workspace_id)
+            if actual_label != project_workspace:
+                raise AgentDeliveryError(
+                    f"workspace {workspace_id!r} is labelled {actual_label!r}, "
+                    f"but project configuration requires {project_workspace!r}"
+                )
         with self._lock(name):
             with self._identity_transaction():
                 if resume is not None:
@@ -1361,7 +1527,9 @@ class ManagedAgents:
                                      adapter="herdr-pane" if harness == "muse" else "herdr")
                 self._save(record)
                 try:
-                    self._create_presentation(record, workspace_id, environment)
+                    self._create_presentation(
+                        record, workspace_id, environment, project_workspace
+                    )
                     assert record.pane_id is not None
                     if record.adapter == "herdr-pane":
                         def persist_identity(identity: CustomProcessIdentity) -> None:
@@ -1381,7 +1549,7 @@ class ManagedAgents:
                          record.effective_reasoning_effort) = muse_startup_metadata(screen)
                     else:
                         self.client.start_agent(name, harness, record.pane_id, arguments, timeout=startup_timeout)
-                    info = self._checked(record, ready=True)
+                    info = self._checked(record, ready=True, enforce_policy=True)
                     if info.workspace_id != record.workspace_id:
                         raise AgentDeliveryError("started agent moved to another workspace")
                     record.session_agent = info.session_agent
@@ -1405,7 +1573,7 @@ class ManagedAgents:
                                 "closed the conflicting new pane"
                             )
                         try:
-                            agent.resolve_target(self.client, record.target())
+                            agent.resolve_target(self.client, self._target(record))
                         except HerdrRunError as identity_error:
                             record.session_agent = record.session_value = None
                             raise AgentDeliveryError(
@@ -1415,7 +1583,7 @@ class ManagedAgents:
                     record.lifecycle = "running"
                     self._save(record)
                     try:
-                        agent.resolve_target(self.client, record.target())
+                        agent.resolve_target(self.client, self._target(record))
                         final_info = self._checked(record, ready=True)
                     except HerdrRunError:
                         record.session_agent = record.session_value = None
@@ -1439,10 +1607,14 @@ class ManagedAgents:
                         f"tab retained at {directory}"
                     ) from exc
             if brief is not None:
-                client = cast(HerdrClient, _WorkspaceClient(self.client, record, queue=self._queue(name)))
-                agent.send(client, record.target(), self._queue(name), brief,
+                client = cast(HerdrClient, _WorkspaceClient(
+                    self.client, record, queue=self._queue(name),
+                    expected_workspace=project_workspace,
+                ))
+                agent.send(client, self._target(record), self._queue(name), brief,
                            ready_timeout=ready_timeout, working_timeout=working_timeout,
-                           max_attempts=max_attempts)
+                           max_attempts=max_attempts,
+                           allow_legacy_workspace_binding=True)
             # Keep the generation lock until its initial instruction and result
             # are captured; a replacement must never receive this launch's brief.
             return self.status(name)
@@ -1462,6 +1634,13 @@ class ManagedAgents:
             raise AgentDeliveryError("adopt needs a nonempty pane id without NUL")
         if not expected_workspace or "\0" in expected_workspace:
             raise AgentDeliveryError("adopt needs a nonempty expected workspace label without NUL")
+        project_workspace = self._project_workspace()
+        if (project_workspace is not None
+                and expected_workspace != project_workspace):
+            raise AgentDeliveryError(
+                f"adopt workspace {expected_workspace!r} does not match project "
+                f"workspace {project_workspace!r}"
+            )
         if not _KIND.fullmatch(harness):
             raise AgentDeliveryError("harness must be a Herdr agent kind")
         if harness == "muse":
@@ -1643,21 +1822,33 @@ class ManagedAgents:
 
     def _create_presentation(
         self, record: AgentRecord, workspace_id: str | None,
-        environment: Sequence[str],
+        environment: Sequence[str], project_workspace: str | None,
     ) -> None:
         # Independent registries can share the default workspace. Serialize label
         # resolution and creation host-wide, releasing before any harness startup.
-        lock = agent._open_private_lock(agent._target_lock_path("managed-workspace:subagents"), "workspace allocation lock")
+        default_label = project_workspace or "subagents"
+        lock = agent._open_private_lock(
+            agent._target_lock_path(f"managed-workspace:{default_label}"),
+            "workspace allocation lock",
+        )
         try:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            selected = workspace_id or os.environ.get("HERDR_WORKSPACE_ID")
+            selected = workspace_id
+            if selected is None and project_workspace is None:
+                selected = os.environ.get("HERDR_WORKSPACE_ID")
             if selected:
-                self.client.workspace_label(selected)
+                actual_label = self.client.workspace_label(selected)
+                if (project_workspace is not None
+                        and actual_label != project_workspace):
+                    raise AgentDeliveryError(
+                        f"workspace {selected!r} is labelled {actual_label!r}, "
+                        f"but project configuration requires {default_label!r}"
+                    )
             else:
-                selected = self.client.workspace_id_for_label("subagents")
+                selected = self.client.workspace_id_for_label(default_label)
             if selected is None:
                 selected, tab, pane = self.client.create_workspace(
-                    label="subagents", cwd=record.cwd, environment=environment
+                    label=default_label, cwd=record.cwd, environment=environment
                 )
                 record.workspace_id, record.tab_id, record.pane_id = selected, tab, pane
                 self._save(record)
@@ -1672,14 +1863,21 @@ class ManagedAgents:
         finally:
             os.close(lock)
 
-    def _checked(self, record: AgentRecord, *, ready: bool = False) -> AgentPaneInfo:
+    def _checked(
+        self, record: AgentRecord, *, ready: bool = False,
+        enforce_policy: bool = False,
+    ) -> AgentPaneInfo:
         if record.adapter not in ("herdr", "herdr-pane", "herdr-foreign"):
             raise AgentDeliveryError("this operation requires the interactive Herdr adapter")
         client = cast(HerdrClient, _WorkspaceClient(self.client, record, check_prompt=ready))
-        info = agent.resolve_target(client, record.target())
+        target = self._policy_target(record) if enforce_policy else self._target(record)
+        info = agent.resolve_target(client, target)
         if info.workspace_id != record.workspace_id:
             raise AgentDeliveryError(f"agent {record.name!r} workspace identity changed")
         return info
+
+    def _require_policy(self, record: AgentRecord) -> None:
+        agent.resolve_target(self.client, self._policy_target(record))
 
     def _checked_or_failed_pane_report(self, record: AgentRecord, pane_id: str) -> None:
         """Prove a failed custom launch is still ours or has returned to its shell."""
@@ -1718,6 +1916,219 @@ class ManagedAgents:
         """Report live state or a visible probe error, preserving every durable record."""
         return self._status_record(self._load(name))
 
+    def move_to_project_workspace(self, name: str) -> dict[str, object]:
+        """Move one owned interactive pane to the configured project workspace.
+
+        A cross-workspace Herdr move changes the public pane id. If that move
+        completed before the registry write, a repeat invocation recovers the
+        new identity through the globally unique managed agent name.
+        """
+        with self._lock(name):
+            record = self._load(name)
+            if (record.adapter != "herdr" or record.lifecycle != "running"
+                    or record.mode != "interactive" or record.backend != "herdr"):
+                raise AgentDeliveryError(
+                    "move supports only a running agentctl-owned native Herdr agent"
+                )
+            expected_workspace = self._project_workspace()
+            if expected_workspace is None:
+                pending_destination = self._pending_move_destination(record)
+                if pending_destination is None:
+                    raise AgentDeliveryError(
+                        "move requires a workspace field in .agentctl/profiles.json "
+                        "or a durable pending move"
+                    )
+                destination = pending_destination
+                expected_workspace = self.client.workspace_label(destination)
+            else:
+                resolved_destination = self.client.workspace_id_for_label(expected_workspace)
+                if resolved_destination is None:
+                    raise AgentDeliveryError(
+                        f"configured project workspace {expected_workspace!r} does not exist"
+                    )
+                destination = resolved_destination
+                if self.client.workspace_label(destination) != expected_workspace:
+                    raise AgentDeliveryError(
+                        "configured project workspace changed during resolution"
+                    )
+            if record.pane_id is None:
+                raise AgentDeliveryError(f"agent {name!r} has no confirmed pane")
+            recorded_pane = record.pane_id
+            previous_target = record.target()
+            named_pane = self.client.agent_pane(name)
+            if named_pane != recorded_pane:
+                self._require_move_intent(record, destination)
+                if any(pane.pane_id == recorded_pane for pane in self.client.panes()):
+                    raise AgentDeliveryError(
+                        f"refusing to recover move of {name!r}: both recorded and named panes are live"
+                    )
+                target = agent.Target(
+                    pane_id=named_pane,
+                    session_agent=record.session_agent,
+                    session_value=record.session_value,
+                    expected_agent=record.harness,
+                    expected_workspace=expected_workspace,
+                    expected_cwd=record.cwd,
+                )
+                binding_target = replace(record.target(), pane_id=named_pane)
+                def recover() -> tuple[agent.Target, object]:
+                    with self._pane_lock(named_pane):
+                        if self.client.agent_pane(name) != named_pane:
+                            raise AgentDeliveryError(
+                                f"refusing to recover move of {name!r}: managed name changed panes"
+                            )
+                        if any(pane.pane_id == recorded_pane for pane in self.client.panes()):
+                            raise AgentDeliveryError(
+                                f"refusing to recover move of {name!r}: both recorded and named panes are live"
+                            )
+                        info = agent.resolve_target(self.client, target)
+                        presentations = [
+                            pane for pane in self.client.panes(destination)
+                            if pane.pane_id == info.pane_id
+                        ]
+                        if len(presentations) != 1:
+                            raise AgentDeliveryError(
+                                f"refusing to recover move of {name!r}: expected one "
+                                f"destination presentation, found {len(presentations)}"
+                            )
+                        presentation = presentations[0]
+                        if sum(
+                            pane.tab_id == presentation.tab_id
+                            for pane in self.client.panes(destination)
+                        ) != 1:
+                            raise AgentDeliveryError(
+                                f"refusing to recover move of {name!r}: its tab contains another pane"
+                            )
+                        return binding_target, (info, presentation)
+
+                recovered = agent.rebind_queue_after(
+                    self._queue(name), previous_target, recover,
+                    already_replacement=binding_target,
+                    allow_legacy_workspace_binding=True,
+                )
+                assert isinstance(recovered, tuple)
+                info, presentation = recovered
+                record.workspace_id = destination
+                record.tab_id = presentation.tab_id
+                record.pane_id = info.pane_id
+                self._save(record)
+                self._clear_move_intent(name)
+                result = self._status_record(record)
+                result.update({
+                    "moved": True,
+                    "recovered": True,
+                    "previous_pane_id": recorded_pane,
+                })
+                return result
+
+            def perform() -> tuple[agent.Target, object]:
+                with self._pane_lock(recorded_pane):
+                    client = cast(HerdrClient, _WorkspaceClient(self.client, record))
+                    source_info = agent.resolve_target(client, previous_target)
+                    if self.client.agent_pane(name) != source_info.pane_id:
+                        raise AgentDeliveryError(
+                            f"refusing to move {name!r}: managed agent name changed panes"
+                        )
+                    presentations = [
+                        pane for pane in self.client.panes(source_info.workspace_id)
+                        if pane.pane_id == source_info.pane_id
+                    ]
+                    if len(presentations) != 1:
+                        raise AgentDeliveryError(
+                            f"refusing to move {name!r}: expected one source "
+                            f"presentation, found {len(presentations)}"
+                        )
+                    source = presentations[0]
+                    if (source.tab_id != record.tab_id
+                            or source.workspace_id != record.workspace_id):
+                        raise AgentDeliveryError(
+                            f"refusing to move {name!r}: recorded tab or workspace "
+                            "identity changed"
+                        )
+                    if sum(
+                        pane.tab_id == source.tab_id
+                        for pane in self.client.panes(source.workspace_id)
+                    ) != 1:
+                        raise AgentDeliveryError(
+                            f"refusing to move {name!r}: its tab contains another pane"
+                        )
+                    if source.workspace_id == destination:
+                        target = agent.Target(
+                            pane_id=source.pane_id,
+                            session_agent=record.session_agent,
+                            session_value=record.session_value,
+                            expected_agent=record.harness,
+                            expected_workspace=expected_workspace,
+                            expected_cwd=record.cwd,
+                        )
+                        return replace(target, expected_workspace=None), (False, None)
+                    self._write_move_intent(record, destination)
+                    try:
+                        moved = self.client.move_pane_to_new_tab(
+                            source.pane_id,
+                            workspace_id=destination,
+                            tab_label=name,
+                        )
+                    except HerdrRunError:
+                        try:
+                            unchanged = self._source_unchanged_after_failed_move(record)
+                        except HerdrRunError:
+                            unchanged = False
+                        if unchanged:
+                            self._clear_move_intent(name)
+                        raise
+                    if self.client.agent_pane(name) != moved.pane_id:
+                        raise AgentDeliveryError(
+                            f"move of {name!r} completed but the managed name did not "
+                            "follow it; rerun move only after inspecting Herdr"
+                        )
+                    target = agent.Target(
+                        pane_id=moved.pane_id,
+                        session_agent=record.session_agent,
+                        session_value=record.session_value,
+                        expected_agent=record.harness,
+                        expected_workspace=expected_workspace,
+                        expected_cwd=record.cwd,
+                    )
+                    info = agent.resolve_target(self.client, target)
+                    final_presentations = [
+                        pane for pane in self.client.panes(destination)
+                        if pane.pane_id == info.pane_id
+                    ]
+                    if (len(final_presentations) != 1
+                            or final_presentations[0].tab_id != moved.tab_id
+                            or final_presentations[0].workspace_id != moved.workspace_id):
+                        raise AgentDeliveryError(
+                            f"move of {name!r} completed but final presentation "
+                            "verification failed; rerun move to recover"
+                        )
+                    return replace(target, expected_workspace=None), (True, moved)
+
+            outcome = agent.rebind_queue_after(
+                self._queue(name), previous_target, perform,
+                allow_legacy_workspace_binding=True,
+            )
+            assert isinstance(outcome, tuple)
+            did_move, moved = outcome
+            if not did_move:
+                self._clear_move_intent(name)
+                result = self._status_record(record)
+                result.update({"moved": False, "recovered": False})
+                return result
+            assert moved is not None
+            record.workspace_id = moved.workspace_id
+            record.tab_id = moved.tab_id
+            record.pane_id = moved.pane_id
+            self._save(record)
+            self._clear_move_intent(name)
+            result = self._status_record(record)
+            result.update({
+                "moved": True,
+                "recovered": False,
+                "previous_pane_id": recorded_pane,
+            })
+            return result
+
     def _status_record(self, record: AgentRecord) -> dict[str, object]:
         """Probe one pinned record without resolving its name a second time."""
         name = record.name
@@ -1727,12 +2138,26 @@ class ManagedAgents:
         result["goal_source"] = "requested" if record.goal is not None else None
         result["goal_delivery"] = self._goal_delivery(record)
         try:
+            destination = self._pending_move_destination(record)
+            if destination is not None:
+                result.update({
+                    "agent_status": "unknown",
+                    "move_pending": True,
+                    "move_destination_workspace_id": destination,
+                    "probe_error": (
+                        f"move of {name!r} is incomplete; rerun `agentctl move {name}`"
+                    ),
+                })
+                return result
             client = cast(
                 HerdrClient,
                 _WorkspaceClient(self.client, record, check_prompt=False),
             )
-            agent.resolve_target(client, record.target())
-            result.update(agent.status(client, record.target(), self._queue(name)))
+            agent.resolve_target(client, self._target(record))
+            result.update(agent.status(
+                client, self._target(record), self._queue(name),
+                allow_legacy_workspace_binding=True,
+            ))
             result["probe_error"] = None
         except HerdrRunError as exc:
             result["agent_status"], result["probe_error"] = "unknown", str(exc)
@@ -1763,23 +2188,38 @@ class ManagedAgents:
         with self._lock(name):
             record = self._load_expected(name, expected_token)
             self._require_automation(record)
-            client = cast(HerdrClient, _WorkspaceClient(self.client, record, queue=self._queue(name)))
-            return agent.send(client, record.target(), self._queue(name), text, message_id=message_id, **options)
+            client = cast(HerdrClient, _WorkspaceClient(
+                self.client, record, queue=self._queue(name),
+                expected_workspace=self._project_workspace(),
+            ))
+            return agent.send(
+                client, self._target(record), self._queue(name), text,
+                message_id=message_id, allow_legacy_workspace_binding=True,
+                **options,
+            )
 
     def drain(self, name: str, **options: object) -> agent.QueueResult:
         """Retry only messages that the shared queue knows were never submitted."""
         with self._lock(name):
             record = self._load(name)
             self._require_automation(record)
-            client = cast(HerdrClient, _WorkspaceClient(self.client, record, queue=self._queue(name)))
-            return agent.drain(client, record.target(), self._queue(name), **options)  # type: ignore[arg-type]
+            client = cast(HerdrClient, _WorkspaceClient(
+                self.client, record, queue=self._queue(name),
+                expected_workspace=self._project_workspace(),
+            ))
+            return agent.drain(
+                client, self._target(record), self._queue(name),
+                allow_legacy_workspace_binding=True,
+                **options,  # type: ignore[arg-type]
+            )
 
     def read(self, name: str, *, lines: int = 500) -> str:
         """Read human and coordinator turns together; persist the latest bounded snapshot."""
         with self._lock(name):
             record = self._load(name)
+            self._require_policy(record)
             self._checked(record)
-            text = agent.read(self.client, record.target(), lines=lines)
+            text = agent.read(self.client, self._target(record), lines=lines)
             agent._atomic_json(str(self._directory(name) / "output.json"),
                                {"text": text, "captured_at": time.time(), "pane_id": record.pane_id})
             return text
@@ -3017,8 +3457,15 @@ class ManagedAgents:
             self._save(record)
             prompt = f"/goal {text}" if record.harness == "codex" else f"Your ongoing goal: {text}\nWork toward this goal and report completion or blockers."
             try:
-                client = cast(HerdrClient, _WorkspaceClient(self.client, record, queue=self._queue(name)))
-                result = agent.send(client, record.target(), self._queue(name), prompt, message_id=identifier, **options)
+                client = cast(HerdrClient, _WorkspaceClient(
+                    self.client, record, queue=self._queue(name),
+                    expected_workspace=self._project_workspace(),
+                ))
+                result = agent.send(
+                    client, self._target(record), self._queue(name), prompt,
+                    message_id=identifier, allow_legacy_workspace_binding=True,
+                    **options,
+                )
             except HerdrRunError as exc:
                 record.goal_delivery = str(getattr(exc, "outcome", "failed"))
                 self._save(record)
@@ -3058,6 +3505,12 @@ class ManagedAgents:
             if confirmed_record.to_document() != record.to_document():
                 raise AgentDeliveryError(f"agent {name!r} record changed before stop")
             record = confirmed_record
+            pending_destination = self._pending_move_destination(record)
+            if pending_destination is not None:
+                raise AgentDeliveryError(
+                    f"refusing to stop {name!r}: move is incomplete; "
+                    f"rerun `agentctl move {name}`"
+                )
             if recover_legacy_adoption:
                 return self._recover_legacy_adoption(
                     record, expected_token=expected_token,

@@ -1193,6 +1193,27 @@ def _binding(target: Target) -> dict[str, object]:
     return identity
 
 
+def _same_binding_identity(left: object, right: object) -> bool:
+    """Compare every durable delivery-identity assertion exactly."""
+    return isinstance(left, dict) and isinstance(right, dict) and left == right
+
+
+def _binding_identity_matches(
+    actual: object, expected: object, *, allow_legacy_workspace_binding: bool,
+) -> bool:
+    """Accept an old managed label only for a deliberately unpinned managed target."""
+    if _same_binding_identity(actual, expected):
+        return True
+    if (not allow_legacy_workspace_binding or not isinstance(actual, dict)
+            or not isinstance(expected, dict)
+            or expected.get("expected_workspace") is not None
+            or not isinstance(actual.get("expected_workspace"), str)):
+        return False
+    compatible = dict(actual)
+    compatible["expected_workspace"] = None
+    return compatible == expected
+
+
 def _target_lock_name(pane_id: str) -> str:
     """Return the lock file name for one resolved live pane, independent of its directory."""
     identity: dict[str, object] = {"kind": "pane", "pane_id": pane_id}
@@ -1233,7 +1254,10 @@ def _lock_resolved_target(
             os.close(descriptor)
 
 
-def _bind_queue(root: str, target: Target, *, max_artifact_bytes: int | None = None) -> None:
+def _bind_queue(
+    root: str, target: Target, *, max_artifact_bytes: int | None = None,
+    allow_legacy_workspace_binding: bool = False,
+) -> None:
     """Create or verify the durable queue-to-target binding under its own lock."""
     if not (target.pane_id or target.session_value):
         raise AgentDeliveryError("target needs --pane or a stable session value")
@@ -1257,7 +1281,10 @@ def _bind_queue(root: str, target: Target, *, max_artifact_bytes: int | None = N
                 binding_path, "queue target binding", require_private=True,
                 max_artifact_bytes=max_artifact_bytes,
             )
-            if actual != expected:
+            if not _binding_identity_matches(
+                actual, expected,
+                allow_legacy_workspace_binding=allow_legacy_workspace_binding,
+            ):
                 raise AgentDeliveryError(
                     _bounded_error(
                         f"queue {root} is bound to {actual!r}, refusing different target {expected!r}",
@@ -1270,7 +1297,106 @@ def _bind_queue(root: str, target: Target, *, max_artifact_bytes: int | None = N
         os.close(descriptor)
 
 
-def _validate_existing_binding(root: str, target: Target) -> None:
+def rebind_queue(root: str, previous: Target, replacement: Target) -> None:
+    """Replace an exact queue binding while excluding concurrent delivery.
+
+    Accepting an already-installed replacement makes recovery idempotent when
+    the binding commit succeeded but the surrounding agent-record commit did
+    not.
+    """
+    for target in (previous, replacement):
+        if not (target.pane_id or target.session_value):
+            raise AgentDeliveryError("target needs --pane or a stable session value")
+    _prepare(root)
+    delivery_path = os.path.join(root, ".delivery.lock")
+    binding_lock_path = os.path.join(root, ".binding.lock")
+    binding_path = os.path.join(root, "target.json")
+    delivery_descriptor = _open_private_lock(delivery_path, "queue delivery lock")
+    binding_descriptor = -1
+    try:
+        fcntl.flock(delivery_descriptor, fcntl.LOCK_EX)
+        binding_descriptor = _open_private_lock(
+            binding_lock_path, "queue binding lock"
+        )
+        fcntl.flock(binding_descriptor, fcntl.LOCK_EX)
+        old = _binding(previous)
+        new = _binding(replacement)
+        if os.path.lexists(binding_path):
+            actual = _read_queue_json(
+                binding_path, "queue target binding", require_private=True,
+            )
+            if (not _same_binding_identity(actual, old)
+                    and not _same_binding_identity(actual, new)):
+                raise AgentDeliveryError(
+                    f"queue {root} is bound to {actual!r}, refusing move "
+                    f"from {old!r} to {new!r}"
+                )
+            if actual != new:
+                _atomic_json(binding_path, new)
+        else:
+            _atomic_json(binding_path, new)
+    finally:
+        if binding_descriptor >= 0:
+            os.close(binding_descriptor)
+        os.close(delivery_descriptor)
+
+
+def rebind_queue_after(
+    root: str,
+    previous: Target,
+    operation: Callable[[], tuple[Target, object]],
+    *, already_replacement: Target | None = None,
+    allow_legacy_workspace_binding: bool = False,
+) -> object:
+    """Run an irreversible move only after proving its queue can be rebound.
+
+    The queue delivery and binding locks remain held across ``operation``.  This
+    gives move the same delivery-lock-before-target-lock order as drain and
+    prevents a foreign binding from being discovered after Herdr changed state.
+    """
+    if not (previous.pane_id or previous.session_value):
+        raise AgentDeliveryError("target needs --pane or a stable session value")
+    _prepare(root)
+    delivery_path = os.path.join(root, ".delivery.lock")
+    binding_lock_path = os.path.join(root, ".binding.lock")
+    binding_path = os.path.join(root, "target.json")
+    delivery_descriptor = _open_private_lock(delivery_path, "queue delivery lock")
+    binding_descriptor = -1
+    try:
+        fcntl.flock(delivery_descriptor, fcntl.LOCK_EX)
+        binding_descriptor = _open_private_lock(binding_lock_path, "queue binding lock")
+        fcntl.flock(binding_descriptor, fcntl.LOCK_EX)
+        old = _binding(previous)
+        if os.path.lexists(binding_path):
+            actual = _read_queue_json(
+                binding_path, "queue target binding", require_private=True,
+            )
+            replacement_allowed = (
+                already_replacement is not None
+                and _same_binding_identity(actual, _binding(already_replacement))
+            )
+            if (not _binding_identity_matches(
+                    actual, old,
+                    allow_legacy_workspace_binding=allow_legacy_workspace_binding,
+                ) and not replacement_allowed):
+                raise AgentDeliveryError(
+                    f"queue {root} is bound to {actual!r}, refusing move from {old!r}"
+                )
+        replacement, result = operation()
+        if not (replacement.pane_id or replacement.session_value):
+            raise AgentDeliveryError("target needs --pane or a stable session value")
+        new = _binding(replacement)
+        _atomic_json(binding_path, new)
+        return result
+    finally:
+        if binding_descriptor >= 0:
+            os.close(binding_descriptor)
+        os.close(delivery_descriptor)
+
+
+def _validate_existing_binding(
+    root: str, target: Target, *, allow_legacy_workspace_binding: bool = False,
+) -> None:
     """Read-only binding validation for observational commands such as status."""
 
     if not os.path.lexists(root):
@@ -1281,7 +1407,10 @@ def _validate_existing_binding(root: str, target: Target) -> None:
         return
     expected = _binding(target)
     actual = _read_queue_json(binding_path, "queue target binding", require_private=True)
-    if actual != expected:
+    if not _binding_identity_matches(
+        actual, expected,
+        allow_legacy_workspace_binding=allow_legacy_workspace_binding,
+    ):
         raise AgentDeliveryError(
             f"queue {root} is bound to {actual!r}, refusing different target {expected!r}"
         )
@@ -1462,18 +1591,22 @@ def drain(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     atomic_policy: AtomicWritePolicy | None = None,
+    allow_legacy_workspace_binding: bool = False,
 ) -> QueueResult:
     """Drain a queue, optionally sharing a bounded atomic staging domain."""
     with atomic_write_policy(atomic_policy):
         return _drain(client, target, root, ready_timeout=ready_timeout,
                       working_timeout=working_timeout, max_attempts=max_attempts,
-                      max_artifact_bytes=max_artifact_bytes, sleep=sleep, monotonic=monotonic)
+                      max_artifact_bytes=max_artifact_bytes, sleep=sleep,
+                      monotonic=monotonic,
+                      allow_legacy_workspace_binding=allow_legacy_workspace_binding)
 
 
 def _drain(
     client: HerdrClient, target: Target, root: str, *, ready_timeout: float,
     working_timeout: float, max_attempts: int, max_artifact_bytes: int | None,
     sleep: Callable[[float], None], monotonic: Callable[[], float],
+    allow_legacy_workspace_binding: bool,
 ) -> QueueResult:
     """Serialize and drain a FIFO; poison prompts are retained in ``failed``.
 
@@ -1483,7 +1616,10 @@ def _drain(
     intact; a failed post-submission update retains the durable inflight barrier.
     """
     max_artifact_bytes = _effective_artifact_limit(max_artifact_bytes)
-    _bind_queue(root, target, max_artifact_bytes=max_artifact_bytes)
+    _bind_queue(
+        root, target, max_artifact_bytes=max_artifact_bytes,
+        allow_legacy_workspace_binding=allow_legacy_workspace_binding,
+    )
     inbox, inflight, processed, failed = _prepare(root)
     lock_path = os.path.join(root, ".delivery.lock")
     delivered: list[str] = []
@@ -1652,7 +1788,15 @@ def _send(
     if max_artifact_bytes is not None and not isinstance(max_artifact_bytes, int):
         raise AgentDeliveryError("max_artifact_bytes must be a positive integer or None")
     max_artifact_bytes = _effective_artifact_limit(max_artifact_bytes)
-    _bind_queue(root, target, max_artifact_bytes=max_artifact_bytes)
+    allow_legacy_workspace_binding = kwargs.pop(
+        "allow_legacy_workspace_binding", False
+    )
+    if not isinstance(allow_legacy_workspace_binding, bool):
+        raise AgentDeliveryError("allow_legacy_workspace_binding must be boolean")
+    _bind_queue(
+        root, target, max_artifact_bytes=max_artifact_bytes,
+        allow_legacy_workspace_binding=allow_legacy_workspace_binding,
+    )
     # Generated identifiers are collision-resistant and the no-replace inbox create is atomic.
     # Do not wait behind a long-running drain merely to persist a new prompt; the subsequent drain
     # and terminal-artifact inspection resolve any cross-sender consumption safely.
@@ -1663,7 +1807,9 @@ def _send(
         max_artifact_bytes=max_artifact_bytes,
     )
     result = drain(client, target, root, max_artifact_bytes=max_artifact_bytes,
-                   atomic_policy=atomic_policy, **kwargs)  # type: ignore[arg-type]
+                   atomic_policy=atomic_policy,
+                   allow_legacy_workspace_binding=allow_legacy_workspace_binding,
+                   **kwargs)  # type: ignore[arg-type]
     filename = f"{identifier}.json"
     failed_path = os.path.join(root, "failed", filename)
     if identifier in result.quarantined or os.path.lexists(failed_path):
@@ -1723,11 +1869,17 @@ def _send(
     )
 
 
-def status(client: HerdrClient, target: Target, root: str) -> dict[str, object]:
+def status(
+    client: HerdrClient, target: Target, root: str, *,
+    allow_legacy_workspace_binding: bool = False,
+) -> dict[str, object]:
     """Read validated live-agent and queue state without creating or changing queue files."""
 
     _validate_existing_queue(root)
-    _validate_existing_binding(root, target)
+    _validate_existing_binding(
+        root, target,
+        allow_legacy_workspace_binding=allow_legacy_workspace_binding,
+    )
     info = resolve_target(client, target)
     inbox, inflight, _processed, failed = _dirs(root)
 

@@ -65,6 +65,9 @@ enum Commands {
         after_help = "Example: agentctl adopt reviewer --pane w1:p2 --workspace project --cwd /work/project --harness codex"
     )]
     Adopt(Adopt),
+    /// Move a running owned native Herdr agent into an existing configured workspace; adopted, custom-pane, and multi-pane tabs are refused
+    #[command(after_help = "Example: agentctl move reviewer")]
+    Move(Named),
     /// Stop an owned runtime, or safely unregister an adopted one, and archive state
     #[command(after_help = "Example: agentctl stop reviewer")]
     Stop(Stop),
@@ -199,7 +202,7 @@ struct Start {
     /// UTF-8 file containing the initial prompt; conflicts with --brief
     #[arg(long, value_name = "PATH")]
     file: Option<PathBuf>,
-    /// Existing Herdr workspace ID (otherwise HERDR_WORKSPACE_ID or a subagents workspace)
+    /// Existing Herdr workspace ID; default: configured project workspace, else HERDR_WORKSPACE_ID, else shared subagents; an explicit ID must match configured policy
     #[arg(long, value_name = "ID")]
     workspace_id: Option<String>,
     /// Seconds to wait for harness startup, greater than zero and at most 300
@@ -673,9 +676,11 @@ fn run(args: Cli) -> Result<i32, Failure> {
             return run_chat(args.registry, args.herdr_bin, value);
         }
         Commands::Profiles(value) => {
-            let (path, profiles) = crate::profiles::load_profiles(&value.cwd, true)?;
+            let (path, profiles, workspace) =
+                crate::profiles::load_configuration(&value.cwd, true)?;
             write_json(&json!({
                 "path": path,
+                "workspace": workspace,
                 "profiles": profiles.values().map(crate::profiles::LaunchProfile::public).collect::<Vec<_>>()
             }))
             .map_err(Failure::Output)?;
@@ -807,6 +812,7 @@ fn run(args: Cli) -> Result<i32, Failure> {
                 session: value.session,
             },
         )?,
+        Commands::Move(value) => manager.move_to_project_workspace(&value.name)?,
         Commands::Stop(value) => {
             if value.recover_legacy_adoption
                 && (value.expected_token.is_none() || value.expected_record_sha256.is_none())
@@ -1044,13 +1050,12 @@ fn add_capabilities(value: &mut serde_json::Value) {
             add_capabilities(value);
         }
     } else if value.get("adapter").is_some() && value.get("name").is_some() {
-        value["capabilities"] = if matches!(
-            value["adapter"].as_str(),
-            Some("herdr" | "herdr-pane" | "herdr-foreign")
-        ) && value["mode"] == "interactive"
+        let adapter = value["adapter"].as_str();
+        value["capabilities"] = if matches!(adapter, Some("herdr" | "herdr-pane" | "herdr-foreign"))
+            && value["mode"] == "interactive"
             && value["backend"] == "herdr"
         {
-            json!([
+            let mut capabilities = vec![
                 "send",
                 "status",
                 "read",
@@ -1062,8 +1067,12 @@ fn add_capabilities(value: &mut serde_json::Value) {
                 "terminal-snapshot",
                 "drain",
                 "goal",
-                "bind-session"
-            ])
+                "bind-session",
+            ];
+            if adapter == Some("herdr") {
+                capabilities.push("move");
+            }
+            json!(capabilities)
         } else {
             json!(["status"])
         };

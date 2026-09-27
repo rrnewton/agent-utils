@@ -1,6 +1,7 @@
 //! Strict project-local launch profiles.
 use serde::de::{Error as _, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -67,6 +68,8 @@ impl LaunchProfile {
 #[serde(deny_unknown_fields)]
 struct Document {
     schema: String,
+    #[serde(default)]
+    workspace: Option<Value>,
     profiles: UniqueMap<RawProfile>,
 }
 
@@ -121,6 +124,13 @@ fn valid_name(value: &str) -> bool {
 
 fn valid_text(value: &str) -> bool {
     !value.is_empty() && !value.contains('\0')
+}
+
+fn valid_workspace(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
 }
 
 fn valid_env_name(value: &str) -> bool {
@@ -560,10 +570,14 @@ fn validate(name: String, raw: RawProfile) -> Result<LaunchProfile, AgentError> 
     })
 }
 
-pub(crate) fn load_profiles(
+/// A loaded project configuration: the configuration file's path, its launch profiles by name,
+/// and the Herdr workspace the project pins, if any.
+pub(crate) type ProjectConfiguration = (PathBuf, BTreeMap<String, LaunchProfile>, Option<String>);
+
+pub(crate) fn load_configuration(
     cwd: &Path,
     absent_ok: bool,
-) -> Result<(PathBuf, BTreeMap<String, LaunchProfile>), AgentError> {
+) -> Result<ProjectConfiguration, AgentError> {
     let cwd = fs::canonicalize(cwd).map_err(|error| {
         fail(format!(
             "cwd is not a directory: {}: {error}",
@@ -574,7 +588,7 @@ pub(crate) fn load_profiles(
     match fs::symlink_metadata(&path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && absent_ok => {
-            return Ok((path, BTreeMap::new()));
+            return Ok((path, BTreeMap::new(), None));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(fail(format!(
@@ -664,13 +678,125 @@ pub(crate) fn load_profiles(
             "profile config must use schema {SCHEMA:?} and an object of profiles"
         )));
     }
+    let workspace = match document.workspace {
+        None | Some(Value::Null) => None,
+        Some(Value::String(workspace)) if valid_workspace(&workspace) => Some(workspace),
+        Some(_) => {
+            return Err(fail(
+                "profile config workspace must be 1-128 bytes, have no surrounding whitespace, and contain no control characters",
+            ))
+        }
+    };
     let profiles = document
         .profiles
         .0
         .into_iter()
         .map(|(name, profile)| validate(name.clone(), profile).map(|value| (name, value)))
         .collect::<Result<BTreeMap<_, _>, _>>()?;
+    Ok((path, profiles, workspace))
+}
+
+pub(crate) fn load_profiles(
+    cwd: &Path,
+    absent_ok: bool,
+) -> Result<(PathBuf, BTreeMap<String, LaunchProfile>), AgentError> {
+    let (path, profiles, _) = load_configuration(cwd, absent_ok)?;
     Ok((path, profiles))
+}
+
+/// Read the workspace policy belonging to a conventional project registry.
+///
+/// Nonstandard registry directories use the default behavior: they do
+/// not acquire policy from an unrelated `.agentctl` directory beside them.
+pub(crate) fn workspace_for_registry(registry: &Path) -> Result<Option<String>, AgentError> {
+    if registry.file_name().and_then(|name| name.to_str()) != Some(".agentctl") {
+        return Ok(None);
+    }
+    let root = registry
+        .parent()
+        .ok_or_else(|| fail("agent registry has no project parent"))?;
+    let path = root.join(PROFILE_PATH);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(fail(format!(
+                "cannot inspect profile config {}: {error}",
+                path.display()
+            )))
+        }
+    }
+    let config_parent = path.parent().expect("profile config parent");
+    let parent = fs::symlink_metadata(config_parent).map_err(|error| {
+        fail(format!(
+            "cannot inspect profile config {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+        .map_err(|error| {
+            fail(format!(
+                "cannot open profile config {}: {error}",
+                path.display()
+            ))
+        })?;
+    let metadata = file.metadata().map_err(|error| {
+        fail(format!(
+            "cannot inspect profile config {}: {error}",
+            path.display()
+        ))
+    })?;
+    let uid = unsafe { libc::geteuid() };
+    if parent.file_type().is_symlink()
+        || !parent.is_dir()
+        || parent.uid() != uid
+        || parent.mode() & 0o077 != 0
+        || !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != uid
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(fail(format!(
+            "profile config must be a same-user private single-link regular file: {}",
+            path.display()
+        )));
+    }
+    require_ignored(root, &path)?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(MAX_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            fail(format!(
+                "cannot read profile config {}: {error}",
+                path.display()
+            ))
+        })?;
+    if bytes.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(fail(format!(
+            "profile config exceeds {MAX_CONFIG_BYTES} bytes: {}",
+            path.display()
+        )));
+    }
+    let UniqueMap(object): UniqueMap<Value> = serde_json::from_slice(&bytes).map_err(|error| {
+        fail(format!(
+            "cannot read profile config {}: {error}",
+            path.display()
+        ))
+    })?;
+    let workspace = match object.get("workspace") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if valid_workspace(value) => Some(value.clone()),
+        Some(_) => {
+            return Err(fail(
+                "profile config workspace must be 1-128 bytes, have no surrounding whitespace, and contain no control characters",
+            ))
+        }
+    };
+    Ok(workspace)
 }
 
 pub(crate) fn reasoning_arguments(
@@ -696,5 +822,74 @@ pub(crate) fn reasoning_arguments(
         _ => Err(fail(format!(
             "reasoning effort is not supported for harness {harness:?}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{load_configuration, valid_workspace, workspace_for_registry, SYSTEM_GIT};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn workspace_labels_are_bounded_literal_non_control_text() {
+        assert!(valid_workspace("project-agents"));
+        assert!(valid_workspace("project ☃"));
+        for invalid in ["", " leading", "trailing ", "line\nfeed", "tab\tlabel"] {
+            assert!(!valid_workspace(invalid), "accepted {invalid:?}");
+        }
+        assert!(!valid_workspace(&"x".repeat(129)));
+        assert!(valid_workspace(&"x".repeat(128)));
+    }
+
+    #[test]
+    fn configuration_exposes_workspace_only_to_its_project_registry() {
+        let root = std::env::temp_dir().join(format!(
+            "agentctl-profiles-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        assert!(Command::new(SYSTEM_GIT)
+            .args(["init", "-q"])
+            .arg(&root)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.join(".gitignore"), ".agentctl/\n").unwrap();
+        let directory = root.join(".agentctl");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("profiles.json");
+        fs::write(
+            &path,
+            r#"{"schema":"agentctl-profiles/v1","workspace":"project-agents","profiles":{}}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let (_, profiles, workspace) = load_configuration(&root, false).unwrap();
+        assert!(profiles.is_empty());
+        assert_eq!(workspace.as_deref(), Some("project-agents"));
+        assert_eq!(
+            workspace_for_registry(&directory).unwrap().as_deref(),
+            Some("project-agents")
+        );
+        assert_eq!(
+            workspace_for_registry(&root.join("unrelated-registry")).unwrap(),
+            None
+        );
+        fs::write(
+            &path,
+            r#"{"schema":"agentctl-profiles/v1","workspace":"first","workspace":"second","profiles":{"broken":{"harness":"codex"}}}"#,
+        )
+        .unwrap();
+        let error = workspace_for_registry(&directory).unwrap_err();
+        assert!(error.to_string().contains("duplicate key \"workspace\""));
+        fs::remove_dir_all(root).unwrap();
     }
 }

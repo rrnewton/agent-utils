@@ -78,6 +78,9 @@ with open(state_path, encoding="utf-8") as handle:
     state = json.load(handle)
 args = sys.argv[1:]
 state.setdefault("calls", []).append(args)
+current_pane = state.get("pane_id", "w1:p1")
+current_tab = state.get("tab_id", "w1:t1")
+current_workspace = state.get("workspace_id", "w1")
 
 if args == ["goal-rpc"]:
     for line in sys.stdin:
@@ -109,8 +112,8 @@ if args[:2] == ["pane", "list"]:
         save()
         raise SystemExit(1)
     panes = [] if state.get("closed") or state.get("missing_pane") else [{
-        "pane_id": "w1:p1", "tab_id": state.get("tab_id", "w1:t1"),
-        "workspace_id": "w1",
+        "pane_id": current_pane, "tab_id": current_tab,
+        "workspace_id": current_workspace,
     }]
     if state.get("duplicate_recorded_pane"):
         panes.append({"pane_id":"w1:p1", "tab_id":"w1:duplicate", "workspace_id":"w1"})
@@ -120,13 +123,13 @@ if args[:2] == ["pane", "list"]:
 elif args[:2] == ["pane", "get"]:
     pane = args[2]
     human = pane == "w1:p2" and state.get("extra_pane")
-    if pane != "w1:p1" and not human:
+    if pane != current_pane and not human:
         print("missing pane", file=sys.stderr)
         save()
         raise SystemExit(1)
     envelope({"pane": {
         "pane_id": pane,
-        "workspace_id": "w1",
+        "workspace_id": current_workspace,
         "cwd": root,
         "agent": None if human or state.get("empty_shell") or (state.get("custom_harness") and not state.get("custom_reported")) else state.get("harness", "codex"),
         "agent_status": "unknown" if human or state.get("empty_shell") or (state.get("custom_harness") and not state.get("custom_reported")) else state.get("status", "idle"),
@@ -165,7 +168,7 @@ elif args[:2] == ["pane", "process-info"]:
             else process_pid if state.get("custom_pid") else 200
         )
     envelope({"process_info": {
-        "pane_id":"w1:p1", "shell_pid":shell_pid,
+        "pane_id":current_pane, "shell_pid":shell_pid,
         "foreground_process_group_id":foreground_process_group_id,
         "foreground_processes":foreground_processes,
     }})
@@ -175,11 +178,14 @@ elif args[:2] == ["tab", "create"]:
         args[index + 1] for index, argument in enumerate(args[:-1])
         if argument == "--env"
     ]
+    state["pane_id"] = "w1:p1"
+    state["tab_id"] = "w1:t1"
+    state["workspace_id"] = args[args.index("--workspace") + 1]
     envelope({"tab": {"tab_id": "w1:t1"}, "root_pane": {
         "pane_id":"w1:p1", "tab_id":"w1:t1", "workspace_id":"w1",
     }})
 elif args[:2] == ["pane", "close"]:
-    if args[2] != "w1:p1":
+    if args[2] != current_pane:
         raise SystemExit("refusing unexpected pane close")
     if state.get("custom_pid"):
         try:
@@ -219,13 +225,38 @@ elif args[:2] == ["agent", "get"]:
         print("named agent unavailable", file=sys.stderr)
         save()
         raise SystemExit(1)
-    envelope({"agent": {"name":args[2], "pane_id":"w1:p1"}})
+    envelope({"agent": {"name":args[2], "pane_id":current_pane}})
 elif args[:2] == ["pane", "report-agent-session"]:
     state["reported_session"] = args[args.index("--agent-session-id") + 1]
 elif args[:2] == ["workspace", "get"]:
+    workspace_id = args[2]
     envelope({"workspace": {
-        "workspace_id": state.get("workspace_response_id", "w1"),
-        "label": "project",
+        "workspace_id": state.get("workspace_response_id", workspace_id),
+        "label": "project-agents" if workspace_id == "w-project" else "project",
+    }})
+elif args[:2] == ["workspace", "list"]:
+    envelope({"workspaces": [
+        {"workspace_id":"w1", "label":"project"},
+        {"workspace_id":"w-project", "label":"project-agents"},
+    ]})
+elif args[:2] == ["pane", "move"]:
+    if args[2] != current_pane:
+        print("missing source pane", file=sys.stderr)
+        save()
+        raise SystemExit(1)
+    destination = args[args.index("--workspace") + 1]
+    previous = current_pane
+    state["pane_id"] = "w-project:p1"
+    state["tab_id"] = "w-project:t1"
+    state["workspace_id"] = destination
+    envelope({"move_result": {
+        "changed": True,
+        "previous_pane_id": previous,
+        "pane": {
+            "pane_id": state["pane_id"],
+            "tab_id": state["tab_id"],
+            "workspace_id": destination,
+        },
     }})
 elif args[:2] == ["agent", "prompt"]:
     state.setdefault("submitted", []).append(args[3])

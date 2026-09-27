@@ -1589,6 +1589,56 @@ impl HerdrClient {
     pub fn panes(&self, workspace_id: Option<&str>) -> Result<Vec<Pane>> {
         self.panes_with_cancellation(workspace_id, &|| false)
     }
+    /// Move one pane into a freshly labelled tab in an existing workspace.
+    ///
+    /// Herdr assigns a new public pane ID for a cross-workspace move. Validate
+    /// both sides of that transition before returning the identity a caller
+    /// will persist.
+    pub fn move_pane_to_new_tab(
+        &self,
+        pane_id: &str,
+        workspace_id: &str,
+        tab_label: &str,
+    ) -> Result<Pane> {
+        let result = self.call(
+            &strings(&[
+                "pane",
+                "move",
+                pane_id,
+                "--new-tab",
+                "--workspace",
+                workspace_id,
+                "--label",
+                tab_label,
+                "--no-focus",
+            ]),
+            &format!("pane move {pane_id}"),
+        )?;
+        let moved = required_object(&result, "move_result", "pane move")?;
+        if moved.get("changed").and_then(Value::as_bool) != Some(true) {
+            return Err(AdapterError::unavailable(
+                "pane move: Herdr reported that no move occurred",
+            ));
+        }
+        if required_string(moved, "previous_pane_id", "pane move")? != pane_id {
+            return Err(AdapterError::unavailable(
+                "pane move: previous pane identity did not match the request",
+            ));
+        }
+        let pane = required_object(moved, "pane", "pane move")?;
+        let parsed = Pane {
+            pane_id: required_string(pane, "pane_id", "pane move")?,
+            tab_id: required_string(pane, "tab_id", "pane move")?,
+            workspace_id: required_string(pane, "workspace_id", "pane move")?,
+        };
+        if parsed.workspace_id != workspace_id {
+            return Err(AdapterError::unavailable(format!(
+                "pane move: returned workspace {:?}, expected {workspace_id:?}",
+                parsed.workspace_id
+            )));
+        }
+        Ok(parsed)
+    }
     pub(crate) fn panes_with_cancellation(
         &self,
         workspace_id: Option<&str>,
@@ -2836,6 +2886,70 @@ mod tests {
                 "--no-focus"
             ])
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pane_move_captures_the_reassigned_identity_and_exact_destination() {
+        let executable = FakeExecutable::new(
+            r#"{"result":{"move_result":{"changed":true,"previous_pane_id":"w1:p1","pane":{"pane_id":"w2:p2","tab_id":"w2:t2","workspace_id":"w2"}}}}"#,
+        );
+        assert_eq!(
+            executable
+                .client()
+                .move_pane_to_new_tab("w1:p1", "w2", "worker")
+                .unwrap(),
+            Pane {
+                pane_id: "w2:p2".to_owned(),
+                tab_id: "w2:t2".to_owned(),
+                workspace_id: "w2".to_owned(),
+            }
+        );
+        assert_eq!(
+            executable.arguments(),
+            serde_json::json!([
+                "pane",
+                "move",
+                "w1:p1",
+                "--new-tab",
+                "--workspace",
+                "w2",
+                "--label",
+                "worker",
+                "--no-focus"
+            ])
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pane_move_refuses_a_response_for_a_different_destination() {
+        let executable = FakeExecutable::new(
+            r#"{"result":{"move_result":{"changed":true,"previous_pane_id":"w1:p1","pane":{"pane_id":"w3:p2","tab_id":"w3:t2","workspace_id":"w3"}}}}"#,
+        );
+        let error = executable
+            .client()
+            .move_pane_to_new_tab("w1:p1", "w2", "worker")
+            .unwrap_err();
+        assert!(error.to_string().contains("expected \"w2\""), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pane_move_refuses_incomplete_transition_proof() {
+        for (changed, previous, message) in [
+            (false, "w1:p1", "no move occurred"),
+            (true, "wrong", "previous pane identity"),
+        ] {
+            let executable = FakeExecutable::new(&format!(
+                r#"{{"result":{{"move_result":{{"changed":{changed},"previous_pane_id":"{previous}","pane":{{"pane_id":"w2:p2","tab_id":"w2:t2","workspace_id":"w2"}}}}}}}}"#,
+            ));
+            let error = executable
+                .client()
+                .move_pane_to_new_tab("w1:p1", "w2", "worker")
+                .unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
+        }
     }
 
     #[cfg(target_os = "linux")]
