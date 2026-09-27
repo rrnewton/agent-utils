@@ -1193,6 +1193,22 @@ def _binding(target: Target) -> dict[str, object]:
     return identity
 
 
+def _same_binding_identity(left: object, right: object) -> bool:
+    """Compare durable delivery identity, excluding mutable placement policy."""
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    left = dict(left)
+    right = dict(right)
+    left_workspace = left.get("expected_workspace")
+    right_workspace = right.get("expected_workspace")
+    if (left_workspace is not None and right_workspace is not None
+            and left_workspace != right_workspace):
+        return False
+    left.pop("expected_workspace", None)
+    right.pop("expected_workspace", None)
+    return left == right
+
+
 def _target_lock_name(pane_id: str) -> str:
     """Return the lock file name for one resolved live pane, independent of its directory."""
     identity: dict[str, object] = {"kind": "pane", "pane_id": pane_id}
@@ -1257,17 +1273,112 @@ def _bind_queue(root: str, target: Target, *, max_artifact_bytes: int | None = N
                 binding_path, "queue target binding", require_private=True,
                 max_artifact_bytes=max_artifact_bytes,
             )
-            if actual != expected:
+            if not _same_binding_identity(actual, expected):
                 raise AgentDeliveryError(
                     _bounded_error(
                         f"queue {root} is bound to {actual!r}, refusing different target {expected!r}",
                         max_artifact_bytes,
                     )
                 )
+            if actual != expected:
+                _atomic_json(binding_path, expected, max_artifact_bytes=max_artifact_bytes)
         else:
             _atomic_json(binding_path, expected, max_artifact_bytes=max_artifact_bytes)
     finally:
         os.close(descriptor)
+
+
+def rebind_queue(root: str, previous: Target, replacement: Target) -> None:
+    """Replace an exact queue binding while excluding concurrent delivery.
+
+    Accepting an already-installed replacement makes recovery idempotent when
+    the binding commit succeeded but the surrounding agent-record commit did
+    not.
+    """
+    for target in (previous, replacement):
+        if not (target.pane_id or target.session_value):
+            raise AgentDeliveryError("target needs --pane or a stable session value")
+    _prepare(root)
+    delivery_path = os.path.join(root, ".delivery.lock")
+    binding_lock_path = os.path.join(root, ".binding.lock")
+    binding_path = os.path.join(root, "target.json")
+    delivery_descriptor = _open_private_lock(delivery_path, "queue delivery lock")
+    binding_descriptor = -1
+    try:
+        fcntl.flock(delivery_descriptor, fcntl.LOCK_EX)
+        binding_descriptor = _open_private_lock(
+            binding_lock_path, "queue binding lock"
+        )
+        fcntl.flock(binding_descriptor, fcntl.LOCK_EX)
+        old = _binding(previous)
+        new = _binding(replacement)
+        if os.path.lexists(binding_path):
+            actual = _read_queue_json(
+                binding_path, "queue target binding", require_private=True,
+            )
+            if (not _same_binding_identity(actual, old)
+                    and not _same_binding_identity(actual, new)):
+                raise AgentDeliveryError(
+                    f"queue {root} is bound to {actual!r}, refusing move "
+                    f"from {old!r} to {new!r}"
+                )
+            if actual != new:
+                _atomic_json(binding_path, new)
+        else:
+            _atomic_json(binding_path, new)
+    finally:
+        if binding_descriptor >= 0:
+            os.close(binding_descriptor)
+        os.close(delivery_descriptor)
+
+
+def rebind_queue_after(
+    root: str,
+    previous: Target,
+    operation: Callable[[], tuple[Target, object]],
+    *, already_replacement: Target | None = None,
+) -> object:
+    """Run an irreversible move only after proving its queue can be rebound.
+
+    The queue delivery and binding locks remain held across ``operation``.  This
+    gives move the same delivery-lock-before-target-lock order as drain and
+    prevents a foreign binding from being discovered after Herdr changed state.
+    """
+    if not (previous.pane_id or previous.session_value):
+        raise AgentDeliveryError("target needs --pane or a stable session value")
+    _prepare(root)
+    delivery_path = os.path.join(root, ".delivery.lock")
+    binding_lock_path = os.path.join(root, ".binding.lock")
+    binding_path = os.path.join(root, "target.json")
+    delivery_descriptor = _open_private_lock(delivery_path, "queue delivery lock")
+    binding_descriptor = -1
+    try:
+        fcntl.flock(delivery_descriptor, fcntl.LOCK_EX)
+        binding_descriptor = _open_private_lock(binding_lock_path, "queue binding lock")
+        fcntl.flock(binding_descriptor, fcntl.LOCK_EX)
+        old = _binding(previous)
+        if os.path.lexists(binding_path):
+            actual = _read_queue_json(
+                binding_path, "queue target binding", require_private=True,
+            )
+            replacement_allowed = (
+                already_replacement is not None
+                and _same_binding_identity(actual, _binding(already_replacement))
+            )
+            if not _same_binding_identity(actual, old) and not replacement_allowed:
+                raise AgentDeliveryError(
+                    f"queue {root} is bound to {actual!r}, refusing move from {old!r}"
+                )
+        replacement, result = operation()
+        if not (replacement.pane_id or replacement.session_value):
+            raise AgentDeliveryError("target needs --pane or a stable session value")
+        new = _binding(replacement)
+        _atomic_json(binding_path, new)
+        return result
+    finally:
+        if binding_descriptor >= 0:
+            os.close(binding_descriptor)
+        os.close(delivery_descriptor)
 
 
 def _validate_existing_binding(root: str, target: Target) -> None:
@@ -1281,7 +1392,7 @@ def _validate_existing_binding(root: str, target: Target) -> None:
         return
     expected = _binding(target)
     actual = _read_queue_json(binding_path, "queue target binding", require_private=True)
-    if actual != expected:
+    if not _same_binding_identity(actual, expected):
         raise AgentDeliveryError(
             f"queue {root} is bound to {actual!r}, refusing different target {expected!r}"
         )

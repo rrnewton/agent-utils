@@ -16,7 +16,7 @@ from pathlib import Path
 
 import agentctl.client as client_module
 from agentctl.client import (
-    CustomProcessIdentity,
+    CustomProcessIdentity, Pane,
     HerdrClient,
     ProcessInfo,
     muse_auto_review_idle_composer,
@@ -113,6 +113,67 @@ def test_tab_creation_passes_literal_environment_before_launch() -> None:
         "--label", "worker", "--cwd", "/work/project",
         "--env", _ENVIRONMENT[0], "--env", _ENVIRONMENT[1], "--no-focus",
     ]]
+
+
+def test_pane_move_captures_reassigned_identity_and_exact_destination() -> None:
+    runner = Runner({
+        "move_result": {
+            "changed": True,
+            "previous_pane_id": "w1:p1",
+            "pane": {
+                "pane_id": "w2:p2", "tab_id": "w2:t2", "workspace_id": "w2",
+            },
+        },
+    })
+    client = HerdrClient(herdr_bin="fixture-herdr", run=runner)
+    assert client.move_pane_to_new_tab(
+        "w1:p1", workspace_id="w2", tab_label="worker",
+    ) == Pane("w2:p2", "w2:t2", "w2")
+    assert runner.calls == [[
+        "fixture-herdr", "pane", "move", "w1:p1", "--new-tab",
+        "--workspace", "w2", "--label", "worker", "--no-focus",
+    ]]
+
+
+def test_pane_move_refuses_response_for_different_destination() -> None:
+    runner = Runner({
+        "move_result": {
+            "changed": True,
+            "previous_pane_id": "w1:p1",
+            "pane": {
+                "pane_id": "w3:p2", "tab_id": "w3:t2", "workspace_id": "w3",
+            },
+        },
+    })
+    client = HerdrClient(herdr_bin="fixture-herdr", run=runner)
+    with pytest.raises(HerdrUnavailable, match="expected 'w2'"):
+        client.move_pane_to_new_tab(
+            "w1:p1", workspace_id="w2", tab_label="worker",
+        )
+
+
+@pytest.mark.parametrize(
+    ("changed", "previous", "message"),
+    ((False, "w1:p1", "no move occurred"),
+     (True, "wrong", "previous pane identity")),
+)
+def test_pane_move_refuses_incomplete_transition_proof(
+    changed: bool, previous: str, message: str,
+) -> None:
+    runner = Runner({
+        "move_result": {
+            "changed": changed,
+            "previous_pane_id": previous,
+            "pane": {
+                "pane_id": "w2:p2", "tab_id": "w2:t2", "workspace_id": "w2",
+            },
+        },
+    })
+    client = HerdrClient(herdr_bin="fixture-herdr", run=runner)
+    with pytest.raises(HerdrUnavailable, match=message):
+        client.move_pane_to_new_tab(
+            "w1:p1", workspace_id="w2", tab_label="worker",
+        )
 
 
 def _custom_runner(

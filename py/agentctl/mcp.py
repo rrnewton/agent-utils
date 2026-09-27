@@ -34,6 +34,8 @@ OPERATIONS = {
     "wait": Operation("Wait for readiness; this does not prove goal completion.", ("name",), ("name", "timeout")),
     "stop": Operation("Stop an owned session, or safely unregister an adopted one, and archive state.",
         ("name",), ("name",)),
+    "move": Operation("Move a running owned native Herdr session into its configured project workspace.",
+        ("name",), ("name",)),
     "pause": Operation("Pause automated input for human interaction.", ("name",), ("name",)),
     "resume": Operation("Resume automated input after human interaction.", ("name",), ("name",)),
     "goal": Operation("Read native goal state when supported, or send a goal instruction.",

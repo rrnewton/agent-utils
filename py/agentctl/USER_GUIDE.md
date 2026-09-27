@@ -237,6 +237,7 @@ credential-shaped environment or argument names.
 ```json
 {
   "schema": "agentctl-profiles/v1",
+  "workspace": "project-agents",
   "profiles": {
     "preferred-reviewer": {
       "harness": "muse",
@@ -250,8 +251,18 @@ credential-shaped environment or argument names.
 }
 ```
 
-`harness` and `mode` are required. `model`, `reasoning_effort`, `argv`, and
-`env` are optional. Values are parsed as JSON strings and passed as literal
+The top-level `workspace` is optional. When present, it is the required Herdr
+workspace label for every interactive session in the project. Starts resolve or
+create that label, ignore an ambient `HERDR_WORKSPACE_ID`, and refuse an explicit
+workspace ID that does not resolve to it. Automated input and reads refuse a pane
+in any other workspace; status and stop remain available for diagnosis and safe
+retirement. When the key is absent, starts use `HERDR_WORKSPACE_ID` when set,
+otherwise the shared `subagents` workspace.
+The label must be 1–128 UTF-8 bytes, have no surrounding whitespace, and contain
+no control characters.
+
+Within each profile, `harness` and `mode` are required. `model`,
+`reasoning_effort`, `argv`, and `env` are optional. Values are parsed as JSON strings and passed as literal
 arguments or environment entries; they are never shell-expanded. A profile
 cannot specify the model or effort both structurally and in `argv`. When
 `--profile NAME` is present, explicit `--harness`, `--mode`, `--model`,
@@ -306,7 +317,23 @@ agentctl send reviewer 'Focus on cancellation and restart behavior'
 be repeated. `--resume SESSION` resumes an explicitly identified conversation.
 When `--resume` is set, raw Codex `resume` and Claude
 `--resume`/`--continue` selectors are refused before registry state is created.
-Use `--workspace-id` to choose an exact Herdr workspace.
+Use `--workspace-id` to choose an exact Herdr workspace. Its default is the
+configured project workspace, then `HERDR_WORKSPACE_ID`, then the shared
+`subagents` workspace. When project config contains `workspace`, an explicit ID
+must resolve to the same label. Adoption's `--workspace` assertion must also
+equal that configured label. To migrate an existing agentctl-owned native Herdr agent without
+restarting its process or native conversation, run:
+
+```sh
+agentctl move reviewer
+```
+
+The configured destination workspace must already exist. Move accepts only a
+running owned native Herdr agent. It verifies the source pane, one-pane tab,
+agent name, harness, working directory, destination label, and Herdr's returned replacement IDs.
+It then rebinds the durable delivery queue and commits the new pane/tab/workspace
+identity. Adopted and custom-pane sessions are refused because they do not have
+the native name-based recovery identity required after a cross-workspace move.
 
 Interactive Herdr starts also accept repeatable `--env KEY=VALUE`. Each entry is
 passed as one literal argument to Herdr when it creates the tab, before the

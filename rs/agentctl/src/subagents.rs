@@ -580,6 +580,17 @@ pub trait ManagedApi: AgentApi {
         cwd: &str,
         environment: &[String],
     ) -> crate::error::Result<(String, String)>;
+    /// Move one exact pane into a fresh labelled tab in another workspace.
+    fn move_pane_to_new_tab(
+        &self,
+        _pane: &str,
+        _workspace: &str,
+        _label: &str,
+    ) -> crate::error::Result<Pane> {
+        Err(crate::error::AdapterError::unavailable(
+            "cross-workspace pane moves are unavailable",
+        ))
+    }
     /// Close exactly one owned pane, preserving any concurrently added siblings.
     fn close_pane(&self, pane: &str) -> crate::error::Result<()>;
     /// Focus an existing pane for direct human interaction.
@@ -789,6 +800,14 @@ impl ManagedApi for HerdrClient {
         environment: &[String],
     ) -> crate::error::Result<(String, String)> {
         HerdrClient::create_tab_with_pane(self, workspace, label, cwd, environment)
+    }
+    fn move_pane_to_new_tab(
+        &self,
+        pane: &str,
+        workspace: &str,
+        label: &str,
+    ) -> crate::error::Result<Pane> {
+        HerdrClient::move_pane_to_new_tab(self, pane, workspace, label)
     }
     fn close_pane(&self, pane: &str) -> crate::error::Result<()> {
         HerdrClient::close_pane(self, pane)
@@ -1108,6 +1127,23 @@ struct WorkspaceClient<'a, A: ManagedApi + ?Sized> {
     custom_submission: Mutex<Option<CustomPaneSubmission>>,
     queue: Option<&'a Path>,
     check_prompt: bool,
+    expected_workspace: Option<String>,
+}
+
+impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
+    fn validate_workspace_policy(&self, info: &AgentPaneInfo) -> crate::error::Result<()> {
+        let Some(expected) = self.expected_workspace.as_deref() else {
+            return Ok(());
+        };
+        let actual = self.client.workspace_label(&info.workspace_id)?;
+        if actual != expected {
+            return Err(crate::error::AdapterError::unavailable(format!(
+                "refusing pane {}: workspace is {actual:?}, expected {expected:?}",
+                info.pane_id
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
@@ -1135,6 +1171,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 self.record.name
             )));
         }
+        self.validate_workspace_policy(&info)?;
         if Some(pane_id) == self.record.pane_id.as_deref() {
             if self.record.goal_session_id.is_some()
                 && info.session_value.is_some()
@@ -1376,6 +1413,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 self.record.name
             )));
         }
+        self.validate_workspace_policy(&info)?;
         if Some(pane_id) == self.record.pane_id.as_deref() {
             if self.record.goal_session_id.is_some()
                 && info.session_value.is_some()
@@ -1709,6 +1747,9 @@ pub struct StopOptions {
 pub struct ManagedAgents<'a, A: ManagedApi + ?Sized> {
     client: &'a A,
     registry: PathBuf,
+    /// Test-only project workspace override. Production policy is loaded lazily
+    /// for each operation that needs it, so long-running managers do not cache it.
+    project_workspace_override: Option<String>,
     /// Workspace inherited from the launching Herdr pane (`HERDR_WORKSPACE_ID`),
     /// used when a start names none.
     inherited_workspace: Option<String>,
@@ -1730,6 +1771,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         Ok(Self {
             client,
             registry,
+            project_workspace_override: None,
             inherited_workspace,
         })
     }
@@ -1739,6 +1781,29 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     fn with_inherited_workspace(mut self, workspace: Option<&str>) -> Self {
         self.inherited_workspace = workspace.map(str::to_owned);
         self
+    }
+
+    #[cfg(test)]
+    fn with_project_workspace(mut self, workspace: Option<&str>) -> Self {
+        self.project_workspace_override = workspace.map(str::to_owned);
+        self
+    }
+
+    fn target(&self, record: &AgentRecord) -> Result<Target> {
+        record.target()
+    }
+
+    fn project_workspace(&self) -> Result<Option<String>> {
+        match self.project_workspace_override.as_ref() {
+            Some(workspace) => Ok(Some(workspace.clone())),
+            None => crate::profiles::workspace_for_registry(&self.registry),
+        }
+    }
+
+    fn policy_target(&self, record: &AgentRecord) -> Result<Target> {
+        let mut target = record.target()?;
+        target.expected_workspace = self.project_workspace()?;
+        Ok(target)
     }
 
     fn directory(&self, agent_name: &str) -> Result<PathBuf> {
@@ -2146,6 +2211,62 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         Ok(self.directory(agent_name)?.join("queue"))
     }
 
+    fn move_intent_path(&self, agent_name: &str) -> Result<PathBuf> {
+        Ok(self.directory(agent_name)?.join("move.json"))
+    }
+
+    fn move_intent(&self, record: &AgentRecord, destination: &str) -> Value {
+        json!({
+            "schema": "agentctl-move/v1",
+            "token": record.token,
+            "source_pane_id": record.pane_id,
+            "source_tab_id": record.tab_id,
+            "source_workspace_id": record.workspace_id,
+            "destination_workspace_id": destination,
+            "harness": record.harness,
+            "cwd": record.cwd,
+            "session_agent": record.session_agent,
+            "session_value": record.session_value,
+        })
+    }
+
+    fn write_move_intent(&self, record: &AgentRecord, destination: &str) -> Result<()> {
+        agent::atomic_json(
+            &self.move_intent_path(&record.name)?,
+            &self.move_intent(record, destination),
+        )
+    }
+
+    fn require_move_intent(&self, record: &AgentRecord, destination: &str) -> Result<()> {
+        let path = self.move_intent_path(&record.name)?;
+        let actual = match fs::symlink_metadata(&path) {
+            Ok(_) => agent::read_private_json(&path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(fail(format!(
+                    "refusing to recover move of {:?}: no durable move intent",
+                    record.name
+                )))
+            }
+            Err(error) => return Err(fail(error.to_string())),
+        };
+        if actual != self.move_intent(record, destination) {
+            return Err(fail(format!(
+                "refusing to recover move of {:?}: durable move intent changed",
+                record.name
+            )));
+        }
+        Ok(())
+    }
+
+    fn clear_move_intent(&self, agent_name: &str) -> Result<()> {
+        let path = self.move_intent_path(agent_name)?;
+        match fs::remove_file(&path) {
+            Ok(()) => agent::sync_directory(path.parent().expect("move intent has parent")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(fail(error.to_string())),
+        }
+    }
+
     /// Read durable metadata even if Herdr is unreachable.
     pub fn get(&self, agent_name: &str) -> Result<Value> {
         Ok(json!(self.load(agent_name)?))
@@ -2233,6 +2354,20 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             &structured_arguments,
         )?;
         options.environment = environment_entries(&options.environment)?;
+        // Placement policy is an input/start concern. Load it before creating
+        // the generation so a configuration error cannot leave the name taken.
+        let project_workspace = self.project_workspace()?;
+        if let (Some(expected), Some(workspace)) = (
+            project_workspace.as_deref(),
+            options.workspace_id.as_deref(),
+        ) {
+            let actual_label = self.client.workspace_label(workspace)?;
+            if actual_label != expected {
+                return Err(fail(format!(
+                    "workspace {workspace:?} is labelled {actual_label:?}, but project configuration requires {expected:?}"
+                )));
+            }
+        }
         let _lock = self.lock(agent_name)?;
         let identity_lock = self.identity_lock()?;
         if let Some(resume) = options.resume.as_deref() {
@@ -2297,7 +2432,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             goal_message_id: None,
         };
         self.save(&record)?;
-        let launched = self.launch(&mut record, &options);
+        let launched = self.launch(&mut record, &options, project_workspace.as_deref());
         if let Err(error) = launched {
             record.lifecycle = "launch_failed".to_owned();
             record.error = Some(if options.environment.is_empty() {
@@ -2328,6 +2463,17 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             return Err(fail(
                 "adopt needs a nonempty expected workspace label without NUL",
             ));
+        }
+        let project_workspace = self.project_workspace()?;
+        if project_workspace
+            .as_deref()
+            .is_some_and(|workspace| workspace != options.expected_workspace)
+        {
+            return Err(fail(format!(
+                "adopt workspace {:?} does not match project workspace {:?}",
+                options.expected_workspace,
+                project_workspace.as_deref().expect("checked above")
+            )));
         }
         harness_arguments(&options.harness, None, None, &[])?;
         if options.harness == "muse" {
@@ -2596,8 +2742,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         Ok(destination)
     }
 
-    fn launch(&self, record: &mut AgentRecord, options: &StartOptions) -> Result<()> {
-        self.create_presentation(record, options)?;
+    fn launch(
+        &self,
+        record: &mut AgentRecord,
+        options: &StartOptions,
+        project_workspace: Option<&str>,
+    ) -> Result<()> {
+        self.create_presentation(record, options, project_workspace)?;
         let pane_id = record.pane_id.clone().expect("new tab has pane");
         if record.adapter == "herdr-pane" {
             let agent_name = record.name.clone();
@@ -2640,8 +2791,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 custom_submission: Mutex::new(None),
                 queue: None,
                 check_prompt: true,
+                expected_workspace: None,
             },
-            &record.target()?,
+            &self.target(record)?,
         )?;
         record.session_agent = info.session_agent;
         record.session_value = info.session_value;
@@ -2673,7 +2825,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             }
         }
         if record.session_value.is_some() {
-            if let Err(error) = agent::resolve_target(self.client, &record.target()?) {
+            if let Err(error) = agent::resolve_target(self.client, &self.target(record)?) {
                 record.session_agent = None;
                 record.session_value = None;
                 return Err(fail(format!(
@@ -2683,7 +2835,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         record.lifecycle = "running".to_owned();
         self.save(record)?;
-        let final_info = match agent::resolve_target(self.client, &record.target()?)
+        let final_info = match agent::resolve_target(self.client, &self.target(record)?)
             .and_then(|_| self.checked(record))
         {
             Ok(info) => info,
@@ -2705,9 +2857,15 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         Ok(())
     }
 
-    fn create_presentation(&self, record: &mut AgentRecord, options: &StartOptions) -> Result<()> {
+    fn create_presentation(
+        &self,
+        record: &mut AgentRecord,
+        options: &StartOptions,
+        project_workspace: Option<&str>,
+    ) -> Result<()> {
+        let default_label = project_workspace.unwrap_or("subagents");
         let lock = agent::open_private_lock(
-            &agent::target_lock_path("managed-workspace:subagents")?,
+            &agent::target_lock_path(&format!("managed-workspace:{default_label}"))?,
             "workspace allocation lock",
         )?;
         lock.lock_exclusive()
@@ -2716,12 +2874,23 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .workspace_id
             .clone()
             .filter(|s| !s.is_empty())
-            .or_else(|| self.inherited_workspace.clone());
+            .or_else(|| {
+                if project_workspace.is_none() {
+                    self.inherited_workspace.clone()
+                } else {
+                    None
+                }
+            });
         let selected = if let Some(workspace) = selected {
-            self.client.workspace_label(&workspace)?;
+            let actual_label = self.client.workspace_label(&workspace)?;
+            if project_workspace.is_some_and(|expected| actual_label != expected) {
+                return Err(fail(format!(
+                    "workspace {workspace:?} is labelled {actual_label:?}, but project configuration requires {default_label:?}"
+                )));
+            }
             Some(workspace)
         } else {
-            self.client.workspace_id_for_label("subagents")?
+            self.client.workspace_id_for_label(default_label)?
         };
         match selected {
             Some(workspace) => {
@@ -2737,9 +2906,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 self.save(record)?;
             }
             None => {
-                let (workspace, tab, pane) =
-                    self.client
-                        .create_workspace("subagents", &record.cwd, &options.environment)?;
+                let (workspace, tab, pane) = self.client.create_workspace(
+                    default_label,
+                    &record.cwd,
+                    &options.environment,
+                )?;
                 record.workspace_id = Some(workspace);
                 record.tab_id = Some(tab.clone());
                 record.pane_id = Some(pane);
@@ -2759,8 +2930,24 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 custom_submission: Mutex::new(None),
                 queue: None,
                 check_prompt: false,
+                expected_workspace: None,
             },
-            &record.target()?,
+            &self.target(record)?,
+        )
+    }
+
+    fn checked_policy(&self, record: &AgentRecord, check_prompt: bool) -> Result<AgentPaneInfo> {
+        agent::resolve_target(
+            &WorkspaceClient {
+                client: self.client,
+                record,
+                goal_objective: Mutex::new(None),
+                custom_submission: Mutex::new(None),
+                queue: None,
+                check_prompt,
+                expected_workspace: self.project_workspace()?,
+            },
+            &self.target(record)?,
         )
     }
 
@@ -2856,6 +3043,258 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         self.checked(&self.load(agent_name)?)
     }
 
+    /// Move one owned interactive agent into the workspace required by the
+    /// project configuration, preserving its process and native session.
+    ///
+    /// Herdr changes public pane IDs during cross-workspace moves. If Herdr
+    /// completed the move but the registry write was interrupted, repeating
+    /// this operation recovers through the globally unique managed agent name
+    /// and commits the already-moved identity.
+    pub fn move_to_project_workspace(&self, agent_name: &str) -> Result<Value> {
+        let project_workspace = self.project_workspace()?;
+        let expected_workspace = project_workspace
+            .as_deref()
+            .ok_or_else(|| fail("move requires a workspace field in .agentctl/profiles.json"))?;
+        let _generation_lock = self.lock(agent_name)?;
+        let mut record = self.load(agent_name)?;
+        record.supported()?;
+        if record.adapter != "herdr" || record.lifecycle != "running" {
+            return Err(fail(
+                "move supports only a running agentctl-owned native Herdr agent",
+            ));
+        }
+        let destination = self
+            .client
+            .workspace_id_for_label(expected_workspace)?
+            .ok_or_else(|| {
+                fail(format!(
+                    "configured project workspace {expected_workspace:?} does not exist"
+                ))
+            })?;
+        if self.client.workspace_label(&destination)? != expected_workspace {
+            return Err(fail(
+                "configured project workspace changed during resolution",
+            ));
+        }
+
+        let recorded_pane = record
+            .pane_id
+            .clone()
+            .ok_or_else(|| fail(format!("agent {agent_name:?} has no confirmed pane")))?;
+        let previous_target = record.target()?;
+        let named_pane = self.client.agent_pane(agent_name)?;
+        if named_pane != recorded_pane {
+            self.require_move_intent(&record, &destination)?;
+            if self
+                .client
+                .panes()?
+                .iter()
+                .any(|pane| pane.pane_id == recorded_pane)
+            {
+                return Err(fail(format!(
+                    "refusing to recover move of {agent_name:?}: both recorded and named panes are live"
+                )));
+            }
+            let target = Target {
+                pane_id: Some(named_pane.clone()),
+                session_agent: record.session_agent.clone(),
+                session_value: record.session_value.clone(),
+                expected_agent: Some(record.harness.clone()),
+                expected_workspace: Some(expected_workspace.to_owned()),
+                expected_cwd: Some(PathBuf::from(&record.cwd)),
+            };
+            let mut binding_target = record.target()?;
+            binding_target.pane_id = Some(named_pane.clone());
+            let (info, presentation) = agent::rebind_queue_after(
+                &self.queue(agent_name)?,
+                &previous_target,
+                Some(&binding_target),
+                || {
+                    let (_target_lock, info) = agent::lock_resolved_target(self.client, &target)?;
+                    if self.client.agent_pane(agent_name)? != named_pane {
+                        return Err(fail(format!(
+                            "refusing to recover move of {agent_name:?}: managed name changed panes"
+                        )));
+                    }
+                    if self
+                        .client
+                        .panes()?
+                        .iter()
+                        .any(|pane| pane.pane_id == recorded_pane)
+                    {
+                        return Err(fail(format!(
+                            "refusing to recover move of {agent_name:?}: both recorded and named panes are live"
+                        )));
+                    }
+                    let mut presentations: Vec<Pane> = self
+                        .client
+                        .panes()?
+                        .into_iter()
+                        .filter(|pane| {
+                            pane.workspace_id == destination && pane.pane_id == info.pane_id
+                        })
+                        .collect();
+                    if presentations.len() != 1 {
+                        return Err(fail(format!(
+                            "refusing to recover move of {agent_name:?}: expected one destination presentation, found {}",
+                            presentations.len()
+                        )));
+                    }
+                    let presentation = presentations.pop().expect("one presentation");
+                    if self
+                        .client
+                        .panes()?
+                        .iter()
+                        .filter(|pane| {
+                            pane.workspace_id == destination && pane.tab_id == presentation.tab_id
+                        })
+                        .count()
+                        != 1
+                    {
+                        return Err(fail(format!(
+                            "refusing to recover move of {agent_name:?}: its tab contains another pane"
+                        )));
+                    }
+                    Ok((binding_target.clone(), (info, presentation)))
+                },
+            )?;
+            record.workspace_id = Some(destination.clone());
+            record.tab_id = Some(presentation.tab_id);
+            record.pane_id = Some(info.pane_id);
+            self.save(&record)?;
+            self.clear_move_intent(agent_name)?;
+            let mut result = self.status_record(&record)?;
+            result["moved"] = json!(true);
+            result["recovered"] = json!(true);
+            result["previous_pane_id"] = json!(recorded_pane);
+            return Ok(result);
+        }
+
+        let moved = agent::rebind_queue_after(
+            &self.queue(agent_name)?,
+            &previous_target,
+            None,
+            || {
+                let source_client = WorkspaceClient {
+                    client: self.client,
+                    record: &record,
+                    goal_objective: Mutex::new(None),
+                    custom_submission: Mutex::new(None),
+                    queue: None,
+                    check_prompt: true,
+                    expected_workspace: None,
+                };
+                let (_target_lock, source_info) =
+                    agent::lock_resolved_target(&source_client, &previous_target)?;
+                if self.client.agent_pane(agent_name)? != source_info.pane_id {
+                    return Err(fail(format!(
+                        "refusing to move {agent_name:?}: managed agent name changed panes"
+                    )));
+                }
+                let mut presentations: Vec<Pane> = self
+                    .client
+                    .panes()?
+                    .into_iter()
+                    .filter(|pane| {
+                        pane.workspace_id == source_info.workspace_id
+                            && pane.pane_id == source_info.pane_id
+                    })
+                    .collect();
+                if presentations.len() != 1 {
+                    return Err(fail(format!(
+                        "refusing to move {agent_name:?}: expected one source presentation, found {}",
+                        presentations.len()
+                    )));
+                }
+                let source = presentations.pop().expect("one source presentation");
+                if Some(&source.tab_id) != record.tab_id.as_ref()
+                    || Some(&source.workspace_id) != record.workspace_id.as_ref()
+                {
+                    return Err(fail(format!(
+                        "refusing to move {agent_name:?}: recorded tab or workspace identity changed"
+                    )));
+                }
+                if self
+                    .client
+                    .panes()?
+                    .iter()
+                    .filter(|pane| {
+                        pane.workspace_id == source.workspace_id && pane.tab_id == source.tab_id
+                    })
+                    .count()
+                    != 1
+                {
+                    return Err(fail(format!(
+                        "refusing to move {agent_name:?}: its tab contains another pane"
+                    )));
+                }
+                if source.workspace_id == destination {
+                    let target = Target {
+                        pane_id: Some(source.pane_id),
+                        session_agent: record.session_agent.clone(),
+                        session_value: record.session_value.clone(),
+                        expected_agent: Some(record.harness.clone()),
+                        expected_workspace: None,
+                        expected_cwd: Some(PathBuf::from(&record.cwd)),
+                    };
+                    return Ok((target, None));
+                }
+                self.write_move_intent(&record, &destination)?;
+                let moved =
+                    self.client
+                        .move_pane_to_new_tab(&source.pane_id, &destination, agent_name)?;
+                if self.client.agent_pane(agent_name)? != moved.pane_id {
+                    return Err(fail(format!(
+                        "move of {agent_name:?} completed but the managed name did not follow it; rerun move only after inspecting Herdr"
+                    )));
+                }
+                let target = Target {
+                    pane_id: Some(moved.pane_id.clone()),
+                    session_agent: record.session_agent.clone(),
+                    session_value: record.session_value.clone(),
+                    expected_agent: Some(record.harness.clone()),
+                    expected_workspace: Some(expected_workspace.to_owned()),
+                    expected_cwd: Some(PathBuf::from(&record.cwd)),
+                };
+                let info = agent::resolve_target(self.client, &target)?;
+                let final_presentations: Vec<Pane> = self
+                    .client
+                    .panes()?
+                    .into_iter()
+                    .filter(|pane| pane.workspace_id == destination && pane.pane_id == info.pane_id)
+                    .collect();
+                if final_presentations.len() != 1
+                    || final_presentations[0].tab_id != moved.tab_id
+                    || final_presentations[0].workspace_id != moved.workspace_id
+                {
+                    return Err(fail(format!(
+                        "move of {agent_name:?} completed but final presentation verification failed; rerun move to recover"
+                    )));
+                }
+                let mut binding_target = target;
+                binding_target.expected_workspace = None;
+                Ok((binding_target, Some(moved)))
+            },
+        )?;
+        let Some(moved) = moved else {
+            self.clear_move_intent(agent_name)?;
+            let mut result = self.status_record(&record)?;
+            result["moved"] = json!(false);
+            result["recovered"] = json!(false);
+            return Ok(result);
+        };
+        record.workspace_id = Some(moved.workspace_id);
+        record.tab_id = Some(moved.tab_id);
+        record.pane_id = Some(moved.pane_id);
+        self.save(&record)?;
+        self.clear_move_intent(agent_name)?;
+        let mut result = self.status_record(&record)?;
+        result["moved"] = json!(true);
+        result["recovered"] = json!(false);
+        result["previous_pane_id"] = json!(recorded_pane);
+        Ok(result)
+    }
+
     /// Resolve the exact live pane while allowing a service owner to cancel control waits.
     pub(crate) fn pane_info_with_runtime(
         &self,
@@ -2872,8 +3311,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 custom_submission: Mutex::new(None),
                 queue: None,
                 check_prompt: false,
+                expected_workspace: None,
             },
-            &record.target()?,
+            &self.target(&record)?,
             runtime,
         )
     }
@@ -2896,8 +3336,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             custom_submission: Mutex::new(None),
             queue: None,
             check_prompt: false,
+            expected_workspace: None,
         };
-        let probe = record.target().and_then(|target| {
+        let probe = self.target(record).and_then(|target| {
             agent::resolve_target(&client, &target)
                 .and_then(|_| agent::status(&client, &target, &self.queue(agent_name)?))
         });
@@ -2971,10 +3412,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             custom_submission: Mutex::new(None),
             queue: Some(&queue),
             check_prompt: true,
+            expected_workspace: self.project_workspace()?,
         };
         agent::send_identified_with_runtime(
             &client,
-            &record.target()?,
+            &self.target(&record)?,
             &queue,
             text,
             options,
@@ -3023,17 +3465,18 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             custom_submission: Mutex::new(None),
             queue: Some(&queue),
             check_prompt: true,
+            expected_workspace: self.project_workspace()?,
         };
         match message_id {
             Some(identifier) => agent::send_identified(
                 &client,
-                &record.target()?,
+                &self.target(record)?,
                 &queue,
                 text,
                 identifier,
                 options,
             ),
-            None => agent::send(&client, &record.target()?, &queue, text, options),
+            None => agent::send(&client, &self.target(record)?, &queue, text, options),
         }
     }
 
@@ -3051,7 +3494,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     pub fn attach(&self, agent_name: &str) -> Result<Value> {
         let _lock = self.lock(agent_name)?;
         let record = self.load(agent_name)?;
-        let info = self.checked(&record)?;
+        let info = self.checked_policy(&record, false)?;
         self.client.focus_pane(&info.pane_id)?;
         Ok(json!({"name": agent_name, "pane_id": info.pane_id, "paused": record.paused}))
     }
@@ -3069,8 +3512,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 custom_submission: Mutex::new(None),
                 queue: Some(&self.queue(agent_name)?),
                 check_prompt: true,
+                expected_workspace: self.project_workspace()?,
             },
-            &record.target()?,
+            &self.target(&record)?,
             &self.queue(agent_name)?,
             options,
         )
@@ -3095,8 +3539,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 custom_submission: Mutex::new(None),
                 queue: Some(&queue),
                 check_prompt: true,
+                expected_workspace: self.project_workspace()?,
             },
-            &record.target()?,
+            &self.target(&record)?,
             &queue,
             options,
             runtime,
@@ -3118,8 +3563,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     pub fn read(&self, agent_name: &str, lines: usize) -> Result<String> {
         let _lock = self.lock(agent_name)?;
         let record = self.load(agent_name)?;
-        self.checked(&record)?;
-        let text = agent::read(self.client, &record.target()?, lines)?;
+        self.checked_policy(&record, false)?;
+        let text = agent::read(self.client, &self.target(&record)?, lines)?;
         self.snapshot(&record, &text)?;
         Ok(text)
     }
@@ -3133,7 +3578,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     ) -> Result<String> {
         let _lock = self.lock_with_runtime(agent_name, runtime)?;
         let record = self.load(agent_name)?;
-        let target = record.target()?;
+        let target = self.policy_target(&record)?;
         let info = agent::resolve_target_with_runtime(
             &WorkspaceClient {
                 client: self.client,
@@ -3142,6 +3587,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 custom_submission: Mutex::new(None),
                 queue: None,
                 check_prompt: false,
+                expected_workspace: None,
             },
             &target,
             runtime,
@@ -3329,7 +3775,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     ) -> Result<Value> {
         let Some(text) = text else {
             let record = self.load(agent_name)?;
-            self.checked(&record)?;
+            self.checked_policy(&record, false)?;
             return Ok(self.goal_result(&record, goal_command));
         };
         if text.trim().is_empty() || text.contains(['\n', '\r']) {
@@ -3365,10 +3811,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             custom_submission: Mutex::new(None),
             queue: Some(&queue),
             check_prompt: true,
+            expected_workspace: self.project_workspace()?,
         };
         let outcome = agent::send_identified(
             &client,
-            &record.target()?,
+            &self.target(&record)?,
             &queue,
             &prompt,
             &identifier,
@@ -4668,6 +5115,8 @@ mod tests {
                 client: Fake {
                     root: root.clone(),
                     panes: Mutex::new(Vec::new()),
+                    named_pane: Mutex::new("owned".to_owned()),
+                    moves: Mutex::new(Vec::new()),
                     panes_calls: AtomicU64::new(0),
                     pane_info_calls: AtomicU64::new(0),
                     runs: Mutex::new(Vec::new()),
@@ -4705,6 +5154,8 @@ mod tests {
                     restart_foreign_on_read: AtomicBool::new(false),
                     leave_idle_shell_on_read: AtomicBool::new(false),
                     wrong_foreign_cwd: AtomicBool::new(false),
+                    move_name_follows: AtomicBool::new(true),
+                    move_return_matches: AtomicBool::new(true),
                 },
                 root,
             }
@@ -4802,6 +5253,8 @@ mod tests {
     struct Fake {
         root: PathBuf,
         panes: Mutex<Vec<Pane>>,
+        named_pane: Mutex<String>,
+        moves: Mutex<Vec<(String, String, String)>>,
         panes_calls: AtomicU64,
         pane_info_calls: AtomicU64,
         runs: Mutex<Vec<String>>,
@@ -4839,6 +5292,8 @@ mod tests {
         restart_foreign_on_read: AtomicBool,
         leave_idle_shell_on_read: AtomicBool,
         wrong_foreign_cwd: AtomicBool,
+        move_name_follows: AtomicBool,
+        move_return_matches: AtomicBool,
     }
     impl Fake {
         fn pane(id: &str) -> Pane {
@@ -4922,14 +5377,23 @@ mod tests {
             } else {
                 "codex"
             };
+            let workspace_id = self
+                .panes
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|entry| entry.pane_id == pane)
+                .map(|entry| entry.workspace_id.clone())
+                .unwrap_or_else(|| {
+                    if pane == "external" {
+                        "other-workspace".to_owned()
+                    } else {
+                        "workspace".to_owned()
+                    }
+                });
             Ok(AgentPaneInfo {
                 pane_id: pane.to_owned(),
-                workspace_id: if pane == "external" {
-                    "other-workspace"
-                } else {
-                    "workspace"
-                }
-                .to_owned(),
+                workspace_id,
                 cwd: if self.wrong_foreign_cwd.load(Ordering::Relaxed) {
                     self.root.join("other").display().to_string()
                 } else {
@@ -4944,7 +5408,7 @@ mod tests {
                 session_value: report_session.then(|| {
                     if changed_after_save {
                         "replacement-thread"
-                    } else if matches!(pane, "owned" | "claude" | "reported")
+                    } else if matches!(pane, "owned" | "claude" | "reported" | "project-pane")
                         || self.duplicate_session.load(Ordering::Relaxed)
                     {
                         "thread"
@@ -4955,8 +5419,13 @@ mod tests {
                 }),
             })
         }
-        fn workspace_label(&self, _: &str) -> AdapterResult<String> {
-            Ok("subagents".to_owned())
+        fn workspace_label(&self, workspace: &str) -> AdapterResult<String> {
+            Ok(if workspace == "project-workspace" {
+                "project-agents"
+            } else {
+                "subagents"
+            }
+            .to_owned())
         }
         fn run(&self, _: &str, text: &str) -> AdapterResult<()> {
             self.runs.lock().unwrap().push(text.to_owned());
@@ -5043,8 +5512,12 @@ mod tests {
         }
     }
     impl ManagedApi for Fake {
-        fn workspace_id_for_label(&self, _: &str) -> AdapterResult<Option<String>> {
-            Ok(Some("workspace".to_owned()))
+        fn workspace_id_for_label(&self, label: &str) -> AdapterResult<Option<String>> {
+            Ok(match label {
+                "subagents" => Some("workspace".to_owned()),
+                "project-agents" => Some("project-workspace".to_owned()),
+                _ => None,
+            })
         }
         fn create_workspace(
             &self,
@@ -5066,14 +5539,53 @@ mod tests {
         }
         fn create_tab_with_pane(
             &self,
-            _: &str,
+            workspace: &str,
             _: &str,
             _: &str,
             environment: &[String],
         ) -> AdapterResult<(String, String)> {
             self.environments.lock().unwrap().push(environment.to_vec());
-            self.panes.lock().unwrap().push(Self::pane("owned"));
+            self.panes.lock().unwrap().push(Pane {
+                pane_id: "owned".to_owned(),
+                tab_id: "tab".to_owned(),
+                workspace_id: workspace.to_owned(),
+            });
             Ok(("tab".to_owned(), "owned".to_owned()))
+        }
+        fn move_pane_to_new_tab(
+            &self,
+            pane: &str,
+            workspace: &str,
+            label: &str,
+        ) -> AdapterResult<Pane> {
+            let mut panes = self.panes.lock().unwrap();
+            let source = panes
+                .iter()
+                .position(|entry| entry.pane_id == pane)
+                .ok_or_else(|| AdapterError::unavailable("missing source pane"))?;
+            panes.remove(source);
+            let moved = Pane {
+                pane_id: "project-pane".to_owned(),
+                tab_id: "project-tab".to_owned(),
+                workspace_id: workspace.to_owned(),
+            };
+            panes.push(moved.clone());
+            if self.move_name_follows.load(Ordering::Relaxed) {
+                *self.named_pane.lock().unwrap() = moved.pane_id.clone();
+            }
+            self.moves.lock().unwrap().push((
+                pane.to_owned(),
+                workspace.to_owned(),
+                label.to_owned(),
+            ));
+            if self.move_return_matches.load(Ordering::Relaxed) {
+                Ok(moved)
+            } else {
+                Ok(Pane {
+                    tab_id: "reported-wrong-tab".to_owned(),
+                    ..moved
+                })
+            }
         }
         fn close_pane(&self, pane: &str) -> AdapterResult<()> {
             if self.fail_close.load(Ordering::Relaxed) {
@@ -5204,7 +5716,7 @@ mod tests {
             Ok(proof)
         }
         fn agent_pane(&self, _: &str) -> AdapterResult<String> {
-            Ok("owned".to_owned())
+            Ok(self.named_pane.lock().unwrap().clone())
         }
         fn report_agent_session(&self, _: &str, _: &str, _: &str, _: &str) -> AdapterResult<()> {
             Ok(())
@@ -5354,6 +5866,7 @@ mod tests {
             unstructured_status["arguments"],
             json!(["--no-alt-screen", "--reasoning-effort=high"])
         );
+        assert_eq!(unstructured_status["workspace_id"], "workspace");
 
         let codex = Fixture::new();
         let codex_status = codex
@@ -5378,6 +5891,7 @@ mod tests {
                 "sandbox_mode=read-only"
             ])
         );
+        assert_eq!(codex_status["workspace_id"], "workspace");
     }
 
     #[test]
@@ -5420,17 +5934,434 @@ mod tests {
             .unwrap();
 
         let inherited = Fixture::new();
-        let error = inherited
+        let status = inherited
             .manager()
             .with_inherited_workspace(Some("elsewhere"))
             .start("worker", &inherited.root, StartOptions::default())
-            .unwrap_err();
-        assert!(error.to_string().contains("workspace identity changed"));
+            .unwrap();
+        assert_eq!(status["workspace_id"], "elsewhere");
         let record: Value = serde_json::from_slice(
             &fs::read(inherited.root.join("registry/worker/agent.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(record["workspace_id"], "elsewhere");
+        assert_eq!(
+            inherited.client.panes.lock().unwrap()[0].workspace_id,
+            "elsewhere"
+        );
+    }
+
+    #[test]
+    fn project_workspace_selects_the_named_destination_and_rejects_an_override() {
+        let selected = Fixture::new();
+        let status = selected
+            .manager()
+            .with_project_workspace(Some("project-agents"))
+            .start("worker", &selected.root, StartOptions::default())
+            .unwrap();
+        assert_eq!(status["workspace_id"], "project-workspace");
+        assert_eq!(status["agent_status"], "idle");
+        assert_eq!(
+            selected.client.panes.lock().unwrap()[0].workspace_id,
+            "project-workspace"
+        );
+
+        let mismatched = Fixture::new();
+        let error = mismatched
+            .manager()
+            .with_project_workspace(Some("project-agents"))
+            .start(
+                "worker",
+                &mismatched.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("project configuration requires \"project-agents\""));
+        assert!(!mismatched.client.started.load(Ordering::Relaxed));
+        assert!(mismatched.client.panes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn move_preserves_the_managed_process_and_commits_the_new_herdr_identity() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        fixture
+            .manager()
+            .send("worker", "establish queue binding", DrainOptions::default())
+            .unwrap();
+        let manager = fixture
+            .manager()
+            .with_project_workspace(Some("project-agents"));
+
+        let before_runs = fixture.client.runs.lock().unwrap().len();
+        let moved = manager.move_to_project_workspace("worker").unwrap();
+        assert_eq!(moved["moved"], true);
+        assert_eq!(moved["recovered"], false);
+        assert_eq!(moved["previous_pane_id"], "owned");
+        assert_eq!(moved["pane_id"], "project-pane");
+        assert_eq!(moved["tab_id"], "project-tab");
+        assert_eq!(moved["workspace_id"], "project-workspace");
+        assert_eq!(moved["agent_status"], "idle");
+        assert_eq!(
+            fixture.client.moves.lock().unwrap().as_slice(),
+            &[(
+                "owned".to_owned(),
+                "project-workspace".to_owned(),
+                "worker".to_owned(),
+            )]
+        );
+        assert_eq!(fixture.client.runs.lock().unwrap().len(), before_runs);
+
+        let stored = manager.load("worker").unwrap();
+        assert_eq!(stored.pane_id.as_deref(), Some("project-pane"));
+        assert_eq!(stored.tab_id.as_deref(), Some("project-tab"));
+        assert_eq!(stored.workspace_id.as_deref(), Some("project-workspace"));
+        assert_eq!(manager.read("worker", 10).unwrap(), "visible output");
+
+        let already_there = manager.move_to_project_workspace("worker").unwrap();
+        assert_eq!(already_there["moved"], false);
+        assert_eq!(fixture.client.moves.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn move_recovery_requires_intent_and_restores_delivery() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        fixture
+            .manager()
+            .send("worker", "before move", DrainOptions::default())
+            .unwrap();
+        let manager = fixture
+            .manager()
+            .with_project_workspace(Some("project-agents"));
+        let record = manager.load("worker").unwrap();
+        fixture
+            .client
+            .move_pane_to_new_tab("owned", "project-workspace", "worker")
+            .unwrap();
+        let error = manager.move_to_project_workspace("worker").unwrap_err();
+        assert!(error.to_string().contains("no durable move intent"));
+        manager
+            .write_move_intent(&record, "project-workspace")
+            .unwrap();
+        let recovered = manager.move_to_project_workspace("worker").unwrap();
+        assert_eq!(recovered["recovered"], true);
+        manager
+            .send("worker", "after recovery", DrainOptions::default())
+            .unwrap();
+        assert_eq!(
+            fixture
+                .client
+                .runs
+                .lock()
+                .unwrap()
+                .last()
+                .map(String::as_str),
+            Some("after recovery")
+        );
+        assert!(!fixture.root.join("registry/worker/move.json").exists());
+    }
+
+    #[test]
+    fn move_preflights_foreign_binding_before_herdr_and_preserves_queue_states() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        fixture
+            .manager()
+            .send("worker", "bind", DrainOptions::default())
+            .unwrap();
+        let queue = fixture.root.join("registry/worker/queue");
+        agent::atomic_json(
+            &queue.join("target.json"),
+            &json!({
+                "kind": "pane", "pane_id": "foreign", "expected_agent": "codex",
+                "expected_workspace": null, "expected_cwd": fixture.root,
+            }),
+        )
+        .unwrap();
+        let manager = fixture
+            .manager()
+            .with_project_workspace(Some("project-agents"));
+        let error = manager.move_to_project_workspace("worker").unwrap_err();
+        assert!(error.to_string().contains("refusing move"));
+        assert!(fixture.client.moves.lock().unwrap().is_empty());
+
+        fs::remove_file(queue.join("target.json")).unwrap();
+        fixture
+            .manager()
+            .send("worker", "restore", DrainOptions::default())
+            .unwrap();
+        for state in ["pending", "inflight", "failed"] {
+            let directory = queue.join(state);
+            fs::create_dir_all(&directory).unwrap();
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+            agent::atomic_json(&directory.join(format!("{state}.json")), &json!({})).unwrap();
+        }
+        manager.move_to_project_workspace("worker").unwrap();
+        for state in ["pending", "inflight", "failed"] {
+            assert!(queue.join(state).join(format!("{state}.json")).exists());
+        }
+    }
+
+    #[test]
+    fn pane_binding_moves_and_delivers_to_replacement() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        fixture.start(None);
+        fixture
+            .manager()
+            .send("worker", "bind pane", DrainOptions::default())
+            .unwrap();
+        let manager = fixture
+            .manager()
+            .with_project_workspace(Some("project-agents"));
+        manager.move_to_project_workspace("worker").unwrap();
+        manager
+            .send("worker", "replacement pane", DrainOptions::default())
+            .unwrap();
+        assert_eq!(
+            fixture
+                .client
+                .runs
+                .lock()
+                .unwrap()
+                .last()
+                .map(String::as_str),
+            Some("replacement pane")
+        );
+    }
+
+    #[test]
+    fn move_refuses_sibling_tab_before_touching_herdr() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        fixture
+            .client
+            .panes
+            .lock()
+            .unwrap()
+            .push(Fake::pane("sibling"));
+        let manager = fixture
+            .manager()
+            .with_project_workspace(Some("project-agents"));
+        let error = manager.move_to_project_workspace("worker").unwrap_err();
+        assert!(error.to_string().contains("tab contains another pane"));
+        assert!(fixture.client.moves.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn move_refuses_name_and_final_presentation_mismatches_with_intent_retained() {
+        let name = Fixture::new();
+        name.start(None);
+        name.client
+            .move_name_follows
+            .store(false, Ordering::Relaxed);
+        let name_manager = name
+            .manager()
+            .with_project_workspace(Some("project-agents"));
+        let error = name_manager
+            .move_to_project_workspace("worker")
+            .unwrap_err();
+        assert!(error.to_string().contains("managed name did not follow"));
+        assert!(name.root.join("registry/worker/move.json").exists());
+
+        let presentation = Fixture::new();
+        presentation.start(None);
+        presentation
+            .client
+            .move_return_matches
+            .store(false, Ordering::Relaxed);
+        let presentation_manager = presentation
+            .manager()
+            .with_project_workspace(Some("project-agents"));
+        let error = presentation_manager
+            .move_to_project_workspace("worker")
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("final presentation verification failed"));
+        assert!(presentation.root.join("registry/worker/move.json").exists());
+    }
+
+    #[test]
+    fn move_refuses_false_recovery_and_unsupported_records() {
+        let both = Fixture::new();
+        both.start(None);
+        let both_manager = both
+            .manager()
+            .with_project_workspace(Some("project-agents"));
+        let record = both_manager.load("worker").unwrap();
+        both_manager
+            .write_move_intent(&record, "project-workspace")
+            .unwrap();
+        both.client
+            .panes
+            .lock()
+            .unwrap()
+            .push(Fake::pane("replacement"));
+        *both.client.named_pane.lock().unwrap() = "replacement".to_owned();
+        let error = both_manager
+            .move_to_project_workspace("worker")
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("both recorded and named panes are live"));
+
+        let no_policy = Fixture::new();
+        no_policy.start(None);
+        assert!(no_policy
+            .manager()
+            .move_to_project_workspace("worker")
+            .unwrap_err()
+            .to_string()
+            .contains("requires a workspace field"));
+
+        let adopted = Fixture::new();
+        adopted.adopt();
+        assert!(adopted
+            .manager()
+            .with_project_workspace(Some("project-agents"))
+            .move_to_project_workspace("foreign")
+            .unwrap_err()
+            .to_string()
+            .contains("supports only"));
+
+        let custom = Fixture::new();
+        custom
+            .manager()
+            .start(
+                "worker",
+                &custom.root,
+                StartOptions {
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(custom
+            .manager()
+            .with_project_workspace(Some("project-agents"))
+            .move_to_project_workspace("worker")
+            .unwrap_err()
+            .to_string()
+            .contains("supports only"));
+
+        let mismatch = Fixture::new();
+        let error = mismatch
+            .manager()
+            .with_project_workspace(Some("project-agents"))
+            .adopt("foreign", mismatch.adopt_options())
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match project workspace"));
+    }
+
+    #[test]
+    fn policy_never_blocks_status_stop_or_workspace_identity_guard() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let manager = fixture
+            .manager()
+            .with_project_workspace(Some("project-agents"));
+        assert_eq!(manager.status("worker").unwrap()["agent_status"], "idle");
+        assert_eq!(manager.stop("worker").unwrap()["pane_closed"], true);
+
+        let adopted = Fixture::new();
+        adopted.adopt();
+        let adopted_manager = adopted
+            .manager()
+            .with_project_workspace(Some("project-agents"));
+        assert_eq!(
+            adopted_manager.stop("foreign").unwrap()["runtime_preserved"],
+            true
+        );
+
+        let changed = Fixture::new();
+        changed.start(None);
+        changed
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        let mut changed_record = changed.manager().load("worker").unwrap();
+        changed_record.session_agent = None;
+        changed_record.session_value = None;
+        changed.manager().save(&changed_record).unwrap();
+        changed.client.panes.lock().unwrap()[0].workspace_id = "elsewhere".to_owned();
+        let error = changed.manager().read("worker", 10).unwrap_err();
+        assert!(error.to_string().contains("workspace identity changed"));
+    }
+
+    #[test]
+    fn policy_changes_never_become_queue_identity() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        fixture
+            .manager()
+            .send("worker", "before policy", DrainOptions::default())
+            .unwrap();
+        fixture
+            .manager()
+            .with_project_workspace(Some("project-agents"))
+            .move_to_project_workspace("worker")
+            .unwrap();
+        fixture
+            .manager()
+            .send("worker", "stale manager", DrainOptions::default())
+            .unwrap();
+        assert_eq!(
+            fixture
+                .client
+                .runs
+                .lock()
+                .unwrap()
+                .last()
+                .map(String::as_str),
+            Some("stale manager")
+        );
+
+        let adopted = Fixture::new();
+        adopted.prepare_foreign();
+        adopted.client.panes.lock().unwrap()[0].workspace_id = "project-workspace".to_owned();
+        let mut options = adopted.adopt_options();
+        options.expected_workspace = "project-agents".to_owned();
+        let manager = adopted
+            .manager()
+            .with_project_workspace(Some("project-agents"));
+        manager.adopt("foreign", options).unwrap();
+        manager
+            .send("foreign", "adopted in place", DrainOptions::default())
+            .unwrap();
+        assert_eq!(
+            adopted
+                .client
+                .runs
+                .lock()
+                .unwrap()
+                .last()
+                .map(String::as_str),
+            Some("adopted in place")
+        );
+    }
+
+    #[test]
+    fn project_policy_blocks_control_until_a_misplaced_agent_is_moved() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let manager = fixture
+            .manager()
+            .with_project_workspace(Some("project-agents"));
+        let error = manager.read("worker", 10).unwrap_err();
+        assert!(error.to_string().contains("workspace"), "{error}");
+        assert!(fixture.client.moves.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -1225,6 +1225,25 @@ fn binding(target: &Target) -> AgentResult<Value> {
     }
 }
 
+fn same_binding_identity(left: &Value, right: &Value) -> bool {
+    let (Some(mut left), Some(mut right)) = (left.as_object().cloned(), right.as_object().cloned())
+    else {
+        return false;
+    };
+    let left_workspace = left
+        .get("expected_workspace")
+        .filter(|value| !value.is_null());
+    let right_workspace = right
+        .get("expected_workspace")
+        .filter(|value| !value.is_null());
+    if left_workspace.is_some() && right_workspace.is_some() && left_workspace != right_workspace {
+        return false;
+    }
+    left.remove("expected_workspace");
+    right.remove("expected_workspace");
+    left == right
+}
+
 #[cfg(test)]
 fn bind_queue(root: &Path, target: &Target) -> AgentResult<()> {
     bind_queue_with_runtime(root, target, &SystemRuntime::default())
@@ -1245,11 +1264,14 @@ fn bind_queue_with_runtime(
     match fs::symlink_metadata(&binding_path) {
         Ok(_) => {
             let actual = read_private_json(&binding_path)?;
-            if actual != expected {
+            if !same_binding_identity(&actual, &expected) {
                 return Err(AgentError::delivery(format!(
                     "queue {} is bound to {actual}, refusing different target {expected}",
                     root.display()
                 )));
+            }
+            if actual != expected {
+                atomic_json(&binding_path, &expected)?;
             }
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -1266,6 +1288,115 @@ fn bind_queue_with_runtime(
     Ok(())
 }
 
+/// Replace one queue's exact target binding after a verified pane move.
+///
+/// Delivery is excluded while the binding changes. The old binding must be
+/// byte-semantically identical to `previous`; accepting `replacement` makes
+/// recovery idempotent when the binding commit succeeded but the surrounding
+/// agent-record commit did not.
+#[cfg(test)]
+pub(crate) fn rebind_queue(
+    root: &Path,
+    previous: &Target,
+    replacement: &Target,
+) -> AgentResult<()> {
+    validate_target_authority(previous)?;
+    validate_target_authority(replacement)?;
+    prepare(root)?;
+
+    let delivery_path = root.join(".delivery.lock");
+    let delivery = open_private_lock(&delivery_path, "queue delivery lock")?;
+    lock_exclusive_with_runtime(
+        &delivery,
+        &delivery_path,
+        "queue delivery",
+        &SystemRuntime::default(),
+    )?;
+
+    let binding_lock_path = root.join(".binding.lock");
+    let binding_lock = open_private_lock(&binding_lock_path, "queue binding lock")?;
+    lock_exclusive_with_runtime(
+        &binding_lock,
+        &binding_lock_path,
+        "queue binding",
+        &SystemRuntime::default(),
+    )?;
+
+    let path = root.join("target.json");
+    let old = binding(previous)?;
+    let new = binding(replacement)?;
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let actual = read_private_json(&path)?;
+            if !same_binding_identity(&actual, &old) && !same_binding_identity(&actual, &new) {
+                return Err(AgentError::delivery(format!(
+                    "queue {} is bound to {actual}, refusing move from {old} to {new}",
+                    root.display()
+                )));
+            }
+            if actual != new {
+                atomic_json(&path, &new)?;
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => atomic_json(&path, &new)?,
+        Err(error) => return Err(io_error("inspect queue target binding", &path, error)),
+    }
+    Ok(())
+}
+
+pub(crate) fn rebind_queue_after<T, F>(
+    root: &Path,
+    previous: &Target,
+    already_replacement: Option<&Target>,
+    operation: F,
+) -> AgentResult<T>
+where
+    F: FnOnce() -> AgentResult<(Target, T)>,
+{
+    validate_target_authority(previous)?;
+    prepare(root)?;
+    let delivery_path = root.join(".delivery.lock");
+    let delivery = open_private_lock(&delivery_path, "queue delivery lock")?;
+    lock_exclusive_with_runtime(
+        &delivery,
+        &delivery_path,
+        "queue delivery",
+        &SystemRuntime::default(),
+    )?;
+    let binding_lock_path = root.join(".binding.lock");
+    let binding_lock = open_private_lock(&binding_lock_path, "queue binding lock")?;
+    lock_exclusive_with_runtime(
+        &binding_lock,
+        &binding_lock_path,
+        "queue binding",
+        &SystemRuntime::default(),
+    )?;
+    let path = root.join("target.json");
+    let old = binding(previous)?;
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let actual = read_private_json(&path)?;
+            let replacement_allowed = already_replacement
+                .map(binding)
+                .transpose()?
+                .as_ref()
+                .is_some_and(|replacement| same_binding_identity(&actual, replacement));
+            if !same_binding_identity(&actual, &old) && !replacement_allowed {
+                return Err(AgentError::delivery(format!(
+                    "queue {} is bound to {actual}, refusing move from {old}",
+                    root.display()
+                )));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error("inspect queue target binding", &path, error)),
+    }
+    let (replacement, result) = operation()?;
+    validate_target_authority(&replacement)?;
+    atomic_json(&path, &binding(&replacement)?)?;
+    Ok(result)
+}
+
 fn validate_existing_binding(root: &Path, target: &Target) -> AgentResult<()> {
     let binding_path = root.join("target.json");
     let actual = match fs::symlink_metadata(&binding_path) {
@@ -1280,7 +1411,7 @@ fn validate_existing_binding(root: &Path, target: &Target) -> AgentResult<()> {
         }
     };
     let expected = binding(target)?;
-    if actual != expected {
+    if !same_binding_identity(&actual, &expected) {
         return Err(AgentError::delivery(format!(
             "queue {} is bound to {actual}, refusing different target {expected}",
             root.display()
@@ -2471,6 +2602,35 @@ mod tests {
             assert!(error.to_string().contains("already exists"));
         });
         assert!(fake.runs().is_empty());
+    }
+
+    #[test]
+    fn queue_rebind_is_idempotent_and_refuses_unrelated_identity() {
+        let directory = TestDirectory::new("queue-rebind");
+        let mut previous = target();
+        previous.session_agent = None;
+        previous.session_value = None;
+        previous.expected_workspace = Some("old-label".to_owned());
+        bind_queue(directory.path(), &previous).unwrap();
+        let mut replacement = previous.clone();
+        replacement.pane_id = Some("w2:p2".to_owned());
+        replacement.expected_workspace = Some("new-label".to_owned());
+        rebind_queue(directory.path(), &previous, &replacement).unwrap();
+        rebind_queue(directory.path(), &previous, &replacement).unwrap();
+        assert_eq!(
+            read_private_json(&directory.path().join("target.json")).unwrap(),
+            binding(&replacement).unwrap()
+        );
+        atomic_json(
+            &directory.path().join("target.json"),
+            &json!({
+                "kind": "pane", "pane_id": "foreign", "expected_agent": "codex",
+                "expected_workspace": null, "expected_cwd": "/work/mtg",
+            }),
+        )
+        .unwrap();
+        let error = rebind_queue(directory.path(), &previous, &replacement).unwrap_err();
+        assert!(error.to_string().contains("refusing move"));
     }
 
     #[test]
