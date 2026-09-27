@@ -18,6 +18,7 @@ from agentctl.client import HerdrClient
 from agentctl.errors import AgentPending, AgentPossiblySubmitted, HerdrRunError
 from agentctl.legacy_cli import _ascii_float, _bounded_uint
 from agentctl.profiles import (
+    AGENTCLOUD_HARNESS,
     load_configuration, load_profiles, validate_raw_harness_arguments,
 )
 from agentctl.sessions import Sessions
@@ -304,6 +305,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 except KeyError as exc:
                     raise ValueError(f"unknown profile {args.profile!r}; run agentctl profiles --cwd {args.cwd}") from exc
             harness = profile.harness if profile else (args.harness or "codex")
+            if harness == AGENTCLOUD_HARNESS:
+                selected = f"profile {profile.name!r}" if profile else "--harness agentcloud"
+                raise ValueError(
+                    f"{selected} uses the agentcloud adapter, which only the Rust edition of "
+                    "agentctl implements; start it with the Rust agentctl, or choose a Codex, "
+                    f"Claude, or Muse profile from agentctl profiles --cwd {args.cwd}"
+                )
             mode = profile.mode if profile else (args.mode or "interactive")
             model = profile.model if profile else args.model
             reasoning_effort = profile.reasoning_effort if profile else args.reasoning_effort

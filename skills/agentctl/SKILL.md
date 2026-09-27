@@ -1,6 +1,6 @@
 ---
 name: agentctl
-description: Start, inspect, message, and retire persistent named coding-agent sessions, including owner-configured local launch profiles. Use when asked to create a managed Codex, Claude, Muse, or other configured subagent.
+description: Start, inspect, message, and retire persistent named coding-agent sessions, including owner-configured local launch profiles and agentcloud workers on their own nodes. Use when asked to create a managed Codex, Claude, Muse, agentcloud, or other configured subagent.
 ---
 
 # agentctl
@@ -27,6 +27,14 @@ Profiles are owner-controlled launch policy. Never invent, add, remove, or
 rewrite harness arguments, environment entries, trust flags, permission-bypass
 flags, models, or reasoning effort. If the requested profile is absent or
 refused, report that failure instead of approximating it with ad hoc flags.
+
+When a task needs its own machine, such as a checkout that must not be created
+locally, and `agentctl capabilities` lists `agentcloud`, start an agentcloud
+worker: an owner profile with harness `agentcloud`, or
+`--harness agentcloud --cloud-harness claude-code --provision --envspec NAME`.
+`agentctl` creates the session, records its ID, and opens `agentterm` in the
+worker's tab. Read its reply with `agentctl read NAME --output last`; `stop`
+halts and archives the session but does not release the node reservation.
 
 Use a fresh name for a fresh task. A successful `start` returns durable session
 identity; it does not prove the initial prompt completed. Use `wait`, `read`, and

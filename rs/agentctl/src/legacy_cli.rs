@@ -359,6 +359,7 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
                 brief,
                 startup_timeout: Duration::from_secs_f64(args.startup_timeout),
                 delivery,
+                cloud: None,
             };
             write_json(&manager.start(name, cwd, options)?)?;
         }
@@ -368,6 +369,7 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
                 expected_token: args.expected_token.clone(),
                 recover_legacy_adoption: args.recover_legacy_adoption,
                 expected_record_sha256: args.expected_record_sha256.clone(),
+                skip_cloud_halt: false,
             },
         )?)?,
         "list" => {
