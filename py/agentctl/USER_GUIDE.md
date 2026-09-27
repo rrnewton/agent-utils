@@ -275,7 +275,8 @@ are launch policy and therefore must not contain secrets. Raw Codex
 model or effort because those opaque settings could override the structured
 selection.
 
-Interactive profiles support Codex, Claude, and Muse. Headless profiles support
+Interactive profiles support Codex, Claude, and Muse, plus `agentcloud` in the
+Rust distribution (see [Agentcloud sessions](#agentcloud-sessions)). Headless profiles support
 Codex, AGY, and Muse in installations that include the worker extension.
 Headless Muse keeps `exec`, `--json`, `--session-id`, and the prompt under the
 runner's control. Extra options with values use one literal `--option=value`
@@ -491,6 +492,126 @@ The interactive queue has four durable directories:
 request ID and artifact path. Preserve that ID and use `drain` for pending
 work. Sending the same task under a new ID creates a second request and can
 duplicate work; it is not a recovery operation.
+
+## Agentcloud sessions
+
+The Rust distribution can also launch a worker whose session runs in
+agentcloud rather than on this machine. This gives a worker a machine of its
+own, such as a freshly provisioned node with the checkout it needs, so that
+checkout never has to exist locally. The Python distribution lists and validates
+agentcloud profiles, marking them `"requires_edition": "rust"`, but refuses to
+start them. `agentctl capabilities` lists the adapter under
+`agentcloud`; it needs Herdr plus the separately installed and authenticated
+`agentcloudctl` and `agentterm` commands.
+
+Starting one is two steps, and `agentctl` performs both:
+
+1. `agentcloudctl create` makes a root session. The agent name becomes its
+   `--title`, the brief becomes its durable `--prompt`, and the model,
+   reasoning effort, driver, and node settings come from the profile or flags.
+   `agentctl` requires stdout to be exactly one complete session UUID and
+   records it before anything else happens; a shorter ID is refused, because the
+   viewer would resolve it as a prefix. A failed create reports its stderr and
+   opens no tab.
+2. The agent's new Herdr tab runs `agentterm -s SESSION_ID`. `agentctl` pins the
+   `agentterm` process as the tab's foreground process, so `status` can later
+   say whether the viewer is still attached. A project `workspace` setting
+   places this tab exactly as it places a local worker's tab. The same policy
+   then governs the agent: `send` and terminal reads (`read --output tail` or
+   `all`) refuse while the tab is missing or in another workspace, before any
+   `agentcloudctl` call. `status`, `attach`, `wait`, `read --output last`, and
+   `stop` remain available; `read --output last` is included because it reads
+   the durable reply from agentcloud, not the terminal.
+
+Both commands, and every later `agentcloudctl` call for that agent, receive the
+same explicit `--ws-url`: the global `--agentcloud-url URL`, else
+`$AGENTCLOUD_ORCHESTRATOR_URL`, else `agentcloudctl`'s documented production
+endpoint. Passing it explicitly matters because `agentcloudctl` and `agentterm`
+otherwise fall back to different settings, so the viewer could watch a
+different orchestrator. The endpoint is recorded with the agent; later commands
+always use it and refuse a different explicit `--agentcloud-url`. A record
+written before endpoints were recorded still loads; its first `send` or `stop`
+resolves the endpoint the same way and saves it, and `stop --skip-cloud-halt`
+never needs one.
+
+For an owner-configured profile, add an `agentcloud` block. This example
+starts a Claude Code session on a freshly provisioned node; replace each
+`<placeholder>` with a value from your deployment. `agentcloudctl models` lists
+each driver's model keys and reasoning efforts:
+
+```json
+{
+  "schema": "agentctl-profiles/v1",
+  "profiles": {
+    "cloud-worker": {
+      "harness": "agentcloud",
+      "mode": "interactive",
+      "model": "<model-key>",
+      "reasoning_effort": "high",
+      "agentcloud": {
+        "harness": "claude-code",
+        "provision": true,
+        "envspec": "<envspec>",
+        "purpose": "<purpose>"
+      }
+    }
+  }
+}
+```
+
+```sh
+agentctl start sub-cloud-worker --cwd . --profile cloud-worker \
+  --brief 'Run hostname, then reply DONE.'
+agentctl wait sub-cloud-worker --timeout 1800
+agentctl read sub-cloud-worker --output last
+agentctl stop sub-cloud-worker
+```
+
+The same launch without a profile uses explicit flags:
+`--harness agentcloud --cloud-harness claude-code --provision --envspec
+<envspec> --purpose <purpose>`, plus `--cloud-workspace /absolute/path` or
+`--node-id ID` where needed. The `agentcloud` block accepts `harness`
+(`native`, `claude-code`, `codex`, or `muse-code`; omitted means the server
+default), `provision`, `envspec` and `purpose` (both require `provision`),
+`workspace` (an absolute path on the node), and `node_id` (which conflicts with
+`provision`). Profile `argv` and `--harness-arg` add literal `agentcloudctl
+create` options, written as `--option=value`. Options that `agentctl` sets
+itself, and endpoint or identity options that must match every later command
+(`--ws-url`, `--client-cert`, `--client-key`, `--as-crewmate`), are refused.
+`env` and `--env` apply only to the terminal tab.
+
+Every later command uses agentcloud's durable interface rather than keystrokes:
+
+| Command | Agentcloud behavior |
+| --- | --- |
+| `status`, `list` | One `agentcloudctl list` call per invocation, which does not attach to or wake a session. `agent_status` is `working` while a run is open, the listing's non-idle `activity` otherwise (for example `waiting` while the first prompt waits for a provisioned node), and `idle` when neither applies; `cloud` carries the listing's run, node, and status fields; `terminal` reports whether the tab and pinned `agentterm` process remain. A session missing from the lagged listing reports `unknown` with a `probe_error`. |
+| `send` | `agentcloudctl send --end-of-turn`, with a 120-second bound, so input waits for the current turn instead of steering it. A leading `/goal` is sent without `--end-of-turn`. When the caller itself runs inside a different agentcloud session (`--from-session`, default `$AGENTCLOUD_SESSION_ID`), `agentcloudctl` refuses that send because it would speak as the human, so `agentctl` uses the attributed `agentcloudctl send-message` from the caller's session instead. The message arrives as an ordinary input and a `/goal` is not interpreted. An explicit human send (`--from-session ''`) from inside a different agentcloud session is refused before any call, because `agentcloudctl` deliberately rejects human input there and `agentctl` passes each child the session context it was given rather than removing it; the error prints the human command to run from a terminal outside any agentcloud session. The worker may try to reply to the sending session; its final text is still available through `read --output last`. `--message-id` becomes the idempotency key; without it `agentctl` generates one. Every failure, including a timeout after the service may already have accepted the input, prints that key and a shell-quoted retry command that repeats the same registry, endpoint, sender, verb, and key. The service deduplicates a key only for the same sender and verb, so follow that command exactly; its `--from-session ''` selects human attribution, which is refused when the command runs inside a different agentcloud session than the recipient's, so run a human retry from a terminal outside any agentcloud session. Delivery timeouts and `drain` do not apply. |
+| `wait` | `agentcloudctl wait --until settle`. Success means the current or last run completed. A failed run, an interrupted run, and a timeout each exit 75 with a message naming which one happened. |
+| `read` | `--output last` prints the last settled run's final reply from `agentcloudctl output`. `tail` and `all` read the `agentterm` tab. |
+| `attach`, `pause`, `resume` | Focus the recorded tab; pause refuses automation input until resume. |
+| `stop` | `agentcloudctl halt`, then close the recorded pane, then `agentcloudctl archive`, then archive the registry record. Immediately before closing, it checks again that the pane is in the same tab and workspace and runs the recorded `agentterm` or its idle shell; otherwise it refuses and keeps the record. It does not release the node reservation. |
+
+A halt failure stops `stop` before anything local changes; retry it, since halt
+is idempotent. Use `--skip-cloud-halt` only when the session no longer exists
+or was retired elsewhere; it closes the tab and archives the record without
+touching the session. `stop` does not release the node reservation, and neither
+does `agentcloudctl node detach`; the orchestrator releases a provisioned
+node's reservation on its own schedule after the halted session goes idle,
+which can be long after `stop` returns. `agentcloudctl inspect -s SESSION_ID`
+shows any remaining reservation. The stop result says which steps happened.
+
+`agentcloudctl create` has a 300-second bound. `--startup-timeout` bounds only
+the wait for `agentterm` to become the tab's foreground process. If create exits
+9, the session exists but its node clause is unverified and the brief was not
+queued. `agentctl` still attaches the tab and records the session, then exits
+nonzero; inspect it, then send the brief or stop it, and do not start it again.
+If the tab cannot be created or attached after a successful create, the record
+keeps the session ID so that `stop` can halt it. The error prints the exact
+manual viewer command, `AGENTTERM --ws-url ENDPOINT -s SESSION_ID` with the
+recorded executable and endpoint, as does `attach` when the tab is gone. Every
+printed `agentctl` recovery command names the registry it applies to. `goal`, `drain`, `bind-session`, and `adopt`
+are refused for agentcloud agents; a goal travels as
+`agentctl send NAME '/goal OBJECTIVE'`.
 
 ## Observe and take over
 

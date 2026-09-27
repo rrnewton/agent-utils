@@ -25,7 +25,18 @@ _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _SECRET_NAME = re.compile(r"(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_KEY|PRIVATE_KEY)", re.I)
 _SECRET_OPTION = re.compile(r"^--?(?:api[-_]?key|token|secret|password|passwd|credential)(?:=|$)", re.I)
 _EFFORTS = frozenset(("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"))
-_HARNESSES = frozenset(("codex", "claude", "muse", "agy"))
+_HARNESSES = frozenset(("codex", "claude", "muse", "agy", "agentcloud"))
+#: Agentcloud profiles are listed and validated here but only the Rust edition launches them.
+AGENTCLOUD_HARNESS = "agentcloud"
+_CLOUD_DRIVERS = ("native", "claude-code", "codex", "muse-code")
+_CLOUD_TEXT_FIELDS = ("envspec", "purpose", "workspace", "node_id")
+_CLOUD_FIELDS = frozenset(("harness", "provision", *_CLOUD_TEXT_FIELDS))
+#: Options the launcher sets itself, or that must match every later agentcloud command.
+_CLOUD_RESERVED_OPTIONS = frozenset((
+    "--prompt", "--title", "--harness", "--model", "--effort", "--provision", "--envspec",
+    "--purpose", "--workspace", "--node-id", "--ws-url", "--client-cert", "--client-key",
+    "--as-crewmate",
+))
 _MODES = frozenset(("interactive", "headless"))
 _MUSE_EXEC_OWNED_OPTIONS = frozenset(
     ("--", "--api-key-stdin", "--json", "--session-id", "--prompt-file")
@@ -49,10 +60,11 @@ class LaunchProfile:
     reasoning_effort: str | None
     argv: tuple[str, ...]
     environment: tuple[str, ...]
+    agentcloud: dict[str, object] | None = None
 
     def public(self) -> dict[str, object]:
         """Return discovery metadata without argument or environment values."""
-        return {
+        result: dict[str, object] = {
             "name": self.name,
             "harness": self.harness,
             "mode": self.mode,
@@ -61,6 +73,10 @@ class LaunchProfile:
             "argv_count": len(self.argv),
             "environment": [entry.partition("=")[0] for entry in self.environment],
         }
+        if self.agentcloud is not None:
+            result["agentcloud"] = dict(self.agentcloud)
+            result["requires_edition"] = "rust"
+        return result
 
 
 def profile_path(cwd: str | Path) -> Path:
@@ -258,12 +274,77 @@ def validate_structured_harness_argument_conflicts(
         )
 
 
+def _single_line(value: object) -> bool:
+    return (isinstance(value, str) and bool(value.strip())
+            and not any(character in value for character in "\0\n\r"))
+
+
+def _agentcloud_settings(name: str, raw: object) -> dict[str, object]:
+    """Validate an ``agentcloud`` block with the same rules as the Rust launcher."""
+    label = f"profile {name!r}"
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise AgentDeliveryError(f"{label} agentcloud must be an object")
+    unknown = sorted(set(raw) - _CLOUD_FIELDS)
+    if unknown:
+        raise AgentDeliveryError(f"{label} agentcloud has unknown fields: {', '.join(unknown)}")
+    driver = raw.get("harness")
+    if driver is not None and driver not in _CLOUD_DRIVERS:
+        raise AgentDeliveryError(
+            f"{label} has unsupported agentcloud driver {driver!r}; use one of {', '.join(_CLOUD_DRIVERS)}"
+        )
+    provision = raw.get("provision", False)
+    if not isinstance(provision, bool):
+        raise AgentDeliveryError(f"{label} agentcloud provision must be true or false")
+    settings: dict[str, object] = {"harness": driver, "provision": provision}
+    for field in _CLOUD_TEXT_FIELDS:
+        value = raw.get(field)
+        if value is not None and not _single_line(value):
+            raise AgentDeliveryError(
+                f"{label} agentcloud {field} must be a nonempty single-line string"
+            )
+        settings[field] = value
+    if not provision and (settings["envspec"] is not None or settings["purpose"] is not None):
+        raise AgentDeliveryError(
+            f"{label} sets an agentcloud envspec or purpose without provision; "
+            "enable provision (--provision) or remove them"
+        )
+    if provision and settings["node_id"] is not None:
+        raise AgentDeliveryError(
+            f"{label} cannot both provision a fresh node and bind node_id; choose one"
+        )
+    workspace = settings["workspace"]
+    if isinstance(workspace, str) and not workspace.startswith("/"):
+        raise AgentDeliveryError(
+            f"{label} agentcloud workspace must be an absolute path on the session's node"
+        )
+    return settings
+
+
+def validate_agentcloud_create_arguments(argv: tuple[str, ...], *, label: str) -> None:
+    """Allow only literal long ``agentcloudctl create`` options that the launcher does not own."""
+    for item in argv:
+        key = item.split("=", 1)[0]
+        if not item.startswith("--") or key == "--":
+            raise AgentDeliveryError(
+                f"{label} agentcloud argument {item!r} must be a long option; join values as "
+                "--option=value because positional values and short options are reserved"
+            )
+        if key in _CLOUD_RESERVED_OPTIONS:
+            raise AgentDeliveryError(
+                f"{label} cannot pass {key} through raw agentcloud arguments; agentctl sets it "
+                "from the name, brief, model, reasoning effort, or structured agentcloud "
+                "settings, and endpoint or identity options must match every later agentctl verb"
+            )
+
+
 def _profile(name: str, raw: object) -> LaunchProfile:
     if not _NAME.fullmatch(name):
         raise AgentDeliveryError(f"invalid profile name {name!r}; use lowercase letters, digits, and hyphens")
     if not isinstance(raw, dict):
         raise AgentDeliveryError(f"profile {name!r} must be an object")
-    allowed = {"harness", "mode", "model", "reasoning_effort", "argv", "env"}
+    allowed = {"harness", "mode", "model", "reasoning_effort", "argv", "env", "agentcloud"}
     unknown = sorted(set(raw) - allowed)
     if unknown:
         raise AgentDeliveryError(f"profile {name!r} has unknown fields: {', '.join(unknown)}")
@@ -275,7 +356,7 @@ def _profile(name: str, raw: object) -> LaunchProfile:
     if mode not in _MODES:
         raise AgentDeliveryError(f"profile {name!r} has unsupported mode {mode!r}")
     supported = (
-        harness in ("codex", "claude", "muse")
+        harness in ("codex", "claude", "muse", AGENTCLOUD_HARNESS)
         if mode == "interactive"
         else harness in ("codex", "agy", "muse")
     )
@@ -303,13 +384,24 @@ def _profile(name: str, raw: object) -> LaunchProfile:
     for index, item in enumerate(argv):
         if _SECRET_OPTION.match(item) or (index and _SECRET_OPTION.match(argv[index - 1])):
             raise AgentDeliveryError(f"profile {name!r} argv appears to contain a secret; use the harness credential store")
-    # Structured and runner-owned settings never enter raw argv. This removes
-    # order-dependent precedence and keeps the headless session/prompt binding
-    # under agentctl's control.
-    validate_raw_harness_arguments(
-        harness, argv, label=f"profile {name!r}",
-        structured_model=model is not None, structured_effort=effort is not None,
-    )
+    agentcloud: dict[str, object] | None = None
+    if harness == AGENTCLOUD_HARNESS:
+        validate_agentcloud_create_arguments(argv, label=f"profile {name!r}")
+        agentcloud = _agentcloud_settings(name, raw.get("agentcloud"))
+    elif raw.get("agentcloud") is not None:
+        # An explicit null means absent, as in the Rust edition.
+        raise AgentDeliveryError(
+            f"profile {name!r} has an agentcloud block but harness {harness!r}; "
+            'use harness "agentcloud" or remove the block'
+        )
+    else:
+        # Structured and runner-owned settings never enter raw argv. This removes
+        # order-dependent precedence and keeps the headless session/prompt binding
+        # under agentctl's control.
+        validate_raw_harness_arguments(
+            harness, argv, label=f"profile {name!r}",
+            structured_model=model is not None, structured_effort=effort is not None,
+        )
     if harness == "muse" and mode == "headless":
         validate_muse_headless_arguments(argv, profile=name)
     raw_env = raw.get("env", {})
@@ -329,7 +421,7 @@ def _profile(name: str, raw: object) -> LaunchProfile:
         if not isinstance(value, str) or "\0" in value:
             raise AgentDeliveryError(f"profile {name!r} environment values must be NUL-free strings")
         environment.append(f"{key}={value}")
-    return LaunchProfile(name, harness, mode, model, effort, argv, tuple(environment))
+    return LaunchProfile(name, harness, mode, model, effort, argv, tuple(environment), agentcloud)
 
 
 def _workspace(value: object) -> str | None:

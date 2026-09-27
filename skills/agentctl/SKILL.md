@@ -1,6 +1,6 @@
 ---
 name: agentctl
-description: Start, inspect, message, and retire persistent named coding-agent sessions, including owner-configured local launch profiles. Use when asked to create a managed Codex, Claude, Muse, or other configured subagent.
+description: Start, inspect, message, and retire persistent named coding-agent sessions, including owner-configured local launch profiles and agentcloud workers on their own nodes. Use when asked to create a managed Codex, Claude, Muse, agentcloud, or other configured subagent.
 ---
 
 # agentctl
@@ -45,6 +45,14 @@ move command; stop refuses until recovery commits the new pane identity. A
 pending move remains recoverable even if the project `workspace` key was
 removed: the rerun uses the exact destination workspace ID stored in the
 durable intent and does not choose a new destination.
+
+When a task needs its own machine, such as a checkout that must not be created
+locally, and `agentctl capabilities` lists `agentcloud`, start an agentcloud
+worker: an owner profile with harness `agentcloud`, or
+`--harness agentcloud --cloud-harness claude-code --provision --envspec NAME`.
+`agentctl` creates the session, records its ID, and opens `agentterm` in the
+worker's tab. Read its reply with `agentctl read NAME --output last`; `stop`
+halts and archives the session but does not release the node reservation.
 
 Use a fresh name for a fresh task. A successful `start` returns durable session
 identity; it does not prove the initial prompt completed. Use `wait`, `read`, and

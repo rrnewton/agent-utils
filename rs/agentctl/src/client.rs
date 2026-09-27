@@ -1535,6 +1535,67 @@ impl HerdrClient {
         )?;
         Ok(())
     }
+    /// Run one literal executable through `pane run` and pin its foreground process identity.
+    ///
+    /// The executable must be a same-user-or-root, non-writable ELF image, exactly as for custom
+    /// harnesses. No agent state is reported to Herdr: the command is a viewer, and a synthetic
+    /// report would go stale the moment the viewed session changed state.
+    pub fn start_pane_command(
+        &self,
+        pane_id: &str,
+        executable: &Path,
+        arguments: &[String],
+        timeout: Duration,
+    ) -> Result<CustomProcessIdentity> {
+        if timeout.is_zero() || timeout > Duration::from_secs(300) {
+            return Err(AdapterError::unavailable(
+                "pane command startup timeout must be between 0 and 300 seconds",
+            ));
+        }
+        let canonical = fs::canonicalize(executable).map_err(|error| {
+            AdapterError::unavailable(format!(
+                "cannot resolve pane command {}: {error}",
+                executable.display()
+            ))
+        })?;
+        let pinned = pin_harness_executable(canonical)?;
+        let mut command = vec![pinned.path.display().to_string()];
+        command.extend_from_slice(arguments);
+        let line = shell_join(&command)?;
+        self.call_ok(
+            &[
+                "pane".to_owned(),
+                "run".to_owned(),
+                pane_id.to_owned(),
+                line,
+            ],
+            &format!("pane run {}", pinned.path.display()),
+        )?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(identity) = self.custom_harness_observed(pane_id, &pinned, &|| false)? {
+                return Ok(identity);
+            }
+            if Instant::now() >= deadline {
+                return Err(AdapterError::unavailable(format!(
+                    "{} was not the foreground process in pane {pane_id} after {}s; read the pane for its error",
+                    pinned.path.display(),
+                    timeout.as_secs_f64()
+                )));
+            }
+            thread::sleep(
+                Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+    /// Report whether a pinned command process is still the pane's foreground process.
+    pub fn pane_runs_command(
+        &self,
+        pane_id: &str,
+        identity: &CustomProcessIdentity,
+    ) -> Result<bool> {
+        self.recorded_custom_harness_observed(pane_id, identity, &|| false)
+    }
     /// Invoke and validate the corresponding Herdr agent-control operation.
     pub fn agent_pane(&self, name: &str) -> Result<String> {
         self.agent_pane_with_cancellation(name, &|| false)

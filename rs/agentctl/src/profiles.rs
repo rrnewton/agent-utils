@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::agent::AgentError;
+use crate::subagents::CloudLaunch;
 
 pub(crate) const SCHEMA: &str = "agentctl-profiles/v1";
 const PROFILE_PATH: &str = ".agentctl/profiles.json";
@@ -33,6 +34,8 @@ pub(crate) struct LaunchProfile {
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) argv: Vec<String>,
     pub(crate) environment: Vec<String>,
+    /// Agentcloud settings; present exactly when `harness` is `agentcloud`.
+    pub(crate) cloud: Option<CloudLaunch>,
 }
 
 #[derive(Debug, Serialize)]
@@ -44,6 +47,11 @@ pub(crate) struct PublicProfile {
     reasoning_effort: Option<String>,
     argv_count: usize,
     environment: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agentcloud: Option<CloudLaunch>,
+    /// Agentcloud profiles are launchable only by this edition; the other edition lists them too.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requires_edition: Option<&'static str>,
 }
 
 impl LaunchProfile {
@@ -60,6 +68,8 @@ impl LaunchProfile {
                 .iter()
                 .filter_map(|entry| entry.split_once('=').map(|(name, _)| name.to_owned()))
                 .collect(),
+            agentcloud: self.cloud.clone(),
+            requires_edition: self.cloud.as_ref().map(|_| "rust"),
         }
     }
 }
@@ -84,6 +94,8 @@ struct RawProfile {
     argv: Vec<String>,
     #[serde(default)]
     env: UniqueMap<String>,
+    #[serde(default)]
+    agentcloud: Option<CloudLaunch>,
 }
 
 #[derive(Debug, Default)]
@@ -449,13 +461,16 @@ fn validate_muse_headless_arguments(name: &str, argv: &[String]) -> Result<(), A
     Ok(())
 }
 
-fn validate(name: String, raw: RawProfile) -> Result<LaunchProfile, AgentError> {
+fn validate(name: String, mut raw: RawProfile) -> Result<LaunchProfile, AgentError> {
     if !valid_name(&name) {
         return Err(fail(format!(
             "invalid profile name {name:?}; use lowercase letters, digits, and hyphens"
         )));
     }
-    if !matches!(raw.harness.as_str(), "codex" | "claude" | "muse" | "agy") {
+    if !matches!(
+        raw.harness.as_str(),
+        "codex" | "claude" | "muse" | "agy" | "agentcloud"
+    ) {
         return Err(fail(format!(
             "profile {name:?} has unsupported harness {:?}",
             raw.harness
@@ -468,7 +483,10 @@ fn validate(name: String, raw: RawProfile) -> Result<LaunchProfile, AgentError> 
         )));
     }
     let combination_supported = if raw.mode == "interactive" {
-        matches!(raw.harness.as_str(), "codex" | "claude" | "muse")
+        matches!(
+            raw.harness.as_str(),
+            "codex" | "claude" | "muse" | "agentcloud"
+        )
     } else {
         matches!(raw.harness.as_str(), "codex" | "agy" | "muse")
     };
@@ -529,14 +547,27 @@ fn validate(name: String, raw: RawProfile) -> Result<LaunchProfile, AgentError> 
             "profile {name:?} argv appears to contain a secret; use the harness credential store"
         )));
     }
-    validate_raw_harness_arguments(
-        &format!("profile {name:?}"),
-        &raw.harness,
-        &raw.argv,
-        raw.model.is_some(),
-        raw.reasoning_effort.is_some(),
-        false,
-    )?;
+    if raw.harness == "agentcloud" {
+        let label = format!("profile {name:?}");
+        crate::subagents::validate_cloud_create_arguments(&label, &raw.argv)?;
+        raw.agentcloud
+            .get_or_insert_with(CloudLaunch::default)
+            .validate(&label)?;
+    } else if raw.agentcloud.is_some() {
+        return Err(fail(format!(
+            "profile {name:?} has an agentcloud block but harness {:?}; use harness \"agentcloud\" or remove the block",
+            raw.harness
+        )));
+    } else {
+        validate_raw_harness_arguments(
+            &format!("profile {name:?}"),
+            &raw.harness,
+            &raw.argv,
+            raw.model.is_some(),
+            raw.reasoning_effort.is_some(),
+            false,
+        )?;
+    }
     if raw.harness == "muse" && raw.mode == "headless" {
         validate_muse_headless_arguments(&name, &raw.argv)?;
     }
@@ -567,6 +598,7 @@ fn validate(name: String, raw: RawProfile) -> Result<LaunchProfile, AgentError> 
         reasoning_effort: raw.reasoning_effort,
         argv: raw.argv,
         environment,
+        cloud: raw.agentcloud,
     })
 }
 
@@ -827,7 +859,7 @@ pub(crate) fn reasoning_arguments(
 
 #[cfg(test)]
 mod tests {
-    use super::{load_configuration, valid_workspace, workspace_for_registry, SYSTEM_GIT};
+    use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
@@ -891,5 +923,85 @@ mod tests {
         let error = workspace_for_registry(&directory).unwrap_err();
         assert!(error.to_string().contains("duplicate key \"workspace\""));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn parse(profile: serde_json::Value) -> Result<LaunchProfile, AgentError> {
+        validate(
+            "sub-cloud".to_owned(),
+            serde_json::from_value(profile).expect("profile shape"),
+        )
+    }
+
+    #[test]
+    fn agentcloud_profiles_carry_structured_launch_settings() {
+        let profile = parse(serde_json::json!({
+            "harness": "agentcloud",
+            "mode": "interactive",
+            "model": "provider-model-id",
+            "reasoning_effort": "high",
+            "argv": ["--skill=builder", "--narration"],
+            "env": {"TAB_SETTING": "1"},
+            "agentcloud": {
+                "harness": "claude-code",
+                "provision": true,
+                "envspec": "monorepo",
+                "purpose": "sub-cloud worker"
+            }
+        }))
+        .expect("valid agentcloud profile");
+        let cloud = profile.cloud.clone().expect("cloud settings");
+        assert_eq!(cloud.harness.as_deref(), Some("claude-code"));
+        assert!(cloud.provision);
+        assert_eq!(cloud.envspec.as_deref(), Some("monorepo"));
+        let public = serde_json::to_value(profile.public()).expect("public profile");
+        assert_eq!(public["agentcloud"]["envspec"], "monorepo");
+        assert_eq!(public["requires_edition"], "rust");
+        assert_eq!(public["environment"], serde_json::json!(["TAB_SETTING"]));
+
+        let minimal = parse(serde_json::json!({"harness": "agentcloud", "mode": "interactive"}))
+            .expect("server defaults are valid");
+        assert_eq!(minimal.cloud, Some(CloudLaunch::default()));
+    }
+
+    #[test]
+    fn agentcloud_profiles_refuse_ambiguous_or_misplaced_settings() {
+        for (profile, expected) in [
+            (
+                serde_json::json!({"harness": "agentcloud", "mode": "headless"}),
+                "harness/mode combination",
+            ),
+            (
+                serde_json::json!({"harness": "claude", "mode": "interactive", "agentcloud": {}}),
+                "agentcloud block",
+            ),
+            (
+                serde_json::json!({"harness": "agentcloud", "mode": "interactive", "agentcloud": {"envspec": "monorepo"}}),
+                "without provision",
+            ),
+            (
+                serde_json::json!({"harness": "agentcloud", "mode": "interactive", "argv": ["--title=other"]}),
+                "--title",
+            ),
+            (
+                serde_json::json!({"harness": "agentcloud", "mode": "interactive", "argv": ["--skill", "builder"]}),
+                "--option=value",
+            ),
+            (
+                serde_json::json!({"harness": "agentcloud", "mode": "interactive", "argv": ["--token=abc"]}),
+                "secret",
+            ),
+        ] {
+            let message = parse(profile).expect_err("refused profile").to_string();
+            assert!(
+                message.contains(expected),
+                "{expected:?} not in {message:?}"
+            );
+        }
+        assert!(serde_json::from_value::<RawProfile>(serde_json::json!({
+            "harness": "agentcloud",
+            "mode": "interactive",
+            "agentcloud": {"provison": true}
+        }))
+        .is_err());
     }
 }

@@ -27,6 +27,13 @@ use crate::client::{
     Pane, PaneShellProof,
 };
 
+mod cloud;
+
+pub(crate) use cloud::{
+    validate_create_arguments as validate_cloud_create_arguments, CLOUD_DRIVERS,
+};
+pub use cloud::{CloudLaunch, CloudTools};
+
 const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
 const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
 const MAX_AGENT_RECORD_BYTES: usize = 1024 * 1024;
@@ -620,6 +627,28 @@ pub trait ManagedApi: AgentApi {
             "custom pane harness launch is unavailable",
         ))
     }
+    /// Run one literal executable in a fresh shell pane and pin it as the foreground process.
+    fn start_pane_command(
+        &self,
+        _pane: &str,
+        _executable: &Path,
+        _arguments: &[String],
+        _timeout: Duration,
+    ) -> crate::error::Result<CustomProcessIdentity> {
+        Err(crate::error::AdapterError::unavailable(
+            "pane command launch is unavailable",
+        ))
+    }
+    /// Report whether a pinned command process is still the pane's foreground process.
+    fn pane_runs_command(
+        &self,
+        _pane: &str,
+        _identity: &CustomProcessIdentity,
+    ) -> crate::error::Result<bool> {
+        Err(crate::error::AdapterError::unavailable(
+            "pane command verification is unavailable",
+        ))
+    }
     /// Require the configured custom harness in one exact foreground pane.
     fn verify_custom_harness(
         &self,
@@ -839,6 +868,22 @@ impl ManagedApi for HerdrClient {
     ) -> crate::error::Result<()> {
         HerdrClient::start_pane_agent(self, name, harness, pane, args, timeout, persist_identity)
     }
+    fn start_pane_command(
+        &self,
+        pane: &str,
+        executable: &Path,
+        arguments: &[String],
+        timeout: Duration,
+    ) -> crate::error::Result<CustomProcessIdentity> {
+        HerdrClient::start_pane_command(self, pane, executable, arguments, timeout)
+    }
+    fn pane_runs_command(
+        &self,
+        pane: &str,
+        identity: &CustomProcessIdentity,
+    ) -> crate::error::Result<bool> {
+        HerdrClient::pane_runs_command(self, pane, identity)
+    }
     fn verify_custom_harness(
         &self,
         pane: &str,
@@ -908,6 +953,8 @@ struct AgentRecord {
     custom_process_identity: Option<CustomProcessIdentity>,
     #[serde(default)]
     foreign_shell_identity: Option<CustomProcessIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agentcloud: Option<cloud::CloudRecord>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
     name: String,
@@ -1062,6 +1109,15 @@ impl AgentRecord {
                         || self.pane_id.as_deref().is_none_or(str::is_empty)
                         || !identity.valid()
                 })
+            || self.is_cloud()
+                != (self.agentcloud.is_some() && self.harness == cloud::CLOUD_HARNESS)
+            || self.agentcloud.as_ref().is_some_and(|record| {
+                !record.valid()
+                    || self
+                        .session_value
+                        .as_deref()
+                        .is_some_and(|session| !cloud::valid_session_id(session))
+            })
         {
             return Err(fail(format!("invalid agent record: {}", path.display())));
         }
@@ -1069,6 +1125,12 @@ impl AgentRecord {
     }
 
     fn supported(&self) -> Result<()> {
+        if self.is_cloud() {
+            return Err(fail(format!(
+                "agent {:?} is an agentcloud session; this operation drives Herdr-hosted harnesses only. Use agentctl send, status, read, wait, attach, pause, resume, or stop; for a goal, run agentctl send {} '/goal OBJECTIVE'",
+                self.name, self.name
+            )));
+        }
         if !matches!(
             self.adapter.as_str(),
             "herdr" | "herdr-pane" | "herdr-foreign"
@@ -1699,6 +1761,8 @@ pub struct StartOptions {
     pub startup_timeout: Duration,
     /// Delivery options for the initial task.
     pub delivery: DrainOptions,
+    /// Agentcloud settings; required shape for, and only accepted with, harness `agentcloud`.
+    pub cloud: Option<CloudLaunch>,
 }
 
 impl Default for StartOptions {
@@ -1713,6 +1777,7 @@ impl Default for StartOptions {
             brief: None,
             startup_timeout: Duration::from_secs(30),
             delivery: DrainOptions::default(),
+            cloud: None,
         }
     }
 }
@@ -1741,6 +1806,8 @@ pub struct StopOptions {
     pub recover_legacy_adoption: bool,
     /// SHA-256 of the exact current identity-less `agent.json` bytes.
     pub expected_record_sha256: Option<String>,
+    /// Retire an agentcloud agent's record and tab without halting or archiving its session.
+    pub skip_cloud_halt: bool,
 }
 
 /// Registry-backed coordinator interface to visible foreign-harness workers.
@@ -1753,6 +1820,8 @@ pub struct ManagedAgents<'a, A: ManagedApi + ?Sized> {
     /// Workspace inherited from the launching Herdr pane (`HERDR_WORKSPACE_ID`),
     /// used when a start names none.
     inherited_workspace: Option<String>,
+    /// Executables for agentcloud-backed agents.
+    cloud_tools: CloudTools,
 }
 
 impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
@@ -1773,7 +1842,15 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             registry,
             project_workspace_override: None,
             inherited_workspace,
+            cloud_tools: CloudTools::default(),
         })
+    }
+
+    /// Select the `agentcloudctl` and `agentterm` executables for agentcloud agents.
+    #[must_use]
+    pub fn with_cloud_tools(mut self, tools: CloudTools) -> Self {
+        self.cloud_tools = tools;
+        self
     }
 
     /// Replace the inherited workspace, so tests never depend on the pane that runs them.
@@ -2396,6 +2473,23 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         self.start_inner(agent_name, cwd, options, Some(reasoning_effort))
     }
 
+    /// Load the project workspace policy and check an explicit workspace against it.
+    fn start_workspace_policy(&self, options: &StartOptions) -> Result<Option<String>> {
+        let project_workspace = self.project_workspace()?;
+        if let (Some(expected), Some(workspace)) = (
+            project_workspace.as_deref(),
+            options.workspace_id.as_deref(),
+        ) {
+            let actual_label = self.client.workspace_label(workspace)?;
+            if actual_label != expected {
+                return Err(fail(format!(
+                    "workspace {workspace:?} is labelled {actual_label:?}, but project configuration requires {expected:?}"
+                )));
+            }
+        }
+        Ok(project_workspace)
+    }
+
     fn start_inner(
         &self,
         agent_name: &str,
@@ -2414,6 +2508,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         if options.brief.as_deref().is_some_and(str::is_empty) {
             return Err(fail("brief must not be empty"));
+        }
+        if options.harness == cloud::CLOUD_HARNESS {
+            return self.start_cloud(agent_name, cwd, options, reasoning_effort);
+        }
+        if options.cloud.is_some() {
+            return Err(fail(
+                "agentcloud settings apply only with harness agentcloud (--harness agentcloud)",
+            ));
         }
         if matches!(options.harness.as_str(), "codex" | "claude" | "muse") {
             crate::profiles::validate_structured_harness_argument_conflicts(
@@ -2437,18 +2539,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         options.environment = environment_entries(&options.environment)?;
         // Placement policy is an input/start concern. Load it before creating
         // the generation so a configuration error cannot leave the name taken.
-        let project_workspace = self.project_workspace()?;
-        if let (Some(expected), Some(workspace)) = (
-            project_workspace.as_deref(),
-            options.workspace_id.as_deref(),
-        ) {
-            let actual_label = self.client.workspace_label(workspace)?;
-            if actual_label != expected {
-                return Err(fail(format!(
-                    "workspace {workspace:?} is labelled {actual_label:?}, but project configuration requires {expected:?}"
-                )));
-            }
-        }
+        let project_workspace = self.start_workspace_policy(&options)?;
         let _lock = self.lock(agent_name)?;
         let identity_lock = self.identity_lock()?;
         if let Some(resume) = options.resume.as_deref() {
@@ -2486,6 +2577,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             pane_reported_by_agentctl: false,
             custom_process_identity: None,
             foreign_shell_identity: None,
+            agentcloud: None,
             extra: BTreeMap::new(),
             name: agent_name.to_owned(),
             token: format!("{}-{}", now.as_nanos(), std::process::id()),
@@ -2737,6 +2829,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             pane_reported_by_agentctl: false,
             custom_process_identity: None,
             foreign_shell_identity: Some(shell_identity.clone()),
+            agentcloud: None,
             extra: BTreeMap::new(),
             name: agent_name.to_owned(),
             token: format!("{}-{}", now.as_nanos(), std::process::id()),
@@ -3119,6 +3212,18 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         self.status_record(&self.load(agent_name)?)
     }
 
+    fn status_record_listed(
+        &self,
+        record: &AgentRecord,
+        fleet: &mut cloud::FleetCache,
+    ) -> Result<Value> {
+        if record.is_cloud() {
+            self.cloud_status_record(record, fleet)
+        } else {
+            self.status_record(record)
+        }
+    }
+
     /// Resolve and verify the exact live pane owned by one registered agent.
     pub fn pane_info(&self, agent_name: &str) -> Result<AgentPaneInfo> {
         self.checked(&self.load(agent_name)?)
@@ -3423,6 +3528,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     fn status_record(&self, record: &AgentRecord) -> Result<Value> {
+        if record.is_cloud() {
+            return self.cloud_status_record(record, &mut cloud::FleetCache::new());
+        }
         let agent_name = &record.name;
         let mut result = json!(record);
         result["queue"] = json!(self.queue(agent_name)?);
@@ -3494,7 +3602,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .map_err(|error| fail(error.to_string()))?;
         names.retain(|value| name(value).is_ok());
         names.sort();
-        names.iter().map(|name| self.status(name)).collect()
+        // One non-attaching agentcloud listing serves every cloud agent in this pass.
+        let mut fleet = cloud::FleetCache::new();
+        names
+            .iter()
+            .map(|name| self.status_record_listed(&self.load(name)?, &mut fleet))
+            .collect()
     }
 
     /// Serialize against stop and durably deliver one prompt.
@@ -3607,7 +3720,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     pub fn pause(&self, agent_name: &str, paused: bool) -> Result<Value> {
         let _lock = self.lock(agent_name)?;
         let mut record = self.load(agent_name)?;
-        record.supported()?;
+        if !record.is_cloud() {
+            record.supported()?;
+        }
         record.paused = paused;
         self.save(&record)?;
         Ok(json!({"name": agent_name, "token": record.token, "paused": paused}))
@@ -3617,6 +3732,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     pub fn attach(&self, agent_name: &str) -> Result<Value> {
         let _lock = self.lock(agent_name)?;
         let record = self.load(agent_name)?;
+        if record.is_cloud() {
+            return self.cloud_attach(&record);
+        }
         let info = self.checked(&record)?;
         self.client.focus_pane(&info.pane_id)?;
         Ok(json!({"name": agent_name, "pane_id": info.pane_id, "paused": record.paused}))
@@ -3729,7 +3847,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "wait timeout must be finite and between 0 and 31536000 seconds",
             ));
         }
-        let token = self.load(agent_name)?.token;
+        let initial = self.load(agent_name)?;
+        if initial.is_cloud() {
+            return self.cloud_wait(agent_name, timeout);
+        }
+        let token = initial.token;
         let start = Instant::now();
         loop {
             let lock = self.lock(agent_name)?;
@@ -4997,7 +5119,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     pub fn stop_with_options(&self, agent_name: &str, options: StopOptions) -> Result<Value> {
         let _lock = self.lock(agent_name)?;
         let mut record = self.load(agent_name)?;
-        record.supported()?;
+        if !record.is_cloud() {
+            record.supported()?;
+            if options.skip_cloud_halt {
+                return Err(fail("--skip-cloud-halt applies only to agentcloud agents"));
+            }
+        }
         if options
             .expected_token
             .as_deref()
@@ -5014,6 +5141,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             )));
         }
         record = confirmed_record;
+        if record.is_cloud() {
+            return self.cloud_stop(record, &options);
+        }
         if self.pending_move_destination(&record)?.is_some() {
             return Err(fail(format!(
                 "refusing to stop {agent_name:?}: move is incomplete; rerun `agentctl move {agent_name}`"
@@ -7144,6 +7274,7 @@ mod tests {
                     expected_token: Some(adopted["token"].as_str().unwrap().to_owned()),
                     recover_legacy_adoption: true,
                     expected_record_sha256: Some(digest.clone()),
+                    skip_cloud_halt: false,
                 },
             )
             .unwrap();
@@ -7204,6 +7335,7 @@ mod tests {
                         digest.clone()
                     }
                 }),
+                skip_cloud_halt: false,
             };
             assert!(fixture
                 .manager()
@@ -7265,6 +7397,7 @@ mod tests {
                         expected_token: Some(token),
                         recover_legacy_adoption: true,
                         expected_record_sha256: Some(digest),
+                        skip_cloud_halt: false,
                     },
                 )
                 .unwrap_err();
@@ -7308,6 +7441,7 @@ mod tests {
                         expected_token: Some(token),
                         recover_legacy_adoption: true,
                         expected_record_sha256: Some(digest),
+                        skip_cloud_halt: false,
                     },
                 )
                 .is_err());
@@ -7347,6 +7481,7 @@ mod tests {
                         expected_token: Some(token),
                         recover_legacy_adoption: true,
                         expected_record_sha256: Some(digest),
+                        skip_cloud_halt: false,
                     },
                 )
                 .unwrap_err();
@@ -7379,6 +7514,7 @@ mod tests {
                     expected_token: Some(token),
                     recover_legacy_adoption: true,
                     expected_record_sha256: Some(digest),
+                    skip_cloud_halt: false,
                 },
             )
             .unwrap_err();
@@ -7402,6 +7538,7 @@ mod tests {
             expected_token: Some(token),
             recover_legacy_adoption: true,
             expected_record_sha256: Some(digest),
+            skip_cloud_halt: false,
         };
 
         let error = manager
@@ -7434,6 +7571,7 @@ mod tests {
                     expected_token: Some(token.clone()),
                     recover_legacy_adoption: true,
                     expected_record_sha256: Some(digest),
+                    skip_cloud_halt: false,
                 },
             )
             .unwrap_err();
@@ -7464,6 +7602,7 @@ mod tests {
                     expected_token: Some(token),
                     recover_legacy_adoption: true,
                     expected_record_sha256: Some(digest),
+                    skip_cloud_halt: false,
                 },
             )
             .unwrap();
@@ -8367,6 +8506,7 @@ mod tests {
                     expected_token: Some(token),
                     recover_legacy_adoption: true,
                     expected_record_sha256: Some(digest),
+                    skip_cloud_halt: false,
                 },
             );
             fs::set_permissions(&active, fs::Permissions::from_mode(0o700)).unwrap();

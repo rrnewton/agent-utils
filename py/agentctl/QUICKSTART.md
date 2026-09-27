@@ -42,6 +42,34 @@ while keeping their terminals available for direct inspection.
    agentctl move reviewer
    ```
 
+   When `agentctl capabilities` lists `agentcloud`, a worker can instead run
+   on its own agentcloud node, for example one provisioned with the checkout it
+   needs, while its terminal viewer opens in a Herdr tab. `agentctl` runs
+   `agentcloudctl create`, records the session ID, and starts
+   `agentterm -s SESSION_ID` in the tab. `stop` halts and archives the session
+   but does not release the node reservation:
+
+   ```sh
+   agentctl start sub-cloud-worker --harness agentcloud --cloud-harness claude-code \
+     --provision --envspec ENVSPEC --brief 'Run hostname, then reply DONE.'
+   agentctl wait sub-cloud-worker --timeout 1800
+   agentctl read sub-cloud-worker --output last
+   agentctl stop sub-cloud-worker
+   ```
+
+   The session's orchestrator is `--agentcloud-url URL`, else
+   `$AGENTCLOUD_ORCHESTRATOR_URL`, else `agentcloudctl`'s documented production
+   endpoint. It is recorded and passed to both `agentcloudctl` and `agentterm`,
+   so set it once at start when you use a non-default orchestrator:
+
+   ```sh
+   agentctl --agentcloud-url wss://orchestrator.example/ws/chat \
+     start sub-cloud-worker --harness agentcloud --cloud-harness claude-code
+   ```
+
+   `agentctl userguide` describes the matching profile block and how each
+   command behaves for an agentcloud session.
+
    To keep an agent that is already running in Herdr, adopt its exact live
    identity instead. All four assertions are required; adoption changes neither
    the pane nor its process:

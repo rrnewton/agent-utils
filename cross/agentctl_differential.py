@@ -290,6 +290,18 @@ def _profiles(harness: Harness, report: Report) -> None:
                 "harness": "codex", "mode": "interactive",
                 "argv": ["--config=features.web_search=true"], "env": {},
             },
+            # An explicit null agentcloud block means absent in both editions.
+            "codex-null-cloud": {
+                "harness": "codex", "mode": "interactive", "agentcloud": None,
+            },
+            # Launchable only by the Rust edition; both editions must list it identically and
+            # its presence must not break any other profile in the file.
+            "agentcloud-worker": {
+                "harness": "agentcloud", "mode": "interactive", "model": "provider-model",
+                "argv": ["--narration"], "env": {"TAB_SETTING": "private-tab-value"},
+                "agentcloud": {"harness": "claude-code", "provision": True,
+                               "envspec": "<envspec>", "purpose": "<purpose>"},
+            },
         },
     }
     expected = {
@@ -323,6 +335,21 @@ def _profiles(harness: Harness, report: Report) -> None:
                 "azure-codex-cyber:openai" not in serialized
                 and "--dangerously-enable-internet-mode" not in serialized
                 and "private-fixture.png" not in serialized
+                and "private-tab-value" not in serialized
+                and any(
+                    item.get("name") == "codex-null-cloud" and "agentcloud" not in item
+                    for item in public.get("profiles", [])
+                )
+                and any(
+                    item.get("name") == "agentcloud-worker"
+                    and item.get("requires_edition") == "rust"
+                    and item.get("argv_count") == 1
+                    and item.get("agentcloud") == {
+                        "harness": "claude-code", "provision": True, "envspec": "<envspec>",
+                        "purpose": "<purpose>", "workspace": None, "node_id": None,
+                    }
+                    for item in public.get("profiles", [])
+                )
                 and any(
                     item.get("name") == "watermelon-exec"
                     and item.get("harness") == "muse"
@@ -342,6 +369,20 @@ def _profiles(harness: Harness, report: Report) -> None:
             _state(root).get("launch_arguments") == expected[profile]
             for root in (case.python_root, case.rust_root)
         ), "profile argv changed, split, or reordered")
+        if profile == "sol":
+            # The Rust start would contact a real agentcloud service, so only the Python
+            # refusal is exercised here; the Rust launcher is covered by its own tests.
+            python_refusal = harness._invoke_one(harness.python, case.python_root, (
+                "start", "sub-cloud", "--cwd", "<ROOT>", "--workspace-id", "w1",
+                "--profile", "agentcloud-worker", *_COMMON,
+            ))
+            report.require(
+                "primary/profile/agentcloud/python-start-refusal",
+                python_refusal.returncode == 2
+                and "only the Rust edition of agentctl implements" in python_refusal.stderr
+                and not (case.python_root / "registry" / "sub-cloud").exists(),
+                f"Python started or mis-refused a Rust-only agentcloud profile: {python_refusal!r}",
+            )
         adapter = "herdr-pane" if profile in ("watermelon", "muse-literal") else "herdr"
         report.require(f"primary/profile/{profile}/adapter",
                        isinstance(status, dict) and status.get("adapter") == adapter,

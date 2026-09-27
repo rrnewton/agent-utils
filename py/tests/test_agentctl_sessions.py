@@ -17,7 +17,8 @@ from agentctl import cli, mcp
 from agentctl.client import HerdrClient, Pane
 from agentctl.errors import AgentDeliveryError
 from agentctl.profiles import (
-    load_configuration, validate_muse_headless_arguments, workspace_for_registry,
+    load_configuration, load_profiles, validate_muse_headless_arguments,
+    workspace_for_registry,
 )
 from agentctl.sessions import Sessions
 from agentctl.subagents import AgentRecord
@@ -333,6 +334,106 @@ def test_cli_headless_muse_profile_reaches_worker_with_exact_structured_argument
     ]
     assert captured[0]["brief"] == "return PROFILE_OK"
     assert fake.launched == []
+
+
+def _write_profiles(root: Path, profiles: dict[str, object]) -> None:
+    subprocess.run(["/usr/bin/git", "init", "-q", str(root)], check=True)
+    (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+    directory = root / ".agentctl"
+    directory.mkdir(mode=0o700)
+    config = directory / "profiles.json"
+    config.write_text(json.dumps({"schema": "agentctl-profiles/v1", "profiles": profiles}),
+                      encoding="utf-8")
+    config.chmod(0o600)
+
+
+_CLOUD_PROFILE: dict[str, object] = {
+    "harness": "agentcloud", "mode": "interactive", "model": "provider-model",
+    "reasoning_effort": "high", "argv": ["--skill=builder", "--narration"],
+    "env": {"TAB_SETTING": "1"},
+    "agentcloud": {"harness": "claude-code", "provision": True,
+                   "envspec": "<envspec>", "purpose": "<purpose>"},
+}
+
+
+def test_agentcloud_profile_is_listed_as_rust_only_without_breaking_other_profiles(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_profiles(tmp_path, {
+        "cloud": _CLOUD_PROFILE,
+        "local": {"harness": "codex", "mode": "interactive", "argv": [], "env": {}},
+    })
+    _path, profiles = load_profiles(tmp_path)
+    assert profiles["local"].harness == "codex"
+    assert profiles["local"].agentcloud is None
+    assert cli.main(["profiles", "--cwd", str(tmp_path)]) == 0
+    listed = {item["name"]: item for item in json.loads(capsys.readouterr().out)["profiles"]}
+    assert listed["cloud"]["requires_edition"] == "rust"
+    assert listed["cloud"]["agentcloud"] == {
+        "harness": "claude-code", "provision": True, "envspec": "<envspec>",
+        "purpose": "<purpose>", "workspace": None, "node_id": None,
+    }
+    assert listed["cloud"]["argv_count"] == 2
+    assert listed["cloud"]["environment"] == ["TAB_SETTING"]
+    assert "requires_edition" not in listed["local"]
+    assert "agentcloud" not in listed["local"]
+
+
+def test_explicit_null_agentcloud_on_a_local_profile_means_absent(tmp_path: Path) -> None:
+    _write_profiles(tmp_path, {
+        "local": {"harness": "codex", "mode": "interactive", "agentcloud": None},
+    })
+    _path, profiles = load_profiles(tmp_path)
+    assert profiles["local"].agentcloud is None
+    assert "agentcloud" not in profiles["local"].public()
+
+
+@pytest.mark.parametrize("arguments", [
+    ["--profile", "cloud"],
+    ["--harness", "agentcloud"],
+])
+def test_python_refuses_to_start_agentcloud_and_names_the_rust_edition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    arguments: list[str],
+) -> None:
+    _write_profiles(tmp_path, {"cloud": _CLOUD_PROFILE})
+    fake = FakeManagedClient()
+    monkeypatch.setattr(cli, "HerdrClient", lambda **_kwargs: cast(HerdrClient, fake))
+    registry = tmp_path / "registry"
+    assert cli.main([
+        "start", "sub-cloud", "--cwd", str(tmp_path), "--registry", str(registry),
+        *arguments, "--brief", "task",
+    ]) == 2
+    error = capsys.readouterr().err
+    assert "only the Rust edition of agentctl implements" in error
+    assert "agentctl profiles --cwd" in error
+    assert not registry.exists()
+    assert fake.launched == []
+    assert fake.environments == []
+
+
+@pytest.mark.parametrize(("change", "expected"), [
+    ({"mode": "headless"}, "harness/mode combination"),
+    ({"harness": "claude"}, "agentcloud block"),
+    ({"agentcloud": {"envspec": "<envspec>"}}, "without provision"),
+    ({"agentcloud": {"provision": True, "node_id": "node-a"}}, "choose one"),
+    ({"agentcloud": {"workspace": "relative"}}, "absolute path"),
+    ({"agentcloud": {"harness": "claude"}}, "claude-code"),
+    ({"agentcloud": {"provison": True}}, "unknown fields"),
+    ({"agentcloud": {"provision": "yes"}}, "true or false"),
+    ({"argv": ["--title=other"]}, "--title"),
+    ({"argv": ["--skill", "builder"]}, "--option=value"),
+    ({"argv": ["--token=abc"]}, "secret"),
+])
+def test_agentcloud_profiles_refuse_the_same_shapes_as_the_rust_edition(
+    tmp_path: Path, change: dict[str, object], expected: str,
+) -> None:
+    profile = {**_CLOUD_PROFILE, "agentcloud": {}, "argv": [], **change}
+    if profile["mode"] == "headless":
+        profile["env"] = {}
+    _write_profiles(tmp_path, {"cloud": profile})
+    with pytest.raises(AgentDeliveryError, match=expected):
+        load_profiles(tmp_path)
 
 
 def test_mcp_routes_into_the_cli_registry_and_honors_its_pause(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
