@@ -82,9 +82,17 @@ The transport turned out to matter less than two other things:
 - **Precision on common names.** That is where the real saving is, along with fewer follow-up file
   reads.
 
-So: build the engine as a CLI first, found through a skill plus a one-line AGENTS.md note. Add a thin
-MCP adapter only if a shell-less client needs one. `agentctl mcp` already shows that pattern in this
-repo.
+So: build one engine with two faces:
+
+- **A CLI**, found through a skill plus a one-line AGENTS.md note.
+- **A thin MCP adapter that returns the same rows.** This is not optional. Codex has no built-in LSP
+  tool ([codex#8745](https://github.com/openai/codex/issues/8745)), so MCP is how a Codex agent gets
+  rust-analyzer's precision without going through the shell. `agentctl mcp` already shows the pattern
+  in this repo.
+
+Vanilla MCP over rust-analyzer is a sound design. The objection above is to today's off-the-shelf
+bridges: their tool-list size, 0-based lines, missing call hierarchy, and bare-name lookup. The
+objection is not to MCP.
 
 ## How this was evaluated
 
@@ -625,8 +633,9 @@ The conclusions:
 - **Discovery:** ship a skill whose description triggers on "who calls / callers / where is X used",
   plus one AGENTS.md line. Check in a Claude Code permission allow rule for the command so calls do
   not prompt.
-- **MCP:** add a thin adapter later only if a shell-less client needs it, reusing the flat,
-  closed-schema pattern of `agentctl mcp` (`py/agentctl/mcp.py`).
+- **MCP:** ship a thin adapter alongside the CLI, returning the same rows, and reuse the flat,
+  closed-schema pattern of `agentctl mcp` (`py/agentctl/mcp.py`). Codex has no LSP tool, so for Codex
+  this adapter is the precise path. It also serves shell-less clients.
 - **Native tools:** enable the native LSP tool where the harness has one. It is a good second path,
   not a substitute.
 
@@ -753,8 +762,9 @@ files too.
      name-addressed tool measured here stumbled on it.
    - The repository's tool obligations: `quickstart`, `userguide` and per-subcommand help, a skill,
      the AGENTS.md line, and a `RELATED_WORK.md` seeded from this proposal's comparison.
+   - The thin MCP adapter over the same engine, so Codex agents get the same answers.
 3. **The Python backend** (ty), `twin`, and `impls`.
-4. **Snapshot mode**, and an MCP adapter only if a concrete client needs one.
+4. **Snapshot mode.**
 
 ### What not to do
 
