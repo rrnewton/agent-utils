@@ -12,7 +12,8 @@ use serde_json::json;
 use crate::agent::{AgentError, DrainOptions, QueueOutcome};
 use crate::client::HerdrClient;
 use crate::subagents::{
-    environment_entries, AdoptOptions, ManagedAgents, StartOptions, StopOptions,
+    environment_entries, AdoptOptions, CloudLaunch, CloudTools, ManagedAgents, StartOptions,
+    StopOptions,
 };
 
 const MAX_CHAT_PUBLISH_BYTES: usize = 30_000;
@@ -38,6 +39,23 @@ struct Cli {
     /// Herdr executable name on PATH or an explicit path (interactive adapter only)
     #[arg(long, global = true, default_value = "herdr", value_name = "PATH")]
     herdr_bin: PathBuf,
+    /// agentcloudctl executable name on PATH or an explicit path (agentcloud agents only)
+    #[arg(
+        long,
+        global = true,
+        default_value = "agentcloudctl",
+        value_name = "PATH"
+    )]
+    agentcloudctl_bin: PathBuf,
+    /// agentterm executable run in an agentcloud agent's Herdr tab; name on PATH or explicit path
+    #[arg(long, global = true, default_value = "agentterm", value_name = "PATH")]
+    agentterm_bin: PathBuf,
+    /// Agentcloud orchestrator endpoint recorded for NEW agentcloud agents and passed as --ws-url to both agentcloudctl and agentterm; default: $AGENTCLOUD_ORCHESTRATOR_URL when set and nonempty, else agentcloudctl's documented production endpoint wss://mm.internalmeta.com/ws/chat. Later commands use the endpoint recorded for the agent and refuse a different explicit value; a record from before endpoints were recorded gets this resolved endpoint saved on its first send or stop
+    #[arg(long, global = true, value_name = "URL")]
+    agentcloud_url: Option<String>,
+    /// Agentcloud session this caller runs in (an empty value means none, sending as the human even when $AGENTCLOUD_SESSION_ID is set); input to another agentcloud agent is then an attributed `agentcloudctl send-message` from it. Default: $AGENTCLOUD_SESSION_ID when set and nonempty
+    #[arg(long, global = true, value_name = "ID")]
+    from_session: Option<String>,
     /// Print the installed operator reference and exit
     #[arg(long)]
     userguide: bool,
@@ -50,9 +68,9 @@ enum Commands {
     /// Show installed runtime adapters and optional services as JSON
     #[command(after_help = "Example: agentctl capabilities")]
     Capabilities,
-    /// Launch an interactive agent in its own Herdr tab
+    /// Launch an interactive agent, or an agentcloud session viewed through agentterm, in its own Herdr tab
     #[command(
-        after_help = "Example: agentctl start reviewer --cwd . --harness codex --brief 'Review the changes'"
+        after_help = "Examples:\n  agentctl start reviewer --cwd . --harness codex --brief 'Review the changes'\n  agentctl start sub-cloud-worker --harness agentcloud --cloud-harness claude-code \\\n    --provision --envspec ENVSPEC --brief 'Run hostname, then reply DONE.'\n  agentctl start sub-cloud-worker --cwd . --profile cloud-worker --brief 'Investigate the failure'\n\nWith --harness agentcloud, agentctl runs `agentcloudctl create` (title = NAME, the brief is its\ndurable --prompt), records the printed session ID, then runs `agentterm -s SESSION_ID` in the\nnew tab. Both receive the same --ws-url: --agentcloud-url, else $AGENTCLOUD_ORCHESTRATOR_URL, else\nagentcloudctl's documented production endpoint; it is recorded for every later command. --model and --reasoning-effort map to create --model and --effort; --harness-arg adds\nliteral long create options written as --option=value. `agentcloudctl create` is bounded at\n300 seconds; --startup-timeout bounds the wait for agentterm to become the tab's foreground\nprocess. --env applies to the tab only, never to agentcloudctl."
     )]
     Start(Box<Start>),
     /// List safe metadata for ignored private launch profiles
@@ -66,7 +84,9 @@ enum Commands {
     )]
     Adopt(Adopt),
     /// Stop an owned runtime, or safely unregister an adopted one, and archive state
-    #[command(after_help = "Example: agentctl stop reviewer")]
+    #[command(
+        after_help = "Examples:\n  agentctl stop reviewer\n  agentctl stop sub-cloud-worker\n\nFor an agentcloud agent, stop runs `agentcloudctl halt` (the open run is interrupted and no new\nrun starts), closes the recorded agentterm pane, runs `agentcloudctl archive`, and archives the\nregistry record. A halt failure changes nothing locally. stop does not release the node\nreservation; the orchestrator releases it on its own schedule after the halted session goes\nidle (check `agentcloudctl inspect -s SESSION_ID`)."
+    )]
     Stop(Stop),
     /// List registered agents with live status or an explicit probe error
     #[command(after_help = "Example: agentctl list --registry .agentctl")]
@@ -76,17 +96,21 @@ enum Commands {
     Status(Named),
     /// Persist and deliver a prompt when the agent is ready
     #[command(
-        after_help = "Examples:\n  agentctl send reviewer 'Review the diff'\n  agentctl send reviewer --file task.txt --message-id review-1"
+        after_help = "Examples:\n  agentctl send reviewer 'Review the diff'\n  agentctl send reviewer --file task.txt --message-id review-1\n\nFor an agentcloud agent the prompt is journaled by `agentcloudctl send --end-of-turn` (a leading\n/goal is sent without --end-of-turn), up to 102400 bytes. When --from-session (default:\n$AGENTCLOUD_SESSION_ID) names a different agentcloud session, agentcloudctl refuses that send,\nso the prompt goes as an attributed `agentcloudctl send-message` from that session instead; it\narrives as an ordinary input and a /goal is not interpreted. --message-id becomes the idempotency\nkey, so repeating it journals nothing new; without it agentctl generates and prints one. The\ndelivery timeouts and --max-attempts do not apply."
     )]
     Send(Send),
     /// Deliver queued prompts that are known not to have been submitted
     #[command(after_help = "Example: agentctl drain reviewer --ready-timeout 60")]
     Drain(Drain),
     /// Read visible terminal output and save a bounded snapshot
-    #[command(after_help = "Example: agentctl read reviewer --lines 100")]
+    #[command(
+        after_help = "Examples:\n  agentctl read reviewer --lines 100\n  agentctl read sub-cloud-worker --output last\n\nFor an agentcloud agent, --output last prints the last settled run's final reply from\n`agentcloudctl output` (unbounded by --lines); tail and all read the agentterm tab."
+    )]
     Read(Read),
     /// Wait until the agent is ready for input; this does not prove goal completion
-    #[command(after_help = "Example: agentctl wait reviewer --timeout 60")]
+    #[command(
+        after_help = "Example: agentctl wait reviewer --timeout 60\n\nFor an agentcloud agent this is `agentcloudctl wait --until settle`: success means the current or\nlast run completed (or none has run); a failed or interrupted run exits 75 with a redirect."
+    )]
     Wait(Wait),
     /// Inspect a goal or set an ongoing objective (native /goal for Codex)
     #[command(
@@ -135,6 +159,10 @@ struct Stop {
     /// Exact lowercase SHA-256 of the identity-less agent.json bytes
     #[arg(long, value_name = "SHA256")]
     expected_record_sha256: Option<String>,
+    /// Agentcloud agents only: close the tab and archive the record WITHOUT halting or archiving
+    /// the agentcloud session (use when the session no longer exists or was retired elsewhere)
+    #[arg(long)]
+    skip_cloud_halt: bool,
 }
 
 #[derive(Args)]
@@ -175,9 +203,27 @@ struct Start {
     /// Terminal host; interactive Rust agents require Herdr
     #[arg(long, default_value = "herdr", value_parser = ["herdr", "tmux"])]
     backend: String,
-    /// Herdr harness kind; Codex, Claude, and Muse have model presets
+    /// Herdr harness kind; Codex, Claude, and Muse have model presets; agentcloud creates an agentcloud session viewed through agentterm
     #[arg(long)]
     harness: Option<String>,
+    /// agentcloud only: session driver passed to agentcloudctl create --harness (default: server default)
+    #[arg(long, value_name = "KIND", value_parser = ["native", "claude-code", "codex", "muse-code"])]
+    cloud_harness: Option<String>,
+    /// agentcloud only: provision a fresh node for the session; the orchestrator holds its lease while the session is live and releases it once idle
+    #[arg(long)]
+    provision: bool,
+    /// agentcloud only: envspec the provisioned node is reserved from, which decides its checkout; requires --provision
+    #[arg(long, value_name = "NAME", requires = "provision")]
+    envspec: Option<String>,
+    /// agentcloud only: roster label for the provisioned node; requires --provision
+    #[arg(long, value_name = "TEXT", requires = "provision")]
+    purpose: Option<String>,
+    /// agentcloud only: absolute session working directory on the node (default: server default)
+    #[arg(long, value_name = "PATH")]
+    cloud_workspace: Option<String>,
+    /// agentcloud only: bind this existing node at creation; conflicts with --provision
+    #[arg(long, value_name = "ID", conflicts_with = "provision")]
+    node_id: Option<String>,
     /// Model identifier passed unchanged to the Codex or Claude harness
     #[arg(long)]
     model: Option<String>,
@@ -343,7 +389,7 @@ struct Read {
     /// Maximum terminal lines to read
     #[arg(long, default_value = "500", value_parser = clap::value_parser!(u32).range(1..=1_000_000))]
     lines: u32,
-    /// Output boundary; last and since_turn require headless transcripts
+    /// Output boundary; last reads an agentcloud agent's final reply or a headless transcript; since_turn requires headless transcripts
     #[arg(long, default_value = "tail", value_parser = ["tail", "all", "last", "since_turn"])]
     output: String,
     /// First included headless turn; requires the worker extension and --output since_turn
@@ -682,9 +728,15 @@ fn run(args: Cli) -> Result<i32, Failure> {
             return Ok(0);
         }
         Commands::Skill(value) => {
-            if args.registry != Path::new(".agentctl") || args.herdr_bin != Path::new("herdr") {
+            if args.registry != Path::new(".agentctl")
+                || args.herdr_bin != Path::new("herdr")
+                || args.agentcloudctl_bin != Path::new("agentcloudctl")
+                || args.agentterm_bin != Path::new("agentterm")
+                || args.from_session.is_some()
+                || args.agentcloud_url.is_some()
+            {
                 return Err(Failure::Usage(
-                    "--registry and --herdr-bin do not apply to skill install".to_owned(),
+                    "--registry, --herdr-bin, --agentcloudctl-bin, --agentterm-bin, --agentcloud-url, and --from-session do not apply to skill install".to_owned(),
                 ));
             }
             let SkillCommand::Install(install) = value.command;
@@ -699,10 +751,34 @@ fn run(args: Cli) -> Result<i32, Failure> {
     }
     let client =
         HerdrClient::with_executable("direct", &args.herdr_bin).map_err(AgentError::from)?;
-    let manager = ManagedAgents::new(&client, &args.registry)?;
+    let manager = ManagedAgents::new(&client, &args.registry)?.with_cloud_tools(CloudTools {
+        agentcloudctl: args.agentcloudctl_bin,
+        agentterm: args.agentterm_bin,
+        caller_session: caller_session(
+            args.from_session,
+            std::env::var("AGENTCLOUD_SESSION_ID").ok(),
+        ),
+        endpoint_explicit: args.agentcloud_url.is_some(),
+        endpoint: args.agentcloud_url.or_else(|| {
+            std::env::var("AGENTCLOUD_ORCHESTRATOR_URL")
+                .ok()
+                .filter(|endpoint| !endpoint.is_empty())
+        }),
+    });
     let mut result = match command {
         Commands::Start(value) => {
-            let (harness, mode, model, reasoning_effort, harness_args, environment) =
+            let cloud_flags = [
+                (value.cloud_harness.is_some(), "--cloud-harness"),
+                (value.provision, "--provision"),
+                (value.envspec.is_some(), "--envspec"),
+                (value.purpose.is_some(), "--purpose"),
+                (value.cloud_workspace.is_some(), "--cloud-workspace"),
+                (value.node_id.is_some(), "--node-id"),
+            ]
+            .into_iter()
+            .filter_map(|(present, flag)| present.then_some(flag))
+            .collect::<Vec<_>>();
+            let (harness, mode, model, reasoning_effort, harness_args, environment, cloud) =
                 if let Some(profile_name) = value.profile.as_deref() {
                     let mut overlaps = Vec::new();
                     if value.mode.is_some() {
@@ -726,6 +802,7 @@ fn run(args: Cli) -> Result<i32, Failure> {
                     if !value.environment.is_empty() {
                         overlaps.push("--env");
                     }
+                    overlaps.extend_from_slice(&cloud_flags);
                     if !overlaps.is_empty() {
                         return Err(Failure::Usage(format!(
                             "--profile conflicts with explicit launch settings: {}",
@@ -746,17 +823,36 @@ fn run(args: Cli) -> Result<i32, Failure> {
                         profile.reasoning_effort.clone(),
                         profile.argv.clone(),
                         profile.environment.clone(),
+                        profile.cloud.clone(),
                     )
                 } else {
                     let harness = value.harness.unwrap_or_else(|| "codex".to_owned());
-                    crate::profiles::validate_raw_harness_arguments(
-                        "launch",
-                        &harness,
-                        &value.harness_args,
-                        value.model.is_some(),
-                        value.reasoning_effort.is_some(),
-                        value.resume.is_some(),
-                    )?;
+                    let cloud = if harness == "agentcloud" {
+                        Some(CloudLaunch {
+                            harness: value.cloud_harness,
+                            provision: value.provision,
+                            envspec: value.envspec,
+                            purpose: value.purpose,
+                            workspace: value.cloud_workspace,
+                            node_id: value.node_id,
+                        })
+                    } else {
+                        if !cloud_flags.is_empty() {
+                            return Err(Failure::Usage(format!(
+                                "{} apply only with --harness agentcloud",
+                                cloud_flags.join(", ")
+                            )));
+                        }
+                        crate::profiles::validate_raw_harness_arguments(
+                            "launch",
+                            &harness,
+                            &value.harness_args,
+                            value.model.is_some(),
+                            value.reasoning_effort.is_some(),
+                            value.resume.is_some(),
+                        )?;
+                        None
+                    };
                     (
                         harness,
                         value.mode.unwrap_or_else(|| "interactive".to_owned()),
@@ -764,6 +860,7 @@ fn run(args: Cli) -> Result<i32, Failure> {
                         value.reasoning_effort,
                         value.harness_args,
                         value.environment,
+                        cloud,
                     )
                 };
             if mode != "interactive" || value.backend != "herdr" {
@@ -785,6 +882,7 @@ fn run(args: Cli) -> Result<i32, Failure> {
                 brief,
                 startup_timeout: Duration::from_secs_f64(value.startup_timeout),
                 delivery: value.delivery.options(),
+                cloud,
             };
             if let Some(effort) = reasoning_effort.as_deref() {
                 manager.start_with_reasoning_effort(
@@ -827,6 +925,7 @@ fn run(args: Cli) -> Result<i32, Failure> {
                     expected_token: value.expected_token,
                     recover_legacy_adoption: value.recover_legacy_adoption,
                     expected_record_sha256: value.expected_record_sha256,
+                    skip_cloud_halt: value.skip_cloud_halt,
                 },
             )?
         }
@@ -844,12 +943,16 @@ fn run(args: Cli) -> Result<i32, Failure> {
                 .read()
                 .map_err(Failure::Usage)?
                 .ok_or_else(|| Failure::Usage("send requires prompt text or --file".to_owned()))?;
-            json!(manager.send_identified(
-                &value.agent.name,
-                &text,
-                value.delivery.options(),
-                value.message_id.as_deref()
-            )?)
+            if manager.is_cloud(&value.agent.name)? {
+                manager.send_cloud(&value.agent.name, &text, value.message_id.as_deref())?
+            } else {
+                json!(manager.send_identified(
+                    &value.agent.name,
+                    &text,
+                    value.delivery.options(),
+                    value.message_id.as_deref()
+                )?)
+            }
         }
         Commands::Drain(value) => {
             let result = manager.drain(&value.agent.name, value.delivery.options())?;
@@ -863,6 +966,16 @@ fn run(args: Cli) -> Result<i32, Failure> {
             });
         }
         Commands::Read(value) => {
+            if manager.is_cloud(&value.agent.name)? {
+                if value.since_turn.is_some() || value.output == "since_turn" {
+                    return Err(Failure::Usage("agentcloud agents support --output last, tail, or all; since_turn requires a headless transcript".to_owned()));
+                }
+                print!(
+                    "{}",
+                    manager.read_cloud(&value.agent.name, value.lines as usize, &value.output)?
+                );
+                return Ok(0);
+            }
             if !matches!(value.output.as_str(), "tail" | "all") || value.since_turn.is_some() {
                 return Err(Failure::Usage("interactive agents expose terminal snapshots; last/since_turn require headless transcripts".to_owned()));
             }
@@ -904,6 +1017,17 @@ fn run(args: Cli) -> Result<i32, Failure> {
     add_capabilities(&mut result);
     write_json(&result).map_err(Failure::Output)?;
     Ok(0)
+}
+
+/// The agentcloud session input is sent from: `--from-session`, else `$AGENTCLOUD_SESSION_ID`.
+/// An explicit empty value pins "no sender", so a printed retry stays a human send even when it
+/// runs inside some agentcloud session.
+fn caller_session(flag: Option<String>, environment: Option<String>) -> Option<String> {
+    match flag {
+        Some(session) if session.is_empty() => None,
+        Some(session) => Some(session),
+        None => environment.filter(|session| !session.is_empty()),
+    }
 }
 
 fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Failure> {
@@ -996,6 +1120,11 @@ fn capabilities_document(
             "backends": ["herdr"],
             "harnesses": ["codex", "claude", "muse"]
         },
+        "agentcloud": {
+            "drivers": crate::subagents::CLOUD_DRIVERS,
+            "requires": ["herdr", "agentcloudctl", "agentterm"],
+            "capabilities": CLOUD_CAPABILITIES
+        },
         "headless": null,
         "services": [{
             "name": "chat-bridge",
@@ -1038,13 +1167,28 @@ fn capabilities_document(
     })
 }
 
+/// Named operations an agentcloud-backed agent supports.
+const CLOUD_CAPABILITIES: [&str; 9] = [
+    "send",
+    "status",
+    "read",
+    "wait",
+    "stop",
+    "attach",
+    "pause",
+    "resume",
+    "final-output",
+];
+
 fn add_capabilities(value: &mut serde_json::Value) {
     if let Some(values) = value.as_array_mut() {
         for value in values {
             add_capabilities(value);
         }
     } else if value.get("adapter").is_some() && value.get("name").is_some() {
-        value["capabilities"] = if matches!(
+        value["capabilities"] = if value["adapter"] == "agentcloud" {
+            json!(CLOUD_CAPABILITIES)
+        } else if matches!(
             value["adapter"].as_str(),
             Some("herdr" | "herdr-pane" | "herdr-foreign")
         ) && value["mode"] == "interactive"
@@ -1422,6 +1566,182 @@ mod tests {
                 .expect("missing capability list")
                 .contains(&json!("rust-provider"))
         );
+    }
+
+    #[test]
+    fn agentcloud_start_flags_parse_document_and_refuse_misuse() {
+        let parsed = Cli::try_parse_from([
+            "agentctl",
+            "--agentcloudctl-bin",
+            "/opt/bin/agentcloudctl",
+            "start",
+            "sub-cloud",
+            "--harness",
+            "agentcloud",
+            "--cloud-harness",
+            "claude-code",
+            "--provision",
+            "--envspec",
+            "monorepo",
+            "--purpose",
+            "sub-cloud checkout",
+            "--agentterm-bin",
+            "/opt/bin/agentterm",
+        ])
+        .expect("agentcloud start parses");
+        assert_eq!(
+            parsed.agentcloudctl_bin,
+            PathBuf::from("/opt/bin/agentcloudctl")
+        );
+        assert_eq!(parsed.agentterm_bin, PathBuf::from("/opt/bin/agentterm"));
+        let Some(Commands::Start(start)) = parsed.command else {
+            panic!("expected start");
+        };
+        assert!(start.provision);
+        assert_eq!(start.cloud_harness.as_deref(), Some("claude-code"));
+        for invalid in [
+            vec![
+                "start",
+                "sub-cloud",
+                "--harness",
+                "agentcloud",
+                "--envspec",
+                "monorepo",
+            ],
+            vec![
+                "start",
+                "sub-cloud",
+                "--harness",
+                "agentcloud",
+                "--purpose",
+                "label",
+            ],
+            vec![
+                "start",
+                "sub-cloud",
+                "--harness",
+                "agentcloud",
+                "--provision",
+                "--node-id",
+                "n1",
+            ],
+            vec![
+                "start",
+                "sub-cloud",
+                "--harness",
+                "agentcloud",
+                "--cloud-harness",
+                "claude",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(std::iter::once("agentctl").chain(invalid.iter().copied()))
+                    .is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+        let help = Cli::try_parse_from(["agentctl", "start", "--help"])
+            .err()
+            .expect("start help")
+            .to_string();
+        for required in [
+            "--cloud-harness",
+            "--provision",
+            "--envspec",
+            "--purpose",
+            "--cloud-workspace",
+            "--node-id",
+            "--agentcloudctl-bin",
+            "--agentterm-bin",
+            "agentterm -s SESSION_ID",
+            "300",
+        ] {
+            assert!(help.contains(required), "start help omitted {required:?}");
+        }
+        for (command, required) in [
+            ("stop", "--skip-cloud-halt"),
+            ("send", "idempotency"),
+            ("read", "--output last"),
+            ("wait", "--until settle"),
+        ] {
+            let help = Cli::try_parse_from(["agentctl", command, "-h"])
+                .err()
+                .expect("short help")
+                .to_string();
+            assert!(help.contains(required), "{command} -h omitted {required:?}");
+        }
+    }
+
+    #[test]
+    fn agentcloud_flags_are_usage_errors_outside_agentcloud_launches() {
+        let registry = std::env::temp_dir().join(format!(
+            "agentctl-cli-cloud-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let registry = registry.display().to_string();
+        for arguments in [
+            vec![
+                "--registry",
+                registry.as_str(),
+                "--herdr-bin",
+                "/nonexistent/herdr",
+                "start",
+                "sub-local",
+                "--harness",
+                "codex",
+                "--provision",
+            ],
+            vec![
+                "--registry",
+                registry.as_str(),
+                "--herdr-bin",
+                "/nonexistent/herdr",
+                "start",
+                "sub-local",
+                "--profile",
+                "cloud",
+                "--cloud-workspace",
+                "/w",
+            ],
+        ] {
+            let code = main(arguments.iter().map(OsString::from));
+            assert_eq!(code, 2, "{arguments:?}");
+        }
+        assert!(!Path::new(&registry).exists());
+        assert_eq!(
+            main(["skill", "install", "--agentterm-bin", "/x"].map(OsString::from)),
+            2
+        );
+    }
+
+    #[test]
+    fn an_empty_from_session_pins_a_human_send_even_inside_a_session() {
+        let inside = Some("c0ffee00-0000-4000-8000-000000000001".to_owned());
+        assert_eq!(caller_session(Some(String::new()), inside.clone()), None);
+        assert_eq!(caller_session(None, inside.clone()), inside);
+        assert_eq!(
+            caller_session(Some("a".to_owned()), inside),
+            Some("a".to_owned())
+        );
+        assert_eq!(caller_session(None, Some(String::new())), None);
+        assert_eq!(caller_session(None, None), None);
+    }
+
+    #[test]
+    fn agentcloud_records_advertise_only_the_cloud_interface() {
+        let mut record = json!({
+            "name": "sub-cloud",
+            "adapter": "agentcloud",
+            "mode": "interactive",
+            "backend": "herdr",
+        });
+        add_capabilities(&mut record);
+        assert_eq!(record["capabilities"], json!(CLOUD_CAPABILITIES));
+        assert!(!record["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("drain")));
     }
 
     #[test]
