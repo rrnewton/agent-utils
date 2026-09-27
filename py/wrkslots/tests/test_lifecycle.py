@@ -210,19 +210,24 @@ def test_task_scope_identity_round_trips_and_legacy_rows_remain_readable(
             owner,
         )
 
-    non_integer = dict(encoded["task_scope"])
+    # The encoded record is typed as a mapping of objects; narrow the one entry these
+    # mutation cases copy, so strict mypy can type the copies.
+    encoded_scope = encoded["task_scope"]
+    assert isinstance(encoded_scope, dict)
+
+    non_integer = dict(encoded_scope)
     non_integer["leader_pid"] = "123"
     with pytest.raises(wrkslots.StateError, match="leader_pid"):
         wrkslots._task_scope_from_obj(non_integer, "non-integer scope")
 
-    wrong_cgroup = dict(encoded["task_scope"])
+    wrong_cgroup = dict(encoded_scope)
     wrong_cgroup["cgroup_path"] = "/user.slice/prefix-wrkslots-worker.scope"
     with pytest.raises(wrkslots.StateError, match="cgroup path"):
         wrkslots._task_scope_from_obj(wrong_cgroup, "wrong-cgroup scope")
 
     for codepoint in range(0x1C, 0x20):
         control = chr(codepoint)
-        invalid_control = dict(encoded["task_scope"])
+        invalid_control = dict(encoded_scope)
         invalid_control["unit"] = f"wrkslots-{control}.scope"
         invalid_control["cgroup_path"] = f"/user.slice/wrkslots-{control}.scope"
         with pytest.raises(wrkslots.StateError, match="task-scoped systemd unit"):
@@ -234,7 +239,7 @@ def test_task_scope_identity_round_trips_and_legacy_rows_remain_readable(
         control = chr(codepoint)
         if unicodedata.category(control) != "Cf":
             continue
-        invalid_format = dict(encoded["task_scope"])
+        invalid_format = dict(encoded_scope)
         invalid_format["unit"] = f"wrkslots-{control}.scope"
         invalid_format["cgroup_path"] = f"/user.slice/wrkslots-{control}.scope"
         with pytest.raises(wrkslots.StateError, match="task-scoped systemd unit"):
@@ -242,7 +247,7 @@ def test_task_scope_identity_round_trips_and_legacy_rows_remain_readable(
                 invalid_format, f"U+{codepoint:04X} format-control scope"
             )
 
-    visible_unicode = dict(encoded["task_scope"])
+    visible_unicode = dict(encoded_scope)
     visible_unicode["unit"] = "wrkslots-é.scope"
     visible_unicode["cgroup_path"] = "/user.slice/wrkslots-é.scope"
     assert (
