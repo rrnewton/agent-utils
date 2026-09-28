@@ -229,7 +229,7 @@ are kept in `fence-feedback.json` in the bridge state directory. The exact pendi
 prompt is saved before submission, so recovery settles its original queue ID even
 if a crash hides the submission result or newer unavailable markers appear.
 The history retains up to 4,096 distinct reported or pending IDs. At that limit,
-new diagnostics stay held; previously reported IDs are never evicted or submitted
+new diagnostics stay held; reported IDs are never evicted or submitted
 again.
 
 A per-thread post-rate breaker bounds any remaining reply loop. After one

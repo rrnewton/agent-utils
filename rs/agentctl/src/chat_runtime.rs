@@ -3008,7 +3008,7 @@ impl BridgeState {
     /// Set process-local prefixes whose new messages are committed without request admission.
     ///
     /// Matching is literal and case-sensitive after leading Unicode whitespace is removed.
-    /// This does not change saved configuration or suppress previously admitted work.
+    /// This does not change saved configuration or suppress admitted work.
     pub fn with_ignored_text_prefixes(mut self, prefixes: Vec<String>) -> Result<Self> {
         if prefixes.len() > MAX_IGNORED_TEXT_PREFIXES {
             return Err(ChatRuntimeError::invalid(format!(
