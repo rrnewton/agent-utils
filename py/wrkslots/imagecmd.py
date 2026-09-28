@@ -318,10 +318,17 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser], fo
             "`wrkslots run SLOT -- SHELL -i`, using absolute interpreter paths and exec at "
             "every step so the process ID never changes. A terminal multiplexer that only "
             "starts agents in a pane whose own shell is at its prompt (Herdr) keeps working. "
-            "An agent launcher runs it in a fresh pane before starting a harness. The box is the "
-            "same for plain-worktree and image-backed slots."
+            "An agent launcher runs it in a fresh pane before starting a harness. With a COMMAND "
+            "after --, the line runs that program boxed instead of the shell (used for root "
+            "isolation, where sudo stays in front of the program and the multiplexer cannot start "
+            "an agent in the pane itself). The box is the same for plain-worktree and image-backed "
+            "slots."
         ),
-        epilog="Example: wrkslots shell-command slot01 --format json",
+        epilog=(
+            "Examples:\n"
+            "  wrkslots shell-command slot01 --format json\n"
+            "  wrkslots shell-command slot01 --isolation root --format json -- /usr/local/bin/HARNESS ARGS"
+        ),
         formatter_class=formatter,
     )
     shell_command.add_argument("slot", help="registered slot name")
@@ -338,6 +345,11 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser], fo
         choices=("text", "json"),
         default="text",
         help="text prints the command line; json prints {command, slot_path, isolation} (default: text)",
+    )
+    shell_command.add_argument(
+        "command",
+        nargs="*",
+        help="program to run boxed instead of the interactive shell, after a literal -- (default: SHELL -i)",
     )
     shell_command.set_defaults(handler=_cmd_shell_command)
     for name in ("image", "run", "sandbox", "limits", "shell-command"):
@@ -725,7 +737,13 @@ def _cmd_shell_command(args: argparse.Namespace) -> int:
     ]
     if args.isolation is not None:
         argv += ["--isolation", args.isolation]
-    argv += ["--", os.path.realpath(shutil.which(shell) or shell), "-i"]
+    command = list(args.command)
+    if command:
+        # A command given after -- replaces the interactive shell: the pane then
+        # runs that program boxed, and closes when it exits.
+        argv += ["--", *command]
+    else:
+        argv += ["--", os.path.realpath(shutil.which(shell) or shell), "-i"]
     line = " ".join(shlex.quote(part) if index else part for index, part in enumerate(argv))
     if args.format == "json":
         slot_path = cli._slot_directory(config, args.slot, args.slot_type)
