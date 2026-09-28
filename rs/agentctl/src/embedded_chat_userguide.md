@@ -221,30 +221,67 @@ claim of infinite local audit history.
 
 A reply marker in the pane whose ID is not available, such as a typo or a stale
 block left in scrollback by another bridge state, produces one routing-error
-prompt to the agent. The prompt names the unavailable ID and the available
-ones and is never posted to chat. Each unavailable ID is reported at most once,
-including after a restart. While a routing-error prompt is still queued, newer
-unavailable IDs wait for it instead of producing a second prompt. Reported IDs
-are kept in `fence-feedback.json` in the bridge state directory. The exact pending
-prompt is saved before submission, so recovery settles its original queue ID even
-if a crash hides the submission result or newer unavailable markers appear.
-The history retains up to 4,096 distinct reported or pending IDs. At that limit,
-new diagnostics stay held; reported IDs are never evicted or submitted
-again.
+prompt to the agent. The prompt names the unavailable ID and the reply IDs that
+were available when it was written, and it is never posted to chat. Reported IDs
+are kept in `fence-feedback.json` in the bridge state directory, so each
+unavailable ID is reported at most once per state directory, including after a
+restart. A new state directory starts with no reported IDs. A marker that stays
+visible after its report is left out of later prompts, and every scan that sees
+it logs an `already reported, so not repeated` line naming it. A later block
+that reuses a reported ID is therefore neither reported again nor posted; that
+log line is its only trace. Already reported markers are set aside before the
+bound on new ones, so a screen full of old markers cannot hide a new one. While
+a routing-error prompt is still queued, newer unavailable IDs wait for it
+instead of producing a second prompt. The exact pending prompt is saved before
+submission, so recovery settles its original queue ID even if a crash hides the
+submission result or newer unavailable markers appear. A prompt whose queue
+outcome is uncertain counts as reported: it is not submitted again, even if it
+never reached the agent. The history retains up to 4,096 distinct reported or
+pending IDs. At that limit, new diagnostics stay held; reported IDs are never
+evicted or submitted again. Deleting `fence-feedback.json` clears the history,
+so the IDs it held can be reported once more. If the file cannot be read or is
+outside its bounds, the error names it and diagnostics stay held until it is
+repaired or deleted.
 
-A per-thread post-rate breaker bounds any remaining reply loop. After one
-provider thread reserves 3 distinct reply operations within 60 seconds, the next reply to that
-thread trips the breaker. Replies to that thread then stay captured but unsent
-for 600 seconds, and the log names the thread with a `post-rate breaker` error.
-Other threads are unaffected. After the cooldown, held replies go out in order
-under their original operation IDs. To release a thread early, first confirm
-that no reply loop is running, then delete `reply-breaker.json` from the bridge
-state directory. Reservations are durable before a provider call, including calls
-whose outcome is unknown. Unresolved reservations keep their budget until the
-same operation is reconciled or the ledger is explicitly reset. A valid receipt
-starts its 60-second retention window; retrying an expired completed reservation
-must pass the current budget again. A full ledger holds new sends until completed
-entries expire. This can conservatively hold replies after a failed attempt.
+A per-thread post-rate breaker bounds any remaining reply loop. One provider
+thread may reserve 8 distinct reply operations within 60 seconds. That leaves
+room for several requests in one thread, each with progress updates and a
+multi-message answer, and each request prompt states this budget to the agent.
+The next reply to that thread trips the breaker. Replies to that thread then
+stay captured but unsent for 300 seconds; replies to other threads are
+unaffected. Held replies go out in order, under their original operation IDs, at
+the first retry after the cooldown ends: the next reconciliation (every 300
+seconds by default; see `--reconcile-interval`), the next time the agent pane
+settles idle or done, the next captured reply for the same request, a restart of
+`chat run`, or `chat tick` while the daemon is stopped. Those sends count
+against a new window, so a longer backlog goes out 8 at a time, with a new hold
+after each group of 8. While a thread is held, every attempt fails with a
+`post-rate breaker` error that names the thread and the release time in
+milliseconds after the Unix epoch. `chat run` logs that error, and `chat tick`
+reports it and exits with status 75. `chat status` reports the breaker under
+`reply_breaker`: its limits (`max_replies_per_thread`, `window_seconds`, and
+`cooldown_seconds`), each held thread in `held_threads` with
+`held_until_millis`, `held_for_seconds`, and
+`recent_or_unresolved_reservations`, and an `error` that is null unless the
+record is unusable. Neither the agent nor the chat thread is told about a hold:
+a notice to the agent could prompt more replies, and a notice in the thread
+would be one more post to the thread being held.
+
+To release held threads early, first confirm that no reply loop is running, then
+delete `reply-breaker.json` from the bridge state directory. This releases every
+thread and discards the budget history of all of them; held replies go out at
+the next retry. If that file cannot be read or is outside its bounds, replies to
+every thread stay held until it is repaired or deleted: each publish error names
+the file, and `chat status` shows the failure in `reply_breaker.error`. A
+reservation or trip stamped later than the current time, as after the wall clock
+steps back, is moved to the current time, so its window or cooldown restarts
+once instead of lasting as long as the step. Reservations are durable before a
+provider call, including calls whose outcome is unknown. Unresolved reservations
+keep their budget until the same operation is reconciled or the ledger is
+explicitly reset. A valid receipt starts its 60-second retention window;
+retrying an expired completed reservation must pass the current budget again. A
+full ledger holds new sends until completed entries expire. This can
+conservatively hold replies after a failed attempt.
 
 ## Service management
 
