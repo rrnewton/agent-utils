@@ -172,6 +172,40 @@ with a limit of 64 records and 512 KiB per record. This procedure cannot reset
 to the provider head, accept loss, replay quarantined work, or claim recovery
 before provider confirmation.
 
+For a committed boundary containing messages, use the separate explicit
+`chat retry-boundary-gap` operation only after reviewing evidence that the
+provider can replay the **exact original batch** at the saved cursor:
+
+```sh
+agentctl chat retry-boundary-gap \
+  --bridge-state /home/me/.local/state/agentctl/project-chat \
+  --expected-gap-sha256 "$GAP_SHA256" \
+  --expected-checkpoint-sha256 "$CHECKPOINT_SHA256" \
+  --expected-configuration-sha256 "$CONFIGURATION_SHA256" \
+  --keep-cursor "$COMMITTED_CURSOR" \
+  --evidence-file /home/me/private/provider-evidence.json \
+  --evidence-sha256 "$EVIDENCE_SHA256"
+```
+
+It applies the same stopped-runner, digest, evidence and committed-receipt
+checks. The audit additionally records exact-boundary authority. The complete
+ordered event fingerprint, event count and every retained message guard must
+remain equal, including original full provider payloads. Matching only a
+message ID or text is insufficient; current REST metadata may differ from the
+original event. A checkpoint cannot replace a message-bearing boundary, even
+when a runtime prefix filter excluded its message from actionable work.
+
+Approval does not fetch messages, change the cursor, clear the gap, reset to
+provider head, or accept loss. The next generation must replay the original
+inclusive boundary; any mismatch stops without provider acknowledgement.
+Only a newer exact committed replay resolves the incident. Same-cursor replay
+creates no new requests or ACK/reply UUIDs, even if the current prefix policy
+differs; existing quarantines remain intact. New gaps revoke this authority,
+and the same receipt-based crash recovery and bounded audit retention apply.
+The checkpoint-only command continues to refuse message-bearing boundaries.
+An older host that cannot read an exact-boundary audit fails closed; keep the
+matching host available through retry and confirmation.
+
 For a bounded local work recovery pass while the daemon is stopped (`tick` does
 not repair provider gaps):
 
