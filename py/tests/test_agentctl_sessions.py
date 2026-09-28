@@ -4,6 +4,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import replace
@@ -578,3 +579,88 @@ def test_invalid_turn_boundaries_are_refused_before_worker_dispatch(output: str,
     with pytest.raises(AgentDeliveryError, match="requires"):
         sessions.read_session("worker", output=output, since_turn=since)
     assert not calls
+
+
+def _fake_wrkslots(tmp_path: Path, slot_path: Path, behaviour: str = "ok") -> Path:
+    """A stand-in wrkslots that records its cwd and argv, then answers shell-command."""
+    script = tmp_path / f"fake-wrkslots-{behaviour}"
+    answers = {
+        "ok": "printf '%s\\n' " + repr(json.dumps({"command": "exec boxed-shell", "slot_path": str(slot_path)})),
+        "fail": "echo 'unknown slot s9' >&2; exit 3",
+        "root": "printf '%s\\n' " + repr(json.dumps(
+            {"command": "exec boxed-shell", "slot_path": str(slot_path), "isolation": "root"})),
+        "junk": "echo 'not json'",
+    }
+    script.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$PWD\" \"$@\" > {str(tmp_path / f'argv-{behaviour}')!r}\n"
+        f"{answers[behaviour]}\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return script
+
+
+def test_slot_start_boxes_the_pane_before_the_harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    entered: list[tuple[str, str]] = []
+
+    def enter(pane_id: str, command_line: str, *, timeout: float = 30.0) -> int:
+        entered.append((pane_id, command_line))
+        return 4242
+
+    monkeypatch.setattr(fake, "enter_slot_sandbox", enter, raising=False)
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setenv("AGENTCTL_WRKSLOTS_BIN", str(_fake_wrkslots(tmp_path, tmp_path)))
+    status = sessions.start_session(
+        "worker", cwd=str(tmp_path), slot="s1", slot_isolation="root", slot_project=str(project)
+    )
+    assert [line for _pane, line in entered] == ["exec boxed-shell"]
+    assert status["cwd"] == str(tmp_path)
+    argv = (tmp_path / "argv-ok").read_text(encoding="utf-8").splitlines()
+    assert Path(argv[0]).resolve() == project.resolve()
+    assert argv[1:] == [
+        "--project-root", str(project), "shell-command", "s1", "--isolation", "root", "--format", "json",
+    ]
+
+
+def test_slot_start_leaves_isolation_to_the_project_configuration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from agentctl.subagents import _slot_shell_command
+
+    monkeypatch.setenv("AGENTCTL_WRKSLOTS_BIN", str(_fake_wrkslots(tmp_path, tmp_path / "slot")))
+    line, slot_path = _slot_shell_command("s2", isolation=None, project=str(tmp_path))
+    assert (line, slot_path) == ("exec boxed-shell", str(tmp_path / "slot"))
+    argv = (tmp_path / "argv-ok").read_text(encoding="utf-8").splitlines()
+    assert argv[1:] == ["shell-command", "s2", "--format", "json"]
+
+
+@pytest.mark.parametrize(
+    "behaviour,isolation,expected",
+    [
+        ("fail", None, "wrkslots shell-command 's9' failed: unknown slot s9"),
+        ("junk", None, "wrkslots shell-command 's9' returned invalid JSON"),
+        ("ok", "namespace", "--slot-isolation must be userns, cgroup, or root"),
+        ("root", None, "--slot with root isolation cannot host a Herdr agent"),
+    ],
+)
+def test_slot_failures_are_refused_before_registry_or_tab_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, behaviour: str, isolation: str | None, expected: str,
+) -> None:
+    sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("AGENTCTL_WRKSLOTS_BIN", str(_fake_wrkslots(tmp_path, tmp_path, behaviour)))
+    with pytest.raises(AgentDeliveryError, match=re.escape(expected)):
+        sessions.start_session("worker", cwd=str(tmp_path), slot="s9", slot_isolation=isolation)
+    assert not (sessions.registry / "worker").exists()
+
+
+def test_slot_needs_wrkslots_and_slot_options_need_slot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sessions, _fake, _calls = setup(tmp_path, monkeypatch)
+    monkeypatch.delenv("AGENTCTL_WRKSLOTS_BIN", raising=False)
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    with pytest.raises(AgentDeliveryError, match="needs wrkslots on PATH"):
+        sessions.start_session("worker", cwd=str(tmp_path), slot="s1")
+    with pytest.raises(AgentDeliveryError, match="interactive Herdr sessions only"):
+        sessions.start_session("worker", cwd=str(tmp_path), mode="headless", slot="s1")
+    assert cli.main(["--registry", str(sessions.registry), "start", "w", "--cwd", str(tmp_path),
+                     "--slot-isolation", "userns"]) != 0

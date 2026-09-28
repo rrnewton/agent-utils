@@ -1470,15 +1470,16 @@ class ManagedAgents:
         brief: str | None = None,
         startup_timeout: float = 30.0, ready_timeout: float = 900.0,
         working_timeout: float = 30.0, max_attempts: int = 3,
-        slot: str | None = None, slot_isolation: str = "namespace",
+        slot: str | None = None, slot_isolation: str | None = None,
         slot_project: str | None = None,
     ) -> dict[str, object]:
         """Create one new tab and start its interactive harness without stealing focus.
 
         With ``slot``, the new pane's shell is first replaced by a shell boxed
-        to that slot (per-slot resource limits, and with the default
-        ``namespace`` isolation a private file-system view), so the harness and
-        everything it runs stay inside the slot's box.
+        to that slot (per-slot resource limits and, unless the isolation is
+        ``cgroup``, a confined file-system view), so the harness and everything
+        it runs stay inside the slot's box. ``slot_isolation`` None uses the
+        project's configured isolation.
 
         Failed launches retain their record and terminal for diagnosis. Stop the
         named agent after inspecting it to archive its artifacts and release its name.
@@ -3774,18 +3775,31 @@ class ManagedAgents:
             return {"name": name, "pane_id": info.pane_id, "paused": record.paused}
 
 
+SLOT_ISOLATIONS = ("userns", "cgroup", "root")
+#: sudo keeps the pane's shell PID and relays a private terminal to the boxed
+#: shell, so Herdr sees only sudo: it cannot start or detect a harness there.
+ROOT_SLOT_REFUSAL = (
+    "--slot with root isolation cannot host a Herdr agent: sudo stays the pane's foreground "
+    "process and runs the boxed shell on a private terminal, so Herdr can neither start nor "
+    "detect the harness; use --slot-isolation userns or cgroup, or run `wrkslots run SLOT "
+    "--isolation root -- HARNESS` directly"
+)
+
+
 def _slot_shell_command(
-    slot: str, *, isolation: str, project: str, explicit_project: bool = False
+    slot: str, *, isolation: str | None, project: str, explicit_project: bool = False
 ) -> tuple[str, str]:
     """Ask the slot manager for the exec-only command that boxes a pane shell."""
-    if isolation not in ("namespace", "cgroup"):
-        raise AgentDeliveryError("--slot-isolation must be namespace or cgroup")
+    if isolation is not None and isolation not in SLOT_ISOLATIONS:
+        raise AgentDeliveryError("--slot-isolation must be userns, cgroup, or root")
     executable = os.environ.get("AGENTCTL_WRKSLOTS_BIN") or shutil.which("wrkslots")
     if not executable:
         raise AgentDeliveryError(
             "--slot needs wrkslots on PATH (or AGENTCTL_WRKSLOTS_BIN naming it)"
         )
-    command = [executable, "shell-command", slot, "--isolation", isolation, "--format", "json"]
+    command = [executable, "shell-command", slot, "--format", "json"]
+    if isolation is not None:
+        command[3:3] = ["--isolation", isolation]
     if explicit_project:
         command[1:1] = ["--project-root", project]
     completed = subprocess.run(
@@ -3803,4 +3817,6 @@ def _slot_shell_command(
             raise ValueError("missing fields")
     except (ValueError, KeyError) as exc:
         raise AgentDeliveryError(f"wrkslots shell-command {slot!r} returned invalid JSON: {exc}") from exc
+    if document.get("isolation") == "root":
+        raise AgentDeliveryError(ROOT_SLOT_REFUSAL)
     return line, slot_path

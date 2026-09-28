@@ -800,7 +800,7 @@ class HerdrClient:
                 self._sleep(0.05)
                 continue
             pids = {entry[0] for entry in info.foreground}
-            names = {os.path.basename(entry[3]) for entry in info.foreground}
+            names = {os.path.basename(entry[3]).lstrip("-") for entry in info.foreground}
             if pids == {info.shell_pid} and names & shells:
                 try:
                     with open(f"/proc/{info.shell_pid}/cgroup", encoding="utf-8") as stream:

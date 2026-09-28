@@ -12,8 +12,8 @@ use serde_json::json;
 use crate::agent::{AgentError, DrainOptions, QueueOutcome};
 use crate::client::HerdrClient;
 use crate::subagents::{
-    environment_entries, AdoptOptions, CloudLaunch, CloudTools, ManagedAgents, StartOptions,
-    StopOptions,
+    environment_entries, AdoptOptions, CloudLaunch, CloudTools, ManagedAgents, SlotLaunch,
+    StartOptions, StopOptions,
 };
 
 const MAX_CHAT_PUBLISH_BYTES: usize = 30_000;
@@ -251,6 +251,15 @@ struct Start {
     /// Existing Herdr workspace ID; default: configured project workspace, else HERDR_WORKSPACE_ID, else shared subagents; an explicit ID must match configured policy
     #[arg(long, value_name = "ID")]
     workspace_id: Option<String>,
+    /// Interactive only: box the agent to this wrkslots slot (plain-worktree or image-backed); the pane shell is replaced by the line `wrkslots shell-command SLOT` prints (per-slot slice limits and, except with cgroup isolation, a confined file-system view) before the harness starts, and the agent's cwd is the slot directory. Needs wrkslots on PATH or AGENTCTL_WRKSLOTS_BIN
+    #[arg(long, value_name = "SLOT")]
+    slot: Option<String>,
+    /// With --slot: userns = limits plus the file-system view in a user namespace; cgroup = limits only; root is refused (sudo stays the pane's foreground process, so Herdr cannot start or detect the harness; use `wrkslots run SLOT --isolation root -- HARNESS` directly) (default: the project's configuration.sandbox.isolation, else userns)
+    #[arg(long, value_name = "MODE", value_parser = ["userns", "cgroup", "root"], requires = "slot")]
+    slot_isolation: Option<String>,
+    /// With --slot: wrkslots project root (default: --cwd, searched upward for .wrkslots.yml)
+    #[arg(long, value_name = "DIR", requires = "slot")]
+    slot_project: Option<PathBuf>,
     /// Seconds to wait for harness startup, greater than zero and at most 300
     #[arg(long, default_value = "30", value_parser = startup_seconds)]
     startup_timeout: f64,
@@ -881,6 +890,12 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 ),
                 None => value.brief,
             };
+            let slot = value.slot.clone().map(|slot| SlotLaunch {
+                slot,
+                isolation: value.slot_isolation.clone(),
+                project: value.slot_project.clone(),
+                executable: None,
+            });
             let options = StartOptions {
                 workspace_id: value.workspace_id,
                 harness,
@@ -892,6 +907,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 startup_timeout: Duration::from_secs_f64(value.startup_timeout),
                 delivery: value.delivery.options(),
                 cloud,
+                slot,
             };
             if let Some(effort) = reasoning_effort.as_deref() {
                 manager.start_with_reasoning_effort(
@@ -1335,6 +1351,55 @@ mod tests {
                 })
             }))
         ));
+    }
+
+    #[test]
+    fn start_slot_options_parse_and_need_slot() {
+        let parsed = Cli::try_parse_from([
+            "agentctl",
+            "start",
+            "worker",
+            "--slot",
+            "s1",
+            "--slot-isolation",
+            "root",
+            "--slot-project",
+            "/p",
+        ])
+        .unwrap();
+        let Some(Commands::Start(start)) = parsed.command else {
+            panic!("expected start");
+        };
+        assert_eq!(start.slot.as_deref(), Some("s1"));
+        assert_eq!(start.slot_isolation.as_deref(), Some("root"));
+        assert_eq!(start.slot_project, Some(PathBuf::from("/p")));
+        for arguments in [
+            vec!["agentctl", "start", "worker", "--slot-isolation", "userns"],
+            vec!["agentctl", "start", "worker", "--slot-project", "/p"],
+            vec![
+                "agentctl",
+                "start",
+                "worker",
+                "--slot",
+                "s1",
+                "--slot-isolation",
+                "namespace",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_err());
+        }
+        let help = Cli::try_parse_from(["agentctl", "start", "--help"])
+            .err()
+            .unwrap()
+            .to_string();
+        for flag in [
+            "--slot <SLOT>",
+            "--slot-isolation",
+            "--slot-project",
+            "AGENTCTL_WRKSLOTS_BIN",
+        ] {
+            assert!(help.contains(flag), "{flag} missing from start help");
+        }
     }
 
     #[test]

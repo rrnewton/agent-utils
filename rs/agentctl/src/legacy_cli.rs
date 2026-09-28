@@ -360,6 +360,7 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
                 startup_timeout: Duration::from_secs_f64(args.startup_timeout),
                 delivery,
                 cloud: None,
+                slot: None,
             };
             write_json(&manager.start(name, cwd, options)?)?;
         }

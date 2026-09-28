@@ -74,7 +74,7 @@ class Sessions(ManagedAgents):
                       workspace_id: str | None = None, startup_timeout: float = 30.0,
                       ready_timeout: float = 900.0, working_timeout: float = 30.0,
                       max_attempts: int = 3, slot: str | None = None,
-                      slot_isolation: str = "namespace",
+                      slot_isolation: str | None = None,
                       slot_project: str | None = None) -> dict[str, object]:
         """Create a native interactive terminal or a persistent headless runner."""
         _name(name)

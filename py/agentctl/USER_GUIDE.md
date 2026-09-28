@@ -493,6 +493,34 @@ request ID and artifact path. Preserve that ID and use `drain` for pending
 work. Sending the same task under a new ID creates a second request and can
 duplicate work; it is not a recovery operation.
 
+## Boxing an agent to a wrkslots slot
+
+```sh
+agentctl start implementer --harness codex --cwd /work/project --slot slot07 \
+  --brief 'Implement the parser change in this slot'
+```
+
+`--slot SLOT` (interactive Herdr sessions only) runs the agent inside a wrkslots
+slot's box (see the wrkslots user guide). agentctl asks
+`wrkslots shell-command SLOT --format json` for an exec-only command line (from
+`AGENTCTL_WRKSLOTS_BIN`, else `wrkslots` on `PATH`, run in `--slot-project DIR`
+or `--cwd`), runs it in the new pane, and waits until the pane's own shell PID
+is once more the sole foreground process, is a shell, and sits in a wrkslots
+slice. Only then does it start the harness. The agent's recorded working
+directory is the slot directory. The box is the same whether the slot is plain
+worktrees or a disk image: per-slot limits, and a file-system view in which
+only the slot, its Git directories, the project's blessed outputs, and the
+shared harness state are writable.
+
+`--slot-isolation userns|cgroup` overrides the project's
+`configuration.sandbox.isolation` for this agent: `userns` builds the view in an
+unprivileged user namespace, and `cgroup` applies limits only. `root` isolation
+is refused, whether you pass it or the project configures it: sudo stays the
+pane's foreground process and runs the boxed shell on a private terminal, so
+Herdr can neither start nor detect a harness there. Run such harnesses directly
+with `wrkslots run SLOT --isolation root -- HARNESS ...` instead.
+Slot problems are refused before any registry record or tab is created.
+
 ## Agentcloud sessions
 
 The Rust distribution can also launch a worker whose session runs in
