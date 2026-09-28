@@ -2945,6 +2945,8 @@ pub struct BridgeState {
     retirement_boundary_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     confirm_fault_after: Arc<std::sync::Mutex<Option<usize>>>,
+    #[cfg(test)]
+    gap_retry_runner_probe: Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<File>>>>,
 }
 
 /// Revalidate and pin the configured provider executable without launching it.
@@ -3041,6 +3043,8 @@ impl BridgeState {
             retirement_boundary_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             confirm_fault_after: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            gap_retry_runner_probe: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -3124,6 +3128,8 @@ impl BridgeState {
             retirement_boundary_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             confirm_fault_after: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            gap_retry_runner_probe: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -3468,6 +3474,19 @@ impl BridgeState {
         runner.try_lock_exclusive().map_err(|error| {
             ChatRuntimeError::invalid(format!("gap retry requires a stopped runner: {error}"))
         })?;
+        // Release on every return even if a concurrent child inherited the descriptor.
+        let _runner = RunnerLease { file: runner };
+        #[cfg(test)]
+        if let Some(probe) = self
+            .gap_retry_runner_probe
+            .lock()
+            .expect("runner probe")
+            .as_ref()
+        {
+            probe
+                .send(_runner.file.try_clone().expect("duplicate approval runner"))
+                .expect("retain approval runner duplicate");
+        }
         let state_lock = open_existing_private_state_lock(&self.root.join(".state.lock"))?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
         let gap_bytes = read_artifact_bytes(&self.root.join("gap.json"), MAX_GAP_DIAGNOSTIC_BYTES)?;
@@ -9431,6 +9450,63 @@ mod tests {
         assert!(state.subscribe_request().is_err());
         assert!(approve_fixture_gap(&state, None).is_err());
         fs::remove_dir_all(&state.root).expect("cleanup");
+    }
+
+    fn assert_gap_retry_releases_duplicated_runner(inject_failure: bool) {
+        let label = if inject_failure {
+            "gap-retry-duplicate-error"
+        } else {
+            "gap-retry-duplicate-success"
+        };
+        let state = checkpoint_gap_fixture(label);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        *state.gap_retry_runner_probe.lock().expect("runner probe") = Some(sender);
+        if inject_failure {
+            *state.confirm_fault_after.lock().expect("fault") = Some(0);
+        }
+        let result = approve_fixture_gap(&state, None);
+        if inject_failure {
+            assert!(result
+                .expect_err("injected approval failure")
+                .to_string()
+                .contains("injected commit-confirmation boundary failure"));
+        } else {
+            assert_eq!(result.expect("approve retry")["retry_approved"], true);
+        }
+        // Retain the same open file description beyond the actual approval return, as a
+        // concurrently forked child can before exec. No scheduling or sleep is required.
+        let inherited_duplicate = receiver.try_recv().expect("captured runner duplicate");
+        state
+            .gap_retry_runner_probe
+            .lock()
+            .expect("runner probe")
+            .take();
+        inherited_duplicate
+            .metadata()
+            .expect("duplicate remains open");
+        let lease = state
+            .acquire_runner_lease()
+            .expect("approval released runner despite inherited duplicate");
+        drop(lease);
+        assert_eq!(
+            approve_fixture_gap(&state, None).expect("idempotent approval retry")["retry_approved"],
+            true
+        );
+        inherited_duplicate
+            .metadata()
+            .expect("retry kept duplicate open");
+        drop(inherited_duplicate);
+        fs::remove_dir_all(&state.root).expect("cleanup");
+    }
+
+    #[test]
+    fn checkpoint_gap_retry_success_releases_runner_with_inherited_duplicate() {
+        assert_gap_retry_releases_duplicated_runner(false);
+    }
+
+    #[test]
+    fn checkpoint_gap_retry_error_releases_runner_with_inherited_duplicate() {
+        assert_gap_retry_releases_duplicated_runner(true);
     }
 
     #[test]
