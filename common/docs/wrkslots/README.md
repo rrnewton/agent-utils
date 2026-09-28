@@ -13,6 +13,13 @@ outside the disposable checkout. `remove --validate-complete` lets the exact own
 completed validation slot immediately, or lets a later participant skip only the heartbeat wait
 after owner death.
 
+Slots can be stored as plain directories or, the default for new projects, as one sparse disk
+image per slot, so an agent's build trees never become host file-system metadata and reclaim
+deletes one file. `wrkslots run SLOT -- COMMAND` boxes a command (or, through an agent
+launcher that uses `wrkslots shell-command`, a whole agent) to one slot: per-slot memory, CPU, and task limits, and a file-system view
+in which only the slot is writable. Neither needs host configuration; see the user guide's
+"Disk-image slots" and "Running commands and agents inside a slot's box".
+
 ## Install
 
 ```sh
@@ -20,6 +27,9 @@ python3 -m pip install ./py/wrkslots
 ```
 
 Python 3.10 or newer, Git, and Linux `/proc` are required.
+Disk-image slots additionally need `mkfs.ext4` (e2fsprogs) and either passwordless `sudo` or
+`fuse2fs` with `/dev/fuse`. `wrkslots run` needs a systemd user manager (`systemd-run`, `busctl`)
+and, for its file-system view, unprivileged user namespaces.
 
 ## Quick start
 

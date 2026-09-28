@@ -73,7 +73,9 @@ class Sessions(ManagedAgents):
                       environment: Sequence[str] = (), brief: str | None = None,
                       workspace_id: str | None = None, startup_timeout: float = 30.0,
                       ready_timeout: float = 900.0, working_timeout: float = 30.0,
-                      max_attempts: int = 3) -> dict[str, object]:
+                      max_attempts: int = 3, slot: str | None = None,
+                      slot_isolation: str = "namespace",
+                      slot_project: str | None = None) -> dict[str, object]:
         """Create a native interactive terminal or a persistent headless runner."""
         _name(name)
         if mode == "interactive":
@@ -85,8 +87,11 @@ class Sessions(ManagedAgents):
                 harness_args=harness_args, environment=environment, brief=brief,
                 workspace_id=workspace_id, startup_timeout=startup_timeout,
                 ready_timeout=ready_timeout, working_timeout=working_timeout,
-                max_attempts=max_attempts,
+                max_attempts=max_attempts, slot=slot, slot_isolation=slot_isolation,
+                slot_project=slot_project,
             )
+        if slot is not None:
+            raise AgentDeliveryError("--slot is supported for interactive Herdr sessions only")
         if mode != "headless" or backend not in ("herdr", "tmux") or harness not in ("codex", "agy", "muse"):
             raise AgentDeliveryError("headless sessions support codex/agy/muse with herdr/tmux")
         if resume is not None or workspace_id is not None or environment:

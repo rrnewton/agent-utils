@@ -16,7 +16,9 @@ import json
 import math
 import os
 import re
+import shutil
 import stat
+import subprocess
 import sys
 import time
 import uuid
@@ -1468,8 +1470,15 @@ class ManagedAgents:
         brief: str | None = None,
         startup_timeout: float = 30.0, ready_timeout: float = 900.0,
         working_timeout: float = 30.0, max_attempts: int = 3,
+        slot: str | None = None, slot_isolation: str = "namespace",
+        slot_project: str | None = None,
     ) -> dict[str, object]:
         """Create one new tab and start its interactive harness without stealing focus.
+
+        With ``slot``, the new pane's shell is first replaced by a shell boxed
+        to that slot (per-slot resource limits, and with the default
+        ``namespace`` isolation a private file-system view), so the harness and
+        everything it runs stay inside the slot's box.
 
         Failed launches retain their record and terminal for diagnosis. Stop the
         named agent after inspecting it to archive its artifacts and release its name.
@@ -1510,6 +1519,14 @@ class ManagedAgents:
                     f"workspace {workspace_id!r} is labelled {actual_label!r}, "
                     f"but project configuration requires {project_workspace!r}"
                 )
+        slot_command: str | None = None
+        if slot is not None:
+            # The agent works in the slot: its record and pane cwd are the slot
+            # directory, which is where the boxed shell starts.
+            slot_command, root = _slot_shell_command(
+                slot, isolation=slot_isolation, project=slot_project or root,
+                explicit_project=slot_project is not None,
+            )
         with self._lock(name):
             with self._identity_transaction():
                 if resume is not None:
@@ -1532,6 +1549,10 @@ class ManagedAgents:
                         record, workspace_id, environment, project_workspace
                     )
                     assert record.pane_id is not None
+                    if slot_command is not None:
+                        self.client.enter_slot_sandbox(
+                            record.pane_id, slot_command, timeout=startup_timeout
+                        )
                     if record.adapter == "herdr-pane":
                         def persist_identity(identity: CustomProcessIdentity) -> None:
                             record.custom_process_identity = identity
@@ -3751,3 +3772,35 @@ class ManagedAgents:
             info = self._checked(record)
             self.client.focus_pane(info.pane_id)
             return {"name": name, "pane_id": info.pane_id, "paused": record.paused}
+
+
+def _slot_shell_command(
+    slot: str, *, isolation: str, project: str, explicit_project: bool = False
+) -> tuple[str, str]:
+    """Ask the slot manager for the exec-only command that boxes a pane shell."""
+    if isolation not in ("namespace", "cgroup"):
+        raise AgentDeliveryError("--slot-isolation must be namespace or cgroup")
+    executable = os.environ.get("AGENTCTL_WRKSLOTS_BIN") or shutil.which("wrkslots")
+    if not executable:
+        raise AgentDeliveryError(
+            "--slot needs wrkslots on PATH (or AGENTCTL_WRKSLOTS_BIN naming it)"
+        )
+    command = [executable, "shell-command", slot, "--isolation", isolation, "--format", "json"]
+    if explicit_project:
+        command[1:1] = ["--project-root", project]
+    completed = subprocess.run(
+        command, cwd=project, capture_output=True, text=True, timeout=60, check=False,
+    )
+    if completed.returncode != 0 or not completed.stdout.strip():
+        detail = (completed.stderr or completed.stdout).strip() or f"exit {completed.returncode}"
+        raise AgentDeliveryError(f"wrkslots shell-command {slot!r} failed: {detail}")
+    try:
+        document: object = json.loads(completed.stdout)
+        if not isinstance(document, dict):
+            raise ValueError("not an object")
+        line, slot_path = document["command"], document["slot_path"]
+        if not isinstance(line, str) or not isinstance(slot_path, str) or not line:
+            raise ValueError("missing fields")
+    except (ValueError, KeyError) as exc:
+        raise AgentDeliveryError(f"wrkslots shell-command {slot!r} returned invalid JSON: {exc}") from exc
+    return line, slot_path

@@ -109,6 +109,15 @@ def parser() -> argparse.ArgumentParser:
     first = start.add_mutually_exclusive_group()
     first.add_argument("--brief", metavar="TEXT", help="initial task, submitted after launch")
     first.add_argument("--file", metavar="PATH", help="UTF-8 file containing the initial task")
+    start.add_argument("--slot", metavar="SLOT",
+        help="interactive only: box the agent to this wrkslots slot; the pane shell is replaced by "
+             "`wrkslots run SLOT` (per-slot slice limits; with namespace isolation, a private "
+             "file-system view) before the harness starts. Needs wrkslots on PATH or AGENTCTL_WRKSLOTS_BIN")
+    start.add_argument("--slot-isolation", choices=("namespace", "cgroup"), default="namespace",
+        help="with --slot: namespace = limits plus private file-system view (default); cgroup = "
+             "limits only, for harness launchers that enter their own site sandbox through a setuid helper")
+    start.add_argument("--slot-project", metavar="DIR",
+        help="with --slot: wrkslots project root (default: --cwd, searched upward for .wrkslots.yml)")
     start.add_argument("--startup-timeout", type=_ascii_float, default=30.0, metavar="SECONDS",
         help="interactive startup deadline, greater than 0 and at most 300 (default: 30)")
     _delivery(start)
@@ -331,7 +340,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 environment=environment,
                 workspace_id=args.workspace_id,
                 startup_timeout=args.startup_timeout, ready_timeout=args.ready_timeout,
-                working_timeout=args.working_timeout, max_attempts=args.max_attempts)
+                working_timeout=args.working_timeout, max_attempts=args.max_attempts,
+                slot=args.slot, slot_isolation=args.slot_isolation,
+                slot_project=args.slot_project)
         elif args.command == "adopt":
             result = sessions.adopt(name, pane_id=args.pane,
                 expected_workspace=args.workspace, expected_cwd=args.cwd,
