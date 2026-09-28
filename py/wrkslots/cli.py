@@ -761,6 +761,22 @@ class _HandoffRead:
 
 
 @dataclasses.dataclass(frozen=True)
+class _OwnerConsent:
+    """A live owner's release of its slot, established from its own handoff.
+
+    Every field is durable evidence the coordinator can cite: the exact
+    generation-bound sidecar, the owner-authenticated publication intent that
+    names the writer, and the coordinator read that acknowledged those bytes.
+    """
+
+    handoff_path: Path
+    sha256: str
+    intent_sequence: int
+    read_sequence: int
+    writer: ProcessIdentity
+
+
+@dataclasses.dataclass(frozen=True)
 class _RetirementCandidate:
     """One exact handoff read whose current slot awaits safe retirement."""
 
@@ -10713,6 +10729,228 @@ def _assert_handoff_read(
     return latest
 
 
+OWNER_CONSENT_ACTION = "owner-consented-release-recorded"
+OWNER_CONSENT_BASIS = "owner-consented-handoff"
+
+
+def _handoff_write_intent_writer(
+    events: Sequence[Mapping[str, object]], intent_sequence: int
+) -> ProcessIdentity:
+    for event in events:
+        if event.get("kind") != "handoff-write-intended":
+            continue
+        if _as_int(event["sequence"], "handoff write intent sequence", minimum=1) != (
+            intent_sequence
+        ):
+            continue
+        payload = _as_mapping(event["payload"], "handoff write intent payload")
+        writer = _identity_from_obj(payload.get("writer"), "handoff write intent writer")
+        if writer is None:
+            raise StateError("handoff write intent lacks an owner identity")
+        return writer
+    raise StateError(f"handoff write intent {intent_sequence} is absent from history")
+
+
+def _stale_generation_owner_handoffs(
+    record: ActiveRecord, events: Sequence[Mapping[str, object]]
+) -> list[int]:
+    """Earlier or later generations of this slot whose handoff the current owner wrote."""
+
+    generations: set[int] = set()
+    for event in events:
+        if event.get("kind") != "handoff-write-intended":
+            continue
+        payload = _as_mapping(event["payload"], "handoff write intent payload")
+        if payload.get("slot") != record.slot:
+            continue
+        generation = payload.get("generation")
+        if not isinstance(generation, int) or generation == record.generation:
+            continue
+        writer = _identity_from_obj(payload.get("writer"), "handoff write intent writer")
+        if writer is not None and writer == record.owner:
+            generations.add(generation)
+    return sorted(generations)
+
+
+def _owner_consented_release(
+    config: Config,
+    record: ActiveRecord,
+    owner_detail: str,
+    *,
+    events: Sequence[Mapping[str, object]],
+    coordinator_authorized: bool,
+    expired: bool,
+    age: float,
+) -> _OwnerConsent | None:
+    """Decide whether a LIVE recorded owner released this agent slot itself.
+
+    The ordinary rule is that an agent slot is removed only after its exact
+    owner process generation is proven dead. That rule strands every slot whose
+    owner keeps running after its work is done: a long-lived agent session that
+    hands a slot back cannot make its own process exit to prove it.
+
+    The owner's release is accepted as a substitute for its death only when
+    every one of these holds, and each missing one is named in the refusal:
+
+    (a) the removal is ``--coordinator-authorized``; the coordinator process
+        itself has already been verified live by the caller;
+    (b) the heartbeat time-to-live has expired, so the owner has stopped
+        renewing the slot (``--validate-complete`` is not a substitute);
+    (c) a handoff for THIS slot generation was published through
+        ``write-handoff`` and its owner-authenticated intent names a writer
+        identical to the recorded owner -- pid, start ticks, boot, host and
+        cgroup -- so a reused PID, an earlier owner, or an earlier slot
+        generation cannot stand in for it; and
+    (d) the coordinator read exactly those bytes with ``read-handoff``.
+
+    Returns ``None`` when no handoff by this owner exists at all, so that case
+    keeps its original refusal text unchanged. A writerless legacy
+    ``HANDOFF.md`` carries no identity and therefore never expresses consent.
+    Every other remove guard still runs after this: slot contents, uncommitted
+    handoffs, the handoff-read check, the direct process-use check, and salvage
+    before deletion.
+    """
+
+    if record.slot_type != "agent" or record.owner is None:
+        return None
+    publication = _handoff_write_publication(record, events)
+    prefix = (
+        "remove requires a proven-dead recorded owner or an owner-consented handoff; "
+        f"owner is live: {owner_detail}. owner-consented release of slot {record.slot} "
+        f"generation {record.generation} is not established"
+    )
+    tail = "state: REFUSED -- no checkout was salvaged or removed."
+    if publication is None:
+        stale = _stale_generation_owner_handoffs(record, events)
+        if not stale:
+            return None
+        raise Refusal(
+            f"{prefix}: stale generation -- the recorded owner's handoff belongs to slot "
+            f"generation(s) {', '.join(str(item) for item in stale)}, not current generation "
+            f"{record.generation}, and consent does not carry across generations. {tail} "
+            "remedy: have the current owner run 'wrkslots write-handoff "
+            f"{record.slot} --expected-generation {record.generation} ...' for this "
+            "generation, or wait for the owner process to exit"
+        )
+    intent_sequence, intended, completed = publication
+    writer = _handoff_write_intent_writer(events, intent_sequence)
+    if writer != record.owner:
+        raise Refusal(
+            f"{prefix}: handoff writer mismatch -- the handoff was written by PID "
+            f"{writer.pid} start ticks {writer.start_ticks}, but the recorded owner is PID "
+            f"{record.owner.pid} start ticks {record.owner.start_ticks}; a different process "
+            f"generation cannot release another owner's slot. {tail} remedy: wait for the "
+            "recorded owner to exit, or have the recorded owner write its own handoff"
+        )
+    missing: list[str] = []
+    remedies: list[str] = []
+    artifact = _load_handoff_sidecar(config, record) if completed else None
+    if (
+        artifact is None
+        or artifact.source != "write-handoff"
+        or artifact.generation != record.generation
+        or not _json_equal(_handoff_artifact_to_obj(artifact), intended)
+    ):
+        missing.append(
+            "handoff publication incomplete -- no canonical sidecar matches the owner's "
+            "completed write-handoff intent"
+        )
+        remedies.append("have the exact owner retry write-handoff")
+    if not coordinator_authorized:
+        missing.append("coordinator authorization -- --coordinator-authorized was not given")
+        remedies.append("rerun remove with --coordinator-authorized")
+    if not expired:
+        remaining = max(1, record.heartbeat_ttl_seconds - int(age))
+        missing.append(
+            f"expired heartbeat -- the heartbeat is {int(age)}s old and its "
+            f"{record.heartbeat_ttl_seconds}s time-to-live has not expired"
+        )
+        remedies.append(f"wait at least {remaining}s without renewal")
+    latest = _latest_handoff_read(record, events)
+    if artifact is not None and (
+        latest is None or not _handoff_read_matches_artifact(latest, artifact)
+    ):
+        missing.append(
+            "coordinator read -- the owner's handoff has not been read with read-handoff"
+        )
+        remedies.append(
+            f"run 'wrkslots read-handoff {record.slot} --coordinator-pid "
+            "<current-coordinator-pid>' and read its output"
+        )
+    if missing:
+        raise Refusal(
+            f"{prefix}; missing: {'; '.join(missing)}. {tail} remedy: "
+            f"{'; '.join(remedies)}, then retry remove"
+        )
+    assert artifact is not None and latest is not None
+    return _OwnerConsent(
+        handoff_path=artifact.path,
+        sha256=artifact.sha256,
+        intent_sequence=intent_sequence,
+        read_sequence=latest.sequence,
+        writer=writer,
+    )
+
+
+def _owner_consent_evidence(
+    record: ActiveRecord,
+    consent: _OwnerConsent,
+    *,
+    coordinator: ProcessIdentity,
+    coordinator_authorized: bool,
+    age: float,
+    registered_liveness: tuple[str, str],
+) -> dict[str, object]:
+    return {
+        "basis": OWNER_CONSENT_BASIS,
+        "owner_state": "live",
+        "generation": record.generation,
+        "owner": _identity_to_obj(record.owner),
+        "actor": _identity_to_obj(coordinator),
+        "coordinator_authorized": coordinator_authorized,
+        "heartbeat_age_seconds": int(age),
+        "heartbeat_ttl_seconds": record.heartbeat_ttl_seconds,
+        "registered_liveness": registered_liveness[0],
+        "registered_liveness_detail": registered_liveness[1],
+        "handoff": {
+            "path": str(consent.handoff_path),
+            "sha256": consent.sha256,
+            "source": "write-handoff",
+            "intent_sequence": consent.intent_sequence,
+            "read_sequence": consent.read_sequence,
+            "writer": _identity_to_obj(consent.writer),
+        },
+    }
+
+
+def _owner_consent_was_recorded(
+    record: ActiveRecord,
+    consent: _OwnerConsent,
+    events: Sequence[Mapping[str, object]],
+) -> bool:
+    """Whether remove durably recorded this exact consent before it began."""
+
+    for event in events:
+        if event.get("kind") != "active-state-recorded":
+            continue
+        payload = _as_mapping(event["payload"], "active-state-recorded payload")
+        if payload.get("action") != OWNER_CONSENT_ACTION or payload.get("slot") != record.slot:
+            continue
+        evidence = _as_mapping(payload.get("evidence"), "owner consent evidence")
+        handoff = evidence.get("handoff")
+        if (
+            evidence.get("basis") == OWNER_CONSENT_BASIS
+            and evidence.get("generation") == record.generation
+            and evidence.get("coordinator_authorized") is True
+            and _json_equal(evidence.get("owner"), _identity_to_obj(record.owner))
+            and isinstance(handoff, Mapping)
+            and handoff.get("sha256") == consent.sha256
+            and handoff.get("intent_sequence") == consent.intent_sequence
+        ):
+            return True
+    return False
+
+
 def _handoff_preconditions(
     config: Config,
     record: ActiveRecord,
@@ -10732,7 +10970,11 @@ def _handoff_preconditions(
 
 
 def _remove_preconditions(
-    config: Config, record: ActiveRecord, vcs: _GitVcs
+    config: Config,
+    record: ActiveRecord,
+    vcs: _GitVcs,
+    *,
+    owner_consented: bool = False,
 ) -> tuple[Path, tuple[Checkout, ...]]:
     if record.handoff is None:
         raise Refusal(
@@ -10743,7 +10985,15 @@ def _remove_preconditions(
         raise Refusal(
             f"slot {record.slot} changed after its handoff was recorded; preserve it for inspection"
         )
-    _assert_slot_unused(slot_path, record)
+    _assert_slot_unused(
+        slot_path,
+        _record_for_slot_use_check(
+            record,
+            validate_complete=False,
+            allow_live_validate_owner=False,
+            owner_consented=owner_consented,
+        ),
+    )
     return slot_path, final_checkouts
 
 
@@ -10761,6 +11011,7 @@ def _reclaim_preconditions(
         record,
         validate_complete=finish.validate_complete,
         allow_live_validate_owner=finish.allow_live_validate_owner,
+        owner_consented=finish.owner_consented,
     )
     private_cleanup = finish.private_cleanup
     if private_cleanup is not None:
@@ -10815,7 +11066,9 @@ def _reclaim_preconditions(
     elif finish.salvage:
         _assert_salvage_still_matches(config, record, finish.salvage, vcs)
     elif record.handoff is not None:
-        return _remove_preconditions(config, record, vcs)
+        return _remove_preconditions(
+            config, record, vcs, owner_consented=finish.owner_consented
+        )
     else:
         raise StateError("agent slot reclaim has neither salvage nor an owner handoff")
     return slot_path, tuple(final)
@@ -10826,8 +11079,17 @@ def _record_for_slot_use_check(
     *,
     validate_complete: bool,
     allow_live_validate_owner: bool,
+    owner_consented: bool = False,
 ) -> ActiveRecord | None:
     if record.slot_type != "validate":
+        if owner_consented:
+            # The recorded owner is LIVE and released the slot itself, so its
+            # own process -- and any sibling in a shared session scope -- is
+            # expected to remain in the recorded cgroup. That comparison would
+            # refuse on the very consent being honoured. Only the cgroup
+            # comparison is dropped: returning a record (not None) keeps the
+            # direct cwd/root/exe/descriptor/mapping use test fully active.
+            return dataclasses.replace(record, owner=None)
         return record
     if allow_live_validate_owner:
         return None
@@ -16523,6 +16785,7 @@ def _finish_remove_paths(
                 record,
                 validate_complete=finish.validate_complete,
                 allow_live_validate_owner=finish.allow_live_validate_owner,
+                owner_consented=finish.owner_consented,
             )
             if private_fence_identity is None:
                 _assert_slot_unused(
@@ -17083,9 +17346,31 @@ def _cmd_remove(
             and owner_state == "live"
             and record.owner == coordinator
         )
+        owner_consent: _OwnerConsent | None = None
+        if (
+            record.slot_type == "agent"
+            and owner_state == "live"
+            and not args.validate_complete
+            and not _owner_record_is_absent(record)
+        ):
+            owner_consent = _owner_consented_release(
+                config,
+                record,
+                detail,
+                events=_load_events(config, record.machine),
+                coordinator_authorized=bool(args.coordinator_authorized),
+                expired=expired,
+                age=age,
+            )
+        consent_liveness: tuple[str, str] | None = None
         if live_validate_owner:
             if handoff_writer is None:
                 _assert_caller_process(coordinator, "validate owner")
+        elif owner_consent is not None:
+            # The registered liveness authority answers "is the owner still
+            # running?", and for a consenting owner the answer is yes by
+            # construction. Record its answer as evidence; do not gate on it.
+            consent_liveness = _registered_liveness_state(config, record)
         else:
             _assert_registered_liveness(config, record)
         if not expired and not args.validate_complete:
@@ -17102,7 +17387,12 @@ def _cmd_remove(
         # protects work still runs below: the handoff read, the direct-use
         # check, and salvage before delete. See _owner_record_is_absent.
         owner_unrecorded = _owner_record_is_absent(record)
-        if owner_state != "dead" and not live_validate_owner and not owner_unrecorded:
+        if (
+            owner_state != "dead"
+            and not live_validate_owner
+            and not owner_unrecorded
+            and owner_consent is None
+        ):
             raise Refusal(
                 f"remove requires a proven-dead recorded owner; owner is {owner_state}: {detail}. "
                 "state: REFUSED -- no checkout was salvaged or removed. remedy: wait for the "
@@ -17130,6 +17420,7 @@ def _cmd_remove(
                 record,
                 validate_complete=bool(args.validate_complete),
                 allow_live_validate_owner=live_validate_owner,
+                owner_consented=owner_consent is not None,
             ),
             use_lsof=not live_validate_owner,
             ignore_invoking_ancestry=live_validate_owner,
@@ -17160,6 +17451,27 @@ def _cmd_remove(
         _ensure_event_log(
             config, record.machine, require_repository=False
         )
+        if owner_consent is not None:
+            # Record the basis BEFORE any salvage or deletion so the removal
+            # is attributable from the append-only history alone, and so an
+            # interrupted removal can re-derive the same consent on recovery.
+            assert consent_liveness is not None
+            state = _replace_record(state, record)
+            _write_active_state(
+                config,
+                state,
+                action=OWNER_CONSENT_ACTION,
+                slot=record.slot,
+                evidence=_owner_consent_evidence(
+                    record,
+                    owner_consent,
+                    coordinator=coordinator,
+                    coordinator_authorized=bool(args.coordinator_authorized),
+                    age=age,
+                    registered_liveness=consent_liveness,
+                ),
+                require_repository=False,
+            )
         _write_event_file(
             config,
             record.machine,
@@ -17176,7 +17488,9 @@ def _cmd_remove(
                 ),
                 "coordinator_authorized": bool(args.coordinator_authorized),
                 "owner_state": owner_state,
-                "registered_liveness": "dead",
+                "registered_liveness": (
+                    "dead" if consent_liveness is None else consent_liveness[0]
+                ),
                 "heartbeat_age_seconds": int(age),
                 "heartbeat_ttl_seconds": record.heartbeat_ttl_seconds,
                 "validate_complete": bool(args.validate_complete),
@@ -17234,6 +17548,14 @@ def _cmd_remove(
                     "owner_state": owner_state,
                     "heartbeat_age_seconds": int(age),
                     "salvage": list(salvage),
+                    **(
+                        {}
+                        if owner_consent is None
+                        else {
+                            "basis": OWNER_CONSENT_BASIS,
+                            "handoff_sha256": owner_consent.sha256,
+                        }
+                    ),
                 },
                 require_repository=False,
             )
@@ -17249,6 +17571,7 @@ def _cmd_remove(
                 allow_live_validate_owner=live_validate_owner,
                 private_cleanup=private_cleanup,
                 validation_removal_proof=validation_removal_proof,
+                owner_consented=owner_consent is not None,
             ),
             journal_path=(
                 _finish_journal_path(config, record.slot)
@@ -18658,9 +18981,35 @@ def _recover_finish(
         and owner_state == "live"
         and current.owner == coordinator
     )
+    owner_consent: _OwnerConsent | None = None
+    if (
+        current.slot_type == "agent"
+        and owner_state == "live"
+        and not validate_complete
+        and not _owner_record_is_absent(current)
+    ):
+        # An interrupted owner-consented removal must be resumable while the
+        # consenting owner is still running; otherwise its global journal
+        # would block every mutation until that unrelated process exits.
+        # Resume only the exact consent that remove durably recorded before
+        # it began, and re-establish every condition from current state.
+        recovery_events = _load_events(config, current.machine)
+        candidate = _owner_consented_release(
+            config,
+            current,
+            detail,
+            events=recovery_events,
+            coordinator_authorized=True,
+            expired=expired,
+            age=age,
+        )
+        if candidate is not None and _owner_consent_was_recorded(
+            current, candidate, recovery_events
+        ):
+            owner_consent = candidate
     if live_validate_owner:
         _assert_recovery_processes(coordinator, processes, "validate owner")
-    else:
+    elif owner_consent is None:
         _assert_registered_liveness(config, current)
     if not expired and not validate_complete:
         raise Refusal(
@@ -18672,7 +19021,7 @@ def _recover_finish(
             f"slot {current.slot} has no recorded owner process, so owner death is unknown; "
             "preserve it rather than completing deletion"
         )
-    if owner_state != "dead" and not live_validate_owner:
+    if owner_state != "dead" and not live_validate_owner and owner_consent is None:
         raise Refusal(f"recorded owner is {owner_state}: {detail}")
     journal = dict(raw)
     phase = _as_str(journal["phase"], "finish journal.phase")
@@ -18717,6 +19066,7 @@ def _recover_finish(
                             record,
                             validate_complete=validate_complete,
                             allow_live_validate_owner=live_validate_owner,
+                            owner_consented=owner_consent is not None,
                         ),
                         ignore_invoking_ancestry=(
                             live_validate_owner and record.slot_type == "validate"
@@ -18757,6 +19107,7 @@ def _recover_finish(
                 allow_live_validate_owner=live_validate_owner,
                 private_cleanup=private_cleanup,
                 validation_removal_proof=removal_proof,
+                owner_consented=owner_consent is not None,
             ),
             journal_path=path,
         )
@@ -26004,6 +26355,7 @@ class _FinishContext:
     allow_live_validate_owner: bool = False
     private_cleanup: _PrivateCleanupContext | None = None
     validation_removal_proof: _ValidationRemovalProof | None = None
+    owner_consented: bool = False
 
 
 def _capture_process_path_census(
@@ -28787,6 +29139,9 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "Attempt one bounded group of handoff-read agent slots. Each target runs the "
             "ordinary remove state machine under its own lock scope; every liveness, hold, "
             "process-use, Git salvage, remote, digest, and path-fence refusal remains active."
+            " A target whose recorded owner is still alive is removed only under the "
+            "owner-consented-handoff conditions documented for remove, which include "
+            "--coordinator-authorized and an expired heartbeat; otherwise it is retained."
             " The default end-to-end lock-wait budget is 5 seconds and any global "
             "--wait-lock value is capped at 30 seconds for this bounded command."
         ),
@@ -28810,7 +29165,10 @@ usage or audit gate unknown, 3 fail-closed refusal.
     retire_pending.add_argument(
         "--coordinator-authorized",
         action="store_true",
-        help="record coordinator authorization with each ordinary removal attempt",
+        help=(
+            "record coordinator authorization with each ordinary removal attempt; required "
+            "for a target whose recorded owner is still alive (see remove --help)"
+        ),
     )
     retire_pending.add_argument(
         "--format",
@@ -28886,7 +29244,13 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "the heartbeat TTL to be expired, the registered running command to return dead, the "
             "exact owner process generation to be absent, and independent process, mount, Git, "
             "and path checks to agree. Agent slots are salvaged to their recorded remote first; "
-            "validate slots skip salvage. Ambiguity refuses."
+            "validate slots skip salvage. Ambiguity refuses. One narrow exception covers an "
+            "agent slot whose recorded owner is still alive: removal proceeds only when it is "
+            "--coordinator-authorized, the heartbeat TTL has expired, the current slot generation "
+            "carries a completed write-handoff whose recorded writer is exactly the recorded "
+            "owner process, and the coordinator has read that handoff with read-handoff. Every "
+            "process-use, path, Git, and salvage check still runs, and the basis is recorded in "
+            "the event log as owner-consented-handoff."
         ),
         formatter_class=_HelpFormatter,
     )
@@ -28894,8 +29258,10 @@ usage or audit gate unknown, 3 fail-closed refusal.
     remove.add_argument(
         "--coordinator-authorized", action="store_true",
         help=(
-            "record that this cleanup was coordinator-authorized; optional provenance only, "
-            "never a gate on helping an abandoned operation"
+            "record that this cleanup was coordinator-authorized. Optional provenance when the "
+            "recorded owner is dead; required, together with an expired heartbeat and a read, "
+            "owner-written current-generation handoff, to release an agent slot whose recorded "
+            "owner is still alive"
         ),
     )
     remove.add_argument(

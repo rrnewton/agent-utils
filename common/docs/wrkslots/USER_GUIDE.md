@@ -36,11 +36,24 @@ type, task and purpose, owner process identity, coordinator history, heartbeat t
    free. `--validate-complete` lets the exact live owner remove its completed validation slot, or
    lets a later participant remove it after proven owner death without waiting out the heartbeat.
    Process-use, path, and Git checks still run.
-6. Before removing an agent slot, `remove` publishes unpushed commits and tracked and ordinary
+6. An agent slot whose recorded owner is still alive may be released only with that owner's
+   consent, expressed as a handoff. `remove` accepts it when all of these hold: the removal is
+   `--coordinator-authorized` with a live coordinator; the heartbeat time-to-live has expired
+   (`--validate-complete` is not a shortcut); the current slot generation has a completed
+   `write-handoff` whose recorded writer is exactly the recorded owner process identity, so a reused
+   PID or a handoff from an earlier generation does not qualify; and the coordinator has read that
+   handoff with `read-handoff`. Every other check still runs: slot contents, uncommitted handoffs,
+   the census of live processes whose working directory, open files, executable, or mappings are
+   inside the checkout, and salvage before deletion. Only the comparison against the recorded
+   owner's cgroup is skipped, because the consenting owner is still alive there by definition. Each
+   missing condition is named in the refusal. The accepted basis is recorded in the event log as an
+   `owner-consented-release-recorded` active-state event with `owner_state: live`,
+   `basis: owner-consented-handoff`, and the handoff path and SHA-256 digest.
+7. Before removing an agent slot, `remove` publishes unpushed commits and tracked and ordinary
    untracked files outside configured regenerable cache paths to the recorded remote. It never
    uploads gitignored content. It records and rechecks the exact remote ref and commit before
    deletion. A validate slot skips this step.
-7. `recover` lets any later participant complete an interrupted create or removal from the durable
+8. `recover` lets any later participant complete an interrupted create or removal from the durable
    history. It is not tied to the participant that began the operation.
 
 Run `wrkslots quickstart` for copyable commands and `wrkslots COMMAND --help` for exact effects and
@@ -72,10 +85,12 @@ Omitting `--owner-pid` also requires an invoking coordinator; the owner then imm
 again before publishing the row. If either identity changes during provisioning, creation
 refuses publication and retains the recovery journal.
 
-`--coordinator-authorized` on `remove` and `read-handoff` is optional provenance. It is required
-when `recover` starts a new cleanup for an unregistered validation path, because that operation has
-no ACTIVE row naming who allocated it. Resuming the durable journal does not require the original
-flag or coordinator; otherwise a departed coordinator could strand an interrupted cleanup.
+`--coordinator-authorized` on `remove` and `read-handoff` is optional provenance when the recorded
+owner is dead. It is required for an owner-consented release of an agent slot whose recorded owner
+is still alive (step 6 above), and when `recover` starts a new cleanup for an unregistered
+validation path, because that operation has no ACTIVE row naming who allocated it. Resuming the
+durable journal does not require the original flag or coordinator; otherwise a departed coordinator
+could strand an interrupted cleanup.
 
 `status` always returns the complete readable roster and reports each observable directory or
 Git-registration disagreement as a typed inconsistency. Git registrations are observable only for
@@ -165,9 +180,10 @@ outside this destructive workflow before a fresh slot can provide new retirement
 
 Inspect the queue with `wrkslots retirement-queue --format json`. A coordinator may attempt a
 bounded group with `wrkslots retire-pending --limit N --coordinator-pid PID --format json`. Each
-item runs the ordinary removal state machine independently; a live owner, fresh heartbeat, hold,
-process use, changed handoff, dirty or unpublished work that cannot be salvaged, remote mismatch,
-or path-fence race retains the slot in the queue. Successful archived removal clears its sidecar.
+item runs the ordinary removal state machine independently; a live owner without an
+owner-consented handoff (step 6 above), fresh heartbeat, hold, process use, changed handoff, dirty
+or unpublished work that cannot be salvaged, remote mismatch, or path-fence race retains the slot in
+the queue. Successful archived removal clears its sidecar.
 Attempt events rotate blocked entries behind never-attempted and less-recently-attempted entries, so
 one retained slot cannot starve the rest of a bounded queue. Lock contention is deferred; corrupt,
 partial, or indeterminate state stops the batch and requires recovery instead of being mislabeled as
