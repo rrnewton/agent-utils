@@ -522,6 +522,15 @@ def test_wrkslots_run_boxes_a_plain_worktree_slot(box_base: Path) -> None:
         "--repo", "src=src", "--branch", "src=agent/box",
     )
     assert created.returncode == 0, created.stderr
+    shell = wrkslots("shell-command", slot, "--format", "json")
+    assert shell.returncode == 0, shell.stderr
+    document = json.loads(shell.stdout)
+    assert document["isolation"] == "userns" and document["command"].endswith(" -i")
+    harness = wrkslots("shell-command", slot, "--isolation", "root", "--format", "json", "--", "/bin/echo", "a b")
+    assert harness.returncode == 0, harness.stderr
+    document = json.loads(harness.stdout)
+    assert document["isolation"] == "root"
+    assert document["command"].endswith("--isolation root -- /bin/echo 'a b'")
     probe = _PROBE + r"""
 report representation '[ "$WRKSLOTS_SLOT_REPRESENTATION" = worktree ]'
 report checkout_commit 'cd "$WRKSLOTS_SLOT_PATH"/src && echo w > w && git add w && git -c user.name=t -c user.email=t@e commit -qm w'

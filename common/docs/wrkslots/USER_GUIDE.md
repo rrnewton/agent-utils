@@ -736,8 +736,9 @@ view. Only the location of the slot's private state differs (`state.img` for an 
   builds the view (so a FUSE mount you own stays reachable). It then drops that capability too and
   execs COMMAND. No user namespace exists, so setuid programs inside the box work. One consequence:
   sudo stays in front of COMMAND and relays a private terminal to it. A terminal multiplexer
-  therefore sees only `sudo` as the pane's foreground process and cannot detect an agent there.
-  Use `root` for commands and headless harnesses, not for multiplexer-detected agents.
+  therefore sees only `sudo` as the pane's foreground process. It can neither start an agent in
+  such a pane nor detect one, so an agent launcher runs the boxed harness itself
+  (`shell-command SLOT -- HARNESS ...`) and tracks it without the multiplexer's agent start.
 
 ### The view
 
@@ -823,13 +824,15 @@ Per-run options override it: `--isolation`, `--home`, `--tmp-size`, `--env NAME=
 
 ### Starting an agent in a slot
 
-`wrkslots shell-command SLOT [--isolation MODE] [--format json]` prints one exec-only command
-line that replaces an interactive shell with `wrkslots run SLOT -- $SHELL -i`. It uses absolute
-interpreter paths and adds nothing to the shell's environment. With `--format json` it also prints
-the slot directory and the effective isolation. An agent launcher runs it in a fresh terminal pane,
+`wrkslots shell-command SLOT [--isolation MODE] [--format json] [-- COMMAND...]` prints one
+exec-only command line that replaces an interactive shell with `wrkslots run SLOT -- $SHELL -i`
+(or, with a COMMAND, with that program boxed; the pane then closes when it exits). It uses
+absolute interpreter paths and adds nothing to the shell's environment. With `--format json` it
+also prints the slot directory and the effective isolation. An agent launcher runs it in a fresh terminal pane,
 waits until the pane's own shell PID is again the foreground shell inside a wrkslots slice,
 registers the slot directory as the agent's working directory, and then starts the harness. The
-agent and everything it runs stay in the slot's box.
+agent and everything it runs stay in the slot's box. Under `root` isolation the launcher instead
+runs the COMMAND form with the harness, because the multiplexer cannot start an agent behind sudo.
 
 ### Builds with a shared action cache
 
