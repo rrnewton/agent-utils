@@ -38,6 +38,18 @@ type, task and purpose, owner process identity, coordinator history, heartbeat t
    Process-use, path, and Git checks still run. A newly started validation removal first records an
    identity-bound private seal, releases the registry locks for both bounded process censuses, then
    reacquires the locks and revalidates the exact seal, finish journal, owner, and ACTIVE row before deletion.
+6. An agent slot whose recorded owner is still alive may be released only with that owner's
+   consent, expressed as a handoff. `remove` accepts it when all of these hold: the removal is
+   `--coordinator-authorized` with a live coordinator; the heartbeat time-to-live has expired
+   (`--validate-complete` is not a shortcut); the current slot generation has a completed
+   `write-handoff` whose recorded writer is exactly the recorded owner process identity, so a reused
+   PID or a handoff from an earlier generation does not qualify; and the coordinator has read that
+   handoff with `read-handoff`. Every other check still runs: slot contents, uncommitted handoffs,
+   the census of live processes whose working directory, open files, executable, or mappings are
+   inside the checkout, and salvage before deletion. Only the comparison against the recorded
+   owner's cgroup is skipped, because the consenting owner is still alive there by definition. Each missing condition is named in the refusal. The accepted basis is recorded in the
+   event log as an `owner-consented-release-recorded` active-state event with `owner_state: live`,
+   `basis: owner-consented-handoff`, and the handoff path and SHA-256 digest.
    Heartbeats, handoff finishes, and creates for provably disjoint slots can proceed during either
    census; operations on the sealed slot refuse. The short Git and registry mutation phase remains
    serialized.
@@ -157,8 +169,9 @@ reports this blocker and adds `POLICY_INPUTS_MISSING`. Once an index holds polic
 rebuild of that index is refused rather than discarding the evidence; delete the disposable index
 file first to rebuild it without policy inputs.
 
-`--coordinator-authorized` on `remove` and `read-handoff` is optional provenance. It is required
-when `recover` starts a new cleanup for an unregistered validation path, because that operation has
+`--coordinator-authorized` on `remove` and `read-handoff` is optional provenance when the recorded
+owner is dead. It is required for an owner-consented release of an agent slot whose recorded owner
+is still alive (step 6 above), and when `recover` starts a new cleanup for an unregistered validation path, because that operation has
 no ACTIVE row naming who allocated it. Resuming the durable journal does not require the original
 flag or coordinator; otherwise a departed coordinator could strand an interrupted cleanup.
 
@@ -360,8 +373,8 @@ outside this destructive workflow before a fresh slot can provide new retirement
 
 Inspect the queue with `wrkslots retirement-queue --format json`. A coordinator may attempt a
 bounded group with `wrkslots retire-pending --limit N --coordinator-pid PID --format json`. Each
-item runs the ordinary removal state machine independently; a live owner, fresh heartbeat, hold,
-process use, changed handoff, dirty or unpublished work that cannot be salvaged, remote mismatch,
+item runs the ordinary removal state machine independently; a live owner without an
+owner-consented handoff (step 6 above), fresh heartbeat, hold, process use, changed handoff, dirty or unpublished work that cannot be salvaged, remote mismatch,
 or path-fence race retains the slot in the queue. Successful archived removal clears its sidecar.
 Attempt events rotate blocked entries behind never-attempted and less-recently-attempted entries, so
 one retained slot cannot starve the rest of a bounded queue. Lock contention is deferred; corrupt,
