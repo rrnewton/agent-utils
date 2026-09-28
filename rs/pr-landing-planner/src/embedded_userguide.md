@@ -1,1 +1,0 @@
-../../../common/docs/pr-landing-planner/rendered/rust/USER_GUIDE.md

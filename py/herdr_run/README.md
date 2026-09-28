@@ -1,1 +1,0 @@
-../../common/docs/herdr-run/rendered/python/README.md

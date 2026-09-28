@@ -1,1 +1,0 @@
-../../../common/docs/tick-hub/rendered/rust/USER_GUIDE.md

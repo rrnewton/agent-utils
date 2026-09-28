@@ -1,1 +1,0 @@
-../../common/docs/pr-landing-planner/rendered/python/USER_GUIDE.md

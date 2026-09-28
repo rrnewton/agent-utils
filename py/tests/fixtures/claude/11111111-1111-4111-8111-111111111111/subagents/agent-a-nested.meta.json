@@ -1,1 +1,0 @@
-{"agentType":"test-auditor","description":"Check test receipts","toolUseId":"tool-spawn-nested","parentAgentId":"a-child","spawnDepth":2}

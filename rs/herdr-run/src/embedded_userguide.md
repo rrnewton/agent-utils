@@ -1,1 +1,0 @@
-../../../common/docs/herdr-run/rendered/rust/USER_GUIDE.md
