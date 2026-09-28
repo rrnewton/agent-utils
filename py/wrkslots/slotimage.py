@@ -8,7 +8,7 @@ slot, whatever the agent writes inside it:
     <control>/slot-images/<slot-type>/<slot>/
         IMAGE.json   representation record (location, backend, ceiling)
         slot.img     sparse ext4 image mounted at the slot directory
-        state.img    sparse ext4 image for the sandbox's private HOME and TMPDIR
+        state.img    sparse ext4 image for the sandbox's per-slot private HOME directories
         state/       mount point of state.img
 
 Why this helps: a slot's millions of small build files are metadata inside the
@@ -55,7 +55,9 @@ DEFAULT_STATE_CEILING_BYTES = 128 * 1024**3
 #: Entries mkfs creates that a fresh image may still contain. Anything else at
 #: the image root is slot content and blocks destruction.
 REPRESENTATION_RESIDUE = frozenset({"lost+found"})
-STATE_SUBDIRECTORIES = ("home", "tmp")
+#: The state image holds the sandbox's per-slot private $HOME directories
+#: (home_private). /tmp is a fresh tmpfs per launch and is never stored.
+STATE_SUBDIRECTORIES = ("home",)
 
 
 class ImageError(RuntimeError):
@@ -93,7 +95,7 @@ class SlotImage:
 
     @property
     def state_image(self) -> Path:
-        """The sparse image holding the sandbox's private HOME and /tmp."""
+        """The sparse image holding the sandbox's per-slot private HOME directories."""
 
         return self.directory / STATE_IMAGE_NAME
 

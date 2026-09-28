@@ -62,15 +62,30 @@ echo work > "$CO/work.txt"; git -C "$CO" add work.txt; git -C "$CO" -c user.emai
 W status >/dev/null && echo "status ok (slot not flagged)"
 W image status
 
-say "sandboxed run: writes allowed only in the slot"
-W run s1 --memory-max 2G --tasks-max 256 -- bash -c '
-  set -e; echo "cwd=$PWD home=$HOME tmp=$TMPDIR"; cat /proc/self/cgroup
+# The box is the same for both representations; run_box_probe is reused for a
+# plain-worktree slot below.
+run_box_probe() {
+  W run "$1" --memory-max 2G --tasks-max 256 -- bash -c '
+  set -e; echo "cwd=$PWD home=$HOME tmp=$TMPDIR repr=$WRKSLOTS_SLOT_REPRESENTATION"; cat /proc/self/cgroup
+  [ "$WRKSLOTS_SLOT_REPRESENTATION" = "'"$2"'" ]
   touch $WRKSLOTS_SLOT_PATH/ok-from-sandbox && echo slot-writable
   touch /tmp/x && echo tmp-writable
-  if touch '"$BASE"'/escape 2>/dev/null; then echo ESCAPED; exit 9; else echo host-readonly; fi
+  for p in '"$BASE"'/escape '"$BASE"'/src/escape '"$BASE"'/project/escape ~/.config/.wrkslots-e2e-escape; do
+    if touch "$p" 2>/dev/null; then echo "ESCAPED $p"; exit 9; fi
+  done
+  echo outside-readonly
+  echo x > ~/.wrkslots-e2e-top && echo home-top-level-private
   mkdir -p ~/.cache/probe && echo cache-writable
 '
-W run s1 --home none -- bash -c 'ls ~ | head; test ! -e ~/bin || { echo "HOME leaked"; exit 9; }; echo home-hidden'
+  [ ! -e "$HOME/.wrkslots-e2e-top" ] || { echo "FAIL: real HOME modified"; exit 1; }
+}
+
+say "sandboxed run: writes allowed only in the slot"
+run_box_probe s1 image
+MARKER=$HOME/.wrkslots-e2e-marker-$$; touch "$MARKER"
+W run s1 --home hidden -- bash -c 'test ! -e "'"$MARKER"'" || { echo "HOME leaked"; exit 9; }; echo home-hidden'
+W run s1 -- bash -c 'test -e "'"$MARKER"'" && ! touch "'"$MARKER"'" 2>/dev/null && echo home-readonly'
+rm -f "$MARKER"
 rm -f "$SLOT/ok-from-sandbox" "$CO/ok-from-sandbox" 2>/dev/null || true
 
 say "remove: owner dies, TTL expires, salvage publishes, image destroyed"
@@ -88,6 +103,9 @@ W create s2 --slot-type agent --coordinator-authorized --agent a2 --task t2 --pu
 CO2=worktrees/slots/s2; [ "$LAYOUT" = nested ] && CO2=$CO2/src
 echo dirty > "$CO2/untracked.txt"
 findmnt "$(realpath worktrees/slots/s2)" >/dev/null && { echo "FAIL: s2 should not be a mount"; exit 1; } || echo "s2 is plain"
+say "sandboxed run on the plain-worktree slot: the same box"
+run_box_probe s2 worktree
+rm -f worktrees/slots/s2/ok-from-sandbox "$CO2/ok-from-sandbox" 2>/dev/null || true
 W image convert s2 --to image
 findmnt -no FSTYPE "$(realpath worktrees/slots/s2)"
 git -C "$CO2" status --short
