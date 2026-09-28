@@ -358,3 +358,11 @@ def test_json_and_yaml_configurations_are_validated_identically(tmp_path: Path) 
     config.write_text(cli.render_config(value, "yaml").replace("tmp_size: 16G", "tmp_size: |"), encoding="utf-8")
     refused = _wrkslots(project, "status")
     assert refused.returncode != 0 and "block scalars" in refused.stderr and f"{config}:" in refused.stderr
+
+
+def test_deeply_nested_documents_are_refused_not_crashed() -> None:
+    deep_flow = "a: " + "[" * 5000 + "]" * 5000 + "\n"
+    deep_block = "".join(" " * (2 * depth) + f"k{depth}:\n" for depth in range(1500)) + " " * 3000 + "v: 1\n"
+    for text in (deep_flow, deep_block):
+        with pytest.raises(yamlconfig.YamlError):
+            yamlconfig.loads(text)

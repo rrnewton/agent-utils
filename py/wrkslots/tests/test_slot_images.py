@@ -724,3 +724,38 @@ def test_image_helper_refuses_paths_it_should_not_touch(tmp_path: Path) -> None:
         result = run(*arguments)
         assert result.returncode != 0 and fragment in result.stderr, (arguments, result.stderr)
     assert not os.path.ismount(target)
+
+
+def test_build_spec_creates_the_root_spec_directory_before_the_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A box started before any root launch must find the spec directory already
+    # present (and therefore read-only), not create it itself.
+    home = _fake_home(tmp_path)
+    for directory in ("slot", "repo.git", "control", "project"):
+        (tmp_path / directory).mkdir(parents=True)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    spec = sandbox.build_spec(_view(tmp_path), sandbox.SandboxSettings(), home, tmp_path / "slot")
+    spec_directory = runtime / "wrkslots"
+    assert spec_directory.is_dir() and not spec_directory.is_symlink()
+    assert spec_directory.stat().st_mode & 0o777 == 0o700
+    assert str(spec_directory) in spec["read_only"]  # type: ignore[operator]
+    spec_directory.chmod(0o755)
+    with pytest.raises(sandbox.SandboxError, match="mode 0700"):
+        sandbox.build_spec(_view(tmp_path), sandbox.SandboxSettings(), home, tmp_path / "slot")
+
+
+def test_image_helper_resolves_system_tools_without_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from wrkslots import imagehelper
+
+    decoy = tmp_path / "resize2fs"
+    decoy.write_text("#!/bin/sh\nexit 0\n")
+    decoy.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    try:
+        resolved = imagehelper._system_tool("resize2fs")
+    except imagehelper.HelperError:
+        pytest.skip("resize2fs is not installed in a system directory")
+    assert resolved != str(decoy) and resolved.startswith(("/usr/sbin/", "/sbin/", "/usr/bin/", "/bin/"))

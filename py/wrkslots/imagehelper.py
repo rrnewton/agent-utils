@@ -247,11 +247,25 @@ def grow(mount_point: str) -> None:
             fcntl.ioctl(device, _LOOP_SET_CAPACITY)
         finally:
             os.close(device)
-        result = subprocess.run(["resize2fs", name], capture_output=True, text=True, check=False, timeout=600)
+        result = subprocess.run([_system_tool("resize2fs"), name], capture_output=True, text=True, check=False, timeout=600)
         if result.returncode != 0:
             raise HelperError(f"resize2fs {name}: {(result.stderr or result.stdout).strip()}")
     finally:
         os.close(descriptor)
+
+
+def _system_tool(name: str) -> str:
+    """A root-owned system executable by absolute path: never resolved on the caller's PATH."""
+
+    for directory in ("/usr/sbin", "/sbin", "/usr/bin", "/bin"):
+        candidate = os.path.join(directory, name)
+        try:
+            info = os.stat(candidate)
+        except OSError:
+            continue
+        if info.st_uid == 0 and not info.st_mode & 0o022 and os.access(candidate, os.X_OK):
+            return candidate
+    raise HelperError(f"{name} was not found as a root-owned executable in the system directories")
 
 
 _OPERATIONS = {

@@ -20,6 +20,10 @@ Refused, each with its line: tab indentation, anchors, aliases, tags,
 directives, block scalars (``|``/``>``), multi-line plain or flow values,
 complex keys (``?``), multiple documents, and duplicate keys.
 
+Scalars follow YAML 1.2: ``yes``/``no``/``on``/``off`` are strings, not booleans
+(so ``protect_system: no`` is refused by type validation rather than read as
+false), ``0755`` is the integer 755, and ``1:30`` is a string.
+
 A document whose first non-blank character is ``{`` is JSON (also valid YAML)
 and is decoded by :mod:`json`, still refusing duplicate keys.
 """
@@ -456,7 +460,10 @@ def loads(text: str) -> object:
 
     if text.startswith("\ufeff"):
         text = text[1:]
-    return _Parser(_logical_lines(text)).parse_document()
+    try:
+        return _Parser(_logical_lines(text)).parse_document()
+    except RecursionError as exc:
+        raise YamlError("document is nested too deeply") from exc
 
 
 # ------------------------------------------------------------------ writing

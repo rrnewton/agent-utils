@@ -851,6 +851,10 @@ def build_spec(view: SlotView, settings: SandboxSettings, home: Path, cwd: Path)
     read_only = [str(view.control_directory)]
     runtime = spec_directory()
     if runtime is not None:
+        # Create it now: the view makes it read-only only if it exists, and a
+        # box started before any root launch must not be able to create (and
+        # then plant files in) the root launcher's spec directory itself.
+        ensure_spec_directory(runtime)
         read_only.append(str(runtime))
     masks = [str(base / relative) for base in aliases for relative in settings.home_hidden]
     # Other slots' images and private HOME layers (which hold private copies of
@@ -1406,6 +1410,21 @@ def spec_directory() -> Path | None:
     if not runtime or not os.path.isdir(runtime):
         return None
     return Path(runtime) / "wrkslots"
+
+
+def ensure_spec_directory(directory: Path) -> None:
+    """Create the root-launcher spec directory (0700) and check it is a real directory we own."""
+
+    try:
+        directory.mkdir(mode=0o700, exist_ok=True)
+        info = os.lstat(directory)
+    except OSError as exc:
+        raise SandboxError(f"cannot create the root launcher spec directory {directory}: {exc}") from exc
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise SandboxError(
+            f"root launcher spec directory {directory} must be a directory owned by uid "
+            f"{os.getuid()} with mode 0700; remove it and retry"
+        )
 
 
 _STALE_SPEC_SECONDS = 300

@@ -864,6 +864,9 @@ The box stops accidents, not a process that sets out to leave it:
   host processes cannot be ptraced or entered through `/proc/<pid>/root`.
 - **`home_shared` and `read_write` paths are writable by design**, and harness settings and hooks
   kept there run later outside the box.
+- **Git directories are writable** so commits work, which includes the shared common directory of
+  a linked worktree: a boxed process can write `.git/hooks/*` (and `config`), which Git runs later
+  in other checkouts of the same repository, outside the box.
 - **`cgroup` isolation** applies limits only.
 
 ### Configuring the box
