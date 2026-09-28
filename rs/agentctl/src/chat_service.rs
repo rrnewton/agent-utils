@@ -416,7 +416,18 @@ pub fn run<A: ManagedApi + ?Sized>(
     manager: &ManagedAgents<'_, A>,
     options: ServiceOptions,
 ) -> Result<Value, ChatServiceError> {
-    let state = BridgeState::open(state_root)?;
+    run_with_ignored_text_prefixes(state_root, client, manager, options, Vec::new())
+}
+
+/// Run with process-local admission exclusions; the saved configuration remains unchanged.
+pub fn run_with_ignored_text_prefixes<A: ManagedApi + ?Sized>(
+    state_root: &Path,
+    client: &HerdrClient,
+    manager: &ManagedAgents<'_, A>,
+    options: ServiceOptions,
+    ignored_text_prefixes: Vec<String>,
+) -> Result<Value, ChatServiceError> {
+    let state = BridgeState::open(state_root)?.with_ignored_text_prefixes(ignored_text_prefixes)?;
     let _resume_request = state.subscribe_request()?;
     validate_service_outbound(state.config())?;
     let outbound_cancellation = OutboundCancellation::new()?;

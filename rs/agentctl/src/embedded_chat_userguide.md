@@ -71,6 +71,17 @@ those exact bytes into a sealed in-memory executable, and retains that image for
 the generation. Reply and reaction operations neither reopen nor rehash the
 source path.
 
+If outbound messages use an allowed sender identity, prevent their labelled text
+from becoming new requests with a runtime-only exclusion, for example
+`chat run --bridge-state PATH --ignore-text-prefix '[assistant'`. Repeat the
+option for up to 32 prefixes. Matching is literal and case-sensitive after
+leading Unicode whitespace; each prefix must be nonempty, at most 256 UTF-8
+bytes, and contain no control characters. The default excludes nothing.
+Ignored messages still participate in the original provider batch fingerprint,
+replay boundary, and cursor commit, but create no request, reaction ACK or pane
+delivery. This does not suppress already admitted work. Supply the options on
+every run; they do not change the persisted configuration or apply to `chat tick`.
+
 In `chat run`, a generation-owned worker queues reaction ACKs as soon as the
 inbound batch is durably admitted and its provider commit is confirmed. Pane
 delivery, later intake, output capture and replies do not wait for that worker.

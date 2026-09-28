@@ -453,7 +453,7 @@ enum ChatCommand {
     /// Run one bounded delivery, terminal-capture, and outbound recovery pass
     Tick(ChatOperate),
     /// Run event-driven provider and Herdr subscriptions until SIGINT or SIGTERM
-    Run(ChatOperate),
+    Run(ChatRun),
     /// Stop accepting fenced replies for one exact retained request
     Close(ChatClose),
     /// Internal systemd ExecStop helper for one inode-bound main-process pidfd
@@ -513,6 +513,15 @@ impl ChatPublish {
         .read_bounded(MAX_CHAT_PUBLISH_BYTES, "chat publish message")?
         .ok_or_else(|| "chat publish requires message text or --file".to_owned())
     }
+}
+
+#[derive(Args)]
+struct ChatRun {
+    #[command(flatten)]
+    operate: ChatOperate,
+    /// Ignore new messages starting with PREFIX after leading whitespace (case-sensitive; repeat up to 32 times; default: none). Prefixes must be nonempty, at most 256 UTF-8 bytes, without control characters; applies only to this run.
+    #[arg(long = "ignore-text-prefix", value_name = "PREFIX", value_parser = chat_ignored_text_prefix)]
+    ignored_text_prefixes: Vec<String>,
 }
 
 #[derive(Args)]
@@ -603,6 +612,11 @@ fn positive_chat_delivery_seconds(value: &str) -> Result<f64, String> {
 fn environment_value(value: &str) -> Result<String, String> {
     environment_entries(&[value.to_owned()])
         .map(|entries| entries.into_iter().next().expect("one validated entry"))
+        .map_err(|error| error.to_string())
+}
+fn chat_ignored_text_prefix(value: &str) -> Result<String, String> {
+    crate::chat_runtime::validate_ignored_text_prefix(value)
+        .map(|()| value.to_owned())
         .map_err(|error| error.to_string())
 }
 fn operation_uuid(value: &str) -> Result<String, String> {
@@ -1102,13 +1116,18 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             Ok(code)
         }
         ChatCommand::Run(value) => {
-            let options = value.options();
+            let options = value.operate.options();
             let client =
                 HerdrClient::with_executable("direct", &herdr_bin).map_err(AgentError::from)?;
             let manager = ManagedAgents::new(&client, &registry)?;
-            let result =
-                crate::chat_service::run(&value.state.bridge_state, &client, &manager, options)
-                    .map_err(Failure::Chat)?;
+            let result = crate::chat_service::run_with_ignored_text_prefixes(
+                &value.operate.state.bridge_state,
+                &client,
+                &manager,
+                options,
+                value.ignored_text_prefixes,
+            )
+            .map_err(Failure::Chat)?;
             write_json(&result).map_err(Failure::Output)?;
             Ok(0)
         }
@@ -1335,6 +1354,51 @@ mod tests {
                 })
             }))
         ));
+    }
+
+    #[test]
+    fn chat_run_parses_repeated_runtime_only_ignored_text_prefixes() {
+        let parsed = Cli::try_parse_from([
+            "agentctl",
+            "chat",
+            "run",
+            "--bridge-state",
+            "/tmp/chat-state",
+            "--ignore-text-prefix",
+            "[assistant",
+            "--ignore-text-prefix",
+            "[notice]",
+        ])
+        .unwrap();
+        let Some(Commands::Chat(Chat {
+            command: ChatCommand::Run(run),
+        })) = parsed.command
+        else {
+            panic!("expected chat run");
+        };
+        assert_eq!(run.ignored_text_prefixes, ["[assistant", "[notice]"]);
+        for prefix in ["", "  ", "invalid\n"] {
+            assert!(Cli::try_parse_from([
+                "agentctl",
+                "chat",
+                "run",
+                "--bridge-state",
+                "/tmp/chat-state",
+                "--ignore-text-prefix",
+                prefix,
+            ])
+            .is_err());
+        }
+        assert!(Cli::try_parse_from([
+            "agentctl",
+            "chat",
+            "tick",
+            "--bridge-state",
+            "/tmp/chat-state",
+            "--ignore-text-prefix",
+            "[assistant",
+        ])
+        .is_err());
     }
 
     #[test]

@@ -43,6 +43,8 @@ const MAX_REQUEST_RECORD_BYTES: usize = 512 * 1_024;
 const MAX_PLUGIN_NAME_BYTES: usize = 128;
 const MAX_AGENT_NAME_BYTES: usize = 32;
 const MAX_AGENT_LABEL_BYTES: usize = 400;
+const MAX_IGNORED_TEXT_PREFIXES: usize = 32;
+const MAX_IGNORED_TEXT_PREFIX_BYTES: usize = 256;
 const REPLY_NONCE_BYTES: usize = 16;
 const MAX_REPLY_BYTES: usize = 30_000;
 const MAX_REPLY_RECORD_BYTES: usize = 64 * 1_024;
@@ -1149,12 +1151,9 @@ struct RequestRecord {
     delivery_error: Option<String>,
 }
 
-impl RequestRecord {
-    fn from_message(
-        message: &chat_subscription::InboundMessage,
-        ack_reaction: Option<&str>,
-    ) -> Result<Self> {
-        let source = SavedMessage {
+impl SavedMessage {
+    fn from_inbound(message: &chat_subscription::InboundMessage) -> Self {
+        Self {
             channel_id: message.channel_id().as_str().to_owned(),
             message_id: message.message_id().as_str().to_owned(),
             thread_id: message.thread_id().as_str().to_owned(),
@@ -1168,7 +1167,12 @@ impl RequestRecord {
                     schema: payload.schema().to_owned(),
                     data: payload.data().clone(),
                 }),
-        };
+        }
+    }
+}
+
+impl RequestRecord {
+    fn from_saved_message(source: SavedMessage, ack_reaction: Option<&str>) -> Result<Self> {
         let key = message_key(&source)?;
         let ack_request_id = ack_reaction.map(|_| random_operation_uuid()).transpose()?;
         Ok(Self {
@@ -2784,6 +2788,8 @@ impl Drop for RunnerLease {
 pub struct BridgeState {
     root: PathBuf,
     config: BridgeConfiguration,
+    // Admission policy belongs to this process generation, never to serialized configuration.
+    ignored_text_prefixes: Arc<[String]>,
     #[cfg(test)]
     admission_fault_after: Arc<std::sync::Mutex<Option<usize>>>,
     #[cfg(test)]
@@ -2879,6 +2885,7 @@ impl BridgeState {
         Ok(Self {
             root: root.to_path_buf(),
             config,
+            ignored_text_prefixes: Arc::from([]),
             #[cfg(test)]
             admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -2961,6 +2968,7 @@ impl BridgeState {
         Ok(Self {
             root: root.to_path_buf(),
             config: envelope.config,
+            ignored_text_prefixes: Arc::from([]),
             #[cfg(test)]
             admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -2972,6 +2980,23 @@ impl BridgeState {
             #[cfg(test)]
             confirm_fault_after: Arc::new(std::sync::Mutex::new(None)),
         })
+    }
+
+    /// Set process-local prefixes whose new messages are committed without request admission.
+    ///
+    /// Matching is literal and case-sensitive after leading Unicode whitespace is removed.
+    /// This does not change saved configuration or suppress previously admitted work.
+    pub fn with_ignored_text_prefixes(mut self, prefixes: Vec<String>) -> Result<Self> {
+        if prefixes.len() > MAX_IGNORED_TEXT_PREFIXES {
+            return Err(ChatRuntimeError::invalid(format!(
+                "at most {MAX_IGNORED_TEXT_PREFIXES} ignored text prefixes are allowed"
+            )));
+        }
+        for prefix in &prefixes {
+            validate_ignored_text_prefix(prefix)?;
+        }
+        self.ignored_text_prefixes = prefixes.into();
+        Ok(self)
     }
 
     /// Borrow the immutable authority configuration.
@@ -3405,26 +3430,22 @@ impl BridgeState {
         for event in batch.events() {
             match event {
                 CommittableEvent::MessageCreated(message) => {
-                    let mut record =
-                        RequestRecord::from_message(message, self.config.ack_reaction.as_deref())?;
-                    record.admitted_host_batch_sequence = Some(host_batch_sequence);
-                    record.admitted_provider_sequence = Some(batch.sequence().get());
-                    record.admitted_delivery_id = Some(batch.delivery_id().as_str().to_owned());
-                    record.admitted_cursor = Some(batch.cursor().as_str().to_owned());
-                    if let Some(existing) = candidate_messages.get(&record.key) {
-                        if existing != &record.message {
+                    let source = SavedMessage::from_inbound(message);
+                    let key = message_key(&source)?;
+                    if let Some(existing) = candidate_messages.get(&key) {
+                        if existing != &source {
                             return Err(ChatRuntimeError::invalid(
                                 "one batch reused a request key for different message content",
                             ));
                         }
                         continue;
                     }
-                    candidate_messages.insert(record.key.clone(), record.message.clone());
-                    let path = self.request_path(&record.key);
+                    candidate_messages.insert(key.clone(), source.clone());
+                    let path = self.request_path(&key);
                     if fs::symlink_metadata(&path).is_ok() {
                         let saved: RequestRecord = read_document(&path, MAX_REQUEST_RECORD_BYTES)?;
-                        saved.validate(&record.key)?;
-                        if saved.message != record.message {
+                        saved.validate(&key)?;
+                        if saved.message != source {
                             return Err(ChatRuntimeError::invalid(
                                 "an existing request key names different message content",
                             ));
@@ -3438,8 +3459,8 @@ impl BridgeState {
                         }
                         continue;
                     }
-                    if let Some(retired) = self.retired_key(&record.key)? {
-                        let fingerprint = saved_message_fingerprint(&record.message)?;
+                    if let Some(retired) = self.retired_key(&key)? {
+                        let fingerprint = saved_message_fingerprint(&source)?;
                         if retired.message_fingerprint != fingerprint {
                             return Err(ChatRuntimeError::invalid(
                                 "a retired request key names different message content",
@@ -3454,6 +3475,23 @@ impl BridgeState {
                         }
                         continue;
                     }
+                    // Keep every original message in the replay boundary, including ignored
+                    // text, but create no request/ACK identity or reply route for ignored input.
+                    if self
+                        .ignored_text_prefixes
+                        .iter()
+                        .any(|prefix| message.text().trim_start().starts_with(prefix.as_str()))
+                    {
+                        continue;
+                    }
+                    let mut record = RequestRecord::from_saved_message(
+                        source,
+                        self.config.ack_reaction.as_deref(),
+                    )?;
+                    record.admitted_host_batch_sequence = Some(host_batch_sequence);
+                    record.admitted_provider_sequence = Some(batch.sequence().get());
+                    record.admitted_delivery_id = Some(batch.delivery_id().as_str().to_owned());
+                    record.admitted_cursor = Some(batch.cursor().as_str().to_owned());
                     let encoded_bytes_usize = encoded_document_bytes(&record)?;
                     let encoded_bytes = u64::try_from(encoded_bytes_usize).map_err(|_| {
                         ChatRuntimeError::invalid("request record length does not fit u64")
@@ -6251,6 +6289,18 @@ pub(crate) fn deliver_request_with(
     }
 }
 
+pub(crate) fn validate_ignored_text_prefix(prefix: &str) -> Result<()> {
+    if prefix.trim().is_empty()
+        || prefix.len() > MAX_IGNORED_TEXT_PREFIX_BYTES
+        || prefix.chars().any(char::is_control)
+    {
+        return Err(ChatRuntimeError::invalid(format!(
+            "ignored text prefix must be nonempty, at most {MAX_IGNORED_TEXT_PREFIX_BYTES} UTF-8 bytes, and contain no control characters"
+        )));
+    }
+    Ok(())
+}
+
 /// Receive, durably admit, and acknowledge one ordered stream item.
 pub fn consume_one(
     subscription: &mut ChatSubscription,
@@ -7629,6 +7679,185 @@ mod tests {
         assert!(!valid_nonce("AAAAAAAAAAAAAAAAAAAAAA="));
     }
 
+    fn text_prefix_batch(texts: &[&str]) -> DeliveryBatch {
+        let mut events = vec![CommittableEvent::Checkpoint];
+        for (index, text) in texts.iter().enumerate() {
+            events.extend(
+                indexed_delivery_at(1, index as u64, "cursor-prefix", text)
+                    .events()
+                    .iter()
+                    .cloned(),
+            );
+        }
+        DeliveryBatch::new(
+            EventSequence::new(1).unwrap(),
+            ProviderCursor::new("cursor-prefix").unwrap(),
+            DeliveryId::new("receipt-prefix").unwrap(),
+            events,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ignored_text_prefix_commits_full_batch_without_requests_ack_or_delivery() {
+        let root = temporary("ignored-prefix-commit");
+        let state = BridgeState::initialize(&root, config())
+            .unwrap()
+            .with_ignored_text_prefixes(vec!["[assistant".to_owned()])
+            .unwrap();
+        let configuration_before = fs::read(root.join("bridge.json")).unwrap();
+        let batch = text_prefix_batch(&[
+            "[assistant] reply",
+            " \t\n\u{2003}[assistant] another reply",
+        ]);
+        let fingerprint = batch_fingerprint(&batch).unwrap();
+        let acknowledged = Arc::new(Mutex::new(Vec::new()));
+        let mut backend = Backend {
+            items: Some(VecDeque::from([SubscriptionItem::Batch(batch.clone())])),
+            acknowledged: Arc::clone(&acknowledged),
+            next_calls: Arc::new(AtomicU64::new(0)),
+            fail_ack: false,
+            sabotage_receipt_directory: None,
+        };
+        let request = state.subscribe_request().unwrap();
+        let mut subscription = ChatSubscription::open(&mut backend, &request).unwrap();
+        let ConsumedItem::Batch(admission) = consume_one(&mut subscription, &state).unwrap() else {
+            panic!("expected batch");
+        };
+        assert!(admission.new_request_keys.is_empty());
+        assert_eq!(admission.event_count, 3);
+        assert_eq!(admission.batch_fingerprint, fingerprint);
+        assert_eq!(*acknowledged.lock().unwrap(), ["receipt-prefix"]);
+        assert_eq!(state.cursor().unwrap().as_deref(), Some("cursor-prefix"));
+        assert_eq!(
+            state.status().unwrap()["runtime_evidence"]["latest_commit_receipt"]["phase"],
+            "committed"
+        );
+        assert_eq!(state.read_checkpoint().unwrap().boundary_messages.len(), 2);
+        assert_eq!(fs::read_dir(root.join("requests")).unwrap().count(), 0);
+        assert!(state.pending_ack_keys().unwrap().is_empty());
+        assert!(state.pending_work_keys().unwrap().is_empty());
+        assert!(state.available_reply_ids().unwrap().is_empty());
+        assert_eq!(
+            fs::read(root.join("bridge.json")).unwrap(),
+            configuration_before
+        );
+
+        // Policy is not serialized. An unchanged inclusive replay remains a no-op even
+        // after reopening without exclusions, as an older host would do.
+        let reopened = BridgeState::open(&root).unwrap();
+        assert!(reopened.ignored_text_prefixes.is_empty());
+        assert!(reopened
+            .admit_batch(&batch)
+            .unwrap()
+            .new_request_keys
+            .is_empty());
+        assert!(reopened.pending_work_keys().unwrap().is_empty());
+        let filtered = reopened
+            .with_ignored_text_prefixes(vec!["[assistant".to_owned()])
+            .unwrap();
+        assert!(filtered
+            .admit_batch(&batch)
+            .unwrap()
+            .new_request_keys
+            .is_empty());
+        assert!(filtered
+            .admit_batch(&text_prefix_batch(&[
+                "[assistant] changed",
+                " \t\n\u{2003}[assistant] another reply"
+            ]))
+            .is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ignored_text_prefix_preserves_normal_owner_messages_and_existing_boundary() {
+        let root = temporary("ignored-prefix-mixed");
+        let state = BridgeState::initialize(&root, config())
+            .unwrap()
+            .with_ignored_text_prefixes(vec!["[assistant".to_owned(), "[notice]".to_owned()])
+            .unwrap();
+        let batch = text_prefix_batch(&[
+            "[assistant] reply",
+            "\t[notice] generated",
+            "normal owner request",
+            "please discuss [assistant]",
+            "[Assistant] different case",
+        ]);
+        let admission = state.clone().admit_batch(&batch).unwrap();
+        assert_eq!(admission.new_request_keys.len(), 3);
+        assert_eq!(admission.event_count, 6);
+        assert_eq!(
+            admission.batch_fingerprint,
+            batch_fingerprint(&batch).unwrap()
+        );
+        assert_eq!(state.pending_ack_keys().unwrap().len(), 3);
+        assert_eq!(state.pending_work_keys().unwrap().len(), 3);
+        assert_eq!(state.read_checkpoint().unwrap().boundary_messages.len(), 5);
+        let texts = admission
+            .new_request_keys
+            .iter()
+            .map(|key| {
+                let record = state.read_request(key).unwrap();
+                assert_eq!(record.message.sender_id, "users/owner");
+                assert!(record.ack_request_id.is_some());
+                record.message.text
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            [
+                "normal owner request",
+                "please discuss [assistant]",
+                "[Assistant] different case"
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
+
+        // Enabling an exclusion does not change an existing boundary's full-message
+        // identity and deliberately does not erase already-admitted work.
+        let root = temporary("ignored-prefix-enable");
+        let original = BridgeState::initialize(&root, config()).unwrap();
+        let batch = text_prefix_batch(&["[assistant] previously admitted"]);
+        assert_eq!(
+            original.admit_batch(&batch).unwrap().new_request_keys.len(),
+            1
+        );
+        let filtered = BridgeState::open(&root)
+            .unwrap()
+            .with_ignored_text_prefixes(vec!["[assistant".to_owned()])
+            .unwrap();
+        assert!(filtered
+            .admit_batch(&batch)
+            .unwrap()
+            .new_request_keys
+            .is_empty());
+        assert_eq!(filtered.pending_work_keys().unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ignored_text_prefix_policy_rejects_unbounded_or_empty_exclusions() {
+        let root = temporary("ignored-prefix-validation");
+        let state = BridgeState::initialize(&root, config()).unwrap();
+        for prefix in [
+            "".to_owned(),
+            "   ".to_owned(),
+            "x\n".to_owned(),
+            "x\0".to_owned(),
+            "x".repeat(257),
+        ] {
+            assert!(state
+                .clone()
+                .with_ignored_text_prefixes(vec![prefix])
+                .is_err());
+        }
+        assert!(state
+            .with_ignored_text_prefixes(vec!["x".to_owned(); 33])
+            .is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn durable_admission_precedes_upstream_acknowledgement_and_deduplicates_replay() {
         let root = temporary("commit-order");
@@ -7825,7 +8054,9 @@ mod tests {
         let CommittableEvent::MessageCreated(message) = &batch.events()[1] else {
             panic!("message fixture");
         };
-        let record = RequestRecord::from_message(message, Some("🤖")).expect("request record");
+        let record =
+            RequestRecord::from_saved_message(SavedMessage::from_inbound(message), Some("🤖"))
+                .expect("request record");
 
         let mut partial_provenance = record.clone();
         partial_provenance.admitted_host_batch_sequence = Some(1);
@@ -9464,7 +9695,9 @@ mod tests {
             let CommittableEvent::MessageCreated(message) = &batch.events()[0] else {
                 panic!("message fixture");
             };
-            let mut record = RequestRecord::from_message(message, None).expect("old record");
+            let mut record =
+                RequestRecord::from_saved_message(SavedMessage::from_inbound(message), None)
+                    .expect("old record");
             record.admitted_cursor = Some(format!("cursor-old-{index}"));
             if first_nonterminal_key.is_none() {
                 first_nonterminal_key = Some(record.key.clone());
@@ -9950,7 +10183,9 @@ mod tests {
         let CommittableEvent::MessageCreated(message) = &batch.events()[1] else {
             panic!("message fixture");
         };
-        let mut record = RequestRecord::from_message(message, Some("🤖")).expect("record");
+        let mut record =
+            RequestRecord::from_saved_message(SavedMessage::from_inbound(message), Some("🤖"))
+                .expect("record");
         record.admitted_cursor = Some("forged-cursor".to_owned());
         write_document(&state.request_path(&record.key), &record).expect("orphan request");
         assert_eq!(
@@ -9974,7 +10209,9 @@ mod tests {
         let CommittableEvent::MessageCreated(message) = &batch.events()[0] else {
             panic!("message fixture");
         };
-        let cursorless = RequestRecord::from_message(message, Some("🤖")).expect("cursorless");
+        let cursorless =
+            RequestRecord::from_saved_message(SavedMessage::from_inbound(message), Some("🤖"))
+                .expect("cursorless");
         write_document(&state.request_path(&cursorless.key), &cursorless)
             .expect("substitute cursorless request");
         let error = BridgeState::open(&root).expect_err("cursorless substitution must fail");
