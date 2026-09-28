@@ -121,7 +121,8 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser], fo
             "slot. The slot path, branches, and registry record are unchanged."
         ),
         epilog=(
-            "Converting to worktree discards the sandbox's private HOME and /tmp state image. "
+            "Converting to worktree discards the state image's private HOME directories "
+            "(home_private). "
             "--keep-original leaves the pre-conversion copy under the slot's image directory "
             "(or beside it) for inspection instead of deleting it."
         ),
@@ -136,58 +137,160 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser], fo
 
     run = subparsers.add_parser(
         "run",
-        help="run a command boxed to one slot (limits + private file-system view)",
+        help="run a command boxed to one slot (limits + confined file-system view)",
         description=(
-            "Run COMMAND as a transient systemd user service in the slot's own slice. The "
-            "slot, its private state, the Git directories its checkouts commit into, and the "
-            "wrkslots control directory are writable; with protect_system (the default) every "
-            "other path is read-only. /tmp and the home_writable directories are private to "
-            "the slot. Works for image-backed and plain slots; no root is needed."
+            "Run COMMAND boxed to one slot. The calling process joins a transient systemd user "
+            "scope in the slot's own slice (limits shared by everything run against the slot) "
+            "and then execs, so the PID never changes. With isolation userns or root, COMMAND "
+            "also sees a confined file-system view: a fresh /tmp per launch; $HOME as the slot's "
+            "persistent private layer, in which every real top-level entry is bound read-only "
+            "(nothing is copied), home_private_files are private copies seeded once, "
+            "home_private directories are per-slot and writable, home_shared paths are the real "
+            "ones and writable, and home_hidden credentials are masked; the slot, its Git "
+            "directories, the control directory, the project's outputs, and read_write paths "
+            "writable; and, with protect_system, every other mount read-only. The box is the "
+            "same for plain-worktree and image-backed slots. Defaults come from "
+            "configuration.sandbox (see `wrkslots sandbox show-config`); list options ADD to "
+            "the configured lists."
         ),
         epilog=(
-            "HOME modes: ro exposes all of $HOME read-only; select exposes only --home-path "
-            "entries; none exposes nothing. Limits apply to wrkslots-<slot>.slice and are shared "
-            "by every command run against the slot. Defaults come from configuration.sandbox. "
-            "Example: wrkslots run slot01 --memory-max 32G --cpu-quota 800% -- claude"
+            "Isolation: userns (default) builds the view in an unprivileged user namespace; "
+            "root builds the identical view through a short-lived `sudo -n` launcher in a plain "
+            "mount namespace and then drops to your uid, gid, and groups, so setuid helpers "
+            "(sudo, a harness launcher that enters a site sandbox) work inside the box; cgroup "
+            "applies limits only. HOME modes: ro (default) keeps the real $HOME visible "
+            "read-only; hidden covers it with an empty tmpfs and binds back only home_expose "
+            "paths, read-only.\n\n"
+            "Examples:\n"
+            "  wrkslots run slot01 -- make test\n"
+            "  wrkslots run slot01 --memory-max 32G --cpu-quota 800% -- claude\n"
+            "  wrkslots run slot01 --isolation root -- claude\n"
+            "  wrkslots run slot01 --home hidden --home-expose .gitconfig -- bash\n"
+            "  wrkslots run slot01 --print -- bash"
         ),
         formatter_class=formatter,
     )
     run.add_argument("slot", help="registered slot name")
     run.add_argument("--slot-type", choices=("agent", "validate"), default="agent", help="slot type (default: agent)")
-    run.add_argument("--home", choices=sandbox.HOME_MODES, help="HOME exposure (default: configuration, else ro)")
-    run.add_argument("--home-path", action="append", metavar="REL", help="$HOME-relative path exposed read-only in select mode (repeatable)")
     run.add_argument(
-        "--home-writable",
-        action="append",
-        metavar="REL",
-        help=f"$HOME-relative directory made private and writable (repeatable; replaces the default {', '.join(sandbox.DEFAULT_HOME_WRITABLE)})",
+        "--isolation",
+        choices=sandbox.ISOLATIONS,
+        default=None,
+        help=(
+            "userns: limits plus the file-system view in an unprivileged user namespace; root: "
+            "the same view built through sudo -n, then privileges dropped (setuid helpers work "
+            "inside); cgroup: limits only, no file-system view (default: "
+            "configuration.sandbox.isolation, else userns)"
+        ),
+    )
+    run.add_argument(
+        "--home",
+        choices=sandbox.HOME_MODES,
+        help="ro: every real $HOME entry visible read-only in the slot's layer; hidden: only home_expose paths (default: configuration.sandbox.home, else ro)",
     )
     run.add_argument(
         "--home-shared",
         action="append",
         metavar="REL",
-        help=f"$HOME-relative path kept shared with the host and writable (repeatable; replaces the default {', '.join(sandbox.DEFAULT_HOME_SHARED)})",
+        help="$HOME-relative path bound read-write onto itself, shared with the host (repeatable; added to configuration.sandbox.home_shared)",
     )
-    run.add_argument("--read-write", action="append", metavar="PATH", help="extra absolute path left writable (repeatable)")
+    run.add_argument(
+        "--home-private",
+        action="append",
+        metavar="REL",
+        help="$HOME-relative directory replaced by a persistent per-slot writable directory in the slot's layer (repeatable; added to configuration.sandbox.home_private)",
+    )
+    run.add_argument(
+        "--home-private-file",
+        action="append",
+        metavar="NAME",
+        help="top-level $HOME file seeded once into the slot's layer as a private writable copy (repeatable; added to configuration.sandbox.home_private_files)",
+    )
+    run.add_argument(
+        "--home-hidden",
+        action="append",
+        metavar="REL",
+        help="$HOME-relative path masked in the box: empty read-only directory or /dev/null (repeatable; added to configuration.sandbox.home_hidden)",
+    )
+    run.add_argument(
+        "--home-expose",
+        action="append",
+        metavar="REL",
+        help="with --home hidden: $HOME-relative path bound back read-only (repeatable; added to configuration.sandbox.home_expose)",
+    )
+    run.add_argument(
+        "--output",
+        action="append",
+        metavar="REL",
+        help="project-root-relative directory in the primary checkout left writable, skipped if missing (repeatable; added to configuration.sandbox.outputs)",
+    )
+    run.add_argument(
+        "--read-write",
+        action="append",
+        metavar="PATH",
+        help="extra absolute or ~/ path left writable, skipped if missing; $USER and $HOME are expanded (repeatable; added to configuration.sandbox.read_write)",
+    )
+    run.add_argument(
+        "--env",
+        action="append",
+        metavar="NAME=VALUE",
+        help="extra environment variable for COMMAND; a leading ~ in VALUE is your $HOME (repeatable; overrides configuration.sandbox.env)",
+    )
+    run.add_argument("--tmp-size", metavar="SIZE", help="size limit of the per-launch /tmp tmpfs, such as 16G or 25%% (default: configuration.sandbox.tmp_size, else 16G)")
     run.add_argument("--memory-max", metavar="SIZE", help="slot memory limit, such as 32G (swap is disabled when set)")
     run.add_argument("--memory-high", metavar="SIZE", help="slot memory throttling threshold, such as 24G")
     run.add_argument("--cpu-quota", metavar="PERCENT", help="slot CPU limit, such as 800%% for eight CPUs")
-    run.add_argument("--tasks-max", type=int, metavar="N", help=f"slot process and thread limit (default: {sandbox.DEFAULT_TASKS_MAX})")
-    run.add_argument("--no-protect-system", action="store_true", help="leave paths outside the slot writable (limits and HOME policy still apply)")
+    run.add_argument("--tasks-max", type=int, metavar="N", help=f"slot process and thread limit (default: configuration, else {sandbox.DEFAULT_TASKS_MAX})")
+    run.add_argument("--no-protect-system", action="store_true", help="leave mounts outside the slot writable ($HOME stays read-only; limits and masks still apply)")
     run.add_argument("--cwd", metavar="PATH", help="working directory (default: the slot directory)")
-    run.add_argument(
-        "--isolation",
-        choices=sandbox.ISOLATIONS,
-        default="namespace",
-        help=(
-            "namespace: limits plus the private file-system view (default); cgroup: limits "
-            "only, for programs that need setuid helpers such as sudo or a harness launcher "
-            "that enters its own site sandbox"
-        ),
-    )
-    run.add_argument("--print", action="store_true", dest="print_only", help="print the scope, slice limits, and helper command; run nothing")
+    run.add_argument("--print", action="store_true", dest="print_only", help="print the scope, slice limits, environment additions, and helper command or view; run nothing")
     run.add_argument("command", nargs="*", help="command to run, after a literal -- (default: $SHELL)")
     run.set_defaults(handler=_cmd_run)
+
+    box = subparsers.add_parser(
+        "sandbox",
+        help="show or complete the configuration.sandbox section",
+        description=(
+            "configuration.sandbox holds the defaults for `wrkslots run`, `wrkslots "
+            "shell-command`, and agent launchers that box agents to slots. `init` writes the "
+            "full section for a new project; unknown keys are refused."
+        ),
+        epilog=(
+            "Keys: isolation (userns|cgroup|root), home (ro|hidden), home_shared, home_private, "
+            "home_hidden, home_expose ($HOME-relative lists), home_private_files (top-level "
+            "names), outputs (project-root-relative list), read_write (absolute or ~/ paths; "
+            "$USER and $HOME expanded), env (NAME: value; leading ~ is $HOME), "
+            "tmp_size, protect_system, limits {memory_max, memory_high, cpu_quota, tasks_max, "
+            "io_weight, all_slots_memory_max, all_slots_cpu_quota}.\n\n"
+            "Examples:\n"
+            "  wrkslots sandbox show-config\n"
+            "  wrkslots sandbox write-defaults"
+        ),
+        formatter_class=formatter,
+    )
+    box_actions = box.add_subparsers(dest="sandbox_command", metavar="ACTION")
+    show = box_actions.add_parser(
+        "show-config",
+        help="print the effective sandbox configuration as JSON",
+        description=(
+            "Print configuration.sandbox with every default filled in, exactly as `wrkslots "
+            "run` will use it (before per-run options)."
+        ),
+        formatter_class=formatter,
+    )
+    show.set_defaults(handler=_cmd_sandbox_show)
+    write_defaults = box_actions.add_parser(
+        "write-defaults",
+        help="add every missing sandbox default to the project configuration",
+        description=(
+            "Write each missing configuration.sandbox key (and missing limits key) with its "
+            "default value. Present keys, and every other configuration key, are left as they "
+            "are; the result is validated before it is written."
+        ),
+        formatter_class=formatter,
+    )
+    write_defaults.set_defaults(handler=_cmd_sandbox_write_defaults)
+    box.set_defaults(handler=_cmd_sandbox_help, sandbox_parser=box)
 
     limits = subparsers.add_parser(
         "limits",
@@ -215,21 +318,56 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser], fo
             "`wrkslots run SLOT -- SHELL -i`, using absolute interpreter paths and exec at "
             "every step so the process ID never changes. A terminal multiplexer that only "
             "starts agents in a pane whose own shell is at its prompt (Herdr) keeps working. "
-            "An agent launcher runs it in a fresh pane before starting a harness."
+            "An agent launcher runs it in a fresh pane before starting a harness. The box is the "
+            "same for plain-worktree and image-backed slots."
         ),
+        epilog="Example: wrkslots shell-command slot01 --format json",
         formatter_class=formatter,
     )
     shell_command.add_argument("slot", help="registered slot name")
     shell_command.add_argument("--slot-type", choices=("agent", "validate"), default="agent", help="slot type (default: agent)")
-    shell_command.add_argument("--isolation", choices=sandbox.ISOLATIONS, default="namespace", help="passed to run (default: namespace)")
+    shell_command.add_argument(
+        "--isolation",
+        choices=sandbox.ISOLATIONS,
+        default=None,
+        help="passed to run (default: configuration.sandbox.isolation, else userns)",
+    )
     shell_command.add_argument("--shell", default=None, metavar="PATH", help="interactive shell (default: $SHELL, else /bin/bash)")
     shell_command.add_argument(
         "--format",
         choices=("text", "json"),
         default="text",
-        help="text prints the command line; json prints {command, slot_path} (default: text)",
+        help="text prints the command line; json prints {command, slot_path, isolation} (default: text)",
     )
     shell_command.set_defaults(handler=_cmd_shell_command)
+    for name in ("image", "run", "sandbox", "limits", "shell-command"):
+        _fill_help(subparsers.choices[name])
+
+
+def _fill(text: str | None) -> str | None:
+    """Wrap prose paragraphs for the raw-description help formatter; keep indented lines."""
+
+    import textwrap
+
+    if not text:
+        return text
+    blocks = []
+    for block in text.split("\n\n"):
+        lines = block.split("\n")
+        prose = " ".join(line for line in lines if not line.startswith("  "))
+        indented = [line for line in lines if line.startswith("  ")]
+        parts = [textwrap.fill(prose, width=96)] if prose else []
+        blocks.append("\n".join([*parts, *indented]))
+    return "\n\n".join(blocks)
+
+
+def _fill_help(parser: argparse.ArgumentParser) -> None:
+    parser.description = _fill(parser.description)
+    parser.epilog = _fill(parser.epilog)
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for child in action.choices.values():
+                _fill_help(child)
 
 
 def _slot_arguments(parser: argparse.ArgumentParser) -> None:
@@ -467,38 +605,48 @@ def _convert_to_worktree(
     os.rename(staging, slot_path)
 
 
-def _cmd_run(args: argparse.Namespace) -> int:
+def slot_view(config: "cli.Config", slot: str, slot_type: str) -> sandbox.SlotView:
+    """Describe a registered slot for the sandbox, whatever its representation."""
+
     from wrkslots import cli
 
-    config = _config(args)
     state = cli._load_active(config)
-    record = cli._find_record(state, args.slot)
-    if record.slot_type != args.slot_type:
-        raise _refuse(f"slot {args.slot!r} is a {record.slot_type} slot, not {args.slot_type}")
-    slot_path = cli._slot_directory(config, args.slot, args.slot_type)
-    image = slotimage.load(config.control, args.slot_type, args.slot)
+    record = cli._find_record(state, slot)
+    if record.slot_type != slot_type:
+        raise _refuse(f"slot {slot!r} is a {record.slot_type} slot, not {slot_type}")
+    slot_path = cli._slot_directory(config, slot, slot_type)
+    try:
+        image = slotimage.load(config.control, slot_type, slot)
+    except slotimage.ImageError as exc:
+        raise _refuse(str(exc)) from exc
+    # Representation decides only where the slot's private state lives.
     if image is not None:
         state_directory = image.state_mount
     else:
-        state_directory = config.control / "slot-state" / args.slot_type / args.slot
+        state_directory = config.control / "slot-state" / slot_type / slot
     vcs = cli._GitVcs()
     git_directories: list[Path] = []
     for repository, path, _head in _checkout_paths(config, record):
         common = vcs.common_directory(path if path.exists() else repository)
         if common not in git_directories:
             git_directories.append(common)
-    view = sandbox.SlotView(
-        slot=args.slot,
-        slot_type=args.slot_type,
+    return sandbox.SlotView(
+        slot=slot,
+        slot_type=slot_type,
         slot_path=slot_path,
         state_directory=state_directory,
         git_directories=tuple(git_directories),
         control_directory=config.control,
         representation="image" if image is not None else "worktree",
+        project_root=config.root,
     )
-    settings = config.sandbox_settings
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    config = _config(args)
+    view = slot_view(config, args.slot, args.slot_type)
     try:
-        settings = _override_settings(settings, args)
+        settings = _override_settings(config.sandbox_settings, args)
         command = list(args.command)
         if not command:
             command = [os.environ.get("SHELL", "/bin/sh")]
@@ -508,10 +656,46 @@ def _cmd_run(args: argparse.Namespace) -> int:
             command,
             cwd=Path(args.cwd).absolute() if args.cwd else None,
             print_only=args.print_only,
-            isolation=args.isolation,
         )
     except sandbox.SandboxError as exc:
         raise _refuse(str(exc)) from exc
+
+
+def _cmd_sandbox_help(args: argparse.Namespace) -> int:
+    parser = args.sandbox_parser
+    assert isinstance(parser, argparse.ArgumentParser)
+    parser.print_help()
+    return 0
+
+
+def _cmd_sandbox_show(args: argparse.Namespace) -> int:
+    config = _config(args)
+    print(json.dumps(sandbox.settings_to_obj(config.sandbox_settings), indent=2))
+    return 0
+
+
+def _cmd_sandbox_write_defaults(args: argparse.Namespace) -> int:
+    from wrkslots import cli
+
+    config = _config(args)
+    with cli._locked_config(config.config_path, args.wait_lock):
+        raw = cli._as_mapping(cli._read_json(config.config_path, "configuration"), "configuration")
+        existing = raw.get("sandbox", {})
+        if not isinstance(existing, dict):
+            raise _refuse("configuration.sandbox must be an object")
+        try:
+            merged, added = sandbox.merge_defaults(existing)
+        except sandbox.SandboxError as exc:
+            raise _refuse(str(exc)) from exc
+        if added:
+            updated = dict(raw)
+            updated["sandbox"] = merged
+            cli._atomic_write_json(config.config_path, updated)
+    if added:
+        print(f"added to configuration.sandbox in {config.config_path}: {', '.join(added)}")
+    else:
+        print(f"configuration.sandbox in {config.config_path} already has every key")
+    return 0
 
 
 def _cmd_shell_command(args: argparse.Namespace) -> int:
@@ -524,30 +708,29 @@ def _cmd_shell_command(args: argparse.Namespace) -> int:
     state = cli._load_active(config)
     cli._find_record(state, args.slot)
     shell = args.shell or os.environ.get("SHELL") or "/bin/bash"
-    package_parent = str(Path(__file__).resolve().parent.parent)
+    # The real interpreter (a wrapper script that forks would change the PID)
+    # running the entry script in isolated mode: nothing is added to the
+    # environment the boxed shell inherits (no PYTHONPATH).
     argv = [
         "exec",
-        "env",
-        f"PYTHONPATH={package_parent}",
         os.path.realpath(sys.executable),
-        "-m",
-        "wrkslots",
+        "-I",
+        str(Path(__file__).resolve().with_name("__main__.py")),
         "--project-root",
         str(config.root),
         "run",
         args.slot,
         "--slot-type",
         args.slot_type,
-        "--isolation",
-        args.isolation,
-        "--",
-        os.path.realpath(shutil.which(shell) or shell),
-        "-i",
     ]
+    if args.isolation is not None:
+        argv += ["--isolation", args.isolation]
+    argv += ["--", os.path.realpath(shutil.which(shell) or shell), "-i"]
     line = " ".join(shlex.quote(part) if index else part for index, part in enumerate(argv))
     if args.format == "json":
         slot_path = cli._slot_directory(config, args.slot, args.slot_type)
-        print(json.dumps({"command": line, "slot_path": str(slot_path)}))
+        isolation = args.isolation or config.sandbox_settings.isolation
+        print(json.dumps({"command": line, "slot_path": str(slot_path), "isolation": isolation}))
     else:
         print(line)
     return 0
@@ -589,40 +772,45 @@ def _cmd_limits(args: argparse.Namespace) -> int:
 
 
 def _override_settings(settings: sandbox.SandboxSettings, args: argparse.Namespace) -> sandbox.SandboxSettings:
-    import dataclasses
+    """Apply per-run options on top of the configured settings, then re-validate."""
 
-    changes: dict[str, object] = {}
+    merged = sandbox.settings_to_obj(settings)
+    if args.isolation is not None:
+        merged["isolation"] = args.isolation
     if args.home is not None:
-        changes["home"] = args.home
-    if args.home_path:
-        changes["home_paths"] = tuple(args.home_path)
-        if args.home is None:
-            changes["home"] = "select"
-    if args.home_writable:
-        changes["home_writable"] = tuple(args.home_writable)
-    if args.home_shared:
-        changes["home_shared"] = tuple(args.home_shared)
-    if args.read_write:
-        changes["read_write"] = settings.read_write + tuple(args.read_write)
-    if args.memory_max is not None:
-        changes["memory_max"] = sandbox.validate_limit(args.memory_max, "--memory-max")
-    if args.memory_high is not None:
-        changes["memory_high"] = sandbox.validate_limit(args.memory_high, "--memory-high")
-    if args.cpu_quota is not None:
-        changes["cpu_quota"] = sandbox.validate_limit(args.cpu_quota, "--cpu-quota")
-    if args.tasks_max is not None:
-        changes["tasks_max"] = args.tasks_max
+        merged["home"] = args.home
+    for option, key in (
+        ("home_shared", "home_shared"),
+        ("home_private", "home_private"),
+        ("home_private_file", "home_private_files"),
+        ("home_hidden", "home_hidden"),
+        ("home_expose", "home_expose"),
+        ("output", "outputs"),
+        ("read_write", "read_write"),
+    ):
+        extra = getattr(args, option)
+        if extra:
+            current = merged[key]
+            assert isinstance(current, list)
+            merged[key] = [*current, *extra]
+    if args.env:
+        env = merged["env"]
+        assert isinstance(env, dict)
+        for item in args.env:
+            name, separator, value = item.partition("=")
+            if not separator:
+                raise sandbox.SandboxError(f"--env needs NAME=VALUE, not {item!r}")
+            env[name] = value
+    if args.tmp_size is not None:
+        merged["tmp_size"] = args.tmp_size
     if args.no_protect_system:
-        changes["protect_system"] = False
-    merged = sandbox.settings_from_obj(
-        {
-            **{
-                field.name: (list(value) if isinstance(value, tuple) else value)
-                for field in dataclasses.fields(sandbox.SandboxSettings)
-                for value in [getattr(settings, field.name)]
-            },
-            **{key: (list(value) if isinstance(value, tuple) else value) for key, value in changes.items()},
-        }
-    )
-    return merged
-
+        merged["protect_system"] = False
+    limits = merged["limits"]
+    assert isinstance(limits, dict)
+    for option in ("memory_max", "memory_high", "cpu_quota"):
+        value = getattr(args, option)
+        if value is not None:
+            limits[option] = sandbox.validate_limit(value, "--" + option.replace("_", "-"))
+    if args.tasks_max is not None:
+        limits["tasks_max"] = args.tasks_max
+    return sandbox.settings_from_obj(merged)

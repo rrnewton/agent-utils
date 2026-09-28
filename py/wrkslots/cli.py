@@ -2626,6 +2626,7 @@ def _config_payload(
     disk_emergency_bytes: int | None = None,
     slot_representation: str = "worktree",
     image: Mapping[str, object] | None = None,
+    sandbox_section: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "schema": SCHEMA,
@@ -2661,6 +2662,8 @@ def _config_payload(
         payload["slot_representation"] = slot_representation
     if image:
         payload["image"] = dict(image)
+    if sandbox_section is not None:
+        payload["sandbox"] = dict(sandbox_section)
     return payload
 
 
@@ -3185,6 +3188,25 @@ def _init_representation(
         if args.image_backend is not None:
             image_section["backend"] = args.image_backend
     return representation, image_section
+
+
+def _init_sandbox_section(config_path: Path) -> dict[str, object] | None:
+    """The sandbox section init writes: every default for a new project.
+
+    An existing configuration keeps exactly what it has (possibly nothing), so
+    rerunning init never conflicts; `wrkslots sandbox write-defaults` fills in
+    missing keys explicitly.
+    """
+
+    if not config_path.exists() and not config_path.is_symlink():
+        return sandbox.default_config_obj()
+    try:
+        loaded: object = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if isinstance(loaded, dict) and isinstance(loaded.get("sandbox"), dict):
+        return {str(key): value for key, value in loaded["sandbox"].items()}
+    return None
 
 
 def _requested_representation(config: Config, args: argparse.Namespace) -> str:
@@ -13779,6 +13801,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
         disk_bytes = (None, None, None)
     config_path = root / CONFIG_NAME
     representation, image_section = _init_representation(args, config_path)
+    sandbox_section = _init_sandbox_section(config_path)
     payload = _config_payload(
         worktrees_relative,
         machine,
@@ -13797,6 +13820,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
         disk_bytes[2],
         representation,
         image_section,
+        sandbox_section,
     )
     with _locked_config(config_path, args.wait_lock):
         _recover_config_write(config_path, payload)
@@ -36021,6 +36045,16 @@ If a create or removal is interrupted, preserve all paths and run:
 
      wrkslots recover --coordinator-pid "$CURRENT_COORDINATOR_PID"
 
+Box a command or agent to a slot (plain or image-backed alike): per-slot limits, a fresh /tmp,
+the real $HOME read-only under a per-slot private layer, and only the slot, its Git directories,
+the project's outputs (ai_docs, experiments), and shared harness state writable. `init` writes
+every default into the configuration's sandbox section; inspect it with `sandbox show-config`.
+
+     wrkslots run slot01 -- make test
+     wrkslots run slot01 --isolation root -- HARNESS ...   # setuid helpers work inside
+     wrkslots shell-command slot01 --format json            # for agent launchers
+     wrkslots sandbox write-defaults                        # older projects: add missing keys
+
 Use `wrkslots COMMAND --help` for the exact effects and inputs of one command.
 """
 
@@ -36045,6 +36079,9 @@ recover-unbound-owner, heartbeat, hold, unhold, clean-caches deletion, finish,
 write-handoff, read-handoff, retire-pending, remove, recover-absent-validate-rows
 --apply, and recover. Registry mutations take a state lock and append
 hash-linked events. ACTIVE and ARCHIVED are compatibility views derived from those events.
+Storage and boxing: image (slot disk images), run and shell-command (box a command
+or agent to a slot, for plain and image slots alike), sandbox (show or complete the
+configuration's sandbox section), and limits (the machine-wide guard).
 Each slot binds an agent identity, coordinator process generation, and one or more linked Git
 worktrees to durable machine-sharded state. Removal fails closed unless the time-to-live,
 registered running command, process evidence, Git state, salvage evidence, and recovery journal
