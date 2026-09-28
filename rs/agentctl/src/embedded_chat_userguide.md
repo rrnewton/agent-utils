@@ -129,16 +129,51 @@ a local wake descriptor. A disk-backed terminal and delivery reconciliation
 occurs every 300 seconds by default and can be changed with
 `--reconcile-interval`.
 
-A provider `Gap` is a terminal loss signal in protocol v1. Its reason does not
+A provider `Gap` is a terminal continuity warning in protocol v1. Its reason does not
 contain a recoverable range or completeness proof, so the host journals the
 incident, keeps the prior safe cursor, sends no commit, cancels that provider
 generation, and exits degraded. `chat status` reports `healthy: false` and the
-exact unresolved incident; `chat run` refuses automatic reconnect. Repair needs
-a future provider history protocol or an explicit operator procedure—one later
-message or checkpoint is not treated as proof that the missing interval was
-recovered.
+exact unresolved incident; `chat run` refuses automatic reconnect. One later
+message or checkpoint does not prove that a missing interval was recovered.
 
-For a bounded manual recovery while the daemon is stopped:
+An operator may approve a retry only when the saved boundary is exactly one
+committed `Checkpoint`, the gap proposes that same cursor, and independent
+provider evidence establishes that retrying that fixed cursor is safe. Stop the
+runner and review its backend's explicit retention-boundary recovery policy
+first. The host does not interpret a provider's free-text reason as proof.
+
+```sh
+agentctl chat retry-checkpoint-gap \
+  --bridge-state /home/me/.local/state/agentctl/project-chat \
+  --expected-gap-sha256 "$GAP_SHA256" \
+  --expected-checkpoint-sha256 "$CHECKPOINT_SHA256" \
+  --expected-configuration-sha256 "$CONFIGURATION_SHA256" \
+  --keep-cursor "$COMMITTED_CURSOR" \
+  --evidence-file /home/me/private/provider-evidence.json \
+  --evidence-sha256 "$EVIDENCE_SHA256"
+```
+
+Supply lowercase SHA256 digests of the exact reviewed `gap.json`,
+`checkpoint.json`, `bridge.json`, and evidence file bytes. Evidence must be a
+private nonempty JSON object of at most 64 KiB. It is retained as an explicit
+operator attestation, not a host-verified claim about provider history. The
+command verifies the stopped runner lease, all local digests, and the exact
+committed checkpoint receipt; it refuses message-bearing boundaries, including
+messages excluded by a runtime prefix filter.
+
+Approval writes only a bounded audit under `gap-retries/`; it preserves the
+cursor, request bytes, UUIDs, and unresolved diagnostic. Status reports
+`gap_retry_approved: true` and `healthy: false`. The next generation may admit
+only the identical checkpoint at the kept cursor. A new exact provider commit
+resolves the gap and clears reconciliation; an interrupted resolution is
+repaired from that new committed receipt. A new gap revokes the approval before
+it is published. Audits retain original state and evidence without eviction,
+with a limit of 64 records and 512 KiB per record. This procedure cannot reset
+to the provider head, accept loss, replay quarantined work, or claim recovery
+before provider confirmation.
+
+For a bounded local work recovery pass while the daemon is stopped (`tick` does
+not repair provider gaps):
 
 ```sh
 agentctl --registry /work/project/.agentctl chat tick \

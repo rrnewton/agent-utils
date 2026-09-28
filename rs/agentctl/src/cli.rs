@@ -446,6 +446,8 @@ enum ChatCommand {
     Init(ChatInit),
     /// Inspect durable bridge state without contacting Herdr or a provider
     Status(ChatState),
+    /// Approve one unchanged checkpoint-only gap retry while the service is stopped
+    RetryCheckpointGap(ChatRetryCheckpointGap),
     /// Inspect one exact active retained request without writes or external access
     Inspect(ChatInspect),
     /// Publish one explicit operator root message through the configured helper
@@ -484,6 +486,30 @@ struct ChatInspect {
     /// Exact 64-character lowercase hexadecimal request key
     #[arg(long)]
     request: String,
+}
+
+#[derive(Args)]
+struct ChatRetryCheckpointGap {
+    #[command(flatten)]
+    state: ChatState,
+    /// SHA256 of the reviewed unresolved gap.json bytes
+    #[arg(long, value_name = "SHA256")]
+    expected_gap_sha256: String,
+    /// SHA256 of the reviewed checkpoint.json bytes
+    #[arg(long, value_name = "SHA256")]
+    expected_checkpoint_sha256: String,
+    /// SHA256 of the reviewed bridge.json configuration bytes
+    #[arg(long, value_name = "SHA256")]
+    expected_configuration_sha256: String,
+    /// Exact existing opaque cursor to preserve; this command cannot advance it
+    #[arg(long, value_name = "CURSOR")]
+    keep_cursor: String,
+    /// Private JSON object of operator-reviewed provider evidence (maximum 64 KiB)
+    #[arg(long, value_name = "FILE")]
+    evidence_file: PathBuf,
+    /// SHA256 of the exact reviewed evidence file bytes
+    #[arg(long, value_name = "SHA256")]
+    evidence_sha256: String,
 }
 
 #[derive(Args)]
@@ -1069,6 +1095,22 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             write_json(&result).map_err(Failure::Output)?;
             Ok(0)
         }
+        ChatCommand::RetryCheckpointGap(value) => {
+            let result = crate::chat_service::retry_checkpoint_gap(
+                &value.state.bridge_state,
+                &crate::chat_runtime::CheckpointGapRetryApproval {
+                    expected_gap_sha256: &value.expected_gap_sha256,
+                    expected_checkpoint_sha256: &value.expected_checkpoint_sha256,
+                    expected_configuration_sha256: &value.expected_configuration_sha256,
+                    keep_cursor: &value.keep_cursor,
+                    evidence_path: &value.evidence_file,
+                    evidence_sha256: &value.evidence_sha256,
+                },
+            )
+            .map_err(Failure::Chat)?;
+            write_json(&result).map_err(Failure::Output)?;
+            Ok(0)
+        }
         ChatCommand::Inspect(value) => {
             let result =
                 crate::chat_service::inspect_request(&value.state.bridge_state, &value.request)
@@ -1319,6 +1361,40 @@ mod tests {
         for required in ["--bridge-state", "--channel-id", "--request-id", "--file"] {
             assert!(help.contains(required));
         }
+        let retry = Cli::try_parse_from([
+            "agentctl",
+            "chat",
+            "retry-checkpoint-gap",
+            "--bridge-state",
+            "/tmp/chat-state",
+            "--expected-gap-sha256",
+            &"a".repeat(64),
+            "--expected-checkpoint-sha256",
+            &"b".repeat(64),
+            "--expected-configuration-sha256",
+            &"c".repeat(64),
+            "--keep-cursor",
+            "cursor-safe",
+            "--evidence-file",
+            "/tmp/evidence.json",
+            "--evidence-sha256",
+            &"d".repeat(64),
+        ])
+        .expect("parse explicit checkpoint retry");
+        assert!(matches!(
+            retry.command,
+            Some(Commands::Chat(Chat {
+                command: ChatCommand::RetryCheckpointGap(_),
+            }))
+        ));
+        assert!(Cli::try_parse_from([
+            "agentctl",
+            "chat",
+            "retry-checkpoint-gap",
+            "--bridge-state",
+            "/tmp/chat-state",
+        ])
+        .is_err());
         let inspect = Cli::try_parse_from([
             "agentctl",
             "chat",

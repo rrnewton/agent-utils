@@ -199,6 +199,14 @@ pub fn status(state_root: &Path) -> Result<Value, ChatServiceError> {
     Ok(BridgeState::inspect(state_root)?.status()?)
 }
 
+/// Approve an operator-reviewed checkpoint retry without provider or coordinator access.
+pub fn retry_checkpoint_gap(
+    state_root: &Path,
+    request: &chat_runtime::CheckpointGapRetryApproval<'_>,
+) -> Result<Value, ChatServiceError> {
+    Ok(BridgeState::inspect(state_root)?.approve_checkpoint_gap_retry(request)?)
+}
+
 /// Inspect one exact active retained request without writes or external service access.
 pub fn inspect_request(state_root: &Path, key: &str) -> Result<Value, ChatServiceError> {
     Ok(BridgeState::inspect(state_root)?.inspect_request(key)?)

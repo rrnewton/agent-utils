@@ -26,7 +26,7 @@ use chat_subscription::{
 };
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::agent::{self, DrainOptions, QueueMessageState};
@@ -77,6 +77,9 @@ const MAX_RETIREMENT_RECORD_BYTES: usize = 256 * 1_024;
 const MAX_RETIREMENT_CHUNK_BYTES: usize = 256 * 1_024;
 const MAX_COMMIT_RECEIPT_BYTES: usize = 64 * 1_024;
 const MAX_GAP_DIAGNOSTIC_BYTES: usize = 64 * 1_024;
+const MAX_GAP_RETRY_EVIDENCE_BYTES: usize = 64 * 1_024;
+const MAX_GAP_RETRY_BYTES: usize = 512 * 1_024;
+const MAX_GAP_RETRIES: usize = 64;
 const MAX_ADMISSION_INTENT_BYTES: usize = 1_024 * 1_024;
 /// Stable read-only JSON schema emitted by `agentctl chat inspect`.
 pub const REQUEST_INSPECTION_SCHEMA: &str = "agentctl-chat-request-inspection/v1";
@@ -655,6 +658,125 @@ impl GapDiagnostic {
         }
         Ok(())
     }
+}
+
+/// Explicit operator approval to retry one unchanged committed checkpoint after a gap.
+pub struct CheckpointGapRetryApproval<'a> {
+    /// SHA256 of the exact unresolved gap document reviewed by the operator.
+    pub expected_gap_sha256: &'a str,
+    /// SHA256 of the exact durable checkpoint document reviewed by the operator.
+    pub expected_checkpoint_sha256: &'a str,
+    /// SHA256 of the exact configuration naming the reviewed plugin and channels.
+    pub expected_configuration_sha256: &'a str,
+    /// Existing opaque cursor to preserve, never a replacement cursor.
+    pub keep_cursor: &'a str,
+    /// Private bounded JSON object containing operator-reviewed provider evidence.
+    pub evidence_path: &'a Path,
+    /// SHA256 of the exact evidence file bytes reviewed by the operator.
+    pub evidence_sha256: &'a str,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointGapRetryRecord {
+    version: u32,
+    gap_json: String,
+    gap_sha256: String,
+    checkpoint_json: String,
+    checkpoint_sha256: String,
+    committed_receipt_json: String,
+    configuration_sha256: String,
+    evidence_json: String,
+    evidence_sha256: String,
+    approved_at_millis: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    superseded_by: Option<String>,
+}
+
+impl CheckpointGapRetryRecord {
+    fn validate(&self) -> Result<(GapDiagnostic, Checkpoint, CommitReceipt)> {
+        if self.version != STATE_VERSION
+            || self.approved_at_millis == 0
+            || !valid_key(&self.configuration_sha256)
+            || self.gap_json.len() > MAX_GAP_DIAGNOSTIC_BYTES
+            || self.checkpoint_json.len() > 1 << 20
+            || self.committed_receipt_json.len() > MAX_COMMIT_RECEIPT_BYTES
+            || self.evidence_json.len() > MAX_GAP_RETRY_EVIDENCE_BYTES
+            || bytes_sha256(self.gap_json.as_bytes()) != self.gap_sha256
+            || bytes_sha256(self.checkpoint_json.as_bytes()) != self.checkpoint_sha256
+            || bytes_sha256(self.evidence_json.as_bytes()) != self.evidence_sha256
+        {
+            return Err(ChatRuntimeError::invalid(
+                "invalid checkpoint gap retry audit",
+            ));
+        }
+        let gap: GapDiagnostic = decode_document(self.gap_json.as_bytes())?;
+        let checkpoint: Checkpoint = decode_document(self.checkpoint_json.as_bytes())?;
+        let receipt: CommitReceipt = decode_document(self.committed_receipt_json.as_bytes())?;
+        let evidence: Value = decode_document(self.evidence_json.as_bytes())?;
+        gap.validate()?;
+        validate_checkpoint(&checkpoint)?;
+        receipt.validate()?;
+        validate_checkpoint_only_boundary(&checkpoint, &receipt)?;
+        if gap.phase != GapPhase::Unresolved
+            || gap.reasons.len() != 1
+            || gap.resume_cursor != checkpoint.cursor
+            || Some(gap.proposed_cursor.as_str()) != checkpoint.cursor.as_deref()
+            || !checkpoint.reconciliation_required
+            || !checkpoint.boundary_ever_committed
+            || receipt.phase != CommitReceiptPhase::Committed
+            || !evidence
+                .as_object()
+                .is_some_and(|object| !object.is_empty())
+        {
+            return Err(ChatRuntimeError::invalid(
+                "gap retry requires an unchanged committed checkpoint-only boundary and explicit evidence",
+            ));
+        }
+        if self
+            .superseded_by
+            .as_deref()
+            .is_some_and(|digest| !valid_key(digest))
+        {
+            return Err(ChatRuntimeError::invalid("invalid superseding gap digest"));
+        }
+        Ok((gap, checkpoint, receipt))
+    }
+}
+
+fn validate_checkpoint_only_boundary(
+    checkpoint: &Checkpoint,
+    receipt: &CommitReceipt,
+) -> Result<()> {
+    let cursor = checkpoint.cursor.as_deref().ok_or_else(|| {
+        ChatRuntimeError::invalid("checkpoint gap retry requires an existing cursor")
+    })?;
+    let fingerprint = checkpoint_only_fingerprint(cursor)?;
+    if checkpoint.host_batch_sequence == 0
+        || checkpoint.boundary_batch_fingerprint.as_deref() != Some(fingerprint.as_str())
+        || checkpoint.boundary_event_count != 1
+        || !checkpoint.boundary_messages.is_empty()
+        || receipt.host_batch_sequence != checkpoint.host_batch_sequence
+        || receipt.cursor != cursor
+        || receipt.event_count != 1
+        || receipt.batch_fingerprint != fingerprint
+    {
+        return Err(ChatRuntimeError::invalid(
+            "gap retry requires the exact checkpoint-only boundary and matching receipt",
+        ));
+    }
+    Ok(())
+}
+
+fn checkpoint_only_fingerprint(cursor: &str) -> Result<String> {
+    Ok(bytes_sha256(&serde_json::to_vec(&serde_json::json!({
+        "cursor": cursor,
+        "events": [{"kind": "checkpoint"}],
+    }))?))
+}
+
+fn bytes_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3086,6 +3208,7 @@ impl BridgeState {
             checkpoint.updated_at_millis = unix_millis();
             write_document(&self.root.join("checkpoint.json"), checkpoint)?;
         }
+        self.complete_checkpoint_gap_retry_locked(checkpoint, &receipt)?;
         Ok(())
     }
 
@@ -3303,16 +3426,283 @@ impl BridgeState {
 
     /// Build the next subscription request from durable replay authority.
     pub fn subscribe_request(&self) -> Result<SubscribeRequest> {
+        let _snapshot = self.lock_state_snapshot()?;
+        let checkpoint = self.read_checkpoint()?;
         if let Some(gap) = self.gap_diagnostic()? {
-            if gap.phase == GapPhase::Unresolved {
+            if gap.phase == GapPhase::Unresolved
+                && self
+                    .active_checkpoint_gap_retry(&gap, &checkpoint)?
+                    .is_none()
+            {
                 return Err(ChatRuntimeError::UnresolvedGap(format!(
                     "sequence {} delivery {:?} remains unresolved; automatic reconnect is refused",
                     gap.provider_sequence, gap.delivery_id
                 )));
             }
         }
-        let checkpoint = self.read_checkpoint()?;
         self.config.subscribe_request(checkpoint.cursor.as_deref())
+    }
+
+    /// Approve one checkpoint-only replay, preserving the unresolved gap until provider commit.
+    ///
+    /// Provider evidence is an explicit operator attestation. Local state hashes and the exact
+    /// committed checkpoint are verified here; the backend must independently enforce its safe
+    /// retention-boundary retry policy. This cannot accept loss or select a new cursor.
+    pub fn approve_checkpoint_gap_retry(
+        &self,
+        request: &CheckpointGapRetryApproval<'_>,
+    ) -> Result<Value> {
+        for digest in [
+            request.expected_gap_sha256,
+            request.expected_checkpoint_sha256,
+            request.expected_configuration_sha256,
+            request.evidence_sha256,
+        ] {
+            if !valid_key(digest) {
+                return Err(ChatRuntimeError::invalid(
+                    "retry approval requires lowercase SHA256 pins",
+                ));
+            }
+        }
+        let runner = open_existing_private_state_lock(&self.root.join(".run.lock"))?;
+        runner.try_lock_exclusive().map_err(|error| {
+            ChatRuntimeError::invalid(format!("gap retry requires a stopped runner: {error}"))
+        })?;
+        let state_lock = open_existing_private_state_lock(&self.root.join(".state.lock"))?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let gap_bytes = read_artifact_bytes(&self.root.join("gap.json"), MAX_GAP_DIAGNOSTIC_BYTES)?;
+        let checkpoint_bytes = read_artifact_bytes(&self.root.join("checkpoint.json"), 1 << 20)?;
+        let configuration_bytes = read_artifact_bytes(&self.root.join("bridge.json"), 1 << 20)?;
+        let evidence_bytes =
+            read_artifact_bytes(request.evidence_path, MAX_GAP_RETRY_EVIDENCE_BYTES)?;
+        if bytes_sha256(&gap_bytes) != request.expected_gap_sha256
+            || bytes_sha256(&checkpoint_bytes) != request.expected_checkpoint_sha256
+            || bytes_sha256(&configuration_bytes) != request.expected_configuration_sha256
+            || bytes_sha256(&evidence_bytes) != request.evidence_sha256
+        {
+            return Err(ChatRuntimeError::invalid(
+                "gap retry inputs differ from the reviewed SHA256 pins",
+            ));
+        }
+        self.verify_gap_retry_configuration(&configuration_bytes)?;
+        if !path_is_absent(&self.admission_path())? {
+            return Err(ChatRuntimeError::invalid(
+                "gap retry refuses an unfinished admission transaction",
+            ));
+        }
+        let checkpoint: Checkpoint = decode_document(&checkpoint_bytes)?;
+        if checkpoint.cursor.as_deref() != Some(request.keep_cursor) {
+            return Err(ChatRuntimeError::invalid(
+                "gap retry must keep the existing cursor",
+            ));
+        }
+        let receipt_bytes = read_artifact_bytes(
+            &self.commit_receipt_path(checkpoint.host_batch_sequence),
+            MAX_COMMIT_RECEIPT_BYTES,
+        )?;
+        let as_text = |bytes| {
+            String::from_utf8(bytes)
+                .map_err(|_| ChatRuntimeError::invalid("gap retry input is not UTF-8 JSON"))
+        };
+        let record = CheckpointGapRetryRecord {
+            version: STATE_VERSION,
+            gap_json: as_text(gap_bytes)?,
+            gap_sha256: request.expected_gap_sha256.to_owned(),
+            checkpoint_json: as_text(checkpoint_bytes)?,
+            checkpoint_sha256: request.expected_checkpoint_sha256.to_owned(),
+            committed_receipt_json: as_text(receipt_bytes)?,
+            configuration_sha256: request.expected_configuration_sha256.to_owned(),
+            evidence_json: as_text(evidence_bytes)?,
+            evidence_sha256: request.evidence_sha256.to_owned(),
+            approved_at_millis: unix_millis(),
+            superseded_by: None,
+        };
+        let (gap, _, _) = record.validate()?;
+        let path = self.checkpoint_gap_retry_path(&gap)?;
+        if !path_is_absent(&path)? {
+            let existing = self
+                .read_checkpoint_gap_retry(&gap)?
+                .ok_or_else(|| ChatRuntimeError::invalid("gap retry audit disappeared"))?;
+            if existing.superseded_by.is_some()
+                || existing.gap_sha256 != record.gap_sha256
+                || existing.checkpoint_sha256 != record.checkpoint_sha256
+                || existing.configuration_sha256 != record.configuration_sha256
+                || existing.evidence_sha256 != record.evidence_sha256
+                || existing.committed_receipt_json != record.committed_receipt_json
+            {
+                return Err(ChatRuntimeError::invalid(
+                    "gap retry already has a different or revoked approval",
+                ));
+            }
+            return Ok(
+                json!({"retry_approved": true, "resolved": false, "cursor": request.keep_cursor,
+                "evidence_sha256": existing.evidence_sha256, "audit": path}),
+            );
+        }
+        if encoded_document_bytes(&record)? > MAX_GAP_RETRY_BYTES - 256 {
+            return Err(ChatRuntimeError::invalid(
+                "gap retry audit exceeds its byte bound",
+            ));
+        }
+        let directory = self.root.join("gap-retries");
+        if !path_is_absent(&directory)? {
+            agent::validate_private_directory(&directory, "gap retry audit directory", false)?;
+            if fs::read_dir(&directory)?.count() >= MAX_GAP_RETRIES {
+                return Err(ChatRuntimeError::invalid("gap retry audit history is full"));
+            }
+        } else {
+            agent::create_private_directory(&directory, "gap retry audit directory", false, true)?;
+            agent::sync_directory(&self.root)?;
+        }
+        // This one atomic audit write is the approval. Gap/checkpoint/request bytes do not change.
+        write_document(&path, &record)?;
+        self.confirm_boundary()?;
+        Ok(
+            json!({"retry_approved": true, "resolved": false, "cursor": request.keep_cursor,
+            "evidence_sha256": record.evidence_sha256, "audit": path}),
+        )
+    }
+
+    fn checkpoint_gap_retry_path(&self, gap: &GapDiagnostic) -> Result<PathBuf> {
+        let mut original = gap.clone();
+        original.phase = GapPhase::Unresolved;
+        original.resolved_at_millis = None;
+        original.resolved_host_batch_sequence = None;
+        let identity = bytes_sha256(&serde_json::to_vec(&original)?);
+        Ok(self
+            .root
+            .join("gap-retries")
+            .join(format!("{identity}.json")))
+    }
+
+    fn read_checkpoint_gap_retry(
+        &self,
+        gap: &GapDiagnostic,
+    ) -> Result<Option<CheckpointGapRetryRecord>> {
+        let directory = self.root.join("gap-retries");
+        if path_is_absent(&directory)? {
+            return Ok(None);
+        }
+        agent::validate_private_directory(&directory, "gap retry audit directory", false)?;
+        let path = self.checkpoint_gap_retry_path(gap)?;
+        let record: CheckpointGapRetryRecord = match read_document(&path, MAX_GAP_RETRY_BYTES) {
+            Ok(record) => record,
+            Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        };
+        let (original, _, _) = record.validate()?;
+        let mut normalized = gap.clone();
+        normalized.phase = GapPhase::Unresolved;
+        normalized.resolved_at_millis = None;
+        normalized.resolved_host_batch_sequence = None;
+        if original != normalized {
+            return Err(ChatRuntimeError::invalid(
+                "gap retry audit does not match its incident",
+            ));
+        }
+        Ok(Some(record))
+    }
+
+    fn active_checkpoint_gap_retry(
+        &self,
+        gap: &GapDiagnostic,
+        checkpoint: &Checkpoint,
+    ) -> Result<Option<CheckpointGapRetryRecord>> {
+        let Some(record) = self.read_checkpoint_gap_retry(gap)? else {
+            return Ok(None);
+        };
+        if record.superseded_by.is_some() {
+            return Ok(None);
+        }
+        let (_, original, _) = record.validate()?;
+        let receipt = self
+            .current_commit_receipt(checkpoint)?
+            .ok_or_else(|| ChatRuntimeError::invalid("approved retry lost its current receipt"))?;
+        validate_checkpoint_only_boundary(checkpoint, &receipt)?;
+        let configuration = read_artifact_bytes(&self.root.join("bridge.json"), 1 << 20)?;
+        self.verify_gap_retry_configuration(&configuration)?;
+        if checkpoint.cursor != original.cursor
+            || checkpoint.host_batch_sequence < original.host_batch_sequence
+            || bytes_sha256(&configuration) != record.configuration_sha256
+        {
+            return Err(ChatRuntimeError::invalid(
+                "approved retry authority changed",
+            ));
+        }
+        Ok(Some(record))
+    }
+
+    fn verify_gap_retry_configuration(&self, bytes: &[u8]) -> Result<()> {
+        let envelope: ConfigurationEnvelope = decode_document(bytes)?;
+        envelope.config.validate()?;
+        if envelope.version != STATE_VERSION || envelope.config != self.config {
+            return Err(ChatRuntimeError::invalid(
+                "gap retry configuration differs from this runtime's authority",
+            ));
+        }
+        Ok(())
+    }
+
+    fn revoke_checkpoint_gap_retry_locked(&self, replacement: &GapDiagnostic) -> Result<()> {
+        let Some(current) = self.gap_diagnostic()? else {
+            return Ok(());
+        };
+        let Some(mut record) = self.read_checkpoint_gap_retry(&current)? else {
+            return Ok(());
+        };
+        if record.superseded_by.is_none() {
+            record.superseded_by = Some(bytes_sha256(&serde_json::to_vec(replacement)?));
+            if encoded_document_bytes(&record)? > MAX_GAP_RETRY_BYTES {
+                return Err(ChatRuntimeError::invalid(
+                    "revoked gap retry audit exceeds its byte bound",
+                ));
+            }
+            // Revoke before publishing another gap, including byte-identical incidents.
+            write_document(&self.checkpoint_gap_retry_path(&current)?, &record)?;
+        }
+        Ok(())
+    }
+
+    fn complete_checkpoint_gap_retry_locked(
+        &self,
+        checkpoint: &mut Checkpoint,
+        receipt: &CommitReceipt,
+    ) -> Result<()> {
+        if !checkpoint.reconciliation_required || receipt.phase != CommitReceiptPhase::Committed {
+            return Ok(());
+        }
+        let Some(mut gap) = self.gap_diagnostic()? else {
+            return Ok(());
+        };
+        let Some(record) = self.active_checkpoint_gap_retry(&gap, checkpoint)? else {
+            return Ok(());
+        };
+        let (_, original, _) = record.validate()?;
+        if receipt.host_batch_sequence <= original.host_batch_sequence {
+            return Ok(());
+        }
+        if gap.phase == GapPhase::Resolved {
+            if gap.resolved_host_batch_sequence != Some(receipt.host_batch_sequence) {
+                return Err(ChatRuntimeError::invalid(
+                    "resolved retry does not match its committed replay receipt",
+                ));
+            }
+        } else {
+            gap.phase = GapPhase::Resolved;
+            gap.resolved_at_millis = receipt.committed_at_millis;
+            gap.resolved_host_batch_sequence = Some(receipt.host_batch_sequence);
+            gap.validate()?;
+            write_document(&self.root.join("gap.json"), &gap)?;
+            self.confirm_boundary()?;
+        }
+        // A crash after gap resolution is repaired only from this same new Committed receipt.
+        checkpoint.reconciliation_required = false;
+        checkpoint.updated_at_millis = unix_millis();
+        write_document(&self.root.join("checkpoint.json"), checkpoint)?;
+        self.confirm_boundary()?;
+        Ok(())
     }
 
     /// Acquire the generation-wide owner lease. The wrapper must remain live until shutdown.
@@ -3366,6 +3756,7 @@ impl BridgeState {
                 resolved_host_batch_sequence: None,
             };
             diagnostic.validate()?;
+            self.revoke_checkpoint_gap_retry_locked(&diagnostic)?;
             write_document(&self.root.join("gap.json"), &diagnostic)?;
             checkpoint.reconciliation_required = true;
             checkpoint.updated_at_millis = unix_millis();
@@ -3375,6 +3766,23 @@ impl BridgeState {
                 batch.sequence().get(),
                 batch.delivery_id().as_str()
             )));
+        }
+        if let Some(gap) = self.gap_diagnostic()? {
+            if gap.phase == GapPhase::Unresolved {
+                let approved = self
+                    .active_checkpoint_gap_retry(&gap, &checkpoint)?
+                    .is_some();
+                if !approved
+                    || checkpoint.cursor.as_deref() != Some(batch.cursor().as_str())
+                    || batch.events() != [CommittableEvent::Checkpoint]
+                    || checkpoint.boundary_batch_fingerprint.as_deref()
+                        != Some(batch_fingerprint.as_str())
+                {
+                    return Err(ChatRuntimeError::UnresolvedGap(
+                        "unresolved gap permits only its explicitly approved identical checkpoint replay".to_owned(),
+                    ));
+                }
+            }
         }
         let mut restore_guard = None;
         match read_document::<AdmissionIntent>(&self.admission_path(), MAX_ADMISSION_INTENT_BYTES) {
@@ -3722,6 +4130,7 @@ impl BridgeState {
         checkpoint.updated_at_millis = unix_millis();
         write_document(&self.root.join("checkpoint.json"), &checkpoint)?;
         self.confirm_boundary()?;
+        self.complete_checkpoint_gap_retry_locked(&mut checkpoint, &receipt)?;
         let boundary_keys = checkpoint
             .boundary_messages
             .iter()
@@ -3741,6 +4150,12 @@ impl BridgeState {
         let unresolved_gap = gap
             .as_ref()
             .is_some_and(|diagnostic| diagnostic.phase == GapPhase::Unresolved);
+        let gap_retry =
+            if let Some(gap) = gap.as_ref().filter(|gap| gap.phase == GapPhase::Unresolved) {
+                self.active_checkpoint_gap_retry(gap, &checkpoint)?
+            } else {
+                None
+            };
         let commit_receipt = self.current_commit_receipt(&checkpoint)?;
         let latest_commit_confirmed = commit_receipt
             .as_ref()
@@ -3794,7 +4209,9 @@ impl BridgeState {
                 "healthy": !unresolved_gap,
                 "durable_batch_verified": latest_commit_confirmed && !unresolved_gap,
                 "latest_commit_receipt": commit_receipt,
-                "basis": if unresolved_gap {
+                "basis": if gap_retry.is_some() {
+                    "operator approved an identical checkpoint retry; provider commit has not resolved the gap"
+                } else if unresolved_gap {
                     "the provider declared a gap; no commit was sent and automatic reconnect is refused"
                 } else {
                     "provider-free durable status; use the service manager for current process liveness"
@@ -3802,6 +4219,8 @@ impl BridgeState {
             },
             "reconciliation_required": checkpoint.reconciliation_required,
             "unresolved_gap": gap,
+            "gap_retry_approved": gap_retry.is_some(),
+            "gap_retry_evidence_sha256": gap_retry.as_ref().map(|retry| &retry.evidence_sha256),
             "reply_count": checkpoint.reply_count,
             "reply_bytes": checkpoint.reply_bytes,
             "retired_route_count": checkpoint.retired_route_count,
@@ -7148,6 +7567,18 @@ fn read_document_sized<T: for<'de> Deserialize<'de>>(
     path: &Path,
     maximum: usize,
 ) -> Result<(T, u64)> {
+    let bytes = read_artifact_bytes(path, maximum)?;
+    let size = u64::try_from(bytes.len())
+        .map_err(|_| ChatRuntimeError::invalid("chat artifact size exceeds u64"))?;
+    Ok((decode_document(&bytes)?, size))
+}
+
+fn decode_document<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T> {
+    chat_subscription_plugin::decode_strict_json(bytes)
+        .map_err(|error| ChatRuntimeError::invalid(error.to_string()))
+}
+
+fn read_artifact_bytes(path: &Path, maximum: usize) -> Result<Vec<u8>> {
     let mut file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
@@ -7184,9 +7615,7 @@ fn read_document_sized<T: for<'de> Deserialize<'de>>(
             path.display()
         )));
     }
-    let document = chat_subscription_plugin::decode_strict_json(&bytes)
-        .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
-    Ok((document, metadata.len()))
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -8635,6 +9064,373 @@ mod tests {
             assert_eq!(chunk.retirement_sequence, retirement.retirement_sequence);
         }
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    fn checkpoint_delivery(sequence: u64, cursor: &str) -> DeliveryBatch {
+        DeliveryBatch::new(
+            EventSequence::new(sequence).expect("sequence"),
+            ProviderCursor::new(cursor).expect("cursor"),
+            DeliveryId::new(format!("checkpoint-{sequence}")).expect("delivery"),
+            vec![CommittableEvent::Checkpoint],
+        )
+        .expect("checkpoint delivery")
+    }
+
+    fn checkpoint_gap_fixture(name: &str) -> BridgeState {
+        let root = temporary(name);
+        let state = BridgeState::initialize(&root, config()).expect("initialize");
+        drop(
+            state
+                .acquire_runner_lease()
+                .expect("create stopped runner authority"),
+        );
+        for index in 1..=2 {
+            let admission = state
+                .admit_batch(&indexed_delivery(index, index))
+                .expect("admit");
+            state.confirm_batch_commit(&admission).expect("commit");
+            let mut record = state
+                .read_request(&admission.new_request_keys[0])
+                .expect("request");
+            record.phase = RequestPhase::DeliveryUncertain;
+            record.ack_phase = AckPhase::Acked;
+            record.reaction_id = Some(format!("reaction-{index}"));
+            record.reaction_already_present = Some(false);
+            let mut checkpoint = state.read_checkpoint().expect("checkpoint");
+            state
+                .write_request_accounted(&record, &mut checkpoint)
+                .expect("save quarantine");
+            state
+                .persist_checkpoint(&mut checkpoint)
+                .expect("account quarantine");
+        }
+        let admission = state
+            .admit_batch(&checkpoint_delivery(3, "cursor-safe"))
+            .expect("checkpoint");
+        state
+            .confirm_batch_commit(&admission)
+            .expect("committed boundary");
+        assert!(matches!(
+            state.admit_batch(&gap_delivery(1, "cursor-safe", "gap-1")),
+            Err(ChatRuntimeError::UnresolvedGap(_))
+        ));
+        write_document(
+            &root.join("operator-evidence.json"),
+            &json!({"reviewed": "retained boundary"}),
+        )
+        .expect("private evidence");
+        state
+    }
+
+    fn approve_fixture_gap(state: &BridgeState, mismatch: Option<&str>) -> Result<Value> {
+        let pin = |name| bytes_sha256(&fs::read(state.root.join(name)).expect("pin input"));
+        let mut gap = pin("gap.json");
+        let mut checkpoint = pin("checkpoint.json");
+        let mut configuration = pin("bridge.json");
+        let mut evidence = pin("operator-evidence.json");
+        let wrong = "0".repeat(64);
+        match mismatch {
+            Some("gap") => gap = wrong,
+            Some("checkpoint") => checkpoint = wrong,
+            Some("configuration") => configuration = wrong,
+            Some("evidence") => evidence = wrong,
+            _ => {}
+        }
+        state.approve_checkpoint_gap_retry(&CheckpointGapRetryApproval {
+            expected_gap_sha256: &gap,
+            expected_checkpoint_sha256: &checkpoint,
+            expected_configuration_sha256: &configuration,
+            evidence_path: &state.root.join("operator-evidence.json"),
+            evidence_sha256: &evidence,
+            keep_cursor: if mismatch == Some("cursor") {
+                "cursor-other"
+            } else {
+                "cursor-safe"
+            },
+        })
+    }
+
+    fn fixture_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut files = BTreeMap::new();
+        for entry in fs::read_dir(root).expect("fixture entries") {
+            let path = entry.expect("fixture entry").path();
+            if path.is_dir() {
+                files.extend(fixture_files(&path));
+            } else {
+                files.insert(path.clone(), fs::read(path).expect("fixture bytes"));
+            }
+        }
+        files
+    }
+
+    #[test]
+    fn checkpoint_gap_retry_preserves_quarantine_and_requires_new_exact_commit() {
+        let state = checkpoint_gap_fixture("gap-retry-commit");
+        let before = fixture_files(&state.root);
+        let original_sequence = state
+            .read_checkpoint()
+            .expect("checkpoint")
+            .host_batch_sequence;
+        let approval = approve_fixture_gap(&state, None).expect("approve retry");
+        assert_eq!(approval["resolved"], false);
+        for (path, bytes) in &before {
+            assert_eq!(
+                &fs::read(path).expect("unchanged artifact"),
+                bytes,
+                "{}",
+                path.display()
+            );
+        }
+        let approved_files = fixture_files(&state.root);
+        approve_fixture_gap(&state, None).expect("idempotent approval");
+        assert_eq!(fixture_files(&state.root), approved_files);
+        let status = state.status().expect("approved status");
+        assert_eq!(status["gap_retry_approved"], true);
+        assert_eq!(status["runtime_evidence"]["healthy"], false);
+        assert_eq!(
+            state
+                .subscribe_request()
+                .expect("retry subscription")
+                .resume_from()
+                .map(ProviderCursor::as_str),
+            Some("cursor-safe")
+        );
+
+        for forbidden in [
+            checkpoint_delivery(4, "cursor-later"),
+            indexed_delivery_at(4, 10, "cursor-safe", "new message"),
+            boundary_delivery_at(4, 10, "cursor-safe", "mixed boundary"),
+        ] {
+            assert!(matches!(
+                state.admit_batch(&forbidden),
+                Err(ChatRuntimeError::UnresolvedGap(_))
+            ));
+            assert_eq!(fixture_files(&state.root), approved_files);
+        }
+        let admission = state
+            .admit_batch(&checkpoint_delivery(4, "cursor-safe"))
+            .expect("exact replay");
+        assert!(admission.new_request_keys.is_empty());
+        assert!(admission.host_batch_sequence > original_sequence);
+        assert!(
+            state
+                .read_checkpoint()
+                .expect("prepared")
+                .boundary_ever_committed
+        );
+        assert!(
+            state
+                .read_checkpoint()
+                .expect("prepared")
+                .reconciliation_required
+        );
+        let reopened = BridgeState::open(&state.root).expect("recover Prepared replay");
+        assert_eq!(
+            reopened
+                .gap_diagnostic()
+                .expect("gap")
+                .expect("incident")
+                .phase,
+            GapPhase::Unresolved
+        );
+        reopened
+            .subscribe_request()
+            .expect("Prepared replay stays retryable");
+        // The old committed-boundary bit and a Prepared receipt never resolve the incident.
+        let admission = reopened
+            .admit_batch(&checkpoint_delivery(5, "cursor-safe"))
+            .expect("replay after restart");
+        reopened
+            .confirm_batch_commit(&admission)
+            .expect("new exact Committed receipt");
+        let checkpoint = reopened.read_checkpoint().expect("resolved checkpoint");
+        assert_eq!(checkpoint.cursor.as_deref(), Some("cursor-safe"));
+        assert!(!checkpoint.reconciliation_required);
+        let gap = reopened
+            .gap_diagnostic()
+            .expect("gap")
+            .expect("retained incident");
+        assert_eq!(gap.phase, GapPhase::Resolved);
+        assert_eq!(
+            gap.resolved_host_batch_sequence,
+            Some(admission.host_batch_sequence)
+        );
+        assert_eq!(
+            reopened.status().expect("status")["phases"]["delivery_uncertain"],
+            2
+        );
+        assert_eq!(
+            reopened.status().expect("status")["acknowledgements"]["acked"],
+            2
+        );
+        assert_eq!(checkpoint.reply_count, 0);
+        assert!(reopened
+            .pending_work_keys()
+            .expect("pending delivery")
+            .is_empty());
+        assert!(reopened.pending_ack_keys().expect("pending ACK").is_empty());
+        for (path, bytes) in before
+            .iter()
+            .filter(|(path, _)| path.parent() == Some(state.root.join("requests").as_path()))
+        {
+            assert_eq!(&fs::read(path).expect("request and UUID bytes"), bytes);
+        }
+        fs::remove_dir_all(&state.root).expect("cleanup");
+    }
+
+    #[test]
+    fn checkpoint_gap_retry_rejects_changed_pins_live_lease_and_unbounded_evidence_without_writes()
+    {
+        let state = checkpoint_gap_fixture("gap-retry-refusals");
+        for mismatch in ["gap", "checkpoint", "configuration", "evidence", "cursor"] {
+            let before = fixture_files(&state.root);
+            assert!(
+                approve_fixture_gap(&state, Some(mismatch)).is_err(),
+                "{mismatch}"
+            );
+            assert_eq!(fixture_files(&state.root), before, "{mismatch}");
+        }
+        let lease = state.acquire_runner_lease().expect("live runner");
+        let before = fixture_files(&state.root);
+        assert!(approve_fixture_gap(&state, None)
+            .expect_err("live lease")
+            .to_string()
+            .contains("stopped runner"));
+        assert_eq!(fixture_files(&state.root), before);
+        drop(lease);
+        for evidence in [
+            json!({}),
+            json!({"large": "x".repeat(MAX_GAP_RETRY_EVIDENCE_BYTES)}),
+        ] {
+            write_document(&state.root.join("operator-evidence.json"), &evidence)
+                .expect("evidence");
+            let before = fixture_files(&state.root);
+            assert!(approve_fixture_gap(&state, None).is_err());
+            assert_eq!(fixture_files(&state.root), before);
+        }
+        fs::remove_dir_all(&state.root).expect("cleanup");
+    }
+
+    #[test]
+    fn checkpoint_gap_retry_refuses_message_fingerprints_and_uncommitted_boundary() {
+        for variant in ["message", "ignored-message", "prepared"] {
+            let state = checkpoint_gap_fixture(&format!("gap-retry-{variant}"));
+            let mut checkpoint = state.read_checkpoint().expect("checkpoint");
+            let path = state.commit_receipt_path(checkpoint.host_batch_sequence);
+            let mut receipt: CommitReceipt =
+                read_document(&path, MAX_COMMIT_RECEIPT_BYTES).expect("receipt");
+            if variant == "prepared" {
+                receipt.phase = CommitReceiptPhase::Prepared;
+                receipt.committed_at_millis = None;
+            } else {
+                // Even an ignored Message leaves no actionable requests; its canonical full
+                // fingerprint must still forbid treating it as a checkpoint-only boundary.
+                let message = indexed_delivery_at(3, 42, "cursor-safe", variant);
+                let fingerprint = batch_fingerprint(&message).expect("message fingerprint");
+                checkpoint.boundary_batch_fingerprint = Some(fingerprint.clone());
+                receipt.batch_fingerprint = fingerprint;
+                if variant == "message" {
+                    checkpoint.boundary_messages.push(BoundaryMessageGuard {
+                        request_key: "a".repeat(64),
+                        message_fingerprint: "b".repeat(64),
+                    });
+                }
+            }
+            write_document(&path, &receipt).expect("receipt");
+            write_document(&state.root.join("checkpoint.json"), &checkpoint).expect("checkpoint");
+            let before = fixture_files(&state.root);
+            assert!(approve_fixture_gap(&state, None).is_err(), "{variant}");
+            assert_eq!(fixture_files(&state.root), before);
+            fs::remove_dir_all(&state.root).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn checkpoint_gap_retry_rejects_stale_configuration_before_approval_or_subscribe() {
+        let stale = checkpoint_gap_fixture("gap-retry-stale-config");
+        let mut envelope: ConfigurationEnvelope =
+            read_document(&stale.root.join("bridge.json"), 1 << 20).expect("configuration");
+        envelope.config.subscription_plugin = "other-fixture".to_owned();
+        write_document(&stale.root.join("bridge.json"), &envelope)
+            .expect("replace stopped configuration");
+        let before = fixture_files(&stale.root);
+        assert!(approve_fixture_gap(&stale, None).is_err());
+        assert_eq!(fixture_files(&stale.root), before);
+        let current = BridgeState::inspect(&stale.root).expect("current configuration");
+        approve_fixture_gap(&current, None).expect("approve current configuration");
+        let approved = fixture_files(&stale.root);
+        assert!(stale.subscribe_request().is_err());
+        assert_eq!(fixture_files(&stale.root), approved);
+        current
+            .subscribe_request()
+            .expect("approved configuration subscribes");
+        fs::remove_dir_all(&stale.root).expect("cleanup");
+    }
+
+    #[test]
+    fn checkpoint_gap_retry_crashes_repair_only_from_the_new_committed_receipt() {
+        for fault in 0..4 {
+            let state = checkpoint_gap_fixture(&format!("gap-retry-crash-{fault}"));
+            approve_fixture_gap(&state, None).expect("approve");
+            let gap_before = state.gap_diagnostic().expect("gap").expect("incident");
+            let audit_path = state
+                .checkpoint_gap_retry_path(&gap_before)
+                .expect("audit path");
+            let audit_before = fs::read(&audit_path).expect("audit");
+            let admission = state
+                .admit_batch(&checkpoint_delivery(4, "cursor-safe"))
+                .expect("exact replay");
+            *state.confirm_fault_after.lock().expect("fault") = Some(fault);
+            assert!(
+                state.confirm_batch_commit(&admission).is_err(),
+                "fault {fault}"
+            );
+            let reopened = BridgeState::open(&state.root).expect("repair exact committed receipt");
+            let checkpoint = reopened.read_checkpoint().expect("checkpoint");
+            assert_eq!(checkpoint.cursor.as_deref(), Some("cursor-safe"));
+            assert!(!checkpoint.reconciliation_required, "fault {fault}");
+            let gap = reopened.gap_diagnostic().expect("gap").expect("incident");
+            assert_eq!(gap.phase, GapPhase::Resolved);
+            assert_eq!(
+                gap.resolved_host_batch_sequence,
+                Some(admission.host_batch_sequence)
+            );
+            assert_eq!(fs::read(audit_path).expect("retained audit"), audit_before);
+            reopened
+                .subscribe_request()
+                .expect("normal subscribe after repair");
+            fs::remove_dir_all(&state.root).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn checkpoint_gap_retry_approval_crash_is_idempotent_and_fresh_gap_revokes_it() {
+        let state = checkpoint_gap_fixture("gap-retry-revocation");
+        *state.confirm_fault_after.lock().expect("fault") = Some(0);
+        assert!(approve_fixture_gap(&state, None).is_err());
+        approve_fixture_gap(&state, None).expect("recover committed approval");
+        let original = state.gap_diagnostic().expect("gap").expect("incident");
+        let audit_path = state.checkpoint_gap_retry_path(&original).expect("path");
+        let audit_before = state
+            .read_checkpoint_gap_retry(&original)
+            .expect("audit")
+            .expect("record");
+        assert!(matches!(
+            state.admit_batch(&gap_delivery(2, "cursor-safe", "gap-again")),
+            Err(ChatRuntimeError::UnresolvedGap(_))
+        ));
+        let revoked: CheckpointGapRetryRecord =
+            read_document(&audit_path, MAX_GAP_RETRY_BYTES).expect("revoked audit");
+        assert!(revoked.superseded_by.is_some());
+        assert_eq!(revoked.gap_json, audit_before.gap_json);
+        assert_eq!(revoked.evidence_json, audit_before.evidence_json);
+        assert!(state.subscribe_request().is_err());
+        assert_eq!(state.status().expect("status")["gap_retry_approved"], false);
+        // Even an identical incident cannot regain authority from the old sidecar.
+        write_document(&state.root.join("gap.json"), &original).expect("identical diagnostic");
+        assert!(state.subscribe_request().is_err());
+        assert!(approve_fixture_gap(&state, None).is_err());
+        fs::remove_dir_all(&state.root).expect("cleanup");
     }
 
     #[test]
