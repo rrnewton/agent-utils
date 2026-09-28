@@ -118,10 +118,13 @@ agentctl --registry /work/project/.agentctl chat run \
 
 `run` owns an exclusive state lease. Provider intake blocks on the plugin event
 stream; it does not poll a REST listing. Terminal reply capture blocks on
-Herdr's `events.subscribe` socket with one bounded generic closing-fence
-predicate, then routes the exact reply ID through the in-memory durable-state
-index. This supports a maximum-sized provider batch without exceeding Herdr's
-predicate limit. Provider notices and SIGINT/SIGTERM interrupt that wait through
+Herdr's `events.subscribe` socket with bounded groups of current closing-fence
+IDs and a generic predicate for unavailable IDs. The current groups rearm when
+reply routes change, so a consumed closing fence left on screen cannot mask the
+next reply. Exact IDs route through the in-memory durable-state index; all
+2,048 active requests fit within the subscription budget of 128 predicates,
+32 KiB per predicate and 96 KiB total. Provider notices and SIGINT/SIGTERM
+interrupt that wait through
 a local wake descriptor. A disk-backed terminal and delivery reconciliation
 occurs every 300 seconds by default and can be changed with
 `--reconcile-interval`.

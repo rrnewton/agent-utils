@@ -23,7 +23,7 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::{Handle as SignalHandle, Signals};
 
 use crate::agent::{AgentError, AgentRuntime, DrainOptions, QueueMessageState};
-use crate::chat_events::{PaneEvent, PaneEventStream, PaneEventWake};
+use crate::chat_events::{self, PaneEvent, PaneEventStream, PaneEventWake};
 use crate::chat_runtime::{
     self, AckResult, BridgeConfiguration, BridgeState, ChatRuntimeError, CommandOutboundTransport,
     CoordinatorDeliveryResult, OutboundCancellation, OutboundFailure, ReplyRoute, ReplyRouteEntry,
@@ -1289,8 +1289,50 @@ impl RouteCache {
             .is_some_and(|(nonce, _)| self.by_nonce.contains_key(nonce))
     }
 
-    fn patterns(&self) -> Vec<String> {
-        vec![r"^[^\S\r\n]*(?:[•⏺●][ \t]+)?</(?:GCHAT|CHAT)_REPLY_[^<>\s]*>[^\S\r\n]*$".to_owned()]
+    fn patterns(&self) -> Result<Vec<String>, ChatServiceError> {
+        const PREFIX: &str = r"^[^\S\r\n]*(?:[•⏺●][ \t]+)?</(?:GCHAT|CHAT)_REPLY_";
+        const SUFFIX: &str = r">[^\S\r\n]*$";
+        let mut patterns = Vec::new();
+        let mut alternatives = String::new();
+        for identifier in self.by_identifier.keys() {
+            if identifier.is_empty()
+                || identifier.len() > 29
+                || !identifier
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            {
+                return Err(ChatServiceError::Generation(
+                    "reply route has an invalid output subscription identifier".to_owned(),
+                ));
+            }
+            // Herdr's match stays true while any matching line remains in the pane. Keep current
+            // IDs separate from the generic predicate, and rearm them when a route advances.
+            // Chunk exact literals so all durable requests fit without broadening the matcher.
+            let extra = identifier.len() + usize::from(!alternatives.is_empty());
+            if PREFIX.len() + 4 + alternatives.len() + extra + SUFFIX.len()
+                > chat_events::MAX_PATTERN_BYTES
+            {
+                patterns.push(format!("{PREFIX}(?:{alternatives}){SUFFIX}"));
+                alternatives.clear();
+            }
+            if !alternatives.is_empty() {
+                alternatives.push('|');
+            }
+            alternatives.push_str(identifier);
+        }
+        if !alternatives.is_empty() {
+            patterns.push(format!("{PREFIX}(?:{alternatives}){SUFFIX}"));
+        }
+        patterns.push(format!(r"{PREFIX}[^<>\s]*{SUFFIX}"));
+        if patterns.len() > chat_events::MAX_PATTERNS
+            || patterns.iter().map(String::len).sum::<usize>()
+                > chat_events::MAX_TOTAL_PATTERN_BYTES
+        {
+            return Err(ChatServiceError::Generation(
+                "reply routes exceed the output subscription budget".to_owned(),
+            ));
+        }
+        Ok(patterns)
     }
 }
 
@@ -2270,7 +2312,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
         }
 
         let desired_patterns = if state.config().outbound_enabled {
-            routes.patterns()
+            routes.patterns()?
         } else {
             Vec::new()
         };
@@ -3665,8 +3707,182 @@ mod tests {
         fs::remove_dir_all(fixture).expect("remove fixture");
     }
 
+    fn edge_triggered_output_roundtrip(
+        patterns: Vec<String>,
+        snapshots: &[&str],
+    ) -> Vec<Vec<PaneEvent>> {
+        let root = std::env::temp_dir().join(format!(
+            "agentctl-chat-output-edges-{}-{}",
+            std::process::id(),
+            NEXT_STATE.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        fs::create_dir(&root).expect("create edge fixture root");
+        let socket = root.join("events.sock");
+        let listener = UnixListener::bind(&socket).expect("bind edge fixture");
+        let (poll, polls) = mpsc::channel::<String>();
+        let (completed, completions) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut connection, _) = listener.accept().expect("accept edge client");
+            let mut request = String::new();
+            BufReader::new(connection.try_clone().expect("clone edge connection"))
+                .read_line(&mut request)
+                .expect("read edge subscription");
+            let request: Value = serde_json::from_str(&request).expect("decode edge subscription");
+            let mut matchers = request["params"]["subscriptions"]
+                .as_array()
+                .expect("subscriptions")
+                .iter()
+                .filter(|subscription| subscription["type"] == "pane.output_matched")
+                .map(|subscription| {
+                    (
+                        regex::Regex::new(subscription["match"]["value"].as_str().expect("regex"))
+                            .expect("compile output regex"),
+                        false,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let acknowledgement = json!({
+                "id": request["id"],
+                "result": {"type": "subscription_started"},
+            });
+            writeln!(connection, "{acknowledgement}").expect("acknowledge edge subscription");
+            while let Ok(text) = polls.recv_timeout(Duration::from_secs(2)) {
+                for (matcher, currently_matching) in &mut matchers {
+                    // Herdr emits only the first matching line on a false-to-true transition.
+                    // A different matching line cannot wake a subscription that remains true.
+                    let matched = text.lines().find(|line| matcher.is_match(line));
+                    if let Some(line) = matched.filter(|_| !*currently_matching) {
+                        let event = json!({
+                            "event": "pane.output_matched",
+                            "data": {
+                                "pane_id": "workspace:pane",
+                                "matched_line": line,
+                                "read": {
+                                    "pane_id": "workspace:pane",
+                                    "workspace_id": "workspace",
+                                    "tab_id": "workspace:tab",
+                                    "source": "recent_unwrapped",
+                                    "format": "text",
+                                    "text": text,
+                                    "revision": 1,
+                                    "truncated": false,
+                                },
+                            },
+                        });
+                        writeln!(connection, "{event}").expect("write edge event");
+                    }
+                    *currently_matching = matched.is_some();
+                }
+                completed.send(()).expect("complete snapshot poll");
+            }
+        });
+        let mut stream = PaneEventStream::connect(
+            &socket,
+            "workspace:pane",
+            patterns,
+            SNAPSHOT_LINES_U32,
+            Duration::from_secs(2),
+        )
+        .expect("connect edge fixture");
+        let mut observed = Vec::new();
+        for snapshot in snapshots {
+            poll.send((*snapshot).to_owned()).expect("poll snapshot");
+            completions
+                .recv_timeout(Duration::from_secs(2))
+                .expect("snapshot polled");
+            observed.push(
+                stream
+                    .wait(Duration::from_millis(20))
+                    .expect("read edge events"),
+            );
+        }
+        drop(poll);
+        server.join().expect("join edge fixture");
+        fs::remove_dir_all(root).expect("remove edge fixture");
+        observed
+    }
+
     #[test]
-    fn route_cache_uses_one_generic_line_pattern_and_updates_direct_id_index() {
+    fn current_reply_wakes_survive_retained_closes_and_reconnect() {
+        let first_key = "a".repeat(64);
+        let second_key = "b".repeat(64);
+        let third_key = "c".repeat(64);
+        let mut routes = RouteCache::new(vec![
+            ReplyRoute {
+                key: first_key,
+                identifier: "AAAAAAAAAAAAAAAAAAAAAA_2".to_owned(),
+            },
+            ReplyRoute {
+                key: second_key.clone(),
+                identifier: "BBBBBBBBBBBBBBBBBBBBBB_1".to_owned(),
+            },
+            ReplyRoute {
+                key: third_key.clone(),
+                identifier: "CCCCCCCCCCCCCCCCCCCCCC_1".to_owned(),
+            },
+        ]);
+        let old = "  </CHAT_REPLY_AAAAAAAAAAAAAAAAAAAAAA_1>";
+        let two_new = format!(
+            "{old}\n<CHAT_REPLY_BBBBBBBBBBBBBBBBBBBBBB_1>\nsecond\n  </CHAT_REPLY_BBBBBBBBBBBBBBBBBBBBBB_1>\n<CHAT_REPLY_CCCCCCCCCCCCCCCCCCCCCC_1>\nthird\n● </CHAT_REPLY_CCCCCCCCCCCCCCCCCCCCCC_1>"
+        );
+        let identifiers = |events: &[PaneEvent]| {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    PaneEvent::Output { matched_line, .. } => {
+                        matched_identifier(matched_line).map(str::to_owned)
+                    }
+                    PaneEvent::Settled { .. } => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let first_patterns = routes.patterns().expect("initial patterns");
+        let observed =
+            edge_triggered_output_roundtrip(first_patterns.clone(), &[old, &two_new, &two_new]);
+        assert_eq!(identifiers(&observed[0]), ["AAAAAAAAAAAAAAAAAAAAAA_1"]);
+        assert_eq!(
+            identifiers(&observed[1]),
+            ["BBBBBBBBBBBBBBBBBBBBBB_1"],
+            "a consumed closing fence must not mask a newly visible current reply"
+        );
+        assert!(
+            observed[2].is_empty(),
+            "fixture must suppress a sustained match"
+        );
+
+        routes.replace(
+            &second_key,
+            Some(ReplyRoute {
+                key: second_key.clone(),
+                identifier: "BBBBBBBBBBBBBBBBBBBBBB_2".to_owned(),
+            }),
+        );
+        let next_patterns = routes.patterns().expect("advanced patterns");
+        assert_ne!(
+            next_patterns, first_patterns,
+            "route advance must reconnect"
+        );
+        let observed = edge_triggered_output_roundtrip(next_patterns, &[&two_new]);
+        assert_eq!(
+            identifiers(&observed[0]),
+            ["CCCCCCCCCCCCCCCCCCCCCC_1", "AAAAAAAAAAAAAAAAAAAAAA_1"],
+            "reconnecting must immediately find the other current close in the same snapshot"
+        );
+
+        routes.replace(&third_key, None);
+        let next_reply = format!(
+            "{two_new}\n<GCHAT_REPLY_BBBBBBBBBBBBBBBBBBBBBB_2>\nnext\n⏺ </GCHAT_REPLY_BBBBBBBBBBBBBBBBBBBBBB_2>"
+        );
+        let observed = edge_triggered_output_roundtrip(
+            routes.patterns().expect("remaining patterns"),
+            &[&two_new, &next_reply],
+        );
+        assert_eq!(identifiers(&observed[0]), ["AAAAAAAAAAAAAAAAAAAAAA_1"]);
+        assert_eq!(identifiers(&observed[1]), ["BBBBBBBBBBBBBBBBBBBBBB_2"]);
+    }
+
+    #[test]
+    fn route_cache_rearms_current_patterns_and_updates_direct_id_index() {
         let first_key = "a".repeat(64);
         let second_key = "b".repeat(64);
         let mut routes = RouteCache::new(vec![
@@ -3679,8 +3895,8 @@ mod tests {
                 identifier: "BBBBBBBBBBBBBBBBBBBBBB_7".to_owned(),
             },
         ]);
-        let patterns = routes.patterns();
-        assert_eq!(patterns.len(), 1);
+        let patterns = routes.patterns().expect("route patterns");
+        assert_eq!(patterns.len(), 2);
         assert!(patterns[0].contains("(?:GCHAT|CHAT)_REPLY_"));
         assert_eq!(
             routes.key("AAAAAAAAAAAAAAAAAAAAAA_1"),
@@ -3697,11 +3913,31 @@ mod tests {
         );
         assert_eq!(routes.key("AAAAAAAAAAAAAAAAAAAAAA_1"), None);
         assert_eq!(routes.key("AAAAAAAAAAAAAAAAAAAAAA_2"), Some(key.as_str()));
+        let advanced_patterns = routes.patterns().expect("advanced patterns");
+        assert_ne!(advanced_patterns, patterns);
+        assert_eq!(advanced_patterns.last(), patterns.last());
+        let current = regex::Regex::new(&advanced_patterns[0]).expect("current matcher");
+        assert!(!current.is_match("</CHAT_REPLY_AAAAAAAAAAAAAAAAAAAAAA_1>"));
+        assert!(current.is_match("</CHAT_REPLY_AAAAAAAAAAAAAAAAAAAAAA_2>"));
+        assert!(!current.is_match("</CHAT_REPLY_unknown_1>"));
+        routes.replace(
+            &"c".repeat(64),
+            Some(ReplyRoute {
+                key: "c".repeat(64),
+                identifier: "CCCCCCCCCCCCCCCCCCCCCC_1".to_owned(),
+            }),
+        );
+        assert_ne!(
+            routes.patterns().expect("admitted patterns"),
+            advanced_patterns
+        );
     }
 
     #[test]
     fn empty_route_cache_uses_only_the_bounded_unavailable_fence_predicate() {
-        let patterns = RouteCache::new(Vec::new()).patterns();
+        let patterns = RouteCache::new(Vec::new())
+            .patterns()
+            .expect("empty patterns");
         assert_eq!(patterns.len(), 1);
         assert!(patterns[0].contains("(?:GCHAT|CHAT)_REPLY_"));
         assert_eq!(
@@ -3717,19 +3953,58 @@ mod tests {
     }
 
     #[test]
-    fn one_generic_closing_predicate_routes_full_provider_batch_capacity() {
-        let routes = (1..=chat_subscription::MAX_BATCH_EVENTS)
+    fn current_reply_patterns_cover_full_durable_request_capacity_within_wire_bounds() {
+        let routes = (1..=MAX_DIRECT_REQUEST_KEYS)
             .map(|index| ReplyRoute {
                 key: format!("{index:064x}"),
-                identifier: format!("AAAAAAAAAAAAAAAAAAAAAA_{index}"),
+                identifier: format!("{index:022x}_999999"),
             })
             .collect::<Vec<_>>();
         let cache = RouteCache::new(routes);
-        assert_eq!(cache.by_identifier.len(), 256);
-        let patterns = cache.patterns();
-        assert_eq!(patterns.len(), 1);
-        assert!(patterns[0].starts_with("^[^\\S\\r\\n]*"));
-        assert!(patterns[0].contains("</(?:GCHAT|CHAT)_REPLY_"));
+        assert_eq!(cache.by_identifier.len(), 2_048);
+        let patterns = cache.patterns().expect("full capacity patterns");
+        assert_eq!(patterns.len(), 3);
+        assert!(patterns
+            .iter()
+            .all(|pattern| pattern.len() <= chat_events::MAX_PATTERN_BYTES));
+        assert!(
+            patterns.iter().map(String::len).sum::<usize>() <= chat_events::MAX_TOTAL_PATTERN_BYTES
+        );
+        let matchers = patterns[..2]
+            .iter()
+            .map(|pattern| regex::Regex::new(pattern).expect("compile bounded current matcher"))
+            .collect::<Vec<_>>();
+        for identifier in cache.by_identifier.keys() {
+            let line = format!("  </CHAT_REPLY_{identifier}>");
+            assert_eq!(
+                matchers
+                    .iter()
+                    .filter(|matcher| matcher.is_match(&line))
+                    .count(),
+                1
+            );
+            let consumed = line.replace("_999999>", "_999998>");
+            assert!(matchers.iter().all(|matcher| !matcher.is_match(&consumed)));
+        }
+        assert!(edge_triggered_output_roundtrip(patterns, &[]).is_empty());
+    }
+
+    #[test]
+    fn current_reply_patterns_reject_invalid_identifiers_and_excess_budget() {
+        let invalid = RouteCache::new(vec![ReplyRoute {
+            key: "a".repeat(64),
+            identifier: "AAAAAAAAAAAAAAAAAAAAAA_.*".to_owned(),
+        }]);
+        assert!(invalid.patterns().is_err());
+        let over_budget = RouteCache::new(
+            (0..4_096)
+                .map(|index| ReplyRoute {
+                    key: format!("{index:064x}"),
+                    identifier: format!("{index:022x}_999999"),
+                })
+                .collect(),
+        );
+        assert!(over_budget.patterns().is_err());
     }
 
     #[test]

@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Map, Value};
 
 const MAX_FRAME_BYTES: usize = 2 * 1_024 * 1_024;
-const MAX_PATTERNS: usize = 128;
-const MAX_PATTERN_BYTES: usize = 32 * 1_024;
+pub(crate) const MAX_PATTERNS: usize = 128;
+pub(crate) const MAX_PATTERN_BYTES: usize = 32 * 1_024;
+pub(crate) const MAX_TOTAL_PATTERN_BYTES: usize = 96 * 1_024;
 const MAX_LINES: u32 = 100_000;
 const MAX_EVENTS_PER_WAIT: usize = 64;
 const MAX_EVENT_BYTES_PER_WAIT: usize = 8 * 1_024 * 1_024;
@@ -484,15 +485,19 @@ fn validate_configuration(
     lines: u32,
     timeout: Duration,
 ) -> Result<(), ChatEventError> {
-    let pattern_bytes = patterns.iter().map(String::len).sum::<usize>();
+    let pattern_bytes = patterns.iter().fold(0_usize, |total, pattern| {
+        total.saturating_add(pattern.len())
+    });
     if !socket_path.is_absolute()
         || socket_path.as_os_str().as_bytes().contains(&0)
         || pane_id.is_empty()
         || pane_id.len() > 512
         || pane_id.contains(['\0', '\n', '\r'])
         || patterns.len() > MAX_PATTERNS
-        || pattern_bytes > MAX_PATTERN_BYTES
-        || patterns.iter().any(|pattern| pattern.is_empty())
+        || pattern_bytes > MAX_TOTAL_PATTERN_BYTES
+        || patterns
+            .iter()
+            .any(|pattern| pattern.is_empty() || pattern.len() > MAX_PATTERN_BYTES)
         || lines == 0
         || lines > MAX_LINES
         || timeout.is_zero()
@@ -817,6 +822,27 @@ mod tests {
                 .write_all(&response(request))
                 .expect("write fixture response");
         })
+    }
+
+    #[test]
+    fn output_pattern_configuration_bounds_individual_total_and_count() {
+        let validate = |patterns: Vec<String>| {
+            validate_configuration(
+                Path::new("/tmp/events.sock"),
+                "workspace:pane",
+                &patterns,
+                4_000,
+                Duration::from_secs(2),
+            )
+        };
+        assert!(validate(vec!["x".repeat(MAX_PATTERN_BYTES); 3]).is_ok());
+        assert!(validate(vec!["x".repeat(MAX_PATTERN_BYTES + 1)]).is_err());
+        let mut over_total = vec!["x".repeat(MAX_PATTERN_BYTES); 3];
+        over_total.push("x".to_owned());
+        assert!(validate(over_total).is_err());
+        assert!(validate(vec!["x".to_owned(); MAX_PATTERNS]).is_ok());
+        assert!(validate(vec!["x".to_owned(); MAX_PATTERNS + 1]).is_err());
+        assert!(validate(vec![String::new()]).is_err());
     }
 
     #[test]
