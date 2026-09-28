@@ -1603,6 +1603,23 @@ impl OutboundCancellation {
 }
 
 impl CommandOutboundTransport {
+    /// Share this generation's sealed executable and captured launch configuration.
+    ///
+    /// This does not reopen the source path or recapture environment values. Each handle owns
+    /// independent exchanges; callers must serialize operations for the same durable request.
+    pub(crate) fn try_clone_generation(&self) -> io::Result<Self> {
+        Ok(Self {
+            executable_image: self.executable_image.try_clone()?,
+            executable_path: self.executable_path.clone(),
+            _source_identity: self._source_identity.clone(),
+            arguments: self.arguments.clone(),
+            environment: self.environment.clone(),
+            timeout: self.timeout,
+            shutdown_grace: self.shutdown_grace,
+            cancellation: self.cancellation.clone(),
+        })
+    }
+
     /// Validate and pin one native helper and its non-secret launch configuration.
     ///
     /// `environment_names` is an operator-controlled allowlist. Each named value must already be
@@ -2730,6 +2747,10 @@ impl BridgeState {
         ] {
             agent::create_private_directory(&directory, label, true, true)?;
         }
+        // Publish the snapshot lock before the first readable state documents. Read-only
+        // inspection must not create lock authority, even before the first batch arrives.
+        let state_lock = agent::open_private_lock(&root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
         let envelope = ConfigurationEnvelope {
             version: STATE_VERSION,
             config: config.clone(),
@@ -3535,6 +3556,7 @@ impl BridgeState {
 
     /// Read bounded local status without contacting a provider or coordinator.
     pub fn status(&self) -> Result<Value> {
+        let _snapshot = self.lock_state_snapshot()?;
         let checkpoint = self.read_checkpoint()?;
         let gap = self.gap_diagnostic()?;
         let unresolved_gap = gap
@@ -3707,6 +3729,7 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
 
     /// Read pending request keys during startup recovery or an explicit delivery pass.
     pub fn pending_request_keys(&self) -> Result<Vec<String>> {
+        let _snapshot = self.lock_state_snapshot()?;
         Ok(self
             .request_records()?
             .into_iter()
@@ -3722,6 +3745,7 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
 
     /// Return every retained request key in deterministic order.
     pub fn request_keys(&self) -> Result<Vec<String>> {
+        let _snapshot = self.lock_state_snapshot()?;
         Ok(self
             .request_records()?
             .into_iter()
@@ -3731,6 +3755,7 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
 
     /// Return requests whose durable reaction operation awaits reconciliation.
     pub fn pending_ack_keys(&self) -> Result<Vec<String>> {
+        let _snapshot = self.lock_state_snapshot()?;
         Ok(self
             .request_records()?
             .into_iter()
@@ -3743,6 +3768,7 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
 
     /// Return requests with at least one captured reply not durably sent yet.
     pub fn pending_reply_keys(&self) -> Result<Vec<String>> {
+        let _snapshot = self.lock_state_snapshot()?;
         Ok(self
             .request_records()?
             .into_iter()
@@ -3754,8 +3780,13 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
 
     /// Return the deterministic union of delivery, acknowledgement, and reply work in one scan.
     pub fn pending_work_keys(&self) -> Result<Vec<String>> {
+        self.pending_work_keys_with_hook(|| {})
+    }
+
+    fn pending_work_keys_with_hook(&self, after_listing: impl FnOnce()) -> Result<Vec<String>> {
+        let _snapshot = self.lock_state_snapshot()?;
         Ok(self
-            .request_records()?
+            .request_records_with_hook(after_listing)?
             .into_iter()
             .filter_map(|(record, _)| {
                 (matches!(
@@ -3885,6 +3916,7 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         if !self.config.outbound_enabled {
             return Ok(Vec::new());
         }
+        let _snapshot = self.lock_state_snapshot()?;
         Ok(self
             .request_records()?
             .into_iter()
@@ -3898,6 +3930,7 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         if !self.config.outbound_enabled {
             return Ok(Vec::new());
         }
+        let _snapshot = self.lock_state_snapshot()?;
         Ok(self
             .request_records()?
             .into_iter()
@@ -3914,6 +3947,7 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         if !self.config.outbound_enabled {
             return Ok(Vec::new());
         }
+        let _snapshot = self.lock_state_snapshot()?;
         let mut entries = self
             .request_records()?
             .into_iter()
@@ -3941,6 +3975,7 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         if !self.config.outbound_enabled {
             return Ok(None);
         }
+        let _snapshot = self.lock_state_snapshot()?;
         let record = match self.read_request(key) {
             Ok(record) => record,
             Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
@@ -4974,7 +5009,20 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         Ok(routes)
     }
 
+    fn lock_state_snapshot(&self) -> Result<File> {
+        let lock = open_existing_private_state_lock(&self.root.join(".state.lock"))?;
+        FileExt::lock_shared(&lock).map_err(ChatRuntimeError::Io)?;
+        Ok(lock)
+    }
+
     fn request_records(&self) -> Result<Vec<(RequestRecord, u64)>> {
+        self.request_records_with_hook(|| {})
+    }
+
+    fn request_records_with_hook(
+        &self,
+        after_listing: impl FnOnce(),
+    ) -> Result<Vec<(RequestRecord, u64)>> {
         let mut paths = Vec::new();
         for entry in fs::read_dir(self.root.join("requests"))? {
             let entry = entry?;
@@ -4997,6 +5045,7 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
             }
         }
         paths.sort_by(|left, right| left.1.cmp(&right.1));
+        after_listing();
         paths
             .into_iter()
             .map(|(path, key)| {
@@ -9091,6 +9140,85 @@ mod tests {
     }
 
     #[test]
+    fn pending_snapshot_excludes_concurrent_ack_retirement_until_files_are_read() {
+        struct GatedReaction {
+            started: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+
+        impl ReactionTransport for GatedReaction {
+            fn ensure_reaction(
+                &mut self,
+                submission: ReactionSubmission<'_>,
+            ) -> std::result::Result<ReactionReceipt, OutboundFailure> {
+                self.started.send(()).expect("announce ACK transport");
+                self.release
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("release ACK transport");
+                FakeReactionTransport::default().ensure_reaction(submission)
+            }
+        }
+
+        let (state, key, root) = state_with_old_request("pending-snapshot-retirement", config());
+        state
+            .set_delivery_phase(&key, RequestPhase::Delivered, None)
+            .expect("deliver request");
+        state.close_replies(&key).expect("close request replies");
+        let (started, starts) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (finished, completion) = std::sync::mpsc::channel();
+        let writer_state = state.clone();
+        let writer_key = key.clone();
+        let writer = std::thread::spawn(move || {
+            let result = writer_state.ensure_ack(
+                &writer_key,
+                &mut GatedReaction {
+                    started,
+                    release: released,
+                },
+            );
+            finished.send(result).expect("report terminal ACK");
+        });
+        starts
+            .recv_timeout(Duration::from_secs(1))
+            .expect("ACK has released its state lock for transport");
+
+        let keys = state
+            .pending_work_keys_with_hook(|| {
+                // The scan has collected filenames but has not opened their records. Let the
+                // ACK finish now: retirement must wait until the complete snapshot is read.
+                release.send(()).expect("complete provider ACK");
+                assert!(matches!(
+                    completion.recv_timeout(Duration::from_millis(20)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ));
+                assert!(state.request_path(&key).exists());
+            })
+            .expect("read a coherent pending snapshot");
+        assert!(keys.contains(&key));
+        completion
+            .recv_timeout(Duration::from_secs(1))
+            .expect("retirement proceeds after the snapshot")
+            .expect("terminal ACK succeeds");
+        writer.join().expect("join ACK writer");
+        assert!(!state.request_path(&key).exists());
+        assert!(!state
+            .pending_ack_keys()
+            .expect("pending ACKs")
+            .contains(&key));
+        assert!(state
+            .next_reply_route(&key)
+            .expect("retired route")
+            .is_none());
+        assert!(state
+            .reply_route_entries()
+            .expect("coherent route snapshot")
+            .iter()
+            .any(|entry| entry.key == key && entry.current_identifier.is_none()));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn every_terminal_mutation_retries_retirement_with_exact_same_process_accounting() {
         #[derive(Clone, Copy, Debug)]
         enum TerminalPath {
@@ -10276,17 +10404,22 @@ mod tests {
         )
         .expect("pin helper");
         fs::remove_file(&helper).expect("remove source after generation pin");
-        assert_eq!(
-            transport
-                .send(ReplySubmission {
-                    channel_id: "spaces/example",
-                    thread_id: "spaces/example/threads/one",
-                    body: "hello",
-                    request_id: "123e4567-e89b-42d3-a456-426614174000",
-                })
-                .expect("execute sealed generation image"),
-            "spaces/example/messages/pinned"
-        );
+        let mut cloned = transport
+            .try_clone_generation()
+            .expect("clone sealed image without source");
+        for transport in [&mut transport, &mut cloned] {
+            assert_eq!(
+                transport
+                    .send(ReplySubmission {
+                        channel_id: "spaces/example",
+                        thread_id: "spaces/example/threads/one",
+                        body: "hello",
+                        request_id: "123e4567-e89b-42d3-a456-426614174000",
+                    })
+                    .expect("execute sealed generation image"),
+                "spaces/example/messages/pinned"
+            );
+        }
         fs::remove_dir_all(root).expect("cleanup");
     }
 

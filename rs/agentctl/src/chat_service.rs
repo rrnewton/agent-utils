@@ -40,6 +40,8 @@ const MAX_SENDS_PER_PASS: usize = 64;
 const PROVIDER_NOTICE_CAPACITY: usize = 64;
 const MAX_PROVIDER_NOTICES_PER_PASS: usize = 64;
 const MAX_DIRECT_REQUEST_KEYS: usize = 2_048;
+const ACK_QUEUE_CAPACITY: usize = 64;
+const ACK_RETRY_DELAY: Duration = Duration::from_secs(60);
 const MAX_IMMEDIATE_BACKLOG_CHUNKS: usize = 64;
 const EVENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTPUT_RETRY_MAX: Duration = Duration::from_secs(60);
@@ -422,6 +424,21 @@ pub fn run<A: ManagedApi + ?Sized>(
     if let Some(transport) = outbound.as_mut() {
         transport.set_cancellation(outbound_cancellation.clone());
     }
+    let ack_cancellation = OutboundCancellation::new()?;
+    let mut ack_transport = if state.config().ack_reaction.is_some() {
+        outbound
+            .as_ref()
+            .map(CommandOutboundTransport::try_clone_generation)
+            .transpose()?
+    } else {
+        None
+    };
+    if let Some(transport) = ack_transport.as_mut() {
+        transport.set_cancellation(ack_cancellation.clone());
+    }
+    let ack_queue = ack_transport
+        .as_ref()
+        .map(|_| Arc::new(AckQueue::default()));
     let inventory = crate::plugins::discover();
     let pinned = chat_runtime::select_plugin(&inventory, state.config())?;
     let selected_process_timeouts = pinned.process_phase_timeouts();
@@ -433,7 +450,13 @@ pub fn run<A: ManagedApi + ?Sized>(
     let _target = manager.pane_info(&state.config().agent_name)?;
     let _lease = state.acquire_runner_lease()?;
 
-    let stop = Arc::new(StopState::default());
+    if let Some(queue) = ack_queue.as_ref() {
+        queue.enqueue(state.pending_ack_keys()?);
+    }
+    let stop = Arc::new(StopState {
+        ack_queue: ack_queue.clone(),
+        ..StopState::default()
+    });
     let cancellation: SharedCancellation =
         Arc::new(Mutex::new(ProviderCancellationRegistry::default()));
     let output_wake: SharedWake = Arc::new(Mutex::new(None));
@@ -445,6 +468,30 @@ pub fn run<A: ManagedApi + ?Sized>(
         initial_provider_join_timeout,
         outbound_join_timeout,
     )?;
+    let ack_worker = if let Some(transport) = ack_transport {
+        match spawn_ack_worker(
+            state.clone(),
+            ack_queue.expect("ACK transport has a queue"),
+            transport,
+            Arc::clone(&stop),
+            Arc::clone(&output_wake),
+        ) {
+            Ok(worker) => Some(worker),
+            Err(error) => {
+                let deadline = begin_service_stop(
+                    &stop,
+                    &cancellation,
+                    initial_provider_join_timeout,
+                    outbound_join_timeout,
+                );
+                signal_handle.close();
+                let _ = join_worker_until(signal_thread, "chat signal", deadline);
+                return Err(ChatServiceError::Io(error));
+            }
+        }
+    } else {
+        None
+    };
     let (notices, notice_receiver) = mpsc::sync_channel(PROVIDER_NOTICE_CAPACITY);
     let provider = match spawn_provider(
         state.clone(),
@@ -466,6 +513,11 @@ pub fn run<A: ManagedApi + ?Sized>(
             outbound_cancellation.cancel();
             signal_handle.close();
             let _ = join_worker_until(signal_thread, "chat signal", deadline);
+            if let Some(worker) = ack_worker {
+                if let Err(cleanup) = join_ack_worker_until(worker, &ack_cancellation, deadline) {
+                    return Err(ChatServiceError::Worker(format!("{error}; {cleanup}")));
+                }
+            }
             return Err(error);
         }
     };
@@ -504,6 +556,11 @@ pub fn run<A: ManagedApi + ?Sized>(
     if let Err(error) = join_worker_until(provider, "chat provider", shutdown_deadline) {
         stop.record_cleanup_error(error.to_string());
     }
+    if let Some(worker) = ack_worker {
+        if let Err(error) = join_ack_worker_until(worker, &ack_cancellation, shutdown_deadline) {
+            stop.record_cleanup_error(error.to_string());
+        }
+    }
     let cleanup_errors = stop.take_cleanup_errors();
     match (result, cleanup_errors.is_empty()) {
         (Ok(()), true) => Ok(json!({"stopped": true})),
@@ -541,6 +598,187 @@ fn join_worker_until(
 struct ServiceWorker {
     handle: thread::JoinHandle<()>,
     done: mpsc::Receiver<()>,
+}
+
+#[derive(Default)]
+struct AckQueueState {
+    pending: VecDeque<String>,
+    retained: BTreeSet<String>,
+    retry_at: BTreeMap<String, Instant>,
+    rescan: bool,
+    stopped: bool,
+}
+
+#[derive(Default)]
+struct AckQueue {
+    state: Mutex<AckQueueState>,
+    changed: Condvar,
+}
+
+enum AckWork {
+    Request(String),
+    Reconcile,
+}
+
+impl AckQueue {
+    fn enqueue(&self, keys: impl IntoIterator<Item = String>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.stopped {
+            return;
+        }
+        let now = Instant::now();
+        for key in keys {
+            if state.retained.contains(&key)
+                || state.retry_at.get(&key).is_some_and(|retry| *retry > now)
+            {
+                continue;
+            }
+            if state.retained.len() >= ACK_QUEUE_CAPACITY {
+                // The request remains durable. The worker scans the bounded pending population
+                // after draining this queue; subscription intake never waits for ACK capacity.
+                state.rescan = true;
+                continue;
+            }
+            state.retry_at.remove(&key);
+            state.retained.insert(key.clone());
+            state.pending.push_back(key);
+        }
+        self.changed.notify_one();
+    }
+
+    fn stop(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.stopped = true;
+        self.changed.notify_all();
+    }
+
+    fn next(&self) -> Option<AckWork> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            // This mutex serializes operation admission with stop. A request returned here is
+            // owned until completion; queued requests stay durable when stop wins instead.
+            if state.stopped {
+                return None;
+            }
+            if let Some(key) = state.pending.pop_front() {
+                return Some(AckWork::Request(key));
+            }
+            if state.rescan {
+                state.rescan = false;
+                return Some(AckWork::Reconcile);
+            }
+            let next_retry = state.retry_at.values().min().copied();
+            if let Some(retry) = next_retry {
+                let now = Instant::now();
+                if retry <= now {
+                    state.retry_at.retain(|_, deadline| *deadline > now);
+                    return Some(AckWork::Reconcile);
+                }
+                state = self
+                    .changed
+                    .wait_timeout(state, retry - now)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .0;
+            } else {
+                state = self
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+    }
+
+    fn finished(&self, key: &str, failed: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.retained.remove(key);
+        if failed {
+            // Failed ACKs cannot retire, so this map is bounded by the durable request limit.
+            // Retain an explicit ceiling as well if a caller supplies an invalid request key.
+            if state.retry_at.len() < MAX_DIRECT_REQUEST_KEYS {
+                state
+                    .retry_at
+                    .insert(key.to_owned(), Instant::now() + ACK_RETRY_DELAY);
+            }
+        } else {
+            state.retry_at.remove(key);
+        }
+        self.changed.notify_one();
+    }
+}
+
+fn spawn_ack_worker(
+    state: BridgeState,
+    queue: Arc<AckQueue>,
+    mut transport: impl chat_runtime::ReactionTransport + Send + 'static,
+    stop: Arc<StopState>,
+    output_wake: SharedWake,
+) -> io::Result<ServiceWorker> {
+    let (done_sender, done) = mpsc::sync_channel(1);
+    let handle = thread::Builder::new()
+        .name("agentctl-chat-ack".to_owned())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                while let Some(work) = queue.next() {
+                    match work {
+                        AckWork::Request(key) => {
+                            let result = state.ensure_ack(&key, &mut transport);
+                            queue.finished(&key, result.is_err());
+                            let mut report = CycleReport::default();
+                            record_acknowledgement(&mut report, &key, result);
+                            log_report(&report);
+                            wake_output(&output_wake);
+                        }
+                        AckWork::Reconcile => match state.pending_ack_keys() {
+                            Ok(keys) => queue.enqueue(keys),
+                            Err(error) => {
+                                stop.record_cleanup_error(format!("ACK recovery failed: {error}"));
+                                stop.stop();
+                                wake_output(&output_wake);
+                            }
+                        },
+                    }
+                }
+            }));
+            if let Err(panic) = result {
+                stop.record_cleanup_error("ACK worker panicked; operation outcome is uncertain");
+                stop.stop();
+                wake_output(&output_wake);
+                std::panic::resume_unwind(panic);
+            }
+            let _ = done_sender.send(());
+        })?;
+    Ok(ServiceWorker { handle, done })
+}
+
+fn join_ack_worker_until(
+    worker: ServiceWorker,
+    cancellation: &OutboundCancellation,
+    deadline: Instant,
+) -> Result<(), ChatServiceError> {
+    // Keep a small part of the existing outer margin for cancellation and process reaping if
+    // normal bounded completion unexpectedly stalls. Never cancel an admitted ACK on SIGTERM.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if matches!(
+        worker
+            .done
+            .recv_timeout(remaining.saturating_sub(Duration::from_secs(5))),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ) {
+        cancellation.cancel();
+    }
+    join_worker_until(worker, "chat ACK", deadline)
 }
 
 fn connected_provider_join_timeout(timeouts: ProcessPhaseTimeouts) -> Duration {
@@ -701,6 +939,10 @@ fn process_keys_with_delivery(
     if keys.is_empty() {
         return Ok(CycleReport::default());
     }
+    let async_ack = control.stop.and_then(|stop| stop.ack_queue.as_ref());
+    if let Some(queue) = async_ack {
+        queue.enqueue(keys.iter().cloned());
+    }
     let mut report = CycleReport {
         deferred_keys: keys.iter().skip(MAX_KEYS_PER_PASS).cloned().collect(),
         more_work: keys.len() > MAX_KEYS_PER_PASS,
@@ -713,26 +955,27 @@ fn process_keys_with_delivery(
             break;
         }
         let acknowledgement_enabled = state.config().ack_reaction.is_some();
-        let concurrent = if acknowledgement_enabled && control.transport.is_some() {
-            let transport = control
-                .transport
-                .as_mut()
-                .expect("checked acknowledgement transport");
-            Some(thread::scope(|scope| {
-                match thread::Builder::new()
-                    .name("agentctl-chat-ack".to_owned())
-                    .spawn_scoped(scope, move || state.ensure_ack(key, transport))
-                {
-                    Ok(worker) => Ok((
-                        chat_runtime::deliver_request_with(state, coordinator, key, delivery),
-                        worker.join(),
-                    )),
-                    Err(error) => Err(error),
-                }
-            }))
-        } else {
-            None
-        };
+        let concurrent =
+            if async_ack.is_none() && acknowledgement_enabled && control.transport.is_some() {
+                let transport = control
+                    .transport
+                    .as_mut()
+                    .expect("checked acknowledgement transport");
+                Some(thread::scope(|scope| {
+                    match thread::Builder::new()
+                        .name("agentctl-chat-ack".to_owned())
+                        .spawn_scoped(scope, move || state.ensure_ack(key, transport))
+                    {
+                        Ok(worker) => Ok((
+                            chat_runtime::deliver_request_with(state, coordinator, key, delivery),
+                            worker.join(),
+                        )),
+                        Err(error) => Err(error),
+                    }
+                }))
+            } else {
+                None
+            };
 
         let delivery_result = match concurrent {
             Some(Ok((delivery_result, acknowledgement_result))) => {
@@ -1075,6 +1318,7 @@ struct StopState {
     changed: Condvar,
     cleanup_errors: Mutex<Vec<String>>,
     shutdown_window: Mutex<Option<(Instant, Instant)>>,
+    ack_queue: Option<Arc<AckQueue>>,
 }
 
 impl StopState {
@@ -1083,6 +1327,9 @@ impl StopState {
     }
 
     fn stop(&self) {
+        if let Some(queue) = self.ack_queue.as_ref() {
+            queue.stop();
+        }
         self.stopped.store(true, Ordering::SeqCst);
         self.changed.notify_all();
     }
@@ -1697,6 +1944,9 @@ where
             chat_runtime::ConsumedItem::Heartbeat => {}
             chat_runtime::ConsumedItem::End => return Ok(()),
             chat_runtime::ConsumedItem::Batch(admission) => {
+                if let Some(queue) = stop.ack_queue.as_ref() {
+                    queue.enqueue(admission.new_request_keys.iter().cloned());
+                }
                 send_notice(
                     notices,
                     ProviderNotice::Batch(admission.new_request_keys),
@@ -2746,6 +2996,288 @@ mod tests {
             .new_request_keys
             .remove(0);
         (state, key, root)
+    }
+
+    fn admit_more_requests(state: &BridgeState, count: usize) -> Vec<String> {
+        let events = (0..count)
+            .map(|index| {
+                let message = InboundMessage::new(
+                    ChannelId::new("spaces/example").expect("channel"),
+                    MessageId::new(format!("spaces/example/messages/more-{index}"))
+                        .expect("message"),
+                    ThreadId::new("spaces/example/threads/one").expect("thread"),
+                    SenderId::new("users/owner").expect("sender"),
+                    "another request",
+                    "2026-09-21T12:00:01Z",
+                    false,
+                )
+                .expect("message");
+                CommittableEvent::message_created(message)
+            })
+            .collect();
+        let batch = DeliveryBatch::new(
+            EventSequence::new(2).expect("sequence"),
+            ProviderCursor::new("cursor-more").expect("cursor"),
+            DeliveryId::new("delivery-more").expect("delivery"),
+            events,
+        )
+        .expect("batch");
+        let admission = state.admit_batch(&batch).expect("admit more requests");
+        admission.new_request_keys
+    }
+
+    struct ObservedReactionTransport {
+        started: mpsc::Sender<(String, String)>,
+        release: Option<mpsc::Receiver<bool>>,
+    }
+
+    impl chat_runtime::ReactionTransport for ObservedReactionTransport {
+        fn ensure_reaction(
+            &mut self,
+            submission: chat_runtime::ReactionSubmission<'_>,
+        ) -> Result<chat_runtime::ReactionReceipt, OutboundFailure> {
+            self.started
+                .send((
+                    submission.message_id.to_owned(),
+                    submission.request_id.to_owned(),
+                ))
+                .expect("observe ACK admission");
+            if self
+                .release
+                .as_ref()
+                .is_some_and(|release| release.recv_timeout(Duration::from_secs(5)) != Ok(true))
+            {
+                return Err(OutboundFailure {
+                    code: "fixture_unknown".to_owned(),
+                    detail: "provider result is uncertain".to_owned(),
+                    outcome: chat_runtime::OutboundOutcome::Unknown,
+                    retryable: true,
+                });
+            }
+            Ok(chat_runtime::ReactionReceipt {
+                reaction_id: format!("{}/reactions/ack", submission.message_id),
+                already_present: false,
+            })
+        }
+    }
+
+    #[test]
+    fn async_ack_does_not_block_later_intake_or_delivery_and_shutdown_owns_inflight() {
+        let (state, key, root) = state_with_request();
+        let queue = Arc::new(AckQueue::default());
+        let stop = Arc::new(StopState {
+            ack_queue: Some(Arc::clone(&queue)),
+            ..StopState::default()
+        });
+        let (started, starts) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let worker = spawn_ack_worker(
+            state.clone(),
+            Arc::clone(&queue),
+            ObservedReactionTransport {
+                started,
+                release: Some(released),
+            },
+            Arc::clone(&stop),
+            Arc::new(Mutex::new(None)),
+        )
+        .expect("spawn ACK worker");
+        queue.enqueue([key.clone()]);
+        let first = starts
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first ACK entered");
+        queue.enqueue([key.clone(), key.clone()]);
+
+        // A second durable intake and both pane deliveries complete while the first ACK is held.
+        let mut keys = vec![key.clone()];
+        keys.extend(admit_more_requests(&state, 1));
+        let delivery = RecordingDelivery::default();
+        let mut transport = None;
+        let report = process_keys_with_delivery(
+            &state,
+            &delivery,
+            DrainOptions::default(),
+            &keys,
+            &mut PassControl {
+                transport: &mut transport,
+                stop: Some(&stop),
+            },
+        )
+        .expect("delivery must not wait for ACK");
+        assert_eq!(report.delivered, keys);
+        assert_eq!(delivery.prompts.lock().expect("prompts").len(), 2);
+        assert!(
+            starts.try_recv().is_err(),
+            "one in-flight ACK owns the deduplicated key"
+        );
+
+        stop.stop();
+        let (joined, join_result) = mpsc::channel();
+        let joiner = thread::spawn(move || {
+            let result = join_ack_worker_until(
+                worker,
+                &OutboundCancellation::new().expect("cancellation"),
+                Instant::now() + Duration::from_secs(10),
+            );
+            joined.send(result).expect("report join");
+        });
+        assert!(
+            matches!(
+                join_result.recv_timeout(Duration::from_millis(20)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "shutdown must retain its admitted ACK"
+        );
+        release.send(true).expect("finish admitted ACK");
+        join_result
+            .recv_timeout(Duration::from_secs(1))
+            .expect("bounded shutdown")
+            .expect("join ACK");
+        joiner.join().expect("join shutdown owner");
+        assert_eq!(first.0, "spaces/example/messages/one");
+        assert!(
+            starts.try_recv().is_err(),
+            "stop must not launch queued ACKs"
+        );
+        assert_eq!(
+            state.inspect_request(&key).expect("first receipt")["acknowledgement"]["phase"],
+            "acked"
+        );
+        assert_eq!(
+            state.inspect_request(&keys[1]).expect("queued durable ACK")["acknowledgement"]
+                ["phase"],
+            "pending"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn async_ack_unknown_outcome_does_not_hot_retry_and_restart_keeps_operation_id() {
+        let (state, key, root) = state_with_request();
+        let queue = Arc::new(AckQueue::default());
+        let stop = Arc::new(StopState {
+            ack_queue: Some(Arc::clone(&queue)),
+            ..StopState::default()
+        });
+        let (started, starts) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let worker = spawn_ack_worker(
+            state.clone(),
+            Arc::clone(&queue),
+            ObservedReactionTransport {
+                started,
+                release: Some(released),
+            },
+            Arc::clone(&stop),
+            Arc::new(Mutex::new(None)),
+        )
+        .expect("spawn ACK worker");
+        queue.enqueue([key.clone()]);
+        let first = starts
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first attempt");
+        release.send(false).expect("unknown outcome");
+        let (guard, timeout) = queue
+            .changed
+            .wait_timeout_while(
+                queue.state.lock().expect("queue state"),
+                Duration::from_secs(1),
+                |state| state.retained.contains(&key),
+            )
+            .expect("await persisted unknown outcome");
+        assert!(!timeout.timed_out());
+        drop(guard);
+        queue.enqueue([key.clone(), key.clone()]);
+        assert!(matches!(
+            starts.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        let inspection = state.inspect_request(&key).expect("inspect failed ACK");
+        assert_eq!(inspection["acknowledgement"]["phase"], "sending");
+        assert!(inspection["acknowledgement"]["error"]
+            .as_str()
+            .expect("error")
+            .contains("Unknown"));
+        assert!(inspection["timestamps"]["ack_completed_at_millis"].is_null());
+        stop.stop();
+        join_worker_until(worker, "ACK", Instant::now() + Duration::from_secs(1))
+            .expect("join failed generation");
+
+        let reopened = BridgeState::open(&root).expect("restart durable state");
+        let queue = Arc::new(AckQueue::default());
+        queue.enqueue(reopened.pending_ack_keys().expect("recover ACKs"));
+        let stop = Arc::new(StopState {
+            ack_queue: Some(Arc::clone(&queue)),
+            ..StopState::default()
+        });
+        let (started, starts) = mpsc::channel();
+        let worker = spawn_ack_worker(
+            reopened.clone(),
+            queue,
+            ObservedReactionTransport {
+                started,
+                release: None,
+            },
+            Arc::clone(&stop),
+            Arc::new(Mutex::new(None)),
+        )
+        .expect("restart ACK worker");
+        let retry = starts
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reconciliation attempt");
+        assert_eq!(retry, first);
+        stop.stop();
+        join_worker_until(worker, "ACK", Instant::now() + Duration::from_secs(1))
+            .expect("join restart");
+        assert_eq!(
+            reopened.inspect_request(&key).expect("receipt")["acknowledgement"]["phase"],
+            "acked"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn async_ack_queue_overflow_recovers_durable_requests_without_blocking_intake() {
+        let (state, key, root) = state_with_request();
+        let mut keys = vec![key];
+        keys.extend(admit_more_requests(&state, ACK_QUEUE_CAPACITY));
+        let queue = Arc::new(AckQueue::default());
+        queue.enqueue(keys.clone());
+        assert_eq!(
+            queue.state.lock().expect("queue").retained.len(),
+            ACK_QUEUE_CAPACITY
+        );
+        let stop = Arc::new(StopState {
+            ack_queue: Some(Arc::clone(&queue)),
+            ..StopState::default()
+        });
+        let (started, starts) = mpsc::channel();
+        let worker = spawn_ack_worker(
+            state.clone(),
+            queue,
+            ObservedReactionTransport {
+                started,
+                release: None,
+            },
+            Arc::clone(&stop),
+            Arc::new(Mutex::new(None)),
+        )
+        .expect("spawn ACK worker");
+        let mut observed = BTreeSet::new();
+        for _ in &keys {
+            observed.insert(
+                starts
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("recovered ACK")
+                    .0,
+            );
+        }
+        stop.stop();
+        join_worker_until(worker, "ACK", Instant::now() + Duration::from_secs(1))
+            .expect("join ACK worker");
+        assert_eq!(observed.len(), keys.len());
+        assert!(state.pending_ack_keys().expect("remaining ACKs").is_empty());
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     fn connected_event_stream(
