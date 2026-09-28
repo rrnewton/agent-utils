@@ -127,6 +127,9 @@ def test_default_sandbox_section_spells_out_every_key() -> None:
     shared = section["home_shared"]
     assert isinstance(shared, list) and ".local/share/muse" in shared
     assert section["home_private_files"] == [".claude.json"]
+    # Package caches are shared; the rest of ~/.cargo (bin, config.toml) stays read-only.
+    assert ".cargo/registry" in shared and ".cargo/git" in shared
+    assert ".cargo" not in shared and ".cargo/bin" not in shared
     assert section["outputs"] == ["ai_docs", "experiments"]
     assert section["env"] == {} and section["tmp_size"] == "16G"
     json.dumps(section)
@@ -213,8 +216,13 @@ def test_build_spec_layers_home_and_binds_blessed_paths(tmp_path: Path) -> None:
     # Shared paths are bound onto themselves, nested ones included; missing ones are skipped.
     assert [str(home / ".config/muse")] * 2 in binds
     assert str(home / ".claude") not in targets
-    for path in ("slot", "repo.git", "control", "project/ai_docs"):
+    for path in ("slot", "repo.git", "project/ai_docs"):
         assert str(tmp_path / path) in targets
+    # The control directory is never writable from a box; other slots' state is masked.
+    assert str(tmp_path / "control") not in targets
+    assert spec["read_only"][0] == str(tmp_path / "control")  # type: ignore[index]
+    assert str(tmp_path / "control" / "slot-state") in spec["masks"]  # type: ignore[operator]
+    assert str(tmp_path / "control" / "slot-images") in spec["masks"]  # type: ignore[operator]
     assert str(tmp_path / "project/experiments") not in targets  # missing output: skipped
     # Every real top-level entry is bound read-only over the layer, .config and
     # .local included; private directories and private files are not.
@@ -306,6 +314,7 @@ def test_image_lifecycle_relocate_and_destroy(tmp_path: Path) -> None:
     control = tmp_path / "control"
     (control / "slots").mkdir(parents=True)
     location = control / "slots" / "s1"
+    slotimage.register_layout(control, lambda _slot_type, slot: control / "slots" / slot)
     image = slotimage.provision(
         control, "agent", "s1", location, slotimage.ImageSettings(ceiling_bytes=2 * cli.GIB, backend=backend)
     )
@@ -543,9 +552,175 @@ report checkout_commit 'cd "$WRKSLOTS_SLOT_PATH"/src && echo w > w && git add w 
     expected = {**_EXPECTED, "representation": True, "checkout_commit": True}
     assert _probe_results(boxed.stdout) == expected, boxed.stdout + boxed.stderr
     assert (repository / "seed").read_text(encoding="utf-8") == "seed\n"  # primary checkout unchanged
+    # The box's private state beside the slots is storage, not an unregistered slot.
+    status = wrkslots("status")
+    assert "directory-without-row" not in status.stdout + status.stderr, status.stdout
     state = project / "worktrees" / ".wrkslots" / "slot-state" / "agent" / slot
     if not state.exists():
         candidates = list(project.rglob(f"slot-state/agent/{slot}"))
         assert candidates, "worktree slot state directory not found"
         state = candidates[0]
     _assert_home_untouched_and_layered(box_base, home, state)
+
+
+_CONTROL_PROBE = r"""
+report() { if eval "$2" >/dev/null 2>&1; then echo "$1=yes"; else echo "$1=no"; fi; }
+report own_slot_write 'echo x > "$WRKSLOTS_SLOT_PATH/mine"'
+report other_slot_write 'echo x > "$OTHER/secret.txt"'
+report other_slot_read 'grep -q "other slot" "$OTHER/secret.txt"'
+report registry_write 'echo "{}" > "$CONTROL/ACTIVE.testhost.json"'
+report registry_new_file 'echo x > "$CONTROL/stray"'
+report registry_read 'grep -q registry "$CONTROL/ACTIVE.testhost.json"'
+report other_layer_hidden '[ ! -e "$CONTROL/slot-state/agent/other/home/.claude.json" ]'
+report images_hidden '[ -z "$(ls -A "$CONTROL/slot-images")" ]'
+report home_new_file 'echo x > ~/new-top-level'
+"""
+
+
+@pytest.mark.parametrize("isolation", ["userns", "root"])
+@pytest.mark.parametrize("layout", ["nested", "flat"])
+@pytest.mark.parametrize("protect_system", [True, False])
+def test_other_slots_and_the_registry_are_read_only_from_a_box(
+    box_base: Path, isolation: str, layout: str, protect_system: bool
+) -> None:
+    _sandbox_host_or_skip(isolation)
+    home = _fake_home(box_base)
+    control = box_base / "wt"
+    slots = control if layout == "nested" else control / "slots"
+    mine, other = slots / "mine", slots / "other"
+    for directory in (mine, other, box_base / "project"):
+        directory.mkdir(parents=True)
+    (other / "secret.txt").write_text("other slot's work\n", encoding="utf-8")
+    (control / "ACTIVE.testhost.json").write_text('{"registry": true}\n', encoding="utf-8")
+    other_layer = control / "slot-state" / "agent" / "other" / "home"
+    other_layer.mkdir(parents=True)
+    (other_layer / ".claude.json").write_text("{}", encoding="utf-8")
+    (control / "slot-images" / "agent" / "other").mkdir(parents=True)
+    (control / "slot-images" / "agent" / "other" / "IMAGE.json").write_text("{}", encoding="utf-8")
+    state = control / "slot-state" / "agent" / "mine"
+    slot = f"pytest-ctl-{isolation}-{layout}-{int(protect_system)}-{os.getpid()}"
+    script = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from wrkslots import sandbox\n"
+        "base = Path(sys.argv[1])\n"
+        f"view = sandbox.SlotView({slot!r}, 'agent', Path({str(mine)!r}), Path({str(state)!r}), (), "
+        f"Path({str(control)!r}), 'worktree', base / 'project')\n"
+        f"settings = sandbox.SandboxSettings(isolation={isolation!r}, tmp_size='64M', "
+        f"protect_system={protect_system!r}, limits=sandbox.SandboxLimits(tasks_max=256))\n"
+        "sandbox.run(view, settings, sys.argv[2:])\n"
+    )
+    environment = {
+        **os.environ,
+        "HOME": str(home),
+        "OTHER": str(other),
+        "CONTROL": str(control),
+        "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+    }
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(box_base), "bash", "-c", _CONTROL_PROBE],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=environment,
+            check=False,
+        )
+    finally:
+        subprocess.run(["systemctl", "--user", "stop", sandbox.slice_name("agent", slot)], capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    assert _probe_results(result.stdout) == {
+        "own_slot_write": True,
+        "other_slot_write": False,
+        "other_slot_read": True,
+        "registry_write": False,
+        "registry_new_file": False,
+        "registry_read": True,
+        "other_layer_hidden": True,
+        "images_hidden": True,
+        "home_new_file": True,
+    }, result.stdout + result.stderr
+    assert (other / "secret.txt").read_text(encoding="utf-8") == "other slot's work\n"
+    assert not (control / "stray").exists()
+    assert (state / "home" / "new-top-level").exists()
+
+
+def test_image_records_cannot_redirect_a_slot(tmp_path: Path) -> None:
+    """IMAGE.json is untrusted: its location must be where wrkslots itself would put the slot."""
+
+    control = tmp_path / "control"
+    directory = slotimage.image_directory(control, "agent", "s1")
+    directory.mkdir(parents=True)
+    slots = control / "slots"
+    record = {
+        "schema": slotimage.SCHEMA, "slot": "s1", "slot_type": "agent", "ceiling_bytes": 1,
+        "state_ceiling_bytes": 1, "backend": "kernel", "created_at": "now", "phase": "ready",
+    }
+
+    def write(location: str, **changes: object) -> None:
+        (directory / slotimage.RECORD_NAME).write_text(
+            json.dumps({**record, "location": location, **changes}), encoding="utf-8"
+        )
+
+    write(str(slots / "s1"))
+    with pytest.raises(slotimage.ImageError, match="no slot layout is registered"):
+        slotimage.read_record(directory)
+    slotimage.register_layout(control, lambda _slot_type, slot: slots / slot)
+    for accepted in (
+        slots / "s1",
+        slots / ".s1.fenced.1.0123456789abcdef0123456789abcdef",
+        directory.parent / ".s1.convert-0123abcd",
+    ):
+        write(str(accepted))
+        assert slotimage.read_record(directory).location == accepted
+    for refused in ("/usr", str(slots / "s2"), str(slots / "s1" / "sub"), str(slots / ".s2.fenced.1.x"),
+                    str(slots / ".." / "slots" / "s1"), str(tmp_path / ".s1.fenced.1.x")):
+        write(refused)
+        with pytest.raises(slotimage.ImageError):
+            slotimage.read_record(directory)
+    write(str(slots / "s1"), slot="s2")
+    with pytest.raises(slotimage.ImageError, match="names another slot"):
+        slotimage.read_record(directory)
+
+
+def test_image_helper_refuses_paths_it_should_not_touch(tmp_path: Path) -> None:
+    """The root helper checks each path through its own descriptor before acting."""
+
+    if subprocess.run(["sudo", "-n", "true"], capture_output=True, check=False).returncode:
+        pytest.skip("needs passwordless sudo")
+    helper = Path(slotimage.__file__).with_name("imagehelper.py")
+
+    def run(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["sudo", "-n", "--", os.path.realpath(sys.executable), "-I", str(helper), *arguments],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+
+    image = tmp_path / "x.img"
+    image.write_bytes(b"")
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    (tmp_path / "full").mkdir()
+    (tmp_path / "full" / "file").write_text("x", encoding="utf-8")
+    linked = tmp_path / "linked.img"
+    linked.write_bytes(b"")
+    hard = tmp_path / "hard.img"
+    os.link(linked, hard)
+    for arguments, fragment in (
+        (("mount", str(image), str(link)), "Not a directory"),  # O_PATH|O_NOFOLLOW|O_DIRECTORY on a symlink
+        (("mount", str(image), "/usr"), "not a directory owned by the invoking user"),
+        (("mount", str(image), str(tmp_path / "full")), "not empty"),
+        (("mount", str(hard), str(target)), "singly linked"),
+        (("umount", "/usr"), "not the root of a loop-mounted slot image"),
+        (("umount", str(target)), "not the root of a loop-mounted slot image"),
+        (("trim", "/"), "not the root of a loop-mounted slot image"),
+        (("rmdir-lost-found", "/"), "not the root of a loop-mounted slot image"),
+    ):
+        result = run(*arguments)
+        assert result.returncode != 0 and fragment in result.stderr, (arguments, result.stderr)
+    assert not os.path.ismount(target)

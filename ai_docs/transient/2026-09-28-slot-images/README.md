@@ -188,6 +188,54 @@ through the same `_read_config_document`. Every rewrite keeps the file's format 
 previous bytes to `.wrkslots.yml.bak`. `config convert` switches formats. The refused constructs,
 and why each one stays out, are listed in the module docstring.
 
+### Review fixes (2026-09-28, independent review of #145 slot-images)
+
+Threat model, per the owner: an accident boundary for cooperative agents (no stray checkouts or
+files), not containment of a hostile agent.
+
+- **Control directory (B1).** It is no longer bound writable. It is bound onto itself and
+  remounted read-only (the whole tree, other slots' image mounts included) whatever
+  `protect_system` says. `<control>/slot-state` and `<control>/slot-images` are masked, and the
+  slot's own layer is bound over `$HOME` from a descriptor pinned beforehand. A boxed agent
+  needs no control-directory writes: registry writers (`heartbeat`, `finish`, `write-handoff`)
+  run outside the box. Heartbeats are diagnosis only, so a slot whose owner never heartbeats is
+  merely reclaimed later.
+- **IMAGE.json is untrusted (B2).** Its location must be the slot's canonical directory, a
+  `.<slot>.*` sibling (removal and recovery fences), or the conversion staging directory, and its
+  slot and type must match its directory. Kernel-backend operations go through `imagehelper.py`
+  as root. The helper takes the user from SUDO_UID, opens every path once with O_NOFOLLOW, checks
+  it through the descriptor, and acts on `/proc/self/fd/N`. The loop device is configured by
+  ioctl from the pinned image descriptor (autoclear), so neither `mount` nor `losetup`
+  re-resolves a path. Unmount re-checks the mount identity by lstat, then uses UMOUNT_NOFOLLOW
+  (an open descriptor would keep the mount busy).
+- **Root helper identity (B3, S1).** uid and gid come from SUDO_UID/SUDO_GID, and groups from
+  getgrouplist for that user; a spec that disagrees is refused. The spec lives in
+  `$XDG_RUNTIME_DIR/wrkslots` (tmpfs, 0700, read-only inside every box). It must be a 0600,
+  singly linked regular file owned by the user, and it is deleted right after reading or on any
+  failure. Stale specs a failed sudo left behind are removed by the next launch. Passing an
+  inherited descriptor instead needs `sudo -C`, which sudoers must allow, so a file is used.
+- **PID namespace for root mode (B4): tried, reverted.** The helper unshared mount and PID
+  namespaces and forked a small init (fresh `/proc`, reaping, signal forwarding). Our own tests
+  passed, including host PIDs hidden and signals forwarded. But the real claude launcher printed
+  "Failed to connect to user scope bus via local transport: No data available" and hung: the
+  systemd user bus cannot identify a peer in another PID namespace. So root mode shares the host
+  PID namespace, and `/proc/<pid>/root` and ptrace of the user's other processes stay reachable
+  (this host has no Yama ptrace restriction). Documented under "Limits of the box".
+- **Fuse units (S5)** run in `<root_slice>-images.slice`, nested in the caller's slice, and are
+  named by a SHA-256 of the image path.
+- **Documented, not changed.** The user bus stays writable, so a `systemd-run --user` service
+  starts outside the box (B5). `home_shared` directories hold hooks and settings that run unboxed
+  (S4). Root mode allows setuid programs, `sudo` included, cannot set no_new_privs, and shares the
+  host PID namespace (B4).
+
+Follow-ups, not done:
+
+- **S2**: a content command (status, finish, remove, convert) on an image slot whose image is not
+  mounted should refuse outright, rather than warn and continue against the empty mount point.
+- **S3**: `image convert` needs a journal so an interruption between copy and swap is recovered
+  by `wrkslots recover`. Until then the guide says to convert only idle slots and to keep
+  `--keep-original` for the first conversions.
+
 ## Verification
 
 - `py/wrkslots/tests/test_slot_images.py`: configuration defaults and migration rules, sandbox

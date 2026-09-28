@@ -17,7 +17,8 @@
 #
 # Each harness is asked to run one probe script. The probe records, in the slot, whether writes
 # succeeded to: the slot, a blessed output directory, the project's primary checkout, a
-# directory outside the project, /tmp, a new top-level $HOME file, and ~/.cache. The script then
+# directory outside the project, /tmp, a new top-level $HOME file, ~/.cache, and the wrkslots
+# control directory (the registry). The script then
 # asserts the expected outcome of each and that the real $HOME was not modified.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -80,11 +81,12 @@ try outside 'echo x > "$BASE/outside/written-\$1"'
 try tmp 'echo x > /tmp/written-\$1'
 try home_top_level 'echo x > "\$HOME/.wrkslots-accept-\$1"'
 try home_cache 'echo x > "\$HOME/.cache/wrkslots-accept-\$1"'
+try registry 'echo x > "$BASE/project/worktrees/stray-\$1"'
 EOF
 chmod +x "$PROBE"
 set +e
 
-EXPECTED="slot=yes output=yes primary_checkout=no outside=no tmp=yes home_top_level=yes home_cache=yes"
+EXPECTED="slot=yes output=yes primary_checkout=no outside=no tmp=yes home_top_level=yes home_cache=yes registry=no"
 failures=0
 while IFS= read -r entry; do
   [ -n "${entry// }" ] || continue

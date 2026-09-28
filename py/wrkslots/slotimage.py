@@ -34,14 +34,20 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as _dt
+import hashlib
 import json
 import os
 import shutil
 import stat as _stat
 import subprocess
+import sys
 import time
+import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import Mapping, Sequence
+
+from wrkslots import sandbox
 
 SCHEMA = "wrkslots-slot-image/v1"
 IMAGES_DIRECTORY = "slot-images"
@@ -198,8 +204,52 @@ def _field(raw: Mapping[str, object], key: str, kind: type, path: Path) -> objec
     return value
 
 
+#: Per control directory, the function giving a slot's canonical directory
+#: (``slot_type, slot -> path``). Registered by the configuration loader; an
+#: image record's location is checked against it, never trusted as written.
+_LAYOUTS: dict[Path, Callable[[str, str], Path]] = {}
+
+
+def register_layout(control: Path, slot_directory: Callable[[str, str], Path]) -> None:
+    """Tell image records where each slot of this control directory may live."""
+
+    _LAYOUTS[Path(os.path.abspath(control))] = slot_directory
+
+
+def _check_location(directory: Path, slot_type: str, slot: str, location: Path) -> None:
+    """Refuse a recorded location wrkslots itself would not have chosen for this slot.
+
+    Allowed: the slot's canonical directory; a sibling named ``.<slot>.<suffix>``
+    (the path fences used by removal and recovery); and the conversion staging
+    directory ``<images>/<type>/.<slot>.convert-<hex>``.
+    """
+
+    record = directory / RECORD_NAME
+    if directory.name != slot or directory.parent.name != slot_type:
+        raise ImageError(f"slot image record {record} names another slot ({slot_type}/{slot})")
+    control = Path(os.path.abspath(directory.parent.parent.parent))
+    layout = _LAYOUTS.get(control)
+    if layout is None:
+        raise ImageError(f"no slot layout is registered for {control}; load the configuration first")
+    if not location.is_absolute() or os.path.normpath(location) != str(location):
+        raise ImageError(f"slot image record {record} has a non-canonical location {location}")
+    expected = Path(os.path.abspath(layout(slot_type, slot)))
+    if location == expected:
+        return
+    sibling = re.fullmatch(rf"\.{re.escape(slot)}\.[A-Za-z0-9._-]+", location.name) is not None
+    if sibling and location.parent == expected.parent:
+        return
+    staging = re.fullmatch(rf"\.{re.escape(slot)}\.convert-[0-9a-f]{{8}}", location.name) is not None
+    if staging and location.parent == directory.parent:
+        return
+    raise ImageError(
+        f"slot image record {record} places slot {slot_type}/{slot} at {location}, not at {expected}; "
+        "refusing to mount or remove anything there"
+    )
+
+
 def read_record(directory: Path) -> SlotImage:
-    """Read and validate one image directory's IMAGE.json."""
+    """Read and validate one image directory's IMAGE.json (its location included)."""
 
     path = directory / RECORD_NAME
     try:
@@ -214,6 +264,7 @@ def read_record(directory: Path) -> SlotImage:
     location = Path(str(_field(raw, "location", str, path)))
     if not location.is_absolute():
         raise ImageError(f"slot image record {path} has a relative location")
+    _check_location(directory, str(_field(raw, "slot_type", str, path)), str(_field(raw, "slot", str, path)), location)
     return SlotImage(
         directory=directory,
         slot=str(_field(raw, "slot", str, path)),
@@ -284,6 +335,17 @@ def _run(argv: Sequence[str], *, cwd: Path | None = None, timeout: float = 120.0
             f"{detail[-1] if detail else 'no output'}"
         )
     return result.stdout
+
+
+def _privileged_argv() -> list[str]:
+    helper = Path(__file__).resolve().with_name("imagehelper.py")
+    return ["sudo", "-n", "--", os.path.realpath(sys.executable), "-I", str(helper)]
+
+
+def _privileged(operation: str, *arguments: str, timeout: float = 120.0) -> str:
+    """Run one kernel-backend operation through the checking helper as root."""
+
+    return _run([*_privileged_argv(), operation, *arguments], timeout=timeout)
 
 
 def sudo_available() -> bool:
@@ -476,7 +538,11 @@ def _fuse_mount(image_file: Path, mount_point: Path) -> None:
     # Run the FUSE server in its own transient user service so it outlives the
     # command (or agent sandbox) that mounted it.
     if shutil.which("systemd-run") is not None:
-        unit = "wrkslots-fuse-" + format(abs(hash(str(image_file))) % (1 << 48), "012x")
+        digest = hashlib.sha256(os.path.abspath(image_file).encode()).hexdigest()[:12]
+        unit = f"wrkslots-fuse-{digest}"
+        # Nested in the caller's own enclosing slice, like every slot slice:
+        # wrkslots never moves work out of a slice site policy placed it in.
+        images_slice = sandbox.root_slice().removesuffix(".slice") + "-images.slice"
         probe = subprocess.run(
             [
                 "systemd-run",
@@ -484,7 +550,7 @@ def _fuse_mount(image_file: Path, mount_point: Path) -> None:
                 "--quiet",
                 "--collect",
                 f"--unit={unit}-{os.getpid()}-{int(time.time())}",
-                "--slice=wrkslots-images.slice",
+                f"--slice={images_slice}",
                 f"--working-directory={image_file.parent}",
                 "--",
                 "fuse2fs",
@@ -524,17 +590,7 @@ def mount(image_file: Path, mount_point: Path, backend_preference: str) -> str:
     if _fuse_servers(image_file):
         raise ImageError(f"a fuse2fs process still serves {image_file}; refusing a second mount")
     if backend == "kernel":
-        _run(
-            [
-                "sudo",
-                "-n",
-                "mount",
-                "-o",
-                "loop,discard,noatime,nosuid,nodev",
-                str(image_file),
-                str(mount_point),
-            ]
-        )
+        _privileged("mount", str(image_file), str(mount_point))
     else:
         _fuse_mount(image_file, mount_point)
     if not is_mounted(image_file, mount_point):
@@ -577,7 +633,7 @@ def unmount(image_file: Path, mount_point: Path) -> None:
         return
     backend = mounted[0]
     if backend == "kernel":
-        _run(["sudo", "-n", "umount", str(mount_point)])
+        _privileged("umount", str(mount_point))
     else:
         subprocess.run(["fstrim", str(mount_point)], capture_output=True, check=False)
         _run(["fusermount", "-u", str(mount_point)])
@@ -607,7 +663,7 @@ def _prepare_fresh_root(mount_point: Path) -> None:
             # lost+found belongs to root on a kernel mount. It is harmless
             # residue, but a nested checkout or `git worktree add` needs an
             # empty root, so remove it with the same privilege that mounted it.
-            _run(["sudo", "-n", "rmdir", str(lost)])
+            _privileged("rmdir-lost-found", str(mount_point))
 
 
 def provision(
@@ -794,9 +850,10 @@ def trim(image: SlotImage) -> list[str]:
         mounted = mounted_image_at(mount_point)
         if mounted is None:
             continue
-        argv = ["fstrim", str(mount_point)]
         if mounted[0] == "kernel":
-            argv = ["sudo", "-n", *argv]
+            argv = [*_privileged_argv(), "trim", str(mount_point)]
+        else:
+            argv = ["fstrim", str(mount_point)]
         result = subprocess.run(argv, capture_output=True, text=True, check=False)
         done.append(f"{mount_point}: {'trimmed' if result.returncode == 0 else result.stderr.strip()}")
     return done
@@ -817,19 +874,7 @@ def grow(image: SlotImage, new_ceiling_bytes: int) -> SlotImage:
         mounted = None
     os.truncate(image.slot_image, new_ceiling_bytes)
     if mounted is not None and mounted[0] == "kernel":
-        device = next(
-            (
-                entry.source
-                for entry in mount_table()
-                if entry.mount_point == Path(os.path.abspath(image.location))
-                and entry.fstype == "ext4"
-            ),
-            None,
-        )
-        if device is None:
-            raise ImageError(f"cannot find the loop device mounted at {image.location}")
-        _run(["sudo", "-n", "losetup", "-c", device])
-        _run(["sudo", "-n", "resize2fs", device], timeout=600)
+        _privileged("grow", str(image.location), timeout=600)
     else:
         _run(["e2fsck", "-p", "-f", str(image.slot_image)], timeout=600)
         _run(["resize2fs", str(image.slot_image)], timeout=600)

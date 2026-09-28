@@ -51,7 +51,12 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser], fo
         ),
         formatter_class=formatter,
     )
-    status.add_argument("--format", choices=("human", "json"), default="human")
+    status.add_argument(
+        "--format",
+        choices=("human", "json"),
+        default="human",
+        help="human prints one block per slot; json prints {new_slot_representation, images} (default: human)",
+    )
     status.set_defaults(handler=_cmd_image_status)
 
     mount = actions.add_parser(
@@ -144,23 +149,29 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser], fo
             "Run COMMAND boxed to one slot. The calling process joins a transient systemd user "
             "scope in the slot's own slice (limits shared by everything run against the slot) "
             "and then execs, so the PID never changes. With isolation userns or root, COMMAND "
-            "also sees a confined file-system view: a fresh /tmp per launch; $HOME as the slot's "
+            "also sees a confined file-system view (an accident boundary for cooperative agents, "
+            "not containment of a hostile process; see the user guide's \"Limits of the box\"): "
+            "a fresh /tmp per launch; $HOME as the slot's "
             "persistent private layer, in which every real top-level entry is bound read-only "
             "(nothing is copied), home_private_files are private copies seeded once, "
             "home_private directories are per-slot and writable, home_shared paths are the real "
             "ones and writable, and home_hidden credentials are masked; the slot, its Git "
-            "directories, the control directory, the project's outputs, and read_write paths "
-            "writable; and, with protect_system, every other mount read-only. The box is the "
+            "directories, the project's outputs, and read_write paths writable; the wrkslots "
+            "control directory (registry and other slots) always read-only, so registry commands "
+            "such as heartbeat run outside the box; and, with protect_system, every other mount "
+            "read-only. The box is the "
             "same for plain-worktree and image-backed slots. Defaults come from "
             "configuration.sandbox (see `wrkslots sandbox show-config`); list options ADD to "
             "the configured lists."
         ),
         epilog=(
-            "Isolation: userns (default) builds the view in an unprivileged user namespace; "
-            "root builds the identical view through a short-lived `sudo -n` launcher in a plain "
-            "mount namespace and then drops to your uid, gid, and groups, so setuid helpers "
-            "(sudo, a harness launcher that enters a site sandbox) work inside the box; cgroup "
-            "applies limits only. HOME modes: ro (default) keeps the real $HOME visible "
+            "Isolation: userns (default) builds the view in an unprivileged user namespace, where "
+            "setuid programs gain nothing and host processes cannot be ptraced; root builds the "
+            "identical view through a short-lived `sudo -n` launcher in a plain mount namespace "
+            "and drops to your uid, gid, and groups, so setuid helpers (sudo, a harness launcher "
+            "that enters a site sandbox) work inside the box, sudo can do whatever it allows, and "
+            "your processes outside the box stay reachable through /proc; cgroup applies limits "
+            "only. HOME modes: ro (default) keeps the real $HOME visible "
             "read-only; hidden covers it with an empty tmpfs and binds back only home_expose "
             "paths, read-only.\n\n"
             "Examples:\n"
@@ -180,9 +191,10 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser], fo
         default=None,
         help=(
             "userns: limits plus the file-system view in an unprivileged user namespace; root: "
-            "the same view built through sudo -n, then privileges dropped (setuid helpers work "
-            "inside); cgroup: limits only, no file-system view (default: "
-            "configuration.sandbox.isolation, else userns)"
+            "the same view built through sudo -n, then privileges dropped (setuid helpers, sudo "
+            "included, work inside); cgroup: limits only, no file-system "
+            "view (default: configuration.sandbox.isolation, else userns). Every mode is an "
+            "accident boundary, not containment of a hostile process"
         ),
     )
     run.add_argument(
@@ -723,6 +735,13 @@ def _cmd_shell_command(args: argparse.Namespace) -> int:
     config = _config(args)
     state = cli._load_active(config)
     cli._find_record(state, args.slot)
+    if not sandbox.scope_in_place_available():
+        # The line must keep the pane's process ID (a multiplexer checks it); the
+        # fallback that `wrkslots run` uses without D-Bus cannot.
+        raise _refuse(
+            "shell-command needs the systemd user manager's D-Bus API (busctl --user) so the "
+            "boxed shell keeps the pane's process ID; it is unavailable here"
+        )
     shell = args.shell or os.environ.get("SHELL") or "/bin/bash"
     # The real interpreter (a wrapper script that forks would change the PID)
     # running the entry script in isolated mode: nothing is added to the

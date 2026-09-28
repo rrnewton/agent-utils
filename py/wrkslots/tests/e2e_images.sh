@@ -6,7 +6,7 @@ BACKEND=${1:-kernel}
 LAYOUT=${2:-nested}
 HERE=$(cd "$(dirname "$0")" && pwd)
 PYROOT=$(cd "$HERE/../.." && pwd)
-BASE=${E2E_BASE:-/data/users/$USER/scratch/wrkslots-e2e}/$BACKEND-$LAYOUT
+BASE=${E2E_BASE:-/var/tmp/wrkslots-e2e-$USER}/$BACKEND-$LAYOUT
 export WRKSLOTS_IMAGE_BACKEND=$BACKEND
 W() { PYTHONPATH="$PYROOT" python3 -m wrkslots "$@"; }
 say() { printf '\n=== %s\n' "$*"; }

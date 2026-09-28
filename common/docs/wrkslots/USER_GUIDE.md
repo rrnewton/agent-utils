@@ -733,7 +733,9 @@ Conversion refuses while any process has files open in the slot or works inside 
 agent may stay registered). It copies the content, proves the copy matches file by file (path,
 type, size, mode, and modification time), swaps it in at the same path, and re-verifies every
 checkout's Git identity. The branch, registry record, and path are unchanged. `--keep-original`
-keeps the pre-conversion copy for inspection. Converting to `worktree` discards the sandbox state
+keeps the pre-conversion copy for inspection; use it for the first conversions of a project.
+Conversion is not journaled: convert only idle slots, and if a conversion is interrupted, inspect
+the slot, its image directory, and the kept copy before retrying. Converting to `worktree` discards the sandbox state
 image (the slot's private HOME layer).
 
 ## Running commands and agents inside a slot's box
@@ -742,6 +744,11 @@ image (the slot's private HOME layer).
 slot is stored: a plain-worktree slot and an image-backed slot get the same limits and the same
 view. Only the location of the slot's private state differs (`state.img` for an image slot,
 `<control>/slot-state/<type>/<slot>/` for a plain slot). Nothing is written to host configuration.
+
+**What the box is for.** It is an accident boundary for cooperative agents: it keeps an agent's
+writes (stray checkouts, build output, edits to the wrong tree) inside its slot and the paths it
+was given. It is not containment against a hostile agent. What each mode leaves open is listed
+under "Limits of the box" below.
 
 - **Limits.** The calling process joins a transient systemd user scope inside the slot's own slice,
   `wrkslots-<slot>.slice` below `wrkslots.slice`, and then execs COMMAND. Memory, CPU, task, and IO
@@ -764,7 +771,10 @@ view. Only the location of the slot's private state differs (`state.img` for an 
   Setuid programs cannot gain privilege inside a user namespace, so `sudo`, and any harness
   launcher that performs a setuid step, fail under `userns`. `root` exists for them. The launcher
   enters the slot's scope first (so the cgroup is inherited), checks that `sudo -n` will not
-  prompt, and passes the complete environment in a private spec file because sudo scrubs it. It
+  prompt, and passes the complete environment in a private 0600 spec file in the per-user runtime
+  tmpfs (`$XDG_RUNTIME_DIR/wrkslots`, read-only inside every box), because sudo scrubs it. The
+  helper takes your identity from sudo (`SUDO_UID`, `SUDO_GID`, and your groups from the group
+  database) and refuses a spec that disagrees. It deletes the spec as soon as it has read it. It
   switches to your uid, gid, and supplementary groups at once, keeping only `CAP_SYS_ADMIN` while it
   builds the view (so a FUSE mount you own stays reachable). It then drops that capability too and
   execs COMMAND. No user namespace exists, so setuid programs inside the box work. One consequence:
@@ -784,8 +794,9 @@ With `userns` or `root` isolation, COMMAND sees:
    appears in it as a **read-only** bind mount of the real entry, with its submounts. Nothing is
    copied, and `~/.config`, `~/.local/bin`, and the rest stay readable. Symbolic links are recreated
    as links. Other mount paths that expose the same directory (for example the file system that
-   `$HOME` is bind-mounted from) are made read-only too. So the real `$HOME` cannot be modified from
-   inside, even with `protect_system: false`. New top-level files land in the layer. A harness that
+   `$HOME` is bind-mounted from) are made read-only too, even with `protect_system: false`, so the
+   view offers no writable path into the real `$HOME` except `home_shared` (see "Limits of the box"
+   for what a determined process can still reach). New top-level files land in the layer. A harness that
    rewrites its state file with a temporary file and a rename therefore works, and each slot keeps
    its own copy.
    - `home_private_files` (default `.claude.json`): top-level files seeded **once** into the layer as
@@ -794,25 +805,36 @@ With `userns` or `root` isolation, COMMAND sees:
      top-level entry is simply part of the layer; a nested one is bound from the layer over the
      real path.
    - `home_shared` (default `.claude`, `.codex`, `.muse`, `.config/muse`, `.config/opencode`,
-     `.local/share/opencode`, `.local/state/herdr`, `.local/share/muse`): bound **read-write**
-     from the real `$HOME`, so an agent keeps its login, settings, and transcripts. Missing paths
+     `.local/share/opencode`, `.local/state/herdr`, `.local/share/muse`, `.cargo/registry`,
+     `.cargo/git`): bound **read-write** from the real `$HOME`, so an agent keeps its login,
+     settings, and transcripts, and cargo can fill its package caches (`~/.cargo/bin` and
+     `~/.cargo/config.toml` stay read-only on purpose; a project that pins a toolchain version
+     may also need the toolchain manager's home directory here so it can install that version;
+     the literate configuration names it). Missing paths
      are skipped. Only the named paths are writable; the rest of `~/.config` and `~/.local` stays
-     read-only.
+     read-only. **These directories hold harness settings and hook files that run later outside
+     any box**, so an agent that edits them affects its unboxed runs.
    - `home: hidden` binds only the `home_expose` paths (default `bin`, `.local/bin`) read-only
      into the layer, plus the shared and private paths, and covers the aliases with empty tmpfs.
-3. **Writable binds**: the slot, the Git common directories its checkouts commit into, the wrkslots
-   control directory (heartbeats), the project's blessed `outputs`, and `read_write` paths.
+3. **The wrkslots control directory stays read-only**, whatever `protect_system` says: the
+   registry, journals, and every other slot (including other slots' image mounts) can be read but
+   not written. Other slots' private `$HOME` layers (`<control>/slot-state`) and the image
+   directory (`<control>/slot-images`) are masked. Registry commands that write (`heartbeat`,
+   `finish`, `write-handoff`) therefore run outside the box, for example from the coordinator.
+4. **Writable binds**: the slot, the Git common directories its checkouts commit into, the
+   project's blessed `outputs`, and `read_write` paths.
    `outputs` (default `ai_docs`, `experiments`) are relative to the project root, the primary
    checkout that holds `.wrkslots.yml`, and are skipped when missing. `read_write` entries are
    absolute paths; a leading `~` and `$USER` or `$HOME` are expanded, so a project can name a
    per-user credential staging directory as `/var/.../$USER/...`.
-4. **Masks** (`home_hidden`, default `.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`,
+5. **Masks** (`home_hidden`, default `.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`,
    `.docker/config.json`, `.netrc`, `.git-credentials`, `.pgpass`, `.arcrc`,
    `.config/gh/hosts.yml`, `.config/gcloud`): a directory shows as an empty read-only directory
    owned by you, and a file reads as empty (`/dev/null`). This applies under `$HOME` and its
    aliases.
-5. **Everything else read-only** with `protect_system` (default), except `/proc`, `/sys`, `/dev`,
-   and `/run/user`. Each mount keeps its own `nosuid`/`nodev`/`noexec`/atime flags. A mount that
+6. **Everything else read-only** with `protect_system` (default), except `/proc`, `/sys`, `/dev`,
+   and `/run/user` (the user bus there is what `systemd-run --user --scope`, `busctl`, and terminal
+   multiplexers need). Each mount keeps its own `nosuid`/`nodev`/`noexec`/atime flags. A mount that
    cannot be made read-only while you could write to it refuses the run.
 
 `env` adds variables to COMMAND's environment (a leading `~` in a value is your `$HOME`). The
@@ -822,6 +844,27 @@ its bound paths behind the fresh `/tmp`.
 
 `wrkslots run SLOT --print -- COMMAND` shows the scope, slice limits, environment additions, and
 the helper command (for `root`, the view spec) without running anything.
+
+### Limits of the box
+
+The box stops accidents, not a process that sets out to leave it:
+
+- **The user bus.** `/run/user` stays writable, so a boxed process can ask the user's systemd
+  manager to start a *service* (`systemd-run --user` without `--scope`, or `systemctl --user
+  start`), which runs outside the box and outside the slot's slice. `systemd-run --user --scope`
+  keeps the command inside.
+- **`root` isolation** runs COMMAND with your uid and no user namespace, so it can run setuid
+  programs (that is its purpose): `sudo` works inside and can do anything sudo allows.
+  `no_new_privs` cannot be set, because harness launchers that need a setuid step would then fail.
+  It shares the host's PID namespace: a process in the box can reach the real file system through
+  `/proc/<pid>/root` of any of your processes outside it, and can ptrace them. A PID namespace
+  would close that, but harness launchers that talk to your systemd manager fail inside one (the
+  bus cannot identify a peer in another PID namespace).
+- **`userns` isolation** runs COMMAND in a user namespace, where setuid programs gain nothing and
+  host processes cannot be ptraced or entered through `/proc/<pid>/root`.
+- **`home_shared` and `read_write` paths are writable by design**, and harness settings and hooks
+  kept there run later outside the box.
+- **`cgroup` isolation** applies limits only.
 
 ### Configuring the box
 
@@ -835,7 +878,7 @@ sandbox:
   isolation: userns
   home: ro
   home_shared: [.claude, .codex, .muse, .config/muse, .config/opencode, .local/share/opencode,
-                .local/state/herdr, .local/share/muse]
+                .local/state/herdr, .local/share/muse, .cargo/registry, .cargo/git]
   home_private: [.cache, .buck]
   home_private_files: [.claude.json]
   home_hidden: [.ssh, .gnupg, .aws, .azure, .kube, .docker/config.json, .netrc, .git-credentials,

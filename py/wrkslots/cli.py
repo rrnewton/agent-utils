@@ -3211,6 +3211,9 @@ def _activate_representation(config: Config) -> None:
     """
 
     global _OWNED_REPRESENTATION_MOUNTS
+    slotimage.register_layout(
+        config.control, lambda slot_type, slot: _slot_directory(config, slot, slot_type)
+    )
     if not slotimage.images_root(config.control).exists():
         _OWNED_REPRESENTATION_MOUNTS = frozenset()
         return
@@ -3234,6 +3237,16 @@ def _owned_mount_line(line: str) -> bool:
         return False
     key = (_mountinfo_path(left_fields[4]), str(_mountinfo_path(right_fields[1])))
     return key in _OWNED_REPRESENTATION_MOUNTS
+
+
+#: Control-directory entries that hold slot storage rather than being slots:
+#: the disk images and the box's per-slot private state. In the nested layout
+#: they sit beside the slot directories.
+_REPRESENTATION_DIRECTORIES = (slotimage.IMAGES_DIRECTORY, "slot-state")
+
+
+def _is_representation_directory(config: Config, entry: Path) -> bool:
+    return entry.parent == config.control and entry.name in _REPRESENTATION_DIRECTORIES
 
 
 def _slot_image_at(config: Config, path: Path) -> slotimage.SlotImage | None:
@@ -7502,6 +7515,7 @@ def _registry_storage_inconsistencies(
                 if (entry.is_dir() or entry.is_symlink())
                 and not entry.name.startswith("EVENTS.")
                 and entry != config.control / "wrkslots"
+                and not _is_representation_directory(config, entry)
                 and not (
                     slot_type == "agent"
                     and entry == _validate_slots_directory(config)
@@ -8855,6 +8869,7 @@ def _assert_registry_storage_consistent(
             if (entry.is_dir() or entry.is_symlink())
             and not entry.name.startswith("EVENTS.")
             and entry != config.control / "wrkslots"
+            and not _is_representation_directory(config, entry)
             and not (
                 slot_type == "agent"
                 and entry == _validate_slots_directory(config)
@@ -19661,6 +19676,7 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
                 or entry.is_symlink()
                 or entry.name.startswith("EVENTS.")
                 or entry == _validate_slots_directory(config)
+                or _is_representation_directory(config, entry)
                 or entry.name in registered_slots
             ):
                 continue
@@ -20078,6 +20094,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                     if entry.is_dir()
                     and not entry.is_symlink()
                     and not entry.name.startswith("EVENTS.")
+                    and not _is_representation_directory(config, entry)
                     and not (
                         slot_type == "agent"
                         and entry == _validate_slots_directory(config)

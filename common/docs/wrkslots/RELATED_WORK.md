@@ -477,7 +477,12 @@ What `wrkslots` takes from them:
 
 - **bubblewrap's model** — a fresh user and mount namespace, read-only binds of the host, writable
   binds of exactly what the task owns — implemented directly so it works where bubblewrap is not
-  installed, and extended with a private per-slot `$HOME` that seeds copies of top-level dotfiles.
+  installed, and extended with a private per-slot `$HOME` layer over read-only binds of the real
+  entries, and with a `root` mode (a `sudo -n` launcher and a mount namespace, then dropped
+  privileges) for harness launchers that need a setuid step. Like bubblewrap without seccomp, and
+  unlike a container runtime, the result is an accident boundary for cooperative agents on the
+  user's own uid, not containment of a hostile process: the user's systemd bus stays reachable,
+  and `root` mode allows setuid programs.
 - **Harness sandboxes confine commands, not budgets.** The Claude Code and Codex sandboxes decide
   where a command may write and connect; neither bounds memory, CPU, processes, or bytes at rest,
   and neither reclaims anything. `wrkslots run` adds those per slot and leaves the network and the

@@ -42,6 +42,7 @@ The network is not touched: agent harnesses and site policy own that.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import dataclasses
 import errno as _errno
@@ -49,6 +50,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -70,6 +72,9 @@ DEFAULT_HOME_SHARED = (
     ".local/share/opencode",
     ".local/state/herdr",
     ".local/share/muse",
+    # Package caches: a build that fetches a crate it has not cached writes here.
+    ".cargo/registry",
+    ".cargo/git",
 )
 #: Per-slot, persistent, writable directories: they live in the slot's private
 #: $HOME layer instead of being bound from the real $HOME.
@@ -189,8 +194,12 @@ SETTING_DOCS: dict[str, str] = {
         "(default): limits plus the file-system view below, built in an unprivileged user "
         "namespace. root: the same view built by a short-lived `sudo -n` launcher, then "
         "privileges dropped to your uid, gid, and groups; use it for harness launchers that "
-        "perform a setuid step, which a user namespace refuses. Needs passwordless sudo. "
-        "cgroup: per-slot limits only, no file-system view."
+        "perform a setuid step, which a user namespace refuses. Setuid programs (sudo included) "
+        "work inside, and your processes outside the box stay reachable through /proc. Needs "
+        "passwordless sudo. cgroup: per-slot limits only, no file-system view. The box is an "
+        "accident boundary for cooperative agents, not containment of a hostile process: the "
+        "user's systemd bus stays reachable, so `systemd-run --user` without --scope starts work "
+        "outside it."
     ),
     "home": (
         "ro (default): $HOME inside the box is this slot's persistent private layer, in "
@@ -200,9 +209,14 @@ SETTING_DOCS: dict[str, str] = {
     ),
     "home_shared": (
         "$HOME-relative paths bound read-write from the real $HOME: agent credentials, "
-        "settings, and transcripts that must stay shared with the host. Missing paths are "
-        "skipped. Only these paths are writable; the rest of ~/.config and ~/.local stays "
-        "read-only."
+        "settings, and transcripts that must stay shared with the host, and package caches "
+        "(.cargo/registry and .cargo/git, which cargo writes when it fetches a crate it has "
+        "not cached; ~/.cargo/bin and ~/.cargo/config.toml stay read-only on purpose). A "
+        "project that pins its toolchain in rust-toolchain.toml may also need .rustup here "
+        "so rustup can install it. Missing paths are skipped. Only these paths are writable; "
+        "the rest of ~/.config and ~/.local stays read-only. Note: these directories hold "
+        "settings and hook files that the harness later runs OUTSIDE any box, so a boxed "
+        "agent that edits them affects unboxed runs."
     ),
     "home_private": (
         "$HOME-relative directories that are private to the slot, persistent, and writable "
@@ -783,7 +797,9 @@ def prepare_state(view: SlotView, settings: SandboxSettings, home: Path) -> None
                 stale.unlink()
         except OSError:
             created.add(relative)  # not empty: the agent's own content; keep tracking
-    record.write_text(json.dumps(sorted(created)), encoding="utf-8")
+    temporary = record.with_name(f"{record.name}.tmp.{os.getpid()}")
+    temporary.write_text(json.dumps(sorted(created)), encoding="utf-8")
+    os.replace(temporary, record)
     # Earlier drafts kept a persistent per-slot /tmp; /tmp is per launch now.
     legacy_tmp = view.state_directory / "tmp"
     if legacy_tmp.is_dir() and not legacy_tmp.is_symlink():
@@ -819,7 +835,9 @@ def build_spec(view: SlotView, settings: SandboxSettings, home: Path, cwd: Path)
     add(view.slot_path, view.slot_path)
     for directory in view.git_directories:
         add(directory, directory)
-    add(view.control_directory, view.control_directory)
+    # The wrkslots control directory (registry, journals, other slots, slot images,
+    # private HOME layers) is never writable from a box: registry commands such as
+    # heartbeat, finish, and write-handoff run outside it.
     if view.project_root is not None:
         for relative in settings.outputs:
             path = view.project_root / relative
@@ -830,14 +848,23 @@ def build_spec(view: SlotView, settings: SandboxSettings, home: Path, cwd: Path)
         if path.exists():
             add(path, path)
     entries = home_entries(settings, home)
+    read_only = [str(view.control_directory)]
+    runtime = spec_directory()
+    if runtime is not None:
+        read_only.append(str(runtime))
+    masks = [str(base / relative) for base in aliases for relative in settings.home_hidden]
+    # Other slots' images and private HOME layers (which hold private copies of
+    # credential files). This slot's own layer is bound over $HOME beforehand.
+    masks += [str(view.control_directory / name) for name in ("slot-images", "slot-state")]
     return {
         "home": str(home),
         "home_aliases": [str(alias) for alias in aliases[1:]],
         "home_mode": settings.home,
         "home_layer": str(home_layer(view)),
         "home_binds": [relative for relative, kind in entries if kind != "link"],
+        "read_only": read_only,
         "binds": binds,
-        "masks": [str(base / relative) for base in aliases for relative in settings.home_hidden],
+        "masks": masks,
         "tmp_size": settings.tmp_size,
         "protect_system": settings.protect_system,
         "cwd": str(cwd),
@@ -1048,8 +1075,15 @@ def build_view(spec: Mapping[str, object]) -> None:
     # Pin every source before anything is covered: once /tmp or $HOME is
     # covered, the real paths below it are reachable only through these
     # descriptors, and nothing has to be staged on the host.
+    read_only = [path for path in strings("read_only") if os.path.isdir(path)]
     pinned: dict[str, int] = {}
-    for path in [layer, *aliases, *(os.path.join(home, rel) for rel in home_binds), *(src for src, _ in binds)]:
+    for path in [
+        layer,
+        *aliases,
+        *(os.path.join(home, rel) for rel in home_binds),
+        *read_only,
+        *(src for src, _ in binds),
+    ]:
         if path not in pinned:
             pinned[path] = os.open(path, _O_PATH)
 
@@ -1076,9 +1110,18 @@ def build_view(spec: Mapping[str, object]) -> None:
         else:
             _mount("tmpfs", alias, "tmpfs", _MS_NOSUID | _MS_NODEV, "mode=0755,size=16m")
 
-    # 3-4. Writable binds, in order: shared $HOME state, nested private
-    # directories, the slot, Git directories, control directory, outputs,
-    # extra paths.
+    # 3. Trees that stay read-only whatever protect_system says: the wrkslots
+    # control directory (registry, other slots and their mounts) and the root
+    # launcher's spec directory. A slot below the control directory is bound
+    # writable again next.
+    for path in read_only:
+        _bind_fd(pinned[path], path)
+        failures = _remount_tree_read_only(path)
+        if failures:
+            raise SandboxError(f"could not make {path} read-only: " + "; ".join(failures[:3]))
+
+    # 4. Writable binds, in order: shared $HOME state, nested private
+    # directories, the slot, Git directories, outputs, extra paths.
     for source, target in binds:
         _bind_fd(pinned[source], target)
 
@@ -1151,31 +1194,123 @@ def _prctl(option: int, value: int) -> None:
     _check(_libc().prctl(option, ctypes.c_ulong(value), 0, 0, 0), f"prctl({option})")
 
 
-def enter_root(spec_file: str) -> None:
-    """``sudo -n`` side of ``isolation: root``: build the view, drop to the user, exec.
+_SPEC_BYTES_LIMIT = 16 * 1024 * 1024
+def _sudo_identity() -> tuple[int, int, list[int], str]:
+    """The invoking user, from what sudo itself recorded (never from the spec)."""
 
-    The spec file carries the view, the command, the user's identity, and the
-    complete child environment (sudo scrubbed ours). Privilege is shed in two
-    steps: uid, gid, and groups become the user's immediately, keeping only
-    CAP_SYS_ADMIN, so the view is built with the user's own path access (a
-    FUSE mount the user owns stays reachable); then that capability is dropped
-    too. No user namespace is created, so setuid programs inside the box work.
+    import pwd
+
+    try:
+        uid = int(os.environ["SUDO_UID"])
+        gid = int(os.environ["SUDO_GID"])
+    except (KeyError, ValueError) as exc:
+        raise SandboxError("enter-root must run through sudo (SUDO_UID/SUDO_GID are missing)") from exc
+    if uid == 0:
+        raise SandboxError("isolation root boxes a non-root user; the invoking user is root")
+    try:
+        name = pwd.getpwuid(uid).pw_name
+    except KeyError as exc:
+        raise SandboxError(f"invoking uid {uid} has no passwd entry") from exc
+    groups = sorted(set(os.getgrouplist(name, gid)))
+    return uid, gid, groups, name
+
+
+def _read_root_spec(spec_file: str, uid: int) -> dict[str, object]:
+    """Read and delete the launcher's spec, trusting it only if the user alone could write it."""
+
+    try:
+        directory = os.stat(os.path.dirname(spec_file) or ".", follow_symlinks=False)
+        descriptor = os.open(spec_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            os.unlink(spec_file)
+        raise SandboxError(f"cannot open the root launcher spec: {exc}") from exc
+    try:
+        info = os.fstat(descriptor)
+        problems = []
+        if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != uid or directory.st_mode & 0o077:
+            problems.append("its directory is not private to the invoking user")
+        if not stat.S_ISREG(info.st_mode):
+            problems.append("it is not a regular file")
+        if info.st_uid != uid:
+            problems.append("it is not owned by the invoking user")
+        if stat.S_IMODE(info.st_mode) != 0o600:
+            problems.append("its mode is not 0600")
+        if info.st_nlink != 1:
+            problems.append("it has other links")
+        if info.st_size > _SPEC_BYTES_LIMIT:
+            problems.append("it is too large")
+        if problems:
+            raise SandboxError("refusing the root launcher spec: " + "; ".join(problems))
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1 << 20)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if sum(len(part) for part in chunks) > _SPEC_BYTES_LIMIT:
+                raise SandboxError("refusing the root launcher spec: it is too large")
+    finally:
+        os.close(descriptor)
+        with contextlib.suppress(OSError):
+            os.unlink(spec_file)
+    try:
+        document = json.loads(b"".join(chunks))
+    except ValueError as exc:
+        raise SandboxError(f"the root launcher spec is not JSON: {exc}") from exc
+    if not isinstance(document, dict):
+        raise SandboxError("root sandbox spec must be a JSON object")
+    return document
+
+
+def enter_root(spec_file: str) -> None:
+    """``sudo -n`` side of ``isolation: root``: build the view, drop to the user, run the command.
+
+    The identity comes from sudo (SUDO_UID, SUDO_GID, and the user's groups from
+    the group database); the spec must agree with it. The spec, which carries
+    the complete child environment because sudo scrubbed ours, is accepted only
+    from a 0600 file owned by the user in a directory only the user can write,
+    and is deleted as soon as it is read. Privilege is shed in two steps: uid,
+    gid, and groups become the user's immediately, keeping only CAP_SYS_ADMIN,
+    so the view is built with the user's own path access (a FUSE mount the user
+    owns stays reachable); then that capability is dropped too, and the command
+    replaces this process.
+
+    No user namespace is created, so setuid programs inside the box work. No
+    PID namespace either: harness launchers that talk to the user's systemd
+    manager fail inside one (the bus cannot identify a peer in another PID
+    namespace), so host processes stay visible (see the user guide's "Limits of
+    the box").
     """
 
     if os.geteuid() != 0:
+        with contextlib.suppress(OSError):
+            os.unlink(spec_file)
         raise SandboxError("enter-root must run as root (through sudo -n)")
-    with open(spec_file, encoding="utf-8") as handle:
-        document = json.load(handle)
-    os.unlink(spec_file)
-    if not isinstance(document, dict):
-        raise SandboxError("root sandbox spec must be a JSON object")
+    try:
+        uid, gid, groups, name = _sudo_identity()
+    except SandboxError:
+        with contextlib.suppress(OSError):
+            os.unlink(spec_file)
+        raise
+    document = _read_root_spec(spec_file, uid)
     view = document["view"]
-    command = [str(item) for item in document["command"]]
-    environment = {str(key): str(value) for key, value in dict(document["environment"]).items()}
-    uid, gid = int(document["uid"]), int(document["gid"])
-    groups = [int(item) for item in document["groups"]]
-    if uid == 0:
-        raise SandboxError("isolation root boxes a non-root user; the invoking user is root")
+    assert isinstance(view, dict)
+    raw_command = document["command"]
+    raw_environment = document["environment"]
+    raw_groups = document.get("groups", [])
+    if not isinstance(raw_command, list) or not raw_command or not isinstance(raw_environment, dict):
+        raise SandboxError("the root launcher spec has no command or environment")
+    if not isinstance(raw_groups, list) or not all(isinstance(item, int) for item in raw_groups):
+        raise SandboxError("the root launcher spec has invalid groups")
+    command = [str(item) for item in raw_command]
+    environment = {str(key): str(value) for key, value in raw_environment.items()}
+    claimed = (document.get("uid"), document.get("gid"), sorted(set(raw_groups)))
+    if claimed != (uid, gid, groups):
+        raise SandboxError(
+            f"the root launcher spec names uid/gid/groups {claimed[0]}/{claimed[1]}/{claimed[2]}, "
+            f"but sudo was invoked by {name} ({uid}/{gid}/{groups}); refusing"
+        )
     os.setgroups(groups)
     os.setresgid(gid, gid, gid)
     _prctl(_PR_SET_KEEPCAPS, 1)
@@ -1183,7 +1318,7 @@ def enter_root(spec_file: str) -> None:
     _set_capabilities([_CAP_SYS_ADMIN])
     _prctl(_PR_SET_KEEPCAPS, 0)
     _prctl(_PR_SET_DUMPABLE, 1)
-    os.umask(int(document.get("umask", 0o022)))
+    os.umask(int(str(document.get("umask", 0o022))))
     _check(_libc().unshare(_CLONE_NEWNS), "unshare mount namespace")
     build_view(view)
     _set_capabilities([])
@@ -1264,14 +1399,42 @@ def check_sudo() -> None:
         )
 
 
-def write_root_spec(
-    view: SlotView, spec: Mapping[str, object], command: Sequence[str], environment: Mapping[str, str]
-) -> str:
-    """Write the root helper's input to a private file only the user (and root) can read."""
+def spec_directory() -> Path | None:
+    """Private directory for root-launcher specs: in the per-user runtime tmpfs, never on disk."""
 
     runtime = os.environ.get("XDG_RUNTIME_DIR")
-    directory = Path(runtime) / "wrkslots" if runtime and os.path.isdir(runtime) else view.state_directory
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not runtime or not os.path.isdir(runtime):
+        return None
+    return Path(runtime) / "wrkslots"
+
+
+_STALE_SPEC_SECONDS = 300
+
+
+def write_root_spec(
+    spec: Mapping[str, object], command: Sequence[str], environment: Mapping[str, str]
+) -> str:
+    """Write the root helper's input to a 0600 file in the user's runtime tmpfs.
+
+    The directory is private (0700) and read-only inside every box, so a boxed
+    process cannot tamper with another launch's spec. The helper deletes the
+    file as soon as it has read it; specs a failed sudo left behind are removed
+    by the next launch.
+    """
+
+    directory = spec_directory()
+    if directory is None:
+        raise SandboxError("isolation root needs XDG_RUNTIME_DIR (a per-user tmpfs) for its launch spec")
+    directory.mkdir(mode=0o700, exist_ok=True)
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise SandboxError(f"{directory} is not a directory owned by this user")
+    os.chmod(directory, 0o700)
+    now = time.time()
+    for stale in directory.glob("sandbox-*.json"):
+        with contextlib.suppress(OSError):
+            if now - stale.lstat().st_mtime > _STALE_SPEC_SECONDS:
+                stale.unlink()
     umask = os.umask(0o077)
     os.umask(umask)
     document = {
@@ -1280,13 +1443,34 @@ def write_root_spec(
         "environment": dict(environment),
         "uid": os.getuid(),
         "gid": os.getgid(),
-        "groups": os.getgroups(),
+        "groups": sorted(set(os.getgroups())),
         "umask": umask,
     }
     descriptor, path = tempfile.mkstemp(prefix="sandbox-", suffix=".json", dir=directory)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        json.dump(document, handle)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(document, handle)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise
     return path
+
+
+def scope_in_place_available() -> bool:
+    """Whether a process can join a transient scope without forking (the D-Bus path)."""
+
+    if shutil.which("busctl") is None:
+        return False
+    result = subprocess.run(
+        ["busctl", "--user", "status", "org.freedesktop.systemd1"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    return result.returncode == 0
 
 
 def place_in_scope(unit: str, slice_unit: str) -> bool:
@@ -1386,15 +1570,26 @@ def run(
     if isolation == "userns":
         argv = userns_helper(build_spec(view, settings, home, workdir), command)
     elif isolation == "root":
-        spec_file = write_root_spec(view, build_spec(view, settings, home, workdir), command, environment)
+        spec_file = write_root_spec(build_spec(view, settings, home, workdir), command, environment)
         argv = root_helper(spec_file)
     else:
         os.chdir(workdir)
         argv = list(command)
     # The scope is established BEFORE sudo in root mode, so the root helper and
     # the command inherit the slot's cgroup.
-    if place_in_scope(unit_name, slot_slice):
-        os.execvpe(argv[0], argv, environment)
+    try:
+        if place_in_scope(unit_name, slot_slice):
+            os.execvpe(argv[0], argv, environment)
+    except OSError:
+        if isolation == "root":
+            with contextlib.suppress(OSError):
+                os.unlink(argv[-1])
+        raise
+    print(
+        "wrkslots run: the user manager's D-Bus API is unavailable, so the command runs under "
+        "`systemd-run --scope`; its process ID differs from the caller's",
+        file=sys.stderr,
+    )
     fallback = [
         "systemd-run",
         "--user",
