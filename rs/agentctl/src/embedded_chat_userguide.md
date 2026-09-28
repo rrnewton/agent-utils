@@ -71,6 +71,16 @@ those exact bytes into a sealed in-memory executable, and retains that image for
 the generation. Reply and reaction operations neither reopen nor rehash the
 source path.
 
+In `chat run`, a generation-owned worker queues reaction ACKs as soon as the
+inbound batch is durably admitted and its provider commit is confirmed. Pane
+delivery, later intake, output capture and replies do not wait for that worker.
+It runs one ACK at a time through a bounded queue; overflow stays in durable
+state for recovery. Failed or uncertain ACKs retain their operation ID and wait
+at least 60 seconds before an in-process retry. A restart reconciles pending
+ACKs using those same IDs. `chat tick` still completes its bounded ACK work
+before returning. During service shutdown, queued work remains pending and an
+already admitted ACK is owned until bounded completion or uncertain cleanup.
+
 To run intentionally without reactions or replies, set `outbound_enabled` to
 `false`, set `ack_reaction` to `null`, and omit `outbound_command`. The delivered
 prompt then explicitly identifies the bridge as inbound-only and forbids reply
