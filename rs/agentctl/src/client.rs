@@ -105,6 +105,40 @@ struct PaneProcessState {
     processes: Vec<Map<String, Value>>,
 }
 
+/// Whether a Claude or Codex workspace trust dialog is on screen.
+pub fn relay_trust_prompt(screen: &str) -> bool {
+    (screen.contains("Quick safety check: Is this a project you created or one you trust?")
+        && screen.contains("Yes, I trust this folder"))
+        || (screen.contains("Trust this folder?") && screen.contains("Trust and continue"))
+}
+
+/// Parent -> children for every visible process, from world-readable stat files. A root-owned
+/// process's own task directory is not readable by the user, so descendants of sudo are found
+/// through their parent links instead.
+fn process_children_map() -> HashMap<u64, Vec<u64>> {
+    let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return children;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let Ok(value) = bounded_file(&entry.path().join("stat"), PROC_STAT_BYTES, "process stat")
+        else {
+            continue;
+        };
+        if let Ok(stat) = parse_process_stat(&value, pid) {
+            children.entry(stat.parent_pid).or_default().push(pid);
+        }
+    }
+    children
+}
+
 /// The pane's own shell PID is the sole foreground process, is a shell, and sits in a
 /// wrkslots slice.
 fn slot_boxed_shell(state: &PaneProcessState) -> bool {
@@ -1661,6 +1695,236 @@ impl HerdrClient {
             "pane {pane_id} did not return to a wrkslots-boxed shell within {}s; inspect the pane for the wrkslots error",
             timeout.as_secs_f64()
         )))
+    }
+
+    /// Identify the program a slot's root relay runs in one pane, if any.
+    ///
+    /// Under root slot isolation the pane's shell PID execs into sudo, which keeps the
+    /// terminal and runs the boxed program on a private pty behind a monitor process. The
+    /// program is the first process below the pane's shell PID that belongs to this user and
+    /// shares its wrkslots slot scope. The pane lives exactly as long as that chain.
+    pub fn relay_process(&self, pane_id: &str) -> Result<Option<CustomProcessIdentity>> {
+        let state = self.pane_process_state(pane_id, &|| false)?;
+        let argv0 = state
+            .processes
+            .first()
+            .and_then(|process| process.get("argv"))
+            .and_then(Value::as_array)
+            .and_then(|values| values.first())
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if state.processes.len() != 1
+            || state.processes[0].get("pid").and_then(Value::as_u64) != Some(state.shell_pid)
+            || state.foreground_process_group_id != state.shell_pid
+            || argv0.rsplit('/').next() != Some("sudo")
+        {
+            return Ok(None);
+        }
+        let cgroup = |pid: u64| fs::read_to_string(format!("/proc/{pid}/cgroup")).ok();
+        let Some(scope) = cgroup(state.shell_pid).filter(|scope| scope.contains("wrkslots")) else {
+            return Ok(None);
+        };
+        let uid = fs::metadata("/proc/self")
+            .map(|metadata| metadata.uid())
+            .map_err(|error| {
+                AdapterError::unavailable(format!("cannot read this process's owner: {error}"))
+            })?;
+        let tree = process_children_map();
+        let mut frontier = vec![state.shell_pid];
+        let mut seen = HashSet::from([state.shell_pid]);
+        for _depth in 0..4 {
+            let mut following = Vec::new();
+            for parent in frontier {
+                let mut children = tree.get(&parent).cloned().unwrap_or_default();
+                children.sort_unstable();
+                for child in children {
+                    if !seen.insert(child) {
+                        continue;
+                    }
+                    let owner =
+                        fs::metadata(format!("/proc/{child}")).map(|metadata| metadata.uid());
+                    if owner.is_ok_and(|owner| owner == uid)
+                        && cgroup(child).as_ref() == Some(&scope)
+                    {
+                        return Ok(live_custom_process(child)
+                            .ok()
+                            .map(|process| process.identity));
+                    }
+                    following.push(child);
+                }
+            }
+            frontier = following;
+        }
+        Ok(None)
+    }
+
+    /// Require the recorded program to still run behind this pane's root relay.
+    pub fn verify_relay_harness(
+        &self,
+        pane_id: &str,
+        expected: Option<&CustomProcessIdentity>,
+    ) -> Result<()> {
+        let observed = self.relay_process(pane_id)?;
+        if observed.is_none() || observed.as_ref() != expected {
+            return Err(AdapterError::unavailable(format!(
+                "the recorded program is not running behind the slot relay in pane {pane_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Herdr's live screen-rule verdict for one pane: (agent kind, state).
+    ///
+    /// Herdr keeps a reported pane state as reported; its bundled screen rules are evaluated
+    /// live only by `agent explain`.
+    pub fn explain_agent(&self, pane_id: &str) -> Result<(Option<String>, String)> {
+        let completed =
+            self.invoke_with_timeout(&strings(&["agent", "explain", pane_id]), CONTROL_TIMEOUT)?;
+        if completed.status != 0 {
+            return Err(AdapterError::unavailable(format!(
+                "agent explain {pane_id}: {}",
+                detail(&completed)
+            )));
+        }
+        let mut agent = None;
+        let mut state = None;
+        let mut rule = None;
+        let mut fallback = false;
+        for line in completed.stdout.lines() {
+            if let Some((key, value)) = line.split_once(':') {
+                match key.trim() {
+                    "agent" if agent.is_none() => agent = Some(value.trim().to_owned()),
+                    "state" if state.is_none() => state = Some(value.trim().to_owned()),
+                    "rule" if rule.is_none() => rule = Some(value.trim().to_owned()),
+                    "fallback_reason" => fallback = true,
+                    _ => {}
+                }
+            }
+        }
+        // A default for a known agent with no matching rule is not screen evidence.
+        let matched = !fallback && rule.as_deref().is_some_and(|rule| rule != "none");
+        let state = state
+            .filter(|state| {
+                matched
+                    && matches!(
+                        state.as_str(),
+                        "idle" | "working" | "blocked" | "done" | "unknown"
+                    )
+            })
+            .unwrap_or_else(|| "unknown".to_owned());
+        Ok((agent.filter(|agent| !agent.is_empty()), state))
+    }
+
+    /// Label one exact pane as a harness kind with a lifecycle state, without naming an agent.
+    pub fn report_pane_agent(&self, pane_id: &str, kind: &str, state: &str) -> Result<()> {
+        self.call_ok(
+            &strings(&[
+                "pane",
+                "report-agent",
+                pane_id,
+                "--source",
+                "agentctl",
+                "--agent",
+                kind,
+                "--state",
+                state,
+                "--message",
+                "agentctl custom harness",
+            ]),
+            &format!("report custom agent {pane_id}"),
+        )
+    }
+
+    /// Run a slot-boxed harness behind a root relay in a fresh pane and prove it ready.
+    ///
+    /// Herdr cannot start an agent there (sudo, not a shell, is the pane's foreground
+    /// process), so the boxed harness line is run directly, the relayed program is pinned,
+    /// and readiness comes from Herdr's live screen rules, which Herdr applies once the pane
+    /// is reported as `kind`.
+    pub fn start_relay_agent(
+        &self,
+        kind: &str,
+        pane_id: &str,
+        command_line: &str,
+        timeout: Duration,
+        persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> Result<()>,
+    ) -> Result<CustomProcessIdentity> {
+        if timeout.is_zero() || timeout > Duration::from_secs(300) {
+            return Err(AdapterError::unavailable(
+                "agent startup timeout must be between 0 and 300 seconds",
+            ));
+        }
+        self.call_ok(
+            &[
+                "pane".to_owned(),
+                "run".to_owned(),
+                pane_id.to_owned(),
+                command_line.to_owned(),
+            ],
+            &format!("pane run slot relay {kind:?}"),
+        )?;
+        let deadline = Instant::now() + timeout;
+        let mut observed = None;
+        while observed.is_none() && Instant::now() < deadline {
+            observed = self.relay_process(pane_id).ok().flatten();
+            if observed.is_none() {
+                thread::sleep(
+                    Duration::from_millis(100)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+        }
+        let observed = observed.ok_or_else(|| {
+            AdapterError::unavailable(format!(
+                "no slot relay program appeared in pane {pane_id}; inspect the pane for the wrkslots error"
+            ))
+        })?;
+        persist_identity(observed.clone())?;
+        self.report_pane_agent(pane_id, kind, "unknown")?;
+        let mut state = "unknown".to_owned();
+        loop {
+            if Instant::now() >= deadline {
+                return Err(AdapterError::unavailable(format!(
+                    "{kind} behind the slot relay did not reach an idle screen in pane {pane_id} within {}s (last state {state})",
+                    timeout.as_secs_f64()
+                )));
+            }
+            // The program may exec while it starts; any relay program still running counts.
+            if self.relay_process(pane_id)?.is_none() {
+                return Err(AdapterError::unavailable(format!(
+                    "the slot relay program in pane {pane_id} exited during startup"
+                )));
+            }
+            if relay_trust_prompt(&self.read(pane_id, "visible", Some(200))?) {
+                return Err(AdapterError::unavailable(format!(
+                    "{kind} workspace trust prompt requires human attention; no input was submitted"
+                )));
+            }
+            let (agent, observed_state) = self.explain_agent(pane_id)?;
+            state = observed_state;
+            if agent.as_deref() == Some(kind) && state == "idle" {
+                break;
+            }
+            if agent.as_deref() == Some(kind) && state == "blocked" {
+                return Err(AdapterError::unavailable(format!(
+                    "{kind} is waiting for human attention (for example a workspace trust prompt); no input was submitted"
+                )));
+            }
+            thread::sleep(
+                Duration::from_millis(200).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+        // Pin the generation that reached the idle screen.
+        let settled = self.relay_process(pane_id)?.ok_or_else(|| {
+            AdapterError::unavailable(format!(
+                "the slot relay program in pane {pane_id} exited during startup"
+            ))
+        })?;
+        if settled != observed {
+            persist_identity(settled.clone())?;
+        }
+        self.report_pane_agent(pane_id, kind, "idle")?;
+        Ok(settled)
     }
 
     /// Report whether a pinned command process is still the pane's foreground process.

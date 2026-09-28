@@ -614,6 +614,60 @@ pub trait ManagedApi: AgentApi {
         args: &[String],
         timeout: Duration,
     ) -> crate::error::Result<()>;
+    /// The fixed install location of a harness executable.
+    fn harness_executable(&self, kind: &str) -> crate::error::Result<PathBuf> {
+        crate::client::resolve_harness_executable(kind)
+    }
+    /// Run a slot-boxed harness behind a root relay and pin the relayed program.
+    fn start_relay_agent(
+        &self,
+        _kind: &str,
+        _pane: &str,
+        _command_line: &str,
+        _timeout: Duration,
+        _persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> crate::error::Result<()>,
+    ) -> crate::error::Result<CustomProcessIdentity> {
+        Err(crate::error::AdapterError::unavailable(
+            "slot relay launch is unavailable",
+        ))
+    }
+    /// The program running behind a root slot relay in one pane, if any.
+    fn relay_process(&self, _pane: &str) -> crate::error::Result<Option<CustomProcessIdentity>> {
+        Err(crate::error::AdapterError::unavailable(
+            "slot relay inspection is unavailable",
+        ))
+    }
+    /// Require the recorded program to still run behind this pane's root relay.
+    fn verify_relay_harness(
+        &self,
+        pane: &str,
+        expected: Option<&CustomProcessIdentity>,
+    ) -> crate::error::Result<()> {
+        let observed = self.relay_process(pane)?;
+        if observed.is_none() || observed.as_ref() != expected {
+            return Err(crate::error::AdapterError::unavailable(format!(
+                "the recorded program is not running behind the slot relay in pane {pane}"
+            )));
+        }
+        Ok(())
+    }
+    /// Herdr's live screen-rule verdict for one pane: (agent kind, state).
+    fn explain_agent(&self, _pane: &str) -> crate::error::Result<(Option<String>, String)> {
+        Err(crate::error::AdapterError::unavailable(
+            "screen-rule explanation is unavailable",
+        ))
+    }
+    /// Label one exact pane as a harness kind with a lifecycle state.
+    fn report_pane_agent(
+        &self,
+        _pane: &str,
+        _kind: &str,
+        _state: &str,
+    ) -> crate::error::Result<()> {
+        Err(crate::error::AdapterError::unavailable(
+            "pane agent reports are unavailable",
+        ))
+    }
     /// Replace a fresh pane's shell with a slot-boxed shell; return the pane's shell PID.
     fn enter_slot_sandbox(
         &self,
@@ -877,6 +931,25 @@ impl ManagedApi for HerdrClient {
     ) -> crate::error::Result<u64> {
         HerdrClient::enter_slot_sandbox(self, pane, command_line, timeout)
     }
+    fn start_relay_agent(
+        &self,
+        kind: &str,
+        pane: &str,
+        command_line: &str,
+        timeout: Duration,
+        persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> crate::error::Result<()>,
+    ) -> crate::error::Result<CustomProcessIdentity> {
+        HerdrClient::start_relay_agent(self, kind, pane, command_line, timeout, persist_identity)
+    }
+    fn relay_process(&self, pane: &str) -> crate::error::Result<Option<CustomProcessIdentity>> {
+        HerdrClient::relay_process(self, pane)
+    }
+    fn explain_agent(&self, pane: &str) -> crate::error::Result<(Option<String>, String)> {
+        HerdrClient::explain_agent(self, pane)
+    }
+    fn report_pane_agent(&self, pane: &str, kind: &str, state: &str) -> crate::error::Result<()> {
+        HerdrClient::report_pane_agent(self, pane, kind, state)
+    }
     fn start_pane_agent(
         &self,
         name: &str,
@@ -1116,9 +1189,10 @@ impl AgentRecord {
                 .custom_process_identity
                 .as_ref()
                 .is_some_and(|identity| {
-                    self.adapter != "herdr-pane"
-                        || self.harness != "muse"
-                        || self.pane_id.as_deref().is_none_or(str::is_empty)
+                    !matches!(
+                        (self.adapter.as_str(), self.harness.as_str()),
+                        ("herdr-pane", "muse") | ("herdr-relay", "claude" | "codex")
+                    ) || self.pane_id.as_deref().is_none_or(str::is_empty)
                         || !identity.valid()
                 })
             || self
@@ -1153,7 +1227,7 @@ impl AgentRecord {
         }
         if !matches!(
             self.adapter.as_str(),
-            "herdr" | "herdr-pane" | "herdr-foreign"
+            "herdr" | "herdr-pane" | "herdr-foreign" | "herdr-relay"
         ) || self.mode != "interactive"
             || self.backend != "herdr"
         {
@@ -1213,6 +1287,83 @@ struct WorkspaceClient<'a, A: ManagedApi + ?Sized> {
 }
 
 impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
+    /// State of a harness behind a root slot relay, from Herdr's live screen rules.
+    ///
+    /// Herdr reports the state agentctl last reported for such a pane, so the live verdict
+    /// comes from `agent explain`, and a changed verdict is reported back so Herdr's own
+    /// listing stays current.
+    fn relay_pane_info(&self, mut info: AgentPaneInfo) -> crate::error::Result<AgentPaneInfo> {
+        self.client
+            .verify_relay_harness(&info.pane_id, self.record.custom_process_identity.as_ref())?;
+        let (agent, state) = self.client.explain_agent(&info.pane_id)?;
+        if agent.as_deref() != Some(self.record.harness.as_str()) {
+            return Err(crate::error::AdapterError::unavailable(format!(
+                "pane {} no longer shows a {} screen",
+                info.pane_id, self.record.harness
+            )));
+        }
+        if state == "blocked" {
+            return Err(crate::error::AdapterError::unavailable(format!(
+                "{} behind the slot relay is waiting for human attention; no input was submitted",
+                self.record.harness
+            )));
+        }
+        let mut state = state;
+        if state != "working" {
+            // Claude keeps its prompt box on screen while it works, and Herdr's rules then read
+            // that box as idle; the interrupt hint is the tell.
+            let screen = self.client.read(&info.pane_id, "visible", Some(200))?;
+            if crate::client::relay_trust_prompt(&screen) {
+                return Err(crate::error::AdapterError::unavailable(format!(
+                    "{} workspace trust prompt requires human attention; no input was submitted",
+                    self.record.harness
+                )));
+            }
+            if screen.contains(RELAY_WORKING_MARKER) {
+                state = "working".to_owned();
+            }
+        }
+        if state != info.status
+            && !(state == "idle" && info.status == "done")
+            && matches!(state.as_str(), "idle" | "working" | "unknown")
+        {
+            self.client
+                .report_pane_agent(&info.pane_id, &self.record.harness, &state)?;
+        }
+        info.agent = Some(self.record.harness.clone());
+        info.status = state;
+        Ok(info)
+    }
+
+    fn relay_wait(&self, pane_id: &str, status: &str, timeout_ms: u64) -> crate::error::Result<()> {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            let observed = self.pane_info(pane_id)?.status;
+            if observed == status {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(crate::error::AdapterError::unavailable(format!(
+                    "relayed {} in pane {pane_id} did not become {status} within {timeout_ms} ms (last {observed})",
+                    self.record.harness
+                )));
+            }
+            std::thread::sleep(
+                Duration::from_millis(200).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+
+    fn relay_refuses_raw_input(&self, text: &str) -> crate::error::Result<()> {
+        Err(crate::error::AdapterError::unavailable(
+            if text.trim_start().starts_with('/') {
+                "slash commands cannot be delivered to a harness behind a root slot relay"
+            } else {
+                "a harness behind a root slot relay takes only verified submissions"
+            },
+        ))
+    }
+
     fn validate_workspace_policy(&self, info: &AgentPaneInfo) -> crate::error::Result<()> {
         let Some(expected) = self.expected_workspace.as_deref() else {
             return Ok(());
@@ -1277,6 +1428,9 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                     return Err(crate::error::AdapterError::unavailable("Claude workspace trust prompt requires human attention; no input was submitted"));
                 }
             }
+            if self.record.adapter == "herdr-relay" {
+                return self.relay_pane_info(info);
+            }
             if self.record.adapter == "herdr-pane" {
                 self.client.verify_custom_harness(
                     pane_id,
@@ -1322,6 +1476,9 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                     }
                 }
             }
+        }
+        if self.record.adapter == "herdr-relay" {
+            return self.relay_refuses_raw_input(text);
         }
         if self.record.adapter != "herdr-pane" {
             return self.client.run(pane_id, text);
@@ -1384,6 +1541,9 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         status: &str,
         timeout_ms: u64,
     ) -> crate::error::Result<()> {
+        if self.record.adapter == "herdr-relay" {
+            return self.relay_wait(pane_id, status, timeout_ms);
+        }
         if self.record.adapter == "herdr-pane" && status == "working" {
             let submission = self
                 .custom_submission
@@ -1521,6 +1681,9 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                     return Err(crate::error::AdapterError::unavailable("Claude workspace trust prompt requires human attention; no input was submitted"));
                 }
             }
+            if self.record.adapter == "herdr-relay" {
+                return self.relay_pane_info(info);
+            }
             if self.record.adapter == "herdr-pane" {
                 self.client.verify_custom_harness_with_runtime(
                     pane_id,
@@ -1586,6 +1749,9 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                     }
                 }
             }
+        }
+        if self.record.adapter == "herdr-relay" {
+            return self.relay_refuses_raw_input(text);
         }
         if self.record.adapter != "herdr-pane" {
             return self.client.run_with_runtime(pane_id, text, runtime);
@@ -1678,6 +1844,15 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             .goal_objective
             .lock()
             .expect("goal operation lock poisoned") = None;
+        if self.record.adapter == "herdr-relay" {
+            let status = self.pane_info_with_runtime(pane_id, runtime)?.status;
+            if status != "idle" {
+                return Ok(Submission::NotStaged(format!(
+                    "relayed {} in pane {pane_id} is {status}, not idle",
+                    self.record.harness
+                )));
+            }
+        }
         self.client.submit_with_runtime(pane_id, text, runtime)
     }
 
@@ -1688,6 +1863,10 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         timeout_ms: u64,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<()> {
+        if self.record.adapter == "herdr-relay" {
+            let _ = runtime;
+            return self.relay_wait(pane_id, status, timeout_ms);
+        }
         if self.record.adapter == "herdr-pane" && status == "working" {
             let submission = self
                 .custom_submission
@@ -1828,9 +2007,12 @@ pub struct SlotLaunch {
 /// Isolation modes `wrkslots run` accepts.
 pub const SLOT_ISOLATIONS: [&str; 3] = ["userns", "cgroup", "root"];
 
-/// sudo keeps the pane's shell PID and relays a private terminal to the boxed shell, so
-/// Herdr sees only sudo: it cannot start or detect a harness there.
-pub const ROOT_SLOT_REFUSAL: &str = "--slot with root isolation cannot host a Herdr agent: sudo stays the pane's foreground process and runs the boxed shell on a private terminal, so Herdr can neither start nor detect the harness; use --slot-isolation userns or cgroup, or run `wrkslots run SLOT --isolation root -- HARNESS` directly";
+/// Harnesses agentctl can drive behind a root slot relay: Herdr has screen rules for them and
+/// agentctl has verified composer models.
+pub const RELAY_HARNESSES: [&str; 2] = ["claude", "codex"];
+
+/// Both relayed harnesses show this hint only while a turn is running.
+const RELAY_WORKING_MARKER: &str = "esc to interrupt";
 
 /// Environment variable naming the wrkslots executable, overriding `PATH`.
 pub const WRKSLOTS_BIN_ENV: &str = "AGENTCTL_WRKSLOTS_BIN";
@@ -1851,10 +2033,15 @@ fn wrkslots_executable() -> Option<PathBuf> {
 
 /// Ask the slot manager for the exec-only command line that boxes a pane shell.
 ///
-/// Returns the command line and the slot directory, which becomes the agent's
-/// working directory. Runs `wrkslots [--project-root DIR] shell-command SLOT
-/// [--isolation MODE] --format json` in `project`, bounded at 60 seconds.
-pub fn slot_shell_command(launch: &SlotLaunch, project: &Path) -> Result<(String, PathBuf)> {
+/// Returns the command line, the slot directory (the agent's working directory), and the
+/// effective isolation. Runs `wrkslots [--project-root DIR] shell-command SLOT
+/// [--isolation MODE] --format json [-- COMMAND...]` in `project`, bounded at 60 seconds; a
+/// `command` replaces the interactive shell in the line.
+pub fn slot_shell_command(
+    launch: &SlotLaunch,
+    project: &Path,
+    command_argv: &[String],
+) -> Result<(String, PathBuf, String)> {
     if let Some(isolation) = launch.isolation.as_deref() {
         if !SLOT_ISOLATIONS.contains(&isolation) {
             return Err(fail("--slot-isolation must be userns, cgroup, or root"));
@@ -1876,8 +2063,11 @@ pub fn slot_shell_command(launch: &SlotLaunch, project: &Path) -> Result<(String
     if let Some(isolation) = launch.isolation.as_deref() {
         command.args(["--isolation", isolation]);
     }
+    command.args(["--format", "json"]);
+    if !command_argv.is_empty() {
+        command.arg("--").args(command_argv);
+    }
     command
-        .args(["--format", "json"])
         .current_dir(project)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -1942,10 +2132,19 @@ pub fn slot_shell_command(launch: &SlotLaunch, project: &Path) -> Result<(String
     let (Some(line), Some(slot_path)) = (line, slot_path) else {
         return Err(invalid("missing fields"));
     };
-    if object.get("isolation").and_then(Value::as_str) == Some("root") {
-        return Err(fail(ROOT_SLOT_REFUSAL));
+    let effective = object
+        .get("isolation")
+        .and_then(Value::as_str)
+        .or(launch.isolation.as_deref())
+        .unwrap_or("userns");
+    if !SLOT_ISOLATIONS.contains(&effective) {
+        return Err(invalid(&format!("unknown isolation {effective:?}")));
     }
-    Ok((line.to_owned(), PathBuf::from(slot_path)))
+    Ok((
+        line.to_owned(),
+        PathBuf::from(slot_path),
+        effective.to_owned(),
+    ))
 }
 
 impl Default for StartOptions {
@@ -2729,17 +2928,38 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let project_workspace = self.start_workspace_policy(&options)?;
         // The agent works in the slot: its record and pane cwd are the slot
         // directory, which is where the boxed shell starts.
+        let mut relay_command = None;
         let (cwd, slot_command) = match options.slot.as_ref() {
             Some(launch) => {
                 let project = launch.project.clone().unwrap_or_else(|| cwd.clone());
-                let (line, slot_path) = slot_shell_command(launch, &project)?;
+                let (line, slot_path, isolation) = slot_shell_command(launch, &project, &[])?;
                 let slot_path = fs::canonicalize(&slot_path).map_err(|_| {
                     fail(format!(
                         "slot directory is not a directory: {}",
                         slot_path.display()
                     ))
                 })?;
-                (slot_path, Some(line))
+                if isolation == "root" {
+                    // sudo stays the pane's foreground process under root isolation, so Herdr
+                    // cannot start the harness; the boxed harness line runs in the pane
+                    // directly and agentctl owns its lifecycle state.
+                    if !RELAY_HARNESSES.contains(&options.harness.as_str()) {
+                        return Err(fail(format!(
+                            "--slot with root isolation supports {}, not {:?}",
+                            RELAY_HARNESSES.join(", "),
+                            options.harness
+                        )));
+                    }
+                    let executable = self.client.harness_executable(&options.harness)?;
+                    let mut argv = vec![executable.display().to_string()];
+                    argv.extend(arguments.iter().cloned());
+                    let (relay_line, _path, _isolation) =
+                        slot_shell_command(launch, &project, &argv)?;
+                    relay_command = Some(relay_line);
+                    (slot_path, None)
+                } else {
+                    (slot_path, Some(line))
+                }
             }
             None => (cwd, None),
         };
@@ -2768,7 +2988,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .duration_since(UNIX_EPOCH)
             .map_err(|error| fail(error.to_string()))?;
         let mut record = AgentRecord {
-            adapter: if options.harness == "muse" {
+            adapter: if relay_command.is_some() {
+                "herdr-relay".to_owned()
+            } else if options.harness == "muse" {
                 "herdr-pane".to_owned()
             } else {
                 herdr_adapter()
@@ -2813,6 +3035,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             &options,
             project_workspace.as_deref(),
             slot_command.as_deref(),
+            relay_command.as_deref(),
         );
         if let Err(error) = launched {
             record.lifecycle = "launch_failed".to_owned();
@@ -3130,6 +3353,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         options: &StartOptions,
         project_workspace: Option<&str>,
         slot_command: Option<&str>,
+        relay_command: Option<&str>,
     ) -> Result<()> {
         self.create_presentation(record, options, project_workspace)?;
         let pane_id = record.pane_id.clone().expect("new tab has pane");
@@ -3137,7 +3361,25 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             self.client
                 .enter_slot_sandbox(&pane_id, line, options.startup_timeout)?;
         }
-        if record.adapter == "herdr-pane" {
+        if let Some(line) = relay_command {
+            let harness = record.harness.clone();
+            self.client.start_relay_agent(
+                &harness,
+                &pane_id,
+                line,
+                options.startup_timeout,
+                &mut |identity| {
+                    record.custom_process_identity = Some(identity);
+                    self.save(record).map_err(|error| {
+                        crate::error::AdapterError::unavailable(format!(
+                            "cannot persist relay process identity: {error}"
+                        ))
+                    })
+                },
+            )?;
+            record.pane_reported_by_agentctl = true;
+            self.save(record)?;
+        } else if record.adapter == "herdr-pane" {
             let agent_name = record.name.clone();
             let harness = record.harness.clone();
             let arguments = record.arguments.clone();
@@ -4299,6 +4541,34 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     fn checked_or_launch_failed(&self, record: &AgentRecord, pane: &str) -> Result<()> {
+        if record.adapter == "herdr-relay"
+            && matches!(record.lifecycle.as_str(), "starting" | "launch_failed")
+        {
+            // The pane is the one agentctl created; its shell exec'd into the slot relay
+            // agentctl ran. A relay still running there with the slot as its cwd is that
+            // launch, pinned or not.
+            let info = self.client.pane_info(pane)?;
+            let cwd_matches = info.cwd == record.cwd
+                || fs::canonicalize(&info.cwd)
+                    .ok()
+                    .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&record.cwd).ok());
+            if info.pane_id == pane
+                && Some(&info.workspace_id) == record.workspace_id.as_ref()
+                && cwd_matches
+            {
+                if let Some(observed) = self.client.relay_process(pane)? {
+                    if record
+                        .custom_process_identity
+                        .as_ref()
+                        .is_none_or(|expected| *expected == observed)
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            self.checked(record)?;
+            return Ok(());
+        }
         if record.adapter != "herdr-pane" {
             if record.lifecycle != "launch_failed" || self.client.pane_info(pane)?.agent.is_some() {
                 self.checked(record)?;
@@ -5502,7 +5772,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             {
                 return Err(fail("refusing to close a tab whose pane ownership changed"));
             }
-            if record.adapter == "herdr-pane"
+            if matches!(record.adapter.as_str(), "herdr-pane" | "herdr-relay")
                 || record.lifecycle == "running"
                 || self.client.pane_info(&owned[0].pane_id)?.agent.is_some()
             {
@@ -6090,6 +6360,38 @@ mod tests {
         fn rename_tab(&self, _: &str, _: &str) -> AdapterResult<()> {
             Ok(())
         }
+        fn harness_executable(&self, kind: &str) -> AdapterResult<PathBuf> {
+            Ok(PathBuf::from(format!("/opt/bin/{kind}")))
+        }
+        fn start_relay_agent(
+            &self,
+            kind: &str,
+            pane: &str,
+            command_line: &str,
+            _: Duration,
+            persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> AdapterResult<()>,
+        ) -> AdapterResult<CustomProcessIdentity> {
+            self.slot_commands
+                .lock()
+                .unwrap()
+                .push((format!("relay:{kind}:{pane}"), command_line.to_owned()));
+            self.started.store(true, Ordering::Relaxed);
+            persist_identity(relay_identity())?;
+            Ok(relay_identity())
+        }
+        fn relay_process(&self, _: &str) -> AdapterResult<Option<CustomProcessIdentity>> {
+            Ok(self.started.load(Ordering::Relaxed).then(relay_identity))
+        }
+        fn explain_agent(&self, _: &str) -> AdapterResult<(Option<String>, String)> {
+            Ok((Some("codex".to_owned()), "idle".to_owned()))
+        }
+        fn report_pane_agent(&self, pane: &str, kind: &str, state: &str) -> AdapterResult<()> {
+            self.runs
+                .lock()
+                .unwrap()
+                .push(format!("report {pane} {kind} {state}"));
+            Ok(())
+        }
         fn enter_slot_sandbox(
             &self,
             pane: &str,
@@ -6307,6 +6609,58 @@ mod tests {
         assert!(fixture.client.environments.lock().unwrap().is_empty());
     }
 
+    fn relay_identity() -> CustomProcessIdentity {
+        CustomProcessIdentity {
+            version: 1,
+            boot_id: "00000000-0000-4000-8000-000000000000".to_owned(),
+            pid: 4242,
+            starttime_ticks: 7,
+            executable_device: 1,
+            executable_inode: 2,
+        }
+    }
+
+    #[test]
+    fn root_slot_starts_the_harness_behind_the_relay() {
+        let fixture = Fixture::new();
+        // The fake Herdr reports every pane at the fixture root, so the slot is there.
+        let executable = fake_wrkslots(&fixture.root, &fixture.root, "root");
+        let status = fixture
+            .manager()
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    slot: Some(SlotLaunch {
+                        slot: "s1".to_owned(),
+                        executable: Some(executable),
+                        ..SlotLaunch::default()
+                    }),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(status["adapter"], "herdr-relay");
+        assert_eq!(status["lifecycle"], "running");
+        assert_eq!(status["pane_reported_by_agentctl"], true);
+        assert_eq!(status["custom_process_identity"]["pid"], 4242);
+        let commands = fixture.client.slot_commands.lock().unwrap().clone();
+        assert_eq!(commands.len(), 1);
+        assert!(commands[0].0.starts_with("relay:codex:"));
+        let argv = fs::read_to_string(fixture.root.join("argv-root")).unwrap();
+        let argv: Vec<&str> = argv.lines().collect();
+        let separator = argv.iter().position(|item| *item == "--").unwrap();
+        assert_eq!(argv[separator + 1], "/opt/bin/codex");
+        let record: AgentRecord = serde_json::from_value(
+            agent::read_private_json(&fixture.root.join("registry/worker/agent.json")).unwrap(),
+        )
+        .unwrap();
+        record
+            .validate_loaded(&fixture.root.join("registry/worker/agent.json"), "worker")
+            .unwrap();
+    }
+
     /// A stand-in `wrkslots` that records its argv and cwd, then answers like
     /// `shell-command --format json` (or fails, when told to).
     fn fake_wrkslots(root: &Path, slot_path: &Path, behaviour: &str) -> PathBuf {
@@ -6352,7 +6706,7 @@ mod tests {
                     workspace_id: Some("workspace".to_owned()),
                     slot: Some(SlotLaunch {
                         slot: "s1".to_owned(),
-                        isolation: Some("root".to_owned()),
+                        isolation: Some("cgroup".to_owned()),
                         project: Some(project.clone()),
                         executable: Some(executable),
                     }),
@@ -6375,7 +6729,7 @@ mod tests {
                 "shell-command",
                 "s1",
                 "--isolation",
-                "root",
+                "cgroup",
                 "--format",
                 "json"
             ]
@@ -6392,17 +6746,19 @@ mod tests {
         let slot_path = fixture.root.join("slots/s2");
         fs::create_dir_all(&slot_path).unwrap();
         let executable = fake_wrkslots(&fixture.root, &slot_path, "ok");
-        let (line, path) = slot_shell_command(
+        let (line, path, isolation) = slot_shell_command(
             &SlotLaunch {
                 slot: "s2".to_owned(),
                 executable: Some(executable),
                 ..SlotLaunch::default()
             },
             &fixture.root,
+            &[],
         )
         .unwrap();
         assert_eq!(line, "exec boxed-shell");
         assert_eq!(path, slot_path);
+        assert_eq!(isolation, "userns");
         let argv = fs::read_to_string(fixture.root.join("argv-ok")).unwrap();
         assert_eq!(
             argv.lines().skip(1).collect::<Vec<_>>(),
@@ -6414,6 +6770,7 @@ mod tests {
     fn slot_failures_are_refused_before_registry_or_tab_creation() {
         let fixture = Fixture::new();
         let slot_path = fixture.root.join("slots/s9");
+        fs::create_dir_all(&slot_path).unwrap();
         let cases = [
             (
                 "fail",
@@ -6433,17 +6790,19 @@ mod tests {
             (
                 "root",
                 None,
-                "--slot with root isolation cannot host a Herdr agent",
+                "--slot with root isolation supports claude, codex, not \"muse\"",
             ),
         ];
         for (behaviour, isolation, expected) in cases {
             let executable = fake_wrkslots(&fixture.root, &slot_path, behaviour);
+            let harness = if behaviour == "root" { "muse" } else { "codex" };
             let error = fixture
                 .manager()
                 .start(
                     "worker",
                     &fixture.root,
                     StartOptions {
+                        harness: harness.to_owned(),
                         slot: Some(SlotLaunch {
                             slot: "s9".to_owned(),
                             isolation: isolation.map(str::to_owned),

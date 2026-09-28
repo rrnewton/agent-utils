@@ -254,7 +254,7 @@ struct Start {
     /// Interactive only: box the agent to this wrkslots slot (plain-worktree or image-backed); the pane shell is replaced by the line `wrkslots shell-command SLOT` prints (per-slot slice limits and, except with cgroup isolation, a confined file-system view) before the harness starts, and the agent's cwd is the slot directory. Needs wrkslots on PATH or AGENTCTL_WRKSLOTS_BIN
     #[arg(long, value_name = "SLOT")]
     slot: Option<String>,
-    /// With --slot: userns = limits plus the file-system view in a user namespace; cgroup = limits only; root is refused (sudo stays the pane's foreground process, so Herdr cannot start or detect the harness; use `wrkslots run SLOT --isolation root -- HARNESS` directly) (default: the project's configuration.sandbox.isolation, else userns)
+    /// With --slot: userns = limits plus the file-system view in a user namespace; root = the same view built through sudo -n, for harness launchers that need a setuid step (claude and codex only: the boxed harness runs behind sudo's terminal relay, so agentctl launches it itself, reads its state from Herdr's screen rules, and types prompts with screen verification; goals are unavailable); cgroup = limits only (default: the project's configuration.sandbox.isolation, else userns)
     #[arg(long, value_name = "MODE", value_parser = ["userns", "cgroup", "root"], requires = "slot")]
     slot_isolation: Option<String>,
     /// With --slot: wrkslots project root (default: --cwd, searched upward for .wrkslots.yml)
@@ -1215,8 +1215,10 @@ fn add_capabilities(value: &mut serde_json::Value) {
         let adapter = value["adapter"].as_str();
         value["capabilities"] = if adapter == Some("agentcloud") {
             json!(CLOUD_CAPABILITIES)
-        } else if matches!(adapter, Some("herdr" | "herdr-pane" | "herdr-foreign"))
-            && value["mode"] == "interactive"
+        } else if matches!(
+            adapter,
+            Some("herdr" | "herdr-pane" | "herdr-foreign" | "herdr-relay")
+        ) && value["mode"] == "interactive"
             && value["backend"] == "herdr"
         {
             let mut capabilities = vec![
@@ -1233,6 +1235,10 @@ fn add_capabilities(value: &mut serde_json::Value) {
                 "goal",
                 "bind-session",
             ];
+            if adapter == Some("herdr-relay") {
+                // Goals are slash commands, which a relayed pane cannot take.
+                capabilities.retain(|capability| *capability != "goal");
+            }
             if adapter == Some("herdr") {
                 capabilities.push("move");
             }

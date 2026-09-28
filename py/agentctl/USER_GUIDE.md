@@ -512,13 +512,24 @@ worktrees or a disk image: per-slot limits, and a file-system view in which
 only the slot, its Git directories, the project's blessed outputs, and the
 shared harness state are writable.
 
-`--slot-isolation userns|cgroup` overrides the project's
+`--slot-isolation userns|cgroup|root` overrides the project's
 `configuration.sandbox.isolation` for this agent: `userns` builds the view in an
-unprivileged user namespace, and `cgroup` applies limits only. `root` isolation
-is refused, whether you pass it or the project configures it: sudo stays the
-pane's foreground process and runs the boxed shell on a private terminal, so
-Herdr can neither start nor detect a harness there. Run such harnesses directly
-with `wrkslots run SLOT --isolation root -- HARNESS ...` instead.
+unprivileged user namespace, `root` builds the same view through a short-lived
+`sudo -n` launcher (for harness launchers that perform a setuid step, which a
+user namespace refuses), and `cgroup` applies limits only.
+
+Under `root` isolation sudo stays the pane's foreground process and runs the
+boxed program on a private terminal, so Herdr can neither start nor detect a
+harness there. agentctl therefore runs the boxed harness line in the new pane
+itself (adapter `herdr-relay`, Claude and Codex only). It pins the program behind
+the relay by kernel identity (the first process below the pane's shell that is
+yours and shares the slot's cgroup scope) and reports the pane to Herdr as that
+harness. It reads the harness state from Herdr's live screen rules
+(`herdr agent explain`) plus the harness's interrupt hint, and types prompts
+through the same screen-verified submission it uses for native Claude and Codex
+panes. Herdr's `agent start` and `agent prompt` do not apply to such a pane.
+Slash commands, and therefore goals, are refused. A workspace trust dialog
+stops the launch for human attention. The pane closes when the harness exits.
 Slot problems are refused before any registry record or tab is created.
 
 ## Agentcloud sessions

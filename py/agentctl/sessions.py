@@ -60,8 +60,10 @@ class Sessions(ManagedAgents):
             result.extend(("final-answer", "reset", "migrate", "repair"))
         else:
             result.append("terminal-snapshot")
-        if record.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
-            result.extend(("drain", "goal", "bind-session"))
+        if record.adapter in ("herdr", "herdr-pane", "herdr-foreign", "herdr-relay"):
+            # Goals are slash commands, which a relayed pane cannot take.
+            result.extend(("drain", "bind-session") if record.adapter == "herdr-relay"
+                          else ("drain", "goal", "bind-session"))
         if record.adapter == "herdr":
             result.append("move")
         return result
@@ -179,7 +181,7 @@ class Sessions(ManagedAgents):
         return self._status_record(self._load(name))
 
     def _status_record(self, record: AgentRecord) -> dict[str, object]:
-        if record.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
+        if record.adapter in ("herdr", "herdr-pane", "herdr-foreign", "herdr-relay"):
             result = super()._status_record(record)
         else:
             result = record.to_document()
@@ -204,7 +206,7 @@ class Sessions(ManagedAgents):
                      model: str | None = None, **options: object) -> dict[str, object]:
         """Submit to the selected adapter without reusing another generation's name."""
         record = self._load(name)
-        if record.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
+        if record.adapter in ("herdr", "herdr-pane", "herdr-foreign", "herdr-relay"):
             if model is not None:
                 raise AgentDeliveryError("per-turn model overrides require a headless session")
             return asdict(super().send(name, text, message_id=message_id, expected_token=record.token, **options))
@@ -226,7 +228,7 @@ class Sessions(ManagedAgents):
             raise AgentDeliveryError("--output since_turn requires since-turn")
         with self._lock(name):
             record = self._load(name)
-            if record.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
+            if record.adapter in ("herdr", "herdr-pane", "herdr-foreign", "herdr-relay"):
                 if output not in ("tail", "all") or since_turn is not None:
                     raise AgentDeliveryError("interactive terminals expose snapshots, not final-answer boundaries")
                 self._checked(record)
@@ -246,7 +248,7 @@ class Sessions(ManagedAgents):
     ) -> dict[str, object]:
         """Retire a runtime, then archive its canonical identity and artifacts."""
         record = self._load_expected(name, expected_token)
-        if record.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
+        if record.adapter in ("herdr", "herdr-pane", "herdr-foreign", "herdr-relay"):
             return self._stop(
                 name, expected_token=record.token,
                 recover_legacy_adoption=recover_legacy_adoption,
@@ -300,7 +302,7 @@ class Sessions(ManagedAgents):
         if not math.isfinite(timeout) or not 0 <= timeout <= 31_536_000:
             raise AgentDeliveryError("wait timeout must be finite and between 0 and 31536000 seconds")
         initial = self._load(name)
-        if initial.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
+        if initial.adapter in ("herdr", "herdr-pane", "herdr-foreign", "herdr-relay"):
             return super().wait(name, timeout=timeout, expected_token=initial.token, **options)  # type: ignore[arg-type]
         deadline = time.monotonic() + timeout
         while True:
@@ -329,7 +331,7 @@ class Sessions(ManagedAgents):
     def attach(self, name: str, *, expected_token: str | None = None) -> dict[str, object]:
         """Focus a verified Herdr tab or attach the current terminal to an exact tmux window."""
         initial = self._load_expected(name, expected_token)
-        if initial.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
+        if initial.adapter in ("herdr", "herdr-pane", "herdr-foreign", "herdr-relay"):
             return super().attach(name, expected_token=initial.token)
         attach_command: list[str] | None = None
         with self._lock(name):

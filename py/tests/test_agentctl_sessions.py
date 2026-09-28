@@ -614,14 +614,14 @@ def test_slot_start_boxes_the_pane_before_the_harness(tmp_path: Path, monkeypatc
     project.mkdir()
     monkeypatch.setenv("AGENTCTL_WRKSLOTS_BIN", str(_fake_wrkslots(tmp_path, tmp_path)))
     status = sessions.start_session(
-        "worker", cwd=str(tmp_path), slot="s1", slot_isolation="root", slot_project=str(project)
+        "worker", cwd=str(tmp_path), slot="s1", slot_isolation="cgroup", slot_project=str(project)
     )
     assert [line for _pane, line in entered] == ["exec boxed-shell"]
     assert status["cwd"] == str(tmp_path)
     argv = (tmp_path / "argv-ok").read_text(encoding="utf-8").splitlines()
     assert Path(argv[0]).resolve() == project.resolve()
     assert argv[1:] == [
-        "--project-root", str(project), "shell-command", "s1", "--isolation", "root", "--format", "json",
+        "--project-root", str(project), "shell-command", "s1", "--isolation", "cgroup", "--format", "json",
     ]
 
 
@@ -629,8 +629,8 @@ def test_slot_start_leaves_isolation_to_the_project_configuration(tmp_path: Path
     from agentctl.subagents import _slot_shell_command
 
     monkeypatch.setenv("AGENTCTL_WRKSLOTS_BIN", str(_fake_wrkslots(tmp_path, tmp_path / "slot")))
-    line, slot_path = _slot_shell_command("s2", isolation=None, project=str(tmp_path))
-    assert (line, slot_path) == ("exec boxed-shell", str(tmp_path / "slot"))
+    line, slot_path, isolation = _slot_shell_command("s2", isolation=None, project=str(tmp_path))
+    assert (line, slot_path, isolation) == ("exec boxed-shell", str(tmp_path / "slot"), "userns")
     argv = (tmp_path / "argv-ok").read_text(encoding="utf-8").splitlines()
     assert argv[1:] == ["shell-command", "s2", "--format", "json"]
 
@@ -641,16 +641,18 @@ def test_slot_start_leaves_isolation_to_the_project_configuration(tmp_path: Path
         ("fail", None, "wrkslots shell-command 's9' failed: unknown slot s9"),
         ("junk", None, "wrkslots shell-command 's9' returned invalid JSON"),
         ("ok", "namespace", "--slot-isolation must be userns, cgroup, or root"),
-        ("root", None, "--slot with root isolation cannot host a Herdr agent"),
+        ("root-muse", None, "--slot with root isolation supports claude, codex, not 'muse'"),
     ],
 )
 def test_slot_failures_are_refused_before_registry_or_tab_creation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, behaviour: str, isolation: str | None, expected: str,
 ) -> None:
     sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    harness = "muse" if behaviour == "root-muse" else "codex"
+    behaviour = "root" if behaviour == "root-muse" else behaviour
     monkeypatch.setenv("AGENTCTL_WRKSLOTS_BIN", str(_fake_wrkslots(tmp_path, tmp_path, behaviour)))
     with pytest.raises(AgentDeliveryError, match=re.escape(expected)):
-        sessions.start_session("worker", cwd=str(tmp_path), slot="s9", slot_isolation=isolation)
+        sessions.start_session("worker", cwd=str(tmp_path), harness=harness, slot="s9", slot_isolation=isolation)
     assert not (sessions.registry / "worker").exists()
 
 
@@ -664,3 +666,83 @@ def test_slot_needs_wrkslots_and_slot_options_need_slot(tmp_path: Path, monkeypa
         sessions.start_session("worker", cwd=str(tmp_path), mode="headless", slot="s1")
     assert cli.main(["--registry", str(sessions.registry), "start", "w", "--cwd", str(tmp_path),
                      "--slot-isolation", "userns"]) != 0
+
+
+def test_root_slot_starts_the_harness_behind_the_relay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Root isolation: the boxed harness line runs in the pane and agentctl owns the record."""
+    from agentctl.client import CustomProcessIdentity
+
+    sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    identity = CustomProcessIdentity(
+        version=1, boot_id="00000000-0000-4000-8000-000000000000", pid=4242,
+        starttime_ticks=7, executable_device=1, executable_inode=2,
+    )
+    launched: list[tuple[str, str, str]] = []
+
+    def start_relay(kind: str, pane_id: str, line: str, *, timeout: float = 30.0,
+                    on_observed: object = None) -> CustomProcessIdentity:
+        launched.append((kind, pane_id, line))
+        assert callable(on_observed)
+        on_observed(identity)
+        return identity
+
+    monkeypatch.setattr(fake, "start_relay_agent", start_relay, raising=False)
+    monkeypatch.setattr(fake, "_harness_executable", lambda kind: f"/opt/bin/{kind}", raising=False)
+    monkeypatch.setattr(fake, "enter_slot_sandbox", lambda *a, **k: pytest.fail("no boxed shell"), raising=False)
+    checked: list[CustomProcessIdentity | None] = []
+    monkeypatch.setattr(fake, "verify_relay_harness",
+                        lambda pane, expected: checked.append(expected), raising=False)
+    monkeypatch.setattr(fake, "explain_agent", lambda pane: ("codex", "idle"), raising=False)
+    reports: list[tuple[str, str]] = []
+    def report(pane: str, kind: str, state: str) -> None:
+        # Like Herdr: a reported pane is listed as that agent kind.
+        reports.append((kind, state))
+        fake.infos[pane] = replace(fake.infos[pane], agent=kind, status=state)
+
+    monkeypatch.setattr(fake, "report_pane_agent", report, raising=False)
+    monkeypatch.setenv("AGENTCTL_WRKSLOTS_BIN", str(_fake_wrkslots(tmp_path, tmp_path, "root")))
+    status = sessions.start_session("worker", cwd=str(tmp_path), harness="codex", slot="s1")
+    assert status["lifecycle"] == "running" and status["agent_status"] == "idle"
+    assert checked and all(item == identity for item in checked)
+    assert reports and reports[-1] == ("codex", "idle")
+    assert [(kind, line) for kind, _pane, line in launched] == [("codex", "exec boxed-shell")]
+    argv = (tmp_path / "argv-root").read_text(encoding="utf-8").splitlines()
+    assert argv[argv.index("--") + 1] == "/opt/bin/codex"
+    record = json.loads((sessions.registry / "worker" / "agent.json").read_text(encoding="utf-8"))
+    assert record["adapter"] == "herdr-relay" and record["pane_reported_by_agentctl"] is True
+    assert record["custom_process_identity"]["pid"] == 4242
+
+
+def test_explain_agent_parses_herdr_screen_rule_verdicts() -> None:
+    outputs = iter([
+        CompletedProcess([], 0, "agent: codex\nstate: working\nmanifest: bundled\nrule: x\n", ""),
+        CompletedProcess([], 0, "agent: claude\nstate: sleeping\n", ""),
+        CompletedProcess([], 1, "", "agent_not_found"),
+    ])
+    client = HerdrClient(run=lambda *args, **kwargs: next(outputs))
+    assert client.explain_agent("w1:p1") == ("codex", "working")
+    assert client.explain_agent("w1:p1") == ("claude", "unknown")
+    with pytest.raises(Exception, match="agent_not_found"):
+        client.explain_agent("w1:p1")
+
+
+def test_relay_records_round_trip_and_admit_only_relay_harnesses(tmp_path: Path) -> None:
+    from agentctl.client import CustomProcessIdentity
+
+    identity = CustomProcessIdentity(
+        version=1, boot_id="00000000-0000-4000-8000-000000000000", pid=4242,
+        starttime_ticks=7, executable_device=1, executable_inode=2,
+    )
+    record = AgentRecord("w", "t", "codex", str(tmp_path), 1.0, adapter="herdr-relay",
+                         pane_id="w1:p1", lifecycle="running", custom_process_identity=identity)
+    path = tmp_path / "agent.json"
+    for harness, accepted in (("codex", True), ("claude", True), ("muse", False)):
+        document = {**record.to_document(), "harness": harness}
+        path.write_text(json.dumps(document), encoding="utf-8")
+        path.chmod(0o600)
+        if accepted:
+            loaded = AgentRecord.load(path, "w")
+            assert (loaded.adapter, loaded.custom_process_identity) == ("herdr-relay", identity)
+        else:
+            with pytest.raises(AgentDeliveryError):
+                AgentRecord.load(path, "w")

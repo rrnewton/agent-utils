@@ -116,10 +116,12 @@ def parser() -> argparse.ArgumentParser:
              "the harness starts, and the agent's cwd is the slot directory. Needs wrkslots on PATH "
              "or AGENTCTL_WRKSLOTS_BIN")
     start.add_argument("--slot-isolation", choices=("userns", "cgroup", "root"), default=None,
-        help="with --slot: userns = limits plus the file-system view in a user namespace; cgroup = "
-             "limits only; root is refused (sudo stays the pane's foreground process, so Herdr cannot "
-             "start or detect the harness; use `wrkslots run SLOT --isolation root -- HARNESS` "
-             "directly) (default: the project's configuration.sandbox.isolation, else userns)")
+        help="with --slot: userns = limits plus the file-system view in a user namespace; root = the "
+             "same view built through sudo -n, for harness launchers that need a setuid step (claude "
+             "and codex only: the boxed harness runs behind sudo's terminal relay, so agentctl launches "
+             "it itself, reads its state from Herdr's screen rules, and types prompts with screen "
+             "verification; goals are unavailable); cgroup = limits only (default: the project's "
+             "configuration.sandbox.isolation, else userns)")
     start.add_argument("--slot-project", metavar="DIR",
         help="with --slot: wrkslots project root (default: --cwd, searched upward for .wrkslots.yml)")
     start.add_argument("--startup-timeout", type=_ascii_float, default=30.0, metavar="SECONDS",
