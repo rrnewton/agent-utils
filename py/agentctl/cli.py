@@ -110,12 +110,16 @@ def parser() -> argparse.ArgumentParser:
     first.add_argument("--brief", metavar="TEXT", help="initial task, submitted after launch")
     first.add_argument("--file", metavar="PATH", help="UTF-8 file containing the initial task")
     start.add_argument("--slot", metavar="SLOT",
-        help="interactive only: box the agent to this wrkslots slot; the pane shell is replaced by "
-             "`wrkslots run SLOT` (per-slot slice limits; with namespace isolation, a private "
-             "file-system view) before the harness starts. Needs wrkslots on PATH or AGENTCTL_WRKSLOTS_BIN")
-    start.add_argument("--slot-isolation", choices=("namespace", "cgroup"), default="namespace",
-        help="with --slot: namespace = limits plus private file-system view (default); cgroup = "
-             "limits only, for harness launchers that enter their own site sandbox through a setuid helper")
+        help="interactive only: box the agent to this wrkslots slot (plain-worktree or image-backed); "
+             "the pane shell is replaced by the line `wrkslots shell-command SLOT` prints (per-slot "
+             "slice limits and, except with cgroup isolation, a confined file-system view) before "
+             "the harness starts, and the agent's cwd is the slot directory. Needs wrkslots on PATH "
+             "or AGENTCTL_WRKSLOTS_BIN")
+    start.add_argument("--slot-isolation", choices=("userns", "cgroup", "root"), default=None,
+        help="with --slot: userns = limits plus the file-system view in a user namespace; cgroup = "
+             "limits only; root is refused (sudo stays the pane's foreground process, so Herdr cannot "
+             "start or detect the harness; use `wrkslots run SLOT --isolation root -- HARNESS` "
+             "directly) (default: the project's configuration.sandbox.isolation, else userns)")
     start.add_argument("--slot-project", metavar="DIR",
         help="with --slot: wrkslots project root (default: --cwd, searched upward for .wrkslots.yml)")
     start.add_argument("--startup-timeout", type=_ascii_float, default=30.0, metavar="SECONDS",
@@ -313,6 +317,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     profile = available[args.profile]
                 except KeyError as exc:
                     raise ValueError(f"unknown profile {args.profile!r}; run agentctl profiles --cwd {args.cwd}") from exc
+            if args.slot is None and (args.slot_isolation is not None or args.slot_project is not None):
+                raise ValueError("--slot-isolation and --slot-project need --slot")
             harness = profile.harness if profile else (args.harness or "codex")
             if harness == AGENTCLOUD_HARNESS:
                 selected = f"profile {profile.name!r}" if profile else "--harness agentcloud"

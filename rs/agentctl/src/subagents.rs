@@ -614,6 +614,17 @@ pub trait ManagedApi: AgentApi {
         args: &[String],
         timeout: Duration,
     ) -> crate::error::Result<()>;
+    /// Replace a fresh pane's shell with a slot-boxed shell; return the pane's shell PID.
+    fn enter_slot_sandbox(
+        &self,
+        _pane: &str,
+        _command_line: &str,
+        _timeout: Duration,
+    ) -> crate::error::Result<u64> {
+        Err(crate::error::AdapterError::unavailable(
+            "slot sandbox entry is unavailable",
+        ))
+    }
     /// Start a custom harness through `pane run` and verify the foreground process.
     fn start_pane_agent(
         &self,
@@ -857,6 +868,14 @@ impl ManagedApi for HerdrClient {
         timeout: Duration,
     ) -> crate::error::Result<()> {
         HerdrClient::start_agent(self, name, harness, pane, args, timeout)
+    }
+    fn enter_slot_sandbox(
+        &self,
+        pane: &str,
+        command_line: &str,
+        timeout: Duration,
+    ) -> crate::error::Result<u64> {
+        HerdrClient::enter_slot_sandbox(self, pane, command_line, timeout)
     }
     fn start_pane_agent(
         &self,
@@ -1789,6 +1808,145 @@ pub struct StartOptions {
     pub delivery: DrainOptions,
     /// Agentcloud settings; required shape for, and only accepted with, harness `agentcloud`.
     pub cloud: Option<CloudLaunch>,
+    /// Box the interactive agent to one wrkslots slot before the harness starts.
+    pub slot: Option<SlotLaunch>,
+}
+
+/// The wrkslots slot an interactive agent is boxed to (`agentctl start --slot`).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SlotLaunch {
+    /// Registered slot name.
+    pub slot: String,
+    /// `userns`, `cgroup`, or `root`; `None` uses the project's configured isolation.
+    pub isolation: Option<String>,
+    /// Explicit wrkslots project root; `None` searches upward from the agent cwd.
+    pub project: Option<PathBuf>,
+    /// Explicit wrkslots executable; `None` uses `AGENTCTL_WRKSLOTS_BIN`, else `PATH`.
+    pub executable: Option<PathBuf>,
+}
+
+/// Isolation modes `wrkslots run` accepts.
+pub const SLOT_ISOLATIONS: [&str; 3] = ["userns", "cgroup", "root"];
+
+/// sudo keeps the pane's shell PID and relays a private terminal to the boxed shell, so
+/// Herdr sees only sudo: it cannot start or detect a harness there.
+pub const ROOT_SLOT_REFUSAL: &str = "--slot with root isolation cannot host a Herdr agent: sudo stays the pane's foreground process and runs the boxed shell on a private terminal, so Herdr can neither start nor detect the harness; use --slot-isolation userns or cgroup, or run `wrkslots run SLOT --isolation root -- HARNESS` directly";
+
+/// Environment variable naming the wrkslots executable, overriding `PATH`.
+pub const WRKSLOTS_BIN_ENV: &str = "AGENTCTL_WRKSLOTS_BIN";
+
+fn wrkslots_executable() -> Option<PathBuf> {
+    if let Some(value) = std::env::var_os(WRKSLOTS_BIN_ENV).filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(value));
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join("wrkslots"))
+        .find(|candidate| {
+            fs::metadata(candidate).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+}
+
+/// Ask the slot manager for the exec-only command line that boxes a pane shell.
+///
+/// Returns the command line and the slot directory, which becomes the agent's
+/// working directory. Mirrors the Python edition: `wrkslots [--project-root DIR]
+/// shell-command SLOT [--isolation MODE] --format json`, run in `project`, bounded
+/// at 60 seconds.
+pub fn slot_shell_command(launch: &SlotLaunch, project: &Path) -> Result<(String, PathBuf)> {
+    if let Some(isolation) = launch.isolation.as_deref() {
+        if !SLOT_ISOLATIONS.contains(&isolation) {
+            return Err(fail("--slot-isolation must be userns, cgroup, or root"));
+        }
+    }
+    let executable = launch
+        .executable
+        .clone()
+        .or_else(wrkslots_executable)
+        .ok_or_else(|| {
+            fail("--slot needs wrkslots on PATH (or AGENTCTL_WRKSLOTS_BIN naming it)")
+        })?;
+    let slot = launch.slot.as_str();
+    let mut command = std::process::Command::new(&executable);
+    if launch.project.is_some() {
+        command.arg("--project-root").arg(project);
+    }
+    command.args(["shell-command", slot]);
+    if let Some(isolation) = launch.isolation.as_deref() {
+        command.args(["--isolation", isolation]);
+    }
+    command
+        .args(["--format", "json"])
+        .current_dir(project)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| fail(format!("wrkslots shell-command '{slot}' failed: {error}")))?;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(fail(format!(
+                    "wrkslots shell-command '{slot}' failed: timed out after 60s"
+                )));
+            }
+            Err(error) => {
+                return Err(fail(format!(
+                    "wrkslots shell-command '{slot}' failed: {error}"
+                )))
+            }
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| fail(format!("wrkslots shell-command '{slot}' failed: {error}")))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() || stdout.trim().is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        let detail = if detail.is_empty() {
+            format!("exit {}", output.status.code().unwrap_or(-1))
+        } else {
+            detail.to_owned()
+        };
+        return Err(fail(format!(
+            "wrkslots shell-command '{slot}' failed: {detail}"
+        )));
+    }
+    let invalid = |reason: &str| {
+        fail(format!(
+            "wrkslots shell-command '{slot}' returned invalid JSON: {reason}"
+        ))
+    };
+    let document: Value =
+        serde_json::from_str(stdout.trim()).map_err(|error| invalid(&error.to_string()))?;
+    let object = document
+        .as_object()
+        .ok_or_else(|| invalid("not an object"))?;
+    let line = object
+        .get("command")
+        .and_then(Value::as_str)
+        .filter(|line| !line.is_empty());
+    let slot_path = object.get("slot_path").and_then(Value::as_str);
+    let (Some(line), Some(slot_path)) = (line, slot_path) else {
+        return Err(invalid("missing fields"));
+    };
+    if object.get("isolation").and_then(Value::as_str) == Some("root") {
+        return Err(fail(ROOT_SLOT_REFUSAL));
+    }
+    Ok((line.to_owned(), PathBuf::from(slot_path)))
 }
 
 impl Default for StartOptions {
@@ -1804,6 +1962,7 @@ impl Default for StartOptions {
             startup_timeout: Duration::from_secs(30),
             delivery: DrainOptions::default(),
             cloud: None,
+            slot: None,
         }
     }
 }
@@ -2536,6 +2695,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             return Err(fail("brief must not be empty"));
         }
         if options.harness == cloud::CLOUD_HARNESS {
+            if options.slot.is_some() {
+                return Err(fail("--slot does not apply to harness agentcloud"));
+            }
             return self.start_cloud(agent_name, cwd, options, reasoning_effort);
         }
         if options.cloud.is_some() {
@@ -2566,6 +2728,22 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         // Placement policy is an input/start concern. Load it before creating
         // the generation so a configuration error cannot leave the name taken.
         let project_workspace = self.start_workspace_policy(&options)?;
+        // The agent works in the slot: its record and pane cwd are the slot
+        // directory, which is where the boxed shell starts.
+        let (cwd, slot_command) = match options.slot.as_ref() {
+            Some(launch) => {
+                let project = launch.project.clone().unwrap_or_else(|| cwd.clone());
+                let (line, slot_path) = slot_shell_command(launch, &project)?;
+                let slot_path = fs::canonicalize(&slot_path).map_err(|_| {
+                    fail(format!(
+                        "slot directory is not a directory: {}",
+                        slot_path.display()
+                    ))
+                })?;
+                (slot_path, Some(line))
+            }
+            None => (cwd, None),
+        };
         let _lock = self.lock(agent_name)?;
         let identity_lock = self.identity_lock()?;
         if let Some(resume) = options.resume.as_deref() {
@@ -2631,7 +2809,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             goal_message_id: None,
         };
         self.save(&record)?;
-        let launched = self.launch(&mut record, &options, project_workspace.as_deref());
+        let launched = self.launch(
+            &mut record,
+            &options,
+            project_workspace.as_deref(),
+            slot_command.as_deref(),
+        );
         if let Err(error) = launched {
             record.lifecycle = "launch_failed".to_owned();
             record.error = Some(if options.environment.is_empty() {
@@ -2947,9 +3130,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         record: &mut AgentRecord,
         options: &StartOptions,
         project_workspace: Option<&str>,
+        slot_command: Option<&str>,
     ) -> Result<()> {
         self.create_presentation(record, options, project_workspace)?;
         let pane_id = record.pane_id.clone().expect("new tab has pane");
+        if let Some(line) = slot_command {
+            self.client
+                .enter_slot_sandbox(&pane_id, line, options.startup_timeout)?;
+        }
         if record.adapter == "herdr-pane" {
             let agent_name = record.name.clone();
             let harness = record.harness.clone();
@@ -5404,6 +5592,7 @@ mod tests {
                     panes_calls: AtomicU64::new(0),
                     pane_info_calls: AtomicU64::new(0),
                     runs: Mutex::new(Vec::new()),
+                    slot_commands: Mutex::new(Vec::new()),
                     environments: Mutex::new(Vec::new()),
                     closed: Mutex::new(Vec::new()),
                     focused: Mutex::new(Vec::new()),
@@ -5544,6 +5733,7 @@ mod tests {
         panes_calls: AtomicU64,
         pane_info_calls: AtomicU64,
         runs: Mutex<Vec<String>>,
+        slot_commands: Mutex<Vec<(String, String)>>,
         environments: Mutex<Vec<Vec<String>>>,
         closed: Mutex<Vec<String>>,
         focused: Mutex<Vec<String>>,
@@ -5901,6 +6091,18 @@ mod tests {
         fn rename_tab(&self, _: &str, _: &str) -> AdapterResult<()> {
             Ok(())
         }
+        fn enter_slot_sandbox(
+            &self,
+            pane: &str,
+            command_line: &str,
+            _: Duration,
+        ) -> AdapterResult<u64> {
+            self.slot_commands
+                .lock()
+                .unwrap()
+                .push((pane.to_owned(), command_line.to_owned()));
+            Ok(4242)
+        }
         fn start_agent(
             &self,
             _: &str,
@@ -6103,6 +6305,178 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("environment variable name"));
         assert!(!fixture.root.join("registry").exists());
+        assert!(fixture.client.environments.lock().unwrap().is_empty());
+    }
+
+    /// A stand-in `wrkslots` that records its argv and cwd, then answers like
+    /// `shell-command --format json` (or fails, when told to).
+    fn fake_wrkslots(root: &Path, slot_path: &Path, behaviour: &str) -> PathBuf {
+        let script = root.join(format!("fake-wrkslots-{behaviour}"));
+        let body = match behaviour {
+            "ok" => format!(
+                "printf '{{\"command\": \"exec boxed-shell\", \"slot_path\": \"{}\"}}\\n'",
+                slot_path.display()
+            ),
+            "fail" => "echo 'unknown slot s9' >&2; exit 3".to_owned(),
+            "root" => format!(
+                "printf '{{\"command\": \"exec boxed-shell\", \"slot_path\": \"{}\", \"isolation\": \"root\"}}\\n'",
+                slot_path.display()
+            ),
+            _ => "echo 'not json'".to_owned(),
+        };
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$@\" > '{}'\n{body}\n",
+                root.join(format!("argv-{behaviour}")).display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[test]
+    fn slot_start_boxes_the_pane_and_works_in_the_slot() {
+        let fixture = Fixture::new();
+        // The fake Herdr reports every pane at the fixture root, so the slot is there.
+        let slot_path = fixture.root.clone();
+        let project = fixture.root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let executable = fake_wrkslots(&fixture.root, &slot_path, "ok");
+        let status = fixture
+            .manager()
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    slot: Some(SlotLaunch {
+                        slot: "s1".to_owned(),
+                        isolation: Some("root".to_owned()),
+                        project: Some(project.clone()),
+                        executable: Some(executable),
+                    }),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let commands = fixture.client.slot_commands.lock().unwrap().clone();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].1, "exec boxed-shell");
+        let canonical_slot = fs::canonicalize(&slot_path).unwrap();
+        assert_eq!(status["cwd"], json!(canonical_slot.display().to_string()));
+        let argv = fs::read_to_string(fixture.root.join("argv-ok")).unwrap();
+        let lines: Vec<&str> = argv.lines().collect();
+        assert_eq!(
+            lines[1..],
+            [
+                "--project-root",
+                project.to_str().unwrap(),
+                "shell-command",
+                "s1",
+                "--isolation",
+                "root",
+                "--format",
+                "json"
+            ]
+        );
+        assert_eq!(
+            fs::canonicalize(lines[0]).unwrap(),
+            fs::canonicalize(&project).unwrap()
+        );
+    }
+
+    #[test]
+    fn slot_start_defaults_to_configured_isolation_and_the_agent_cwd() {
+        let fixture = Fixture::new();
+        let slot_path = fixture.root.join("slots/s2");
+        fs::create_dir_all(&slot_path).unwrap();
+        let executable = fake_wrkslots(&fixture.root, &slot_path, "ok");
+        let (line, path) = slot_shell_command(
+            &SlotLaunch {
+                slot: "s2".to_owned(),
+                executable: Some(executable),
+                ..SlotLaunch::default()
+            },
+            &fixture.root,
+        )
+        .unwrap();
+        assert_eq!(line, "exec boxed-shell");
+        assert_eq!(path, slot_path);
+        let argv = fs::read_to_string(fixture.root.join("argv-ok")).unwrap();
+        assert_eq!(
+            argv.lines().skip(1).collect::<Vec<_>>(),
+            ["shell-command", "s2", "--format", "json"]
+        );
+    }
+
+    #[test]
+    fn slot_failures_are_refused_before_registry_or_tab_creation() {
+        let fixture = Fixture::new();
+        let slot_path = fixture.root.join("slots/s9");
+        let cases = [
+            (
+                "fail",
+                None,
+                "wrkslots shell-command 's9' failed: unknown slot s9",
+            ),
+            (
+                "junk",
+                None,
+                "wrkslots shell-command 's9' returned invalid JSON",
+            ),
+            (
+                "ok",
+                Some("namespace"),
+                "--slot-isolation must be userns, cgroup, or root",
+            ),
+            (
+                "root",
+                None,
+                "--slot with root isolation cannot host a Herdr agent",
+            ),
+        ];
+        for (behaviour, isolation, expected) in cases {
+            let executable = fake_wrkslots(&fixture.root, &slot_path, behaviour);
+            let error = fixture
+                .manager()
+                .start(
+                    "worker",
+                    &fixture.root,
+                    StartOptions {
+                        slot: Some(SlotLaunch {
+                            slot: "s9".to_owned(),
+                            isolation: isolation.map(str::to_owned),
+                            executable: Some(executable),
+                            ..SlotLaunch::default()
+                        }),
+                        ..StartOptions::default()
+                    },
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{behaviour}: {error}");
+        }
+        let error = fixture
+            .manager()
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    harness: "agentcloud".to_owned(),
+                    slot: Some(SlotLaunch {
+                        slot: "s9".to_owned(),
+                        ..SlotLaunch::default()
+                    }),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("--slot does not apply to harness agentcloud"));
+        assert!(!fixture.root.join("registry").exists());
+        assert!(fixture.client.slot_commands.lock().unwrap().is_empty());
         assert!(fixture.client.environments.lock().unwrap().is_empty());
     }
 

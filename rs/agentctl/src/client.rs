@@ -105,6 +105,36 @@ struct PaneProcessState {
     processes: Vec<Map<String, Value>>,
 }
 
+/// The pane's own shell PID is the sole foreground process, is a shell, and sits in a
+/// wrkslots slice.
+fn slot_boxed_shell(state: &PaneProcessState) -> bool {
+    const SHELLS: [&str; 6] = ["bash", "zsh", "sh", "fish", "dash", "ksh"];
+    let only_shell = !state.processes.is_empty()
+        && state
+            .processes
+            .iter()
+            .all(|process| process.get("pid").and_then(Value::as_u64) == Some(state.shell_pid));
+    let is_shell = state.processes.iter().any(|process| {
+        process
+            .get("argv")
+            .and_then(Value::as_array)
+            .and_then(|values| values.first())
+            .and_then(Value::as_str)
+            .map(|argv0| {
+                argv0
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(argv0)
+                    .trim_start_matches('-')
+            })
+            .is_some_and(|name| SHELLS.contains(&name))
+    });
+    only_shell
+        && is_shell
+        && fs::read_to_string(format!("/proc/{}/cgroup", state.shell_pid))
+            .is_ok_and(|cgroup| cgroup.contains("wrkslots"))
+}
+
 fn canonical_boot_uuid(value: &str) -> bool {
     value.len() == 36
         && value.bytes().enumerate().all(|(index, byte)| {
@@ -1588,6 +1618,51 @@ impl HerdrClient {
             );
         }
     }
+    /// Replace a fresh pane's shell with a slot-boxed shell and return its PID.
+    ///
+    /// `command_line` comes from `wrkslots shell-command` and execs at every step, so the
+    /// boxed interactive shell keeps the pane's shell PID. Readiness is proven from kernel
+    /// state, not screen text: the pane's own shell PID is the sole foreground process, it
+    /// is a shell again, and its cgroup is a wrkslots slice.
+    pub fn enter_slot_sandbox(
+        &self,
+        pane_id: &str,
+        command_line: &str,
+        timeout: Duration,
+    ) -> Result<u64> {
+        if timeout.is_zero() || timeout > Duration::from_secs(300) {
+            return Err(AdapterError::unavailable(
+                "slot sandbox timeout must be between 0 and 300 seconds",
+            ));
+        }
+        self.call_ok(
+            &[
+                "pane".to_owned(),
+                "run".to_owned(),
+                pane_id.to_owned(),
+                command_line.to_owned(),
+            ],
+            &format!("pane run wrkslots sandbox {pane_id}"),
+        )?;
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            // A process mid-exec can briefly report no argv; retry.
+            if let Ok(state) = self.pane_process_state(pane_id, &|| false) {
+                if slot_boxed_shell(&state) {
+                    thread::sleep(Duration::from_millis(300)); // let the new shell draw its prompt
+                    return Ok(state.shell_pid);
+                }
+            }
+            thread::sleep(
+                Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+        Err(AdapterError::unavailable(format!(
+            "pane {pane_id} did not return to a wrkslots-boxed shell within {}s; inspect the pane for the wrkslots error",
+            timeout.as_secs_f64()
+        )))
+    }
+
     /// Report whether a pinned command process is still the pane's foreground process.
     pub fn pane_runs_command(
         &self,
