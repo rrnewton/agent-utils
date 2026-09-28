@@ -2,7 +2,8 @@
 """Pin documented shell-executor and agent-control numeric defaults to their code constants.
 
 The guides are shipped artifacts: `py/agentctl/USER_GUIDE.md` is embedded into the agent-control
-crate and included in the wheel, the shell guides go inside both distributions, and
+crate and included in the wheel, the chat bridge guide `rs/agentctl/src/embedded_chat_userguide.md`
+is compiled into the same crate, the shell guides go inside both distributions, and
 `CONFIG_TEMPLATE.yaml` is what `herdr-run init` writes into a project. Agents read those documents
 as fact. Until this guard existed, "up to `--ready-timeout` (900 seconds by default)" was held true
 by nothing at all: the constant lives in several places across two implementations, and changing them
@@ -35,6 +36,12 @@ Not covered, deliberately:
   an 85%-of-`MemTotal` budget with an 8 GiB margin. They are real drift candidates and each is one
   more row in `PINS`, but they belong to a different tool and a different survey; this landed with
   `#88 herdr-run-pin-documented-defaults`, which is herdr-run's.
+* **Numbers the chat guide derives from the breaker constants.** Its breaker paragraph says a loop
+  under the limit can post 480 times an hour, a faster loop trips on its 9th post, one posting
+  every 3 seconds trips 24 seconds in, and a tripped loop sends about 96 posts an hour. A pin
+  compares one stated number with one constant, so these are not checked. They sit in the same
+  paragraph as the pinned numbers they come from, so changing any constant they come from makes
+  this guard name lines of that paragraph.
 * **Exit codes.** The guides tabulate `75`/`76`/`77`/`78`, but those are a wire contract already
   asserted by the Python and Rust suites and by the cross-language differential, so a change to one
   cannot reach main with the table still standing.
@@ -486,6 +493,165 @@ PINS: tuple[Pin, ...] = (
                 "common/docs/herdr-run/rendered/rust/USER_GUIDE.md",
                 r"retention beyond (?P<value>[\d_,]+) days",
                 "the retention ceiling the packaged Rust guide states",
+            ),
+        ),
+    ),
+    # The chat bridge's post-rate breaker. Its guide argues from these numbers: what a normal
+    # thread may send, how long a loop is held, and how fast a loop still gets through. The
+    # patterns allow any whitespace between words, so a reflow of the guide does not break them.
+    Pin(
+        "chat-thread-reply-limit",
+        "the reply operations one chat thread may reserve within the breaker window",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_runtime.rs",
+                r"(?m)^const MAX_THREAD_REPLIES_PER_WINDOW: usize = (?P<value>[\d_]+);$",
+                "the Rust breaker limit",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"may\s+reserve\s+(?P<value>[A-Za-z\d,]+)\s+distinct\s+reply\s+operations",
+                "the per-thread budget the chat guide states",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"goes\s+out\s+(?P<value>[A-Za-z\d,]+)\s+at\s+a\s+time",
+                "the backlog batch the chat guide states",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"after\s+each\s+group\s+of\s+(?P<value>[A-Za-z\d,]+)\.",
+                "the backlog batch the chat guide repeats",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"receipt\s+of\s+the\s+post\s+(?P<value>[A-Za-z\d,]+)\s+before\s+it",
+                "the fastest loop the chat guide says never trips",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"sends\s+(?P<value>[A-Za-z\d,]+)\s+more\s+posts\s+after\s+each",
+                "the per-hold post count the chat guide gives for a tripped loop",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"even\s+if\s+(?P<value>[A-Za-z\d,]+)\s+of\s+its\s+reservations",
+                "the reservation count the chat guide says trips an unlisted thread again",
+            ),
+        ),
+    ),
+    Pin(
+        "chat-thread-reply-window-seconds",
+        "the chat breaker's reply window, in seconds",
+        code=(
+            # The constant is in milliseconds. The pattern stops before its final `_000`, so the
+            # value it lifts is the seconds the guide states.
+            Site(
+                "rs/agentctl/src/chat_runtime.rs",
+                r"(?m)^const THREAD_REPLY_WINDOW_MILLIS: u64 = (?P<value>[\d_]+)_000;$",
+                "the Rust breaker window",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"distinct\s+reply\s+operations\s+within\s+(?P<value>[A-Za-z\d,]+)\s+seconds",
+                "the window the chat guide states",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"starts\s+at\s+least\s+(?P<value>[A-Za-z\d,]+)\s+seconds\s+after",
+                "the window of the loop the chat guide says never trips",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"its\s+\w+\s+post\s+within\s+(?P<value>[A-Za-z\d,]+)\s+seconds",
+                "the window in which the chat guide says a faster loop trips",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"(?P<value>[A-Za-z\d,]+)-second\s+retention\s+window",
+                "the receipt retention the chat guide states",
+            ),
+        ),
+    ),
+    Pin(
+        "chat-thread-breaker-cooldown-seconds",
+        "how long a tripped chat thread holds its replies, in seconds",
+        code=(
+            # In milliseconds, lifted as seconds, as for the window.
+            Site(
+                "rs/agentctl/src/chat_runtime.rs",
+                r"(?m)^const THREAD_BREAKER_COOLDOWN_MILLIS: u64 = (?P<value>[\d_]+)_000;$",
+                "the Rust breaker cooldown",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"captured\s+but\s+unsent\s+for\s+(?P<value>[A-Za-z\d,]+)\s+seconds",
+                "the hold the chat guide states",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"after\s+each\s+(?P<value>[A-Za-z\d,]+)-second\s+hold",
+                "the hold the chat guide's loop bound assumes",
+            ),
+        ),
+    ),
+    Pin(
+        "chat-already-reported-log-ids",
+        "the already reported reply IDs one chat recovery-scan log line names",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_service.rs",
+                r"(?m)^const ALREADY_REPORTED_LOG_IDS: usize = (?P<value>[\d_]+);$",
+                "the Rust log bound",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"names\s+up\s+to\s+(?P<value>[A-Za-z\d,]+)\s+of\s+them",
+                "the log line the chat guide describes",
+            ),
+        ),
+    ),
+    Pin(
+        "chat-feedback-ids-per-scan",
+        "the unavailable reply IDs one chat capture keeps in each of its lists",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_runtime.rs",
+                r"(?m)^const MAX_FEEDBACK_UNAVAILABLE_IDS: usize = (?P<value>[\d_]+);$",
+                "the Rust list bound",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"up\s+to\s+(?P<value>[A-Za-z\d,]+)\s+per\s+scan",
+                "the per-scan bound the chat guide states",
+            ),
+        ),
+    ),
+    Pin(
+        "chat-feedback-available-ids",
+        "the available reply IDs one chat routing-error prompt names",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_runtime.rs",
+                r"(?m)^const MAX_FEEDBACK_AVAILABLE_IDS: usize = (?P<value>[\d_]+);$",
+                "the Rust display bound",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"up\s+to\s+(?P<value>[A-Za-z\d,]+)\s+of\s+the\s+reply\s+IDs\s+that\s+were\s+available",
+                "the prompt the chat guide describes",
             ),
         ),
     ),
