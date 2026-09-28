@@ -198,6 +198,23 @@ inclusive monotone cursor; a cursor regression or a reused message identity
 with different content fails closed. This is bounded local retention, not a
 claim of infinite local audit history.
 
+A reply marker in the pane whose ID is not available, such as a typo or a stale
+block left in scrollback by another bridge state, produces one routing-error
+prompt to the agent. The prompt names the unavailable ID and the available
+ones and is never posted to chat. Each unavailable ID is reported at most once,
+including after a restart. While a routing-error prompt is still queued, newer
+unavailable IDs wait for it instead of producing a second prompt. Reported IDs
+are kept in `fence-feedback.json` in the bridge state directory.
+
+A per-thread post-rate breaker bounds any remaining reply loop. After one
+provider thread receives 3 replies within 60 seconds, the next reply to that
+thread trips the breaker. Replies to that thread then stay captured but unsent
+for 600 seconds, and the log names the thread with a `post-rate breaker` error.
+Other threads are unaffected. After the cooldown, held replies go out in order
+under their original operation IDs. To release a thread early, first confirm
+that no reply loop is running, then delete `reply-breaker.json` from the bridge
+state directory.
+
 ## Service management
 
 `chat run` is a foreground process and exits cleanly after SIGINT or SIGTERM.

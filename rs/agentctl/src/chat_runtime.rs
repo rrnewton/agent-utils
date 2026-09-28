@@ -53,6 +53,20 @@ const MAX_STATE_REPLIES: u64 = 65_536;
 const MAX_STATE_REPLY_BYTES: u64 = 1_024 * 1_024 * 1_024;
 const MAX_VISIBLE_MARKERS: usize = 4_096;
 const MAX_FEEDBACK_AVAILABLE_IDS: usize = 32;
+const MAX_FEEDBACK_UNAVAILABLE_IDS: usize = 128;
+const MAX_FEEDBACK_ID_BYTES: usize = 256;
+// One snapshot shows at most this many markers, so a reported marker is forgotten, and could be
+// reported again, only after that many newer ones were reported.
+const MAX_REPORTED_REPLY_MARKERS: usize = MAX_VISIBLE_MARKERS;
+const MAX_FENCE_FEEDBACK_PROMPT_BYTES: usize = 64 * 1_024;
+const MAX_FENCE_FEEDBACK_BYTES: usize = 2 * 1_024 * 1_024;
+// Replies one provider thread may receive within the window before its post-rate breaker trips.
+const MAX_THREAD_REPLIES_PER_WINDOW: usize = 3;
+const THREAD_REPLY_WINDOW_MILLIS: u64 = 60_000;
+// A tripped thread holds its replies this long unless an operator deletes the breaker record.
+const THREAD_BREAKER_COOLDOWN_MILLIS: u64 = 600_000;
+const MAX_REPLY_BREAKER_EVENTS: usize = 4_096;
+const MAX_REPLY_BREAKER_BYTES: usize = 4 * 1_024 * 1_024;
 const MAX_OUTBOUND_EXECUTABLE_BYTES: u64 = 64 * 1_024 * 1_024;
 const COMMIT_RECEIPT_SLOTS: u64 = 256;
 const RETIRED_ROUTE_SLOTS: u64 = 4_096;
@@ -943,6 +957,110 @@ impl RetiredRouteIndex {
         ProviderCursor::new(self.admitted_cursor.clone())
             .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
         Ok(())
+    }
+}
+
+/// Unavailable reply marker identifiers already reported to the coordinator, oldest first, and
+/// the prompt the coordinator queue still holds for more of them.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FenceFeedbackRecord {
+    version: u32,
+    reported: Vec<String>,
+    pending: Option<PendingFenceFeedback>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingFenceFeedback {
+    unavailable: Vec<String>,
+    prompt: String,
+}
+
+fn valid_feedback_id(identifier: &str) -> bool {
+    !identifier.is_empty() && identifier.len() <= MAX_FEEDBACK_ID_BYTES
+}
+
+impl FenceFeedbackRecord {
+    fn validate(&self) -> Result<()> {
+        let pending_valid = self.pending.as_ref().is_none_or(|pending| {
+            !pending.unavailable.is_empty()
+                && pending.unavailable.len() <= MAX_FEEDBACK_UNAVAILABLE_IDS
+                && pending
+                    .unavailable
+                    .iter()
+                    .all(|identifier| valid_feedback_id(identifier))
+                && !pending.prompt.is_empty()
+                && pending.prompt.len() <= MAX_FENCE_FEEDBACK_PROMPT_BYTES
+        });
+        if self.version != STATE_VERSION
+            || self.reported.len() > MAX_REPORTED_REPLY_MARKERS
+            || !self
+                .reported
+                .iter()
+                .all(|identifier| valid_feedback_id(identifier))
+            || !pending_valid
+        {
+            return Err(ChatRuntimeError::invalid(
+                "fence feedback record is inconsistent or outside protocol bounds",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Recent reply sends and tripped threads for the per-thread post-rate breaker.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplyBreakerRecord {
+    version: u32,
+    sends: Vec<ThreadEvent>,
+    trips: Vec<ThreadEvent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThreadEvent {
+    channel_id: String,
+    thread_id: String,
+    at_millis: u64,
+}
+
+impl ThreadEvent {
+    fn is_for(&self, message: &SavedMessage) -> bool {
+        self.channel_id == message.channel_id && self.thread_id == message.thread_id
+    }
+}
+
+impl ReplyBreakerRecord {
+    fn validate(&self) -> Result<()> {
+        if self.version != STATE_VERSION
+            || self.sends.len() > MAX_REPLY_BREAKER_EVENTS
+            || self.trips.len() > MAX_REPLY_BREAKER_EVENTS
+            || self.sends.iter().chain(&self.trips).any(|event| {
+                event.channel_id.is_empty()
+                    || event.thread_id.is_empty()
+                    || event.channel_id.len() > chat_subscription::MAX_RESOURCE_ID_BYTES
+                    || event.thread_id.len() > chat_subscription::MAX_RESOURCE_ID_BYTES
+            })
+        {
+            return Err(ChatRuntimeError::invalid(
+                "reply post-rate breaker record is inconsistent or outside protocol bounds",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Drop sends outside the window and trips past their cooldown, then the oldest overflow.
+    fn prune(&mut self, now: u64) {
+        self.sends
+            .retain(|send| now.saturating_sub(send.at_millis) < THREAD_REPLY_WINDOW_MILLIS);
+        self.trips
+            .retain(|trip| now.saturating_sub(trip.at_millis) < THREAD_BREAKER_COOLDOWN_MILLIS);
+        for events in [&mut self.sends, &mut self.trips] {
+            let excess = events.len().saturating_sub(MAX_REPLY_BREAKER_EVENTS);
+            events.drain(..excess);
+        }
     }
 }
 
@@ -3893,6 +4011,136 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
             .collect())
     }
 
+    /// Record one fence feedback prompt. A prompt the queue still holds stays pending, so later
+    /// scans settle it instead of composing another; a settled prompt marks its markers reported,
+    /// so no later scan reports them again, even after a restart.
+    fn record_fence_feedback(
+        &self,
+        unavailable: &[String],
+        prompt: &str,
+        queued: bool,
+    ) -> Result<()> {
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let mut record = self.read_fence_feedback()?;
+        if queued {
+            record.pending = Some(PendingFenceFeedback {
+                unavailable: unavailable.to_vec(),
+                prompt: prompt.to_owned(),
+            });
+        } else {
+            record.pending = None;
+            for identifier in unavailable {
+                if !record.reported.contains(identifier) {
+                    record.reported.push(identifier.clone());
+                }
+            }
+            let excess = record
+                .reported
+                .len()
+                .saturating_sub(MAX_REPORTED_REPLY_MARKERS);
+            record.reported.drain(..excess);
+        }
+        write_document(&self.root.join("fence-feedback.json"), &record)
+    }
+
+    fn read_fence_feedback(&self) -> Result<FenceFeedbackRecord> {
+        let record: FenceFeedbackRecord = match read_document(
+            &self.root.join("fence-feedback.json"),
+            MAX_FENCE_FEEDBACK_BYTES,
+        ) {
+            Ok(record) => record,
+            Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(FenceFeedbackRecord {
+                    version: STATE_VERSION,
+                    reported: Vec::new(),
+                    pending: None,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    /// Hold a reply while its thread's post-rate breaker is tripped, and trip the breaker when
+    /// the thread already received the most replies one window allows.
+    fn enforce_reply_rate_locked(&self, message: &SavedMessage) -> Result<()> {
+        let path = self.root.join("reply-breaker.json");
+        let mut record = self.read_reply_breaker()?;
+        let now = unix_millis();
+        if let Some(trip) = record.trips.iter().rev().find(|trip| {
+            trip.is_for(message)
+                && now.saturating_sub(trip.at_millis) < THREAD_BREAKER_COOLDOWN_MILLIS
+        }) {
+            return Err(ChatRuntimeError::invalid(format!(
+                "chat reply post-rate breaker for thread {} tripped {} s ago; its replies stay \
+held for {} s or until {} is deleted",
+                message.thread_id,
+                now.saturating_sub(trip.at_millis) / 1_000,
+                THREAD_BREAKER_COOLDOWN_MILLIS / 1_000,
+                path.display()
+            )));
+        }
+        let recent = record
+            .sends
+            .iter()
+            .filter(|send| {
+                send.is_for(message)
+                    && now.saturating_sub(send.at_millis) < THREAD_REPLY_WINDOW_MILLIS
+            })
+            .count();
+        if recent < MAX_THREAD_REPLIES_PER_WINDOW {
+            return Ok(());
+        }
+        record.trips.push(ThreadEvent {
+            channel_id: message.channel_id.clone(),
+            thread_id: message.thread_id.clone(),
+            at_millis: now,
+        });
+        record.prune(now);
+        write_document(&path, &record)?;
+        Err(ChatRuntimeError::invalid(format!(
+            "chat reply post-rate breaker tripped: thread {} already received {recent} replies \
+in the last {} s, so a reply loop is likely; its replies stay held for {} s or until {} is deleted",
+            message.thread_id,
+            THREAD_REPLY_WINDOW_MILLIS / 1_000,
+            THREAD_BREAKER_COOLDOWN_MILLIS / 1_000,
+            path.display()
+        )))
+    }
+
+    fn record_reply_send_locked(&self, message: &SavedMessage, sent_at_millis: u64) -> Result<()> {
+        let mut record = self.read_reply_breaker()?;
+        record.sends.push(ThreadEvent {
+            channel_id: message.channel_id.clone(),
+            thread_id: message.thread_id.clone(),
+            at_millis: sent_at_millis,
+        });
+        record.prune(unix_millis());
+        write_document(&self.root.join("reply-breaker.json"), &record)
+    }
+
+    fn read_reply_breaker(&self) -> Result<ReplyBreakerRecord> {
+        let record: ReplyBreakerRecord = match read_document(
+            &self.root.join("reply-breaker.json"),
+            MAX_REPLY_BREAKER_BYTES,
+        ) {
+            Ok(record) => record,
+            Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(ReplyBreakerRecord {
+                    version: STATE_VERSION,
+                    sends: Vec::new(),
+                    trips: Vec::new(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
     /// Build the bounded active route cache during startup or explicit recovery.
     pub fn active_reply_routes(&self) -> Result<Vec<ReplyRoute>> {
         if !self.config.outbound_enabled {
@@ -4586,6 +4834,8 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
             while request.next_send_ordinal < request.next_reply_ordinal {
                 let mut reply = self.read_reply(key, request.next_send_ordinal)?;
                 if reply.phase != ReplyPhase::Sent {
+                    // A tripped breaker holds the reply in its current phase; nothing is lost.
+                    self.enforce_reply_rate_locked(&request.message)?;
                     reply.phase = ReplyPhase::Sending;
                     write_document(&self.reply_path(key, reply.ordinal), &reply)?;
                     break;
@@ -4637,8 +4887,10 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         }
         current.phase = ReplyPhase::Sent;
         current.provider_message_id = Some(provider_message_id.clone());
-        current.sent_at_millis = Some(causal_wall_millis(current.captured_at_millis));
+        let sent_at_millis = causal_wall_millis(current.captured_at_millis);
+        current.sent_at_millis = Some(sent_at_millis);
         write_document(&self.reply_path(key, current.ordinal), &current)?;
+        self.record_reply_send_locked(&request_snapshot.message, sent_at_millis)?;
         reply = current;
         let mut request = self.read_request(key)?;
         if request.next_send_ordinal == reply.ordinal {
@@ -5736,30 +5988,75 @@ pub(crate) fn deliver_fence_feedback_with(
     if unknown_ids.is_empty() {
         return Ok(CoordinatorDeliveryResult::AlreadyDelivered);
     }
-    if unknown_ids.len() > 128
-        || unknown_ids
+    if unknown_ids.len() > MAX_FEEDBACK_UNAVAILABLE_IDS
+        || !unknown_ids
             .iter()
-            .any(|identifier| identifier.is_empty() || identifier.len() > 256)
+            .all(|identifier| valid_feedback_id(identifier))
     {
         return Err(ChatRuntimeError::invalid(
             "unavailable reply marker diagnostics exceed their bounded population",
         ));
     }
-    let available = state.available_reply_ids()?;
-    let mut unavailable = unknown_ids.to_vec();
+    // Settle a prompt the queue still holds before composing another, so no marker ever reaches
+    // the coordinator in two prompts.
+    let mut settled = None;
+    if let Some(pending) = state.read_fence_feedback()?.pending {
+        let result = drive_fence_feedback(
+            state,
+            delivery,
+            &pending.unavailable,
+            &pending.prompt,
+            options,
+        )?;
+        if matches!(result, CoordinatorDeliveryResult::Pending(_)) {
+            return Ok(result);
+        }
+        state.record_fence_feedback(&pending.unavailable, &pending.prompt, false)?;
+        settled = Some(result);
+    }
+    let reported = state
+        .read_fence_feedback()?
+        .reported
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let mut unavailable = unknown_ids
+        .iter()
+        .filter(|identifier| !reported.contains(*identifier))
+        .cloned()
+        .collect::<Vec<_>>();
     unavailable.sort();
     unavailable.dedup();
-    let identity = serde_json::to_vec(&serde_json::json!({
-        "unavailable": unavailable,
-        "available": available,
-    }))?;
-    let message_id = format!("chat-feedback-{:x}", Sha256::digest(identity));
+    if unavailable.is_empty() {
+        return Ok(settled.unwrap_or(CoordinatorDeliveryResult::AlreadyDelivered));
+    }
+    let available = state.available_reply_ids()?;
     let prompt = format!(
         "Chat reply routing error: your output referenced unavailable reply ID(s): {}. \
 The currently available reply ID(s) are: {}. Emit a complete reply block using one exact available ID.",
         unavailable.join(", "),
         format_available_reply_ids(&available)
     );
+    let result = drive_fence_feedback(state, delivery, &unavailable, &prompt, options)?;
+    state.record_fence_feedback(
+        &unavailable,
+        &prompt,
+        matches!(result, CoordinatorDeliveryResult::Pending(_)),
+    )?;
+    Ok(result)
+}
+
+/// Submit or settle one fence feedback prompt. Its queue identity is the unavailable markers
+/// alone: the available IDs advance with every captured reply, so keying on them too made each
+/// rescan of one stale marker a new prompt, a new reply and a new post.
+fn drive_fence_feedback(
+    state: &BridgeState,
+    delivery: &dyn CoordinatorDelivery,
+    unavailable: &[String],
+    prompt: &str,
+    options: DrainOptions,
+) -> Result<CoordinatorDeliveryResult> {
+    let identity = serde_json::to_vec(&serde_json::json!({ "unavailable": unavailable }))?;
+    let message_id = format!("chat-feedback-{:x}", Sha256::digest(identity));
     let agent_name = &state.config.agent_name;
     let initial = delivery
         .message_state(agent_name, &message_id)
@@ -5774,7 +6071,7 @@ The currently available reply ID(s) are: {}. Emit a complete reply block using o
             ));
         }
         Some(QueueMessageState::Pending) => delivery.drain(agent_name, options),
-        None => delivery.submit(agent_name, &prompt, &message_id, options),
+        None => delivery.submit(agent_name, prompt, &message_id, options),
     };
     if operation.is_ok() && initial.is_none() {
         return Ok(CoordinatorDeliveryResult::Delivered);
@@ -6835,6 +7132,81 @@ mod tests {
             *self.queue_state.lock().expect("queue state lock") =
                 Some(QueueMessageState::Processed);
             Ok(())
+        }
+    }
+
+    /// Coordinator queue that, like the durable agent queue, tracks each message ID separately
+    /// and delivers every queued message whenever a drain finds the coordinator free.
+    #[derive(Default)]
+    struct QueueDelivery {
+        states: Mutex<BTreeMap<String, QueueMessageState>>,
+        submitted: Mutex<Vec<(String, String)>>,
+        busy_drains: Mutex<u32>,
+    }
+
+    impl QueueDelivery {
+        fn prompts(&self) -> Vec<String> {
+            self.submitted
+                .lock()
+                .expect("submission lock")
+                .iter()
+                .map(|(_, prompt)| prompt.clone())
+                .collect()
+        }
+
+        fn drain_queue(&self) -> std::result::Result<(), String> {
+            let mut busy = self.busy_drains.lock().expect("busy lock");
+            if *busy > 0 {
+                *busy -= 1;
+                return Err("coordinator is busy; the prompt stays queued".to_owned());
+            }
+            for state in self.states.lock().expect("queue lock").values_mut() {
+                if *state == QueueMessageState::Pending {
+                    *state = QueueMessageState::Processed;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl CoordinatorDelivery for QueueDelivery {
+        fn message_state(
+            &self,
+            _agent_name: &str,
+            message_id: &str,
+        ) -> std::result::Result<Option<QueueMessageState>, String> {
+            Ok(self
+                .states
+                .lock()
+                .expect("queue lock")
+                .get(message_id)
+                .copied())
+        }
+
+        fn submit(
+            &self,
+            _agent_name: &str,
+            prompt: &str,
+            message_id: &str,
+            _options: DrainOptions,
+        ) -> std::result::Result<(), String> {
+            self.submitted
+                .lock()
+                .expect("submission lock")
+                .push((message_id.to_owned(), prompt.to_owned()));
+            self.states
+                .lock()
+                .expect("queue lock")
+                .insert(message_id.to_owned(), QueueMessageState::Pending);
+            self.drain_queue()
+        }
+
+        fn drain(
+            &self,
+            _agent_name: &str,
+            _options: DrainOptions,
+        ) -> std::result::Result<(), String> {
+            self.drain_queue()
         }
     }
 
@@ -9929,6 +10301,270 @@ mod tests {
         assert!(displayed.contains("reply-31"));
         assert!(!displayed.contains("reply-32"));
         assert!(displayed.contains("and 3 more"));
+    }
+
+    #[test]
+    fn stale_foreign_reply_marker_is_reported_once_instead_of_looping_replies() {
+        // A fresh bridge state targets a pane whose scrollback still shows a reply block from
+        // another bridge state. Each routing-error prompt makes the coordinator emit its answer
+        // again under the next available ID, and the stale block never leaves the screen. When
+        // the feedback identity included the advancing available ID, every recovery scan was a
+        // new prompt and a new post: 11 posts in 30 seconds.
+        let root = temporary("stale-marker-loop");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let key = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request")
+            .new_request_keys[0]
+            .clone();
+        let nonce = state.read_request(&key).expect("request").reply_nonce;
+        let foreign = "1glbtIyB9sddh4NmJtZhiA";
+        assert_ne!(nonce, foreign);
+        let mut rendered = format!(
+            "<CHAT_REPLY_{foreign}_1>\nanswer from another bridge state\n</CHAT_REPLY_{foreign}_1>\n\
+<CHAT_REPLY_{nonce}_1>\nanswer\n</CHAT_REPLY_{nonce}_1>\n"
+        );
+        let coordinator = QueueDelivery::default();
+        let mut transport = FakeReplyTransport::default();
+        for _ in 0..11 {
+            let capture = state.capture_snapshot(&rendered).expect("recovery scan");
+            assert_eq!(capture.unknown_ids, vec![format!("{foreign}_1")]);
+            while state
+                .publish_one(&key, &mut transport)
+                .expect("publish captured reply")
+                .is_some()
+            {}
+            let prompts_before = coordinator.prompts().len();
+            deliver_fence_feedback_with(
+                &state,
+                &coordinator,
+                &capture.unknown_ids,
+                DrainOptions::default(),
+            )
+            .expect("fence feedback");
+            if coordinator.prompts().len() == prompts_before {
+                break;
+            }
+            let identifier = state.available_reply_ids().expect("available IDs")[0].clone();
+            rendered.push_str(&format!(
+                "<CHAT_REPLY_{identifier}>\nanswer again\n</CHAT_REPLY_{identifier}>\n"
+            ));
+        }
+        let prompts = coordinator.prompts();
+        assert_eq!(
+            prompts.len(),
+            1,
+            "stale marker was re-reported: {prompts:#?}"
+        );
+        assert!(prompts[0].contains(&format!("{foreign}_1")));
+        assert!(prompts[0].contains(&format!("{nonce}_2")));
+        assert_eq!(
+            transport
+                .submissions
+                .iter()
+                .map(|submission| submission.2.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "[codex coordinator] answer",
+                "[codex coordinator] answer again"
+            ]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn fence_feedback_reports_each_unavailable_marker_once_across_restarts() {
+        let root = temporary("feedback-once");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request");
+        let coordinator = QueueDelivery::default();
+        let report = |state: &BridgeState, identifiers: &[&str]| {
+            deliver_fence_feedback_with(
+                state,
+                &coordinator,
+                &identifiers
+                    .iter()
+                    .map(|identifier| (*identifier).to_owned())
+                    .collect::<Vec<_>>(),
+                DrainOptions::default(),
+            )
+            .expect("fence feedback")
+        };
+
+        // A queued prompt that has not reached the coordinator is drained under its original
+        // message ID rather than submitted again, and only then counts as reported.
+        *coordinator.busy_drains.lock().expect("busy lock") = 1;
+        assert!(matches!(
+            report(&state, &["stale_1"]),
+            CoordinatorDeliveryResult::Pending(_)
+        ));
+        assert_eq!(
+            report(&state, &["stale_1"]),
+            CoordinatorDeliveryResult::Delivered
+        );
+        assert_eq!(coordinator.prompts().len(), 1);
+
+        // A new marker is reported alone; markers already reported never return.
+        assert_eq!(
+            report(&state, &["typo_7", "stale_1"]),
+            CoordinatorDeliveryResult::Delivered
+        );
+        let prompts = coordinator.prompts();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[1].contains("typo_7"));
+        assert!(!prompts[1].contains("stale_1"));
+
+        // While a prompt stays queued, a scan that also shows a newer marker composes nothing
+        // new; once the queued prompt lands, the newer marker is reported on its own.
+        *coordinator.busy_drains.lock().expect("busy lock") = 2;
+        assert!(matches!(
+            report(&state, &["queued_3"]),
+            CoordinatorDeliveryResult::Pending(_)
+        ));
+        assert!(matches!(
+            report(&state, &["queued_3", "newer_4"]),
+            CoordinatorDeliveryResult::Pending(_)
+        ));
+        assert_eq!(coordinator.prompts().len(), 3);
+        drop(state);
+        let state = BridgeState::open(&root).expect("reopen state");
+        assert_eq!(
+            report(&state, &["queued_3", "newer_4"]),
+            CoordinatorDeliveryResult::Delivered
+        );
+        let prompts = coordinator.prompts();
+        assert_eq!(prompts.len(), 4);
+        assert!(prompts[2].contains("queued_3"));
+        assert!(prompts[3].contains("newer_4"));
+        assert!(!prompts[3].contains("queued_3"));
+        for identifiers in [
+            &["typo_7"][..],
+            &["stale_1", "typo_7"],
+            &["stale_1"],
+            &["newer_4", "queued_3", "stale_1"],
+        ] {
+            assert_eq!(
+                report(&state, identifiers),
+                CoordinatorDeliveryResult::AlreadyDelivered
+            );
+        }
+        assert_eq!(coordinator.prompts().len(), 4);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn thread_post_rate_breaker_holds_a_reply_burst_until_cooldown_or_reset() {
+        let root = temporary("reply-breaker");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let key = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request")
+            .new_request_keys[0]
+            .clone();
+        let nonce = state.read_request(&key).expect("request").reply_nonce;
+        let burst = (1..=7)
+            .map(|ordinal| {
+                format!(
+                    "<CHAT_REPLY_{nonce}_{ordinal}>\npart {ordinal}\n</CHAT_REPLY_{nonce}_{ordinal}>\n"
+                )
+            })
+            .collect::<String>();
+        state.capture_replies(&key, &burst).expect("capture burst");
+        let mut transport = FakeReplyTransport::default();
+        for _ in 0..MAX_THREAD_REPLIES_PER_WINDOW {
+            assert!(state
+                .publish_one(&key, &mut transport)
+                .expect("publish within the thread budget")
+                .is_some());
+        }
+        let error = state
+            .publish_one(&key, &mut transport)
+            .expect_err("one more reply within the window trips the breaker")
+            .to_string();
+        assert!(error.contains("post-rate breaker tripped"), "{error}");
+        assert_eq!(transport.submissions.len(), 3);
+        let held = state.read_reply(&key, 4).expect("held reply");
+        assert_eq!(held.phase, ReplyPhase::Pending);
+
+        // Other threads keep their own budget.
+        let other = state
+            .admit_batch(&indexed_delivery(2, 7))
+            .expect("admit request in another thread")
+            .new_request_keys[0]
+            .clone();
+        let other_nonce = state
+            .read_request(&other)
+            .expect("other request")
+            .reply_nonce;
+        state
+            .capture_replies(
+                &other,
+                &format!("<CHAT_REPLY_{other_nonce}_1>\nelsewhere\n</CHAT_REPLY_{other_nonce}_1>"),
+            )
+            .expect("capture reply in another thread");
+        assert!(state
+            .publish_one(&other, &mut transport)
+            .expect("other thread publishes")
+            .is_some());
+        assert_eq!(transport.submissions[3].1, "spaces/example/threads/7");
+
+        // The trip latches: sends aging out of the window do not release the thread, and
+        // neither does a restart.
+        let breaker = root.join("reply-breaker.json");
+        let age = |sends: u64, trips: u64| {
+            let mut record: ReplyBreakerRecord =
+                read_document(&breaker, MAX_REPLY_BREAKER_BYTES).expect("read breaker");
+            for send in &mut record.sends {
+                send.at_millis = send.at_millis.saturating_sub(sends);
+            }
+            for trip in &mut record.trips {
+                trip.at_millis = trip.at_millis.saturating_sub(trips);
+            }
+            write_document(&breaker, &record).expect("write breaker");
+        };
+        age(2 * THREAD_REPLY_WINDOW_MILLIS, 0);
+        let error = state
+            .publish_one(&key, &mut transport)
+            .expect_err("tripped thread stays held")
+            .to_string();
+        assert!(error.contains("replies stay held"), "{error}");
+        drop(state);
+        let state = BridgeState::open(&root).expect("reopen tripped state");
+        assert!(state.publish_one(&key, &mut transport).is_err());
+        assert_eq!(transport.submissions.len(), 4);
+
+        // After the cooldown the held reply goes out under its original request ID.
+        age(0, THREAD_BREAKER_COOLDOWN_MILLIS);
+        assert!(state
+            .publish_one(&key, &mut transport)
+            .expect("cooldown elapsed")
+            .is_some());
+        assert_eq!(transport.submissions[4].2, "[codex coordinator] part 4");
+        assert_eq!(transport.submissions[4].3, held.send_request_id);
+        for _ in 1..MAX_THREAD_REPLIES_PER_WINDOW {
+            assert!(state
+                .publish_one(&key, &mut transport)
+                .expect("publish within the refilled budget")
+                .is_some());
+        }
+        assert!(state.publish_one(&key, &mut transport).is_err());
+
+        // Deleting the record resets the breaker.
+        fs::remove_file(&breaker).expect("reset breaker");
+        assert!(state
+            .publish_one(&key, &mut transport)
+            .expect("publish after reset")
+            .is_some());
+        assert_eq!(
+            state
+                .publish_one(&key, &mut transport)
+                .expect("outbox empty"),
+            None
+        );
+        assert_eq!(transport.submissions.len(), 8);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
