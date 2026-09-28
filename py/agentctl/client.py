@@ -484,6 +484,15 @@ def default_runner(command: Sequence[str]) -> "subprocess.CompletedProcess[str]"
 _PRODUCTION_RUNNER = default_runner
 
 
+def relay_trust_prompt(screen: str) -> bool:
+    """Whether a Claude or Codex workspace trust dialog is on screen."""
+    return (
+        ("Quick safety check: Is this a project you created or one you trust?" in screen
+         and "Yes, I trust this folder" in screen)
+        or ("Trust this folder?" in screen and "Trust and continue" in screen)
+    )
+
+
 def _validated_executable(candidate: str, name: str) -> str:
     """Canonicalize and validate one fixed executable candidate."""
     resolved = os.path.realpath(os.path.abspath(candidate))
@@ -1183,6 +1192,172 @@ class HerdrClient:
         """Prove both idle-shell state and the exact shell generation captured earlier."""
         proof = self.pane_idle_shell_identity(pane_id)
         return proof is not None and proof.identity == expected
+
+    @staticmethod
+    def _process_cgroup(pid: int) -> str | None:
+        try:
+            with open(f"/proc/{pid}/cgroup", encoding="utf-8") as stream:
+                return stream.read(4097)
+        except OSError:
+            return None
+
+    @staticmethod
+    def _process_children_map() -> dict[int, list[int]]:
+        """Parent -> children for every visible process, from world-readable stat files.
+
+        A root-owned process's own task directory is not readable by the user,
+        so descendants of sudo are found through their parent links instead.
+        """
+        children: dict[int, list[int]] = {}
+        try:
+            entries = [entry for entry in os.listdir("/proc") if entry.isascii() and entry.isdigit()]
+        except OSError:
+            return children
+        for entry in entries[:_MAX_PROC_ENTRIES]:
+            try:
+                with open(f"/proc/{entry}/stat", "rb") as stream:
+                    raw = stream.read(8193)
+            except OSError:
+                continue
+            parsed = parse_process_stat(raw)
+            if parsed is not None and parsed.pid == int(entry):
+                children.setdefault(parsed.ppid, []).append(parsed.pid)
+        return children
+
+    def relay_process(self, pane_id: str) -> CustomProcessIdentity | None:
+        """Identify the program a slot's root relay runs in one pane, or None.
+
+        Under root slot isolation the pane's shell PID execs into sudo, which
+        keeps the terminal and runs the boxed program on a private pty behind
+        a monitor process. The program is the first process below the pane's
+        shell PID that belongs to this user and shares its wrkslots slot scope.
+        The pane lives exactly as long as that chain, so a later generation in
+        the same pane cannot be mistaken for this one.
+        """
+        info = self.process_info(pane_id)
+        if (len(info.foreground) != 1 or info.foreground[0][0] != info.shell_pid
+                or info.foreground_pgid != info.shell_pid
+                or os.path.basename(info.foreground[0][3]) != "sudo"):
+            return None
+        scope = self._process_cgroup(info.shell_pid)
+        if scope is None or "wrkslots" not in scope:
+            return None
+        tree = self._process_children_map()
+        frontier, seen = [info.shell_pid], {info.shell_pid}
+        for _depth in range(4):
+            following: list[int] = []
+            for parent in frontier:
+                for child in sorted(tree.get(parent, ())):
+                    if child in seen:
+                        continue
+                    seen.add(child)
+                    try:
+                        owner = os.stat(f"/proc/{child}").st_uid
+                    except OSError:
+                        continue
+                    if owner == os.getuid() and self._process_cgroup(child) == scope:
+                        observed = self._process_identity(child)
+                        return None if observed is None else observed[0]
+                    following.append(child)
+            frontier = following
+        return None
+
+    def verify_relay_harness(self, pane_id: str, expected: CustomProcessIdentity | None) -> None:
+        """Require the recorded program to still run behind this pane's root relay."""
+        observed = self.relay_process(pane_id)
+        if observed is None or expected is None or observed != expected:
+            raise HerdrUnavailable(
+                f"the recorded program is not running behind the slot relay in pane {pane_id}"
+            )
+
+    def explain_agent(self, pane_id: str) -> tuple[str | None, str]:
+        """Herdr's screen-rule verdict for one pane: (agent kind, state).
+
+        Herdr keeps a reported pane state as reported; its bundled screen rules
+        are evaluated live only by ``agent explain``.
+        """
+        completed = self._invoke(["agent", "explain", pane_id])
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "").strip() or f"exit {completed.returncode}"
+            raise HerdrUnavailable(f"agent explain {pane_id}: {detail}")
+        fields: dict[str, str] = {}
+        for line in completed.stdout.splitlines():
+            key, separator, value = line.partition(":")
+            if (separator and key.strip() in ("agent", "state", "rule", "fallback_reason")
+                    and key.strip() not in fields):
+                fields[key.strip()] = value.strip()
+        state = fields.get("state", "unknown")
+        # A default for a known agent with no matching rule is not screen evidence.
+        if (state not in ("idle", "working", "blocked", "done", "unknown")
+                or fields.get("rule", "none") == "none" or "fallback_reason" in fields):
+            state = "unknown"
+        return fields.get("agent") or None, state
+
+    def start_relay_agent(
+        self, kind: str, pane_id: str, command_line: str, *, timeout: float = 30.0,
+        on_observed: Callable[[CustomProcessIdentity], None] | None = None,
+    ) -> CustomProcessIdentity:
+        """Run a slot-boxed harness behind a root relay in a fresh pane and prove it ready.
+
+        Herdr cannot start an agent there (sudo, not a shell, is the pane's
+        foreground process), so the boxed harness line is run directly, the
+        relayed program is pinned, and readiness comes from Herdr's live screen
+        rules, which Herdr applies once the pane is reported as ``kind``.
+        """
+        if not 0 < timeout <= 300:
+            raise ValueError("agent startup timeout must be between 0 and 300 seconds")
+        self._call_ok(["pane", "run", pane_id, command_line], f"pane run slot relay {kind!r}")
+        deadline = time.monotonic() + timeout
+        observed: CustomProcessIdentity | None = None
+        while time.monotonic() < deadline and observed is None:
+            try:
+                observed = self.relay_process(pane_id)
+            except HerdrUnavailable:
+                observed = None
+            if observed is None:
+                self._sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+        if observed is None:
+            raise HerdrUnavailable(
+                f"no slot relay program appeared in pane {pane_id}; inspect the pane for the wrkslots error"
+            )
+        if on_observed is not None:
+            on_observed(observed)
+        # Herdr evaluates screen rules only for a pane it knows as an agent.
+        self.report_pane_agent(pane_id, kind, "unknown")
+        state = "unknown"
+        while time.monotonic() < deadline:
+            # The program may exec while it starts; any relay program still running counts.
+            if self.relay_process(pane_id) is None:
+                raise HerdrUnavailable(
+                    f"the slot relay program in pane {pane_id} exited during startup"
+                )
+            if relay_trust_prompt(self.read(pane_id, source="visible", lines=200)):
+                raise HerdrUnavailable(
+                    f"{kind} workspace trust prompt requires human attention; no input was submitted"
+                )
+            agent_kind, state = self.explain_agent(pane_id)
+            if agent_kind == kind and state == "idle":
+                break
+            if agent_kind == kind and state == "blocked":
+                raise HerdrUnavailable(
+                    f"{kind} is waiting for human attention (for example a workspace trust prompt); "
+                    "no input was submitted"
+                )
+            self._sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+        else:
+            raise HerdrUnavailable(
+                f"{kind} behind the slot relay did not reach an idle screen in pane {pane_id} "
+                f"within {timeout:g}s (last state {state})"
+            )
+        # A relayed program may exec more than once while it starts; pin the
+        # generation that reached the idle screen.
+        settled = self.relay_process(pane_id)
+        if settled is None:
+            raise HerdrUnavailable(f"the slot relay program in pane {pane_id} exited during startup")
+        if on_observed is not None and settled != observed:
+            on_observed(settled)
+        self.report_pane_agent(pane_id, kind, "idle")
+        return settled
 
     def start_pane_agent(
         self, name: str, kind: str, pane_id: str, arguments: Sequence[str] = (),

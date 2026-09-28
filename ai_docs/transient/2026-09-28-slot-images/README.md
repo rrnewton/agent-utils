@@ -105,14 +105,28 @@ review and a root-launcher acceptance run against real harnesses.
   the user owns, such as a `fuse2fs` slot image. It then drops the capability and execs; `sudo`
   inside the box works and `CapEff` is 0. The environment travels in a private spec file (sudo
   scrubs it), and the scope is entered before sudo so the cgroup is inherited.
-- **Root mode and Herdr: does not work.** sudo forks, and since sudo 1.9.14 `use_pty` is on by
-  default: the pane's shell PID becomes `sudo`, and the boxed shell runs on a private pty behind a
-  sudo monitor. Tested in a real pane: the boxed shell works through sudo's relay, but
-  `herdr agent start` refuses (`agent_pane_busy: ... is not an available shell`), and a harness
-  started by hand is never detected (agent_status stays `unknown`; process-info shows only sudo).
-  Avoiding this needs sudoers changes (`!use_pty`, `!pam_session`), which are ruled out as host
-  customization. `agentctl start --slot` therefore refuses root isolation. `wrkslots run
-  --isolation root -- HARNESS` works for commands and headless harnesses.
+- **Root mode and Herdr.** sudo forks, and since sudo 1.9.14 `use_pty` is on by default: the
+  pane's shell PID becomes `sudo`, and the boxed program runs on a private pty behind a sudo
+  monitor. Tested in a real pane: `herdr agent start` refuses (`agent_pane_busy: ... is not an
+  available shell`), `herdr agent prompt` refuses, and Herdr never detects a harness there by
+  itself. Avoiding this needs sudoers changes (`!use_pty`, `!pam_session`), which count as host
+  customization. What works: `pane report-agent` labels the pane, after which
+  `herdr agent explain` evaluates the bundled screen rules live (codex: idle -> working -> idle
+  through the relay). The reported state itself stays whatever was reported. Claude keeps its
+  prompt box on screen while working, so its rules read idle throughout. The "esc to interrupt"
+  hint is the reliable working signal for both harnesses. A dead end, reported by the coordinator:
+  `setsid sudo` plus a root TIOCSCTTY steal of the pane pty makes the harness the tty's foreground,
+  but the pane shell permanently loses its controlling tty.
+- **agentctl `herdr-relay` adapter** (both editions). For root isolation, agentctl runs
+  `wrkslots shell-command SLOT -- HARNESS ARGS` in the new pane. It pins the relayed program (the
+  first process below the pane's shell PID that belongs to the user and shares its slot scope,
+  found through world-readable `/proc/*/stat` parent links, because sudo's own task directory is
+  unreadable) and reports the pane as the harness. The state is `agent explain` plus the interrupt
+  hint; a changed state is reported back so Herdr's listing stays current. Prompts go through
+  the screen-verified submission used for native Claude and Codex panes. A default "known agent
+  idle" verdict with no matching rule is not treated as evidence, and trust dialogs stop for a
+  human. Claude and Codex only; slash commands (goals) are refused. Verified with real Claude and
+  Codex in Herdr, in both editions: start, send, working/idle, wait, stop.
 - **View.** In order: `/` made private; every source pinned by an `O_PATH` descriptor (nothing is
   staged on the host); a fresh tmpfs on `/tmp` (per launch, `tmp_size`); the slot's persistent
   private layer bound over `$HOME`, with each real top-level entry bound read-only (submounts
@@ -142,9 +156,10 @@ review and a root-launcher acceptance run against real harnesses.
 
 ### agentctl
 
-`agentctl start NAME --slot SLOT [--slot-isolation userns|cgroup] [--slot-project DIR]`, in both
-editions (Rust: `SlotLaunch` in `StartOptions`). It asks `wrkslots shell-command --format json`
-for the command, slot path, and effective isolation, and refuses `root`. It records the slot path
+`agentctl start NAME --slot SLOT [--slot-isolation userns|cgroup|root] [--slot-project DIR]`, in
+both editions (Rust: `SlotLaunch` in `StartOptions`). It asks `wrkslots shell-command --format
+json` for the command, slot path, and effective isolation (root: see the relay adapter above). It
+records the slot path
 as the agent's cwd, runs the command in the new pane, and waits until the pane's shell PID is
 again the sole foreground process, is a shell, and sits in a wrkslots slice. Then it starts the
 harness normally. Verified in Herdr: a boxed pane under `userns` keeps the pane's shell PID and
@@ -185,5 +200,6 @@ slot works the same way; the sandbox leaves the network alone. `~/.buck` is a pr
   worktrees: stronger isolation of Git objects, but it changes the salvage and registration model.
 - Host-wide early warning: read the file system's unallocated-space counters and freeze slot
   slices below a threshold.
-- Herdr agent detection behind sudo (root isolation) needs either a sudo that execs directly
-  or an agentctl adapter that follows sudo's private pty.
+- Root isolation leaves a short window after a verified submission in which the harness
+  shows neither a working rule nor the interrupt hint; a `wait` issued in that window can
+  return idle early.

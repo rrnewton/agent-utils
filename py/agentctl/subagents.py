@@ -45,6 +45,7 @@ from agentctl.client import (
     muse_verified_process_composer,
     muse_verified_process_goal_paused,
     muse_verified_process_idle_composer,
+    relay_trust_prompt,
 )
 from agentctl.errors import AgentDeliveryError, HerdrRunError, HerdrUnavailable
 from agentctl.profiles import (
@@ -52,7 +53,7 @@ from agentctl.profiles import (
     validate_structured_harness_argument_conflicts,
     workspace_for_registry,
 )
-from agentctl.submission import SubmissionReceipt
+from agentctl.submission import SubmissionReceipt, submit_verified
 
 _NAME = re.compile(r"[a-z][a-z0-9-]{0,31}\Z")
 _KIND = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
@@ -406,7 +407,7 @@ class AgentRecord:
             raise AgentDeliveryError(f"invalid effective reasoning effort in agent record: {path}")
         known = {key for key, field_info in cls.__dataclass_fields__.items() if field_info.init}
         fields = {key: document[key] for key in known if key in document}
-        if document.get("adapter", "herdr") not in ("herdr", "herdr-pane", "herdr-foreign", "turn-runner"):
+        if document.get("adapter", "herdr") not in ("herdr", "herdr-pane", "herdr-foreign", "herdr-relay", "turn-runner"):
             raise AgentDeliveryError(f"unsupported runtime adapter in {path}")
         if document.get("mode", "interactive") not in ("interactive", "headless"):
             raise AgentDeliveryError(f"invalid execution mode in {path}")
@@ -458,12 +459,12 @@ class AgentRecord:
         if foreign_shell_identity is not None:
             fields["foreign_shell_identity"] = foreign_shell_identity
         if (custom_identity is not None
-                and (document.get("adapter", "herdr") != "herdr-pane"
-                     or document.get("harness") != "muse"
+                and ((document.get("adapter", "herdr"), document.get("harness"))
+                     not in (("herdr-pane", "muse"), ("herdr-relay", "claude"), ("herdr-relay", "codex"))
                      or not isinstance(document.get("pane_id"), str)
                      or not document["pane_id"])):
             raise AgentDeliveryError(
-                f"custom process identity requires a Muse herdr-pane in {path}"
+                f"custom process identity requires a Muse herdr-pane or a herdr-relay in {path}"
             )
         if (foreign_shell_identity is not None
                 and (document.get("adapter", "herdr") != "herdr-foreign"
@@ -536,7 +537,7 @@ class AgentRecord:
         permission_mode = launch.get("permission_mode")
         if (not isinstance(harness, str) or _KIND.fullmatch(harness) is None
                 or not isinstance(cwd, str) or not Path(cwd).is_absolute()
-                or adapter not in ("herdr", "herdr-pane", "herdr-foreign")
+                or adapter not in ("herdr", "herdr-pane", "herdr-foreign", "herdr-relay")
                 or mode != "interactive" or backend != "herdr"
                 or profile is not None
                     and (not isinstance(profile, str) or not profile or "\0" in profile)
@@ -547,7 +548,8 @@ class AgentRecord:
             )
         if ((adapter == "herdr-foreign" and ownership != "foreign")
                 or (adapter != "herdr-foreign" and ownership != "owned")
-                or (adapter == "herdr-pane" and harness != "muse")):
+                or (adapter == "herdr-pane" and harness != "muse")
+                or (adapter == "herdr-relay" and harness not in RELAY_HARNESSES)):
             raise AgentDeliveryError(
                 f"inconsistent launch ownership or adapter: {path}"
             )
@@ -590,7 +592,7 @@ class AgentRecord:
                 or (adapter != "herdr-foreign"
                     and (not argv or argv[0] != expected_program))):
             raise AgentDeliveryError(f"invalid agent record launch argv: {path}")
-        if adapter in ("herdr", "herdr-pane"):
+        if adapter in ("herdr", "herdr-pane", "herdr-relay"):
             try:
                 structured = harness_arguments(
                     harness,
@@ -609,7 +611,7 @@ class AgentRecord:
             raise AgentDeliveryError(
                 f"interactive nested record cannot contain runner identity: {path}"
             )
-        if (adapter == "herdr-pane"
+        if (adapter in ("herdr-pane", "herdr-relay")
                 and lifecycle in {"running", "stopping", "stopped"}
                 and document.get("custom_process_identity") is None):
             raise AgentDeliveryError(
@@ -843,6 +845,8 @@ class _WorkspaceClient:
                 if ("Quick safety check: Is this a project you created or one you trust?" in screen
                     and "No, exit" in screen and "Yes, I trust this folder" in screen):
                     raise HerdrUnavailable("Claude workspace trust prompt requires human attention; no input was submitted")
+            if self.record.adapter == "herdr-relay":
+                return self._relay_pane_info(info)
             if self.record.adapter == "herdr-pane":
                 self.client.verify_custom_harness(
                     pane_id, self.record.harness, self.record.custom_process_identity
@@ -880,6 +884,44 @@ class _WorkspaceClient:
                 )
         return info
 
+    def _relay_pane_info(self, info: AgentPaneInfo) -> AgentPaneInfo:
+        """State of a harness behind a root slot relay, from Herdr's live screen rules.
+
+        Herdr reports the state agentctl last reported for such a pane, so the
+        live verdict comes from ``agent explain``, and a changed verdict is
+        reported back so Herdr's own listing stays current.
+        """
+        self.client.verify_relay_harness(info.pane_id, self.record.custom_process_identity)
+        agent_kind, state = self.client.explain_agent(info.pane_id)
+        if agent_kind != self.record.harness:
+            raise HerdrUnavailable(
+                f"pane {info.pane_id} no longer shows a {self.record.harness} screen"
+            )
+        if state == "blocked":
+            raise HerdrUnavailable(
+                f"{self.record.harness} behind the slot relay is waiting for human attention; "
+                "no input was submitted"
+            )
+        if state != "working":
+            # Claude keeps its prompt box on screen while it works, and Herdr's
+            # rules then read that box as idle; the interrupt hint is the tell.
+            screen = self.client.read(info.pane_id, source="visible", lines=200)
+            if relay_trust_prompt(screen):
+                raise HerdrUnavailable(
+                    f"{self.record.harness} workspace trust prompt requires human attention; "
+                    "no input was submitted"
+                )
+            if RELAY_WORKING_MARKER in screen:
+                state = "working"
+        if (state != info.status and not (state == "idle" and info.status == "done")
+                and state in ("idle", "working", "unknown")):
+            self.client.report_pane_agent(info.pane_id, self.record.harness, state)
+        return AgentPaneInfo(
+            pane_id=info.pane_id, workspace_id=info.workspace_id, cwd=info.cwd,
+            agent=self.record.harness, status=state,
+            session_agent=info.session_agent, session_value=info.session_value,
+        )
+
     def panes(self, workspace_id: str | None = None) -> tuple[Pane, ...]:
         del workspace_id
         return self.client.panes(self.record.workspace_id)
@@ -897,6 +939,14 @@ class _WorkspaceClient:
                     if isinstance(document, dict) and document.get("text") == command:
                         self.goal_objective = objective
                         break
+        if self.record.adapter == "herdr-relay":
+            if command.lstrip().startswith("/"):
+                raise HerdrUnavailable(
+                    "slash commands cannot be delivered to a harness behind a root slot relay"
+                )
+            if self.pane_info(pane_id).status != "idle":
+                raise HerdrUnavailable(f"relayed {self.record.harness} in pane {pane_id} is not idle")
+            return submit_verified(self.client, pane_id, self.record.harness, command)
         if self.record.adapter != "herdr-pane":
             return self.client.prompt_agent(pane_id, command)
         if "\0" in command or "\x1b" in command:
@@ -942,6 +992,18 @@ class _WorkspaceClient:
         return None
 
     def wait_agent_status(self, pane_id: str, status: str, timeout_ms: int) -> None:
+        if self.record.adapter == "herdr-relay":
+            deadline = time.monotonic() + timeout_ms / 1000
+            while True:
+                observed = self.pane_info(pane_id).status
+                if observed == status:
+                    return
+                if time.monotonic() >= deadline:
+                    raise HerdrUnavailable(
+                        f"relayed {self.record.harness} in pane {pane_id} did not become {status} "
+                        f"within {timeout_ms} ms (last {observed})"
+                    )
+                time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
         if self.record.adapter == "herdr-pane" and status == "working":
             if self.custom_submission is None:
                 raise HerdrUnavailable(
@@ -1521,13 +1583,33 @@ class ManagedAgents:
                     f"but project configuration requires {project_workspace!r}"
                 )
         slot_command: str | None = None
+        relay_command: str | None = None
         if slot is not None:
             # The agent works in the slot: its record and pane cwd are the slot
             # directory, which is where the boxed shell starts.
-            slot_command, root = _slot_shell_command(
-                slot, isolation=slot_isolation, project=slot_project or root,
+            project = slot_project or root
+            slot_command, root, effective_isolation = _slot_shell_command(
+                slot, isolation=slot_isolation, project=project,
                 explicit_project=slot_project is not None,
             )
+            if effective_isolation == "root":
+                # sudo stays the pane's foreground process under root isolation,
+                # so Herdr cannot start the harness; the boxed harness line runs
+                # in the pane directly and agentctl owns its lifecycle state.
+                if harness not in RELAY_HARNESSES:
+                    raise AgentDeliveryError(
+                        f"--slot with root isolation supports {', '.join(RELAY_HARNESSES)}, not {harness!r}"
+                    )
+                try:
+                    executable = self.client._harness_executable(harness)
+                except HerdrRunError as exc:
+                    raise AgentDeliveryError(str(exc)) from exc
+                relay_command, _path, _isolation = _slot_shell_command(
+                    slot, isolation=slot_isolation, project=project,
+                    explicit_project=slot_project is not None,
+                    command=(executable, *arguments),
+                )
+                slot_command = None
         with self._lock(name):
             with self._identity_transaction():
                 if resume is not None:
@@ -1543,7 +1625,8 @@ class ManagedAgents:
                 agent._fsync_dir(str(self.registry))
                 record = AgentRecord(name, uuid.uuid4().hex, harness, root, time.time(),
                                      model=model, resume=resume, arguments=list(arguments),
-                                     adapter="herdr-pane" if harness == "muse" else "herdr")
+                                     adapter="herdr-relay" if relay_command is not None
+                                     else "herdr-pane" if harness == "muse" else "herdr")
                 self._save(record)
                 try:
                     self._create_presentation(
@@ -1554,7 +1637,18 @@ class ManagedAgents:
                         self.client.enter_slot_sandbox(
                             record.pane_id, slot_command, timeout=startup_timeout
                         )
-                    if record.adapter == "herdr-pane":
+                    if relay_command is not None:
+                        def persist_relay(identity: CustomProcessIdentity) -> None:
+                            record.custom_process_identity = identity
+                            self._save(record)
+
+                        self.client.start_relay_agent(
+                            harness, record.pane_id, relay_command,
+                            timeout=startup_timeout, on_observed=persist_relay,
+                        )
+                        record.pane_reported_by_agentctl = True
+                        self._save(record)
+                    elif record.adapter == "herdr-pane":
                         def persist_identity(identity: CustomProcessIdentity) -> None:
                             record.custom_process_identity = identity
                             self._save(record)
@@ -1890,7 +1984,7 @@ class ManagedAgents:
         self, record: AgentRecord, *, ready: bool = False,
         enforce_policy: bool = False,
     ) -> AgentPaneInfo:
-        if record.adapter not in ("herdr", "herdr-pane", "herdr-foreign"):
+        if record.adapter not in ("herdr", "herdr-pane", "herdr-foreign", "herdr-relay"):
             raise AgentDeliveryError("this operation requires the interactive Herdr adapter")
         client = cast(HerdrClient, _WorkspaceClient(self.client, record, check_prompt=ready))
         target = self._policy_target(record) if enforce_policy else self._target(record)
@@ -1904,6 +1998,17 @@ class ManagedAgents:
 
     def _checked_or_failed_pane_report(self, record: AgentRecord, pane_id: str) -> None:
         """Prove a failed custom launch is still ours or has returned to its shell."""
+        if (record.lifecycle in ("starting", "launch_failed")
+                and record.adapter == "herdr-relay"):
+            # The pane is the one agentctl created; its shell exec'd into the
+            # slot relay agentctl ran. A relay still running there with the
+            # slot as its cwd is that launch, pinned or not.
+            info = self.client.pane_info(pane_id)
+            if (info.pane_id == pane_id and info.workspace_id == record.workspace_id
+                    and os.path.realpath(info.cwd) == os.path.realpath(record.cwd)):
+                observed = self.client.relay_process(pane_id)
+                if observed is not None and record.custom_process_identity in (None, observed):
+                    return
         if (record.lifecycle in ("starting", "launch_failed")
                 and record.adapter == "herdr-pane"
                 and record.custom_process_identity is not None):
@@ -3722,7 +3827,7 @@ class ManagedAgents:
                     raise AgentDeliveryError("refusing to close a tab whose pane ownership changed")
             archive, destination = self._archive_destination(record)
             if owned:
-                if (record.adapter == "herdr-pane" or record.lifecycle == "running"
+                if (record.adapter in ("herdr-pane", "herdr-relay") or record.lifecycle == "running"
                         or self.client.pane_info(owned[0].pane_id).agent is not None):
                     self._checked_or_failed_pane_report(record, owned[0].pane_id)
                 try:
@@ -3735,7 +3840,7 @@ class ManagedAgents:
                     raise AgentDeliveryError(f"cannot preserve terminal output before stop: {exc}") from exc
                 # Output capture can involve another control round trip. Recheck
                 # the owned native identity before acting on that pane again.
-                if (record.adapter == "herdr-pane" or record.lifecycle == "running"
+                if (record.adapter in ("herdr-pane", "herdr-relay") or record.lifecycle == "running"
                         or self.client.pane_info(owned[0].pane_id).agent is not None):
                     self._checked_or_failed_pane_report(record, owned[0].pane_id)
                 record.lifecycle = "stopping"
@@ -3776,20 +3881,21 @@ class ManagedAgents:
 
 
 SLOT_ISOLATIONS = ("userns", "cgroup", "root")
-#: sudo keeps the pane's shell PID and relays a private terminal to the boxed
-#: shell, so Herdr sees only sudo: it cannot start or detect a harness there.
-ROOT_SLOT_REFUSAL = (
-    "--slot with root isolation cannot host a Herdr agent: sudo stays the pane's foreground "
-    "process and runs the boxed shell on a private terminal, so Herdr can neither start nor "
-    "detect the harness; use --slot-isolation userns or cgroup, or run `wrkslots run SLOT "
-    "--isolation root -- HARNESS` directly"
-)
+#: Harnesses agentctl can drive behind a root slot relay: Herdr has screen rules
+#: for them and agentctl has verified composer models.
+RELAY_HARNESSES = ("claude", "codex")
+#: Both relayed harnesses show this hint only while a turn is running.
+RELAY_WORKING_MARKER = "esc to interrupt"
 
 
 def _slot_shell_command(
-    slot: str, *, isolation: str | None, project: str, explicit_project: bool = False
-) -> tuple[str, str]:
-    """Ask the slot manager for the exec-only command that boxes a pane shell."""
+    slot: str, *, isolation: str | None, project: str, explicit_project: bool = False,
+    command: Sequence[str] = (),
+) -> tuple[str, str, str]:
+    """Ask the slot manager for the exec-only line that boxes a pane shell (or ``command``).
+
+    Returns the line, the slot directory, and the effective isolation.
+    """
     if isolation is not None and isolation not in SLOT_ISOLATIONS:
         raise AgentDeliveryError("--slot-isolation must be userns, cgroup, or root")
     executable = os.environ.get("AGENTCTL_WRKSLOTS_BIN") or shutil.which("wrkslots")
@@ -3797,13 +3903,15 @@ def _slot_shell_command(
         raise AgentDeliveryError(
             "--slot needs wrkslots on PATH (or AGENTCTL_WRKSLOTS_BIN naming it)"
         )
-    command = [executable, "shell-command", slot, "--format", "json"]
+    argv = [executable, "shell-command", slot, "--format", "json"]
     if isolation is not None:
-        command[3:3] = ["--isolation", isolation]
+        argv[3:3] = ["--isolation", isolation]
     if explicit_project:
-        command[1:1] = ["--project-root", project]
+        argv[1:1] = ["--project-root", project]
+    if command:
+        argv += ["--", *command]
     completed = subprocess.run(
-        command, cwd=project, capture_output=True, text=True, timeout=60, check=False,
+        argv, cwd=project, capture_output=True, text=True, timeout=60, check=False,
     )
     if completed.returncode != 0 or not completed.stdout.strip():
         detail = (completed.stderr or completed.stdout).strip() or f"exit {completed.returncode}"
@@ -3817,6 +3925,9 @@ def _slot_shell_command(
             raise ValueError("missing fields")
     except (ValueError, KeyError) as exc:
         raise AgentDeliveryError(f"wrkslots shell-command {slot!r} returned invalid JSON: {exc}") from exc
-    if document.get("isolation") == "root":
-        raise AgentDeliveryError(ROOT_SLOT_REFUSAL)
-    return line, slot_path
+    effective = document.get("isolation", isolation or "userns")
+    if effective not in SLOT_ISOLATIONS:
+        raise AgentDeliveryError(
+            f"wrkslots shell-command {slot!r} returned invalid JSON: unknown isolation {effective!r}"
+        )
+    return line, slot_path, str(effective)
