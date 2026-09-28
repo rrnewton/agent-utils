@@ -7570,6 +7570,87 @@ def _owner_cgroup_is_evidence(record: ActiveRecord | None) -> bool:
     return _process_state(record.owner)[0] != "dead"
 
 
+def _owner_evidence_is_unattributable(record: ActiveRecord | None) -> bool:
+    """Whether this row's owner was degenerate AT REGISTRATION, so it can never be attributed.
+
+    ⚠️ THIS IS A CHECKABLE PROPERTY OF THE RECORD, NOT A JUDGEMENT ABOUT THE
+    SLOT. It holds exactly when the recorded owner is a machine-level process,
+    which cannot have owned anything. Nothing about age, size or apparent
+    abandonment enters into it.
+
+    ⚠️ AND THE EVIDENCE TO REPAIR IT DOES NOT EXIST, which is why these rows get
+    a different release condition rather than a better migration. Searched
+    across an entire 6,841-entry append-only log on one host: for the 17 rows
+    in this state, a non-degenerate identity is NEVER recorded in an `owner`
+    field, in any event, ever. The create journal itself recorded the machine's
+    init for both `owner` and `coordinator_lease`, so the degeneracy was
+    present at the instant of registration and no later observer saw the real
+    process. A first pass appeared to recover six of them; tracing which FIELD
+    each identity came from, every one was a coordinator or a handoff reader.
+    Recorded against a slot is not the same as owning it.
+
+    So the ordinary release condition -- a proven-dead recorded owner -- demands
+    evidence nobody ever wrote. A rule that can only be satisfied by data that
+    does not exist is not a rule, it is a permanent hold, and it holds hardest
+    on exactly the rows nothing can vouch for.
+    """
+    if record is None or record.owner is None:
+        return False
+    machine_level = _MACHINE_LEVEL_PROCESSES.get(record.owner.pid)
+    return machine_level is not None and record.owner.cgroup_path == machine_level[1]
+
+
+def _slot_work_signals(slot_path: Path) -> list[str]:
+    """Direct evidence that a slot holds work, named so a refusal can say what it found.
+
+    ⚠️ OWNER IDENTITY IS A PROXY FOR THIS QUESTION, AND THIS IS THE QUESTION.
+    The release condition asks who owned a slot because that is normally how
+    you find out whether the slot matters. Where the owner is unattributable
+    the proxy is unanswerable, but "does this hold work" is directly checkable
+    and it is what the guard actually protects.
+
+    An unread handoff is deliberately NOT one of these signals: it is enforced
+    earlier and separately, because a handoff must block removal outright
+    rather than being weighed against anything.
+
+    ⚠️ KNOWN LIMIT, stated rather than left for someone to discover: this asks
+    the OUTER repository. A slot containing a nested clone answers "untracked
+    directory" for the whole of it, and whether that nested repository holds
+    work of its own is a question this does not ask.
+    """
+    signals: list[str] = []
+    vcs = _GitVcs()
+    status = vcs._run(
+        slot_path, ["status", "--porcelain", "--untracked-files=all"], check=False
+    )
+    if status.returncode == 0 and status.stdout.strip():
+        entries = status.stdout.strip().splitlines()
+        signals.append(f"{len(entries)} uncommitted change(s), first: {entries[0].strip()}")
+    unpushed = vcs._run(
+        slot_path, ["log", "--format=%H", "--not", "--remotes", "-n", "200"], check=False
+    )
+    if unpushed.returncode == 0 and unpushed.stdout.strip():
+        count = len(unpushed.stdout.strip().splitlines())
+        signals.append(f"{count} commit(s) on no remote")
+    return signals
+
+
+def _assert_unattributable_slot_holds_no_work(
+    record: ActiveRecord, slot_path: Path
+) -> None:
+    """An unattributable row is removable only if it holds nothing."""
+    signals = _slot_work_signals(slot_path)
+    if not signals:
+        return
+    raise Refusal(
+        f"slot {record.slot} cannot be attributed to any owner, and it holds work: "
+        + "; ".join(signals)
+        + ". state: REFUSED -- no checkout was salvaged or removed. remedy: land, push or "
+        "discard that work deliberately, then retry; an unattributable slot is released only "
+        "when the direct question -- does it hold work -- answers no"
+    )
+
+
 def _read_process_cgroup(pid_dir: Path) -> str:
     try:
         lines = (pid_dir / "cgroup").read_text(encoding="ascii").splitlines()
@@ -14673,7 +14754,12 @@ def _cmd_remove(
                 "slot until an evidence-based migration can establish its historical owner; "
                 "heartbeat expiry alone cannot do that"
             )
-        if owner_state != "dead" and not live_validate_owner:
+        # An unattributable row swaps the owner proxy for the direct question;
+        # see _owner_evidence_is_unattributable for why its evidence can never
+        # be repaired, and _slot_work_signals for what replaces it. Every other
+        # guard below still applies to it, unchanged and in the same order.
+        unattributable = _owner_evidence_is_unattributable(record)
+        if owner_state != "dead" and not live_validate_owner and not unattributable:
             raise Refusal(
                 f"remove requires a proven-dead recorded owner; owner is {owner_state}: {detail}. "
                 "state: REFUSED -- no checkout was salvaged or removed. remedy: wait for the "
@@ -14682,7 +14768,11 @@ def _cmd_remove(
                 "slot as free"
             )
         slot_path = _assert_slot_contents(config, record)
+        # Ordered deliberately: a handoff blocks removal outright, so it is
+        # enforced before the work question rather than weighed inside it.
         _assert_handoff_read(config, record, slot_path)
+        if unattributable:
+            _assert_unattributable_slot_holds_no_work(record, slot_path)
         if private_cleanup is not None:
             if private_cleanup.target.path != slot_path:
                 raise StateError("private cleanup context does not match its slot path")

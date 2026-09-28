@@ -308,3 +308,61 @@ def test_no_recorded_owner_is_not_evidence() -> None:
     object.__setattr__(record, "owner", None)
     assert cli._owner_cgroup_is_evidence(record) is False
     assert cli._owner_cgroup_is_evidence(None) is False
+
+
+def _record_with_owner(owner: cli.ProcessIdentity | None) -> cli.ActiveRecord:
+    record = cli.ActiveRecord.__new__(cli.ActiveRecord)
+    object.__setattr__(record, "owner", owner)
+    object.__setattr__(record, "slot", "slot01")
+    return record
+
+
+def test_a_machine_level_owner_is_unattributable() -> None:
+    live = cli._read_process_identity(os.getpid())
+    init = dataclasses.replace(live, pid=1, cgroup_path="/init.scope")
+    assert cli._owner_evidence_is_unattributable(_record_with_owner(init)) is True
+
+
+def test_an_ordinary_owner_is_attributable() -> None:
+    """The control: the swap must apply to degenerate rows only.
+
+    ⚠️ IF THIS EVER PASSES FOR AN ORDINARY OWNER the change has replaced the
+    proven-dead release condition for every slot, not for the unattributable
+    ones, which is a far larger thing than was ruled.
+    """
+    live = cli._read_process_identity(os.getpid())
+    assert cli._owner_evidence_is_unattributable(_record_with_owner(live)) is False
+    assert cli._owner_evidence_is_unattributable(_record_with_owner(None)) is False
+    assert cli._owner_evidence_is_unattributable(None) is False
+    # Same PID, ordinary cgroup: a process that is PID 1 inside its own
+    # namespace is attributable, and must not be swept into this path.
+    namespaced = dataclasses.replace(live, pid=1, cgroup_path="/user.slice/session-3.scope")
+    assert cli._owner_evidence_is_unattributable(_record_with_owner(namespaced)) is False
+
+
+def test_an_unattributable_slot_holding_work_still_refuses(tmp_path: Path) -> None:
+    """The half of the ruling that preserves, and it names what it found."""
+    vcs = cli._GitVcs()
+    checkout = tmp_path / "slot"
+    checkout.mkdir()
+    vcs._run(checkout, ["init", "--quiet", "-b", "main"])
+    (checkout / "authored.md").write_text("work nobody has landed\n", encoding="utf-8")
+
+    record = _record_with_owner(None)
+    with pytest.raises(cli.Refusal) as refused:
+        cli._assert_unattributable_slot_holds_no_work(record, checkout)
+    rendered = str(refused.value)
+    assert "holds work" in rendered
+    # The refusal has to say WHAT it found, or preserving is indistinguishable
+    # from a guard that refuses everything.
+    assert "authored.md" in rendered
+
+
+def test_an_unattributable_slot_holding_nothing_is_released(tmp_path: Path) -> None:
+    vcs = cli._GitVcs()
+    checkout = tmp_path / "slot"
+    checkout.mkdir()
+    vcs._run(checkout, ["init", "--quiet", "-b", "main"])
+
+    cli._assert_unattributable_slot_holds_no_work(_record_with_owner(None), checkout)
+    assert cli._slot_work_signals(checkout) == []
