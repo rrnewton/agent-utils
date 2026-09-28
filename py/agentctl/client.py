@@ -28,6 +28,7 @@ from agentctl.submission import (
     VERIFIED_HARNESSES,
     PromptNotStaged,
     SubmissionReceipt,
+    composer_view,
     submit_verified,
 )
 
@@ -1336,7 +1337,10 @@ class HerdrClient:
                     f"{kind} workspace trust prompt requires human attention; no input was submitted"
                 )
             agent_kind, state = self.explain_agent(pane_id)
-            if agent_kind == kind and state == "idle":
+            # Herdr's title rule can read idle before the harness has drawn
+            # anything; the verified composer on screen is the ready signal.
+            if (agent_kind == kind and state == "idle"
+                    and composer_view(kind, self.read_screen(pane_id)) is not None):
                 break
             if agent_kind == kind and state == "blocked":
                 raise HerdrUnavailable(

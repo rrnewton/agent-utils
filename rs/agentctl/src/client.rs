@@ -1902,7 +1902,16 @@ impl HerdrClient {
             }
             let (agent, observed_state) = self.explain_agent(pane_id)?;
             state = observed_state;
-            if agent.as_deref() == Some(kind) && state == "idle" {
+            // Herdr's title rule can read idle before the harness has drawn anything; the
+            // verified composer on screen is the ready signal.
+            if agent.as_deref() == Some(kind)
+                && state == "idle"
+                && crate::submission::composer_view(
+                    kind,
+                    &self.read_screen_with_cancellation(pane_id, &|| false)?,
+                )
+                .is_some()
+            {
                 break;
             }
             if agent.as_deref() == Some(kind) && state == "blocked" {
