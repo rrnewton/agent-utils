@@ -57,12 +57,12 @@ const MAX_VISIBLE_MARKERS: usize = 4_096;
 const MAX_FEEDBACK_AVAILABLE_IDS: usize = 32;
 const MAX_FEEDBACK_UNAVAILABLE_IDS: usize = 128;
 const MAX_FEEDBACK_ID_BYTES: usize = 256;
-// One snapshot shows at most this many markers, so a reported marker is forgotten, and could be
-// reported again, only after that many newer ones were reported.
+// Retain every reported marker. At this bound, hold new diagnostics instead of forgetting old
+// markers and allowing them to be submitted again.
 const MAX_REPORTED_REPLY_MARKERS: usize = MAX_VISIBLE_MARKERS;
 const MAX_FENCE_FEEDBACK_PROMPT_BYTES: usize = 64 * 1_024;
 const MAX_FENCE_FEEDBACK_BYTES: usize = 2 * 1_024 * 1_024;
-// Replies one provider thread may receive within the window before its post-rate breaker trips.
+// Distinct reply operations one thread may attempt within the window before its breaker trips.
 const MAX_THREAD_REPLIES_PER_WINDOW: usize = 3;
 const THREAD_REPLY_WINDOW_MILLIS: u64 = 60_000;
 // A tripped thread holds its replies this long unless an operator deletes the breaker record.
@@ -1007,11 +1007,20 @@ impl FenceFeedbackRecord {
                 "fence feedback record is inconsistent or outside protocol bounds",
             ));
         }
+        let mut retained = self.reported.iter().collect::<BTreeSet<_>>();
+        if let Some(pending) = &self.pending {
+            retained.extend(&pending.unavailable);
+        }
+        if retained.len() > MAX_REPORTED_REPLY_MARKERS {
+            return Err(ChatRuntimeError::invalid(
+                "fence feedback marker history limit reached; new diagnostics stay held",
+            ));
+        }
         Ok(())
     }
 }
 
-/// Recent reply sends and tripped threads for the per-thread post-rate breaker.
+/// Recent reply reservations (including unknown outcomes) and tripped threads.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReplyBreakerRecord {
@@ -1026,6 +1035,11 @@ struct ThreadEvent {
     channel_id: String,
     thread_id: String,
     at_millis: u64,
+    // Old ledgers contain successful sends without an operation ID; they still consume budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    send_request_id: Option<String>,
+    #[serde(default)]
+    pending: bool,
 }
 
 impl ThreadEvent {
@@ -1036,6 +1050,7 @@ impl ThreadEvent {
 
 impl ReplyBreakerRecord {
     fn validate(&self) -> Result<()> {
+        let mut operation_ids = BTreeSet::new();
         if self.version != STATE_VERSION
             || self.sends.len() > MAX_REPLY_BREAKER_EVENTS
             || self.trips.len() > MAX_REPLY_BREAKER_EVENTS
@@ -1045,6 +1060,17 @@ impl ReplyBreakerRecord {
                     || event.channel_id.len() > chat_subscription::MAX_RESOURCE_ID_BYTES
                     || event.thread_id.len() > chat_subscription::MAX_RESOURCE_ID_BYTES
             })
+            || self.sends.iter().any(|send| {
+                (send.pending && send.send_request_id.is_none())
+                    || send
+                        .send_request_id
+                        .as_ref()
+                        .is_some_and(|id| !valid_operation_uuid(id) || !operation_ids.insert(id))
+            })
+            || self
+                .trips
+                .iter()
+                .any(|trip| trip.send_request_id.is_some() || trip.pending)
         {
             return Err(ChatRuntimeError::invalid(
                 "reply post-rate breaker record is inconsistent or outside protocol bounds",
@@ -1053,16 +1079,13 @@ impl ReplyBreakerRecord {
         Ok(())
     }
 
-    /// Drop sends outside the window and trips past their cooldown, then the oldest overflow.
+    /// Drop only expired events. Live budget must never be evicted to admit more work.
     fn prune(&mut self, now: u64) {
-        self.sends
-            .retain(|send| now.saturating_sub(send.at_millis) < THREAD_REPLY_WINDOW_MILLIS);
+        self.sends.retain(|send| {
+            send.pending || now.saturating_sub(send.at_millis) < THREAD_REPLY_WINDOW_MILLIS
+        });
         self.trips
             .retain(|trip| now.saturating_sub(trip.at_millis) < THREAD_BREAKER_COOLDOWN_MILLIS);
-        for events in [&mut self.sends, &mut self.trips] {
-            let excess = events.len().saturating_sub(MAX_REPLY_BREAKER_EVENTS);
-            events.drain(..excess);
-        }
     }
 }
 
@@ -4106,12 +4129,8 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
                     record.reported.push(identifier.clone());
                 }
             }
-            let excess = record
-                .reported
-                .len()
-                .saturating_sub(MAX_REPORTED_REPLY_MARKERS);
-            record.reported.drain(..excess);
         }
+        record.validate()?;
         write_document(&self.root.join("fence-feedback.json"), &record)
     }
 
@@ -4134,12 +4153,17 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         Ok(record)
     }
 
-    /// Hold a reply while its thread's post-rate breaker is tripped, and trip the breaker when
-    /// the thread already received the most replies one window allows.
-    fn enforce_reply_rate_locked(&self, message: &SavedMessage) -> Result<()> {
+    /// Persist budget before provider IO. Unknown outcomes keep their reservation until a valid
+    /// receipt is saved. A completed reservation can expire and must then pass admission again.
+    fn reserve_reply_send_locked(
+        &self,
+        message: &SavedMessage,
+        send_request_id: &str,
+    ) -> Result<()> {
         let path = self.root.join("reply-breaker.json");
         let mut record = self.read_reply_breaker()?;
         let now = unix_millis();
+        record.prune(now);
         if let Some(trip) = record.trips.iter().rev().find(|trip| {
             trip.is_for(message)
                 && now.saturating_sub(trip.at_millis) < THREAD_BREAKER_COOLDOWN_MILLIS
@@ -4153,43 +4177,94 @@ held for {} s or until {} is deleted",
                 path.display()
             )));
         }
+        if let Some(reservation) = record
+            .sends
+            .iter_mut()
+            .find(|send| send.send_request_id.as_deref() == Some(send_request_id))
+        {
+            if !reservation.is_for(message) {
+                return Err(ChatRuntimeError::invalid(
+                    "reply reservation changed its channel or thread",
+                ));
+            }
+            reservation.at_millis = now;
+            reservation.pending = true;
+            return self.write_reply_breaker(&record);
+        }
         let recent = record
             .sends
             .iter()
-            .filter(|send| {
-                send.is_for(message)
-                    && now.saturating_sub(send.at_millis) < THREAD_REPLY_WINDOW_MILLIS
-            })
+            .filter(|send| send.is_for(message))
             .count();
         if recent < MAX_THREAD_REPLIES_PER_WINDOW {
-            return Ok(());
+            if record.sends.len() >= MAX_REPLY_BREAKER_EVENTS {
+                return Err(ChatRuntimeError::invalid(
+                    "reply post-rate breaker reservation population limit reached",
+                ));
+            }
+            record.sends.push(ThreadEvent {
+                channel_id: message.channel_id.clone(),
+                thread_id: message.thread_id.clone(),
+                at_millis: now,
+                send_request_id: Some(send_request_id.to_owned()),
+                pending: true,
+            });
+            return self.write_reply_breaker(&record);
+        }
+        if record.trips.len() >= MAX_REPLY_BREAKER_EVENTS {
+            return Err(ChatRuntimeError::invalid(
+                "reply post-rate breaker trip population limit reached",
+            ));
         }
         record.trips.push(ThreadEvent {
             channel_id: message.channel_id.clone(),
             thread_id: message.thread_id.clone(),
             at_millis: now,
+            send_request_id: None,
+            pending: false,
         });
         record.prune(now);
-        write_document(&path, &record)?;
+        self.write_reply_breaker(&record)?;
         Err(ChatRuntimeError::invalid(format!(
-            "chat reply post-rate breaker tripped: thread {} already received {recent} replies \
-in the last {} s, so a reply loop is likely; its replies stay held for {} s or until {} is deleted",
+            "chat reply post-rate breaker tripped: thread {} has {recent} recent or unresolved \
+reply reservations, so a reply loop is likely; its replies stay held for {} s or until {} is deleted",
             message.thread_id,
-            THREAD_REPLY_WINDOW_MILLIS / 1_000,
             THREAD_BREAKER_COOLDOWN_MILLIS / 1_000,
             path.display()
         )))
     }
 
-    fn record_reply_send_locked(&self, message: &SavedMessage, sent_at_millis: u64) -> Result<()> {
+    /// Save the receipt-time budget before publishing Sent. If either write faults, recovery
+    /// retains a charged reservation and the original provider operation identity.
+    fn complete_reply_reservation_locked(
+        &self,
+        message: &SavedMessage,
+        send_request_id: &str,
+    ) -> Result<()> {
         let mut record = self.read_reply_breaker()?;
-        record.sends.push(ThreadEvent {
-            channel_id: message.channel_id.clone(),
-            thread_id: message.thread_id.clone(),
-            at_millis: sent_at_millis,
-        });
-        record.prune(unix_millis());
-        write_document(&self.root.join("reply-breaker.json"), &record)
+        let reservation = record
+            .sends
+            .iter_mut()
+            .find(|send| send.send_request_id.as_deref() == Some(send_request_id))
+            .ok_or_else(|| ChatRuntimeError::invalid("reply send reservation is missing"))?;
+        if !reservation.is_for(message) {
+            return Err(ChatRuntimeError::invalid(
+                "reply reservation changed its channel or thread",
+            ));
+        }
+        reservation.pending = false;
+        reservation.at_millis = unix_millis();
+        self.write_reply_breaker(&record)
+    }
+
+    fn write_reply_breaker(&self, record: &ReplyBreakerRecord) -> Result<()> {
+        record.validate()?;
+        if encoded_document_bytes(record)? > MAX_REPLY_BREAKER_BYTES {
+            return Err(ChatRuntimeError::invalid(
+                "reply post-rate breaker encoded byte limit reached",
+            ));
+        }
+        write_document(&self.root.join("reply-breaker.json"), record)
     }
 
     fn read_reply_breaker(&self) -> Result<ReplyBreakerRecord> {
@@ -4908,7 +4983,7 @@ in the last {} s, so a reply loop is likely; its replies stay held for {} s or u
                 let mut reply = self.read_reply(key, request.next_send_ordinal)?;
                 if reply.phase != ReplyPhase::Sent {
                     // A tripped breaker holds the reply in its current phase; nothing is lost.
-                    self.enforce_reply_rate_locked(&request.message)?;
+                    self.reserve_reply_send_locked(&request.message, &reply.send_request_id)?;
                     reply.phase = ReplyPhase::Sending;
                     write_document(&self.reply_path(key, reply.ordinal), &reply)?;
                     break;
@@ -4962,8 +5037,11 @@ in the last {} s, so a reply loop is likely; its replies stay held for {} s or u
         current.provider_message_id = Some(provider_message_id.clone());
         let sent_at_millis = causal_wall_millis(current.captured_at_millis);
         current.sent_at_millis = Some(sent_at_millis);
+        self.complete_reply_reservation_locked(
+            &request_snapshot.message,
+            &current.send_request_id,
+        )?;
         write_document(&self.reply_path(key, current.ordinal), &current)?;
-        self.record_reply_send_locked(&request_snapshot.message, sent_at_millis)?;
         reply = current;
         let mut request = self.read_request(key)?;
         if request.next_send_ordinal == reply.ordinal {
@@ -6123,6 +6201,9 @@ The currently available reply ID(s) are: {}. Emit a complete reply block using o
         unavailable.join(", "),
         format_available_reply_ids(&available)
     );
+    // The exact marker set and prompt must survive a crash after submission, before the queue
+    // result can be recorded. Otherwise a later superset could report the same marker again.
+    state.record_fence_feedback(&unavailable, &prompt, true)?;
     let result = drive_fence_feedback(state, delivery, &unavailable, &prompt, options)?;
     state.record_fence_feedback(
         &unavailable,
@@ -10816,6 +10897,471 @@ mod tests {
             );
         }
         assert_eq!(coordinator.prompts().len(), 4);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn fence_feedback_history_capacity_never_evicts_or_submits_again() {
+        struct NoQueueOperations;
+        impl CoordinatorDelivery for NoQueueOperations {
+            fn message_state(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> std::result::Result<Option<QueueMessageState>, String> {
+                panic!("history capacity must be checked before querying the queue");
+            }
+            fn submit(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: DrainOptions,
+            ) -> std::result::Result<(), String> {
+                panic!("history capacity must prevent pane input");
+            }
+            fn drain(&self, _: &str, _: DrainOptions) -> std::result::Result<(), String> {
+                panic!("overfull pending feedback must not drain");
+            }
+        }
+        let root = temporary("feedback-history-capacity");
+        let state = BridgeState::initialize(&root, config()).expect("initialize");
+        let mut record = FenceFeedbackRecord {
+            version: STATE_VERSION,
+            reported: (0..MAX_REPORTED_REPLY_MARKERS)
+                .map(|index| format!("old_{index}"))
+                .collect(),
+            pending: None,
+        };
+        let path = root.join("fence-feedback.json");
+        write_document(&path, &record).expect("full retained history");
+        let before = fs::read(&path).expect("history bytes");
+        drop(state);
+        let state = BridgeState::open(&root).expect("reopen full history");
+        assert_eq!(
+            deliver_fence_feedback_with(
+                &state,
+                &NoQueueOperations,
+                &["old_0".to_owned()],
+                DrainOptions::default()
+            )
+            .expect("old marker stays suppressed"),
+            CoordinatorDeliveryResult::AlreadyDelivered
+        );
+        for ids in [
+            vec!["new_4096".to_owned()],
+            vec!["old_0".to_owned(), "new_4096".to_owned()],
+        ] {
+            assert!(deliver_fence_feedback_with(
+                &state,
+                &NoQueueOperations,
+                &ids,
+                DrainOptions::default()
+            )
+            .expect_err("new marker held before pane input")
+            .to_string()
+            .contains("marker history limit"));
+            assert_eq!(fs::read(&path).expect("retained history"), before);
+        }
+        // A legacy record may already have overfull pending work. Refuse before even asking
+        // whether its queue ID was submitted, and preserve the evidence for explicit repair.
+        record.pending = Some(PendingFenceFeedback {
+            unavailable: vec!["new_4096".to_owned()],
+            prompt: "legacy pending prompt".to_owned(),
+        });
+        write_document(&path, &record).expect("legacy overflow fixture");
+        let legacy = fs::read(&path).expect("legacy bytes");
+        assert!(deliver_fence_feedback_with(
+            &state,
+            &NoQueueOperations,
+            &["new_4096".to_owned()],
+            DrainOptions::default()
+        )
+        .is_err());
+        assert_eq!(fs::read(&path).expect("legacy evidence preserved"), legacy);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn fence_feedback_crash_after_submission_settles_exact_pending_markers() {
+        struct CrashAfterSubmission<'a> {
+            state: &'a BridgeState,
+            queue: &'a QueueDelivery,
+            uncertain: bool,
+        }
+        impl CoordinatorDelivery for CrashAfterSubmission<'_> {
+            fn message_state(
+                &self,
+                agent_name: &str,
+                message_id: &str,
+            ) -> std::result::Result<Option<QueueMessageState>, String> {
+                self.queue.message_state(agent_name, message_id)
+            }
+            fn submit(
+                &self,
+                agent_name: &str,
+                prompt: &str,
+                message_id: &str,
+                options: DrainOptions,
+            ) -> std::result::Result<(), String> {
+                let pending = self
+                    .state
+                    .read_fence_feedback()
+                    .expect("durable feedback")
+                    .pending
+                    .expect("pending before pane submission");
+                assert_eq!(pending.unavailable, ["old_1"]);
+                assert_eq!(pending.prompt, prompt);
+                self.queue.submit(agent_name, prompt, message_id, options)?;
+                if self.uncertain {
+                    self.queue
+                        .states
+                        .lock()
+                        .expect("queue lock")
+                        .insert(message_id.to_owned(), QueueMessageState::Inflight);
+                }
+                panic!("crash after pane submission, before saving its result");
+            }
+            fn drain(
+                &self,
+                agent_name: &str,
+                options: DrainOptions,
+            ) -> std::result::Result<(), String> {
+                self.queue.drain(agent_name, options)
+            }
+        }
+        for uncertain in [false, true] {
+            let root = temporary("feedback-submission-crash");
+            let state = BridgeState::initialize(&root, config()).expect("initialize");
+            let queue = QueueDelivery::default();
+            let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                deliver_fence_feedback_with(
+                    &state,
+                    &CrashAfterSubmission {
+                        state: &state,
+                        queue: &queue,
+                        uncertain,
+                    },
+                    &["old_1".to_owned()],
+                    DrainOptions::default(),
+                )
+            }));
+            assert!(crashed.is_err());
+            assert_eq!(
+                queue.prompts().len(),
+                1,
+                "failure happened after submission"
+            );
+            drop(state);
+            let state = BridgeState::open(&root).expect("reopen after crash");
+            assert_eq!(
+                deliver_fence_feedback_with(
+                    &state,
+                    &queue,
+                    &["old_1".to_owned(), "new_2".to_owned()],
+                    DrainOptions::default(),
+                )
+                .expect("settle original queue ID before new feedback"),
+                CoordinatorDeliveryResult::Delivered
+            );
+            let prompts = queue.prompts();
+            assert_eq!(prompts.len(), 2);
+            assert!(prompts[1].contains("new_2"));
+            assert!(!prompts[1].contains("old_1"));
+            assert!(state
+                .read_fence_feedback()
+                .expect("feedback")
+                .pending
+                .is_none());
+            fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    fn same_thread_reply_requests(state: &BridgeState, count: u64) -> Vec<String> {
+        let messages = (1..=count)
+            .map(|index| {
+                CommittableEvent::message_created(
+                    InboundMessage::new(
+                        ChannelId::new("spaces/example").expect("channel"),
+                        MessageId::new(format!("spaces/example/messages/{index}"))
+                            .expect("message"),
+                        ThreadId::new("spaces/example/threads/shared").expect("thread"),
+                        SenderId::new("users/owner").expect("sender"),
+                        "ordinary request",
+                        "2026-09-21T12:00:00Z",
+                        false,
+                    )
+                    .expect("normalized message"),
+                )
+            })
+            .collect();
+        let batch = DeliveryBatch::new(
+            EventSequence::new(1).expect("sequence"),
+            ProviderCursor::new("cursor-1").expect("cursor"),
+            DeliveryId::new("same-thread-batch").expect("receipt"),
+            messages,
+        )
+        .expect("batch");
+        let keys = state
+            .admit_batch(&batch)
+            .expect("admit requests")
+            .new_request_keys;
+        for key in &keys {
+            let nonce = state.read_request(key).expect("request").reply_nonce;
+            state
+                .capture_replies(
+                    key,
+                    &format!("<CHAT_REPLY_{nonce}_1>\nanswer\n</CHAT_REPLY_{nonce}_1>"),
+                )
+                .expect("capture");
+        }
+        keys
+    }
+
+    #[test]
+    fn reply_reservations_survive_unknown_outcomes_crash_and_slow_receipts() {
+        struct CrashAfterSend<'a> {
+            state: &'a BridgeState,
+            transport: &'a mut FakeReplyTransport,
+            crash: bool,
+        }
+        impl ReplyTransport for CrashAfterSend<'_> {
+            fn send(
+                &mut self,
+                submission: ReplySubmission<'_>,
+            ) -> std::result::Result<String, OutboundFailure> {
+                let mut ledger = self
+                    .state
+                    .read_reply_breaker()
+                    .expect("durable reservation");
+                let reservation = ledger
+                    .sends
+                    .iter_mut()
+                    .find(|event| event.send_request_id.as_deref() == Some(submission.request_id))
+                    .expect("reservation precedes provider IO");
+                assert!(reservation.pending);
+                // Simulate a provider call longer than the post-rate window without a sleep.
+                reservation.at_millis = 1;
+                write_document(&self.state.root.join("reply-breaker.json"), &ledger)
+                    .expect("age in-flight reservation");
+                let lock = agent::open_private_lock(&self.state.root.join(".state.lock"), "probe")
+                    .expect("lock file");
+                lock.try_lock_exclusive()
+                    .expect("no state lock across provider call");
+                drop(lock);
+                let result = self.transport.send(submission);
+                assert!(result.is_ok());
+                if self.crash {
+                    panic!("provider accepted, crash before receipt persistence");
+                }
+                result
+            }
+        }
+        let root = temporary("reply-reservation-crash");
+        let state = BridgeState::initialize(&root, config()).expect("initialize");
+        let keys = same_thread_reply_requests(&state, 4);
+        let mut transport = FakeReplyTransport::default();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.publish_one(
+                &keys[0],
+                &mut CrashAfterSend {
+                    state: &state,
+                    transport: &mut transport,
+                    crash: true,
+                },
+            )
+        }))
+        .is_err());
+        assert_eq!(transport.submissions.len(), 1);
+        drop(state);
+        let state = BridgeState::open(&root).expect("recover unknown send");
+        for key in &keys[1..3] {
+            transport.fail_once = true;
+            assert!(state.publish_one(key, &mut transport).is_err());
+        }
+        let mut ledger = state.read_reply_breaker().expect("three charged attempts");
+        assert_eq!(ledger.sends.len(), 3);
+        for event in &mut ledger.sends {
+            event.at_millis = 1;
+        }
+        write_document(&root.join("reply-breaker.json"), &ledger).expect("age unknown outcomes");
+        assert!(state
+            .publish_one(&keys[3], &mut transport)
+            .expect_err("unknowns still count")
+            .to_string()
+            .contains("post-rate breaker tripped"));
+        assert_eq!(transport.submissions.len(), 3);
+        let mut ledger = state.read_reply_breaker().expect("tripped ledger");
+        for event in &mut ledger.trips {
+            event.at_millis = 1;
+        }
+        write_document(&root.join("reply-breaker.json"), &ledger).expect("cooldown elapsed");
+        let before_receipt = unix_millis();
+        state
+            .publish_one(
+                &keys[0],
+                &mut CrashAfterSend {
+                    state: &state,
+                    transport: &mut transport,
+                    crash: false,
+                },
+            )
+            .expect("same operation reconciles without another reservation");
+        assert_eq!(transport.submissions[0].3, transport.submissions[3].3);
+        let ledger = state.read_reply_breaker().expect("completed reservation");
+        assert_eq!(ledger.sends.len(), 3);
+        let completed = ledger
+            .sends
+            .iter()
+            .find(|event| !event.pending)
+            .expect("completion");
+        assert!(
+            completed.at_millis >= before_receipt,
+            "receipt starts retention window"
+        );
+        assert_eq!(
+            state.read_reply(&keys[0], 1).expect("reply").phase,
+            ReplyPhase::Sent
+        );
+        assert!(state.publish_one(&keys[3], &mut transport).is_err());
+        assert_eq!(transport.submissions.len(), 4);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn reply_reservation_expired_completion_rechecks_budget_after_crash() {
+        let root = temporary("reply-reservation-expired");
+        let state = BridgeState::initialize(&root, config()).expect("initialize");
+        let keys = same_thread_reply_requests(&state, 4);
+        let mut transport = FakeReplyTransport {
+            fail_once: true,
+            ..Default::default()
+        };
+        assert!(state.publish_one(&keys[0], &mut transport).is_err());
+        let request = state.read_request(&keys[0]).expect("request");
+        let reply = state.read_reply(&keys[0], 1).expect("sending reply");
+        // Crash after the valid receipt's budget update, before the Sent artifact is written.
+        let lock =
+            agent::open_private_lock(&root.join(".state.lock"), "fixture lock").expect("lock");
+        lock.lock_exclusive().expect("exclusive");
+        state
+            .complete_reply_reservation_locked(&request.message, &reply.send_request_id)
+            .expect("receipt budget commit");
+        let mut ledger = state.read_reply_breaker().expect("completed reservation");
+        ledger.sends[0].at_millis = 1;
+        write_document(&root.join("reply-breaker.json"), &ledger).expect("window elapsed");
+        drop(lock);
+        drop(state);
+        let state = BridgeState::open(&root).expect("recover before Sent artifact");
+        for key in &keys[1..] {
+            state.publish_one(key, &mut transport).expect("new budget");
+        }
+        assert!(state
+            .publish_one(&keys[0], &mut transport)
+            .expect_err("old ID needs current budget")
+            .to_string()
+            .contains("post-rate breaker tripped"));
+        assert_eq!(transport.submissions.len(), 4);
+        assert_eq!(
+            state
+                .read_reply(&keys[0], 1)
+                .expect("held reply")
+                .send_request_id,
+            reply.send_request_id
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn reply_reservation_capacity_and_legacy_history_fail_closed() {
+        let root = temporary("reply-reservation-capacity");
+        let state = BridgeState::initialize(&root, config()).expect("initialize");
+        let keys = same_thread_reply_requests(&state, 1);
+        let message = state.read_request(&keys[0]).expect("request").message;
+        let legacy = serde_json::json!({ "version": STATE_VERSION, "sends": (0..3).map(|_| {
+            serde_json::json!({ "channel_id": message.channel_id,
+                "thread_id": message.thread_id, "at_millis": unix_millis() })
+        }).collect::<Vec<_>>(), "trips": [] });
+        write_document(&root.join("reply-breaker.json"), &legacy).expect("legacy ledger");
+        let mut transport = FakeReplyTransport::default();
+        assert!(state.publish_one(&keys[0], &mut transport).is_err());
+        let mut record = state.read_reply_breaker().expect("legacy history accepted");
+        record.trips.clear();
+        record.sends = (0..MAX_REPLY_BREAKER_EVENTS)
+            .map(|index| ThreadEvent {
+                channel_id: message.channel_id.clone(),
+                thread_id: format!("other-{index}"),
+                at_millis: unix_millis(),
+                send_request_id: None,
+                pending: false,
+            })
+            .collect();
+        write_document(&root.join("reply-breaker.json"), &record).expect("full live ledger");
+        assert!(state
+            .publish_one(&keys[0], &mut transport)
+            .expect_err("no live budget eviction")
+            .to_string()
+            .contains("population limit"));
+        assert!(transport.submissions.is_empty());
+        assert_eq!(
+            state
+                .read_reply_breaker()
+                .expect("retained ledger")
+                .sends
+                .len(),
+            MAX_REPLY_BREAKER_EVENTS
+        );
+        record.sends[0].pending = true;
+        assert!(
+            record.validate().is_err(),
+            "pending must name its stable operation"
+        );
+        record.sends[0].send_request_id = Some(random_operation_uuid().expect("UUID"));
+        record.sends[1] = record.sends[0].clone();
+        assert!(
+            record.validate().is_err(),
+            "duplicate operation IDs fail closed"
+        );
+        // A readable ledger near the byte cap must not be replaced by an unreadable one,
+        // even though its event population leaves room for another operation.
+        record.sends = vec![
+            ThreadEvent {
+                channel_id: "x".repeat(chat_subscription::MAX_RESOURCE_ID_BYTES),
+                thread_id: "y".repeat(chat_subscription::MAX_RESOURCE_ID_BYTES),
+                at_millis: unix_millis(),
+                send_request_id: None,
+                pending: false,
+            };
+            2_000
+        ];
+        let desired = MAX_REPLY_BREAKER_BYTES - 64;
+        let mut excess = encoded_document_bytes(&record).expect("encoded size") - desired;
+        for event in &mut record.sends {
+            for field in [&mut event.channel_id, &mut event.thread_id] {
+                let remove = excess.min(field.len() - 1);
+                field.truncate(field.len() - remove);
+                excess -= remove;
+            }
+        }
+        assert_eq!(excess, 0);
+        assert_eq!(
+            encoded_document_bytes(&record).expect("bounded size"),
+            desired
+        );
+        state
+            .write_reply_breaker(&record)
+            .expect("readable near-full ledger");
+        let before = fs::read(root.join("reply-breaker.json")).expect("original bytes");
+        assert!(state
+            .publish_one(&keys[0], &mut transport)
+            .expect_err("byte cap holds before provider IO")
+            .to_string()
+            .contains("encoded byte limit"));
+        assert!(transport.submissions.is_empty());
+        assert_eq!(
+            fs::read(root.join("reply-breaker.json")).expect("retained bytes"),
+            before
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 

@@ -225,16 +225,26 @@ prompt to the agent. The prompt names the unavailable ID and the available
 ones and is never posted to chat. Each unavailable ID is reported at most once,
 including after a restart. While a routing-error prompt is still queued, newer
 unavailable IDs wait for it instead of producing a second prompt. Reported IDs
-are kept in `fence-feedback.json` in the bridge state directory.
+are kept in `fence-feedback.json` in the bridge state directory. The exact pending
+prompt is saved before submission, so recovery settles its original queue ID even
+if a crash hides the submission result or newer unavailable markers appear.
+The history retains up to 4,096 distinct reported or pending IDs. At that limit,
+new diagnostics stay held; previously reported IDs are never evicted or submitted
+again.
 
 A per-thread post-rate breaker bounds any remaining reply loop. After one
-provider thread receives 3 replies within 60 seconds, the next reply to that
+provider thread reserves 3 distinct reply operations within 60 seconds, the next reply to that
 thread trips the breaker. Replies to that thread then stay captured but unsent
 for 600 seconds, and the log names the thread with a `post-rate breaker` error.
 Other threads are unaffected. After the cooldown, held replies go out in order
 under their original operation IDs. To release a thread early, first confirm
 that no reply loop is running, then delete `reply-breaker.json` from the bridge
-state directory.
+state directory. Reservations are durable before a provider call, including calls
+whose outcome is unknown. Unresolved reservations keep their budget until the
+same operation is reconciled or the ledger is explicitly reset. A valid receipt
+starts its 60-second retention window; retrying an expired completed reservation
+must pass the current budget again. A full ledger holds new sends until completed
+entries expire. This can conservatively hold replies after a failed attempt.
 
 ## Service management
 
