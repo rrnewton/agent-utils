@@ -38,7 +38,7 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence, Set as AbstractSet
 from pathlib import Path
 
-from wrkslots import __version__
+from wrkslots import __version__, imagecmd, sandbox, slotimage
 
 VERSION = __version__
 SCHEMA = 2
@@ -350,6 +350,9 @@ OPTIONAL_CONFIG_KEYS = frozenset(
         "disk_advisory_bytes",
         "disk_provisioning_floor_bytes",
         "disk_emergency_bytes",
+        "slot_representation",
+        "image",
+        "sandbox",
     }
 )
 # Fields `init --repair` may overwrite when the caller names a different value.
@@ -365,6 +368,7 @@ GIB = 1024**3
 HOLD_SCHEMA = 1
 EVENT_SCHEMA = 1
 SLOT_TYPES = ("agent", "validate")
+SLOT_REPRESENTATIONS = ("worktree", "image")
 HISTORICAL_ACTIVE_STATUSES = frozenset(
     {"active", "lease-quarantined", "owner-lease-revoked", "release-requested"}
 )
@@ -480,6 +484,13 @@ class Config:
     disk_advisory_bytes: int | None = None
     disk_provisioning_floor_bytes: int | None = None
     disk_emergency_bytes: int | None = None
+    #: How NEW slots are stored: "worktree" (plain directories, the historical
+    #: default when the key is absent) or "image" (one sparse disk image per
+    #: slot). Existing slots keep whatever representation they were created
+    #: with; see slotimage.py.
+    slot_representation: str = "worktree"
+    image_settings: slotimage.ImageSettings = slotimage.ImageSettings()
+    sandbox_settings: sandbox.SandboxSettings = sandbox.SandboxSettings()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2613,6 +2624,8 @@ def _config_payload(
     disk_advisory_bytes: int | None = None,
     disk_provisioning_floor_bytes: int | None = None,
     disk_emergency_bytes: int | None = None,
+    slot_representation: str = "worktree",
+    image: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "schema": SCHEMA,
@@ -2644,6 +2657,10 @@ def _config_payload(
         payload["disk_advisory_bytes"] = disk_advisory_bytes
         payload["disk_provisioning_floor_bytes"] = disk_provisioning_floor_bytes
         payload["disk_emergency_bytes"] = disk_emergency_bytes
+    if slot_representation != "worktree":
+        payload["slot_representation"] = slot_representation
+    if image:
+        payload["image"] = dict(image)
     return payload
 
 
@@ -2657,6 +2674,8 @@ def _canonical_config_payload(value: Mapping[str, object]) -> dict[str, object]:
         canonical.pop("repo_cache_globs")
     if canonical.get("post_provision_hooks") == []:
         canonical.pop("post_provision_hooks")
+    if canonical.get("slot_representation") == "worktree":
+        canonical.pop("slot_representation")
     return canonical
 
 
@@ -2913,7 +2932,7 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
         disk_values = advisory, provisioning, emergency
     else:
         disk_values = None, None, None
-    return Config(
+    config = Config(
         root=root,
         config_path=path,
         worktrees=worktrees,
@@ -2940,7 +2959,246 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
         disk_advisory_bytes=disk_values[0],
         disk_provisioning_floor_bytes=disk_values[1],
         disk_emergency_bytes=disk_values[2],
+        slot_representation=_parse_slot_representation(raw),
+        image_settings=_parse_image_settings(raw),
+        sandbox_settings=_parse_sandbox_settings(raw),
     )
+    _activate_representation(config)
+    return config
+
+
+def _parse_slot_representation(raw: Mapping[str, object]) -> str:
+    value = raw.get("slot_representation", "worktree")
+    if value not in SLOT_REPRESENTATIONS:
+        raise StateError(
+            f"configuration.slot_representation must be one of "
+            f"{', '.join(SLOT_REPRESENTATIONS)}, not {value!r}"
+        )
+    return str(value)
+
+
+def _parse_image_settings(raw: Mapping[str, object]) -> slotimage.ImageSettings:
+    value = raw.get("image")
+    if value is None:
+        return slotimage.ImageSettings()
+    section = _as_mapping(value, "configuration.image")
+    _exact_keys(
+        section,
+        set(),
+        frozenset({"ceiling_bytes", "state_ceiling_bytes", "backend"}),
+        "configuration.image",
+    )
+    defaults = slotimage.ImageSettings()
+    backend = section.get("backend", defaults.backend)
+    if backend not in slotimage.BACKENDS:
+        raise StateError(
+            f"configuration.image.backend must be one of {', '.join(slotimage.BACKENDS)}"
+        )
+    return slotimage.ImageSettings(
+        ceiling_bytes=_as_int(
+            section.get("ceiling_bytes", defaults.ceiling_bytes),
+            "configuration.image.ceiling_bytes",
+            minimum=GIB,
+        ),
+        state_ceiling_bytes=_as_int(
+            section.get("state_ceiling_bytes", defaults.state_ceiling_bytes),
+            "configuration.image.state_ceiling_bytes",
+            minimum=GIB,
+        ),
+        backend=str(backend),
+    )
+
+
+def _parse_sandbox_settings(raw: Mapping[str, object]) -> sandbox.SandboxSettings:
+    value = raw.get("sandbox")
+    if value is None:
+        return sandbox.SandboxSettings()
+    try:
+        return sandbox.settings_from_obj(_as_mapping(value, "configuration.sandbox"))
+    except sandbox.SandboxError as exc:
+        raise StateError(str(exc)) from exc
+
+
+#: Mount points and sources that are this project's own slot-image mounts. The
+#: process-use census ignores exactly these mount lines: a slot's own storage is
+#: not evidence that anything is using the slot.
+_OWNED_REPRESENTATION_MOUNTS: frozenset[tuple[Path, str]] = frozenset()
+
+
+def _activate_representation(config: Config) -> None:
+    """Mount any image-backed slot whose image is not mounted, then note owned mounts.
+
+    Runs whenever a configuration is loaded, so that after a reboot (or a crash
+    between unmount and remount during relocation) every image-backed slot is
+    back at its recorded location before any lifecycle logic inspects it.
+    """
+
+    global _OWNED_REPRESENTATION_MOUNTS
+    if not slotimage.images_root(config.control).exists():
+        _OWNED_REPRESENTATION_MOUNTS = frozenset()
+        return
+    try:
+        for action in slotimage.ensure_all_mounted(config.control):
+            print(f"wrkslots: {action}", file=sys.stderr)
+    except slotimage.ImageError as exc:
+        print(f"wrkslots: WARNING: slot image not mounted: {exc}", file=sys.stderr)
+    _OWNED_REPRESENTATION_MOUNTS = slotimage.owned_mounts(config.control)
+
+
+def _owned_mount_line(line: str) -> bool:
+    if not _OWNED_REPRESENTATION_MOUNTS:
+        return False
+    left, separator, right = line.partition(" - ")
+    if not separator:
+        return False
+    left_fields = left.split()
+    right_fields = right.split()
+    if len(left_fields) < 5 or len(right_fields) < 2:
+        return False
+    key = (_mountinfo_path(left_fields[4]), str(_mountinfo_path(right_fields[1])))
+    return key in _OWNED_REPRESENTATION_MOUNTS
+
+
+def _slot_image_at(config: Config, path: Path) -> slotimage.SlotImage | None:
+    if not slotimage.images_root(config.control).exists():
+        return None
+    try:
+        return slotimage.image_for_location(config.control, path)
+    except slotimage.ImageError as exc:
+        raise Refusal(f"cannot read slot image records: {exc}") from exc
+
+
+def _refresh_owned_mounts(config: Config) -> None:
+    global _OWNED_REPRESENTATION_MOUNTS
+    _OWNED_REPRESENTATION_MOUNTS = slotimage.owned_mounts(config.control)
+
+
+def _rename_slot_path(config: Config, source: Path, destination: Path) -> None:
+    """Rename a slot directory, relocating its image mount when it has one.
+
+    A mount point cannot be renamed. For an image-backed slot the image is
+    unmounted, the empty mount point renamed, and the image mounted again at
+    the destination. Failures surface as OSError so every caller's existing
+    rename error handling still applies.
+    """
+
+    image = _slot_image_at(config, source)
+    if image is None:
+        os.rename(source, destination)
+        return
+    try:
+        slotimage.relocate(image, destination)
+    except slotimage.ImageError as exc:
+        raise OSError(errno.EBUSY, f"cannot relocate slot image: {exc}") from exc
+    finally:
+        _refresh_owned_mounts(config)
+
+
+def _remove_slot_directory(config: Config, path: Path) -> None:
+    """Remove an emptied slot directory: rmdir, or destroy its image.
+
+    Raises OSError with the same meaning as rmdir when the slot still holds
+    content, so callers keep their refusal wording.
+    """
+
+    image = _slot_image_at(config, path)
+    if image is None:
+        path.rmdir()
+        return
+    try:
+        slotimage.destroy(image)
+    except slotimage.ImageError as exc:
+        raise OSError(errno.ENOTEMPTY, str(exc)) from exc
+    finally:
+        _refresh_owned_mounts(config)
+
+
+def _provision_slot_image(
+    config: Config, slot: str, slot_type: str, slot_path: Path
+) -> slotimage.SlotImage:
+    try:
+        image = slotimage.provision(
+            config.control, slot_type, slot, slot_path, config.image_settings
+        )
+    except slotimage.ImageError as exc:
+        raise Refusal(
+            f"cannot provision the disk image for slot {slot}: {exc}",
+            remedy=(
+                "check `sudo -n true` or fuse2fs availability, or create this slot as "
+                "plain worktrees with `create --representation worktree`"
+            ),
+        ) from exc
+    _refresh_owned_mounts(config)
+    return image
+
+
+def _slot_representation_of(config: Config, slot: str, slot_type: str) -> str:
+    try:
+        image = slotimage.load(config.control, slot_type, slot)
+    except slotimage.ImageError as exc:
+        raise Refusal(str(exc)) from exc
+    return "worktree" if image is None else "image"
+
+
+def _init_representation(
+    args: argparse.Namespace, config_path: Path
+) -> tuple[str, dict[str, object] | None]:
+    """Choose the representation and image section init should write.
+
+    A new project defaults to images. An existing configuration keeps what it
+    has (absent means worktree) so rerunning init after an upgrade neither
+    conflicts with nor silently converts a live project.
+    """
+
+    existing: Mapping[str, object] | None = None
+    if config_path.exists() and not config_path.is_symlink():
+        try:
+            loaded: object = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            loaded = None
+        if isinstance(loaded, dict):
+            existing = {str(key): value for key, value in loaded.items()}
+    if args.slot_representation is not None:
+        representation = str(args.slot_representation)
+    elif existing is not None:
+        representation = str(existing.get("slot_representation", "worktree"))
+    else:
+        # WRKSLOTS_INIT_REPRESENTATION changes the default for a NEW project
+        # only (for example a test suite that exercises plain worktrees).
+        representation = os.environ.get("WRKSLOTS_INIT_REPRESENTATION", "image")
+        if representation not in SLOT_REPRESENTATIONS:
+            raise Refusal(
+                "WRKSLOTS_INIT_REPRESENTATION must be worktree or image, "
+                f"not {representation!r}"
+            )
+    image_section: dict[str, object] | None = None
+    if existing is not None and isinstance(existing.get("image"), dict):
+        raw_image = existing.get("image")
+        assert isinstance(raw_image, dict)
+        image_section = {str(key): value for key, value in raw_image.items()}
+    if args.image_ceiling_gib is not None or args.image_backend is not None:
+        image_section = dict(image_section or {})
+        if args.image_ceiling_gib is not None:
+            if args.image_ceiling_gib < 1:
+                raise Refusal("--image-ceiling-gib must be at least 1")
+            image_section["ceiling_bytes"] = args.image_ceiling_gib * GIB
+        if args.image_backend is not None:
+            image_section["backend"] = args.image_backend
+    return representation, image_section
+
+
+def _requested_representation(config: Config, args: argparse.Namespace) -> str:
+    requested = getattr(args, "representation", None)
+    if requested in (None, "config"):
+        return config.slot_representation
+    if requested not in SLOT_REPRESENTATIONS:
+        raise Refusal(f"--representation must be config, worktree, or image, not {requested!r}")
+    return str(requested)
+
+
+def _is_owned_image_root(path: Path) -> bool:
+    target = Path(os.path.abspath(path))
+    return any(mount_point == target for mount_point, _source in _OWNED_REPRESENTATION_MOUNTS)
 
 
 def _load_new_slot_config(args: argparse.Namespace, operation: str) -> Config:
@@ -9622,7 +9880,28 @@ class _GitVcs:
         if force:
             args.append("--force")
         args.extend(("--", str(checkout)))
-        self._run(repository, args)
+        if not _is_owned_image_root(checkout):
+            self._run(repository, args)
+            return
+        # A flat image-backed checkout's root is the image's mount point, which
+        # cannot be removed. Git deletes the working tree's contents, fails only
+        # on that final rmdir, and still deletes the administrative directory.
+        # Accept exactly that outcome; the image itself is destroyed with the
+        # slot directory afterwards.
+        result = self._run(repository, args, check=False)
+        if result.returncode == 0:
+            return
+        leftover = [
+            entry.name
+            for entry in checkout.iterdir()
+            if entry.name not in slotimage.REPRESENTATION_RESIDUE
+        ]
+        if leftover or checkout.absolute() in self.listed_worktrees(repository):
+            detail = (result.stderr or result.stdout).strip().splitlines()
+            raise Refusal(
+                f"git worktree remove failed for image-backed checkout {checkout}: "
+                f"{detail[-1] if detail else 'no output'}"
+            )
 
     def remote_ref_sha(
         self,
@@ -10956,6 +11235,8 @@ def _parse_mountinfo_paths(
             return cached
     references: list[tuple[Path, str]] = []
     for line in text.splitlines():
+        if _owned_mount_line(line):
+            continue
         left, separator, right = line.partition(" - ")
         if not separator:
             raise Refusal(f"{label} is malformed")
@@ -13496,6 +13777,8 @@ def _cmd_init(args: argparse.Namespace) -> int:
         )
     else:
         disk_bytes = (None, None, None)
+    config_path = root / CONFIG_NAME
+    representation, image_section = _init_representation(args, config_path)
     payload = _config_payload(
         worktrees_relative,
         machine,
@@ -13512,8 +13795,9 @@ def _cmd_init(args: argparse.Namespace) -> int:
         disk_bytes[0],
         disk_bytes[1],
         disk_bytes[2],
+        representation,
+        image_section,
     )
-    config_path = root / CONFIG_NAME
     with _locked_config(config_path, args.wait_lock):
         _recover_config_write(config_path, payload)
         if config_path.exists() or config_path.is_symlink():
@@ -14160,7 +14444,13 @@ def _cmd_create(args: argparse.Namespace) -> int:
             ),
             journal_path=journal_path,
         )
-        if config.layout == "nested":
+        representation = _requested_representation(config, args)
+        if representation == "image":
+            # The slot directory becomes the mount point of a fresh image; for
+            # the flat layout `git worktree add` then fills the empty image root.
+            _provision_slot_image(config, args.slot, args.slot_type, slot_path)
+            _fsync_directory(slot_path.parent)
+        elif config.layout == "nested":
             slot_path.mkdir(mode=0o755)
             _fsync_directory(slot_path.parent)
         for item in plan:
@@ -20607,7 +20897,7 @@ def _repair_registration_at_slot(
 def _remove_fenced_directory(config: Config, fenced_slot: Path) -> None:
     if fenced_slot.exists():
         try:
-            fenced_slot.rmdir()
+            _remove_slot_directory(config, fenced_slot)
         except OSError as exc:
             raise Refusal(
                 f"fenced slot directory is not empty after Git removal: {fenced_slot}: {exc}"
@@ -21692,7 +21982,7 @@ def _rollback_path_fence(
     if not fenced.is_dir() or fenced.is_symlink():
         raise Refusal(f"fenced slot is missing or unsafe during rollback: {fenced}")
     try:
-        os.rename(fenced, original)
+        _rename_slot_path(config, fenced, original)
         private_identity = _finish_private_census_identity(journal)
         if private_identity is None:
             _restore_finish_original_mode(original, journal)
@@ -21752,7 +22042,7 @@ def _begin_or_resume_path_fence(
                 "rerun remove so the changed state is recorded"
             )
         try:
-            os.rename(original, fenced)
+            _rename_slot_path(config, original, fenced)
             _fsync_directory(original.parent)
         except OSError as exc:
             raise Refusal(f"cannot establish path fence {original} -> {fenced}: {exc}") from exc
@@ -24271,7 +24561,7 @@ def _abort_create(
         vcs.delete_branch_at(repository, item.branch, expected_head)
     if slot_path.exists():
         try:
-            slot_path.rmdir()
+            _remove_slot_directory(config, slot_path)
         except OSError as exc:
             raise Refusal(f"cannot remove aborted slot directory {slot_path}: {exc}") from exc
         _fsync_directory(slot_path.parent)
@@ -24561,7 +24851,11 @@ def _recover_create(
     slot_path = _slot_directory(config, slot, slot_type)
     if slot_path.exists() and (not slot_path.is_dir() or slot_path.is_symlink()):
         raise Refusal(f"create recovery found an unsafe slot path: {slot_path}")
-    if not slot_path.exists() and config.layout == "nested":
+    if (
+        not slot_path.exists()
+        and config.layout == "nested"
+        and _slot_representation_of(config, slot, slot_type) == "worktree"
+    ):
         slot_path.mkdir(mode=0o755)
         _fsync_directory(slot_path.parent)
     vcs = _GitVcs()
@@ -27557,7 +27851,7 @@ def _rollback_validation_fence(
 ) -> None:
     if target.exists() or target.is_symlink() or fenced.is_symlink() or not fenced.is_dir():
         raise Refusal("cannot safely roll back validation path fence; preserve both paths")
-    os.rename(fenced, target)
+    _rename_slot_path(config, fenced, target)
     _fsync_directory(target.parent)
     rollback_journal = {**journal, "phase": "prepared"}
     _write_journal(config, rollback_journal)
@@ -28773,7 +29067,7 @@ def _recover_ownerless_validation(
                 )
             _interrupt_for_test("after-ownerless-validation-proof-seal")
         if active == target:
-            os.rename(target, fenced)
+            _rename_slot_path(config, target, fenced)
             _fsync_directory(target.parent)
             _interrupt_for_test("after-ownerless-validate-path-fence-before-journal")
             if authorization.target_kind == "checkout":
@@ -29277,10 +29571,10 @@ def _recover_ownerless_agent(
             config, authorization, checkout, salvage, vcs, active
         )
         if active == target:
-            os.rename(target, fenced)
+            _rename_slot_path(config, target, fenced)
             _fsync_directory(target.parent)
             if _open_directory_identity(fenced, "fenced ownerless agent worktree") != authorization.identity:
-                os.rename(fenced, target)
+                _rename_slot_path(config, fenced, target)
                 _fsync_directory(target.parent)
                 raise Refusal("ownerless agent worktree identity changed during fencing")
             _interrupt_for_test("after-ownerless-agent-fence-before-journal")
@@ -29545,10 +29839,10 @@ def _recover_ownerless_agent_cache(
         for candidate in (source, fenced, destination):
             _assert_unregistered_path_systemd_unrelated(candidate)
         if active == source:
-            os.rename(source, fenced)
+            _rename_slot_path(config, source, fenced)
             _fsync_directory(source.parent)
             if _open_directory_identity(fenced, "fenced ownerless agent cache") != _identity:
-                os.rename(fenced, source)
+                _rename_slot_path(config, fenced, source)
                 _fsync_directory(source.parent)
                 raise Refusal("ownerless agent cache identity changed during fencing")
             journal["phase"] = "fenced"
@@ -29562,10 +29856,10 @@ def _recover_ownerless_agent_cache(
         if destination.exists() or destination.is_symlink():
             raise Refusal(f"ownerless agent cache destination already exists: {destination}")
         try:
-            os.rename(fenced, destination)
+            _rename_slot_path(config, fenced, destination)
         except OSError as exc:
             if not source.exists() and fenced.is_dir() and not destination.exists():
-                os.rename(fenced, source)
+                _rename_slot_path(config, fenced, source)
                 _fsync_directory(source.parent)
             raise Refusal(f"cannot relocate exact ownerless agent cache tree: {exc}") from exc
         _fsync_directory(destination.parent)
@@ -35934,6 +36228,36 @@ usage or audit gate unknown, 3 fail-closed refusal.
         metavar="SHELL-COMMAND",
         help="ordered shell command run in every new checkout (repeatable)",
     )
+    init.add_argument(
+        "--slot-representation",
+        choices=SLOT_REPRESENTATIONS,
+        default=None,
+        help=(
+            "storage for NEW slots: image (one sparse disk image per slot; the default for a "
+            "new project) or worktree (plain directories). Rerunning init on an existing "
+            "project keeps its current setting unless this flag is given; change it later "
+            "with `wrkslots image set-default`. Existing slots are never converted by this"
+        ),
+    )
+    init.add_argument(
+        "--image-ceiling-gib",
+        type=int,
+        default=None,
+        metavar="GIB",
+        help=(
+            "apparent size of each new slot image in GiB. Images are sparse: this is an upper "
+            f"bound, not a reservation (default: {slotimage.DEFAULT_CEILING_BYTES // GIB})"
+        ),
+    )
+    init.add_argument(
+        "--image-backend",
+        choices=slotimage.BACKENDS,
+        default=None,
+        help=(
+            "how slot images are mounted: kernel (sudo -n mount -o loop), fuse (fuse2fs, no "
+            "privilege), or auto (kernel when sudo -n works, else fuse; default)"
+        ),
+    )
     init.add_argument("--disk-advisory-gib", type=int)
     init.add_argument("--disk-provisioning-floor-gib", type=int)
     init.add_argument("--disk-emergency-gib", type=int)
@@ -36131,6 +36455,17 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--override-disk-floor",
         action="store_true",
         help="allow create below the provisioning floor, but never below the emergency floor",
+    )
+    create.add_argument(
+        "--representation",
+        choices=("config", *SLOT_REPRESENTATIONS),
+        default="config",
+        help=(
+            "how this slot is stored: worktree (plain directories on the host), image (the "
+            "slot directory is the mount point of one sparse ext4 disk image under "
+            "<control>/slot-images/), or config (the configured slot_representation; "
+            "default). The choice is recorded per slot and never changes lifecycle policy"
+        ),
     )
     create.add_argument("--format", choices=("human", "json"), default="human")
     create.set_defaults(handler=_cmd_create)
@@ -37093,6 +37428,7 @@ usage or audit gate unknown, 3 fail-closed refusal.
         ),
     )
     recover.set_defaults(handler=_cmd_recover)
+    imagecmd.register(subparsers, _HelpFormatter)
     return parser
 
 

@@ -617,6 +617,157 @@ wrkslots recover-ownerless-agent-cache --apply --coordinator-authorized \
 This command accepts no arbitrary path, refuses symlinks, mounts, `.git`, `HANDOFF.md`, unexpected
 top-level content, live use, or an occupied destination, and journals the same-inode relocation.
 
+## Disk-image slots
+
+A slot can be stored in one of two representations, chosen per slot when it is created:
+
+- `worktree`: plain directories. Checkouts, caches, and build outputs are ordinary directories
+  on the host file system.
+- `image`: the slot directory is the mount point of one sparse ext4 image file. The host sees a
+  fixed handful of files per slot, however many files the agent creates inside it:
+
+  ```text
+  <control>/slot-images/<slot-type>/<slot>/
+      IMAGE.json   representation record (location, backend, ceiling)
+      slot.img     sparse ext4 image mounted at the slot directory
+      state.img    sparse ext4 image for the sandbox's private HOME and /tmp
+      state/       mount point of state.img
+  ```
+
+Why this helps: a slot's millions of small build files become metadata inside the image instead of
+metadata of the host file system. A runaway writer fills its own image and gets "no space left on
+device" instead of filling the host. Reclaim unmounts and deletes one file instead of walking a
+tree.
+
+Representation is a storage choice only. Ownership, heartbeats, salvage, handoffs, and reclaim
+are identical for both. Git linked worktrees are still used; only the checkout files and anything
+written below the slot live in the image. The Git common directory stays where it was.
+
+### Choosing the representation
+
+`init` writes `slot_representation: image` for a new project. Rerunning `init` on an existing
+project keeps what it has, and a configuration without the key means `worktree`, so upgrading
+wrkslots never converts a live project. Change the default for future slots with:
+
+```sh
+wrkslots image set-default image      # or: worktree
+```
+
+`create --representation worktree|image` overrides the default for one slot. Existing slots keep
+their representation; `wrkslots image convert SLOT --to image|worktree` migrates one idle slot in
+place (below).
+
+### Sizing: a ceiling, not a reservation
+
+Images are sparse and are never pre-allocated. `configuration.image.ceiling_bytes` (default
+512 GiB; set with `init --image-ceiling-gib`) is only the largest the slot may grow. A fresh
+image costs about 70 MiB of host space (the ext4 journal and metadata). Deleted files return
+their blocks to the host: kernel mounts use online discard, FUSE mounts return them on
+`wrkslots image trim` or unmount. `wrkslots image grow SLOT --ceiling-gib N` raises a ceiling
+without copying anything.
+
+Host-wide space is still finite. Watch it with `wrkslots image status`, which reports each image's
+host-allocated bytes, bytes used inside it, and inode count.
+
+### Mounting without host configuration
+
+Nothing is written to host configuration; mounts are created and removed by wrkslots itself.
+`configuration.image.backend` selects how:
+
+| Backend | Mechanism | Needs | Trade-off |
+|---|---|---|---|
+| `kernel` | `sudo -n mount -o loop,discard` | passwordless sudo | native speed |
+| `fuse` | `fuse2fs` as the invoking user, in a transient user service | `/dev/fuse`, `fuse2fs` | no privilege; metadata-heavy work is about ten times slower |
+| `auto` (default) | `kernel` when `sudo -n true` works, else `fuse` | either | |
+
+`WRKSLOTS_IMAGE_BACKEND` overrides the choice for one command. Every wrkslots command first
+mounts any image-backed slot whose image is not mounted (after a reboot, for example), at the
+location its `IMAGE.json` records, so lifecycle logic always sees the slot content. A slot's own
+image mount is not treated as a process using the slot.
+
+A mount point cannot be renamed, so the path fence that removal uses unmounts the image, renames
+the empty mount point, and mounts the image again at the fenced path. The unmount refuses while
+anything still uses the file system, which is the same refusal the fence already expects.
+
+### Converting an existing slot in place
+
+```sh
+wrkslots image convert slot07 --to image       # plain directories -> image
+wrkslots image convert slot07 --to worktree    # image -> plain directories
+```
+
+Conversion refuses while any process has files open in the slot or works inside it (an idle
+agent may stay registered). It copies the content, proves the copy matches file by file (path,
+type, size, mode, and modification time), swaps it in at the same path, and re-verifies every
+checkout's Git identity. The branch, registry record, and path are unchanged. `--keep-original`
+keeps the pre-conversion copy for inspection. Converting to `worktree` discards the sandbox state
+image (private HOME and /tmp contents).
+
+## Running commands and agents inside a slot's box
+
+`wrkslots run SLOT -- COMMAND` runs COMMAND boxed to one slot. It needs no root and works for
+both representations:
+
+- **Limits.** COMMAND runs in a transient systemd user scope inside the slot's own slice,
+  `wrkslots-<slot>.slice`, below `wrkslots.slice`. Memory, CPU, task, and IO limits
+  (`--memory-max`, `--memory-high`, `--cpu-quota`, `--tasks-max`, or `configuration.sandbox`)
+  apply to the slice, so every command run against the slot shares one budget. When the caller
+  is already inside a slice (for example a harness's own sandbox slice), the slot's slices are
+  created inside that slice instead: wrkslots never moves a process out of an enclosing slice.
+- **Process tree.** The scope is created for the running process itself, which then execs
+  COMMAND, so the PID does not change and COMMAND stays a child of the caller. A terminal
+  multiplexer that only starts agents in a pane whose own shell is at its prompt keeps working.
+- **File-system view** (`--isolation namespace`, the default). COMMAND enters a new user and
+  mount namespace with the current user mapped to itself. With `protect_system` (default) every
+  mount becomes read-only except the slot, its private state, the Git common directories its
+  checkouts commit into, the wrkslots control directory, `/proc`, `/sys`, `/dev`, and
+  `/run/user`. `/tmp` is the slot's private `tmp`.
+- **HOME policy** (`--home`). `$HOME` inside the box is a private, persistent, per-slot
+  directory:
+  - `ro` (default) exposes every top-level entry of the real `$HOME`: directories as read-only
+    bind mounts, files up to 1 MiB as private copies made once. Tools in `~/bin` keep working,
+    and a tool that atomically rewrites a top-level dotfile writes its private copy. The host's
+    `$HOME` is never modified.
+  - `select` exposes only the `--home-path` entries (for example `bin`, `.local/bin`).
+  - `none` exposes nothing from `$HOME`.
+
+  In every mode the `home_writable` directories (default `.cache`, `.buck`, `.local/state`) are
+  private and writable per slot, and the `home_shared` paths (default: agent harness state such
+  as `.claude` and `.codex`) stay shared with the host and writable so an agent keeps its login
+  and transcripts.
+
+`--isolation cgroup` applies the limits without the namespace. Use it for programs that must run
+setuid helpers, which cannot gain privilege inside a user namespace: `sudo`, or a harness
+launcher that enters its own sandbox through one. Such a harness brings its own file-system jail.
+
+`wrkslots run SLOT --print -- COMMAND` shows the scope, slice limits, and helper command without
+running anything. The network is not changed.
+
+### Starting an agent in a slot
+
+`wrkslots shell-command SLOT [--isolation MODE] [--format json]` prints one exec-only command
+line that replaces an interactive shell with `wrkslots run SLOT -- $SHELL -i` (and, with
+`--format json`, the slot directory). An agent launcher runs it in a fresh terminal pane, waits
+until the pane's own shell PID is again the foreground shell inside a wrkslots slice, registers
+the slot directory as the agent's working directory, and then starts the harness, so the agent
+and everything it runs stay in the slot's box.
+
+### Builds with a shared action cache
+
+A build tool whose outputs are materialized on demand keeps only the final outputs in the slot.
+For example, Buck2 with `materializations = deferred` and remote execution or a remote action
+cache: intermediates stay in the cache, outside every slot, and a second slot building the same
+targets gets cache hits without downloading intermediates. The daemon's own state (`~/.buck`) is
+one of the private `home_writable` directories. Without a remote cache, every intermediate
+output is written inside the slot's image.
+
+### The machine-wide guard
+
+`wrkslots limits apply --memory-fraction 0.8 --cpu-fraction 0.9` applies runtime (reboot-cleared)
+ceilings to the user's whole `user-UID.slice` through `sudo -n systemctl set-property --runtime`,
+so every process the user runs shares one outer bound, including agents that a harness moves
+into a slice of its own. `wrkslots limits show` prints the current values; `clear` removes them.
+
 ## Recovery and compatibility views
 
 Every mutation appends a numbered, hash-linked JSON event before refreshing the readable ACTIVE,

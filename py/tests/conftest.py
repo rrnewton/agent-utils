@@ -115,3 +115,9 @@ def _no_ambient_operator_build_width(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(BUILD_JOBS_ENV, raising=False)
     monkeypatch.delenv(OPERATOR_BUILD_JOBS_ENV, raising=False)
     monkeypatch.setattr("dagrun.sizing._OPERATOR_BUILD_JOBS", None)
+
+# New wrkslots projects created by these tests use plain worktrees; disk-image
+# slots have their own tests under wrkslots/tests.
+import os as _os  # noqa: E402
+
+_os.environ.setdefault("WRKSLOTS_INIT_REPRESENTATION", "worktree")

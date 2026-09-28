@@ -29,6 +29,15 @@ use crate::{canonical_sha256, read_index, rebuild_index, replay};
 
 static SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// A `python3` command for driving the Python wrkslots oracle. These tests
+/// exercise plain-worktree projects; new Python projects otherwise default to
+/// disk-image slots, whose mounts the scratch-directory cleanup cannot remove.
+fn python_command() -> Command {
+    let mut command = Command::new("python3");
+    command.env("WRKSLOTS_INIT_REPRESENTATION", "worktree");
+    command
+}
+
 struct Scratch(PathBuf);
 
 impl Scratch {
@@ -309,7 +318,7 @@ fn python_event_oracle(events: &Path, body: &str) -> std::process::Output {
         .parent()
         .and_then(Path::parent)
         .expect("fixture project root");
-    Command::new("python3")
+    python_command()
         .arg("-c")
         .arg(format!("{PYTHON_EVENT_ORACLE_PRELUDE}{body}"))
         .arg(repository.join("py"))
@@ -410,7 +419,7 @@ row, _running = w._audit_record(
 )
 print(row['verdict'])
 "#;
-    Command::new("python3")
+    python_command()
         .arg("-c")
         .arg(script)
         .arg(repository.join("py"))
@@ -475,7 +484,7 @@ print(json.dumps({
     'journal_sha256': hashlib.sha256(canonical.encode('utf-8')).hexdigest(),
 }, sort_keys=True, separators=(',', ':')))
 "#;
-    Command::new("python3")
+    python_command()
         .arg("-c")
         .arg(script)
         .arg(repository.join("py"))
@@ -515,7 +524,7 @@ print(json.dumps({
     'slot': journal['slot'],
 }, sort_keys=True, separators=(',', ':')))
 "#;
-    Command::new("python3")
+    python_command()
         .arg("-c")
         .arg(script)
         .arg(repository.join("py"))
@@ -620,7 +629,7 @@ print(json.dumps({
     'event_kinds': kinds,
 }, sort_keys=True, separators=(',', ':')))
 "#;
-    Command::new("python3")
+    python_command()
         .arg("-c")
         .arg(script)
         .arg(repository.join("py"))
@@ -741,7 +750,7 @@ print(json.dumps({
     'slot': journal['slot'],
 }, sort_keys=True, separators=(',', ':')))
 "#;
-    Command::new("python3")
+    python_command()
         .arg("-c")
         .arg(script)
         .arg(repository.join("py"))
@@ -765,7 +774,7 @@ print(json.dumps({
     'sha256': hashlib.sha256(canonical.encode('utf-8')).hexdigest(),
 }))
 "#;
-    let output = Command::new("python3")
+    let output = python_command()
         .arg("-c")
         .arg(script)
         .arg(source)
@@ -809,7 +818,7 @@ print(json.dumps([
 ], separators=(',', ':')))
 "#;
     let encoded = serde_json::to_string(values).expect("encode timestamp instants");
-    let mut child = Command::new("python3")
+    let mut child = python_command()
         .arg("-c")
         .arg(script)
         .arg(repository.join("py"))
@@ -856,7 +865,7 @@ for value in json.load(sys.stdin):
 print(json.dumps(results, separators=(',', ':')))
 "#;
     let encoded = serde_json::to_string(values).expect("encode timestamp matrix");
-    let mut child = Command::new("python3")
+    let mut child = python_command()
         .arg("-c")
         .arg(script)
         .arg(repository.join("py"))
@@ -6614,7 +6623,7 @@ print(json.dumps({
     'active_slots': sorted(record.slot for record in active.slots),
 }, sort_keys=True, separators=(',', ':')))
 "#;
-    Command::new("python3")
+    python_command()
         .arg("-c")
         .arg(script)
         .arg(repository.join("py"))

@@ -455,6 +455,50 @@ Sources:
 - [finalizers](https://kubernetes.io/docs/concepts/overview/working-with-objects/finalizers/)
 - [Lease objects](https://kubernetes.io/docs/concepts/architecture/leases/)
 
+## Slot storage and sandboxing
+
+`wrkslots` added two things that the lifecycle comparison above does not cover: storing a slot as
+one disk image, and running a command or agent boxed to one slot. The public systems below solve
+parts of this; none combines per-slot storage bounds, per-slot resource limits, and lifecycle
+authority without root or host configuration.
+
+| System | File-system confinement | Resource limits | Storage bound per workspace | Needs root or host setup |
+|---|---|---|---|---|
+| bubblewrap | user + mount namespaces, bind mounts | none (delegates to caller) | none | no (unprivileged user namespaces) |
+| Claude Code sandbox runtime | bubblewrap on Linux, Seatbelt on macOS, around shell commands | none | none | no |
+| Codex CLI sandbox | Landlock + seccomp, or bubblewrap, with read-only/workspace-write/full modes | none | none | no |
+| OpenCode | per-tool allow/ask/deny permission rules; no OS sandbox | none | none | no |
+| systemd-run / systemd-nspawn | nspawn: full container; `systemd-run --user`: mount properties need `PrivateUsers` | cgroup properties on units and slices | none | nspawn needs root |
+| Podman (rootless) | full OCI container | cgroup v2 when delegated | image layers; volume quotas need XFS project quotas | subordinate UID ranges configured by root |
+| Dev Containers / Codespaces | container per workspace | container runtime limits | container disk | container runtime or cloud VM |
+| btrfs subvolume + qgroup | none | none | yes, but quotas account every change on the whole file system | root to delete subvolumes and to enable quotas |
+
+What `wrkslots` takes from them:
+
+- **bubblewrap's model** — a fresh user and mount namespace, read-only binds of the host, writable
+  binds of exactly what the task owns — implemented directly so it works where bubblewrap is not
+  installed, and extended with a private per-slot `$HOME` that seeds copies of top-level dotfiles.
+- **Harness sandboxes confine commands, not budgets.** The Claude Code and Codex sandboxes decide
+  where a command may write and connect; neither bounds memory, CPU, processes, or bytes at rest,
+  and neither reclaims anything. `wrkslots run` adds those per slot and leaves the network and the
+  harness's own sandbox alone, so the two compose.
+- **systemd slices as the budget unit**, as `systemd-run` offers, with the slot's slice nested
+  inside whatever slice the caller is already in so a caller's enclosing policy is never escaped.
+- **Images instead of quotas.** btrfs qgroups bound a subvolume's bytes but make every write on
+  the host file system pay for quota accounting, and deleting a subvolume needs root. A sparse
+  ext4 image bounds bytes and inodes per slot, confines metadata growth to the image, and is
+  reclaimed by deleting one file. Its mount is created and removed by wrkslots through `sudo -n`
+  or unprivileged FUSE (`fuse2fs`), so no host configuration is required.
+
+Sources:
+
+- [bubblewrap](https://github.com/containers/bubblewrap)
+- [Claude Code sandbox runtime](https://github.com/anthropic-experimental/sandbox-runtime)
+- [Codex sandboxing](https://github.com/openai/codex/blob/main/docs/sandbox.md)
+- [OpenCode permissions](https://opencode.ai/docs/permissions/)
+- [systemd.resource-control](https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html)
+- [fuse2fs](https://man7.org/linux/man-pages/man1/fuse2fs.1.html)
+
 ## Design lessons for wrkslots
 
 The comparison narrows what wrkslots should implement:

@@ -778,6 +778,44 @@ class HerdrClient:
         """Close one explicitly owned tab, without closing its shared workspace."""
         self._call_ok(["tab", "close", tab_id], f"tab close {tab_id}")
 
+    def enter_slot_sandbox(self, pane_id: str, command_line: str, *, timeout: float = 30.0) -> int:
+        """Replace a fresh pane's shell with a slot-boxed shell; return its PID.
+
+        ``command_line`` comes from the slot manager's ``shell-command`` and execs
+        at every step, so the boxed interactive shell keeps the pane's shell PID.
+        Readiness is proven from kernel state, not screen text: the pane's own
+        shell PID is the sole foreground process, it is a shell again, and its
+        cgroup is a slot slice.
+        """
+        if not 0 < timeout <= 300:
+            raise ValueError("slot sandbox timeout must be between 0 and 300 seconds")
+        self._call_ok(["pane", "run", pane_id, command_line], f"pane run wrkslots sandbox {pane_id}")
+        deadline = time.monotonic() + timeout
+        shells = {"bash", "zsh", "sh", "fish", "dash", "ksh"}
+        while time.monotonic() < deadline:
+            try:
+                info = self.process_info(pane_id)
+            except HerdrUnavailable:
+                # A process mid-exec can briefly report no argv; retry.
+                self._sleep(0.05)
+                continue
+            pids = {entry[0] for entry in info.foreground}
+            names = {os.path.basename(entry[3]) for entry in info.foreground}
+            if pids == {info.shell_pid} and names & shells:
+                try:
+                    with open(f"/proc/{info.shell_pid}/cgroup", encoding="utf-8") as stream:
+                        cgroup = stream.read()
+                except OSError:
+                    cgroup = ""
+                if "wrkslots" in cgroup:
+                    self._sleep(0.3)  # let the new shell draw its prompt
+                    return info.shell_pid
+            self._sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+        raise HerdrUnavailable(
+            f"pane {pane_id} did not return to a wrkslots-boxed shell within {timeout:g}s; "
+            "inspect the pane for the wrkslots error"
+        )
+
     def start_agent(
         self, name: str, kind: str, pane_id: str, arguments: Sequence[str] = (),
         *, timeout: float = 30.0,
