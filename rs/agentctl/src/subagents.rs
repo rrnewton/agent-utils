@@ -1852,9 +1852,8 @@ fn wrkslots_executable() -> Option<PathBuf> {
 /// Ask the slot manager for the exec-only command line that boxes a pane shell.
 ///
 /// Returns the command line and the slot directory, which becomes the agent's
-/// working directory. Mirrors the Python edition: `wrkslots [--project-root DIR]
-/// shell-command SLOT [--isolation MODE] --format json`, run in `project`, bounded
-/// at 60 seconds.
+/// working directory. Runs `wrkslots [--project-root DIR] shell-command SLOT
+/// [--isolation MODE] --format json` in `project`, bounded at 60 seconds.
 pub fn slot_shell_command(launch: &SlotLaunch, project: &Path) -> Result<(String, PathBuf)> {
     if let Some(isolation) = launch.isolation.as_deref() {
         if !SLOT_ISOLATIONS.contains(&isolation) {

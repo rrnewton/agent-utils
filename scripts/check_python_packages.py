@@ -161,6 +161,9 @@ PROJECTS: tuple[Project, ...] = (
                    "AGENT_USER_GUIDE.md", "FOREIGN_USER_GUIDE.md", "CHAT_USER_GUIDE.md",
                    "AGENTCTL_SKILL.md"),
         required_dependencies=(),
+        # `start --slot` runs the wrkslots command-line tool (an executable found on PATH,
+        # never an import), so the guide must name it.
+        sibling_package_exemptions=("wrkslots",),
         command_userguides=(("herdr-agent", "USER_GUIDE.md"),
                            ("herdr-subagents", "USER_GUIDE.md"), ("herdr-chat", "CHAT_USER_GUIDE.md")),
         package_owned_docs=True,
