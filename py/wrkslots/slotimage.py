@@ -73,6 +73,25 @@ class ImageSettings:
     backend: str = "auto"
 
 
+#: The comment written above each ``image`` key in a literate configuration.
+IMAGE_DOCS: dict[str, str] = {
+    "ceiling_bytes": (
+        f"Apparent size of each new slot image in bytes (default "
+        f"{DEFAULT_CEILING_BYTES // 1024**3} GiB). Images are sparse: an upper bound, not a "
+        "reservation. Raise one slot later with `wrkslots image grow`."
+    ),
+    "state_ceiling_bytes": (
+        f"Apparent size of each slot's state image (its private $HOME layer) in bytes "
+        f"(default {DEFAULT_STATE_CEILING_BYTES // 1024**3} GiB)."
+    ),
+    "backend": (
+        "How slot images are mounted: kernel (sudo -n mount -o loop), fuse (fuse2fs, no "
+        "privilege, slower for metadata-heavy work), or auto (default: kernel when sudo -n "
+        "works, else fuse)."
+    ),
+}
+
+
 @dataclasses.dataclass(frozen=True)
 class SlotImage:
     """One slot's image directory and its durable representation record."""

@@ -51,6 +51,39 @@ type, task and purpose, owner process identity, coordinator history, heartbeat t
 Run `wrkslots quickstart` for copyable commands and `wrkslots COMMAND --help` for exact effects and
 inputs.
 
+## Configuration file
+
+`init` writes `.wrkslots.yml` at the project root as literate YAML: a header saying what the file
+is, and a comment above every key explaining it, including the `sandbox` and `image` sections.
+Optional keys that are absent keep their documented meaning, and the file ends with a list of
+them.
+
+The reader accepts a strict YAML subset and refuses anything else with the file and line:
+
+- accepted: full-line and trailing comments, block mappings nested by space indentation, block
+  sequences (of scalars, of one-line flow collections, and of mappings), one-line flow sequences
+  and mappings (`[a, b]`, `{}`), `null`/`~`, `true`/`false`, integers, floats, double-quoted
+  strings with JSON escapes, single-quoted strings, and one-line plain strings;
+- refused: tab indentation, anchors, aliases, tags, directives, block scalars (`|`, `>`),
+  multi-line plain or flow values, complex keys, several documents, and duplicate keys.
+
+`yes` and `no` are strings, as in YAML 1.2, so `protect_system: yes` is refused rather than read as
+true. A file whose first non-blank character is `{` is JSON, the format projects created before
+YAML support use. Every command reads both formats through one loader, with the same strict key
+validation.
+
+Commands that rewrite the file (`init --repair`, `sandbox write-defaults`, `image set-default`,
+`config convert`) keep its format: a JSON file stays JSON, and a YAML file is rewritten in the
+canonical literate form. **Hand-written comments are not kept.** The previous bytes are saved to
+`.wrkslots.yml.bak` first. Convert an existing project, or regenerate the comments after an upgrade,
+with:
+
+```sh
+wrkslots config convert --to yaml      # or: --to json
+```
+
+`init --config-format json` still creates a JSON file.
+
 ## Coordinator assignment and creation
 
 `create`, `register`, and `import-existing --apply` require both `--slot-type` and
@@ -797,26 +830,28 @@ configuration. An existing project keeps what it has; `wrkslots sandbox write-de
 missing key (and missing `limits` key) without changing present keys or anything else.
 `wrkslots sandbox show-config` prints the effective settings as JSON. Unknown keys are refused.
 
-```json
-"sandbox": {
-  "isolation": "userns",
-  "home": "ro",
-  "home_shared": [".claude", ".codex", ".muse", ".config/muse", ".config/opencode",
-                  ".local/share/opencode", ".local/state/herdr", ".local/share/muse"],
-  "home_private": [".cache", ".buck"],
-  "home_private_files": [".claude.json"],
-  "home_hidden": [".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker/config.json", ".netrc",
-                  ".git-credentials", ".pgpass", ".arcrc", ".config/gh/hosts.yml", ".config/gcloud"],
-  "home_expose": ["bin", ".local/bin"],
-  "outputs": ["ai_docs", "experiments"],
-  "read_write": [],
-  "env": {},
-  "tmp_size": "16G",
-  "protect_system": true,
-  "limits": {"memory_max": null, "memory_high": null, "cpu_quota": null, "tasks_max": 8192,
-             "io_weight": null, "all_slots_memory_max": null, "all_slots_cpu_quota": null}
-}
+```yaml
+sandbox:
+  isolation: userns
+  home: ro
+  home_shared: [.claude, .codex, .muse, .config/muse, .config/opencode, .local/share/opencode,
+                .local/state/herdr, .local/share/muse]
+  home_private: [.cache, .buck]
+  home_private_files: [.claude.json]
+  home_hidden: [.ssh, .gnupg, .aws, .azure, .kube, .docker/config.json, .netrc, .git-credentials,
+                .pgpass, .arcrc, .config/gh/hosts.yml, .config/gcloud]
+  home_expose: [bin, .local/bin]
+  outputs: [ai_docs, experiments]
+  read_write: []
+  env: {}
+  tmp_size: 16G
+  protect_system: true
+  limits: {memory_max: null, memory_high: null, cpu_quota: null, tasks_max: 8192,
+           io_weight: null, all_slots_memory_max: null, all_slots_cpu_quota: null}
 ```
+
+This is the shape only: in the file, each list is written one item per line with a comment above
+every key, because the reader does not accept a flow collection spanning lines.
 
 Per-run options override it: `--isolation`, `--home`, `--tmp-size`, `--env NAME=VALUE`,
 `--no-protect-system`, and the limit options replace values; `--home-shared`, `--home-private`,

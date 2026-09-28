@@ -45,7 +45,8 @@ worktrees/
 
 Control files remain beside `slots/`, never inside it. Flat layout permits exactly one repository
 per slot. The default nested layout remains `<worktrees-dir>/<slot>/<repo-name>/` and supports
-multiple repositories. Despite its historical suffix, `.wrkslots.yml` contains JSON. The
+multiple repositories. `.wrkslots.yml` is literate YAML (a strict subset; older projects may hold
+JSON, which is read the same way; `wrkslots config convert --to yaml` converts). The
 corresponding policy keys are `cache_globs`, `repo_cache_globs`, `post_provision_hooks`,
 `disk_advisory_bytes`, `disk_provisioning_floor_bytes`, and `disk_emergency_bytes`; configure all
 three disk thresholds or none. A global `--cache-glob PATH` applies to every checkout. For a

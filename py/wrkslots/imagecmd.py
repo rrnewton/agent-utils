@@ -104,7 +104,9 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser], fo
         help="choose the representation for slots created from now on",
         description=(
             "Change configuration.slot_representation. Only slots created afterwards are "
-            "affected; existing slots keep their representation (convert them explicitly)."
+            "affected; existing slots keep their representation (convert them explicitly). The "
+            "configuration keeps its format (literate YAML is regenerated; JSON stays JSON) and "
+            "the previous bytes are saved to .wrkslots.yml.bak."
         ),
         formatter_class=formatter,
     )
@@ -285,7 +287,9 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser], fo
         description=(
             "Write each missing configuration.sandbox key (and missing limits key) with its "
             "default value. Present keys, and every other configuration key, are left as they "
-            "are; the result is validated before it is written."
+            "are; the result is validated before it is written. A YAML file is rewritten in the "
+            "canonical literate form (hand-written comments are regenerated) and a JSON file "
+            "stays JSON; the previous bytes are saved to .wrkslots.yml.bak."
         ),
         formatter_class=formatter,
     )
@@ -501,13 +505,13 @@ def _cmd_image_set_default(args: argparse.Namespace) -> int:
 
     config = _config(args)
     with cli._locked_config(config.config_path, args.wait_lock):
-        raw = cli._as_mapping(cli._read_json(config.config_path, "configuration"), "configuration")
+        raw = cli._read_config(config.config_path)
         updated = dict(raw)
         if args.representation == "worktree":
             updated.pop("slot_representation", None)
         else:
             updated["slot_representation"] = args.representation
-        cli._atomic_write_json(config.config_path, updated)
+        cli._write_config(config.config_path, updated)
     print(
         f"new slots will use the {args.representation} representation; "
         "existing slots are unchanged (see `wrkslots image convert`)"
@@ -691,7 +695,7 @@ def _cmd_sandbox_write_defaults(args: argparse.Namespace) -> int:
 
     config = _config(args)
     with cli._locked_config(config.config_path, args.wait_lock):
-        raw = cli._as_mapping(cli._read_json(config.config_path, "configuration"), "configuration")
+        raw = cli._read_config(config.config_path)
         existing = raw.get("sandbox", {})
         if not isinstance(existing, dict):
             raise _refuse("configuration.sandbox must be an object")
@@ -702,7 +706,7 @@ def _cmd_sandbox_write_defaults(args: argparse.Namespace) -> int:
         if added:
             updated = dict(raw)
             updated["sandbox"] = merged
-            cli._atomic_write_json(config.config_path, updated)
+            cli._write_config(config.config_path, updated)
     if added:
         print(f"added to configuration.sandbox in {config.config_path}: {', '.join(added)}")
     else:

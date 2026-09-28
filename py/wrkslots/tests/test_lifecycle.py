@@ -41,6 +41,7 @@ WRKSLOTS = PACKAGE_ROOT / "__main__.py"
 COMPATIBILITY_COMMAND = PY_ROOT / "wrkslots.py"
 sys.path.insert(0, str(PY_ROOT))
 from wrkslots import cli as wrkslots  # noqa: E402
+from wrkslots import yamlconfig  # noqa: E402
 
 
 SYSTEM_GIT = Path("/usr/bin/git")
@@ -1505,12 +1506,15 @@ def test_import_dry_run_preserves_cross_shard_read_only_inspection(
     assert active_slots(project, stale_machine) == []
 
 
-def configuration(project: Path) -> dict[str, object]:
-    value: object = json.loads(
-        (project / ".wrkslots.yml").read_text(encoding="utf-8")
-    )
+def read_config_file(path: Path) -> dict[str, object]:
+    """Decode a configuration file in either supported format (YAML subset or JSON)."""
+    value, _format = yamlconfig.load_document(path.read_text(encoding="utf-8"))
     assert isinstance(value, dict)
     return value
+
+
+def configuration(project: Path) -> dict[str, object]:
+    return read_config_file(project / ".wrkslots.yml")
 
 
 def update_configuration(project: Path, **updates: object) -> None:
@@ -3461,7 +3465,7 @@ def test_init_is_idempotent_and_installs_relative_symlink(tmp_path: Path) -> Non
     assert link.is_symlink()
     assert not Path(os.readlink(link)).is_absolute()
     assert link.resolve() == WRKSLOTS.resolve()
-    config = json.loads((project / ".wrkslots.yml").read_text(encoding="utf-8"))
+    config = read_config_file(project / ".wrkslots.yml")
     assert config["machine"] == "testhost"
     assert config["worktrees_dir"] == "opaque"
 
@@ -23919,7 +23923,7 @@ def test_init_recovers_complete_configuration_temp_without_durable_target(
 
     assert config_path.is_file()
     assert not temp.exists()
-    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config = read_config_file(config_path)
     assert config["liveness_command"] == "liveness.py"
 
 
@@ -23929,7 +23933,7 @@ def test_init_records_optional_batch_liveness_command(tmp_path: Path) -> None:
 
     initialize(project, liveness_batch=True)
 
-    config = json.loads((project / ".wrkslots.yml").read_text(encoding="utf-8"))
+    config = read_config_file(project / ".wrkslots.yml")
     assert config["liveness_command"] == "liveness.py"
     assert config["liveness_batch_command"] == "liveness-batch.py"
 
@@ -24243,7 +24247,7 @@ def test_configuration_from_an_older_build_is_dead_until_repaired(
     """
     project, _repository, _remote = make_project(tmp_path)
     config_path = project / ".wrkslots.yml"
-    stale = json.loads(config_path.read_text(encoding="utf-8"))
+    stale = read_config_file(config_path)
     del stale["liveness_command"]
     stale["schema"] = 1
     config_path.write_text(json.dumps(stale, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -24260,7 +24264,7 @@ def test_configuration_from_an_older_build_is_dead_until_repaired(
 
     healthy = command(project, "status", "--all-machines")
     assert healthy.returncode == 0, healthy.stderr
-    current = json.loads(config_path.read_text(encoding="utf-8"))
+    current = read_config_file(config_path)
     assert current["schema"] == wrkslots.SCHEMA
     assert current["liveness_command"] == "liveness.py"
     # Repair must not have disturbed anything else.
@@ -24386,7 +24390,7 @@ def test_repair_refuses_to_relocate_live_state_and_lists_every_conflict(
     """Repair adds missing fields; it must never redirect the tool elsewhere."""
     project, _repository, _remote = make_project(tmp_path)
     config_path = project / ".wrkslots.yml"
-    stale = json.loads(config_path.read_text(encoding="utf-8"))
+    stale = read_config_file(config_path)
     before = dict(stale)
     stale["worktrees_dir"] = "somewhere-else"
     stale["default_remote"] = "upstream"
@@ -24398,7 +24402,7 @@ def test_repair_refuses_to_relocate_live_state_and_lists_every_conflict(
     assert "worktrees_dir" in refused.stderr
     # Every conflict at once, not one per run.
     assert "default_remote" in refused.stderr
-    unchanged = json.loads(config_path.read_text(encoding="utf-8"))
+    unchanged = read_config_file(config_path)
     assert unchanged["worktrees_dir"] == "somewhere-else"
     assert unchanged["default_remote"] == "upstream"
     assert before["worktrees_dir"] != unchanged["worktrees_dir"]
@@ -24423,7 +24427,7 @@ def test_repair_never_reinterprets_implicit_nested_layout_as_flat(
 def test_init_treats_explicit_optional_defaults_as_idempotent(tmp_path: Path) -> None:
     project, _repository, _remote = make_project(tmp_path)
     config_path = project / ".wrkslots.yml"
-    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config = read_config_file(config_path)
     config["layout"] = "nested"
     config["cache_globs"] = []
     config["post_provision_hooks"] = []
@@ -24463,7 +24467,7 @@ def test_active_slot_cap_refuses_the_allocation_that_would_breach_it(
 def test_absent_cap_means_uncapped_and_init_stays_idempotent(tmp_path: Path) -> None:
     """Absent must keep meaning "no cap", or every pre-existing config changes."""
     project, _repository, _remote = make_project(tmp_path)
-    config = json.loads((project / ".wrkslots.yml").read_text(encoding="utf-8"))
+    config = read_config_file(project / ".wrkslots.yml")
     assert "max_active_slots" not in config
 
     assert create(project, slot="slot01", agent="codex-1", branch="codex/one").returncode == 0
@@ -27401,7 +27405,7 @@ def test_cache_glob_with_redundant_relative_separators_is_canonicalized(
 
     initialize(project, cache_globs=(".//target",))
 
-    config = json.loads((project / ".wrkslots.yml").read_text(encoding="utf-8"))
+    config = read_config_file(project / ".wrkslots.yml")
     assert config["cache_globs"] == ["target"]
 
 

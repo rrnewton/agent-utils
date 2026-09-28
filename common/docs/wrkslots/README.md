@@ -54,6 +54,10 @@ wrkslots remove slot01 \
   --coordinator-pid "$CURRENT_COORDINATOR_PID" --expected-generation 1
 ```
 
+`init` writes `.wrkslots.yml` as literate YAML, with a comment above every key; the reader
+accepts a strict YAML subset and still reads the JSON files of older projects
+(`wrkslots config convert --to yaml` converts one). See the user guide's "Configuration file".
+
 Creation requires `--coordinator-authorized` as a readable reminder, not as a claimed permission
 boundary. The same-user processes can bypass any such convention. Removal accepts the flag as
 optional provenance. Recovery requires it only when starting a new direct cleanup of an

@@ -513,7 +513,7 @@ def test_wrkslots_run_boxes_a_plain_worktree_slot(box_base: Path) -> None:
 
     initialized = wrkslots("init", str(project), "--worktrees-dir", "worktrees", "--liveness-command", "liveness.py")
     assert initialized.returncode == 0, initialized.stderr
-    configuration = json.loads((project / ".wrkslots.yml").read_text(encoding="utf-8"))
+    configuration = cli._read_config(project / ".wrkslots.yml")
     assert configuration["sandbox"] == sandbox.default_config_obj()
     slot = f"box{os.getpid()}"
     created = wrkslots(

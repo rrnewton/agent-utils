@@ -51,13 +51,15 @@ printf '#!/usr/bin/env python3\nraise SystemExit(1)\n' > "$BASE/project/liveness
 chmod +x "$BASE/project/liveness.py"
 WRKSLOTS_INIT_REPRESENTATION=worktree python3 "$PYROOT/wrkslots/__main__.py" init "$BASE/project" --worktrees-dir worktrees \
   --liveness-command liveness.py >/dev/null
-python3 - "$BASE/project/.wrkslots.yml" <<'EOF'
-import json, os, sys
-path = sys.argv[1]
-config = json.load(open(path, encoding="utf-8"))
+PYTHONPATH="$PYROOT" python3 - "$BASE/project/.wrkslots.yml" <<'EOF'
+import os, sys
+from pathlib import Path
+from wrkslots import cli
+path = Path(sys.argv[1])
+config = dict(cli._read_config(path))
 extra = [line for line in os.environ.get("WRKSLOTS_ACCEPT_READ_WRITE", "").splitlines() if line.strip()]
-config["sandbox"].update({"isolation": "root", "read_write": extra})
-json.dump(config, open(path, "w", encoding="utf-8"), indent=2)
+config["sandbox"] = {**config["sandbox"], "isolation": "root", "read_write": extra}
+cli._write_config(path, config)
 EOF
 sleep 100000 & OWNER=$!
 W create acc --slot-type agent --coordinator-authorized --agent accept --task accept --purpose accept \

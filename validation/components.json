@@ -289,7 +289,8 @@
         "py/wrkslots/tests/test_scoped_journal_episodes.py",
         "py/wrkslots/tests/test_slot_images.py",
         "py/wrkslots/tests/test_tool_authority.py",
-        "py/wrkslots/tests/test_validate_batch_seal_ownership.py"
+        "py/wrkslots/tests/test_validate_batch_seal_ownership.py",
+        "py/wrkslots/tests/test_yamlconfig.py"
       ]
     },
     "wrkviz": {

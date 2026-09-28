@@ -35,10 +35,10 @@ import time
 import unicodedata
 import urllib.parse
 import uuid
-from collections.abc import Callable, Iterator, Mapping, Sequence, Set as AbstractSet
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Set as AbstractSet
 from pathlib import Path
 
-from wrkslots import __version__, imagecmd, sandbox, slotimage
+from wrkslots import __version__, imagecmd, sandbox, slotimage, yamlconfig
 
 VERSION = __version__
 SCHEMA = 2
@@ -354,6 +354,90 @@ OPTIONAL_CONFIG_KEYS = frozenset(
         "image",
         "sandbox",
     }
+)
+REQUIRED_CONFIG_KEYS = frozenset(
+    {
+        "schema",
+        "worktrees_dir",
+        "machine",
+        "default_remote",
+        "default_landed_ref",
+        "heartbeat_ttl_seconds",
+        "liveness_command",
+    }
+)
+#: The comment written above each top-level key in a literate configuration, in
+#: the order keys are written. Nested sections take their comments from the
+#: tables beside their own defaults (sandbox.SETTING_DOCS, slotimage.IMAGE_DOCS).
+CONFIG_KEY_DOCS: dict[str, str] = {
+    "schema": f"Configuration schema version ({SCHEMA}). Written by init; do not edit.",
+    "machine": (
+        "Machine shard name: state files are ACTIVE.<machine>.json and EVENTS.<machine>. "
+        "Defaults to the short host name at init; WRKSLOTS_MACHINE or --machine overrides it."
+    ),
+    "worktrees_dir": (
+        "Where slot directories live, relative to the project root. It says where live state "
+        "is: never change it while slots exist."
+    ),
+    "layout": (
+        "nested (default when absent): <worktrees_dir>/<slot>/<repo>/. flat: each slot "
+        "directory is its single checkout."
+    ),
+    "default_remote": (
+        "Remote whose landed ref decides whether published work is safe; `create --remote` "
+        "overrides it per checkout."
+    ),
+    "default_landed_ref": (
+        "Remote-tracking ref that counts as landed; must be under refs/remotes/<default_remote>/."
+    ),
+    "heartbeat_ttl_seconds": (
+        "Seconds a slot owner's heartbeat stays valid. Removal waits until the owner is proven "
+        "dead and this time-to-live has expired."
+    ),
+    "liveness_command": (
+        "Project-relative program run with the agent name. Exit 0: dead, 1: alive, 2: cannot "
+        "tell."
+    ),
+    "liveness_batch_command": (
+        "Project-relative batch liveness program (one wrkslots-liveness-batch-request/v1 JSON "
+        "request for many agents), used by audit on large registries."
+    ),
+    "max_active_slots": "Cap on active slots. Absent means uncapped.",
+    "cache_globs": "Slot-relative globs of regenerable caches that `clean-caches` may delete.",
+    "repo_cache_globs": "Per-repository cache globs: repository name to a list of globs.",
+    "post_provision_hooks": "Shell commands run, in order, in every new checkout.",
+    "disk_advisory_bytes": (
+        "Free-space level (bytes) below which create warns. The three disk_* keys are set "
+        "together and must satisfy emergency < provisioning floor < advisory."
+    ),
+    "disk_provisioning_floor_bytes": (
+        "Free-space level (bytes) below which create refuses unless --override-disk-floor is "
+        "given."
+    ),
+    "disk_emergency_bytes": "Free-space level (bytes) below which create always refuses.",
+    "slot_representation": (
+        "How NEW slots are stored: image (one sparse ext4 disk image per slot, mounted at the "
+        "slot directory) or worktree (plain directories; the meaning when absent). Existing "
+        "slots keep their representation: change this default with `wrkslots image "
+        "set-default`, and migrate one idle slot in place with `wrkslots image convert SLOT "
+        "--to image|worktree`."
+    ),
+    "image": "Settings for new disk-image slots; absent keys take their defaults.",
+    "sandbox": (
+        "Defaults for the slot box (`wrkslots run`, `wrkslots shell-command`, and agent "
+        "launchers). The box is the same for plain and image slots. `wrkslots sandbox "
+        "show-config` prints the effective values; `wrkslots sandbox write-defaults` adds "
+        "missing keys."
+    ),
+}
+CONFIG_HEADER = (
+    "wrkslots project configuration ({name}): where this project's agent and validation "
+    "slots live and how they are stored and boxed. The format is a strict YAML subset "
+    "(`wrkslots --userguide`, section \"Configuration file\"); a file whose first character "
+    "is {{ is read as JSON.\n"
+    "wrkslots rewrites this file with these comments regenerated (init --repair, sandbox "
+    "write-defaults, image set-default); hand-written comments are not kept, and the previous "
+    "bytes are saved to {name}.bak. Regenerate it with `wrkslots config convert --to yaml`."
 )
 # Fields `init --repair` may overwrite when the caller names a different value.
 # Everything else is refused, because a configuration says where live state
@@ -1241,6 +1325,107 @@ def _read_json(path: Path, label: str) -> object:
         raise StateError(f"{label} is malformed JSON: {exc}") from exc
     except OSError as exc:
         raise StateError(f"cannot read {label} {path}: {exc}") from exc
+
+
+def _read_config_document(path: Path, label: str = "configuration") -> tuple[Mapping[str, object], str]:
+    """Read a configuration file (YAML subset or JSON); return the mapping and its format.
+
+    The one reader for every configuration consumer, so a JSON and a YAML
+    configuration behave identically. Duplicate keys are refused in both.
+    """
+
+    _refuse_symlink(path, label)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise StateError(f"missing {label}: {path}") from exc
+    except (OSError, UnicodeError) as exc:
+        raise StateError(f"cannot read {label} {path}: {exc}") from exc
+    try:
+        value, fmt = yamlconfig.load_document(text)
+    except yamlconfig.YamlError as exc:
+        where = f"{path}:{exc.line}" if exc.line is not None else str(path)
+        raise StateError(f"{label} is malformed: {where}: {exc.reason}") from exc
+    if not isinstance(value, dict):
+        raise StateError(f"{label} must be a mapping: {path}")
+    return {str(key): item for key, item in value.items()}, fmt
+
+
+def _read_config(path: Path, label: str = "configuration") -> Mapping[str, object]:
+    return _read_config_document(path, label)[0]
+
+
+def _config_key_order(path: tuple[str, ...], keys: Iterable[str]) -> list[str]:
+    tables: dict[tuple[str, ...], Sequence[str]] = {
+        (): tuple(CONFIG_KEY_DOCS),
+        ("sandbox",): sandbox.SETTING_KEYS,
+        ("sandbox", "limits"): sandbox.LIMIT_KEYS,
+        ("image",): tuple(slotimage.IMAGE_DOCS),
+    }
+    known = tables.get(path)
+    names = list(keys)
+    if known is None:
+        return names
+    return [key for key in known if key in names] + sorted(key for key in names if key not in known)
+
+
+def config_comments() -> dict[tuple[str, ...], str]:
+    """Every documented configuration key path and the comment written above it."""
+
+    comments: dict[tuple[str, ...], str] = {(key,): text for key, text in CONFIG_KEY_DOCS.items()}
+    comments.update({("sandbox", key): text for key, text in sandbox.SETTING_DOCS.items()})
+    comments.update({("sandbox", "limits", key): text for key, text in sandbox.LIMIT_DOCS.items()})
+    comments.update({("image", key): text for key, text in slotimage.IMAGE_DOCS.items()})
+    return comments
+
+
+def render_config(payload: Mapping[str, object], fmt: str) -> str:
+    """Serialize a configuration: canonical literate YAML, or indented JSON."""
+
+    if fmt == "json":
+        return json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+    if fmt != "yaml":
+        raise ValueError(f"unknown configuration format {fmt!r}")
+    absent = [key for key in CONFIG_KEY_DOCS if key not in payload and key in OPTIONAL_CONFIG_KEYS]
+    footer = ""
+    if absent:
+        footer = "Optional keys not set here (absent keeps their documented meaning): " + ", ".join(absent) + "."
+    return yamlconfig.emit(
+        payload,
+        header=CONFIG_HEADER.format(name=CONFIG_NAME),
+        comments=config_comments(),
+        order=_config_key_order,
+        footer=footer,
+    )
+
+
+def _write_config(path: Path, payload: Mapping[str, object], fmt: str | None = None) -> None:
+    """Replace the configuration durably, keeping the previous bytes in ``<name>.bak``.
+
+    ``fmt`` None keeps an existing file's format (JSON stays JSON) and writes
+    literate YAML for a new file.
+    """
+
+    previous: bytes | None = None
+    if path.exists() or path.is_symlink():
+        _refuse_symlink(path, "configuration")
+        try:
+            previous = path.read_bytes()
+        except OSError as exc:
+            raise Refusal(f"cannot read configuration {path}: {exc}") from exc
+    if fmt is None:
+        fmt = "yaml" if previous is None else yamlconfig.detect_format(previous.decode("utf-8", "replace"))
+    text = render_config(payload, fmt)
+    if previous is not None:
+        if previous == text.encode("utf-8"):
+            return
+        backup = path.with_name(path.name + ".bak")
+        _refuse_symlink(backup, "configuration backup")
+        for stale in backup.parent.glob(f"{backup.name}.tmp.*"):
+            with contextlib.suppress(FileNotFoundError):
+                stale.unlink()
+        _atomic_write_bytes(backup, previous)
+    _atomic_write_bytes(path, text.encode("utf-8"))
 
 
 def _read_bounded_regular_file(path: Path, label: str, limit: int) -> bytes:
@@ -2746,10 +2931,8 @@ def _config_is_authoritative_candidate(root: Path, config_path: Path) -> bool:
     if config_path.is_symlink():
         return True
     try:
-        raw = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return True
-    if not isinstance(raw, dict):
+        raw = _read_config(config_path)
+    except StateError:
         return True
     worktrees_value = raw.get("worktrees_dir")
     layout_value = raw.get("layout", "nested")
@@ -2794,18 +2977,9 @@ def _discover_root(explicit: str | None) -> Path:
 def _load_config(explicit_root: str | None, machine_override: str | None) -> Config:
     root = _discover_root(explicit_root)
     path = root / CONFIG_NAME
-    raw = _as_mapping(_read_json(path, "configuration"), "configuration")
-    required = {
-        "schema",
-        "worktrees_dir",
-        "machine",
-        "default_remote",
-        "default_landed_ref",
-        "heartbeat_ttl_seconds",
-        "liveness_command",
-    }
+    raw = _read_config(path)
     try:
-        _exact_keys(raw, required, OPTIONAL_CONFIG_KEYS, "configuration")
+        _exact_keys(raw, set(REQUIRED_CONFIG_KEYS), OPTIONAL_CONFIG_KEYS, "configuration")
     except StateError as exc:
         # A configuration written by an older build is missing fields this build
         # requires. Without a repair path every command, including read-only
@@ -3156,11 +3330,9 @@ def _init_representation(
     existing: Mapping[str, object] | None = None
     if config_path.exists() and not config_path.is_symlink():
         try:
-            loaded: object = json.loads(config_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            loaded = None
-        if isinstance(loaded, dict):
-            existing = {str(key): value for key, value in loaded.items()}
+            existing = _read_config(config_path)
+        except StateError:
+            existing = None
     if args.slot_representation is not None:
         representation = str(args.slot_representation)
     elif existing is not None:
@@ -3201,11 +3373,12 @@ def _init_sandbox_section(config_path: Path) -> dict[str, object] | None:
     if not config_path.exists() and not config_path.is_symlink():
         return sandbox.default_config_obj()
     try:
-        loaded: object = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        loaded = _read_config(config_path)
+    except StateError:
         return None
-    if isinstance(loaded, dict) and isinstance(loaded.get("sandbox"), dict):
-        return {str(key): value for key, value in loaded["sandbox"].items()}
+    section = loaded.get("sandbox")
+    if isinstance(section, dict):
+        return {str(key): value for key, value in section.items()}
     return None
 
 
@@ -3621,6 +3794,11 @@ def _fsync_directory(directory: Path) -> None:
 
 
 def _atomic_write_json(path: Path, payload: object) -> None:
+    text = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+    _atomic_write_bytes(path, text.encode("utf-8"))
+
+
+def _atomic_write_bytes(path: Path, contents: bytes) -> None:
     _refuse_symlink(path, "state file")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -3640,9 +3818,8 @@ def _atomic_write_json(path: Path, payload: object) -> None:
     except OSError as exc:
         raise Refusal(f"cannot create temporary state file {temp}: {exc}") from exc
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", closefd=True) as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True, ensure_ascii=True)
-            handle.write("\n")
+        with os.fdopen(fd, "wb", closefd=True) as handle:
+            handle.write(contents)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp, path)
@@ -3768,7 +3945,7 @@ def _recover_config_write(path: Path, payload: object) -> None:
     if not leftovers:
         return
     if path.exists() or path.is_symlink():
-        existing = _as_mapping(_read_json(path, "configuration"), "configuration")
+        existing = _read_config(path)
         if dict(existing) != payload:
             raise StateError(
                 f"configuration temp file exists beside a different durable configuration: {leftovers[0]}"
@@ -3780,7 +3957,7 @@ def _recover_config_write(path: Path, payload: object) -> None:
     matching: list[Path] = []
     for leftover in leftovers:
         try:
-            candidate = _read_json(leftover, "configuration temp file")
+            candidate: object = _read_config(leftover, "configuration temp file")
         except StateError:
             leftover.unlink()
             continue
@@ -13825,7 +14002,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
     with _locked_config(config_path, args.wait_lock):
         _recover_config_write(config_path, payload)
         if config_path.exists() or config_path.is_symlink():
-            existing = _as_mapping(_read_json(config_path, "configuration"), "configuration")
+            existing = _read_config(config_path)
             if _canonical_config_payload(existing) != payload:
                 existing_worktrees = existing.get("worktrees_dir")
                 if isinstance(existing_worktrees, str):
@@ -13856,13 +14033,13 @@ def _cmd_init(args: argparse.Namespace) -> int:
                         "longer loads, migrate it with `init --repair`."
                     )
                 repaired, changes = _repaired_config(dict(existing), payload)
-                _atomic_write_json(config_path, repaired)
+                _write_config(config_path, repaired)
                 for line in changes:
                     print(f"REPAIRED {config_path}: {line}")
             elif args.repair:
                 print(f"UNCHANGED {config_path}: already current")
         else:
-            _atomic_write_json(config_path, payload)
+            _write_config(config_path, payload, args.config_format)
     if worktrees.exists() and (not worktrees.is_dir() or worktrees.is_symlink()):
         raise Refusal(f"worktrees directory is not a real directory: {worktrees}")
     worktrees.mkdir(parents=True, exist_ok=True)
@@ -35994,7 +36171,9 @@ _QUICKSTART = """\
 wrkslots manages durable agent and validation worktree slots.
 
 1. Initialize the project once. The running command is project-owned and is called with the agent
-   name. It must return 0 for dead, 1 for alive, or 2 when it cannot determine the answer.
+   name. It must return 0 for dead, 1 for alive, or 2 when it cannot determine the answer. init
+   writes .wrkslots.yml as literate YAML with a comment above every key (older JSON projects
+   still load; `wrkslots config convert --to yaml` converts them).
 
      wrkslots init . --worktrees-dir worktrees/slots --liveness-command tools/agent-liveness.py
 
@@ -36059,6 +36238,24 @@ Use `wrkslots COMMAND --help` for the exact effects and inputs of one command.
 """
 
 
+def _cmd_config_help(args: argparse.Namespace) -> int:
+    parser = args.config_parser
+    assert isinstance(parser, argparse.ArgumentParser)
+    parser.print_help()
+    return 0
+
+
+def _cmd_config_convert(args: argparse.Namespace) -> int:
+    # Loading validates the whole configuration first: an invalid file is not rewritten.
+    config = _load_config(args.project_root, args.machine)
+    with _locked_config(config.config_path, args.wait_lock):
+        raw, current = _read_config_document(config.config_path)
+        _write_config(config.config_path, raw, args.target)
+    backup = config.config_path.with_name(config.config_path.name + ".bak")
+    print(f"wrote {config.config_path} as {args.target} (was {current}); previous bytes in {backup}")
+    return 0
+
+
 def _cmd_quickstart(_args: argparse.Namespace) -> int:
     print(_QUICKSTART)
     return 0
@@ -36079,6 +36276,7 @@ recover-unbound-owner, heartbeat, hold, unhold, clean-caches deletion, finish,
 write-handoff, read-handoff, retire-pending, remove, recover-absent-validate-rows
 --apply, and recover. Registry mutations take a state lock and append
 hash-linked events. ACTIVE and ARCHIVED are compatibility views derived from those events.
+Configuration: config convert (literate YAML or JSON .wrkslots.yml).
 Storage and boxing: image (slot disk images), run and shell-command (box a command
 or agent to a slot, for plain and image slots alike), sandbox (show or complete the
 configuration's sandbox section), and limits (the machine-wide guard).
@@ -36264,6 +36462,16 @@ usage or audit gate unknown, 3 fail-closed refusal.
         action="append",
         metavar="SHELL-COMMAND",
         help="ordered shell command run in every new checkout (repeatable)",
+    )
+    init.add_argument(
+        "--config-format",
+        choices=yamlconfig.FORMATS,
+        default=None,
+        help=(
+            f"format of a NEW {CONFIG_NAME}: yaml (literate YAML with a comment above every "
+            "key; the default) or json. An existing file keeps its format when init --repair "
+            "rewrites it; convert it with `wrkslots config convert`"
+        ),
     )
     init.add_argument(
         "--slot-representation",
@@ -37465,6 +37673,34 @@ usage or audit gate unknown, 3 fail-closed refusal.
         ),
     )
     recover.set_defaults(handler=_cmd_recover)
+    config_parser = subparsers.add_parser(
+        "config",
+        help=f"convert or regenerate {CONFIG_NAME}",
+        description=(
+            f"{CONFIG_NAME} is literate YAML (a strict subset: block mappings and sequences, "
+            "one-line flow collections, quoted and plain scalars, comments) or, for projects "
+            "created before YAML support, JSON. Every command reads both the same way."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    config_actions = config_parser.add_subparsers(dest="config_command", metavar="ACTION")
+    convert = config_actions.add_parser(
+        "convert",
+        help="rewrite the configuration as literate YAML or as JSON",
+        description=(
+            f"Validate {CONFIG_NAME}, then rewrite it in the requested format: yaml writes the "
+            "canonical literate form, with a header and a comment above every key (also the "
+            "way to regenerate comments after an upgrade); json writes the historical form. The "
+            f"values are unchanged. The previous bytes are saved to {CONFIG_NAME}.bak; "
+            "hand-written comments are not kept."
+        ),
+        epilog="Examples:\n  wrkslots config convert --to yaml\n  wrkslots config convert --to json",
+        formatter_class=_HelpFormatter,
+    )
+    convert.add_argument("--to", choices=yamlconfig.FORMATS, required=True, dest="target", help="format to write")
+    convert.set_defaults(handler=_cmd_config_convert)
+    config_parser.set_defaults(handler=_cmd_config_help, config_parser=config_parser)
+    imagecmd._fill_help(config_parser)
     imagecmd.register(subparsers, _HelpFormatter)
     return parser
 

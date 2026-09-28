@@ -177,6 +177,17 @@ is written inside the slot (74 MB `buck-out`). Any remote-execution API cache se
 slot works the same way; the sandbox leaves the network alone. `~/.buck` is a private
 `home_private` directory, so each slot has its own daemon state.
 
+### Configuration format (YAML)
+
+`.wrkslots.yml` is literate YAML for new projects: `render_config` writes a header and a comment
+above every key, and the comments come from tables kept beside the defaults
+(`cli.CONFIG_KEY_DOCS`, `sandbox.SETTING_DOCS`/`LIMIT_DOCS`, `slotimage.IMAGE_DOCS`). The package
+is standard-library only, so `yamlconfig.py` implements a strict, fail-closed subset reader that
+refuses anything outside it with the line number. JSON files, from before this change, still load
+through the same `_read_config_document`. Every rewrite keeps the file's format and saves the
+previous bytes to `.wrkslots.yml.bak`. `config convert` switches formats. The refused constructs,
+and why each one stays out, are listed in the module docstring.
+
 ## Verification
 
 - `py/wrkslots/tests/test_slot_images.py`: configuration defaults and migration rules, sandbox

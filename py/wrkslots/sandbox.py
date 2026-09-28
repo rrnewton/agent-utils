@@ -181,6 +181,78 @@ class SandboxSettings:
 SETTING_KEYS = tuple(field.name for field in dataclasses.fields(SandboxSettings))
 LIMIT_KEYS = tuple(field.name for field in dataclasses.fields(SandboxLimits))
 
+#: The comment written above each ``sandbox`` key in a literate configuration.
+#: Kept beside the defaults above so documentation and defaults cannot drift.
+SETTING_DOCS: dict[str, str] = {
+    "isolation": (
+        "How `wrkslots run`, `shell-command`, and agent launchers box a command. userns "
+        "(default): limits plus the file-system view below, built in an unprivileged user "
+        "namespace. root: the same view built by a short-lived `sudo -n` launcher, then "
+        "privileges dropped to your uid, gid, and groups; use it for harness launchers that "
+        "perform a setuid step, which a user namespace refuses. Needs passwordless sudo. "
+        "cgroup: per-slot limits only, no file-system view."
+    ),
+    "home": (
+        "ro (default): $HOME inside the box is this slot's persistent private layer, in "
+        "which every real top-level entry is bound read-only (nothing is copied). New "
+        "top-level files land in the layer; the real $HOME is never written. hidden: only "
+        "the home_expose paths are bound into the layer."
+    ),
+    "home_shared": (
+        "$HOME-relative paths bound read-write from the real $HOME: agent credentials, "
+        "settings, and transcripts that must stay shared with the host. Missing paths are "
+        "skipped. Only these paths are writable; the rest of ~/.config and ~/.local stays "
+        "read-only."
+    ),
+    "home_private": (
+        "$HOME-relative directories that are private to the slot, persistent, and writable "
+        "(kept in the slot's state: the state image, or <control>/slot-state/)."
+    ),
+    "home_private_files": (
+        "Top-level $HOME files copied into the slot's layer once and then private and "
+        "writable, for tools that rewrite a state file with a temporary file and a rename."
+    ),
+    "home_hidden": (
+        "$HOME-relative credentials masked inside the box: a directory appears empty, a "
+        "file reads as empty."
+    ),
+    "home_expose": "With home: hidden, the $HOME-relative paths bound in, read-only.",
+    "outputs": (
+        "Directories, relative to the project root (the primary checkout holding this "
+        "file), that a boxed command may write. Missing ones are skipped."
+    ),
+    "read_write": (
+        "Extra absolute paths a boxed command may write. A leading ~ and $USER or $HOME "
+        "are expanded, so a per-user path can be written as /var/.../$USER/... Missing "
+        "paths are skipped."
+    ),
+    "env": (
+        "Extra environment variables for the boxed command, as NAME: value. A leading ~ in "
+        "a value is your $HOME."
+    ),
+    "tmp_size": (
+        f"Size of the fresh /tmp tmpfs each launch gets (discarded at exit), such as "
+        f"{DEFAULT_TMP_SIZE} or 25%."
+    ),
+    "protect_system": (
+        "true (default): every mount outside the writable paths above is read-only. false "
+        "leaves the rest of the file system writable; $HOME stays read-only either way."
+    ),
+    "limits": (
+        "systemd limits for the slot's slice, shared by everything run against the slot. "
+        "null means no limit."
+    ),
+}
+LIMIT_DOCS: dict[str, str] = {
+    "memory_max": "Slot memory ceiling, such as 32G; swap is disabled when set.",
+    "memory_high": "Slot memory throttling threshold, such as 24G.",
+    "cpu_quota": "Slot CPU ceiling, such as 800% for eight CPUs.",
+    "tasks_max": f"Slot process and thread limit (default {DEFAULT_TASKS_MAX}).",
+    "io_weight": "Slot IO weight, 1 to 10000.",
+    "all_slots_memory_max": "Memory ceiling shared by all slots together.",
+    "all_slots_cpu_quota": "CPU ceiling shared by all slots together.",
+}
+
 
 def _str_tuple(value: object, label: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
