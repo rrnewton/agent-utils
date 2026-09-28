@@ -15,10 +15,14 @@ after owner death.
 
 Slots can be stored as plain directories or, the default for new projects, as one sparse disk
 image per slot, so an agent's build trees never become host file-system metadata and reclaim
-deletes one file. `wrkslots run SLOT -- COMMAND` boxes a command (or, through an agent
-launcher that uses `wrkslots shell-command`, a whole agent) to one slot: per-slot memory, CPU, and task limits, and a file-system view
-in which only the slot is writable. Neither needs host configuration; see the user guide's
-"Disk-image slots" and "Running commands and agents inside a slot's box".
+deletes one file. Independently of that storage choice, `wrkslots run SLOT -- COMMAND` boxes a
+command (or, through an agent launcher that uses `wrkslots shell-command`, a whole agent) to one
+slot. The box applies per-slot memory, CPU, and task limits, a fresh `/tmp`, and a file-system
+view with the real `$HOME` read-only under a per-slot private layer and credentials masked. Only
+the slot, its Git directories, the project's blessed output directories, and shared harness state
+are writable. The box is identical for plain and image slots, is configured in the project's
+`sandbox` section, and needs no host configuration. See the user guide's "Disk-image slots" and
+"Running commands and agents inside a slot's box".
 
 ## Install
 
@@ -29,7 +33,8 @@ python3 -m pip install ./py/wrkslots
 Python 3.10 or newer, Git, and Linux `/proc` are required.
 Disk-image slots additionally need `mkfs.ext4` (e2fsprogs) and either passwordless `sudo` or
 `fuse2fs` with `/dev/fuse`. `wrkslots run` needs a systemd user manager (`systemd-run`, `busctl`)
-and, for its file-system view, unprivileged user namespaces.
+and, for its file-system view, unprivileged user namespaces (`isolation: userns`) or passwordless
+`sudo` (`isolation: root`, for commands that need setuid helpers).
 
 ## Quick start
 

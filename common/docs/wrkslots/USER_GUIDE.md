@@ -630,7 +630,7 @@ A slot can be stored in one of two representations, chosen per slot when it is c
   <control>/slot-images/<slot-type>/<slot>/
       IMAGE.json   representation record (location, backend, ceiling)
       slot.img     sparse ext4 image mounted at the slot directory
-      state.img    sparse ext4 image for the sandbox's private HOME and /tmp
+      state.img    sparse ext4 image for the sandbox's per-slot private HOME layer
       state/       mount point of state.img
   ```
 
@@ -701,56 +701,135 @@ agent may stay registered). It copies the content, proves the copy matches file 
 type, size, mode, and modification time), swaps it in at the same path, and re-verifies every
 checkout's Git identity. The branch, registry record, and path are unchanged. `--keep-original`
 keeps the pre-conversion copy for inspection. Converting to `worktree` discards the sandbox state
-image (private HOME and /tmp contents).
+image (the slot's private HOME layer).
 
 ## Running commands and agents inside a slot's box
 
-`wrkslots run SLOT -- COMMAND` runs COMMAND boxed to one slot. It needs no root and works for
-both representations:
+`wrkslots run SLOT -- COMMAND` runs COMMAND boxed to one slot. The box does not depend on how the
+slot is stored: a plain-worktree slot and an image-backed slot get the same limits and the same
+view. Only the location of the slot's private state differs (`state.img` for an image slot,
+`<control>/slot-state/<type>/<slot>/` for a plain slot). Nothing is written to host configuration.
 
-- **Limits.** COMMAND runs in a transient systemd user scope inside the slot's own slice,
-  `wrkslots-<slot>.slice`, below `wrkslots.slice`. Memory, CPU, task, and IO limits
-  (`--memory-max`, `--memory-high`, `--cpu-quota`, `--tasks-max`, or `configuration.sandbox`)
-  apply to the slice, so every command run against the slot shares one budget. When the caller
-  is already inside a slice (for example a harness's own sandbox slice), the slot's slices are
-  created inside that slice instead: wrkslots never moves a process out of an enclosing slice.
-- **Process tree.** The scope is created for the running process itself, which then execs
-  COMMAND, so the PID does not change and COMMAND stays a child of the caller. A terminal
-  multiplexer that only starts agents in a pane whose own shell is at its prompt keeps working.
-- **File-system view** (`--isolation namespace`, the default). COMMAND enters a new user and
-  mount namespace with the current user mapped to itself. With `protect_system` (default) every
-  mount becomes read-only except the slot, its private state, the Git common directories its
-  checkouts commit into, the wrkslots control directory, `/proc`, `/sys`, `/dev`, and
-  `/run/user`. `/tmp` is the slot's private `tmp`.
-- **HOME policy** (`--home`). `$HOME` inside the box is a private, persistent, per-slot
-  directory:
-  - `ro` (default) exposes every top-level entry of the real `$HOME`: directories as read-only
-    bind mounts, files up to 1 MiB as private copies made once. Tools in `~/bin` keep working,
-    and a tool that atomically rewrites a top-level dotfile writes its private copy. The host's
-    `$HOME` is never modified.
-  - `select` exposes only the `--home-path` entries (for example `bin`, `.local/bin`).
-  - `none` exposes nothing from `$HOME`.
+- **Limits.** The calling process joins a transient systemd user scope inside the slot's own slice,
+  `wrkslots-<slot>.slice` below `wrkslots.slice`, and then execs COMMAND. Memory, CPU, task, and IO
+  limits (`--memory-max`, `--memory-high`, `--cpu-quota`, `--tasks-max`, or
+  `configuration.sandbox.limits`) apply to the slice, so every command run against the slot shares
+  one budget. When the caller is already inside a slice (a harness's own sandbox slice, for
+  example), the slot's slices are created inside it: wrkslots never moves a process out of an
+  enclosing slice.
+- **Process identity.** Every step execs, so COMMAND keeps the caller's PID and stays a child of
+  the caller. A terminal multiplexer that only starts agents in a pane whose own shell is at its
+  prompt keeps working (except with `root` isolation; see below).
+- **Isolation** (`--isolation`, `configuration.sandbox.isolation`):
 
-  In every mode the `home_writable` directories (default `.cache`, `.buck`, `.local/state`) are
-  private and writable per slot, and the `home_shared` paths (default: agent harness state such
-  as `.claude` and `.codex`) stay shared with the host and writable so an agent keeps its login
-  and transcripts.
+  | Mode | Limits | File-system view | Needs |
+  |---|---|---|---|
+  | `userns` (default) | yes | built in an unprivileged user and mount namespace | unprivileged user namespaces |
+  | `root` | yes | the same view, built by a short-lived `sudo -n` launcher in a plain mount namespace, then privileges dropped | passwordless `sudo` |
+  | `cgroup` | yes | none: the host file system as is | nothing more |
 
-`--isolation cgroup` applies the limits without the namespace. Use it for programs that must run
-setuid helpers, which cannot gain privilege inside a user namespace: `sudo`, or a harness
-launcher that enters its own sandbox through one. Such a harness brings its own file-system jail.
+  Setuid programs cannot gain privilege inside a user namespace, so `sudo`, and any harness
+  launcher that performs a setuid step, fail under `userns`. `root` exists for them. The launcher
+  enters the slot's scope first (so the cgroup is inherited), checks that `sudo -n` will not
+  prompt, and passes the complete environment in a private spec file because sudo scrubs it. It
+  switches to your uid, gid, and supplementary groups at once, keeping only `CAP_SYS_ADMIN` while it
+  builds the view (so a FUSE mount you own stays reachable). It then drops that capability too and
+  execs COMMAND. No user namespace exists, so setuid programs inside the box work. One consequence:
+  sudo stays in front of COMMAND and relays a private terminal to it. A terminal multiplexer
+  therefore sees only `sudo` as the pane's foreground process and cannot detect an agent there.
+  Use `root` for commands and headless harnesses, not for multiplexer-detected agents.
 
-`wrkslots run SLOT --print -- COMMAND` shows the scope, slice limits, and helper command without
-running anything. The network is not changed.
+### The view
+
+With `userns` or `root` isolation, COMMAND sees:
+
+1. **A fresh `/tmp`**: an empty tmpfs (mode 1777, `tmp_size`, default `16G`) for this launch only,
+   discarded when COMMAND exits. `TMPDIR` is `/tmp`.
+2. **`$HOME` as a per-slot layer.** A persistent, private, writable directory from the slot's state
+   is mounted over `$HOME`. With `home: ro` (default), every top-level entry of the real `$HOME`
+   appears in it as a **read-only** bind mount of the real entry, with its submounts. Nothing is
+   copied, and `~/.config`, `~/.local/bin`, and the rest stay readable. Symbolic links are recreated
+   as links. Other mount paths that expose the same directory (for example the file system that
+   `$HOME` is bind-mounted from) are made read-only too. So the real `$HOME` cannot be modified from
+   inside, even with `protect_system: false`. New top-level files land in the layer. A harness that
+   rewrites its state file with a temporary file and a rename therefore works, and each slot keeps
+   its own copy.
+   - `home_private_files` (default `.claude.json`): top-level files seeded **once** into the layer as
+     a private, writable copy, instead of being bound read-only.
+   - `home_private` (default `.cache`, `.buck`): per-slot, persistent, writable directories. A
+     top-level entry is simply part of the layer; a nested one is bound from the layer over the
+     real path.
+   - `home_shared` (default `.claude`, `.codex`, `.muse`, `.config/muse`, `.config/opencode`,
+     `.local/share/opencode`, `.local/state/herdr`, `.local/share/muse`): bound **read-write**
+     from the real `$HOME`, so an agent keeps its login, settings, and transcripts. Missing paths
+     are skipped. Only the named paths are writable; the rest of `~/.config` and `~/.local` stays
+     read-only.
+   - `home: hidden` binds only the `home_expose` paths (default `bin`, `.local/bin`) read-only
+     into the layer, plus the shared and private paths, and covers the aliases with empty tmpfs.
+3. **Writable binds**: the slot, the Git common directories its checkouts commit into, the wrkslots
+   control directory (heartbeats), the project's blessed `outputs`, and `read_write` paths.
+   `outputs` (default `ai_docs`, `experiments`) are relative to the project root, the primary
+   checkout that holds `.wrkslots.yml`, and are skipped when missing. `read_write` entries are
+   absolute paths; a leading `~` and `$USER` or `$HOME` are expanded, so a project can name a
+   per-user credential staging directory as `/var/.../$USER/...`.
+4. **Masks** (`home_hidden`, default `.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`,
+   `.docker/config.json`, `.netrc`, `.git-credentials`, `.pgpass`, `.arcrc`,
+   `.config/gh/hosts.yml`, `.config/gcloud`): a directory shows as an empty read-only directory
+   owned by you, and a file reads as empty (`/dev/null`). This applies under `$HOME` and its
+   aliases.
+5. **Everything else read-only** with `protect_system` (default), except `/proc`, `/sys`, `/dev`,
+   and `/run/user`. Each mount keeps its own `nosuid`/`nodev`/`noexec`/atime flags. A mount that
+   cannot be made read-only while you could write to it refuses the run.
+
+`env` adds variables to COMMAND's environment (a leading `~` in a value is your `$HOME`). The
+network is not changed. Commands that need a path this view hides should list it in `read_write`
+(writable) or rely on the read-only view. A project located under `/tmp` loses everything except
+its bound paths behind the fresh `/tmp`.
+
+`wrkslots run SLOT --print -- COMMAND` shows the scope, slice limits, environment additions, and
+the helper command (for `root`, the view spec) without running anything.
+
+### Configuring the box
+
+`init` writes the full `sandbox` section, every default spelled out, into a new project's
+configuration. An existing project keeps what it has; `wrkslots sandbox write-defaults` adds every
+missing key (and missing `limits` key) without changing present keys or anything else.
+`wrkslots sandbox show-config` prints the effective settings as JSON. Unknown keys are refused.
+
+```json
+"sandbox": {
+  "isolation": "userns",
+  "home": "ro",
+  "home_shared": [".claude", ".codex", ".muse", ".config/muse", ".config/opencode",
+                  ".local/share/opencode", ".local/state/herdr", ".local/share/muse"],
+  "home_private": [".cache", ".buck"],
+  "home_private_files": [".claude.json"],
+  "home_hidden": [".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker/config.json", ".netrc",
+                  ".git-credentials", ".pgpass", ".arcrc", ".config/gh/hosts.yml", ".config/gcloud"],
+  "home_expose": ["bin", ".local/bin"],
+  "outputs": ["ai_docs", "experiments"],
+  "read_write": [],
+  "env": {},
+  "tmp_size": "16G",
+  "protect_system": true,
+  "limits": {"memory_max": null, "memory_high": null, "cpu_quota": null, "tasks_max": 8192,
+             "io_weight": null, "all_slots_memory_max": null, "all_slots_cpu_quota": null}
+}
+```
+
+Per-run options override it: `--isolation`, `--home`, `--tmp-size`, `--env NAME=VALUE`,
+`--no-protect-system`, and the limit options replace values; `--home-shared`, `--home-private`,
+`--home-hidden`, `--home-expose`, `--output`, and `--read-write` add to the configured lists.
 
 ### Starting an agent in a slot
 
 `wrkslots shell-command SLOT [--isolation MODE] [--format json]` prints one exec-only command
-line that replaces an interactive shell with `wrkslots run SLOT -- $SHELL -i` (and, with
-`--format json`, the slot directory). An agent launcher runs it in a fresh terminal pane, waits
-until the pane's own shell PID is again the foreground shell inside a wrkslots slice, registers
-the slot directory as the agent's working directory, and then starts the harness, so the agent
-and everything it runs stay in the slot's box.
+line that replaces an interactive shell with `wrkslots run SLOT -- $SHELL -i`. It uses absolute
+interpreter paths and adds nothing to the shell's environment. With `--format json` it also prints
+the slot directory and the effective isolation. An agent launcher runs it in a fresh terminal pane,
+waits until the pane's own shell PID is again the foreground shell inside a wrkslots slice,
+registers the slot directory as the agent's working directory, and then starts the harness. The
+agent and everything it runs stay in the slot's box.
 
 ### Builds with a shared action cache
 
@@ -758,7 +837,7 @@ A build tool whose outputs are materialized on demand keeps only the final outpu
 For example, Buck2 with `materializations = deferred` and remote execution or a remote action
 cache: intermediates stay in the cache, outside every slot, and a second slot building the same
 targets gets cache hits without downloading intermediates. The daemon's own state (`~/.buck`) is
-one of the private `home_writable` directories. Without a remote cache, every intermediate
+one of the private `home_private` directories. Without a remote cache, every intermediate
 output is written inside the slot's image.
 
 ### The machine-wide guard
