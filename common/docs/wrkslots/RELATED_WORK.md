@@ -276,7 +276,7 @@ mechanics instead of recreating generic worktree UX. The remaining distinction i
 Worktrunk's age is worktree or reference age, not a renewable lease held by an exact process
 identity. Its process discovery is narrower than a conservative host-wide reconciliation across
 process cwd, file descriptors, mapped files, cgroups, mounts, and namespaces. It also does not
-publish abandoned dirty work to a deterministic rescue branch before reclaiming space.
+publish abandoned dirty work to a deterministic, non-branch rescue ref before reclaiming space.
 
 Sources:
 

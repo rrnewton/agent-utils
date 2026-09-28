@@ -189,7 +189,7 @@ def test_network_git_commands_use_wrapper_and_preserve_git_isolation(
     authority = vcs.remote_authority(repository, "origin")
     vcs.fetch_remote(repository, "origin", "refs/remotes/origin/main", authority)
     assert vcs.verify_ref(repository, "refs/remotes/origin/main", "fetched ref") == expected
-    ref = "refs/heads/salvage/testhost/slot01/network-test"
+    ref = "refs/salvage/testhost/slot01/network-test"
     vcs.push_salvage(repository, "origin", expected, ref, authority)
     assert vcs.verify_ref(remote, ref, "published ref") == expected
     assert vcs.head(repository) == expected
@@ -268,7 +268,7 @@ def test_https_shaped_remote_fetch_and_salvage_use_transport_helper(
         "transport helper exercised\n",
         "https salvage",
     )
-    ref = "refs/heads/salvage/testhost/https-shaped"
+    ref = "refs/salvage/testhost/https-shaped"
     vcs.push_salvage(repository, "origin", commit, ref, authority)
     assert lifecycle.git(remote, "rev-parse", ref).stdout.strip() == commit
 
@@ -396,7 +396,7 @@ def test_salvage_push_preserves_ref_created_after_preflight(
         "must not overwrite a concurrent ref\n",
         "salvage race",
     )
-    ref = "refs/heads/salvage/testhost/concurrent"
+    ref = "refs/salvage/testhost/concurrent"
     vcs = wrkslots._GitVcs()
     authority = vcs.remote_authority(repository, "origin")
     original_run = wrkslots._GitVcs._run
@@ -613,7 +613,7 @@ def test_create_and_remote_round_trip_work_without_installed_wrapper(
     assert len(lifecycle.active_slots(project)) == 1
     vcs = wrkslots._GitVcs()
     expected = vcs.head(repository)
-    ref = "refs/heads/salvage/testhost/slot01/network-test"
+    ref = "refs/salvage/testhost/slot01/network-test"
     authority = vcs.remote_authority(repository, "origin")
     vcs.push_salvage(repository, "origin", expected, ref, authority)
     assert vcs.verify_ref(remote, ref, "published ref") == expected

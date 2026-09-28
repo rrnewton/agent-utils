@@ -379,8 +379,12 @@ worktrees directory.
 
 For a dirty or unpushed agent checkout, reclaim constructs a commit without changing the checkout's
 ordinary index or branch. It includes tracked and ordinary untracked files except configured cache
-paths, pushes the commit to `refs/heads/salvage/<machine>/<slot>/...`, reads that exact ref back, and
-records the result. If the checkout was already clean and published, the existing remote containment
+paths, pushes the commit to `refs/salvage/<machine>/<slot>/...`, reads that exact ref back, and
+records the result. Salvage refs, like the absent-agent rescue refs under `refs/rescue/wrkslots/`,
+are deliberately outside `refs/heads/`: they are addressable by exact name but are not branches, so
+publishing them does not add branches to a repository that keeps only `main`. Receipts written
+before this change name `refs/heads/salvage/...` or `refs/heads/rescue/wrkslots/...` and still
+verify against the exact ref they recorded. If the checkout was already clean and published, the existing remote containment
 is recorded instead. A failed or unverifiable push preserves the checkout.
 
 When the recorded remote cannot accept a salvage ref, an operator may explicitly choose durable

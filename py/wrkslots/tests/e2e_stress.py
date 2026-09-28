@@ -663,6 +663,7 @@ def _abandoned_work(base: Path, trace: Trace, *, unpublished_commit: bool) -> No
             project.remote,
             "for-each-ref",
             "--format=%(refname)",
+            f"refs/salvage/{MACHINE}/{slot}",
             f"refs/heads/salvage/{MACHINE}/{slot}",
             env=project.environment,
             trace=trace,

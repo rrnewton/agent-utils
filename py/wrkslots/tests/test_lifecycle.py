@@ -44,6 +44,10 @@ from wrkslots import cli as wrkslots  # noqa: E402
 
 
 SYSTEM_GIT = Path("/usr/bin/git")
+# An absence assertion must cover the namespace wrkslots writes today AND the
+# legacy branch namespace; checking only one would pass vacuously if salvage
+# landed in the other.
+SALVAGE_REF_NAMESPACES = ("refs/salvage", "refs/heads/salvage")
 
 
 def test_task_scope_identity_round_trips_and_legacy_rows_remain_readable(
@@ -13424,7 +13428,7 @@ def test_salvage_push_ignores_pushurl_installed_at_network_boundary(
         text=True,
     )
     commit = commit_local(repository, "local-only.txt", "preserve me\n", "local")
-    rescue_ref = "refs/heads/salvage/test-boundary"
+    rescue_ref = "refs/salvage/test-boundary"
     original_run = wrkslots._GitVcs._run
     network_calls: list[tuple[str, ...]] = []
     mutated = False
@@ -13489,7 +13493,7 @@ def test_salvage_push_refuses_redirect_in_isolated_config_at_network_boundary(
         text=True,
     )
     commit = commit_local(repository, "local-only.txt", "preserve me\n", "local")
-    rescue_ref = "refs/heads/salvage/test-isolated-config-boundary"
+    rescue_ref = "refs/salvage/test-isolated-config-boundary"
     vcs = wrkslots._GitVcs()
     authority = vcs.remote_authority(repository, "origin")
     original_run = wrkslots._GitVcs._run
@@ -13595,7 +13599,7 @@ def test_salvage_reads_refuse_redirect_in_isolated_config(
             vcs.remote_ref_sha(
                 repository,
                 "origin",
-                "refs/heads/salvage/not-present",
+                "refs/salvage/not-present",
                 authority,
             )
 
@@ -13622,7 +13626,7 @@ def test_salvage_push_refuses_url_changed_after_authority_preflight(
         text=True,
     )
     commit = commit_local(repository, "local-only.txt", "preserve me\n", "local")
-    rescue_ref = "refs/heads/salvage/test-preflight-authority"
+    rescue_ref = "refs/salvage/test-preflight-authority"
     vcs = wrkslots._GitVcs()
     authority = vcs.remote_authority(repository, "origin")
 
@@ -13910,7 +13914,13 @@ def test_agent_reclaim_pushes_unpushed_commits_and_nonignored_files(
     assert receipt["disposition"] == "salvaged"
     salvage_commit = receipt["salvage_commit"]
     remote_ref = receipt["remote_ref"]
+    assert remote_ref.startswith("refs/salvage/testhost/")
     assert git(remote, "rev-parse", remote_ref).stdout.strip() == salvage_commit
+    # Salvage must not create a branch on the recorded remote.
+    assert (
+        git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/salvage").stdout
+        == ""
+    )
     names = set(git(remote, "ls-tree", "-r", "--name-only", salvage_commit).stdout.splitlines())
     assert {
         ".gitignore",
@@ -14213,7 +14223,7 @@ def test_agent_reclaim_does_not_salvage_ignored_only_payload(
         remote,
         "for-each-ref",
         "--format=%(refname)",
-        "refs/heads/salvage",
+        *SALVAGE_REF_NAMESPACES,
     ).stdout == ""
     archive = json.loads(
         (project / "worktrees" / "ARCHIVED.testhost.json").read_text(
@@ -14510,7 +14520,7 @@ def test_agent_reclaim_refuses_nested_push_redirect_before_network(
             redirected_remote,
             "for-each-ref",
             "--format=%(refname)",
-            "refs/heads/salvage",
+            *SALVAGE_REF_NAMESPACES,
         ).stdout
         == ""
     )
@@ -14633,7 +14643,7 @@ def test_agent_reclaim_materializes_all_nested_candidates_before_network(
                 bare,
                 "for-each-ref",
                 "--format=%(refname)",
-                "refs/heads/salvage",
+                *SALVAGE_REF_NAMESPACES,
             ).stdout
             == ""
         )
@@ -14668,7 +14678,7 @@ def test_validate_slot_removes_dirty_checkout_without_salvage(tmp_path: Path) ->
         "refs/heads/wrkslots/validate/testhost/slot01/product",
         check=False,
     ).returncode == 1
-    assert git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/salvage").stdout == ""
+    assert git(remote, "for-each-ref", "--format=%(refname)", *SALVAGE_REF_NAMESPACES).stdout == ""
     archive = json.loads(
         (project / "worktrees" / "ARCHIVED.testhost.json").read_text(
             encoding="utf-8"
@@ -18428,7 +18438,7 @@ def test_validate_slot_removes_checkout_with_unfinished_git_operation(
             remote,
             "for-each-ref",
             "--format=%(refname)",
-            "refs/heads/salvage",
+            *SALVAGE_REF_NAMESPACES,
         ).stdout
         == ""
     )
@@ -18665,7 +18675,7 @@ def test_remove_guards_uncommitted_handoffs_for_every_slot_type(
         assert handoff.is_file()
         assert tree.is_dir()
         assert (
-            git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/salvage").stdout
+            git(remote, "for-each-ref", "--format=%(refname)", *SALVAGE_REF_NAMESPACES).stdout
             == ""
         )
 
@@ -18688,7 +18698,7 @@ def test_unread_handoff_blocks_reclaim_until_its_exact_contents_are_read(
     assert "no checkout was salvaged or removed" in refused.stderr
     assert "wrkslots read-handoff" in refused.stderr
     assert checkout(project).is_dir()
-    assert git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/salvage").stdout == ""
+    assert git(remote, "for-each-ref", "--format=%(refname)", *SALVAGE_REF_NAMESPACES).stdout == ""
 
     read = raw_command(
         project,
@@ -21623,7 +21633,7 @@ def test_remove_refuses_dead_owner_while_time_to_live_is_fresh(
     assert "wrkslots heartbeat" in refused.stderr
     assert checkout(project).is_dir()
     assert active_slots(project)
-    assert git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/salvage").stdout == ""
+    assert git(remote, "for-each-ref", "--format=%(refname)", *SALVAGE_REF_NAMESPACES).stdout == ""
 
 
 def test_validate_complete_cannot_bypass_agent_reclaim(tmp_path: Path) -> None:
@@ -21647,7 +21657,7 @@ def test_validate_complete_cannot_bypass_agent_reclaim(tmp_path: Path) -> None:
     assert "no checkout was salvaged or removed" in refused.stderr
     assert checkout(project).is_dir()
     assert active_slots(project)
-    assert git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/salvage").stdout == ""
+    assert git(remote, "for-each-ref", "--format=%(refname)", *SALVAGE_REF_NAMESPACES).stdout == ""
 
 
 def test_reclaim_shares_live_use_recheck_across_pre_and_post_fence(
@@ -30114,7 +30124,12 @@ def test_recover_absent_agent_row_preserves_commit_before_registry_repair(
         "state after the durable removal marker is asserted",
     ]
     rescue_ref = wrkslots._absent_agent_rescue_ref(record, record.checkouts[0])
+    assert rescue_ref.startswith("refs/rescue/wrkslots/testhost/")
     assert git(remote, "rev-parse", rescue_ref).stdout.strip() == record.checkouts[0].head
+    assert (
+        git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/rescue").stdout
+        == ""
+    )
     path = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
     assert wrkslots._GitVcs().worktree_registration(repository, path) is None
     assert run_absent_agent_recovery(project, record, apply=True) == 0
@@ -30413,6 +30428,17 @@ def test_recover_absent_agent_row_refuses_rescue_local_branch_collision_before_p
     )
     record = prepare_absent_agent_row(
         project, repository, branch=branch
+    )
+    # The default rescue root lies outside refs/heads/, so no local branch can
+    # ever equal it. Exercise the retained guard at the legacy branch root,
+    # which a journal written before the move may still resume at.
+    default_ref = wrkslots._absent_agent_rescue_ref(record, record.checkouts[0])
+    assert default_ref == f"refs/{branch}"
+    assert not default_ref.startswith("refs/heads/")
+    monkeypatch.setattr(
+        wrkslots,
+        "ABSENT_AGENT_RESCUE_REF_ROOT",
+        wrkslots.LEGACY_ABSENT_AGENT_RESCUE_REF_ROOT,
     )
     git(repository, "remote", "set-url", "origin", str(repository))
     record = rewrite_absent_agent_recorded_remote(project, record, str(repository))
@@ -30845,6 +30871,66 @@ def test_recover_absent_agent_row_resumes_after_preserved_head_is_pruned_locally
         == 0
     )
     assert not wrkslots._load_active(config).slots
+
+
+def test_recover_absent_agent_row_resumes_a_legacy_branch_rescue_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A journal that planned a refs/heads/ rescue ref resumes at exactly that ref."""
+    project, repository, remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    checkout_record = record.checkouts[0]
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(point: str) -> None:
+        if point == "after-absent-agent-rescue-ref":
+            raise Interrupted
+
+    current_root = wrkslots.ABSENT_AGENT_RESCUE_REF_ROOT
+    monkeypatch.setattr(
+        wrkslots,
+        "ABSENT_AGENT_RESCUE_REF_ROOT",
+        wrkslots.LEGACY_ABSENT_AGENT_RESCUE_REF_ROOT,
+    )
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_absent_agent_recovery(project, record, apply=True)
+    legacy_ref = wrkslots._absent_agent_rescue_ref(record, checkout_record)
+    assert legacy_ref.startswith("refs/heads/rescue/wrkslots/")
+    assert git(remote, "rev-parse", legacy_ref).stdout.strip() == checkout_record.head
+
+    monkeypatch.setattr(wrkslots, "ABSENT_AGENT_RESCUE_REF_ROOT", current_root)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 0
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._load_active(config).slots
+    archived = wrkslots._load_archive(config).records[-1]
+    assert archived["slot"] == record.slot
+    salvage = archived["salvage"]
+    assert isinstance(salvage, list)
+    receipt = salvage[0]
+    assert isinstance(receipt, dict)
+    assert receipt["remote_ref"] == legacy_ref
+    assert git(remote, "rev-parse", legacy_ref).stdout.strip() == checkout_record.head
+    # Resuming must not re-plan the recorded destination to the new root.
+    assert git(remote, "for-each-ref", "--format=%(refname)", "refs/rescue").stdout == ""
 
 
 def test_recover_absent_agent_row_uses_each_durable_preserved_prefix_after_crash(
@@ -31343,6 +31429,7 @@ def test_recover_ownerless_agent_worktree_salvages_dirty_tree_without_owner(
     )
     assert receipt["disposition"] == "salvaged"
     rescue_ref = wrkslots._as_str(receipt["remote_ref"], "ownerless rescue ref")
+    assert rescue_ref.startswith("refs/salvage/testhost/")
     salvage_commit = git(remote, "rev-parse", rescue_ref).stdout.strip()
     assert salvage_commit == receipt["salvage_commit"]
     assert git(remote, "show", f"{salvage_commit}:uncommitted.txt").stdout == "preserve me\n"
@@ -31411,7 +31498,7 @@ def test_ownerless_salvage_refuses_url_changed_after_candidate_preflight(
                 remote,
                 "for-each-ref",
                 "--format=%(refname)",
-                "refs/heads/salvage",
+                *SALVAGE_REF_NAMESPACES,
             ).stdout
             == ""
         )

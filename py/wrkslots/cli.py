@@ -60,6 +60,16 @@ _NETWORK_CONFIG_SHA256_ENV = "WRKSLOTS_NETWORK_CONFIG_SHA256"
 _NETWORK_CONFIG_BYTES_LIMIT = 1024 * 1024
 _LOCAL_SALVAGE_RECEIPT_SCHEMA = 1
 _LOCAL_SALVAGE_RECEIPT_BYTES_LIMIT = 256 * 1024
+# Remote salvage and rescue refs are published outside refs/heads/. A branch
+# namespace would make every reclaim create a visible branch on the recorded
+# remote, which a main-only repository must not accumulate. Custom refs are
+# neither cloned nor fetched by default, yet remain addressable by their exact
+# name, which is all the read-back and removal gates need. Receipts and
+# journals written before this change name the legacy refs/heads/ locations;
+# every verifier reads the exact ref a receipt recorded, so those still verify.
+SALVAGE_REF_ROOT = "refs/salvage"
+ABSENT_AGENT_RESCUE_REF_ROOT = "refs/rescue/wrkslots"
+LEGACY_ABSENT_AGENT_RESCUE_REF_ROOT = "refs/heads/rescue/wrkslots"
 _NETWORK_CONFIG = (
     b"[core]\n"
     b"\trepositoryformatversion = 0\n"
@@ -12617,7 +12627,7 @@ def _salvage_one_checkout(
         }
     salvage_name = checkout.name.replace("/", "-")
     salvage_ref = (
-        f"refs/heads/salvage/{record.machine}/{record.slot}/"
+        f"{SALVAGE_REF_ROOT}/{record.machine}/{record.slot}/"
         f"{salvage_name}-{record.generation}-{facts.commit[:12]}"
     )
     _validate_full_ref(salvage_ref, "salvage ref")
@@ -12743,7 +12753,7 @@ def _salvage_ownerless_checkout(
         }
     salvage_name = checkout.name.replace("/", "-")
     ref = (
-        f"refs/heads/salvage/{config.machine}/{slot}/"
+        f"{SALVAGE_REF_ROOT}/{config.machine}/{slot}/"
         f"{salvage_name}-{facts.commit[:12]}"
     )
     _validate_full_ref(ref, "ownerless worktree salvage ref")
@@ -29721,10 +29731,12 @@ def _assert_absent_agent_liveness(
     _assert_absent_validate_systemd_unrelated(rows, {record.slot: ()}, processes)
 
 
-def _absent_agent_rescue_ref(record: ActiveRecord, checkout: Checkout) -> str:
+def _absent_agent_rescue_ref(
+    record: ActiveRecord, checkout: Checkout, *, root: str | None = None
+) -> str:
     name = checkout.name.replace("/", "-")
     ref = (
-        f"refs/heads/rescue/wrkslots/{record.machine}/{record.slot}/"
+        f"{root or ABSENT_AGENT_RESCUE_REF_ROOT}/{record.machine}/{record.slot}/"
         f"{name}-{record.generation}-{checkout.head[:12]}"
     )
     _validate_full_ref(ref, "agent-row rescue ref")
@@ -29899,6 +29911,7 @@ def _absent_agent_planned_receipts(
     branch_witnesses: Sequence[_AbsentAgentBranchWitness],
     *,
     include_branch_witness: bool = True,
+    rescue_root: str | None = None,
 ) -> tuple[dict[str, object], ...]:
     if len(branch_witnesses) != len(record.checkouts):
         raise StateError("absent-agent branch witness count differs from checkout count")
@@ -29910,7 +29923,9 @@ def _absent_agent_planned_receipts(
             "salvage_commit": checkout.head,
             "status_sha256": None,
             "disposition": "salvaged",
-            "remote_ref": _absent_agent_rescue_ref(record, checkout),
+            "remote_ref": _absent_agent_rescue_ref(
+                record, checkout, root=rescue_root
+            ),
             "containing_remote_refs": [],
             "working_tree_contents": "unknown-storage-absent-before-recovery",
         }
@@ -30163,17 +30178,27 @@ def _absent_agent_journal_inputs(
     archive_entry = dict(
         _as_mapping(raw["archive_entry"], "absent-agent-row journal.archive_entry")
     )
-    expected_receipts = _absent_agent_planned_receipts(
-        record,
-        branch_witnesses,
-        include_branch_witness=not legacy_branches,
-    )
     finished_at = _as_str(archive_entry.get("finished_at"), "absent-agent archive.finished_at")
     _parse_timestamp(finished_at, "absent-agent archive.finished_at")
-    expected_archive = _absent_agent_archive_entry(
-        record, item, finished_at, expected_receipts
-    )
-    if not _json_equal(archive_entry, expected_archive):
+    # A journal written before rescue refs left refs/heads/ planned the legacy
+    # destination and may already have pushed to it. Resume such a journal at
+    # exactly the destination it recorded; never re-plan it to the new root.
+    for rescue_root in (
+        ABSENT_AGENT_RESCUE_REF_ROOT,
+        LEGACY_ABSENT_AGENT_RESCUE_REF_ROOT,
+    ):
+        expected_receipts = _absent_agent_planned_receipts(
+            record,
+            branch_witnesses,
+            include_branch_witness=not legacy_branches,
+            rescue_root=rescue_root,
+        )
+        expected_archive = _absent_agent_archive_entry(
+            record, item, finished_at, expected_receipts
+        )
+        if _json_equal(archive_entry, expected_archive):
+            break
+    else:
         raise StateError("absent-agent-row archive entry differs from its exact inputs")
     for index, receipt in enumerate(receipts):
         if not _json_equal(receipt, expected_receipts[index]):
