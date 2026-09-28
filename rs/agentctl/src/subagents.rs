@@ -26,6 +26,7 @@ use crate::client::{
     muse_startup_metadata, muse_trust_prompt, AgentPaneInfo, CustomProcessIdentity, HerdrClient,
     Pane, PaneShellProof,
 };
+use crate::submission::Submission;
 
 mod cloud;
 
@@ -1634,6 +1635,31 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             text: text.to_owned(),
         });
         Ok(())
+    }
+
+    fn submit_with_runtime(
+        &self,
+        pane_id: &str,
+        text: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<Submission> {
+        // Custom panes verify through their own composer model, and slash
+        // commands (including goal replacement) need the native primitive.
+        if self.record.adapter == "herdr-pane" || text.trim_start().starts_with('/') {
+            return self
+                .run_with_runtime(pane_id, text, runtime)
+                .map(|()| Submission::Unconfirmed);
+        }
+        if runtime.cancelled() {
+            return Ok(Submission::NotStaged(
+                "delivery was cancelled before typing".to_owned(),
+            ));
+        }
+        *self
+            .goal_objective
+            .lock()
+            .expect("goal operation lock poisoned") = None;
+        self.client.submit_with_runtime(pane_id, text, runtime)
     }
 
     fn wait_agent_status_with_runtime(

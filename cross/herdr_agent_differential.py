@@ -106,6 +106,54 @@ def save():
 def envelope(result):
     print(json.dumps({"result": result}, sort_keys=True))
 
+def verified_composer():
+    # Claude and Codex panes render a composer that clients stage text into and submit from.
+    return not state.get("custom_harness") and state.get("harness", "codex") in ("claude", "codex")
+
+def after_write(text):
+    # Injected transport behavior once a prompt has reached the agent.
+    if state.get("run_mode") == "gate":
+        save()
+        with open(os.path.join(root, "run-entered"), "w", encoding="utf-8") as handle:
+            handle.write(text)
+        deadline = time.monotonic() + 20
+        while not os.path.exists(os.path.join(root, "run-release")):
+            if time.monotonic() >= deadline:
+                print("gate timed out", file=sys.stderr)
+                raise SystemExit(1)
+            time.sleep(0.01)
+    if state.get("run_mode") == "fail":
+        print("transport lost after write", file=sys.stderr)
+        save()
+        raise SystemExit(1)
+
+def composer_screen():
+    dim = lambda text: "\x1b[2m" + text + "\x1b[22m"
+    draft = state.get("composer_draft", "")
+    busy = state.get("status") == "working"
+    if state.get("harness", "codex") == "claude":
+        rule = "\u2500" * 40
+        lines = ["\u2022 earlier output"]
+        for text in state.get("submitted", []):
+            lines += ["\u276f " + text, "\u25cf accepted"]
+        lines.append(rule)
+        rows = draft.split("\n") if draft else [""]
+        lines.append("\u276f " + rows[0] if draft else "\u276f\xa0")
+        lines += ["  " + row for row in rows[1:]]
+        lines += [rule, "  auto mode on" + (" \u00b7 esc to interrupt" if busy else "")]
+    else:
+        lines = ["\u2022 earlier output"]
+        for text in state.get("submitted", []):
+            lines += ["\u203a " + text, "\u2022 accepted"]
+        if draft:
+            rows = draft.split("\n")
+            lines.append("\u203a " + rows[0])
+            lines += ["  " + row for row in rows[1:]]
+        else:
+            lines.append("\u203a " + dim("Ask Codex to do anything"))
+        lines += ["", "  tab to queue message" if busy and draft else "  model default \u00b7 project"]
+    return "\n".join(lines) + "\n"
+
 if args[:2] == ["pane", "list"]:
     if state.get("offline"):
         print("server unavailable", file=sys.stderr)
@@ -260,26 +308,15 @@ elif args[:2] == ["pane", "move"]:
     }})
 elif args[:2] == ["agent", "prompt"]:
     state.setdefault("submitted", []).append(args[3])
-    if state.get("run_mode") == "gate":
-        save()
-        with open(os.path.join(root, "run-entered"), "w", encoding="utf-8") as handle:
-            handle.write(args[3])
-        deadline = time.monotonic() + 20
-        while not os.path.exists(os.path.join(root, "run-release")):
-            if time.monotonic() >= deadline:
-                print("gate timed out", file=sys.stderr)
-                raise SystemExit(1)
-            time.sleep(0.01)
-    if state.get("run_mode") == "fail":
-        print("transport lost after write", file=sys.stderr)
-        save()
-        raise SystemExit(1)
+    after_write(args[3])
 elif args[:2] == ["pane", "send-text"]:
     pasted = args[3]
     start, end = "\x1b[200~", "\x1b[201~"
     state["paste_wrapped"] = pasted.startswith(start) and pasted.endswith(end)
     state["custom_draft"] = pasted[len(start):-len(end)] if state["paste_wrapped"] else pasted
     state["custom_submitted"] = False
+    if verified_composer():
+        state["composer_draft"] = state.get("composer_draft", "") + state["custom_draft"]
     if state.get("custom_exit_after_send_text") and state.get("custom_pid"):
         state["retired_custom_pid"] = state["custom_pid"]
         try:
@@ -311,6 +348,8 @@ elif args[:2] == ["pane", "read"]:
     source = args[args.index("--source") + 1]
     if source == "visible" and state.get("screen"):
         sys.stdout.write(state["screen"])
+    elif source == "visible" and verified_composer():
+        sys.stdout.write(composer_screen())
     elif source == "visible" and state.get("custom_harness"):
         prefix = "Muse Code 1.3.0\n\nreasoning effort ultra is not available (gate ultra_reasoning_effort is closed); using xhigh\n"
         divider = "────────────────\n"
@@ -332,6 +371,12 @@ elif args[:2] == ["pane", "read"]:
         sys.stdout.write(state.get("read_unwrapped", "agent transcript\n"))
     else:
         sys.stdout.write(state.get("read_recent", "fallback transcript\n"))
+elif args[:2] == ["pane", "send-keys"] and verified_composer() and state.get("composer_draft"):
+    # Enter submits; Tab queues only while the agent is busy.
+    if args[3] == "Enter" or (args[3] == "Tab" and state.get("status") == "working"):
+        text = state.pop("composer_draft")
+        state.setdefault("submitted", []).append(text)
+        after_write(text)
 elif args[:2] == ["pane", "send-keys"]:
     if state.get("custom_harness") and state.get("custom_draft") and args[3] == "Enter":
         state["custom_submitted"] = True

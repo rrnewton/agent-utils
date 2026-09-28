@@ -28,6 +28,7 @@ from agentctl.errors import (
     AgentPossiblySubmitted,
     HerdrUnavailable,
 )
+from agentctl.submission import PromptNotStaged, SubmissionReceipt
 
 __all__ = [
     "Target", "QueueResult", "resolve_target", "enqueue", "drain", "send", "status", "read",
@@ -88,6 +89,10 @@ class QueueResult:
 
 class _PossiblySubmitted(AgentDeliveryError):
     """The atomic pane injection happened, but its working transition was not observed."""
+
+
+class _NotStaged(AgentDeliveryError):
+    """Nothing was typed into the pane, so the prompt remains safe to retry."""
 
 
 class _ArtifactTooLarge(AgentDeliveryError):
@@ -1564,13 +1569,19 @@ def _deliver_one(
     working_timeout: float,
 ) -> None:
     try:
-        client.prompt_agent(info.pane_id, text)
+        receipt = client.prompt_agent(info.pane_id, text)
+    except PromptNotStaged as exc:
+        raise _NotStaged(str(exc)) from exc
     except Exception as exc:
         # The terminal server may have accepted the atomic text+Enter before the client lost its
         # response. Once agent.prompt is entered, failure is ambiguous and must never be retried.
         raise _PossiblySubmitted(
             f"pane {info.pane_id} agent-prompt outcome is unknown; prompt may have been submitted: {exc}"
         ) from exc
+    if isinstance(receipt, SubmissionReceipt):
+        # The screen already proved the prompt left the composer. A lifecycle
+        # transition adds nothing and is absent when the agent queues the prompt.
+        return
     try:
         client.wait_agent_status(info.pane_id, "working", max(1, int(working_timeout * 1000)))
     except HerdrUnavailable as exc:
@@ -1719,6 +1730,19 @@ def _drain(
                         _deliver_one(
                             client, info, str(document["text"]), working_timeout=working_timeout,
                         )
+                    except _NotStaged as exc:
+                        # Nothing reached the composer: undo the at-most-once barrier so the
+                        # prompt stays pending. A crash before the rename still quarantines it.
+                        blocked = _bounded_error(str(exc), max_artifact_bytes)
+                        document.pop("possibly_submitted", None)
+                        document.pop("inflight_at", None)
+                        document["delivery_state"] = "pending"
+                        document["delivery_error"] = blocked
+                        document["delivery_blocked_at"] = time.time()
+                        _atomic_json(inflight_path, document, max_artifact_bytes=max_artifact_bytes)
+                        _transition(inflight_path, path, max_artifact_bytes=max_artifact_bytes)
+                        retained_path = path
+                        break
                     except _PossiblySubmitted as exc:
                         attempts += 1
                         document["delivery_attempts"] = attempts

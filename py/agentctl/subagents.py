@@ -50,6 +50,7 @@ from agentctl.profiles import (
     validate_structured_harness_argument_conflicts,
     workspace_for_registry,
 )
+from agentctl.submission import SubmissionReceipt
 
 _NAME = re.compile(r"[a-z][a-z0-9-]{0,31}\Z")
 _KIND = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
@@ -884,7 +885,7 @@ class _WorkspaceClient:
     def workspace_label(self, workspace_id: str) -> str:
         return self.client.workspace_label(workspace_id)
 
-    def prompt_agent(self, pane_id: str, command: str) -> None:
+    def prompt_agent(self, pane_id: str, command: str) -> SubmissionReceipt | None:
         self.goal_objective = None
         if self.queue is not None:
             for identifier, objective in self.record.goal_messages.items():
@@ -895,8 +896,7 @@ class _WorkspaceClient:
                         self.goal_objective = objective
                         break
         if self.record.adapter != "herdr-pane":
-            self.client.prompt_agent(pane_id, command)
-            return
+            return self.client.prompt_agent(pane_id, command)
         if "\0" in command or "\x1b" in command:
             raise HerdrUnavailable(
                 "Muse pane prompts cannot contain NUL or terminal escape characters"
@@ -937,6 +937,7 @@ class _WorkspaceClient:
         self.custom_submission = (
             staged, command, muse_prompt_transcript_count(staged, command),
         )
+        return None
 
     def wait_agent_status(self, pane_id: str, status: str, timeout_ms: int) -> None:
         if self.record.adapter == "herdr-pane" and status == "working":

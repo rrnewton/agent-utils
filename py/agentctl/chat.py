@@ -63,6 +63,7 @@ from agentctl.errors import AgentDeliveryError, HerdrRunError, HerdrUnavailable
 from agentctl.jsonx import as_mapping, as_sequence, get_str
 from agentctl.procstat import parse_process_stat
 from agentctl.subagents import harness_arguments
+from agentctl.submission import SubmissionReceipt
 
 
 _MIN_POLL_INTERVAL = 0.1
@@ -778,9 +779,9 @@ class _NamedClient(HerdrClient):
     def workspace_label(self, workspace_id: str) -> str:
         return self._delegate.workspace_label(workspace_id)
 
-    def prompt_agent(self, pane_id: str, command: str) -> None:
+    def prompt_agent(self, pane_id: str, command: str) -> SubmissionReceipt | None:
         self.pane_info(pane_id)
-        self._delegate.prompt_agent(pane_id, command)
+        return self._delegate.prompt_agent(pane_id, command)
 
     def wait_agent_status(self, pane_id: str, status: str, timeout_ms: int) -> None:
         self.pane_info(pane_id)

@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 
 use crate::client::{AgentPaneInfo, HerdrClient, Pane};
 use crate::error::{AdapterError, EXIT_BUSY, EXIT_TIMEOUT};
+use crate::submission::{PromptTerminal, Submission, SubmitTimeouts};
 
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -268,6 +269,19 @@ pub trait AgentApi: Send + Sync {
     ) -> crate::error::Result<()> {
         self.run(pane_id, text)
     }
+    /// Submit one prompt and report how the submission was established.
+    ///
+    /// The default hands the prompt to [`AgentApi::run_with_runtime`], which
+    /// proves nothing, so the queue then waits for a native working transition.
+    fn submit_with_runtime(
+        &self,
+        pane_id: &str,
+        text: &str,
+        runtime: &dyn AgentRuntime,
+    ) -> crate::error::Result<Submission> {
+        self.run_with_runtime(pane_id, text, runtime)
+            .map(|()| Submission::Unconfirmed)
+    }
     /// Cancellation-aware native status wait used by long-running service owners.
     fn wait_agent_status_with_runtime(
         &self,
@@ -354,6 +368,39 @@ impl AgentApi for HerdrClient {
         HerdrClient::prompt_agent_with_cancellation(self, pane_id, text, &|| runtime.cancelled())
     }
 
+    fn submit_with_runtime(
+        &self,
+        pane_id: &str,
+        text: &str,
+        runtime: &dyn AgentRuntime,
+    ) -> crate::error::Result<Submission> {
+        let cancelled = || runtime.cancelled();
+        let harness = match HerdrClient::pane_info_with_cancellation(self, pane_id, &cancelled) {
+            Ok(info) => info.agent.unwrap_or_default(),
+            Err(error) => {
+                return Ok(Submission::NotStaged(format!(
+                    "pane {pane_id}: harness lookup failed before typing: {error}"
+                )))
+            }
+        };
+        if crate::submission::verifies(&harness, text) {
+            let terminal = HerdrTerminal {
+                client: self,
+                runtime,
+            };
+            return crate::submission::submit_verified(
+                &terminal,
+                pane_id,
+                &harness,
+                text,
+                SubmitTimeouts::default(),
+                runtime,
+            );
+        }
+        HerdrClient::prompt_agent_with_cancellation(self, pane_id, text, &cancelled)
+            .map(|()| Submission::Unconfirmed)
+    }
+
     fn wait_agent_status_with_runtime(
         &self,
         pane_id: &str,
@@ -374,6 +421,27 @@ impl AgentApi for HerdrClient {
         runtime: &dyn AgentRuntime,
     ) -> crate::error::Result<String> {
         HerdrClient::read_with_cancellation(self, pane_id, source, lines, &|| runtime.cancelled())
+    }
+}
+
+/// Herdr pane operations bound to one cancellation source.
+struct HerdrTerminal<'a> {
+    client: &'a HerdrClient,
+    runtime: &'a dyn AgentRuntime,
+}
+
+impl PromptTerminal for HerdrTerminal<'_> {
+    fn read_screen(&self, pane_id: &str) -> crate::error::Result<String> {
+        self.client
+            .read_screen_with_cancellation(pane_id, &|| self.runtime.cancelled())
+    }
+    fn send_text(&self, pane_id: &str, text: &str) -> crate::error::Result<()> {
+        self.client
+            .send_text_with_cancellation(pane_id, text, &|| self.runtime.cancelled())
+    }
+    fn send_keys(&self, pane_id: &str, keys: &str) -> crate::error::Result<()> {
+        self.client
+            .send_keys_with_cancellation(pane_id, keys, &|| self.runtime.cancelled())
     }
 }
 
@@ -754,7 +822,20 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
             options.working_timeout,
             runtime,
         ) {
-            Ok(()) => {
+            Ok(Delivered::NotStaged(detail)) => {
+                // Nothing reached the composer: undo the at-most-once barrier so the
+                // prompt stays pending. A crash before the rename still quarantines it.
+                document.remove("possibly_submitted");
+                document.remove("inflight_at");
+                document.insert("delivery_state".to_owned(), json!("pending"));
+                document.insert("delivery_error".to_owned(), json!(detail));
+                document.insert("delivery_blocked_at".to_owned(), json!(unix_seconds()));
+                atomic_json(&inflight_path, &Value::Object(document))?;
+                transition(&inflight_path, &path)?;
+                blocked = Some(detail);
+                break;
+            }
+            Ok(Delivered::Confirmed) => {
                 document.insert("delivery_state".to_owned(), json!("processed"));
                 document.insert("confirmed_at".to_owned(), json!(unix_seconds()));
                 atomic_json(&inflight_path, &Value::Object(document))?;
@@ -1177,25 +1258,41 @@ fn wait_ready<A: AgentApi + ?Sized>(
     }
 }
 
+/// Result of one delivery that did not fail after typing began.
+enum Delivered {
+    /// The prompt was submitted and confirmed.
+    Confirmed,
+    /// Nothing was typed, so the prompt remains safe to retry.
+    NotStaged(String),
+}
+
 fn deliver_one<A: AgentApi + ?Sized>(
     client: &A,
     info: &AgentPaneInfo,
     text: &str,
     working_timeout: Duration,
     runtime: &dyn AgentRuntime,
-) -> AgentResult<()> {
-    client
-        .run_with_runtime(&info.pane_id, text, runtime)
+) -> AgentResult<Delivered> {
+    let submission = client
+        .submit_with_runtime(&info.pane_id, text, runtime)
         .map_err(|error| {
             AgentError::delivery(format!(
                 "pane {} agent-prompt outcome is unknown; prompt may have been submitted: {error}",
                 info.pane_id
             ))
         })?;
+    match submission {
+        // The screen already proved the prompt left the composer. A lifecycle
+        // transition adds nothing and is absent when the agent queues the prompt.
+        Submission::Verified(_) => return Ok(Delivered::Confirmed),
+        Submission::NotStaged(reason) => return Ok(Delivered::NotStaged(reason)),
+        Submission::Unconfirmed => {}
+    }
     let Some(chunk) = runtime.delivery_wait_chunk() else {
         let millis = working_timeout.as_millis().clamp(1, u64::MAX.into()) as u64;
         return client
             .wait_agent_status_with_runtime(&info.pane_id, "working", millis, runtime)
+            .map(|()| Delivered::Confirmed)
             .map_err(|error| {
                 AgentError::delivery(format!(
                     "pane {} did not confirm idle/done -> working submission: {error}",
@@ -1223,7 +1320,7 @@ fn deliver_one<A: AgentApi + ?Sized>(
         let wait = chunk.min(remaining);
         let millis = wait.as_millis().clamp(1, u64::MAX.into()) as u64;
         match client.wait_agent_status_with_runtime(&info.pane_id, "working", millis, runtime) {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(Delivered::Confirmed),
             Err(error) => last_error = Some(error.to_string()),
         }
     }
@@ -2289,6 +2386,7 @@ mod tests {
         state: Mutex<FakeState>,
         run_gate: Option<Arc<RunGate>>,
         cancel_after_run: Option<Arc<AtomicBool>>,
+        screen: Option<crate::submission::fake::FakeScreen>,
     }
 
     impl FakeAgent {
@@ -2310,7 +2408,14 @@ mod tests {
                 }),
                 run_gate: None,
                 cancel_after_run: None,
+                screen: None,
             }
+        }
+
+        fn with_screen(screen: crate::submission::fake::FakeScreen) -> Self {
+            let mut fake = Self::new(&["idle"]);
+            fake.screen = Some(screen);
+            fake
         }
 
         fn with_run_gate(states: &[&str], run_gate: Arc<RunGate>) -> Self {
@@ -2385,6 +2490,31 @@ mod tests {
                 Err(AdapterError::unavailable("connection vanished after write"))
             } else {
                 Ok(())
+            }
+        }
+
+        fn submit_with_runtime(
+            &self,
+            pane_id: &str,
+            text: &str,
+            runtime: &dyn AgentRuntime,
+        ) -> crate::error::Result<Submission> {
+            match &self.screen {
+                // Mirrors the production override: the composer is driven directly.
+                Some(screen) => crate::submission::submit_verified(
+                    screen,
+                    pane_id,
+                    "codex",
+                    text,
+                    crate::submission::SubmitTimeouts {
+                        stage: Duration::from_secs(3),
+                        submit: Duration::from_secs(5),
+                    },
+                    runtime,
+                ),
+                None => self
+                    .run_with_runtime(pane_id, text, runtime)
+                    .map(|()| Submission::Unconfirmed),
             }
         }
 
@@ -2626,6 +2756,113 @@ mod tests {
             [("w1:p1".to_owned(), "working".to_owned(), 30_000)]
         );
         assert_eq!(result.delivered, [result.message_id]);
+    }
+
+    #[test]
+    fn queue_delivers_through_a_dropped_submit_key_without_a_working_wait() {
+        let directory = TestDirectory::new("dropped-key");
+        let screen = crate::submission::fake::FakeScreen::new("codex", false);
+        screen.state().drop_keys = 2;
+        let fake = FakeAgent::with_screen(screen);
+        let runtime = FakeRuntime::default();
+        let result = send_with_runtime(
+            &fake,
+            &target(),
+            directory.path(),
+            "survive a dropped key",
+            DrainOptions::default(),
+            &runtime,
+        )
+        .unwrap();
+        assert_eq!(result.outcome, QueueOutcome::Delivered);
+        assert_eq!(result.delivered, [result.message_id]);
+        let screen = fake.screen.as_ref().unwrap().state();
+        assert_eq!(screen.pastes, ["survive a dropped key"]);
+        assert_eq!(screen.keys, ["Enter", "Enter", "Enter"]);
+        assert_eq!(screen.submitted, ["survive a dropped key"]);
+        drop(screen);
+        assert!(
+            fake.runs().is_empty(),
+            "the unverified primitive must not be used"
+        );
+        assert!(
+            fake.waits().is_empty(),
+            "screen proof replaces the working wait"
+        );
+    }
+
+    #[test]
+    fn queue_keeps_a_prompt_pending_when_nothing_was_typed() {
+        let directory = TestDirectory::new("not-staged");
+        let screen = crate::submission::fake::FakeScreen::new("codex", false);
+        screen.state().composer = "an operator's draft".to_owned();
+        let fake = FakeAgent::with_screen(screen);
+        let runtime = FakeRuntime::default();
+        let error = send_with_runtime(
+            &fake,
+            &target(),
+            directory.path(),
+            "wait your turn",
+            DrainOptions::default(),
+            &runtime,
+        )
+        .unwrap_err();
+        assert_eq!(error.exit_code(), 75, "{error}");
+        assert!(error.to_string().contains("refusing to append"), "{error}");
+        let pending = json_paths(&directory.path().join("inbox")).unwrap();
+        assert_eq!(pending.len(), 1);
+        let document = read_json(&pending[0]).unwrap();
+        assert_eq!(document["delivery_state"], "pending");
+        assert!(document.get("possibly_submitted").is_none(), "{document}");
+        assert!(document.get("inflight_at").is_none(), "{document}");
+        assert!(json_paths(&directory.path().join("inflight"))
+            .unwrap()
+            .is_empty());
+        assert!(json_paths(&directory.path().join("failed"))
+            .unwrap_or_default()
+            .is_empty());
+        assert!(fake.screen.as_ref().unwrap().state().pastes.is_empty());
+
+        fake.screen.as_ref().unwrap().state().composer.clear();
+        let result = drain_with_runtime(
+            &fake,
+            &target(),
+            directory.path(),
+            DrainOptions::default(),
+            &runtime,
+        )
+        .unwrap();
+        assert_eq!(result.outcome, QueueOutcome::Delivered);
+        assert_eq!(
+            fake.screen.as_ref().unwrap().state().submitted,
+            ["wait your turn"]
+        );
+    }
+
+    #[test]
+    fn queue_quarantines_a_prompt_left_staged() {
+        let directory = TestDirectory::new("left-staged");
+        let screen = crate::submission::fake::FakeScreen::new("codex", false);
+        screen.state().drop_keys = u32::MAX;
+        let fake = FakeAgent::with_screen(screen);
+        let runtime = FakeRuntime::default();
+        let error = send_with_runtime(
+            &fake,
+            &target(),
+            directory.path(),
+            "stuck in the composer",
+            DrainOptions::default(),
+            &runtime,
+        )
+        .unwrap_err();
+        assert_eq!(error.exit_code(), 76, "{error}");
+        assert!(error.to_string().contains("NOT submitted"), "{error}");
+        let artifact = &error.undelivered().expect("ambiguous details").artifact;
+        let document = read_json(artifact).unwrap();
+        assert_eq!(document["possibly_submitted"], true);
+        let screen = fake.screen.as_ref().unwrap().state();
+        assert_eq!(screen.pastes.len(), 1, "never typed twice");
+        assert_eq!(screen.composer, "stuck in the composer");
     }
 
     #[test]

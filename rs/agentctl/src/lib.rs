@@ -16,6 +16,7 @@ pub mod plugins;
 pub(crate) mod profiles;
 pub(crate) mod skill_install;
 pub mod subagents;
+pub mod submission;
 
 /// Reference for the canonical command and its supported adapters.
 pub const USER_GUIDE: &str = include_str!("embedded_userguide.md");

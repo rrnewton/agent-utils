@@ -23,6 +23,13 @@ from dataclasses import dataclass
 from agentctl.errors import HerdrUnavailable
 from agentctl.jsonx import as_mapping, as_sequence, get_int, get_str, opt_str
 from agentctl.procstat import parse_process_stat
+from agentctl.submission import (
+    SCREEN_LINES as SUBMISSION_SCREEN_LINES,
+    VERIFIED_HARNESSES,
+    PromptNotStaged,
+    SubmissionReceipt,
+    submit_verified,
+)
 
 __all__ = [
     "HerdrClient",
@@ -1465,14 +1472,42 @@ class HerdrClient:
             raise HerdrUnavailable(f"{purpose}: {detail}")
 
 
-    def prompt_agent(self, pane_id: str, text: str) -> None:
-        """Submit agent text using live bracketed-paste mode and encoded Enter.
+    def prompt_agent(self, pane_id: str, text: str) -> SubmissionReceipt | None:
+        """Submit one prompt, proving the submission from the screen when the harness allows it.
 
-        Agent composers can treat a raw text-and-Enter burst as one paste. The
-        native prompt primitive preserves the submission key outside that paste.
-        This call does not wait for a lifecycle transition.
+        For harnesses with a known composer layout the text is pasted into an
+        empty composer, the harness's submission key is sent and repeated with
+        bounded backoff while the text stays staged, and a receipt is returned
+        only once the text has left the composer with corroborating screen
+        evidence. ``PromptNotStaged`` means nothing was typed.
+
+        Slash commands open harness menus and confirmation dialogs rather than
+        submitting through the composer, and other harnesses have no composer
+        model, so both use the native ``agent prompt`` primitive and return
+        ``None``: the caller must then confirm submission some other way.
         """
+        try:
+            harness = self.pane_info(pane_id).agent or ""
+        except HerdrUnavailable as exc:
+            raise PromptNotStaged(
+                f"pane {pane_id}: harness lookup failed before typing: {exc}"
+            ) from exc
+        if harness in VERIFIED_HARNESSES and not text.lstrip().startswith("/"):
+            return submit_verified(self, pane_id, harness, text)
         self._call_ok(["agent", "prompt", pane_id, text], f"agent prompt {pane_id}")
+        return None
+
+    def read_screen(self, pane_id: str) -> str:
+        """Read the visible rows with SGR styling retained for composer inspection."""
+        args = [
+            "pane", "read", pane_id, "--source", "visible",
+            "--lines", str(SUBMISSION_SCREEN_LINES), "--format", "ansi",
+        ]
+        completed = self._invoke(args)
+        if completed.returncode != 0:
+            detail = (completed.stderr or "").strip() or f"exit {completed.returncode}"
+            raise HerdrUnavailable(f"pane read {pane_id}: {detail}")
+        return completed.stdout
 
     def send_text(self, pane_id: str, text: str) -> None:
         """Insert literal text without synthesizing a submission keystroke."""

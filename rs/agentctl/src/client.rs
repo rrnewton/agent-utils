@@ -1886,6 +1886,26 @@ impl HerdrClient {
         }
         Ok(completed.stdout)
     }
+    /// Read the visible rows with SGR styling retained for composer inspection.
+    pub(crate) fn read_screen_with_cancellation(
+        &self,
+        pane_id: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<String> {
+        let lines = crate::submission::SCREEN_LINES.to_string();
+        let args = strings(&[
+            "pane", "read", pane_id, "--source", "visible", "--lines", &lines, "--format", "ansi",
+        ]);
+        let completed =
+            self.invoke_with_timeout_and_cancellation(&args, CONTROL_TIMEOUT, cancelled)?;
+        if completed.status != 0 {
+            return Err(AdapterError::unavailable(format!(
+                "pane read {pane_id}: {}",
+                stderr_detail(&completed)
+            )));
+        }
+        Ok(completed.stdout)
+    }
     /// Invoke and validate the corresponding Herdr agent-control operation.
     pub fn prompt_agent(&self, pane_id: &str, text: &str) -> Result<()> {
         self.prompt_agent_with_cancellation(pane_id, text, &|| false)
