@@ -209,6 +209,14 @@ pub fn retry_checkpoint_gap(
     Ok(BridgeState::inspect(state_root)?.approve_checkpoint_gap_retry(request)?)
 }
 
+/// Approve an exact committed-boundary retry without provider or coordinator access.
+pub fn retry_boundary_gap(
+    state_root: &Path,
+    request: &chat_runtime::GapRetryApproval<'_>,
+) -> Result<Value, ChatServiceError> {
+    Ok(BridgeState::inspect(state_root)?.approve_boundary_gap_retry(request)?)
+}
+
 /// Inspect one exact active retained request without writes or external service access.
 pub fn inspect_request(state_root: &Path, key: &str) -> Result<Value, ChatServiceError> {
     Ok(BridgeState::inspect(state_root)?.inspect_request(key)?)

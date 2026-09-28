@@ -456,7 +456,12 @@ enum ChatCommand {
     /// Inspect durable bridge state without contacting Herdr or a provider
     Status(ChatState),
     /// Approve one unchanged checkpoint-only gap retry while the service is stopped
-    RetryCheckpointGap(ChatRetryCheckpointGap),
+    RetryCheckpointGap(ChatRetryGap),
+    /// Approve an exact committed-boundary replay, including messages, with the runner stopped
+    #[command(
+        after_help = "Example: agentctl chat retry-boundary-gap --bridge-state /home/me/chat-state --expected-gap-sha256 <SHA256> --expected-checkpoint-sha256 <SHA256> --expected-configuration-sha256 <SHA256> --keep-cursor <CURSOR> --evidence-file /home/me/private/evidence.json --evidence-sha256 <SHA256>\n\nThis preserves the cursor and unresolved gap. Recovery requires a newer exact provider commit; changed message payloads or a replacement checkpoint are refused."
+    )]
+    RetryBoundaryGap(ChatRetryGap),
     /// Inspect one exact active retained request without writes or external access
     Inspect(ChatInspect),
     /// Publish one explicit operator root message through the configured helper
@@ -498,7 +503,7 @@ struct ChatInspect {
 }
 
 #[derive(Args)]
-struct ChatRetryCheckpointGap {
+struct ChatRetryGap {
     #[command(flatten)]
     state: ChatState,
     /// SHA256 of the reviewed unresolved gap.json bytes
@@ -1127,6 +1132,22 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             write_json(&result).map_err(Failure::Output)?;
             Ok(0)
         }
+        ChatCommand::RetryBoundaryGap(value) => {
+            let result = crate::chat_service::retry_boundary_gap(
+                &value.state.bridge_state,
+                &crate::chat_runtime::GapRetryApproval {
+                    expected_gap_sha256: &value.expected_gap_sha256,
+                    expected_checkpoint_sha256: &value.expected_checkpoint_sha256,
+                    expected_configuration_sha256: &value.expected_configuration_sha256,
+                    keep_cursor: &value.keep_cursor,
+                    evidence_path: &value.evidence_file,
+                    evidence_sha256: &value.evidence_sha256,
+                },
+            )
+            .map_err(Failure::Chat)?;
+            write_json(&result).map_err(Failure::Output)?;
+            Ok(0)
+        }
         ChatCommand::Inspect(value) => {
             let result =
                 crate::chat_service::inspect_request(&value.state.bridge_state, &value.request)
@@ -1417,6 +1438,56 @@ mod tests {
             "/tmp/chat-state",
         ])
         .is_err());
+        let exact_retry = Cli::try_parse_from([
+            "agentctl",
+            "chat",
+            "retry-boundary-gap",
+            "--bridge-state",
+            "/tmp/chat-state",
+            "--expected-gap-sha256",
+            &"a".repeat(64),
+            "--expected-checkpoint-sha256",
+            &"b".repeat(64),
+            "--expected-configuration-sha256",
+            &"c".repeat(64),
+            "--keep-cursor",
+            "cursor-safe",
+            "--evidence-file",
+            "/tmp/evidence.json",
+            "--evidence-sha256",
+            &"d".repeat(64),
+        ])
+        .expect("parse explicit exact-boundary retry");
+        assert!(matches!(
+            exact_retry.command,
+            Some(Commands::Chat(Chat {
+                command: ChatCommand::RetryBoundaryGap(_),
+            }))
+        ));
+        assert!(Cli::try_parse_from([
+            "agentctl",
+            "chat",
+            "retry-boundary-gap",
+            "--bridge-state",
+            "/tmp/chat-state",
+        ])
+        .is_err());
+        let help = Cli::try_parse_from(["agentctl", "chat", "retry-boundary-gap", "--help"])
+            .err()
+            .expect("exact-boundary help")
+            .to_string();
+        for option in [
+            "--bridge-state",
+            "--expected-gap-sha256",
+            "--expected-checkpoint-sha256",
+            "--expected-configuration-sha256",
+            "--keep-cursor",
+            "--evidence-file",
+            "--evidence-sha256",
+        ] {
+            assert!(help.contains(option), "{option}");
+        }
+        assert!(help.contains("newer exact provider commit"));
         let inspect = Cli::try_parse_from([
             "agentctl",
             "chat",
