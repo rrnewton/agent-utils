@@ -36719,3 +36719,471 @@ def test_git_branch_probes_distinguish_refusals_from_git_failure(tmp_path: Path)
         with pytest.raises(wrkslots.Refusal) as refusal:
             vcs.check_branch_name(repository, invalid)
         assert str(refusal.value) == f"invalid Git branch name {invalid!r}"
+
+
+# Owner-consented release: a recorded owner that is still running hands its
+# agent slot back through a handoff instead of by exiting.
+
+_OWNER_CONSENT_LEGACY_REFUSAL = (
+    "remove requires a proven-dead recorded owner; owner is live: PID {pid} generation is "
+    "live. state: REFUSED -- no checkout was salvaged or removed. remedy: wait for the exact "
+    "owner process to exit and for the time-to-live to remain expired; if process evidence "
+    "is unavailable, repair that evidence rather than treating the slot as free"
+)
+
+
+def _owner_consent_prefix(*, pid: int | None = None, generation: int = 1) -> str:
+    owner_pid = os.getpid() if pid is None else pid
+    return (
+        "remove requires a proven-dead recorded owner or an owner-consented handoff; "
+        f"owner is live: PID {owner_pid} generation is live. owner-consented release of "
+        f"slot slot01 generation {generation} is not established"
+    )
+
+
+def _owner_consent_missing(stderr: str) -> list[str]:
+    marker = "; missing: "
+    assert marker in stderr, stderr
+    listed = stderr.split(marker, 1)[1].split(". state: REFUSED", 1)[0]
+    return [item.split(" -- ", 1)[0] for item in listed.split("; ")]
+
+
+def _write_owner_handoff(
+    project: Path,
+    tmp_path: Path,
+    *,
+    generation: int = 1,
+    text: str = "released: every commit is published\n",
+) -> str:
+    source = tmp_path / f"owner-handoff-{generation}.md"
+    source.write_text(text, encoding="utf-8")
+    written = raw_command(
+        project,
+        "write-handoff",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        str(generation),
+        "--from-file",
+        str(source),
+    )
+    assert written.returncode == 0, written.stderr
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _read_owner_handoff(project: Path) -> None:
+    read = raw_command(
+        project, "read-handoff", "slot01", "--coordinator-pid", str(os.getpid())
+    )
+    assert read.returncode == 0, read.stderr
+
+
+def _owner_consent_ready(
+    tmp_path: Path, *, read: bool = True, expire: bool = True
+) -> tuple[Path, str]:
+    """An agent slot whose live owner (this test process) wrote a handoff."""
+
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    commit_task(repository, checkout(project), "codex/task")
+    digest = _write_owner_handoff(project, tmp_path)
+    if read:
+        _read_owner_handoff(project)
+    if expire:
+        expire_heartbeat(project)
+    return project, digest
+
+
+def _owner_consent_events(project: Path) -> list[dict[str, object]]:
+    events = wrkslots._load_events(wrkslots._load_config(str(project), "testhost"))
+    return [
+        event
+        for event in events
+        if event["kind"] == "active-state-recorded"
+        and wrkslots._as_mapping(event["payload"], "payload")["action"]
+        == wrkslots.OWNER_CONSENT_ACTION
+    ]
+
+
+def _assert_slot_retained(project: Path) -> None:
+    assert checkout(project).is_dir()
+    assert len(active_slots(project)) == 1
+    assert _owner_consent_events(project) == []
+
+
+def test_owner_consented_release_removes_a_live_owners_read_handoff_slot(
+    tmp_path: Path,
+) -> None:
+    project, digest = _owner_consent_ready(tmp_path)
+    tree = checkout(project)
+    owner = wrkslots._read_process_identity(os.getpid())
+    # The consenting owner is alive by definition, and so is the rest of its
+    # session. A live process sharing the owner's cgroup that touches nothing in
+    # the slot must not block the release; only direct use does.
+    sibling = subprocess.Popen(["sleep", "600"], cwd=tmp_path, text=True)
+    try:
+        assert (
+            wrkslots._read_process_identity(sibling.pid).cgroup_path == owner.cgroup_path
+        )
+        removed = remove(project)
+        assert removed.returncode == 0, removed.stderr
+        assert sibling.poll() is None
+    finally:
+        terminate_process(sibling)
+
+    assert not tree.exists()
+    assert active_slots(project) == []
+    config = wrkslots._load_config(str(project), "testhost")
+    consent = _owner_consent_events(project)
+    assert len(consent) == 1
+    payload = wrkslots._as_mapping(consent[0]["payload"], "payload")
+    assert payload["slot"] == "slot01"
+    evidence = wrkslots._as_mapping(payload["evidence"], "evidence")
+    assert evidence["basis"] == "owner-consented-handoff"
+    assert evidence["owner_state"] == "live"
+    assert evidence["generation"] == 1
+    assert evidence["coordinator_authorized"] is True
+    assert evidence["owner"] == wrkslots._identity_to_obj(owner)
+    assert evidence["registered_liveness"] == "alive"
+    assert int(str(evidence["heartbeat_age_seconds"])) > int(
+        str(evidence["heartbeat_ttl_seconds"])
+    )
+    handoff = wrkslots._as_mapping(evidence["handoff"], "handoff")
+    assert handoff["sha256"] == digest
+    assert handoff["source"] == "write-handoff"
+    assert handoff["path"] == str(wrkslots._handoff_sidecar_path(config, "slot01", 1))
+    assert handoff["writer"] == wrkslots._identity_to_obj(owner)
+    events = wrkslots._load_events(config)
+    started = [event for event in events if event["kind"] == "reclaim-started"]
+    assert len(started) == 1
+    started_payload = wrkslots._as_mapping(started[0]["payload"], "payload")
+    assert started_payload["owner_state"] == "live"
+    assert started_payload["registered_liveness"] == "alive"
+    assert int(str(consent[0]["sequence"])) < int(str(started[0]["sequence"]))
+    archive = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
+    )
+    assert len(archive["records"]) == 1
+
+
+def test_owner_consented_release_requires_coordinator_authorization(
+    tmp_path: Path,
+) -> None:
+    project, _digest = _owner_consent_ready(tmp_path)
+
+    refused = raw_command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+
+    assert refused.returncode == 3
+    assert _owner_consent_prefix() in refused.stderr
+    assert _owner_consent_missing(refused.stderr) == ["coordinator authorization"]
+    assert "--coordinator-authorized was not given" in refused.stderr
+    _assert_slot_retained(project)
+    authorized = remove(project)
+    assert authorized.returncode == 0, authorized.stderr
+    assert not checkout(project).exists()
+
+
+def test_owner_consented_release_requires_an_expired_heartbeat(tmp_path: Path) -> None:
+    project, _digest = _owner_consent_ready(tmp_path, expire=False)
+
+    refused = remove(project)
+
+    assert refused.returncode == 3
+    assert _owner_consent_prefix() in refused.stderr
+    assert _owner_consent_missing(refused.stderr) == ["expired heartbeat"]
+    assert "time-to-live has not expired" in refused.stderr
+    _assert_slot_retained(project)
+    # --validate-complete waives the time-to-live only for validate slots; it is
+    # not a shortcut around the consenting owner's expired heartbeat.
+    shortcut = command(
+        project,
+        "remove",
+        "slot01",
+        "--validate-complete",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+    assert shortcut.returncode == 3
+    assert "--validate-complete applies only to a slot created with" in shortcut.stderr
+    _assert_slot_retained(project)
+    expire_heartbeat(project)
+    expired = remove(project)
+    assert expired.returncode == 0, expired.stderr
+    assert not checkout(project).exists()
+
+
+def test_owner_consented_release_refuses_a_handoff_by_a_different_owner(
+    tmp_path: Path,
+) -> None:
+    project, _digest = _owner_consent_ready(tmp_path)
+    writer = wrkslots._read_process_identity(os.getpid())
+    successor = subprocess.Popen(["sleep", "600"], cwd=tmp_path, text=True)
+    try:
+        successor_identity = wrkslots._read_process_identity(successor.pid)
+        replace_owner(project, successor_identity)
+
+        refused = remove(project)
+
+        assert refused.returncode == 3
+        assert _owner_consent_prefix(pid=successor.pid) in refused.stderr
+        assert (
+            "handoff writer mismatch -- the handoff was written by PID "
+            f"{writer.pid} start ticks {writer.start_ticks}, but the recorded owner is PID "
+            f"{successor_identity.pid} start ticks {successor_identity.start_ticks}"
+        ) in refused.stderr
+        assert "; missing: " not in refused.stderr
+        _assert_slot_retained(project)
+    finally:
+        terminate_process(successor)
+
+
+def test_owner_consented_release_compares_the_full_writer_identity(
+    tmp_path: Path,
+) -> None:
+    """A reused PID is a different process generation, so it never consents."""
+
+    project, _digest = _owner_consent_ready(tmp_path)
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._load_active(config).slots[0]
+    assert record.owner is not None
+    events = wrkslots._load_events(config)
+    age = float(record.heartbeat_ttl_seconds + 1)
+    consent = wrkslots._owner_consented_release(
+        config,
+        record,
+        "exact owner",
+        events=events,
+        coordinator_authorized=True,
+        expired=True,
+        age=age,
+    )
+    assert consent is not None
+    assert consent.writer == record.owner
+    for field, successor in (
+        ("start_ticks", replace(record.owner, start_ticks=record.owner.start_ticks + 1)),
+        ("boot_id", replace(record.owner, boot_id="another-boot")),
+        ("cgroup_path", replace(record.owner, cgroup_path="/another-cgroup")),
+    ):
+        reused = replace(record, owner=successor)
+        with pytest.raises(wrkslots.Refusal) as refusal:
+            wrkslots._owner_consented_release(
+                config,
+                reused,
+                "reused PID",
+                events=events,
+                coordinator_authorized=True,
+                expired=True,
+                age=age,
+            )
+        assert "handoff writer mismatch" in str(refusal.value), field
+
+
+def test_owner_consented_release_refuses_a_previous_generations_handoff(
+    tmp_path: Path,
+) -> None:
+    """Consent is bound to one slot generation and does not carry to another.
+
+    Slot names are never reused, so every row this tool creates is generation 1
+    and a second generation exists only in history written under other rules.
+    The gate is therefore exercised directly on a generation-2 view of a row
+    whose only owner handoff was published for generation 1.
+    """
+
+    project, _digest = _owner_consent_ready(tmp_path)
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._load_active(config).slots[0]
+    events = wrkslots._load_events(config)
+    age = float(record.heartbeat_ttl_seconds + 1)
+    assert record.owner is not None
+    later = replace(record, generation=2)
+
+    with pytest.raises(wrkslots.Refusal) as refusal:
+        wrkslots._owner_consented_release(
+            config,
+            later,
+            f"PID {os.getpid()} generation is live",
+            events=events,
+            coordinator_authorized=True,
+            expired=True,
+            age=age,
+        )
+
+    message = str(refusal.value)
+    assert message.startswith(_owner_consent_prefix(generation=2)), message
+    assert (
+        "stale generation -- the recorded owner's handoff belongs to slot generation(s) 1, "
+        "not current generation 2, and consent does not carry across generations"
+    ) in message
+    assert "state: REFUSED -- no checkout was salvaged or removed." in message
+    # The same history still consents for the generation it was written for.
+    assert (
+        wrkslots._owner_consented_release(
+            config,
+            record,
+            f"PID {os.getpid()} generation is live",
+            events=events,
+            coordinator_authorized=True,
+            expired=True,
+            age=age,
+        )
+        is not None
+    )
+    # A generation-2 row whose owner wrote nothing for any generation keeps the
+    # original refusal: there is no consent to report as stale.
+    stranger = replace(later, owner=replace(record.owner, start_ticks=1))
+    assert (
+        wrkslots._owner_consented_release(
+            config,
+            stranger,
+            "unrelated",
+            events=events,
+            coordinator_authorized=True,
+            expired=True,
+            age=age,
+        )
+        is None
+    )
+
+
+def test_owner_consented_release_requires_the_coordinator_to_read_the_handoff(
+    tmp_path: Path,
+) -> None:
+    project, _digest = _owner_consent_ready(tmp_path, read=False)
+
+    refused = remove(project)
+
+    assert refused.returncode == 3
+    assert _owner_consent_prefix() in refused.stderr
+    assert _owner_consent_missing(refused.stderr) == ["coordinator read"]
+    assert "has not been read with read-handoff" in refused.stderr
+    _assert_slot_retained(project)
+    _read_owner_handoff(project)
+    read = remove(project)
+    assert read.returncode == 0, read.stderr
+    assert not checkout(project).exists()
+
+
+def test_owner_consented_release_still_refuses_a_process_using_the_checkout(
+    tmp_path: Path,
+) -> None:
+    project, _digest = _owner_consent_ready(tmp_path)
+    tree = checkout(project)
+    user = subprocess.Popen(["sleep", "600"], cwd=tree, text=True)
+    try:
+        refused = remove(project)
+
+        assert refused.returncode == 3
+        assert f"live process {user.pid} uses slot" in refused.stderr
+        _assert_slot_retained(project)
+    finally:
+        terminate_process(user)
+
+
+def test_live_owner_without_an_owner_handoff_keeps_the_original_refusal(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    commit_task(repository, checkout(project), "codex/task")
+    expire_heartbeat(project)
+    set_liveness(project, "dead")
+    expected = _OWNER_CONSENT_LEGACY_REFUSAL.format(pid=os.getpid())
+
+    refused = remove(project)
+
+    assert refused.returncode == 3
+    assert expected in refused.stderr
+    assert "owner-consented" not in refused.stderr
+    _assert_slot_retained(project)
+    # A writerless legacy HANDOFF.md names no process, so reading one is not
+    # the owner's consent either.
+    (checkout(project).parent / "HANDOFF.md").write_text(
+        "legacy notes without a writer\n", encoding="utf-8"
+    )
+    _read_owner_handoff(project)
+    legacy = remove(project)
+    assert legacy.returncode == 3
+    assert expected in legacy.stderr
+    assert "owner-consented" not in legacy.stderr
+    _assert_slot_retained(project)
+
+
+def test_retire_pending_releases_an_owner_consented_slot_only_when_authorized(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, digest = _owner_consent_ready(tmp_path)
+    base = [
+        "--project-root",
+        str(project),
+        "retire-pending",
+        "--limit",
+        "1",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--format",
+        "json",
+    ]
+
+    assert wrkslots.main(base) == 0
+    unauthorized = json.loads(capsys.readouterr().out)
+    assert unauthorized["removed"] == []
+    assert unauthorized["retained"][0]["slot"] == "slot01"
+    assert "missing: coordinator authorization" in unauthorized["retained"][0]["reason"]
+    _assert_slot_retained(project)
+
+    assert wrkslots.main([*base, "--coordinator-authorized"]) == 0
+    authorized = json.loads(capsys.readouterr().out)
+    assert authorized["removed"] == [
+        {
+            "generation": 1,
+            "machine": "testhost",
+            "outcome": "removed",
+            "reason": "ordinary remove completed",
+            "sha256": digest,
+            "slot": "slot01",
+        }
+    ]
+    assert not checkout(project).exists()
+    assert len(_owner_consent_events(project)) == 1
+
+
+def test_interrupted_owner_consented_removal_recovers_while_the_owner_lives(
+    tmp_path: Path,
+) -> None:
+    project, _digest = _owner_consent_ready(tmp_path)
+    interrupted = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-remove-worktree"},
+    )
+    assert interrupted.returncode == 86
+    assert not checkout(project).exists()
+    assert len(active_slots(project)) == 1
+
+    recovered = command(project, "recover", "--coordinator-pid", str(os.getpid()))
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert active_slots(project) == []
+    archive = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
+    )
+    assert len(archive["records"]) == 1
