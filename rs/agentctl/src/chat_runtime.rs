@@ -63,10 +63,15 @@ const MAX_REPORTED_REPLY_MARKERS: usize = MAX_VISIBLE_MARKERS;
 const MAX_FENCE_FEEDBACK_PROMPT_BYTES: usize = 64 * 1_024;
 const MAX_FENCE_FEEDBACK_BYTES: usize = 2 * 1_024 * 1_024;
 // Distinct reply operations one thread may attempt within the window before its breaker trips.
-const MAX_THREAD_REPLIES_PER_WINDOW: usize = 3;
+// This leaves room for several requests in one thread, each with progress updates and a
+// multi-message answer. The cost is a looser bound on a loop. A loop never trips if each post
+// starts at least 60 s after the receipt of the post 8 before it, so it can post 480 times an
+// hour to one thread. A faster loop trips on its 9th post within 60 s; one that posts every 3 s
+// trips 24 s in. After each hold it sends 8 more posts and trips again, about 96 posts an hour.
+const MAX_THREAD_REPLIES_PER_WINDOW: usize = 8;
 const THREAD_REPLY_WINDOW_MILLIS: u64 = 60_000;
 // A tripped thread holds its replies this long unless an operator deletes the breaker record.
-const THREAD_BREAKER_COOLDOWN_MILLIS: u64 = 600_000;
+const THREAD_BREAKER_COOLDOWN_MILLIS: u64 = 300_000;
 const MAX_REPLY_BREAKER_EVENTS: usize = 4_096;
 const MAX_REPLY_BREAKER_BYTES: usize = 4 * 1_024 * 1_024;
 const MAX_OUTBOUND_EXECUTABLE_BYTES: u64 = 64 * 1_024 * 1_024;
@@ -1135,7 +1140,8 @@ impl FenceFeedbackRecord {
         }
         if retained.len() > MAX_REPORTED_REPLY_MARKERS {
             return Err(ChatRuntimeError::invalid(
-                "fence feedback marker history limit reached; new diagnostics stay held",
+                "fence feedback marker history limit reached; new diagnostics stay held until an \
+operator deletes fence-feedback.json from the bridge state directory, which forgets every reported ID",
             ));
         }
         Ok(())
@@ -1202,12 +1208,24 @@ impl ReplyBreakerRecord {
     }
 
     /// Drop only expired events. Live budget must never be evicted to admit more work.
-    fn prune(&mut self, now: u64) {
+    ///
+    /// A stamp ahead of `now`, left behind when the wall clock steps back, is moved to `now`, so
+    /// its window or cooldown restarts once instead of lasting as long as the step. Returns
+    /// whether any stamp moved, so a caller that otherwise writes nothing can persist the move.
+    fn prune(&mut self, now: u64) -> bool {
+        let mut clamped = false;
+        for event in self.sends.iter_mut().chain(self.trips.iter_mut()) {
+            if event.at_millis > now {
+                event.at_millis = now;
+                clamped = true;
+            }
+        }
         self.sends.retain(|send| {
             send.pending || now.saturating_sub(send.at_millis) < THREAD_REPLY_WINDOW_MILLIS
         });
         self.trips
             .retain(|trip| now.saturating_sub(trip.at_millis) < THREAD_BREAKER_COOLDOWN_MILLIS);
+        clamped
     }
 }
 
@@ -2799,8 +2817,11 @@ pub struct ReplyCapture {
 pub struct SnapshotCapture {
     /// Request key and newly durable ordinals for each completed reply sequence.
     pub replies: Vec<(String, Vec<u32>)>,
-    /// First-seen unavailable marker identifiers requiring coordinator feedback.
+    /// First-seen unavailable marker identifiers requiring coordinator feedback. Identifiers
+    /// already reported are left out before the bound applies, so they cannot crowd out new ones.
     pub unknown_ids: Vec<String>,
+    /// Visible unavailable identifiers left out because the coordinator already received them.
+    pub suppressed_ids: Vec<String>,
     /// Active and closed nonce index derived by this same bounded state scan.
     pub(crate) route_entries: Vec<ReplyRouteEntry>,
 }
@@ -4227,6 +4248,7 @@ impl BridgeState {
             "retirement_sequence": checkpoint.retirement_sequence,
             "phases": phases,
             "acknowledgements": acknowledgements,
+            "reply_breaker": self.reply_breaker_status(),
         }))
     }
 
@@ -4320,8 +4342,14 @@ Sender: {}\n\n\
 Complete this request using your normal instructions and tools. You may send one or multiple replies, including progress updates. \
 Your next reply ID is `{reply_id}`. Compose an opening line from the literal prefix `<CHAT_REPLY_`, that ID, and `>`; \
 compose its closing line from `</CHAT_REPLY_`, the same ID, and `>`. Keep both lines standalone and outside code fences. \
-Increment the numeric suffix for every later reply. Each consecutive complete block is sent as a separate chat message.",
-            record.message.message_id, record.message.sender_id, record.message.text,
+Increment the numeric suffix for every later reply. Each consecutive complete block is sent as a separate chat message. \
+The bridge sends at most {MAX_THREAD_REPLIES_PER_WINDOW} messages to one chat thread within {} seconds and holds any further ones \
+for {} seconds, so combine short updates.",
+            record.message.message_id,
+            record.message.sender_id,
+            record.message.text,
+            THREAD_REPLY_WINDOW_MILLIS / 1_000,
+            THREAD_BREAKER_COOLDOWN_MILLIS / 1_000,
         ))
     }
 
@@ -4411,6 +4439,7 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
             return Ok(SnapshotCapture {
                 replies: Vec::new(),
                 unknown_ids: Vec::new(),
+                suppressed_ids: Vec::new(),
                 route_entries: Vec::new(),
             });
         }
@@ -4419,6 +4448,12 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
         let records = self.request_records()?;
         let retired_routes = self.retired_routes()?;
+        // A feedback record that cannot be read only disables this filter. Fence feedback reads
+        // the record again and reports the failure, so capture itself never stalls on it.
+        let reported = self
+            .read_fence_feedback()
+            .map(|record| record.reported.into_iter().collect::<BTreeSet<_>>())
+            .unwrap_or_default();
         after_state_scan();
         let mut known_nonces = records
             .iter()
@@ -4439,10 +4474,14 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
             .filter(|(record, _)| !record.reply_closed)
             .map(|(record, _)| (record.reply_nonce.clone(), record.next_reply_ordinal))
             .collect::<BTreeMap<_, _>>();
-        let mut scan = scan_reply_blocks_for_nonces(rendered, &known_nonces)?;
+        let mut scan = scan_reply_blocks_for_nonces(rendered, &known_nonces, &reported)?;
         let observed_ids = std::mem::take(&mut scan.observed_ids);
         let mut replies = Vec::new();
-        let mut unknown_ids = std::mem::take(&mut scan.unknown_ids);
+        let mut unavailable = UnavailableIds {
+            reported: &reported,
+            unknown: std::mem::take(&mut scan.unknown_ids),
+            suppressed: std::mem::take(&mut scan.suppressed_ids),
+        };
         for (nonce, blocks) in scan.blocks_by_nonce {
             let Some(key) = nonce_to_key.get(&nonce) else {
                 // Closed retained requests stay recognized so a stale terminal marker is a no-op.
@@ -4462,13 +4501,11 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
                 replies.push((key.clone(), capture.ordinals));
             }
             for identifier in capture.unknown_ids {
-                if unknown_ids.len() < 128 && !unknown_ids.contains(&identifier) {
-                    unknown_ids.push(identifier);
-                }
+                unavailable.push(identifier);
             }
         }
         for identifier in observed_ids {
-            let unavailable = identifier
+            let ahead = identifier
                 .rsplit_once('_')
                 .and_then(|(nonce, _)| {
                     next_by_nonce.get(nonce).and_then(|next| {
@@ -4476,8 +4513,8 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
                     })
                 })
                 .unwrap_or(false);
-            if unavailable && unknown_ids.len() < 128 && !unknown_ids.contains(&identifier) {
-                unknown_ids.push(identifier);
+            if ahead {
+                unavailable.push(identifier);
             }
         }
         let mut route_entries = records
@@ -4504,7 +4541,8 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         }));
         Ok(SnapshotCapture {
             replies,
-            unknown_ids,
+            unknown_ids: unavailable.unknown,
+            suppressed_ids: unavailable.suppressed,
             route_entries,
         })
     }
@@ -4554,10 +4592,15 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
     }
 
     fn read_fence_feedback(&self) -> Result<FenceFeedbackRecord> {
-        let record: FenceFeedbackRecord = match read_document(
-            &self.root.join("fence-feedback.json"),
-            MAX_FENCE_FEEDBACK_BYTES,
-        ) {
+        let path = self.root.join("fence-feedback.json");
+        let unusable = |error: ChatRuntimeError| {
+            ChatRuntimeError::invalid(format!(
+                "fence feedback record {} is unusable: {error}; unavailable reply ID diagnostics \
+stay held until an operator repairs or deletes it, and deleting it forgets which IDs were reported",
+                path.display()
+            ))
+        };
+        let record: FenceFeedbackRecord = match read_document(&path, MAX_FENCE_FEEDBACK_BYTES) {
             Ok(record) => record,
             Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
                 return Ok(FenceFeedbackRecord {
@@ -4566,9 +4609,9 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
                     pending: None,
                 });
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(unusable(error)),
         };
-        record.validate()?;
+        record.validate().map_err(unusable)?;
         Ok(record)
     }
 
@@ -4582,19 +4625,28 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         let path = self.root.join("reply-breaker.json");
         let mut record = self.read_reply_breaker()?;
         let now = unix_millis();
-        record.prune(now);
+        if record.prune(now) {
+            // Without this write, every refused attempt would move the stamp to its own `now`
+            // again.
+            self.write_reply_breaker(&record)?;
+        }
         if let Some(trip) = record.trips.iter().rev().find(|trip| {
             trip.is_for(message)
                 && now.saturating_sub(trip.at_millis) < THREAD_BREAKER_COOLDOWN_MILLIS
         }) {
-            return Err(ChatRuntimeError::invalid(format!(
+            let released_at = trip
+                .at_millis
+                .saturating_add(THREAD_BREAKER_COOLDOWN_MILLIS);
+            let held = ChatRuntimeError::invalid(format!(
                 "chat reply post-rate breaker for thread {} tripped {} s ago; its replies stay \
-held for {} s or until {} is deleted",
+held for {} more s, until {released_at} ms after the Unix epoch, or until {} is deleted; the first \
+retry after that sends them in order",
                 message.thread_id,
                 now.saturating_sub(trip.at_millis) / 1_000,
-                THREAD_BREAKER_COOLDOWN_MILLIS / 1_000,
+                released_at.saturating_sub(now).div_ceil(1_000),
                 path.display()
-            )));
+            ));
+            return Err(held);
         }
         if let Some(reservation) = record
             .sends
@@ -4646,9 +4698,13 @@ held for {} s or until {} is deleted",
         self.write_reply_breaker(&record)?;
         Err(ChatRuntimeError::invalid(format!(
             "chat reply post-rate breaker tripped: thread {} has {recent} recent or unresolved \
-reply reservations, so a reply loop is likely; its replies stay held for {} s or until {} is deleted",
+reply reservations (limit {MAX_THREAD_REPLIES_PER_WINDOW} per {} s), so a reply loop is likely; its \
+replies stay held for {} s, until {} ms after the Unix epoch, or until {} is deleted; the first retry \
+after that sends them in order",
             message.thread_id,
+            THREAD_REPLY_WINDOW_MILLIS / 1_000,
             THREAD_BREAKER_COOLDOWN_MILLIS / 1_000,
+            now.saturating_add(THREAD_BREAKER_COOLDOWN_MILLIS),
             path.display()
         )))
     }
@@ -4687,10 +4743,15 @@ reply reservations, so a reply loop is likely; its replies stay held for {} s or
     }
 
     fn read_reply_breaker(&self) -> Result<ReplyBreakerRecord> {
-        let record: ReplyBreakerRecord = match read_document(
-            &self.root.join("reply-breaker.json"),
-            MAX_REPLY_BREAKER_BYTES,
-        ) {
+        let path = self.root.join("reply-breaker.json");
+        let unusable = |error: ChatRuntimeError| {
+            ChatRuntimeError::invalid(format!(
+                "reply post-rate breaker record {} is unusable: {error}; replies to every thread \
+stay held until an operator repairs or deletes it, and deleting it releases every thread",
+                path.display()
+            ))
+        };
+        let record: ReplyBreakerRecord = match read_document(&path, MAX_REPLY_BREAKER_BYTES) {
             Ok(record) => record,
             Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
                 return Ok(ReplyBreakerRecord {
@@ -4699,10 +4760,68 @@ reply reservations, so a reply loop is likely; its replies stay held for {} s or
                     trips: Vec::new(),
                 });
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(unusable(error)),
         };
-        record.validate()?;
+        record.validate().map_err(unusable)?;
         Ok(record)
+    }
+
+    /// Summarize the thread post-rate breaker for status without changing it. An unusable
+    /// record holds every thread's replies, so it is reported here instead of failing status.
+    /// Only threads with a live trip are listed. A trip stamped in the future counts from now,
+    /// as the next send attempt to any thread will save it; until then, each call reports a full
+    /// cooldown from the time of the call.
+    fn reply_breaker_status(&self) -> Value {
+        let now = unix_millis();
+        let mut held = BTreeMap::<(String, String), u64>::new();
+        let mut reservations = BTreeMap::<(String, String), usize>::new();
+        let error = match self.read_reply_breaker() {
+            Ok(record) => {
+                for trip in &record.trips {
+                    let released_at = trip
+                        .at_millis
+                        .min(now)
+                        .saturating_add(THREAD_BREAKER_COOLDOWN_MILLIS);
+                    if released_at > now {
+                        let thread = (trip.channel_id.clone(), trip.thread_id.clone());
+                        let entry = held.entry(thread).or_default();
+                        *entry = (*entry).max(released_at);
+                    }
+                }
+                for send in &record.sends {
+                    let thread = (send.channel_id.clone(), send.thread_id.clone());
+                    if held.contains_key(&thread)
+                        && (send.pending
+                            || now.saturating_sub(send.at_millis.min(now))
+                                < THREAD_REPLY_WINDOW_MILLIS)
+                    {
+                        *reservations.entry(thread).or_default() += 1;
+                    }
+                }
+                Value::Null
+            }
+            Err(error) => Value::String(error.to_string()),
+        };
+        let held_threads = held
+            .into_iter()
+            .map(|(thread, released_at)| {
+                let reservations = reservations.get(&thread).copied().unwrap_or(0);
+                serde_json::json!({
+                    "channel_id": thread.0,
+                    "thread_id": thread.1,
+                    "held_until_millis": released_at,
+                    "held_for_seconds": released_at.saturating_sub(now).div_ceil(1_000),
+                    "recent_or_unresolved_reservations": reservations,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "max_replies_per_thread": MAX_THREAD_REPLIES_PER_WINDOW,
+            "window_seconds": THREAD_REPLY_WINDOW_MILLIS / 1_000,
+            "cooldown_seconds": THREAD_BREAKER_COOLDOWN_MILLIS / 1_000,
+            "held_threads": held_threads,
+            "error": error,
+        })
     }
 
     /// Build the bounded active route cache during startup or explicit recovery.
@@ -6616,7 +6735,7 @@ pub(crate) fn deliver_fence_feedback_with(
     let available = state.available_reply_ids()?;
     let prompt = format!(
         "Chat reply routing error: your output referenced unavailable reply ID(s): {}. \
-The currently available reply ID(s) are: {}. Emit a complete reply block using one exact available ID.",
+The reply ID(s) available when this notice was written are: {}. Emit a complete reply block using one exact available ID.",
         unavailable.join(", "),
         format_available_reply_ids(&available)
     );
@@ -7116,6 +7235,29 @@ struct MultiReplyScan {
     blocks_by_nonce: BTreeMap<String, Vec<ScannedReply>>,
     observed_ids: Vec<String>,
     unknown_ids: Vec<String>,
+    suppressed_ids: Vec<String>,
+}
+
+/// Unavailable marker identifiers split by whether the coordinator already received them. Both
+/// lists are deduplicated and bounded, and the split happens before the bound, so reported
+/// identifiers cannot crowd a new one out of its feedback.
+struct UnavailableIds<'a> {
+    reported: &'a BTreeSet<String>,
+    unknown: Vec<String>,
+    suppressed: Vec<String>,
+}
+
+impl UnavailableIds<'_> {
+    fn push(&mut self, identifier: String) {
+        let list = if self.reported.contains(&identifier) {
+            &mut self.suppressed
+        } else {
+            &mut self.unknown
+        };
+        if list.len() < MAX_FEEDBACK_UNAVAILABLE_IDS && !list.contains(&identifier) {
+            list.push(identifier);
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -7130,7 +7272,7 @@ struct ActiveReply {
 
 fn scan_reply_blocks(rendered: &str, expected_nonce: &str) -> Result<ReplyScan> {
     let expected_nonces = BTreeSet::from([expected_nonce.to_owned()]);
-    let mut scan = scan_reply_blocks_for_nonces(rendered, &expected_nonces)?;
+    let mut scan = scan_reply_blocks_for_nonces(rendered, &expected_nonces, &BTreeSet::new())?;
     Ok(ReplyScan {
         blocks: scan
             .blocks_by_nonce
@@ -7143,6 +7285,7 @@ fn scan_reply_blocks(rendered: &str, expected_nonce: &str) -> Result<ReplyScan> 
 fn scan_reply_blocks_for_nonces(
     rendered: &str,
     expected_nonces: &BTreeSet<String>,
+    reported: &BTreeSet<String>,
 ) -> Result<MultiReplyScan> {
     if expected_nonces.iter().any(|nonce| !valid_nonce(nonce)) {
         return Err(ChatRuntimeError::invalid(
@@ -7157,7 +7300,11 @@ fn scan_reply_blocks_for_nonces(
     let normalized = rendered.replace("\r\n", "\n");
     let mut blocks_by_nonce = BTreeMap::<String, Vec<ScannedReply>>::new();
     let mut observed_ids = Vec::new();
-    let mut unknown_ids = Vec::new();
+    let mut unavailable = UnavailableIds {
+        reported,
+        unknown: Vec::new(),
+        suppressed: Vec::new(),
+    };
     let mut seen_unknown_ids = BTreeSet::new();
     let mut seen_identifiers = BTreeSet::new();
     let mut active: Option<ActiveReply> = None;
@@ -7224,11 +7371,8 @@ fn scan_reply_blocks_for_nonces(
             observed_ids.push(marker.identifier.clone());
         }
         let expected = recognized_reply_marker(&marker.identifier, expected_nonces);
-        if expected.is_none()
-            && unknown_ids.len() < 128
-            && seen_unknown_ids.insert(marker.identifier.clone())
-        {
-            unknown_ids.push(bounded_detail(&marker.identifier, 256));
+        if expected.is_none() && seen_unknown_ids.insert(marker.identifier.clone()) {
+            unavailable.push(bounded_detail(&marker.identifier, MAX_FEEDBACK_ID_BYTES));
         }
 
         match active.as_mut() {
@@ -7273,7 +7417,8 @@ fn scan_reply_blocks_for_nonces(
     Ok(MultiReplyScan {
         blocks_by_nonce,
         observed_ids,
-        unknown_ids,
+        unknown_ids: unavailable.unknown,
+        suppressed_ids: unavailable.suppressed,
     })
 }
 
@@ -11219,6 +11364,10 @@ mod tests {
         let prompts = target.submitted_prompts.lock().expect("prompt lock");
         assert_eq!(prompts.len(), 1);
         assert!(prompts[0].contains("one or multiple replies"));
+        assert!(prompts[0].ends_with(
+            "The bridge sends at most 8 messages to one chat thread within 60 seconds and holds \
+any further ones for 300 seconds, so combine short updates."
+        ));
         assert!(prompts[0].contains("<CHAT_REPLY_"));
         assert!(!prompts[0].contains("GCHAT_REPLY"));
         drop(prompts);
@@ -11417,7 +11566,8 @@ mod tests {
 <CHAT_REPLY_{second}_1>\nsecond\n</CHAT_REPLY_{second}_1>\n\
 <CHAT_REPLY_unknown_1>\nunknown\n</CHAT_REPLY_unknown_1>"
         );
-        let scan = scan_reply_blocks_for_nonces(&rendered, &expected).expect("scan once");
+        let scan = scan_reply_blocks_for_nonces(&rendered, &expected, &BTreeSet::new())
+            .expect("scan once");
         assert_eq!(scan.blocks_by_nonce.len(), 2);
         assert_eq!(scan.blocks_by_nonce[first][0].body, "first");
         assert_eq!(scan.blocks_by_nonce[second][0].body, "second");
@@ -11568,9 +11718,17 @@ mod tests {
         );
         let coordinator = QueueDelivery::default();
         let mut transport = FakeReplyTransport::default();
-        for _ in 0..11 {
+        let stale = vec![format!("{foreign}_1")];
+        for scan in 0..11 {
             let capture = state.capture_snapshot(&rendered).expect("recovery scan");
-            assert_eq!(capture.unknown_ids, vec![format!("{foreign}_1")]);
+            if scan == 0 {
+                assert_eq!(capture.unknown_ids, stale);
+                assert!(capture.suppressed_ids.is_empty());
+            } else {
+                // Once reported, the stale marker is left out of new feedback at capture.
+                assert!(capture.unknown_ids.is_empty(), "{:?}", capture.unknown_ids);
+                assert_eq!(capture.suppressed_ids, stale);
+            }
             while state
                 .publish_one(&key, &mut transport)
                 .expect("publish captured reply")
@@ -11598,8 +11756,14 @@ mod tests {
             1,
             "stale marker was re-reported: {prompts:#?}"
         );
-        assert!(prompts[0].contains(&format!("{foreign}_1")));
-        assert!(prompts[0].contains(&format!("{nonce}_2")));
+        assert_eq!(
+            prompts[0],
+            format!(
+                "Chat reply routing error: your output referenced unavailable reply ID(s): \
+{foreign}_1. The reply ID(s) available when this notice was written are: {nonce}_2. Emit a \
+complete reply block using one exact available ID."
+            )
+        );
         assert_eq!(
             transport
                 .submissions
@@ -11609,6 +11773,199 @@ mod tests {
             [
                 "[codex coordinator] answer",
                 "[codex coordinator] answer again"
+            ]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn reported_ahead_reply_block_is_posted_once_its_id_is_next() {
+        // An answer under an ID ahead of the request's next reply ID is reported. If the agent
+        // sends it again under the ID the notice names while the first block is still on screen,
+        // the next capture takes both blocks, so the answer is posted twice, as the guide says.
+        let root = temporary("ahead-marker-on-screen");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let key = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request")
+            .new_request_keys[0]
+            .clone();
+        let nonce = state.read_request(&key).expect("request").reply_nonce;
+        let coordinator = QueueDelivery::default();
+        let mut transport = FakeReplyTransport::default();
+        let mut rendered = format!("<CHAT_REPLY_{nonce}_2>\nanswer\n</CHAT_REPLY_{nonce}_2>\n");
+        let capture = state.capture_snapshot(&rendered).expect("first scan");
+        assert!(capture.replies.is_empty());
+        assert_eq!(capture.unknown_ids, [format!("{nonce}_2")]);
+        deliver_fence_feedback_with(
+            &state,
+            &coordinator,
+            &capture.unknown_ids,
+            DrainOptions::default(),
+        )
+        .expect("fence feedback");
+        assert_eq!(
+            coordinator.prompts(),
+            [format!(
+                "Chat reply routing error: your output referenced unavailable reply ID(s): \
+{nonce}_2. The reply ID(s) available when this notice was written are: {nonce}_1. Emit a \
+complete reply block using one exact available ID."
+            )]
+        );
+        rendered.push_str(&format!(
+            "<CHAT_REPLY_{nonce}_1>\nanswer\n</CHAT_REPLY_{nonce}_1>\n"
+        ));
+        let capture = state.capture_snapshot(&rendered).expect("second scan");
+        assert_eq!(capture.replies, [(key.clone(), vec![1, 2])]);
+        assert!(capture.unknown_ids.is_empty());
+        assert!(capture.suppressed_ids.is_empty());
+        while state
+            .publish_one(&key, &mut transport)
+            .expect("publish captured reply")
+            .is_some()
+        {}
+        assert_eq!(
+            transport
+                .submissions
+                .iter()
+                .map(|submission| submission.2.as_str())
+                .collect::<Vec<_>>(),
+            ["[codex coordinator] answer", "[codex coordinator] answer"]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn reported_ahead_reply_id_is_posted_when_a_later_block_uses_it_as_next() {
+        // The reported block leaves the screen. Once the earlier reply is captured, the reported
+        // ID is the next one, and a new block under it is posted, though the ID stays reported.
+        let root = temporary("ahead-marker-later");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let key = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request")
+            .new_request_keys[0]
+            .clone();
+        let nonce = state.read_request(&key).expect("request").reply_nonce;
+        let coordinator = QueueDelivery::default();
+        let mut transport = FakeReplyTransport::default();
+        let capture = state
+            .capture_snapshot(&format!(
+                "<CHAT_REPLY_{nonce}_2>\nearly\n</CHAT_REPLY_{nonce}_2>\n"
+            ))
+            .expect("first scan");
+        assert_eq!(capture.unknown_ids, [format!("{nonce}_2")]);
+        deliver_fence_feedback_with(
+            &state,
+            &coordinator,
+            &capture.unknown_ids,
+            DrainOptions::default(),
+        )
+        .expect("fence feedback");
+        let first = format!("<CHAT_REPLY_{nonce}_1>\nfirst\n</CHAT_REPLY_{nonce}_1>\n");
+        let capture = state.capture_snapshot(&first).expect("second scan");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+        let later = format!("{first}<CHAT_REPLY_{nonce}_2>\nsecond\n</CHAT_REPLY_{nonce}_2>\n");
+        let capture = state.capture_snapshot(&later).expect("third scan");
+        assert_eq!(capture.replies, [(key.clone(), vec![2])]);
+        assert!(capture.unknown_ids.is_empty());
+        assert!(capture.suppressed_ids.is_empty());
+        assert_eq!(
+            state
+                .read_fence_feedback()
+                .expect("feedback record")
+                .reported,
+            [format!("{nonce}_2")]
+        );
+        while state
+            .publish_one(&key, &mut transport)
+            .expect("publish captured reply")
+            .is_some()
+        {}
+        assert_eq!(
+            transport
+                .submissions
+                .iter()
+                .map(|submission| submission.2.as_str())
+                .collect::<Vec<_>>(),
+            ["[codex coordinator] first", "[codex coordinator] second"]
+        );
+        assert_eq!(coordinator.prompts().len(), 1);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn next_reply_id_seen_in_part_is_reported_and_its_complete_block_posted() {
+        // A recovery scan that sees only part of the next reply's block, its opening marker
+        // before the closing one or its closing marker after the opening one has scrolled away,
+        // reports the request's own next reply ID. With only this request open, the notice names
+        // that ID as both unavailable and available. A complete block under it is posted, as the
+        // guide says.
+        let root = temporary("next-marker-in-part");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let key = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request")
+            .new_request_keys[0]
+            .clone();
+        let nonce = state.read_request(&key).expect("request").reply_nonce;
+        let coordinator = QueueDelivery::default();
+        let mut transport = FakeReplyTransport::default();
+        let report = |identifiers: &[String]| {
+            deliver_fence_feedback_with(&state, &coordinator, identifiers, DrainOptions::default())
+                .expect("fence feedback")
+        };
+        let notice = |ordinal: u32| {
+            format!(
+                "Chat reply routing error: your output referenced unavailable reply ID(s): \
+{nonce}_{ordinal}. The reply ID(s) available when this notice was written are: \
+{nonce}_{ordinal}. Emit a complete reply block using one exact available ID."
+            )
+        };
+
+        // The opening marker, before the agent has written the closing one.
+        let opening = format!("<CHAT_REPLY_{nonce}_1>\nfirst answer\n");
+        let capture = state.capture_snapshot(&opening).expect("opening scan");
+        assert!(capture.replies.is_empty());
+        assert_eq!(capture.unknown_ids, [format!("{nonce}_1")]);
+        report(&capture.unknown_ids);
+        let capture = state
+            .capture_snapshot(&format!("{opening}</CHAT_REPLY_{nonce}_1>\n"))
+            .expect("scan of the closed block");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+        assert!(capture.unknown_ids.is_empty());
+
+        // The closing marker, after the opening one has scrolled away. The agent sends the
+        // answer again under the same ID.
+        let closing = format!("end of the second answer\n</CHAT_REPLY_{nonce}_2>\n");
+        let capture = state.capture_snapshot(&closing).expect("closing scan");
+        assert!(capture.replies.is_empty());
+        assert_eq!(capture.unknown_ids, [format!("{nonce}_2")]);
+        report(&capture.unknown_ids);
+        let capture = state
+            .capture_snapshot(&format!(
+                "{closing}<CHAT_REPLY_{nonce}_2>\nsecond answer\n</CHAT_REPLY_{nonce}_2>\n"
+            ))
+            .expect("scan of the block sent again");
+        assert_eq!(capture.replies, [(key.clone(), vec![2])]);
+        assert!(capture.unknown_ids.is_empty());
+        assert!(capture.suppressed_ids.is_empty());
+
+        assert_eq!(coordinator.prompts(), [notice(1), notice(2)]);
+        while state
+            .publish_one(&key, &mut transport)
+            .expect("publish captured reply")
+            .is_some()
+        {}
+        assert_eq!(
+            transport
+                .submissions
+                .iter()
+                .map(|submission| submission.2.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "[codex coordinator] first answer",
+                "[codex coordinator] second answer"
             ]
         );
         fs::remove_dir_all(root).expect("cleanup");
@@ -11873,6 +12230,161 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fence_feedback_queued_prompt_keeps_its_queue_identity_after_available_ids_advance() {
+        let root = temporary("feedback-identity");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let key = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request")
+            .new_request_keys[0]
+            .clone();
+        let nonce = state.read_request(&key).expect("request").reply_nonce;
+        let coordinator = QueueDelivery::default();
+        *coordinator.busy_drains.lock().expect("busy lock") = 1;
+        let unknown = ["stale_1".to_owned()];
+        assert!(matches!(
+            deliver_fence_feedback_with(&state, &coordinator, &unknown, DrainOptions::default())
+                .expect("queue feedback"),
+            CoordinatorDeliveryResult::Pending(_)
+        ));
+        // A reply captured while the prompt waits advances the available IDs its text names.
+        state
+            .capture_replies(
+                &key,
+                &format!("<CHAT_REPLY_{nonce}_1>\nanswer\n</CHAT_REPLY_{nonce}_1>\n"),
+            )
+            .expect("capture reply while the prompt is queued");
+        assert_eq!(
+            state.available_reply_ids().expect("available"),
+            [format!("{nonce}_2")]
+        );
+        assert_eq!(
+            deliver_fence_feedback_with(&state, &coordinator, &unknown, DrainOptions::default())
+                .expect("settle the queued prompt"),
+            CoordinatorDeliveryResult::Delivered
+        );
+        assert_eq!(
+            coordinator.prompts().len(),
+            1,
+            "{:#?}",
+            coordinator.prompts()
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn fence_feedback_uncertain_submission_counts_as_reported() {
+        struct InjectedThenFailed<'a>(&'a QueueDelivery);
+        impl CoordinatorDelivery for InjectedThenFailed<'_> {
+            fn message_state(
+                &self,
+                agent_name: &str,
+                message_id: &str,
+            ) -> std::result::Result<Option<QueueMessageState>, String> {
+                self.0.message_state(agent_name, message_id)
+            }
+            fn submit(
+                &self,
+                agent_name: &str,
+                prompt: &str,
+                message_id: &str,
+                options: DrainOptions,
+            ) -> std::result::Result<(), String> {
+                self.0.submit(agent_name, prompt, message_id, options)?;
+                self.0
+                    .states
+                    .lock()
+                    .expect("queue lock")
+                    .insert(message_id.to_owned(), QueueMessageState::Inflight);
+                Err("the pane closed while the prompt was being typed".to_owned())
+            }
+            fn drain(
+                &self,
+                agent_name: &str,
+                options: DrainOptions,
+            ) -> std::result::Result<(), String> {
+                self.0.drain(agent_name, options)
+            }
+        }
+        let root = temporary("feedback-uncertain");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let queue = QueueDelivery::default();
+        let unknown = ["stale_1".to_owned()];
+        assert!(matches!(
+            deliver_fence_feedback_with(
+                &state,
+                &InjectedThenFailed(&queue),
+                &unknown,
+                DrainOptions::default()
+            )
+            .expect("uncertain feedback"),
+            CoordinatorDeliveryResult::Uncertain(_)
+        ));
+        // The coordinator may have read the prompt, so its marker counts as reported and no
+        // later scan sends it again.
+        let record = state.read_fence_feedback().expect("feedback");
+        assert!(record.pending.is_none());
+        assert_eq!(record.reported, ["stale_1"]);
+        assert_eq!(
+            deliver_fence_feedback_with(&state, &queue, &unknown, DrainOptions::default())
+                .expect("rescan"),
+            CoordinatorDeliveryResult::AlreadyDelivered
+        );
+        assert_eq!(queue.prompts().len(), 1);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn capture_leaves_out_reported_ids_before_bounding_new_ones() {
+        let root = temporary("feedback-filter-before-bound");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let key = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request")
+            .new_request_keys[0]
+            .clone();
+        let nonce = state.read_request(&key).expect("request").reply_nonce;
+        let foreign = "F".repeat(22);
+        // One full feedback round already reported a future ordinal of a live request and all
+        // but one of the foreign IDs below.
+        let mut reported = (1..MAX_FEEDBACK_UNAVAILABLE_IDS)
+            .map(|ordinal| format!("{foreign}_{ordinal}"))
+            .collect::<Vec<_>>();
+        reported.push(format!("{nonce}_3"));
+        assert_eq!(
+            deliver_fence_feedback_with(
+                &state,
+                &QueueDelivery::default(),
+                &reported,
+                DrainOptions::default()
+            )
+            .expect("report one full round"),
+            CoordinatorDeliveryResult::Delivered
+        );
+        let rendered = (1..=MAX_FEEDBACK_UNAVAILABLE_IDS + 1)
+            .map(|ordinal| format!("{foreign}_{ordinal}"))
+            .chain([format!("{nonce}_3")])
+            .map(|identifier| {
+                format!("<CHAT_REPLY_{identifier}>\nstray\n</CHAT_REPLY_{identifier}>\n")
+            })
+            .collect::<String>();
+        let capture = state.capture_snapshot(&rendered).expect("capture");
+        assert!(capture.replies.is_empty());
+        assert_eq!(
+            capture.unknown_ids,
+            [
+                format!("{foreign}_{MAX_FEEDBACK_UNAVAILABLE_IDS}"),
+                format!("{foreign}_{}", MAX_FEEDBACK_UNAVAILABLE_IDS + 1),
+            ]
+        );
+        let mut suppressed = capture.suppressed_ids.clone();
+        suppressed.sort();
+        reported.sort();
+        assert_eq!(suppressed, reported);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     fn same_thread_reply_requests(state: &BridgeState, count: u64) -> Vec<String> {
         let messages = (1..=count)
             .map(|index| {
@@ -11912,6 +12424,21 @@ mod tests {
                 .expect("capture");
         }
         keys
+    }
+
+    /// Move every breaker stamp back, as if `millis` passed before the next send attempt.
+    fn let_breaker_time_pass(state: &BridgeState, millis: u64) {
+        let mut record = state.read_reply_breaker().expect("read breaker");
+        for event in record.sends.iter_mut().chain(record.trips.iter_mut()) {
+            event.at_millis = event.at_millis.saturating_sub(millis);
+        }
+        // A plain write, without the syncs of write_document, keeps the delay before the next
+        // clock read short. The eleven-post test's check at 299.6 s needs it under 400 ms.
+        fs::write(
+            state.root.join("reply-breaker.json"),
+            serde_json::to_vec(&record).expect("encode breaker"),
+        )
+        .expect("write breaker");
     }
 
     #[test]
@@ -11955,7 +12482,8 @@ mod tests {
         }
         let root = temporary("reply-reservation-crash");
         let state = BridgeState::initialize(&root, config()).expect("initialize");
-        let keys = same_thread_reply_requests(&state, 4);
+        let limit = MAX_THREAD_REPLIES_PER_WINDOW;
+        let keys = same_thread_reply_requests(&state, limit as u64 + 1);
         let mut transport = FakeReplyTransport::default();
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             state.publish_one(
@@ -11971,22 +12499,28 @@ mod tests {
         assert_eq!(transport.submissions.len(), 1);
         drop(state);
         let state = BridgeState::open(&root).expect("recover unknown send");
-        for key in &keys[1..3] {
+        for key in &keys[1..limit] {
             transport.fail_once = true;
             assert!(state.publish_one(key, &mut transport).is_err());
         }
-        let mut ledger = state.read_reply_breaker().expect("three charged attempts");
-        assert_eq!(ledger.sends.len(), 3);
+        let mut ledger = state.read_reply_breaker().expect("charged attempts");
+        assert_eq!(ledger.sends.len(), limit);
         for event in &mut ledger.sends {
             event.at_millis = 1;
         }
         write_document(&root.join("reply-breaker.json"), &ledger).expect("age unknown outcomes");
         assert!(state
-            .publish_one(&keys[3], &mut transport)
+            .publish_one(&keys[limit], &mut transport)
             .expect_err("unknowns still count")
             .to_string()
             .contains("post-rate breaker tripped"));
-        assert_eq!(transport.submissions.len(), 3);
+        assert_eq!(transport.submissions.len(), limit);
+        // Status counts the unresolved reservations that tripped the thread, however old.
+        assert_eq!(
+            state.status().expect("status")["reply_breaker"]["held_threads"][0]
+                ["recent_or_unresolved_reservations"],
+            limit
+        );
         let mut ledger = state.read_reply_breaker().expect("tripped ledger");
         for event in &mut ledger.trips {
             event.at_millis = 1;
@@ -12003,9 +12537,9 @@ mod tests {
                 },
             )
             .expect("same operation reconciles without another reservation");
-        assert_eq!(transport.submissions[0].3, transport.submissions[3].3);
+        assert_eq!(transport.submissions[0].3, transport.submissions[limit].3);
         let ledger = state.read_reply_breaker().expect("completed reservation");
-        assert_eq!(ledger.sends.len(), 3);
+        assert_eq!(ledger.sends.len(), limit);
         let completed = ledger
             .sends
             .iter()
@@ -12019,8 +12553,8 @@ mod tests {
             state.read_reply(&keys[0], 1).expect("reply").phase,
             ReplyPhase::Sent
         );
-        assert!(state.publish_one(&keys[3], &mut transport).is_err());
-        assert_eq!(transport.submissions.len(), 4);
+        assert!(state.publish_one(&keys[limit], &mut transport).is_err());
+        assert_eq!(transport.submissions.len(), limit + 1);
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -12028,7 +12562,7 @@ mod tests {
     fn reply_reservation_expired_completion_rechecks_budget_after_crash() {
         let root = temporary("reply-reservation-expired");
         let state = BridgeState::initialize(&root, config()).expect("initialize");
-        let keys = same_thread_reply_requests(&state, 4);
+        let keys = same_thread_reply_requests(&state, MAX_THREAD_REPLIES_PER_WINDOW as u64 + 1);
         let mut transport = FakeReplyTransport {
             fail_once: true,
             ..Default::default()
@@ -12057,7 +12591,10 @@ mod tests {
             .expect_err("old ID needs current budget")
             .to_string()
             .contains("post-rate breaker tripped"));
-        assert_eq!(transport.submissions.len(), 4);
+        assert_eq!(
+            transport.submissions.len(),
+            MAX_THREAD_REPLIES_PER_WINDOW + 1
+        );
         assert_eq!(
             state
                 .read_reply(&keys[0], 1)
@@ -12074,7 +12611,8 @@ mod tests {
         let state = BridgeState::initialize(&root, config()).expect("initialize");
         let keys = same_thread_reply_requests(&state, 1);
         let message = state.read_request(&keys[0]).expect("request").message;
-        let legacy = serde_json::json!({ "version": STATE_VERSION, "sends": (0..3).map(|_| {
+        let legacy = serde_json::json!({ "version": STATE_VERSION,
+            "sends": (0..MAX_THREAD_REPLIES_PER_WINDOW).map(|_| {
             serde_json::json!({ "channel_id": message.channel_id,
                 "thread_id": message.thread_id, "at_millis": unix_millis() })
         }).collect::<Vec<_>>(), "trips": [] });
@@ -12082,30 +12620,65 @@ mod tests {
         let mut transport = FakeReplyTransport::default();
         assert!(state.publish_one(&keys[0], &mut transport).is_err());
         let mut record = state.read_reply_breaker().expect("legacy history accepted");
+        let live_events = |thread: &str, count: usize| {
+            (0..count)
+                .map(|index| ThreadEvent {
+                    channel_id: message.channel_id.clone(),
+                    thread_id: format!("{thread}{index}"),
+                    at_millis: unix_millis(),
+                    send_request_id: None,
+                    pending: false,
+                })
+                .collect::<Vec<_>>()
+        };
+        // Each full ledger carries one stamp from a clock that has since stepped back. The
+        // refusal still saves the moved stamp.
+        let future = unix_millis() + 3_600_000;
+        let stamped_by_now = || {
+            let now = unix_millis();
+            let record = state.read_reply_breaker().expect("retained ledger");
+            let stamped = record
+                .sends
+                .iter()
+                .chain(&record.trips)
+                .all(|event| event.at_millis <= now);
+            (record.sends.len(), record.trips.len(), stamped)
+        };
         record.trips.clear();
-        record.sends = (0..MAX_REPLY_BREAKER_EVENTS)
-            .map(|index| ThreadEvent {
-                channel_id: message.channel_id.clone(),
-                thread_id: format!("other-{index}"),
-                at_millis: unix_millis(),
-                send_request_id: None,
-                pending: false,
-            })
-            .collect();
+        record.sends = live_events("other-", MAX_REPLY_BREAKER_EVENTS);
+        record.sends[0].at_millis = future;
         write_document(&root.join("reply-breaker.json"), &record).expect("full live ledger");
-        assert!(state
+        let error = state
             .publish_one(&keys[0], &mut transport)
             .expect_err("no live budget eviction")
-            .to_string()
-            .contains("population limit"));
+            .to_string();
+        assert!(error.contains("reservation population limit"), "{error}");
+        assert!(transport.submissions.is_empty());
+        assert_eq!(stamped_by_now(), (MAX_REPLY_BREAKER_EVENTS, 0, true));
+        // With this thread's budget used, the refusal comes from the trip population instead.
+        let mut full_trips = ReplyBreakerRecord {
+            version: STATE_VERSION,
+            sends: live_events("", MAX_THREAD_REPLIES_PER_WINDOW),
+            trips: live_events("other-", MAX_REPLY_BREAKER_EVENTS),
+        };
+        for send in &mut full_trips.sends {
+            send.thread_id.clone_from(&message.thread_id);
+        }
+        full_trips.trips[0].at_millis = future;
+        write_document(&root.join("reply-breaker.json"), &full_trips).expect("full trip ledger");
+        let error = state
+            .publish_one(&keys[0], &mut transport)
+            .expect_err("no live trip eviction")
+            .to_string();
+        assert!(error.contains("trip population limit"), "{error}");
         assert!(transport.submissions.is_empty());
         assert_eq!(
-            state
-                .read_reply_breaker()
-                .expect("retained ledger")
-                .sends
-                .len(),
-            MAX_REPLY_BREAKER_EVENTS
+            stamped_by_now(),
+            (
+                MAX_THREAD_REPLIES_PER_WINDOW,
+                MAX_REPLY_BREAKER_EVENTS,
+                true
+            )
         );
         record.sends[0].pending = true;
         assert!(
@@ -12171,7 +12744,8 @@ mod tests {
             .new_request_keys[0]
             .clone();
         let nonce = state.read_request(&key).expect("request").reply_nonce;
-        let burst = (1..=7)
+        let limit = MAX_THREAD_REPLIES_PER_WINDOW;
+        let burst = (1..=2 * limit + 1)
             .map(|ordinal| {
                 format!(
                     "<CHAT_REPLY_{nonce}_{ordinal}>\npart {ordinal}\n</CHAT_REPLY_{nonce}_{ordinal}>\n"
@@ -12180,7 +12754,7 @@ mod tests {
             .collect::<String>();
         state.capture_replies(&key, &burst).expect("capture burst");
         let mut transport = FakeReplyTransport::default();
-        for _ in 0..MAX_THREAD_REPLIES_PER_WINDOW {
+        for _ in 0..limit {
             assert!(state
                 .publish_one(&key, &mut transport)
                 .expect("publish within the thread budget")
@@ -12191,8 +12765,10 @@ mod tests {
             .expect_err("one more reply within the window trips the breaker")
             .to_string();
         assert!(error.contains("post-rate breaker tripped"), "{error}");
-        assert_eq!(transport.submissions.len(), 3);
-        let held = state.read_reply(&key, 4).expect("held reply");
+        assert_eq!(transport.submissions.len(), limit);
+        let held = state
+            .read_reply(&key, limit as u32 + 1)
+            .expect("held reply");
         assert_eq!(held.phase, ReplyPhase::Pending);
 
         // Other threads keep their own budget.
@@ -12215,7 +12791,7 @@ mod tests {
             .publish_one(&other, &mut transport)
             .expect("other thread publishes")
             .is_some());
-        assert_eq!(transport.submissions[3].1, "spaces/example/threads/7");
+        assert_eq!(transport.submissions[limit].1, "spaces/example/threads/7");
 
         // The trip latches: sends aging out of the window do not release the thread, and
         // neither does a restart.
@@ -12240,7 +12816,7 @@ mod tests {
         drop(state);
         let state = BridgeState::open(&root).expect("reopen tripped state");
         assert!(state.publish_one(&key, &mut transport).is_err());
-        assert_eq!(transport.submissions.len(), 4);
+        assert_eq!(transport.submissions.len(), limit + 1);
 
         // After the cooldown the held reply goes out under its original request ID.
         age(0, THREAD_BREAKER_COOLDOWN_MILLIS);
@@ -12248,9 +12824,12 @@ mod tests {
             .publish_one(&key, &mut transport)
             .expect("cooldown elapsed")
             .is_some());
-        assert_eq!(transport.submissions[4].2, "[codex coordinator] part 4");
-        assert_eq!(transport.submissions[4].3, held.send_request_id);
-        for _ in 1..MAX_THREAD_REPLIES_PER_WINDOW {
+        assert_eq!(
+            transport.submissions[limit + 1].2,
+            format!("[codex coordinator] part {}", limit + 1)
+        );
+        assert_eq!(transport.submissions[limit + 1].3, held.send_request_id);
+        for _ in 1..limit {
             assert!(state
                 .publish_one(&key, &mut transport)
                 .expect("publish within the refilled budget")
@@ -12270,7 +12849,539 @@ mod tests {
                 .expect("outbox empty"),
             None
         );
+        assert_eq!(transport.submissions.len(), 2 * limit + 2);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn thread_post_rate_breaker_admits_a_normal_burst_and_reports_the_held_thread() {
+        let root = temporary("reply-breaker-burst");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let limit = MAX_THREAD_REPLIES_PER_WINDOW;
+        let keys = same_thread_reply_requests(&state, 4);
+        // Three requests in one thread, each with a progress update and a multi-part answer,
+        // fit in one window. A fourth request uses what is left and then posts two more.
+        let parts = [2, 2, 4];
+        let burst = parts.iter().sum::<usize>();
+        assert!(burst <= limit);
+        let counts = [parts[0], parts[1], parts[2], limit - burst + 2];
+        for (key, count) in keys.iter().zip(counts) {
+            let nonce = state.read_request(key).expect("request").reply_nonce;
+            let blocks = (2..=count)
+                .map(|ordinal| {
+                    format!(
+                        "<CHAT_REPLY_{nonce}_{ordinal}>\npart {ordinal}\n</CHAT_REPLY_{nonce}_{ordinal}>\n"
+                    )
+                })
+                .collect::<String>();
+            if !blocks.is_empty() {
+                state.capture_replies(key, &blocks).expect("capture parts");
+            }
+        }
+        let mut transport = FakeReplyTransport::default();
+        for (key, count) in keys.iter().zip(counts).take(parts.len()) {
+            for _ in 0..count {
+                assert!(state
+                    .publish_one(key, &mut transport)
+                    .expect("a normal burst fits the thread budget")
+                    .is_some());
+            }
+        }
+        for _ in burst..limit {
+            assert!(state
+                .publish_one(&keys[3], &mut transport)
+                .expect("the rest of the thread budget")
+                .is_some());
+        }
+        let error = state
+            .publish_one(&keys[3], &mut transport)
+            .expect_err("one more reply within the window trips the breaker")
+            .to_string();
+        assert!(error.contains("post-rate breaker tripped"), "{error}");
+        assert!(error.contains("ms after the Unix epoch"), "{error}");
+        assert_eq!(transport.submissions.len(), limit);
+
+        let status = state.status().expect("status");
+        let breaker = &status["reply_breaker"];
+        assert_eq!(breaker["max_replies_per_thread"], 8);
+        assert_eq!(breaker["window_seconds"], 60);
+        assert_eq!(breaker["cooldown_seconds"], 300);
+        assert!(breaker["error"].is_null(), "{breaker}");
+        let held_threads = breaker["held_threads"].as_array().expect("held threads");
+        assert_eq!(held_threads.len(), 1, "{breaker}");
+        assert_eq!(held_threads[0]["channel_id"], "spaces/example");
+        assert_eq!(
+            held_threads[0]["thread_id"],
+            "spaces/example/threads/shared"
+        );
+        assert_eq!(held_threads[0]["recent_or_unresolved_reservations"], 8);
+        let tripped_at = state.read_reply_breaker().expect("breaker").trips[0].at_millis;
+        assert_eq!(held_threads[0]["held_until_millis"], tripped_at + 300_000);
+        let held_for = held_threads[0]["held_for_seconds"]
+            .as_u64()
+            .expect("held seconds");
+        assert!(held_for > 0 && held_for <= 300, "{held_for}");
+
+        // Deleting the record releases the thread at the next retry. The held replies keep
+        // their order and their original request IDs.
+        let first_held = u32::try_from(limit - burst + 1).expect("ordinal");
+        let held = [first_held, first_held + 1].map(|ordinal| {
+            let reply = state.read_reply(&keys[3], ordinal).expect("held reply");
+            assert_eq!(reply.phase, ReplyPhase::Pending);
+            reply
+        });
+        fs::remove_file(root.join("reply-breaker.json")).expect("operator reset");
+        assert_eq!(
+            state.status().expect("status")["reply_breaker"]["held_threads"],
+            serde_json::json!([])
+        );
+        for reply in &held {
+            assert!(state
+                .publish_one(&keys[3], &mut transport)
+                .expect("released reply")
+                .is_some());
+            let (_, thread, body, request_id) = transport.submissions.last().expect("sent");
+            assert_eq!(thread, "spaces/example/threads/shared");
+            assert_eq!(body, &format!("[codex coordinator] {}", reply.body));
+            assert_eq!(request_id, &reply.send_request_id);
+        }
+        assert_eq!(
+            state
+                .publish_one(&keys[3], &mut transport)
+                .expect("outbox empty"),
+            None
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn thread_post_rate_breaker_stops_a_loop_of_eleven_posts_in_thirty_seconds() {
+        // The incident's loop posted 11 times in 30 s to one thread. The numbers here are
+        // literal, so a higher limit or a shorter hold fails this test.
+        let root = temporary("reply-breaker-loop");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let keys = same_thread_reply_requests(&state, 1);
+        let key = &keys[0];
+        let nonce = state.read_request(key).expect("request").reply_nonce;
+        let blocks = (2..=11)
+            .map(|ordinal| {
+                format!(
+                    "<CHAT_REPLY_{nonce}_{ordinal}>\npost {ordinal}\n</CHAT_REPLY_{nonce}_{ordinal}>\n"
+                )
+            })
+            .collect::<String>();
+        state
+            .capture_replies(key, &blocks)
+            .expect("capture the loop's replies");
+        let ninth = state.read_reply(key, 9).expect("9th reply");
+        let breaker = root.join("reply-breaker.json");
+        let tripped_at = || state.read_reply_breaker().expect("breaker").trips[0].at_millis;
+        let mut transport = FakeReplyTransport::default();
+
+        // One post every 3 s. Posts 1 to 8, from 0 s to 21 s, go out.
+        for post in 1..=8 {
+            if post > 1 {
+                let_breaker_time_pass(&state, 3_000);
+            }
+            assert!(
+                state
+                    .publish_one(key, &mut transport)
+                    .expect("within the thread budget")
+                    .is_some(),
+                "post {post}"
+            );
+        }
+        // Post 9, 24 s in, trips the breaker.
+        let_breaker_time_pass(&state, 3_000);
+        let error = state
+            .publish_one(key, &mut transport)
+            .expect_err("the 9th post trips the breaker")
+            .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "chat reply post-rate breaker tripped: thread spaces/example/threads/shared has 8 \
+recent or unresolved reply reservations (limit 8 per 60 s), so a reply loop is likely; its replies \
+stay held for 300 s, until {} ms after the Unix epoch, or until {} is deleted; the first retry after \
+that sends them in order",
+                tripped_at() + 300_000,
+                breaker.display()
+            )
+        );
+        // Posts 10 and 11, 27 s and 30 s in, are held.
+        for _ in 10..=11 {
+            let_breaker_time_pass(&state, 3_000);
+            let error = state
+                .publish_one(key, &mut transport)
+                .expect_err("held")
+                .to_string();
+            assert!(
+                error.starts_with(
+                    "chat reply post-rate breaker for thread spaces/example/threads/shared tripped "
+                ),
+                "{error}"
+            );
+            assert!(
+                error.ends_with(&format!(
+                    " more s, until {} ms after the Unix epoch, or until {} is deleted; the first \
+retry after that sends them in order",
+                    tripped_at() + 300_000,
+                    breaker.display()
+                )),
+                "{error}"
+            );
+        }
         assert_eq!(transport.submissions.len(), 8);
+
+        // 299.6 s after the trip the thread is still held, and status lists it. For any delay
+        // under 400 ms before the breaker reads the clock, the age rounds down to 299 s and the
+        // remaining hold rounds up to 1 s. Rounding either one the other way, or half up, gives
+        // 300 s or 0 s however soon the clock is read.
+        let trip_age = unix_millis().saturating_sub(tripped_at());
+        let_breaker_time_pass(&state, 299_600_u64.saturating_sub(trip_age));
+        let error = state
+            .publish_one(key, &mut transport)
+            .expect_err("held 299 s after the trip")
+            .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "chat reply post-rate breaker for thread spaces/example/threads/shared tripped 299 \
+s ago; its replies stay held for 1 more s, until {} ms after the Unix epoch, or until {} is \
+deleted; the first retry after that sends them in order",
+                tripped_at() + 300_000,
+                breaker.display()
+            )
+        );
+        assert_eq!(
+            state.status().expect("status")["reply_breaker"]["held_threads"],
+            serde_json::json!([{
+                "channel_id": "spaces/example",
+                "thread_id": "spaces/example/threads/shared",
+                "held_until_millis": tripped_at() + 300_000,
+                "held_for_seconds": 1,
+                "recent_or_unresolved_reservations": 0,
+            }])
+        );
+
+        // 300 s after the trip status no longer lists the thread, although the expired trip
+        // stays in the record until a send attempt prunes it.
+        let trip_age = unix_millis().saturating_sub(tripped_at());
+        let_breaker_time_pass(&state, 300_000_u64.saturating_sub(trip_age));
+        assert_eq!(state.read_reply_breaker().expect("breaker").trips.len(), 1);
+        assert_eq!(
+            state.status().expect("status")["reply_breaker"]["held_threads"],
+            serde_json::json!([])
+        );
+        // The next attempt sends the held reply under its original request ID, then the rest.
+        while state
+            .publish_one(key, &mut transport)
+            .expect("released 300 s after the trip")
+            .is_some()
+        {}
+        assert_eq!(transport.submissions[8].3, ninth.send_request_id);
+        assert_eq!(
+            transport
+                .submissions
+                .iter()
+                .map(|submission| submission.2.clone())
+                .collect::<Vec<_>>(),
+            std::iter::once("[codex coordinator] answer".to_owned())
+                .chain((2..=11).map(|ordinal| format!("[codex coordinator] post {ordinal}")))
+                .collect::<Vec<_>>()
+        );
+        assert!(state
+            .read_reply_breaker()
+            .expect("breaker")
+            .trips
+            .is_empty());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn thread_post_rate_breaker_lets_a_loop_of_eight_posts_a_minute_through() {
+        // The cost of the budget: a loop never trips if each post starts at least 60 s after the
+        // receipt of the post 8 before it, so it can post 480 times an hour to one thread. Only a
+        // faster loop is held.
+        let root = temporary("reply-breaker-slow-loop");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let keys = same_thread_reply_requests(&state, 1);
+        let nonce = state.read_request(&keys[0]).expect("request").reply_nonce;
+        let blocks = (2..=20)
+            .map(|ordinal| {
+                format!(
+                    "<CHAT_REPLY_{nonce}_{ordinal}>\npost {ordinal}\n</CHAT_REPLY_{nonce}_{ordinal}>\n"
+                )
+            })
+            .collect::<String>();
+        state
+            .capture_replies(&keys[0], &blocks)
+            .expect("capture the loop's replies");
+        let mut transport = FakeReplyTransport::default();
+        // One post every 7.5 s: each attempt finds the 7 posts of the last 52.5 s in its window.
+        for post in 1..=20 {
+            if post > 1 {
+                let_breaker_time_pass(&state, 7_500);
+            }
+            assert!(
+                state
+                    .publish_one(&keys[0], &mut transport)
+                    .expect("8 posts a minute are never held")
+                    .is_some(),
+                "post {post}"
+            );
+        }
+        assert_eq!(transport.submissions.len(), 20);
+        assert!(state
+            .read_reply_breaker()
+            .expect("breaker")
+            .trips
+            .is_empty());
+        assert_eq!(
+            state.status().expect("status")["reply_breaker"]["held_threads"],
+            serde_json::json!([])
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn thread_post_rate_breaker_trips_a_loop_of_one_post_every_seven_seconds() {
+        // Just faster than the budget: the 9th post, 56 s after the 1st, trips the breaker, and
+        // status counts all 8 posts, so a window or a status count of 56 s or less fails this.
+        let root = temporary("reply-breaker-seven-seconds");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let keys = same_thread_reply_requests(&state, 1);
+        let key = &keys[0];
+        let nonce = state.read_request(key).expect("request").reply_nonce;
+        let blocks = (2..=9)
+            .map(|ordinal| {
+                format!(
+                    "<CHAT_REPLY_{nonce}_{ordinal}>\npost {ordinal}\n</CHAT_REPLY_{nonce}_{ordinal}>\n"
+                )
+            })
+            .collect::<String>();
+        state
+            .capture_replies(key, &blocks)
+            .expect("capture the loop's replies");
+        let mut transport = FakeReplyTransport::default();
+        // Each wait is timed from the receipt of post 1, so the real time the posts take does
+        // not add to its age, and the 9th post starts 56 s after it however loaded the machine
+        // is. The trip and the status check then have 4 s before post 1 leaves the window.
+        let first_post_age = || {
+            let sends = state.read_reply_breaker().expect("breaker").sends;
+            let first = sends.iter().map(|send| send.at_millis).min();
+            unix_millis().saturating_sub(first.expect("post 1"))
+        };
+        for post in 1..=8_u64 {
+            if post > 1 {
+                let_breaker_time_pass(
+                    &state,
+                    (7_000 * (post - 1)).saturating_sub(first_post_age()),
+                );
+            }
+            assert!(
+                state
+                    .publish_one(key, &mut transport)
+                    .expect("within the thread budget")
+                    .is_some(),
+                "post {post}"
+            );
+        }
+        let_breaker_time_pass(&state, 56_000_u64.saturating_sub(first_post_age()));
+        let error = state
+            .publish_one(key, &mut transport)
+            .expect_err("the 9th post, 56 s in, trips the breaker")
+            .to_string();
+        assert!(
+            error.starts_with(
+                "chat reply post-rate breaker tripped: thread spaces/example/threads/shared has 8 \
+recent or unresolved reply reservations (limit 8 per 60 s)"
+            ),
+            "{error}"
+        );
+        assert_eq!(transport.submissions.len(), 8);
+        // The 8 posts are 7 s to 56 s old, and status counts them all.
+        assert_eq!(
+            state.status().expect("status")["reply_breaker"]["held_threads"][0]
+                ["recent_or_unresolved_reservations"],
+            8
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn thread_post_rate_breaker_restarts_future_stamps_after_the_clock_steps_back() {
+        let root = temporary("reply-breaker-clock");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let keys = same_thread_reply_requests(&state, 2);
+        let message = state.read_request(&keys[0]).expect("request").message;
+        let breaker = root.join("reply-breaker.json");
+        // Stamps one hour ahead, as left behind when the wall clock steps back an hour.
+        let future = unix_millis() + 3_600_000;
+        let event = |at_millis| ThreadEvent {
+            channel_id: message.channel_id.clone(),
+            thread_id: message.thread_id.clone(),
+            at_millis,
+            send_request_id: None,
+            pending: false,
+        };
+        let age = |sends: u64, trips: u64| {
+            let mut record = state.read_reply_breaker().expect("read breaker");
+            for send in &mut record.sends {
+                send.at_millis = send.at_millis.saturating_sub(sends);
+            }
+            for trip in &mut record.trips {
+                trip.at_millis = trip.at_millis.saturating_sub(trips);
+            }
+            write_document(&breaker, &record).expect("write breaker");
+        };
+        let stamped_by_now = || {
+            let now = unix_millis();
+            let record = state.read_reply_breaker().expect("read breaker");
+            record
+                .sends
+                .iter()
+                .chain(&record.trips)
+                .all(|event| event.at_millis <= now)
+        };
+        let mut transport = FakeReplyTransport::default();
+
+        // Future sends count once, from now: one window later they no longer fill the budget.
+        write_document(
+            &breaker,
+            &ReplyBreakerRecord {
+                version: STATE_VERSION,
+                sends: vec![event(future); MAX_THREAD_REPLIES_PER_WINDOW],
+                trips: Vec::new(),
+            },
+        )
+        .expect("seed future sends");
+        let error = state
+            .publish_one(&keys[0], &mut transport)
+            .expect_err("future sends fill the window")
+            .to_string();
+        assert!(error.contains("post-rate breaker tripped"), "{error}");
+        assert!(stamped_by_now());
+        age(THREAD_REPLY_WINDOW_MILLIS, THREAD_BREAKER_COOLDOWN_MILLIS);
+        assert!(state
+            .publish_one(&keys[0], &mut transport)
+            .expect("window and cooldown restarted once")
+            .is_some());
+
+        // A future trip holds the thread for one cooldown from now. The refused attempt saves
+        // the moved stamp, so a later retry does not restart the cooldown again.
+        write_document(
+            &breaker,
+            &ReplyBreakerRecord {
+                version: STATE_VERSION,
+                sends: Vec::new(),
+                trips: vec![event(future)],
+            },
+        )
+        .expect("seed future trip");
+        // Status changes nothing, so until a send attempt saves the moved stamp it reports a
+        // full cooldown from the time of the call.
+        let before = unix_millis();
+        let held = state.status().expect("status")["reply_breaker"]["held_threads"][0].clone();
+        let after = unix_millis();
+        assert_eq!(held["held_for_seconds"], 300, "{held}");
+        let until = held["held_until_millis"].as_u64().expect("release time");
+        assert!(
+            (before + 300_000..=after + 300_000).contains(&until),
+            "{held}"
+        );
+        assert_eq!(
+            state.read_reply_breaker().expect("breaker").trips[0].at_millis,
+            future
+        );
+        let error = state
+            .publish_one(&keys[1], &mut transport)
+            .expect_err("future trip holds the thread")
+            .to_string();
+        assert!(error.contains("replies stay held"), "{error}");
+        assert!(stamped_by_now());
+        let saved = state.read_reply_breaker().expect("breaker").trips[0].at_millis;
+        assert_eq!(
+            state.status().expect("status")["reply_breaker"]["held_threads"][0]
+                ["held_until_millis"],
+            saved + 300_000
+        );
+        age(0, THREAD_BREAKER_COOLDOWN_MILLIS);
+        assert!(state
+            .publish_one(&keys[1], &mut transport)
+            .expect("cooldown restarted once")
+            .is_some());
+        assert_eq!(transport.submissions.len(), 2);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn unusable_breaker_and_feedback_records_name_their_file() {
+        let root = temporary("unusable-records");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let keys = same_thread_reply_requests(&state, 1);
+        let write_raw = |path: &Path, bytes: &[u8]| {
+            fs::write(path, bytes).expect("raw record");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("record mode");
+        };
+        let breaker = root.join("reply-breaker.json");
+        let breaker_name = breaker.display().to_string();
+        let mut transport = FakeReplyTransport::default();
+        let unnamed_pending = serde_json::json!({ "version": STATE_VERSION, "sends": [{
+            "channel_id": "spaces/example", "thread_id": "spaces/example/threads/shared",
+            "at_millis": unix_millis(), "pending": true }], "trips": [] });
+        for bytes in [
+            b"{ not json".to_vec(),
+            serde_json::to_vec(&unnamed_pending).expect("encode record"),
+        ] {
+            write_raw(&breaker, &bytes);
+            let error = state
+                .publish_one(&keys[0], &mut transport)
+                .expect_err("an unusable breaker record holds every reply")
+                .to_string();
+            assert!(error.contains(&breaker_name), "{error}");
+            assert!(
+                error.contains("deleting it releases every thread"),
+                "{error}"
+            );
+            let status = state.status().expect("status survives an unusable breaker");
+            let reported = status["reply_breaker"]["error"]
+                .as_str()
+                .expect("breaker error");
+            assert!(reported.contains(&breaker_name), "{reported}");
+        }
+        assert!(transport.submissions.is_empty());
+        assert_eq!(
+            state.read_reply(&keys[0], 1).expect("reply").phase,
+            ReplyPhase::Pending
+        );
+        fs::remove_file(&breaker).expect("operator deletes the breaker record");
+        assert!(state
+            .publish_one(&keys[0], &mut transport)
+            .expect("released")
+            .is_some());
+
+        let feedback = root.join("fence-feedback.json");
+        write_raw(&feedback, b"{ not json");
+        let error = deliver_fence_feedback_with(
+            &state,
+            &QueueDelivery::default(),
+            &["stale_1".to_owned()],
+            DrainOptions::default(),
+        )
+        .expect_err("an unusable feedback record holds diagnostics")
+        .to_string();
+        assert!(error.contains(&feedback.display().to_string()), "{error}");
+        assert!(error.contains("forgets which IDs were reported"), "{error}");
+        // Capture does not stall on it; every unavailable ID simply counts as new.
+        let foreign = "F".repeat(22);
+        let capture = state
+            .capture_snapshot(&format!(
+                "<CHAT_REPLY_{foreign}_1>\nstray\n</CHAT_REPLY_{foreign}_1>\n"
+            ))
+            .expect("capture survives an unusable feedback record");
+        assert_eq!(capture.unknown_ids, [format!("{foreign}_1")]);
+        assert!(capture.suppressed_ids.is_empty());
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -12359,6 +13470,7 @@ mod tests {
             SnapshotCapture {
                 replies: Vec::new(),
                 unknown_ids: Vec::new(),
+                suppressed_ids: Vec::new(),
                 route_entries: Vec::new(),
             }
         );

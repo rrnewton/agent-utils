@@ -45,6 +45,8 @@ const ACK_RETRY_DELAY: Duration = Duration::from_secs(60);
 const MAX_IMMEDIATE_BACKLOG_CHUNKS: usize = 64;
 const EVENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTPUT_RETRY_MAX: Duration = Duration::from_secs(60);
+// Already reported reply IDs one recovery-scan log line names before it counts the rest.
+const ALREADY_REPORTED_LOG_IDS: usize = 8;
 // Two seconds are reserved by the process supervisor for forced pidfd reap; the remaining five
 // seconds cover host-worker reconciliation and joins. The selected Close + grace is added after
 // Hello, while an as-yet-unconnected generation also owns its complete Hello deadline.
@@ -1093,6 +1095,11 @@ fn capture_recovery_snapshot<A: ManagedApi + ?Sized>(
         snapshot_revision: snapshot.revision,
         ..CycleReport::default()
     };
+    // Visible markers the coordinator already received are not reported twice. Log them, since
+    // a marker that stays on screen is otherwise silent after its one report.
+    if let Some(line) = already_reported_log_line(&capture.suppressed_ids) {
+        eprintln!("{line}");
+    }
     if !capture.unknown_ids.is_empty() {
         match deliver_feedback(state, manager, &capture.unknown_ids, delivery, control.stop) {
             Ok(CoordinatorDeliveryResult::Pending(_)) => report.more_work = true,
@@ -2644,6 +2651,30 @@ fn log_report(report: &CycleReport) {
             eprintln!("agentctl: chat operation: {error}");
         }
     }
+}
+
+/// Name up to `ALREADY_REPORTED_LOG_IDS` already reported reply IDs and count the rest.
+fn already_reported_log_line(suppressed_ids: &[String]) -> Option<String> {
+    if suppressed_ids.is_empty() {
+        return None;
+    }
+    let hidden = suppressed_ids
+        .len()
+        .saturating_sub(ALREADY_REPORTED_LOG_IDS);
+    Some(format!(
+        "agentctl: chat reply fence feedback: already reported, so not repeated: {}{}",
+        suppressed_ids
+            .iter()
+            .take(ALREADY_REPORTED_LOG_IDS)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", "),
+        if hidden > 0 {
+            format!(" and {hidden} more")
+        } else {
+            String::new()
+        }
+    ))
 }
 
 #[cfg(test)]
@@ -4213,6 +4244,25 @@ mod tests {
         assert_eq!(report.captured[0].0, key);
         assert!(routes.knows_identifier_nonce(&route.identifier));
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn already_reported_log_line_names_eight_ids_and_counts_the_rest() {
+        assert_eq!(already_reported_log_line(&[]), None);
+        assert_eq!(
+            already_reported_log_line(&["stale_1".to_owned()]).as_deref(),
+            Some("agentctl: chat reply fence feedback: already reported, so not repeated: stale_1")
+        );
+        let many = (1..=10)
+            .map(|index| format!("stale_{index}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            already_reported_log_line(&many).as_deref(),
+            Some(
+                "agentctl: chat reply fence feedback: already reported, so not repeated: stale_1, \
+stale_2, stale_3, stale_4, stale_5, stale_6, stale_7, stale_8 and 2 more"
+            )
+        );
     }
 
     #[test]
