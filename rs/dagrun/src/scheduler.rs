@@ -2439,6 +2439,50 @@ fn failure_detail_lines(tag: &str, streams: &[&[u8]], verbosity: i64) -> Vec<Str
     rendered
 }
 
+/// The last few non-empty lines of captured output, oldest first, as one bounded
+/// fragment for a diagnostic that would otherwise name only what is missing.
+///
+/// WHY NOT [`last_line`]. That is the right summariser for a step whose own final
+/// line IS the failure. It is the wrong one for a refused report, because the
+/// line that explains the refusal is usually not last: a wrapper prints its own
+/// generic line after the tool that actually explained itself. Measured on a real
+/// run, a node whose tests ALL PASSED ended with
+///
+///   run-nextest-counted: cannot derive typed test results from /tmp/tmp.GnIJuuSDYR
+///
+/// while the line that says why -- "expected 505 tests to execute, saw 507;
+/// refusing because the selected set changed" -- sits immediately above it. A
+/// one-line summary there reproduces the uselessness it is meant to cure.
+///
+/// BOUNDED TWICE, per line and in total. The capture is already ring-limited
+/// because a runaway step once OOM-killed the runner, but one line inside that
+/// ring can still be enormous, and this text is carried into a typed record that
+/// consumers store per node.
+fn tail_lines(bytes: &[u8], limit: usize, per_line: usize) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut kept: Vec<String> = Vec::new();
+    for line in text.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut piece = String::new();
+        for ch in trimmed.chars() {
+            if piece.len() + ch.len_utf8() > per_line {
+                piece.push_str("...");
+                break;
+            }
+            piece.push(ch);
+        }
+        kept.push(piece);
+        if kept.len() == limit {
+            break;
+        }
+    }
+    kept.reverse();
+    kept.join(" | ")
+}
+
 /// Best-effort one-line summary: the last non-empty decoded line of captured output.
 fn last_line(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
@@ -2656,9 +2700,24 @@ fn resolved_test_counts(
             let location = path
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "<scheduler-owned path unavailable>".into());
-            Err(format!(
-                "required structured test results were not written to {location}"
-            ))
+            // The step's own account of WHY it wrote nothing is in `captured`,
+            // which this arm previously ignored. Without it every distinct cause
+            // -- a drifted test population where everything passed, stale
+            // prepared executables, a malformed report, an unsupported event --
+            // reaches the typed record as this one sentence plus an exit code,
+            // and a consumer cannot tell them apart. The prefix is unchanged, so
+            // every existing `contains`/`starts_with` reader keeps matching.
+            let tail = tail_lines(captured, 5, 200);
+            if tail.is_empty() {
+                Err(format!(
+                    "required structured test results were not written to {location}"
+                ))
+            } else {
+                Err(format!(
+                    "required structured test results were not written to {location}; \
+                     the step's last output was: {tail}"
+                ))
+            }
         }
         TestResultsMode::ExplicitNone => Ok(CapturedTestResults {
             executed: None,
@@ -8307,6 +8366,60 @@ mod tests {
         assert!(!cap.dropped());
         assert_eq!(cap.kept(), 13);
         assert_eq!(last_line(&cap.tail()), "second");
+    }
+
+    #[test]
+    fn a_refused_report_carries_the_line_that_explains_it_not_just_the_last_one() {
+        // The real shape this exists for, from validate run 1838. The node's
+        // tests ALL PASSED; the count ratchet refused because the population
+        // drifted; the wrapper then printed its own generic line LAST.
+        let captured = b"    Summary [10.087s] 507 tests run: 507 passed, 0 skipped\n            nextest-test-results: expected 505 tests to execute, saw 507;             refusing because the selected set changed\n            run-nextest-counted: cannot derive typed test results from /tmp/tmp.X\n";
+
+        // last_line alone reproduces the uselessness it is meant to cure: the
+        // final line is the wrapper's, and names no cause at all.
+        assert_eq!(
+            last_line(captured),
+            "run-nextest-counted: cannot derive typed test results from /tmp/tmp.X"
+        );
+
+        // The bounded tail keeps the line that says why, AND the one that says
+        // every test passed -- which is what lets a reader tell a bookkeeping
+        // drift apart from a real regression.
+        let tail = tail_lines(captured, 5, 200);
+        assert!(tail.contains("507 passed"), "{tail}");
+        assert!(
+            tail.contains("expected 505 tests to execute, saw 507"),
+            "{tail}"
+        );
+        assert!(
+            tail.contains("refusing because the selected set changed"),
+            "{tail}"
+        );
+        // Oldest first, so it reads in the order the step emitted it.
+        assert!(
+            tail.find("507 passed") < tail.find("cannot derive"),
+            "{tail}"
+        );
+    }
+
+    #[test]
+    fn a_tail_is_bounded_per_line_and_in_total() {
+        // This text is carried into a typed record stored per node, and one line
+        // inside the already-bounded ring can still be enormous.
+        let huge = format!("{}\n", "x".repeat(10_000));
+        let mut captured = String::new();
+        for index in 0..50 {
+            captured.push_str(&format!("line {index}\n"));
+        }
+        captured.push_str(&huge);
+        let tail = tail_lines(captured.as_bytes(), 5, 200);
+        assert!(tail.ends_with("..."), "{tail}");
+        assert!(tail.len() <= 5 * (200 + 3) + 4 * 3, "{} bytes", tail.len());
+        assert_eq!(tail.matches(" | ").count(), 4, "{tail}");
+        // Empty input yields an empty fragment, which is what lets the caller
+        // keep the original single-sentence message unchanged.
+        assert_eq!(tail_lines(b"", 5, 200), "");
+        assert_eq!(tail_lines(b"   \n\n  \n", 5, 200), "");
     }
 
     #[test]
