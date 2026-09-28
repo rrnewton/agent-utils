@@ -5,7 +5,7 @@ with a ``{seed}`` placeholder, per-worker hard limits, and a hit predicate) and 
 a range of seeds. Everything here is immutable data + pure helpers with no I/O, so the
 planning/calibration logic is trivially testable and the runner never hides a scheduling or
 containment implementation of its own — it lowers each round onto a
-:class:`safe_ci_dag_runner.DagConfig` and hands it to ``safe-ci-dag-runner``.
+:class:`dagrun.DagConfig` and hands it to ``dagrun``.
 
 This is RESOURCE CONTAINMENT, not a security sandbox. The workers run our own code; the
 only thing we don't trust about it is its RESOURCE USAGE — code that leaks memory, runs
@@ -73,7 +73,7 @@ BREACH_STATUSES = frozenset(
 class WorkerLimits:
     """Per-worker HARD resource envelope — enforced, not advisory.
 
-    Each of these lowers onto one ``safe-ci-dag-runner`` per-step control so a single runaway
+    Each of these lowers onto one ``dagrun`` per-step control so a single runaway
     seed is capped at its own characterized limit and cannot starve the host or its siblings:
 
     * ``cpu_cores`` -> the step's inner ``cpu.max`` cap (via ``preferred_inner_jobs``), so a
@@ -277,7 +277,7 @@ class SeedOutcome:
 
 @dataclass(frozen=True)
 class RoundResult:
-    """Aggregate outcome of one round (one generated DAG executed by safe-ci-dag-runner)."""
+    """Aggregate outcome of one round (one generated DAG executed by dagrun)."""
 
     width: int
     seeds: tuple[int, ...]

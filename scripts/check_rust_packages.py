@@ -30,14 +30,15 @@ class Crate:
     bins: tuple[str, ...]
     library: str
     command_userguides: tuple[tuple[str, str], ...]
+    extra_documents: tuple[str, ...] = ()
 
 
 CRATES: tuple[Crate, ...] = (
     Crate(
-        "safe-ci-dag-runner",
-        ("safe-ci-dag-runner", "cpuset-alloc"),
-        "safe_ci_dag_runner",
-        (("safe-ci-dag-runner", "src/embedded_userguide.md"),),
+        "dagrun",
+        ("dagrun", "cpuset-alloc"),
+        "dagrun",
+        (("dagrun", "src/embedded_userguide.md"),),
     ),
     Crate("tick-hub", ("tick-hub",), "tick_hub", (("tick-hub", "src/embedded_userguide.md"),)),
     Crate(
@@ -48,12 +49,14 @@ CRATES: tuple[Crate, ...] = (
     ),
     Crate(
         "herdr-run",
-        ("herdr-run", "herdr-agent"),
+        ("herdr-run",),
         "herdr_run",
-        (
-            ("herdr-run", "src/embedded_userguide.md"),
-            ("herdr-agent", "src/embedded_agent_userguide.md"),
-        ),
+        (("herdr-run", "src/embedded_userguide.md"),),
+    ),
+    Crate(
+        "agentctl", ("agentctl", "herdr-agent"), "agentctl",
+        (("agentctl", "src/embedded_userguide.md"), ("herdr-agent", "src/embedded_agent_userguide.md")),
+        ("src/embedded_quickstart.md",),
     ),
 )
 
@@ -89,6 +92,14 @@ _COMMON_DOC_TERMS: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
 )
+
+
+#: How each command is asked to print its own user guide.
+#:
+#: A global `--userguide` flag is the norm here, but a command whose surface is
+#: `<command> <subcommand>` says it as a subcommand instead, because a documentation flag sitting
+#: beside a subcommand list is the mixing that surface exists to avoid.
+_USERGUIDE_INVOCATION: dict[str, tuple[str, ...]] = {"herdr-run": ("userguide",), "agentctl": ("userguide",)}
 
 
 class CheckError(RuntimeError):
@@ -139,10 +150,14 @@ def _check_missing_docs() -> None:
         ],
         env=env,
     )
-def _doc_violations(crate: Crate, text: str) -> list[str]:
+def _doc_violations(crate: Crate, text: str, *, document_name: str | None = None) -> list[str]:
     errors: list[str] = []
-    foreign = _FOREIGN_DOC_TERMS.search(text)
-    if foreign is not None:
+    for foreign in _FOREIGN_DOC_TERMS.finditer(text):
+        # Only the shared operator guide may name the distribution providing
+        # optional adapters. Public rustdoc and other package docs stay scoped.
+        if (crate.name == "agentctl" and foreign.group(0).lower() == "python"
+                and document_name in ("src/embedded_userguide.md", "src/embedded_agent_userguide.md")):
+            continue
         errors.append(f"foreign-package term {foreign.group(0)!r}")
     for description, pattern in _COMMON_DOC_TERMS:
         match = pattern.search(text)
@@ -192,6 +207,7 @@ def _metadata(crate: Crate) -> tuple[str, set[str], set[str]]:
         "README.md",
         "LICENSE",
         *(relative for _command, relative in crate.command_userguides),
+        *crate.extra_documents,
     }
     for relative in sorted(linked_resources):
         linked = RS_ROOT / crate.name / relative
@@ -280,6 +296,7 @@ def _inspect(crate: Crate, version: str, archive: Path) -> dict[str, str]:
             f"{prefix}LICENSE",
             f"{prefix}README.md",
             *(f"{prefix}{relative}" for _command, relative in crate.command_userguides),
+            *(f"{prefix}{relative}" for relative in crate.extra_documents),
         }
         missing = sorted(required - names)
         if missing:
@@ -324,6 +341,7 @@ def _inspect(crate: Crate, version: str, archive: Path) -> dict[str, str]:
         document_paths = {
             "README.md",
             *(relative for _command, relative in crate.command_userguides),
+            *crate.extra_documents,
         }
         for relative in sorted(document_paths):
             member = package.extractfile(f"{prefix}{relative}")
@@ -335,7 +353,7 @@ def _inspect(crate: Crate, version: str, archive: Path) -> dict[str, str]:
                 raise CheckError(
                     f"{crate.name}: registry {relative} differs from its generated source"
                 )
-            errors = _doc_violations(crate, text)
+            errors = _doc_violations(crate, text, document_name=relative)
             if errors:
                 raise CheckError(
                     f"{crate.name}: {relative} is not standalone: {'; '.join(errors)}"
@@ -350,13 +368,16 @@ def _inspect(crate: Crate, version: str, archive: Path) -> dict[str, str]:
 
 
 def _smoke(
-    crate: Crate, version: str, documents: dict[str, str], target_root: Path
+    crate: Crate,
+    version: str,
+    documents: dict[str, str],
+    target_root: Path,
+    run_root: Path,
 ) -> None:
     bindir = target_root / "debug"
     suffix = ".exe" if os.name == "nt" else ""
     env = dict(os.environ)
     env["NO_COLOR"] = "1"
-    run_root = target_root / "smoke-cwd"
     run_root.mkdir()
 
     for binary in crate.bins:
@@ -364,9 +385,10 @@ def _smoke(
         if not executable.is_file():
             raise CheckError(f"{crate.name}: verified binary is missing: {executable}")
         command_guides = dict(crate.command_userguides)
-        invocations = [("--help",), ("--version",)]
+        guide_args = _USERGUIDE_INVOCATION.get(binary, ("--userguide",))
+        invocations: list[tuple[str, ...]] = [("--help",), ("--version",)]
         if binary in command_guides:
-            invocations.append(("--userguide",))
+            invocations.append(guide_args)
         for args in invocations:
             result = _run(
                 [str(executable), *args],
@@ -379,10 +401,19 @@ def _smoke(
                 raise CheckError(
                     f"{binary} --version did not report {version!r}: {combined!r}"
                 )
-            if args == ("--userguide",) and (
+            if args == guide_args and (
                 result.stdout != documents[command_guides[binary]] or result.stderr
             ):
-                raise CheckError(f"{binary} --userguide differs from packaged user guide")
+                raise CheckError(
+                    f"{binary} {' '.join(guide_args)} differs from packaged user guide"
+                )
+        if binary == "agentctl":
+            result = _run([str(executable), "quickstart"], cwd=run_root, env=env, timeout=30)
+            expected = documents["src/embedded_quickstart.md"]
+            if result.stdout != expected or result.stderr:
+                raise CheckError("agentctl quickstart differs from packaged CLI documentation")
+            for arguments in (("capabilities",), ("start", "--help"), ("send", "--help"), ("stop", "--help")):
+                _run([str(executable), *arguments], cwd=run_root, env=env, timeout=30)
 
 
 def main() -> int:
@@ -398,6 +429,9 @@ def main() -> int:
             )
         with tempfile.TemporaryDirectory(prefix="agent-utils-rust-packages-") as raw:
             package_root = Path(raw)
+            target_root = package_root / "target"
+            smoke_root = package_root / "smoke"
+            smoke_root.mkdir()
             for crate in CRATES:
                 version, bins, libraries = _metadata(crate)
                 if bins != set(crate.bins):
@@ -410,10 +444,9 @@ def main() -> int:
                         f"{crate.name}: library targets {sorted(libraries)}, "
                         f"expected {[crate.library]}"
                     )
-                target_root = package_root / crate.name
                 archive = _package(crate, version, target_root)
                 documents = _inspect(crate, version, archive)
-                _smoke(crate, version, documents, target_root)
+                _smoke(crate, version, documents, target_root, smoke_root / crate.name)
                 print(
                     f"check_rust_packages: ok {crate.name} {version} "
                     f"({', '.join(crate.bins)})"

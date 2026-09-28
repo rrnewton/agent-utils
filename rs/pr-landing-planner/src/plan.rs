@@ -5,13 +5,37 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::graph::{build_stacks, held_reasons, partition_parallel_safe};
 use crate::model::{
     CiState, CollectedGraph, ConflictEdge, Diagnostics, HeldPr, OrderingEdge, Plan, PlanResult,
-    PolicyClass, PrAction, PrActionDecision, PrNode, RedClass, ValidationEvidence,
+    PolicyClass, PrAction, PrActionDecision, PrNode, RedClass, ValidationAuthority,
+    ValidationEvidence,
 };
 
-/// Default maximum number of base commits a directly landable PR may trail.
-pub const DEFAULT_FRESHNESS_MAX_BEHIND: i64 = 0;
+/// Default freshness policy: being behind the fetched base is NOT by itself a
+/// reason to rebase before landing, so no freshness reroute is applied.
+///
+/// Follow the consuming workspace's own validation-authority rule, which states
+/// this with its reasoning: "A lagging ancestor is legitimate; requiring the tip
+/// made the verdict a property of WHEN you looked rather than of the tree."
+/// That is the single statement of the rule; this comment quotes it rather than
+/// paraphrasing it, because a paraphrase is what drifts.
+///
+/// A default of `Some(0)` is not merely the conservative choice: it reroutes
+/// EVERY branch behind the base to `RebaseThenLand`, and on a busy repository
+/// essentially nothing is ever not behind, so `LandNow` becomes close to
+/// unreachable. A bound nobody can satisfy does not prevent anything; it just
+/// routes every row through a rebase the rule does not ask for.
+///
+/// A real conflict is a separate question, decided by the conflict graph and by
+/// mergeability, not by this counter. The knob is retained so a caller that
+/// genuinely wants a freshness bound can set one.
+pub const DEFAULT_FRESHNESS_MAX_BEHIND: Option<i64> = None;
 
 fn held_action(reasons: &[String]) -> (PrAction, String) {
+    if reasons
+        .iter()
+        .any(|reason| reason == "review-evidence-unavailable")
+    {
+        return (PrAction::Wait, format!("held: {}", reasons.join(", ")));
+    }
     if reasons.iter().any(|reason| reason == "ordering-cycle") {
         return (
             PrAction::Wait,
@@ -44,7 +68,7 @@ fn held_action(reasons: &[String]) -> (PrAction, String) {
         return (
             PrAction::RebaseThenLand,
             format!(
-                "held: {} — rebase onto base, then revalidate before landing",
+                "held: {} — rebase onto base before landing; validation landability remains delegated to the consuming workspace",
                 reasons.join(", ")
             ),
         );
@@ -52,7 +76,7 @@ fn held_action(reasons: &[String]) -> (PrAction, String) {
     (PrAction::Wait, format!("held: {}", reasons.join(", ")))
 }
 
-fn ci_action(node: &PrNode, freshness_max_behind: i64) -> (PrAction, String) {
+fn ci_action(node: &PrNode, freshness_max_behind: Option<i64>) -> (PrAction, String) {
     if node.policy_class == PolicyClass::GatePolicy {
         return (
             PrAction::EscalateGatePolicy,
@@ -61,21 +85,30 @@ fn ci_action(node: &PrNode, freshness_max_behind: i64) -> (PrAction, String) {
         );
     }
     if node.validation_evidence == ValidationEvidence::CleanValidateRecord {
-        if node.commits_behind > freshness_max_behind {
+        if node.validation_authority == ValidationAuthority::None {
+            return (
+                PrAction::Wait,
+                "clean-validate-record has no consuming-workspace hard/soft-green authority"
+                    .to_owned(),
+            );
+        }
+        if freshness_max_behind.is_some_and(|limit| node.commits_behind > limit) {
             return (
                 PrAction::RebaseThenLand,
                 format!(
-                    "{} applies to the current head; rebase {} commit(s), then revalidate the new head before landing",
+                    "{} at exact head with {} authority; rebase {} commit(s), then land without pre-landing revalidation; post-facto validation remains due",
                     node.validation_evidence.as_str(),
-                    node.commits_behind
+                    node.validation_authority.as_str(),
+                    node.commits_behind,
                 ),
             );
         }
         return (
             PrAction::LandNow,
             format!(
-                "{} at exact head and base; no merge-gate wait",
-                node.validation_evidence.as_str()
+                "{} at exact head with {} authority; no merge-gate wait",
+                node.validation_evidence.as_str(),
+                node.validation_authority.as_str(),
             ),
         );
     }
@@ -107,15 +140,18 @@ fn ci_action(node: &PrNode, freshness_max_behind: i64) -> (PrAction, String) {
             "required gate passed; another CI check has NO_RESULT".to_owned(),
         );
     }
-    if node.commits_behind > freshness_max_behind {
+    if freshness_max_behind.is_some_and(|limit| node.commits_behind > limit) {
         return (
             PrAction::RebaseThenLand,
-            format!("green but {} commit(s) behind base", node.commits_behind),
+            format!(
+                "authoritative CI green, gate ok, but {} commit(s) behind base; rebase before landing",
+                node.commits_behind
+            ),
         );
     }
     (
         PrAction::LandNow,
-        "authoritative CI green, fresh, gate ok".to_owned(),
+        "authoritative CI green, gate ok".to_owned(),
     )
 }
 
@@ -152,7 +188,7 @@ pub fn compute_plan(
     conflict_edges: &[ConflictEdge],
     ordering_edges: &[OrderingEdge],
     held: &[HeldPr],
-    freshness_max_behind: i64,
+    freshness_max_behind: Option<i64>,
     outage_min_prs: usize,
     batch: bool,
 ) -> (Plan, Diagnostics) {
@@ -273,7 +309,7 @@ pub fn compute_plan(
 /// Derive stacks and holds, then compute a complete result from a collected graph.
 pub fn assemble_result(
     graph: CollectedGraph,
-    freshness_max_behind: i64,
+    freshness_max_behind: Option<i64>,
     outage_min_prs: usize,
     batch: bool,
 ) -> PlanResult {
@@ -320,15 +356,40 @@ mod tests {
     fn fusion_table_respects_evidence_policy_and_freshness() {
         let mut evidence = green(1);
         evidence.validation_evidence = ValidationEvidence::CleanValidateRecord;
+        evidence.validation_authority = ValidationAuthority::HardGreen;
         evidence.ci = CiVerdict::default();
         let mut policy = green(2);
         policy.policy_class = PolicyClass::GatePolicy;
         let mut behind = green(3);
         behind.commits_behind = 1;
-        let (plan, _) = compute_plan(&[evidence, policy, behind], &[], &[], &[], 0, 2, false);
+        // Explicit bound: this table is about evidence and policy, not freshness,
+        // and being behind is no longer a reroute reason by default. `behind`
+        // exists here to keep RebaseThenLand covered in the table.
+        let (plan, _) = compute_plan(
+            &[evidence, policy, behind],
+            &[],
+            &[],
+            &[],
+            Some(0),
+            2,
+            false,
+        );
         assert_eq!(plan.per_pr_actions[0].action, PrAction::LandNow);
         assert_eq!(plan.per_pr_actions[1].action, PrAction::EscalateGatePolicy);
         assert_eq!(plan.per_pr_actions[2].action, PrAction::RebaseThenLand);
+
+        let mut strict_behind = green(4);
+        strict_behind.commits_behind = 1;
+        let (strict, _) = compute_plan(&[strict_behind], &[], &[], &[], Some(0), 2, false);
+        assert_eq!(strict.per_pr_actions[0].action, PrAction::RebaseThenLand);
+
+        let mut unproven = green(5);
+        unproven.validation_evidence = ValidationEvidence::CleanValidateRecord;
+        let (unproven_plan, _) = compute_plan(&[unproven], &[], &[], &[], None, 2, false);
+        assert_eq!(unproven_plan.per_pr_actions[0].action, PrAction::Wait);
+        assert!(unproven_plan.per_pr_actions[0]
+            .why
+            .contains("no consuming-workspace hard/soft-green authority"));
     }
 
     #[test]
@@ -353,7 +414,7 @@ mod tests {
             },
             ..PrNode::default()
         };
-        let (plan, _) = compute_plan(&[missing, non_passing], &[], &[], &[], 0, 2, false);
+        let (plan, _) = compute_plan(&[missing, non_passing], &[], &[], &[], None, 2, false);
         assert_eq!(plan.per_pr_actions[0].action, PrAction::RefireCi);
         assert_eq!(plan.per_pr_actions[1].action, PrAction::RefireCi);
         assert!(plan.land_now.is_empty());
@@ -383,7 +444,7 @@ mod tests {
             &[],
             std::slice::from_ref(&edge),
             &[],
-            0,
+            None,
             2,
             true,
         );
@@ -406,7 +467,7 @@ mod tests {
                 reason: "base-ref".into(),
             }],
             &[],
-            0,
+            None,
             2,
             true,
         );
@@ -415,14 +476,45 @@ mod tests {
     }
 
     #[test]
-    fn gate_policy_escalates_even_when_held_and_rebase_invalidates_exact_evidence() {
+    fn unavailable_review_evidence_waits_before_base_conflict_rebase() {
+        let mut local = green(4);
+        local.review_evidence_unavailable = true;
+        local.base_conflict_paths = vec!["src/conflict.rs".into()];
+        local.validation_evidence = ValidationEvidence::CleanValidateRecord;
+        local.validation_authority = ValidationAuthority::HardGreen;
+
+        let mut github = green(5);
+        github.review_evidence_unavailable = true;
+        github.mergeable = "CONFLICTING".into();
+        github.validation_evidence = ValidationEvidence::CleanValidateRecord;
+        github.validation_authority = ValidationAuthority::HardGreen;
+
+        let nodes = vec![local, github];
+        let held = held_reasons(&nodes, &[]);
+        let (plan, _) = compute_plan(&nodes, &[], &[], &held, None, 2, false);
+        let by_pr = plan
+            .per_pr_actions
+            .iter()
+            .map(|decision| (decision.pr, decision))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(by_pr[&4].action, PrAction::Wait);
+        assert_eq!(by_pr[&5].action, PrAction::Wait);
+        assert!(by_pr[&4].why.contains("review-evidence-unavailable"));
+        assert!(by_pr[&4].why.contains("local-base-conflict"));
+        assert!(by_pr[&5].why.contains("review-evidence-unavailable"));
+        assert!(by_pr[&5].why.contains("github-base-conflicting"));
+        assert!(plan.land_now.is_empty());
+    }
+
+    #[test]
+    fn gate_policy_escalates_and_main_advance_requires_rebase_without_revalidation() {
         let mut policy = green(1);
         policy.policy_class = PolicyClass::GatePolicy;
         let held = HeldPr {
             pr: 1,
             reasons: vec!["draft".into()],
         };
-        let (policy_plan, _) = compute_plan(&[policy], &[], &[], &[held], 0, 2, false);
+        let (policy_plan, _) = compute_plan(&[policy], &[], &[], &[held], None, 2, false);
         assert_eq!(
             policy_plan.per_pr_actions[0].action,
             PrAction::EscalateGatePolicy
@@ -430,12 +522,36 @@ mod tests {
 
         let mut evidence = green(2);
         evidence.validation_evidence = ValidationEvidence::CleanValidateRecord;
+        evidence.validation_authority = ValidationAuthority::SoftGreen;
         evidence.commits_behind = 3;
-        let (evidence_plan, _) = compute_plan(&[evidence], &[], &[], &[], 0, 2, false);
+        // Main moving under a validated branch is not a landing obstacle: by
+        // default a soft-green ancestor lands.
+        let (default_plan, _) = compute_plan(
+            &[evidence.clone()],
+            &[],
+            &[],
+            &[],
+            DEFAULT_FRESHNESS_MAX_BEHIND,
+            2,
+            false,
+        );
+        assert_eq!(default_plan.per_pr_actions[0].action, PrAction::LandNow);
+
+        // The reroute and its exact wording are retained for a caller that asks.
+        let (evidence_plan, _) =
+            compute_plan(&[evidence.clone()], &[], &[], &[], Some(0), 2, false);
         let decision = &evidence_plan.per_pr_actions[0];
         assert_eq!(decision.action, PrAction::RebaseThenLand);
-        assert!(decision.why.contains("revalidate the new head"));
-        assert!(!decision.why.contains("without waiting"));
+        assert!(decision.why.contains("soft-green authority"));
+        assert!(decision.why.contains("rebase 3 commit(s), then land"));
+        assert!(decision.why.contains("without pre-landing revalidation"));
+        assert!(decision.why.contains("post-facto validation remains due"));
+
+        evidence.commits_behind = 0;
+        let (fresh_plan, _) = compute_plan(&[evidence], &[], &[], &[], Some(0), 2, false);
+        let fresh_decision = &fresh_plan.per_pr_actions[0];
+        assert_eq!(fresh_decision.action, PrAction::LandNow);
+        assert!(!fresh_decision.why.contains("rebase"));
     }
 
     #[test]
@@ -489,7 +605,7 @@ mod tests {
             b: 10,
             paths: vec!["x".into()],
         }];
-        let (plan, diagnostics) = compute_plan(&nodes, &conflicts, &[], &[], 0, 2, true);
+        let (plan, diagnostics) = compute_plan(&nodes, &conflicts, &[], &[], None, 2, true);
         let actions: BTreeMap<_, _> = plan
             .per_pr_actions
             .iter()

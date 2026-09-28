@@ -1,9 +1,9 @@
-"""Tests for safe_ci_dag_runner.viz (synthetic DAG)."""
+"""Tests for dagrun.viz (synthetic DAG)."""
 
 from __future__ import annotations
 
-from safe_ci_dag_runner.model import DagConfig, ResourceHint, Step
-from safe_ci_dag_runner.viz import to_ascii, to_dot
+from dagrun.model import DagConfig, ResourceHint, Step
+from dagrun.viz import to_ascii, to_dot
 
 
 def _cfg() -> DagConfig:

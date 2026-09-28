@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.summarize import (
+from wrkviz.summarize import (
     GLOSSARY_DEFINITION_PROMPT_VERSION,
     GLOSSARY_DEFINITION_STYLE,
     PLAIN_LANGUAGE_ROLLUP_STYLE,
@@ -30,7 +30,7 @@ from agent_team_timeline.summarize import (
     knowledge_text_has_link,
     summarize_jobs,
 )
-from agent_team_timeline.token_usage import TokenUsage
+from wrkviz.token_usage import TokenUsage
 
 
 def _job(
@@ -40,7 +40,7 @@ def _job(
 ) -> SummaryJob:
     return SummaryJob(
         key=key,
-        team_slug="codex-hermit",
+        team_slug="codex-widget",
         agent_label="coordinator" if key == "root" else key,
         start_ms=1_800_000_000_000,
         end_ms=1_800_000_060_000,
@@ -366,7 +366,7 @@ for required in (
 expected_service_tier = os.environ.get("FAKE_CODEX_SERVICE_TIER")
 if expected_service_tier is not None:
     assert f'service_tier="{expected_service_tier}"' in args
-assert Path.cwd().name.startswith("agent-team-timeline-summary-")
+assert Path.cwd().name.startswith("wrkviz-summary-")
 repository_check = subprocess.run(
     ["git", "rev-parse", "--is-inside-work-tree"],
     text=True,
@@ -394,7 +394,7 @@ for job in jobs:
     style = job.get("summary_style", "phase")
     if style == "project-overview":
         phrase = "Project overview supported"
-        paragraph = "Hermit runs guest software in a controlled, repeatable environment."
+        paragraph = "Widget runs guest software in a controlled, repeatable environment."
         work_summary = []
     elif style == "glossary-definition":
         phrase = "Definition supported"

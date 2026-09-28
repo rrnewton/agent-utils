@@ -33,7 +33,10 @@ impl SubprocessGateRunner {
 }
 
 impl GateRunner for SubprocessGateRunner {
-    fn run(&self, cmd: &str) -> GateResult {
+    fn run(&self, cmd: &str, timeout_secs: Option<u64>) -> GateResult {
+        // The gate's own bound when it declares one, else this runner's. Mirrors the Python
+        // edition's `run(cmd, timeout=None)`.
+        let effective = timeout_secs.map_or(self.timeout, Duration::from_secs);
         let mut command = Command::new("bash");
         command
             .args(["-c", cmd])
@@ -67,7 +70,7 @@ impl GateRunner for SubprocessGateRunner {
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    while started.elapsed() < self.timeout
+                    while started.elapsed() < effective
                         && (!stdout_reader.is_finished() || !stderr_reader.is_finished())
                     {
                         thread::sleep(Duration::from_millis(10));
@@ -78,7 +81,7 @@ impl GateRunner for SubprocessGateRunner {
                         let _ = stderr_reader.join();
                         return GateResult::failed(format!(
                             "timed out after {}s",
-                            self.timeout.as_secs()
+                            effective.as_secs()
                         ));
                     }
                     let stdout = stdout_reader.join().unwrap_or_default();
@@ -86,17 +89,14 @@ impl GateRunner for SubprocessGateRunner {
                     let code = status.code().unwrap_or_else(|| signal_returncode(&status));
                     return GateResult::completed(code, String::from_utf8_lossy(&stdout));
                 }
-                Ok(None) if started.elapsed() < self.timeout => {
+                Ok(None) if started.elapsed() < effective => {
                     thread::sleep(Duration::from_millis(10));
                 }
                 Ok(None) => {
                     terminate(&mut child);
                     let _ = stdout_reader.join();
                     let _ = stderr_reader.join();
-                    return GateResult::failed(format!(
-                        "timed out after {}s",
-                        self.timeout.as_secs()
-                    ));
+                    return GateResult::failed(format!("timed out after {}s", effective.as_secs()));
                 }
                 Err(error) => {
                     terminate(&mut child);
@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn subprocess_gate_captures_stdout_and_exit_status() {
         let runner = SubprocessGateRunner::new(2);
-        let result = runner.run("printf 'count=7\\n'; exit 3");
+        let result = runner.run("printf 'count=7\\n'; exit 3", None);
         assert!(result.ok);
         assert_eq!(result.returncode, 3);
         assert_eq!(result.stdout, "count=7\n");
@@ -219,7 +219,7 @@ mod tests {
 
     #[test]
     fn subprocess_gate_replaces_invalid_utf8() {
-        let result = SubprocessGateRunner::new(2).run("printf '\\377'");
+        let result = SubprocessGateRunner::new(2).run("printf '\\377'", None);
         assert!(result.ok);
         assert_eq!(result.returncode, 0);
         assert_eq!(result.stdout, "\u{fffd}");
@@ -228,7 +228,7 @@ mod tests {
     #[test]
     fn subprocess_gate_times_out_loudly() {
         let runner = SubprocessGateRunner::new(0);
-        let result = runner.run("sleep 1");
+        let result = runner.run("sleep 1", None);
         assert!(!result.ok);
         assert_eq!(result.returncode, -1);
         assert_eq!(result.error.as_deref(), Some("timed out after 0s"));
@@ -238,7 +238,7 @@ mod tests {
     fn timeout_kills_background_descendants_holding_capture_pipes() {
         let runner = SubprocessGateRunner::new(0);
         let started = std::time::Instant::now();
-        let result = runner.run("sleep 30 &");
+        let result = runner.run("sleep 30 &", None);
         assert!(!result.ok);
         assert!(started.elapsed() < Duration::from_secs(2));
     }
@@ -257,5 +257,58 @@ mod tests {
             .newest_age_secs(&recursive_looking, wall_clock_now())
             .is_some());
         let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- per-gate timeout enforcement ------------------------------------------------
+    // The point of these is that the gate's own bound is ENFORCED, not merely accepted.
+    // A parser that takes timeout_secs and a runner that ignores it is worse than refusing
+    // the field: the config would claim a bound that never fires.
+
+    #[test]
+    fn a_gate_bound_shorter_than_the_runner_default_is_the_one_enforced() {
+        // Runner default 30s, gate bound 1s, command sleeps 5s. If the gate bound were
+        // ignored this would complete; it must time out instead.
+        let runner = SubprocessGateRunner::new(30);
+        let started = std::time::Instant::now();
+        let result = runner.run("sleep 5", Some(1));
+        assert!(
+            !result.ok,
+            "a gate past its own bound must not report a completion"
+        );
+        assert_eq!(result.returncode, -1);
+        assert_eq!(result.error.as_deref(), Some("timed out after 1s"));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "it must be terminated at its own bound, not at the command's own end"
+        );
+    }
+
+    #[test]
+    fn a_healthy_command_inside_its_gate_bound_still_succeeds() {
+        let runner = SubprocessGateRunner::new(30);
+        let result = runner.run("printf 'ok=1\n'; exit 0", Some(10));
+        assert!(result.ok, "{:?}", result.error);
+        assert_eq!(result.returncode, 0);
+        assert_eq!(result.stdout, "ok=1\n");
+        assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn no_gate_bound_falls_back_to_the_runner_default() {
+        // Runner default 1s, no gate bound, command sleeps 5s -> the runner's bound applies.
+        let runner = SubprocessGateRunner::new(1);
+        let result = runner.run("sleep 5", None);
+        assert!(!result.ok);
+        assert_eq!(result.error.as_deref(), Some("timed out after 1s"));
+    }
+
+    #[test]
+    fn a_gate_bound_longer_than_the_runner_default_is_also_honoured() {
+        // Runner default 1s, gate bound 10s, command sleeps 2s. If the gate bound were
+        // ignored the runner default would cut this off; it must complete.
+        let runner = SubprocessGateRunner::new(1);
+        let result = runner.run("sleep 2; printf 'done\n'", Some(10));
+        assert!(result.ok, "{:?}", result.error);
+        assert_eq!(result.stdout, "done\n");
     }
 }

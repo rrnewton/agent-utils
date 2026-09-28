@@ -8,8 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.archive import narrow_json, read_json
-from agent_team_timeline.artifacts import (
+from wrkviz.build_store import team_build_root
+from wrkviz.archive import narrow_json, read_json
+from wrkviz.artifacts import (
     ArtifactKind,
     ArtifactRangeIndex,
     EvidenceRelation,
@@ -18,18 +19,20 @@ from agent_team_timeline.artifacts import (
     extract_artifacts,
     output_artifact_ids_for_range,
 )
-from agent_team_timeline.model import Agent, Event, SourceSnapshot, TeamData, ToolCall
-from agent_team_timeline.pipeline import (
+from wrkviz.model import Agent, Event, SourceSnapshot, TeamData, ToolCall
+from wrkviz.pipeline import (
     _write_ingested_team,
     build_archive,
     load_artifact_catalog,
     summarize_archive,
 )
+from wrkviz.snapshot_store import resolve_snapshot_root
+from tests.timeline_projection import read_stored_text, schema_1_timeline_text
 
 
 ROOT = "00000000-0000-0000-0000-000000000001"
 START = 1_775_000_000_000
-REPOSITORY = "https://github.com/rrnewton/example"
+REPOSITORY = "https://github.com/example-org/example"
 
 
 def _tool(
@@ -137,18 +140,18 @@ def test_extracts_confirmed_commit_push_and_pull_request_without_duplicates() ->
         "push",
         2_000,
         "with-proxy git push origin HEAD:refs/heads/topic",
-        "To https://github.com/rrnewton/example.git\n   1111111..abc1234  HEAD -> topic",
+        "To https://github.com/example-org/example.git\n   1111111..abc1234  HEAD -> topic",
     )
     pull = _tool(
         "pr",
         3_000,
-        "with-proxy gh pr create -R rrnewton/example --title Fix --body body",
-        "https://github.com/rrnewton/example/pull/42\nexit_code=0",
+        "with-proxy gh pr create -R example-org/example --title Fix --body body",
+        "https://github.com/example-org/example/pull/42\nexit_code=0",
     )
     mention = _event(
         "mention",
         4_000,
-        "The output is https://github.com/rrnewton/example/pull/42.",
+        "The output is https://github.com/example-org/example/pull/42.",
     )
 
     catalog = extract_artifacts(_team(events=(mention,), tools=(commit, push, pull)))
@@ -205,13 +208,13 @@ def test_artifact_range_index_preserves_half_open_output_and_dedupe_semantics() 
         "push",
         2_000,
         "git push origin HEAD:refs/heads/topic",
-        "To https://github.com/rrnewton/example.git\n"
+        "To https://github.com/example-org/example.git\n"
         "   1111111..abc1234  HEAD -> topic",
     )
     reference = _event(
         "reference",
         3_000,
-        "Review https://github.com/rrnewton/example/commit/abc1234.",
+        "Review https://github.com/example-org/example/commit/abc1234.",
     )
     catalog = extract_artifacts(_team(events=(reference,), tools=(commit, push)))
     artifact = next(item for item in catalog.artifacts if item.kind is ArtifactKind.COMMIT)
@@ -247,13 +250,13 @@ def test_policy_search_and_failed_commands_never_claim_outputs() -> None:
         1_000,
         "rg -n 'git commit|git push|gh pr create' docs",
         "example: [main deadbee] Not an executed commit\n"
-        "https://github.com/rrnewton/example/pull/7",
+        "https://github.com/example-org/example/pull/7",
     )
     failed_create = _tool(
         "failed-pr",
         2_000,
-        "with-proxy gh pr create -R rrnewton/example --title Nope --body Nope",
-        "https://github.com/rrnewton/example/pull/8\nfatal: authentication failed\nexit=128",
+        "with-proxy gh pr create -R example-org/example --title Nope --body Nope",
+        "https://github.com/example-org/example/pull/8\nfatal: authentication failed\nexit=128",
     )
     commit = _tool(
         "commit",
@@ -296,7 +299,7 @@ def test_multiline_quoted_pr_body_keeps_true_command_boundary() -> None:
     create = _tool(
         "multiline-pr",
         1_000,
-        "with-proxy gh pr create -R rrnewton/example --title Fix "
+        "with-proxy gh pr create -R example-org/example --title Fix "
         "--body 'Summary\nThe prose says git commit and git push, but executes neither.'",
         REPOSITORY + "/pull/13",
     )
@@ -401,13 +404,16 @@ def test_ingest_writes_catalog_before_redacting_tool_payloads(tmp_path: Path) ->
             _tool(
                 "pr",
                 1_000,
-                "with-proxy gh pr create -R rrnewton/example --title Fix --body body",
+                "with-proxy gh pr create -R example-org/example --title Fix --body body",
                 REPOSITORY + "/pull/55",
             ),
         )
     )
 
-    archived, report = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+    archived, report = _write_ingested_team(
+        tmp_path, team.team_slug, team, None, 0,
+        resolve_snapshot_root(tmp_path, team.team_slug),
+    )
 
     assert archived.tool_calls[0].input_text is None
     assert archived.tool_calls[0].output_text is None
@@ -416,7 +422,7 @@ def test_ingest_writes_catalog_before_redacting_tool_payloads(tmp_path: Path) ->
     assert report.artifacts >= 2  # repository plus pull request
     assert report.projects == 1
     catalog_path = (
-        tmp_path / "teams" / team.team_slug / "raw" / "artifacts.json"
+        team_build_root(tmp_path, team.team_slug) / "raw" / "artifacts.json"
     )
     assert catalog_path.is_file()
     catalog = load_artifact_catalog(tmp_path, team.team_slug, archived)
@@ -430,21 +436,22 @@ def test_build_associates_catalog_with_phase_agent_and_rollups(tmp_path: Path) -
             _tool(
                 "pr",
                 10_000,
-                "with-proxy gh pr create -R rrnewton/example --title Fix --body body",
+                "with-proxy gh pr create -R example-org/example --title Fix --body body",
                 REPOSITORY + "/pull/56",
             ),
         )
     )
-    _, report = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+    _, report = _write_ingested_team(
+        tmp_path, team.team_slug, team, None, 0,
+        resolve_snapshot_root(tmp_path, team.team_slug),
+    )
     assert report.artifacts >= 2
     summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
 
     first = build_archive(tmp_path, team.team_slug)
     second = build_archive(tmp_path, team.team_slug)
 
-    catalog = json.loads(
-        (tmp_path / "data" / "artifacts.json").read_text(encoding="utf-8")
-    )
+    catalog = json.loads(read_stored_text(tmp_path / "data" / "artifacts.json"))
     pull = next(
         item
         for item in catalog["artifacts"]
@@ -452,9 +459,7 @@ def test_build_associates_catalog_with_phase_agent_and_rollups(tmp_path: Path) -
         and item["external_id"] == "56"
     )
     artifact_id = pull["artifact_id"]
-    timeline = json.loads(
-        (tmp_path / "data" / "timeline.json").read_text(encoding="utf-8")
-    )
+    timeline = json.loads(schema_1_timeline_text(tmp_path))
     assert timeline["artifact_catalog_path"] == "data/artifacts.json"
     assert [project["url"] for project in timeline["projects"]] == [REPOSITORY]
     phase = next(
@@ -462,9 +467,7 @@ def test_build_associates_catalog_with_phase_agent_and_rollups(tmp_path: Path) -
         for item in timeline["phases"]
         if artifact_id in item["output_artifact_ids"]
     )
-    detail = json.loads(
-        (tmp_path / phase["detail_path"]).read_text(encoding="utf-8")
-    )
+    detail = json.loads(read_stored_text(tmp_path / phase["detail_path"]))
     assert artifact_id in detail["artifact_ids"]
     assert artifact_id in detail["output_artifact_ids"]
     assert artifact_id in timeline["agents"][0]["output_artifact_ids"]
@@ -492,19 +495,24 @@ def test_ingest_never_persists_cwd_or_repository_credentials(tmp_path: Path) -> 
     unsafe_source = replace(
         team.sources[0],
         working_directory="/home/private/customer/project",
-        repository_url="https://alice:supersecret@github.com/rrnewton/example.git",
+        repository_url="https://alice:supersecret@github.com/example-org/example.git",
     )
     unsafe_team = replace(team, sources=(unsafe_source,))
 
     archived, _ = _write_ingested_team(
-        tmp_path, unsafe_team.team_slug, unsafe_team, None, 0
+        tmp_path,
+        unsafe_team.team_slug,
+        unsafe_team,
+        None,
+        0,
+        resolve_snapshot_root(tmp_path, unsafe_team.team_slug),
     )
 
     assert archived.sources[0].working_directory is None
     assert archived.sources[0].repository_url is None
     persisted = "\n".join(
         path.read_text(encoding="utf-8")
-        for path in (tmp_path / "teams" / team.team_slug / "raw").rglob("*.json")
+        for path in (team_build_root(tmp_path, team.team_slug) / "raw").rglob("*.json")
     )
     assert "supersecret" not in persisted
     assert "/home/private" not in persisted

@@ -74,6 +74,21 @@ with open(state_path, encoding="utf-8") as handle:
 args = sys.argv[1:]
 state.setdefault("calls", []).append(args)
 
+if args == ["goal-rpc"]:
+    for line in sys.stdin:
+        request = json.loads(line)
+        if "id" not in request:
+            continue
+        result = {}
+        if request.get("method") == "thread/goal/get":
+            goals = [text[6:] for text in state.get("submitted", []) if text.startswith("/goal ")]
+            result = {"goal": None if not goals else {
+                "threadId": request["params"]["threadId"], "objective":goals[-1], "status":"active",
+                "tokensUsed":1, "timeUsedSeconds":1, "createdAt":1, "updatedAt":1, "tokenBudget":None,
+            }}
+        print(json.dumps({"id":request["id"], "result":result}), flush=True)
+    raise SystemExit(0)
+
 def save():
     temporary = state_path + ".tmp"
     with open(temporary, "w", encoding="utf-8") as handle:
@@ -84,10 +99,18 @@ def envelope(result):
     print(json.dumps({"result": result}, sort_keys=True))
 
 if args[:2] == ["pane", "list"]:
-    envelope({"panes": [{"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1"}]})
+    if state.get("offline"):
+        print("server unavailable", file=sys.stderr)
+        save()
+        raise SystemExit(1)
+    panes = [] if state.get("closed") else [{"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1"}]
+    if state.get("extra_pane"):
+        panes.append({"pane_id":"w1:p2", "tab_id":"w1:t1", "workspace_id":"w1"})
+    envelope({"panes": panes})
 elif args[:2] == ["pane", "get"]:
     pane = args[2]
-    if pane != "w1:p1":
+    human = pane == "w1:p2" and state.get("extra_pane")
+    if pane != "w1:p1" and not human:
         print("missing pane", file=sys.stderr)
         save()
         raise SystemExit(1)
@@ -95,16 +118,48 @@ elif args[:2] == ["pane", "get"]:
         "pane_id": pane,
         "workspace_id": "w1",
         "cwd": root,
-        "agent": "codex",
-        "agent_status": state.get("status", "idle"),
-        "agent_session": {"agent": "codex", "value": "session-1"},
+        "agent": None if human else state.get("harness", "codex"),
+        "agent_status": "unknown" if human else state.get("status", "idle"),
+        "agent_session": None if human else {"agent": state.get("harness", "codex"), "value": "session-1"},
     }})
+elif args[:2] == ["tab", "create"]:
+    state["closed"] = False
+    state["tab_environment"] = [
+        args[index + 1] for index, argument in enumerate(args[:-1])
+        if argument == "--env"
+    ]
+    envelope({"tab": {"tab_id": "w1:t1"}, "root_pane": {
+        "pane_id":"w1:p1", "tab_id":"w1:t1", "workspace_id":"w1",
+    }})
+elif args[:2] == ["pane", "close"]:
+    if args[2] != "w1:p1":
+        raise SystemExit("refusing unexpected pane close")
+    state["closed"] = True
+    state.setdefault("closed_panes", []).append(args[2])
+elif args[:2] in (["agent", "focus"], ["tab", "focus"]):
+    state["focused"] = args[2]
+elif args[:2] == ["agent", "start"]:
+    state["name"] = args[2]
+    state["harness"] = args[args.index("--kind") + 1]
+    state["launch_arguments"] = args[args.index("--") + 1:]
+    if state.get("start_failure"):
+        print("startup requires attention", file=sys.stderr)
+        save()
+        raise SystemExit(1)
+elif args[:2] == ["agent", "get"]:
+    if state.get("offline") or state.get("name") != args[2]:
+        print("named agent unavailable", file=sys.stderr)
+        save()
+        raise SystemExit(1)
+    envelope({"agent": {"name":args[2], "pane_id":"w1:p1"}})
+elif args[:2] == ["pane", "report-agent-session"]:
+    state["reported_session"] = args[args.index("--agent-session-id") + 1]
 elif args[:2] == ["workspace", "get"]:
     envelope({"workspace": {
         "workspace_id": state.get("workspace_response_id", "w1"),
         "label": "project",
     }})
-elif args[:2] == ["pane", "run"]:
+elif args[:2] == ["agent", "prompt"]:
     state.setdefault("submitted", []).append(args[3])
     if state.get("run_mode") == "gate":
         save()
@@ -120,18 +175,28 @@ elif args[:2] == ["pane", "run"]:
         print("transport lost after write", file=sys.stderr)
         save()
         raise SystemExit(1)
-elif args[:2] == ["wait", "agent-status"]:
+elif args[:2] == ["agent", "wait"]:
+    if state.get("goal_menu") and not state.get("confirmed_goal"):
+        print("replacement menu requires confirmation", file=sys.stderr)
+        save()
+        raise SystemExit(1)
     if state.get("wait_mode") == "fail":
         print("working transition unavailable", file=sys.stderr)
         save()
         raise SystemExit(1)
-    print(json.dumps({"data": {"pane_id": args[2], "agent_status": "working"}}, sort_keys=True))
+    print(json.dumps({"result": {"agent": {"pane_id": args[2], "agent_status": "working"}}}, sort_keys=True))
 elif args[:2] == ["pane", "read"]:
+    if state.get("extra_pane_on_read"):
+        state["extra_pane"] = True
     source = args[args.index("--source") + 1]
-    if source == "recent-unwrapped":
+    if source == "visible" and state.get("screen"):
+        sys.stdout.write(state["screen"])
+    elif source == "recent-unwrapped":
         sys.stdout.write(state.get("read_unwrapped", "agent transcript\n"))
     else:
         sys.stdout.write(state.get("read_recent", "fallback transcript\n"))
+elif args[:2] == ["pane", "send-keys"]:
+    state["confirmed_goal"] = args[3] == "Enter"
 else:
     print("unsupported fake Herdr call: " + repr(args), file=sys.stderr)
     save()
@@ -185,7 +250,7 @@ class Harness:
         existing = environment.get("PYTHONPATH", "")
         local = str(REPO_ROOT / "py")
         environment["PYTHONPATH"] = local if not existing else local + os.pathsep + existing
-        environment.update({"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "NO_COLOR": "1"})
+        environment.update({"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "NO_COLOR": "1", "HERDR_WORKSPACE_ID": "w1"})
         try:
             completed = subprocess.run(
                 [*command, *expanded],
@@ -751,7 +816,6 @@ def _invalid_cli(harness: Harness, report: Report) -> None:
         ("lines-over-bound", ("read", "--lines", "1000001"), 2),
         ("timeout-underscore", ("status", "--ready-timeout", "1_0"), 2),
         ("timeout-unicode", ("status", "--ready-timeout", "١.0"), 2),
-        ("empty-exact-pane", ("status", "--pane", ""), 75),
     ):
         python, rust = harness.invoke(case, arguments)
         report.require(
@@ -761,6 +825,154 @@ def _invalid_cli(harness: Harness, report: Report) -> None:
             and "panicked" not in (python.stderr + rust.stderr).lower(),
             f"invalid invocation was not a clean usage error: python={python!r} rust={rust!r}",
         )
+
+    python, rust = harness.invoke(case, ("status", "--pane", ""))
+    expected = "target needs --pane or a stable session value"
+    report.require(
+        "cli/empty-exact-pane",
+        python.returncode == rust.returncode == 75
+        and python.stdout == rust.stdout == ""
+        and expected in python.stderr
+        and expected in rust.stderr,
+        "empty exact pane did not fail target validation before Herdr resolution: "
+        f"python={python!r} rust={rust!r}",
+    )
+
+
+def _managed_lifecycle(harness: Harness, report: Report) -> None:
+    """Exercise the same named lifecycle and cross-edition durable registry format."""
+    def normalized(outcome: Outcome) -> object:
+        if outcome.returncode != 0:
+            return outcome
+        value: object = json.loads(outcome.stdout)
+        def clean(item: object) -> object:
+            if isinstance(item, list):
+                return [clean(entry) for entry in item]
+            if isinstance(item, dict):
+                return {
+                    str(key): ("<TOKEN>" if key == "token" else 0 if key == "created_at"
+                               else "<ARCHIVE>" if key == "archive" else clean(child))
+                    for key, child in item.items()
+                }
+            return item
+        return clean(value)
+
+    for kind in ("codex", "claude"):
+        case = harness.case(f"managed-{kind}")
+        common: tuple[str, ...] = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry", "--goal-command-json", '["<HERDR>","goal-rpc"]')
+        start = ("start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+                 "--harness", kind, "--model", "selected-model", "--harness-arg=--extra", *common)
+        python, rust = harness.invoke(case, start)
+        report.require(f"managed/{kind}/start", python.returncode == rust.returncode == 0 and normalized(python) == normalized(rust),
+                       f"start diverged: {python!r} {rust!r}")
+        if python.returncode or rust.returncode:
+            continue
+        for command in (("list",), ("status", "--name", "worker"), ("bind-session", "session-1", "--name", "worker"), ("wait", "--name", "worker", "--ready-timeout", "0"),
+                        ("goal", "finish the task", "--name", "worker"), ("goal", "--name", "worker"),
+                        ("send", "literal\nmessage", "--name", "worker")):
+            python, rust = harness.invoke(case, (*command, *common))
+            report.require(f"managed/{kind}/{command[0]}", python.returncode == rust.returncode == 0 and normalized(python) == normalized(rust),
+                           f"managed command diverged: {python!r} {rust!r}")
+        python, rust = harness.invoke(case, ("read", "--name", "worker", *common))
+        report.exact(f"managed/{kind}/read", python, rust, 0)
+        python, rust = harness.invoke(case, ("stop", "worker", *common))
+        report.require(f"managed/{kind}/stop", python.returncode == rust.returncode == 0 and normalized(python) == normalized(rust),
+                       f"stop diverged: {python!r} {rust!r}")
+        report.require(f"managed/{kind}/literal-launch", _state(case.python_root).get("launch_arguments") == _state(case.rust_root).get("launch_arguments"),
+                       "harness arguments differed")
+
+    # A record written by Python can be read, messaged and archived by Rust, and vice versa.
+    for label, producer, consumer in (("python-rust", harness.python, harness.rust), ("rust-python", harness.rust, harness.python)):
+        case = harness.case(f"managed-interop-{label}")
+        root = case.python_root
+        common = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry")
+        started = harness._invoke_one(producer, root, ("start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1", *common))
+        sent = harness._invoke_one(consumer, root, ("send", "shared registry", "--name", "worker", *common))
+        stopped = harness._invoke_one(consumer, root, ("stop", "worker", *common))
+        report.require(f"managed/interop/{label}", started.returncode == sent.returncode == stopped.returncode == 0 and _state(root).get("submitted") == ["shared registry"],
+                       f"registry interop failed: {started!r} {sent!r} {stopped!r}")
+
+    for label, change in (("offline", {"offline": True}), ("busy", {"status": "working"}), ("extra-pane", {"extra_pane": True})):
+        case = harness.case(f"managed-{label}")
+        common = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry")
+        harness.invoke(case, ("start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1", *common))
+        for root in (case.python_root, case.rust_root):
+            state = _state(root)
+            state.update(change)
+            (root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        if label == "extra-pane":
+            python, rust = harness.invoke(case, ("stop", "worker", *common))
+            report.require("managed/stop-extra-pane", python.returncode == rust.returncode == 75
+                           and "ownership changed" in python.stderr and "ownership changed" in rust.stderr,
+                           f"unsafe tab close was accepted: {python!r} {rust!r}")
+        else:
+            python, rust = harness.invoke(case, ("send", "retain this prompt", "--name", "worker", "--ready-timeout", "0", *common))
+            report.require(f"managed/{label}-pending", python.returncode == rust.returncode == 75
+                           and '"outcome": "pending"' in python.stdout and '"outcome": "pending"' in rust.stdout,
+                           f"prompt was not durably retained: {python!r} {rust!r}")
+            report.require(f"managed/{label}-durable-state", _queue_snapshot(case.python_root, "registry/worker/queue") == _queue_snapshot(case.rust_root, "registry/worker/queue"),
+                           "pending managed queue artifacts differed")
+        report.require(f"managed/{label}-no-mutation", _state(case.python_root).get("submitted") == []
+                       and _state(case.rust_root).get("submitted") == []
+                       and not _state(case.python_root).get("closed") and not _state(case.rust_root).get("closed"),
+                       "failure injected a prompt or closed a tab")
+
+    case = harness.case("managed-failed-launch", {"start_failure": True})
+    common = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry")
+    python, rust = harness.invoke(case, ("start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1", *common))
+    report.require("managed/failed-launch-retained", python.returncode == rust.returncode == 75
+                   and (case.python_root / "registry/worker/agent.json").exists()
+                   and (case.rust_root / "registry/worker/agent.json").exists()
+                   and not _state(case.python_root).get("closed") and not _state(case.rust_root).get("closed"),
+                   f"launch failed without inspectable state: {python!r} {rust!r}")
+    for root in (case.python_root, case.rust_root):
+        state = _state(root)
+        state["name"] = "replacement"
+        (root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    python, rust = harness.invoke(case, ("stop", "worker", *common))
+    report.require("managed/failed-launch-replacement-preserved", python.returncode == rust.returncode == 69
+                   and not _state(case.python_root).get("closed") and not _state(case.rust_root).get("closed"),
+                   f"cleanup targeted replacement harness: {python!r} {rust!r}")
+
+    for correct in (True, False):
+        objective = "finish this task" if correct else "different objective"
+        screen = f"Replace goal?\nNew objective: {objective}\n› 1. Replace current goal  Set the new objective and start it now\n2. Cancel  Keep the current goal\nPress enter to confirm or esc to go back"
+        case = harness.case(f"goal-menu-{correct}", {"goal_menu": True, "screen": screen})
+        common = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry", "--goal-command-json", '["<HERDR>","goal-rpc"]')
+        harness.invoke(case, ("start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1", *common))
+        python, rust = harness.invoke(case, ("goal", "finish this task", "--name", "worker", *common))
+        expected = 0 if correct else 76
+        report.require(f"managed/goal-replacement-{correct}", python.returncode == rust.returncode == expected
+                       and bool(_state(case.python_root).get("confirmed_goal")) == correct
+                       and bool(_state(case.rust_root).get("confirmed_goal")) == correct,
+                       f"goal menu handling diverged: {python!r} {rust!r}")
+
+    for label, producer, consumer in (("python-rust", harness.python, harness.rust), ("rust-python", harness.rust, harness.python)):
+        case = harness.case(f"queued-goal-interop-{label}")
+        root = case.python_root
+        common = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry", "--goal-command-json", '["<HERDR>","goal-rpc"]')
+        started = harness._invoke_one(producer, root, ("start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1", *common))
+        state = _state(root)
+        state["status"] = "working"
+        (root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        queued = harness._invoke_one(producer, root, ("goal", "finish this task", "--name", "worker", "--ready-timeout", "0", *common))
+        state = _state(root)
+        state.update({"status": "idle", "goal_menu": True,
+                      "screen": "Replace goal?\nNew objective: finish this task\n› 1. Replace current goal  Set the new objective and start it now\n2. Cancel  Keep the current goal\nPress enter to confirm or esc to go back"})
+        (root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        drained = harness._invoke_one(consumer, root, ("drain", "--name", "worker", *common))
+        goal = harness._invoke_one(consumer, root, ("goal", "--name", "worker", *common))
+        report.require(f"managed/queued-goal/{label}", started.returncode == drained.returncode == goal.returncode == 0
+                       and queued.returncode == 75 and bool(_state(root).get("confirmed_goal"))
+                       and _state(root).get("submitted") == ["/goal finish this task"]
+                       and json.loads(goal.stdout).get("delivery") == "delivered",
+                       f"queued goal lost durable operation identity: {started!r} {queued!r} {drained!r} {goal!r}")
+        state = _state(root)
+        state["confirmed_goal"] = False
+        (root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        raw = harness._invoke_one(consumer, root, ("send", "/goal finish this task", "--name", "worker", *common))
+        report.require(f"managed/raw-goal-not-authorized/{label}", raw.returncode == 76 and not _state(root).get("confirmed_goal"),
+                       f"ordinary text incorrectly inherited goal confirmation: {raw!r}")
 
 
 def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> Report:
@@ -777,6 +989,7 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
         _shared_queue_interop(harness, report)
         _cross_process_serialization(harness, report)
         _invalid_cli(harness, report)
+        _managed_lifecycle(harness, report)
     return report
 
 
@@ -800,7 +1013,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Standalone source-tree entry point used for focused development."""
 
     del argv
-    python = [sys.executable, "-m", "herdr_run.agent_cli"]
+    python = [sys.executable, "-m", "agentctl.legacy_cli"]
     launcher = REPO_ROOT / "rs/bin/herdr-agent"
     environment = dict(os.environ)
     environment["AGENT_UTILS_RS_ENSURE_ONLY"] = "1"

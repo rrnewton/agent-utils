@@ -7,14 +7,14 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline import cli as timeline_cli
-from agent_team_timeline.archive import JsonValue, write_json_if_changed
-from agent_team_timeline.glossary_audit import (
+from wrkviz import cli as timeline_cli
+from wrkviz.archive import JsonValue, write_json_if_changed
+from wrkviz.glossary_audit import (
     audit_legacy_glossaries,
     audit_legacy_term,
     format_glossary_audit,
 )
-from agent_team_timeline.terminology import glossary_term_id
+from wrkviz.terminology import glossary_term_id
 
 
 def _term(
@@ -68,13 +68,13 @@ def test_legacy_glossary_audit_rejects_noise_without_publishing_candidates(
             _term("get-target", "An action that prints a host target."),
             _term("4c70658e", "A commit identifier used as a baseline."),
             _term("recording_metadata", "A method used to read recording metadata."),
-            _term("KVM", "A controlled execution backend in the Hermit system."),
-            _term("e9patch", "A binary rewriting system used as a Hermit backend."),
+            _term("KVM", "A controlled execution backend in the Widget system."),
+            _term("e9patch", "A binary rewriting system used as a Widget backend."),
             _term(
                 "ancestry-gating Reverie pin bumps",
                 "A workstream for safely updating the Reverie dependency.",
             ),
-            _term("dev-hermit", "The repository and shared development workspace."),
+            _term("dev-widget", "The repository and shared development workspace."),
             _term("M9", "A project milestone for userspace execution."),
         ],
     )

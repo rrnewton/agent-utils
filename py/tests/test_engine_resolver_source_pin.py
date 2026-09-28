@@ -46,7 +46,7 @@ def _run_launcher(
     env = {
         **os.environ,
         "CARGO_NET_OFFLINE": "true",
-        "SAFE_CI_DAG_RUNNER_ENGINE": "rust",
+        "DAGRUN_ENGINE": "rust",
     }
     if ensure_only:
         env["AGENT_UTILS_RS_ENSURE_ONLY"] = "1"
@@ -308,6 +308,62 @@ def test_launcher_ignores_unrelated_cwd_config_and_restores_tool_cwd(tmp_path: P
     assert launched.stdout.strip() == str(outside)
 
 
+def test_launcher_ignores_checkout_ancestor_cargo_config_for_cached_and_refreshed_builds(
+    tmp_path: Path,
+) -> None:
+    """An enclosing consumer repository's Cargo policy cannot poison agent-utils builds."""
+    ambient = tmp_path / "ambient parent"
+    root = _build_sandbox(ambient / "checkout")
+    first = _run_launcher(root)
+    assert first.returncode == 0, first.stderr
+    assert first.stdout == "v1\n"
+
+    cargo_config = ambient / ".cargo" / "config.toml"
+    cargo_config.parent.mkdir()
+    cargo_config.write_text(
+        '[build]\nrustc = "/definitely/not/a/rustc"\n'
+        '[profile.release]\ntrim-paths = "all"\n'
+    )
+    (ambient / "rust-toolchain.toml").write_text(
+        '[toolchain]\nchannel = "agent-utils-must-not-load-this-toolchain"\n'
+    )
+
+    cached = _run_launcher(root)
+    assert cached.returncode == 0, cached.stderr
+    assert cached.stdout == "v1\n"
+    assert "cache=verified" in cached.stderr
+
+    (root / "rs" / "tick-hub" / "src" / "lib.rs").write_text(
+        'pub fn message() -> &\'static str { "v2" }\n'
+    )
+    refreshed = _run_launcher(root)
+    assert refreshed.returncode == 0, refreshed.stderr
+    assert refreshed.stdout == "v2\n"
+    assert "cache=refreshed" in refreshed.stderr
+
+
+def test_launcher_absolutizes_an_explicit_checkout_relative_rustc(tmp_path: Path) -> None:
+    """Neutral Cargo cwd preserves a caller's explicit checkout-relative compiler wrapper."""
+    root = _build_sandbox(tmp_path)
+    real_rustc = shutil.which("rustc")
+    assert real_rustc is not None
+    wrapper = root / "tool chain" / "rustc wrapper"
+    wrapper.parent.mkdir()
+    wrapper.write_text('#!/bin/sh\nexec "$AGENT_UTILS_TEST_REAL_RUSTC" "$@"\n')
+    _chmod_x(wrapper)
+
+    launched = _run_launcher(
+        root,
+        extra_env={
+            "RUSTC": str(wrapper.relative_to(root)),
+            "AGENT_UTILS_TEST_REAL_RUSTC": real_rustc,
+        },
+    )
+
+    assert launched.returncode == 0, launched.stderr
+    assert launched.stdout == "v1\n"
+
+
 def test_source_change_during_snapshot_retries_before_execution(tmp_path: Path) -> None:
     """A source edit while the executable copy is paused cannot launch the earlier build."""
     root = _build_sandbox(tmp_path)
@@ -331,7 +387,7 @@ def test_source_change_during_snapshot_retries_before_execution(tmp_path: Path) 
     env = {
         **os.environ,
         "CARGO_NET_OFFLINE": "true",
-        "SAFE_CI_DAG_RUNNER_ENGINE": "rust",
+        "DAGRUN_ENGINE": "rust",
         "PATH": str(wrapper_dir) + os.pathsep + os.environ["PATH"],
         "AGENT_UTILS_TEST_CP_STARTED": str(started),
         "AGENT_UTILS_TEST_CP_RELEASE": str(release),
@@ -376,7 +432,7 @@ def test_coordinated_clean_waits_for_build_and_does_not_break_launch(tmp_path: P
     env = {
         **os.environ,
         "CARGO_NET_OFFLINE": "true",
-        "SAFE_CI_DAG_RUNNER_ENGINE": "rust",
+        "DAGRUN_ENGINE": "rust",
     }
     launched = subprocess.Popen(
         [str(root / "common" / "bin" / "tick-hub")],

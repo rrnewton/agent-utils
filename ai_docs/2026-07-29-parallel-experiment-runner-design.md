@@ -1,5 +1,17 @@
 # Parallel Experiment Runner Design
 
+> **Provenance.** This is a dated investigation record. It was produced against a private
+> downstream workspace, so it refers to repositories, hosts and services outside this one
+> that cannot be resolved from here. Projects that consume `agent-utils` appear under
+> neutral labels — `consumer-a`, `consumer-b` — and those are REDACTIONS, not real names:
+> `agent-utils` is a reusable library and has to read standalone, without naming whoever
+> happens to use it. **The measurements, dates and findings are unchanged**; only names
+> were replaced. Nothing here describes `agent-utils` itself.
+> See `#86 scrub-client-names` and `#67 standalone-repo`.
+>
+> This record was written before the tool was renamed to `dagrun`. That rename and the
+> consumer-name redaction described above are the only changes made to it.
+
 **Date:** 2026-07-29
 **Status:** proposed; implementation waits for owner review
 **Target:** `agent-utils` v0.12.0 (additive minor release)
@@ -7,30 +19,29 @@
 
 ## 1. Problem and scope
 
-Hermit chaos experiments search a seed space by running many independent guest
-executions. A single Hermit container remains sequential internally, but a host
-with 158 physical cores can explore many seeds concurrently. Existing sweeps
-have been ad hoc and sequential; some also streamed enough trace/build output to
-overwhelm agents. Simply launching dozens of QEMU or Hermit processes is unsafe:
-memory and disk footprints vary, host load changes, and an interrupted process
-can leave descendants behind.
+Deterministic-execution chaos experiments search a seed space by running many
+independent guest executions. A single such container remains sequential
+internally, but a host with 158 physical cores can explore many seeds
+concurrently. Existing sweeps have been ad hoc and sequential; some also streamed
+enough trace/build output to overwhelm agents. Simply launching dozens of QEMU or
+container processes is unsafe: memory and disk footprints vary, host load changes,
+and an interrupted process can leave descendants behind.
 
 The proposed runner turns a seed search into a sequence of dynamically generated
-`safe-ci-dag-runner` rounds. It does not introduce a second scheduler or a
-second isolation/reaping implementation. `safe-ci-dag-runner` remains the
-executor and supplies its existing two-level cgroup containment, per-step
-profiling, process-group capture, eager teardown, and profile store.
+`dagrun` rounds. It does not introduce a second scheduler or a second
+isolation/reaping implementation. `dagrun` remains the executor and supplies its
+existing two-level cgroup containment, per-step profiling, process-group capture,
+eager teardown, and profile store.
 
-The first release targets Linux/cgroup-v2 and Hermit `--chaos`/QEMU-style
+The first release targets Linux/cgroup-v2 and `--chaos`/QEMU-style
 workers, while keeping the experiment API generic enough for backend builds,
 CI shards, fuzzers, and other independent parameter sweeps.
 
 ## 2. Today: a fixed DAG and per-step profiles
 
-Today `safe-ci-dag-runner` consumes a caller-authored JSON or YAML `DagConfig`.
-The file normally lives in the repository and contains a stable set of steps,
-dependency edges, commands, resource hints, and scarce-resource caps. The
-runner:
+Today `dagrun` consumes a caller-authored JSON or YAML `DagConfig`. The file
+normally lives in the repository and contains a stable set of steps, dependency
+edges, commands, resource hints, and scarce-resource caps. The runner:
 
 - selects a memory-aware concurrency;
 - executes each step inside a child cgroup beneath a delegated outer scope;
@@ -56,7 +67,7 @@ ExperimentSpec + seed cursor + coordinator ResourceSlice + profile history
                     generate_round_dag(...)
                               |
                               v
-                 safe_ci_dag_runner.run_dag(DagConfig)
+                  dagrun.run_dag(DagConfig)
                               |
                               v
               RoundResult -> hits, profiles, next width
@@ -85,7 +96,7 @@ coordinator:
 ```python
 spec = ExperimentSpec(
     name="btrfs-chunk-recover",
-    command=("hermit", "run", "--chaos", "--seed", "{seed}", "--", "./case"),
+    command=("consumer-a", "run", "--chaos", "--seed", "{seed}", "--", "./case"),
     profile_key=ProfileKey(...),
     worker_limits=WorkerLimits(cpu_cores=1, memory_bytes=4 << 30, disk_bytes=8 << 30),
     hit=HitCondition(regex="BUG:|panic|Segmentation fault"),
@@ -93,7 +104,7 @@ spec = ExperimentSpec(
 
 runner = ParallelExperimentRunner(profile_store=store)
 plan = runner.plan_round(spec, seeds, resource_slice)
-result = runner.execute_round(plan)       # delegates to safe-ci-dag-runner
+result = runner.execute_round(plan)       # delegates to dagrun
 next_plan = runner.plan_next(result, resource_slice)
 ```
 
@@ -125,10 +136,10 @@ the source of truth.
 ### 3.2 Why an on-the-fly executor is not a second executor
 
 The outer loop decides *which steps exist in the next round*. It must not run
-subprocesses itself. `execute_round` calls the same `safe-ci-dag-runner`
-scheduler used for fixed DAGs, with the same cgroup manager, metrics sink,
-failure semantics, and reaper. This keeps one implementation of containment and
-prevents behavioral drift between CI and experiment workloads.
+subprocesses itself. `execute_round` calls the same `dagrun` scheduler used for
+fixed DAGs, with the same cgroup manager, metrics sink, failure semantics, and
+reaper. This keeps one implementation of containment and prevents behavioral
+drift between CI and experiment workloads.
 
 ## 4. Stable profile keys
 
@@ -140,11 +151,11 @@ wall-time history.
 
 ### 4.1 Canonical key inputs
 
-For QEMU/Hermit runs, an automatic key should hash a canonical identity record:
+For QEMU/container runs, an automatic key should hash a canonical identity record:
 
 - tool and profile-schema versions;
-- Hermit executable content SHA-256 and backend;
-- Hermit determinism/chaos flags other than the seed;
+- container executable content SHA-256 and backend;
+- determinism/chaos flags other than the seed;
 - guest command template with the seed replaced by `{seed}`;
 - VM kernel, root image, snapshot, and target-artifact content IDs;
 - vCPU count, guest-memory size, disk/overlay class, and accelerator;
@@ -274,7 +285,7 @@ fork/clone(s) denied at pids.max 16`). Because a contained fork bomb is reaped b
 the wall/CPU guard, the classifier ranks `pids-cap` ahead of `timeout` using the
 in-memory denied-fork count, so a fork bomb is never mislabelled as a plain hang.
 
-This design builds directly on `safe-ci-dag-runner`'s existing two levels:
+This design builds directly on `dagrun`'s existing two levels:
 
 1. **Outer delegated scope:** one transient systemd/cgroup-v2 scope for the
    experiment lane invocation, capped to the coordinator's CPU and memory
@@ -294,7 +305,7 @@ must never use broad `pkill`, process-name matching, or host-wide cleanup.
 An earlier draft of this section proposed a *next-run-cleans-previous* reaper on
 the theory that abandonment (an agent recycle, the 120-second tool cap, a detached
 run outliving its launcher) strands leaked `tracing-appender` threads that pin a
-scope. **Reproduction (hermit-ci) refuted that theory**, so the reaper was removed:
+scope. **Reproduction (consumer-a CI) refuted that theory**, so the reaper was removed:
 
 - Five abandonment scenarios — SIGKILL the launcher mid-run, launcher-then-guest
   kill, `--verify` kill mid-Run-1, and six staggered kills — each stranded **zero**
@@ -314,7 +325,7 @@ What survives the refutation, and is a cleaner justification for the box:
    its cause) — so a box validating only cpu and memory would still report *perfect
    health*. Only a `pids.max` cap catches this.
 2. **The real cause is a live hang the box already kills.** The zombies were held
-   open by a **live, hung** `hermit run --strict --verify` — its main parked in
+   open by a **live, hung** `consumer-a run --strict --verify` — its main parked in
    tokio `epoll_wait`, guest not progressing — keeping a PID namespace alive. A hang
    is exactly what the per-worker **cpu-time / wall backstop** (§7, guarantee 1)
    exists to kill.
@@ -322,8 +333,8 @@ What survives the refutation, and is a cleaner justification for the box:
 The requirement the real cause implies is about *how* the kill lands: it must
 reclaim the **namespace**, not just one process — otherwise the box kills the hung
 main and inherits its zombies. It does. Every breach and the normal exit route
-through `safe_ci_dag_runner.teardown.reap`, which writes the step's child
-`cgroup.kill` — an **atomic SIGKILL of the entire cgroup subtree**, including
+through `dagrun.teardown.reap`, which writes the step's child `cgroup.kill` — an
+**atomic SIGKILL of the entire cgroup subtree**, including
 `setsid`/double-fork escapees a process-group kill misses. When the hung main and
 all its PID-namespace peers die together, the namespace refcount drops to zero and
 the kernel reaps the zombies inside. This reuses existing machinery (no new module,
@@ -374,12 +385,12 @@ This is additive and should release as **agent-utils v0.12.0**:
   load-average signal, and the earlier draft's **reap-on-teardown reaper was
   removed** after reproduction refuted its premise — the namespace-reclaiming
   breach kill via the existing subtree `cgroup.kill` is the fix, see §7.1);
-- additive dynamic-DAG/profile-key API in `safe-ci-dag-runner`;
+- additive dynamic-DAG/profile-key API in `dagrun`;
 - the `pids` axis rides an in-memory `StepOutcome.pids_events` field and adds no
   profile-store CSV column; measured-headroom capacity (a `/proc/stat` sample in
   `calibrate`) is likewise runtime-only, and the namespace-reclaiming breach kill
-  reuses `safe-ci-dag-runner`'s existing subtree `cgroup.kill` (no new module), so
-  the `cross/` schema and the Rust runner are all unaffected; live cgroup boxing
+  reuses `dagrun`'s existing subtree `cgroup.kill` (no new module), so the
+  `cross/` schema and the Rust runner are all unaffected; live cgroup boxing
   (`cpu.*` columns) remains out of differential scope, as before;
 - no change to existing fixed JSON/YAML DAG behavior or schemas when
   `profile_key` is absent; and
@@ -391,7 +402,7 @@ without the key remain readable and retain their current tag-based identity.
 
 ## 10. Implementation sequence after review
 
-1. Add `profile_key` to the safe-ci model/profile store with compatibility and
+1. Add `profile_key` to the `dagrun` model/profile store with compatibility and
    deterministic tests.
 2. Add the dynamic round-planning types and pure calibration logic.
 3. Build the Python CLI as an outer loop that generates `DagConfig` values and

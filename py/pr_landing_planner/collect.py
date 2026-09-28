@@ -34,6 +34,8 @@ from pr_landing_planner.host import VcsHost
 from pr_landing_planner.landing_context import (
     LandingContext,
     apply_landing_context,
+    has_comment_changes_requested,
+    review_evidence_digest,
 )
 from pr_landing_planner.model import (
     CollectedGraph,
@@ -158,10 +160,11 @@ def collect_graph(
     # ONE bulk fetch for the whole planning run, never a per-PR fan-out. Every merge-tree / ancestry
     # probe below is a plain local git command once the objects are present, so the only network cost
     # that matters is getting the base ref + every PR head into the local graph. We gather all those
-    # refspecs first and hand them to the host in a single round-trip. Measured 2026-08-04 (warm, 25
-    # hermit PR heads): per-PR `git fetch` fan-out = 21.5 s wall / 14.3 s sys; one batched fetch =
-    # 0.85 s wall — ~25× faster, and O(1) round-trips instead of O(N). This is what makes `merge-tree`
-    # (the default conflict detector) cheap enough to run over the entire open set (~37 ms/probe local).
+    # refspecs first and hand them to the host in a single round-trip. Measured 2026-08-04 (warm,
+    # 25 PR heads in a consuming repository): per-PR `git fetch` fan-out = 21.5 s wall / 14.3 s sys;
+    # one batched fetch = 0.85 s wall — ~25× faster, and O(1) round-trips instead of O(N). This is
+    # what makes `merge-tree` (the default conflict detector) cheap enough to run over the entire
+    # open set (~37 ms/probe local).
     base_dest: dict[str, str] = {}
     pr_dest: dict[int, str] = {}
     refspecs: list[tuple[str, str]] = []
@@ -201,6 +204,35 @@ def collect_graph(
                 f"PR #{pr.number} host returned negative commits-behind value {behind}"
             )
         verdict = classify_pr(pr.checks, cfg)
+        review_digest = ""
+        review_decision = pr.review_decision
+        if pr.review_snapshot is not None:
+            if pr.review_snapshot.head_sha != head_sha:
+                raise CollectionError(
+                    f"PR #{pr.number} review evidence changed during collection: "
+                    f"snapshot={pr.review_snapshot.head_sha}, fetched={head_sha}; rerun"
+                )
+            if (
+                review_decision
+                and pr.review_snapshot.review_decision != review_decision
+            ):
+                raise CollectionError(
+                    f"PR #{pr.number} aggregate review decision changed during collection: "
+                    f"list={review_decision!r}, "
+                    f"snapshot={pr.review_snapshot.review_decision!r}; rerun"
+                )
+            if pr.review_snapshot.review_decision:
+                review_decision = pr.review_snapshot.review_decision
+            try:
+                review_digest = review_evidence_digest(pr.review_snapshot)
+            except ValueError as exc:
+                raise CollectionError(
+                    f"PR #{pr.number} review evidence is not safely identifiable: {exc}"
+                ) from exc
+            if review_decision in ("", "APPROVED") and has_comment_changes_requested(
+                pr.review_snapshot
+            ):
+                review_decision = "CHANGES_REQUESTED"
         nodes.append(
             PrNode(
                 number=pr.number,
@@ -212,8 +244,10 @@ def collect_graph(
                 author=pr.author,
                 is_draft=pr.is_draft,
                 mergeable=pr.mergeable,
-                review_decision=pr.review_decision,
+                review_decision=review_decision,
+                review_evidence_unavailable=pr.review_evidence_unavailable,
                 created_at=pr.created_at,
+                updated_at=pr.updated_at,
                 additions=pr.additions,
                 deletions=pr.deletions,
                 labels=pr.labels,
@@ -223,6 +257,7 @@ def collect_graph(
                 commits_behind=behind,
                 ci=verdict,
                 priority=provider.priority(pr.number, pr.labels),
+                review_evidence_digest=review_digest,
             )
         )
 

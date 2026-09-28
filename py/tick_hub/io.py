@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     # an installation is damaged.
     import yaml
 
+from tick_hub.cadence import INTERNAL_STATE_PREFIX
 from tick_hub.model import (
     Emit,
     EmitKind,
@@ -93,6 +94,11 @@ def _require_reminder_name(value: str, where: str) -> str:
         raise TickConfigError(
             f"{where}: field 'name' must not contain whitespace or '=' "
             "(it is a fired-state key)"
+        )
+    if value.startswith(INTERNAL_STATE_PREFIX):
+        raise TickConfigError(
+            f"{where}: field 'name' must not start with reserved internal-state prefix "
+            f"{INTERNAL_STATE_PREFIX!r}"
         )
     return value
 
@@ -174,7 +180,9 @@ def _gate_from(value: object, where: str) -> Gate | None:
     if value is None:
         return None
     obj = _as_obj(value, where)
-    _reject_unknown(obj, frozenset({"cmd", "when", "capture", "timeout_secs"}), where)
+    _reject_unknown(
+        obj, frozenset({"cmd", "when", "capture", "timeout_secs", "parallel"}), where
+    )
     when_name = _opt_str(obj, "when", GateWhen.SUCCESS.value, where)
     try:
         when = GateWhen(when_name)
@@ -188,6 +196,7 @@ def _gate_from(value: object, where: str) -> Gate | None:
         when=when,
         capture=_opt_bool(obj, "capture", False, where),
         timeout_secs=_opt_positive_int_or_none(obj, "timeout_secs", where),
+        parallel=_opt_bool(obj, "parallel", False, where),
     )
 
 
@@ -218,7 +227,16 @@ def _reminder_from(value: object, where: str) -> Reminder:
     _reject_unknown(
         obj,
         frozenset(
-            {"name", "emit", "cadence_secs", "requires_flags", "depends_on", "gate"}
+            {
+                "name",
+                "emit",
+                "cadence_secs",
+                "cadence_offset_secs",
+                "cadence_window_secs",
+                "requires_flags",
+                "depends_on",
+                "gate",
+            }
         ),
         where,
     )
@@ -228,10 +246,45 @@ def _reminder_from(value: object, where: str) -> Reminder:
     depends_on = _opt_str_list(obj, "depends_on", where)
     for index, dependency in enumerate(depends_on):
         _require_reminder_name(dependency, f"{where}.depends_on[{index}]")
+    cadence_secs = _opt_nonnegative_int(obj, "cadence_secs", 0, where)
+    cadence_offset_secs: int | None = None
+    if obj.get("cadence_offset_secs") is not None:
+        # Refuse a phase that cannot mean what it says, rather than silently
+        # normalising it: an offset on an every-tick reminder has no window to sit
+        # in, and an offset at or beyond the cadence aliases onto a different
+        # window than the author wrote. Both are configuration mistakes that would
+        # otherwise show up as a reminder quietly running on the wrong tick.
+        cadence_offset_secs = _opt_nonnegative_int(obj, "cadence_offset_secs", 0, where)
+        if cadence_secs <= 0:
+            raise TickConfigError(
+                f"{where}: 'cadence_offset_secs' requires a positive 'cadence_secs'; "
+                "an every-tick reminder is always due and cannot be phased"
+            )
+        if cadence_offset_secs >= cadence_secs:
+            raise TickConfigError(
+                f"{where}: 'cadence_offset_secs' ({cadence_offset_secs}) must be less than "
+                f"'cadence_secs' ({cadence_secs}); a larger offset names the same instants "
+                "as offset % cadence and hides which tick the author meant"
+            )
+    cadence_window_secs: int | None = None
+    if obj.get("cadence_window_secs") is not None:
+        cadence_window_secs = _opt_nonnegative_int(obj, "cadence_window_secs", 0, where)
+        if cadence_offset_secs is None:
+            raise TickConfigError(
+                f"{where}: 'cadence_window_secs' requires 'cadence_offset_secs'; "
+                "a window only means anything relative to a phase"
+            )
+        if not 0 < cadence_window_secs <= cadence_secs:
+            raise TickConfigError(
+                f"{where}: 'cadence_window_secs' ({cadence_window_secs}) must be greater "
+                f"than 0 and at most 'cadence_secs' ({cadence_secs})"
+            )
     return Reminder(
         name=_require_reminder_name(_req_str(obj, "name", where), where),
         emit=_emit_from(emit_raw, f"{where}.emit"),
-        cadence_secs=_opt_nonnegative_int(obj, "cadence_secs", 0, where),
+        cadence_secs=cadence_secs,
+        cadence_offset_secs=cadence_offset_secs,
+        cadence_window_secs=cadence_window_secs,
         requires_flags=_opt_str_list(obj, "requires_flags", where),
         depends_on=depends_on,
         gate=_gate_from(obj.get("gate"), f"{where}.gate"),
@@ -379,6 +432,8 @@ def _gate_to_obj(gate: Gate | None) -> object:
     }
     if gate.timeout_secs is not None:
         obj["timeout_secs"] = gate.timeout_secs
+    if gate.parallel:
+        obj["parallel"] = True
     return obj
 
 
@@ -397,6 +452,16 @@ def _reminder_to_obj(rem: Reminder) -> dict[str, object]:
     obj: dict[str, object] = {
         "name": rem.name,
         "cadence_secs": rem.cadence_secs,
+        **(
+            {"cadence_offset_secs": rem.cadence_offset_secs}
+            if rem.cadence_offset_secs is not None
+            else {}
+        ),
+        **(
+            {"cadence_window_secs": rem.cadence_window_secs}
+            if rem.cadence_window_secs is not None
+            else {}
+        ),
         "requires_flags": list(rem.requires_flags),
         "gate": _gate_to_obj(rem.gate),
         "emit": _emit_to_obj(rem.emit),

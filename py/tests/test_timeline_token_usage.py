@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.archive import JsonValue
-from agent_team_timeline.token_usage import (
+from wrkviz.archive import JsonValue
+from wrkviz.token_usage import (
     BatchUsageReceipt,
     TokenUsage,
     content_hash_from_json,

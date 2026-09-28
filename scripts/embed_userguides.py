@@ -3,7 +3,8 @@
 
 Each tool keeps language-neutral prose in ``common/docs/<tool>/*.template.md``
 and distribution-specific prose in ``common/docs/<tool>/fragments/<language>/``.
-Rendered README and user-guide files live under ``common/docs``.  Package trees
+Rendered README and user-guide files live under ``common/docs``. CLI-first tools
+may instead keep their authoritative assets in the owning package. Package trees
 link to those committed artifacts; package builders dereference the links so
 installed wheels and crates remain self-contained.  Edit templates, fragments,
 or a single-language source document, then run this script.
@@ -28,7 +29,7 @@ PLACEHOLDER = "{{DISTRIBUTION}}"
 UNEXPANDED_TEMPLATE = re.compile(r"\{\{|\}\}")
 
 TOOLS: tuple[tuple[str, str, str], ...] = (
-    ("safe-ci-dag-runner", "safe_ci_dag_runner", "safe-ci-dag-runner"),
+    ("dagrun", "dagrun", "dagrun"),
     ("tick-hub", "tick_hub", "tick-hub"),
     ("pr-landing-planner", "pr_landing_planner", "pr-landing-planner"),
     ("herdr-run", "herdr_run", "herdr-run"),
@@ -172,31 +173,73 @@ class PackageLink:
 
 
 STANDALONE_DOCUMENTS: tuple[StandaloneDocument, ...] = (
-    # This guide is shared byte-for-byte by both herdr-run packages. Linting it under both rule
-    # sets ensures it contains neither edition's package-manager or implementation language.
+    # agentctl keeps its operator reference as package-owned CLI assets. The
+    # shared core guide is checked under both language rules; Chat is an extension.
+    *(StandaloneDocument(tool="agentctl", document=document, language=language,
+        source=f"py/agentctl/{document}.md",
+        # This shared guide must identify which distribution supplies each
+        # capability; implementation names are its explicit subject matter.
+        exemptions=("other implementation language",) if document == "USER_GUIDE" else ())
+      for document in ("README", "USER_GUIDE", "QUICKSTART") for language in ("python", "rust")),
+    StandaloneDocument(tool="agentctl", document="CHAT_USER_GUIDE", language="python",
+        source="py/agentctl/CHAT_USER_GUIDE.md"),
+    # The quickstart is shared byte-for-byte by both herdr-run packages, so it is linted under
+    # both rule sets and must name neither edition's toolchain.
     StandaloneDocument(
         tool="herdr-run",
-        document="AGENT_USER_GUIDE",
+        document="QUICKSTART",
         language="python",
-        source="common/docs/herdr-run/AGENT_USER_GUIDE.md",
+        source="common/docs/herdr-run/QUICKSTART.md",
     ),
     StandaloneDocument(
         tool="herdr-run",
-        document="AGENT_USER_GUIDE",
+        document="QUICKSTART",
         language="rust",
-        source="common/docs/herdr-run/AGENT_USER_GUIDE.md",
+        source="common/docs/herdr-run/QUICKSTART.md",
+    ),
+    # The generated `.herdr-run.yaml` is shared byte-for-byte by both herdr-run packages, so it
+    # is linted under both rule sets. It documents `cargo` as an allowlisted TARGET program, which
+    # is subject matter rather than a reference to a sibling implementation.
+    StandaloneDocument(
+        tool="herdr-run",
+        document="CONFIG_TEMPLATE",
+        language="python",
+        source="common/docs/herdr-run/CONFIG_TEMPLATE.yaml",
+        exemptions=("target Cargo command",),
     ),
     StandaloneDocument(
-        tool="agent-team-timeline",
+        tool="herdr-run",
+        document="CONFIG_TEMPLATE",
+        language="rust",
+        source="common/docs/herdr-run/CONFIG_TEMPLATE.yaml",
+    ),
+    StandaloneDocument(
+        tool="wrkviz",
         document="README",
         language="python",
-        source="common/docs/agent-team-timeline/README.md",
+        source="common/docs/wrkviz/README.md",
     ),
     StandaloneDocument(
-        tool="agent-team-timeline",
+        tool="wrkviz",
         document="USER_GUIDE",
         language="python",
-        source="common/docs/agent-team-timeline/USER_GUIDE.md",
+        source="common/docs/wrkviz/USER_GUIDE.md",
+    ),
+    StandaloneDocument(
+        tool="wrkslots",
+        document="README",
+        language="python",
+        source="common/docs/wrkslots/README.md",
+        # `validate-cargo-*` is a managed directory spelling in wrkslots' public
+        # lifecycle contract, not a command for another implementation language.
+        exemptions=("target Cargo command",),
+    ),
+    StandaloneDocument(
+        tool="wrkslots",
+        document="USER_GUIDE",
+        language="python",
+        source="common/docs/wrkslots/USER_GUIDE.md",
+        exemptions=("target Cargo command",),
     ),
     StandaloneDocument(
         tool="parallel-experiment-runner",
@@ -242,23 +285,48 @@ def _package_links() -> tuple[PackageLink, ...]:
         )
     links.extend(
         (
+            PackageLink("py/agentctl/LICENSE", "LICENSE"),
+            PackageLink("py/agentctl/AGENT_USER_GUIDE.md", "py/agentctl/USER_GUIDE.md"),
+            PackageLink("py/agentctl/FOREIGN_USER_GUIDE.md", "py/agentctl/USER_GUIDE.md"),
+            PackageLink("rs/agentctl/LICENSE", "LICENSE"),
+            PackageLink("rs/agentctl/README.md", "py/agentctl/README.md"),
+            PackageLink("rs/agentctl/src/embedded_userguide.md", "py/agentctl/USER_GUIDE.md"),
+            PackageLink("rs/agentctl/src/embedded_agent_userguide.md", "py/agentctl/USER_GUIDE.md"),
+            PackageLink("rs/agentctl/src/embedded_quickstart.md", "py/agentctl/QUICKSTART.md"),
             PackageLink(
-                "py/herdr_run/AGENT_USER_GUIDE.md",
-                "common/docs/herdr-run/AGENT_USER_GUIDE.md",
+                "rs/herdr-run/src/config_template.yaml",
+                "common/docs/herdr-run/CONFIG_TEMPLATE.yaml",
             ),
             PackageLink(
-                "rs/herdr-run/src/embedded_agent_userguide.md",
-                "common/docs/herdr-run/AGENT_USER_GUIDE.md",
+                "py/herdr_run/config_template.yaml",
+                "common/docs/herdr-run/CONFIG_TEMPLATE.yaml",
             ),
             PackageLink(
-                "py/agent_team_timeline/README.md",
-                "common/docs/agent-team-timeline/README.md",
+                "rs/herdr-run/src/embedded_quickstart.md",
+                "common/docs/herdr-run/QUICKSTART.md",
             ),
             PackageLink(
-                "py/agent_team_timeline/USER_GUIDE.md",
-                "common/docs/agent-team-timeline/USER_GUIDE.md",
+                "py/herdr_run/QUICKSTART.md",
+                "common/docs/herdr-run/QUICKSTART.md",
             ),
-            PackageLink("py/agent_team_timeline/LICENSE", "LICENSE"),
+            PackageLink(
+                "py/wrkviz/README.md",
+                "common/docs/wrkviz/README.md",
+            ),
+            PackageLink(
+                "py/wrkviz/USER_GUIDE.md",
+                "common/docs/wrkviz/USER_GUIDE.md",
+            ),
+            PackageLink("py/wrkviz/LICENSE", "LICENSE"),
+            PackageLink(
+                "py/wrkslots/README.md",
+                "common/docs/wrkslots/README.md",
+            ),
+            PackageLink(
+                "py/wrkslots/USER_GUIDE.md",
+                "common/docs/wrkslots/USER_GUIDE.md",
+            ),
+            PackageLink("py/wrkslots/LICENSE", "LICENSE"),
             PackageLink(
                 "py/parallel_experiment_runner/README.md",
                 "common/docs/parallel-experiment-runner/README.md",
@@ -303,10 +371,14 @@ def _lint(item: Render | StandaloneDocument, text: str) -> list[str]:
         line = text.count("\n", 0, template_match.start()) + 1
         errors.append(f"unexpanded template syntax at line {line}")
     exemptions = getattr(item, "exemptions", ())
+    language_text = text
+    if item.language == "python" and item.tool == "dagrun":
+        for value in ("cargo-build", "cargo-test", "cargo-nextest"):
+            language_text = language_text.replace(value, " " * len(value))
     for description, pattern in COMMON_FORBIDDEN + LANGUAGE_FORBIDDEN[item.language]:
         if description in exemptions:
             continue
-        match = pattern.search(text)
+        match = pattern.search(language_text)
         if match is not None:
             line = text.count("\n", 0, match.start()) + 1
             errors.append(f"{description} at line {line}: {match.group(0)!r}")
@@ -353,16 +425,29 @@ def _standalone_expected() -> tuple[tuple[StandaloneDocument, str], ...]:
     return tuple(expected)
 
 
-def _replace_with_link(item: PackageLink) -> None:
+def _replace_with_link(item: PackageLink) -> bool:
     destination = REPO_ROOT / item.destination
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.is_symlink() and os.readlink(destination) == item.relative_target:
-        return
+        return False
     if destination.exists() or destination.is_symlink():
         if destination.is_dir() and not destination.is_symlink():
             raise IsADirectoryError(f"package link destination is a directory: {item.destination}")
         destination.unlink()
     destination.symlink_to(item.relative_target)
+    return True
+
+
+def _write_text_if_changed(path: Path, text: str) -> bool:
+    """Write *text* only when *path* does not already contain those bytes."""
+
+    try:
+        if not path.is_symlink() and path.read_text(encoding="utf-8") == text:
+            return False
+    except (FileNotFoundError, IsADirectoryError, UnicodeError):
+        pass
+    path.write_text(text, encoding="utf-8")
+    return True
 
 
 def _link_is_current(item: PackageLink) -> bool:
@@ -385,11 +470,11 @@ def generate() -> list[str]:
     for render, text in rendered:
         destination = REPO_ROOT / render.destination
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(text, encoding="utf-8")
-        written.append(render.destination)
+        if _write_text_if_changed(destination, text):
+            written.append(render.destination)
     for link in PACKAGE_LINKS:
-        _replace_with_link(link)
-        written.append(link.destination)
+        if _replace_with_link(link):
+            written.append(link.destination)
     return written
 
 

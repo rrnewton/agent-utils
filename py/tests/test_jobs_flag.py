@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from safe_ci_dag_runner import (
+from dagrun import (
     DagConfig,
     ResourceHint,
     Step,
@@ -31,6 +31,8 @@ def test_command_with_inner_jobs() -> None:
     assert command_with_inner_jobs(s2, "-j", 8) == "cargo build -j8"  # step override
     s3 = Step("g", "j", "", "mytool", jobs_flag="")
     assert command_with_inner_jobs(s3, "-j", 4) == "mytool"  # empty template disables append
+    s4 = Step("g", "j", "", "fixed", jobs_flag="   ")
+    assert command_with_inner_jobs(s4, "-j", 4) == "fixed"  # whitespace is also empty
 
 
 def test_jobs_flag_json_roundtrip() -> None:
@@ -67,7 +69,7 @@ def test_jobs_flag_appended_at_runtime() -> None:
             ),
         )
     )
-    assert run_dag(good, jobs=1, verbosity=0).ok
+    assert run_dag(good, jobs=4, verbosity=0).ok
 
     # A wrong expectation fails, proving the append actually happened (not a no-op).
     bad = DagConfig(
@@ -82,4 +84,4 @@ def test_jobs_flag_appended_at_runtime() -> None:
             ),
         )
     )
-    assert not run_dag(bad, jobs=1, verbosity=0).ok
+    assert not run_dag(bad, jobs=4, verbosity=0).ok

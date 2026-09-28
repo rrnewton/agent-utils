@@ -29,7 +29,7 @@ findings are recorded in `reviews/herdr-run.md` and `reviews/rust-source-launche
 
 ## Findings resolved
 
-1. `agent-team-timeline` was source-only and documented a broken aggregate install. It now has an
+1. `wrkviz` was source-only and documented a broken aggregate install. It now has an
    independent manifest, README, user guide, license, command entry point, wheel, sdist, and isolated
    artifact smoke test. Its explicit exception is Rust parity, not package quality.
 2. Sixteen paired package documents, two timeline documents, and package licenses were duplicated
@@ -57,8 +57,8 @@ findings are recorded in `reviews/herdr-run.md` and `reviews/rust-source-launche
 9. The repository dispatcher and dependency smoke test omitted the packaged `cpuset-alloc` companion
    command. `./bin/cpuset-alloc` now shares the tracked resolver, and all seven Python entry-point
    commands receive the dependency-free startup probes.
-10. `safe_ci_dag_runner.analyze` mixed a stable public `summarize` library helper with an undeclared
-    Python-only `main()`. Removing the module would break the package API, so the helper remains
+10. `dagrun.analyze` mixed a stable public `summarize` library helper with an undeclared Python-only
+    `main()`. Removing the module would break the package API, so the helper remains
     documented and re-exported while only the CLI-shaped surface was retired. A compatibility test
     pins the helper, and a manifest-derived test rejects any public `main()` not backed by a declared
     console entry point.

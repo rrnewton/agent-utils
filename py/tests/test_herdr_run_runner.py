@@ -7,6 +7,7 @@ are actually executed.
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import threading
@@ -19,6 +20,7 @@ from herdr_run.allowlist import admit
 from herdr_run.client import HerdrClient
 from herdr_run.config import MAX_TIMEOUT_SECONDS, Config
 from herdr_run.errors import ConfigError, HerdrUnavailable, PaneBusy, RunTimeout
+from herdr_run.reap import evidence_from_runs
 from herdr_run.runner import (
     RunResult,
     build_shell_command,
@@ -569,6 +571,43 @@ def test_timeout_reports_that_the_command_is_still_running(tmp_path: object) -> 
     assert len(fake.commands) == 1
 
 
+def test_a_timed_out_run_is_recorded_as_unfinished(tmp_path: object) -> None:
+    """The ONLY writer of the state the reaper calls IN FLIGHT.
+
+    A command that outlived its deadline is still running in a pane nobody owns. If the timeout
+    left no record, the one pane that provably still has work in it would be the one pane the
+    reaper had no evidence about, and ``exit_code: null`` would be a state no writer could produce.
+    """
+    root = str(tmp_path)
+    config = _config(root)
+    fake = FakeHerdrClient(execute_locally=False)
+    target = resolve_target(_client(fake), config, "agent")
+
+    with pytest.raises(RunTimeout):
+        execute(
+            _client(fake),
+            config,
+            target,
+            admit("echo never-completes", config),
+            agent="agent",
+            cwd=root,
+            ready_timeout=0.0,
+            timeout=0.05,
+            poll_interval=0.01,
+            home="/nonexistent",
+        )
+
+    runs = os.path.join(root, "spool", "runs")
+    run_id = os.listdir(runs)[0]
+    with open(os.path.join(runs, run_id, "meta.json"), encoding="utf-8") as handle:
+        document = json.load(handle)
+    assert document["exit_code"] is None, "a run still running must not record a status"
+    assert document["pane_id"] == target.pane_id
+    flags, recorded = evidence_from_runs(target.pane_id, [document])
+    assert flags == (False,), "the reaper must read this as work in flight"
+    assert recorded is not None
+
+
 def test_partially_written_exit_code_is_not_read_as_a_result(tmp_path: object) -> None:
     """A non-integer exit-code file means "still being written", never a corrupt result."""
     root = str(tmp_path)
@@ -662,3 +701,29 @@ def test_zero_day_retention_does_not_delete_the_run_being_created(tmp_path: obje
 
     assert result.exit_code == 0  # type: ignore[attr-defined]
     assert os.path.isdir(result.spool.directory)  # type: ignore[attr-defined]
+
+
+def test_meta_records_the_identity_the_reaper_needs(tmp_path: object) -> None:
+    """A run record with only a shell PID can never authorise closing anything.
+
+    ``herdr_run.reap`` requires ``(pid, boot_id, start_ticks)`` before it will call a tab stale, so
+    a writer that records the pid alone makes the whole reaper inert -- it would answer UNKNOWN for
+    every pane forever, and "reaped 0" would look exactly like a healthy workspace.
+    """
+    root = str(tmp_path)
+    config = _config(root)
+    fake = FakeHerdrClient()
+    # Report our own pid as the pane shell, so the recorded identity binds against a real /proc.
+    fake.shell_pids["w1:p1"] = os.getpid()
+    result = cast(RunResult, _run(fake, config, "echo identity"))
+    meta_path = write_meta(result, admit("echo identity", config), config, "agent")
+
+    with open(meta_path, encoding="utf-8") as handle:
+        document = cast(dict[str, object], json.load(handle))
+    readiness = cast(dict[str, object], document["readiness"])
+    flags, identity = evidence_from_runs(cast(str, document["pane_id"]), [document])
+    assert readiness["shell_pid"] == os.getpid()
+    assert isinstance(readiness["boot_id"], str) and readiness["boot_id"]
+    assert isinstance(readiness["shell_start_ticks"], int)
+    assert flags == (True,)
+    assert identity is not None and identity.is_bound()

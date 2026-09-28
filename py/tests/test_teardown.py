@@ -1,6 +1,6 @@
 """Deterministic process-liveness checks for timeout teardown."""
 
-from safe_ci_dag_runner.teardown import _live_process_group_from_stat
+from dagrun.teardown import _live_process_group_from_stat
 
 
 def test_proc_stat_parser_excludes_zombies_from_the_term_grace() -> None:

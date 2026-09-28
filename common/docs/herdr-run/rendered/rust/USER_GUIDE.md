@@ -1,15 +1,20 @@
 # herdr-run — user guide
 
-Run an **allowlisted** command in a Herdr pane that lives **outside** the agent sandbox, and get its
-real stdout, stderr, and exit code back.
+Run an **allowlisted** command in a terminal pane belonging to a separate terminal server, and get
+its real stdout, stderr, and exit code back.
 
 ```
-herdr-run release-agent 'with-proxy git ls-remote origin main'
+herdr-run --agent release-agent run 'git ls-remote origin main'
 ```
 
-> **This tool deliberately uses an out-of-sandbox channel.** It exists because an agent's
-> confinement can block network access needed to land work. Its allowlist is a cooperative safety
-> rail, not a containment boundary against a hostile same-user process. Read the trust model below.
+The pane is not a child of the calling process. Whatever constrains that process therefore does
+not constrain the command — its network policy, its environment, its working directory, its
+lifetime. `herdr-run` makes that one narrow, audited, allowlisted door rather than an ad-hoc pile
+of keystroke-injection calls.
+
+> **Read the trust model before widening `allow`.** The allowlist is a cooperative safety rail: it
+> keeps a well-behaved caller inside a policy. It is not a containment boundary against a hostile
+> process running as the same user, and it makes no claim to be one.
 
 ## Installation
 
@@ -27,48 +32,104 @@ compatible newer releases must provide its `status`, `workspace`, `tab`, and `pa
 
 ---
 
-## Why it exists
+## Why you would want this
 
-An agent process may run inside a sandbox whose network policy blocks a destination it legitimately
-needs in order to publish work. Inside that confinement:
+A pane on a separate terminal server differs from a subprocess in ways that are occasionally
+exactly what you need:
+
+- **It is not inside your confinement.** A process under a restrictive network policy, a seccomp
+  filter, or a container cannot reach something the terminal server can. Running the command in a
+  pane sidesteps that without weakening the caller's own policy.
+- **It outlives you.** The pane keeps running after the calling process exits, so a long operation
+  is not tied to the lifetime of whatever launched it. When a command outruns its timeout,
+  `herdr-run` says so and leaves it running rather than killing it.
+- **It has a different ambient environment.** A different `PATH`, a different `HOME`, a login
+  session, credentials an unattended process does not carry, a working directory somewhere else on
+  the machine.
+- **A human can watch it and take it over.** The pane is a real terminal somebody can look at,
+  scroll back through, and type into. That is why readiness detection is conservative: the tool
+  refuses to type over a person rather than assuming the pane is its own.
+- **Every use is on the record.** Refusals, admissions, failures, and completions are appended to a
+  private log, and each run keeps its command, byte-exact output, and exit code on disk.
+
+What you give up is that the command runs somewhere your process does not control. Hence the
+allowlist, the readiness checks, the locking, and the audit log — most of this guide is about
+making that trade safely.
+
+### One example: an agent whose sandbox blocks the network
+
+The scenario this was first built for, kept here as an example rather than as the definition. An
+AI coding agent runs inside a sandbox whose network policy blocks a destination it legitimately
+needs in order to publish its work:
 
 ```
-$ with-proxy git ls-remote https://github.com/example-org/example-repo main
+$ git ls-remote https://github.com/example-org/example-repo main
 fatal: unable to access 'https://github.com/example-org/example-repo/': CONNECT tunnel failed, response 403
 ```
 
-The Herdr terminal server runs outside the confinement, so shells in its panes are not confined. The
-same command through a pane returns the real SHA. `herdr-run` turns that into one narrow, audited
-door instead of an ad-hoc pile of `send-keys` calls.
+The terminal server runs outside that confinement, so shells in its panes are not confined, and the
+same command through a pane returns the real SHA. `herdr-run net-doctor` checks precisely this
+situation and nothing else. The rest of the tool has no opinion about sandboxes: it is a way to run
+a policy-admitted command in a pane.
 
 ---
 
 ## Usage
 
+The shape is `herdr-run [GLOBAL OPTIONS] <subcommand> [OPTIONS]`. There is no subcommand-less form:
+running a command is what `run` is for.
+
 ```
-herdr-run <agent> '<command>'      # explicit agent -> tab name
-herdr-run '<command>'              # agent taken from $DG_AGENT_NAME / $HERDR_RUN_AGENT
+herdr-run run '<command>'          # run it; exits with the command's own exit code
 herdr-run check '<command>'        # policy only: allowed or refused. Touches no pane.
+herdr-run status                   # what is in effect here. Changes nothing.
+herdr-run init                     # write an annotated .herdr-run.yaml in this directory
 herdr-run target                   # resolve/bring up the pane; print ids and readiness
-herdr-run config                   # print the effective configuration
-herdr-run doctor                   # bracket the premise in both directions (see below)
+herdr-run config                   # print the effective configuration as JSON
+herdr-run reap                     # report which command tabs are provably finished. Closes nothing.
+herdr-run net-doctor               # smoke-test one narrow scenario (see below)
 herdr-run userguide                # this document
 ```
 
-Useful flags:
+**Global options** identify the invocation and its configuration, and go **before** the subcommand:
 
-| Flag | Effect |
+| Option | Effect |
+| --- | --- |
+| `--config PATH` | Use an explicit configuration file instead of the discovered one. Refused by `init`, `quickstart`, and `userguide`, which read no configuration file at all. |
+| `--agent NAME` | The agent this invocation speaks for; names its tab. Otherwise `$HERDR_RUN_AGENT`, `$DG_AGENT_NAME`, or `$ORC_AGENT_NAME`. Refused by `check`, `init`, `reap`, `quickstart`, and `userguide`, which name no tab. |
+| `--json` | Emit machine-readable output where the subcommand has one. Refused by `net-doctor`, `quickstart`, and `userguide`, whose only output is prose. `config`, `target`, and `reap` print JSON with or without it. |
+| `--version` | Print the version and exit. |
+
+**`run` options** only mean something to `run`, and go **after** it:
+
+| Option | Effect |
 | --- | --- |
 | `--dry-run` | Admit the command and print the exact rendered line; execute nothing. |
 | `--wait-ready S` | Wait up to `S` seconds for the pane to go idle instead of refusing at once. |
 | `--timeout S` | Override the command timeout. |
-| `--json` | One JSON object with exit status, readable text, byte-exact base64 streams, target, and spool paths. |
 | `--cwd PATH` | Working directory for the command. |
 | `--no-cache` | Ignore the session cache and re-resolve the pane from labels. |
-| `--config PATH` | Use an explicit config file. |
+
+`init` takes `--force`, and `target` also takes `--no-cache`. Every other subcommand takes no
+options of its own.
+Offering an option at the wrong level is an error that says which level it belongs to, so
+`herdr-run --cwd /tmp run …` tells you to write `herdr-run run --cwd /tmp …` rather than failing
+as an unrecognized argument. Run `herdr-run <subcommand> --help` for one subcommand's own options;
+neither level's help documents the other's. An option at the right level that the chosen subcommand
+still cannot observe is refused too: `herdr-run --config P init` reads as an instruction to write
+`P` and would in fact write `./.herdr-run.yaml`, so it fails and says so rather than doing
+something else quietly. All three globals work that way — each is refused by exactly the
+subcommands that cannot observe it, with a message saying why, and each of those subcommands says
+so in its own `--help`. Being told at the flag is the point: a `--json` accepted by a subcommand
+that only prints prose would be discovered at the parse of the output, where it looks like corrupt
+data rather than a request that was never going to be honoured.
+
+```
+herdr-run --agent release-agent run --timeout 60 'with-proxy git ls-remote origin main'
+```
 
 By default stdout and stderr are passed straight through and **the process exits with the command's
-own exit code**, so `herdr-run` composes in a shell script like the command it wraps.
+own exit code**, so `herdr-run run` composes in a shell script like the command it wraps.
 
 ### Exit codes
 
@@ -78,7 +139,7 @@ Wrapped-command statuses are passed through unchanged. Wrapper failures use thes
 | --- | --- |
 | `77` | **REFUSED** by the allowlist. Nothing was executed. |
 | `75` | **PANE BUSY** — the pane was not observably idle. Nothing was executed; retrying is meaningful. |
-| `69` | Herdr server / workspace / tab / pane could not be established. |
+| `69` | Herdr server / workspace / tab / pane could not be established. **Not a retry signal**: it covers both a transient bring-up failure and the `max_panes` refusal, and the second only clears when somebody closes tabs. `75` is the only code that promises retrying is meaningful. |
 | `76` | The command was launched but did not finish before the timeout. It is **still running**. |
 | `78` | The project config is malformed. |
 
@@ -94,61 +155,76 @@ an accidental unbounded wait.
 
 ## Configuration — `.herdr-run.yaml`
 
-The tool is generic; the policy is per-project. The nearest `.herdr-run.yaml` (or `.herdr-run.yml`)
-searched from the working directory upward wins, `.gitignore`-style. With no config file at all the
-built-in defaults apply, so a project can adopt the tool with zero configuration.
+The tool is generic; the policy is per project.
 
-```yaml
-# Herdr workspace LABEL holding this project's command tabs.
-workspace: agent-cmds
-
-# Tab-label schema. {agent} = invoking agent, {project} = project directory basename.
-tab_name: "{agent}"
-
-# Working directory for commands. null = caller's cwd; relative paths use the project root.
-cwd: null
-
-# Cooperative allowlist. Programs that may run. Keep it small.
-allow:
-  - git
-  - gh
-
-# Optional Cargo trust widening: add `cargo` to `allow` only if the project accepts that even
-# dependency-oriented Cargo commands may execute ambient wrappers/helpers. This fail-closed list
-# then prevents compilation-oriented and unknown subcommands; see Threat model.
-allow_subcommand:
-  cargo: [fetch, update, generate-lockfile, vendor, metadata, tree, search]
-
-# Wrapper programs that may PRECEDE an allowlisted program, never run on their own.
-prefixes:
-  - with-proxy
-
-# Defense in depth (see Threat model) — not the boundary.
-deny_global:
-  git: ["-c", "--config-env", "--exec-path", "--namespace"]
-  # Cargo accepts these before or after its subcommand; attached forms are also refused.
-  cargo: ["--config", "-Z"]
-deny_subcommand:
-  git: ["filter-branch", "daemon", "instaweb"]
-  gh:  ["alias", "extension", "ext", "codespace", "cs"]
-deny_anywhere: ["--upload-pack", "--receive-pack"]
-
-# Git-IGNORED directory for run spools and the audit log.
-spool_dir: .herdr-run
-
-timeout_seconds: 900          # wait for the command's exit code
-retention_days: 4             # completed run spools older than this are pruned on a later write
-ready_timeout_seconds: 0      # wait for the pane to go idle (0 = refuse immediately)
-
-readiness: both               # 'both' = process signal AND prompt veto; 'process' = drop the veto
-prompt_tail: null             # e.g. "$ ". null = infer from ~/.bashrc / ~/.zshrc, abstain on failure
-
-broker: direct                # 'direct' | 'systemd-run' (see Brokering)
+```
+herdr-run init
 ```
 
+writes an annotated `.herdr-run.yaml` into the current directory, the way `git init` writes into
+the current directory. **That file is the reference for what is configurable.** Every key is in
+it, commented, set to the value already in force — so adopting it changes nothing until you edit
+something, and this guide does not restate the list and then drift from it. `herdr-run init`
+refuses to overwrite an existing configuration; `--force` overrides that.
+
+The nearest `.herdr-run.yaml` (or `.herdr-run.yml`) found by searching upward from the working
+directory wins, `.gitignore`-style. With no configuration file at all the built-in defaults apply,
+so a project can adopt the tool with no file at all. `herdr-run status` says which file is in
+effect and `herdr-run config` prints every value resolved from it.
+
+Two things in that file are worth naming here, because they are decisions rather than settings:
+
+- **`allow` is a human-only knob.** An agent that can widen its own allowlist does not have one.
+  The usual arrangement is agents working inside `worktrees/slotNN/` while `.herdr-run.yaml` stays
+  at the top of the project, outside their write scope. The generated file says so in place.
+- **`allow: ["*"]` is a supported mode**, not a workaround: it admits any program. Everything else
+  still applies — control characters are still refused, the program must still be a bare name
+  resolved from the pane's `PATH`, wrapper prefixes must still be declared, and every `deny_*` rule
+  still bites. `"*"` must be the only entry, because `["*", "git"]` reads narrower than it is.
+
 Unknown or duplicate keys, merge keys, non-finite/excessive timeouts, fractional/negative retention
-days, retention beyond 365,000 days, control characters, and unsupported tab placeholders are hard
-errors. A typo'd policy key must not silently fall back to defaults.
+days, retention beyond 365,000 days, a fractional/negative/oversized `max_panes`, control
+characters, and unsupported tab placeholders are hard errors. A typo'd policy key must not silently
+fall back to defaults.
+
+---
+
+## What is in effect here — `herdr-run status`
+
+```
+herdr-run status
+```
+
+Answers "what would happen if I ran something here?" the way `git status` does, and answers it by
+looking:
+
+```
+herdr-run status
+
+  configuration
+    file          /project/.herdr-run.yaml
+    project root  /project
+    spool dir     .herdr-run
+
+  policy
+    allow         git, gh
+    prefixes      with-proxy
+
+  session
+    agent         release-agent
+    workspace     agent-cmds
+    tab label     release-agent (not created yet)
+    herdr         installed; server is running
+    panes         3 in workspace 'agent-cmds'
+
+Nothing was changed: status only reads.
+```
+
+**Strictly non-mutating.** It starts no server and creates no workspace, tab, or pane — a status
+command that brought those up in order to describe them would be reporting on its own side
+effects, and the next reader could not tell the difference. Anything it could not observe is
+reported as unknown, with the reason, rather than guessed at. `--json` gives the same facts as one
+object.
 
 ---
 
@@ -174,17 +250,17 @@ bring-up work once; running it against half-built state completes only the missi
 
 ### Why the server must start via `systemd-run`
 
-Panes are children of the Herdr **server**. If a confined agent starts the server, every pane it
-creates inherits that confinement, and the tool silently reproduces the very `403` it exists to
-avoid — nothing about such a pane looks different from a good one. `systemd-run --user` reparents the
-server onto the user manager, outside the jail.
+Panes are children of the Herdr **server**. If a confined process starts the server, every pane it
+creates inherits that confinement, and the tool quietly reproduces the very limit it was reached
+for — nothing about such a pane looks different from a good one. `systemd-run --user` reparents the
+server onto the user manager, clear of the caller's confinement.
 
 The launcher ignores caller-provided `HOME` and `PATH` for brokered execution. It reads the account
 home from the user database, resolves `herdr` from a fixed set of install locations, canonicalizes
 the result, and passes that absolute path to systemd. This blocks a planted workspace executable;
 it cannot make an owner-writable per-user install trustworthy against another same-user process.
 
-If a bad server is already running, `herdr-run doctor` will catch it. Its fix is
+If a bad server is already running, `herdr-run net-doctor` will catch it. Its fix is
 `herdr server stop`, then let `herdr-run` restart it.
 
 ### Readiness detection
@@ -258,10 +334,67 @@ the exact runs root are considered; and the root itself is never removed. The **
 pruned**: it is a separate best-effort evidence trail, and a record that deletes itself would be
 misleading.
 
+### The pane cap and `reap`
+
+Every agent that ever runs a command leaves a tab behind, and **nothing closes it**. Agents are
+coined and destroyed continuously, so the command workspace grows for as long as agents are coined
+— until the Herdr server itself becomes the bottleneck. That end state is measured, not feared: on
+a 316-core host a session with 260 panes drove the server to over 1000% CPU, with roughly 98% of
+cycles in the allocator's futex spinlock and every control call timing out.
+
+`max_panes` (32 by default) turns that slow collapse into one legible refusal. When the workspace
+already holds that many panes and this agent has **no tab yet**, bring-up fails with exit 69 and a
+message naming the remedy. The check is deliberately only on the create path: an agent whose tab
+already exists is never locked out of it, because a cap that can break work in progress is a cap
+that gets switched off. Set `max_panes: 0` to disable it.
+
+The cap is **per workspace**, while the measurement behind the number is **per server**. Nine
+projects each with their own `workspace:` and each sitting at 31 panes reproduce the measured
+condition without any of them breaching its cap. `max_panes` bounds one project's contribution to
+the leak, not a host's total.
+
+`herdr-run reap` says which tabs can go. It considers only panes **this tool has run a command in**
+(read from the run spool, not from `herdr pane list`, so a human's tab in the same workspace is not
+a candidate), and it re-derives scope from the current configuration: the recorded workspace label
+must equal `workspace`, and the recorded tab label must equal what `tab_name` renders today for the
+recorded agent. Retarget either and the old tabs immediately fall out of scope.
+
+**The candidate set is bounded by retention, and this matters.** Run records are the candidates,
+and herdr-run deletes a run record `retention_days` (four by default) after the run finished. A tab
+whose owning agent last ran a week ago therefore has no surviving record, is not a candidate, and
+will never appear in this report — while still holding a pane and still counting against
+`max_panes`. The oldest leaks are the ones `reap` cannot see, and they have to be closed by hand.
+The report prints `candidate_source.retention_days` for exactly this reason: `"considered": 3` means
+three panes were *eligible to look at*, not that the workspace holds three tabs.
+
+A tab is reported STALE only when all three hold, each of them positive evidence:
+
+1. **No in-flight work** — every run naming the pane recorded an `exit_code`. A run without one is
+   the agent-is-thinking case, and it wins over every other signal. That state is written when a
+   command outlives its timeout: it is still running in a pane nobody owns, so the run is recorded
+   with a null exit code rather than not recorded at all. If the command later finishes, its
+   `exit_code` file is re-read on the next sweep, so one timeout cannot make a pane permanently
+   unreapable.
+2. **The pane's shell is gone** — herdr still lists the pane, but `/proc` says the shell pid it
+   reports does not exist. Note this is the PANE shell, not the trailing PID in the run directory
+   name: that one is the short-lived `herdr-run` CLI and is dead for every completed run, so a
+   policy anchored on it would classify every healthy idle agent as stale.
+3. **Reuse and reboot are excluded** — identity is the triple `(pid, boot_id, start_ticks)` from
+   field 22 of `/proc/<pid>/stat`, recorded in `meta.json` at run time and compared against the live
+   process. A recycled pid, a new pane incarnation, or a record from a previous boot is UNKNOWN.
+
+Everything else — an unreadable or unparseable `/proc` entry, a pane herdr no longer lists, a
+workspace label herdr cannot resolve, a control call that fails — is UNKNOWN, and UNKNOWN is never
+reaped. Only a `/proc` entry that is *positively absent* may contribute to STALE; "could not tell"
+never does. **`reap` closes nothing**; it prints the plan, with a reason
+for every pane it declined and a count for every verdict including the zeros, because "reaped 0
+because nothing was stale" and "reaped 0 because the detector is inert" are otherwise the same
+output.
+
 ### Audit log
 
 `herdr-run` attempts to append JSON lines to `<spool_dir>/audit.jsonl` for **refusals**, dry runs,
-admission before target resolution/launch, wrapper failures, and completed commands. The `doctor`
+admission before target resolution/launch, wrapper failures, and completed commands. The `net-doctor`
 pane probe follows the same path. This makes a successful run a two-phase record (`ADMITTED`, then
 `RAN`) and leaves an admission marker when a later control operation fails.
 
@@ -296,21 +429,22 @@ commands "download only" would overstate the boundary. A project may explicitly 
 `allow` when it accepts that trust widening. The built-in `allow_subcommand` policy then limits the
 opt-in to dependency-oriented commands; `build`, `test`, `run`, `install`, `clippy` and every
 third-party `cargo-*` subcommand remain refused. `--config` and unstable `-Z` flags are refused in
-every argument position, including attached forms. Fetching outside and building in-jail with
-`--offline` can still be operationally useful, but it is not a no-code-execution guarantee.
+every argument position, including attached forms. Fetching through the pane and then building
+locally with `--offline` can still be operationally useful, but it is not a no-code-execution
+guarantee.
 
 **What is NOT guaranteed:** anything an allowlisted program can do by itself. `git` writes files,
 runs hooks from the repository being operated on, and honours ambient configuration. `gh`
 authenticates as you and can modify repositories. The `deny_*` lists remove the best-known
 self-escapes (`git -c alias.x='!sh'`, `git --exec-path=…`, `gh extension exec`) but they are
-**defense in depth, not the boundary** — treat "an agent can run `git`" as the actual privilege being
-granted, and size the allowlist accordingly.
+**defense in depth, not the boundary** — treat "the caller can run `git`" as the actual privilege
+being granted, and size the allowlist accordingly.
 
 This process runs under the same user identity as the caller. If that caller can access Herdr's
 socket or the user-systemd bus directly, it can bypass this command, its project policy, and its
-audit. An enforceable security boundary requires an out-of-jail broker that owns immutable policy
-and audit storage, plus sandbox rules denying direct Herdr and systemd access. This package does not
-claim to provide that stronger architecture.
+audit. An enforceable security boundary requires a broker outside the caller's confinement that
+owns immutable policy and audit storage, plus rules denying the caller direct Herdr and systemd
+access. This package does not claim to provide that stronger architecture.
 
 **Operational notes:**
 
@@ -328,15 +462,21 @@ claim to provide that stronger architecture.
 
 ---
 
-## Verifying it works
+## Verifying one narrow scenario
 
 ```
-herdr-run doctor
+herdr-run net-doctor
 ```
 
-Brackets the premise in **both** directions rather than asserting it: the probe command must **fail**
-in-jail and **succeed** through the pane. Three verdicts:
+`net-doctor` is deliberately about **one** situation and says so before it does anything: a caller
+whose own network access is blocked, reaching the network through a pane that is not blocked. It is
+not a health check of the tool as a whole, and a project using `herdr-run` for one of the other
+reasons above should not read its verdict as one.
 
-- blocked in-jail, succeeds via pane → working as intended;
-- succeeds both ways → the pane is buying nothing here, run the command directly;
-- fails via pane → the path is broken, most likely a server started from inside a sandbox.
+Within that scenario it brackets the premise in **both** directions rather than asserting it: the
+probe (`git ls-remote` against `probe_remote`) must **fail** run directly and **succeed** through
+the pane. Three verdicts:
+
+- blocked directly, succeeds via pane → this scenario works;
+- succeeds both ways → for this scenario the pane is buying nothing, run the command directly;
+- fails via pane → the pane path is broken, most likely a server started from inside a confinement.

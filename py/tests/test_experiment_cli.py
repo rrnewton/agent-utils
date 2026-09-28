@@ -3,11 +3,12 @@ path (which needs no cgroups). Exercises requirement 4 (a clean kill that NAMES 
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
 
-from safe_ci_dag_runner import StepOutcome
+from dagrun import StepOutcome
 
 from parallel_experiment_runner.cli import _spec_from_args, build_parser, main, parse_seeds
 from parallel_experiment_runner.execute import _classify_outcome
@@ -56,7 +57,8 @@ def _spec(**kw: object) -> ExperimentSpec:
 def _outcome(returncode: int = 0, *, aborted: bool = False, pids_events: int = 0) -> StepOutcome:
     return StepOutcome(
         tag="seed.3", ok=(returncode == 0 and not aborted), duration_s=1.0,
-        summary="", returncode=returncode, aborted=aborted, pids_events=pids_events,
+        summary="", returncode=returncode, oomed=False, oom_kills=0, timed_out=False,
+        cpu_timed_out=False, aborted=aborted, pids_events=pids_events,
     )
 
 
@@ -195,3 +197,44 @@ def test_quickstart_and_version() -> None:
     with pytest.raises(SystemExit) as exc:
         main(["--version"])
     assert exc.value.code == 0
+
+
+# --- the canonical example says one thing, in three places -------------------------------------
+#
+# `--help`, the shipped user guide and the agent-facing skill card each print the SAME headline
+# invocation, and nothing used to compare them. They drifted: a redaction sweep rewrote the target
+# program as `./workload` in two of them and left `target-runner ... ./demo` in the third, so the
+# tool's own canonical command had two names and two arities depending on where you read it. A
+# reader who copies the wrong one gets a command this project never ran.
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+_CANONICAL_SOURCES = {
+    "cli --help": _REPO_ROOT / "py" / "parallel_experiment_runner" / "cli.py",
+    "USER_GUIDE.md": _REPO_ROOT / "common" / "docs" / "parallel-experiment-runner" / "USER_GUIDE.md",
+    "SKILL.md": _REPO_ROOT / "skills" / "parallel-experiment-runner" / "SKILL.md",
+}
+
+
+def _canonical_target(text: str) -> str:
+    """The `-- <program and args>` tail of the canonical `run` example in one file.
+
+    Anchored on `image=demo5`, which only the canonical example carries, and tolerant of the three
+    layouts it appears in: a help string whose continuations are escaped backslashes, a fenced
+    shell block, and a single backticked line in Markdown. `{{seed}}` is the help string's
+    escaping of `{seed}`.
+    """
+    match = re.search(r"image=demo5[\s\\]*--\s+([^\n`]+)", text)
+    assert match is not None, "the canonical `run` example is gone"
+    return match.group(1).strip().replace("{{", "{").replace("}}", "}")
+
+
+def test_the_canonical_run_example_is_the_same_command_everywhere() -> None:
+    found = {
+        where: _canonical_target(path.read_text(encoding="utf-8"))
+        for where, path in _CANONICAL_SOURCES.items()
+    }
+    assert len(set(found.values())) == 1, f"the canonical example disagrees with itself: {found}"
+    # Named literally, not read from one of the three: a test that only compared them to each other
+    # would go green on three copies of the wrong command.
+    assert set(found.values()) == {"./workload --chaos --seed {seed}"}

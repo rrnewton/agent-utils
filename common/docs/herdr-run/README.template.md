@@ -1,28 +1,26 @@
-# herdr-run and herdr-agent
+# herdr-run
 
-Run an **allowlisted** command in a Herdr terminal pane that lives **outside** an AI agent's
-sandbox, and get its real stdout, stderr, and exit code back.
+Run an **allowlisted** command in a terminal pane belonging to a separate terminal server, and get
+its real stdout, stderr, and exit code back.
 
 ```
-herdr-run release-agent 'with-proxy git ls-remote origin main'
+herdr-run --agent release-agent run 'git ls-remote origin main'
 ```
 
-The same package also installs `herdr-agent`, a durable FIFO transport for messaging an
-already-running interactive agent without losing or accidentally duplicating a prompt:
+The pane is not a child of the calling process, so whatever constrains that process does not
+constrain the command: not its network policy, not its environment, not its lifetime. A pane also
+outlives the caller, carries a different ambient environment, and can be watched and taken over by
+a person.
 
-```sh
-herdr-agent send --session-agent codex --session "$CODEX_SESSION_ID" \
-  --agent codex --workspace project --cwd /work/project --file ./next-task.md
-```
+One common case, kept as an example rather than as the definition: an AI coding agent inside a
+sandbox that blocks the network cannot `git push` or run `gh`, even though it legitimately needs
+to in order to publish its work. The terminal server runs outside that confinement, so a shell in
+one of its panes is not confined either. `herdr-run net-doctor` checks exactly that situation and
+says so before it starts.
 
-A sandboxed coding agent often cannot reach the network, so `git fetch`, `git push`, and `gh` fail
-even though the agent legitimately needs them to publish its work. The Herdr terminal server runs
-outside that confinement, so a shell in one of its panes is not confined either. `herdr-run` turns
-that into one narrow, audited door instead of an ad-hoc pile of keystroke injection.
-
-> **This tool deliberately uses an out-of-sandbox channel.** Its allowlist prevents accidental and
-> cooperative misuse; it is not a containment boundary against a hostile process running as the
-> same user. Read the trust model in the user guide before widening policy.
+> **The allowlist is a cooperative safety rail.** It prevents accidental and cooperative misuse; it
+> is not a containment boundary against a hostile process running as the same user. Read the trust
+> model in the user guide before widening policy.
 
 {{DISTRIBUTION}}
 
@@ -42,44 +40,38 @@ that into one narrow, audited door instead of an ad-hoc pile of keystroke inject
 - **Serialized account-wide use.** An account-global resolution lock prevents duplicate first-run
   workspaces/tabs, and an account-global per-pane lock spans readiness, launch, and collection, so
   callers from different projects cannot inject into the same pane concurrently.
+- **Bounded tab growth.** Every agent that runs a command leaves a tab behind and nothing closes
+  it, so the workspace grows until the Herdr server is the bottleneck (measured: 260 panes, >1000%
+  CPU, every control call timing out). `max_panes` refuses to open a NEW tab past a ceiling -- never
+  an existing one -- and `herdr-run reap` reports which tabs are provably finished with.
 - **Visible, best-effort audit.** Refusals, admissions, failures, and completions are appended to a
   private JSONL log. Storage failures warn but never replace a completed command's exit status.
 
-## Interactive-agent messaging
-
-`herdr-agent` binds a private on-disk queue to one exact pane or stable agent session. It waits for
-native `idle` or `done` state, durably marks the prompt in flight, submits the full literal text in
-one operation, and requires a subsequent `working` event. A pre-submission failure stays pending
-and safe to retry; an ambiguous post-submission failure is quarantined and is never automatically
-submitted twice. `status` and `read` inspect a validated target without altering its queue.
-
 ## Configuration
 
-Policy is per project, in the nearest `.herdr-run.yaml`. Every field has a working default, so a
-project can adopt the tool with no configuration at all:
+Policy is per project, in the nearest `.herdr-run.yaml`. `herdr-run init` writes an annotated one
+into the current directory with every knob present, commented, and set to the value already in
+force -- so adopting it changes nothing until you edit something, and that file, rather than any
+documentation, is the reference for what is configurable.
 
-```yaml
-workspace: agent-cmds     # Herdr workspace holding this project's command tabs
-tab_name: "{agent}"       # one tab per agent
-allow: [git, gh]          # cooperative policy rail - keep it small
-prefixes: [with-proxy]    # wrappers that may precede an allowlisted program
-spool_dir: .herdr-run     # git-ignored: holds command output, not source
-```
+`allow` is a **human-only knob**: an agent that can widen its own allowlist does not have one.
+Keep `.herdr-run.yaml` at the top of the project, outside whatever directory the agents write in.
+`allow: ["*"]` is a supported allow-everything mode for projects where the pane is not meant to be
+a trust boundary at all.
 
 ## Quick reference
 
 ```
-herdr-run <agent> '<command>'    run the command; exits with the command's own exit code
+herdr-run status                 what configuration, policy, and session are in effect
+herdr-run init                   write an annotated .herdr-run.yaml in this directory
+herdr-run run '<command>'        run the command; exits with the command's own exit code
 herdr-run check '<command>'      policy only: allowed or refused. Touches no pane.
 herdr-run target                 resolve/bring up the pane; print ids and readiness
 herdr-run config                 print the effective configuration
-herdr-run doctor                 verify the sandbox-crossing actually works, both directions
+herdr-run reap                   report which command tabs are provably finished. Closes nothing.
+herdr-run net-doctor             smoke-test one scenario: a caller whose own network is blocked
+herdr-run quickstart             the one-screen introduction
 herdr-run userguide              the full user guide
-herdr-agent send ...             durably submit one prompt to an interactive agent
-herdr-agent drain ...            resume a bound queue without duplicating ambiguous prompts
-herdr-agent status ...           inspect validated agent identity and queue state
-herdr-agent read ...             read recent validated agent output
-herdr-agent userguide            the complete messaging and recovery contract
 ```
 
 Requires Linux with a working systemd user manager and a separately installed
@@ -87,4 +79,4 @@ Requires Linux with a working systemd user manager and a separately installed
 `~/.local/bin`, or `~/bin`. The integration is tested with Herdr 0.8.0; compatible
 newer releases must provide its `status`, `workspace`, `tab`, and `pane` command APIs.
 
-Full documentation: `herdr-run userguide` and `herdr-agent userguide`.
+Start with `herdr-run quickstart`, one screen. `herdr-run userguide` is the complete reference.

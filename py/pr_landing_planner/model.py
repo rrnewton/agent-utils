@@ -23,6 +23,10 @@ DEFAULT_BASE = "main"
 #: The legacy default workflow-check name; consuming repository policy decides its role.
 DEFAULT_GATE_CHECK = "merge-gate"
 
+NATIVE_REVIEW_STATES = frozenset(
+    {"APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING"}
+)
+
 
 class CiState(Enum):
     """The trinary workflow-check verdict for a PR's whole check rollup.
@@ -78,7 +82,7 @@ class PrAction(Enum):
 
 
 class ValidationEvidence(Enum):
-    """Evidence that can satisfy a caller's landing precondition at exact head/base identities."""
+    """Evidence attached to an exact tested head and recorded base identity."""
 
     NONE = "none"
     AUTHORITATIVE_CI = "authoritative-ci"
@@ -86,6 +90,14 @@ class ValidationEvidence(Enum):
     # A bare label never produces this variant.
     LOCALLY_VALIDATED = "locally-validated"
     CLEAN_VALIDATE_RECORD = "clean-validate-record"
+
+
+class ValidationAuthority(Enum):
+    """Consuming-workspace decision about whether recorded validation authorizes landing."""
+
+    NONE = "none"
+    HARD_GREEN = "hard-green"
+    SOFT_GREEN = "soft-green"
 
 
 class ReviewBinding(Enum):
@@ -125,6 +137,35 @@ class CheckRun:
 
 
 @dataclass(frozen=True)
+class ReviewEvidenceEvent:
+    """One stable event with separate creation and current-version timestamps."""
+
+    kind: str
+    identity: str
+    state: str
+    head_sha: str
+    created_at: str = ""
+    updated_at: str = ""
+    last_edited_at: str = ""
+    body: str = ""
+    #: Immutable repository-host login when available. It is authority only for an
+    #: exact current retirement whose permission was verified.
+    author: str = ""
+    #: Current repository permission for an exact current retirement's immutable
+    #: repository-host author. Empty for all other events and failed permission checks.
+    retirement_actor_permission: str = ""
+
+
+@dataclass(frozen=True)
+class ReviewEvidenceSnapshot:
+    """Exact review/comment evidence observed together at one PR head."""
+
+    head_sha: str
+    review_decision: str
+    events: tuple[ReviewEvidenceEvent, ...]
+
+
+@dataclass(frozen=True)
 class RawPr:
     """A single open PR as produced by a :class:`pr_landing_planner.host.VcsHost`.
 
@@ -144,12 +185,15 @@ class RawPr:
     is_draft: bool = False
     mergeable: str = ""
     review_decision: str = ""
+    #: True when the host could not produce the complete exact-head review snapshot.
+    review_evidence_unavailable: bool = False
     created_at: str = ""
     updated_at: str = ""
     additions: int = 0
     deletions: int = 0
     labels: tuple[str, ...] = ()
     checks: tuple[CheckRun, ...] = ()
+    review_snapshot: ReviewEvidenceSnapshot | None = None
     #: DERIVE-stage output: mechanism-candidate strings pulled mechanically from the diff (const/env
     #: names, YAML keys). Classified into the stable mechanism enum downstream; defaults empty.
     mechanism_symbols: tuple[str, ...] = ()
@@ -191,7 +235,10 @@ class PrNode:
     is_draft: bool = False
     mergeable: str = ""
     review_decision: str = ""
+    #: True when review evidence collection was incomplete or indeterminate.
+    review_evidence_unavailable: bool = False
     created_at: str = ""
+    updated_at: str = ""
     additions: int = 0
     deletions: int = 0
     labels: tuple[str, ...] = ()
@@ -207,7 +254,14 @@ class PrNode:
     priority: int = 0
     assigned_agent: str = ""
     validation_evidence: ValidationEvidence = ValidationEvidence.NONE
+    validation_authority: ValidationAuthority = ValidationAuthority.NONE
     review_pass_heads: tuple[tuple[str, str], ...] = ()
+    #: Digest of the exact review/comment event snapshot collected at ``head_sha``.
+    review_evidence_digest: str = ""
+    #: Caller authority, bound to ``head_sha`` and ``review_evidence_digest``, that every
+    #: recorded review objection has an exact resolution record. GitHub's
+    #: aggregate review decision may remain CHANGES_REQUESTED after that record.
+    review_objections_resolved: bool = False
     policy_class: PolicyClass = PolicyClass.UNCLASSIFIED
 
     @property

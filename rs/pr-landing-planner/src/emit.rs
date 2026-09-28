@@ -8,7 +8,7 @@ use crate::graph::{cluster_by_conflict, rebases_avoided, review_binding};
 use crate::model::{CiState, Cluster, HeldPr, PlanResult, PrAction, PrActionDecision, PrNode};
 
 /// Explanation emitted with the rebase and validation-run savings calculation.
-pub const VALIDATE_ECONOMICS_RATIONALE: &str = "The clean-validate record is keyed to the exact head and base SHAs. Landing moves the base, and rebasing also changes the head, so serial draining invalidates queued validation evidence at every step (self-defeating). Landing each real-conflict cluster as ONE stack collapses that to one rebase and one validate per cluster, so clustering avoids the same count of rebases AND validate runs.";
+pub const VALIDATE_ECONOMICS_RATIONALE: &str = "A branch behind its fetched base must rebase before landing. The consuming workspace may authorize that rebase to retain soft-green without pre-landing revalidation; post-facto validation remains due. Landing each real-conflict cluster as ONE stack avoids the same count of repeated rebases and post-facto validate runs.";
 
 fn economics(clusters: &[Cluster]) -> Value {
     let saved = rebases_avoided(clusters);
@@ -26,6 +26,7 @@ fn node_obj(node: &PrNode, held: bool) -> Value {
         "title": node.title,
         "author": node.author,
         "head": node.head_sha,
+        "updated_at": (!node.updated_at.is_empty()).then_some(node.updated_at.as_str()),
         "base_sha": node.base_sha,
         "base_ref": node.base_ref,
         "ci": node.ci.raw_state.as_str(),
@@ -39,8 +40,13 @@ fn node_obj(node: &PrNode, held: bool) -> Value {
         "labels": node.labels,
         "assigned_agent": (!node.assigned_agent.is_empty()).then_some(node.assigned_agent.as_str()),
         "validation_evidence": node.validation_evidence.as_str(),
+        "validation_authority": node.validation_authority.as_str(),
         "policy_class": node.policy_class.as_str(),
         "review_decision": (!node.review_decision.is_empty()).then_some(node.review_decision.as_str()),
+        "review_evidence_unavailable": node.review_evidence_unavailable,
+        "review_evidence_digest": (!node.review_evidence_digest.is_empty())
+            .then_some(node.review_evidence_digest.as_str()),
+        "review_objections_resolved": node.review_objections_resolved,
         "review_binding": review_binding(node).0.as_str(),
         "review_pass_heads": node.review_pass_heads,
     })

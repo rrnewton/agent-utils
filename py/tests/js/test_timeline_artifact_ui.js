@@ -7,7 +7,7 @@ const vm = require("vm");
 
 const appPath = path.resolve(
   __dirname,
-  "../../agent_team_timeline/static/app.js"
+  "../../wrkviz/static/app.js"
 );
 const source = fs.readFileSync(appPath, "utf8");
 
@@ -77,8 +77,8 @@ assert.deepStrictEqual(
 );
 assert.deepStrictEqual(Array.from(grouped.references), ["artifact-issue41"]);
 
-const external = context.safeArtifactTarget("https://github.com/rrnewton/dev-hermit/pull/38");
-assert.strictEqual(external.href, "https://github.com/rrnewton/dev-hermit/pull/38");
+const external = context.safeArtifactTarget("https://github.com/example-org/dev-widget/pull/38");
+assert.strictEqual(external.href, "https://github.com/example-org/dev-widget/pull/38");
 assert.strictEqual(external.external, true);
 
 const internal = context.safeArtifactTarget("#glossary/term-parser");

@@ -18,8 +18,8 @@ import re
 import subprocess
 from pathlib import Path
 
-from safe_ci_dag_runner import cgroup as cgroup_module
-from safe_ci_dag_runner.cgroup import Cgroups
+from dagrun import cgroup as cgroup_module
+from dagrun.cgroup import Cgroups
 
 GIB = 1024**3
 

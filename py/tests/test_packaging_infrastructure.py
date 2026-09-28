@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import re
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -10,6 +13,41 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _collect_lifecycle_tests(mark_expression: str | None = None) -> set[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "--collect-only",
+        "-q",
+        "--strict-markers",
+        "-p",
+        "no:cacheprovider",
+        "-c",
+        "pyproject.toml",
+        "--rootdir=.",
+        "wrkslots/tests/test_lifecycle.py",
+    ]
+    if mark_expression is not None:
+        command.extend(("-m", mark_expression))
+    environment = os.environ.copy()
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    completed = subprocess.run(
+        command,
+        cwd=REPO_ROOT / "py",
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+    return {
+        line
+        for line in completed.stdout.splitlines()
+        if line.startswith("wrkslots/tests/test_lifecycle.py::")
+    }
 
 
 def _load_script(name: str) -> ModuleType:
@@ -25,7 +63,7 @@ def _load_script(name: str) -> ModuleType:
 
 def test_embed_lint_rejects_unknown_placeholders_and_sibling_packages() -> None:
     docs = _load_script("embed_userguides")
-    item = docs.Render("safe-ci-dag-runner", "README", "python", "out/README.md")
+    item = docs.Render("dagrun", "README", "python", "out/README.md")
 
     errors = docs._lint(item, "{{UNKNOWN}}\nRust\ntick-hub\n")
 
@@ -38,14 +76,14 @@ def test_embed_check_reports_both_staleness_and_lint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     docs = _load_script("embed_userguides")
-    item = docs.Render("safe-ci-dag-runner", "README", "python", "out/README.md")
+    item = docs.Render("dagrun", "README", "python", "out/README.md")
     template = tmp_path / item.template
     fragment = tmp_path / item.fragment
     destination = tmp_path / item.destination
     template.parent.mkdir(parents=True)
     fragment.parent.mkdir(parents=True)
     destination.parent.mkdir(parents=True)
-    template.write_text("# safe-ci-dag-runner\n\n{{DISTRIBUTION}}\n", encoding="utf-8")
+    template.write_text("# dagrun\n\n{{DISTRIBUTION}}\n", encoding="utf-8")
     fragment.write_text("Install this distribution.\n", encoding="utf-8")
     destination.write_text("{{UNKNOWN}}\ntick-hub\n", encoding="utf-8")
     monkeypatch.setattr(docs, "REPO_ROOT", tmp_path)
@@ -60,14 +98,12 @@ def test_embed_check_reports_both_staleness_and_lint(
     assert any("sibling package" in error for error in lint_errors)
 
 
-def test_embed_prevalidates_every_input_before_writing(
+def test_embed_generate_prevalidates_and_writes_only_changed_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     docs = _load_script("embed_userguides")
-    first = docs.Render("safe-ci-dag-runner", "README", "python", "out/README.md")
-    second = docs.Render(
-        "safe-ci-dag-runner", "USER_GUIDE", "python", "out/USER_GUIDE.md"
-    )
+    first = docs.Render("dagrun", "README", "python", "out/README.md")
+    second = docs.Render("dagrun", "USER_GUIDE", "python", "out/USER_GUIDE.md")
     first_template = tmp_path / first.template
     first_fragment = tmp_path / first.fragment
     first_destination = tmp_path / first.destination
@@ -89,6 +125,21 @@ def test_embed_prevalidates_every_input_before_writing(
         docs.generate()
 
     assert first_destination.read_text(encoding="utf-8") == "leave me alone\n"
+    second_fragment = tmp_path / second.fragment
+    second_fragment.parent.mkdir(parents=True, exist_ok=True)
+    second_fragment.write_text("also valid\n", encoding="utf-8")
+    assert docs.generate() == [first.destination, second.destination]
+    assert first_destination.read_text(encoding="utf-8") == "valid\n"
+
+    old_mtime_ns = 1_600_000_000_000_000_000
+    os.utime(first_destination, ns=(old_mtime_ns, old_mtime_ns))
+
+    assert docs.generate() == []
+    assert first_destination.stat().st_mtime_ns == old_mtime_ns
+
+    first_destination.write_text("stale\n", encoding="utf-8")
+    assert docs.generate() == [first.destination]
+    assert first_destination.read_text(encoding="utf-8") == "valid\n"
 
 
 def test_embed_check_rejects_regular_copy_and_wrong_link_target(
@@ -124,7 +175,19 @@ def test_embed_check_rejects_regular_copy_and_wrong_link_target(
 def test_package_docs_and_licenses_are_authoritative_links() -> None:
     docs = _load_script("embed_userguides")
 
-    assert len(docs.PACKAGE_LINKS) == 32
+    assert len(docs.PACKAGE_LINKS) == 45
+    assert {
+        "py/agentctl/AGENT_USER_GUIDE.md",
+        "py/agentctl/FOREIGN_USER_GUIDE.md",
+        "rs/agentctl/src/embedded_userguide.md",
+        "rs/agentctl/src/embedded_quickstart.md",
+    } <= {link.destination for link in docs.PACKAGE_LINKS}
+    assert not {
+        "py/herdr_run/AGENT_USER_GUIDE.md",
+        "py/herdr_run/CHAT_USER_GUIDE.md",
+        "py/herdr_run/FOREIGN_USER_GUIDE.md",
+        "rs/herdr-run/src/embedded_agent_userguide.md",
+    } & {link.destination for link in docs.PACKAGE_LINKS}
     for link in docs.PACKAGE_LINKS:
         destination = REPO_ROOT / link.destination
         assert destination.is_symlink(), link.destination
@@ -164,6 +227,24 @@ def test_python_doc_lint_exemption_cannot_hide_a_later_foreign_term() -> None:
     assert "foreign-language term 'Cargo'" not in errors
 
 
+def test_agentctl_capability_comparison_exemption_is_scoped_to_its_operator_guide() -> None:
+    python_check = _load_script("check_python_packages")
+    rust_check = _load_script("check_rust_packages")
+    project = next(project for project in python_check.PROJECTS if project.package == "agentctl")
+    crate = next(crate for crate in rust_check.CRATES if crate.name == "agentctl")
+    comparison = "Python includes worker/Chat/MCP capabilities; Rust provides the interactive core."
+    assert not python_check._doc_violations(project, comparison, document_name="USER_GUIDE.md")
+    assert not rust_check._doc_violations(crate, comparison, document_name="src/embedded_userguide.md")
+    assert python_check._doc_violations(project, comparison)
+    assert rust_check._doc_violations(crate, comparison)
+    assert python_check._doc_violations(project, comparison, document_name="README.md")
+    assert rust_check._doc_violations(crate, comparison, document_name="README.md")
+    assert "foreign-language term 'Cargo'" in python_check._doc_violations(
+        project, comparison + " Cargo", document_name="USER_GUIDE.md")
+    assert "foreign-package term 'pip'" in rust_check._doc_violations(
+        crate, comparison + " pip", document_name="src/embedded_userguide.md")
+
+
 def test_python_sibling_dependency_requires_a_project_local_exemption() -> None:
     python_check = _load_script("check_python_packages")
     parallel = next(
@@ -171,10 +252,10 @@ def test_python_sibling_dependency_requires_a_project_local_exemption() -> None:
         for project in python_check.PROJECTS
         if project.distribution == "parallel-experiment-runner"
     )
-    safe_ci_requirement = {"safe-ci-dag-runner"}
+    dagrun_requirement = {"dagrun"}
 
     assert not python_check._unexpected_sibling_requirements(
-        parallel, safe_ci_requirement
+        parallel, dagrun_requirement
     )
     assert python_check._unexpected_sibling_requirements(
         python_check.PROJECTS[0], {"tick-hub"}
@@ -312,6 +393,18 @@ def test_public_api_docs_are_standalone_without_banning_native_package_terms() -
     )
 
 
+def test_dagrun_rust_dependency_snippets_match_the_published_minor_version() -> None:
+    manifest = (REPO_ROOT / "rs" / "dagrun" / "Cargo.toml").read_text(encoding="utf-8")
+    matched = re.search(r'^version = "(\d+\.\d+)\.\d+"$', manifest, re.MULTILINE)
+    assert matched is not None
+    dependency = f'dagrun = "{matched.group(1)}"'
+    for name in ("README.md", "USER_GUIDE.md"):
+        fragment = (
+            REPO_ROOT / "common" / "docs" / "dagrun" / "fragments" / "rust" / name
+        ).read_text(encoding="utf-8")
+        assert dependency in fragment
+
+
 def test_package_indexes_name_real_check_commands() -> None:
     python_index = (REPO_ROOT / "py" / "README.md").read_text(encoding="utf-8")
     rust_index = (REPO_ROOT / "rs" / "README.md").read_text(encoding="utf-8")
@@ -322,3 +415,138 @@ def test_package_indexes_name_real_check_commands() -> None:
     assert "check-python-packages:" in makefile
     assert "check-rust-packages:" in makefile
     assert "python" not in rust_index.lower()
+
+
+def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
+    all_tests = _collect_lifecycle_tests()
+    ordinary = _collect_lifecycle_tests("ordinary_environment")
+    mapped = _collect_lifecycle_tests("not ordinary_environment")
+    mapped_root = _collect_lifecycle_tests("mapped_root_namespace")
+
+    assert ordinary.isdisjoint(mapped)
+    assert ordinary | mapped == all_tests
+    assert len(all_tests) == 1070
+    assert len(ordinary) == 282
+    assert len(mapped) == 788
+    assert {
+        node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
+    } == {
+        "test_adopt_refuses_pid_outside_invoking_process_ancestry",
+        "test_batch_census_isolated_real_file_alias_mapping_and_socket",
+        "test_batch_census_two_selected_trees_cannot_mask_socket_holder",
+        "test_batch_census_validation_filesystem_outside_hardlink_mapping",
+        "test_batch_maps_filter_preserves_large_inode_strings_and_read_errors",
+        "test_bounded_read_only_command_cleans_up_post_spawn_setup_failure",
+        "test_bounded_read_only_command_discards_output_before_timeout",
+        "test_bounded_read_only_command_kills_descendant_holding_output",
+        "test_bounded_read_only_command_refuses_when_killed_child_cannot_be_reaped",
+        "test_bounded_lsof_reports_installed_binary_file_and_alias_matches",
+        "test_create_binds_owner_running_beside_its_assigned_coordinator",
+        "test_current_frozen_result_without_removal_proof_blocks_entry",
+        "test_current_incomplete_frozen_binds_checkout_and_gitlink_identity",
+        "test_current_incomplete_frozen_binds_initial_facts_to_recursive_snapshot",
+        "test_current_incomplete_frozen_rechecks_after_fresh_census",
+        "test_current_incomplete_frozen_refuses_untrusted_or_live_evidence",
+        "test_current_incomplete_frozen_requires_exact_current_shape",
+        "test_current_incomplete_frozen_requires_pristine_recursive_checkout",
+        "test_current_incomplete_frozen_retains_evidence_and_allows_stable_source_work",
+        "test_current_incomplete_frozen_retention_does_not_authorize_direct_recovery",
+        "test_direct_current_frozen_recovery_refuses_lost_journal_proof",
+        "test_direct_current_frozen_recovery_refuses_tampered_proof",
+        "test_direct_current_frozen_recovery_requires_removal_proof",
+        "test_direct_frozen_recovery_preserves_proofless_legacy_schemas",
+        "test_direct_historical_projection_cannot_use_batch_only_nonblocking_result",
+        "test_frozen_parser_and_consumer_use_exact_real_projection_shape",
+        "test_frozen_parser_authority_accepts_real_nested_linked_worktree",
+        "test_frozen_parser_failures_preserve_checkout_without_journal",
+        "test_frozen_parser_reads_immutable_initial_snapshot_during_live_restore",
+        "test_frozen_parser_refuses_each_module_tampered_before_or_after_inspect",
+        "test_frozen_parser_refuses_record_mutation_after_inspect",
+        "test_frozen_validate_batch_closes_operation_owned_fds_before_censuses",
+        "test_frozen_validate_batch_accepts_exact_validation_removal_proof",
+        "test_frozen_validate_batch_fresh_census_does_not_ignore_current_process",
+        "test_frozen_validate_detects_pre_exclusion_same_uid_holder_and_rolls_back",
+        "test_frozen_validate_excludes_late_same_uid_checkout_entry",
+        "test_frozen_validate_sealed_guard_fd_cannot_open_late_payload",
+        "test_frozen_validate_checkout_binds_terminal_record_fields",
+        "test_frozen_validate_checkout_recovers_each_durable_crash_boundary",
+        "test_frozen_validate_recovery_refuses_exclusion_identity_tampering",
+        "test_frozen_validate_recovery_refuses_absent_fenced_path",
+        "test_frozen_validate_recovery_refuses_absent_prepared_path_twice",
+        "test_frozen_validate_recovery_refuses_changed_identity_binding",
+        "test_frozen_validate_recovery_refuses_changed_terminal_record_digest",
+        "test_frozen_validate_rebinds_external_proof_after_exclusion_census",
+        "test_frozen_validate_refuses_disappearance_after_final_check",
+        "test_frozen_validate_refuses_cross_device_exclusion_root",
+        "test_frozen_validate_refuses_fenced_replacement_after_final_check",
+        "test_frozen_validate_refuses_replacement_after_final_check",
+        "test_frozen_validate_refuses_when_verified_root_context_is_unavailable",
+        "test_frozen_validate_rejects_counterfeit_minimal_terminal_records",
+        "test_historical_frozen_entry_classification_closes_operation_owned_fds",
+        "test_historical_frozen_entry_classification_fails_closed_on_evidence_change",
+        "test_historical_frozen_entry_classification_fails_closed_on_shape_changes",
+        "test_historical_frozen_live_process_identity_blocks_entry",
+        "test_historical_frozen_retention_reports_schema_two_exactly",
+        "test_host_context_recover_finish_preserves_actor_and_issued_proof",
+        "test_host_context_recover_rechecks_authority_before_locked_writes",
+        "test_host_context_recover_rejects_invalid_handoff_before_mutation",
+        "test_lock_conflict_refuses_without_state_change",
+        "test_ownerless_validate_batch_removes_terminal_frozen_checkout",
+        "test_process_entering_after_final_scan_before_path_move_is_not_deleted",
+        "test_remove_refuses_live_process_using_slot",
+        "test_root_owned_executable_accepts_host_root_helper",
+        "test_run1773_historical_frozen_checkout_is_retained_without_blocking_entry",
+        "test_socket_orphan_namespace_unavailable_is_an_exact_classifier",
+        "test_uncontained_current_frozen_checkout_still_cannot_be_removed",
+        "test_uncontained_historical_frozen_retention_binds_head_and_source",
+        "test_validate_batch_rechecks_external_proof_after_private_seal",
+    }
+
+    negative = (
+        "wrkslots/tests/test_lifecycle.py::"
+        "test_root_owned_executable_rejects_namespace_root_without_host_root"
+    )
+    exclusion_root = (
+        "wrkslots/tests/test_lifecycle.py::"
+        "test_validation_exclusion_fixture_preserves_host_root_boundary"
+    )
+    assert mapped_root == {negative, exclusion_root}
+    assert negative in mapped
+    assert negative not in ordinary
+    assert exclusion_root in mapped
+    assert exclusion_root not in ordinary
+
+    replay_test = (
+        "wrkslots/tests/test_lifecycle.py::"
+        "test_doctor_replays_hold_events_once_per_machine"
+    )
+    assert replay_test in mapped
+    assert replay_test not in ordinary
+    assert replay_test not in mapped_root
+
+    degenerate_owner_test = (
+        "wrkslots/tests/test_lifecycle.py::"
+        "test_remove_releases_a_slot_whose_owner_record_is_degenerate"
+    )
+    assert degenerate_owner_test in mapped
+    assert degenerate_owner_test not in ordinary
+    assert degenerate_owner_test not in mapped_root
+
+    makefile = re.sub(
+        r"\s+",
+        " ",
+        (REPO_ROOT / "Makefile").read_text(encoding="utf-8").replace("\\\n", " "),
+    )
+    assert (
+        'test_python="$$(python3 -c '
+        "'import os, sys; print(os.path.realpath(sys.executable))')\" && "
+        "unshare --user --map-root-user --pid --fork --mount-proc "
+        '"$$test_python" ../scripts/pid_namespace_init.py -- '
+        "python3 -m pytest -q -c pyproject.toml --rootdir=. "
+        "wrkslots/tests/test_lifecycle.py -m 'not ordinary_environment'"
+    ) in makefile
+    assert (
+        "python3 -m pytest -q -c pyproject.toml --rootdir=. "
+        "wrkslots/tests/test_lifecycle.py -m ordinary_environment"
+    ) in makefile
+    assert "wrkslots/tests/test_lifecycle.py::" not in makefile

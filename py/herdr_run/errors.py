@@ -30,7 +30,10 @@ __all__ = [
 #: installed guide documents how JSON mode distinguishes that case.
 EXIT_CONFIG = 78  # EX_CONFIG: the project config is malformed or unreadable.
 EXIT_REFUSED = 77  # EX_NOPERM: the allowlist rejected the command. Nothing was executed.
-EXIT_UNAVAILABLE = 69  # EX_UNAVAILABLE: Herdr server / workspace / pane could not be brought up.
+# EX_UNAVAILABLE: Herdr server / workspace / pane could not be brought up. NOT a retry signal: it
+# also carries the max_panes refusal, which only clears when somebody closes tabs. EXIT_BUSY is the
+# only code that promises retrying is meaningful.
+EXIT_UNAVAILABLE = 69
 EXIT_BUSY = 75  # EX_TEMPFAIL: the pane was not idle. Nothing was executed; retry is meaningful.
 EXIT_TIMEOUT = 76  # EX_PROTOCOL: the command was launched but did not finish in time.
 

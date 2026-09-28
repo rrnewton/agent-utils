@@ -13,9 +13,9 @@ from typing import NoReturn
 
 import pytest
 
-from agent_team_timeline import cli as timeline_cli
-from agent_team_timeline import pipeline as timeline_pipeline
-from agent_team_timeline.archive import as_object, read_json
+from wrkviz import cli as timeline_cli
+from wrkviz import pipeline as timeline_pipeline
+from wrkviz.archive import as_object, read_json
 
 
 def _process_is_dead(process_id: int) -> bool:
@@ -80,7 +80,7 @@ while True:
         """from pathlib import Path
 import sys
 
-from agent_team_timeline.summarize import SummaryJob, summarize_jobs
+from wrkviz.summarize import SummaryJob, summarize_jobs
 
 jobs = [
     SummaryJob(
@@ -200,7 +200,7 @@ def test_cli_interrupt_receipt_is_written_after_archive_lock_release(
     assert manifest["last_run_status"] == "interrupted"
 
     descriptor = os.open(
-        archive / ".agent-team-timeline.lock",
+        archive / ".wrkviz.lock",
         os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
     )
     try:

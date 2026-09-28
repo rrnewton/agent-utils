@@ -35,7 +35,13 @@ A tab is STALE only when all of these hold, each positive evidence rather than a
 
 * **R1 no in-flight work.** Every run naming this pane recorded an ``exit_code``. A run with no
   recorded exit code is IN FLIGHT -- that is the "agent is thinking" case, and it is positively
-  distinguishable from a finished one rather than being inferred from silence.
+  distinguishable from a finished one rather than being inferred from silence. The state is
+  written by exactly one place: :func:`herdr_run.runner.execute` records the run with a null exit
+  code when collection times out, because the command is then still running in a pane this process
+  does not own. That is the whole reason the rule exists, and until the timeout path recorded
+  anything the rule was unreachable -- documented as a protection while no writer could produce the
+  state it tests for. :func:`herdr_run.sweep.load_run_records` re-reads the run's ``exit_code``
+  file afterwards, so a command that finished after we stopped waiting stops looking in flight.
 * **R2 the pane's shell is gone.** Not the run-directory PID; the shell PID.
 * **R3 reboot and PID reuse are excluded.** ``kill(pid, 0)`` alone is not sufficient on a busy
   host: a recycled PID makes an unrelated live process look like proof of liveness, and a

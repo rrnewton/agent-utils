@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.github_metadata import (
+from wrkviz.github_metadata import (
     GitHubMetadataError,
     HttpResponse,
     MAX_API_RESPONSE_BYTES,
@@ -137,7 +137,7 @@ def test_fetch_parses_fields_bounds_body_and_uses_github_endpoint() -> None:
             "https://api.github.com/repos/sched-ext/scx/pulls/3668",
             {
                 "Accept": "application/vnd.github+json",
-                "User-Agent": "agent-team-timeline",
+                "User-Agent": "wrkviz",
                 "X-GitHub-Api-Version": "2022-11-28",
             },
             7.5,

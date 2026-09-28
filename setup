@@ -10,7 +10,7 @@
 #
 # Every mode wires ./bin at the TRACKED engine resolver (common/bin). The resolver runs the tracked
 # Python entrypoint by default and the tracked Cargo-backed Rust launcher only on explicit
-# SAFE_CI_DAG_RUNNER_ENGINE=rust, logging which engine won on every invocation.
+# DAGRUN_ENGINE=rust, logging which engine won on every invocation.
 #
 # `make` just calls `./setup`.
 set -euo pipefail
@@ -68,7 +68,7 @@ setup_py() {
 
 setup_rs() {
   local runner legacy unexpected launcher tool target
-  local -a rust_tools=(safe-ci-dag-runner cpuset-alloc tick-hub pr-landing-planner herdr-run herdr-agent)
+  local -a rust_tools=(dagrun cpuset-alloc tick-hub pr-landing-planner herdr-run herdr-agent agentctl)
   echo "==> [rs] verify/build tracked Cargo-backed launchers"
   command -v cargo >/dev/null || { echo "rs: cargo not found" >&2; return 1; }
   command -v flock >/dev/null || { echo "rs: flock not found" >&2; return 1; }
@@ -86,7 +86,7 @@ setup_rs() {
   fi
   # Migrate the four adjacent stamps written by setup versions that copied binaries into rs/bin.
   # These exact files were generated cache metadata; no other unexpected entry is removed.
-  for tool in safe-ci-dag-runner cpuset-alloc tick-hub pr-landing-planner; do
+  for tool in dagrun cpuset-alloc tick-hub pr-landing-planner; do
     legacy="$ROOT/rs/bin/$tool.provenance"
     if [ -f "$legacy" ] && [ ! -L "$legacy" ]; then
       rm -f -- "$legacy"
@@ -97,9 +97,9 @@ setup_rs() {
     fi
   done
   unexpected="$(find "$ROOT/rs/bin" -mindepth 1 -maxdepth 1 \
-    ! -name cargo-runner ! -name safe-ci-dag-runner ! -name cpuset-alloc \
+    ! -name cargo-runner ! -name dagrun ! -name cpuset-alloc \
     ! -name tick-hub ! -name pr-landing-planner ! -name herdr-run \
-    ! -name herdr-agent -print -quit)"
+    ! -name herdr-agent ! -name agentctl -print -quit)"
   if [ -n "$unexpected" ]; then
     echo "rs: unexpected rs/bin entry refused: ${unexpected#"$ROOT"/}" >&2
     return 1
@@ -127,11 +127,11 @@ case "$WHAT" in
 esac
 # Wire ./bin at the TRACKED, deterministic engine resolver (common/bin) regardless of what was
 # built. The resolver defaults to the tracked Python entrypoint and runs Rust ONLY on explicit
-# SAFE_CI_DAG_RUNNER_ENGINE=rust (never a silent fallback), logging which engine won on every run.
-# This replaces the old footgun where `both` wired ./bin straight at the UNTRACKED rs/bin, letting a
-# stale locally-built Rust binary silently beat the tracked entrypoint.
+# DAGRUN_ENGINE=rust (never a silent fallback), logging which engine won on every run. This replaces
+# the old footgun where `both` wired ./bin straight at the UNTRACKED rs/bin, letting a stale
+# locally-built Rust binary silently beat the tracked entrypoint.
 wire_bin "common/bin"
 if [ "$WHAT" = rs ]; then
-  echo "==> note: run Rust via SAFE_CI_DAG_RUNNER_ENGINE=rust ./bin/safe-ci-dag-runner (default is tracked Python; rs/bin is Cargo-backed)"
+  echo "==> note: run Rust via DAGRUN_ENGINE=rust ./bin/dagrun (default is tracked Python; rs/bin is Cargo-backed)"
 fi
 echo "setup: done ($WHAT)"

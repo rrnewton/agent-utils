@@ -103,7 +103,7 @@ def _epilog(c: Palette) -> str:
         f"  {ex(f'{PROG} tick --config ops.yaml --flush')}      {c.dim('# ...and persist the fired-state')}\n"
         f"  {ex(f'{PROG} list --config ops.yaml')}              {c.dim('# reminders + health checks')}\n"
         f"  {ex(f'{PROG} state --state host.yaml')}             {c.dim('# validate + show the ops-state lines')}\n\n"
-        f"{c.dim('The fired-state (per-reminder last-fired epochs) lives at ./.tick-hub/state by')}\n"
+        f"{c.dim('The fired-state (cadence epochs + reserved retry diagnostics) lives at ./.tick-hub/state by')}\n"
         f"{c.dim(f'default (override with --fired-state or ${STATE_FILE_ENV}); it is written only on --flush.')}"
     )
 
@@ -175,7 +175,7 @@ def _quickstart(c: Palette) -> str:
     benchmark_enabled: true
 
 {h('Cadence + state files')}
-  Per-reminder last-fired epochs live in a tiny key=last_fired_epoch file:
+  Last-fired epochs and reserved __tick_hub_internal__.* retry diagnostics share one atomic file:
     {k('./.tick-hub/state')}   {c.dim('(created on demand; override with --fired-state or $' + STATE_FILE_ENV + ')')}
   It is written ONLY on {k('--flush')}; the default dry-run mutates nothing.
 
@@ -309,7 +309,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--fired-state",
         metavar="FILE",
         default=None,
-        help=f"per-reminder last-fired-epoch file (default: ./{DEFAULT_FIRED_STATE} or "
+        help=f"cadence and reserved retry-diagnostic state file (default: ./{DEFAULT_FIRED_STATE} or "
         f"${STATE_FILE_ENV})",
     )
     tick_p.add_argument(
@@ -331,6 +331,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--flush",
         action="store_true",
         help="persist the advanced fired-state (default: dry-run, mutate nothing)",
+    )
+    tick_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "show EVERY reminder regardless of when it last fired, and print a line "
+            "for the clean ones too (implies no state write; refuses --flush)"
+        ),
+    )
+    tick_p.add_argument(
+        "--report-pending",
+        action="store_true",
+        help=(
+            "print a verdict for each due reminder, including CLEAN and SUPPRESSED; "
+            "unlike --dry-run, preserves cadence selection and is compatible with --flush"
+        ),
     )
     tick_p.add_argument(
         "--no-header",
@@ -401,25 +417,54 @@ def _cmd_tick(ns: argparse.Namespace, c: Palette) -> int:
     now = int(ns.now) if isinstance(ns.now, int) else wall_clock_now()
     current_tick_min = ns.current_tick_min if isinstance(ns.current_tick_min, int) else None
     fired_path = _resolve_fired_path(ns.fired_state if isinstance(ns.fired_state, str) else None)
+    dry_run = bool(ns.dry_run)
+    report_pending = dry_run or bool(ns.report_pending)
+    if dry_run and bool(ns.flush):
+        # Refuse rather than silently ignore one of them. --dry-run reports what
+        # WOULD run; --flush records what DID. Advancing the cadence from a report
+        # that deliberately ignored the cadence would mark every reminder as just
+        # fired, which is the one outcome that silently destroys the schedule.
+        print(
+            f"{PROG}: --dry-run and --flush are mutually exclusive: --dry-run ignores "
+            "the fired-state, so persisting its result would reset every cadence",
+            file=sys.stderr,
+        )
+        return 2
+
+    # ⚠️ THE FIRED-STATE IS STILL READ AND STILL NOT WRITTEN. Passing {} to run_tick
+    # is what makes this a real report of everything pending: is_due() treats a
+    # reminder with no recorded epoch as never-run and therefore due, so an empty
+    # mapping means "ask every reminder". The file on disk is untouched either way
+    # -- run_tick is pure with respect to it and only --flush persists, which the
+    # guard above has already excluded.
     fired = load_fired_state(fired_path)
 
-    result = run_tick(
-        cfg,
-        state,
-        now=now,
-        fired=fired,
-        gate_runner=SubprocessGateRunner(),
-        age_probe=GlobFileAgeProbe(),
-        current_tick_min=current_tick_min,
-    )
-
+    # ⚠️ THE HEADER GOES OUT BEFORE THE TICK RUNS, because the report now does too.
+    # A tick can take minutes, and callers run it under an external time bound
+    # that kills it. Everything this command has already determined must be on
+    # stdout by then, so each line is written and FLUSHED as it is produced
+    # rather than collected and printed after run_tick returns -- which, in the
+    # case that matters, it never does.
     if not bool(ns.no_header):
         print(_banner(c), file=sys.stderr)
         if state_note is not None:
             print(f"{PROG}: {state_note}", file=sys.stderr)
 
-    for line in result.lines:
+    def emit_line(line: str) -> None:
         print(line)
+        sys.stdout.flush()
+
+    result = run_tick(
+        cfg,
+        state,
+        now=now,
+        fired={} if dry_run else fired,
+        gate_runner=SubprocessGateRunner(),
+        age_probe=GlobFileAgeProbe(),
+        current_tick_min=current_tick_min,
+        report_pending=report_pending,
+        emit=emit_line,
+    )
 
     if bool(ns.flush):
         try:
@@ -430,7 +475,9 @@ def _cmd_tick(ns: argparse.Namespace, c: Palette) -> int:
         print(f"{PROG}: fired-state persisted to {fired_path}", file=sys.stderr)
     else:
         print(
-            f"{PROG}: dry-run (fired-state NOT persisted; pass --flush to persist)",
+            f"{PROG}: no state write (fired-state NOT persisted; pass --flush to persist). "
+            f"This still consults the fired-state, so it shows only what is DUE -- "
+            f"pass --dry-run to ignore it and see everything outstanding.",
             file=sys.stderr,
         )
     return 0

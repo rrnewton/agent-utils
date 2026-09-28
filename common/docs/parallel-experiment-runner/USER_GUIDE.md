@@ -1,8 +1,8 @@
 # parallel-experiment-runner — user guide
 
-Run **N concurrent seed-sweep workers under RESOURCE CONTAINMENT**, using `safe-ci-dag-runner`'s
-two-level cgroup-v2 scope. A seed sweep is one command template with a `{seed}` placeholder, run
-over a range of seeds — a chaos search, a fuzz sweep, a flaky-repro hunt, a parameter scan.
+Run **N concurrent seed-sweep workers under RESOURCE CONTAINMENT**, using `dagrun`'s two-level
+cgroup-v2 scope. A seed sweep is one command template with a `{seed}` placeholder, run over a
+range of seeds — a chaos search, a fuzz sweep, a flaky-repro hunt, a parameter scan.
 
 This tool exists because unbounded parallel experiments once left hundreds of processes piled up
 on a host. Reproduction sharpened *how* they piled up, and corrected two first impressions:
@@ -47,9 +47,9 @@ returns `EAGAIN`) rather than kernel-killing the worker, so the denied-fork coun
 the cpu/wall guard reaps the contained worker. The kill message then names the fork-bomb even
 though the reaping cause was the wall/CPU guard.
 
-It is a thin, additive generalization of `safe-ci-dag-runner`: each seed becomes one contained
-`Step`, and the existing scheduler runs them. There is **no second runner** — the containment,
-teardown, CPU-second budget, and per-step measurement are all the CI runner's, reused.
+It is a thin, additive generalization of `dagrun`: each seed becomes one contained `Step`, and
+the existing scheduler runs them. There is **no second runner** — the containment, teardown,
+CPU-second budget, and per-step measurement are all the CI runner's, reused.
 
 ## The four guarantees
 
@@ -83,7 +83,7 @@ parallel-experiment-runner run \
   --cpu-cores 1 --memory 4G --cpu-timeout 120 --pids 512 \
   --hit-regex 'DIVERGENCE|panic' --max-concurrency 32 \
   --identity backend=ptrace image=demo5 \
-  -- target-runner --chaos --seed {seed} ./demo
+  -- ./workload --chaos --seed {seed}
 ```
 
 `--wall-timeout` is omitted above on purpose: with a `--cpu-timeout`, the wall backstop is
@@ -168,11 +168,11 @@ kernel could not reap the zombies inside it. That is a running process over its 
 is precisely what the per-worker **cpu-time / wall backstop** kills. The requirement that follows is
 about *how* the kill lands: it must reclaim the **namespace**, not just one process. It does — every
 breach (and normal exit) routes through a **cgroup-subtree `cgroup.kill`** (see
-`safe_ci_dag_runner.teardown.reap`) that SIGKILLs *every* member of the worker's cgroup atomically,
-including `setsid`/double-fork escapees a process-group kill would miss. When the hung main and all
-its namespace peers die together, the namespace refcount drops to zero and the kernel reaps the
-zombies — so the box does not kill one pid and inherit the orphans. No separate teardown reaper is
-needed; the containment kill is the fix.
+`dagrun.teardown.reap`) that SIGKILLs *every* member of the worker's cgroup atomically, including
+`setsid`/double-fork escapees a process-group kill would miss. When the hung main and all its
+namespace peers die together, the namespace refcount drops to zero and the kernel reaps the zombies
+— so the box does not kill one pid and inherit the orphans. No separate teardown reaper is needed;
+the containment kill is the fix.
 
 ## Spec files
 
@@ -181,7 +181,7 @@ Instead of inline flags, pass `--spec sweep.json` (or `.yaml`, needing PyYAML):
 ```json
 {
   "name": "chaos-divergence",
-  "command": ["target-runner", "--chaos", "--seed", "{seed}", "./demo"],
+  "command": ["./workload", "--chaos", "--seed", "{seed}"],
   "worker_limits": {"cpu_cores": 1, "memory_bytes": 4294967296, "cpu_timeout_s": 120, "pids_max": 512},
   "hit": {"regex": "DIVERGENCE|panic", "hit_exit_codes": [134]},
   "identity": {"backend": "ptrace", "image": "demo5"}

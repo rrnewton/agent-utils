@@ -6,18 +6,20 @@ version, license, README, and embedded user guide.
 
 | Crate | Binaries | Purpose |
 |---|---|---|
-| `safe-ci-dag-runner` | `safe-ci-dag-runner`, `cpuset-alloc` | Run and inspect resource-aware CI DAGs; reserve hard-isolated CPU sets for benchmarks. |
+| `dagrun` | `dagrun`, `cpuset-alloc` | Run and inspect resource-aware CI DAGs; reserve hard-isolated CPU sets for benchmarks. |
 | `tick-hub` | `tick-hub` | Evaluate cadenced reminders and health checks in one deterministic tick. |
 | `pr-landing-planner` | `pr-landing-planner` | Produce advisory, conflict-aware pull-request landing plans. |
-| `herdr-run` | `herdr-run`, `herdr-agent` | Run policy-admitted commands and durably message interactive agents through Herdr panes. |
+| `herdr-run` | `herdr-run` | Execute policy-admitted shell commands through Herdr panes. |
+| `agentctl` | `agentctl`, `herdr-agent` | Control persistent interactive Herdr agents through one session registry. |
 
 Install one published command with Cargo:
 
 ```sh
-cargo install safe-ci-dag-runner
+cargo install dagrun
 cargo install tick-hub
 cargo install pr-landing-planner
 cargo install herdr-run
+cargo install agentctl
 ```
 
 For workspace development:
@@ -41,6 +43,13 @@ that will run. Before execution, the launcher publishes a named,
 content-addressed copy outside the deletable Cargo cache; containment code can
 therefore safely re-execute its own path while another process cleans or rebuilds.
 Direct invocations cannot silently use a binary from older checked-out source.
+
+Cargo and the host-compiler probe run from filesystem root with absolute
+workspace and target paths. This prevents a consumer repository that contains
+the agent-utils checkout from injecting an enclosing `.cargo/config.toml` or
+`rust-toolchain.toml`. Explicit environment choices and the normal user
+`CARGO_HOME` configuration remain available. After validation, the utility
+itself still starts in the caller's original working directory.
 
 These source-checkout launchers target Linux development hosts and require Git,
 Bash 4+, Cargo/Rust, GNU coreutils (`cp`, `readlink`, and `sha256sum`), and

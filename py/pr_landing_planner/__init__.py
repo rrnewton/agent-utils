@@ -69,6 +69,7 @@ from pr_landing_planner.model import (
     RawPr,
     RedClass,
     ReviewBinding,
+    ValidationAuthority,
     ValidationEvidence,
 )
 from pr_landing_planner.plan import assemble_result, compute_plan
@@ -103,6 +104,7 @@ __all__ = [
     "RawPr",
     "RedClass",
     "ReviewBinding",
+    "ValidationAuthority",
     "ValidationEvidence",
     # classify
     "ClassifyConfig",

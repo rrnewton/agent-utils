@@ -29,27 +29,26 @@ from pr_landing_planner.model import (
 ColorFn = Callable[[str, str], str]
 
 #: Why clustering saves *validate runs*, not just rebases. A clean validation record is keyed to the
-#: exact head and base SHAs. Landing moves the base and rebasing also changes the head, so serial
-#: draining invalidates queued evidence at every step. Landing a real-conflict cluster as one stack
-#: collapses that to one rebase and validation per cluster. Single source: reused by every renderer.
+#: exact head SHA, while the consuming workspace may authorize a rebase to retain soft-green without
+#: pre-landing revalidation. Landing a real-conflict cluster as one stack avoids repeated rebases and
+#: their post-facto validation runs. Single source: reused by every renderer.
 VALIDATE_ECONOMICS_RATIONALE = (
-    "The clean-validate record is keyed to the exact head and base SHAs. Landing moves the base, "
-    "and rebasing also changes the head, so serial draining invalidates queued validation evidence "
-    "at every step (self-defeating). Landing each real-conflict cluster as ONE stack collapses that "
-    "to one rebase and one validate per cluster, so clustering avoids the same count of rebases "
-    "AND validate runs."
+    "A branch behind its fetched base must rebase before landing. The consuming workspace may "
+    "authorize that rebase to retain soft-green without pre-landing revalidation; post-facto "
+    "validation remains due. Landing each real-conflict cluster as ONE stack avoids the same "
+    "count of repeated rebases and post-facto validate runs."
 )
 
 
 def _rebase_economics(clusters: Sequence[Cluster]) -> dict[str, object]:
-    """The rebase/validate economics of this plan: rebases avoided by clustering are ALSO the
-    validate runs avoided, because the validate record is SHA-keyed (see
+    """The rebase/validate economics of this plan: each landing avoided by clustering avoids
+    both its rebase and its post-facto validate run (see
     :data:`VALIDATE_ECONOMICS_RATIONALE`). Pure; deterministic."""
     saved = rebases_avoided(clusters)
     return {
         "validate_record_keyed_to": "head_sha+base_sha",
         "rebases_avoided_by_clustering": saved,
-        # 1:1 with rebases: a rebase changes the head SHA, which invalidates that PR's validate record.
+        # 1:1 with rebases: each avoided landing also avoids its post-facto validate run.
         "validate_runs_avoided_by_clustering": saved,
         "rationale": VALIDATE_ECONOMICS_RATIONALE,
     }
@@ -68,6 +67,7 @@ def _node_obj(node: PrNode, held: bool) -> dict[str, object]:
         "title": node.title,
         "author": node.author,
         "head": node.head_sha,
+        "updated_at": node.updated_at or None,
         "base_sha": node.base_sha,
         "base_ref": node.base_ref,
         "ci": node.ci.raw_state.value,
@@ -81,8 +81,12 @@ def _node_obj(node: PrNode, held: bool) -> dict[str, object]:
         "labels": list(node.labels),
         "assigned_agent": node.assigned_agent or None,
         "validation_evidence": node.validation_evidence.value,
+        "validation_authority": node.validation_authority.value,
         "policy_class": node.policy_class.value,
         "review_decision": node.review_decision or None,
+        "review_evidence_unavailable": node.review_evidence_unavailable,
+        "review_evidence_digest": node.review_evidence_digest or None,
+        "review_objections_resolved": node.review_objections_resolved,
         "review_binding": review_binding(node)[0].value,
         "review_pass_heads": dict(node.review_pass_heads),
     }

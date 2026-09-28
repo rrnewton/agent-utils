@@ -41,6 +41,7 @@ def _cfg() -> TickConfig:
                     when=GateWhen.ALWAYS,
                     capture=True,
                     timeout_secs=195,
+                    parallel=True,
                 ),
             ),
         ),
@@ -63,6 +64,7 @@ def test_roundtrip_is_stable() -> None:
     gate = back.reminders[1].gate
     assert gate is not None and gate.when is GateWhen.ALWAYS and gate.capture is True
     assert gate.timeout_secs == 195
+    assert gate.parallel is True
     assert back.reminders[1].emit.fields == {"threshold": "20"}
     assert back.health_checks[0].glob == "/var/*.sql"
 
@@ -72,6 +74,14 @@ def test_direct_models_are_validated_before_serialization() -> None:
         TickConfig(
             reminders=(
                 Reminder("two words", Emit(EmitKind.ACTION, skill="handler")),
+            )
+        ),
+        TickConfig(
+            reminders=(
+                Reminder(
+                    "__tick_hub_internal__.collision",
+                    Emit(EmitKind.ACTION, skill="handler"),
+                ),
             )
         ),
         TickConfig(
@@ -160,6 +170,7 @@ def test_strict_parse_errors() -> None:
         '{"reminders": [{"name": "", "emit": {"skill": "s"}}]}',
         '{"reminders": [{"name": "two words", "emit": {"skill": "s"}}]}',
         '{"reminders": [{"name": "key=value", "emit": {"skill": "s"}}]}',
+        '{"reminders": [{"name": "__tick_hub_internal__.collision", "emit": {"skill": "s"}}]}',
         '{"reminders": [{"name": "r", "cadence_secs": -1, "emit": {"skill": "s"}}]}',
         '{"reminders": [{"name": "r", "requires_flags": null, "emit": {"skill": "s"}}]}',
         '{"reminders": [{"name": "r", "emit": {"skill": "s", "fields": {"<<": "x"}}}]}',

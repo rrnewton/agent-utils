@@ -1,21 +1,54 @@
+"""The schema-2 projection, which no build performs any more.
+
+`timeline_shards.SCHEMA_2_IS_PUBLISHED` is ``False`` and :func:`write_timeline_shards` refuses to
+run while it is. The writer survives its own retirement for one reason: `query.py` and
+`static/app.js` both still *read* schema 2, for archives an older tool built, and a reader whose
+input cannot be produced cannot be tested. That makes this file the description of what those
+archives contain -- so it is kept, whole, rather than reduced to a test of the refusal.
+
+The refusal itself is asserted once, at the bottom, and every other test here runs inside
+:func:`schema_2_writer_enabled`. The autouse fixture is deliberate and deliberately module-scoped
+in effect: enabling the writer globally would let a *build* test silently produce a generation this
+tool no longer emits, which is the one mistake the constant exists to prevent.
+"""
+
 from __future__ import annotations
 
 import gzip
 import hashlib
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.archive import JsonValue, as_array, as_object, read_json
-from agent_team_timeline.timeline_shards import (
+from wrkviz.archive import JsonValue, as_array, as_object, read_json
+from wrkviz.search_bloom import (
+    TRIGRAM_BLOOM_HASH_COUNT,
+    build_trigram_bloom,
+    bloom_might_contain,
+    trigram_bloom_from_catalog,
+)
+from wrkviz.timeline_shards import (
     SCHEMA_2_BOOTSTRAP_PATH,
     write_timeline_shards,
 )
 
+from tests.timeline_legacy_generations import schema_2_writer_enabled
+
+
+@pytest.fixture(autouse=True)
+def _legacy_writer() -> Iterator[None]:
+    """Every test in this file is about the retired writer, so every test may run it."""
+
+    with schema_2_writer_enabled():
+        yield
+
 
 def _ms(value: str) -> int:
-    return int(datetime.fromisoformat(value).astimezone(timezone.utc).timestamp() * 1000)
+    return int(
+        datetime.fromisoformat(value).astimezone(timezone.utc).timestamp() * 1000
+    )
 
 
 def _timeline() -> dict[str, JsonValue]:
@@ -45,6 +78,7 @@ def _timeline() -> dict[str, JsonValue]:
                 "agent_id": "root",
                 "start_ms": start,
                 "end_ms": end,
+                "stats": {"tool_calls": 2},
                 "states": [],
             },
             {
@@ -52,6 +86,7 @@ def _timeline() -> dict[str, JsonValue]:
                 "agent_id": "root",
                 "start_ms": start,
                 "end_ms": midnight,
+                "stats": {"tool_calls": 1},
                 "states": [],
             },
         ],
@@ -87,7 +122,7 @@ def _timeline() -> dict[str, JsonValue]:
                 "target_id": "root",
                 "source_ms": midnight,
                 "target_ms": midnight,
-            }
+            },
         ],
         "events": [
             {"agent_id": "root", "at_ms": start, "kind": "user_prompt"},
@@ -145,6 +180,7 @@ def test_schema_2_projection_is_content_addressed_range_sharded_and_idempotent(
     phase_index_reference = as_object(bootstrap["phase_index"], "phase index reference")
     phase_index = _object(tmp_path, phase_index_reference)
     assert phase_index["kind"] == "timeline-phase-index"
+    assert phase_index["source_digest"] == "source-digest"
     indexed_phases = [
         as_object(value, "indexed phase")
         for value in as_array(phase_index["phases"], "indexed phases")
@@ -164,6 +200,7 @@ def test_schema_2_projection_is_content_addressed_range_sharded_and_idempotent(
             "end_ms",
             "activity_start_ms",
             "activity_end_ms",
+            "stats",
         }
         for phase in indexed_phases
     )
@@ -171,6 +208,7 @@ def test_schema_2_projection_is_content_addressed_range_sharded_and_idempotent(
     global_reference = as_object(bootstrap["global"], "global reference")
     global_object = _object(tmp_path, global_reference)
     assert global_object["kind"] == "timeline-global"
+    assert global_object["source_digest"] == "source-digest"
     assert len(as_array(global_object["agents"], "global agents")) == 1
     assert [
         as_object(value, "structural edge")["id"]
@@ -210,6 +248,129 @@ def test_schema_2_projection_is_content_addressed_range_sharded_and_idempotent(
     assert second.generated_files == first.generated_files
 
 
+def test_schema_2_publishes_content_addressed_transcript_search_shards(
+    tmp_path: Path,
+) -> None:
+    start = _ms("2026-08-11T23:30:00+00:00")
+    midnight = _ms("2026-08-12T00:00:00+00:00")
+    records: list[dict[str, JsonValue]] = [
+        {
+            "schema_version": 1,
+            "ref": "message:test-team::prompt",
+            "record_type": "prompt",
+            "role": "user",
+            "team": "test-team",
+            "agent_id": "root",
+            "agent_ref": "agent:test-team::root",
+            "agent_path": "/root",
+            "event_id": "prompt",
+            "turn_id": "turn-1",
+            "at_ms": start,
+            "text": "Where is backend maturity documented?",
+            "author_kind": "owner_human",
+            "ingress_kind": "web",
+            "prompt_ref": "message:test-team::prompt",
+            "prompt_author_kind": "owner_human",
+            "content_fidelity": "verbatim",
+        },
+        {
+            "schema_version": 1,
+            "ref": "message:test-team::response",
+            "record_type": "response",
+            "role": "assistant",
+            "team": "test-team",
+            "agent_id": "root",
+            "agent_ref": "agent:test-team::root",
+            "agent_path": "/root",
+            "event_id": "response",
+            "turn_id": "turn-1",
+            "at_ms": midnight,
+            "text": "B3 means at least half of the ptrace corpus passes.",
+            "author_kind": "agent",
+            "ingress_kind": "codex",
+            "prompt_ref": "message:test-team::prompt",
+            "prompt_author_kind": "owner_human",
+            "content_fidelity": "verbatim",
+        },
+    ]
+
+    first = write_timeline_shards(tmp_path, _timeline(), search_records=records)
+
+    assert first.search_shards == 2
+    bootstrap = as_object(
+        read_json(tmp_path / SCHEMA_2_BOOTSTRAP_PATH), "search bootstrap"
+    )
+    search = as_object(bootstrap["search"], "search")
+    assert search["strategy"] == "transcript-message-shards"
+    assert search["counts"] == {
+        "inter_agent": 0,
+        "prompts": 1,
+        "records": 2,
+        "responses": 1,
+        "tools": 0,
+    }
+    catalog = [
+        as_object(value, "search shard")
+        for value in as_array(search["shards"], "search shards")
+    ]
+    assert [value["day"] for value in catalog] == ["2026-08-11", "2026-08-12"]
+    prompt_filter = trigram_bloom_from_catalog(
+        as_object(catalog[0]["trigram_bloom"], "prompt trigram bloom")
+    )
+    response_filter = trigram_bloom_from_catalog(
+        as_object(catalog[1]["trigram_bloom"], "response trigram bloom")
+    )
+    assert bloom_might_contain(prompt_filter, "backend maturity")
+    assert not bloom_might_contain(prompt_filter, "ptrace corpus")
+    assert bloom_might_contain(response_filter, "ptrace corpus")
+    prompt_shard = _object(tmp_path, catalog[0])
+    response_shard = _object(tmp_path, catalog[1])
+    prompt_linkage = _object(
+        tmp_path, as_object(catalog[0]["linkage"], "prompt linkage")
+    )
+    response_linkage = _object(
+        tmp_path, as_object(catalog[1]["linkage"], "response linkage")
+    )
+    assert prompt_shard["source_digest"] == "source-digest"
+    assert response_shard["source_digest"] == "source-digest"
+    assert [
+        as_object(value, "search record")["ref"]
+        for value in as_array(prompt_shard["records"], "records")
+    ] == ["message:test-team::prompt"]
+    assert [
+        as_object(value, "search record")["ref"]
+        for value in as_array(response_shard["records"], "records")
+    ] == ["message:test-team::response"]
+    assert prompt_linkage["prompts"] == [
+        {
+            "excerpt": "Where is backend maturity documented?",
+            "ref": "message:test-team::prompt",
+        }
+    ]
+    assert prompt_linkage["responses"] == []
+    assert response_linkage["prompts"] == []
+    assert response_linkage["responses"] == [
+        {
+            "agent_ref": "agent:test-team::root",
+            "at_ms": midnight,
+            "prompt_ref": "message:test-team::prompt",
+            "ref": "message:test-team::response",
+        }
+    ]
+
+    second = write_timeline_shards(tmp_path, _timeline(), search_records=records)
+    assert second.files_changed == 0
+    assert second.generated_files == first.generated_files
+
+
+def test_trigram_bloom_catalog_requires_the_portable_hash_count() -> None:
+    catalog = build_trigram_bloom(("backend maturity",)).catalog_obj()
+    assert catalog["hash_count"] == TRIGRAM_BLOOM_HASH_COUNT
+    catalog["hash_count"] = TRIGRAM_BLOOM_HASH_COUNT - 1
+    with pytest.raises(ValueError, match=r"hash_count: expected 7"):
+        trigram_bloom_from_catalog(catalog)
+
+
 def _shard_manifest(root: Path) -> dict[str, JsonValue]:
     path = root / "data" / "timeline-v2" / "manifest.json"
     return as_object(read_json(path), str(path))
@@ -217,9 +378,7 @@ def _shard_manifest(root: Path) -> dict[str, JsonValue]:
 
 def _object_file_set(manifest: dict[str, JsonValue], field: str) -> set[str]:
     return {
-        value
-        for value in as_array(manifest[field], field)
-        if isinstance(value, str)
+        value for value in as_array(manifest[field], field) if isinstance(value, str)
     }
 
 
@@ -243,9 +402,10 @@ def test_schema_2_retains_one_distinct_generation_and_idempotent_reruns(
 
     unchanged = write_timeline_shards(tmp_path, second_timeline)
     assert unchanged.files_changed == 0
-    assert _object_file_set(
-        _shard_manifest(tmp_path), "retained_objects"
-    ) == second_retained
+    assert (
+        _object_file_set(_shard_manifest(tmp_path), "retained_objects")
+        == second_retained
+    )
 
     third_timeline = _timeline()
     third_timeline["project_overview"] = {"text": "generation three"}
@@ -274,7 +434,9 @@ def test_schema_2_narrower_scope_drops_prior_generation_immediately(
     current = _object_file_set(manifest, "current_objects")
 
     assert _object_file_set(manifest, "retained_objects") == set()
-    assert all(not (tmp_path / relative).exists() for relative in wide_objects - current)
+    assert all(
+        not (tmp_path / relative).exists() for relative in wide_objects - current
+    )
 
 
 def test_schema_2_projection_can_skip_sidecars_for_temporary_builds(
@@ -316,3 +478,26 @@ def test_schema_2_projection_rejects_symlinked_bootstrap_files(
         write_timeline_shards(tmp_path, _timeline())
 
     assert victim.read_text(encoding="utf-8") == "preserve me\n"
+
+
+def test_the_writer_refuses_to_run_for_a_build(tmp_path: Path) -> None:
+    """The refusal, with the fixture's licence explicitly withdrawn.
+
+    This is the enforcement `archive_gc` leans on when it offers a whole 1.4 GB generation to the
+    trash. A constant that merely *said* the writer had stopped would be a comment; this makes it a
+    fact, and makes the flip impossible to land as a one-line lie that left the writer running.
+    """
+
+    import wrkviz.timeline_shards as module
+
+    # The autouse fixture above has lifted the constant for this test as for every other, so it is
+    # put back here -- which is also the only way to reach the branch a build would reach. What the
+    # *default* is is asserted where it belongs, beside the collector that depends on it, in
+    # `test_timeline_archive_gc.py`.
+    module.SCHEMA_2_IS_PUBLISHED = False
+    try:
+        with pytest.raises(ValueError, match="must not publish schema 2"):
+            write_timeline_shards(tmp_path, _timeline())
+    finally:
+        module.SCHEMA_2_IS_PUBLISHED = True
+    assert not (tmp_path / SCHEMA_2_BOOTSTRAP_PATH).exists()

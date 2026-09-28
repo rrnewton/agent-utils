@@ -8,16 +8,17 @@ from pathlib import Path
 
 import pytest
 
-import agent_team_timeline.pipeline as pipeline_module
-from agent_team_timeline.model import TeamData
-from agent_team_timeline.orc import (
+import wrkviz.pipeline as pipeline_module
+from wrkviz.build_store import team_build_root
+from wrkviz.model import TeamData
+from wrkviz.orc import (
     OrcContinuationLink,
     OrcContinuationSpec,
     OrcParseError,
     OrcSnapshotResult,
     OrcSourceCopy,
 )
-from agent_team_timeline.pipeline import (
+from wrkviz.pipeline import (
     _load_orc_source_manifest,
     ingest_orc,
     load_archived_team,
@@ -44,7 +45,7 @@ def _spec(value: str | OrcContinuationSpec) -> OrcContinuationSpec:
 
 
 def _manifest_path(archive: Path) -> Path:
-    path = archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+    path = team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -56,6 +57,7 @@ def _link(
     started_at_ms: int = 2_000,
     start_message_id: str | None = None,
     start_source_line: int | None = None,
+    predecessor_source_table: str | None = None,
 ) -> OrcContinuationLink:
     return OrcContinuationLink(
         predecessor_session_id=predecessor,
@@ -68,6 +70,7 @@ def _link(
         gap_ms=started_at_ms - predecessor_at_ms,
         start_message_id=start_message_id,
         start_source_line=start_source_line,
+        predecessor_source_table=predecessor_source_table,
     )
 
 
@@ -87,10 +90,15 @@ def _write_manifest(
     }
     if continuations:
         records = [continuation.to_json_obj() for continuation in continuations]
-        if schema_version == 3:
-            for record in records:
+        # Each manifest version is written in exactly the shape that version defines, rather than
+        # the newest shape with fields the loader happens to tolerate. A test that wrote a v3 record
+        # carrying v5 fields would be asserting nothing about v3.
+        for record in records:
+            if schema_version == 3:
                 del record["start_message_id"]
                 del record["start_source_line"]
+            if schema_version in (3, 4):
+                del record["predecessor_source_table"]
         value["continuation_sessions"] = records
     _manifest_path(archive).write_text(json.dumps(value), encoding="utf-8")
 
@@ -124,7 +132,7 @@ def test_orc_schema_two_manifest_can_upgrade_with_continuations(
     assert state.continuation_specs == (OrcContinuationSpec(NEXT),)
 
 
-@pytest.mark.parametrize("schema_version", (3, 4))
+@pytest.mark.parametrize("schema_version", (3, 4, 5))
 def test_orc_continuation_manifest_requires_continuation_records(
     tmp_path: Path, schema_version: int
 ) -> None:
@@ -132,6 +140,59 @@ def test_orc_continuation_manifest_requires_continuation_records(
 
     with pytest.raises(OrcParseError, match="continuation_sessions"):
         _load_orc_source_manifest(tmp_path, "orc-test", ROOT, None)
+
+
+def test_manifest_version_and_boundary_table_field_must_agree(
+    tmp_path: Path,
+) -> None:
+    """The field's presence is the version's whole meaning, so neither may drift from the other.
+
+    A v4 record carrying a boundary table would claim a fact the v4 writer could not have
+    established, and a v5 record without the key would be a v4 record wearing a v5 label -- read as
+    "already resolved" and therefore never migrated. Both directions refuse, because a manifest that
+    silently tolerated either would make the version number stop meaning anything.
+    """
+
+    link = _link(
+        start_message_id="restart-message",
+        start_source_line=11,
+        predecessor_source_table="messages",
+    )
+    _write_manifest(tmp_path, 4, (link,))
+    forward_dated = json.loads(
+        _manifest_path(tmp_path).read_text(encoding="utf-8")
+    )
+    forward_dated["continuation_sessions"][0]["predecessor_source_table"] = "messages"
+    _manifest_path(tmp_path).write_text(
+        json.dumps(forward_dated), encoding="utf-8"
+    )
+    with pytest.raises(OrcParseError, match="cannot name a predecessor boundary table"):
+        _load_orc_source_manifest(tmp_path, "orc-test", ROOT, None)
+
+    _write_manifest(tmp_path, 5, (link,))
+    back_dated = json.loads(_manifest_path(tmp_path).read_text(encoding="utf-8"))
+    del back_dated["continuation_sessions"][0]["predecessor_source_table"]
+    _manifest_path(tmp_path).write_text(json.dumps(back_dated), encoding="utf-8")
+    with pytest.raises(OrcParseError, match="lacks its predecessor_source_table"):
+        _load_orc_source_manifest(tmp_path, "orc-test", ROOT, None)
+
+
+def test_unresolved_boundary_table_survives_a_manifest_round_trip(
+    tmp_path: Path,
+) -> None:
+    """A null table is a recorded state, not a missing field, and must decode back as one."""
+
+    link = _link(
+        start_message_id="restart-message",
+        start_source_line=11,
+        predecessor_source_table=None,
+    )
+    _write_manifest(tmp_path, 5, (link,))
+
+    state = _load_orc_source_manifest(tmp_path, "orc-test", ROOT, None)
+
+    assert state.continuation_links == (link,)
+    assert state.continuation_links[0].predecessor_source_table is None
 
 
 def test_recorded_orc_continuations_are_reused_and_only_prefix_extended(
@@ -197,6 +258,7 @@ def test_orc_pipeline_persists_and_reuses_continuation_manifest_state(
     link = _link(
         start_message_id="restart-message",
         start_source_line=11,
+        predecessor_source_table="messages",
     )
     snapshot_calls: list[
         tuple[
@@ -215,8 +277,9 @@ def test_orc_pipeline_persists_and_reuses_continuation_manifest_state(
         captured_at: str,
         continuation_specs: Sequence[str | OrcContinuationSpec] = (),
         previous_continuations: Sequence[OrcContinuationLink] = (),
+        accept_prefix_rewrite: Sequence[str] = (),
     ) -> OrcSnapshotResult:
-        del source_root, snapshot_root, captured_at
+        del source_root, snapshot_root, captured_at, accept_prefix_rewrite
         assert root_session_id == ROOT
         snapshot_calls.append(
             (
@@ -262,7 +325,7 @@ def test_orc_pipeline_persists_and_reuses_continuation_manifest_state(
     manifest = json.loads(
         _manifest_path(archive).read_text(encoding="utf-8")
     )
-    assert manifest["schema_version"] == 4
+    assert manifest["schema_version"] == 5
     assert manifest["continuation_sessions"] == [link.to_json_obj()]
     assert snapshot_calls == [
         ((), (bounded,), ()),
@@ -283,6 +346,7 @@ def test_orc_pipeline_rejects_resolved_boundary_drift_before_normalization(
         captured_at: str,
         continuation_specs: Sequence[str | OrcContinuationSpec] = (),
         previous_continuations: Sequence[OrcContinuationLink] = (),
+        accept_prefix_rewrite: Sequence[str] = (),
     ) -> OrcSnapshotResult:
         del (
             source_root,
@@ -292,6 +356,7 @@ def test_orc_pipeline_rejects_resolved_boundary_drift_before_normalization(
             captured_at,
             continuation_specs,
             previous_continuations,
+            accept_prefix_rewrite,
         )
         return OrcSnapshotResult((), 0, (_link(),))
 
@@ -329,7 +394,7 @@ def test_orc_pipeline_rejects_resolved_boundary_drift_before_normalization(
             (OrcContinuationSpec(NEXT, "restart-message"),),
         )
     assert not (
-        archive / "teams" / "orc-test" / "raw" / "source-manifest.json"
+        team_build_root(archive, "orc-test") / "raw" / "source-manifest.json"
     ).exists()
 
 
@@ -364,9 +429,13 @@ def test_orc_pipeline_dispatches_typed_spec_into_real_snapshot(
     assert first.sources > 0
     assert second.files_changed == 0
     manifest = json.loads(_manifest_path(archive).read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == 4
+    assert manifest["schema_version"] == 5
     assert manifest["continuation_sessions"][0]["session_id"] == FIXTURE_SUCCESSOR
     assert manifest["continuation_sessions"][0]["start_message_id"] is None
+    assert (
+        manifest["continuation_sessions"][0]["predecessor_source_table"]
+        == "content_blocks"
+    )
 
 
 def test_orc_normalizer_schema_bump_fails_closed_until_reingest(
@@ -376,7 +445,7 @@ def test_orc_normalizer_schema_bump_fails_closed_until_reingest(
     archive = tmp_path / "archive"
     ingest_orc(archive, source, FIXTURE_ROOT, "orc-test", "UTC")
     marker_path = (
-        archive / "teams" / "orc-test" / "raw" / "normalized-generation.json"
+        team_build_root(archive, "orc-test") / "raw" / "normalized-generation.json"
     )
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
 

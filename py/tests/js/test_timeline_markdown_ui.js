@@ -5,7 +5,7 @@ const fs = require("fs");
 const path = require("path");
 
 const repoPy = path.resolve(__dirname, "..", "..");
-const staticRoot = path.join(repoPy, "agent_team_timeline", "static");
+const staticRoot = path.join(repoPy, "wrkviz", "static");
 const bundlePath = path.join(
   staticRoot,
   "vendor",

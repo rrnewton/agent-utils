@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from agent_team_timeline.model import Agent, Edge, Event, TeamData, Turn
-from agent_team_timeline.naming import AgentNameResult
-from agent_team_timeline.render import _result_edge_objs
+from wrkviz.model import Agent, Edge, Event, TeamData, Turn
+from wrkviz.naming import AgentNameResult
+from wrkviz.render import _result_edge_objs
 
 
 START = 1_800_000_000_000

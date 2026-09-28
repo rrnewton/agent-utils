@@ -21,7 +21,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -244,6 +244,11 @@ impl Sleeper for ThreadSleeper {
 pub trait HerdrApi {
     /// Ensure a compatible server is running; return whether this call started it.
     fn ensure_server(&self) -> Result<bool>;
+    /// Report whether a server is running, WITHOUT starting one.
+    ///
+    /// Separate from [`HerdrApi::ensure_server`] because a read-only caller must be able to say
+    /// "no server" without becoming the reason there is one.
+    fn server_running(&self) -> bool;
     /// Resolve a workspace label, refusing ambiguous duplicate labels.
     fn workspace_id_for_label(&self, label: &str) -> Result<Option<String>>;
     /// Return the live label for a workspace ID, if that ID exists.
@@ -290,7 +295,8 @@ impl Broker {
 
 /// Production command-level client for a Herdr session.
 pub struct HerdrClient {
-    herdr_bin: String,
+    configured_herdr_bin: PathBuf,
+    herdr_bin: OnceLock<String>,
     systemd_run_bin: String,
     account_home: String,
     broker: Broker,
@@ -302,7 +308,8 @@ impl fmt::Debug for HerdrClient {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("HerdrClient")
-            .field("herdr_bin", &self.herdr_bin)
+            .field("configured_herdr_bin", &self.configured_herdr_bin)
+            .field("herdr_bin", &self.herdr_bin.get())
             .field("systemd_run_bin", &self.systemd_run_bin)
             .field("account_home", &self.account_home)
             .field("broker", &self.broker)
@@ -323,7 +330,6 @@ impl HerdrClient {
     /// group/world writable; caller-controlled `PATH` is never searched.
     pub fn with_executable(broker: &str, configured: &Path) -> Result<Self> {
         let account_home = current_account_home()?;
-        let herdr_bin = resolve_configured_herdr_executable(configured, &account_home)?;
         let systemd_run_bin = resolve_fixed_executable(
             "systemd-run",
             &[
@@ -332,16 +338,20 @@ impl HerdrClient {
             ],
         )?;
         let runner = Arc::new(SystemCommandRunner::new(&account_home));
-        Self::from_parts(
-            broker,
-            herdr_bin,
+        let account_home = utf8_absolute(&account_home, "account home")?;
+        let systemd_run_bin = utf8_absolute(&systemd_run_bin, "systemd-run executable")?;
+        Ok(Self {
+            configured_herdr_bin: configured.to_path_buf(),
+            herdr_bin: OnceLock::new(),
             systemd_run_bin,
             account_home,
+            broker: Broker::parse(broker)?,
             runner,
-            Arc::new(ThreadSleeper),
-        )
+            sleeper: Arc::new(ThreadSleeper),
+        })
     }
 
+    #[cfg(test)]
     fn from_parts(
         broker: &str,
         herdr_bin: PathBuf,
@@ -354,13 +364,43 @@ impl HerdrClient {
         let systemd_run_bin = utf8_absolute(&systemd_run_bin, "systemd-run executable")?;
         let account_home = utf8_absolute(&account_home, "account home")?;
         Ok(Self {
-            herdr_bin,
+            configured_herdr_bin: PathBuf::from(&herdr_bin),
+            herdr_bin: OnceLock::from(herdr_bin),
             systemd_run_bin,
             account_home,
             broker: Broker::parse(broker)?,
             runner,
             sleeper,
         })
+    }
+
+    /// Resolve the configured Herdr executable without invoking it.
+    ///
+    /// Normal construction is deliberately lazy: report-only operations such as an empty reap do
+    /// not depend on a Herdr installation. `status` calls this method because it must distinguish
+    /// "Herdr is not installed" from "Herdr is installed and no server is running".
+    pub fn preflight(&self) -> Result<()> {
+        self.herdr_executable()?;
+        Ok(())
+    }
+
+    fn herdr_executable(&self) -> Result<String> {
+        if let Some(resolved) = self.herdr_bin.get() {
+            return Ok(resolved.clone());
+        }
+        let resolved = resolve_configured_herdr_executable(
+            &self.configured_herdr_bin,
+            Path::new(&self.account_home),
+        )?;
+        let resolved = utf8_absolute(&resolved, "Herdr executable")?;
+        // Concurrent first callers may both resolve. Whichever stores first becomes the stable
+        // executable for this client; every caller returns that same cached winner.
+        let _ = self.herdr_bin.set(resolved);
+        Ok(self
+            .herdr_bin
+            .get()
+            .expect("a successful Herdr resolution must populate the cache")
+            .clone())
     }
 
     /// Ensure a compatible server is available, using production polling limits.
@@ -377,6 +417,8 @@ impl HerdrClient {
             return Ok(false);
         }
 
+        let herdr_bin = self.herdr_executable()?;
+
         let launch = vec![
             self.systemd_run_bin.clone(),
             "--user".to_owned(),
@@ -387,7 +429,7 @@ impl HerdrClient {
             "herdr-run Herdr server (outside the agent sandbox)".to_owned(),
             "--setenv".to_owned(),
             format!("HOME={}", self.account_home),
-            self.herdr_bin.clone(),
+            herdr_bin,
             "server".to_owned(),
         ];
         let completed = self.runner.run(&launch).map_err(|error| {
@@ -510,6 +552,95 @@ impl HerdrClient {
         Ok(())
     }
 
+    /// Close one explicitly owned tab, without closing its shared workspace.
+    pub fn close_tab(&self, tab_id: &str) -> Result<()> {
+        self.call_ok(
+            &strings(&["tab", "close", tab_id]),
+            &format!("tab close {tab_id}"),
+        )
+    }
+
+    /// Start a visible harness in an existing shell pane with literal arguments.
+    /// Requires Herdr 0.8 or newer and preserves a failed launch for inspection.
+    pub fn start_agent(
+        &self,
+        name: &str,
+        kind: &str,
+        pane_id: &str,
+        arguments: &[String],
+        timeout: Duration,
+    ) -> Result<()> {
+        if timeout.is_zero() || timeout > Duration::from_secs(300) {
+            return Err(HerdrRunError::unavailable(
+                "agent startup timeout must be between 0 and 300 seconds",
+            ));
+        }
+        let mut args = strings(&[
+            "agent",
+            "start",
+            name,
+            "--kind",
+            kind,
+            "--pane",
+            pane_id,
+            "--timeout",
+        ]);
+        args.extend([timeout.as_millis().max(1).to_string(), "--".to_owned()]);
+        args.extend_from_slice(arguments);
+        let result = self.invoke_with_timeout(&args, timeout + CONTROL_TIMEOUT)?;
+        if result.status != 0 {
+            return Err(HerdrRunError::unavailable(format!(
+                "agent start {name:?}: {}",
+                stderr_detail(&result)
+            )));
+        }
+        Ok(())
+    }
+
+    /// Resolve an exact live Herdr agent name, rejecting a stale pane occupant.
+    pub fn agent_pane(&self, name: &str) -> Result<String> {
+        let result = self.call(
+            &strings(&["agent", "get", name]),
+            &format!("agent get {name:?}"),
+        )?;
+        let info = required_object(&result, "agent", "agent get")?;
+        if required_string(info, "name", "agent get")? != name {
+            return Err(HerdrRunError::unavailable(format!(
+                "agent get: returned a different agent name for {name:?}"
+            )));
+        }
+        required_string(info, "pane_id", "agent get")
+    }
+
+    /// Publish an explicitly supplied native session identity on its named pane.
+    pub fn report_agent_session(
+        &self,
+        name: &str,
+        pane_id: &str,
+        kind: &str,
+        session_id: &str,
+    ) -> Result<()> {
+        if self.agent_pane(name)? != pane_id {
+            return Err(HerdrRunError::unavailable(
+                "cannot bind a session to a different named agent pane",
+            ));
+        }
+        self.call_ok(
+            &strings(&[
+                "pane",
+                "report-agent-session",
+                pane_id,
+                "--source",
+                "herdr-agent",
+                "--agent",
+                kind,
+                "--agent-session-id",
+                session_id,
+            ]),
+            "report managed agent session",
+        )
+    }
+
     /// List all panes, optionally restricted to `workspace_id`.
     pub fn panes(&self, workspace_id: Option<&str>) -> Result<Vec<Pane>> {
         let mut args = strings(&["pane", "list"]);
@@ -608,10 +739,10 @@ impl HerdrClient {
         let purpose = format!("wait for pane {pane_id} status {status}");
         let completed = self.invoke_with_timeout(
             &[
+                "agent".to_owned(),
                 "wait".to_owned(),
-                "agent-status".to_owned(),
                 pane_id.to_owned(),
-                "--status".to_owned(),
+                "--until".to_owned(),
                 status.to_owned(),
                 "--timeout".to_owned(),
                 timeout_ms.to_string(),
@@ -631,7 +762,8 @@ impl HerdrClient {
         let envelope = document.as_object().ok_or_else(|| {
             HerdrRunError::unavailable(format!("{purpose}: event response is not an object"))
         })?;
-        let data = required_object(envelope, "data", &purpose)?;
+        let result = required_object(envelope, "result", &purpose)?;
+        let data = required_object(result, "agent", &purpose)?;
         let returned_pane = required_string(data, "pane_id", &purpose)?;
         let returned_status = required_string(data, "agent_status", &purpose)?;
         if returned_pane != pane_id || returned_status != status {
@@ -703,6 +835,17 @@ impl HerdrClient {
         )
     }
 
+    /// Submit agent text using live bracketed-paste mode and encoded Enter.
+    ///
+    /// The native primitive keeps Enter outside the paste interpreted by agent
+    /// composers. This call does not wait for a lifecycle transition.
+    pub fn prompt_agent(&self, pane_id: &str, text: &str) -> Result<()> {
+        self.call_ok(
+            &strings(&["agent", "prompt", pane_id, text]),
+            &format!("agent prompt {pane_id}"),
+        )
+    }
+
     /// Send named `keys` to `pane_id`.
     pub fn send_keys(&self, pane_id: &str, keys: &str) -> Result<()> {
         self.call_ok(
@@ -717,7 +860,8 @@ impl HerdrClient {
         object_entries(values, "workspace list entry")
     }
 
-    fn server_running(&self) -> bool {
+    /// Report whether a Herdr server is currently running, starting nothing.
+    pub fn server_running(&self) -> bool {
         let completed = match self.invoke(&strings(&["status", "--json"])) {
             Ok(completed) if completed.status == 0 => completed,
             _ => return false,
@@ -740,7 +884,7 @@ impl HerdrClient {
 
     fn invoke_with_timeout(&self, args: &[String], timeout: Duration) -> Result<CommandOutput> {
         let mut command = Vec::with_capacity(args.len() + 1);
-        command.push(self.herdr_bin.clone());
+        command.push(self.herdr_executable()?);
         command.extend_from_slice(args);
         if self.broker == Broker::SystemdRun {
             let mut wrapped = vec![
@@ -805,6 +949,10 @@ impl HerdrClient {
 impl HerdrApi for HerdrClient {
     fn ensure_server(&self) -> Result<bool> {
         HerdrClient::ensure_server(self)
+    }
+
+    fn server_running(&self) -> bool {
+        HerdrClient::server_running(self)
     }
 
     fn workspace_id_for_label(&self, label: &str) -> Result<Option<String>> {
@@ -1238,6 +1386,34 @@ mod tests {
     }
 
     #[test]
+    fn missing_herdr_is_deferred_until_preflight_or_a_live_query() {
+        let missing = std::env::temp_dir().join(format!(
+            "missing-herdr-{}-{}",
+            std::process::id(),
+            TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let client = HerdrClient::with_executable("direct", &missing)
+            .expect("constructing a query-free client must not resolve Herdr");
+
+        assert!(client.herdr_bin.get().is_none());
+        let preflight_error = client.preflight().unwrap_err();
+        assert_eq!(preflight_error.kind(), crate::error::ErrorKind::Unavailable);
+        assert!(preflight_error
+            .to_string()
+            .contains(&missing.display().to_string()));
+        assert!(
+            client.herdr_bin.get().is_none(),
+            "failed resolution is not cached"
+        );
+
+        let query_error = client.workspace_id_for_label("wanted").unwrap_err();
+        assert_eq!(query_error.kind(), crate::error::ErrorKind::Unavailable);
+        assert!(query_error
+            .to_string()
+            .contains(&missing.display().to_string()));
+    }
+
+    #[test]
     fn systemd_broker_uses_absolute_paths_and_only_account_home() {
         let runner =
             FakeRunner::with_outputs(vec![output(0, r#"{"result":{"workspaces":[]}}"#, "")]);
@@ -1319,7 +1495,7 @@ mod tests {
             ),
             output(
                 0,
-                r#"{"data":{"pane_id":"p1","agent_status":"working"}}"#,
+                r#"{"result":{"agent":{"pane_id":"p1","agent_status":"working"}}}"#,
                 "",
             ),
         ]);
@@ -1342,10 +1518,10 @@ mod tests {
         assert_eq!(
             &calls[2][1..],
             strings(&[
+                "agent",
                 "wait",
-                "agent-status",
                 "p1",
-                "--status",
+                "--until",
                 "working",
                 "--timeout",
                 "30000",
@@ -1367,7 +1543,7 @@ mod tests {
 
         let wrong_event = FakeRunner::with_outputs(vec![output(
             0,
-            r#"{"data":{"pane_id":"other","agent_status":"done"}}"#,
+            r#"{"result":{"agent":{"pane_id":"other","agent_status":"done"}}}"#,
             "",
         )]);
         let error = client("direct", wrong_event)
@@ -1527,6 +1703,32 @@ mod tests {
         )]);
         let error = client("direct", wrong_type).process_info("p").unwrap_err();
         assert!(error.to_string().contains("not an integer"));
+    }
+
+    #[test]
+    fn agent_prompt_uses_native_paste_while_shell_run_stays_raw() {
+        let runner = FakeRunner::with_outputs(vec![
+            output(0, r#"{"result":{"type":"agent_prompted"}}"#, ""),
+            output(0, "", ""),
+        ]);
+        let client = client("direct", runner.clone());
+        client
+            .prompt_agent("p", "literal\nmessage $(untouched)")
+            .unwrap();
+        client.run("p", "printf shell").unwrap();
+        assert_eq!(
+            runner.calls(),
+            vec![
+                strings(&[
+                    "/opt/herdr/bin/herdr",
+                    "agent",
+                    "prompt",
+                    "p",
+                    "literal\nmessage $(untouched)"
+                ]),
+                strings(&["/opt/herdr/bin/herdr", "pane", "run", "p", "printf shell"]),
+            ]
+        );
     }
 
     #[test]

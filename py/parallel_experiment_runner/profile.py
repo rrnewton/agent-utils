@@ -1,6 +1,6 @@
 """Stable profile keys + a small per-key sample store for cost estimation and calibration.
 
-This layer is DELIBERATELY separate from ``safe-ci-dag-runner``'s own profile store. A seed
+This layer is DELIBERATELY separate from ``dagrun``'s own profile store. A seed
 sweep's per-round step tags embed the seed (``seed.00000042``) and so cannot be prior-run
 keys; instead every seed step in one apples-to-apples round shares ONE stable
 :func:`profile_identity` key, and this store groups samples under that key. Keeping it here

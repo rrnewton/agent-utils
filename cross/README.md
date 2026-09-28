@@ -20,7 +20,7 @@ cleaning or rebuilding therefore cannot mix Rust versions within a differential.
 Run one tool, or increase the randomized corpus reproducibly:
 
 ```sh
-python3 cross/differential.py --tool safe-ci-dag-runner
+python3 cross/differential.py --tool dagrun
 python3 cross/differential.py --tool tick-hub --random 100 --seed 8675309
 python3 cross/differential.py --tool pr-landing-planner --random 100 --seed 8675309
 python3 cross/differential.py --tool cpuset-alloc
@@ -28,13 +28,13 @@ python3 cross/differential.py --tool herdr-run
 python3 cross/differential.py --tool herdr-agent
 ```
 
-When `--tool` is omitted, the harness checks `safe-ci-dag-runner`.
+When `--tool` is omitted, the harness checks `dagrun`.
 
 ## What is compared
 
 | Tool | Differential contract |
 |---|---|
-| `safe-ci-dag-runner` | Canonical DAG listing, visualization, JSON, YAML loading, validation failures, plan and summary data, selection, successful parallel-speedup sweeps, argument forwarding, stress reports, resource sizing, run outcomes, profile-store schema, CLI surface, and enforcement-capability manifest. |
+| `dagrun` | Canonical DAG listing, visualization, JSON, YAML loading, validation failures, plan and summary data, selection, successful parallel-speedup sweeps, argument forwarding, stress reports, resource sizing, run outcomes, profile-store schema, CLI surface, and enforcement-capability manifest. |
 | `cpuset-alloc` | CLI surface, version, durable-ledger status and reclaim JSON, malformed and boundary arguments, reservation behavior, mutation self-test verdicts, and hard-pin fail-closed behavior. |
 | `tick-hub` | Strict JSON/YAML config loading, canonical emission, cadence state, reminder gates, freshness output, flush transitions, CLI failures, numeric boundaries, malformed documents, and randomized tick configurations. |
 | `pr-landing-planner` | Fixture collection, graphs, clusters, status and plan output in every format, exact-head/base validation, approval and gate safety decisions, ordering/conflict groups, malformed evidence, numeric boundaries, and randomized PR graphs. |

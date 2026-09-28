@@ -1,24 +1,43 @@
-"""Tests for the safe-ci-dag-runner CLI surface (in-process, stdlib capture)."""
+"""Tests for the dagrun CLI surface (in-process, stdlib capture)."""
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
+import csv
 import io
 import json
+import shlex
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import cast
 
 import pytest
 
-from safe_ci_dag_runner import __version__
-from safe_ci_dag_runner.cli import (
+from dagrun import __version__
+import dagrun.cli as cli
+from dagrun.cli import (
     CGROUP_SETUP_ENVIRONMENT_ERROR,
     PROG,
     _load_userguide,
     main,
 )
+from dagrun.model import DagConfig, Step
+from dagrun.protocols import CgroupManager, MetricsSink
+from dagrun.profile_capture import (
+    CaptureConfig,
+    CaptureKind,
+    CaptureManifest,
+    CaptureState,
+    CaptureWindow,
+    IsolatedTrialRequest,
+    IsolatedTrialResult,
+    ProfileCaptureError,
+)
+from dagrun.sweep import CpuTopology
 
 _DEMO = '{"steps": [{"group": "g", "job": "j", "cmd": "true", "deps": []}]}'
 
@@ -69,23 +88,55 @@ def test_run_help_lists_flags_and_cores_pinning() -> None:
     """`run --help` exits 0, lists its flags, and surfaces --cores CPU pinning discoverably."""
     code, out, _ = _capture_help(["run", "--help"])
     assert code == 0
-    for flag in ("--dag", "--jobs", "--cores", "--only", "--planner", "--keep-going"):
+    for flag in (
+        "--dag",
+        "--max-steps",
+        "--max-cpus",
+        "--cores",
+        "--selected",
+        "--labels",
+        "--ignore-selected-deps",
+        "--planner",
+        "--keep-going",
+        "--allow-unwise-nest-dagruns",
+    ):
         assert flag in out, flag
+    assert "--jobs" not in out
+    assert "--only" not in out
     # Discoverable pinning aliases + intent keywords (greppable).
     assert "--cpuset" in out and "--pin" in out
     # argparse line-wraps help, so collapse whitespace before substring checks.
     low = " ".join(out.lower().split())
     assert "pinning" in low or "cpuset" in low or "affinity" in low
     assert "opt-in" in low and "off by default" in low
+    assert "every dependency they require" in low
+    assert "run only the named steps" in low
+    for cmdtype in (
+        "unknown",
+        "make",
+        "cargo-build",
+        "cargo-test",
+        "cargo-nextest",
+        "generic-dash-j-command",
+        "generic-with-flag",
+    ):
+        assert cmdtype in out
+    assert "$DAGRUN_EXTRA_ARGS" in out
 
 
 def test_run_help_has_no_rust_binary_mention() -> None:
-    """The Python help must describe the PYTHON tool only - no Rust binary / cargo."""
+    """The Python help must not direct the reader to a Rust executable."""
     _, out, _ = _capture_help(["run", "--help"])
     low = out.lower()
-    assert "cargo" not in low
     assert "rs/target" not in low
     assert "rust binary" not in low
+
+    _, top, _ = _capture_help(["--help"])
+    assert "rust" not in top.lower()
+    normalized = " ".join(top.split())
+    assert "sweep: --output-dir" in normalized
+    assert "--perf-dir as an alias" in normalized
+    assert "other commands: --perf-dir" in normalized
 
 
 @pytest.mark.parametrize("command", ["run", "pin-run"])
@@ -115,6 +166,50 @@ def test_subcommand_help_exits_zero_and_lists_flags(sub: str, expected: str) -> 
     code, out, _ = _capture_help([sub, "--help"])
     assert code == 0
     assert expected in out
+
+
+def test_sweep_help_explains_modes_widths_and_profile_artifacts() -> None:
+    code, out, _ = _capture_help(["sweep", "--help"])
+    normalized = " ".join(out.lower().split())
+
+    assert code == 0
+    for phrase in (
+        "single-step dense mode",
+        "target-time graph mode",
+        "one at a time in stable topological order",
+        "pass 1 always completes",
+        "every started pass finishes",
+        "powers of two through the physical-core count",
+        "physical-core and logical-thread counts",
+        "1,2,4,8,16,32,64,128,158,316",
+        "integer midpoints",
+        "cmdtype, jobs_flag, and/or jobs_env",
+        "./.dagrun/profiles/",
+        "does not redirect terminal or child-process output",
+        "scaling_model_*.json",
+        "profile_report.html",
+        "traces/<run_id>.csv",
+        "persist every sample and show the fastest wall time",
+        "-vv streams child stdout/stderr",
+        "separate perf-record trial",
+        "not added to the scaling model",
+        "acknowledged fifo control interface",
+        "repeatable",
+        "typically 300ms..500ms",
+        "sudo -n",
+        "this sweep's own uninstrumented data",
+        "under captures/",
+    ):
+        assert phrase in normalized
+    assert "--output-dir" in out
+    assert "--report-html" in out
+    assert "--no-report" in out
+    assert "--perf-record" in out
+    assert "--perf-window" in out
+    assert "--wprof-window" in out
+    assert "--profiler-sudo" in out
+    assert "backward-compatible alias for --output-dir" in normalized
+    assert "--max-cpus" not in out
 
 
 def test_summary_top_help_describes_local_plan_and_single_input_merge() -> None:
@@ -183,12 +278,12 @@ def test_summary_action_schema_rejects_invalid_invocations(args: list[str]) -> N
 
 
 def test_python_quickstart_mentions_python_install_only() -> None:
-    """The Python quickstart install step must mention pip, never cargo/the Rust binary."""
+    """The Python quickstart install step must not direct the reader to the Rust binary."""
     rc, out, _ = _capture(["quickstart"])
     assert rc == 0
     low = out.lower()
     assert "pip install" in low
-    assert "cargo" not in low
+    assert "cargo install" not in low
     assert "rs/target" not in low
 
 
@@ -200,7 +295,7 @@ def test_userguide_prints_embedded_guide() -> None:
     assert out == embedded
     # A real, substantial guide (not a stub) with recognizable content.
     assert len(out) > 5000
-    assert "safe-ci-dag-runner" in out
+    assert "dagrun" in out
 
 
 def test_list_and_ascii() -> None:
@@ -238,6 +333,109 @@ def test_run_exit_codes() -> None:
         assert _capture(["run", "--dag", str(bad), "-q", _ACF])[0] == 1
 
 
+@pytest.mark.parametrize("schema", [2, 3])
+def test_structured_result_descriptor_lists_but_run_refuses_before_execution(
+    tmp_path: Path, schema: int,
+) -> None:
+    marker = tmp_path / "ran"
+    dag = tmp_path / "structured.json"
+    dag.write_text(
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "group": "test",
+                        "job": "counts",
+                        "cmd": f"touch {shlex.quote(str(marker))}",
+                        "result_manifests": [
+                            {
+                                "kind": "structured-test-results",
+                                "schema": schema,
+                                "path_env": "DAGRUN_TEST_COUNTS_PATH",
+                                "owner": "test.counts",
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    list_rc, listed, list_error = _capture(["list", "--dag", str(dag)])
+    assert list_rc == 0, list_error
+    assert "test.counts" in listed
+
+    run_rc, _, run_error = _capture(["run", "--dag", str(dag), "-q", _ACF])
+    assert run_rc == 1
+    assert "REFUSING to run before any node starts" in run_error
+    assert "Python runner does not implement structured test-result capture" in run_error
+    assert not marker.exists()
+
+
+def test_nested_run_refuses_by_outer_run_and_override_is_explicit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "seen-outer-run"
+    dag = tmp_path / "inner.json"
+    dag.write_text(
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "group": "g",
+                        "job": "j",
+                        "cmd": f"printf '%s' \"$DAGRUN_OUTER_RUN\" > {shlex.quote(str(marker))}",
+                        # Runner policy must replace a manifest-authored value on this key.
+                        "env": {"DAGRUN_OUTER_RUN": "forged"},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("DAGRUN_OUTER_RUN", "--dag outer.json")
+    rc, out, err = _capture(["run", "--dag", "/does/not/need/to/exist.json"])
+    assert rc == 2
+    assert out == ""
+    assert "refusing nested invocation" in err
+    assert "--dag outer.json" in err
+    assert "--allow-unwise-nest-dagruns" in err
+    assert "No such file" not in err
+
+    rc, _, err = _capture(
+        [
+            "run",
+            "--dag",
+            str(dag),
+            "--allow-unwise-nest-dagruns",
+            "--unsafe-no-cgroups",
+            "--no-profile",
+            "--no-profile-feedback",
+            "-q",
+        ]
+    )
+    assert rc == 0, err
+    assert marker.read_text(encoding="utf-8") == "g.j"
+
+    marker.unlink()
+    monkeypatch.delenv("DAGRUN_OUTER_RUN")
+    rc, _, err = _capture(
+        [
+            "run",
+            "--dag",
+            str(dag),
+            "--unsafe-no-cgroups",
+            "--no-profile",
+            "--no-profile-feedback",
+            "-q",
+        ]
+    )
+    assert rc == 0, err
+    assert marker.read_text(encoding="utf-8") == "g.j"
+
+
 def test_missing_and_malformed_dag_exit_2() -> None:
     assert _capture(["run", "--dag", "/nonexistent/nope.json", "-q"])[0] == 2
     with tempfile.TemporaryDirectory() as tmp:
@@ -246,8 +444,24 @@ def test_missing_and_malformed_dag_exit_2() -> None:
         assert _capture(["list", "--dag", str(junk)])[0] == 2
 
 
+def test_wrong_document_error_names_the_path_contents_and_next_action(tmp_path: Path) -> None:
+    path = tmp_path / "not-a-dag.yaml"
+    path.write_text("schema: 2\nbucket: example\ntest: []\n", encoding="utf-8")
+
+    rc, out, err = _capture(["list", "--dag", str(path)])
+
+    assert rc == 2
+    assert out == ""
+    assert err == (
+        f"dagrun: {path}: expected a dagrun DAG document with a top-level 'steps' list; "
+        "found no 'steps' key (top-level keys: 'bucket', 'schema', 'test'). This may be a "
+        "different document type. Pass a dagrun DAG file, or run `dagrun quickstart` for the "
+        "schema.\n"
+    )
+
+
 def test_run_max_mem_exits_0() -> None:
-    # --max-mem picks a memory-aware -j; a passing DAG still exits 0.
+    # --max-mem picks a memory-aware active-step ceiling; a passing DAG still exits 0.
     with tempfile.TemporaryDirectory() as tmp:
         dag = _demo_path(tmp)
         rc, _, err = _capture(["run", "--max-mem", "8G", "--dag", dag, "-q", _ACF])
@@ -255,16 +469,22 @@ def test_run_max_mem_exits_0() -> None:
         assert "--max-mem 8G" in err  # the sizing decision is surfaced
 
 
-def test_run_max_mem_no_throttle_note() -> None:
-    # A DAG with no per-step rss_baseline_bytes: the modeled footprint collapses to the
-    # mem_cap_floor_bytes floor, so a budget at/above the floor picks the full -j (CPU count)
-    # and a note explains why --max-mem did not throttle (No Silent Failure).
+def test_run_max_mem_counts_the_undeclared_step_default() -> None:
+    # A bare runnable step still receives the positive default memory cap, so --max-mem models
+    # that real enforced cap rather than pretending the footprint collapsed to zero/the floor.
     with tempfile.TemporaryDirectory() as tmp:
-        dag = _demo_path(tmp)
-        rc, _, err = _capture(["run", "--max-mem", "16G", "--dag", dag, "-q", _ACF])
+        dag = Path(tmp) / "dag.json"
+        dag.write_text(
+            '{"mem_cap_floor_bytes": 0, "steps": '
+            '[{"group": "g", "job": "j", "cmd": "true"}]}',
+            encoding="utf-8",
+        )
+        rc, _, err = _capture(
+            ["run", "--max-mem", "16G", "--dag", str(dag), "-q", _ACF]
+        )
         assert rc == 0
-        assert "no step carries rss_baseline_bytes" in err
-        assert "did not throttle" in err
+        assert "worst-case 1073741824 bytes" in err
+        assert "no runnable step has a positive" not in err
 
 
 def test_run_max_mem_with_baseline_no_note() -> None:
@@ -279,16 +499,19 @@ def test_run_max_mem_with_baseline_no_note() -> None:
         )
         rc, _, err = _capture(["run", "--max-mem", "64G", "--dag", str(dag), "-q", _ACF])
         assert rc == 0
-        assert "no step carries rss_baseline_bytes" not in err
+        assert "no runnable step has a positive" not in err
 
 
-def test_run_jobs_overrides_max_mem() -> None:
-    # When both --jobs and --max-mem are given, --jobs wins with a visible note.
+def test_run_max_cpus_and_max_mem_control_independent_limits() -> None:
+    # --max-cpus sets total CPU capacity while --max-mem independently derives max active steps.
     with tempfile.TemporaryDirectory() as tmp:
         dag = _demo_path(tmp)
-        rc, _, err = _capture(["run", "--jobs", "2", "--max-mem", "8G", "--dag", dag, "-q", _ACF])
+        rc, _, err = _capture(
+            ["run", "--max-cpus", "2", "--max-mem", "8G", "--dag", dag, "-q", _ACF]
+        )
         assert rc == 0
-        assert "--jobs=2 wins" in err
+        assert "--max-mem 8G -> modeled memory ceiling" in err
+        assert "base active-step ceiling 2; final --max-steps 2" in err
 
 
 def test_run_perf_dir_writes_csv() -> None:
@@ -302,29 +525,53 @@ def test_run_perf_dir_writes_csv() -> None:
         assert csvs, "expected at least one perf CSV to be written"
         assert any(p.stat().st_size > 0 for p in csvs)
         assert "perf CSVs written under" in err
-        # No stray flock sidecar left behind in the user's --perf-dir.
+        # Lock coordination stays in the hidden .locks directory, not beside data files.
         assert not list(perf.glob("*.lock"))
 
 
-def test_run_only_runs_exactly_selected_step() -> None:
-    # --only runs EXACTLY the named step(s) and nothing else (deps not run). The selected step's
-    # dep (build.app) is NOT executed, so exactly one step passes.
-    dag = (
-        '{"steps": ['
-        '{"group": "build", "job": "app", "cmd": "true"},'
-        '{"group": "test", "job": "unit", "cmd": "true", "deps": ["build.app"]}'
-        "]}"
-    )
+def test_run_selected_runs_full_dependency_ancestry_in_order() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "dag.json"
-        path.write_text(dag, encoding="utf-8")
-        rc, _, err = _capture(["run", "--dag", str(path), "--only", "test.unit", "-q", _ACF])
+        order = Path(tmp) / "order"
+        path.write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "group": "package",
+                            "job": "tarball",
+                            "cmd": f"printf 'package\\n' >> {order}",
+                            "deps": ["test.unit"],
+                        },
+                        {
+                            "group": "test",
+                            "job": "unit",
+                            "cmd": f"printf 'test\\n' >> {order}",
+                            "deps": ["build.app"],
+                        },
+                        {
+                            "group": "build",
+                            "job": "app",
+                            "cmd": f"printf 'build\\n' >> {order}",
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        rc, _, err = _capture(
+            ["run", "--dag", str(path), "--selected", "package.tarball", "-q", _ACF]
+        )
         assert rc == 0
-        assert "1 passed, 0 failed, 0 aborted, 0 intentionally skipped, 0 dependency-skipped" in err
+        assert order.read_text(encoding="utf-8") == "build\ntest\npackage\n"
+        assert (
+            "3 passed, 0 failed, 0 aborted, 0 intentionally skipped, "
+            "0 dependency-skipped, 0 not launched"
+        ) in err
 
 
-def test_run_only_multiple_steps() -> None:
-    # A comma-separated selection runs exactly those steps.
+def test_run_selected_multiple_steps() -> None:
+    # A comma-separated selection runs those steps and any dependencies they require.
     dag = (
         '{"steps": ['
         '{"group": "a", "job": "x", "cmd": "true"},'
@@ -335,17 +582,145 @@ def test_run_only_multiple_steps() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "dag.json"
         path.write_text(dag, encoding="utf-8")
-        rc, _, err = _capture(["run", "--dag", str(path), "--only", "a.x,c.z", "-q", _ACF])
+        rc, _, err = _capture(
+            ["run", "--dag", str(path), "--selected", "a.x,c.z", "-q", _ACF]
+        )
         assert rc == 0
-        assert "2 passed, 0 failed, 0 aborted, 0 intentionally skipped, 0 dependency-skipped" in err
+        assert (
+            "2 passed, 0 failed, 0 aborted, 0 intentionally skipped, "
+            "0 dependency-skipped, 0 not launched"
+        ) in err
 
 
-def test_run_only_unknown_tag_exits_2() -> None:
+def test_run_labels_select_a_union_and_include_dependencies() -> None:
+    dag = (
+        '{"steps": ['
+        '{"group":"build","job":"app","cmd":"true"},'
+        '{"group":"test","job":"unit","cmd":"true","labels":["quick","full"],"deps":["build.app"]},'
+        '{"group":"test","job":"slow","cmd":"true","labels":["full"]},'
+        '{"group":"privileged","job":"host","cmd":"true","labels":["super"]}'
+        "]}"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "dag.json"
+        path.write_text(dag, encoding="utf-8")
+        rc, _, err = _capture(["run", "--dag", str(path), "--labels", "quick,super", "-q", _ACF])
+        assert rc == 0
+        assert (
+            "3 passed, 0 failed, 0 aborted, 0 intentionally skipped, "
+            "0 dependency-skipped, 0 not launched"
+        ) in err
+
+        rc, _, err = _capture(["run", "--dag", str(path), "--labels", "test.unit", "-q", _ACF])
+        assert rc == 2
+        assert "unknown label(s): test.unit" in err
+        assert "Known labels: full, quick, super" in err
+
+
+def test_run_selected_and_labels_are_mutually_exclusive() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "dag.json"
+        path.write_text(
+            '{"steps":[{"group":"g","job":"j","cmd":"true","labels":["quick"]}]}',
+            encoding="utf-8",
+        )
+        rc, _, err = _capture(
+            ["run", "--dag", str(path), "--selected", "g.j", "--labels", "quick", "-q", _ACF]
+        )
+        assert rc == 2
+        assert "--selected and --labels cannot be combined" in err
+
+
+def test_keep_going_launches_later_independent_work_and_reports_full_accounting() -> None:
+    dag = (
+        '{"steps": ['
+        '{"group":"g","job":"fail","cmd":"exit 1","hint":{"est_duration_s":100}},'
+        '{"group":"g","job":"dependent","cmd":"true","deps":["g.fail"],"hint":{"est_duration_s":90}},'
+        '{"group":"g","job":"independent","cmd":"true","hint":{"est_duration_s":80}}'
+        "]}"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "dag.json"
+        path.write_text(dag, encoding="utf-8")
+
+        rc, _, err = _capture(["run", "--dag", str(path), "-q", "-s", "1", _ACF])
+        assert rc == 1
+        assert "0 passed, 1 failed, 0 aborted" in err
+        assert "1 dependency-skipped, 1 not launched" in err
+        assert "not launched: g.independent" in err
+
+        rc, _, err = _capture(
+            ["run", "--dag", str(path), "-q", "-s", "1", "--keep-going", _ACF]
+        )
+        assert rc == 1
+        assert "1 passed, 1 failed, 0 aborted" in err
+        assert "1 dependency-skipped, 0 not launched" in err
+        assert "not launched:" not in err
+
+
+def test_run_selected_can_ignore_dependencies() -> None:
+    dag = (
+        '{"steps": ['
+        '{"group": "build", "job": "app", "cmd": "true"},'
+        '{"group": "test", "job": "unit", "cmd": "true", "deps": ["build.app"]}'
+        "]}"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "dag.json"
+        path.write_text(dag, encoding="utf-8")
+        rc, _, err = _capture(
+            [
+                "run",
+                "--dag",
+                str(path),
+                "--selected",
+                "test.unit",
+                "--ignore-selected-deps",
+                "-q",
+                _ACF,
+            ]
+        )
+        assert rc == 0
+        assert (
+            "1 passed, 0 failed, 0 aborted, 0 intentionally skipped, "
+            "0 dependency-skipped, 0 not launched"
+        ) in err
+
+
+def test_ignore_selected_deps_requires_selected() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         dag = _demo_path(tmp)
-        rc, _, err = _capture(["run", "--dag", dag, "--only", "no.pe", "-q", _ACF])
+        rc, _, err = _capture(["run", "--dag", dag, "--ignore-selected-deps", "-q", _ACF])
+        assert rc == 2
+        assert "--ignore-selected-deps requires --selected" in err
+
+
+def test_run_selected_unknown_tag_exits_2() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = _demo_path(tmp)
+        rc, _, err = _capture(["run", "--dag", dag, "--selected", "no.pe", "-q", _ACF])
         assert rc == 2
         assert "unknown step tag" in err
+
+
+def test_retired_only_flag_and_boolean_value_are_rejected() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = _demo_path(tmp)
+        with pytest.raises(SystemExit) as only_error:
+            main(["run", "--dag", dag, "--only", "test.unit"])
+        assert only_error.value.code == 2
+        with pytest.raises(SystemExit) as boolean_value_error:
+            main(
+                [
+                    "run",
+                    "--dag",
+                    dag,
+                    "--selected",
+                    "test.unit",
+                    "--ignore-selected-deps=true",
+                ]
+            )
+        assert boolean_value_error.value.code == 2
 
 
 def test_run_profile_prints_table() -> None:
@@ -361,14 +736,14 @@ def test_run_profile_prints_table() -> None:
 def test_run_default_profile_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # With NEITHER --perf-dir NOR $SAFE_CI_DAG_RUNNER_PROFILE_DIR set, a run auto-logs to the
-    # repo-local default ./.safe-ci-dag-runner/profiles/ (relative to CWD) and says where.
-    monkeypatch.delenv("SAFE_CI_DAG_RUNNER_PROFILE_DIR", raising=False)
+    # With NEITHER --perf-dir NOR $DAGRUN_PROFILE_DIR set, a run auto-logs to the repo-local
+    # default ./.dagrun/profiles/ (relative to CWD) and says where.
+    monkeypatch.delenv("DAGRUN_PROFILE_DIR", raising=False)
     monkeypatch.chdir(tmp_path)
     dag = _demo_path(str(tmp_path))
     rc, _, err = _capture(["run", "--dag", dag, "-q", _ACF])
     assert rc == 0
-    store = tmp_path / ".safe-ci-dag-runner" / "profiles"
+    store = tmp_path / ".dagrun" / "profiles"
     csvs = list(store.glob("*.csv"))
     assert csvs, "expected the default profile store to be created and written"
     assert "default profile store" in err
@@ -377,12 +752,12 @@ def test_run_default_profile_store(
 def test_run_no_profile_writes_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("SAFE_CI_DAG_RUNNER_PROFILE_DIR", raising=False)
+    monkeypatch.delenv("DAGRUN_PROFILE_DIR", raising=False)
     monkeypatch.chdir(tmp_path)
     dag = _demo_path(str(tmp_path))
     rc, _, err = _capture(["run", "--dag", dag, "--no-profile", "-q", _ACF])
     assert rc == 0
-    assert not (tmp_path / ".safe-ci-dag-runner").exists()
+    assert not (tmp_path / ".dagrun").exists()
     assert "profile data appended" not in err
 
 
@@ -402,7 +777,24 @@ def test_sweep_prints_table_and_writes_store() -> None:
         assert "parallel-speedup sweep: g.j" in out
         for column in ("jobs", "wall_s", "user_s", "sys_s", "rss_hwm", "speedup(vs j1)"):
             assert column in out
-        assert list(store.glob("*.csv")), "sweep should append to the profile store"
+        profile = next(store.glob("step_profiles_*.csv"))
+        with profile.open(newline="", encoding="utf-8") as source:
+            rows = list(csv.DictReader(source))
+        assert rows
+        assert {row["enforcement_kind"] for row in rows} == {"unboxed"}
+        assert {row["runner_name"] for row in rows} == {"sweep"}
+
+
+def test_sweep_sink_labels_a_present_cgroup_manager_as_cgroup_v2(tmp_path: Path) -> None:
+    # The sink only needs manager presence to describe how the enclosing scheduler run is boxed;
+    # it does not call the manager itself.
+    manager = cast(CgroupManager, object())
+
+    sink = cli._sweep_sink(str(tmp_path), "deadbee", {}, manager)
+
+    assert sink is not None
+    assert getattr(sink, "enforcement_kind") == "cgroup-v2"
+    assert getattr(sink, "runner_name") == "sweep"
 
 
 def test_sweep_unknown_step_exits_2() -> None:
@@ -429,10 +821,1048 @@ def test_sweep_bad_range_exits_2() -> None:
         assert "invalid --jobs range" in err
 
 
+@pytest.mark.parametrize(
+    "extra",
+    (
+        ["--step", "g.j", "--jobs", "abc"],
+        ["--target-time", "0", "--jobs", "1,,2"],
+    ),
+)
+def test_sweep_usage_errors_precede_cgroup_and_profile_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra: list[str]
+) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "j", "cmd": "true", '
+        '"jobs_flag": "--workers="}]}',
+        encoding="utf-8",
+    )
+
+    def unexpected(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("usage validation must run before environment/profile setup")
+
+    monkeypatch.setattr(cli, "_resolve_cgroup_manager", unexpected)
+    monkeypatch.setattr(cli, "_resolve_profile_dir", unexpected)
+
+    rc, _, err = _capture(["sweep", "--dag", str(dag), *extra])
+
+    assert rc == 2
+    assert "invalid --jobs" in err
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    (
+        (["--no-profile", "--report-html", "report.html"], "cannot be combined with --no-profile"),
+        (["--no-report", "--report-html", "report.html"], "cannot be combined with --no-report"),
+        (["--output-dir", "one", "--perf-dir", "two"], "--output-dir and --perf-dir disagree"),
+    ),
+)
+def test_sweep_report_output_conflicts_are_usage_errors_before_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extra: list[str],
+    message: str,
+) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "j", "cmd": "true", '
+        '"jobs_flag": "--workers="}]}',
+        encoding="utf-8",
+    )
+
+    def unexpected(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("report/output validation must precede cgroup setup")
+
+    monkeypatch.setattr(cli, "_resolve_cgroup_manager", unexpected)
+    rc, _, err = _capture(
+        ["sweep", "--dag", str(dag), "--step", "g.j", "--jobs", "1", *extra]
+    )
+
+    assert rc == 2
+    assert message in err
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    (
+        (
+            ["--wprof-window", "300ms", "--wprof-window", "400ms"],
+            "durations must match",
+        ),
+        (["--perf-window", "0"], "duration must be greater than zero"),
+        (["--profiler-sudo"], "requires --perf-record"),
+        (
+            ["--perf-record", "--no-profile"],
+            "profiler capture options cannot be combined with --no-profile",
+        ),
+    ),
+)
+def test_sweep_profiler_usage_errors_precede_cgroup_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extra: list[str],
+    message: str,
+) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "j", "cmd": "true", '
+        '"jobs_flag": "--workers="}]}',
+        encoding="utf-8",
+    )
+
+    def unexpected(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("profiler validation must precede cgroup setup")
+
+    monkeypatch.setattr(cli, "_resolve_cgroup_manager", unexpected)
+    rc, _, err = _capture(
+        ["sweep", "--dag", str(dag), "--step", "g.j", "--jobs", "1", *extra]
+    )
+
+    assert rc == 2
+    assert message in err
+
+
+def test_repeated_equivalent_wprof_windows_request_separate_trials() -> None:
+    ns = cli.build_parser().parse_args(
+        [
+            "sweep",
+            "--dag",
+            "dag.json",
+            "--step",
+            "g.j",
+            "--jobs",
+            "1..2",
+            "--wprof-window",
+            "400ms",
+            "--wprof-window",
+            "0.4s",
+        ]
+    )
+
+    request = cli._parse_profiler_request(ns)
+
+    assert request.wprof_windows == 2
+    assert request.wprof_window_s == pytest.approx(0.4)
+    assert not request.capture_perf
+
+
+def test_legacy_sweep_still_requires_step_and_jobs() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = _demo_path(tmp)
+        rc, _, err = _capture(["sweep", "--dag", dag, "--no-profile"])
+    assert rc == 2
+    assert "without --target-time, --step and --jobs are required" in err
+
+
+def test_runtime_sweep_topology_falls_back_to_logical_when_physical_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "detect_cpu_topology",
+        lambda: CpuTopology(tuple(range(6)), physical_core_count=None),
+    )
+    monkeypatch.setattr(cli, "container_core_budget", lambda: 4)
+
+    topology = cli._effective_sweep_topology()
+
+    assert topology.logical_thread_count == 4
+    assert topology.physical_core_count == 4
+
+
+def test_target_sweep_completes_pass_one_in_topological_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A zero target still runs the entire mandatory first pass, one node at a time."""
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "group": "g",
+                        "job": "leaf",
+                        "cmd": "true",
+                        "deps": ["g.root"],
+                        "jobs_flag": "--workers=",
+                    },
+                    {
+                        "group": "g",
+                        "job": "root",
+                        "cmd": "true",
+                        "jobs_flag": "--workers=",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: list[tuple[str, int, bool]] = []
+
+    def fake_run(
+        step: Step,
+        cfg: DagConfig,
+        inner_jobs: int,
+        cgroups: CgroupManager | None,
+        metrics: MetricsSink | None,
+        verbosity: int,
+        *,
+        vary_width: bool = True,
+        profile_timeseries_interval_s: float | None = None,
+    ) -> cli._SweepMeasure:
+        del cfg, cgroups, metrics, verbosity, profile_timeseries_interval_s
+        calls.append((step.tag, inner_jobs, vary_width))
+        return cli._SweepMeasure(1.0, 1.0, 0.0, 1024, True)
+
+    monkeypatch.setattr(cli, "_run_single_step", fake_run)
+    monkeypatch.setattr(
+        cli,
+        "_effective_sweep_topology",
+        lambda: CpuTopology(tuple(range(4)), physical_core_count=2),
+    )
+    monkeypatch.setattr(cli, "_resolve_cgroup_manager", lambda *_args, **_kwargs: (None, 0))
+
+    rc, out, err = _capture(
+        ["sweep", "--dag", str(dag), "--target-time", "0", "--no-profile"]
+    )
+
+    assert rc == 0
+    assert calls == [
+        ("g.root", 1, True),
+        ("g.root", 2, True),
+        ("g.root", 4, True),
+        ("g.leaf", 1, True),
+        ("g.leaf", 2, True),
+        ("g.leaf", 4, True),
+    ]
+    assert "parallel-scaling sweep: 2 node(s), target 0.000s" in out
+    assert "sweep pass 1 starting: cumulative widths [1,2,4] (mandatory minimum pass)" in out
+    assert "target-time sweep complete: 1 pass(es), 6 sample(s)" in out
+    assert "overrun " in out
+    assert err == ""
+
+
+def test_target_sweep_starts_a_second_cumulative_pass_and_finishes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The target is checked between passes; a started refinement pass is atomic."""
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "j", "cmd": "true", '
+        '"cmdtype": "generic-with-flag", "jobs_flag": "--workers="}]}',
+        encoding="utf-8",
+    )
+    calls: list[int] = []
+
+    def fake_run(
+        step: Step,
+        cfg: DagConfig,
+        inner_jobs: int,
+        cgroups: CgroupManager | None,
+        metrics: MetricsSink | None,
+        verbosity: int,
+        *,
+        vary_width: bool = True,
+        profile_timeseries_interval_s: float | None = None,
+    ) -> cli._SweepMeasure:
+        del step, cfg, cgroups, metrics, verbosity, vary_width, profile_timeseries_interval_s
+        calls.append(inner_jobs)
+        return cli._SweepMeasure(1.0, 1.0, 0.0, None, True)
+
+    ticks = iter((0.0, 0.0, 0.5, 0.5, 0.5, 2.0, 2.0, 2.0))
+    monkeypatch.setattr(cli, "_run_single_step", fake_run)
+    monkeypatch.setattr("dagrun.cli.time.monotonic", lambda: next(ticks))
+    monkeypatch.setattr(
+        cli,
+        "_effective_sweep_topology",
+        lambda: CpuTopology(tuple(range(4)), physical_core_count=2),
+    )
+    monkeypatch.setattr(cli, "_resolve_cgroup_manager", lambda *_args, **_kwargs: (None, 0))
+
+    rc, out, err = _capture(
+        ["sweep", "--dag", str(dag), "--target-time", "1", "--no-profile"]
+    )
+
+    assert rc == 0
+    assert calls == [1, 2, 4, 1, 2, 3, 4]
+    assert "sweep pass 2 starting: cumulative widths [1,2,3,4]" in out
+    assert "target-time sweep complete: 2 pass(es), 7 sample(s)" in out
+    assert "overrun 1.000s" in out
+    assert err == ""
+
+
+def test_legacy_profiler_capture_uses_current_sweep_sweet_spot_and_no_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "j", "cmd": "echo build", '
+        '"cmdtype": "generic-with-flag", "jobs_flag": "--workers="}]}',
+        encoding="utf-8",
+    )
+    ordinary_widths: list[int] = []
+    instrumented: list[tuple[int, str, MetricsSink | None, float | None]] = []
+
+    def fake_run(
+        step: Step,
+        cfg: DagConfig,
+        inner_jobs: int,
+        cgroups: CgroupManager | None,
+        metrics: MetricsSink | None,
+        verbosity: int,
+        *,
+        vary_width: bool = True,
+        profile_timeseries_interval_s: float | None = None,
+    ) -> cli._SweepMeasure:
+        del cfg, cgroups, verbosity, vary_width
+        if metrics is None:
+            instrumented.append(
+                (inner_jobs, step.cmd, metrics, profile_timeseries_interval_s)
+            )
+        else:
+            ordinary_widths.append(inner_jobs)
+        walls = {1: 10.0, 2: 5.0, 3: 4.8}
+        return cli._SweepMeasure(
+            walls[inner_jobs], 9.0, 1.0, 1024, True, returncode=0
+        )
+
+    def fake_capture(
+        selection: object,
+        config: CaptureConfig,
+        run_trial: object,
+    ) -> CaptureManifest:
+        from dagrun.profile_capture import RunIsolatedTrial, SweetSpotSelection
+
+        assert isinstance(selection, SweetSpotSelection)
+        assert selection.inner_jobs == 2
+        assert selection.expected_wall_s == pytest.approx(5.0)
+        assert selection.source == "scaling-model-economic-plateau"
+        assert config.capture_perf
+        assert config.perf_window_s == pytest.approx(0.02)
+        assert config.sudo == ("sudo", "-n")
+        callback = cast(RunIsolatedTrial, run_trial)
+        result = callback(
+            IsolatedTrialRequest(
+                trial_id="perf-001",
+                step="g.j",
+                inner_jobs=2,
+                kind=CaptureKind.PERF,
+                output_dir=tmp_path,
+                expected_wall_s=5.0,
+                window=CaptureWindow(0.02, 2.49, 0.02, False),
+                argv_prefix=("sudo", "-n", "fake-perf", "record", "--"),
+            )
+        )
+        assert isinstance(result, IsolatedTrialResult)
+        assert result.ok
+        return CaptureManifest(
+            path=tmp_path / "manifest.json",
+            capture_id="capture-test",
+            state=CaptureState.COMPLETE,
+            created_at="2026-01-01T00:00:00Z",
+            finished_at="2026-01-01T00:00:01Z",
+            selection=selection,
+            preflight=(),
+            trials=(),
+            errors=(),
+        )
+
+    monkeypatch.setattr(cli, "_run_single_step", fake_run)
+    monkeypatch.setattr(cli, "capture_at_sweet_spot", fake_capture)
+    monkeypatch.setattr(cli, "_resolve_cgroup_manager", lambda *_args, **_kwargs: (None, 0))
+    monkeypatch.setattr(cli, "_report_profile_written", lambda *_args: None)
+    monkeypatch.setattr(cli, "_refresh_scaling_model", lambda *_args: None)
+    monkeypatch.setattr(cli, "_refresh_profile_report", lambda *_args: None)
+
+    rc, out, err = _capture(
+        [
+            "sweep",
+            "--dag",
+            str(dag),
+            "--step",
+            "g.j",
+            "--jobs",
+            "1..3",
+            "--output-dir",
+            str(tmp_path / "profiles"),
+            "--perf-window",
+            "20ms",
+            "--profiler-sudo",
+        ]
+    )
+
+    assert rc == 0, err
+    assert ordinary_widths == [1, 2, 3]
+    assert len(instrumented) == 1
+    width, command, metrics, trace_interval = instrumented[0]
+    assert width == 2
+    assert metrics is None
+    assert trace_interval is None
+    assert "sudo -n fake-perf record --" in command
+    assert "guest-launch-ready.fifo" in command
+    assert "guest-launch-release.fifo" in command
+    assert command.index("fake-perf record --") < command.index("guest-launch-ready.fifo")
+    assert "echo build --workers=2" in command
+    assert "sweet-spot width 2" in out
+    assert f"profiler capture manifest: {tmp_path / 'manifest.json'}" in out
+
+
+def test_single_step_measure_preserves_exact_child_returncode() -> None:
+    step = Step("g", "status", "", "exit 37")
+    measure = cli._run_single_step(
+        step,
+        DagConfig(steps=(step,)),
+        1,
+        None,
+        None,
+        0,
+        vary_width=False,
+    )
+
+    assert not measure.ok
+    assert measure.returncode == 37
+
+
+@pytest.mark.parametrize(("channel", "width", "refused", "observe_startup"), (
+    ("CARGO_BUILD_JOBS", 1, False, False),
+    ("CARGO_BUILD_JOBS", 4, False, False),
+    ("LINENO", 1, True, False),
+    ("IFS", 1, True, False),
+    ("WORKER_JOBS", 2, False, True),
+))
+def test_jobs_env_profiled_guest_boundary(
+    tmp_path: Path, channel: str, width: int, refused: bool, observe_startup: bool,
+) -> None:
+    from dagrun.model import ResourceHint
+
+    profiler = tmp_path / "profiler"
+    guest = tmp_path / "guest"
+    startup = tmp_path / "startup"
+    hook = tmp_path / "startup.sh"
+    hook.write_text(f"printf '%s\\n' \"${{{channel}-unset}}\" >> {shlex.quote(str(startup))}\n")
+    step = Step("g", "j", "", f"printf '%s' \"${{{channel}-}}\" > {shlex.quote(str(guest))}",
+                jobs_flag="", hint=ResourceHint(preferred_inner_jobs=width),
+                env={channel: "99"})
+    request = IsolatedTrialRequest(
+        trial_id="jobs-env", step=step.tag, inner_jobs=width, kind=CaptureKind.PERF,
+        output_dir=tmp_path, expected_wall_s=1.0,
+        window=CaptureWindow(0.02, 0.0, 0.02, False),
+        argv_prefix=("/bin/bash", "-c", 'printf started > "$1"; shift; exec "$@"',
+                     "profiler", str(profiler)),
+        env={channel: "88", **({"BASH_ENV": str(hook)} if observe_startup else {})},
+    )
+    # Exercise the real shell handshake, using local regular files rather than a capture
+    # controller. This tests inner command execution, not FIFO/controller timing or real perf.
+    request.guest_launch_release_path.write_text("go\n")
+    cfg = DagConfig(steps=(step,), default_jobs_env=channel)
+    wrapped = cli._profiled_step(step, cfg, request)
+    assert wrapped.jobs_env == "" and wrapped.jobs_flag == ""
+    result = cli._run_single_step(wrapped, cfg, width, None, None, 0)
+    assert profiler.read_text() == "started"
+    assert int(request.guest_launch_ready_path.read_text()) > 0
+    if refused:
+        assert not result.ok
+        assert result.returncode == 125
+        assert not guest.exists(), "profiler startup is not proof that the guest was protected"
+    else:
+        assert result.ok and result.returncode == 0
+        assert guest.read_text() == str(width)
+        if observe_startup:
+            assert startup.read_text().splitlines()[0] == "unset"
+
+
+def test_target_profiler_capture_runs_after_pass_one_and_consumes_target_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "j", "cmd": "true", '
+        '"jobs_flag": "--workers="}]}',
+        encoding="utf-8",
+    )
+    clock = [0.0]
+    widths: list[int] = []
+    captures: list[tuple[str, tuple[int, ...]]] = []
+
+    def fake_run(
+        step: Step,
+        cfg: DagConfig,
+        inner_jobs: int,
+        cgroups: CgroupManager | None,
+        metrics: MetricsSink | None,
+        verbosity: int,
+        *,
+        vary_width: bool = True,
+        profile_timeseries_interval_s: float | None = None,
+    ) -> cli._SweepMeasure:
+        del step, cfg, cgroups, metrics, verbosity, vary_width, profile_timeseries_interval_s
+        widths.append(inner_jobs)
+        clock[0] += 0.1
+        return cli._SweepMeasure(1.0, 1.0, 0.0, None, True)
+
+    def fake_captures(
+        cfg: DagConfig,
+        step_samples: Sequence[
+            tuple[Step, Mapping[int, Sequence[cli._SweepMeasure]]]
+        ],
+        config: CaptureConfig,
+        cgroups: CgroupManager | None,
+        sweep_git_sha: str,
+        verbosity: int,
+    ) -> int:
+        del cfg, cgroups, sweep_git_sha, verbosity
+        assert config.capture_perf
+        assert len(step_samples) == 1
+        step, samples = step_samples[0]
+        captures.append((step.tag, tuple(samples)))
+        clock[0] += 0.6
+        return 0
+
+    monkeypatch.setattr(cli, "_run_single_step", fake_run)
+    monkeypatch.setattr(cli, "_run_profiler_captures", fake_captures)
+    monkeypatch.setattr("dagrun.cli.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        cli,
+        "_effective_sweep_topology",
+        lambda: CpuTopology(tuple(range(4)), physical_core_count=2),
+    )
+    monkeypatch.setattr(cli, "_resolve_cgroup_manager", lambda *_args, **_kwargs: (None, 0))
+    monkeypatch.setattr(cli, "_report_profile_written", lambda *_args: None)
+    monkeypatch.setattr(cli, "_refresh_scaling_model", lambda *_args: None)
+    monkeypatch.setattr(cli, "_refresh_profile_report", lambda *_args: None)
+
+    rc, out, err = _capture(
+        [
+            "sweep",
+            "--dag",
+            str(dag),
+            "--target-time",
+            "0.5",
+            "--jobs",
+            "1,4",
+            "--output-dir",
+            str(tmp_path / "profiles"),
+            "--perf-record",
+        ]
+    )
+
+    assert rc == 0, err
+    assert widths == [1, 4]
+    assert captures == [("g.j", (1, 4))]
+    assert "target-time sweep complete: 1 pass(es), 2 sample(s)" in out
+    assert "elapsed 0.800s, target 0.500s, overrun 0.300s" in out
+
+
+def test_target_profiler_capture_includes_a_fixed_width_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "fixed", "cmd": "true", '
+        '"jobs_flag": "", "hint": {"preferred_inner_jobs": 2}}]}',
+        encoding="utf-8",
+    )
+    captured: list[tuple[str, tuple[int, ...]]] = []
+
+    def fake_run(
+        step: Step,
+        cfg: DagConfig,
+        inner_jobs: int,
+        cgroups: CgroupManager | None,
+        metrics: MetricsSink | None,
+        verbosity: int,
+        *,
+        vary_width: bool = True,
+        profile_timeseries_interval_s: float | None = None,
+    ) -> cli._SweepMeasure:
+        del step, cfg, cgroups, metrics, verbosity, profile_timeseries_interval_s
+        assert not vary_width
+        assert inner_jobs == 2
+        return cli._SweepMeasure(1.0, 0.8, 0.1, 1024, True)
+
+    def fake_captures(
+        cfg: DagConfig,
+        step_samples: Sequence[
+            tuple[Step, Mapping[int, Sequence[cli._SweepMeasure]]]
+        ],
+        config: CaptureConfig,
+        cgroups: CgroupManager | None,
+        sweep_git_sha: str,
+        verbosity: int,
+    ) -> int:
+        del cfg, config, cgroups, sweep_git_sha, verbosity
+        step, samples = step_samples[0]
+        captured.append((step.tag, tuple(samples)))
+        return 0
+
+    monkeypatch.setattr(cli, "_run_single_step", fake_run)
+    monkeypatch.setattr(cli, "_run_profiler_captures", fake_captures)
+    monkeypatch.setattr(cli, "_resolve_cgroup_manager", lambda *_args, **_kwargs: (None, 0))
+    monkeypatch.setattr(cli, "_report_profile_written", lambda *_args: None)
+    monkeypatch.setattr(cli, "_refresh_scaling_model", lambda *_args: None)
+    monkeypatch.setattr(cli, "_refresh_profile_report", lambda *_args: None)
+
+    rc, _, err = _capture(
+        [
+            "sweep",
+            "--dag",
+            str(dag),
+            "--target-time",
+            "0",
+            "--output-dir",
+            str(tmp_path / "profiles"),
+            "--perf-record",
+        ]
+    )
+
+    assert rc == 0, err
+    assert captured == [("g.fixed", (2,))]
+
+
+def test_profiler_failure_is_loud_nonzero_and_names_retained_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    step = Step("g", "j", "", "true", jobs_flag="--workers=")
+    cfg = DagConfig(steps=(step,))
+    manifest_path = tmp_path / "captures" / "failed" / "manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text("{}\n", encoding="utf-8")
+
+    def fail_capture(
+        selection: object,
+        config: CaptureConfig,
+        run_trial: object,
+    ) -> CaptureManifest:
+        from dagrun.profile_capture import SweetSpotSelection
+
+        del config, run_trial
+        assert isinstance(selection, SweetSpotSelection)
+        manifest = CaptureManifest(
+            path=manifest_path,
+            capture_id="failed",
+            state=CaptureState.FAILED,
+            created_at="2026-01-01T00:00:00Z",
+            finished_at="2026-01-01T00:00:01Z",
+            selection=selection,
+            preflight=(),
+            trials=(),
+            errors=("wprof denied",),
+        )
+        raise ProfileCaptureError("wprof denied", manifest)
+
+    monkeypatch.setattr(cli, "capture_at_sweet_spot", fail_capture)
+    code = cli._run_profiler_captures(
+        cfg,
+        ((step, {1: (cli._SweepMeasure(1.0, 1.0, 0.0, None, True),)}),),
+        CaptureConfig(output_dir=tmp_path, capture_perf=True),
+        None,
+        "deadbeef",
+        0,
+    )
+
+    captured = capsys.readouterr()
+    assert code == cli._SWEEP_CAPTURE_FAILURE
+    assert "profiler capture FAILED" in captured.err
+    assert str(manifest_path) in captured.err
+    assert manifest_path.exists()
+
+
+def test_capture_failure_still_refreshes_model_and_report_before_public_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "j", "cmd": "true", '
+        '"jobs_flag": "--workers="}]}',
+        encoding="utf-8",
+    )
+    store = tmp_path / "profiles"
+    manifest = store / "captures" / "failed" / "manifest.json"
+    refreshed: list[str] = []
+
+    def failed_sweep(*args: object, **kwargs: object) -> int:
+        del args, kwargs
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text("{}\n", encoding="utf-8")
+        return cli._SWEEP_CAPTURE_FAILURE
+
+    def refresh_model(perf_dir: str, cfg: DagConfig) -> None:
+        del cfg
+        assert Path(perf_dir) == store
+        assert manifest.exists()
+        refreshed.append("model")
+
+    def refresh_report(
+        perf_dir: str, cfg: DagConfig, dag_label: str, report_html: str | None
+    ) -> bool:
+        del cfg, dag_label, report_html
+        assert Path(perf_dir) == store
+        assert manifest.exists()
+        refreshed.append("report")
+        return True
+
+    monkeypatch.setattr(cli, "_run_legacy_sweep", failed_sweep)
+    monkeypatch.setattr(cli, "_resolve_cgroup_manager", lambda *_args, **_kwargs: (None, 0))
+    monkeypatch.setattr(cli, "_report_profile_written", lambda *_args: None)
+    monkeypatch.setattr(cli, "_refresh_scaling_model", refresh_model)
+    monkeypatch.setattr(cli, "_refresh_profile_report", refresh_report)
+
+    rc, _, _ = _capture(
+        [
+            "sweep",
+            "--dag",
+            str(dag),
+            "--step",
+            "g.j",
+            "--jobs",
+            "1..2",
+            "--output-dir",
+            str(store),
+            "--perf-record",
+        ]
+    )
+
+    assert rc == 1
+    assert refreshed == ["model", "report"]
+
+
+def test_target_sweep_characterizes_a_fixed_node_only_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "group": "g",
+                        "job": "fixed",
+                        "cmd": "true",
+                        "jobs_flag": "",
+                        "hint": {"preferred_inner_jobs": 2},
+                    },
+                    {
+                        "group": "g",
+                        "job": "scaling",
+                        "cmd": "true",
+                        "deps": ["g.fixed"],
+                        "jobs_flag": "--workers=",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: list[tuple[str, int, bool]] = []
+
+    def fake_run(
+        step: Step,
+        cfg: DagConfig,
+        inner_jobs: int,
+        cgroups: CgroupManager | None,
+        metrics: MetricsSink | None,
+        verbosity: int,
+        *,
+        vary_width: bool = True,
+        profile_timeseries_interval_s: float | None = None,
+    ) -> cli._SweepMeasure:
+        del cfg, cgroups, metrics, verbosity, profile_timeseries_interval_s
+        calls.append((step.tag, inner_jobs, vary_width))
+        return cli._SweepMeasure(1.0, 1.0, 0.0, None, True)
+
+    ticks = iter((0.0, 0.0, 0.5, 0.5, 0.5, 2.0, 2.0, 2.0))
+    monkeypatch.setattr(cli, "_run_single_step", fake_run)
+    monkeypatch.setattr("dagrun.cli.time.monotonic", lambda: next(ticks))
+    monkeypatch.setattr(
+        cli,
+        "_effective_sweep_topology",
+        lambda: CpuTopology(tuple(range(4)), physical_core_count=2),
+    )
+    monkeypatch.setattr(cli, "_resolve_cgroup_manager", lambda *_args, **_kwargs: (None, 0))
+
+    rc, out, err = _capture(
+        ["sweep", "--dag", str(dag), "--target-time", "1", "--no-profile"]
+    )
+
+    assert rc == 0
+    assert calls == [
+        ("g.fixed", 2, False),
+        ("g.scaling", 1, True),
+        ("g.scaling", 2, True),
+        ("g.scaling", 4, True),
+        ("g.scaling", 1, True),
+        ("g.scaling", 2, True),
+        ("g.scaling", 3, True),
+        ("g.scaling", 4, True),
+    ]
+    assert "characterizing its configured width once (width 2)" in out
+    assert err == ""
+
+
+def test_target_sweep_persists_pass_metadata(tmp_path: Path) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "j", "cmd": "true", '
+        '"cmdtype": "generic-with-flag", "jobs_flag": "--workers="}]}',
+        encoding="utf-8",
+    )
+    store = tmp_path / "profiles"
+
+    rc, _, err = _capture(
+        [
+            "sweep",
+            "--dag",
+            str(dag),
+            "--target-time",
+            "0",
+            "--jobs",
+            "1,2",
+            "--perf-dir",
+            str(store),
+            "--unsafe-no-cgroups",
+        ]
+    )
+
+    assert rc == 0, err
+    profile = next(store.glob("step_profiles_*.csv"))
+    with profile.open(newline="", encoding="utf-8") as source:
+        rows = list(csv.DictReader(source))
+    assert len(rows) == 2
+    assert rows[0]["sweep_id"]
+    assert rows[0]["sweep_pass"] == "1"
+    assert rows[0]["sweep_sample"] == "1"
+    assert rows[0]["sweep_width_source"] == "explicit"
+    assert rows[0]["sweep_mode"] == "target-time"
+    assert int(rows[0]["sweep_physical_cores"]) >= 1
+    assert int(rows[0]["sweep_logical_cpus"]) >= 1
+    assert len(rows[0]["workload_digest"]) == 16
+    assert all(row["user_s"] != "" for row in rows)
+    assert all(row["sys_s"] != "" for row in rows)
+    assert {row["enforcement_kind"] for row in rows} == {"unboxed"}
+    assert {row["runner_name"] for row in rows} == {"sweep"}
+    models = list(store.glob("scaling_model_*.json"))
+    assert len(models) == 1
+    saved_model = json.loads(models[0].read_text(encoding="utf-8"))
+    assert saved_model["schema"] == 2
+    assert saved_model["steps"][0]["step"] == "g.j"
+    assert saved_model["steps"][0]["workload_digest"] == rows[0]["workload_digest"]
+    report = store / "profile_report.html"
+    assert report.is_file()
+    assert 'id="dagrun-report-data"' in report.read_text(encoding="utf-8")
+    assert f"interactive profile report refreshed at {report}" in err
+
+
+def test_sweep_output_dir_report_override_and_opt_out(tmp_path: Path) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "j", "cmd": "true", '
+        '"jobs_flag": "--workers="}]}',
+        encoding="utf-8",
+    )
+    store = tmp_path / "artifacts"
+    custom = tmp_path / "reports" / "latest.html"
+
+    rc, _, err = _capture(
+        [
+            "sweep",
+            "--dag",
+            str(dag),
+            "--step",
+            "g.j",
+            "--jobs",
+            "1",
+            "--output-dir",
+            str(store),
+            "--report-html",
+            str(custom),
+            "--unsafe-no-cgroups",
+        ]
+    )
+    assert rc == 0, err
+    assert custom.is_file()
+    assert not (store / "profile_report.html").exists()
+    assert "profile artifacts written under" in err
+    assert f"interactive profile report refreshed at {custom}" in err
+
+    no_report_store = tmp_path / "no-report"
+    rc, _, err = _capture(
+        [
+            "sweep",
+            "--dag",
+            str(dag),
+            "--step",
+            "g.j",
+            "--jobs",
+            "1",
+            "--output-dir",
+            str(no_report_store),
+            "--no-report",
+            "--unsafe-no-cgroups",
+        ]
+    )
+    assert rc == 0, err
+    assert next(no_report_store.glob("step_profiles_*.csv")).is_file()
+    assert not (no_report_store / "profile_report.html").exists()
+    assert "interactive profile report refreshed" not in err
+
+
+def test_explicit_report_collision_fails_after_preserving_measurements(
+    tmp_path: Path,
+) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "j", "cmd": "true", '
+        '"jobs_flag": "--workers="}]}',
+        encoding="utf-8",
+    )
+    original = dag.read_bytes()
+    store = tmp_path / "artifacts"
+
+    rc, _, err = _capture(
+        [
+            "sweep",
+            "--dag",
+            str(dag),
+            "--step",
+            "g.j",
+            "--jobs",
+            "1",
+            "--output-dir",
+            str(store),
+            "--report-html",
+            str(dag),
+            "--unsafe-no-cgroups",
+        ]
+    )
+
+    assert rc == 1
+    assert dag.read_bytes() == original
+    assert next(store.glob("step_profiles_*.csv")).is_file()
+    assert "WARNING could not refresh interactive profile report" in err
+    assert "report output resolves to DAG input" in err
+    assert "interactive profile report refreshed at" not in err
+
+
+def test_default_report_collision_warns_without_failing_sweep(tmp_path: Path) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "j", "cmd": "true", '
+        '"jobs_flag": "--workers="}]}',
+        encoding="utf-8",
+    )
+    store = tmp_path / "artifacts"
+    store.mkdir()
+    report = store / "profile_report.html"
+    report.write_bytes(b"do not overwrite")
+
+    rc, _, err = _capture(
+        [
+            "sweep",
+            "--dag",
+            str(dag),
+            "--step",
+            "g.j",
+            "--jobs",
+            "1",
+            "--output-dir",
+            str(store),
+            "--unsafe-no-cgroups",
+        ]
+    )
+
+    assert rc == 0
+    assert report.read_bytes() == b"do not overwrite"
+    assert next(store.glob("step_profiles_*.csv")).is_file()
+    assert "WARNING could not refresh interactive profile report" in err
+    assert "without dagrun report marker" in err
+    assert "interactive profile report refreshed at" not in err
+
+
+def test_target_sweep_refines_sparse_explicit_widths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "j", "cmd": "true", '
+        '"jobs_flag": "--workers="}]}',
+        encoding="utf-8",
+    )
+    calls: list[int] = []
+
+    def fake_run(
+        step: Step,
+        cfg: DagConfig,
+        inner_jobs: int,
+        cgroups: CgroupManager | None,
+        metrics: MetricsSink | None,
+        verbosity: int,
+        *,
+        vary_width: bool = True,
+        profile_timeseries_interval_s: float | None = None,
+    ) -> cli._SweepMeasure:
+        del step, cfg, cgroups, metrics, verbosity, vary_width, profile_timeseries_interval_s
+        calls.append(inner_jobs)
+        return cli._SweepMeasure(1.0, 1.0, 0.0, None, True)
+
+    ticks = iter((0.0, 0.0, 0.5, 0.5, 0.5, 2.0, 2.0, 2.0))
+    monkeypatch.setattr(cli, "_run_single_step", fake_run)
+    monkeypatch.setattr("dagrun.cli.time.monotonic", lambda: next(ticks))
+    monkeypatch.setattr(
+        cli,
+        "_effective_sweep_topology",
+        lambda: CpuTopology(tuple(range(8)), physical_core_count=4),
+    )
+    monkeypatch.setattr(cli, "_resolve_cgroup_manager", lambda *_args, **_kwargs: (None, 0))
+
+    rc, out, err = _capture(
+        [
+            "sweep",
+            "--dag",
+            str(dag),
+            "--target-time",
+            "1",
+            "--jobs",
+            "1,4",
+            "--no-profile",
+        ]
+    )
+
+    assert rc == 0
+    assert calls == [1, 4, 1, 2, 4]
+    assert "cumulative widths [1,2,4]" in out
+    assert err == ""
+
+
+def test_sync_upload_rows_reuse_the_local_run_identity() -> None:
+    rows = [{"step": "g.a"}, {"step": "g.a"}]
+
+    stamped = cli._rows_with_observation_ids(rows, "run-local")
+
+    assert stamped[0]["observation_id"] == "run-local"
+    assert stamped[1]["observation_id"] == "run-local"
+
+
+def test_sync_uploaded_and_local_copies_deduplicate() -> None:
+    from dagrun import summary as summarylib
+
+    raw = {"step": "g.a", "inner_jobs": "2", "elapsed_s": "1.0"}
+    local = summarylib.summary_from_rows(
+        [{**raw, "run_id": "run-local"}], "m", "c", None
+    )
+    uploaded = summarylib.summary_from_rows(
+        cli._rows_with_observation_ids([raw], "run-local"), "m", "c", None
+    )
+
+    merged = summarylib.merge(local, uploaded)
+
+    assert summarylib.summary_stats(merged) == (1, 1, 1)
+
+
 def test_version_via_module() -> None:
     # argparse --version exits(0); run as a subprocess so it doesn't kill the test process.
     result = subprocess.run(
-        [sys.executable, "-m", "safe_ci_dag_runner", "--version"],
+        [sys.executable, "-m", "dagrun", "--version"],
         capture_output=True,
         text=True,
         check=True,
@@ -451,7 +1881,7 @@ def test_run_default_requires_cgroups_or_flag() -> None:
         dag = _demo_path(tmp)
         env = dict(os.environ, CI="1")  # force the boxing re-exec to be skipped
         required = subprocess.run(
-            [sys.executable, "-m", "safe_ci_dag_runner", "run", "--dag", dag, "-q"],
+            [sys.executable, "-m", "dagrun", "run", "--dag", dag, "-q"],
             capture_output=True,
             text=True,
             env=env,
@@ -460,7 +1890,7 @@ def test_run_default_requires_cgroups_or_flag() -> None:
         assert "cgroup boxing" in required.stderr.lower()
 
         allowed = subprocess.run(
-            [sys.executable, "-m", "safe_ci_dag_runner", "run", "--dag", dag, "-q",
+            [sys.executable, "-m", "dagrun", "run", "--dag", dag, "-q",
              "--allow-cgroup-failure"],
             capture_output=True,
             text=True,
@@ -483,7 +1913,7 @@ def test_unsafe_no_cgroups_deliberately_skips_boxing() -> None:
         # regardless of whether boxing could have been established.
         env = dict(os.environ)
         result = subprocess.run(
-            [sys.executable, "-m", "safe_ci_dag_runner", "run", "--dag", dag, "-q",
+            [sys.executable, "-m", "dagrun", "run", "--dag", dag, "-q",
              "--unsafe-no-cgroups"],
             capture_output=True,
             text=True,
@@ -512,7 +1942,7 @@ def test_boxed_run_enforces_cpu_timeout() -> None:
         path = Path(tmp) / "cpu.json"
         path.write_text(dag, encoding="utf-8")
         proc = subprocess.run(
-            [sys.executable, "-m", "safe_ci_dag_runner", "run", "--dag", str(path),
+            [sys.executable, "-m", "dagrun", "run", "--dag", str(path),
              "-q", "--no-profile"],
             capture_output=True,
             text=True,
@@ -560,7 +1990,7 @@ def test_default_small_cpu_cap_is_enforced_and_allows_compliant_work() -> None:
         path.write_text(dag, encoding="utf-8")
         env = {k: v for k, v in os.environ.items() if k not in ("CI", "GITHUB_ACTIONS")}
         return subprocess.run(
-            [sys.executable, "-m", "safe_ci_dag_runner", "run", "--dag", str(path),
+            [sys.executable, "-m", "dagrun", "run", "--dag", str(path),
              "-q", "--no-profile"],
             capture_output=True,
             text=True,
@@ -595,15 +2025,15 @@ def test_default_small_cpu_cap_is_enforced_and_allows_compliant_work() -> None:
 def test_boxed_reexec_via_symlink_imports_package() -> None:
     # Regression guard for the fleet-wide local-validate breakage: a DEFAULT boxed run invoked
     # through the py/bin symlink (NOT `python -m`, NOT pip-installed) must re-exec a child that
-    # can still import the package. The old code re-exec'd `python -m safe_ci_dag_runner`, whose
-    # fresh child had py/ off sys.path -> `No module named safe_ci_dag_runner`, so every non-CI
-    # `run` (i.e. validate.sh) died. The fix re-execs __main__.py by absolute path, which does its
-    # own sys.path fixup. Run from a CWD *outside* py/ so an accidental cwd-relative import can't
-    # mask the bug. Boxing is environment-dependent, so exit 3 (boxing genuinely unavailable) is a
-    # valid LOUD skip; the one thing that must NEVER appear is the import failure.
+    # can still import the package. The old code re-exec'd `python -m dagrun`, whose fresh child
+    # had py/ off sys.path -> `No module named dagrun`, so every non-CI `run` (i.e. validate.sh)
+    # died. The fix re-execs __main__.py by absolute path, which does its own sys.path fixup. Run
+    # from a CWD *outside* py/ so an accidental cwd-relative import can't mask the bug. Boxing is
+    # environment-dependent, so exit 3 (boxing genuinely unavailable) is a valid LOUD skip; the
+    # one thing that must NEVER appear is the import failure.
     import os
 
-    symlink = Path(__file__).resolve().parent.parent / "bin" / "safe-ci-dag-runner"
+    symlink = Path(__file__).resolve().parent.parent / "bin" / "dagrun"
     assert symlink.exists(), f"expected the console symlink at {symlink}"
     dag = (
         '{"steps": [{"group": "cpu", "job": "burn", "desc": "burn",'
@@ -622,7 +2052,7 @@ def test_boxed_reexec_via_symlink_imports_package() -> None:
             env=env,
         )
         combined = proc.stdout + proc.stderr
-        assert "No module named safe_ci_dag_runner" not in combined, (
+        assert "No module named dagrun" not in combined, (
             "boxed re-exec child failed to import the package (the regression this guards): "
             f"rc={proc.returncode}\n{combined}"
         )
@@ -654,7 +2084,7 @@ def test_cores_flag_refuses_unboxed_soft_affinity() -> None:
 def test_boxed_stdin_dag_survives_scope_reexec() -> None:
     import os
 
-    symlink = Path(__file__).resolve().parent.parent / "bin" / "safe-ci-dag-runner"
+    symlink = Path(__file__).resolve().parent.parent / "bin" / "dagrun"
     dag = (
         '{"steps":[{"group":"stress","job":"singleton","cmd":"sleep 1",'
         '"hint":{"hard_mem_max_bytes":67108864}}]}'
@@ -669,7 +2099,7 @@ def test_boxed_stdin_dag_survives_scope_reexec() -> None:
             "-",
             "--stress",
             "3",
-            "--jobs",
+            "--max-cpus",
             "3",
             "--no-profile",
             "--no-profile-feedback",
@@ -690,7 +2120,10 @@ def test_boxed_stdin_dag_survives_scope_reexec() -> None:
     assert "containment OBSERVED" in combined
     assert "invalid JSON" not in combined
     assert "stress.singleton: 3/3 passed" in proc.stdout
-    assert "maximum concurrent steps: 3 (--jobs 3)" in proc.stdout
+    assert (
+        "maximum concurrent steps: 3 "
+        "(--max-steps 3; --max-cpus 3 CPU target/per-step ceiling)"
+    ) in proc.stdout
 
 
 # --------------------------------------------------------------------------- --stress
@@ -707,19 +2140,33 @@ def test_stress_reports_ratio_all_pass() -> None:
     # per-copy PASS/FAIL ratio (the finding). A passing step gives N/N.
     with tempfile.TemporaryDirectory() as tmp:
         dag = _one_step_dag(tmp, "sleep 0.3")
-        rc, out, err = _capture(["run", "--dag", dag, "--stress", "3", "-q", _ACF])
+        rc, out, err = _capture(
+            [
+                "run",
+                "--dag",
+                dag,
+                "--stress",
+                "3",
+                "--max-steps",
+                "3",
+                "--max-cpus",
+                "3",
+                "-q",
+                _ACF,
+            ]
+        )
         assert rc == 0
         assert "stress results (3 generated graph copies):" in out
         assert "g.j: 3/3 passed" in out
-        assert "maximum concurrent steps: 3 (--jobs" in out
+        assert "maximum concurrent steps: 3 (--max-steps" in out
         # All 3 copies actually ran (the run summary counts every copy).
         assert "3 passed, 0 failed" in err
         # The memory-safe OK line names the derivation.
         assert "--stress 3: OK" in err and "max safe" in err
 
 
-def test_stress_single_node_via_only() -> None:
-    # The common case: stress ONE suspect node selected with --only (its deps are dropped).
+def test_stress_single_node_while_ignoring_selected_dependencies() -> None:
+    # A focused experiment can stress one selected node after explicitly dropping its dependencies.
     dag = (
         '{"steps": ['
         '{"group": "build", "job": "app", "cmd": "true"},'
@@ -730,7 +2177,18 @@ def test_stress_single_node_via_only() -> None:
         path = Path(tmp) / "dag.json"
         path.write_text(dag, encoding="utf-8")
         rc, out, err = _capture(
-            ["run", "--dag", str(path), "--only", "test.unit", "--stress", "4", "-q", _ACF]
+            [
+                "run",
+                "--dag",
+                str(path),
+                "--selected",
+                "test.unit",
+                "--ignore-selected-deps",
+                "--stress",
+                "4",
+                "-q",
+                _ACF,
+            ]
         )
         assert rc == 0
         assert "test.unit: 4/4 passed" in out
@@ -778,17 +2236,32 @@ def test_stress_generation_removes_named_resource_serialization() -> None:
             encoding="utf-8",
         )
         rc, out, err = _capture(
-            ["run", "--dag", str(dag), "--stress", "4", "-q", _ACF]
+            [
+                "run",
+                "--dag",
+                str(dag),
+                "--stress",
+                "4",
+                "--max-steps",
+                "4",
+                "--max-cpus",
+                "4",
+                "-q",
+                _ACF,
+            ]
         )
         assert rc == 0, err
         assert "g.j: 4/4 passed" in out
-        assert "maximum concurrent steps: 4 (--jobs" in out
+        assert (
+            "maximum concurrent steps: 4 "
+            "(--max-steps 4; --max-cpus 4 CPU target/per-step ceiling)"
+        ) in out
 
 
 def test_stress_generated_graph_has_no_named_resource_scheduling() -> None:
-    from safe_ci_dag_runner.cli import _expand_stress
-    from safe_ci_dag_runner.io import dag_from_json
-    from safe_ci_dag_runner.scheduler import run_dag
+    from dagrun.cli import _expand_stress
+    from dagrun.io import dag_from_json
+    from dagrun.scheduler import run_dag
 
     cfg = dag_from_json(
         '{"resource_caps":{"exclusive":1},"steps":['
@@ -800,15 +2273,18 @@ def test_stress_generated_graph_has_no_named_resource_scheduling() -> None:
     assert result.max_concurrent_steps == 4
 
 
-def test_stress_reports_concurrency_governed_by_jobs() -> None:
+def test_stress_defaults_max_steps_to_max_cpus() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         dag = _one_step_dag(tmp, "sleep 1")
         rc, out, err = _capture(
-            ["run", "--dag", dag, "--stress", "4", "--jobs", "3", "-q", _ACF]
+            ["run", "--dag", dag, "--stress", "4", "--max-cpus", "3", "-q", _ACF]
         )
         assert rc == 0, err
         assert "g.j: 4/4 passed" in out
-        assert "maximum concurrent steps: 3 (--jobs 3)" in out
+        assert (
+            "maximum concurrent steps: 3 "
+            "(--max-steps 3; --max-cpus 3 CPU target/per-step ceiling)"
+        ) in out
 
 
 def test_stress_n_must_be_positive() -> None:
@@ -821,8 +2297,8 @@ def test_stress_n_must_be_positive() -> None:
 
 def test_expand_stress_replicates_steps_and_rewires_deps() -> None:
     # Unit test of the fan-out: N shards, distinct #NN suffixes, intra-shard deps rewired.
-    from safe_ci_dag_runner.cli import _expand_stress
-    from safe_ci_dag_runner.io import dag_from_json
+    from dagrun.cli import _expand_stress
+    from dagrun.io import dag_from_json
 
     cfg = dag_from_json(
         '{"steps": ['
@@ -843,6 +2319,33 @@ def test_expand_stress_replicates_steps_and_rewires_deps() -> None:
     assert all(not step.hint.resources for step in expanded.steps)
     # n <= 1 is a no-op.
     assert _expand_stress(cfg, 1).steps == cfg.steps
+
+
+def test_expand_stress_gives_each_copy_a_stable_index_in_its_environment() -> None:
+    # Every copy runs the SAME `cmd`, so without a per-copy value in the environment the
+    # command cannot choose a distinct output path: N copies write one file, the last writer
+    # wins, and nothing errors. The `#NN` suffix does not help -- it is part of the job NAME,
+    # which the command never sees.
+    from dagrun.cli import STRESS_COPIES_ENV
+    from dagrun.cli import STRESS_COPY_ENV
+    from dagrun.cli import _expand_stress
+    from dagrun.io import dag_from_json
+
+    cfg = dag_from_json(
+        '{"steps": [{"group": "demo", "job": "run", "cmd": "true", "env": {"KEEP": "me"}}]}'
+    )
+    expanded = _expand_stress(cfg, 10)
+    indices = [s.env[STRESS_COPY_ENV] for s in expanded.steps]
+    # Distinct, so a path built from the index cannot collide...
+    assert len(set(indices)) == 10
+    # ...zero-padded to the job suffix's width, so those paths sort in copy order...
+    assert sorted(indices) == [f"{i:02d}" for i in range(1, 11)]
+    # ...and every copy is told the total, so a split does not have to be given N twice.
+    assert {s.env[STRESS_COPIES_ENV] for s in expanded.steps} == {"10"}
+    # A step's own environment survives the expansion.
+    assert all(s.env["KEEP"] == "me" for s in expanded.steps)
+    # Unmultiplied graphs are untouched, so a command can tell one run from a copy.
+    assert STRESS_COPY_ENV not in _expand_stress(cfg, 1).steps[0].env
 
 
 # --------------------------------------------------------------------------- --args passthrough
@@ -888,9 +2391,8 @@ def test_args_declared_but_not_passed_removes_token() -> None:
         assert "{args}" not in out
 
 
-def test_args_composes_with_only_and_stress() -> None:
-    # The full owner scenario: scope to one node (--only), pass a specific test case (--args),
-    # multiply it (--stress). All three compose; the per-copy ratio is reported.
+def test_args_composes_with_selected_ignored_dependencies_and_stress() -> None:
+    # Scope to one node, explicitly omit its dependencies, pass a test case, and multiply it.
     with tempfile.TemporaryDirectory() as tmp:
         dag = Path(tmp) / "dag.json"
         dag.write_text(
@@ -902,9 +2404,154 @@ def test_args_composes_with_only_and_stress() -> None:
             encoding="utf-8",
         )
         rc, out, err = _capture(
-            ["run", "--dag", str(dag), "--only", "dbi.file_metadata",
-             "--args=--case xyz", "--stress", "5", "-q", _ACF]
+            [
+                "run",
+                "--dag",
+                str(dag),
+                "--selected",
+                "dbi.file_metadata",
+                "--ignore-selected-deps",
+                "--args=--case xyz",
+                "--stress",
+                "5",
+                "-q",
+                _ACF,
+            ]
         )
         assert rc == 0, err
         assert "dbi.file_metadata: 5/5 passed" in out
         assert "build.app" not in out
+
+
+def test_unboxed_run_enforces_a_lower_bound_and_exposes_its_escape() -> None:
+    # THE REGRESSION THIS FILE DID NOT HAVE. `test_boxed_run_enforces_cpu_timeout` above only
+    # anchors the BOXED path. Unboxed, `CgroupManager.cpu_stats` returns None and the scheduler's
+    # guard used to be skipped entirely, so every `cpu_timeout` was inert on exactly the lane that
+    # matters most: any caller passing --allow-cgroup-failure, which an originating CI wrapper does
+    # unconditionally under GITHUB_ACTIONS/CI. Measured before the procfs fallback existed, the
+    # spinner below burned 60 CPU-seconds against a 3-second budget and exited GREEN.
+    #
+    # Unlike the boxed test this one can NEVER skip: it deliberately runs with boxing off, so it
+    # is a real guard on every machine including boxing-less CI.
+    #
+    # Four brackets, run as separate invocations where needed so eager-exit cannot abort a
+    # control: one breach, two concurrent breaches, an idle step, and a setsid escapee.
+    # The sleeper is the discriminator, not decoration: it runs 6.7x its budget in WALL terms, so
+    # a wall timeout mislabelled as a CPU timeout would kill it. Only a real CPU bound lets it
+    # through, and only the breach proves the bound is enforced at all. Assert both or neither.
+    import os
+
+    spin = (
+        '{"steps": [{"group": "cpu", "job": "burn", "desc": "burn CPU past budget",'
+        ' "cmd": "python3 -c \\"import time\\nt=time.time()\\nwhile time.time()-t<60: pass\\"",'
+        ' "cpu_timeout": 3, "timeout": 300}]}'
+    )
+    sleeper = (
+        '{"steps": [{"group": "cpu", "job": "idle", "desc": "sleep well past the budget",'
+        ' "cmd": "sleep 20", "cpu_timeout": 3, "timeout": 300}]}'
+    )
+    burn_command = "python3 -c 'import time\nt=time.time()\nwhile time.time()-t<60: pass'"
+    multi = json.dumps(
+        {
+            "steps": [
+                {
+                    "group": "cpu",
+                    "job": job,
+                    "cmd": burn_command,
+                    "cpu_timeout": 3,
+                    "timeout": 300,
+                }
+                for job in ("burn-a", "burn-b")
+            ]
+        }
+    )
+    escapee = json.dumps(
+        {
+            "steps": [
+                {
+                    "group": "cpu",
+                    "job": "escape",
+                    "desc": "leave the measured group",
+                    "cmd": (
+                        "python3 -c 'import os,time\n"
+                        "pid=os.fork()\n"
+                        "if pid == 0:\n"
+                        " os.setsid()\n"
+                        " if os.fork() == 0:\n"
+                        "  end=time.time()+4\n"
+                        "  while time.time()<end: pass\n"
+                        "  os._exit(0)\n"
+                        " os._exit(0)\n"
+                        "os.waitpid(pid,0)\n"
+                        "time.sleep(5)'"
+                    ),
+                    "cpu_timeout": 1,
+                    "timeout": 30,
+                }
+            ]
+        }
+    )
+    env = dict(os.environ)
+    # Force the unboxed path the same way a CI lane does.
+    env["GITHUB_ACTIONS"] = "1"
+    env["CI"] = "1"
+
+    def _run(dag_text: str, name: str) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / f"{name}.json"
+            path.write_text(dag_text, encoding="utf-8")
+            return subprocess.run(
+                [sys.executable, "-m", "dagrun", "run", "--dag", str(path),
+                 "--allow-cgroup-failure", "--keep-going", "--max-steps", "2", "-q",
+                 "--no-profile"],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+    # The idle control has its own temporary directory and process group. Start it first so its
+    # required 20 seconds of wall time overlaps the three independent enforcement invocations.
+    # Every invocation and every assertion below is unchanged; only their waiting overlaps.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        idle_future = executor.submit(_run, sleeper, "idle")
+
+        breach = _run(spin, "burn")
+        breach_out = breach.stdout + breach.stderr
+        assert "running UNBOXED" in breach_out, (
+            "this test is only meaningful with boxing OFF; if the run was boxed it is exercising the "
+            f"cgroup path and proves nothing about the fallback:\n{breach_out}"
+        )
+        assert breach.returncode == 1, (
+            "an UNBOXED step that burns 20x its CPU budget must FAIL; exit 0 here is the original "
+            f"defect (declared budget, no enforcement). got {breach.returncode}\n{breach_out}"
+        )
+        assert "CPU-TIMEOUT >3s cpu" in breach_out, (
+            f"expected the CPU budget to fire, not the (300s) wall timeout:\n{breach_out}"
+        )
+        assert "PROCFS SUBTREE" in breach_out, (
+            "an unboxed breach must NAME the degraded accounting that produced it, so a reader can "
+            f"weigh its known blind spots:\n{breach_out}"
+        )
+
+        parallel = _run(multi, "multi")
+        parallel_out = parallel.stdout + parallel.stderr
+        assert parallel.returncode == 1, parallel_out
+        assert parallel_out.count("CPU-TIMEOUT >3s cpu") == 2, parallel_out
+        assert parallel_out.count("PROCFS SUBTREE") == 2, parallel_out
+
+        escaped = _run(escapee, "escape")
+        idle = idle_future.result()
+
+    idle_out = idle.stdout + idle.stderr
+    assert idle.returncode == 0, (
+        "a step that sleeps 20s on a 3s CPU budget burns ~no CPU and must SURVIVE. Killing it "
+        "would mean the guard is measuring WALL time while calling itself a CPU timeout — the "
+        f"exact confusion this bound exists to avoid. got {idle.returncode}\n{idle_out}"
+    )
+
+    escaped_out = escaped.stdout + escaped.stderr
+    assert escaped.returncode == 0, (
+        "the procfs process-group floor unexpectedly claimed cgroup-equivalent coverage; a "
+        f"setsid escape must remain visible as the reason capabilities stays false:\n{escaped_out}"
+    )
+    assert "CPU-TIMEOUT" not in escaped_out, escaped_out

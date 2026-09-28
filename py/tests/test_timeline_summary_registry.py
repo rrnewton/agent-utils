@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from agent_team_timeline.summary_artifacts import (
+from wrkviz.summary_artifacts import (
     SummaryArtifactProvenance,
     make_summary_provenance,
 )
-from agent_team_timeline.summary_registry import (
+from wrkviz.summary_registry import (
     ContextComponent,
     ContextCoverage,
     GLOSSARY_DEFINITION_SUMMARIZER,
@@ -92,7 +92,7 @@ def test_summary_artifact_provenance_has_stable_validated_identity() -> None:
     provenance = make_summary_provenance(
         PHASE_SUMMARIZER,
         logical_key="phase:one",
-        team_slug="codex-hermit",
+        team_slug="codex-widget",
         start_ms=100,
         end_ms=200,
         input_hash="abc123",

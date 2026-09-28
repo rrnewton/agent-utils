@@ -11,20 +11,22 @@ import threading
 
 import pytest
 
-import agent_team_timeline.codex as codex_module
-import agent_team_timeline.pipeline as pipeline_module
-from agent_team_timeline.cli import main as timeline_main
-from agent_team_timeline.codex import (
+import wrkviz.codex as codex_module
+import wrkviz.pipeline as pipeline_module
+from wrkviz.build_store import team_build_root
+from wrkviz.cli import main as timeline_main
+from wrkviz.codex import (
     CodexParseError,
     CodexSnapshotResult,
     CodexSourceCopy,
     load_codex_team,
     snapshot_codex_lineage,
 )
-from agent_team_timeline.pipeline import ingest_codex
-from agent_team_timeline.phases import build_phases
-from agent_team_timeline.pipeline import _phase_jobs
-from agent_team_timeline.summarize import _input_hash
+from wrkviz.pipeline import ingest_codex
+from wrkviz.phases import build_phases
+from wrkviz.pipeline import _phase_jobs
+from wrkviz.summarize import _input_hash
+from tests.timeline_snapshots import snapshot_root
 
 
 ROOT = "root-thread"
@@ -58,7 +60,7 @@ def _root_bytes(*, incomplete_tail: bytes = b"") -> bytes:
                 "timestamp": _iso(1_000),
                 "cwd": "/work/project",
                 "git": {
-                    "repository_url": "git@github.com:rrnewton/dev-hermit.git"
+                    "repository_url": "git@github.com:example-org/dev-widget.git"
                 },
                 "source": "cli",
             },
@@ -362,10 +364,7 @@ def _origin(sessions: Path) -> Path:
 
 def _snapshot(archive: Path) -> Path:
     return (
-        archive
-        / "teams"
-        / "codex-test"
-        / "source_snapshots"
+        snapshot_root(archive, "codex-test")
         / "2026"
         / "08"
         / "05"
@@ -374,7 +373,7 @@ def _snapshot(archive: Path) -> Path:
 
 
 def _manifest(archive: Path) -> Path:
-    return archive / "teams" / "codex-test" / "raw" / "source-manifest.json"
+    return team_build_root(archive, "codex-test") / "raw" / "source-manifest.json"
 
 
 def _first_ingest(tmp_path: Path, data: bytes | None = None) -> tuple[Path, Path, Path]:
@@ -405,7 +404,7 @@ def test_ingest_copies_complete_lines_then_parses_the_backup(tmp_path: Path) -> 
 
     # The normalized parser has everything it needs in the copy, independent of the live root.
     parsed = load_codex_team(
-        archive / "teams" / "codex-test" / "source_snapshots",
+        snapshot_root(archive, "codex-test"),
         ROOT,
         "codex-test",
         "UTC",
@@ -414,17 +413,15 @@ def test_ingest_copies_complete_lines_then_parses_the_backup(tmp_path: Path) -> 
     assert manifest["source_root"] == str(sessions.resolve())
     identity = json.loads(
         (
-            archive
-            / "teams"
-            / "codex-test"
+            team_build_root(archive, "codex-test")
             / "raw"
             / "site-identity.json"
         ).read_text(encoding="utf-8")
     )
     assert identity["projects"] == [
         {
-            "label": "dev-hermit",
-            "repository_url": "https://github.com/rrnewton/dev-hermit",
+            "label": "dev-widget",
+            "repository_url": "https://github.com/example-org/dev-widget",
             "primary": True,
             "source": "session_metadata",
         }
@@ -454,6 +451,87 @@ def test_append_replaces_snapshot_with_longer_complete_prefix(tmp_path: Path) ->
     assert manifest["sources"][0]["copied_bytes"] == len(expected)
     assert manifest["sources"][0]["sha256"] == hashlib.sha256(expected).hexdigest()
     assert report.source_bytes == len(expected)
+
+
+def test_real_ingest_writes_no_per_thread_message_projection(tmp_path: Path) -> None:
+    _, archive, _ = _first_ingest(tmp_path)
+
+    # Nothing anywhere in the archive, not just under the one team: this is the check that catches
+    # a second writer being added later under a different team root.
+    assert [path for path in archive.rglob("messages") if path.is_dir()] == []
+    raw = team_build_root(archive, "codex-test") / "raw"
+    assert sorted(path.name for path in raw.iterdir()) == [
+        "artifacts.json",
+        "site-identity.json",
+        "source-manifest.json",
+        "source-snapshot.json",
+        "team.json",
+    ]
+
+
+def test_real_ingest_retires_a_legacy_projection_and_says_so_on_stderr(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sessions, archive, _ = _first_ingest(tmp_path)
+    legacy = team_build_root(archive, "codex-test") / "raw" / "messages"
+    legacy.mkdir()
+    payload = json.dumps({"agent": {}, "turns": [], "messages": []}) + "\n"
+    for thread_id in (ROOT, CHILD):
+        (legacy / f"{thread_id}.json").write_text(payload, encoding="utf-8")
+    freed = 2 * len(payload.encode("utf-8"))
+    capsys.readouterr()
+
+    status = timeline_main(
+        (
+            "ingest",
+            "--sessions-root",
+            str(sessions),
+            "--root-session",
+            ROOT,
+            "--team",
+            "codex-test",
+            "--output",
+            str(archive),
+            "--timezone",
+            "UTC",
+        )
+    )
+
+    assert status == 0
+    assert not legacy.exists()
+    captured = capsys.readouterr()
+    # On stderr, not stdout: a scheduled run redirects stdout, and this is the operator's only
+    # live notice that a few thousand tracked files just left their archive.
+    assert "retired" in captured.err and "raw/messages" in captured.err
+    assert "removed 2 retired" in captured.err
+    assert "raw/messages" not in captured.out
+
+    run_path = sorted((archive / "runs").glob("*.json"))[-1]
+    run = json.loads(run_path.read_text(encoding="utf-8"))
+    assert run["ingest"]["retired_message_projections"] == 2
+    assert run["ingest"]["retired_message_projection_bytes"] == freed
+
+    # Second run: nothing left to sweep, and nothing said about it.
+    capsys.readouterr()
+    assert (
+        timeline_main(
+            (
+                "ingest",
+                "--sessions-root",
+                str(sessions),
+                "--root-session",
+                ROOT,
+                "--team",
+                "codex-test",
+                "--output",
+                str(archive),
+                "--timezone",
+                "UTC",
+            )
+        )
+        == 0
+    )
+    assert "raw/messages" not in capsys.readouterr().err
 
 
 def test_disappeared_source_fails_and_preserves_snapshot(tmp_path: Path) -> None:
@@ -684,7 +762,7 @@ def test_cli_accepts_ordered_repeatable_continuation_sessions(tmp_path: Path) ->
     ] == [CONTINUATION, CONTINUATION_TWO]
     assert manifest["continuation_sessions"][1]["predecessor_thread_id"] == CONTINUATION
     raw = json.loads(
-        (archive / "teams" / "codex-test" / "raw" / "team.json").read_text(
+        (team_build_root(archive, "codex-test") / "raw" / "team.json").read_text(
             encoding="utf-8"
         )
     )
@@ -855,7 +933,7 @@ def test_collaboration_edge_cannot_overwrite_continuation_edge(tmp_path: Path) -
     child = origin.with_name("rollout-child.jsonl")
     child.write_bytes(_child_bytes())
     baseline, _ = ingest_codex(archive, sessions, ROOT, "codex-test", "UTC")
-    raw_team = archive / "teams" / "codex-test" / "raw" / "team.json"
+    raw_team = team_build_root(archive, "codex-test") / "raw" / "team.json"
     raw_before = raw_team.read_bytes()
     edge_id = f"codex-continuation-{CONTINUATION}"
     origin.write_bytes(
@@ -943,7 +1021,7 @@ def test_continuation_source_truncation_fails_without_replacing_archive(
         continuation_thread_ids=(CONTINUATION,),
     )
     manifest_before = _manifest(archive).read_bytes()
-    raw_team = archive / "teams" / "codex-test" / "raw" / "team.json"
+    raw_team = team_build_root(archive, "codex-test") / "raw" / "team.json"
     team_before = raw_team.read_bytes()
     child_bytes = continuation_child.read_bytes()
     continuation_child.write_bytes(child_bytes.rsplit(b"\n", 2)[0] + b"\n")
@@ -958,14 +1036,7 @@ def test_continuation_source_truncation_fails_without_replacing_archive(
 
 def test_orphan_snapshot_is_excluded_from_manifest_bound_parse(tmp_path: Path) -> None:
     sessions, archive, _ = _first_ingest(tmp_path)
-    orphan = (
-        archive
-        / "teams"
-        / "codex-test"
-        / "source_snapshots"
-        / "orphan"
-        / "rollout-child.jsonl"
-    )
+    orphan = snapshot_root(archive, "codex-test") / "orphan" / "rollout-child.jsonl"
     orphan.parent.mkdir(parents=True)
     orphan.write_bytes(_child_bytes())
 
@@ -987,18 +1058,18 @@ def test_snapshot_directory_symlink_escape_is_rejected(
     origin.parent.mkdir(parents=True)
     origin.write_bytes(_root_bytes())
     archive.mkdir()
-    (archive / ".agent-team-timeline.json").write_text(
-        '{"schema_version":1,"tool":"agent-team-timeline"}\n', encoding="utf-8"
+    (archive / ".wrkviz.json").write_text(
+        '{"schema_version":1,"tool":"wrkviz"}\n', encoding="utf-8"
     )
-    snapshot_root = archive / "teams" / "codex-test" / "source_snapshots"
+    snapshots = snapshot_root(archive, "codex-test")
     outside = tmp_path / "outside"
     outside.mkdir()
     if symlink_level == "root":
-        snapshot_root.parent.mkdir(parents=True)
-        snapshot_root.symlink_to(outside, target_is_directory=True)
+        snapshots.parent.mkdir(parents=True)
+        snapshots.symlink_to(outside, target_is_directory=True)
     else:
-        snapshot_root.mkdir(parents=True)
-        (snapshot_root / "2026").symlink_to(outside, target_is_directory=True)
+        snapshots.mkdir(parents=True)
+        (snapshots / "2026").symlink_to(outside, target_is_directory=True)
 
     with pytest.raises(CodexParseError, match="symlink or non-directory"):
         ingest_codex(archive, sessions, ROOT, "codex-test", "UTC")
@@ -1054,7 +1125,7 @@ def test_retry_recovers_copy_that_advanced_before_manifest(tmp_path: Path) -> No
     copied_only = snapshot_codex_lineage(
         sessions,
         ROOT,
-        archive / "teams" / "codex-test" / "source_snapshots",
+        snapshot_root(archive, "codex-test"),
         _manifest_sources(archive),
         "2026-08-05T12:00:00Z",
     )

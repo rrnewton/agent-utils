@@ -7,7 +7,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use crate::cadence::{load_fired_state, persist_fired_state};
-use crate::engine::run_tick;
+use crate::engine::run_tick_with_emit;
 use crate::io::{config_from_json, config_from_yaml, config_to_json, config_to_yaml};
 use crate::model::{TickConfig, EVERY_TICK};
 use crate::probes::{wall_clock_now, GlobFileAgeProbe, SubprocessGateRunner};
@@ -98,7 +98,7 @@ options:\n\
         c.dim("# reminders + health checks"),
         c.cyan("tick-hub state --state host.yaml"),
         c.dim("# validate + show the ops-state lines"),
-        c.dim("The fired-state (per-reminder last-fired epochs) lives at ./.tick-hub/state by"),
+        c.dim("The fired-state (cadence epochs + reserved retry diagnostics) lives at ./.tick-hub/state by"),
         c.dim("default (override with --fired-state or $TICK_HUB_STATE); it is written only on --flush.")
     )
 }
@@ -134,7 +134,8 @@ fn quickstart(c: Palette) -> String {
   NOTE:   <free text>\n\
   ERROR:  <text>\n\n\
 {}\n\
-  Per-reminder last-fired epochs live in ./.tick-hub/state by default. The file is written\n\
+  Last-fired epochs and reserved __tick_hub_internal__.* retry diagnostics share\n\
+  ./.tick-hub/state by default. The file is written\n\
   only with {}; a dry run mutates nothing.\n\n\
 {}  0 = tick ran | 2 = bad usage / bad config or state file",
         banner(c),
@@ -160,15 +161,16 @@ fn command_help(command: &str) -> String {
     match command {
         "tick" => format!(
             "usage: {PROG} tick --config FILE [--state FILE] [--fired-state FILE] [--now EPOCH]\n\
-                    [--current-tick-min N] [--flush] [--no-header]\n\n\
+                    [--current-tick-min N] [--flush] [--report-pending] [--no-header]\n\n\
 options:\n\
   -h, --help            show this help message and exit\n\
   --config FILE         reminder-set config; .yaml/.yml load as YAML, else JSON\n\
   --state FILE          optional per-host ops-state YAML\n\
-  --fired-state FILE    per-reminder last-fired-epoch file\n\
+  --fired-state FILE    cadence and reserved retry-diagnostic state file\n\
   --now EPOCH           override the clock for deterministic runs\n\
   --current-tick-min N  actually-running tick cadence in minutes\n\
   --flush               persist the advanced fired-state\n\
+  --report-pending      print CLEAN/SUPPRESSED verdicts for due reminders\n\
   --no-header           suppress the explanatory stderr banner"
         ),
         "state" => format!(
@@ -197,6 +199,7 @@ struct TickArgs {
     now: Option<i64>,
     current_tick_min: Option<i64>,
     flush: bool,
+    report_pending: bool,
     no_header: bool,
 }
 
@@ -285,6 +288,8 @@ fn parse_tick(args: &[String]) -> Result<TickArgs, String> {
             out.current_tick_min = Some(parse_positive_i64(value?, "--current-tick-min")?);
         } else if arg == "--flush" {
             out.flush = true;
+        } else if arg == "--report-pending" {
+            out.report_pending = true;
         } else if arg == "--no-header" {
             out.no_header = true;
         } else {
@@ -455,24 +460,36 @@ fn run_tick_command(
     };
     let path = fired_path(args.fired_state.as_deref());
     let fired = load_fired_state(&path);
-    let result = run_tick(
-        &config,
-        &state,
-        args.now.unwrap_or_else(wall_clock_now),
-        &fired,
-        &SubprocessGateRunner::default(),
-        &GlobFileAgeProbe,
-        args.current_tick_min,
-    );
     if !args.no_header {
         let _ = writeln!(stderr, "{}", banner(c));
         if let Some(note) = state_note {
             let _ = writeln!(stderr, "{PROG}: {note}");
         }
     }
-    for line in result.lines {
-        let _ = writeln!(stdout, "{line}");
-    }
+    let result = {
+        let mut emit_line = |line: &str| {
+            writeln!(stdout, "{line}")?;
+            stdout.flush()
+        };
+        run_tick_with_emit(
+            &config,
+            &state,
+            args.now.unwrap_or_else(wall_clock_now),
+            &fired,
+            &SubprocessGateRunner::default(),
+            &GlobFileAgeProbe,
+            args.current_tick_min,
+            args.report_pending,
+            &mut emit_line,
+        )
+    };
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = writeln!(stderr, "{PROG}: could not write tick report: {error}");
+            return 1;
+        }
+    };
     if args.flush {
         if let Err(error) = persist_fired_state(&path, &result.fired) {
             let _ = writeln!(
@@ -617,7 +634,20 @@ pub fn run_from_env() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct FailedWriter;
+
+    impl Write for FailedWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "reader closed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "reader closed"))
+        }
+    }
 
     fn invoke(args: &[&str]) -> (i32, String, String) {
         let args = args
@@ -695,6 +725,82 @@ mod tests {
         assert!(stderr.contains("dry-run"));
         assert!(!fired.exists());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn report_pending_is_compatible_with_flush_and_cadence() {
+        let config = temp_file(
+            "report-pending.json",
+            r#"{"reminders":[{"name":"quiet","cadence_secs":3600,"gate":{"cmd":"true","when":"failure"},"emit":{"skill":"warn","title":"problem"}}]}"#,
+        );
+        let fired = config.with_extension("state");
+        let config_text = config.to_string_lossy();
+        let fired_text = fired.to_string_lossy();
+        let (code, stdout, stderr) = invoke(&[
+            "tick",
+            "--config",
+            &config_text,
+            "--fired-state",
+            &fired_text,
+            "--now",
+            "1000",
+            "--flush",
+            "--report-pending",
+            "--no-header",
+        ]);
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stdout.contains("CLEAN: quiet ran and found nothing to report\n"));
+        assert!(fs::read_to_string(&fired).unwrap().contains("quiet=1000\n"));
+        assert!(stderr.contains("persisted"));
+
+        let (code, stdout, stderr) = invoke(&[
+            "tick",
+            "--config",
+            &config_text,
+            "--fired-state",
+            &fired_text,
+            "--now",
+            "1001",
+            "--report-pending",
+            "--no-header",
+        ]);
+        assert_eq!(code, 0, "{stderr}");
+        assert!(!stdout.contains("CLEAN: quiet"));
+        let _ = fs::remove_file(config);
+        let _ = fs::remove_file(fired);
+    }
+
+    #[test]
+    fn failed_report_write_returns_nonzero_without_persisting_cadence() {
+        let config = temp_file(
+            "failed-writer.json",
+            r#"{"reminders":[{"name":"due","emit":{"skill":"warn","title":"problem"}}]}"#,
+        );
+        let fired = config.with_extension("state");
+        let args = [
+            "tick",
+            "--config",
+            &config.to_string_lossy(),
+            "--fired-state",
+            &fired.to_string_lossy(),
+            "--now",
+            "1000",
+            "--flush",
+            "--report-pending",
+            "--no-header",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let mut stdout = FailedWriter;
+        let mut stderr = Vec::new();
+        let code = run(&args, &mut stdout, &mut stderr);
+        assert_eq!(code, 1);
+        assert!(String::from_utf8(stderr)
+            .unwrap()
+            .contains("could not write tick report"));
+        assert!(!fired.exists(), "a failed report must not consume cadence");
+        let _ = fs::remove_file(config);
     }
 
     #[test]

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Python-vs-Rust differential tester for safe-ci-dag-runner.
+"""Python-vs-Rust differential tester for dagrun.
 
 Prove the Python and Rust builds produce identical OBSERVABLE behavior. For a set of
-representative and randomized DAG fixtures, this runs BOTH the Python CLI
-(``python3 -m safe_ci_dag_runner``) and a private copy of the executable resolved by the tracked
-``rs/bin`` Cargo launcher and asserts:
+representative and randomized DAG fixtures, this runs BOTH the Python CLI (``python3 -m dagrun``)
+and a private copy of the executable resolved by the tracked ``rs/bin`` Cargo launcher and
+asserts:
 
 * ``list``, ``ascii``, ``dot`` stdout are BYTE-IDENTICAL.
 * ``json`` stdout is BYTE-IDENTICAL (both builds emit ``ensure_ascii=False`` canonical JSON, so
@@ -20,28 +20,53 @@ representative and randomized DAG fixtures, this runs BOTH the Python CLI
   and Python-json-vs-serde_json divergences that the isomorphism check (which only covers
   documents both builds accept) cannot.
 * ``run`` agrees on exit code, and on the passed/failed/aborted/intentionally-skipped/
-  dependency-skipped counts. Counts are
+  dependency-skipped/not-launched counts. Counts are
   compared under ``--keep-going`` so they are deterministic (the default eager-exit path
   races on which in-flight step is cancelled first, so only its exit code is compared).
-* ``--only`` selection (Feature A) agrees: running EXACTLY one named step matches on exit code
-  and counts, and an unknown ``--only`` tag exits 2 on both builds. A successful ``sweep`` must
-  produce the same width rows and table schema; measured timing cells and the ``--profile`` table
-  are not byte-compared because runtimes legitimately differ.
-* The memory-aware ``-j`` decision and modeled footprint from ``--max-mem`` match.
+* ``--selected`` selection agrees: a named leaf brings in its full dependency ancestry, while
+  ``--ignore-selected-deps`` runs only the named node. Both builds match on exit code and counts,
+  and reject an unknown selected tag or the dependency-ignoring flag without a selection.
+  A successful ``sweep`` must produce the same width rows and table schema; measured timing cells
+  and the ``--profile`` table are not byte-compared because runtimes legitimately differ.
+* The memory-aware ``--max-steps`` decision and modeled footprint from ``--max-mem`` match,
+  including effective-width scaling, hard/default/engine-only runnable steps, prompt refusal when
+  even one step cannot fit, CPA infeasibility driven by learned RSS, and signed-64 saturation.
+* ``run`` keeps active-step fan-out (``-s``) independent from its total CPU budget
+  (``-j`` / ``--max-cpus``): the same fork-based guest workload records normalized step/worker
+  overlap under both engines, including two full-width steps whose aggregate live workers exceed
+  the budget while each individual width remains bounded. A declared over-budget self-managed
+  width is refused before spawn, and profile-derived recommendations shown by every run planner
+  remain within the same per-step ceiling. A capability-gated boxed case additionally proves that
+  this allowed worker oversubscription remains inside the live outer ``cpu.max`` and long-window
+  ``cpu.stat`` bandwidth envelope.
 * The auto-logging profile STORE (Feature D) has an identical on-disk schema across builds: an
   unboxed run under each build (into separate ``--perf-dir`` dirs) writes the SAME set of CSV
   filenames — so ``machine_id`` + ``container_class`` (and hence ``nproc``) agree — with
   byte-identical HEADER rows and the SAME line-ending style. Data rows (timestamps, elapsed, git
   SHA) legitimately differ and are not compared. The dynamic cgroup ``cpu.*`` columns only appear
   under boxing (out of scope for the unboxed differential); their alphabetical ordering is pinned
-  by each build's own perflog tests.
-* The ``sweep`` ``--jobs`` error text (malformed range / not-an-integer) matches across builds.
+  by each build's own perflog tests. Each reader also builds byte-identical typed summaries from
+  the other implementation's freshly emitted store, and simultaneous mixed-language writers must
+  preserve every expected whole-run and per-step row.
+* The opt-in time-series TRACE has one cross-language schema and encoding: on hosts that can box a
+  step, a one-width sweep under each build writes the same fixed columns plus the same sorted sweep
+  provenance tail. Volatile timestamps, run ids, counters and timings are shape-normalized, while
+  field precision, blank-vs-present semantics, sample ordering and stable provenance are compared.
+  Hosts without the required cgroup-v2 scope take the same loud capability-skip path.
+* The ``sweep`` ``--jobs`` error text (malformed range / not-an-integer) matches across builds, and
+  a step with an empty effective ``jobs_flag`` is refused because its guest width cannot vary.
 * The profile-store FEEDBACK loop + ``--planner`` agree (``compare_plan_feedback``): against a FIXED
   synthetic store, ``plan`` output is byte-identical across builds for BOTH planners and BOTH formats
   (so the contention-discounted median durations, high-percentile rss estimates, and dispatch order
   all match); the ``critical-path`` order differs from ``greedy-lpt`` (the planner really reorders);
   the hint-only ``--no-profile-feedback`` plan is also identical; and the ``--max-mem`` sizing fed by
   the store's rss estimates matches across builds and throttles below the CPU count.
+* The deterministic ``scaling_model_*.json`` sidecar rebuilt from one fixed raw profile store is
+  byte-identical across builds, including workload digests and the trailing newline.
+* The standalone interactive sweep report embeds the same schema-1 historical dataset in both
+  builds when generated from the same raw rows. Presentation markup may evolve independently;
+  the graph, samples, filters, fitted-input data, traces, and profiler-capture manifests may not
+  diverge.
 * The remaining ``run`` comparisons pass ``--no-profile`` (no store WRITE into the harness CWD) and
   ``--no-profile-feedback`` (no store READ / hint refinement), so the base scheduling behavior under
   test stays hermetic and hint-only; feedback parity is asserted separately (above).
@@ -55,13 +80,16 @@ Exit status is nonzero on any divergence. The module is kept mypy-strict clean.
 from __future__ import annotations
 
 import argparse
+import csv
 import fcntl
 import hashlib
 import json
 import os
+import select
 import signal
 import random
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -69,10 +97,19 @@ import sys
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from cpu_footprint_analysis import (
+    FootprintStats,
+    analyze as analyze_cpu_footprint,
+    check_cgroup_bandwidth,
+    check_limits as check_cpu_limits,
+    load_events as load_cpu_events,
+)
 from herdr_agent_differential import compare_herdr_agent
+from agentctl_differential import compare_agentctl
 from herdr_differential import compare_herdr_run
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -93,19 +130,27 @@ NOPROF = "--no-profile"
 #: proven separately by :func:`compare_plan_feedback` against a fixed SYNTHETIC store.
 NOFB = "--no-profile-feedback"
 
-#: Feedback identity envs (mirrors safe_ci_dag_runner.estimates): pin the machine id + container
-#: class so the feedback reader loads a fixed synthetic ``step_profiles_<mid>_<cc>.csv`` regardless
-#: of the host, making the plan/sizing feedback checks deterministic everywhere.
+#: Feedback identity envs (mirrors dagrun.estimates): pin the machine id + container class so the
+#: feedback reader loads a fixed synthetic ``step_profiles_<mid>_<cc>.csv`` regardless of the host,
+#: making the plan/sizing feedback checks deterministic everywhere.
 SYNTH_MACHINE = "cross_synth_machine"
 SYNTH_CONTAINER = "cross_synth_container"
 
 _COUNTS_RE = re.compile(
     r"(\d+) passed, (\d+) failed, (\d+) aborted, "
-    r"(\d+) intentionally skipped, (\d+) dependency-skipped"
+    r"(\d+) intentionally skipped, (\d+) dependency-skipped, (\d+) not launched"
 )
 _SIZING_RE = re.compile(
-    r"-> -j(\d+) \(modeled worst-case (\d+) bytes fits budget (\d+) bytes\)"
+    r"-> modeled memory ceiling (\d+) active steps "
+    r"\(worst-case (\d+) bytes fits budget (\d+) bytes\); "
+    r"base active-step ceiling (\d+); final --max-steps (\d+)"
 )
+_SIZING_REFUSAL_RE = re.compile(
+    r"REFUSED — minimum runnable footprint (\d+) bytes cannot fit safely within budget "
+    r"(\d+) bytes"
+)
+
+CPU_FOOTPRINT_GUEST = os.path.join(REPO_ROOT, "cross", "cpu_footprint_guest.py")
 
 
 @dataclass(frozen=True)
@@ -131,6 +176,14 @@ class Outcome:
     elapsed_s: float = 0.0
 
 
+@dataclass(frozen=True)
+class CpuFootprintFacts:
+    completed_steps: int
+    workers_per_step: tuple[int, ...]
+    max_live_steps: int
+    max_live_workers: int
+
+
 @dataclass
 class Report:
     checks: int = 0
@@ -151,7 +204,7 @@ class Report:
 
 
 def py_command() -> list[str]:
-    return [sys.executable, "-m", "safe_ci_dag_runner"]
+    return [sys.executable, "-m", "dagrun"]
 
 
 _RUST_SNAPSHOTS: list[tempfile.TemporaryDirectory[str]] = []
@@ -282,15 +335,35 @@ def _env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     env["NO_COLOR"] = "1"
     # Rust and Python both support explicit evidence, but an ambient caller setting must not make
     # unrelated differential cases write into one shared directory or gain extra banners.
-    env.pop("SAFE_CI_DAG_RUNNER_LOG_DIR", None)
-    env.pop("SAFE_CI_DAG_RUNNER_NO_STEP_LOGS", None)
+    env.pop("DAGRUN_LOG_DIR", None)
+    env.pop("DAGRUN_NO_STEP_LOGS", None)
+    # Same reasoning, for the operator's build width. Both engines resolve intent from these two
+    # variables in the OUTERMOST process, which here is the differential's own child — so a
+    # developer who happens to export CARGO_BUILD_JOBS makes every case run under a width nobody
+    # in this file chose, and turns the `operator-build-width:unstated` leg red for a reason that
+    # has nothing to do with either engine. The cases that are ABOUT intent pass it in `extra`,
+    # which is applied after these pops.
+    env.pop("CARGO_BUILD_JOBS", None)
+    env.pop("DAGRUN_OPERATOR_BUILD_JOBS", None)
+    env.pop("DAGRUN_JOBS_ENV", None)
+    # Profile identity overrides belong only to the fixtures that set them explicitly. Ambient
+    # values could make a writer emit one filename while a reader searches another and let an
+    # interoperability check pass vacuously on two empty summaries.
+    env.pop("DAGRUN_MACHINE_ID", None)
+    env.pop("DAGRUN_CONTAINER_CLASS", None)
+    # The retired spelling must not make a differential case accidentally pass.
+    env.pop("SAFE_CI_DAG_RUNNER_JOBS_ENV", None)
     if extra:
         env.update(extra)
     return env
 
 
 def run(
-    cmd: Sequence[str], args: Sequence[str], extra_env: Mapping[str, str] | None = None
+    cmd: Sequence[str],
+    args: Sequence[str],
+    extra_env: Mapping[str, str] | None = None,
+    *,
+    timeout_s: float = 120.0,
 ) -> Outcome:
     started = time.monotonic()
     try:
@@ -301,13 +374,116 @@ def run(
             env=_env(extra_env),
             start_new_session=True,
             check=False,
-            timeout=120,
+            timeout=timeout_s,
         )
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout if isinstance(exc.stdout, str) else ""
         stderr = exc.stderr if isinstance(exc.stderr, str) else ""
-        return Outcome(124, stdout, stderr + "\nTIMEOUT after 120 seconds", time.monotonic() - started)
+        return Outcome(
+            124,
+            stdout,
+            stderr + f"\nTIMEOUT after {timeout_s:g} seconds",
+            time.monotonic() - started,
+        )
     return Outcome(proc.returncode, proc.stdout, proc.stderr, time.monotonic() - started)
+
+
+def run_until_stdout_contains(
+    cmd: Sequence[str],
+    args: Sequence[str],
+    expected: str,
+    *,
+    timeout_s: float = 10.0,
+) -> tuple[Outcome, bytes, bool]:
+    """Run a command and retain the bytes observable when ``expected`` first arrives."""
+    started = time.monotonic()
+    proc = subprocess.Popen(
+        [*cmd, *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_env(),
+        start_new_session=True,
+    )
+    assert proc.stdout is not None
+    expected_bytes = expected.encode("utf-8")
+    observed = bytearray()
+    deadline = started + timeout_s
+    while expected_bytes not in observed and time.monotonic() < deadline:
+        readable, _, _ = select.select([proc.stdout], [], [], 0.05)
+        if readable:
+            chunk = os.read(proc.stdout.fileno(), 4096)
+            if not chunk:
+                break
+            observed.extend(chunk)
+        elif proc.poll() is not None:
+            break
+    observed_before_exit = expected_bytes in observed and proc.poll() is None
+    # Give a wrongly streamed line immediately after the expected prefix a
+    # chance to become observable while the final gate remains deliberately
+    # asleep. Reading is nonblocking after the short sampling interval.
+    if observed_before_exit:
+        time.sleep(0.1)
+        while select.select([proc.stdout], [], [], 0)[0]:
+            chunk = os.read(proc.stdout.fileno(), 4096)
+            if not chunk:
+                break
+            observed.extend(chunk)
+    try:
+        remaining_stdout, stderr = proc.communicate(timeout=max(0.1, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        remaining_stdout, stderr = proc.communicate()
+        stderr += f"\nTIMEOUT after {timeout_s:g} seconds".encode()
+    stdout = bytes(observed) + remaining_stdout
+    return (
+        Outcome(
+            proc.returncode if proc.returncode is not None else 124,
+            stdout.decode("utf-8", errors="replace"),
+            stderr.decode("utf-8", errors="replace"),
+            time.monotonic() - started,
+        ),
+        bytes(observed),
+        observed_before_exit,
+    )
+
+
+def run_with_closed_stdout(
+    cmd: Sequence[str],
+    args: Sequence[str],
+    *,
+    timeout_s: float = 10.0,
+) -> Outcome:
+    """Run with no stdout reader so the first flushed report gets EPIPE."""
+    started = time.monotonic()
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    try:
+        proc = subprocess.Popen(
+            [*cmd, *args],
+            stdout=write_fd,
+            stderr=subprocess.PIPE,
+            env=_env(),
+            start_new_session=True,
+        )
+    finally:
+        os.close(write_fd)
+    assert proc.stderr is not None
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+    stderr = proc.stderr.read().decode("utf-8", errors="replace")
+    if timed_out:
+        stderr += f"\nTIMEOUT after {timeout_s:g} seconds"
+    return Outcome(
+        124 if timed_out else proc.returncode,
+        "",
+        stderr,
+        time.monotonic() - started,
+    )
 
 
 # --------------------------------------------------------------------------- fixtures
@@ -352,6 +528,23 @@ def representative_fixtures() -> list[Fixture]:
                         "job": "smoke",
                         "desc": "browser smoke",
                         "cmd": "echo e2e",
+                        "manifest": {"lane": "portable", "category": "applications"},
+                        "result_manifests": [
+                            {
+                                "lane": "portable",
+                                "category": "applications",
+                                "mode": "verify",
+                                "backend": "ptrace",
+                            },
+                            {
+                                "lane": "portable",
+                                "category": "c-programs",
+                                "test": "c-programs/add-key-enosys",
+                                "mode": "run",
+                                "backend": "kvm",
+                            },
+                        ],
+                        "integration_test_binaries": ["unit_alpha", "unit_beta"],
                         "deps": ["build.app"],
                         "hint": {"resources": {"browser": 1}, "classification": "latency-bound"},
                     },
@@ -360,8 +553,18 @@ def representative_fixtures() -> list[Fixture]:
                         "job": "smoke2",
                         "desc": "browser smoke 2",
                         "cmd": "echo e2e2",
+                        "result_manifests": [],
                         "deps": ["build.app"],
                         "hint": {"resources": {"browser": 1}},
+                    },
+                    {
+                        "group": "e2e",
+                        "job": "smoke3",
+                        "desc": "singular fallback through null",
+                        "cmd": "echo e2e3",
+                        "manifest": {"lane": "portable", "category": "applications"},
+                        "result_manifests": None,
+                        "deps": ["build.app"],
                     },
                 ],
             },
@@ -465,7 +668,7 @@ def representative_fixtures() -> list[Fixture]:
         )
     )
 
-    # A memory-modeled DAG sized against a tight budget: the chosen -j and footprint are
+    # A memory-modeled DAG sized against a tight budget: the chosen --max-steps and footprint are
     # compared; the budget throttles below any plausible CPU count so the check is
     # CPU-count-independent.
     fixtures.append(
@@ -505,7 +708,8 @@ def representative_fixtures() -> list[Fixture]:
 
     # jobs_flag: the inner-parallelism flag appended to a step's command when it declares
     # preferred_inner_jobs. Each fixture's command PASSES iff exactly the expected appended token(s)
-    # arrive as "$*", so a serial run (-j1) yields 1-passed in BOTH builds only when Python and
+    # arrive as "$*", so a serial run (-s1 with an ample -j budget) yields 1-passed in BOTH builds
+    # only when Python and
     # Rust render + append the flag identically. The `json` check additionally pins schema parity
     # for the jobs_flag / default_jobs_flag fields.
     fixtures.append(
@@ -556,6 +760,84 @@ def representative_fixtures() -> list[Fixture]:
             },
         )
     )
+    fixtures.append(
+        Fixture(
+            "jobs_env_schema",
+            {
+                "default_jobs_env": "CARGO_BUILD_JOBS",
+                "steps": [
+                    {
+                        "group": "g",
+                        "job": "inherit",
+                        "cmd": "true",
+                        "hint": {"preferred_inner_jobs": 1},
+                    },
+                    {
+                        "group": "g",
+                        "job": "override",
+                        "cmd": "true",
+                        "jobs_env": "CUSTOM_BUILD_JOBS",
+                        "hint": {"preferred_inner_jobs": 1},
+                    },
+                    {
+                        "group": "g",
+                        "job": "opt-out",
+                        "cmd": "true",
+                        "jobs_env": "",
+                    },
+                ],
+            },
+        )
+    )
+    fixtures.append(
+        Fixture(
+            "cmdtype_simple_append",
+            {
+                "steps": [
+                    {
+                        "group": "g",
+                        "job": "j",
+                        "cmd": "sh -c 'test \"$#\" = 2 && test \"$1\" = --jobs && test \"$2\" = 3' c",
+                        "cmdtype": "cargo-build",
+                        "hint": {"preferred_inner_jobs": 3},
+                    }
+                ]
+            },
+        )
+    )
+    fixtures.append(
+        Fixture(
+            "cmdtype_compound_placement",
+            {
+                "steps": [
+                    {
+                        "group": "g",
+                        "job": "j",
+                        "cmd": 'c() { [ "$#" = 2 ] && [ "$1" = --jobs ] && [ "$2" = 3 ]; }; z() { [ "$#" = 0 ]; }; c $DAGRUN_EXTRA_ARGS && z',
+                        "cmdtype": "cargo-build",
+                        "hint": {"preferred_inner_jobs": 3},
+                    }
+                ]
+            },
+        )
+    )
+    fixtures.append(
+        Fixture(
+            "cmdtype_unknown_has_no_variable",
+            {
+                "steps": [
+                    {
+                        "group": "g",
+                        "job": "j",
+                        "cmd": 'test -z "${DAGRUN_EXTRA_ARGS+x}"',
+                        "cmdtype": "unknown",
+                        "jobs_flag": "",
+                        "hint": {"preferred_inner_jobs": 3},
+                    }
+                ]
+            },
+        )
+    )
 
     return fixtures
 
@@ -585,7 +867,9 @@ def _random_dag(rng: random.Random) -> tuple[dict[str, object], bool]:
         if rng.random() < 0.5:
             hint["classification"] = rng.choice(classes)
         if rng.random() < 0.4:
-            # Only demand resources that exist in caps (an unmet demand would hang the run).
+            # Only demand resources that exist in caps. An undeclared demand is refused before
+            # any node starts (both engines), which is a correct outcome but not the one this
+            # generator is here to compare.
             res_name = rng.choice(list(caps))
             hint["resources"] = {res_name: 1}
         if rng.random() < 0.3:
@@ -874,7 +1158,7 @@ def compare_scalar_parity(py: list[str], rs: list[str], rep: Report) -> None:
 # --------------------------------------------------------------------------- comparisons
 
 
-def _counts(stderr: str) -> tuple[int, int, int, int, int] | None:
+def _counts(stderr: str) -> tuple[int, int, int, int, int, int] | None:
     m = _COUNTS_RE.search(stderr)
     if not m:
         return None
@@ -884,14 +1168,39 @@ def _counts(stderr: str) -> tuple[int, int, int, int, int] | None:
         int(m.group(3)),
         int(m.group(4)),
         int(m.group(5)),
+        int(m.group(6)),
     )
 
 
-def _sizing(stderr: str) -> tuple[int, int, int] | None:
+def _sizing_details(stderr: str) -> tuple[int, int, int, int, int] | None:
+    """Return ``(memory_ceiling, footprint, budget, base_ceiling, final_ceiling)``."""
     m = _SIZING_RE.search(stderr)
     if not m:
         return None
-    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    memory_steps = int(m.group(1))
+    footprint = int(m.group(2))
+    budget = int(m.group(3))
+    base = int(m.group(4))
+    selected = int(m.group(5))
+    if selected != min(base, memory_steps):
+        return None
+    return memory_steps, footprint, budget, base, selected
+
+
+def _sizing(stderr: str) -> tuple[int, int, int] | None:
+    details = _sizing_details(stderr)
+    if details is None:
+        return None
+    _memory_steps, footprint, budget, _base, selected = details
+    return selected, footprint, budget
+
+
+def _sizing_refusal(stderr: str) -> tuple[int, int] | None:
+    """Return ``(minimum_footprint, budget)`` from a fail-closed max-memory refusal."""
+    match = _SIZING_REFUSAL_RE.search(stderr)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
 
 
 def _static_parity(py: list[str], rs: list[str], dag_path: str, name: str, rep: Report) -> None:
@@ -939,10 +1248,10 @@ def _static_parity(py: list[str], rs: list[str], dag_path: str, name: str, rep: 
     rep.json_byte_identical += 1
 
 
-def _first_tag(fx: Fixture) -> str | None:
-    """The ``group.job`` tag of the fixture's first step, or ``None`` for an empty/odd DAG.
+def _first_selection(fx: Fixture) -> tuple[str, int] | None:
+    """The first step's tag and dependency-inclusive node count, or ``None`` for an odd DAG.
 
-    Used to exercise ``--only`` selection parity (Feature A) on a concrete, present tag."""
+    Used to exercise ``--selected`` parity on a concrete, present tag."""
     steps = fx.dag.get("steps")
     if not isinstance(steps, list) or not steps:
         return None
@@ -950,24 +1259,494 @@ def _first_tag(fx: Fixture) -> str | None:
     if not isinstance(first, dict):
         return None
     group, job = first.get("group"), first.get("job")
-    if isinstance(group, str) and isinstance(job, str):
-        return f"{group}.{job}"
-    return None
+    if not isinstance(group, str) or not isinstance(job, str):
+        return None
+    tag = f"{group}.{job}"
+    direct: dict[str, tuple[str, ...]] = {}
+    for step in steps:
+        if not isinstance(step, dict):
+            return None
+        step_group, step_job, deps = step.get("group"), step.get("job"), step.get("deps", [])
+        if (
+            not isinstance(step_group, str)
+            or not isinstance(step_job, str)
+            or not isinstance(deps, list)
+            or any(not isinstance(dep, str) for dep in deps)
+        ):
+            return None
+        direct[f"{step_group}.{step_job}"] = tuple(deps)
+    selected = {tag}
+    pending = [tag]
+    while pending:
+        current = pending.pop()
+        for dep in direct.get(current, ()):
+            if dep not in direct:
+                return None
+            if dep not in selected:
+                selected.add(dep)
+                pending.append(dep)
+    return tag, len(selected)
 
 
-def compare_only_errors(py: list[str], rs: list[str], rep: Report) -> None:
-    """``--only`` with an unknown tag must exit 2 on BOTH builds (Feature A error parity)."""
+def compare_selected_behavior(py: list[str], rs: list[str], rep: Report) -> None:
+    """Selected-step dependency handling and usage errors must agree in both builds."""
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "dag.json")
         with open(path, "w", encoding="utf-8") as fh:
-            fh.write('{"steps": [{"group": "g", "job": "j", "cmd": "true"}]}')
-        po = run(py, ("run", "--dag", path, "-q", "--only", "no.pe", NOPROF, NOFB, ACF))
-        ro = run(rs, ("run", "--dag", path, "-q", "--only", "no.pe", NOPROF, NOFB, ACF))
-        label = "only-unknown-tag"
+            fh.write(
+                '{"steps": ['
+                '{"group": "a", "job": "root", "cmd": "true"},'
+                '{"group": "b", "job": "middle", "cmd": "true", "deps": ["a.root"]},'
+                '{"group": "c", "job": "leaf", "cmd": "true", "deps": ["b.middle"]}'
+                "]}"
+            )
+
+        cases = (
+            ("selected-dependency-ancestry", ("--selected", "c.leaf"), 0, 3),
+            (
+                "selected-ignore-dependencies",
+                ("--selected", "c.leaf", "--ignore-selected-deps"),
+                0,
+                1,
+            ),
+            ("selected-ignore-requires-selection", ("--ignore-selected-deps",), 2, None),
+            ("selected-unknown-tag", ("--selected", "no.pe"), 2, None),
+            ("selected-retired-only-flag", ("--only", "c.leaf"), 2, None),
+            (
+                "selected-ignore-boolean-value",
+                ("--selected", "c.leaf", "--ignore-selected-deps=true"),
+                2,
+                None,
+            ),
+        )
+        for label, extra, expected_exit, expected_nodes in cases:
+            args = ("run", "--dag", path, "-q", *extra, NOPROF, NOFB, ACF)
+            po = run(py, args)
+            ro = run(rs, args)
+            pc, rc = _counts(po.stderr), _counts(ro.stderr)
+            if po.returncode != ro.returncode:
+                rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
+            elif po.returncode != expected_exit:
+                rep.bad(label, f"expected exit {expected_exit}; got {po.returncode}")
+            elif expected_nodes is None:
+                rep.ok(label)
+            elif pc is None or rc is None:
+                rep.bad(label, f"missing summary counts py={po.stderr!r} rs={ro.stderr!r}")
+            elif pc != rc:
+                rep.bad(label, f"counts py={pc} rs={rc}")
+            elif sum(pc) != expected_nodes:
+                rep.bad(label, f"expected {expected_nodes} accounted nodes; got counts {pc}")
+            else:
+                rep.ok(label)
+
+
+#: Top-level DAG-document keys that name a real ``DagConfig`` field the format cannot carry, and
+#: that BOTH editions must therefore refuse by name rather than silently default.
+#:
+#: Written out here, in the one mechanism that can see both builds at once.  Each edition's own
+#: suite pins its own copy, but "both editions refuse the same keys byte for byte" — which both
+#: loaders' doc comments claim — is a statement about the PAIR, and nothing was checking it: a
+#: key dropped from one edition alone left every test in both suites green and made a document
+#: that loads on one build and is rejected on the other.
+UNCARRIED_CONFIG_KEYS = (
+    "default_step_mem_cap_bytes",
+    "default_step_cpu_count",
+    "default_step_cpu_timeout",
+    "cpu_timeout_multiplier",
+    "cpu_timeout_platform",
+    "known_failures",
+)
+
+
+def compare_uncarried_config_keys(py: list[str], rs: list[str], rep: Report) -> None:
+    """Both builds must refuse the same uncarried top-level keys, with the same message.
+
+    ``known_failures`` is in the set although only the Python edition has such a field: the key
+    set is a portability contract, and a document is not more portable for being accepted by one
+    build and rejected by the other.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        for key in UNCARRIED_CONFIG_KEYS:
+            path = os.path.join(tmp, f"{key}.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write('{"%s": 5, "steps": []}' % key)
+            po = run(py, ("plan", "--dag", path))
+            ro = run(rs, ("plan", "--dag", path))
+            label = f"uncarried-key:{key}"
+            if po.returncode != ro.returncode:
+                rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
+            elif po.returncode != 2:
+                rep.bad(
+                    label,
+                    f"a key naming an uncarried DagConfig field must be REFUSED (exit 2), not "
+                    f"silently defaulted; both builds exited {po.returncode}",
+                )
+            elif po.stderr != ro.stderr:
+                rep.bad(label, f"stderr py={po.stderr!r} rs={ro.stderr!r}")
+            elif key not in po.stderr or "SILENTLY replaced by a default" not in po.stderr:
+                rep.bad(label, f"the refusal must name the key: {po.stderr!r}")
+            else:
+                rep.ok(label)
+        # The other side of the contract, so "refuse everything" cannot pass the cases above: a
+        # key naming nothing at all cannot masquerade as a setting that took effect, so both
+        # builds still accept it.
+        path = os.path.join(tmp, "unknown.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('{"future_thing": 5, "steps": []}')
+        po = run(py, ("plan", "--dag", path))
+        ro = run(rs, ("plan", "--dag", path))
+        label = "uncarried-key:unimplemented-key-still-tolerated"
         if po.returncode != ro.returncode:
             rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
-        elif po.returncode != 2:
-            rep.bad(label, f"expected exit 2 for an unknown --only tag; got {po.returncode}")
+        elif po.returncode != 0:
+            rep.bad(label, f"an unimplemented key must stay tolerated; got {po.returncode}")
+        else:
+            rep.ok(label)
+
+
+#: Every graph the loader must REFUSE, as ``(label, document, phrase the refusal must contain)``.
+#:
+#: All five were accepted by both builds until the loader learned to check the graph, and four of
+#: them then produced a wrong run rather than an error: a field that did nothing, a step that
+#: never ran while the summary counted it as passed, a starve found only after unrelated work had
+#: completed, and a crash (``RecursionError`` in Python, a stack-overflow ABORT WITH CORE DUMP in
+#: Rust). Pinned here so the two editions cannot drift back apart one refusal at a time.
+LOADER_REFUSALS: tuple[tuple[str, str, str], ...] = (
+    (
+        "different-document-type",
+        '{"schema":2,"bucket":"example","test":[]}',
+        "expected a dagrun DAG document with a top-level 'steps' list; found no 'steps' key "
+        "(top-level keys: 'bucket', 'schema', 'test')",
+    ),
+    (
+        "unknown-step-field",
+        '{"steps":[{"group":"a","job":"one","cmd":"true","bogus_field":42}]}',
+        "steps[0] (a.one): unknown field(s) 'bogus_field'",
+    ),
+    (
+        "unknown-cmdtype",
+        '{"steps":[{"group":"a","job":"one","cmd":"true","cmdtype":"cargo"}]}',
+        "valid values: unknown, make, cargo-build, cargo-test, cargo-nextest, "
+        "generic-dash-j-command, generic-with-flag",
+    ),
+    (
+        "quoted-multi-word-extra-args",
+        '{"steps":[{"group":"a","job":"one",'
+        '"cmd":"cargo build \\"$DAGRUN_EXTRA_ARGS\\"","cmdtype":"cargo-build",'
+        '"hint":{"preferred_inner_jobs":3}}]}',
+        "DAGRUN_EXTRA_ARGS must be unquoted",
+    ),
+    (
+        "compound-cmdtype-without-placement",
+        '{"steps":[{"group":"a","job":"one","cmd":"prepare && cargo build",'
+        '"cmdtype":"cargo-build","hint":{"preferred_inner_jobs":3}}]}',
+        "compound cmd with cmdtype cargo-build must place unquoted",
+    ),
+    (
+        "unknown-hint-field",
+        '{"steps":[{"group":"a","job":"one","cmd":"true","hint":{"est_duration":9}}]}',
+        "steps[0].hint: unknown field(s) 'est_duration'",
+    ),
+    (
+        "incomplete-manifest-selection",
+        '{"steps":[{"group":"a","job":"one","cmd":"true",'
+        '"manifest":{"lane":"portable"}}]}',
+        "steps[0].manifest: field 'category' must be a string",
+    ),
+    (
+        "unknown-manifest-field",
+        '{"steps":[{"group":"a","job":"one","cmd":"true",'
+        '"manifest":{"lane":"portable","category":"applications","future":1}}]}',
+        "steps[0].manifest: unknown field(s) 'future'",
+    ),
+    (
+        "result-manifests-not-a-list",
+        '{"steps":[{"group":"a","job":"one","cmd":"true",'
+        '"result_manifests":{"lane":"portable","category":"applications"}}]}',
+        "steps[0].result_manifests: must be a list of result declarations or null",
+    ),
+    (
+        "incomplete-result-manifest-selector",
+        '{"steps":[{"group":"a","job":"one","cmd":"true",'
+        '"result_manifests":[{"lane":"portable"}]}]}',
+        "steps[0].result_manifests[0]: field 'category' must be a string",
+    ),
+    (
+        "unknown-result-manifest-field",
+        '{"steps":[{"group":"a","job":"one","cmd":"true",'
+        '"result_manifests":[{"lane":"portable","category":"applications",'
+        '"future":1}]}]}',
+        "steps[0].result_manifests[0]: unknown field(s) 'future'",
+    ),
+    (
+        "duplicate-result-manifest-selector",
+        '{"steps":[{"group":"a","job":"one","cmd":"true",'
+        '"result_manifests":[{"lane":"portable","category":"applications"},'
+        '{"lane":"portable","category":"applications"}]}]}',
+        "steps[0].result_manifests: duplicate selector at index 1",
+    ),
+    (
+        "unknown-result-manifest-kind",
+        '{"steps":[{"group":"test","job":"counts","cmd":"true",'
+        '"result_manifests":[{"kind":"future","schema":3,'
+        '"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}]}]}',
+        "steps[0].result_manifests[0].kind: unknown result-manifest kind 'future'",
+    ),
+    (
+        "wrong-structured-result-schema",
+        '{"steps":[{"group":"test","job":"counts","cmd":"true",'
+        '"result_manifests":[{"kind":"structured-test-results","schema":4,'
+        '"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}]}]}',
+        "steps[0].result_manifests[0].schema: structured test results require default schema 2 or classified schema 3, got 4",
+    ),
+    (
+        "wrong-structured-result-path",
+        '{"steps":[{"group":"test","job":"counts","cmd":"true",'
+        '"result_manifests":[{"kind":"structured-test-results","schema":2,'
+        '"path_env":"OTHER","owner":"test.counts"}]}]}',
+        "steps[0].result_manifests[0].path_env: structured test results require "
+        "'DAGRUN_TEST_COUNTS_PATH', got 'OTHER'",
+    ),
+    (
+        "wrong-structured-result-owner",
+        '{"steps":[{"group":"test","job":"counts","cmd":"true",'
+        '"result_manifests":[{"kind":"structured-test-results","schema":2,'
+        '"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"other.step"}]}]}',
+        "step test.counts: structured test-result owner 'other.step' must equal the containing step tag",
+    ),
+    (
+        "duplicate-structured-result-declarations",
+        '{"steps":[{"group":"test","job":"counts","cmd":"true",'
+        '"result_manifests":[{"kind":"structured-test-results","schema":2,'
+        '"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"},'
+        '{"kind":"structured-test-results","schema":2,'
+        '"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}]}]}',
+        "steps[0].result_manifests: duplicate selector at index 1",
+    ),
+    (
+        "empty-integration-test-binary",
+        '{"steps":[{"group":"a","job":"one","cmd":"true",'
+        '"integration_test_binaries":["unit_alpha",""]}]}',
+        "field 'integration_test_binaries' must not contain empty names",
+    ),
+    (
+        "duplicate-integration-test-binary",
+        '{"steps":[{"group":"a","job":"one","cmd":"true",'
+        '"integration_test_binaries":["unit_alpha","unit_alpha"]}]}',
+        "field 'integration_test_binaries' contains duplicate name 'unit_alpha'",
+    ),
+    (
+        "unknown-write-domain-policy-field",
+        '{"steps":[],"write_domain_policy":{"require_explicits":true}}',
+        "write_domain_policy: unknown field(s) 'require_explicits'",
+    ),
+    (
+        "duplicate-step-tag",
+        '{"steps":[{"group":"a","job":"one","cmd":"echo FIRST"},'
+        '{"group":"a","job":"one","cmd":"echo SECOND"}]}',
+        "duplicate step tag 'a.one': declared 2 times",
+    ),
+    (
+        "missing-dependency",
+        '{"steps":[{"group":"z","job":"zero","cmd":"true"},'
+        '{"group":"a","job":"one","cmd":"true","deps":["b.missing"]}]}',
+        "step a.one: depends on 'b.missing', which no step declares",
+    ),
+    (
+        "dependency-cycle",
+        '{"steps":[{"group":"a","job":"one","cmd":"true","deps":["b.two"]},'
+        '{"group":"b","job":"two","cmd":"true","deps":["a.one"]}]}',
+        "dependency cycle: a.one -> b.two -> a.one",
+    ),
+    (
+        "self-dependency",
+        '{"steps":[{"group":"a","job":"one","cmd":"true","deps":["a.one"]}]}',
+        "dependency cycle: a.one -> a.one",
+    ),
+    (
+        "demand-above-positive-cap",
+        '{"resource_caps":{"browser":1},"steps":[{"group":"a","job":"one","cmd":"true",'
+        '"hint":{"resources":{"browser":2}}}]}',
+        "step a.one: demands browser=2 but resource_caps declares browser=1",
+    ),
+    (
+        "several-faults-at-once",
+        '{"resource_caps":{"browser":1},'
+        '"steps":[{"group":"a","job":"one","cmd":"true","deps":["nope.gone"]},'
+        '{"group":"b","job":"two","cmd":"true","deps":["c.three"]},'
+        '{"group":"c","job":"three","cmd":"true","deps":["b.two"]},'
+        '{"group":"d","job":"four","cmd":"true","hint":{"resources":{"browser":5}}}]}',
+        "3 graph error(s)",
+    ),
+)
+
+#: Graphs that must still LOAD, so "refuse everything" cannot pass the table above. Each one is
+#: the near-miss of a refusal: the boundary is the part that is easy to get wrong in only one
+#: edition.
+LOADER_ACCEPTANCES: tuple[tuple[str, str], ...] = (
+    (
+        "classified-result-schema-is-explicit",
+        '{"steps":[{"group":"test","job":"counts","cmd":"true",'
+        '"result_manifests":[{"kind":"structured-test-results","schema":3,'
+        '"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}]}]}',
+    ),
+    (
+        "every-declared-step-field",
+        '{"steps":[{"group":"a","job":"one","desc":"d","description":"long","cmd":"true",'
+        '"manifest":{"lane":"portable","category":"applications"},'
+        '"result_manifests":[{"lane":"portable","category":"applications",'
+        '"test":"applications/date","mode":"verify","backend":"ptrace"},'
+        '{"kind":"structured-test-results","schema":2,'
+        '"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"a.one"}],'
+        '"integration_test_binaries":["unit_alpha"],'
+        '"deps":[],"env":{"K":"V"},"networkonly":false,"engine_only":false,"timeout":5,'
+        '"cpu_timeout":3,"cmdtype":"generic-with-flag","jobs_flag":"-j","jobs_env":"J","explains":[],'
+        '"fail_fast_family":"fam",'
+        '"hint":{"resources":{},"est_duration_s":1.0,"classification":"light"}}]}',
+    ),
+    (
+        # A cap of exactly 0 is documented as "blocked on purpose", NOT as a load error.
+        "cap-of-zero-is-a-deliberate-block",
+        '{"resource_caps":{"browser":0},"steps":[{"group":"a","job":"one","cmd":"true",'
+        '"hint":{"resources":{"browser":1}}}]}',
+    ),
+    (
+        # An intentionally-skipped step never launches, so its dormant demand cannot starve.
+        "skipped-step-dormant-demand",
+        '{"resource_caps":{"browser":1},"steps":[{"group":"a","job":"one","cmd":"true",'
+        '"skip_reason":"empty-manifest-bucket","hint":{"resources":{"browser":9}}}]}',
+    ),
+    (
+        # A diamond is not a cycle. The three-colour walk grey-lists a node while it is on the
+        # path; a shared ancestor reached twice by different routes must not read as one.
+        "diamond-is-not-a-cycle",
+        '{"steps":[{"group":"g","job":"root","cmd":"true"},'
+        '{"group":"g","job":"left","cmd":"true","deps":["g.root"]},'
+        '{"group":"g","job":"right","cmd":"true","deps":["g.root"]},'
+        '{"group":"g","job":"join","cmd":"true","deps":["g.left","g.right"]}]}',
+    ),
+)
+
+#: Inspection subcommands. Validating in ALL of them is the point: a graph check that needs a run
+#: is not a check, it is a build.
+INSPECTION_SUBCOMMANDS: tuple[str, ...] = ("list", "plan", "ascii", "dot", "json", "yaml")
+
+
+def compare_loader_graph_validation(py: list[str], rs: list[str], rep: Report) -> None:
+    """Both builds must refuse the same broken graphs, with the same bytes, from every entry.
+
+    THE CHEAP CHECK IS THE POINT. A `list` that prints a cyclic graph and exits 0 gives a caller
+    no way to validate a DAG short of running it, and running it was, for a cycle, a crash. So the
+    refusal is asserted on `run` AND on every inspection subcommand, with the same exit code.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        for label, doc, phrase in LOADER_REFUSALS:
+            path = os.path.join(tmp, f"{label}.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(doc)
+            for sub in ("run", *INSPECTION_SUBCOMMANDS):
+                args = (sub, "--dag", path)
+                po = run(py, args)
+                ro = run(rs, args)
+                case = f"loader-refusal:{label}:{sub}"
+                if po.returncode != ro.returncode:
+                    rep.bad(case, f"exit py={po.returncode} rs={ro.returncode}")
+                elif po.returncode != 2:
+                    rep.bad(
+                        case,
+                        f"a broken graph must be REFUSED at load (exit 2), not accepted or "
+                        f"crashed; both builds exited {po.returncode}: {po.stderr!r}",
+                    )
+                elif phrase not in po.stderr or phrase not in ro.stderr:
+                    rep.bad(
+                        case,
+                        f"the refusal must say {phrase!r}; py={po.stderr!r} rs={ro.stderr!r}",
+                    )
+                elif po.stderr != ro.stderr:
+                    rep.bad(case, f"stderr py={po.stderr!r} rs={ro.stderr!r}")
+                else:
+                    rep.ok(case)
+
+        for label, doc in LOADER_ACCEPTANCES:
+            path = os.path.join(tmp, f"ok-{label}.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(doc)
+            args = ("list", "--dag", path)
+            po = run(py, args)
+            ro = run(rs, args)
+            case = f"loader-acceptance:{label}"
+            if po.returncode != ro.returncode:
+                rep.bad(case, f"exit py={po.returncode} rs={ro.returncode}")
+            elif po.returncode != 0:
+                rep.bad(
+                    case,
+                    f"this graph must still LOAD; both builds exited {po.returncode}: "
+                    f"{po.stderr!r}",
+                )
+            elif po.stdout != ro.stdout:
+                rep.bad(case, f"stdout py={po.stdout!r} rs={ro.stdout!r}")
+            else:
+                rep.ok(case)
+
+
+def compare_uncontained_cpu_budget_notice(py: list[str], rs: list[str], rep: Report) -> None:
+    """Both builds must describe the same best-effort uncontained CPU-time fallback.
+
+    The capability manifest remains ``uncontained.cpu_timeout=false`` because procfs
+    process-group accounting is only a lower bound, not a cgroup-equivalent guarantee. The
+    scheduler nevertheless attempts that weaker guard. This check pins the operator-facing
+    disclosure, its Python/Rust parity, and its once-per-run cardinality.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        live = os.path.join(tmp, "live.json")
+        with open(live, "w", encoding="utf-8") as fh:
+            fh.write(
+                '{"steps": [{"group": "g", "job": "a", '
+                '"cmd": "true", "cpu_timeout": 7, "timeout": 30}]}'
+            )
+        po = run(py, ("run", "--dag", live, ACF))
+        ro = run(rs, ("run", "--dag", live, ACF))
+        label = "uncontained-cpu-budget-notice"
+        phrase = "best-effort procfs process-group CPU floor"
+        py_lines = [ln for ln in po.stderr.splitlines() if phrase in ln]
+        rs_lines = [ln for ln in ro.stderr.splitlines() if phrase in ln]
+        if not py_lines or not rs_lines:
+            rep.bad(
+                label,
+                "an UNCONTAINED run must name the weaker CPU-time fallback; "
+                f"py={py_lines!r} rs={rs_lines!r}",
+            )
+        elif py_lines != rs_lines:
+            rep.bad(label, f"notice differs: py={py_lines!r} rs={rs_lines!r}")
+        elif "largest 7s" not in py_lines[0]:
+            rep.bad(label, f"the notice must quote the budget policed by the fallback: {py_lines[0]!r}")
+        else:
+            rep.ok(label)
+
+        # Once per RUN. A multi-step graph is the case that separates a run-level notice from a
+        # per-step one; a per-tick regression would show up as a much larger count still.
+        many = os.path.join(tmp, "many.json")
+        with open(many, "w", encoding="utf-8") as fh:
+            fh.write(
+                '{"steps": ['
+                '{"group": "g", "job": "a", "cmd": "true", '
+                '"cpu_timeout": 7, "timeout": 30}, '
+                '{"group": "g", "job": "b", "cmd": "true", '
+                '"cpu_timeout": 5, "timeout": 30}, '
+                '{"group": "g", "job": "c", "cmd": "true", '
+                '"cpu_timeout": 3, "timeout": 30}]}'
+            )
+        po = run(py, ("run", "--dag", many, ACF))
+        ro = run(rs, ("run", "--dag", many, ACF))
+        label = "uncontained-cpu-budget-notice:once-per-run"
+        py_count = sum(1 for ln in po.stderr.splitlines() if phrase in ln)
+        rs_count = sum(1 for ln in ro.stderr.splitlines() if phrase in ln)
+        if (py_count, rs_count) != (1, 1):
+            rep.bad(
+                label,
+                "the notice belongs once per RUN, not once per step or once per tick; "
+                f"py={py_count} rs={rs_count}",
+            )
         else:
             rep.ok(label)
 
@@ -998,7 +1777,7 @@ def compare_run_timeout(py: list[str], rs: list[str], rep: Report) -> None:
     budget whose breach cannot be attributed.
     """
     with tempfile.TemporaryDirectory() as tmp:
-        # Natural length ~12s (three 4s steps, -j1); budget 6s; every step's own wall budget 5s,
+        # Natural length ~12s (three 4s steps, -s1); budget 6s; every step's own wall budget 5s,
         # strictly under the run budget, so the ordering is legal.
         bounded = os.path.join(tmp, "bounded.json")
         with open(bounded, "w", encoding="utf-8") as fh:
@@ -1040,7 +1819,10 @@ def compare_run_timeout(py: list[str], rs: list[str], rep: Report) -> None:
         def _run(cmd: list[str], dag: str) -> Outcome:
             return run(
                 cmd,
-                ("run", "--dag", dag, "-q", "-j", "1", NOPROF, NOFB, ACF, "--run-timeout", "6"),
+                (
+                    "run", "--dag", dag, "-q", "-s", "1", "-j", "1", NOPROF, NOFB,
+                    ACF, "--run-timeout", "6",
+                ),
             )
 
         po, ro = _run(py, bounded), _run(rs, bounded)
@@ -1134,7 +1916,10 @@ def compare_escapee_teardown(py: list[str], rs: list[str], rep: Report) -> None:
                         }
                     )
                 )
-            return pid_file, run(cmd, ("run", "--dag", dag_path, "-q", "-j", "1", NOPROF, NOFB, ACF))
+            return pid_file, run(
+                cmd,
+                ("run", "--dag", dag_path, "-q", "-s", "1", "-j", "1", NOPROF, NOFB, ACF),
+            )
 
         pid_files: list[str] = []
         survivors: dict[str, bool | None] = {}
@@ -1208,6 +1993,8 @@ def compare_term_attribution(py: list[str], rs: list[str], rep: Report) -> None:
             "--dag",
             dag_path,
             "-q",
+            "-s",
+            "1",
             "-j",
             "1",
             NOPROF,
@@ -1229,6 +2016,14 @@ def compare_term_attribution(py: list[str], rs: list[str], rep: Report) -> None:
             rep.bad(label, f"{'/'.join(missing)} suppressed the timed-out step's SIGTERM marker")
         else:
             rep.ok(label)
+
+
+def _journal_step_end_ok(row: Mapping[str, object]) -> bool:
+    """Read a journal verdict without accepting a truthy string as success."""
+    value = row.get("ok")
+    if type(value) is not bool:
+        raise ValueError("journal step_end ok must be a boolean")
+    return value
 
 
 def compare_test_attribution_evidence(py: list[str], rs: list[str], rep: Report) -> None:
@@ -1262,6 +2057,8 @@ def compare_test_attribution_evidence(py: list[str], rs: list[str], rep: Report)
             "--dag",
             dag_path,
             "-q",
+            "-s",
+            "1",
             "-j",
             "1",
             NOPROF,
@@ -1269,8 +2066,8 @@ def compare_test_attribution_evidence(py: list[str], rs: list[str], rep: Report)
             "--unsafe-no-cgroups",
         )
         outcomes = {
-            "py": run(py, args, {"SAFE_CI_DAG_RUNNER_LOG_DIR": dirs["py"]}),
-            "rs": run(rs, args, {"SAFE_CI_DAG_RUNNER_LOG_DIR": dirs["rs"]}),
+            "py": run(py, args, {"DAGRUN_LOG_DIR": dirs["py"]}),
+            "rs": run(rs, args, {"DAGRUN_LOG_DIR": dirs["rs"]}),
         }
         phrase = "culprit test suite::gamma_the_hang"
         if any(out.returncode == 0 or phrase not in out.stdout + out.stderr for out in outcomes.values()):
@@ -1278,7 +2075,9 @@ def compare_test_attribution_evidence(py: list[str], rs: list[str], rep: Report)
         else:
             rep.ok("attribution:culprit")
 
-        def normalized(directory: str) -> list[tuple[str, str, str, str, str, str]]:
+        def normalized(
+            directory: str,
+        ) -> list[tuple[str, str, str, str, str, str, bool | None]]:
             rows = [
                 json.loads(line)
                 for line in Path(directory, "journal.jsonl").read_text(encoding="utf-8").splitlines()
@@ -1291,12 +2090,19 @@ def compare_test_attribution_evidence(py: list[str], rs: list[str], rep: Report)
                     str(row.get("verdict", "")),
                     str(row.get("tests_started", "")),
                     str(row.get("tests_completed", "")),
+                    _journal_step_end_ok(row) if row.get("event") == "step_end" else None,
                 )
                 for row in rows
                 if row.get("event") in {"test_start", "test_end", "step_end"}
             ]
 
         try:
+            try:
+                _journal_step_end_ok({"event": "step_end", "ok": "false"})
+            except ValueError:
+                pass
+            else:
+                raise ValueError("journal reader accepted a string step_end verdict")
             py_rows, rs_rows = normalized(dirs["py"]), normalized(dirs["rs"])
             logs = {
                 name: Path(directory, "tests.suite.log").read_text(encoding="utf-8")
@@ -1318,8 +2124,528 @@ def compare_test_attribution_evidence(py: list[str], rs: list[str], rep: Report)
                 rep.ok("attribution:evidence")
 
 
+def compare_step_log_ceiling(py: list[str], rs: list[str], rep: Report) -> None:
+    """The per-step durable-log ceiling truncates at the SAME byte in both engines.
+
+    Byte-for-byte, deliberately. Both the cut position and the truncation marker are public
+    evidence-file content, and the marker is a long literal duplicated in two languages: without
+    a paired check, one engine can be edited and the drift is invisible until someone diffs two
+    incidents' logs. Compared here where a divergence is a failing check, not a footnote.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        dag_path = os.path.join(tmp, "log-ceiling.json")
+        Path(dag_path).write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "group": "flood",
+                            "job": "stdout",
+                            # Far past the 100-byte ceiling set below, and emitted in several
+                            # writes so the cut lands mid-stream rather than on a chunk boundary.
+                            "cmd": "for i in $(seq 1 40); do printf 'ABCDEFGHIJ'; done",
+                            "timeout": 30,
+                            "cpu_timeout": 600,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        dirs = {name: os.path.join(tmp, name) for name in ("py", "rs")}
+        args = (
+            "run", "--dag", dag_path, "-q", "-s", "1", "-j", "1",
+            NOPROF, NOFB, "--unsafe-no-cgroups",
+        )
+        outs = {
+            name: run(
+                cmd,
+                args,
+                {
+                    "DAGRUN_LOG_DIR": dirs[name],
+                    "DAGRUN_LOG_MAX_BYTES": "100",
+                },
+            )
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+        label = "attribution:log-ceiling"
+        if outs["py"].returncode != outs["rs"].returncode:
+            rep.bad(label, f"exit py={outs['py'].returncode} rs={outs['rs'].returncode}")
+            return
+        try:
+            logs = {
+                name: Path(directory, "flood.stdout.log").read_bytes()
+                for name, directory in dirs.items()
+            }
+            journals = {
+                name: Path(directory, "journal.jsonl").read_text(encoding="utf-8")
+                for name, directory in dirs.items()
+            }
+        except OSError as exc:
+            rep.bad(label, str(exc))
+            return
+        # Drop `ts`: it is a wall-clock reading, so it legitimately differs between two runs.
+        truncations = {
+            name: [
+                {k: v for k, v in row.items() if k != "ts"}
+                for row in (json.loads(line) for line in text.splitlines())
+                if row.get("event") == "step_log_truncated"
+            ]
+            for name, text in journals.items()
+        }
+        if logs["py"] != logs["rs"]:
+            rep.bad(label, f"capped log py={logs['py']!r} rs={logs['rs']!r}")
+        elif logs["py"][:100] != b"ABCDEFGHIJ" * 10 or len(logs["py"]) <= 100:
+            rep.bad(label, f"ceiling did not bite: {logs['py']!r}")
+        elif truncations["py"] != truncations["rs"]:
+            rep.bad(label, f"journal py={truncations['py']!r} rs={truncations['rs']!r}")
+        elif len(truncations["py"]) != 1:
+            rep.bad(label, f"expected exactly one truncation record; got {truncations['py']!r}")
+        else:
+            rep.ok(label)
+
+
+def compare_capture_ceiling(py: list[str], rs: list[str], rep: Report) -> None:
+    """The IN-MEMORY capture ceiling drops the same bytes and says so identically in both engines.
+
+    This is the check the archived work could not have: the property is a MEMORY property, so
+    nothing about a normal run reveals it. Its one observable consequence is the failure dump --
+    which tail survived, and the notice that says how much did not -- so that is what is compared,
+    byte for byte, on a step whose output is far past the ceiling.
+
+    Without this pairing, bounding one engine's capture and not the other's creates a divergence
+    that no existing check can see: both runs still pass, both still print a dump, and only the
+    engine that OOMs under a real runaway tells you which one was fixed.
+
+    THE STEP FLOODS BOTH PIPES, and that is not incidental. A stdout-only fixture cannot see the
+    divergence that a per-stream ring produces -- one ring per pipe holds TWICE the ceiling and
+    announces the drop once per pipe, each notice counting only its own half -- so it would have
+    passed while the two engines disagreed about both numbers in the notice and about how much of
+    the step the runner was holding. The step writes its whole stdout burst, pauses so the order
+    is settled rather than raced, then its whole stderr burst: the surviving tail is then pure
+    stderr in both engines, so "the earlier stdout is gone" is a stable assertion about a single
+    step-wide ring rather than a statement about thread scheduling.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        dag_path = os.path.join(tmp, "capture-ceiling.json")
+        Path(dag_path).write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "group": "flood",
+                            "job": "both",
+                            # Far past the 300-byte ceiling set below, emitted in many writes so
+                            # the cut lands mid-stream, and FAILING so the dump is printed.
+                            "cmd": (
+                                'for i in $(seq 1 200); do echo "line$i"; done; sleep 0.5; '
+                                'for i in $(seq 1 200); do echo "oops$i" >&2; done; exit 3'
+                            ),
+                            "timeout": 30,
+                            "cpu_timeout": 600,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        args = (
+            "run", "--dag", dag_path, "-s", "1", "-j", "1",
+            NOPROF, NOFB, "--unsafe-no-cgroups",
+        )
+        outs = {
+            name: run(
+                cmd,
+                args,
+                {
+                    "DAGRUN_NO_STEP_LOGS": "1",
+                    "DAGRUN_CAPTURE_MAX_BYTES": "300",
+                },
+            )
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+        label = "attribution:capture-ceiling"
+        if outs["py"].returncode != outs["rs"].returncode:
+            rep.bad(label, f"exit py={outs['py'].returncode} rs={outs['rs'].returncode}")
+            return
+
+        def detail(text: str) -> list[str]:
+            lines = text.splitlines()
+            try:
+                start = next(
+                    i for i, line in enumerate(lines) if line.endswith("----- detail -----")
+                )
+                end = next(
+                    i for i, line in enumerate(lines) if line.endswith("----- end detail -----")
+                )
+            except StopIteration:
+                return []
+            return lines[start + 1 : end]
+
+        dumps = {name: detail(out.stdout) for name, out in outs.items()}
+        # 1492 bytes of "lineN" plus 1492 of "oopsN": the ceiling is over the STEP, so the notice
+        # counts both pipes. A per-stream ring says 1492, twice.
+        notice = (
+            "[dagrun] EARLIER OUTPUT DROPPED: this step produced 2984 bytes but "
+            "only the last 300 were kept in memory (raise or lift the ceiling with "
+            "DAGRUN_CAPTURE_MAX_BYTES; 0 = unlimited). The durable per-step log is "
+            "unaffected and still has the rest."
+        )
+        notices = {
+            name: [line for line in dump if "EARLIER OUTPUT DROPPED" in line]
+            for name, dump in dumps.items()
+        }
+        if dumps["py"] != dumps["rs"]:
+            rep.bad(label, f"detail py={dumps['py']!r} rs={dumps['rs']!r}")
+        elif not dumps["py"]:
+            rep.bad(label, "neither engine printed a failure detail block")
+        elif len(notices["py"]) != 1 or len(notices["rs"]) != 1:
+            # ONE ceiling, ONE notice: a per-pipe notice reports neither what the step produced
+            # nor what survived, and holds twice the bytes the operator asked for.
+            rep.bad(label, f"expected exactly one dropped-notice: {notices!r}")
+        elif dumps["py"][0] != f"[flood.both] {notice}":
+            rep.bad(label, f"notice line was {dumps['py'][0]!r}")
+        elif "[flood.both] oops200" not in dumps["py"]:
+            rep.bad(label, "the TAIL of the output was not retained")
+        elif any(line.startswith("[flood.both] line") for line in dumps["py"]):
+            # The stdout burst is 1492 bytes ending 1492 bytes before the end, so a step-wide
+            # 300-byte ring cannot have kept ANY of it. A ring per pipe keeps 300 bytes of it.
+            rep.bad(label, "the ceiling did not bite: stdout survived a stderr-filled tail")
+        else:
+            rep.ok(label)
+
+
+def compare_box_subcommand(py: list[str], rs: list[str], rep: Report) -> None:
+    """`box` boxes ONE command identically in both engines, argv quoting included.
+
+    A new user-visible subcommand in one engine and not the other is exactly the parity gap this
+    repository's `make both` / `make cross` contract exists to prevent, and it is the stated
+    reason the archived Rust-only implementation was never landed. The flag inventory is covered
+    by `compare_cli_schema`; what is compared here is BEHAVIOUR: the tag the step is given, the
+    label derivation, and -- the part most likely to diverge silently -- that argv is shell-quoted
+    element by element rather than joined, so an argument containing a space, a quote, a `;` or a
+    `$(...)` survives as ONE argument instead of becoming shell syntax.
+    """
+    label = "box:subcommand"
+    # Deliberately hostile argv: a space, an embedded single quote, a shell metacharacter, and a
+    # command substitution. Correct quoting echoes them back verbatim.
+    hostile = ["a b", "it's", "semi;colon", "$(echo pwned)"]
+    # `--mem 512M` IS PART OF THE FIXTURE, not decoration. It is the value #82, the user guide and
+    # both `--help` texts all show, and it reaches the run as `--max-mem`, which is checked
+    # against the graph's MODELED footprint. Both engines floored that model at 8 GiB and so
+    # REFUSED (exit 2) every `--mem` below the default the flag exists to lower. Boxing one
+    # command with a small memory ceiling is the whole feature; a fixture that omits the ceiling
+    # cannot see it broken, and cannot see it broken in one engine only.
+    outs = {
+        name: run(
+            cmd,
+            (
+                "box",
+                "--allow-cgroup-failure",
+                "--label",
+                "probe",
+                "--mem",
+                "512M",
+                "--timeout",
+                "60",
+                "--cores",
+                "1",
+                "--",
+                "printf",
+                "[%s]",
+                *hostile,
+            ),
+            {"DAGRUN_PROFILE_DIR": os.path.join(tempfile.gettempdir(), "cross-box")},
+        )
+        for name, cmd in (("py", py), ("rs", rs))
+    }
+    if outs["py"].returncode != outs["rs"].returncode:
+        rep.bad(label, f"exit py={outs['py'].returncode} rs={outs['rs'].returncode}")
+        return
+    if outs["py"].returncode != 0:
+        rep.bad(label, f"box exited {outs['py'].returncode}\n{outs['py'].stdout}")
+        return
+    expected = "".join(f"[{part}]" for part in hostile)
+    for name, out in outs.items():
+        if f"[box.probe] \u2713 PASS" not in out.stdout:
+            rep.bad(label, f"{name}: no PASS line for box.probe\n{out.stdout}")
+            return
+        if expected not in out.stdout:
+            rep.bad(label, f"{name}: argv was not passed through verbatim: {out.stdout!r}")
+            return
+
+    # An empty command is a usage error in both, and says so rather than boxing nothing.
+    empty = {name: run(cmd, ("box",)) for name, cmd in (("py", py), ("rs", rs))}
+    if empty["py"].returncode != 2 or empty["rs"].returncode != 2:
+        rep.bad(
+            label,
+            f"empty box exit py={empty['py'].returncode} rs={empty['rs'].returncode}",
+        )
+    elif not all("no command given" in out.stderr for out in empty.values()):
+        rep.bad(label, f"empty box stderr py={empty['py'].stderr!r} rs={empty['rs'].stderr!r}")
+    else:
+        rep.ok(label)
+
+
+def compare_memory_admission(py: list[str], rs: list[str], rep: Report) -> None:
+    """Both engines give the SAME admission verdict, in the same words, with the same exit code.
+
+    Admission is cross-process shared state: the two editions read and write ONE ledger on the
+    host, so they have to agree about its schema, about the arithmetic, and about what each
+    verdict is called. A Python-only implementation would not merely be a missing feature, it
+    would be a runner that ignores reservations the other engine is honouring -- which is worse
+    than no admission at all, because the ledger would then be actively misleading.
+
+    The host limits are pinned through the operator overrides so the comparison is about the
+    DECISION and not about whatever this machine happens to have free.
+    """
+    label = "admission:verdicts"
+    with tempfile.TemporaryDirectory() as tmp:
+        dag_path = os.path.join(tmp, "admission.json")
+        Path(dag_path).write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "group": "g",
+                            "job": "ok",
+                            "cmd": "true",
+                            "timeout": 30,
+                            "cpu_timeout": 600,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        gib = 1024**3
+        base_no_admission = (
+            "run", "--dag", dag_path, "-s", "1", "-j", "1",
+            NOPROF, NOFB, "--unsafe-no-cgroups",
+        )
+        base = (*base_no_admission, "--admission")
+
+        def env(name: str, budget: int, headroom: int) -> dict[str, str]:
+            return {
+                "DAGRUN_MEM_LEDGER": os.path.join(tmp, f"{name}.json"),
+                "DAGRUN_ADMISSION_BUDGET_BYTES": str(budget),
+                "DAGRUN_ADMISSION_HEADROOM_BYTES": str(headroom),
+            }
+
+        # 1. REFUSED: the request alone is bigger than the whole-host budget.
+        refused = {
+            name: run(cmd, (*base, "--max-mem", "64G"), env("refuse", 16 * gib, 64 * gib))
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+        # 2. QUEUED on host memory a non-runner tenant is holding.
+        queued = {
+            name: run(cmd, (*base, "--max-mem", "32G"), env("queue", 64 * gib, 1024))
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+        # 3. GRANTED, and the run then proceeds to completion.
+        granted = {
+            name: run(cmd, (*base, "--max-mem", "16G"), env("grant", 64 * gib, 64 * gib))
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+        # 4. Admission without a number to reserve is a usage error, not a guess.
+        no_number = {
+            name: run(cmd, base, env("nonum", 64 * gib, 64 * gib))
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+        # 5. ALREADY ADMITTED, PROVEN BY THE LEDGER. Cgroup boxing re-execs the runner into a
+        # systemd scope with `execvp`, which keeps the pid AND the /proc start time, so the
+        # pre-exec reservation is still this run's own and both engines must SKIP admission: an
+        # engine that asks again counts one run twice, and on a tight budget queues the run behind
+        # itself with nothing that can ever release it. The seed below writes exactly that record
+        # -- this pid, this start time -- and then `exec`s the engine, which keeps both.
+        own_ledger = os.path.join(tmp, "own-record.json")
+        seed = os.path.join(tmp, "seed_own_record.py")
+        Path(seed).write_text(
+            "import json, sys, time\n"
+            "pid = int(sys.argv[1])\n"
+            "stat = open(f'/proc/{pid}/stat', encoding='utf-8').read()\n"
+            "starttime = int(stat[stat.rfind(')') + 2:].split()[19])\n"
+            "json.dump({'admissions': [{'pid': pid, 'starttime': starttime,\n"
+            "    'bytes': 16 * 1024**3, 'tag': 'run', 'ts': time.time()}]},\n"
+            "    open(sys.argv[2], 'w', encoding='utf-8'))\n",
+            encoding="utf-8",
+        )
+        # `$$` is the shell's own pid, and `exec` hands that very pid to the engine -- the same
+        # identity preservation the boxing re-exec relies on.
+        seeded_shell = (
+            f'{shlex.quote(sys.executable)} {shlex.quote(seed)} "$$" '
+            f'{shlex.quote(own_ledger)} && exec "$@"'
+        )
+        own_record = {
+            name: run(
+                ["sh", "-c", seeded_shell, "sh", *cmd],
+                (*base, "--max-mem", "16G"),
+                {
+                    "DAGRUN_MEM_LEDGER": own_ledger,
+                    "DAGRUN_ADMISSION_BUDGET_BYTES": str(gib),
+                    "DAGRUN_ADMISSION_HEADROOM_BYTES": str(64 * gib),
+                    "DAGRUN_IN_SCOPE": "1",
+                },
+            )
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+        # 5b. AN INHERITED SENTINEL IS NOT AN ADMISSION. `systemd-run --setenv=DAGRUN_IN_SCOPE=1`
+        # sets the variable for the WHOLE scope and every step inherits it, so a runner invoked as
+        # a step of a boxed run reads the same "1" while holding nothing. An engine that skips on
+        # the flag alone reserves nothing, prints no verdict and exits 0 -- here, for a 16 GiB
+        # request against a 1 GiB budget on an EMPTY ledger. Both engines must refuse it instead.
+        inherited = {
+            name: run(
+                cmd,
+                (*base, "--max-mem", "16G"),
+                {**env("inherited", gib, 64 * gib), "DAGRUN_IN_SCOPE": "1"},
+            )
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+        # 5c. THE DEFAULT BUDGET, MEASURED RATHER THAN OVERRIDDEN. Every other leg pins both host
+        # limits through the operator overrides, which makes the two engines agree about the
+        # DECISION while saying nothing about the fraction of MemTotal each of them would claim on
+        # a real host. A request larger than any machine forces both to print that number.
+        default_budget = {
+            name: run(
+                cmd,
+                (*base, "--max-mem", "8000000G"),
+                {"DAGRUN_MEM_LEDGER": os.path.join(tmp, "default.json")},
+            )
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+        # 5d. A WAIT_S NEITHER ENGINE CAN HONOUR IS A USAGE ERROR IN BOTH, with the same ceiling
+        # in the message. 1e19 used to be accepted by both validators and then ABORT the Rust
+        # engine (exit 101, overflow when adding a duration to an instant) while Python ran on.
+        # `-1` pins the other half: argparse eats a negative number as the flag's VALUE, so an
+        # engine that left the token unconsumed would diagnose the same typo differently.
+        too_long = {
+            name: run(
+                cmd,
+                (*base_no_admission, "--max-mem", "16G", "--admission=1e19"),
+                env("long", 64 * gib, 64 * gib),
+            )
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+        negative = {
+            name: run(cmd, (*base, "-1", "--max-mem", "16G"), env("neg", 64 * gib, 64 * gib))
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+        # A day is the ceiling, and it is INCLUSIVE -- a granted run does not wait at all.
+        at_ceiling = {
+            name: run(cmd, (*base, "86400", "--max-mem", "16G"), env("ceil", 64 * gib, 64 * gib))
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+        # 6. A ledger neither engine can read stops the run instead of waving it through: the
+        # ledger IS the shared state, and guessing past it silently restores the contention.
+        corrupt_path = os.path.join(tmp, "corrupt.json")
+        Path(corrupt_path).write_text("{not json at all", encoding="utf-8")
+        corrupt = {
+            name: run(
+                cmd,
+                (*base, "--max-mem", "16G"),
+                {
+                    "DAGRUN_MEM_LEDGER": corrupt_path,
+                    "DAGRUN_ADMISSION_BUDGET_BYTES": str(64 * gib),
+                    "DAGRUN_ADMISSION_HEADROOM_BYTES": str(64 * gib),
+                },
+            )
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+
+        # (name, outcomes, expected exit, phrase both engines must print, phrase is on stderr)
+        checks: list[tuple[str, dict[str, Outcome], int, str, bool]] = [
+            ("refuse", refused, 4, "REFUSED: 64.0 GiB exceeds the whole-host budget", True),
+            ("queue", queued, 4, "QUEUED on HOST MEMORY held outside this tool", True),
+            ("grant", granted, 0, "GRANTED 16.0 GiB", False),
+            ("no-max-mem", no_number, 2, "--admission requires --max-mem", True),
+            ("in-scope-own-record", own_record, 0, "DELIBERATELY UNBOXED", True),
+            (
+                "in-scope-inherited-sentinel",
+                inherited,
+                4,
+                "REFUSED: 16.0 GiB exceeds the whole-host budget of 1.0 GiB",
+                True,
+            ),
+            (
+                "default-budget",
+                default_budget,
+                4,
+                "exceeds the whole-host budget",
+                True,
+            ),
+            (
+                "wait-above-ceiling",
+                too_long,
+                2,
+                "--admission WAIT_S must be a finite number of seconds in [0, 86400] (got '1e19')",
+                True,
+            ),
+            (
+                "wait-negative",
+                negative,
+                2,
+                "--admission WAIT_S must be a finite number of seconds in [0, 86400] (got '-1')",
+                True,
+            ),
+            ("wait-at-ceiling", at_ceiling, 0, "GRANTED 16.0 GiB", False),
+            ("corrupt-ledger", corrupt, 4, "admission ledger unusable", True),
+        ]
+        for name, outs, expected_code, phrase, on_stderr in checks:
+            if outs["py"].returncode != outs["rs"].returncode:
+                rep.bad(
+                    label,
+                    f"{name}: exit py={outs['py'].returncode} rs={outs['rs'].returncode}",
+                )
+                return
+            if outs["py"].returncode != expected_code:
+                rep.bad(
+                    label,
+                    f"{name}: expected exit {expected_code}, got {outs['py'].returncode}\n"
+                    f"{outs['py'].stdout}{outs['py'].stderr}",
+                )
+                return
+            for engine, out in outs.items():
+                text = out.stderr if on_stderr else out.stdout
+                if phrase not in text:
+                    rep.bad(label, f"{name}: {engine} did not say {phrase!r}\n{text}")
+                    return
+        # The own-record leg is defined by what it must NOT do, so say that outright rather than
+        # leaning on exit 0: a re-admitting engine would print its verdict on the way past, and
+        # would leave a SECOND record in the ledger for one run.
+        for engine, out in own_record.items():
+            noise = out.stdout + out.stderr
+            if "[admission]" in noise or "REFUSED" in noise:
+                rep.bad(
+                    label,
+                    f"in-scope-own-record: {engine} re-admitted after the boxing re-exec\n{noise}",
+                )
+                return
+        held = json.loads(Path(own_ledger).read_text(encoding="utf-8"))["admissions"]
+        if len(held) != 1:
+            rep.bad(label, f"in-scope-own-record: one run left {len(held)} records: {held}")
+            return
+        # The measured default budget is the same number in both engines, to the byte. This is
+        # what an unpinned budget FRACTION would break: the decision legs above would stay green
+        # while the two editions disagreed about how much of a real host they may hold.
+        if default_budget["py"].stderr != default_budget["rs"].stderr:
+            rep.bad(
+                label,
+                "default-budget: the two engines measured different host budgets\n"
+                f"--- py ---\n{default_budget['py'].stderr}"
+                f"--- rs ---\n{default_budget['rs'].stderr}",
+            )
+            return
+        rep.ok(label)
+
+
 def compare_batch_teardown_grace(py: list[str], rs: list[str], rep: Report) -> None:
-    """Eager cancellation grants one diagnostic window, not one window per sibling."""
+    """Eager cancellation grants one diagnostic window, not one window per sibling.
+
+    Use an outer run timeout as a behavioral tripwire instead of treating shared-host wall time as
+    a performance SLO. Eight serial five-second TERM graces cannot finish before that tripwire,
+    while one shared grace has ample room even under scheduler and `/proc`-scan contention.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         dag_path = os.path.join(tmp, "batch-grace.json")
         steps: list[dict[str, object]] = [
@@ -1339,7 +2665,7 @@ def compare_batch_teardown_grace(py: list[str], rs: list[str], rep: Report) -> N
                 "timeout": 20,
                 "cpu_timeout": 600,
             }
-            for index in range(4)
+            for index in range(8)
         )
         Path(dag_path).write_text(json.dumps({"steps": steps}), encoding="utf-8")
         args = (
@@ -1347,14 +2673,23 @@ def compare_batch_teardown_grace(py: list[str], rs: list[str], rep: Report) -> N
             "--dag",
             dag_path,
             "-q",
+            "-s",
+            "9",
             "-j",
-            "5",
+            "9",
+            "--run-timeout",
+            "25",
             NOPROF,
             NOFB,
             "--unsafe-no-cgroups",
         )
         po, ro = run(py, args), run(rs, args)
-        if po.returncode == ro.returncode != 0 and max(po.elapsed_s, ro.elapsed_s) < 9.0:
+        evidence = (po.stdout + po.stderr, ro.stdout + ro.stderr)
+        if (
+            po.returncode == ro.returncode != 0
+            and all("[scheduler] RUN TIMEOUT" not in text for text in evidence)
+            and max(po.elapsed_s, ro.elapsed_s) < 32.0
+        ):
             rep.ok("teardown:shared-batch-grace")
         else:
             rep.bad(
@@ -1415,22 +2750,31 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
         # here (see cross/README.md). The flag makes both builds run the SAME observable UNBOXED
         # scheduling core deterministically, regardless of whether the host can box. Boxing itself
         # is proven by each build's own tests (Python pytest + the Rust boxing smoke test).
-        po = run(py, ("run", "--dag", dag_path, "-q", "-j", "4", NOPROF, NOFB, ACF))
-        ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "4", NOPROF, NOFB, ACF))
+        concurrent_args = (
+            "run", "--dag", dag_path, "-q", "-s", "4", "-j", "64", NOPROF, NOFB, ACF,
+        )
+        po = run(py, concurrent_args)
+        ro = run(rs, concurrent_args)
         label = f"{fx.name}/run(default-exit)"
         if po.returncode != ro.returncode:
             rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
         else:
             rep.ok(label)
 
-        # 4) run serial (-j1): deterministic counts + exit code. With one step at a time the
+        # 4) run serial (-s1): deterministic counts + exit code. Keep an ample -j64 aggregate CPU
+        # budget so serial scheduling does not rewrite an authored inner width or its jobs_flag.
+        # With one step at a time the
         # ready-set loop dispatches in a single deterministic LPT sequence, so the
-        # passed/failed/aborted/intentionally-skipped/dependency-skipped counts are fully
-        # reproducible between the two builds.
-        # (Note: --keep-going only suppresses the eager-abort of in-flight steps; on any
-        # failure BOTH builds set stop and launch no new steps, so counts still race at -j>1.)
-        po = run(py, ("run", "--dag", dag_path, "-q", "-j", "1", NOPROF, NOFB, ACF))
-        ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "1", NOPROF, NOFB, ACF))
+        # passed/failed/aborted/intentionally-skipped/dependency-skipped/not-launched counts are
+        # fully reproducible between the two builds.
+        # (Run under --keep-going: with it, a failure no longer stops the launch of independent
+        # work, so both builds account for EVERY node rather than leaving a race-dependent tail in
+        # the not-launched bucket.)
+        serial_args = (
+            "run", "--dag", dag_path, "-q", "-s", "1", "-j", "64", "-k", NOPROF, NOFB, ACF,
+        )
+        po = run(py, serial_args)
+        ro = run(rs, serial_args)
         label = f"{fx.name}/run(serial-counts)"
         pc, rc = _counts(po.stderr), _counts(ro.stderr)
         if po.returncode != ro.returncode:
@@ -1448,23 +2792,34 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
             ro = run(rs, ("run", "--dag", dag_path, "-q", "-k", "--max-mem", fx.max_mem, NOPROF, NOFB, ACF))
             label = f"{fx.name}/sizing"
             ps, rss = _sizing(po.stderr), _sizing(ro.stderr)
-            if ps is None or rss is None:
+            prefusal, rrefusal = _sizing_refusal(po.stderr), _sizing_refusal(ro.stderr)
+            if (
+                po.returncode == ro.returncode == 2
+                and prefusal is not None
+                and prefusal == rrefusal
+            ):
+                rep.ok(label)
+            elif ps is None or rss is None:
                 rep.bad(label, f"missing sizing line py={po.stderr!r} rs={ro.stderr!r}")
             elif ps != rss:
-                rep.bad(label, f"(-j, footprint, budget) py={ps} rs={rss}")
+                rep.bad(label, f"(--max-steps, footprint, budget) py={ps} rs={rss}")
             else:
                 rep.ok(label)
 
-        # 6) --only selection parity (Feature A): running EXACTLY the named step(s) must agree on
-        # exit code AND the passed/failed/aborted/intentionally-skipped/dependency-skipped counts
-        # across both builds. Selecting a
-        # single step at -j1 is deterministic (its deps outside the selection are dropped), so the
-        # counts are reproducible even though full-DAG timing is not.
-        tag = _first_tag(fx)
-        if tag is not None:
-            po = run(py, ("run", "--dag", dag_path, "-q", "-j", "1", "--only", tag, NOPROF, NOFB, ACF))
-            ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "1", "--only", tag, NOPROF, NOFB, ACF))
-            label = f"{fx.name}/only({tag})"
+        # 6) --selected parity: the named step and its dependency ancestry must agree on exit code
+        # and the passed/failed/aborted/intentionally-skipped/dependency-skipped/not-launched
+        # counts across both builds. Serial execution makes the counts reproducible even though
+        # full-DAG timing is not.
+        selection = _first_selection(fx)
+        if selection is not None:
+            tag, expected_nodes = selection
+            selected_args = (
+                "run", "--dag", dag_path, "-q", "-s", "1", "-j", "64", "--selected", tag,
+                NOPROF, NOFB, ACF,
+            )
+            po = run(py, selected_args)
+            ro = run(rs, selected_args)
+            label = f"{fx.name}/selected({tag})"
             pc, rc = _counts(po.stderr), _counts(ro.stderr)
             if po.returncode != ro.returncode:
                 rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
@@ -1472,9 +2827,8 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
                 rep.bad(label, f"missing summary counts py={po.stderr!r} rs={ro.stderr!r}")
             elif pc != rc:
                 rep.bad(label, f"counts py={pc} rs={rc}")
-            elif pc != (1, 0, 0, 0, 0) and pc != (0, 1, 0, 0, 0):
-                # --only <one tag> runs exactly one step: it either passes or fails, nothing else.
-                rep.bad(label, f"--only one step should run exactly one step; got counts {pc}")
+            elif sum(pc) != expected_nodes:
+                rep.bad(label, f"expected {expected_nodes} accounted nodes; got counts {pc}")
             else:
                 rep.ok(label)
 
@@ -1497,13 +2851,49 @@ def _header_and_eol(path: str) -> tuple[str, str]:
     return header, eol
 
 
+def _profile_width_records(directory: str) -> list[tuple[str, str]]:
+    """Read ``(inner_jobs, container_class)`` from the one per-step profile CSV."""
+
+    names = [name for name in _store_csv_names(directory) if name.startswith("step_profiles_")]
+    if len(names) != 1:
+        return []
+    with open(os.path.join(directory, names[0]), newline="", encoding="utf-8") as handle:
+        return [
+            (row.get("inner_jobs", ""), row.get("container_class", ""))
+            for row in csv.DictReader(handle)
+        ]
+
+
+def _ambient_width_from_container_class(container_class: str) -> int | None:
+    """Mirror the conservative whole-core budget encoded in a profile identity."""
+
+    matched = re.fullmatch(
+        r"affinity([0-9]+)_cpu-max-(max|unknown|([0-9]+)_([0-9]+))",
+        container_class,
+    )
+    if matched is None:
+        return None
+    affinity = int(matched.group(1))
+    quota_text = matched.group(2)
+    if quota_text in {"max", "unknown"}:
+        return max(1, affinity)
+    quota = int(matched.group(3))
+    period = int(matched.group(4))
+    if period <= 0:
+        return None
+    return max(1, min(affinity, quota // period))
+
+
 def compare_profile_store(py: list[str], rs: list[str], rep: Report) -> None:
     """Assert the auto-logging profile STORE (Feature D) has an identical on-disk schema in both
     builds. Runs the SAME tiny DAG under each build with ``--perf-dir`` into a fresh temp dir
-    (unboxed via ``--allow-cgroup-failure``, so it is environment-independent), then asserts the two
+    (explicitly unboxed, so it is environment-independent), then asserts the two
     stores agree on: (a) the SET of CSV filenames (proving ``machine_id`` + ``container_class``, and
     hence ``nproc``, agree), (b) each file's HEADER row byte-for-byte, and (c) the line-ending
-    style. Data rows are NOT compared (their timestamps/elapsed/git-SHA legitimately differ)."""
+    style. It also proves that explicitly unboxed undeclared steps retain the same positive ambient
+    width in both engines instead of claiming a cgroup default that was not enforced; boxed
+    default-width behavior is pinned by each engine's scheduler tests. Other data cells are not
+    compared because timestamps/elapsed/git-SHA differ."""
     dag = (
         '{"steps": [{"group": "g", "job": "a", "cmd": "true"}, '
         '{"group": "g", "job": "b", "cmd": "true", "deps": ["g.a"]}]}'
@@ -1514,8 +2904,16 @@ def compare_profile_store(py: list[str], rs: list[str], rep: Report) -> None:
             fh.write(dag)
         py_dir = os.path.join(tmp, "py_store")
         rs_dir = os.path.join(tmp, "rs_store")
-        po = run(py, ("run", "--dag", dag_path, "-q", "-j", "1", "--perf-dir", py_dir, NOFB, ACF))
-        ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "1", "--perf-dir", rs_dir, NOFB, ACF))
+        po = run(
+            py,
+            ("run", "--dag", dag_path, "-q", "-s", "1", "-j", "4", "--perf-dir", py_dir,
+             NOFB, "--unsafe-no-cgroups"),
+        )
+        ro = run(
+            rs,
+            ("run", "--dag", dag_path, "-q", "-s", "1", "-j", "4", "--perf-dir", rs_dir,
+             NOFB, "--unsafe-no-cgroups"),
+        )
         label = "profile-store"
         if po.returncode != ro.returncode:
             rep.bad(label, f"run exit py={po.returncode} rs={ro.returncode}")
@@ -1532,6 +2930,26 @@ def compare_profile_store(py: list[str], rs: list[str], rep: Report) -> None:
         if not py_names:
             rep.bad(label, "no profile CSVs were written by either build")
             return
+        py_records = _profile_width_records(py_dir)
+        rs_records = _profile_width_records(rs_dir)
+        expected = (
+            _ambient_width_from_container_class(py_records[0][1])
+            if py_records
+            else None
+        )
+        valid_ambient = (
+            len(py_records) == 2
+            and expected is not None
+            and all(width == str(expected) for width, _container in py_records)
+        )
+        if py_records != rs_records or not valid_ambient:
+            rep.bad(
+                f"{label}:unboxed-ambient-inner-jobs",
+                f"unboxed undeclared steps must record their identity-derived ambient width "
+                f"{expected!r}; py={py_records!r} rs={rs_records!r}",
+            )
+        else:
+            rep.ok(f"{label}:unboxed-ambient-inner-jobs")
         for name in py_names:
             py_hdr, py_eol = _header_and_eol(os.path.join(py_dir, name))
             rs_hdr, rs_eol = _header_and_eol(os.path.join(rs_dir, name))
@@ -1542,6 +2960,471 @@ def compare_profile_store(py: list[str], rs: list[str], rep: Report) -> None:
                 rep.bad(sub, f"header differs\n--- py ---\n{py_hdr}\n--- rs ---\n{rs_hdr}")
             else:
                 rep.ok(sub)
+
+        # The compatibility promise is stronger than matching headers: either reader must be able
+        # to ingest a store emitted by either writer and reduce it to the same typed summary. This
+        # protects historical data when deployments switch implementations.
+        commands = {"py": py, "rs": rs}
+        for producer, store in (("py", py_dir), ("rs", rs_dir)):
+            summaries = {
+                reader: run(command, ("summary", "build", "--perf-dir", store))
+                for reader, command in commands.items()
+            }
+            label = f"profile-store:{producer}-writer-cross-read"
+            if any(outcome.returncode != 0 for outcome in summaries.values()):
+                rep.bad(label, f"py={summaries['py']}\nrs={summaries['rs']}")
+            elif summaries["py"].stdout != summaries["rs"].stdout:
+                rep.bad(
+                    label,
+                    "readers derived different summaries from the same emitted store\n"
+                    f"--- py ---\n{summaries['py'].stdout}\n"
+                    f"--- rs ---\n{summaries['rs'].stdout}",
+                )
+            else:
+                try:
+                    document = json.loads(summaries["py"].stdout)
+                    buckets = document.get("buckets", [])
+                    tags = {
+                        bucket.get("step")
+                        for bucket in buckets
+                        if isinstance(bucket, dict)
+                    }
+                    samples = sum(
+                        len(bucket.get("samples", []))
+                        for bucket in buckets
+                        if isinstance(bucket, dict)
+                        and isinstance(bucket.get("samples"), list)
+                    )
+                except (json.JSONDecodeError, AttributeError, TypeError):
+                    tags, samples = set(), 0
+                if tags != {"g.a", "g.b"} or samples != 2:
+                    rep.bad(
+                        label,
+                        f"cross-read summary was vacuous or incomplete: tags={tags!r}, "
+                        f"samples={samples}",
+                    )
+                else:
+                    rep.ok(label)
+
+
+def compare_mixed_profile_writers(py: list[str], rs: list[str], rep: Report) -> None:
+    """Exercise simultaneous Python/Rust writers against one shared local profile store."""
+
+    dag = (
+        '{"steps":['
+        '{"group":"g","job":"a","cmd":"true"},'
+        '{"group":"g","job":"b","cmd":"true"},'
+        '{"group":"g","job":"c","cmd":"true"}'
+        "]}"
+    )
+    with tempfile.TemporaryDirectory(prefix="dagrun-mixed-profile-") as tmp:
+        dag_path = os.path.join(tmp, "dag.json")
+        Path(dag_path).write_text(dag, encoding="utf-8")
+        store = os.path.join(tmp, "store")
+        args = (
+            "run",
+            "--dag",
+            dag_path,
+            "--perf-dir",
+            store,
+            NOFB,
+            "--unsafe-no-cgroups",
+            "--max-steps",
+            "1",
+            "-q",
+        )
+        commands = (py, rs, py, rs)
+        with ThreadPoolExecutor(max_workers=len(commands)) as executor:
+            outcomes = list(executor.map(lambda command: run(command, args), commands))
+        if any(outcome.returncode != 0 for outcome in outcomes):
+            rep.bad(
+                "profile-store:mixed-concurrent-writers",
+                "\n".join(f"run {index}: {outcome}" for index, outcome in enumerate(outcomes)),
+            )
+            return
+
+        step_paths = sorted(Path(store).glob("step_profiles_*.csv"))
+        whole_paths = sorted(
+            path
+            for path in Path(store).glob("*.csv")
+            if not path.name.startswith("step_profiles_")
+        )
+        try:
+            if len(step_paths) != 1 or len(whole_paths) != 1:
+                raise ValueError(
+                    f"expected one step and one whole-run CSV, got {step_paths!r}, {whole_paths!r}"
+                )
+            with step_paths[0].open(newline="", encoding="utf-8") as handle:
+                step_rows = list(csv.DictReader(handle))
+            with whole_paths[0].open(newline="", encoding="utf-8") as handle:
+                whole_rows = list(csv.DictReader(handle))
+        except (OSError, ValueError, csv.Error) as error:
+            rep.bad("profile-store:mixed-concurrent-writers", str(error))
+            return
+        if len(step_rows) != 12 or len(whole_rows) != 4:
+            rep.bad(
+                "profile-store:mixed-concurrent-writers",
+                f"lost rows: step={len(step_rows)}/12 whole={len(whole_rows)}/4",
+            )
+            return
+
+        summaries = {
+            "py": run(py, ("summary", "build", "--perf-dir", store)),
+            "rs": run(rs, ("summary", "build", "--perf-dir", store)),
+        }
+        if (
+            any(outcome.returncode != 0 for outcome in summaries.values())
+            or summaries["py"].stdout != summaries["rs"].stdout
+        ):
+            rep.bad(
+                "profile-store:mixed-concurrent-writers",
+                f"mixed store did not cross-read identically\npy={summaries['py']}\n"
+                f"rs={summaries['rs']}",
+            )
+        else:
+            rep.ok("profile-store:mixed-concurrent-writers")
+
+
+# --------------------------------------------------------------------- profile run identity
+
+
+def _run_id_shape(directory: str) -> list[int] | None:
+    """The GROUPING the ``run_id`` column induces over a store's rows, as run indices.
+
+    A ``run_id`` is opaque (nanoseconds + PID) so its literal value cannot be compared across two
+    builds, and comparing headers — all :func:`compare_profile_store` does — cannot see a column's
+    values at all. What a reader actually depends on IS comparable: which rows the column says
+    belong to the same DAG execution. Two rows in one group are asserted to have run at the same
+    time (their offsets share an origin), so the grouping is the whole semantic content.
+
+    Returns run indices in first-appearance order (``[0, 0]`` = one run of two steps, ``[0, 1, 2]``
+    = three separate runs), or ``None`` when the store is unreadable or any ``run_id`` is blank.
+    """
+    names = [name for name in _store_csv_names(directory) if name.startswith("step_profiles_")]
+    if len(names) != 1:
+        return None
+    with open(os.path.join(directory, names[0]), newline="", encoding="utf-8") as handle:
+        ids = [row.get("run_id", "") for row in csv.DictReader(handle)]
+    if not ids or any(not value for value in ids):
+        return None
+    seen: dict[str, int] = {}
+    return [seen.setdefault(value, len(seen)) for value in ids]
+
+
+def compare_profile_run_identity(py: list[str], rs: list[str], rep: Report) -> None:
+    """Assert both builds agree on WHICH ROWS the ``run_id`` column calls one DAG execution.
+
+    Header parity cannot see this: the header comes from the column-list constant, so an edition
+    could mint one id per run, per batch or per process and still pass. The two shapes below are
+    the ones the documented reconstruction rests on:
+
+    * ``run``: every step of one execution shares one id (``[0, 0]``), even though the rows are
+      flushed by the same sink, so an id minted per BATCH would split a single run into groups
+      that never overlap by construction.
+    * ``sweep``: every iteration is its OWN execution with its own Runner and its own monotonic
+      origin, so it must get its own id (``[0, 1, 2]``). One shared id across a strictly
+      sequential sweep makes the documented rule — same ``run_id`` rows overlap iff their
+      ``[started, finished]`` intervals do — declare all three concurrent.
+    """
+    with tempfile.TemporaryDirectory(prefix="run-identity-cross-") as tmp:
+        run_dag = os.path.join(tmp, "run.json")
+        with open(run_dag, "w", encoding="utf-8") as handle:
+            handle.write(
+                '{"steps": [{"group": "g", "job": "a", "cmd": "true"}, '
+                '{"group": "g", "job": "b", "cmd": "true", "deps": ["g.a"]}]}'
+            )
+        for label, args_for, expected in (
+            (
+                "profile-run-identity:one-run-one-id",
+                lambda store: (
+                    "run", "--dag", run_dag, "-q", "-s", "1", "-j", "2",
+                    "--perf-dir", store, NOFB, "--unsafe-no-cgroups",
+                ),
+                [0, 0],
+            ),
+            (
+                "profile-run-identity:sweep-per-execution",
+                lambda store: (
+                    "sweep", "--dag", run_dag, "--step", "g.a", "--jobs", "1..3",
+                    "--perf-dir", store, "--unsafe-no-cgroups",
+                ),
+                [0, 1, 2],
+            ),
+        ):
+            py_dir = os.path.join(tmp, f"py-{label.rsplit(':', 1)[1]}")
+            rs_dir = os.path.join(tmp, f"rs-{label.rsplit(':', 1)[1]}")
+            po = run(py, args_for(py_dir))
+            ro = run(rs, args_for(rs_dir))
+            if po.returncode != 0 or ro.returncode != 0:
+                rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}\n{po}\n{ro}")
+                continue
+            py_shape = _run_id_shape(py_dir)
+            rs_shape = _run_id_shape(rs_dir)
+            if py_shape != expected or rs_shape != expected:
+                rep.bad(
+                    label,
+                    f"run_id grouping must be {expected}; py={py_shape} rs={rs_shape}",
+                )
+            else:
+                rep.ok(label)
+
+
+# --------------------------------------------------------------------- profile time-series trace
+
+
+_TRACE_COLUMNS = (
+    "timestamp",
+    "machine_id",
+    "container_class",
+    "git_sha",
+    "outer_jobs",
+    "profile_base_sha",
+    "enforcement_kind",
+    "runner_name",
+    "run_id",
+    "step",
+    "inner_jobs",
+    "sample_index",
+    "sample_kind",
+    "elapsed_s",
+    "interval_s",
+    "cpu_usage_s",
+    "user_s",
+    "sys_s",
+    "effective_cores",
+    "user_cores",
+    "system_cores",
+    "throttled_s",
+    "interval_throttled_s",
+    "thread_count",
+)
+
+_TRACE_SWEEP_COLUMNS = (
+    "sweep_id",
+    "sweep_logical_cpus",
+    "sweep_mode",
+    "sweep_pass",
+    "sweep_physical_cores",
+    "sweep_repeat",
+    "sweep_sample",
+    "sweep_target_s",
+    "sweep_width_source",
+    "workload_digest",
+)
+
+_TRACE_SECONDS6 = frozenset(
+    {
+        "elapsed_s",
+        "interval_s",
+        "cpu_usage_s",
+        "user_s",
+        "sys_s",
+        "throttled_s",
+        "interval_throttled_s",
+    }
+)
+_TRACE_CORES4 = frozenset({"effective_cores", "user_cores", "system_cores"})
+_TRACE_FIXED_DECIMAL_RE = {
+    4: re.compile(r"^[0-9]+\.[0-9]{4}$"),
+    6: re.compile(r"^[0-9]+\.[0-9]{6}$"),
+}
+_TRACE_TIMESTAMP_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+)
+
+
+def _only_trace_path(directory: str) -> Path:
+    traces = Path(directory) / "traces"
+    paths = sorted(path for path in traces.glob("*.csv") if path.is_file())
+    if len(paths) != 1:
+        raise ValueError(f"expected one trace CSV under {traces}, found {paths}")
+    return paths[0]
+
+
+def _trace_cell(row: Mapping[str, str | None], column: str, row_number: int) -> str:
+    value = row.get(column)
+    if value is None:
+        raise ValueError(f"trace row {row_number} has no {column!r} cell")
+    return value
+
+
+def _normalized_trace_csv(path: Path) -> tuple[str, tuple[str, ...], tuple[tuple[str, ...], ...]]:
+    """Validate one sweep trace and erase only values that are inherently run-specific.
+
+    The returned rows retain stable provenance and blank-vs-present structure. Decimal values are
+    replaced by precision tokens only after their exact fixed-width encoding has been checked, so
+    two executions need not consume identical CPU time to prove that their CSV contracts match.
+    """
+
+    raw = path.read_bytes()
+    eol = "CRLF" if b"\r\n" in raw else ("LF" if b"\n" in raw else "none")
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        header = tuple(reader.fieldnames or ())
+        rows = list(reader)
+    expected_header = (*_TRACE_COLUMNS, *_TRACE_SWEEP_COLUMNS)
+    if header != expected_header:
+        raise ValueError(f"trace header differs: expected {expected_header!r}, got {header!r}")
+    if eol != "LF":
+        raise ValueError(f"trace must use LF line endings, got {eol}")
+    if len(rows) < 3:
+        raise ValueError(f"trace needs start, periodic and final rows, got {len(rows)}")
+
+    kinds = [_trace_cell(row, "sample_kind", number) for number, row in enumerate(rows, start=2)]
+    if kinds[0] != "start" or kinds[-1] != "final" or any(
+        kind != "periodic" for kind in kinds[1:-1]
+    ):
+        raise ValueError(f"trace sample order is not start/periodic*/final: {kinds!r}")
+    indices = [
+        int(_trace_cell(row, "sample_index", number))
+        for number, row in enumerate(rows, start=2)
+    ]
+    if indices != list(range(len(rows))):
+        raise ValueError(f"trace sample indices are not contiguous from zero: {indices!r}")
+    for row_number, row in enumerate(rows, start=2):
+        for column in _TRACE_SECONDS6:
+            value = _trace_cell(row, column, row_number)
+            if value and _TRACE_FIXED_DECIMAL_RE[6].fullmatch(value) is None:
+                raise ValueError(
+                    f"trace row {row_number} {column} must be blank or fixed to 6 decimals, "
+                    f"got {value!r}"
+                )
+        for column in _TRACE_CORES4:
+            value = _trace_cell(row, column, row_number)
+            if value and _TRACE_FIXED_DECIMAL_RE[4].fullmatch(value) is None:
+                raise ValueError(
+                    f"trace row {row_number} {column} must be blank or fixed to 4 decimals, "
+                    f"got {value!r}"
+                )
+        thread_count = _trace_cell(row, "thread_count", row_number)
+        if thread_count and (not thread_count.isascii() or not thread_count.isdigit()):
+            raise ValueError(
+                f"trace row {row_number} thread_count must be blank or an integer, "
+                f"got {thread_count!r}"
+            )
+    elapsed = [
+        float(_trace_cell(row, "elapsed_s", number))
+        for number, row in enumerate(rows, start=2)
+    ]
+    if any(current <= previous for previous, current in zip(elapsed, elapsed[1:])):
+        raise ValueError(f"trace elapsed times are not strictly increasing: {elapsed!r}")
+
+    timestamps = {
+        _trace_cell(row, "timestamp", number) for number, row in enumerate(rows, start=2)
+    }
+    if len(timestamps) != 1 or not _TRACE_TIMESTAMP_RE.fullmatch(next(iter(timestamps))):
+        raise ValueError(f"trace batch timestamp is not one ISO second value: {timestamps!r}")
+    run_ids = {_trace_cell(row, "run_id", number) for number, row in enumerate(rows, start=2)}
+    if len(run_ids) != 1 or not next(iter(run_ids)):
+        raise ValueError(f"trace rows do not share one non-empty run_id: {run_ids!r}")
+    if path.stem != next(iter(run_ids)):
+        raise ValueError(f"trace filename {path.stem!r} does not match row run_id {run_ids!r}")
+    sweep_ids = {
+        _trace_cell(row, "sweep_id", number) for number, row in enumerate(rows, start=2)
+    }
+    if len(sweep_ids) != 1 or not next(iter(sweep_ids)):
+        raise ValueError(f"trace rows do not share one non-empty sweep_id: {sweep_ids!r}")
+
+    representatives = (rows[0], rows[kinds.index("periodic")], rows[-1])
+    normalized: list[tuple[str, ...]] = []
+    for row_number, row in enumerate(representatives, start=1):
+        cells: list[str] = []
+        for column in header:
+            value = _trace_cell(row, column, row_number)
+            if column == "timestamp":
+                cells.append("<timestamp>")
+            elif column in {"run_id", "sweep_id"}:
+                cells.append(f"<{column}>")
+            elif column == "sample_index":
+                cells.append("<sample_index>")
+            elif column in _TRACE_SECONDS6:
+                cells.append("<seconds6>" if value else "")
+            elif column in _TRACE_CORES4:
+                cells.append("<cores4>" if value else "")
+            elif column == "thread_count":
+                cells.append("<integer>" if value else "")
+            else:
+                cells.append(value)
+        normalized.append(tuple(cells))
+    return eol, header, tuple(normalized)
+
+
+def compare_profile_timeseries_trace(py: list[str], rs: list[str], rep: Report) -> None:
+    """Compare one real boxed sweep trace after normalizing only volatile measurements."""
+
+    with tempfile.TemporaryDirectory(prefix="dagrun-trace-cross-") as tmp:
+        dag_path = os.path.join(tmp, "trace.json")
+        Path(dag_path).write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "group": "g",
+                            "job": "trace",
+                            "cmd": "sleep 0.30; true $DAGRUN_EXTRA_ARGS",
+                            "cmdtype": "generic-dash-j-command",
+                            "timeout": 30,
+                            "cpu_timeout": 30,
+                            "hint": {"hard_mem_max_bytes": 268435456},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        stores = {name: os.path.join(tmp, name) for name in ("py", "rs")}
+
+        def args_for(store: str) -> tuple[str, ...]:
+            return (
+                "sweep",
+                "--dag",
+                dag_path,
+                "--target-time",
+                "0",
+                "--jobs",
+                "1",
+                "--profile-timeseries",
+                "50ms",
+                "--perf-dir",
+                store,
+            )
+        extra = {"DAGRUN_NO_STEP_LOGS": "1", "DAGRUN_FORCE_SCOPE_ATTEMPT": "1"}
+        outcomes = {
+            "py": run(py, args_for(stores["py"]), extra),
+            "rs": run(rs, args_for(stores["rs"]), extra),
+        }
+        unavailable = {
+            name: _boxing_capability_unavailable(outcome) for name, outcome in outcomes.items()
+        }
+        if all(unavailable.values()):
+            print(
+                "cross[dagrun]: SKIP time-series trace differential: "
+                "cgroup-v2 + a working systemd --user scope are unavailable"
+            )
+            rep.ok("profile-timeseries:capability-unavailable")
+            return
+        if any(unavailable.values()) or any(outcome.returncode != 0 for outcome in outcomes.values()):
+            rep.bad(
+                "profile-timeseries",
+                f"py={outcomes['py']}\nrs={outcomes['rs']}",
+            )
+            return
+        try:
+            normalized = {
+                name: _normalized_trace_csv(_only_trace_path(store))
+                for name, store in stores.items()
+            }
+        except (OSError, ValueError, csv.Error) as error:
+            rep.bad("profile-timeseries", str(error))
+            return
+        if normalized["py"] != normalized["rs"]:
+            rep.bad(
+                "profile-timeseries",
+                "normalized trace CSV differs\n"
+                f"--- py ---\n{normalized['py']!r}\n--- rs ---\n{normalized['rs']!r}",
+            )
+        else:
+            rep.ok("profile-timeseries:schema-and-encoding")
 
 
 # --------------------------------------------------------------------------- plan feedback
@@ -1568,7 +3451,8 @@ _FEEDBACK_DAG = {
 #: taken under 60% other-work contention, so the reader must DISCOUNT it back to ~8s (matching the
 #: uncontended 8s sample) — proving contention-discounted median duration recovery. peak_bytes give
 #: the memory model its rss estimates (6 GiB for heavy/solo => a tight --max-mem budget throttles to
-#: -j1). Written with the pinned SYNTH identity so the file name matches what the reader loads.
+#: --max-steps 1). Written with the pinned SYNTH identity so the file name matches what the reader
+#: loads.
 _FEEDBACK_STORE_CSV = (
     "timestamp,machine_id,container_class,git_sha,outer_jobs,profile_base_sha,enforcement_kind,"
     "runner_name,step,classification,inner_jobs,elapsed_s,returncode,ok,timed_out,oom_kills,"
@@ -1647,8 +3531,8 @@ def compare_hostile_numeric_cells(py: list[str], rs: list[str], rep: Report) -> 
     not merely that both builds fell back to the hint). This is the regression guard the earlier
     clean-only feedback fixture could not provide."""
     extra = {
-        "SAFE_CI_DAG_RUNNER_MACHINE_ID": SYNTH_MACHINE,
-        "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": SYNTH_CONTAINER,
+        "DAGRUN_MACHINE_ID": SYNTH_MACHINE,
+        "DAGRUN_CONTAINER_CLASS": SYNTH_CONTAINER,
     }
     with tempfile.TemporaryDirectory() as tmp:
         store = os.path.join(tmp, "store")
@@ -1727,8 +3611,8 @@ def compare_plan_feedback(py: list[str], rs: list[str], rep: Report) -> None:
       across builds AND throttles below the CPU count (proving the store feeds the memory model).
     """
     extra = {
-        "SAFE_CI_DAG_RUNNER_MACHINE_ID": SYNTH_MACHINE,
-        "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": SYNTH_CONTAINER,
+        "DAGRUN_MACHINE_ID": SYNTH_MACHINE,
+        "DAGRUN_CONTAINER_CLASS": SYNTH_CONTAINER,
     }
     with tempfile.TemporaryDirectory() as tmp:
         store = os.path.join(tmp, "store")
@@ -1797,8 +3681,9 @@ def compare_plan_feedback(py: list[str], rs: list[str], rep: Report) -> None:
         else:
             rep.ok("plan-feedback:no-feedback")
 
-        # Memory-aware sizing fed by the store's rss estimates: both builds must pick the same -j
-        # and throttle below the CPU count (the 6 GiB heavy+solo pair overflows an 8 GiB budget).
+        # Memory-aware sizing fed by the store's rss estimates: both builds must pick the same
+        # --max-steps and throttle below the CPU count (the 6 GiB heavy+solo pair overflows an
+        # 8 GiB budget).
         po = run(
             py,
             ("run", "--dag", dag_path, "-q", "-k", "--max-mem", "8G", "--perf-dir", store,
@@ -1818,11 +3703,15 @@ def compare_plan_feedback(py: list[str], rs: list[str], rep: Report) -> None:
                 f"missing sizing line py={po.stderr!r} rs={ro.stderr!r}",
             )
         elif ps != rss:
-            rep.bad("plan-feedback:sizing", f"(-j, footprint, budget) py={ps} rs={rss}")
+            rep.bad(
+                "plan-feedback:sizing",
+                f"(--max-steps, footprint, budget) py={ps} rs={rss}",
+            )
         elif ps[0] != 1:
             rep.bad(
                 "plan-feedback:sizing",
-                f"expected the store's rss estimates to throttle to -j1; got -j{ps[0]}",
+                "expected the store's rss estimates to throttle to --max-steps 1; "
+                f"got --max-steps {ps[0]}",
             )
         else:
             rep.ok("plan-feedback:sizing")
@@ -1902,6 +3791,359 @@ def _speedup_store_csv() -> str:
     return _SPEEDUP_HEADER + "".join(rows)
 
 
+def _only_prefixed_file(directory: str, prefix: str, suffix: str) -> Path:
+    paths = sorted(
+        path
+        for path in Path(directory).iterdir()
+        if path.is_file() and path.name.startswith(prefix) and path.name.endswith(suffix)
+    )
+    if len(paths) != 1:
+        raise ValueError(
+            f"expected one {prefix}*{suffix} file under {directory}, found {paths}"
+        )
+    return paths[0]
+
+
+def _write_report_capture_fixtures(store: str) -> None:
+    """Add valid, malformed, and removed-step captures to a report-parity store."""
+
+    capture = Path(store) / "captures" / "capture-001"
+    artifact = capture / "perf-001" / "perf data#1.data"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"PERFILE2")
+    manifest: dict[str, object] = {
+        "schema": "dagrun-profile-capture-v1",
+        "capture_id": "capture-001",
+        "state": "complete",
+        "machine_id": "capture-machine",
+        "container_class": "capture-container",
+        "created_at": "2026-07-26T10:01:00Z",
+        "finished_at": "2026-07-26T10:01:03Z",
+        "artifact_root": ".",
+        "selection": {
+            "step": "p.lin",
+            "workload_digest": "",
+            "inner_jobs": 4,
+            "expected_wall_s": 2.0,
+            "speedup": 4.0,
+            "git_sha": "abc",
+        },
+        "preflight": [],
+        "trials": [
+            {
+                "trial_id": "perf-001",
+                "kind": "perf",
+                "state": "complete",
+                "inner_jobs": 4,
+                "started_at": "2026-07-26T10:01:00Z",
+                "finished_at": "2026-07-26T10:01:03Z",
+                "measured_wall_s": 2.1,
+                "workload_returncode": 0,
+                "profiler_returncode": 0,
+                "included_in_model": False,
+                "artifacts": [
+                    {
+                        "role": "perf-data",
+                        "path": "perf-001/perf data#1.data",
+                        "size_bytes": 8,
+                        "mode": "0o600",
+                    },
+                    {
+                        "role": "perf-log",
+                        "path": "perf-001/missing.log",
+                        "size_bytes": 0,
+                        "mode": "0o600",
+                    },
+                ],
+                "error": "",
+            }
+        ],
+        "errors": [],
+    }
+    (capture / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    malformed = Path(store) / "captures" / "bad-json"
+    malformed.mkdir()
+    (malformed / "manifest.json").write_text("{not json", encoding="utf-8")
+
+    legacy = Path(store) / "captures" / "legacy-capture"
+    legacy.mkdir()
+    legacy_manifest = dict(manifest)
+    legacy_manifest.pop("machine_id")
+    legacy_manifest.pop("container_class")
+    legacy_manifest["capture_id"] = "legacy-capture"
+    legacy_manifest["created_at"] = "2026-07-26T10:02:00Z"
+    (legacy / "manifest.json").write_text(
+        json.dumps(legacy_manifest), encoding="utf-8"
+    )
+
+    removed = Path(store) / "captures" / "removed-step"
+    removed.mkdir()
+    removed_manifest = dict(manifest)
+    removed_manifest["capture_id"] = "removed-step"
+    selection = manifest["selection"]
+    assert isinstance(selection, dict)
+    removed_manifest["selection"] = {**selection, "step": "old.removed"}
+    (removed / "manifest.json").write_text(
+        json.dumps(removed_manifest), encoding="utf-8"
+    )
+
+
+def compare_scaling_model_sidecar(py: list[str], rs: list[str], rep: Report) -> None:
+    """Rebuild the saved scaling model from identical raw rows and compare its exact bytes.
+
+    A deliberately skipped target-sweep node triggers the ordinary post-sweep refresh without
+    appending a timing-dependent sample. A tiny unboxed seed run first discovers each engine's
+    real machine/container filename; the generated profile is then replaced with the same fixed
+    synthetic store used by :func:`compare_speedup_model`.
+    """
+
+    with tempfile.TemporaryDirectory(prefix="dagrun-scaling-model-cross-") as tmp:
+        seed_dag = os.path.join(tmp, "seed.json")
+        Path(seed_dag).write_text(
+            '{"steps":[{"group":"seed","job":"identity","cmd":"true"}]}',
+            encoding="utf-8",
+        )
+        stores = {name: os.path.join(tmp, name) for name in ("py", "rs")}
+        commands = {"py": py, "rs": rs}
+        for name, command in commands.items():
+            outcome = run(
+                command,
+                (
+                    "run",
+                    "--dag",
+                    seed_dag,
+                    "--perf-dir",
+                    stores[name],
+                    NOFB,
+                    "--unsafe-no-cgroups",
+                    "-q",
+                ),
+            )
+            if outcome.returncode != 0:
+                rep.bad(
+                    "scaling-model-sidecar",
+                    f"{name} identity seed failed: {outcome}",
+                )
+                return
+        try:
+            profile_paths = {
+                name: _only_prefixed_file(store, "step_profiles_", ".csv")
+                for name, store in stores.items()
+            }
+        except (OSError, ValueError) as error:
+            rep.bad("scaling-model-sidecar", str(error))
+            return
+        if profile_paths["py"].name != profile_paths["rs"].name:
+            rep.bad(
+                "scaling-model-sidecar",
+                "profile identities differ before model refresh: "
+                f"py={profile_paths['py'].name!r} rs={profile_paths['rs'].name!r}",
+            )
+            return
+        for path in profile_paths.values():
+            path.write_text(_speedup_store_csv(), encoding="utf-8")
+        for store in stores.values():
+            _write_report_capture_fixtures(store)
+
+        raw_steps = _SPEEDUP_DAG.get("steps")
+        if not isinstance(raw_steps, list):
+            rep.bad("scaling-model-sidecar", "internal speedup fixture has no step list")
+            return
+        refresh_dag = os.path.join(tmp, "refresh.json")
+        Path(refresh_dag).write_text(
+            json.dumps(
+                {
+                    **_SPEEDUP_DAG,
+                    "steps": [
+                        *raw_steps,
+                        {
+                            "group": "refresh",
+                            "job": "only",
+                            "cmd": "true",
+                            "skip_reason": "empty-manifest-bucket",
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        for name, command in commands.items():
+            outcome = run(
+                command,
+                (
+                    "sweep",
+                    "--dag",
+                    refresh_dag,
+                    "--step",
+                    "refresh.only",
+                    "--target-time",
+                    "0",
+                    "--perf-dir",
+                    stores[name],
+                    "--unsafe-no-cgroups",
+                ),
+            )
+            if outcome.returncode != 0:
+                rep.bad(
+                    "scaling-model-sidecar",
+                    f"{name} refresh failed: {outcome}",
+                )
+                return
+        try:
+            model_paths = {
+                name: _only_prefixed_file(store, "scaling_model_", ".json")
+                for name, store in stores.items()
+            }
+            encoded = {name: path.read_bytes() for name, path in model_paths.items()}
+        except (OSError, ValueError) as error:
+            rep.bad("scaling-model-sidecar", str(error))
+            return
+        if model_paths["py"].name != model_paths["rs"].name:
+            rep.bad(
+                "scaling-model-sidecar",
+                f"model filenames differ: py={model_paths['py'].name!r} "
+                f"rs={model_paths['rs'].name!r}",
+            )
+        elif encoded["py"] != encoded["rs"]:
+            rep.bad(
+                "scaling-model-sidecar",
+                "model JSON is not byte-identical\n"
+                f"--- py ---\n{encoded['py'].decode(errors='replace')}\n"
+                f"--- rs ---\n{encoded['rs'].decode(errors='replace')}",
+            )
+        elif not encoded["py"].endswith(b"\n"):
+            rep.bad("scaling-model-sidecar", "model JSON lacks its canonical trailing newline")
+        else:
+            try:
+                document = json.loads(encoded["py"])
+                steps = document.get("steps", []) if isinstance(document, dict) else []
+                schema = document.get("schema") if isinstance(document, dict) else None
+                tags = [
+                    step.get("step")
+                    for step in steps
+                    if isinstance(step, dict) and isinstance(step.get("step"), str)
+                ]
+                digests = [
+                    step.get("workload_digest")
+                    for step in steps
+                    if isinstance(step, dict)
+                ]
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                schema, tags, digests = None, [], []
+            expected_tags = ["p.bud", "p.knee", "p.lin", "p.plat"]
+            if schema != 2 or tags != expected_tags or len(digests) != 4 or any(
+                not isinstance(digest, str) or not digest for digest in digests
+            ):
+                rep.bad(
+                    "scaling-model-sidecar",
+                    f"unexpected model schema/steps/workload digests: schema={schema!r} "
+                    f"tags={tags!r} digests={digests!r}",
+                )
+            else:
+                rep.ok("scaling-model-sidecar:byte-identical")
+
+        report_payloads: dict[str, object] = {}
+        for name, store in stores.items():
+            report_path = Path(store) / "profile_report.html"
+            try:
+                document = report_path.read_text(encoding="utf-8")
+            except OSError as error:
+                rep.bad("profile-report:shared-payload", f"{name} report missing: {error}")
+                return
+            match = re.search(
+                r'<script id="dagrun-report-data" type="application/json">(.*?)</script>',
+                document,
+                re.DOTALL,
+            )
+            if match is None:
+                rep.bad(
+                    "profile-report:shared-payload",
+                    f"{name} report has no embedded dagrun-report-data payload",
+                )
+                return
+            try:
+                payload = json.loads(match.group(1))
+            except json.JSONDecodeError as error:
+                rep.bad(
+                    "profile-report:shared-payload",
+                    f"{name} report payload is invalid JSON: {error}",
+                )
+                return
+            if not isinstance(payload, dict):
+                rep.bad(
+                    "profile-report:shared-payload",
+                    f"{name} report payload is not an object",
+                )
+                return
+            # The stores intentionally live in different temp directories; this display-only
+            # field is therefore the sole expected difference for identical source data.
+            payload["profile_dir"] = "<profile-store>"
+            report_payloads[name] = payload
+        if report_payloads.get("py") != report_payloads.get("rs"):
+            rep.bad(
+                "profile-report:shared-payload",
+                "embedded report data differs\n"
+                f"--- py ---\n{json.dumps(report_payloads.get('py'), indent=2, sort_keys=True)}\n"
+                f"--- rs ---\n{json.dumps(report_payloads.get('rs'), indent=2, sort_keys=True)}",
+            )
+        else:
+            shared = report_payloads.get("py")
+            captures = shared.get("captures") if isinstance(shared, dict) else None
+            environments = (
+                shared.get("environments") if isinstance(shared, dict) else None
+            )
+            warnings = shared.get("warnings") if isinstance(shared, dict) else None
+            expected_warnings = [
+                "Ignored malformed capture manifest captures/bad-json/manifest.json.",
+                "Ignored capture manifest captures/removed-step/manifest.json for step "
+                "'old.removed', which is absent from the supplied DAG.",
+            ]
+            captures_by_id = (
+                {
+                    capture.get("capture_id"): capture
+                    for capture in captures
+                    if isinstance(capture, dict)
+                }
+                if isinstance(captures, list)
+                else {}
+            )
+            capture = captures_by_id.get("capture-001")
+            legacy = captures_by_id.get("legacy-capture")
+            artifact = (
+                capture["trials"][0]["artifacts"][0]
+                if isinstance(capture, dict)
+                else None
+            )
+            if (
+                len(captures_by_id) != 2
+                or not isinstance(capture, dict)
+                or capture.get("environment")
+                != "capture-machine␟capture-container"
+                or not isinstance(legacy, dict)
+                or legacy.get("environment") != ""
+                or not isinstance(artifact, dict)
+                or artifact.get("href")
+                != "captures/capture-001/perf-001/perf%20data%231.data"
+                or artifact.get("exists") is not True
+                or not isinstance(environments, list)
+                or not any(
+                    isinstance(environment, dict)
+                    and environment.get("key")
+                    == "capture-machine␟capture-container"
+                    for environment in environments
+                )
+                or warnings != expected_warnings
+            ):
+                rep.bad(
+                    "profile-report:shared-payload",
+                    "capture-manifest data was absent or not canonical: "
+                    f"captures={captures!r} warnings={warnings!r}",
+                )
+                return
+            rep.ok("profile-report:shared-payload")
+
+
 def compare_speedup_model(py: list[str], rs: list[str], rep: Report) -> None:
     """Prove the per-step PARALLEL-SPEEDUP model is byte-identical across builds on a fixed store.
 
@@ -1911,8 +4153,8 @@ def compare_speedup_model(py: list[str], rs: list[str], rep: Report) -> None:
     the recommendations are the expected 4 / 2 / 1 / 8 (positive proof the model actually fired,
     not merely that both builds agree on ``null``)."""
     extra = {
-        "SAFE_CI_DAG_RUNNER_MACHINE_ID": _SPEEDUP_MACHINE,
-        "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": _SPEEDUP_CONTAINER,
+        "DAGRUN_MACHINE_ID": _SPEEDUP_MACHINE,
+        "DAGRUN_CONTAINER_CLASS": _SPEEDUP_CONTAINER,
     }
     with tempfile.TemporaryDirectory() as tmp:
         store = os.path.join(tmp, "store")
@@ -1962,6 +4204,79 @@ def compare_speedup_model(py: list[str], rs: list[str], rep: Report) -> None:
             rep.bad(
                 "speedup-model:recommendations",
                 f"recommended inner_jobs mismatch: expected {expected}, got {recs}",
+            )
+
+        # A run's explicit total CPU budget must also bound profile-derived recommendations shown
+        # by --show-plan under EVERY planner, not only CPA. Measurements above P remain visible in
+        # the curve, but no actionable recommendation may exceed the outer quota.
+        for planner in ("greedy-lpt", "critical-path", "cpa"):
+            run_args: tuple[str, ...] = (
+                "run", "--dag", dag_path, "--perf-dir", store, "--planner", planner,
+                "--show-plan", "--max-steps", "1", "--max-cpus", "2", NOPROF,
+                "--unsafe-no-cgroups", "-q",
+            )
+            po = run(py, run_args, extra)
+            ro = run(rs, run_args, extra)
+            label = f"speedup-model:run-budget/{planner}"
+            if po.returncode != ro.returncode or po.returncode != 0:
+                rep.bad(label, f"py={po}\nrs={ro}")
+                continue
+            if po.stdout != ro.stdout:
+                rep.bad(
+                    label,
+                    f"budgeted --show-plan differs\n--- py ---\n{po.stdout}\n--- rs ---\n{ro.stdout}",
+                )
+                continue
+            table = po.stdout.partition("parallel-speedup model")[2]
+            recommendations: dict[str, int] = {}
+            for step in expected:
+                match = re.search(rf"(?m)^{re.escape(step)}\s+(\d+)\s+", table)
+                if match is not None:
+                    recommendations[step] = int(match.group(1))
+            expected_capped = {"p.lin": 2, "p.knee": 2, "p.plat": 1, "p.bud": 2}
+            if recommendations == expected_capped:
+                rep.ok(label)
+            else:
+                rep.bad(
+                    label,
+                    f"recommendations exceed/miss P=2: expected {expected_capped}, "
+                    f"got {recommendations}\n{po.stdout}",
+                )
+
+        # Positive execution proof for the profile-derived CPA width: the guest accepts exactly
+        # the flag CPA should apply under P=2. This catches a plan/application disconnect even if
+        # both implementations render the same recommendation table.
+        observed_dag = os.path.join(tmp, "observed-width.json")
+        with open(observed_dag, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "steps": [
+                        {
+                            "group": "p",
+                            "job": "lin",
+                            "cmd": 'check() { [ "$*" = "--workers=2" ]; }; check',
+                            "jobs_flag": "--workers=",
+                            "hint": {
+                                "est_duration_s": 9.0,
+                                "preferred_inner_jobs": 1,
+                            },
+                        }
+                    ]
+                },
+                handle,
+            )
+        applied_args = (
+            "run", "--dag", observed_dag, "--perf-dir", store, "--planner", "cpa",
+            "--max-steps", "1", "--max-cpus", "2", NOPROF, "--unsafe-no-cgroups", "-q",
+        )
+        po = run(py, applied_args, extra)
+        ro = run(rs, applied_args, extra)
+        if po.returncode == ro.returncode == 0:
+            rep.ok("speedup-model:cpa-applied-width")
+        else:
+            rep.bad(
+                "speedup-model:cpa-applied-width",
+                f"profile-derived CPA width did not reach the guest exactly: py={po}\nrs={ro}",
             )
 
 
@@ -2050,9 +4365,22 @@ _CPA_MEM_DAG = {
 
 
 def _cpa_mem_store_csv() -> str:
-    """Store for :data:`_CPA_MEM_DAG`: m.heavy scales near-linearly to inner-jobs=8 (flat CPU-s)."""
+    """Store for :data:`_CPA_MEM_DAG`: m.heavy scales near-linearly to inner-jobs=8 (flat CPU-s).
+
+    Every row also carries the same measured 3-GiB RSS as the DAG hint. CPA correctly plans from
+    the selected store estimate, so the fixture must not depend on the pre-fix bug where allocation
+    saw the authored 3-GiB hint but execution later installed a tiny learned RSS value.
+    """
     rows = [
-        _cpa_row(_CPA_MACHINE, _CPA_CONTAINER, "m.heavy", j, w, "40.0")
+        _cpa_row(
+            _CPA_MACHINE,
+            _CPA_CONTAINER,
+            "m.heavy",
+            j,
+            w,
+            "40.0",
+            peak_bytes="3221225472",
+        )
         for j, w in ((1, "40.0"), (2, "20.0"), (4, "10.0"), (8, "5.0"))
     ]
     return _CPA_HEADER + "".join(rows)
@@ -2095,8 +4423,8 @@ def compare_cpa_planner(py: list[str], rs: list[str], rep: Report) -> None:
       with no budget (and the run reports ``mem-capped``) — provided cores were not the limit.
     """
     extra = {
-        "SAFE_CI_DAG_RUNNER_MACHINE_ID": _CPA_MACHINE,
-        "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": _CPA_CONTAINER,
+        "DAGRUN_MACHINE_ID": _CPA_MACHINE,
+        "DAGRUN_CONTAINER_CLASS": _CPA_CONTAINER,
     }
     with tempfile.TemporaryDirectory() as tmp:
         store = os.path.join(tmp, "store")
@@ -2200,6 +4528,638 @@ def compare_cpa_planner(py: list[str], rs: list[str], rep: Report) -> None:
                         f"{free_w} with stop_reason 'mem-capped'; got width {capped_w} "
                         f"reason {capped_reason!r} (P={capped_budget})")
 
+        # A self-managed command wider than any realistic ambient P is not moldable. Standalone
+        # CPA must preserve that declared width as infeasible, not invent P as a guest width; the
+        # two renderers must agree on the null allocation and infinite modeled makespan.
+        fixed_dag = os.path.join(tmp, "fixed-width.json")
+        with open(fixed_dag, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "steps": [
+                        {
+                            "group": "f",
+                            "job": "fixed",
+                            "cmd": "true",
+                            "jobs_flag": "",
+                            "hint": {
+                                "est_duration_s": 1.0,
+                                "preferred_inner_jobs": 1_000_000_000,
+                            },
+                        }
+                    ]
+                },
+                handle,
+            )
+        fixed_args = (
+            "plan", "--dag", fixed_dag, "--planner", "cpa", "--format", "json",
+            "--no-profile-feedback",
+        )
+        pfixed = run(py, fixed_args)
+        rfixed = run(rs, fixed_args)
+        fixed_ok = False
+        if pfixed.returncode == rfixed.returncode == 0 and pfixed.stdout == rfixed.stdout:
+            try:
+                fixed_obj = json.loads(pfixed.stdout)
+                fixed_alloc = fixed_obj["allocation"]
+                fixed_step = fixed_obj["steps"][0]
+                fixed_ok = (
+                    fixed_alloc["stop_reason"] == "infeasible-fixed-width"
+                    and fixed_alloc["modeled_makespan_s"] == "inf"
+                    and fixed_step["alloc_inner_jobs"] is None
+                )
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                fixed_ok = False
+        if fixed_ok:
+            rep.ok("cpa:infeasible-fixed-width")
+        else:
+            rep.bad(
+                "cpa:infeasible-fixed-width",
+                "fixed self-managed width was not rendered as the same infeasible CPA plan\n"
+                f"py={pfixed}\nrs={rfixed}",
+            )
+
+        # Intentional skips have zero executable demand. Adding a huge skipped node must not
+        # suppress the live step's width, and both plans must expose the skip as zero/skip/null.
+        control_dag = os.path.join(tmp, "skip-control.json")
+        skipped_dag = os.path.join(tmp, "skip-present.json")
+        live_step = {
+            "group": "c",
+            "job": "build",
+            "cmd": "true",
+            "jobs_flag": "-j%d",
+            "hint": {"est_duration_s": 40.0, "preferred_inner_jobs": 1},
+        }
+        with open(control_dag, "w", encoding="utf-8") as handle:
+            json.dump({"steps": [live_step]}, handle)
+        with open(skipped_dag, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "steps": [
+                        {
+                            "group": "c",
+                            "job": "skipped",
+                            "cmd": "false",
+                            "jobs_flag": "",
+                            "skip_reason": "empty-manifest-bucket",
+                            "hint": {
+                                "est_duration_s": 100.0,
+                                "rss_baseline_bytes": 1_000_000_000_000,
+                                "preferred_inner_jobs": 1_000_000_000,
+                            },
+                        },
+                        live_step,
+                    ]
+                },
+                handle,
+            )
+        control_args = (
+            "plan", "--dag", control_dag, "--perf-dir", store, "--planner", "cpa",
+            "--format", "json",
+        )
+        skipped_args = (
+            "plan", "--dag", skipped_dag, "--perf-dir", store, "--planner", "cpa",
+            "--format", "json",
+        )
+        pcontrol, rcontrol = run(py, control_args, extra), run(rs, control_args, extra)
+        pskipped, rskipped = run(py, skipped_args, extra), run(rs, skipped_args, extra)
+        skip_ok = False
+        if pcontrol.stdout == rcontrol.stdout and pskipped.stdout == rskipped.stdout:
+            try:
+                control_obj = json.loads(pcontrol.stdout)
+                skipped_obj = json.loads(pskipped.stdout)
+                control_live = next(
+                    step for step in control_obj["steps"] if step["tag"] == "c.build"
+                )
+                skipped_by_tag = {step["tag"]: step for step in skipped_obj["steps"]}
+                skip_entry = skipped_by_tag["c.skipped"]
+                skip_ok = (
+                    skipped_by_tag["c.build"]["alloc_inner_jobs"]
+                    == control_live["alloc_inner_jobs"]
+                    and skip_entry["est_duration_s"] == "0.000"
+                    and skip_entry["est_source"] == "skip"
+                    and skip_entry["alloc_inner_jobs"] is None
+                )
+            except (json.JSONDecodeError, KeyError, StopIteration, TypeError):
+                skip_ok = False
+        if skip_ok:
+            rep.ok("cpa:intentional-skip-zero-demand")
+        else:
+            rep.bad(
+                "cpa:intentional-skip-zero-demand",
+                "intentional skip changed live allocation or was not zero/skip/null\n"
+                f"control py={pcontrol}\ncontrol rs={rcontrol}\n"
+                f"skip py={pskipped}\nskip rs={rskipped}",
+            )
+
+        # A self-managed fixed width uses an exact measured curve level when one exists. With no
+        # exact level it falls back to the independently resolved scalar estimate (store-derived in
+        # this CLI fixture); it must not substitute a neighboring curve width.
+        fixed_curve_dag = os.path.join(tmp, "fixed-curve-source.json")
+        with open(fixed_curve_dag, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "steps": [
+                        {
+                            "group": "c",
+                            "job": "build",
+                            "cmd": "true",
+                            "jobs_flag": "",
+                            "hint": {"est_duration_s": 13.0, "preferred_inner_jobs": 2},
+                        },
+                        {
+                            "group": "c",
+                            "job": "test",
+                            "cmd": "true",
+                            "jobs_flag": "",
+                            "hint": {"est_duration_s": 13.0, "preferred_inner_jobs": 3},
+                        },
+                    ]
+                },
+                handle,
+            )
+        source_args = (
+            "plan", "--dag", fixed_curve_dag, "--perf-dir", store, "--planner", "cpa",
+            "--format", "json",
+        )
+        psource, rsource = run(py, source_args, extra), run(rs, source_args, extra)
+        source_ok = False
+        if psource.returncode == rsource.returncode == 0 and psource.stdout == rsource.stdout:
+            try:
+                source_obj = json.loads(psource.stdout)
+                source_by_tag = {step["tag"]: step for step in source_obj["steps"]}
+                source_ok = (
+                    source_by_tag["c.build"]["est_duration_s"] == "20.000"
+                    and source_by_tag["c.build"]["est_source"] == "store"
+                    and source_by_tag["c.test"]["est_duration_s"] == "8.000"
+                    and source_by_tag["c.test"]["est_source"] == "store"
+                    and source_by_tag["c.build"]["alloc_inner_jobs"] is None
+                    and source_by_tag["c.test"]["alloc_inner_jobs"] is None
+                )
+            except (json.JSONDecodeError, KeyError, TypeError):
+                source_ok = False
+        if source_ok:
+            rep.ok("cpa:self-managed-curve-source")
+        else:
+            rep.bad(
+                "cpa:self-managed-curve-source",
+                "self-managed exact/scalar curve provenance diverged or was mislabeled\n"
+                f"py={psource}\nrs={rsource}",
+            )
+
+
+def compare_memory_hardening(py: list[str], rs: list[str], rep: Report) -> None:
+    """Cross-check the memory semantics that must agree before scheduling begins.
+
+    These cases are intentionally CLI-level rather than duplicate unit tests. They prove that the
+    two independently packaged implementations make the same externally visible decision after
+    config loading, profile enrichment, CPA allocation, and ``--max-mem`` sizing:
+
+    * CPU-bound caps use each step's effective width;
+    * hard-cap-only, default-capped, and selected ``engine_only`` steps remain real memory demand;
+    * an infeasible one-step budget refuses before the guest can spawn;
+    * learned RSS can make a CPA plan explicitly ``infeasible-memory``; and
+    * large concurrent sums saturate in the shared signed-64 domain rather than wrapping or using
+      Python's unbounded integer as a different model.
+    """
+
+    gib = 1024**3
+    i64_max = 2**63 - 1
+
+    def sizing_case(
+        directory: str,
+        label: str,
+        dag: Mapping[str, object],
+        budget: str,
+        max_cpus: int,
+        expected: tuple[int, int, int],
+    ) -> None:
+        dag_path = os.path.join(directory, f"{label}.json")
+        with open(dag_path, "w", encoding="utf-8") as handle:
+            json.dump(dag, handle)
+        args = (
+            "run", "--dag", dag_path, "--max-mem", budget, "--max-cpus", str(max_cpus),
+            "--unsafe-no-cgroups", "-q", NOPROF, NOFB,
+        )
+        po, ro = run(py, args), run(rs, args)
+        py_sizing, rs_sizing = _sizing(po.stderr), _sizing(ro.stderr)
+        if po.returncode != ro.returncode or po.returncode != 0:
+            rep.bad(f"memory:{label}", f"py={po}\nrs={ro}")
+        elif py_sizing is None or rs_sizing is None:
+            rep.bad(
+                f"memory:{label}",
+                f"missing sizing evidence py={po.stderr!r} rs={ro.stderr!r}",
+            )
+        elif py_sizing != rs_sizing:
+            rep.bad(
+                f"memory:{label}",
+                f"sizing differs py={py_sizing} rs={rs_sizing}",
+            )
+        elif py_sizing != expected:
+            rep.bad(
+                f"memory:{label}",
+                f"expected sizing {expected}, got {py_sizing}",
+            )
+        else:
+            rep.ok(f"memory:{label}")
+
+    def refusal_case(
+        directory: str,
+        label: str,
+        step: Mapping[str, object],
+        *,
+        budget: str,
+        budget_bytes: int,
+        footprint: int,
+    ) -> None:
+        marker = {
+            engine: os.path.join(directory, f"{label}-{engine}-spawned")
+            for engine in ("py", "rs")
+        }
+        value: dict[str, object] = {
+            "mem_cap_factor": 1.0,
+            "mem_cap_floor_bytes": 0,
+            "outer_mem_safety_factor": 1.0,
+            "steps": [step],
+        }
+        dag_path = os.path.join(directory, f"{label}.json")
+        with open(dag_path, "w", encoding="utf-8") as handle:
+            json.dump(value, handle)
+        args = (
+            "run", "--dag", dag_path, "--max-mem", budget, "--max-cpus", "2",
+            "--unsafe-no-cgroups", "-q", NOPROF, NOFB,
+        )
+        outcomes = {
+            engine: run(command, args, {"MEMORY_MARKER": marker[engine]})
+            for engine, command in (("py", py), ("rs", rs))
+        }
+        phrase = (
+            f"minimum runnable footprint {footprint} bytes cannot fit safely within budget "
+            f"{budget_bytes} bytes"
+        )
+        if (
+            all(outcome.returncode == 2 for outcome in outcomes.values())
+            and all(phrase in outcome.stderr for outcome in outcomes.values())
+            and not any(os.path.exists(path) for path in marker.values())
+        ):
+            rep.ok(f"memory:{label}")
+        else:
+            rep.bad(
+                f"memory:{label}",
+                f"expected pre-spawn infeasible refusal containing {phrase!r}; "
+                f"outcomes={outcomes} markers={marker}",
+            )
+
+    with tempfile.TemporaryDirectory(prefix="dagrun-cross-memory-") as tmp:
+        width_scaled = {
+            "mem_cap_factor": 1.0,
+            "mem_cap_floor_bytes": 0,
+            "outer_mem_safety_factor": 1.0,
+            "steps": [
+                {
+                    "group": "width",
+                    "job": "preferred",
+                    "cmd": "sleep 0.05",
+                    "jobs_flag": "",
+                    "hint": {
+                        "rss_baseline_bytes": gib,
+                        "classification": "cpu-bound",
+                        "preferred_inner_jobs": 8,
+                    },
+                },
+                {
+                    "group": "width",
+                    "job": "sibling",
+                    "cmd": "sleep 0.05",
+                    "jobs_flag": "",
+                    "hint": {
+                        "rss_baseline_bytes": gib,
+                        "classification": "cpu-bound",
+                        "preferred_inner_jobs": 8,
+                    },
+                },
+            ],
+        }
+        sizing_case(
+            tmp,
+            "effective-j8",
+            width_scaled,
+            "3G",
+            8,
+            (1, 2 * gib, 3 * gib),
+        )
+
+        # A nonbinding memory model must never loosen the CPU-derived active-step base. Four
+        # independent 1-GiB steps fit the 16-GiB memory budget, so the modeled ceiling reaches the
+        # host CPU count; explicit -j1 still makes the final active-step ceiling exactly one. A
+        # genuinely one-CPU host cannot demonstrate a strictly looser memory ceiling and is
+        # reported as a capability skip after all remaining invariants agree.
+        nonbinding = {
+            "mem_cap_factor": 1.0,
+            "mem_cap_floor_bytes": 0,
+            "outer_mem_safety_factor": 1.0,
+            "steps": [
+                {
+                    "group": "nonbinding",
+                    "job": f"s{index}",
+                    "cmd": "sleep 0.05",
+                    "jobs_flag": "",
+                    "hint": {"hard_mem_max_bytes": gib},
+                }
+                for index in range(4)
+            ],
+        }
+        nonbinding_path = os.path.join(tmp, "nonbinding-max-mem.json")
+        with open(nonbinding_path, "w", encoding="utf-8") as handle:
+            json.dump(nonbinding, handle)
+        nonbinding_args = (
+            "run", "--dag", nonbinding_path, "--max-mem", "16G", "--max-cpus", "1",
+            "--unsafe-no-cgroups", "-q", NOPROF, NOFB,
+        )
+        pnon, rnon = run(py, nonbinding_args), run(rs, nonbinding_args)
+        pdetails, rdetails = _sizing_details(pnon.stderr), _sizing_details(rnon.stderr)
+        common_nonbinding = (
+            pnon.returncode == rnon.returncode == 0
+            and pdetails is not None
+            and pdetails == rdetails
+            and pdetails[1] == min(pdetails[0], 4) * gib
+            and pdetails[2:] == (16 * gib, 1, 1)
+        )
+        if common_nonbinding and pdetails is not None and pdetails[0] > 1:
+            rep.ok("memory:nonbinding-max-mem-keeps-cpu-base")
+        elif common_nonbinding and pdetails is not None and pdetails[0] == 1:
+            print(
+                "cross[dagrun]: SKIP strict nonbinding max-mem proof: "
+                "host exposes only one online CPU"
+            )
+            rep.ok("memory:nonbinding-max-mem-one-cpu-capability")
+        else:
+            rep.bad(
+                "memory:nonbinding-max-mem-keeps-cpu-base",
+                f"expected memory ceiling >1 (or one-CPU capability) but final S=1; "
+                f"py={pnon} details={pdetails} rs={rnon} details={rdetails}",
+            )
+
+        # Six-exabyte caps overflow an i64 when two siblings co-run. The modeled peak must
+        # saturate to the i64::MAX unbounded sentinel, which fits no finite budget (including MAX),
+        # so sizing safely falls back to one finite-width step. Wrapping could admit both.
+        huge = 6_000_000_000_000_000_000
+        saturated = {
+            "mem_cap_factor": 1.0,
+            "mem_cap_floor_bytes": 0,
+            "outer_mem_safety_factor": 1.0,
+            "steps": [
+                {
+                    "group": "huge",
+                    "job": f"s{index}",
+                    "cmd": "true",
+                    "jobs_flag": "",
+                    "hint": {"hard_mem_max_bytes": huge},
+                }
+                for index in range(2)
+            ],
+        }
+        sizing_case(
+            tmp,
+            "saturating-sum",
+            saturated,
+            str(i64_max),
+            2,
+            (1, huge, i64_max),
+        )
+
+        marker_step = {
+            "group": "memory",
+            "job": "probe",
+            "cmd": 'printf spawned > "$MEMORY_MARKER"',
+            "jobs_flag": "",
+        }
+        refusal_case(
+            tmp,
+            "hard-cap-only-infeasible",
+            {
+                **marker_step,
+                "hint": {"hard_mem_max_bytes": 3 * gib},
+            },
+            budget="2G",
+            budget_bytes=2 * gib,
+            footprint=3 * gib,
+        )
+        refusal_case(
+            tmp,
+            "default-cap-infeasible",
+            marker_step,
+            budget="512M",
+            budget_bytes=gib // 2,
+            footprint=gib,
+        )
+        refusal_case(
+            tmp,
+            "engine-only-infeasible",
+            {
+                **marker_step,
+                "engine_only": True,
+                "hint": {"hard_mem_max_bytes": 3 * gib},
+            },
+            budget="2G",
+            budget_bytes=2 * gib,
+            footprint=3 * gib,
+        )
+        refusal_case(
+            tmp,
+            "unbounded-sentinel-infeasible",
+            {
+                **marker_step,
+                "hint": {"hard_mem_max_bytes": i64_max},
+            },
+            budget=str(i64_max),
+            budget_bytes=i64_max,
+            footprint=i64_max,
+        )
+
+        store = os.path.join(tmp, "store")
+        os.makedirs(store, exist_ok=True)
+        csv_name = f"step_profiles_{_CPA_MACHINE}_{_CPA_CONTAINER}.csv"
+        with open(os.path.join(store, csv_name), "w", encoding="utf-8") as handle:
+            handle.write(
+                _CPA_HEADER
+                + _cpa_row(
+                    _CPA_MACHINE,
+                    _CPA_CONTAINER,
+                    "learn.heavy",
+                    1,
+                    "10.0",
+                    "10.0",
+                    str(5 * gib),
+                )
+            )
+        learned_dag = os.path.join(tmp, "learned-rss.json")
+        learned_marker = {
+            engine: os.path.join(tmp, f"learned-{engine}-spawned")
+            for engine in ("py", "rs")
+        }
+        with open(learned_dag, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "mem_cap_factor": 1.0,
+                    "mem_cap_floor_bytes": 0,
+                    "outer_mem_safety_factor": 1.0,
+                    "steps": [
+                        {
+                            "group": "learn",
+                            "job": "heavy",
+                            "cmd": 'printf spawned > "$MEMORY_MARKER"',
+                            "hint": {
+                                "est_duration_s": 10.0,
+                                "classification": "cpu-bound",
+                                "preferred_inner_jobs": 1,
+                            },
+                        }
+                    ],
+                },
+                handle,
+            )
+        extra = {
+            "DAGRUN_MACHINE_ID": _CPA_MACHINE,
+            "DAGRUN_CONTAINER_CLASS": _CPA_CONTAINER,
+        }
+        plan_args = (
+            "plan", "--dag", learned_dag, "--perf-dir", store, "--planner", "cpa",
+            "--max-mem", "4G", "--format", "json",
+        )
+        pplan, rplan = run(py, plan_args, extra), run(rs, plan_args, extra)
+        learned_ok = False
+        if pplan.returncode == rplan.returncode == 0 and pplan.stdout == rplan.stdout:
+            try:
+                obj = json.loads(pplan.stdout)
+                step = obj["steps"][0]
+                allocation = obj["allocation"]
+                learned_ok = (
+                    step["rss_estimate_bytes"] == 5 * gib
+                    and step["rss_source"] == "store"
+                    and step["alloc_inner_jobs"] is None
+                    and allocation["stop_reason"] == "infeasible-memory"
+                    and allocation["modeled_makespan_s"] == "inf"
+                )
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                learned_ok = False
+        if learned_ok:
+            rep.ok("memory:cpa-learned-rss-infeasible-plan")
+        else:
+            rep.bad(
+                "memory:cpa-learned-rss-infeasible-plan",
+                f"learned RSS did not produce one byte-identical infeasible plan\n"
+                f"py={pplan}\nrs={rplan}",
+            )
+
+        run_args = (
+            "run", "--dag", learned_dag, "--perf-dir", store, "--planner", "cpa",
+            "--max-mem", "4G", "--max-cpus", "8", "--unsafe-no-cgroups", "-q", NOPROF,
+        )
+        outcomes = {
+            engine: run(
+                command,
+                run_args,
+                {**extra, "MEMORY_MARKER": learned_marker[engine]},
+            )
+            for engine, command in (("py", py), ("rs", rs))
+        }
+        phrase = "CPA allocation is infeasible under --max-mem 4G"
+        if (
+            all(outcome.returncode == 2 for outcome in outcomes.values())
+            and all(phrase in outcome.stderr for outcome in outcomes.values())
+            and not any(os.path.exists(path) for path in learned_marker.values())
+        ):
+            rep.ok("memory:cpa-learned-rss-run-refusal")
+        else:
+            rep.bad(
+                "memory:cpa-learned-rss-run-refusal",
+                f"expected learned-RSS CPA refusal before spawn; "
+                f"outcomes={outcomes} markers={learned_marker}",
+            )
+
+        # Stress performs an authored preflight before tag expansion, then applies learned RSS to
+        # the expanded tags and runs one final no-spawn footprint guard over that planned graph.
+        # The final guard must neither miss the `#N` profile rows nor multiply the expanded graph
+        # by N a second time.
+        stress_store = os.path.join(tmp, "stress-store")
+        os.makedirs(stress_store, exist_ok=True)
+        stress_csv = f"step_profiles_{_CPA_MACHINE}_{_CPA_CONTAINER}.csv"
+        learned_rss = 4_000_000_000_000_000_000
+        with open(os.path.join(stress_store, stress_csv), "w", encoding="utf-8") as handle:
+            handle.write(
+                _CPA_HEADER
+                + "".join(
+                    _cpa_row(
+                        _CPA_MACHINE,
+                        _CPA_CONTAINER,
+                        f"stress.seeded#{copy}",
+                        1,
+                        "1.0",
+                        "0.1",
+                        str(learned_rss),
+                    )
+                    for copy in (1, 2)
+                )
+            )
+        stress_dag = os.path.join(tmp, "seeded-profile-stress.json")
+        stress_marker = {
+            engine: os.path.join(tmp, f"stress-profile-{engine}-spawned")
+            for engine in ("py", "rs")
+        }
+        with open(stress_dag, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "mem_cap_factor": 1.0,
+                    "mem_cap_floor_bytes": 0,
+                    "outer_mem_safety_factor": 1.0,
+                    "steps": [
+                        {
+                            "group": "stress",
+                            "job": "seeded",
+                            "cmd": 'printf spawned > "$STRESS_MEMORY_MARKER"',
+                            "jobs_flag": "",
+                            "hint": {
+                                "est_duration_s": 1.0,
+                                "rss_baseline_bytes": 1,
+                                "classification": "light",
+                                "preferred_inner_jobs": 1,
+                            },
+                        }
+                    ],
+                },
+                handle,
+            )
+        stress_args = (
+            "run", "--dag", stress_dag, "--stress", "2", "--max-cpus", "2",
+            "--perf-dir", stress_store, "--unsafe-no-cgroups", "-q", NOPROF,
+        )
+        stress_outcomes = {
+            engine: run(
+                command,
+                stress_args,
+                {**extra, "STRESS_MEMORY_MARKER": stress_marker[engine]},
+            )
+            for engine, command in (("py", py), ("rs", rs))
+        }
+        if (
+            all(outcome.returncode == 2 for outcome in stress_outcomes.values())
+            and all("--stress 2: OK" in outcome.stderr for outcome in stress_outcomes.values())
+            and all(
+                "final planned expanded graph needs" in outcome.stderr
+                and "exceeding the box memory budget" in outcome.stderr
+                and "unbounded or overflowed" not in outcome.stderr
+                for outcome in stress_outcomes.values()
+            )
+            and not any(os.path.exists(path) for path in stress_marker.values())
+        ):
+            rep.ok("memory:stress-profile-expanded-final-refusal")
+        else:
+            rep.bad(
+                "memory:stress-profile-expanded-final-refusal",
+                f"expected authored preflight success then finite planned-graph refusal; "
+                f"outcomes={stress_outcomes} markers={stress_marker}",
+            )
+
 
 def compare_sweep_errors(py: list[str], rs: list[str], rep: Report) -> None:
     """``sweep --jobs`` malformed inputs must exit 2 with byte-identical stderr in both builds
@@ -2225,6 +5185,136 @@ def compare_sweep_errors(py: list[str], rs: list[str], rep: Report) -> None:
             else:
                 rep.ok(label)
 
+        fixed = os.path.join(tmp, "self-managed.json")
+        marker = {name: os.path.join(tmp, f"sweep-{name}-spawned") for name in ("py", "rs")}
+        with open(fixed, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "steps": [
+                        {
+                            "group": "g",
+                            "job": "fixed",
+                            "cmd": 'printf spawned > "$SELF_MANAGED_MARKER"',
+                            "jobs_flag": "",
+                        }
+                    ]
+                },
+                handle,
+            )
+        args = (
+            "sweep", "--dag", fixed, "--step", "g.fixed", "--jobs", "1..2", NOPROF,
+        )
+        po = run(py, args, {"SELF_MANAGED_MARKER": marker["py"]})
+        ro = run(rs, args, {"SELF_MANAGED_MARKER": marker["rs"]})
+        phrase = "offers no width channel"
+        if (
+            po.returncode == ro.returncode == 2
+            and phrase in po.stderr
+            and phrase in ro.stderr
+            and not any(os.path.exists(path) for path in marker.values())
+        ):
+            rep.ok("sweep-jobs-error:self-managed-width")
+        else:
+            rep.bad(
+                "sweep-jobs-error:self-managed-width",
+                f"expected prompt refusal without spawn; py={po}\nrs={ro}\nmarkers={marker}",
+            )
+
+
+def compare_sweep_report_collisions(py: list[str], rs: list[str], rep: Report) -> None:
+    """Report destinations must never destroy DAG/profile data, in either implementation."""
+
+    with tempfile.TemporaryDirectory(prefix="sweep-report-collision-cross-") as tmp:
+        dag = os.path.join(tmp, "dag.json")
+        dag_source = (
+            '{"steps":[{"group":"g","job":"j","cmd":"true",'
+            '"jobs_flag":"--workers="}]}'
+        )
+        Path(dag).write_text(dag_source, encoding="utf-8")
+        commands = {"py": py, "rs": rs}
+
+        explicit: dict[str, Outcome] = {}
+        explicit_stores = {
+            name: os.path.join(tmp, f"explicit-{name}") for name in commands
+        }
+        for name, command in commands.items():
+            explicit[name] = run(
+                command,
+                (
+                    "sweep",
+                    "--dag",
+                    dag,
+                    "--step",
+                    "g.j",
+                    "--jobs",
+                    "1",
+                    "--output-dir",
+                    explicit_stores[name],
+                    "--report-html",
+                    dag,
+                    "--unsafe-no-cgroups",
+                ),
+            )
+        explicit_preserved = all(
+            list(Path(store).glob("step_profiles_*.csv"))
+            for store in explicit_stores.values()
+        )
+        if (
+            all(outcome.returncode == 1 for outcome in explicit.values())
+            and all(
+                "report output resolves to DAG input" in outcome.stderr
+                for outcome in explicit.values()
+            )
+            and Path(dag).read_text(encoding="utf-8") == dag_source
+            and explicit_preserved
+        ):
+            rep.ok("sweep-report:explicit-collision-fails-after-persist")
+        else:
+            rep.bad(
+                "sweep-report:explicit-collision-fails-after-persist",
+                f"py={explicit['py']}\nrs={explicit['rs']}\n"
+                f"dag={Path(dag).read_text(encoding='utf-8')!r} "
+                f"profiles-preserved={explicit_preserved}",
+            )
+
+        defaults: dict[str, Outcome] = {}
+        default_reports: dict[str, Path] = {}
+        for name, command in commands.items():
+            store = Path(tmp) / f"default-{name}"
+            store.mkdir()
+            report = store / "profile_report.html"
+            report.write_bytes(b"do not overwrite")
+            default_reports[name] = report
+            defaults[name] = run(
+                command,
+                (
+                    "sweep",
+                    "--dag",
+                    dag,
+                    "--step",
+                    "g.j",
+                    "--jobs",
+                    "1",
+                    "--output-dir",
+                    str(store),
+                    "--unsafe-no-cgroups",
+                ),
+            )
+        if (
+            all(outcome.returncode == 0 for outcome in defaults.values())
+            and all(
+                "without dagrun report marker" in outcome.stderr
+                for outcome in defaults.values()
+            )
+            and all(report.read_bytes() == b"do not overwrite" for report in default_reports.values())
+        ):
+            rep.ok("sweep-report:default-collision-is-warning")
+        else:
+            rep.bad(
+                "sweep-report:default-collision-is-warning",
+                f"py={defaults['py']}\nrs={defaults['rs']}\nreports={default_reports}",
+            )
+
 
 def _sweep_widths(text: str) -> set[int]:
     """Return widths from well-formed six-column sweep result rows."""
@@ -2248,26 +5338,125 @@ def _sweep_widths(text: str) -> set[int]:
 
 
 def compare_sweep_success(py: list[str], rs: list[str], rep: Report) -> None:
-    """Exercise a successful sweep and compare its deterministic table structure."""
+    """Exercise a sweep and prove each table width is the width the guest actually received."""
 
     with tempfile.TemporaryDirectory(prefix="sweep-success-cross-") as tmp:
+        observed = os.path.join(tmp, "observed-widths")
+        guest = os.path.join(tmp, "record-width.sh")
+        with open(guest, "w", encoding="utf-8") as handle:
+            handle.write('#!/bin/sh\nprintf "%s\\n" "$1" >> "$OBSERVED_WIDTHS"\n')
+        os.chmod(guest, 0o700)
         path = os.path.join(tmp, "dag.json")
         with open(path, "w", encoding="utf-8") as handle:
-            json.dump({"steps": [{"group": "g", "job": "j", "cmd": "true"}]}, handle)
+            json.dump(
+                {
+                    "steps": [
+                        {
+                            "group": "g",
+                            "job": "j",
+                            "cmd": shlex.quote(guest),
+                            "jobs_flag": "--workers=",
+                            "env": {"OBSERVED_WIDTHS": observed},
+                        }
+                    ]
+                },
+                handle,
+            )
         args = ("sweep", "--dag", path, "--step", "g.j", "--jobs", "1..2", NOPROF, ACF)
         po = run(py, args)
+        try:
+            with open(observed, encoding="utf-8") as handle:
+                py_observed = handle.read().splitlines()
+        except OSError:
+            py_observed = []
+        try:
+            os.unlink(observed)
+        except FileNotFoundError:
+            pass
         ro = run(rs, args)
+        try:
+            with open(observed, encoding="utf-8") as handle:
+                rs_observed = handle.read().splitlines()
+        except OSError:
+            rs_observed = []
         header = "jobs  wall_s  user_s  sys_s  rss_hwm  speedup(vs j1)"
         if (
             po.returncode == ro.returncode == 0
             and header in po.stdout
             and header in ro.stdout
             and _sweep_widths(po.stdout) == _sweep_widths(ro.stdout) == {1, 2}
+            and py_observed == rs_observed == ["--workers=1", "--workers=2"]
         ):
-            rep.ok("sweep:successful-table")
+            rep.ok("sweep:successful-table-and-guest-width")
         else:
             rep.bad(
-                "sweep:successful-table",
+                "sweep:successful-table-and-guest-width",
+                f"py={po.returncode}:{po.stdout!r}:{po.stderr!r}\n"
+                f"rs={ro.returncode}:{ro.stdout!r}:{ro.stderr!r}\n"
+                f"observed py={py_observed!r} rs={rs_observed!r}",
+            )
+
+
+def compare_spawn_failure(py: list[str], rs: list[str], rep: Report) -> None:
+    """Invalid spawn input must fail promptly and eager-cancel an in-flight sibling."""
+
+    with tempfile.TemporaryDirectory(prefix="spawn-failure-cross-") as tmp:
+        path = os.path.join(tmp, "dag.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "steps": [
+                        {
+                            "group": "g",
+                            "job": "slow",
+                            "cmd": "sleep 10",
+                            "hint": {"est_duration_s": 100.0},
+                        },
+                        {
+                            "group": "g",
+                            "job": "gate",
+                            "cmd": "sleep 0.3",
+                            "hint": {"est_duration_s": 50.0},
+                        },
+                        {
+                            "group": "g",
+                            "job": "spawn",
+                            "cmd": "true",
+                            "deps": ["g.gate"],
+                            "env": {"BAD": "embedded\0nul"},
+                        }
+                    ]
+                },
+                handle,
+            )
+        args = (
+            "run",
+            "--dag",
+            path,
+            "-q",
+            "-s2",
+            "-j2",
+            NOPROF,
+            NOFB,
+            "--unsafe-no-cgroups",
+        )
+        po = run(py, args, timeout_s=8.0)
+        ro = run(rs, args, timeout_s=8.0)
+        py_text = po.stdout + po.stderr
+        rs_text = ro.stdout + ro.stderr
+        if (
+            po.returncode == ro.returncode == 1
+            and "spawn failed" in py_text
+            and "spawn failed" in rs_text
+            and "ABORT" in py_text
+            and "ABORT" in rs_text
+            and "Traceback" not in py_text
+            and "Exception in thread" not in py_text
+        ):
+            rep.ok("run:spawn-failure-returns")
+        else:
+            rep.bad(
+                "run:spawn-failure-returns",
                 f"py={po.returncode}:{po.stdout!r}:{po.stderr!r}\n"
                 f"rs={ro.returncode}:{ro.stdout!r}:{ro.stderr!r}",
             )
@@ -2295,8 +5484,8 @@ def _summary_sync_case(
     * ``summary merge`` is byte-identical AND COMMUTATIVE (merge(a,b) == merge(b,a)), across builds —
       the mergeable-summary property that makes concurrent contributions order-independent."""
     extra = {
-        "SAFE_CI_DAG_RUNNER_MACHINE_ID": machine,
-        "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": container,
+        "DAGRUN_MACHINE_ID": machine,
+        "DAGRUN_CONTAINER_CLASS": container,
     }
     with tempfile.TemporaryDirectory() as tmp:
         store = os.path.join(tmp, "store")
@@ -2321,7 +5510,7 @@ def _summary_sync_case(
         rep.ok(f"summary-build:{label}")
 
         fallback_extra = dict(extra)
-        fallback_extra["SAFE_CI_DAG_RUNNER_PROFILE_DIR"] = store
+        fallback_extra["DAGRUN_PROFILE_DIR"] = store
         empty_assignments = ("summary", "build", "--perf-dir=", "--out=")
         empty_py = run(py, empty_assignments, fallback_extra)
         empty_rs = run(rs, empty_assignments, fallback_extra)
@@ -2410,6 +5599,426 @@ def _summary_sync_case(
                     f"merge(a,b) != merge(b,a)\n--- ab ---\n{m_ab}\n--- ba ---\n{m_ba}")
 
 
+#: A fixed synthetic store for :func:`compare_memory_feedback`, carrying the applied-cap and
+#: event-counter provenance the censoring-aware reader needs. All three steps recorded the SAME
+#: 8 GiB applied cap and never OOMed:
+#:
+#: * ``g.learned`` sat at 2 GiB with every counter at zero, so its peaks are real observations.
+#: * ``g.pinned`` peaked EXACTLY at the ceiling every time: identical ``memory_max_bytes``,
+#:   opposite meaning. A build that ignored the provenance would derive a number for it too.
+#: * ``g.throttled`` peaked at the same comfortable 2 GiB as ``g.learned`` but recorded
+#:   ``memory_events_high > 0`` — a SOFT ceiling was throttling it into direct reclaim, so its
+#:   peak is suppressed. Byte-for-byte its ``peak_bytes`` and ``memory_max_bytes`` match
+#:   ``g.learned``; only the counter differs, so a build that reads ``max``/``oom_kill`` but not
+#:   ``high`` gives it the same learned cap and this fixture catches that.
+#: * ``g.failed`` peaked at the same comfortable 2 GiB with every counter at zero, but every one
+#:   of its six runs was KILLED: ``ok=false``, ``returncode=137`` (SIGKILL, which is what an
+#:   ancestor-scope OOM kill looks like from inside the reader). Its peaks are where the step got
+#:   to before it died.
+#: * ``g.four`` recorded only FOUR comfortable samples. Nothing here passes a sample threshold to
+#:   either build, so this step is the only thing that observes the SHIPPED
+#:   ``DEFAULT_MIN_UNCENSORED_SAMPLES``, and the two builds disagreeing about it shows up as a
+#:   difference in its line.
+_CENSORED_STORE_CSV = (
+    "step,peak_bytes,memory_max_bytes,memory_events_high,memory_events_max,"
+    "memory_events_oom,memory_events_oom_kill,ok,returncode\n"
+    + "".join(
+        f"g.learned,{2 * 1024**3},{8 * 1024**3},0,0,0,0,true,0\n" for _ in range(6)
+    )
+    + "".join(
+        f"g.pinned,{8 * 1024**3},{8 * 1024**3},0,0,0,0,true,0\n" for _ in range(6)
+    )
+    + "".join(
+        f"g.throttled,{2 * 1024**3},{8 * 1024**3},4,0,0,0,true,0\n" for _ in range(6)
+    )
+    + "".join(
+        f"g.failed,{2 * 1024**3},{8 * 1024**3},0,0,0,0,false,137\n" for _ in range(6)
+    )
+    + "".join(
+        f"g.four,{2 * 1024**3},{8 * 1024**3},0,0,0,0,true,0\n" for _ in range(4)
+    )
+)
+
+#: What ``g.learned``'s six identical 2147483648 B samples must produce, written out literally:
+#: the 9/10 nearest-rank percentile of six equal values is that value, plus the 20% margin
+#: (429496729 B). Naming it here rather than recomputing it from the builds' own constants is
+#: what makes this a contract instead of a restatement of whatever they currently do.
+_LEARNED_EXPECTED_BYTES = 2576980377
+
+#: Every step that this store makes the builds DECLINE authors a hint of 17179869184 B, above the
+#: largest peak any of them recorded (8589934592 B for ``g.pinned``, 2147483648 B for the rest).
+#: That is deliberate: a decline keeps the LARGER of the authored hint and the floor the evidence
+#: proves, so authoring above the floor is what makes "keeping the authored hint" the true verdict
+#: for these four and leaves the floor half of the rule to
+#: :func:`_memory_feedback_floor_survives_a_decline`, where it is the only thing under test.
+_CENSORED_DAG = {
+    "steps": [
+        {"group": "g", "job": "learned", "cmd": "true"},
+        {"group": "g", "job": "pinned", "cmd": "true",
+         "hint": {"rss_baseline_bytes": 17179869184}},
+        {"group": "g", "job": "throttled", "cmd": "true",
+         "hint": {"rss_baseline_bytes": 17179869184}},
+        {"group": "g", "job": "failed", "cmd": "true",
+         "hint": {"rss_baseline_bytes": 17179869184}},
+        {"group": "g", "job": "four", "cmd": "true",
+         "hint": {"rss_baseline_bytes": 17179869184}},
+    ],
+}
+
+
+def _memory_feedback_reaches_admission(
+    py: list[str], rs: list[str], rep: Report, tmp: str, extra: dict[str, str]
+) -> None:
+    """Prove the derived baseline changes what ``--max-mem`` admission models, identically.
+
+    ONE step, so the modeled worst case is that step's own cap and does not depend on this
+    host's CPU count (only the step-count ceiling in the same line does, which is why the
+    footprint substring is matched rather than the whole line). Its six uncensored samples
+    peaked at 21474836480 B under a 107374182400 B cap, and the DAG authors a much smaller
+    104857600 B hint.
+
+    Without the flag the ordinary feedback takes the peak at face value and admission models
+    26843545600 B; with it the censoring-aware estimate adds the 20% margin (25769803776 B) and
+    admission models 32212254720 B. Both are named literally: a build that applied the estimate
+    after admission had already read the config would report the first number twice.
+    """
+    store = os.path.join(tmp, "admission-store")
+    os.makedirs(store, exist_ok=True)
+    csv_name = f"step_profiles_{SYNTH_MACHINE}_{SYNTH_CONTAINER}.csv"
+    with open(os.path.join(store, csv_name), "w", encoding="utf-8") as fh:
+        fh.write(
+            "step,peak_bytes,memory_max_bytes,memory_events_high,memory_events_max,"
+            "memory_events_oom,memory_events_oom_kill\n"
+            + "".join("g.learned,21474836480,107374182400,0,0,0,0\n" for _ in range(6))
+        )
+    dag_path = os.path.join(tmp, "admission-dag.json")
+    with open(dag_path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"steps": [{
+            "group": "g", "job": "learned", "cmd": "true",
+            "hint": {"rss_baseline_bytes": 104857600},
+        }]}))
+    args = (
+        "run", "--dag", dag_path, "--perf-dir", store, "--no-profile",
+        "--unsafe-no-cgroups", "-q", "--max-mem", "400G",
+    )
+
+    def footprint(outcome: Outcome) -> str | None:
+        for line in outcome.stderr.splitlines():
+            match = re.search(r"worst-case (\d+) bytes", line)
+            if match:
+                return match.group(1)
+        return None
+
+    off = {"py": run(py, args, extra), "rs": run(rs, args, extra)}
+    on_args = (*args, "--profile-memory-feedback")
+    on = {"py": run(py, on_args, extra), "rs": run(rs, on_args, extra)}
+    seen = {
+        f"{engine}/{state}": footprint(outcome)
+        for state, group in (("off", off), ("on", on))
+        for engine, outcome in group.items()
+    }
+    if (
+        seen != {"py/off": "26843545600", "rs/off": "26843545600",
+                 "py/on": "32212254720", "rs/on": "32212254720"}
+        or any(o.returncode != 0 for o in (*off.values(), *on.values()))
+        or "rss_baseline_bytes=25769803776" not in on["py"].stderr
+        or "rss_baseline_bytes=25769803776" not in on["rs"].stderr
+    ):
+        rep.bad("memory-feedback/reaches-max-mem-admission", f"footprints={seen!r}")
+    else:
+        rep.ok("memory-feedback/reaches-max-mem-admission")
+
+
+def _memory_feedback_declines_reach_admission(
+    py: list[str], rs: list[str], rep: Report, tmp: str, extra: dict[str, str]
+) -> None:
+    """Prove a DECLINE removes the censoring-blind estimate too, identically in both builds.
+
+    This is the point of the flag, and the half that is easy to leave undone. ONE step whose six
+    recorded runs were every one of them pinned to their 8589934592 B cap — the all-censored
+    history the path exists for — and a DAG authoring 42949672960 B.
+
+    Without the flag the ordinary feedback takes those censored peaks at face value and admission
+    models 10737418240 B: a cap derived from the cap. With the flag the step is declined, and a
+    decline has to mean the AUTHORED figure reaches admission: 53687091200 B. Both are named
+    literally, because a build that reported "keeping the authored hint" while leaving the
+    censored estimate in the config would report the first number twice.
+
+    The authored 42949672960 B is deliberately ABOVE the 8589934592 B floor those peaks prove, so
+    the decline really does land on the author's number here. The opposite arrangement is
+    :func:`_memory_feedback_floor_survives_a_decline`.
+    """
+    store = os.path.join(tmp, "decline-store")
+    os.makedirs(store, exist_ok=True)
+    csv_name = f"step_profiles_{SYNTH_MACHINE}_{SYNTH_CONTAINER}.csv"
+    with open(os.path.join(store, csv_name), "w", encoding="utf-8") as fh:
+        fh.write(
+            "step,peak_bytes,memory_max_bytes,memory_events_high,memory_events_max,"
+            "memory_events_oom,memory_events_oom_kill\n"
+            + "".join("g.pinned,8589934592,8589934592,0,0,0,0\n" for _ in range(6))
+        )
+    dag_path = os.path.join(tmp, "decline-dag.json")
+    with open(dag_path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"steps": [{
+            "group": "g", "job": "pinned", "cmd": "true",
+            "hint": {"rss_baseline_bytes": 42949672960},
+        }]}))
+    args = (
+        "run", "--dag", dag_path, "--perf-dir", store, "--no-profile",
+        "--unsafe-no-cgroups", "-q", "--max-mem", "400G",
+    )
+
+    def footprint(outcome: Outcome) -> str | None:
+        for line in outcome.stderr.splitlines():
+            match = re.search(r"worst-case (\d+) bytes", line)
+            if match:
+                return match.group(1)
+        return None
+
+    off = {"py": run(py, args, extra), "rs": run(rs, args, extra)}
+    on_args = (*args, "--profile-memory-feedback")
+    on = {"py": run(py, on_args, extra), "rs": run(rs, on_args, extra)}
+    seen = {
+        f"{engine}/{state}": footprint(outcome)
+        for state, group in (("off", off), ("on", on))
+        for engine, outcome in group.items()
+    }
+    if (
+        seen != {"py/off": "10737418240", "rs/off": "10737418240",
+                 "py/on": "53687091200", "rs/on": "53687091200"}
+        or any(o.returncode != 0 for o in (*off.values(), *on.values()))
+        or "g.pinned: keeping the authored hint" not in on["py"].stderr
+        or "g.pinned: keeping the authored hint" not in on["rs"].stderr
+    ):
+        rep.bad("memory-feedback/a-decline-undoes-the-censored-estimate", f"footprints={seen!r}")
+    else:
+        rep.ok("memory-feedback/a-decline-undoes-the-censored-estimate")
+
+
+def _memory_feedback_floor_survives_a_decline(
+    py: list[str], rs: list[str], rep: Report, tmp: str, extra: dict[str, str]
+) -> None:
+    """Prove a decline keeps the FLOOR its censored peaks prove, identically in both builds.
+
+    The other half of the decline contract, and the half that is easy to over-correct into. ONE
+    step whose ten recorded runs were every one of them pinned to the ceiling they were given:
+    nine at 8589934592 B and one at 34359738368 B. The DAG authors 1073741824 B — BELOW what the
+    store proves the step has already used, which is the direction
+    :func:`_memory_feedback_declines_reach_admission` does not cover.
+
+    Without the flag the censoring-blind feedback fits the 9/10 nearest-rank percentile of those
+    peaks — the ninth smallest, 8589934592 B — and admission models 10737418240 B. With the flag
+    the step is DECLINED, because no peak says what it wanted; but one of them says it reached
+    34359738368 B, so that is the floor the decline keeps and admission models 42949672960 B.
+
+    So turning the flag on RAISES the modelled footprint here, which is the only direction a
+    censored sample may move it. Both numbers are named literally: a build that restored the
+    authored figure alone would report a far smaller second number, and a build that added the
+    20% margin to the floor — a floor is a fact about the past, not an estimate of the next run —
+    would report a different one again.
+    """
+    store = os.path.join(tmp, "floor-store")
+    os.makedirs(store, exist_ok=True)
+    csv_name = f"step_profiles_{SYNTH_MACHINE}_{SYNTH_CONTAINER}.csv"
+    with open(os.path.join(store, csv_name), "w", encoding="utf-8") as fh:
+        fh.write(
+            "step,peak_bytes,memory_max_bytes,memory_events_high,memory_events_max,"
+            "memory_events_oom,memory_events_oom_kill\n"
+            + "".join("g.pinned,8589934592,8589934592,0,0,0,0\n" for _ in range(9))
+            + "g.pinned,34359738368,34359738368,0,0,0,0\n"
+        )
+    dag_path = os.path.join(tmp, "floor-dag.json")
+    with open(dag_path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"steps": [{
+            "group": "g", "job": "pinned", "cmd": "true",
+            "hint": {"rss_baseline_bytes": 1073741824},
+        }]}))
+    args = (
+        "run", "--dag", dag_path, "--perf-dir", store, "--no-profile",
+        "--unsafe-no-cgroups", "-q", "--max-mem", "400G",
+    )
+
+    def footprint(outcome: Outcome) -> str | None:
+        for line in outcome.stderr.splitlines():
+            match = re.search(r"worst-case (\d+) bytes", line)
+            if match:
+                return match.group(1)
+        return None
+
+    off = {"py": run(py, args, extra), "rs": run(rs, args, extra)}
+    on_args = (*args, "--profile-memory-feedback")
+    on = {"py": run(py, on_args, extra), "rs": run(rs, on_args, extra)}
+    seen = {
+        f"{engine}/{state}": footprint(outcome)
+        for state, group in (("off", off), ("on", on))
+        for engine, outcome in group.items()
+    }
+    said = "g.pinned: no estimate; rss_baseline_bytes=34359738368, the proven floor"
+    if (
+        seen != {"py/off": "10737418240", "rs/off": "10737418240",
+                 "py/on": "42949672960", "rs/on": "42949672960"}
+        or any(o.returncode != 0 for o in (*off.values(), *on.values()))
+        or said not in on["py"].stderr
+        or said not in on["rs"].stderr
+    ):
+        rep.bad(
+            "memory-feedback/a-decline-keeps-the-proven-floor",
+            f"footprints={seen!r}\n--- py ---\n{on['py'].stderr}\n--- rs ---\n{on['rs'].stderr}",
+        )
+    else:
+        rep.ok("memory-feedback/a-decline-keeps-the-proven-floor")
+
+
+def compare_memory_feedback(py: list[str], rs: list[str], rep: Report) -> None:
+    """Prove the OPT-IN censoring-aware memory feedback agrees across builds, and is really off.
+
+    Against a fixed synthetic store where three steps recorded peaks under the same applied cap
+    — one comfortably, one pinned to the ceiling, one throttled at a soft ceiling:
+
+    * without the flag neither build says anything about memory feedback (it is opt-in, and a
+      default-on reader would be a silent behaviour change for every existing store);
+    * with the flag both builds emit BYTE-IDENTICAL decision lines, so the classification, the
+      percentile, the margin and the wording are one contract rather than two;
+    * the pinned step keeps its authored hint — which it authored ABOVE the floor its peaks
+      prove — and the reason names censoring, while the comfortable step gets a LITERALLY NAMED
+      number, proving the two are not treated alike;
+    * the throttled step, whose ``peak_bytes`` and ``memory_max_bytes`` are byte-identical to the
+      comfortable one and which differs only in ``memory_events_high``, also keeps its hint;
+    * asking for the flag while ``--no-profile-feedback`` disables the reader says so in both
+      builds instead of doing nothing quietly.
+    """
+    extra = {
+        "DAGRUN_MACHINE_ID": SYNTH_MACHINE,
+        "DAGRUN_CONTAINER_CLASS": SYNTH_CONTAINER,
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        store = os.path.join(tmp, "store")
+        os.makedirs(store, exist_ok=True)
+        csv_name = f"step_profiles_{SYNTH_MACHINE}_{SYNTH_CONTAINER}.csv"
+        with open(os.path.join(store, csv_name), "w", encoding="utf-8") as fh:
+            fh.write(_CENSORED_STORE_CSV)
+        dag_path = os.path.join(tmp, "dag.json")
+        with open(dag_path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(_CENSORED_DAG))
+        base = (
+            "run", "--dag", dag_path, "--perf-dir", store, "--no-profile",
+            "--unsafe-no-cgroups", "-q",
+        )
+
+        def lines(outcome: Outcome) -> list[str]:
+            return [
+                line for line in outcome.stderr.splitlines()
+                if "--profile-memory-feedback:" in line
+            ]
+
+        off = {"py": run(py, base, extra), "rs": run(rs, base, extra)}
+        for engine, outcome in off.items():
+            if outcome.returncode != 0 or lines(outcome):
+                rep.bad(
+                    f"memory-feedback:{engine}/off-by-default",
+                    f"exit={outcome.returncode}; unexpected report={lines(outcome)}",
+                )
+            else:
+                rep.ok(f"memory-feedback:{engine}/off-by-default")
+
+        on = (*base, "--profile-memory-feedback")
+        po, ro = run(py, on, extra), run(rs, on, extra)
+        py_lines, rs_lines = lines(po), lines(ro)
+        if po.returncode != 0 or ro.returncode != 0:
+            rep.bad(
+                "memory-feedback/exit",
+                f"exit py={po.returncode} rs={ro.returncode}\n{po.stderr}\n{ro.stderr}",
+            )
+        elif py_lines != rs_lines:
+            rep.bad(
+                "memory-feedback/identical",
+                "decision lines differ\n--- py ---\n"
+                + "\n".join(py_lines)
+                + "\n--- rs ---\n"
+                + "\n".join(rs_lines),
+            )
+        else:
+            rep.ok("memory-feedback/identical")
+        learned = [line for line in py_lines if "g.learned:" in line]
+        pinned = [line for line in py_lines if "g.pinned:" in line]
+        throttled = [line for line in py_lines if "g.throttled:" in line]
+        if (
+            len(learned) != 1
+            or len(pinned) != 1
+            or f"rss_baseline_bytes={_LEARNED_EXPECTED_BYTES}" not in learned[0]
+            or "keeping the authored hint" not in pinned[0]
+            or "censored by its applied cap" not in pinned[0]
+        ):
+            rep.bad(
+                "memory-feedback/censoring-separates-equal-peaks",
+                "learned=" + repr(learned) + " pinned=" + repr(pinned),
+            )
+        else:
+            rep.ok("memory-feedback/censoring-separates-equal-peaks")
+        # The soft ceiling. Same peak, same cap, same absent OOM as g.learned; only
+        # memory_events_high differs, so this fails in exactly the build that skips that counter.
+        if (
+            len(throttled) != 1
+            or "keeping the authored hint" not in throttled[0]
+            or "rss_baseline_bytes=" in throttled[0]
+        ):
+            rep.bad(
+                "memory-feedback/soft-ceiling-throttling-censors",
+                "throttled=" + repr(throttled),
+            )
+        else:
+            rep.ok("memory-feedback/soft-ceiling-throttling-censors")
+
+        # A step whose six runs were KILLED. Byte-for-byte its peak, cap and counters match
+        # g.learned; only ok/returncode differ, so this fails in exactly the build that reads a
+        # peak measured by a dead run as an observation of demand.
+        failed = [line for line in py_lines if "g.failed:" in line]
+        if (
+            len(failed) != 1
+            or "keeping the authored hint" not in failed[0]
+            or "rss_baseline_bytes=" in failed[0]
+            or "6 sample(s) recorded a step that FAILED" not in failed[0]
+        ):
+            rep.bad("memory-feedback/a-failed-run-is-not-evidence", "failed=" + repr(failed))
+        else:
+            rep.ok("memory-feedback/a-failed-run-is-not-evidence")
+
+        # FOUR comfortable samples, and no threshold passed to either build: the only place the
+        # SHIPPED minimum-sample count is observable end to end. The numbers are named literally,
+        # so a build that shipped anything but 5 produces a different line here.
+        four = [line for line in py_lines if "g.four:" in line]
+        if (
+            len(four) != 1
+            or "keeping the authored hint" not in four[0]
+            or "only 4 uncensored sample(s); 5 required" not in four[0]
+        ):
+            rep.bad("memory-feedback/five-uncensored-samples-are-required", "four=" + repr(four))
+        else:
+            rep.ok("memory-feedback/five-uncensored-samples-are-required")
+
+        _memory_feedback_reaches_admission(py, rs, rep, tmp, extra)
+        _memory_feedback_declines_reach_admission(py, rs, rep, tmp, extra)
+        _memory_feedback_floor_survives_a_decline(py, rs, rep, tmp, extra)
+
+        inert = (*base, "--profile-memory-feedback", "--no-profile-feedback")
+        pi, ri = run(py, inert, extra), run(rs, inert, extra)
+        py_inert, rs_inert = lines(pi), lines(ri)
+        if (
+            pi.returncode != 0
+            or ri.returncode != 0
+            or py_inert != rs_inert
+            or len(py_inert) != 1
+            or "no estimate is derived" not in py_inert[0]
+        ):
+            rep.bad(
+                "memory-feedback/inert-under-no-profile-feedback",
+                f"exit py={pi.returncode} rs={ri.returncode}\n"
+                f"py={py_inert!r}\nrs={rs_inert!r}",
+            )
+        else:
+            rep.ok("memory-feedback/inert-under-no-profile-feedback")
+
+
 def compare_summary_sync(py: list[str], rs: list[str], rep: Report) -> None:
     """Prove the mergeable profile SUMMARY (the profile-artifact sync feature's correctness core) is
     byte-identical py<->rs for serialization, merge, and recomputed plan — on BOTH the feedback store
@@ -2424,6 +6033,77 @@ def compare_summary_sync(py: list[str], rs: list[str], rep: Report) -> None:
     )
 
 
+def compare_mixed_local_summary_publishers(
+    py: list[str], rs: list[str], rep: Report
+) -> None:
+    """Prove the local summary backend's lock preserves simultaneous mixed-engine uploads."""
+
+    dag = (
+        '{"steps":['
+        '{"group":"g","job":"a","cmd":"true"},'
+        '{"group":"g","job":"b","cmd":"true"},'
+        '{"group":"g","job":"c","cmd":"true"}'
+        "]}"
+    )
+    with tempfile.TemporaryDirectory(prefix="dagrun-mixed-summary-") as tmp:
+        dag_path = os.path.join(tmp, "dag.json")
+        Path(dag_path).write_text(dag, encoding="utf-8")
+        shared = os.path.join(tmp, "shared")
+        args = (
+            "run",
+            "--dag",
+            dag_path,
+            "--no-profile",
+            NOFB,
+            "--profile-sync",
+            f"local:{shared}",
+            "--profile-sync-direction",
+            "upload",
+            "--unsafe-no-cgroups",
+            "--max-steps",
+            "1",
+            "-q",
+        )
+        commands = (py, rs, py, rs)
+        with ThreadPoolExecutor(max_workers=len(commands)) as executor:
+            outcomes = list(executor.map(lambda command: run(command, args), commands))
+        if any(outcome.returncode != 0 for outcome in outcomes):
+            rep.bad(
+                "summary-sync:mixed-concurrent-publishers",
+                "\n".join(f"run {index}: {outcome}" for index, outcome in enumerate(outcomes)),
+            )
+            return
+        summaries = sorted(Path(shared).glob("summary_*.json"))
+        if len(summaries) != 1:
+            rep.bad(
+                "summary-sync:mixed-concurrent-publishers",
+                f"expected one summary, found {summaries!r}",
+            )
+            return
+        path = str(summaries[0])
+        stats = {
+            "py": run(py, ("summary", "stats", path)),
+            "rs": run(rs, ("summary", "stats", path)),
+        }
+        document = json.loads(summaries[0].read_text(encoding="utf-8"))
+        sample_count = sum(
+            len(bucket.get("samples", []))
+            for bucket in document.get("buckets", [])
+            if isinstance(bucket, dict) and isinstance(bucket.get("samples"), list)
+        )
+        if (
+            sample_count != 12
+            or any(outcome.returncode != 0 for outcome in stats.values())
+            or stats["py"].stdout != stats["rs"].stdout
+        ):
+            rep.bad(
+                "summary-sync:mixed-concurrent-publishers",
+                f"samples={sample_count}/12\npy={stats['py']}\nrs={stats['rs']}",
+            )
+        else:
+            rep.ok("summary-sync:mixed-concurrent-publishers")
+
+
 INVOCATIONS: tuple[Invocation, ...] = (
     Invocation("version", ("--version",)),
     Invocation("help", ("--help",)),
@@ -2432,7 +6112,9 @@ INVOCATIONS: tuple[Invocation, ...] = (
     # separately; language-specific install/API fragments intentionally differ.
     Invocation("userguide", ("--userguide",)),
     # `capabilities` prints each engine's machine-readable enforcement manifest (which guards it
-    # actually implements: cpu_timeout, memory_max, oom_detection, pids_guard, wall_timeout). The
+    # actually implements: cpu_affinity, cpu_bandwidth, cpu_timeout, memory_max, oom_detection,
+    # pids_guard, run_timeout, wall_timeout, and write_domains) — per LANE, since most of them are
+    # a cgroup read or write and simply do not happen on an uncontained run. The
     # WHOLE POINT is that the two engines must enforce the SAME set, so the manifests are asserted
     # byte-identical. This is the recurrence guard for the historical gap where the Rust runner
     # silently did NOT enforce `cpu_timeout` while the Python runner did: with this check, that
@@ -2471,19 +6153,38 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
     """
     command_flags: dict[str, tuple[str, ...]] = {
         "run": (
-            "--dag", "--jobs", "--cores", "--cpuset", "--pin", "--max-mem", "--only",
+            "--dag", "--max-steps", "--max-cpus", "--cores", "--cpuset", "--pin",
+            "--max-mem",
+            "--selected", "--ignore-selected-deps",
             "--args", "--stress", "--perf-dir", "--no-profile", "--profile", "--planner",
-            "--show-plan", "--no-profile-feedback", "--profile-sync",
+            "--profile-timeseries",
+            "--show-plan", "--no-profile-feedback", "--profile-memory-feedback",
+            "--profile-sync",
             "--profile-sync-direction", "--keep-going", "--run-timeout",
+            "--admission",
             "--allow-cgroup-failure",
-            "--unsafe-no-cgroups", "--small-default-cap", "--quiet",
+            "--unsafe-no-cgroups", "--allow-unwise-nest-dagruns", "--small-default-cap", "--quiet",
+        ),
+        "box": (
+            "--mem", "--timeout", "--cores", "--label", "--perf-dir",
+            "--allow-cgroup-failure", "--quiet",
         ),
         "sweep": (
-            "--dag", "--step", "--jobs", "--repeat", "--perf-dir", "--no-profile",
+            "--dag", "--step", "--jobs", "--target-time", "--repeat", "--output-dir",
+            "--perf-dir", "--no-profile", "--report-html", "--no-report",
+            "--profile-timeseries", "--perf-record", "--perf-window", "--wprof-window",
+            "--profiler-sudo",
             "--allow-cgroup-failure", "--unsafe-no-cgroups",
         ),
         "plan": ("--dag", "--planner", "--max-mem", "--format", "--perf-dir", "--no-profile-feedback"),
         "pin-run": ("--cores", "--tag"),
+    }
+    command_forbidden_flags: dict[str, tuple[str, ...]] = {
+        # `--jobs` is a hidden 0.13 compatibility alias; `--only` is retired rather than aliased.
+        "run": ("--jobs", "--only"),
+        # `box` is a front door for ONE command, not a second `run`. A `--dag` here would mean
+        # the two editions had grown different ideas of what the subcommand is for.
+        "box": ("--dag", "--selected", "--ignore-selected-deps", "--stress"),
     }
     summary_action_contracts: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         "build": (
@@ -2508,7 +6209,7 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
         "merge one or more summary json files",
     )
     top_commands = (
-        "run", "sweep", "plan", "list", "ascii", "dot", "json", "yaml", "summary",
+        "run", "box", "sweep", "plan", "list", "ascii", "dot", "json", "yaml", "summary",
         "pin-run", "quickstart", "capabilities",
     )
     for engine, command in (("py", py), ("rs", rs)):
@@ -2535,13 +6236,46 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
             )
         else:
             rep.ok(f"cli-schema:{engine}/summary-top")
+        sweep_help = run(command, ("sweep", "--help"))
+        normalized_sweep_help = " ".join(sweep_help.stdout.lower().split())
+        sweep_contract = (
+            "single-step dense mode",
+            "target-time graph mode",
+            "one at a time in stable topological order",
+            "pass 1 always completes",
+            "every started pass finishes",
+            "powers of two through the physical-core count",
+            "physical-core and logical-thread counts",
+            "integer midpoints",
+            "scaling_model_*.json",
+            "profile_report.html",
+            "traces/<run_id>.csv",
+            "backward-compatible alias for --output-dir",
+            "does not redirect terminal or child-process output",
+        )
+        missing_sweep_phrases = [
+            phrase for phrase in sweep_contract if phrase not in normalized_sweep_help
+        ]
+        if sweep_help.returncode != 0 or missing_sweep_phrases:
+            rep.bad(
+                f"cli-schema:{engine}/sweep-explanation",
+                f"exit={sweep_help.returncode}; missing phrases={missing_sweep_phrases}\n"
+                f"{sweep_help.stdout}",
+            )
+        else:
+            rep.ok(f"cli-schema:{engine}/sweep-explanation")
         for subcommand, flags in command_flags.items():
             outcome = run(command, (subcommand, "--help"))
             missing = [flag for flag in flags if flag not in outcome.stdout]
-            if outcome.returncode != 0 or missing:
+            unexpected = [
+                flag for flag in command_forbidden_flags.get(subcommand, ())
+                if flag in outcome.stdout
+            ]
+            if outcome.returncode != 0 or missing or unexpected:
                 rep.bad(
                     f"cli-schema:{engine}/{subcommand}",
-                    f"exit={outcome.returncode}; missing flags={missing}\n{outcome.stdout}",
+                    f"exit={outcome.returncode}; missing flags={missing}; "
+                    f"unexpected flags={unexpected}\n{outcome.stdout}",
                 )
             else:
                 rep.ok(f"cli-schema:{engine}/{subcommand}")
@@ -2655,7 +6389,7 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
 
 def compare_args_stress(py: list[str], rs: list[str], rep: Report) -> None:
     """Cross-check the previously Python-only passthrough and stress surfaces."""
-    with tempfile.TemporaryDirectory(prefix="safe-ci-cross-args-stress-") as td:
+    with tempfile.TemporaryDirectory(prefix="dagrun-cross-args-stress-") as td:
         passthrough_path = os.path.join(td, "passthrough.json")
         with open(passthrough_path, "w", encoding="utf-8") as handle:
             json.dump(
@@ -2713,21 +6447,36 @@ def compare_args_stress(py: list[str], rs: list[str], rep: Report) -> None:
             "--no-profile", "-q",
         )
         po, ro = run(py, stress), run(rs, stress)
-        # Parallel completion lines are intentionally nondeterministic. Compare only the stable
-        # report block instead of requiring the scheduler trace to finish in the same order.
-        def stress_report(stdout: str) -> str:
+        # Parallel completion lines and the observed peak overlap are intentionally
+        # nondeterministic for three near-instant `true` commands. Compare the stable pass ratio
+        # and configured ceilings while only requiring each observed peak to be in range. Exact
+        # overlap is exercised by the barrier-backed scheduler cases elsewhere in this harness.
+        def stress_report(stdout: str) -> tuple[str, str, int] | None:
             lines = stdout.splitlines()
             start = next(
                 (index for index, line in enumerate(lines) if line.startswith("stress results (")),
                 len(lines),
             )
-            return "\n".join(lines[start:])
+            report = lines[start:]
+            if len(report) != 3:
+                return None
+            match = re.fullmatch(
+                r"  maximum concurrent steps: ([0-9]+) (\(--max-steps .+\))",
+                report[2],
+            )
+            if match is None:
+                return None
+            return report[0] + "\n" + report[1], match.group(2), int(match.group(1))
 
         py_report, rs_report = stress_report(po.stdout), stress_report(ro.stdout)
         if (
             po.returncode == ro.returncode == 0
-            and py_report == rs_report
-            and "3/3 passed" in py_report
+            and py_report is not None
+            and rs_report is not None
+            and py_report[:2] == rs_report[:2]
+            and "3/3 passed" in py_report[0]
+            and 1 <= py_report[2] <= 3
+            and 1 <= rs_report[2] <= 3
         ):
             rep.ok("stress:three-pass-ratio")
         else:
@@ -2755,14 +6504,18 @@ def compare_args_stress(py: list[str], rs: list[str], rep: Report) -> None:
             "--no-profile",
         )
         po, ro = run(py, oversized_stress), run(rs, oversized_stress)
+        expansion_phrase = (
+            "expansion would create 1000000 generated DAG nodes/control units, "
+            "exceeding safety limit 100000"
+        )
         if (
             po.returncode == ro.returncode == 2
-            and "REFUSED" in po.stderr
-            and "REFUSED" in ro.stderr
+            and expansion_phrase in po.stderr
+            and expansion_phrase in ro.stderr
         ):
-            rep.ok("stress:memory-floor-refuses-oversized-fanout")
+            rep.ok("stress:generated-node-cap-refuses-oversized-fanout")
         else:
-            rep.bad("stress:memory-floor-refuses-oversized-fanout", f"py={po}\nrs={ro}")
+            rep.bad("stress:generated-node-cap-refuses-oversized-fanout", f"py={po}\nrs={ro}")
 
         hard_cores = (
             "run",
@@ -2774,7 +6527,7 @@ def compare_args_stress(py: list[str], rs: list[str], rep: Report) -> None:
             "--no-profile",
             "-q",
         )
-        ledger = {"SAFE_CI_CORE_LEDGER": os.path.join(td, "hard-refusal-ledger.json")}
+        ledger = {"DAGRUN_CORE_LEDGER": os.path.join(td, "hard-refusal-ledger.json")}
         po, ro = run(py, hard_cores, ledger), run(rs, hard_cores, ledger)
         if (
             po.returncode == ro.returncode == 3
@@ -2786,10 +6539,775 @@ def compare_args_stress(py: list[str], rs: list[str], rep: Report) -> None:
             rep.bad("cores:unboxed-soft-affinity-refused", f"py={po}\nrs={ro}")
 
 
+def _cpu_guest_dag(
+    widths: Sequence[int],
+    *,
+    duration_s: float,
+    hardcoded_workers: int | None = None,
+    cgroup_parent_levels: int | None = None,
+    barrier_participants: int | None = None,
+) -> dict[str, object]:
+    """One shared DAG whose output path is supplied per engine through the environment."""
+
+    steps: list[object] = []
+    for index, width in enumerate(widths):
+        tag = f"footprint.s{index}"
+        command = (
+            f"{shlex.quote(sys.executable)} {shlex.quote(CPU_FOOTPRINT_GUEST)} "
+            f"--output \"$CPU_FOOTPRINT_OUTPUT\" --step {shlex.quote(tag)} "
+            f"--duration-s {duration_s:g} --sample-ms 10 --start-delay-ms 500"
+        )
+        jobs_flag: str | None = "--workers="
+        if hardcoded_workers is not None:
+            command += f" --workers={hardcoded_workers}"
+            jobs_flag = ""
+        if cgroup_parent_levels is not None:
+            command += (
+                f" --cgroup-parent-levels {cgroup_parent_levels} --cgroup-sample-ms 25"
+            )
+        if barrier_participants is not None:
+            command += (
+                " --barrier-file \"$CPU_FOOTPRINT_BARRIER\" "
+                f"--barrier-participants {barrier_participants} --barrier-timeout-s 10"
+            )
+        steps.append(
+            {
+                "group": "footprint",
+                "job": f"s{index}",
+                "desc": f"CPU footprint width {width}",
+                "cmd": command,
+                "jobs_flag": jobs_flag,
+                "timeout": 15,
+                "cpu_timeout": 120,
+                "hint": {
+                    "preferred_inner_jobs": width,
+                    "hard_mem_max_bytes": 536_870_912,
+                    "est_duration_s": duration_s,
+                },
+            }
+        )
+    return {"steps": steps}
+
+
+def _cpu_facts(log_path: str) -> tuple[FootprintStats, CpuFootprintFacts]:
+    events = load_cpu_events([Path(log_path)])
+    stats = analyze_cpu_footprint(events, bucket_ns=25_000_000)
+    workers: dict[str, set[tuple[int, int]]] = {}
+    for record in events:
+        if record.get("event") != "worker_start":
+            continue
+        step, worker, pid = record.get("step"), record.get("worker"), record.get("pid")
+        if not isinstance(step, str):
+            continue
+        if not isinstance(worker, int) or isinstance(worker, bool):
+            continue
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            continue
+        workers.setdefault(step, set()).add((worker, pid))
+    facts = CpuFootprintFacts(
+        completed_steps=len(stats.step_intervals),
+        workers_per_step=tuple(sorted(len(entries) for entries in workers.values())),
+        max_live_steps=stats.max_live_steps,
+        max_live_workers=stats.max_live_workers,
+    )
+    return stats, facts
+
+
+def compare_run_parallel_limits(py: list[str], rs: list[str], rep: Report) -> None:
+    """Cross-check active-step overlap, per-step width caps, and outer CPU bandwidth."""
+
+    with tempfile.TemporaryDirectory(prefix="dagrun-cross-cpu-limits-") as td:
+        invalid_dag = os.path.join(td, "valid.json")
+        Path(invalid_dag).write_text(
+            '{"steps":[{"group":"g","job":"ok","cmd":"true"}]}', encoding="utf-8"
+        )
+        invalid_cases: tuple[tuple[str, tuple[str, ...]], ...] = (
+            ("max-steps-spaced-zero", ("-s", "0")),
+            ("max-steps-bare-zero", ("-s0",)),
+            ("max-steps-invalid", ("--max-steps", "nope")),
+            ("max-steps-i64-overflow", ("--max-steps", "9223372036854775808")),
+            ("max-cpus-spaced-zero", ("-j", "0")),
+            ("max-cpus-bare-zero", ("-j0",)),
+            ("max-cpus-invalid", ("--max-cpus", "nope")),
+            ("max-cpus-i64-overflow", ("--max-cpus", "9223372036854775808")),
+        )
+        for label, flags in invalid_cases:
+            args = (
+                "run", "--dag", invalid_dag, *flags, NOPROF, NOFB, "--unsafe-no-cgroups",
+            )
+            po, ro = run(py, args), run(rs, args)
+            if po.returncode == ro.returncode == 2 and po.stderr and ro.stderr:
+                rep.ok(f"run-limits:invalid/{label}")
+            else:
+                rep.bad(f"run-limits:invalid/{label}", f"py={po}\nrs={ro}")
+
+        conflict_args = (
+            "run", "--dag", invalid_dag, "--max-cpus", "2", "--jobs", "3",
+            NOPROF, NOFB, "--unsafe-no-cgroups",
+        )
+        po, ro = run(py, conflict_args), run(rs, conflict_args)
+        conflict_message = "--max-cpus and legacy --jobs disagree"
+        if (
+            po.returncode == ro.returncode == 2
+            and conflict_message in po.stderr
+            and conflict_message in ro.stderr
+        ):
+            rep.ok("run-limits:invalid/max-cpus-legacy-jobs-conflict")
+        else:
+            rep.bad(
+                "run-limits:invalid/max-cpus-legacy-jobs-conflict",
+                f"expected exit 2 with {conflict_message!r}; py={po}\nrs={ro}",
+            )
+
+        self_managed_dag = os.path.join(td, "self-managed.json")
+        marker = {name: os.path.join(td, f"run-{name}-spawned") for name in ("py", "rs")}
+        Path(self_managed_dag).write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "group": "g",
+                            "job": "fixed",
+                            "cmd": 'printf spawned > "$SELF_MANAGED_MARKER"',
+                            "jobs_flag": "",
+                            "hint": {"preferred_inner_jobs": 5},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        args = (
+            "run", "--dag", self_managed_dag, "--max-cpus", "2", NOPROF, NOFB,
+            "--unsafe-no-cgroups", "-q",
+        )
+        po = run(py, args, {"SELF_MANAGED_MARKER": marker["py"]})
+        ro = run(rs, args, {"SELF_MANAGED_MARKER": marker["rs"]})
+        phrase = "cannot lower guest parallelism"
+        if (
+            po.returncode == ro.returncode == 2
+            and phrase in po.stderr
+            and phrase in ro.stderr
+            and not any(os.path.exists(path) for path in marker.values())
+        ):
+            rep.ok("run-limits:self-managed-over-budget-refused")
+        else:
+            rep.bad(
+                "run-limits:self-managed-over-budget-refused",
+                f"expected prompt refusal without spawn; py={po}\nrs={ro}\nmarkers={marker}",
+            )
+
+        whitespace_dag = os.path.join(td, "whitespace-jobs-flag.json")
+        Path(whitespace_dag).write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "group": "g",
+                            "job": "fixed",
+                            "cmd": "sh -c 'test \"$#\" -eq 0' _",
+                            "jobs_flag": "   ",
+                            "hint": {"preferred_inner_jobs": 2},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        args = (
+            "run", "--dag", whitespace_dag, "--max-cpus", "2", NOPROF, NOFB,
+            "--unsafe-no-cgroups", "-q",
+        )
+        po, ro = run(py, args), run(rs, args)
+        if po.returncode == ro.returncode == 0:
+            rep.ok("run-limits:whitespace-jobs-flag-does-not-append-width")
+        else:
+            rep.bad(
+                "run-limits:whitespace-jobs-flag-does-not-append-width",
+                f"whitespace-only jobs_flag appended an argument; py={po}\nrs={ro}",
+            )
+
+        cases: tuple[
+            tuple[str, tuple[int, ...], tuple[str, ...], CpuFootprintFacts], ...
+        ] = (
+            (
+                "step-cap-two-cpu-budget-four",
+                (2, 2, 2, 2),
+                ("-s", "2", "-j", "4"),
+                CpuFootprintFacts(4, (2, 2, 2, 2), 2, 4),
+            ),
+            (
+                "bare-step-four-cpu-budget-two",
+                (1, 1, 1, 1),
+                ("-s4", "-j2"),
+                CpuFootprintFacts(4, (1, 1, 1, 1), 4, 4),
+            ),
+            (
+                "two-width-eight-steps-share-eight-core-budget",
+                (8, 8),
+                ("-s2", "-j8"),
+                CpuFootprintFacts(2, (8, 8), 2, 16),
+            ),
+            (
+                "authored-width-capped-to-j",
+                (5,),
+                ("--max-steps=4", "--max-cpus=2"),
+                CpuFootprintFacts(1, (2,), 1, 2),
+            ),
+            (
+                "legacy-hidden-jobs-alias",
+                (1, 1, 1),
+                ("--max-steps=3", "--jobs=2"),
+                CpuFootprintFacts(3, (1, 1, 1), 3, 3),
+            ),
+            (
+                "canonical-and-legacy-equal",
+                (1, 1, 1),
+                ("--max-steps=3", "--max-cpus=2", "--jobs=2"),
+                CpuFootprintFacts(3, (1, 1, 1), 3, 3),
+            ),
+            # #36 dag-core-budget-split. These watch the ONE coupling the split deliberately
+            # kept: with `-s` absent, the active-step ceiling defaults to the RESOLVED `-j`.
+            #
+            # Every case in the list above passes an explicit `-s`, so none of THEM can see it,
+            # but that is a statement about this list and not about the tree. Two cases earlier
+            # in this function do omit `-s` without observing the ceiling (one refuses at exit
+            # 2, one only checks the exit status), and `memory:nonbinding-max-mem-keeps-cpu-base`
+            # over in compare_memory_hardening genuinely does observe it: `--max-cpus 1` with no
+            # `-s`, asserting a base ceiling of 1. Raise the default and that case goes red too
+            # (verified: defaulting both engines to the host CPU count reddens it alongside
+            # `...-cpu-budget-one` and `...-two-hundred`). So the tree was never blind to the
+            # default; what it could not see is the default following a `-j` ABOVE one -- the
+            # direction a user actually feels -- and it saw none of it against live guest
+            # evidence. A user who types `-j1` for bandwidth also gets a serial DAG, and a user
+            # who types `-j3` also gets three-way overlap. Both numbers are literal here, and
+            # the two directions are separate cases so a regression that pinned the default at 1
+            # (or at the CPU count) cannot pass by satisfying the other one.
+            (
+                "absent-step-ceiling-follows-cpu-budget-one",
+                (1, 1, 1),
+                ("-j", "1"),
+                CpuFootprintFacts(3, (1, 1, 1), 1, 1),
+            ),
+            (
+                "absent-step-ceiling-follows-cpu-budget-three",
+                (1, 1, 1),
+                ("-j", "3"),
+                CpuFootprintFacts(3, (1, 1, 1), 3, 3),
+            ),
+            # The hidden 0.13 alias must reach the same default. A 0.13 script that kept its CPU
+            # budget while silently losing its step ceiling is precisely the "old spelling still
+            # works but means something else" outcome the split was supposed to avoid.
+            (
+                "absent-step-ceiling-follows-legacy-jobs-three",
+                (1, 1, 1),
+                ("--jobs=3",),
+                CpuFootprintFacts(3, (1, 1, 1), 3, 3),
+            ),
+        )
+        for label, widths, flags, expected in cases:
+            dag_path = os.path.join(td, f"{label}.json")
+            barrier_participants = expected.max_live_steps if expected.max_live_steps > 1 else None
+            Path(dag_path).write_text(
+                json.dumps(
+                    _cpu_guest_dag(
+                        widths,
+                        duration_s=1.5 if expected.max_live_steps > 1 else 0.4,
+                        barrier_participants=barrier_participants,
+                    )
+                ),
+                encoding="utf-8",
+            )
+            logs = {name: os.path.join(td, f"{label}-{name}.jsonl") for name in ("py", "rs")}
+            args = (
+                "run", "--dag", dag_path, *flags, "-q", NOPROF, NOFB,
+                "--unsafe-no-cgroups",
+            )
+            extra = {
+                name: {
+                    "CPU_FOOTPRINT_OUTPUT": path,
+                    "DAGRUN_NO_STEP_LOGS": "1",
+                    "CPU_FOOTPRINT_BARRIER": os.path.join(td, f"{label}-{name}.barrier"),
+                }
+                for name, path in logs.items()
+            }
+            outcomes = {"py": run(py, args, extra["py"]), "rs": run(rs, args, extra["rs"])}
+            if any(outcome.returncode != 0 for outcome in outcomes.values()):
+                rep.bad(f"run-limits:{label}", f"py={outcomes['py']}\nrs={outcomes['rs']}")
+                continue
+            try:
+                analyzed = {name: _cpu_facts(path) for name, path in logs.items()}
+            except (OSError, ValueError) as exc:
+                rep.bad(f"run-limits:{label}", f"could not analyze guest evidence: {exc}")
+                continue
+            facts = {name: pair[1] for name, pair in analyzed.items()}
+            verdicts = {
+                name: check_cpu_limits(
+                    pair[0],
+                    max_steps=expected.max_live_steps,
+                    max_workers=expected.max_live_workers,
+                )
+                for name, pair in analyzed.items()
+            }
+            if facts["py"] != facts["rs"]:
+                rep.bad(
+                    f"run-limits:{label}",
+                    f"normalized facts py={facts['py']} rs={facts['rs']}",
+                )
+            elif facts["py"] != expected:
+                rep.bad(
+                    f"run-limits:{label}",
+                    f"expected {expected}, observed {facts['py']} "
+                    "(CPU-ID union intentionally ignored)",
+                )
+            elif not all(verdict.ok for verdict in verdicts.values()):
+                rep.bad(f"run-limits:{label}", f"limit verdicts={verdicts}")
+            else:
+                rep.ok(f"run-limits:{label}")
+
+        # The magnitude the shipped README and user guide actually promise: `run -j200` alone
+        # permits TWO HUNDRED active nodes. Launching two hundred spinning guests to watch that
+        # happen would be a host-size lottery, so it is pinned where both engines ANNOUNCE the
+        # number instead: with `--max-mem` present each prints the base active-step ceiling it
+        # derived, and from `-j200` with no `-s` that must read 200 in both. Every guest-evidence
+        # case above uses 1 or 3, so a clamp on the default -- `min(max_cpus, 8)` is the
+        # one-token version -- leaves all of them green while falsifying the shipped sentence.
+        # Only the base is asserted: the modelled memory ceiling is a property of the host, and
+        # _sizing_details already refuses any line whose final ceiling is not min(base, memory).
+        gib = 1024**3
+        wide_default = {
+            "mem_cap_factor": 1.0,
+            "mem_cap_floor_bytes": 0,
+            "outer_mem_safety_factor": 1.0,
+            "steps": [
+                {
+                    "group": "wide-default",
+                    "job": f"s{index}",
+                    "cmd": "true",
+                    "jobs_flag": "",
+                    "hint": {"hard_mem_max_bytes": gib},
+                }
+                for index in range(2)
+            ],
+        }
+        wide_path = os.path.join(td, "absent-step-ceiling-two-hundred.json")
+        Path(wide_path).write_text(json.dumps(wide_default), encoding="utf-8")
+        wide_args = (
+            "run", "--dag", wide_path, "--max-mem", "16G", "-j", "200",
+            "--unsafe-no-cgroups", "-q", NOPROF, NOFB,
+        )
+        pwide, rwide = run(py, wide_args), run(rs, wide_args)
+        pwd, rwd = _sizing_details(pwide.stderr), _sizing_details(rwide.stderr)
+        if (
+            pwide.returncode == rwide.returncode == 0
+            and pwd is not None
+            and pwd == rwd
+            and pwd[3] == 200
+        ):
+            rep.ok("run-limits:absent-step-ceiling-follows-cpu-budget-two-hundred")
+        else:
+            rep.bad(
+                "run-limits:absent-step-ceiling-follows-cpu-budget-two-hundred",
+                f"expected both engines to derive base active-step ceiling 200 from -j200 with "
+                f"no -s; py={pwide} details={pwd} rs={rwide} details={rwd}",
+            )
+
+
+def _boxing_capability_unavailable(outcome: Outcome) -> bool:
+    combined = outcome.stdout + outcome.stderr
+    return outcome.returncode == 3 and (
+        "systemd --user scope is unavailable" in combined
+        or "scope setup was attempted and failed" in combined
+        or ("cgroup boxing could not be established" in combined and "unavailable" in combined)
+    )
+
+
+_BUILD_WIDTH_RE = re.compile(r"build width: (.+)$", re.MULTILINE)
+#: The width the STEP received, echoed by the step's own command.
+_STEP_WIDTH_RE = re.compile(r"WIDTH=(\d+)")
+
+
+def compare_operator_build_width(py: list[str], rs: list[str], rep: Report) -> None:
+    """Both builds must resolve the operator-vs-containment build width the same way, and say so.
+
+    ``derive_build_jobs`` used to overwrite ``CARGO_BUILD_JOBS`` unconditionally, so an operator
+    who set it — having sized a memory cap against exactly that pool — lost it with no word said.
+    Reading the variable back as intent is not the fix either: the runner SETS it — both engines
+    pass ``--setenv=CARGO_BUILD_JOBS`` into the scope, which is the path this check drives — so the
+    in-scope process would read its own derivation as an instruction and stop refining per step.
+
+    This is the one mechanism that can see both engines resolve it, on the boxing path where the
+    substitution actually happens. It checks two observables per leg, because the sentence alone
+    is cheap to keep true while the wiring rots:
+
+    * the SENTENCE each build prints, which must be identical and name the right authority; and
+    * the width the STEP actually received, echoed by the step's own command. Unstated, that must
+      be strictly below the scope-wide number (downward refinement still happening); stated, it
+      must be exactly the operator's number, unrefined.
+
+    Deleting the ``DAGRUN_OPERATOR_BUILD_JOBS`` forwarding in one engine leaves the sentence
+    correct and breaks the second observable, which is the whole reason it is here.
+    """
+    with tempfile.TemporaryDirectory(prefix="dagrun-cross-build-width-") as td:
+        dag_path = os.path.join(td, "dag.json")
+        # A hard 2 GiB per-step cap makes the derived per-step width small and host-independent
+        # relative to the scope's, so "refined downward" is observable rather than incidental.
+        Path(dag_path).write_text(
+            '{"steps": [{"group": "g", "job": "a", '
+            '"cmd": "echo WIDTH=$CARGO_BUILD_JOBS", "timeout": 60, '
+            '"hint": {"hard_mem_max_bytes": 2147483648}}]}',
+            encoding="utf-8",
+        )
+        args = ("run", "--dag", dag_path, "-s1", "-j16", NOPROF, NOFB)
+        base = {
+            "DAGRUN_NO_STEP_LOGS": "1",
+            "DAGRUN_FORCE_SCOPE_ATTEMPT": "1",
+        }
+        for leg, extra_env, want in (
+            ("stated", {"CARGO_BUILD_JOBS": "200"}, "honouring CARGO_BUILD_JOBS=200"),
+            ("unstated", {}, "no CARGO_BUILD_JOBS in the environment"),
+        ):
+            env = {**base, **extra_env}
+            outcomes = {"py": run(py, args, env), "rs": run(rs, args, env)}
+            label = f"operator-build-width:{leg}"
+            if all(_boxing_capability_unavailable(out) for out in outcomes.values()):
+                print(
+                    f"cross[dagrun]: SKIP boxed build-width differential ({leg}): "
+                    "cgroup-v2 + a working systemd --user scope are unavailable"
+                )
+                rep.ok(f"{label}:capability-unavailable")
+                continue
+            combined = {name: out.stdout + out.stderr for name, out in outcomes.items()}
+            said = {name: _BUILD_WIDTH_RE.findall(text) for name, text in combined.items()}
+            applied = {name: _STEP_WIDTH_RE.findall(text) for name, text in combined.items()}
+            if not said["py"] or not said["rs"]:
+                rep.bad(
+                    label,
+                    "each build must announce which width governs; "
+                    f"py={said['py']!r} rs={said['rs']!r}",
+                )
+                continue
+            if said["py"] != said["rs"]:
+                rep.bad(label, f"differing announcement py={said['py']!r} rs={said['rs']!r}")
+                continue
+            if want not in said["py"][0]:
+                rep.bad(label, f"expected {want!r} in {said['py'][0]!r}")
+                continue
+            if not applied["py"] or not applied["rs"]:
+                rep.bad(
+                    label,
+                    "the step must report the width it actually received; "
+                    f"py={applied['py']!r} rs={applied['rs']!r}",
+                )
+                continue
+            if applied["py"] != applied["rs"]:
+                rep.bad(label, f"differing step width py={applied['py']!r} rs={applied['rs']!r}")
+                continue
+            step_width = int(applied["py"][0])
+            if leg == "stated":
+                if step_width != 200:
+                    rep.bad(
+                        label,
+                        "an operator's stated width must reach the step unrefined; "
+                        f"got {step_width}",
+                    )
+                    continue
+            elif step_width >= 16:
+                rep.bad(
+                    label,
+                    "with nothing stated the step must be refined DOWNWARD from the scope's "
+                    f"16-core width by its own 2 GiB cap; got {step_width}. This is what a "
+                    "lost DAGRUN_OPERATOR_BUILD_JOBS forwarding looks like.",
+                )
+                continue
+            rep.ok(label)
+
+
+def compare_jobs_env_width(py: list[str], rs: list[str], rep: Report) -> None:
+    """Prove the allocated width reaches the child through an environment channel.
+
+    The narrow leg catches planner/cap bugs (preferred four under a one-core admission must become
+    one), the roomy leg catches implementations that always collapse to one, and the boxed leg
+    catches the late scope-wide ``CARGO_BUILD_JOBS`` export overwriting the step allocation.
+    Refusal cases prove missing or malformed channels fail before spawning the child.
+    """
+
+    with tempfile.TemporaryDirectory(prefix="dagrun-cross-jobs-env-") as td:
+        root = Path(td)
+        dag_path = root / "dag.json"
+        dag_path.write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "group": "g",
+                            "job": "a",
+                            "cmd": 'printf "%s" "$CARGO_BUILD_JOBS" > "$OBSERVED_PATH"',
+                            "jobs_flag": "",
+                            "timeout": 60,
+                            "hint": {"preferred_inner_jobs": 4},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        def width_leg(label: str, max_cpus: int, expected: str, *, boxed: bool) -> None:
+            outcomes: dict[str, Outcome] = {}
+            observed: dict[str, str | None] = {}
+            for name, command in (("py", py), ("rs", rs)):
+                output = root / f"{label}-{name}.txt"
+                args = [
+                    "run",
+                    "--dag",
+                    str(dag_path),
+                    "-s1",
+                    f"-j{max_cpus}",
+                    "-q",
+                    NOPROF,
+                    NOFB,
+                ]
+                if not boxed:
+                    args.append("--unsafe-no-cgroups")
+                env = {
+                    "DAGRUN_JOBS_ENV": "CARGO_BUILD_JOBS",
+                    "OBSERVED_PATH": str(output),
+                    "DAGRUN_NO_STEP_LOGS": "1",
+                }
+                if boxed:
+                    env.update(
+                        {
+                            "DAGRUN_FORCE_SCOPE_ATTEMPT": "1",
+                            "CARGO_BUILD_JOBS": "8",
+                        }
+                    )
+                outcomes[name] = run(command, args, env)
+                observed[name] = output.read_text(encoding="utf-8") if output.exists() else None
+
+            check = f"jobs-env:{label}"
+            if boxed and all(_boxing_capability_unavailable(out) for out in outcomes.values()):
+                print(
+                    "cross[dagrun]: SKIP boxed jobs-env differential: "
+                    "cgroup-v2 + a working systemd --user scope are unavailable"
+                )
+                rep.ok(f"{check}:capability-unavailable")
+            elif (
+                all(out.returncode == 0 for out in outcomes.values())
+                and observed == {"py": expected, "rs": expected}
+            ):
+                rep.ok(check)
+            else:
+                rep.bad(
+                    check,
+                    f"expected child width {expected}; outcomes={outcomes} observed={observed}",
+                )
+
+        width_leg("unboxed-narrow", 1, "1", boxed=False)
+        width_leg("unboxed-roomy", 8, "4", boxed=False)
+        width_leg("boxed-narrow", 1, "1", boxed=True)
+
+        def readonly_leg(label: str, channel: str = "BASHOPTS", *, boxed: bool) -> None:
+            outcomes: dict[str, Outcome] = {}
+            spawned: dict[str, bool] = {}
+            for name, command in (("py", py), ("rs", rs)):
+                output = root / f"{label}-{name}.txt"
+                args = [
+                    "run",
+                    "--dag",
+                    str(dag_path),
+                    "-s1",
+                    "-j1",
+                    "-q",
+                    NOPROF,
+                    NOFB,
+                ]
+                if not boxed:
+                    args.append("--unsafe-no-cgroups")
+                env = {
+                    "DAGRUN_JOBS_ENV": channel,
+                    "OBSERVED_PATH": str(output),
+                    "DAGRUN_NO_STEP_LOGS": "1",
+                }
+                if boxed:
+                    env["DAGRUN_FORCE_SCOPE_ATTEMPT"] = "1"
+                outcomes[name] = run(command, args, env)
+                spawned[name] = output.exists()
+
+            check = f"jobs-env:{label}"
+            if boxed and all(_boxing_capability_unavailable(out) for out in outcomes.values()):
+                print(
+                    "cross[dagrun]: SKIP boxed readonly jobs-env differential: "
+                    "cgroup-v2 + a working systemd --user scope are unavailable"
+                )
+                rep.ok(f"{check}:capability-unavailable")
+                return
+            combined = {name: out.stdout + out.stderr for name, out in outcomes.items()}
+            if (
+                all(out.returncode != 0 for out in outcomes.values())
+                and not any(spawned.values())
+                and all("did not retain assigned width 1" in text for text in combined.values())
+            ):
+                rep.ok(check)
+            else:
+                rep.bad(
+                    check,
+                    f"shell-managed {channel} must fail before the guest command; "
+                    f"outcomes={outcomes} spawned={spawned}",
+                )
+
+        readonly_leg("unboxed-readonly", boxed=False)
+        readonly_leg("unboxed-dynamic", "LINENO", boxed=False)
+        readonly_leg("unboxed-fresh-bash", "IFS", boxed=False)
+        readonly_leg("boxed-readonly", boxed=True)
+
+        for leg, extra, phrase in (
+            ("missing", {}, "no width channel"),
+            (
+                "malformed",
+                {"DAGRUN_JOBS_ENV": "NOT=A=NAME"},
+                "valid environment variable name",
+            ),
+            *(
+                (f"startup-control-{name.lower()}", {"DAGRUN_JOBS_ENV": name},
+                 "shell startup/control variable")
+                for name in (
+                    "BASH_COMPAT", "BASH_ENV", "BASH_XTRACEFD", "CDPATH", "ENV",
+                    "EXECIGNORE", "GLOBIGNORE", "PATH", "POSIXLY_CORRECT",
+                )
+            ),
+            (
+                "retired-name-ignored",
+                {"SAFE_CI_DAG_RUNNER_JOBS_ENV": "CARGO_BUILD_JOBS"},
+                "no width channel",
+            ),
+        ):
+            outcomes: dict[str, Outcome] = {}
+            spawned: dict[str, bool] = {}
+            for name, command in (("py", py), ("rs", rs)):
+                output = root / f"{leg}-{name}.txt"
+                env = {"OBSERVED_PATH": str(output), "DAGRUN_NO_STEP_LOGS": "1", **extra}
+                outcomes[name] = run(
+                    command,
+                    (
+                        "run",
+                        "--dag",
+                        str(dag_path),
+                        "-s1",
+                        "-j1",
+                        "--unsafe-no-cgroups",
+                        "-q",
+                        NOPROF,
+                        NOFB,
+                    ),
+                    env,
+                )
+                spawned[name] = output.exists()
+            combined = {name: out.stdout + out.stderr for name, out in outcomes.items()}
+            if (
+                all(out.returncode == 2 for out in outcomes.values())
+                and not any(spawned.values())
+                and all(phrase in text for text in combined.values())
+            ):
+                rep.ok(f"jobs-env:{leg}")
+            else:
+                rep.bad(
+                    f"jobs-env:{leg}",
+                    f"expected pre-spawn refusal containing {phrase!r}; "
+                    f"outcomes={outcomes} spawned={spawned}",
+                )
+
+
+def compare_boxed_cpu_bandwidth(py: list[str], rs: list[str], rep: Report) -> None:
+    """Anchor ``-j`` / ``--max-cpus`` to live quota and aggregate CPU counters."""
+
+    with tempfile.TemporaryDirectory(prefix="dagrun-cross-boxed-cpu-") as td:
+        dag_path = os.path.join(td, "dag.json")
+        # Each runner-controlled step receives the full per-step ceiling J=8. Both steps must be
+        # live together under -s2, so their sixteen requested workers exceed J in aggregate while
+        # the parent cgroup's long-window CPU bandwidth remains bounded to eight core-equivalents.
+        Path(dag_path).write_text(
+            json.dumps(
+                _cpu_guest_dag(
+                    (8, 8),
+                    duration_s=1.75,
+                    cgroup_parent_levels=1,
+                    barrier_participants=2,
+                )
+            ),
+            encoding="utf-8",
+        )
+        logs = {name: os.path.join(td, f"boxed-{name}.jsonl") for name in ("py", "rs")}
+        args = (
+            "run", "--dag", dag_path, "-s2", "-j8", "-q", NOPROF, NOFB,
+        )
+        extra = {
+            name: {
+                "CPU_FOOTPRINT_OUTPUT": path,
+                "CPU_FOOTPRINT_BARRIER": os.path.join(td, f"boxed-{name}.barrier"),
+                "DAGRUN_NO_STEP_LOGS": "1",
+                "DAGRUN_FORCE_SCOPE_ATTEMPT": "1",
+            }
+            for name, path in logs.items()
+        }
+        outcomes = {"py": run(py, args, extra["py"]), "rs": run(rs, args, extra["rs"])}
+        unavailable = {name: _boxing_capability_unavailable(out) for name, out in outcomes.items()}
+        if all(unavailable.values()):
+            print(
+                "cross[dagrun]: SKIP boxed CPU-bandwidth differential: "
+                "cgroup-v2 + a working systemd --user scope are unavailable"
+            )
+            rep.ok("boxed-cpu-bandwidth:capability-unavailable")
+            return
+        if any(unavailable.values()) or any(out.returncode != 0 for out in outcomes.values()):
+            rep.bad("boxed-cpu-bandwidth", f"py={outcomes['py']}\nrs={outcomes['rs']}")
+            return
+
+        normalized: dict[str, tuple[bool, ...]] = {}
+        details: dict[str, object] = {}
+        try:
+            for name, path in logs.items():
+                events = load_cpu_events([Path(path)])
+                stats = analyze_cpu_footprint(events, bucket_ns=100_000_000)
+                facts = _cpu_facts(path)[1]
+                limits = check_cpu_limits(stats, max_steps=2)
+                bandwidth = check_cgroup_bandwidth(
+                    events, min_window_periods=10, scheduler_slack_usec=100_000
+                )
+                normalized[name] = (
+                    facts.completed_steps == 2,
+                    facts.workers_per_step == (8, 8),
+                    facts.max_live_steps == 2,
+                    facts.max_live_workers == 16,
+                    limits.ok,
+                    bandwidth.checkable,
+                    bandwidth.ok,
+                    bandwidth.quota_cores == (8.0,),
+                )
+                details[name] = {
+                    "facts": facts,
+                    "quota_cores": bandwidth.quota_cores,
+                    "checked_windows": bandwidth.checked_windows,
+                    "bandwidth_violations": bandwidth.violations,
+                    # sampled_cpu_union is intentionally absent: migration/CPU identity is not
+                    # an aggregate CPU-bandwidth or simultaneous-worker invariant.
+                }
+        except (OSError, ValueError) as exc:
+            rep.bad("boxed-cpu-bandwidth", f"could not analyze boxed guest evidence: {exc}")
+            return
+        expected = (True,) * 8
+        if normalized.get("py") != normalized.get("rs"):
+            rep.bad("boxed-cpu-bandwidth", f"normalized={normalized}; details={details}")
+        elif normalized.get("py") != expected:
+            rep.bad("boxed-cpu-bandwidth", f"invariants={normalized}; details={details}")
+        else:
+            rep.ok("boxed-cpu-bandwidth")
+
+
 def compare_pin_run(py: list[str], rs: list[str], rep: Report) -> None:
     """Exercise shared reservation semantics through the paired safe-runner wrapper."""
-    with tempfile.TemporaryDirectory(prefix="safe-ci-cross-pin-") as td:
-        extra = {"SAFE_CI_CORE_LEDGER": os.path.join(td, "ledger.json")}
+    with tempfile.TemporaryDirectory(prefix="dagrun-cross-pin-") as td:
+        extra = {"DAGRUN_CORE_LEDGER": os.path.join(td, "ledger.json")}
         missing = ("pin-run", "--cores", "1")
         po, ro = run(py, missing, extra), run(rs, missing, extra)
         if po.returncode == ro.returncode == 2:
@@ -2839,8 +7357,8 @@ def compare_pin_run(py: list[str], rs: list[str], rep: Report) -> None:
             rep.bad("pin-run:signal-status", f"py={po}\nrs={ro}")
 
 
-def compare_safe_ci_dag_runner(rand_count: int, seed: int) -> int:
-    tool = "safe-ci-dag-runner"
+def compare_dagrun(rand_count: int, seed: int) -> int:
+    tool = "dagrun"
     py = py_command()
     rs = rs_command(tool)
     rep = Report()
@@ -2856,21 +7374,41 @@ def compare_safe_ci_dag_runner(rand_count: int, seed: int) -> int:
         compare_example_static(py, rs, fx, rep)
     compare_yaml_isomorphism(py, rs, rep)
     compare_scalar_parity(py, rs, rep)
-    compare_only_errors(py, rs, rep)
+    compare_selected_behavior(py, rs, rep)
+    compare_uncarried_config_keys(py, rs, rep)
+    compare_loader_graph_validation(py, rs, rep)
+    compare_uncontained_cpu_budget_notice(py, rs, rep)
     compare_escapee_teardown(py, rs, rep)
     compare_term_attribution(py, rs, rep)
     compare_test_attribution_evidence(py, rs, rep)
+    compare_step_log_ceiling(py, rs, rep)
+    compare_capture_ceiling(py, rs, rep)
+    compare_box_subcommand(py, rs, rep)
+    compare_memory_admission(py, rs, rep)
     compare_batch_teardown_grace(py, rs, rep)
     compare_run_timeout(py, rs, rep)
+    compare_spawn_failure(py, rs, rep)
     compare_profile_store(py, rs, rep)
+    compare_mixed_profile_writers(py, rs, rep)
+    compare_profile_run_identity(py, rs, rep)
+    compare_profile_timeseries_trace(py, rs, rep)
     compare_plan_feedback(py, rs, rep)
     compare_hostile_numeric_cells(py, rs, rep)
     compare_speedup_model(py, rs, rep)
+    compare_scaling_model_sidecar(py, rs, rep)
     compare_cpa_planner(py, rs, rep)
+    compare_memory_hardening(py, rs, rep)
+    compare_memory_feedback(py, rs, rep)
     compare_summary_sync(py, rs, rep)
+    compare_mixed_local_summary_publishers(py, rs, rep)
     compare_sweep_success(py, rs, rep)
     compare_sweep_errors(py, rs, rep)
+    compare_sweep_report_collisions(py, rs, rep)
     compare_args_stress(py, rs, rep)
+    compare_run_parallel_limits(py, rs, rep)
+    compare_boxed_cpu_bandwidth(py, rs, rep)
+    compare_operator_build_width(py, rs, rep)
+    compare_jobs_env_width(py, rs, rep)
     compare_pin_run(py, rs, rep)
     yaml_paths = yaml_fixture_paths()
     n_fixtures = len(fixtures) + len(examples) + len(yaml_paths)
@@ -2897,12 +7435,13 @@ def compare_safe_ci_dag_runner(rand_count: int, seed: int) -> int:
 
 def py_command_for(tool: str) -> list[str]:
     modules = {
-        "safe-ci-dag-runner": "safe_ci_dag_runner",
-        "cpuset-alloc": "safe_ci_dag_runner.cpuset_allocator",
+        "dagrun": "dagrun",
+        "cpuset-alloc": "dagrun.cpuset_allocator",
         "tick-hub": "tick_hub",
         "pr-landing-planner": "pr_landing_planner",
         "herdr-run": "herdr_run",
-        "herdr-agent": "herdr_run.agent_cli",
+        "herdr-agent": "agentctl.legacy_cli",
+        "agentctl": "agentctl",
     }
     module = modules.get(tool)
     if module is None:
@@ -2975,7 +7514,11 @@ def compare_package_guides(
     for language, command, forbidden in pairs:
         outcome = run(command, ("--userguide",))
         lowered = outcome.stdout.lower()
-        leaks = [token for token in forbidden if token in lowered]
+        checked = lowered
+        if tool == "dagrun" and language == "py":
+            for value in ("cargo-build", "cargo-test", "cargo-nextest"):
+                checked = checked.replace(value, " " * len(value))
+        leaks = [token for token in forbidden if token in checked]
         if outcome.returncode != 0:
             rep.bad(f"guide:{language}", f"exit={outcome.returncode}: {outcome.stderr}")
         elif tool not in lowered or len(outcome.stdout) < 500:
@@ -3220,7 +7763,7 @@ def compare_cpuset_alloc() -> int:
                 ("rs-then-py", rs, py),
             ):
                 shared_ledger = os.path.join(tmp, f"interop-{label}.json")
-                extra = {"SAFE_CI_CORE_LEDGER": shared_ledger}
+                extra = {"DAGRUN_CORE_LEDGER": shared_ledger}
                 hold = (
                     "run",
                     "--cores",
@@ -3382,6 +7925,96 @@ def compare_cpuset_alloc() -> int:
     return 0
 
 
+def compare_tick_hub_phased_cadence(
+    py: Sequence[str], rs: Sequence[str], rep: Report
+) -> None:
+    """Phased cadences and per-gate timeouts must mean the same thing in both editions.
+
+    These live HERE, in the mandatory differential, rather than in a pytest case that skips
+    when the Rust binary is absent. The normal order runs the Python suite before cargo
+    builds anything, so such a case passes by skipping on a clean checkout -- it would have
+    reported success for exactly the one-edition regression it exists to catch. This harness
+    resolves the binary through the tracked launcher and RAISES when it cannot, so absence
+    is a failure rather than a quiet pass.
+    """
+    phased: dict[str, object] = {
+        "reminders": [
+            {
+                "name": "phase_a",
+                "cadence_secs": 3600,
+                "cadence_offset_secs": 0,
+                "cadence_window_secs": 1800,
+                "emit": {"kind": "note", "title": "a"},
+            },
+            {
+                "name": "phase_b",
+                "cadence_secs": 3600,
+                "cadence_offset_secs": 1800,
+                "emit": {"kind": "note", "title": "b"},
+            },
+            {"name": "plain", "cadence_secs": 3600, "emit": {"kind": "note", "title": "p"}},
+        ]
+    }
+    bounded: dict[str, object] = {
+        "reminders": [
+            {
+                "name": "bounded",
+                "cadence_secs": 3600,
+                "gate": {
+                    "cmd": "true",
+                    "when": "failure",
+                    "capture": True,
+                    "timeout_secs": 90,
+                    "parallel": True,
+                },
+                "emit": {"kind": "note", "title": "b"},
+            }
+        ]
+    }
+    # Each must be refused by BOTH editions. A shape one takes and the other rejects splits
+    # the contract just as surely as a parse failure, only more quietly.
+    refusals: dict[str, dict[str, object]] = {
+        "offset_at_cadence": {"reminders": [{"name": "r", "cadence_secs": 3600,
+            "cadence_offset_secs": 3600, "emit": {"kind": "note", "title": "t"}}]},
+        "offset_on_every_tick": {"reminders": [{"name": "r", "cadence_secs": 0,
+            "cadence_offset_secs": 5, "emit": {"kind": "note", "title": "t"}}]},
+        "window_without_offset": {"reminders": [{"name": "r", "cadence_secs": 3600,
+            "cadence_window_secs": 60, "emit": {"kind": "note", "title": "t"}}]},
+        "window_beyond_cadence": {"reminders": [{"name": "r", "cadence_secs": 3600,
+            "cadence_offset_secs": 0, "cadence_window_secs": 3601,
+            "emit": {"kind": "note", "title": "t"}}]},
+        "gate_timeout_zero": {"reminders": [{"name": "r", "cadence_secs": 3600,
+            "gate": {"cmd": "true", "timeout_secs": 0},
+            "emit": {"kind": "note", "title": "t"}}]},
+    }
+    with tempfile.TemporaryDirectory(prefix="tick-hub-phase-") as tmp:
+        for label, config in (("phased", phased), ("gate-timeout", bounded)):
+            path = os.path.join(tmp, f"{label}.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(config, handle, ensure_ascii=False)
+            for subcommand in ("list", "json"):
+                _record_exact(
+                    rep,
+                    f"phase:{label}/{subcommand}",
+                    py,
+                    rs,
+                    (subcommand, "--config", path),
+                    expected=0,
+                )
+        for label, refusal in sorted(refusals.items()):
+            path = os.path.join(tmp, f"refuse-{label}.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(refusal, handle, ensure_ascii=False)
+            _record_exact(
+                rep,
+                f"phase:refuse/{label}",
+                py,
+                rs,
+                ("list", "--config", path),
+                expected=2,
+            )
+
+
 def compare_tick_hub(rand_count: int, seed: int) -> int:
     tool = "tick-hub"
     py = py_command_for(tool)
@@ -3390,6 +8023,7 @@ def compare_tick_hub(rand_count: int, seed: int) -> int:
 
     _record_exact(rep, "version", py, rs, ("--version",))
     compare_package_guides(tool, py, rs, rep)
+    compare_tick_hub_phased_cadence(py, rs, rep)
     for engine, command in (("py", py), ("rs", rs)):
         top = run(command, ("--help",))
         required = ("tick", "state", "list", "json", "yaml", "quickstart", "--userguide")
@@ -3406,6 +8040,7 @@ def compare_tick_hub(rand_count: int, seed: int) -> int:
                 "--now",
                 "--current-tick-min",
                 "--flush",
+                "--report-pending",
                 "--no-header",
             ),
             "state": ("--state", "--current-tick-min"),
@@ -3449,12 +8084,18 @@ def compare_tick_hub(rand_count: int, seed: int) -> int:
                         "cmd": "printf 'count=3\\n'",
                         "when": "nonempty",
                         "capture": True,
+                        "parallel": True,
                     },
                     "emit": {
                         "kind": "action",
                         "skill": "triage",
                         "title": "triage {count}",
                     },
+                },
+                {
+                    "name": "parallel_note",
+                    "gate": {"cmd": "true", "when": "success", "parallel": True},
+                    "emit": {"kind": "note", "title": "parallel gate completed"},
                 },
                 {
                     "name": "guarded",
@@ -3529,6 +8170,222 @@ def compare_tick_hub(rand_count: int, seed: int) -> int:
                 f"py={po.returncode}:{po.stdout!r}\nrs={ro.returncode}:{ro.stdout!r}",
             )
 
+        quiet_config = {
+            "reminders": [
+                {
+                    "name": "quiet",
+                    "cadence_secs": 3600,
+                    "gate": {"cmd": "true", "when": "failure"},
+                    "emit": {"skill": "warn", "title": "problem"},
+                }
+            ]
+        }
+        quiet_path = os.path.join(tmp, "report-pending.json")
+        with open(quiet_path, "w", encoding="utf-8") as handle:
+            json.dump(quiet_config, handle)
+        py_quiet_fired = os.path.join(tmp, "py-report-pending-fired")
+        rs_quiet_fired = os.path.join(tmp, "rs-report-pending-fired")
+        quiet_args = (
+            "tick",
+            "--config",
+            quiet_path,
+            "--state",
+            state_path,
+            "--now",
+            "1000",
+            "--report-pending",
+            "--no-header",
+        )
+        po = run(py, (*quiet_args, "--fired-state", py_quiet_fired, "--flush"))
+        ro = run(rs, (*quiet_args, "--fired-state", rs_quiet_fired, "--flush"))
+        py_quiet_state = Path(py_quiet_fired).read_text(encoding="utf-8")
+        rs_quiet_state = Path(rs_quiet_fired).read_text(encoding="utf-8")
+        po_again = run(
+            py,
+            (
+                *quiet_args[:6],
+                "1001",
+                *quiet_args[7:],
+                "--fired-state",
+                py_quiet_fired,
+            ),
+        )
+        ro_again = run(
+            rs,
+            (
+                *quiet_args[:6],
+                "1001",
+                *quiet_args[7:],
+                "--fired-state",
+                rs_quiet_fired,
+            ),
+        )
+        if (
+            po.returncode == ro.returncode == po_again.returncode == ro_again.returncode == 0
+            and po.stdout == ro.stdout
+            and po_again.stdout == ro_again.stdout
+            and py_quiet_state == rs_quiet_state
+            and "quiet=1000\n" in py_quiet_state
+            and "CLEAN: quiet ran and found nothing to report" in po.stdout
+            and "CLEAN: quiet" not in po_again.stdout
+        ):
+            rep.ok("report-pending:flush-preserves-cadence")
+        else:
+            rep.bad(
+                "report-pending:flush-preserves-cadence",
+                f"first py={po}\nfirst rs={ro}\nsecond py={po_again}\nsecond rs={ro_again}\n"
+                f"state py={py_quiet_state!r} rs={rs_quiet_state!r}",
+            )
+
+        py_broken_fired = os.path.join(tmp, "py-broken-pipe-fired")
+        rs_broken_fired = os.path.join(tmp, "rs-broken-pipe-fired")
+        broken_args = (
+            "tick",
+            "--config",
+            quiet_path,
+            "--state",
+            state_path,
+            "--now",
+            "2000",
+            "--report-pending",
+            "--no-header",
+        )
+        po = run_with_closed_stdout(
+            py, (*broken_args, "--fired-state", py_broken_fired, "--flush")
+        )
+        ro = run_with_closed_stdout(
+            rs, (*broken_args, "--fired-state", rs_broken_fired, "--flush")
+        )
+        if (
+            po.returncode != 0
+            and ro.returncode != 0
+            and not os.path.exists(py_broken_fired)
+            and not os.path.exists(rs_broken_fired)
+        ):
+            rep.ok("report-pending:broken-pipe-does-not-consume-cadence")
+        else:
+            rep.bad(
+                "report-pending:broken-pipe-does-not-consume-cadence",
+                f"py={po} py_state_exists={os.path.exists(py_broken_fired)}\n"
+                f"rs={ro} rs_state_exists={os.path.exists(rs_broken_fired)}",
+            )
+
+        ordered_config = {
+            "reminders": [
+                {
+                    "name": "first",
+                    "gate": {"cmd": "exit 1", "when": "failure"},
+                    "emit": {"skill": "warn", "title": "first found a problem"},
+                },
+                {
+                    "name": "suppressed",
+                    "requires_flags": ["disabled"],
+                    "emit": {"skill": "warn", "title": "suppressed fired"},
+                },
+                {
+                    "name": "third",
+                    "gate": {"cmd": "exit 1", "when": "failure"},
+                    "emit": {"skill": "warn", "title": "third found a problem"},
+                },
+            ]
+        }
+        ordered_path = os.path.join(tmp, "report-order.json")
+        with open(ordered_path, "w", encoding="utf-8") as handle:
+            json.dump(ordered_config, handle)
+        ordered_args = (
+            "tick",
+            "--config",
+            ordered_path,
+            "--state",
+            state_path,
+            "--now",
+            "1000",
+            "--report-pending",
+            "--no-header",
+        )
+        po = run(py, ordered_args)
+        ro = run(rs, ordered_args)
+        ordered_verdicts = tuple(
+            line
+            for line in po.stdout.splitlines()
+            if line.startswith(("ACTION: warn", "SUPPRESSED: "))
+        )
+        if (
+            po.returncode == ro.returncode == 0
+            and po.stdout == ro.stdout
+            and ordered_verdicts
+            == (
+                'ACTION: warn title="first found a problem"',
+                "SUPPRESSED: suppressed did not run; required flag(s) not set: disabled",
+                'ACTION: warn title="third found a problem"',
+            )
+        ):
+            rep.ok("report-pending:suppressed-keeps-config-order")
+        else:
+            rep.bad(
+                "report-pending:suppressed-keeps-config-order",
+                f"py={po.returncode}:{po.stdout!r}\nrs={ro.returncode}:{ro.stdout!r}",
+            )
+
+        streaming_config = {
+            "reminders": [
+                {
+                    "name": "independent",
+                    "gate": {"cmd": "exit 1", "when": "failure"},
+                    "emit": {"skill": "warn", "title": "independent found a problem"},
+                },
+                {
+                    "name": "dependent",
+                    "depends_on": ["foundation"],
+                    "gate": {"cmd": "exit 0", "when": "failure"},
+                    "emit": {"skill": "warn", "title": "dependent problem"},
+                },
+                {
+                    "name": "foundation",
+                    "gate": {"cmd": "sleep 1; exit 75", "when": "failure"},
+                    "emit": {"skill": "warn", "title": "foundation problem"},
+                },
+            ]
+        }
+        streaming_path = os.path.join(tmp, "streaming-dependencies.json")
+        with open(streaming_path, "w", encoding="utf-8") as handle:
+            json.dump(streaming_config, handle)
+        streaming_args = (
+            "tick",
+            "--config",
+            streaming_path,
+            "--state",
+            state_path,
+            "--now",
+            "1000",
+            "--report-pending",
+            "--no-header",
+        )
+        expected_prefix = 'ACTION: warn title="independent found a problem"\n'
+        po, py_early, py_before_exit = run_until_stdout_contains(
+            py, streaming_args, expected_prefix
+        )
+        ro, rs_early, rs_before_exit = run_until_stdout_contains(
+            rs, streaming_args, expected_prefix
+        )
+        forbidden_early = b"CLEAN: dependent ran and found nothing to report"
+        if (
+            po.returncode == ro.returncode == 0
+            and po.stdout == ro.stdout
+            and py_before_exit
+            and rs_before_exit
+            and forbidden_early not in py_early
+            and forbidden_early not in rs_early
+            and "NO_RESULT: dependent is unevaluable" in po.stdout
+        ):
+            rep.ok("streaming:mixed-dependency-prefix-visible")
+        else:
+            rep.bad(
+                "streaming:mixed-dependency-prefix-visible",
+                f"py_before_exit={py_before_exit} py_early={py_early!r} py={po}\n"
+                f"rs_before_exit={rs_before_exit} rs_early={rs_early!r} rs={ro}",
+            )
+
         dependency_config = {
             "reminders": [
                 {
@@ -3592,6 +8449,119 @@ def compare_tick_hub(rand_count: int, seed: int) -> int:
                 "dependency-no-result:quiet-dependent-unevaluable",
                 f"py={po.returncode}:{po.stdout!r}:{py_dependency_state!r}\n"
                 f"rs={ro.returncode}:{ro.stdout!r}:{rs_dependency_state!r}",
+            )
+
+        unresolved_config: dict[str, object] = {
+            "reminders": [
+                {
+                    "name": "unresolved",
+                    "gate": {
+                        "cmd": "exit 1",
+                        "when": "failure",
+                        "capture": True,
+                    },
+                    "emit": {"skill": "warn", "title": "problem: {summary}"},
+                }
+            ]
+        }
+        unresolved_path = os.path.join(tmp, "unresolved.json")
+        with open(unresolved_path, "w", encoding="utf-8") as handle:
+            json.dump(unresolved_config, handle)
+        py_unresolved_fired = os.path.join(tmp, "py-unresolved-fired")
+        rs_unresolved_fired = os.path.join(tmp, "rs-unresolved-fired")
+        repeated_ok = True
+        repeated_detail = []
+        for consecutive, now in enumerate((1000, 1001, 1002), start=1):
+            unresolved_args = (
+                "tick",
+                "--config",
+                unresolved_path,
+                "--state",
+                state_path,
+                "--now",
+                str(now),
+                "--no-header",
+                "--flush",
+            )
+            po = run(py, (*unresolved_args, "--fired-state", py_unresolved_fired))
+            ro = run(rs, (*unresolved_args, "--fired-state", rs_unresolved_fired))
+            with open(py_unresolved_fired, encoding="utf-8") as handle:
+                py_unresolved_state = handle.read()
+            with open(rs_unresolved_fired, encoding="utf-8") as handle:
+                rs_unresolved_state = handle.read()
+            repeated = "consecutive_failures=" in po.stdout
+            expected_repeated = consecutive >= 3
+            step_ok = (
+                po.returncode == ro.returncode == 0
+                and po.stdout == ro.stdout
+                and py_unresolved_state == rs_unresolved_state
+                and repeated == expected_repeated
+                and "reason=unresolved-placeholder" in po.stdout
+                and f".count={consecutive}\n" in py_unresolved_state
+                and ".first_failure_epoch=1000\n" in py_unresolved_state
+                and not any(
+                    line.startswith("unresolved=")
+                    for line in py_unresolved_state.splitlines()
+                )
+            )
+            repeated_ok = repeated_ok and step_ok
+            repeated_detail.append(
+                f"step={consecutive} ok={step_ok} py={po.stdout!r} state={py_unresolved_state!r}"
+            )
+        if repeated_ok:
+            rep.ok("unresolved-render:third-consecutive-escalates")
+        else:
+            rep.bad(
+                "unresolved-render:third-consecutive-escalates",
+                "\n".join(repeated_detail),
+            )
+
+        recovered_config = {
+            "reminders": [
+                {
+                    "name": "unresolved",
+                    "gate": {
+                        "cmd": "printf 'summary=recovered\\n'; exit 1",
+                        "when": "failure",
+                        "capture": True,
+                    },
+                    "emit": {"skill": "warn", "title": "problem: {summary}"},
+                }
+            ]
+        }
+        with open(unresolved_path, "w", encoding="utf-8") as handle:
+            json.dump(recovered_config, handle)
+        recovery_args = (
+            "tick",
+            "--config",
+            unresolved_path,
+            "--state",
+            state_path,
+            "--now",
+            "1003",
+            "--no-header",
+            "--flush",
+        )
+        po = run(py, (*recovery_args, "--fired-state", py_unresolved_fired))
+        ro = run(rs, (*recovery_args, "--fired-state", rs_unresolved_fired))
+        with open(py_unresolved_fired, encoding="utf-8") as handle:
+            py_recovered_state = handle.read()
+        with open(rs_unresolved_fired, encoding="utf-8") as handle:
+            rs_recovered_state = handle.read()
+        if (
+            po.returncode == ro.returncode == 0
+            and po.stdout == ro.stdout
+            and py_recovered_state == rs_recovered_state
+            and "problem: recovered" in po.stdout
+            and "unresolved=1003\n" in py_recovered_state
+            and "__tick_hub_internal__.unresolved_render.unresolved" not in py_recovered_state
+        ):
+            rep.ok("unresolved-render:successful-render-clears-streak")
+        else:
+            rep.bad(
+                "unresolved-render:successful-render-clears-streak",
+                f"py={po.returncode}:{po.stdout!r}:{py_recovered_state!r}\n"
+                f"rs={ro.returncode}:{ro.stdout!r}:{rs_recovered_state!r}",
             )
 
         po = run(py, (*common_tick, "--fired-state", py_fired, "--flush"))
@@ -3776,6 +8746,198 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
     rs = rs_command(tool)
     rep = Report()
 
+    def review_digest(
+        head: str, decision: str, events: Sequence[Mapping[str, object]]
+    ) -> str:
+        digest = hashlib.sha256(b"pr-landing-planner-review-evidence-v3")
+
+        def feed(value: str) -> None:
+            encoded = value.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+
+        def event_field(event: Mapping[str, object], field: str) -> str:
+            value = event.get(field)
+            if value is None and field in (
+                "author",
+                "last_edited_at",
+                "retirement_actor_permission",
+            ):
+                return ""
+            if not isinstance(value, str):
+                raise ValueError(f"review event field {field!r} is not a string")
+            return value
+
+        ascii_case = re.ASCII | re.IGNORECASE
+        ascii_whitespace = " \t\r\n\v\f"
+        fence_re = re.compile(r"^ {0,3}(?P<f>`{3,}|~{3,})[ \t]*(?P<info>.*)$")
+        block_prefix = re.compile(r"^(?:#{1,6}[ \t]+|[-+*][ \t]+)")
+        disclosure = re.compile(
+            r"^\[[A-Za-z0-9_.-]+,[ \t]*[A-Za-z0-9_.-]+,[ \t]*"
+            r"[^,\[\]\r\n]+,[ \t]*[A-Za-z0-9_.-]+,[ \t]*"
+            r"role=[A-Za-z0-9_.-]+\]\r?$",
+            ascii_case,
+        )
+        review_marker = re.compile(
+            r"^(?:CHANGES-REQUESTED-WITHDRAWN-AT|CHANGES-REQUESTED-AT|"
+            r"APPROVED-AT):[ \t]*(?:claude|codex)[ \t]+[0-9a-f]{40}",
+            ascii_case,
+        )
+        by_identity = re.compile(
+            r"[ \t]+BY[ \t]+[A-Za-z0-9_.-]+$", ascii_case
+        )
+        who_metadata = re.compile(
+            r"^Unverified --who metadata: [A-Za-z0-9_.-]+\r?$", re.ASCII
+        )
+        withdrawal_marker = re.compile(
+            r"^CHANGES-REQUESTED-WITHDRAWN-AT:[ \t]*"
+            r"(?P<lane>claude|codex)[ \t]+(?P<head>[0-9a-f]{40})",
+            ascii_case,
+        )
+        retirement_target = re.compile(
+            r"^[ \t]*RETIRES[ \t]+#?([0-9]{6,})[ \t]*\r?$", ascii_case
+        )
+        def ascii_strip(value: str) -> str:
+            return value.strip(ascii_whitespace)
+
+        def prose_line_indexes(body: str) -> frozenset[int]:
+            indexes: set[int] = set()
+            fence = ""
+            indented = False
+            previous_blank = True
+            for index, raw in enumerate(body.split("\n")):
+                blank = not ascii_strip(raw)
+                if fence:
+                    match = fence_re.match(raw)
+                    if (
+                        match is not None
+                        and match.group("f")[0] == fence[0]
+                        and len(match.group("f")) >= len(fence)
+                        and not ascii_strip(match.group("info"))
+                    ):
+                        fence = ""
+                    previous_blank = blank
+                    continue
+                match = fence_re.match(raw)
+                if match is not None:
+                    fence = match.group("f")
+                    indented = False
+                    previous_blank = False
+                    continue
+                if indented:
+                    if blank:
+                        previous_blank = True
+                        continue
+                    if raw.startswith(("    ", "\t")):
+                        continue
+                    indented = False
+                elif previous_blank and raw.startswith(("    ", "\t")) and not blank:
+                    indented = True
+                    previous_blank = False
+                    continue
+                indexes.add(index)
+                previous_blank = blank
+            return frozenset(indexes)
+
+        def undecorate(line: str) -> str:
+            normalized = ascii_strip(block_prefix.sub("", ascii_strip(line)))
+            while True:
+                for wrapper in ("`", "**", "__", "*", "_"):
+                    if (
+                        normalized.startswith(wrapper)
+                        and normalized.endswith(wrapper)
+                        and len(normalized) > 2 * len(wrapper)
+                    ):
+                        normalized = ascii_strip(
+                            normalized[len(wrapper) : -len(wrapper)]
+                        )
+                        break
+                else:
+                    return normalized
+
+        def marker_match(pattern: re.Pattern[str], line: str) -> re.Match[str] | None:
+            normalized = undecorate(line)
+            match = pattern.match(normalized)
+            if match is None:
+                return None
+            end = match.end()
+            return (
+                match if end == len(normalized) or normalized[end] in " \t" else None
+            )
+
+        def normalized_review_body(body: str) -> str:
+            lines = body.split("\n")
+            prose = prose_line_indexes(body)
+            first_nonblank = next(
+                (index for index, line in enumerate(lines) if ascii_strip(line)), None
+            )
+            out: list[str] = []
+            for index, raw in enumerate(lines):
+                if index == first_nonblank and index in prose and disclosure.fullmatch(raw):
+                    continue
+                if index in prose and who_metadata.fullmatch(raw):
+                    continue
+                if index in prose and marker_match(review_marker, raw) is not None:
+                    marker_line = undecorate(raw)
+                    claimed = by_identity.search(marker_line)
+                    if claimed is not None:
+                        claimed_text = claimed.group(0)
+                        claimed_start = raw.rfind(claimed_text)
+                        if claimed_start >= 0:
+                            raw = (
+                                raw[:claimed_start]
+                                + raw[claimed_start + len(claimed_text) :]
+                            )
+                out.append(raw)
+            return "\n".join(out)
+
+        def canonical_event(event: Mapping[str, object]) -> tuple[str, ...]:
+            body = event_field(event, "body")
+            lines = body.split("\n")
+            prose = prose_line_indexes(body)
+            targets = [
+                match.group(1)
+                for index, line in enumerate(lines)
+                if index in prose
+                and (match := retirement_target.fullmatch(line)) is not None
+            ]
+            if targets:
+                withdrawals = []
+                for index, line in enumerate(lines):
+                    if index not in prose:
+                        continue
+                    match = marker_match(withdrawal_marker, line)
+                    if match is not None:
+                        withdrawals.append(
+                            (match.group("lane").lower(), match.group("head").lower())
+                        )
+                if len(targets) != 1 or len(withdrawals) != 1:
+                    raise ValueError("review retirement is not canonical")
+            body = normalized_review_body(body)
+            permission = event_field(event, "retirement_actor_permission")
+            author = event_field(event, "author") if permission else ""
+            return (
+                event_field(event, "kind"),
+                event_field(event, "identity"),
+                author,
+                event_field(event, "state"),
+                event_field(event, "head_sha"),
+                event_field(event, "created_at"),
+                event_field(event, "updated_at"),
+                event_field(event, "last_edited_at"),
+                body,
+                permission,
+            )
+
+        feed(head)
+        feed(decision)
+        ordered = sorted(canonical_event(event) for event in events)
+        digest.update(len(ordered).to_bytes(8, "big"))
+        for event in ordered:
+            for value in event:
+                feed(value)
+        return digest.hexdigest()
+
     _record_exact(rep, "version", py, rs, ("--version",))
     compare_package_guides(tool, py, rs, rep)
     command_flags = (
@@ -3820,6 +8982,50 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
             rep.ok(f"schema:{engine}/plan")
 
     with tempfile.TemporaryDirectory(prefix="planner-cross-") as tmp:
+        for label, payload, message in (
+            ("empty", "", "empty stdout"),
+            (
+                "non-object-entry",
+                json.dumps([{"number": 1}, "not-an-object"]),
+                "entry 1 is not an object",
+            ),
+            (
+                "limit-reached",
+                json.dumps([{"number": number} for number in range(500)]),
+                "500-item limit",
+            ),
+        ):
+            fake_gh = os.path.join(tmp, f"fake-gh-list-{label}")
+            Path(fake_gh).write_text(
+                "#!/bin/sh\nprintf %s " + shlex.quote(payload) + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(fake_gh, 0o755)
+            py_list, rs_list = _record_same_exit(
+                rep,
+                f"reject:live-list-{label}",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--repo",
+                    "OWNER/NAME",
+                    "--git-dir",
+                    tmp,
+                    "--gh-cmd",
+                    fake_gh,
+                    "--no-archive",
+                ),
+                2,
+            )
+            if message in py_list.stderr and message in rs_list.stderr:
+                rep.ok(f"reject:live-list-{label}-is-explicit")
+            else:
+                rep.bad(
+                    f"reject:live-list-{label}-is-explicit",
+                    f"py={py_list.stderr!r}; rs={rs_list.stderr!r}",
+                )
+
         fixture: dict[str, object] = {
             "repo": "OWNER/NAME",
             "base": "main",
@@ -4007,6 +9213,7 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                     "head_sha": "sha-9",
                     "base_sha": "basesha-main",
                     "validation_evidence": "clean-validate-record",
+                    "validation_authority": "hard-green",
                     "policy_class": "gate-policy",
                     "assigned_agent": "reviewer",
                 }
@@ -4092,7 +9299,20 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 compare_stderr=True,
             )
 
-        plan = run(py, ("plan", *base_args, "--format", "json", "--batch"))
+        safety_args = ("plan", *base_args, "--format", "json", "--batch")
+        default_safety, _ = _record_exact(
+            rep, "representative:default-freshness", py, rs, safety_args, expected=0
+        )
+        # Preserve the safety table's rebase case under an explicit caller bound.
+        # The production default intentionally applies no freshness reroute.
+        plan, _ = _record_exact(
+            rep,
+            "representative:safety-actions-explicit-freshness",
+            py,
+            rs,
+            (*safety_args, "--freshness-max-behind", "0"),
+            expected=0,
+        )
         ok, parsed = _parsed_json(plan.stdout)
         actions: dict[int, str] = {}
         if ok and isinstance(parsed, dict):
@@ -4126,6 +9346,30 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
             rep.ok("representative:safety-actions")
         else:
             rep.bad("representative:safety-actions", f"expected={expected_actions}; got={actions}")
+
+        default_safety_ok, default_safety_payload = _parsed_json(default_safety.stdout)
+        default_safety_plan = (
+            default_safety_payload.get("plan")
+            if default_safety_ok and isinstance(default_safety_payload, dict)
+            else None
+        )
+        default_pr2_actions = (
+            [
+                decision.get("action")
+                for decision in default_safety_plan.get("per_pr_actions", [])
+                if isinstance(decision, dict) and decision.get("pr") == 2
+            ]
+            if isinstance(default_safety_plan, dict)
+            else []
+        )
+        default_lands_behind = default_pr2_actions == ["land-now"]
+        if default_safety.returncode == 0 and default_lands_behind:
+            rep.ok("representative:default-freshness-lands-behind")
+        else:
+            rep.bad(
+                "representative:default-freshness-lands-behind",
+                f"exit={default_safety.returncode}; land_now={default_lands_behind}",
+            )
 
         if ok and isinstance(parsed, dict):
             nodes = parsed.get("nodes")
@@ -4223,8 +9467,20 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 '{"prs":[{"pr":1,"head_sha":"sha-1","validation_evidence":"clean-validate-record"}]}',
             ),
             (
+                "exact-base-no-authority-context.json",
+                '{"prs":[{"pr":1,"head_sha":"sha-1","base_sha":"basesha-main","validation_evidence":"clean-validate-record"}]}',
+            ),
+            (
                 "stale-base-context.json",
                 '{"prs":[{"pr":1,"head_sha":"sha-1","base_sha":"old-base","validation_evidence":"clean-validate-record"}]}',
+            ),
+            (
+                "hard-green-other-base-context.json",
+                '{"prs":[{"pr":1,"head_sha":"sha-1","base_sha":"divergent-base","validation_evidence":"clean-validate-record","validation_authority":"hard-green"}]}',
+            ),
+            (
+                "authority-without-record-context.json",
+                '{"prs":[{"pr":1,"head_sha":"sha-1","base_sha":"old-base","validation_authority":"soft-green"}]}',
             ),
         )
         for name, body in bad_contexts:
@@ -4239,6 +9495,1955 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
                 ("plan", "--fixture", fixture_path, "--landing-context", path),
                 2,
             )
+
+        soft_green_path = os.path.join(tmp, "soft-green-context.json")
+        with open(soft_green_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                '{"prs":[{"pr":2,"head_sha":"sha-2","base_sha":"earlier-green-base",'
+                '"validation_evidence":"clean-validate-record",'
+                '"validation_authority":"soft-green"}]}'
+            )
+        soft_green_args = (
+            "plan",
+            "--fixture",
+            fixture_path,
+            "--landing-context",
+            soft_green_path,
+            "--format",
+            "json",
+        )
+        default_soft_green, _ = _record_exact(
+            rep, "accept:soft-green-earlier-base", py, rs, soft_green_args, expected=0
+        )
+        default_soft_ok, default_soft_payload = _parsed_json(default_soft_green.stdout)
+        default_soft_nodes = (
+            default_soft_payload.get("nodes")
+            if default_soft_ok and isinstance(default_soft_payload, dict)
+            else None
+        )
+        default_soft_plan = (
+            default_soft_payload.get("plan")
+            if default_soft_ok and isinstance(default_soft_payload, dict)
+            else None
+        )
+        default_soft_authority = isinstance(default_soft_nodes, list) and any(
+            isinstance(node, dict)
+            and node.get("pr") == 2
+            and node.get("validation_authority") == "soft-green"
+            for node in default_soft_nodes
+        )
+        default_soft_pr2_actions = (
+            [
+                decision.get("action")
+                for decision in default_soft_plan.get("per_pr_actions", [])
+                if isinstance(decision, dict) and decision.get("pr") == 2
+            ]
+            if isinstance(default_soft_plan, dict)
+            else []
+        )
+        default_soft_lands = default_soft_pr2_actions == ["land-now"]
+        if default_soft_green.returncode == 0 and default_soft_authority and default_soft_lands:
+            rep.ok("accept:soft-green-default-authority-lands-without-rebase")
+        else:
+            rep.bad(
+                "accept:soft-green-default-authority-lands-without-rebase",
+                f"exit={default_soft_green.returncode}; authority={default_soft_authority}; "
+                f"land_now={default_soft_lands}",
+            )
+
+        # Keep the original authority/rebase/no-revalidation oracle, now naming
+        # the caller policy that requests a rebase instead of changing the default.
+        soft_green, _ = _record_exact(
+            rep,
+            "accept:soft-green-explicit-freshness",
+            py,
+            rs,
+            (*soft_green_args, "--freshness-max-behind", "0"),
+            expected=0,
+        )
+        soft_green_ok, soft_green_payload = _parsed_json(soft_green.stdout)
+        soft_green_nodes = (
+            soft_green_payload.get("nodes")
+            if soft_green_ok and isinstance(soft_green_payload, dict)
+            else None
+        )
+        soft_green_plan = (
+            soft_green_payload.get("plan")
+            if soft_green_ok and isinstance(soft_green_payload, dict)
+            else None
+        )
+        authority_recorded = isinstance(soft_green_nodes, list) and any(
+            isinstance(node, dict)
+            and node.get("pr") == 2
+            and node.get("validation_authority") == "soft-green"
+            for node in soft_green_nodes
+        )
+        soft_green_rebases_without_revalidation = (
+            isinstance(soft_green_plan, dict)
+            and any(
+                isinstance(decision, dict)
+                and decision.get("pr") == 2
+                and decision.get("action") == "rebase-then-land"
+                and "without pre-landing revalidation" in decision.get("why", "")
+                for decision in soft_green_plan.get("per_pr_actions", [])
+            )
+        )
+        if (
+            soft_green.returncode == 0
+            and authority_recorded
+            and soft_green_rebases_without_revalidation
+        ):
+            rep.ok("accept:soft-green-authority-requires-rebase-without-revalidation")
+        else:
+            rep.bad(
+                "accept:soft-green-authority-requires-rebase-without-revalidation",
+                f"exit={soft_green.returncode}; authority={authority_recorded}; "
+                f"rebase_without_revalidation={soft_green_rebases_without_revalidation}",
+            )
+
+        hard_green_path = os.path.join(tmp, "hard-green-context.json")
+        with open(hard_green_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                '{"prs":[{"pr":1,"head_sha":"sha-1","base_sha":"basesha-main",'
+                '"validation_evidence":"clean-validate-record",'
+                '"validation_authority":"hard-green"}]}'
+            )
+        hard_green_args = (
+            "plan",
+            "--fixture",
+            fixture_path,
+            "--landing-context",
+            hard_green_path,
+            "--format",
+            "json",
+        )
+        _record_exact(rep, "accept:hard-green-current-base", py, rs, hard_green_args)
+        hard_green = run(py, hard_green_args)
+        hard_green_ok, hard_green_payload = _parsed_json(hard_green.stdout)
+        hard_green_nodes = (
+            hard_green_payload.get("nodes")
+            if hard_green_ok and isinstance(hard_green_payload, dict)
+            else None
+        )
+        hard_green_plan = (
+            hard_green_payload.get("plan")
+            if hard_green_ok and isinstance(hard_green_payload, dict)
+            else None
+        )
+        hard_authority_recorded = isinstance(hard_green_nodes, list) and any(
+            isinstance(node, dict)
+            and node.get("pr") == 1
+            and node.get("validation_authority") == "hard-green"
+            for node in hard_green_nodes
+        )
+        hard_green_landable = isinstance(hard_green_plan, dict) and 1 in hard_green_plan.get(
+            "land_now", []
+        )
+        if hard_green.returncode == 0 and hard_authority_recorded and hard_green_landable:
+            rep.ok("accept:hard-green-authority-is-durable-and-landable")
+        else:
+            rep.bad(
+                "accept:hard-green-authority-is-durable-and-landable",
+                f"exit={hard_green.returncode}; authority={hard_authority_recorded}; "
+                f"landable={hard_green_landable}",
+            )
+
+        review_head = "a" * 40
+        observed_at = "2026-09-04T12:00:00Z"
+        review_events: list[dict[str, object]] = [
+            {
+                "kind": "review",
+                "identity": "review-1",
+                "author": "reviewer",
+                "state": "CHANGES_REQUESTED",
+                "head_sha": review_head,
+                "created_at": observed_at,
+                "updated_at": observed_at,
+                "last_edited_at": "",
+                "body": "please address this",
+                "retirement_actor_permission": "",
+            },
+            {
+                "kind": "issue-comment",
+                "identity": "comment-1",
+                "author": "release-authority",
+                "state": "ACTIVE",
+                "head_sha": "",
+                "created_at": observed_at,
+                "updated_at": observed_at,
+                "last_edited_at": "",
+                "body": (
+                    "[team, release-authority, session, model, role=observer]\n"
+                    f"CHANGES-REQUESTED-WITHDRAWN-AT: codex {review_head} "
+                    "BY release-authority\n"
+                    "RETIRES 123456"
+                ),
+                "retirement_actor_permission": "write",
+            },
+            {
+                "kind": "review-comment",
+                "identity": "thread-1",
+                "author": "reviewer",
+                "state": "RESOLVED",
+                "head_sha": "",
+                "created_at": observed_at,
+                "updated_at": observed_at,
+                "last_edited_at": "",
+                "body": "inline objection retired",
+                "retirement_actor_permission": "",
+            },
+        ]
+        review_pr: dict[str, object] = {
+            "number": 394,
+            "head_sha": review_head,
+            "review_decision": "CHANGES_REQUESTED",
+            "updated_at": observed_at,
+            "review_events": review_events,
+            "checks": [
+                {
+                    "name": "merge-gate",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                }
+            ],
+        }
+        review_fixture: dict[str, object] = {
+            "repo": "R",
+            "base": "main",
+            "prs": [review_pr],
+        }
+        review_fixture_path = os.path.join(tmp, "review-evidence-fixture.json")
+        with open(review_fixture_path, "w", encoding="utf-8") as handle:
+            json.dump(review_fixture, handle)
+        review_probe_args = (
+            "plan",
+            "--fixture",
+            review_fixture_path,
+            "--format",
+            "json",
+        )
+        probe_py, _probe_rs = _record_exact(
+            rep,
+            "accept:emit-review-event-digest-before-authority",
+            py,
+            rs,
+            review_probe_args,
+            expected=0,
+        )
+        probe_ok, probe_payload = _parsed_json(probe_py.stdout)
+        emitted_review_digest = ""
+        if probe_ok and isinstance(probe_payload, dict):
+            nodes = probe_payload.get("nodes")
+            if isinstance(nodes, list) and len(nodes) == 1 and isinstance(nodes[0], dict):
+                value = nodes[0].get("review_evidence_digest")
+                if isinstance(value, str):
+                    emitted_review_digest = value
+        locally_computed_digest = review_digest(
+            review_head, "CHANGES_REQUESTED", review_events
+        )
+        if emitted_review_digest == locally_computed_digest:
+            rep.ok("accept:emitted-review-digest-matches-canonical-contract")
+        else:
+            rep.bad(
+                "accept:emitted-review-digest-matches-canonical-contract",
+                f"emitted={emitted_review_digest!r}; expected={locally_computed_digest!r}",
+            )
+        review_context_path = os.path.join(tmp, "review-evidence-context.json")
+        with open(review_context_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "prs": [
+                        {
+                            "pr": 394,
+                            "head_sha": review_head,
+                            "review_objections_resolved": True,
+                            "review_evidence_digest": emitted_review_digest,
+                        }
+                    ]
+                },
+                handle,
+            )
+        review_args = (
+            "plan",
+            "--fixture",
+            review_fixture_path,
+            "--landing-context",
+            review_context_path,
+            "--format",
+            "json",
+        )
+
+        def review_disposition(outcome: Outcome, pr: int) -> tuple[bool | None, str]:
+            parsed_ok, payload = _parsed_json(outcome.stdout)
+            if not parsed_ok or not isinstance(payload, dict):
+                return None, ""
+            held: bool | None = None
+            nodes = payload.get("nodes")
+            if isinstance(nodes, list):
+                for node in nodes:
+                    if not isinstance(node, dict) or node.get("pr") != pr:
+                        continue
+                    held_value = node.get("held")
+                    if isinstance(held_value, bool):
+                        held = held_value
+            action = ""
+            plan = payload.get("plan")
+            decisions = plan.get("per_pr_actions") if isinstance(plan, dict) else None
+            if isinstance(decisions, list):
+                for decision in decisions:
+                    if not isinstance(decision, dict) or decision.get("pr") != pr:
+                        continue
+                    action_value = decision.get("action")
+                    if isinstance(action_value, str):
+                        action = action_value
+            return held, action
+        unavailable_fixture = {
+            "repo": "OWNER/NAME",
+            "base": "main",
+            "prs": [
+                {
+                    "number": 1,
+                    "title": "review evidence unavailable",
+                    "head_ref": "green",
+                    "head_sha": "sha-1",
+                    "review_decision": "APPROVED",
+                    "review_evidence_unavailable": True,
+                    "changed_files": ["src/a.rs"],
+                    "checks": [
+                        {
+                            "name": "merge-gate",
+                            "status": "COMPLETED",
+                            "conclusion": "SUCCESS",
+                        }
+                    ],
+                }
+            ],
+        }
+        unavailable_path = os.path.join(tmp, "review-evidence-unavailable.json")
+        with open(unavailable_path, "w", encoding="utf-8") as handle:
+            json.dump(unavailable_fixture, handle)
+        unavailable_outcome, _unavailable_rs = _record_exact(
+            rep,
+            "reject:review-evidence-unavailable-with-clean-validation",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                unavailable_path,
+                "--landing-context",
+                hard_green_path,
+                "--format",
+                "json",
+            ),
+            expected=0,
+        )
+        unavailable_held, unavailable_action = review_disposition(
+            unavailable_outcome, 1
+        )
+        unavailable_ok, unavailable_payload = _parsed_json(
+            unavailable_outcome.stdout
+        )
+        unavailable_nodes = (
+            unavailable_payload.get("nodes")
+            if unavailable_ok and isinstance(unavailable_payload, dict)
+            else None
+        )
+        unavailable_visible = (
+            isinstance(unavailable_nodes, list)
+            and len(unavailable_nodes) == 1
+            and isinstance(unavailable_nodes[0], dict)
+            and unavailable_nodes[0].get("review_evidence_unavailable") is True
+        )
+        if (
+            unavailable_held is True
+            and unavailable_action == "wait"
+            and unavailable_visible
+        ):
+            rep.ok("reject:review-evidence-unavailable-remains-visible-and-held")
+        else:
+            rep.bad(
+                "reject:review-evidence-unavailable-remains-visible-and-held",
+                f"held={unavailable_held}; action={unavailable_action!r}; "
+                f"visible={unavailable_visible}",
+            )
+
+        for label, conflict_field, conflict_value in (
+            ("local", "base_conflict_paths", ["src/conflict.rs"]),
+            ("github", "mergeable", "CONFLICTING"),
+        ):
+            conflict_pr: dict[str, object] = {
+                "number": 1,
+                "title": "review evidence unavailable with base conflict",
+                "head_ref": "green",
+                "head_sha": "sha-1",
+                "review_decision": "APPROVED",
+                "review_evidence_unavailable": True,
+                "changed_files": ["src/a.rs"],
+                "checks": [
+                    {
+                        "name": "merge-gate",
+                        "status": "COMPLETED",
+                        "conclusion": "SUCCESS",
+                    }
+                ],
+            }
+            conflict_pr[conflict_field] = conflict_value
+            conflict_fixture: dict[str, object] = {
+                "repo": "OWNER/NAME",
+                "base": "main",
+                "prs": [conflict_pr],
+            }
+            conflict_path = os.path.join(tmp, f"review-unavailable-{label}-conflict.json")
+            with open(conflict_path, "w", encoding="utf-8") as handle:
+                json.dump(conflict_fixture, handle)
+            conflict_outcome, _conflict_rs = _record_exact(
+                rep,
+                f"reject:review-evidence-unavailable-before-{label}-base-conflict",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    conflict_path,
+                    "--landing-context",
+                    hard_green_path,
+                    "--format",
+                    "json",
+                ),
+                expected=0,
+            )
+            conflict_held, conflict_action = review_disposition(conflict_outcome, 1)
+            if conflict_held is True and conflict_action == "wait":
+                rep.ok(f"reject:review-evidence-unavailable-{label}-conflict-waits")
+            else:
+                rep.bad(
+                    f"reject:review-evidence-unavailable-{label}-conflict-waits",
+                    f"held={conflict_held}; action={conflict_action!r}",
+                )
+
+        review_accept, _review_accept_rs = _record_exact(
+            rep,
+            "accept:exact-review-event-digest",
+            py,
+            rs,
+            review_args,
+            expected=0,
+        )
+        review_accept_held, review_accept_action = review_disposition(review_accept, 394)
+        if (
+            review_accept.returncode == 0
+            and review_accept_held is False
+            and review_accept_action == "land-now"
+        ):
+            rep.ok("accept:resolved-review-is-unheld-and-land-now")
+        else:
+            rep.bad(
+                "accept:resolved-review-is-unheld-and-land-now",
+                f"exit={review_accept.returncode}; held={review_accept_held}; "
+                f"action={review_accept_action!r}",
+            )
+
+        no_retirement_args = (
+            "plan",
+            "--fixture",
+            review_fixture_path,
+            "--format",
+            "json",
+        )
+        no_retirement, _no_retirement_rs = _record_exact(
+            rep,
+            "reject:no-retirement-authority",
+            py,
+            rs,
+            no_retirement_args,
+            expected=0,
+        )
+        no_retirement_held, no_retirement_action = review_disposition(no_retirement, 394)
+        if (
+            no_retirement.returncode == 0
+            and no_retirement_held is True
+            and no_retirement_action == "wait"
+        ):
+            rep.ok("reject:no-retirement-remains-held-and-not-landable")
+        else:
+            rep.bad(
+                "reject:no-retirement-remains-held-and-not-landable",
+                f"exit={no_retirement.returncode}; held={no_retirement_held}; "
+                f"action={no_retirement_action!r}",
+            )
+
+        nullable_last_edit = dict(review_fixture)
+        nullable_last_edit_pr = dict(review_pr)
+        nullable_last_edit_events = [dict(event) for event in review_events]
+        nullable_last_edit_events[0]["last_edited_at"] = None
+        nullable_last_edit_pr["review_events"] = nullable_last_edit_events
+        nullable_last_edit["prs"] = [nullable_last_edit_pr]
+        nullable_last_edit_path = os.path.join(tmp, "nullable-review-last-edit.json")
+        with open(nullable_last_edit_path, "w", encoding="utf-8") as handle:
+            json.dump(nullable_last_edit, handle)
+        _record_exact(
+            rep,
+            "accept:null-native-last-edit-normalizes-to-empty",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                nullable_last_edit_path,
+                "--landing-context",
+                review_context_path,
+                "--format",
+                "json",
+            ),
+        )
+
+        same_second = dict(review_fixture)
+        same_second_pr = dict(review_pr)
+        same_second_pr["review_events"] = [
+            *review_events,
+            {
+                "kind": "review-comment",
+                "identity": "thread-2",
+                "author": "reviewer",
+                "state": "ACTIVE",
+                "head_sha": "",
+                "created_at": observed_at,
+                "updated_at": observed_at,
+                "last_edited_at": "",
+                "body": "new objection in the same timestamp tick",
+                "retirement_actor_permission": "",
+            },
+        ]
+        same_second["prs"] = [same_second_pr]
+        same_second_path = os.path.join(tmp, "same-timestamp-objection.json")
+        with open(same_second_path, "w", encoding="utf-8") as handle:
+            json.dump(same_second, handle)
+        _record_same_exit(
+            rep,
+            "reject:same-timestamp-review-objection",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                same_second_path,
+                "--landing-context",
+                review_context_path,
+            ),
+            2,
+        )
+
+        for label, field, value in (
+            ("body-change", "body", "changed objection text"),
+            ("state-change", "state", "ACTIVE"),
+            ("event-head-change", "head_sha", "b" * 40),
+            ("creation-time-change", "created_at", "2026-09-04T11:59:59Z"),
+            ("version-time-change", "updated_at", "2026-09-04T12:00:01Z"),
+            ("edit-time-change", "last_edited_at", "2026-09-04T12:00:01Z"),
+        ):
+            changed_evidence = dict(review_fixture)
+            changed_pr = dict(review_pr)
+            changed_events = [dict(event) for event in review_events]
+            changed_events[2][field] = value
+            changed_pr["review_events"] = changed_events
+            changed_evidence["prs"] = [changed_pr]
+            changed_path = os.path.join(tmp, f"same-timestamp-review-{label}.json")
+            with open(changed_path, "w", encoding="utf-8") as handle:
+                json.dump(changed_evidence, handle)
+            _record_same_exit(
+                rep,
+                f"reject:same-timestamp-review-{label}",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    changed_path,
+                    "--landing-context",
+                    review_context_path,
+                ),
+                2,
+            )
+
+        for label, event_index, field, value in (
+            ("ordinary-author-change", 2, "author", "different-reviewer"),
+            (
+                "false-claimed-by-hyphen",
+                1,
+                "body",
+                str(review_events[1]["body"]).replace(
+                    "BY release-authority", "BY another-agent"
+                ),
+            ),
+            (
+                "false-claimed-by-underscore",
+                1,
+                "body",
+                str(review_events[1]["body"]).replace(
+                    "BY release-authority", "BY another_agent"
+                ),
+            ),
+            (
+                "false-claimed-by-dot",
+                1,
+                "body",
+                str(review_events[1]["body"]).replace(
+                    "BY release-authority", "BY another.agent"
+                ),
+            ),
+            (
+                "false-claimed-by-ascii-k",
+                1,
+                "body",
+                str(review_events[1]["body"]).replace(
+                    "BY release-authority", "BY K"
+                ),
+            ),
+            (
+                "changed-disclosure-underscore",
+                1,
+                "body",
+                str(review_events[1]["body"]).replace(
+                    "[team, release-authority, session, model, role=observer]",
+                    "[team, departed_reviewer, old-session, model, role=observer]",
+                ),
+            ),
+            (
+                "changed-disclosure-dot",
+                1,
+                "body",
+                str(review_events[1]["body"]).replace(
+                    "[team, release-authority, session, model, role=observer]",
+                    "[team, departed.reviewer, old-session, model, role=observer]",
+                ),
+            ),
+            (
+                "changed-disclosure-ascii-k",
+                1,
+                "body",
+                str(review_events[1]["body"]).replace(
+                    "[team, release-authority, session, model, role=observer]",
+                    "[team, K, old-session, model, role=observer]",
+                ),
+            ),
+        ):
+            metadata_fixture = dict(review_fixture)
+            metadata_pr = dict(review_pr)
+            metadata_events = [dict(event) for event in review_events]
+            metadata_events[event_index][field] = value
+            metadata_pr["review_events"] = metadata_events
+            metadata_fixture["prs"] = [metadata_pr]
+            metadata_path = os.path.join(tmp, f"review-metadata-{label}.json")
+            with open(metadata_path, "w", encoding="utf-8") as handle:
+                json.dump(metadata_fixture, handle)
+            metadata_outcome, _metadata_rs = _record_exact(
+                rep,
+                f"accept:review-metadata-{label}",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    metadata_path,
+                    "--landing-context",
+                    review_context_path,
+                    "--format",
+                    "json",
+                ),
+                expected=0,
+            )
+            metadata_held, metadata_action = review_disposition(metadata_outcome, 394)
+            if metadata_held is False and metadata_action == "land-now":
+                rep.ok(f"accept:review-metadata-{label}-decision-unchanged")
+            else:
+                rep.bad(
+                    f"accept:review-metadata-{label}-decision-unchanged",
+                    f"held={metadata_held}; action={metadata_action!r}",
+                )
+
+        base_review_digest = review_digest(
+            review_head, "CHANGES_REQUESTED", review_events
+        )
+
+        def write_review_variant(
+            label: str, events: list[dict[str, object]]
+        ) -> str:
+            variant = dict(review_fixture)
+            variant_pr = dict(review_pr)
+            variant_pr["review_events"] = events
+            variant["prs"] = [variant_pr]
+            path = os.path.join(tmp, f"review-{label}.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(variant, handle)
+            return path
+
+        def write_review_context(label: str, digest: str) -> str:
+            path = os.path.join(tmp, f"review-{label}-context.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "prs": [
+                            {
+                                "pr": 394,
+                                "head_sha": review_head,
+                                "review_objections_resolved": True,
+                                "review_evidence_digest": digest,
+                            }
+                        ]
+                    },
+                    handle,
+                )
+            return path
+
+        ascii_k_events = [dict(event) for event in review_events]
+        ascii_k_events[1]["body"] = str(ascii_k_events[1]["body"]).replace(
+            "BY release-authority", "BY K"
+        )
+        ascii_k_digest = review_digest(
+            review_head, "CHANGES_REQUESTED", ascii_k_events
+        )
+        if ascii_k_digest == base_review_digest:
+            rep.ok("accept:ascii-k-by-is-canonical-metadata")
+        else:
+            rep.bad(
+                "accept:ascii-k-by-is-canonical-metadata",
+                f"base={base_review_digest}; ascii_k={ascii_k_digest}",
+            )
+
+        for label, non_ascii_identity in (
+            ("kelvin-sign", "K"),
+            ("capital-dotted-i", "İ"),
+            ("dotless-i", "ı"),
+            ("long-s", "ſ"),
+        ):
+            non_ascii_by_events = [dict(event) for event in review_events]
+            non_ascii_by_events[1]["body"] = str(
+                non_ascii_by_events[1]["body"]
+            ).replace("BY release-authority", f"BY {non_ascii_identity}")
+            non_ascii_by_digest = review_digest(
+                review_head, "CHANGES_REQUESTED", non_ascii_by_events
+            )
+            if non_ascii_by_digest != ascii_k_digest:
+                rep.ok(f"reject:non-ascii-by-{label}-remains-in-digest")
+            else:
+                rep.bad(
+                    f"reject:non-ascii-by-{label}-remains-in-digest",
+                    "non-ASCII identity was normalized as ASCII metadata",
+                )
+            non_ascii_by_path = write_review_variant(
+                f"non-ascii-by-{label}", non_ascii_by_events
+            )
+            _record_same_exit(
+                rep,
+                f"reject:non-ascii-by-{label}-invalidates-context",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    non_ascii_by_path,
+                    "--landing-context",
+                    review_context_path,
+                ),
+                2,
+            )
+
+            non_ascii_disclosure_events = [dict(event) for event in review_events]
+            non_ascii_disclosure_events[1]["body"] = str(
+                non_ascii_disclosure_events[1]["body"]
+            ).replace(
+                "[team, release-authority, session, model, role=observer]",
+                f"[team, {non_ascii_identity}, session, model, role=observer]",
+            )
+            non_ascii_disclosure_digest = review_digest(
+                review_head, "CHANGES_REQUESTED", non_ascii_disclosure_events
+            )
+            if non_ascii_disclosure_digest != base_review_digest:
+                rep.ok(f"reject:non-ascii-disclosure-{label}-remains-in-digest")
+            else:
+                rep.bad(
+                    f"reject:non-ascii-disclosure-{label}-remains-in-digest",
+                    "non-ASCII disclosure was normalized as identity metadata",
+                )
+            non_ascii_disclosure_path = write_review_variant(
+                f"non-ascii-disclosure-{label}", non_ascii_disclosure_events
+            )
+            _record_same_exit(
+                rep,
+                f"reject:non-ascii-disclosure-{label}-invalidates-context",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    non_ascii_disclosure_path,
+                    "--landing-context",
+                    review_context_path,
+                ),
+                2,
+            )
+
+            non_ascii_wrapper_events = [dict(event) for event in review_events]
+            for event in non_ascii_wrapper_events:
+                event["body"] = (
+                    f"{event['body']}\n"
+                    f"Unverified --who metadata: {non_ascii_identity}"
+                )
+            non_ascii_wrapper_digest = review_digest(
+                review_head, "CHANGES_REQUESTED", non_ascii_wrapper_events
+            )
+            if non_ascii_wrapper_digest != base_review_digest:
+                rep.ok(f"reject:non-ascii-who-metadata-{label}-remains-in-digest")
+            else:
+                rep.bad(
+                    f"reject:non-ascii-who-metadata-{label}-remains-in-digest",
+                    "non-ASCII who metadata was normalized",
+                )
+            non_ascii_wrapper_path = write_review_variant(
+                f"non-ascii-who-metadata-{label}", non_ascii_wrapper_events
+            )
+            _record_same_exit(
+                rep,
+                f"reject:non-ascii-who-metadata-{label}-invalidates-context",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    non_ascii_wrapper_path,
+                    "--landing-context",
+                    review_context_path,
+                ),
+                2,
+            )
+        for whitespace_label, non_ascii_space in (
+            ("nbsp", "\u00a0"),
+            ("em-space", "\u2003"),
+        ):
+            source_body = str(review_events[1]["body"])
+            whitespace_variants = (
+                (
+                    "by",
+                    source_body.replace(
+                        "BY release-authority",
+                        f"BY{non_ascii_space}release-authority",
+                    ),
+                ),
+                (
+                    "disclosure",
+                    source_body.replace(
+                        "[team, release-authority, session, model, role=observer]",
+                        "[team,"
+                        f"{non_ascii_space}release-authority, session, model, role=observer]",
+                    ),
+                ),
+                (
+                    "who-metadata",
+                    source_body
+                    + f"\nUnverified --who metadata:{non_ascii_space}K",
+                ),
+            )
+            for grammar, changed_body in whitespace_variants:
+                changed_events = [dict(event) for event in review_events]
+                changed_events[1]["body"] = changed_body
+                changed_digest = review_digest(
+                    review_head, "CHANGES_REQUESTED", changed_events
+                )
+                if changed_digest != base_review_digest:
+                    rep.ok(
+                        f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}-digest"
+                    )
+                else:
+                    rep.bad(
+                        f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}-digest",
+                        "non-ASCII whitespace was normalized as review metadata",
+                    )
+                changed_path = write_review_variant(
+                    f"non-ascii-whitespace-{whitespace_label}-{grammar}",
+                    changed_events,
+                )
+                _record_same_exit(
+                    rep,
+                    f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}-context",
+                    py,
+                    rs,
+                    (
+                        "plan",
+                        "--fixture",
+                        changed_path,
+                        "--landing-context",
+                        review_context_path,
+                    ),
+                    2,
+                )
+
+            for grammar, changed_body in (
+                (
+                    "withdrawal",
+                    source_body.replace(
+                        "WITHDRAWN-AT: codex",
+                        f"WITHDRAWN-AT:{non_ascii_space}codex",
+                    ),
+                ),
+                (
+                    "retirement",
+                    source_body.replace("RETIRES 123456", f"RETIRES{non_ascii_space}123456"),
+                ),
+            ):
+                malformed_events = [dict(event) for event in review_events]
+                malformed_events[1]["body"] = changed_body
+                malformed_path = write_review_variant(
+                    f"non-ascii-whitespace-{whitespace_label}-{grammar}",
+                    malformed_events,
+                )
+                _record_same_exit(
+                    rep,
+                    f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}",
+                    py,
+                    rs,
+                    ("plan", "--fixture", malformed_path),
+                    2,
+                )
+
+        malformed_by_digests: list[str] = []
+        for label, malformed_by in (
+            ("slash", "BY release/authority"),
+            ("space", "BY release authority"),
+            ("colon", "BY: release.authority"),
+            ("compact", "BY/release.authority"),
+        ):
+            malformed_events = [dict(event) for event in review_events]
+            malformed_events[1]["body"] = str(malformed_events[1]["body"]).replace(
+                "BY release-authority", malformed_by
+            )
+            malformed_digest = review_digest(
+                review_head, "CHANGES_REQUESTED", malformed_events
+            )
+            malformed_by_digests.append(malformed_digest)
+            malformed_path = write_review_variant(
+                f"malformed-by-{label}", malformed_events
+            )
+            _record_same_exit(
+                rep,
+                f"reject:review-malformed-by-{label}-preserves-bytes",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    malformed_path,
+                    "--landing-context",
+                    review_context_path,
+                ),
+                2,
+            )
+            malformed_context_path = write_review_context(
+                f"malformed-by-{label}", malformed_digest
+            )
+            malformed_outcome, _malformed_rs = _record_exact(
+                rep,
+                f"accept:review-malformed-by-{label}-keeps-withdrawal",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    malformed_path,
+                    "--landing-context",
+                    malformed_context_path,
+                    "--format",
+                    "json",
+                ),
+                expected=0,
+            )
+            malformed_held, malformed_action = review_disposition(
+                malformed_outcome, 394
+            )
+            if malformed_held is False and malformed_action == "land-now":
+                rep.ok(f"accept:review-malformed-by-{label}-decision-unchanged")
+            else:
+                rep.bad(
+                    f"accept:review-malformed-by-{label}-decision-unchanged",
+                    f"held={malformed_held}; action={malformed_action!r}",
+                )
+        if (
+            all(value != base_review_digest for value in malformed_by_digests)
+            and len(set(malformed_by_digests)) == len(malformed_by_digests)
+        ):
+            rep.ok("reject:malformed-by-mutations-change-review-digest")
+        else:
+            rep.bad(
+                "reject:malformed-by-mutations-change-review-digest",
+                f"base={base_review_digest}; malformed={malformed_by_digests}",
+            )
+
+        for agent in ("review-agent", "review_agent", "review.agent", "K"):
+            wrapper_events = [dict(event) for event in review_events]
+            for event in wrapper_events:
+                event["body"] = (
+                    f"{event['body']}\nUnverified --who metadata: {agent}"
+                )
+            wrapper_digest = review_digest(
+                review_head, "CHANGES_REQUESTED", wrapper_events
+            )
+            if wrapper_digest == base_review_digest:
+                rep.ok(f"accept:who-metadata-{agent}-digest-unchanged")
+            else:
+                rep.bad(
+                    f"accept:who-metadata-{agent}-digest-unchanged",
+                    f"base={base_review_digest}; wrapper={wrapper_digest}",
+                )
+            wrapper_path = write_review_variant(
+                f"who-metadata-{agent}", wrapper_events
+            )
+            wrapper_outcome, _wrapper_rs = _record_exact(
+                rep,
+                f"accept:who-metadata-{agent}",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    wrapper_path,
+                    "--landing-context",
+                    review_context_path,
+                    "--format",
+                    "json",
+                ),
+                expected=0,
+            )
+            wrapper_held, wrapper_action = review_disposition(wrapper_outcome, 394)
+            if wrapper_held is False and wrapper_action == "land-now":
+                rep.ok(f"accept:who-metadata-{agent}-decision-unchanged")
+            else:
+                rep.bad(
+                    f"accept:who-metadata-{agent}-decision-unchanged",
+                    f"held={wrapper_held}; action={wrapper_action!r}",
+                )
+
+        preserved_wrapper_events = [dict(event) for event in review_events]
+        preserved_wrapper_events[0]["body"] = (
+            f"{preserved_wrapper_events[0]['body']}\n"
+            "> Unverified --who metadata: review.agent"
+        )
+        preserved_wrapper_events[1]["body"] = (
+            f"{preserved_wrapper_events[1]['body']}\n"
+            "Unverified --who metadata: review.agent extra"
+        )
+        preserved_wrapper_events[2]["body"] = (
+            f"{preserved_wrapper_events[2]['body']}\n```text\n"
+            "Unverified --who metadata: review.agent\n```"
+        )
+        preserved_wrapper_digest = review_digest(
+            review_head, "CHANGES_REQUESTED", preserved_wrapper_events
+        )
+        changed_preserved_events = [dict(event) for event in preserved_wrapper_events]
+        for event in changed_preserved_events:
+            event["body"] = str(event["body"]).replace(
+                "review.agent", "other_agent"
+            )
+        changed_preserved_digest = review_digest(
+            review_head, "CHANGES_REQUESTED", changed_preserved_events
+        )
+        if (
+            preserved_wrapper_digest != base_review_digest
+            and changed_preserved_digest != preserved_wrapper_digest
+        ):
+            rep.ok("reject:who-metadata-near-match-and-examples-remain-in-digest")
+        else:
+            rep.bad(
+                "reject:who-metadata-near-match-and-examples-remain-in-digest",
+                f"base={base_review_digest}; preserved={preserved_wrapper_digest}; "
+                f"changed={changed_preserved_digest}",
+            )
+        preserved_path = write_review_variant(
+            "who-metadata-preserved", preserved_wrapper_events
+        )
+        _record_same_exit(
+            rep,
+            "reject:who-metadata-near-match-invalidates-context",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                preserved_path,
+                "--landing-context",
+                review_context_path,
+            ),
+            2,
+        )
+        appended_objection = dict(review_fixture)
+        appended_objection_pr = dict(review_pr)
+        appended_objection_events = [dict(event) for event in review_events]
+        appended_objection_events[1]["body"] = (
+            f"{appended_objection_events[1]['body']}\n"
+            "Do not land: the race remains."
+        )
+        appended_objection_pr["review_events"] = appended_objection_events
+        appended_objection["prs"] = [appended_objection_pr]
+        appended_objection_path = os.path.join(tmp, "appended-review-objection.json")
+        with open(appended_objection_path, "w", encoding="utf-8") as handle:
+            json.dump(appended_objection, handle)
+        if review_digest(
+            review_head, "CHANGES_REQUESTED", appended_objection_events
+        ) != review_digest(review_head, "CHANGES_REQUESTED", review_events):
+            rep.ok("reject:appended-objection-changes-review-digest")
+        else:
+            rep.bad(
+                "reject:appended-objection-changes-review-digest",
+                "appended substantive objection was absent from the digest",
+            )
+        _record_same_exit(
+            rep,
+            "reject:appended-objection-invalidates-resolution",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                appended_objection_path,
+                "--landing-context",
+                review_context_path,
+            ),
+            2,
+        )
+        appended_uncontexted, _appended_uncontexted_rs = _record_exact(
+            rep,
+            "reject:appended-objection-remains-visible",
+            py,
+            rs,
+            ("plan", "--fixture", appended_objection_path, "--format", "json"),
+            expected=0,
+        )
+        appended_held, appended_action = review_disposition(appended_uncontexted, 394)
+        if appended_held is True and appended_action == "wait":
+            rep.ok("reject:appended-objection-keeps-changes-requested-hold")
+        else:
+            rep.bad(
+                "reject:appended-objection-keeps-changes-requested-hold",
+                f"held={appended_held}; action={appended_action!r}",
+            )
+
+        missing_author_fixture = dict(review_fixture)
+        missing_author_pr = dict(review_pr)
+        missing_author_events = [dict(event) for event in review_events]
+        missing_author_events[2].pop("author")
+        missing_author_pr["review_events"] = missing_author_events
+        missing_author_fixture["prs"] = [missing_author_pr]
+        missing_author_path = os.path.join(tmp, "review-metadata-missing-author.json")
+        with open(missing_author_path, "w", encoding="utf-8") as handle:
+            json.dump(missing_author_fixture, handle)
+        _record_exact(
+            rep,
+            "accept:review-metadata-missing-author",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                missing_author_path,
+                "--landing-context",
+                review_context_path,
+            ),
+            expected=0,
+        )
+
+        changed_permission = dict(review_fixture)
+        changed_permission_pr = dict(review_pr)
+        changed_permission_events = [dict(event) for event in review_events]
+        changed_permission_events[1]["retirement_actor_permission"] = "maintain"
+        changed_permission_pr["review_events"] = changed_permission_events
+        changed_permission["prs"] = [changed_permission_pr]
+        changed_permission_path = os.path.join(
+            tmp, "changed-retirement-actor-permission.json"
+        )
+        with open(changed_permission_path, "w", encoding="utf-8") as handle:
+            json.dump(changed_permission, handle)
+        _record_same_exit(
+            rep,
+            "reject:changed-retirement-actor-permission",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                changed_permission_path,
+                "--landing-context",
+                review_context_path,
+            ),
+            2,
+        )
+
+        for label, remove_author in (
+            ("missing-permission", False),
+            ("missing-author-and-permission", True),
+        ):
+            unavailable = dict(review_fixture)
+            unavailable_pr = dict(review_pr)
+            unavailable_events = [dict(event) for event in review_events]
+            unavailable_events[1].pop("retirement_actor_permission")
+            if remove_author:
+                unavailable_events[1].pop("author")
+            unavailable_pr["review_events"] = unavailable_events
+            unavailable["prs"] = [unavailable_pr]
+            unavailable_path = os.path.join(tmp, f"retirement-{label}.json")
+            with open(unavailable_path, "w", encoding="utf-8") as handle:
+                json.dump(unavailable, handle)
+            outcome, _rust_outcome = _record_exact(
+                rep,
+                f"accept:retirement-{label}-remains-visible",
+                py,
+                rs,
+                ("plan", "--fixture", unavailable_path, "--format", "json"),
+                expected=0,
+            )
+            unavailable_held, unavailable_action = review_disposition(outcome, 394)
+            if unavailable_held is True and unavailable_action == "wait":
+                rep.ok(f"accept:retirement-{label}-does-not-clear-objection")
+            else:
+                rep.bad(
+                    f"accept:retirement-{label}-does-not-clear-objection",
+                    f"held={unavailable_held}; action={unavailable_action!r}",
+                )
+
+        read_only = dict(review_fixture)
+        read_only_pr = dict(review_pr)
+        read_only_events = [dict(event) for event in review_events]
+        read_only_events[1]["retirement_actor_permission"] = "read"
+        read_only_pr["review_events"] = read_only_events
+        read_only["prs"] = [read_only_pr]
+        read_only_path = os.path.join(tmp, "retirement-permission-read-only.json")
+        with open(read_only_path, "w", encoding="utf-8") as handle:
+            json.dump(read_only, handle)
+        _record_same_exit(
+            rep,
+            "reject:retirement-permission-read-only",
+            py,
+            rs,
+            ("plan", "--fixture", read_only_path),
+            2,
+        )
+
+        for label, event_author in (
+            ("departed-issuer", "departed-reviewer"),
+            ("hostname-issuer", "devbig014"),
+        ):
+            named = dict(review_fixture)
+            named_pr = dict(review_pr)
+            named_events = [dict(event) for event in review_events]
+            named_events[1]["author"] = event_author
+            named_events[1]["body"] = str(named_events[1]["body"]).replace(
+                "BY release-authority", "BY someone-else"
+            )
+            named_pr["review_events"] = named_events
+            named["prs"] = [named_pr]
+            named_path = os.path.join(tmp, f"retirement-{label}.json")
+            with open(named_path, "w", encoding="utf-8") as handle:
+                json.dump(named, handle)
+            named_context_path = os.path.join(tmp, f"retirement-{label}-context.json")
+            with open(named_context_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "prs": [
+                            {
+                                "pr": 394,
+                                "head_sha": review_head,
+                                "review_objections_resolved": True,
+                                "review_evidence_digest": review_digest(
+                                    review_head, "CHANGES_REQUESTED", named_events
+                                ),
+                            }
+                        ]
+                    },
+                    handle,
+                )
+            _record_exact(
+                rep,
+                f"accept:retirement-{label}",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    named_path,
+                    "--landing-context",
+                    named_context_path,
+                ),
+                expected=0,
+            )
+
+        multiple_agents = dict(review_fixture)
+        multiple_agents_pr = dict(review_pr)
+        multiple_agents_pr["labels"] = ["agent:departed", "agent:replacement"]
+        multiple_agents["prs"] = [multiple_agents_pr]
+        multiple_agents_path = os.path.join(tmp, "multiple-agent-labels.json")
+        with open(multiple_agents_path, "w", encoding="utf-8") as handle:
+            json.dump(multiple_agents, handle)
+        multiple_agents_outcome, _multiple_agents_rust = _record_exact(
+            rep,
+            "accept:multiple-agent-labels-are-metadata",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                multiple_agents_path,
+                "--landing-context",
+                review_context_path,
+                "--format",
+                "json",
+            ),
+            expected=0,
+        )
+        multiple_agents_ok, multiple_agents_payload = _parsed_json(
+            multiple_agents_outcome.stdout
+        )
+        multiple_agent_nodes = (
+            multiple_agents_payload.get("nodes")
+            if multiple_agents_ok and isinstance(multiple_agents_payload, dict)
+            else None
+        )
+        multiple_agent_value = (
+            multiple_agent_nodes[0].get("assigned_agent")
+            if isinstance(multiple_agent_nodes, list)
+            and len(multiple_agent_nodes) == 1
+            and isinstance(multiple_agent_nodes[0], dict)
+            else "invalid"
+        )
+        if multiple_agent_value is None:
+            rep.ok("accept:multiple-agent-labels-do-not-assign-authority")
+        else:
+            rep.bad(
+                "accept:multiple-agent-labels-do-not-assign-authority",
+                f"assigned_agent={multiple_agent_value!r}",
+            )
+
+        # Observed #2950 host shape: issue comments only, no native reviews, and an
+        # empty aggregate reviewDecision. Stable ids, heads, and times are preserved.
+        live_head = "58bf4f5c17880395400ab3cb6482d0de2ee03a84"
+        refused_head = "c3a85da26110fd8dfc31433c8d4109726127703b"
+        repaired_head = "2a18b7bea06cf66f5cf4a973466afa506c0bd2a4"
+        live_shape_events: list[dict[str, object]] = [
+            {
+                "kind": "issue-comment",
+                "identity": "comment-5545346256",
+                "author": "rrnewton",
+                "state": "ACTIVE",
+                "head_sha": "",
+                "created_at": "2026-09-04T19:14:42Z",
+                "updated_at": "2026-09-04T19:14:42Z",
+                "last_edited_at": "",
+                "body": (
+                    "[team, review-cpuid, unresolved, build-host, role=reviewer]\n"
+                    "# Exact-head adversarial review\n\n"
+                    f"CHANGES-REQUESTED-AT: claude {refused_head}\n\n"
+                    "Major: the backend disagreement remains."
+                ),
+                "retirement_actor_permission": "",
+            },
+            {
+                "kind": "issue-comment",
+                "identity": "comment-5552679512",
+                "author": "rrnewton",
+                "state": "ACTIVE",
+                "head_sha": "",
+                "created_at": "2026-09-05T15:03:48Z",
+                "updated_at": "2026-09-05T15:03:48Z",
+                "last_edited_at": "",
+                "body": (
+                    "[team, review-cpuid, unresolved, build-host, role=reviewer]\n"
+                    "# Reassessment at the repaired head\n\n"
+                    f"CHANGES-REQUESTED-WITHDRAWN-AT: claude {repaired_head}\n\n"
+                    f"APPROVED-AT: claude {repaired_head}\n\n"
+                    "It is retired: the objection is met on the mechanism."
+                ),
+                "retirement_actor_permission": "",
+            },
+            {
+                "kind": "issue-comment",
+                "identity": "comment-5552753110",
+                "author": "rrnewton",
+                "state": "ACTIVE",
+                "head_sha": "",
+                "created_at": "2026-09-05T15:16:26Z",
+                "updated_at": "2026-09-05T15:16:26Z",
+                "last_edited_at": "",
+                "body": (
+                    "[team, review-cpuid, unresolved, build-host, role=reviewer]\n"
+                    "# Rebind to the rebased head\n\n"
+                    f"APPROVED-AT: claude {live_head}\n\n"
+                    "My refusal from the earlier head stays retired."
+                ),
+                "retirement_actor_permission": "",
+            },
+        ]
+        assert all("RETIRES" not in str(event["body"]) for event in live_shape_events)
+        assert not any(event["kind"] == "review" for event in live_shape_events)
+        live_shape_pr = dict(review_pr)
+        live_shape_pr["head_sha"] = live_head
+        live_shape_pr["review_decision"] = ""
+        live_shape_pr["review_snapshot_review_decision"] = ""
+        live_shape_pr["review_events"] = live_shape_events
+        live_shape_fixture = dict(review_fixture)
+        live_shape_fixture["prs"] = [live_shape_pr]
+        live_shape_path = os.path.join(tmp, "chronological-withdrawal.json")
+        with open(live_shape_path, "w", encoding="utf-8") as handle:
+            json.dump(live_shape_fixture, handle)
+        live_shape_context_path = os.path.join(
+            tmp, "chronological-withdrawal-context.json"
+        )
+        with open(live_shape_context_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "prs": [
+                        {
+                            "pr": 394,
+                            "head_sha": live_head,
+                            "review_objections_resolved": True,
+                            "review_evidence_digest": review_digest(
+                                live_head, "", live_shape_events
+                            ),
+                        }
+                    ]
+                },
+                handle,
+            )
+        live_shape_outcome, _live_shape_rust = _record_exact(
+            rep,
+            "accept:chronological-withdrawal-without-retires",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                live_shape_path,
+                "--landing-context",
+                live_shape_context_path,
+                "--format",
+                "json",
+            ),
+            expected=0,
+        )
+        live_shape_held, live_shape_action = review_disposition(live_shape_outcome, 394)
+        if live_shape_held is False and live_shape_action == "land-now":
+            rep.ok("accept:chronological-withdrawal-clears-held-state")
+        else:
+            rep.bad(
+                "accept:chronological-withdrawal-clears-held-state",
+                f"held={live_shape_held}; action={live_shape_action!r}",
+            )
+
+        live_uncontexted, _live_uncontexted_rs = _record_exact(
+            rep,
+            "reject:chronological-withdrawal-needs-resolution-context",
+            py,
+            rs,
+            ("plan", "--fixture", live_shape_path, "--format", "json"),
+            expected=0,
+        )
+        live_uncontexted_held, live_uncontexted_action = review_disposition(
+            live_uncontexted, 394
+        )
+        if live_uncontexted_held is True and live_uncontexted_action == "wait":
+            rep.ok("reject:chronological-withdrawal-uncontexted-hold")
+        else:
+            rep.bad(
+                "reject:chronological-withdrawal-uncontexted-hold",
+                f"held={live_uncontexted_held}; action={live_uncontexted_action!r}",
+            )
+
+        live_false_context_path = os.path.join(
+            tmp, "chronological-withdrawal-false-context.json"
+        )
+        with open(live_false_context_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "prs": [
+                        {
+                            "pr": 394,
+                            "head_sha": live_head,
+                            "review_objections_resolved": False,
+                        }
+                    ]
+                },
+                handle,
+            )
+        live_false, _live_false_rs = _record_exact(
+            rep,
+            "reject:chronological-withdrawal-false-context",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                live_shape_path,
+                "--landing-context",
+                live_false_context_path,
+                "--format",
+                "json",
+            ),
+            expected=0,
+        )
+        live_false_held, live_false_action = review_disposition(live_false, 394)
+        if live_false_held is True and live_false_action == "wait":
+            rep.ok("reject:chronological-withdrawal-false-context-hold")
+        else:
+            rep.bad(
+                "reject:chronological-withdrawal-false-context-hold",
+                f"held={live_false_held}; action={live_false_action!r}",
+            )
+
+        live_metadata_events = [dict(event) for event in live_shape_events]
+        for event in live_metadata_events:
+            body = str(event["body"]).replace(
+                "[team, review-cpuid, unresolved, build-host, role=reviewer]",
+                "[team, departed.reviewer_v2, old-session, other-host, role=reviewer]",
+            )
+            event["body"] = re.sub(
+                r"(?m)^((?:CHANGES-REQUESTED-WITHDRAWN-AT|"
+                r"CHANGES-REQUESTED-AT|APPROVED-AT):\s*"
+                r"(?:claude|codex)\s+[0-9a-f]{40})$",
+                r"\1 BY departed-reviewer",
+                body,
+            )
+        if review_digest(live_head, "", live_metadata_events) == review_digest(
+            live_head, "", live_shape_events
+        ):
+            rep.ok("accept:chronological-withdrawal-attribution-is-metadata")
+        else:
+            rep.bad(
+                "accept:chronological-withdrawal-attribution-is-metadata",
+                "disclosure or BY metadata changed the review digest",
+            )
+        live_metadata_pr = dict(live_shape_pr)
+        live_metadata_pr["review_events"] = live_metadata_events
+        live_metadata_fixture = dict(live_shape_fixture)
+        live_metadata_fixture["prs"] = [live_metadata_pr]
+        live_metadata_path = os.path.join(
+            tmp, "chronological-withdrawal-attribution-metadata.json"
+        )
+        with open(live_metadata_path, "w", encoding="utf-8") as handle:
+            json.dump(live_metadata_fixture, handle)
+        live_metadata_outcome, _live_metadata_rs = _record_exact(
+            rep,
+            "accept:chronological-withdrawal-attribution-metadata",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                live_metadata_path,
+                "--landing-context",
+                live_shape_context_path,
+                "--format",
+                "json",
+            ),
+            expected=0,
+        )
+        live_metadata_held, live_metadata_action = review_disposition(
+            live_metadata_outcome, 394
+        )
+        if live_metadata_held is False and live_metadata_action == "land-now":
+            rep.ok("accept:chronological-withdrawal-metadata-keeps-decision")
+        else:
+            rep.bad(
+                "accept:chronological-withdrawal-metadata-keeps-decision",
+                f"held={live_metadata_held}; action={live_metadata_action!r}",
+            )
+
+        stale_live_context_path = os.path.join(
+            tmp, "chronological-withdrawal-stale-head-context.json"
+        )
+        with open(stale_live_context_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "prs": [
+                        {
+                            "pr": 394,
+                            "head_sha": repaired_head,
+                            "review_objections_resolved": True,
+                            "review_evidence_digest": review_digest(
+                                live_head, "", live_shape_events
+                            ),
+                        }
+                    ]
+                },
+                handle,
+            )
+        _record_same_exit(
+            rep,
+            "reject:chronological-withdrawal-stale-head",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                live_shape_path,
+                "--landing-context",
+                stale_live_context_path,
+            ),
+            2,
+        )
+
+        chronology_cases: tuple[tuple[str, list[dict[str, object]]], ...] = (
+            (
+                "earlier-than-objection",
+                [
+                    *live_shape_events,
+                    {
+                        "kind": "review-comment",
+                        "identity": "later-objection",
+                        "author": "another-reviewer",
+                        "state": "ACTIVE",
+                        "head_sha": "",
+                        "created_at": "2026-09-05T15:17:00Z",
+                        "updated_at": "2026-09-05T15:17:00Z",
+                        "last_edited_at": "",
+                        "body": "later substantive objection",
+                        "retirement_actor_permission": "",
+                    },
+                ],
+            ),
+            (
+                "malformed-later-approval",
+                [
+                    *live_shape_events[:-1],
+                    {
+                        **live_shape_events[-1],
+                        "body": "APPROVED-AT: claude 58bf4f5c",
+                    },
+                ],
+            ),
+        )
+        for label, chronology_events in chronology_cases:
+            changed_live = dict(live_shape_fixture)
+            changed_live_pr = dict(live_shape_pr)
+            changed_live_pr["review_events"] = chronology_events
+            changed_live["prs"] = [changed_live_pr]
+            changed_live_path = os.path.join(tmp, f"chronological-{label}.json")
+            with open(changed_live_path, "w", encoding="utf-8") as handle:
+                json.dump(changed_live, handle)
+            _record_same_exit(
+                rep,
+                f"reject:chronological-withdrawal-{label}",
+                py,
+                rs,
+                (
+                    "plan",
+                    "--fixture",
+                    changed_live_path,
+                    "--landing-context",
+                    live_shape_context_path,
+                ),
+                2,
+            )
+
+        no_later_pr = dict(live_shape_pr)
+        no_later_pr["review_events"] = live_shape_events[:1]
+        no_later_fixture = dict(live_shape_fixture)
+        no_later_fixture["prs"] = [no_later_pr]
+        no_later_path = os.path.join(tmp, "chronological-no-later-artifact.json")
+        with open(no_later_path, "w", encoding="utf-8") as handle:
+            json.dump(no_later_fixture, handle)
+        no_later_outcome, _no_later_rs = _record_exact(
+            rep,
+            "reject:chronological-withdrawal-no-later-artifact-held",
+            py,
+            rs,
+            ("plan", "--fixture", no_later_path, "--format", "json"),
+            expected=0,
+        )
+        no_later_held, no_later_action = review_disposition(no_later_outcome, 394)
+        if no_later_held is True and no_later_action == "wait":
+            rep.ok("reject:chronological-withdrawal-no-later-artifact-is-held")
+        else:
+            rep.bad(
+                "reject:chronological-withdrawal-no-later-artifact-is-held",
+                f"held={no_later_held}; action={no_later_action!r}",
+            )
+        no_later_digest = review_digest(live_head, "", live_shape_events[:1])
+        malformed_refusal_digests: list[str] = []
+        for label, by_suffix, canonical in (
+            ("hyphen", " BY departed-reviewer", True),
+            ("underscore", " BY departed_reviewer", True),
+            ("dot", " BY departed.reviewer", True),
+            ("slash", " BY departed/reviewer", False),
+            ("space", " BY departed reviewer", False),
+            ("missing-agent", " BY", False),
+            ("colon", " BY: departed.reviewer", False),
+            ("compact", " BY/departed.reviewer", False),
+        ):
+            refusal_events = [dict(live_shape_events[0])]
+            marker = f"CHANGES-REQUESTED-AT: claude {refused_head}"
+            refusal_events[0]["body"] = str(refusal_events[0]["body"]).replace(
+                marker, f"{marker}{by_suffix}"
+            )
+            refusal_digest = review_digest(live_head, "", refusal_events)
+            if canonical:
+                if refusal_digest == no_later_digest:
+                    rep.ok(f"accept:comment-refusal-by-{label}-is-metadata")
+                else:
+                    rep.bad(
+                        f"accept:comment-refusal-by-{label}-is-metadata",
+                        f"base={no_later_digest}; changed={refusal_digest}",
+                    )
+            else:
+                malformed_refusal_digests.append(refusal_digest)
+                if refusal_digest != no_later_digest:
+                    rep.ok(f"reject:comment-refusal-by-{label}-bytes-preserved")
+                else:
+                    rep.bad(
+                        f"reject:comment-refusal-by-{label}-bytes-preserved",
+                        "malformed BY text was removed from the digest",
+                    )
+            refusal_fixture = dict(no_later_fixture)
+            refusal_pr = dict(no_later_pr)
+            refusal_pr["review_events"] = refusal_events
+            refusal_fixture["prs"] = [refusal_pr]
+            refusal_path = os.path.join(tmp, f"comment-refusal-by-{label}.json")
+            with open(refusal_path, "w", encoding="utf-8") as handle:
+                json.dump(refusal_fixture, handle)
+            refusal_outcome, _refusal_rs = _record_exact(
+                rep,
+                f"reject:comment-refusal-by-{label}-remains-held",
+                py,
+                rs,
+                ("plan", "--fixture", refusal_path, "--format", "json"),
+                expected=0,
+            )
+            refusal_held, refusal_action = review_disposition(refusal_outcome, 394)
+            if refusal_held is True and refusal_action == "wait":
+                rep.ok(f"reject:comment-refusal-by-{label}-decision-unchanged")
+            else:
+                rep.bad(
+                    f"reject:comment-refusal-by-{label}-decision-unchanged",
+                    f"held={refusal_held}; action={refusal_action!r}",
+                )
+        if len(set(malformed_refusal_digests)) == len(malformed_refusal_digests):
+            rep.ok("reject:malformed-comment-by-mutations-change-digest")
+        else:
+            rep.bad(
+                "reject:malformed-comment-by-mutations-change-digest",
+                f"digests={malformed_refusal_digests}",
+            )
+        for whitespace_label, non_ascii_space in (
+            ("nbsp", "\u00a0"),
+            ("em-space", "\u2003"),
+        ):
+            marker = f"CHANGES-REQUESTED-AT: claude {refused_head}"
+            for grammar, malformed_marker in (
+                (
+                    "before-marker",
+                    f"{non_ascii_space}{marker}",
+                ),
+                (
+                    "after-heading",
+                    f"#{non_ascii_space}{marker}",
+                ),
+                (
+                    "after-colon",
+                    marker.replace(": ", f":{non_ascii_space}"),
+                ),
+                (
+                    "after-lane",
+                    marker.replace("claude ", f"claude{non_ascii_space}"),
+                ),
+            ):
+                refusal_events = [dict(live_shape_events[0])]
+                refusal_events[0]["body"] = str(refusal_events[0]["body"]).replace(
+                    marker, malformed_marker
+                )
+                refusal_digest = review_digest(live_head, "", refusal_events)
+                if refusal_digest != no_later_digest:
+                    rep.ok(
+                        f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}-refusal-digest"
+                    )
+                else:
+                    rep.bad(
+                        f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}-refusal-digest",
+                        "non-ASCII whitespace was accepted as refusal syntax",
+                    )
+                refusal_fixture = dict(no_later_fixture)
+                refusal_pr = dict(no_later_pr)
+                refusal_pr["review_events"] = refusal_events
+                refusal_fixture["prs"] = [refusal_pr]
+                refusal_path = os.path.join(
+                    tmp,
+                    f"comment-refusal-{whitespace_label}-{grammar}.json",
+                )
+                with open(refusal_path, "w", encoding="utf-8") as handle:
+                    json.dump(refusal_fixture, handle)
+                refusal_outcome, _refusal_rs = _record_exact(
+                    rep,
+                    f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}-refusal",
+                    py,
+                    rs,
+                    ("plan", "--fixture", refusal_path, "--format", "json"),
+                    expected=0,
+                )
+                refusal_held, refusal_action = review_disposition(
+                    refusal_outcome, 394
+                )
+                if refusal_held is False and refusal_action == "land-now":
+                    rep.ok(
+                        f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}-unrecognized"
+                    )
+                else:
+                    rep.bad(
+                        f"reject:non-ascii-whitespace-{whitespace_label}-{grammar}-unrecognized",
+                        f"held={refusal_held}; action={refusal_action!r}",
+                    )
+        _record_same_exit(
+            rep,
+            "reject:chronological-withdrawal-no-later-artifact-invalidates-context",
+            py,
+            rs,
+            (
+                "plan",
+                "--fixture",
+                no_later_path,
+                "--landing-context",
+                live_shape_context_path,
+            ),
+            2,
+        )
+
+        mismatched_snapshot = dict(review_fixture)
+        mismatched_pr = dict(review_pr)
+        mismatched_pr["review_snapshot_head_sha"] = "b" * 40
+        mismatched_snapshot["prs"] = [mismatched_pr]
+        mismatch_path = os.path.join(tmp, "mismatched-review-snapshot-head.json")
+        with open(mismatch_path, "w", encoding="utf-8") as handle:
+            json.dump(mismatched_snapshot, handle)
+        _record_same_exit(
+            rep,
+            "reject:review-snapshot-fetched-head-mismatch",
+            py,
+            rs,
+            ("plan", "--fixture", mismatch_path),
+            2,
+        )
+
+        for label, decision in (
+            ("null", None),
+            ("empty", ""),
+            ("conflict", "APPROVED"),
+        ):
+            mismatched_decision = dict(review_fixture)
+            mismatched_decision_pr = dict(review_pr)
+            mismatched_decision_pr["review_snapshot_review_decision"] = decision
+            mismatched_decision["prs"] = [mismatched_decision_pr]
+            decision_path = os.path.join(
+                tmp, f"mismatched-review-decision-{label}.json"
+            )
+            with open(decision_path, "w", encoding="utf-8") as handle:
+                json.dump(mismatched_decision, handle)
+            _record_same_exit(
+                rep,
+                f"reject:review-decision-{label}",
+                py,
+                rs,
+                ("plan", "--fixture", decision_path),
+                2,
+            )
+
+        missing_identity = dict(review_fixture)
+        missing_identity_pr = dict(review_pr)
+        missing_identity_pr["review_events"] = [{**review_events[0], "identity": ""}]
+        missing_identity["prs"] = [missing_identity_pr]
+        missing_identity_path = os.path.join(tmp, "missing-review-event-identity.json")
+        with open(missing_identity_path, "w", encoding="utf-8") as handle:
+            json.dump(missing_identity, handle)
+        _record_same_exit(
+            rep,
+            "reject:missing-review-event-identity",
+            py,
+            rs,
+            ("plan", "--fixture", missing_identity_path),
+            2,
+        )
+
+        malformed_review_cases: list[tuple[str, dict[str, object]]] = []
+        numeric_author = dict(review_events[0])
+        numeric_author["author"] = 7
+        malformed_review_cases.append(("numeric-author", numeric_author))
+        null_created = dict(review_events[0])
+        null_created["created_at"] = None
+        malformed_review_cases.append(("null-created-at", null_created))
+        numeric_last_edit = dict(review_events[0])
+        numeric_last_edit["last_edited_at"] = 7
+        malformed_review_cases.append(("numeric-last-edited-at", numeric_last_edit))
+        missing_body = dict(review_events[0])
+        missing_body.pop("body")
+        malformed_review_cases.append(("missing-body", missing_body))
+        alien_state = dict(review_events[0])
+        alien_state["state"] = "ALIEN_STATE"
+        malformed_review_cases.append(("alien-state", alien_state))
+        for label, malformed_event in malformed_review_cases:
+            malformed = dict(review_fixture)
+            malformed_pr = dict(review_pr)
+            malformed_pr["review_events"] = [malformed_event]
+            malformed["prs"] = [malformed_pr]
+            malformed_path = os.path.join(tmp, f"malformed-review-{label}.json")
+            with open(malformed_path, "w", encoding="utf-8") as handle:
+                json.dump(malformed, handle)
+            _record_same_exit(
+                rep,
+                f"reject:malformed-review-{label}",
+                py,
+                rs,
+                ("plan", "--fixture", malformed_path),
+                2,
+            )
+
+        null_snapshot_head = dict(review_fixture)
+        for label, malformed_unavailable in (
+            ("null", None),
+            ("integer", 0),
+            ("string", "true"),
+            ("array", []),
+            ("object", {}),
+        ):
+            malformed_unavailable_fixture: dict[str, object] = {
+                "repo": "OWNER/NAME",
+                "base": "main",
+                "prs": [
+                    {
+                        "number": 1,
+                        "review_evidence_unavailable": malformed_unavailable,
+                    }
+                ],
+            }
+            malformed_unavailable_path = os.path.join(
+                tmp, f"malformed-review-evidence-unavailable-{label}.json"
+            )
+            with open(malformed_unavailable_path, "w", encoding="utf-8") as handle:
+                json.dump(malformed_unavailable_fixture, handle)
+            _record_same_exit(
+                rep,
+                f"reject:review-evidence-unavailable-{label}",
+                py,
+                rs,
+                ("plan", "--fixture", malformed_unavailable_path),
+                2,
+            )
+
+        null_snapshot_pr = dict(review_pr)
+        null_snapshot_pr["review_snapshot_head_sha"] = None
+        null_snapshot_head["prs"] = [null_snapshot_pr]
+        null_snapshot_path = os.path.join(tmp, "null-review-snapshot-head.json")
+        with open(null_snapshot_path, "w", encoding="utf-8") as handle:
+            json.dump(null_snapshot_head, handle)
+        _record_same_exit(
+            rep,
+            "reject:null-review-snapshot-head",
+            py,
+            rs,
+            ("plan", "--fixture", null_snapshot_path),
+            2,
+        )
 
         for flag, value in (
             ("--outage-min-prs", "-1"),
@@ -4345,14 +11550,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="py-vs-rs differential tester")
     parser.add_argument(
         "--tool",
-        default="safe-ci-dag-runner",
+        default="dagrun",
         choices=(
-            "safe-ci-dag-runner",
+            "dagrun",
             "cpuset-alloc",
             "tick-hub",
             "pr-landing-planner",
             "herdr-run",
             "herdr-agent",
+            "agentctl",
             "all",
         ),
     )
@@ -4362,8 +11568,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     tool = str(ns.tool)
     rand_count = int(ns.random)
     seed = int(ns.seed)
-    if tool == "safe-ci-dag-runner":
-        return compare_safe_ci_dag_runner(rand_count, seed)
+    if tool == "dagrun":
+        return compare_dagrun(rand_count, seed)
     if tool == "cpuset-alloc":
         return compare_cpuset_alloc()
     if tool == "tick-hub":
@@ -4374,13 +11580,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         return compare_herdr_run(py_command_for(tool), rs_command(tool))
     if tool == "herdr-agent":
         return compare_herdr_agent(py_command_for(tool), rs_command(tool))
+    if tool == "agentctl":
+        return compare_agentctl(py_command_for(tool), rs_command(tool))
     results = (
-        compare_safe_ci_dag_runner(rand_count, seed),
+        compare_dagrun(rand_count, seed),
         compare_cpuset_alloc(),
         compare_tick_hub(rand_count, seed),
         compare_pr_landing_planner(rand_count, seed),
         compare_herdr_run(py_command_for("herdr-run"), rs_command("herdr-run")),
         compare_herdr_agent(py_command_for("herdr-agent"), rs_command("herdr-agent")),
+        compare_agentctl(py_command_for("agentctl"), rs_command("agentctl")),
     )
     return 1 if any(results) else 0
 

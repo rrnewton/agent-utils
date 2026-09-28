@@ -91,6 +91,21 @@ pub fn format_unevaluable(name: &str, dependencies: &[String]) -> String {
     )
 }
 
+/// Format a gate that ran and found nothing wrong.
+pub fn format_clean(name: &str) -> String {
+    format!("CLEAN: {name} ran and found nothing to report")
+}
+
+/// Format a reminder not evaluated because one or more required flags are off.
+pub fn format_suppressed(name: &str, missing_flags: &[String]) -> String {
+    let flags = if missing_flags.is_empty() {
+        "(none recorded)".to_string()
+    } else {
+        missing_flags.join(",")
+    };
+    format!("SUPPRESSED: {name} did not run; required flag(s) not set: {flags}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

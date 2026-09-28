@@ -9,6 +9,7 @@ use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
+use crate::cadence::INTERNAL_STATE_PREFIX;
 use crate::model::{Emit, EmitKind, Gate, GateWhen, HealthCheck, Reminder, TickConfig};
 use crate::text::{is_whitespace, string_repr, trim};
 
@@ -311,7 +312,11 @@ fn gate_from(value: Option<&Value>, where_: &str) -> Result<Option<Gate>, TickCo
         return Ok(None);
     }
     let object = as_obj(value, where_)?;
-    reject_unknown(object, &["cmd", "when", "capture"], where_)?;
+    reject_unknown(
+        object,
+        &["cmd", "when", "capture", "timeout_secs", "parallel"],
+        where_,
+    )?;
     let when_name = opt_str(object, "when", "success", where_)?;
     let when = GateWhen::from_value(&when_name).ok_or_else(|| {
         TickConfigError(format!(
@@ -319,10 +324,27 @@ fn gate_from(value: Option<&Value>, where_: &str) -> Result<Option<Gate>, TickCo
             string_repr(&when_name)
         ))
     })?;
+    // A non-positive bound would terminate the command before it could produce anything,
+    // which reads as a gate that always times out. Refuse it rather than accept a value that
+    // can only ever yield NO-SIGNAL.
+    let timeout_secs = match object.get("timeout_secs") {
+        Some(value) if !value.is_null() => {
+            let secs = opt_nonnegative_int(object, "timeout_secs", 0, where_)?;
+            if secs <= 0 {
+                return Err(TickConfigError(format!(
+                    "{where_}: 'timeout_secs' ({secs}) must be greater than 0"
+                )));
+            }
+            Some(secs)
+        }
+        _ => None,
+    };
     Ok(Some(Gate {
         cmd: req_str(object, "cmd", where_)?,
         when,
         capture: opt_bool(object, "capture", false, where_)?,
+        parallel: opt_bool(object, "parallel", false, where_)?,
+        timeout_secs,
     }))
 }
 
@@ -358,6 +380,8 @@ fn reminder_from(value: &Value, where_: &str) -> Result<Reminder, TickConfigErro
             "name",
             "emit",
             "cadence_secs",
+            "cadence_offset_secs",
+            "cadence_window_secs",
             "requires_flags",
             "depends_on",
             "gate",
@@ -379,13 +403,62 @@ fn reminder_from(value: &Value, where_: &str) -> Result<Reminder, TickConfigErro
             "{where_}: field 'name' must not contain whitespace or '=' (it is a fired-state key)"
         )));
     }
+    if name.starts_with(INTERNAL_STATE_PREFIX) {
+        return Err(TickConfigError(format!(
+            "{where_}: field 'name' must not start with reserved internal-state prefix {INTERNAL_STATE_PREFIX:?}"
+        )));
+    }
+    let cadence_secs = opt_nonnegative_int(object, "cadence_secs", 0, where_)?;
+    // Refuse a phase that cannot mean what it says rather than silently normalising it, and
+    // keep every message identical to the Python edition's so the two stay one contract.
+    let cadence_offset_secs = match object.get("cadence_offset_secs") {
+        Some(value) if !value.is_null() => {
+            let offset = opt_nonnegative_int(object, "cadence_offset_secs", 0, where_)?;
+            if cadence_secs <= 0 {
+                return Err(TickConfigError(format!(
+                    "{where_}: 'cadence_offset_secs' requires a positive 'cadence_secs'; \
+                     an every-tick reminder is always due and cannot be phased"
+                )));
+            }
+            if offset >= cadence_secs {
+                return Err(TickConfigError(format!(
+                    "{where_}: 'cadence_offset_secs' ({offset}) must be less than \
+                     'cadence_secs' ({cadence_secs}); a larger offset names the same instants \
+                     as offset % cadence and hides which tick the author meant"
+                )));
+            }
+            Some(offset)
+        }
+        _ => None,
+    };
+    let cadence_window_secs = match object.get("cadence_window_secs") {
+        Some(value) if !value.is_null() => {
+            let window = opt_nonnegative_int(object, "cadence_window_secs", 0, where_)?;
+            if cadence_offset_secs.is_none() {
+                return Err(TickConfigError(format!(
+                    "{where_}: 'cadence_window_secs' requires 'cadence_offset_secs'; \
+                     a window only means anything relative to a phase"
+                )));
+            }
+            if window <= 0 || window > cadence_secs {
+                return Err(TickConfigError(format!(
+                    "{where_}: 'cadence_window_secs' ({window}) must be greater than 0 and at \
+                     most 'cadence_secs' ({cadence_secs})"
+                )));
+            }
+            Some(window)
+        }
+        _ => None,
+    };
     Ok(Reminder {
         name,
         emit: emit_from(emit, &format!("{where_}.emit"))?,
-        cadence_secs: opt_nonnegative_int(object, "cadence_secs", 0, where_)?,
+        cadence_secs,
         requires_flags: opt_str_list(object, "requires_flags", where_)?,
         gate: gate_from(object.get("gate"), &format!("{where_}.gate"))?,
         depends_on: opt_str_list(object, "depends_on", where_)?,
+        cadence_offset_secs,
+        cadence_window_secs,
     })
 }
 
@@ -582,6 +655,15 @@ fn gate_to_value(gate: Option<&Gate>) -> Value {
     object.insert("cmd".into(), Value::String(gate.cmd.clone()));
     object.insert("when".into(), Value::String(gate.when.as_str().into()));
     object.insert("capture".into(), Value::Bool(gate.capture));
+    // Key order matches the Python edition exactly: cmd, when, capture, timeout_secs,
+    // parallel. The two editions are one contract and their `json` output is compared
+    // byte-for-byte, so a reordered key is a real divergence even though the content agrees.
+    if let Some(secs) = gate.timeout_secs {
+        object.insert("timeout_secs".into(), Value::Number(secs.into()));
+    }
+    if gate.parallel {
+        object.insert("parallel".into(), Value::Bool(true));
+    }
     Value::Object(object)
 }
 
@@ -632,6 +714,12 @@ fn config_to_value(config: &TickConfig) -> Value {
                 "cadence_secs".into(),
                 Value::Number(reminder.cadence_secs.into()),
             );
+            if let Some(offset) = reminder.cadence_offset_secs {
+                object.insert("cadence_offset_secs".into(), Value::Number(offset.into()));
+            }
+            if let Some(window) = reminder.cadence_window_secs {
+                object.insert("cadence_window_secs".into(), Value::Number(window.into()));
+            }
             object.insert(
                 "requires_flags".into(),
                 Value::Array(
@@ -671,9 +759,10 @@ fn validate_serializable(config: &TickConfig) -> Result<(), TickConfigError> {
         if trim(&reminder.name).is_empty()
             || reminder.name.contains('=')
             || reminder.name.chars().any(is_whitespace)
+            || reminder.name.starts_with(INTERNAL_STATE_PREFIX)
         {
             return Err(TickConfigError(
-                "reminder names must be valid fired-state keys (nonempty, without whitespace or '=')"
+                "reminder names must be valid fired-state keys (nonempty, without whitespace or '=', and outside the reserved internal-state namespace)"
                     .to_string(),
             ));
         }
@@ -785,11 +874,12 @@ mod tests {
     fn dependency_edges_round_trip_and_reject_invalid_graphs() {
         let text = r#"{
           "reminders": [
-            {"name":"foundation","gate":{"cmd":"f"},"emit":{"skill":"s"}},
+            {"name":"foundation","gate":{"cmd":"f","parallel":true},"emit":{"skill":"s"}},
             {"name":"dependent","depends_on":["foundation"],"gate":{"cmd":"d"},"emit":{"skill":"s"}}
           ]
         }"#;
         let config = config_from_json(text).unwrap();
+        assert!(config.reminders[0].gate.as_ref().unwrap().parallel);
         assert_eq!(config.reminders[1].depends_on, vec!["foundation"]);
         assert_eq!(
             config_from_json(&config_to_json(&config).unwrap()).unwrap(),
@@ -848,6 +938,7 @@ mod tests {
             r#"{"reminders":[{"name":" ","emit":{"skill":"s"}}]}"#,
             r#"{"reminders":[{"name":"has space","emit":{"skill":"s"}}]}"#,
             r#"{"reminders":[{"name":"has=equals","emit":{"skill":"s"}}]}"#,
+            r#"{"reminders":[{"name":"__tick_hub_internal__.collision","emit":{"skill":"s"}}]}"#,
             r#"{"reminders":[{"name":"r","emit":{"skill":"  "}}]}"#,
             r#"{"reminders":[{"name":"r","cadence_secs":-1,"emit":{"skill":"s"}}]}"#,
             r#"{"reminders":[{"name":"r","emit":{"skill":"s"}},{"name":"r","emit":{"kind":"note"}}]}"#,
@@ -974,6 +1065,16 @@ mod tests {
         };
         assert!(config_to_json(&invalid_name).is_err());
         assert!(config_to_yaml(&invalid_name).is_err());
+
+        let reserved_name = TickConfig {
+            reminders: vec![Reminder::new(
+                "__tick_hub_internal__.collision",
+                Emit::note("n"),
+            )],
+            ..TickConfig::default()
+        };
+        assert!(config_to_json(&reserved_name).is_err());
+        assert!(config_to_yaml(&reserved_name).is_err());
 
         let mut invalid_action = Reminder::new("r", Emit::action(" ", "invalid"));
         invalid_action.cadence_secs = -1;

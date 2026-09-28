@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.codex_workspace import (
+from wrkviz.codex_workspace import (
     CodexWorkspaceError,
     codex_failure_detail,
     initialize_codex_workspace,
@@ -43,8 +43,8 @@ def test_workspace_initializes_git_and_available_hg(
     def fake_which(command: str) -> str | None:
         return "/tools/hg" if command == "hg" else None
 
-    monkeypatch.setattr("agent_team_timeline.codex_workspace.subprocess.run", fake_run)
-    monkeypatch.setattr("agent_team_timeline.codex_workspace.shutil.which", fake_which)
+    monkeypatch.setattr("wrkviz.codex_workspace.subprocess.run", fake_run)
+    monkeypatch.setattr("wrkviz.codex_workspace.shutil.which", fake_which)
 
     initialize_codex_workspace(tmp_path)
 
@@ -69,9 +69,9 @@ def test_workspace_remains_portable_without_hg_or_sl(
         calls.append(normalized)
         return _completed(normalized)
 
-    monkeypatch.setattr("agent_team_timeline.codex_workspace.subprocess.run", fake_run)
+    monkeypatch.setattr("wrkviz.codex_workspace.subprocess.run", fake_run)
     monkeypatch.setattr(
-        "agent_team_timeline.codex_workspace.shutil.which", lambda _command: None
+        "wrkviz.codex_workspace.shutil.which", lambda _command: None
     )
 
     initialize_codex_workspace(tmp_path)
@@ -106,9 +106,9 @@ def test_workspace_reports_initializer_failure(
             return _completed(normalized, 5, "initializer diagnostic")
         return _completed(normalized)
 
-    monkeypatch.setattr("agent_team_timeline.codex_workspace.subprocess.run", fake_run)
+    monkeypatch.setattr("wrkviz.codex_workspace.subprocess.run", fake_run)
     monkeypatch.setattr(
-        "agent_team_timeline.codex_workspace.shutil.which",
+        "wrkviz.codex_workspace.shutil.which",
         lambda command: "/tools/hg" if command == "hg" else None,
     )
 

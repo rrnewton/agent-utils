@@ -53,14 +53,16 @@ class Project:
     doc_term_exemptions: tuple[str, ...] = ()
     #: Sibling distributions this package deliberately composes with and therefore must name.
     sibling_package_exemptions: tuple[str, ...] = ()
+    #: CLI-first documentation may live directly in its owning package.
+    package_owned_docs: bool = False
 
 
 PROJECTS: tuple[Project, ...] = (
     Project(
-        directory="safe_ci_dag_runner",
-        distribution="safe-ci-dag-runner",
-        package="safe_ci_dag_runner",
-        commands=("safe-ci-dag-runner", "cpuset-alloc"),
+        directory="dagrun",
+        distribution="dagrun",
+        package="dagrun",
+        commands=("dagrun", "cpuset-alloc"),
         resources=("README.md", "USER_GUIDE.md", "py.typed"),
         required_dependencies=("pyyaml",),
     ),
@@ -95,10 +97,10 @@ PROJECTS: tuple[Project, ...] = (
         required_dependencies=("pyyaml",),
     ),
     Project(
-        directory="agent_team_timeline",
-        distribution="agent-team-timeline",
-        package="agent_team_timeline",
-        commands=("agent-team-timeline",),
+        directory="wrkviz",
+        distribution="wrkviz",
+        package="wrkviz",
+        commands=("wrkviz",),
         resources=(
             "README.md",
             "USER_GUIDE.md",
@@ -124,26 +126,53 @@ PROJECTS: tuple[Project, ...] = (
             "py.typed",
             "examples/chaos-sweep.json",
         ),
-        required_dependencies=("safe-ci-dag-runner",),
-        sibling_package_exemptions=("safe-ci-dag-runner", "safe_ci_dag_runner"),
+        required_dependencies=("dagrun",),
+        sibling_package_exemptions=("dagrun",),
     ),
     Project(
         directory="herdr_run",
         distribution="herdr-run",
         package="herdr_run",
-        commands=("herdr-run", "herdr-agent"),
+        commands=("herdr-run",),
         # The distribution allowlists `cargo` as a target program, so its docs must name it. This is
         # user-visible subject matter, not a reference to the sibling implementation.
         doc_term_exemptions=("cargo",),
         resources=(
             "README.md",
             "USER_GUIDE.md",
-            "AGENT_USER_GUIDE.md",
+            "QUICKSTART.md",
+            # There is deliberately no `examples/` here. `config_template.yaml` is what
+            # `herdr-run init` writes, and it is the configuration reference; a second, partial
+            # example file in the wheel would be a duplicate free to drift away from it.
+            "config_template.yaml",
             "py.typed",
-            "examples/project.yaml",
         ),
         required_dependencies=("pyyaml",),
-        command_userguides=(("herdr-agent", "AGENT_USER_GUIDE.md"),),
+    ),
+    Project(
+        directory="agentctl", distribution="agentctl", package="agentctl",
+        commands=("agentctl", "herdr-agent", "herdr-subagents", "herdr-chat"),
+        resources=("README.md", "USER_GUIDE.md", "QUICKSTART.md", "py.typed",
+                   "AGENT_USER_GUIDE.md", "FOREIGN_USER_GUIDE.md", "CHAT_USER_GUIDE.md"),
+        required_dependencies=(),
+        command_userguides=(("herdr-agent", "USER_GUIDE.md"),
+                           ("herdr-subagents", "USER_GUIDE.md"), ("herdr-chat", "CHAT_USER_GUIDE.md")),
+        package_owned_docs=True,
+    ),
+    Project(
+        directory="wrkslots",
+        distribution="wrkslots",
+        package="wrkslots",
+        commands=("wrkslots",),
+        # `validate-cargo-*` is a public managed-directory spelling.
+        doc_term_exemptions=("cargo",),
+        resources=(
+            "README.md",
+            "USER_GUIDE.md",
+            "py.typed",
+            "examples/liveness_probe.py",
+        ),
+        required_dependencies=(),
     ),
 )
 
@@ -151,6 +180,18 @@ _DIST_SEP = re.compile(r"[-_.]+")
 _FOREIGN_DOC_TERMS = re.compile(
     r"\b(?:cargo|crate|crates\.io|rust|rustc|rustup)\b", re.IGNORECASE
 )
+#: How each command -- and each ``python -m`` module -- is asked to print its own user guide.
+#:
+#: A global ``--userguide`` flag is the norm here, but a command whose surface is
+#: ``<command> <subcommand>`` says it as a subcommand instead, because a documentation flag sitting
+#: beside a subcommand list is the mixing that surface exists to avoid.
+_USERGUIDE_INVOCATION: dict[str, tuple[str, ...]] = {
+    "herdr-run": ("userguide",),
+    "herdr_run": ("userguide",),
+    "agentctl": ("userguide",),
+}
+
+
 _COMMON_DOC_TERMS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("suite name", re.compile(r"agent-utils", re.IGNORECASE)),
     ("unrelated project", re.compile(r"\b(?:DeepScry|Hermit)\b", re.IGNORECASE)),
@@ -179,7 +220,7 @@ _COMMON_DOC_TERMS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
 )
 _REQUIREMENT_NAME = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
-_PUBLIC_SCAN_IGNORED = {"__pycache__", "build", "dist"}
+_PUBLIC_SCAN_IGNORED = {"__pycache__", "build", "dist", "tests"}
 
 _PublicDocNode = ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef
 
@@ -334,7 +375,7 @@ def _source_resources(project: Project, source: Path) -> tuple[tuple[str, bytes]
                 raise CheckError(
                     f"{project.distribution}: documentation resource {relative} is not UTF-8"
                 ) from exc
-            errors = _doc_violations(project, document)
+            errors = _doc_violations(project, document, document_name=relative)
             if errors:
                 raise CheckError(
                     f"{project.distribution}: documentation resource {relative} is not standalone: "
@@ -360,9 +401,18 @@ def _unexpected_package_members(
     )
 
 
-def _doc_violations(project: Project, text: str) -> list[str]:
+def _doc_violations(project: Project, text: str, *, document_name: str | None = None) -> list[str]:
     errors: list[str] = []
-    for foreign in _FOREIGN_DOC_TERMS.finditer(text):
+    checked_text = text
+    if project.distribution == "dagrun":
+        for value in ("cargo-build", "cargo-test", "cargo-nextest"):
+            checked_text = checked_text.replace(value, " " * len(value))
+    for foreign in _FOREIGN_DOC_TERMS.finditer(checked_text):
+        # The unified operator guide deliberately names the distributions whose
+        # supported adapters differ. This does not waive public API/README lint.
+        if (project.package == "agentctl" and foreign.group(0).lower() == "rust"
+                and document_name in ("USER_GUIDE.md", "AGENT_USER_GUIDE.md", "FOREIGN_USER_GUIDE.md")):
+            continue
         if foreign.group(0).lower() not in project.doc_term_exemptions:
             errors.append(f"foreign-language term {foreign.group(0)!r}")
     for description, pattern in _COMMON_DOC_TERMS:
@@ -431,6 +481,8 @@ def _copy_project(project: Project, destination: Path) -> Path:
         raise CheckError(f"{source}: missing pyproject.toml")
     for relative in ("README.md", "USER_GUIDE.md", "LICENSE"):
         linked = source / relative
+        if project.package_owned_docs and relative != "LICENSE" and linked.is_file():
+            continue
         if not linked.is_symlink() or not linked.resolve().is_file():
             raise CheckError(
                 f"{project.distribution}: source {relative} must be a valid authoritative symlink"
@@ -721,7 +773,7 @@ def _inspect_wheel(project: Project, wheel: Path) -> _WheelInspection:
                 raise CheckError(
                     f"{project.distribution}: wheel {document} differs from its authoritative source"
                 )
-            errors = _doc_violations(project, artifact_text)
+            errors = _doc_violations(project, artifact_text, document_name=document)
             if errors:
                 raise CheckError(
                     f"{project.distribution}: wheel {document} is not standalone: "
@@ -802,7 +854,11 @@ def _smoke_wheel(
     smoke_root: Path,
 ) -> None:
     environment_root = smoke_root / project.directory
-    venv.EnvBuilder(with_pip=True, clear=True).create(environment_root)
+    # The package under test needs a fresh environment; it does not need a private copy of pip.
+    # Bootstrapping pip separately into all six environments spends most of this check installing
+    # the same validation tool.  The validator's pip can target each empty environment directly,
+    # while the import-path assertion below still proves the wheel landed in that environment.
+    venv.EnvBuilder(with_pip=False, clear=True).create(environment_root)
     bindir, python = _venv_paths(environment_root)
     env = _offline_env()
     run_root = smoke_root / "work" / project.directory
@@ -815,9 +871,11 @@ def _smoke_wheel(
 
     _run(
         [
-            str(python),
+            sys.executable,
             "-m",
             "pip",
+            "--python",
+            str(python),
             "install",
             "--no-index",
             "--no-deps",
@@ -843,7 +901,8 @@ def _smoke_wheel(
     )
     _run([str(python), "-c", version_code], env=env, cwd=run_root)
 
-    module_invocations = (("--help",), ("--version",), ("--userguide",))
+    module_guide_args = list(_USERGUIDE_INVOCATION.get(project.package, ("--userguide",)))
+    module_invocations = (["--help"], ["--version"], module_guide_args)
     for args in module_invocations:
         result = _run(
             [str(python), "-m", project.package, *args],
@@ -854,13 +913,14 @@ def _smoke_wheel(
         combined = result.stdout + result.stderr
         if "Traceback (most recent call last)" in combined:
             raise CheckError(f"python -m {project.package} {' '.join(args)} emitted a traceback")
-        if args == ("--version",) and version not in combined:
+        if args == ["--version"] and version not in combined:
             raise CheckError(
                 f"python -m {project.package} --version did not report {version!r}: {combined!r}"
             )
-        if args == ("--userguide",) and (result.stdout != userguide or result.stderr):
+        if args == module_guide_args and (result.stdout != userguide or result.stderr):
             raise CheckError(
-                f"python -m {project.package} --userguide differs from packaged USER_GUIDE.md"
+                f"python -m {project.package} {' '.join(module_guide_args)} differs from "
+                "packaged USER_GUIDE.md"
             )
 
     command_userguides = dict(project.command_userguides)
@@ -869,9 +929,10 @@ def _smoke_wheel(
         executable = bindir / command
         if not executable.is_file():
             raise CheckError(f"{project.distribution}: installed command missing: {executable}")
+        guide_args = list(_USERGUIDE_INVOCATION.get(command, ("--userguide",)))
         invocations: list[list[str]] = [["--help"], ["--version"]]
         if command != "cpuset-alloc":
-            invocations.append(["--userguide"])
+            invocations.append(guide_args)
         for command_args in invocations:
             result = _run(
                 [str(executable), *command_args], env=env, cwd=run_root, timeout=30
@@ -883,12 +944,31 @@ def _smoke_wheel(
                 raise CheckError(f"{command} --version did not report {version!r}: {combined!r}")
             expected_guide_name = command_userguides.get(command, "USER_GUIDE.md")
             expected_guide = userguide if expected_guide_name == "USER_GUIDE.md" else resource_text[expected_guide_name]
-            if command_args == ["--userguide"] and (
+            if command_args == guide_args and (
                 result.stdout != expected_guide or result.stderr
             ):
                 raise CheckError(
-                    f"{command} --userguide differs from packaged {expected_guide_name}"
+                    f"{command} {' '.join(guide_args)} differs from packaged {expected_guide_name}"
                 )
+
+    if project.package == "agentctl":
+        # These invocations run in the wheel-only environment whose import
+        # checks above proved every sibling, including herdr_run, absent.
+        agentctl_command = str(bindir / "agentctl")
+        for arguments, expected in (
+            (["quickstart"], resource_text["QUICKSTART.md"]),
+            (["chat", "userguide"], resource_text["CHAT_USER_GUIDE.md"]),
+        ):
+            result = _run([agentctl_command, *arguments], env=env, cwd=run_root)
+            if result.stdout != expected or result.stderr:
+                raise CheckError(f"agentctl {' '.join(arguments)} differs from packaged CLI documentation")
+        for arguments in (["capabilities"], ["chat", "--help"], ["chat", "quickstart"],
+                          ["chat", "init", "--help"], ["chat", "run", "--help"],
+                          ["chat", "tick", "--help"], ["chat", "reply", "--help"],
+                          ["start", "--help"], ["mcp", "--help"]):
+            _run([agentctl_command, *arguments], env=env, cwd=run_root, timeout=30)
+        _run([str(python), "-c", "import agentctl.chat, agentctl.sessions, agentctl.mcp; "
+              "import agentctl.foreign.agent_runner, agentctl.foreign.mcp.server"], env=env, cwd=run_root)
 
 
 def main() -> int:

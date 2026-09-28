@@ -46,7 +46,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "py"))
 
-from safe_ci_dag_runner.cgroup import parse_device_irq_counts  # noqa: E402
+from dagrun.cgroup import parse_device_irq_counts  # noqa: E402
 
 PROG = "irq-survey"
 

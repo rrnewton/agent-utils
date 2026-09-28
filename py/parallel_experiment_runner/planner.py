@@ -1,7 +1,7 @@
-"""Lower one calibrated round onto a ``safe_ci_dag_runner.DagConfig`` (pure) + classify outcomes.
+"""Lower one calibrated round onto a ``dagrun.DagConfig`` (pure) + classify outcomes.
 
-This is where the runner "reuses safe-ci-dag-runner; does NOT write a sibling": each seed becomes
-one :class:`safe_ci_dag_runner.Step`, and every per-worker HARD limit is lowered onto the exact
+This is where the runner "reuses dagrun; does NOT write a sibling": each seed becomes
+one :class:`dagrun.Step`, and every per-worker HARD limit is lowered onto the exact
 per-step control the executor already enforces —
 
 * ``worker_limits.memory_bytes`` -> ``ResourceHint.hard_mem_max_bytes`` (inner ``memory.max``),
@@ -28,7 +28,7 @@ import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
-from safe_ci_dag_runner import DagConfig, ResourceHint, Step
+from dagrun import DagConfig, ResourceHint, Step
 
 from parallel_experiment_runner.model import (
     STATUS_COMMAND_ERROR,
@@ -85,8 +85,8 @@ def generate_round_dag(plan: RoundPlan) -> DagConfig:
     """Build the ``DagConfig`` for a round: one independent, boxed :class:`Step` per seed.
 
     The steps have no ``deps`` (seeds are independent), so the executor runs up to ``plan.width``
-    of them at once; ``jobs=plan.width`` (set by the caller) is what makes the concurrency a
-    DECLARED, ENFORCED number rather than unbounded fan-out.
+    of them at once. The caller maps that to ``max_steps`` and separately sets
+    ``max_cpus = width * per-worker cores``, making both limits declared and enforced.
     """
     limits = plan.spec.worker_limits
     est = plan.per_worker_estimate.wall_s or 0.0

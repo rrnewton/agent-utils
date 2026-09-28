@@ -15,7 +15,12 @@ protection, and who may publish.
 Fetch the target branch before choosing a wave. Rebase or otherwise finalize each candidate first,
 then validate and review that candidate. Review remains exact-revision;
 validation identity and preservation across a rebase follow the consuming
-workspace's skill `hermit-validation-authority`.
+workspace's own validation-authority skill.
+
+Apply the existing validation rule: "A lagging ancestor is legitimate;
+requiring the tip made the verdict a property of WHEN you looked rather than of
+the tree." Use the consuming workspace's explicit `hard-green` or `soft-green`
+decision; do not infer landability from the live base tip.
 
 Classify validation from named checks and their recorded outcomes. An aggregate pass count or label
 does not prove coverage unless repository policy says it does. Likewise, an approval of an older head

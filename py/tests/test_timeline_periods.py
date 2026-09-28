@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from agent_team_timeline.periods import period_heading, periods_for_range
+from wrkviz.periods import period_heading, periods_for_range
 
 
 def _ms(value: str) -> int:

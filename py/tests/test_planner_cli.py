@@ -77,7 +77,17 @@ def test_userguide_prints_embedded_guide() -> None:
 
 
 def test_plan_human_all_classes() -> None:
-    rc, out, _ = _capture(["plan", "--fixture", DEMO, "--flaky-signatures", FLAKY])
+    rc, out, _ = _capture(
+        [
+            "plan",
+            "--fixture",
+            DEMO,
+            "--flaky-signatures",
+            FLAKY,
+            "--freshness-max-behind",
+            "0",
+        ]
+    )
     assert rc == 0
     assert "land-now" in out
     assert "rebase-then-land" in out
@@ -95,6 +105,21 @@ def test_plan_json_is_valid_and_has_schema() -> None:
     assert obj["repository"] == "OWNER/NAME"
     assert set(obj["plan"]) >= {"parallel_safe_groups", "land_now", "order", "per_pr_actions"}
     assert 1043 in obj["plan"]["land_now"]
+    # Behind the base is not a reroute reason by default...
+    behind = next(item for item in obj["plan"]["per_pr_actions"] if item["pr"] == 987)
+    assert behind["action"] == "land-now"
+    # ...but a caller that asks for a freshness bound still gets the reroute and
+    # its wording, so this keeps that path covered rather than dropping it.
+    rc_strict, out_strict, _ = _capture(
+        ["plan", "--fixture", DEMO, "--flaky-signatures", FLAKY, "--format", "json",
+         "--freshness-max-behind", "0"]
+    )
+    assert rc_strict == 0
+    behind_strict = next(
+        item for item in json.loads(out_strict)["plan"]["per_pr_actions"] if item["pr"] == 987
+    )
+    assert behind_strict["action"] == "rebase-then-land"
+    assert "rebase before landing" in behind_strict["why"]
     assert 1049 in obj["diagnostics"]["flaky_reds"]
     assert obj["diagnostics"]["outage_suspected"] is True
     # Deterministic: identical bytes on a second run.
@@ -156,6 +181,7 @@ def test_plan_context_exact_head_bypasses_stale_gate(tmp_path: Path) -> None:
                         "head_sha": "sha-942",
                         "base_sha": "basesha-integration",
                         "validation_evidence": "clean-validate-record",
+                        "validation_authority": "hard-green",
                         "policy_class": "ci-hygiene",
                         "assigned_agent": "agent-a",
                     }
@@ -181,12 +207,25 @@ def test_plan_context_exact_head_bypasses_stale_gate(tmp_path: Path) -> None:
     decision = next(item for item in obj["plan"]["per_pr_actions"] if item["pr"] == 942)
     assert node["assigned_agent"] == "agent-a"
     assert node["validation_evidence"] == "clean-validate-record"
+    assert node["validation_authority"] == "hard-green"
     assert decision["action"] == "land-now"
     assert "no merge-gate wait" in decision["why"]
 
 
 def test_plan_actions_has_capturable_summary_and_loud_lines() -> None:
-    rc, out, _ = _capture(["plan", "--fixture", DEMO, "--flaky-signatures", FLAKY, "--format", "actions"])
+    rc, out, _ = _capture(
+        [
+            "plan",
+            "--fixture",
+            DEMO,
+            "--flaky-signatures",
+            FLAKY,
+            "--freshness-max-behind",
+            "0",
+            "--format",
+            "actions",
+        ]
+    )
     assert rc == 0
     lines = out.splitlines()
     # Bare key=value summary lines (tick-hub `capture: true` lifts these).

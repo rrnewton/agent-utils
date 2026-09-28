@@ -13,6 +13,31 @@ use crate::error::{HerdrRunError, Result};
 /// Accepted configuration basenames, in preference order at each directory.
 pub const CONFIG_FILENAMES: [&str; 2] = [".herdr-run.yaml", ".herdr-run.yml"];
 
+/// The single `allow` entry that turns the allowlist off: any bare program name is admitted.
+///
+/// This is a named mode rather than something to be worked out, because the alternative — writing
+/// out every program a project might ever want — is the kind of list people abandon halfway and
+/// then widen by accident. It is deliberately the only entry permitted when it is present: an
+/// `allow` reading `["*", "git"]` looks narrower than it is.
+///
+/// Everything except the program-name check still applies in this mode: terminal control
+/// characters are still refused, the program must still be a bare name resolved from the pane's
+/// `PATH`, wrapper prefixes must still be declared, and every `deny_*` rule still bites.
+pub const ALLOW_ANY_PROGRAM: &str = "*";
+
+/// Default ceiling on panes in the command workspace before a NEW tab is refused.
+///
+/// Every agent that ever runs a command leaves a tab behind and nothing closes it, so without a
+/// ceiling the workspace grows for as long as agents are coined. The number is not arbitrary:
+/// measured on devbig014 2026-08-10, a session with 260 panes drove the Herdr server to >1000% CPU
+/// with every control call timing out. 32 keeps an eightfold margin below that while being far
+/// more tabs than one project's agents legitimately need, and the cap is per workspace, so several
+/// projects on one server each want headroom of their own.
+pub const DEFAULT_MAX_PANES: u64 = 32;
+
+/// Largest accepted `max_panes`. A shared finite bound keeps the two implementations identical.
+pub const MAX_PANE_CAP: u64 = 1_000_000;
+
 /// Largest command/readiness timeout accepted from configuration or the CLI.
 ///
 /// This deliberately stays far below platform monotonic-clock limits so a finite timeout cannot
@@ -48,6 +73,11 @@ pub struct Config {
     pub timeout_seconds: f64,
     /// Days of per-run spool output to retain, pruned when a new run is written.
     pub retention_days: u64,
+    /// Ceiling on panes in `workspace` before a NEW tab is refused; `0` disables the cap.
+    ///
+    /// Checked only when a tab has to be created, so an agent that already has its tab is never
+    /// locked out of it. A cap that can break work in progress is a cap that gets switched off.
+    pub max_panes: u64,
     /// Maximum seconds to wait for a pane to become ready.
     pub ready_timeout_seconds: f64,
     /// Readiness policy: `both` or `process`.
@@ -64,6 +94,14 @@ pub struct Config {
     pub source_path: Option<String>,
     /// Absolute project root used to resolve relative paths.
     pub project_root: String,
+}
+
+impl Config {
+    /// Report whether `allow` has been set to the [`ALLOW_ANY_PROGRAM`] wildcard.
+    #[must_use]
+    pub fn allows_any_program(&self) -> bool {
+        self.allow.iter().any(|entry| entry == ALLOW_ANY_PROGRAM)
+    }
 }
 
 impl Default for Config {
@@ -128,6 +166,7 @@ impl Default for Config {
             spool_dir: ".herdr-run".to_owned(),
             timeout_seconds: 900.0,
             retention_days: crate::retention::RETENTION_DAYS,
+            max_panes: DEFAULT_MAX_PANES,
             ready_timeout_seconds: 0.0,
             readiness: "both".to_owned(),
             prompt_tail: None,
@@ -429,6 +468,10 @@ pub fn parse_config(
         config.retention_days =
             require_nonnegative_integer(value, &format!("{what}.retention_days"))?;
     }
+    if let Some(value) = mapping.get("max_panes") {
+        config.max_panes =
+            require_bounded_count(value, &format!("{what}.max_panes"), MAX_PANE_CAP)?;
+    }
     if let Some(value) = mapping.get("ready_timeout_seconds") {
         config.ready_timeout_seconds =
             require_number(value, &format!("{what}.ready_timeout_seconds"))?;
@@ -455,6 +498,11 @@ pub fn parse_config(
             "{what}.allow: refusing an EMPTY allowlist — no command could ever run"
         )));
     }
+    if config.allows_any_program() && config.allow.len() > 1 {
+        return Err(HerdrRunError::config(format!(
+            "{what}.allow: {ALLOW_ANY_PROGRAM:?} already admits every program, so it must be the only entry; listing programs beside it makes the policy look narrower than it is"
+        )));
+    }
     if config.allow.iter().any(|program| program == "cargo")
         && !config.allow_subcommand.contains_key("cargo")
     {
@@ -465,34 +513,41 @@ pub fn parse_config(
     Ok(config)
 }
 
+/// Every configuration key the parser accepts.
+///
+/// Public because it is also the definition of "every knob", which the generated
+/// `.herdr-run.yaml` has to cover for the user guide to be able to point at that file instead of
+/// restating it.
+pub const KNOWN_KEYS: [&str; 20] = [
+    "workspace",
+    "tab_name",
+    "cwd",
+    "allow",
+    "prefixes",
+    "deny_global",
+    "deny_subcommand",
+    "deny_anywhere",
+    "allow_subcommand",
+    "value_options",
+    "spool_dir",
+    "timeout_seconds",
+    "retention_days",
+    "max_panes",
+    "ready_timeout_seconds",
+    "readiness",
+    "prompt_tail",
+    "shells",
+    "broker",
+    "probe_remote",
+];
+
 fn reject_unknown_keys(mapping: &Map<String, Value>, what: &str) -> Result<()> {
-    const KNOWN: [&str; 19] = [
-        "workspace",
-        "tab_name",
-        "cwd",
-        "allow",
-        "prefixes",
-        "deny_global",
-        "deny_subcommand",
-        "deny_anywhere",
-        "allow_subcommand",
-        "value_options",
-        "spool_dir",
-        "timeout_seconds",
-        "retention_days",
-        "ready_timeout_seconds",
-        "readiness",
-        "prompt_tail",
-        "shells",
-        "broker",
-        "probe_remote",
-    ];
     if mapping.keys().any(|key| contains_terminal_control(key)) {
         return Err(HerdrRunError::config(format!(
             "{what}: control characters are not allowed in keys"
         )));
     }
-    let known: BTreeSet<&str> = KNOWN.iter().copied().collect();
+    let known: BTreeSet<&str> = KNOWN_KEYS.iter().copied().collect();
     let mut unknown: Vec<&str> = mapping
         .keys()
         .map(String::as_str)
@@ -643,6 +698,21 @@ fn require_nonnegative_integer(value: &Value, what: &str) -> Result<u64> {
     Ok(number)
 }
 
+fn require_bounded_count(value: &Value, what: &str, limit: u64) -> Result<u64> {
+    let number = value.as_u64().ok_or_else(|| {
+        HerdrRunError::config(format!(
+            "{what}: must be a non-negative integer, got {}",
+            value_type(value)
+        ))
+    })?;
+    if number > limit {
+        return Err(HerdrRunError::config(format!(
+            "{what}: must not exceed {limit}"
+        )));
+    }
+    Ok(number)
+}
+
 fn require_nonempty(value: &str, what: &str) -> Result<()> {
     if value.is_empty() {
         Err(HerdrRunError::config(format!(
@@ -764,8 +834,93 @@ mod tests {
         assert_eq!(config.prefixes, strings(&["with-proxy"]));
         assert_eq!(config.timeout_seconds, 900.0);
         assert_eq!(config.retention_days, 4);
+        // Named literally rather than compared against DEFAULT_MAX_PANES: a test that reads the
+        // production constant would agree with any value the constant ever takes, including a
+        // typo, and so would pin nothing at all.
+        assert_eq!(config.max_panes, 32);
         assert_eq!(config.readiness, "both");
         assert_eq!(config.broker, "direct");
+    }
+
+    /// Every ``  `key` (value by default)  `` the shipped guide states in prose.
+    fn prose_defaults(guide: &str) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        for (end, _) in guide.match_indices(" by default)") {
+            let head = &guide[..end];
+            let Some(open) = head.rfind('(') else {
+                continue;
+            };
+            let value = &head[open + 1..];
+            if value.is_empty() || value.contains(')') {
+                continue;
+            }
+            let before = head[..open].trim_end();
+            let Some(stripped) = before.strip_suffix('`') else {
+                continue;
+            };
+            let Some(tick) = stripped.rfind('`') else {
+                continue;
+            };
+            let key = &stripped[tick + 1..];
+            if key.is_empty()
+                || !key
+                    .chars()
+                    .all(|character| character.is_ascii_lowercase() || character == '_')
+            {
+                continue;
+            }
+            found.push((key.to_owned(), value.to_owned()));
+        }
+        found
+    }
+
+    /// The guide restates two defaults in prose; those sentences must say what the code does.
+    ///
+    /// `herdr-run init` exists so the guide can point at a generated file rather than list the
+    /// knobs, and it does that everywhere except the two sentences explaining why retention and
+    /// the pane cap exist. Those name the number, which is the same duplicate-free-to-drift one
+    /// layer up. As with `max_panes` above, the number is written LITERALLY here and the constant
+    /// is READ from the defaults, so changing either one alone goes red.
+    #[test]
+    fn user_guide_prose_defaults_are_the_built_in_defaults() {
+        let expected: &[(&str, &str, u64)] =
+            &[("retention_days", "four", 4), ("max_panes", "32", 32)];
+        let config = Config::default();
+        for (key, _spelling, number) in expected {
+            let actual = match *key {
+                "retention_days" => config.retention_days,
+                "max_panes" => config.max_panes,
+                other => panic!("nothing reads the default for {other}"),
+            };
+            assert_eq!(
+                actual, *number,
+                "the built-in {key} is not what the guide says"
+            );
+        }
+
+        let found = prose_defaults(crate::USER_GUIDE);
+        assert!(
+            !found.is_empty(),
+            "the user guide no longer restates any default in prose; drop the entries here too"
+        );
+        for (key, spelling) in &found {
+            let pinned = expected
+                .iter()
+                .find(|(name, _, _)| name == key)
+                .unwrap_or_else(|| {
+                    panic!("the guide restates a default for '{key}' that nothing pins")
+                });
+            assert_eq!(
+                spelling, pinned.1,
+                "the user guide says {key} defaults to '{spelling}'"
+            );
+        }
+        for (key, _spelling, _number) in expected {
+            assert!(
+                found.iter().any(|(name, _)| name == key),
+                "a pinned prose default is no longer in the shipped guide: {key}"
+            );
+        }
     }
 
     #[test]
@@ -817,6 +972,30 @@ mod tests {
                 .expect_err("malformed config must fail");
             assert_eq!(error.exit_code(), crate::error::EXIT_CONFIG);
         }
+    }
+
+    #[test]
+    fn the_allow_wildcard_must_stand_alone() {
+        let error = parse_config(
+            &serde_json::json!({"allow": ["*", "git"]}),
+            Some("x.yaml".into()),
+            "/tmp".into(),
+        )
+        .expect_err("a wildcard mixed with named programs must fail");
+        assert_eq!(error.exit_code(), crate::error::EXIT_CONFIG);
+        assert!(
+            error.message().contains("must be the only entry"),
+            "{error}"
+        );
+
+        let wildcard = parse_config(
+            &serde_json::json!({"allow": ["*"]}),
+            Some("x.yaml".into()),
+            "/tmp".into(),
+        )
+        .expect("a lone wildcard is a valid allowlist");
+        assert!(wildcard.allows_any_program());
+        assert!(!Config::default().allows_any_program());
     }
 
     #[test]

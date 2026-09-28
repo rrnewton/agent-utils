@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from safe_ci_dag_runner import reservation as res
+from dagrun import reservation as res
 
 
 @pytest.fixture

@@ -1,1 +1,0 @@
-../../common/docs/safe-ci-dag-runner/rendered/python/USER_GUIDE.md

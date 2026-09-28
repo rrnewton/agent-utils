@@ -23,7 +23,11 @@ from herdr_run.retention import MAX_RETENTION_DAYS
 from herdr_run.yamlcore import core_load
 
 __all__ = [
+    "ALLOW_ANY_PROGRAM",
     "CONFIG_FILENAMES",
+    "DEFAULT_MAX_PANES",
+    "KNOWN_KEYS",
+    "MAX_PANE_CAP",
     "MAX_RETENTION_DAYS",
     "MAX_TIMEOUT_SECONDS",
     "Config",
@@ -33,6 +37,35 @@ __all__ = [
 
 #: Accepted config basenames, in search order, looked up from the working directory upward.
 CONFIG_FILENAMES: tuple[str, ...] = (".herdr-run.yaml", ".herdr-run.yml")
+
+#: The single ``allow`` entry that turns the allowlist off: any bare program name is admitted.
+#:
+#: This is a named mode rather than something to be worked out, because the alternative -- writing
+#: out every program a project might ever want -- is the kind of list people abandon halfway and
+#: then widen by accident. It is deliberately the only entry permitted when it is present: an
+#: ``allow`` reading ``["*", "git"]`` looks narrower than it is.
+#:
+#: Everything except the program-name check still applies in this mode: terminal control characters
+#: are still refused, the program must still be a bare name resolved from the pane's ``PATH``,
+#: wrapper prefixes must still be declared, and every ``deny_*`` rule still bites.
+ALLOW_ANY_PROGRAM = "*"
+
+#: Default ceiling on how many panes the command workspace may hold before herdr-run refuses to
+#: open ANOTHER tab. Every agent that ever runs a command leaves a tab behind and nothing closes it,
+#: so without a ceiling the workspace grows for as long as agents are coined. The number is not
+#: arbitrary: measured on devbig014 2026-08-10, a session with 260 panes drove the Herdr server to
+#: >1000% CPU with every control call timing out (see ``client.SERVER_WORKER_THREADS``, which is the
+#: in-tree mitigation for that same convoy). 32 keeps an eightfold margin below that and is far more
+#: tabs than one project's agents legitimately need. Be honest about what the margin is worth,
+#: though: the measurement is SERVER-scoped and this cap is WORKSPACE-scoped, so several projects
+#: each configured with their own ``workspace`` and each sitting just under the cap reproduce the
+#: measured condition without any of them breaching it. The cap bounds one project's contribution
+#: to the leak, not the host's total, which is the other reason not to set it generously.
+DEFAULT_MAX_PANES = 32
+
+#: Largest accepted ``max_panes``. A shared finite bound keeps the two implementations identical and
+#: keeps an absurd integer out of the comparison.
+MAX_PANE_CAP = 1_000_000
 
 #: Largest command/readiness timeout accepted from either configuration or the CLI. Keeping this
 #: comfortably below platform ``Instant``/``time.monotonic`` limits means a finite value can never
@@ -162,6 +195,11 @@ class Config:
     #: Days of run spools to keep. Pruned when a new run is written; see :mod:`herdr_run.retention`.
     retention_days: int = 4
 
+    #: Ceiling on panes in :attr:`workspace` before a NEW tab is refused. ``0`` disables the cap.
+    #: Checked only when a tab has to be created: an agent that already has its tab is never locked
+    #: out of it, because a cap that could break work in progress would be turned off immediately.
+    max_panes: int = DEFAULT_MAX_PANES
+
     #: Seconds to wait for the pane to become idle before giving up with :class:`PaneBusy`.
     ready_timeout_seconds: float = 0.0
 
@@ -176,8 +214,8 @@ class Config:
 
     shells: tuple[str, ...] = _DEFAULT_SHELLS
 
-    #: Remote used by the ``doctor`` self-test. It only needs to be a reachable repository that
-    #: the sandbox blocks and the pane does not.
+    #: Remote used by the ``net-doctor`` smoke test. It only needs to be a reachable repository
+    #: that the caller's own network policy blocks and the pane's does not.
     probe_remote: str = "https://github.com/git/git"
 
     #: How herdr control calls reach the server. ``direct`` uses the server's Unix socket;
@@ -190,6 +228,38 @@ class Config:
 
     #: Project root: the directory holding the config file, else the starting directory.
     project_root: str = "."
+
+    def allows_any_program(self) -> bool:
+        """Report whether ``allow`` has been set to the :data:`ALLOW_ANY_PROGRAM` wildcard."""
+        return ALLOW_ANY_PROGRAM in self.allow
+
+
+#: Every configuration key the parser accepts.
+#:
+#: Public because it is also the definition of "every knob", which the generated ``.herdr-run.yaml``
+#: has to cover for the user guide to be able to point at that file instead of restating it.
+KNOWN_KEYS: tuple[str, ...] = (
+    "workspace",
+    "tab_name",
+    "cwd",
+    "allow",
+    "prefixes",
+    "deny_global",
+    "deny_subcommand",
+    "deny_anywhere",
+    "allow_subcommand",
+    "value_options",
+    "spool_dir",
+    "timeout_seconds",
+    "retention_days",
+    "max_panes",
+    "ready_timeout_seconds",
+    "readiness",
+    "prompt_tail",
+    "shells",
+    "broker",
+    "probe_remote",
+)
 
 
 def find_config_file(start: str) -> str | None:
@@ -253,6 +323,16 @@ def _nonnegative_integer(raw: object, what: str) -> int:
         )
     if raw > MAX_RETENTION_DAYS:
         raise ConfigError(f"{what}: must not exceed {MAX_RETENTION_DAYS} days")
+    return raw
+
+
+def _bounded_count(raw: object, what: str, limit: int) -> int:
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        raise ConfigError(
+            f"{what}: must be a non-negative integer, got {type(raw).__name__}"
+        )
+    if raw > limit:
+        raise ConfigError(f"{what}: must not exceed {limit}")
     return raw
 
 
@@ -321,27 +401,7 @@ def _parse_config(
     what = source_path or "<config>"
     mapping = as_mapping(document, what)
 
-    known = {
-        "workspace",
-        "tab_name",
-        "cwd",
-        "allow",
-        "prefixes",
-        "deny_global",
-        "deny_subcommand",
-        "allow_subcommand",
-        "deny_anywhere",
-        "value_options",
-        "spool_dir",
-        "timeout_seconds",
-        "retention_days",
-        "ready_timeout_seconds",
-        "readiness",
-        "prompt_tail",
-        "shells",
-        "broker",
-        "probe_remote",
-    }
+    known = set(KNOWN_KEYS)
     unknown = sorted(set(mapping) - known)
     if unknown:
         # Reject rather than ignore: a typo'd `allowlist:` key silently falling back to the default
@@ -417,6 +477,11 @@ def _parse_config(
                 mapping["retention_days"], f"{what}.retention_days"
             ),
         )
+    if "max_panes" in mapping:
+        config = replace(
+            config,
+            max_panes=_bounded_count(mapping["max_panes"], f"{what}.max_panes", MAX_PANE_CAP),
+        )
     if "ready_timeout_seconds" in mapping:
         config = replace(
             config,
@@ -456,6 +521,11 @@ def _parse_config(
     if not config.allow:
         raise ConfigError(
             f"{what}.allow: refusing an EMPTY allowlist — no command could ever run"
+        )
+    if config.allows_any_program() and len(config.allow) > 1:
+        raise ConfigError(
+            f'{what}.allow: "{ALLOW_ANY_PROGRAM}" already admits every program, so it must be the '
+            "only entry; listing programs beside it makes the policy look narrower than it is"
         )
     if "cargo" in config.allow and "cargo" not in config.allow_subcommand:
         raise ConfigError(

@@ -24,8 +24,8 @@ from pathlib import Path
 
 import pytest
 
-from safe_ci_dag_runner import cpuset_allocator as ca
-from safe_ci_dag_runner import reservation
+from dagrun import cpuset_allocator as ca
+from dagrun import reservation
 
 
 def _systemd() -> bool:

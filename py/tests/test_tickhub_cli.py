@@ -139,6 +139,55 @@ def test_tick_flush_persists(tmp_path: Path) -> None:
     assert "persisted" in err
 
 
+def test_tick_report_pending_is_compatible_with_flush_and_cadence(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path,
+        "quiet.yaml",
+        """
+reminders:
+  - name: quiet
+    cadence_secs: 3600
+    gate: {cmd: "true", when: failure}
+    emit: {kind: action, skill: warn, title: problem}
+""",
+    )
+    fired = tmp_path / "fired"
+    rc, out, err = _capture(
+        [
+            "tick",
+            "--config",
+            cfg,
+            "--now",
+            "1000",
+            "--fired-state",
+            str(fired),
+            "--flush",
+            "--report-pending",
+            "--no-header",
+        ]
+    )
+    assert rc == 0
+    assert "CLEAN: quiet ran and found nothing to report" in out
+    assert "quiet=1000" in fired.read_text(encoding="utf-8")
+    assert "persisted" in err
+
+    rc, out, _ = _capture(
+        [
+            "tick",
+            "--config",
+            cfg,
+            "--now",
+            "1001",
+            "--fired-state",
+            str(fired),
+            "--report-pending",
+            "--no-header",
+        ]
+    )
+    assert rc == 0
+    assert "CLEAN: quiet" not in out, "reporting must not bypass cadence"
+
+
 def test_tick_flush_failure_is_a_controlled_usage_error(tmp_path: Path) -> None:
     cfg = _write(tmp_path, "c.yaml", _CONFIG)
     fired = tmp_path / "fired-dir"

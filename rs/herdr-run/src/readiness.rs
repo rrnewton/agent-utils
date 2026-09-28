@@ -439,6 +439,9 @@ export PS1="\u@\h:\w\$ " # selected
         fn ensure_server(&self) -> Result<bool> {
             unreachable!()
         }
+        fn server_running(&self) -> bool {
+            unreachable!()
+        }
         fn workspace_id_for_label(&self, _label: &str) -> Result<Option<String>> {
             unreachable!()
         }

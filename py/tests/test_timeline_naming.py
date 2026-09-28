@@ -9,7 +9,7 @@ import sys
 
 import pytest
 
-from agent_team_timeline.naming import (
+from wrkviz.naming import (
     PROMPT_VERSION,
     AgentNameError,
     AgentNameJob,
@@ -20,7 +20,7 @@ from agent_team_timeline.naming import (
     build_agent_name_prompt,
     name_agents,
 )
-from agent_team_timeline.token_usage import TokenUsage
+from wrkviz.token_usage import TokenUsage
 
 
 def _job(
@@ -39,13 +39,13 @@ def _job(
         "The coordinator called this the CPU budget overlap audit before spawning the child."
     ),
     work_summary: str = (
-        "The completed audit separated Hermit CPU-second budgets from Reverie wall-time "
+        "The completed audit separated Widget CPU-second budgets from Reverie wall-time "
         "throughput ratchets and verified the exact PR heads."
     ),
 ) -> AgentNameJob:
     return AgentNameJob(
         key=key,
-        team_slug="codex-hermit",
+        team_slug="codex-widget",
         thread_id=thread_id,
         start_ms=1_800_000_000_000,
         end_ms=1_800_000_060_000,
@@ -340,7 +340,7 @@ def test_heuristic_uses_only_nested_official_leaf(tmp_path: Path) -> None:
     assert "budget_overlap_audit" in result.rationale
     assert "transcript auditor" not in result.short_name.lower()
     assert result.lifetime_summary is not None
-    assert "separated Hermit CPU-second budgets" in result.lifetime_summary
+    assert "separated Widget CPU-second budgets" in result.lifetime_summary
 
 
 def test_pre_lifetime_cache_version_is_regenerated_once(tmp_path: Path) -> None:
@@ -443,7 +443,7 @@ for required in (
 assert 'model_reasoning_effort="high"' in args
 expected_service_tier = os.environ["FAKE_CODEX_SERVICE_TIER"]
 assert f'service_tier="{expected_service_tier}"' in args
-assert Path.cwd().name.startswith("agent-team-timeline-name-")
+assert Path.cwd().name.startswith("wrkviz-name-")
 repository_check = subprocess.run(
     ["git", "rev-parse", "--is-inside-work-tree"],
     text=True,

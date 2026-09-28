@@ -6,6 +6,24 @@ const path = require("path");
 const { performance } = require("perf_hooks");
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+
+//: Where to sit before measuring. The default -- `fit` -- is what the page opens at: the whole
+//: archive in one screen. The other two exist because a timeline's cost is not one number: the
+//: renderer chooses a level of detail from milliseconds-per-pixel, so the SAME archive draws a
+//: handful of aggregate bins fitted and thousands of individual phases at a day's width. A
+//: benchmark that only ever measures one of those measures one third of the tool.
+//:
+//: The spans are the ones a reader actually navigates to, not round numbers: a week and a day.
+const ZOOM_TARGETS = Object.freeze({
+  fit: null,
+  week: 7 * 24 * 60 * 60 * 1000,
+  day: 24 * 60 * 60 * 1000,
+  // An hour, and it is here because a day is NOT enough to reach the expensive level. The
+  // `detail` threshold is 60s per pixel, and a day across a normal chart width is about 61 --
+  // so a day-wide view lands in `lifetime` by a hair, and a run that stopped at `day` would
+  // report the tool's performance without ever having drawn an individual phase.
+  hour: 60 * 60 * 1000
+});
 const WHEEL_SEQUENCE = Object.freeze([
   { name: "zoom-in-1", kind: "zoom", deltaX: 0, deltaY: -360 },
   { name: "zoom-in-2", kind: "zoom", deltaX: 0, deltaY: -360 },
@@ -23,13 +41,17 @@ const WHEEL_SEQUENCE = Object.freeze([
 
 const HELP = `Usage: node benchmark-site.cjs [options] <url>
 
-Benchmark a served agent-team-timeline site with a deterministic Chromium run.
+Benchmark a served wrkviz site with a deterministic Chromium run.
 The complete report is printed as JSON; --json also writes it to disk.
 
 Options:
   --url <url>          Timeline URL (alternative to the positional URL)
   --json <path>        Also write the JSON report to this path
   --timeout-ms <ms>    Load/interaction timeout (default: ${DEFAULT_TIMEOUT_MS})
+  --zoom <level>       Where to sit before measuring: fit (whole archive, the
+                       default), week, or day. The renderer picks its level of
+                       detail from milliseconds-per-pixel, so these measure
+                       genuinely different rendering work on the same archive.
   --headed             Show Chromium while measuring
   -h, --help           Show this help
 
@@ -43,6 +65,7 @@ function parseArguments(argv) {
     jsonPath: "",
     timeoutMs: DEFAULT_TIMEOUT_MS,
     headed: false,
+    zoom: "fit",
     help: false
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -51,6 +74,18 @@ function parseArguments(argv) {
       options.help = true;
     } else if (argument === "--headed") {
       options.headed = true;
+    } else if (argument === "--zoom") {
+      const value = argv[index + 1];
+      if (!value) {
+        throw new Error("--zoom requires a value");
+      }
+      index += 1;
+      if (!Object.prototype.hasOwnProperty.call(ZOOM_TARGETS, value)) {
+        throw new Error(
+          "--zoom must be one of " + Object.keys(ZOOM_TARGETS).join(", ") + "; got " + value
+        );
+      }
+      options.zoom = value;
     } else if (argument === "--url" || argument === "--json" || argument === "--timeout-ms") {
       const value = argv[index + 1];
       if (!value) {
@@ -180,7 +215,59 @@ async function timelineSnapshot(page) {
   });
 }
 
-async function wheelSample(page, action, index, timeoutMs) {
+async function currentSpanMs(page) {
+  return page.evaluate(function () {
+    const timeline = document.querySelector('[data-testid="timeline"]');
+    const start = Number(timeline && timeline.getAttribute("data-view-start-ms"));
+    const end = Number(timeline && timeline.getAttribute("data-view-end-ms"));
+    return Number.isFinite(start) && Number.isFinite(end) ? end - start : NaN;
+  });
+}
+
+
+async function zoomToSpan(page, targetSpanMs, timeoutMs) {
+  // Zoom in until the visible span is at or below `targetSpanMs`.
+  //
+  // Driven by the same wheel events a reader uses, and verified against the view range the page
+  // publishes, rather than by reaching into the app for a setter. That keeps this honest in the way
+  // that matters for a benchmark: the cost being measured includes whatever the real zoom path
+  // costs, and the harness cannot accidentally put the page into a state a user could not reach.
+  //
+  // The seek steps are NOT part of the measurement -- they run before sampling begins -- so their
+  // cost does not contaminate the numbers for the level being measured.
+  const MAX_STEPS = 60;
+  const before = await currentSpanMs(page);
+  if (!Number.isFinite(before)) {
+    throw new Error("the timeline published no view range to zoom from");
+  }
+  let span = before;
+  let steps = 0;
+  while (span > targetSpanMs && steps < MAX_STEPS) {
+    await wheelSample(page, { name: "seek", kind: "zoom", deltaX: 0, deltaY: -360 }, timeoutMs);
+    const next = await currentSpanMs(page);
+    if (!Number.isFinite(next) || next >= span) {
+      // The view stopped narrowing: either a floor was reached or the wheel stopped being
+      // honoured. Either way, continuing would spin for MAX_STEPS learning nothing, and
+      // reporting the span actually reached is more useful than failing.
+      break;
+    }
+    span = next;
+    steps += 1;
+  }
+  return { requested_span_ms: targetSpanMs, reached_span_ms: span, initial_span_ms: before, steps: steps };
+}
+
+
+//: Every wheel sample gets its own key, and the page's sample array is never cleared, so the key
+//: has to be unique for the LIFE of the run rather than for the phase it is in. Numbering each
+//: phase from zero was a silent corruption: `zoomToSpan` seeks with keys 0..n before measuring
+//: begins, so the measured samples 0..11 found the SEEK samples already in the array and returned
+//: instantly with their latencies. Every level that seeks at all -- which is every level but the
+//: fitted one -- reported up to twelve stale numbers taken while the view was somewhere else.
+let wheelSampleSequence = 0;
+
+async function wheelSample(page, action, timeoutMs) {
+  const key = "wheel-" + (wheelSampleSequence += 1);
   const selector = "#time-axis";
   const target = page.locator(selector);
   const box = await target.boundingBox();
@@ -207,19 +294,19 @@ async function wheelSample(page, action, index, timeoutMs) {
           inputToRaf = null;
         }
         window.__agentTimelineBenchmarkSamples.push({
-          index: settings.index,
+          key: settings.key,
           input_to_raf_ms: inputToRaf,
           handler_to_raf_ms: frameAt - handlerAt
         });
       });
     }, { once: true, passive: true });
-  }, { selector: selector, index: index });
+  }, { selector: selector, key: key });
 
   await page.mouse.wheel(action.deltaX, action.deltaY);
-  const sampleHandle = await page.waitForFunction(function (sampleIndex) {
+  const sampleHandle = await page.waitForFunction(function (sampleKey) {
     const samples = window.__agentTimelineBenchmarkSamples || [];
-    return samples.find(function (sample) { return sample.index === sampleIndex; }) || false;
-  }, index, { timeout: Math.min(timeoutMs, 5_000) });
+    return samples.find(function (sample) { return sample.key === sampleKey; }) || false;
+  }, key, { timeout: Math.min(timeoutMs, 5_000) });
   const sample = await sampleHandle.jsonValue();
 
   let renderChanged = false;
@@ -327,7 +414,7 @@ async function benchmarkSite(options) {
   let browser = null;
   const base = {
     schema_version: 1,
-    benchmark: "agent-team-timeline-real-site",
+    benchmark: "wrkviz-real-site",
     generated_at: new Date().toISOString(),
     url: options.url,
     viewport: { width: 1440, height: 900 },
@@ -401,6 +488,19 @@ async function benchmarkSite(options) {
       // A usable timeline is sufficient; background traffic is diagnostic only.
     }
 
+    // Seek to the requested level BEFORE the initial snapshot, so `timeline.initial` describes
+    // the state actually being measured rather than the fitted view the page opened at.
+    const zoomTargetMs = ZOOM_TARGETS[options.zoom];
+    const fittedSpanMs = await currentSpanMs(page);
+    const zoomSeek = zoomTargetMs === null
+      ? {
+          requested_span_ms: null,
+          reached_span_ms: fittedSpanMs,
+          initial_span_ms: fittedSpanMs,
+          steps: 0
+        }
+      : await zoomToSpan(page, zoomTargetMs, options.timeoutMs);
+
     const initial = await timelineSnapshot(page);
     const initialWebPerformance = await browserPerformance(page);
     const initialNetwork = Object.assign(
@@ -413,7 +513,6 @@ async function benchmarkSite(options) {
       samples.push(await wheelSample(
         page,
         WHEEL_SEQUENCE[index],
-        index,
         options.timeoutMs
       ));
     }
@@ -425,6 +524,7 @@ async function benchmarkSite(options) {
     const handlerLatencies = samples.map(function (sample) { return sample.handler_to_raf_ms; });
     const report = Object.assign({}, base, {
       success: pageErrors.length === 0,
+      zoom: Object.assign({ level: options.zoom }, zoomSeek),
       timings: {
         navigation_domcontentloaded_ms: rounded(navigationMs),
         usable_ms: rounded(usableMs),

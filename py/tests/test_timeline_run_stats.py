@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-import agent_team_timeline.run_stats as run_stats
+import wrkviz.run_stats as run_stats
 import pytest
 
 
@@ -44,7 +44,7 @@ def _run(
         "completed_at": completed_at,
         "status": status,
         "team_slug": team_slug,
-        "command": ["agent-team-timeline", "summarize", "--team", team_slug],
+        "command": ["wrkviz", "summarize", "--team", team_slug],
         "ingest": {
             "sources": 2,
             "source_bytes": 4096,

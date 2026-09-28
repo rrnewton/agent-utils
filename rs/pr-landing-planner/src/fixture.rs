@@ -8,7 +8,10 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::host::VcsHost;
-use crate::model::{edge_key, CheckRun, RawPr, DEFAULT_BASE};
+use crate::model::{
+    edge_key, CheckRun, RawPr, ReviewEvidenceEvent, ReviewEvidenceSnapshot, DEFAULT_BASE,
+    NATIVE_REVIEW_STATES,
+};
 
 #[derive(Clone, Debug)]
 struct FakePr {
@@ -134,6 +137,47 @@ fn opt_string(obj: &Map<String, Value>, key: &str, default: &str) -> String {
     }
 }
 
+fn required_review_string(
+    obj: &Map<String, Value>,
+    key: &str,
+    where_: &str,
+    allow_empty: bool,
+) -> Result<String, String> {
+    let value = obj
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{where_}: field {key:?} must be a string"))?;
+    if !allow_empty && value.is_empty() {
+        return Err(format!("{where_}: field {key:?} must be non-empty"));
+    }
+    Ok(value.to_owned())
+}
+
+fn optional_review_author(
+    obj: &Map<String, Value>,
+    key: &str,
+    where_: &str,
+) -> Result<String, String> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(String::new()),
+        Some(Value::String(value)) => Ok(value.trim().to_owned()),
+        Some(_) => Err(format!("{where_}: field {key:?} must be a string or null")),
+    }
+}
+
+fn required_nullable_review_string(
+    obj: &Map<String, Value>,
+    key: &str,
+    where_: &str,
+) -> Result<String, String> {
+    match obj.get(key) {
+        None => Err(format!("{where_}: field {key:?} is required")),
+        Some(Value::Null) => Ok(String::new()),
+        Some(Value::String(value)) => Ok(value.clone()),
+        Some(_) => Err(format!("{where_}: field {key:?} must be a string or null")),
+    }
+}
+
 fn required_integer(
     obj: &Map<String, Value>,
     key: &str,
@@ -221,6 +265,77 @@ fn checks(value: Option<&Value>, where_: &str) -> Result<Vec<CheckRun>, String> 
         .collect()
 }
 
+fn review_snapshot(
+    obj: &Map<String, Value>,
+    where_: &str,
+    default_head: &str,
+    default_decision: &str,
+) -> Result<Option<ReviewEvidenceSnapshot>, String> {
+    let Some(raw_events) = obj.get("review_events") else {
+        return Ok(None);
+    };
+    let entries = raw_events
+        .as_array()
+        .ok_or_else(|| format!("{where_}: 'review_events' must be a list"))?;
+    let mut events = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let role = format!("{where_}.review_events[{index}]");
+        let event = object(entry, &role)?;
+        let kind = required_review_string(&event, "kind", &role, false)?;
+        let identity = required_review_string(&event, "identity", &role, false)?;
+        let author = optional_review_author(&event, "author", &role)?;
+        let state = required_review_string(&event, "state", &role, false)?;
+        if kind == "review" && !NATIVE_REVIEW_STATES.contains(&state.as_str()) {
+            return Err(format!("{role}: review has unknown state {state:?}"));
+        }
+        let head_sha = required_review_string(&event, "head_sha", &role, true)?;
+        if kind == "review" && head_sha.is_empty() {
+            return Err(format!("{role}: review requires non-empty head_sha"));
+        }
+        let created_at = required_review_string(&event, "created_at", &role, false)?;
+        let updated_at = required_review_string(&event, "updated_at", &role, false)?;
+        let last_edited_at = required_nullable_review_string(&event, "last_edited_at", &role)?;
+        let body = required_review_string(&event, "body", &role, true)?;
+        let retirement_actor_permission = if event.contains_key("retirement_actor_permission") {
+            required_review_string(&event, "retirement_actor_permission", &role, true)?
+        } else {
+            String::new()
+        };
+        events.push(ReviewEvidenceEvent {
+            kind,
+            identity,
+            author,
+            state,
+            head_sha,
+            created_at,
+            updated_at,
+            last_edited_at,
+            body,
+            retirement_actor_permission,
+        });
+    }
+    let head_sha = if obj.contains_key("review_snapshot_head_sha") {
+        required_review_string(obj, "review_snapshot_head_sha", where_, false)?
+    } else {
+        default_head.to_owned()
+    };
+    let review_decision = match obj.get("review_snapshot_review_decision") {
+        None => default_decision.to_owned(),
+        Some(Value::Null) => String::new(),
+        Some(Value::String(value)) => value.clone(),
+        Some(_) => {
+            return Err(format!(
+                "{where_}: field 'review_snapshot_review_decision' must be a string or null"
+            ))
+        }
+    };
+    Ok(Some(ReviewEvidenceSnapshot {
+        head_sha,
+        review_decision,
+        events,
+    }))
+}
+
 fn fake_pr(value: &Value, where_: &str, default_base: &str) -> Result<FakePr, String> {
     let obj = object(value, where_)?;
     let number = required_integer(&obj, "number", where_, true)?;
@@ -242,6 +357,7 @@ fn fake_pr(value: &Value, where_: &str, default_base: &str) -> Result<FakePr, St
             ));
         }
     }
+    let review_decision = opt_string(&obj, "review_decision", "");
     Ok(FakePr {
         raw: RawPr {
             number,
@@ -255,13 +371,23 @@ fn fake_pr(value: &Value, where_: &str, default_base: &str) -> Result<FakePr, St
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             mergeable: opt_string(&obj, "mergeable", ""),
-            review_decision: opt_string(&obj, "review_decision", ""),
+            review_decision: review_decision.clone(),
+            review_evidence_unavailable: match obj.get("review_evidence_unavailable") {
+                None => false,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => {
+                    return Err(format!(
+                        "{where_}: field 'review_evidence_unavailable' must be a boolean"
+                    ))
+                }
+            },
             created_at: opt_string(&obj, "created_at", ""),
             updated_at: opt_string(&obj, "updated_at", ""),
             additions: opt_integer(&obj, "additions", 0, where_, true)?,
             deletions: opt_integer(&obj, "deletions", 0, where_, true)?,
             labels: strings(&obj, "labels"),
             checks: checks(obj.get("checks"), where_)?,
+            review_snapshot: review_snapshot(&obj, where_, &head_sha, &review_decision)?,
             mechanism_symbols: strings(&obj, "mechanism_symbols"),
         },
         fetched_head_sha,
@@ -530,6 +656,7 @@ pub fn load_fixture_text(text: &str, as_yaml: bool) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn parses_yaml_defaults_and_simulates_drift() {
@@ -543,5 +670,21 @@ mod tests {
             .prefetch_refs(&[("refs/pull/7/head".into(), "x".into())])
             .unwrap();
         assert_eq!(fetched["x"], "moved");
+    }
+
+    #[test]
+    fn review_evidence_unavailable_is_a_strict_boolean() {
+        for malformed in [Value::Null, json!(0), json!("true"), json!([]), json!({})] {
+            let fixture = json!({
+                "prs": [{
+                    "number": 7,
+                    "review_evidence_unavailable": malformed
+                }]
+            });
+            let error = FakeHost::from_value(&fixture)
+                .err()
+                .expect("malformed boolean must be rejected");
+            assert!(error.contains("field 'review_evidence_unavailable' must be a boolean"));
+        }
     }
 }

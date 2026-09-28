@@ -1,4 +1,4 @@
-"""Tests for lowering one round onto a safe-ci-dag-runner DagConfig and the workload classifier.
+"""Tests for lowering one round onto a dagrun DagConfig and the workload classifier.
 
 These assert the four hard requirements land on the exact per-step controls the executor enforces:
 each seed becomes one boxed Step whose cpu_timeout / memory.max / cpu.max / wall timeout come from
@@ -8,6 +8,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from dagrun import DagConfig, RunResult
+from parallel_experiment_runner import execute
 from parallel_experiment_runner.model import (
     STATUS_COMMAND_ERROR,
     STATUS_HIT,
@@ -30,7 +34,7 @@ from parallel_experiment_runner.planner import (
 def _spec(**kw: object) -> ExperimentSpec:
     base: dict[str, object] = {
         "name": "s",
-        "command": ("hermit", "run", "--seed", "{seed}", "./demo"),
+        "command": ("widget", "run", "--seed", "{seed}", "./demo"),
     }
     base.update(kw)
     return ExperimentSpec(**base)  # type: ignore[arg-type]
@@ -67,6 +71,40 @@ def test_lowering_maps_every_hard_limit(tmp_path: Path) -> None:
     assert step.hint.hard_mem_max_bytes == 4 * 1024**3  # -> inner memory.max
     assert step.hint.preferred_inner_jobs == 3  # -> inner cpu.max + width core-unit
     assert step.jobs_flag == ""  # never append -j to a complete workload argv
+
+
+def test_execute_maps_workers_and_per_worker_cores_to_independent_limits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, int] = {}
+
+    def fake_run(
+        _dag: DagConfig,
+        *,
+        max_steps: int,
+        max_cpus: int,
+        **_kwargs: object,
+    ) -> RunResult:
+        captured.update(max_steps=max_steps, max_cpus=max_cpus)
+        return RunResult(ok=True, wall_s=0.0)
+
+    monkeypatch.setattr(execute, "run_dag_limited", fake_run)
+    plan = _plan(
+        _spec(worker_limits=WorkerLimits(cpu_cores=3)),
+        (0, 1, 2),
+        tmp_path,
+    )
+    plan = RoundPlan(
+        spec=plan.spec,
+        seeds=plan.seeds,
+        width=2,
+        slice_revision=plan.slice_revision,
+        limiting_dimension=plan.limiting_dimension,
+        log_dir=plan.log_dir,
+        per_worker_estimate=plan.per_worker_estimate,
+    )
+    execute.execute_round(plan, cgroups=None)
+    assert captured == {"max_steps": 2, "max_cpus": 6}
 
 
 def test_lowering_cpu_timeout_unset_becomes_zero(tmp_path: Path) -> None:

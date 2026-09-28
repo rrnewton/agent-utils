@@ -217,6 +217,45 @@ def test_project_can_narrow_allowlist() -> None:
         admit("gh pr list", config)
 
 
+def test_the_allow_wildcard_admits_any_program_and_keeps_every_other_rule() -> None:
+    """The wildcard turns off the PROGRAM-NAME check and nothing else.
+
+    Naming each surviving rule matters more than checking that ``curl`` now runs: the value of an
+    allow-everything mode a project can actually reach for is that it is still not a way to smuggle
+    control characters into a shared pane or to execute a planted binary by path.
+    """
+    config = Config(allow=("*",))
+    for command, program in (
+        ("curl https://example.invalid", "curl"),
+        ("bash -lc true", "bash"),
+        ("rm -rf /x", "rm"),
+    ):
+        assert admit(command, config).program == program
+    assert admit("with-proxy curl https://example.invalid", config).prefix == (
+        "with-proxy",
+    )
+
+    for command, fragment in (
+        ("/bin/curl x", "bare command name"),
+        ("./curl x", "bare command name"),
+        ("curl x\x07", "terminal control U+0007"),
+        ("with-proxy with-proxy curl x", "repeated"),
+        ("git --exec-path=/tmp/evil status", "is denied for git"),
+        ("git push --receive-pack=/tmp/evil origin", "is denied"),
+        ("cargo build --release", "subcommand 'cargo build' is not allowlisted"),
+        ("with-proxy", "no program"),
+    ):
+        with pytest.raises(Refused) as excinfo:
+            admit(command, config)
+        assert fragment in str(excinfo.value), command
+
+    # The wildcard does not reach cargo's own guard: without a positive subcommand list, cargo
+    # stays refused outright rather than inheriting "everything is allowed".
+    no_cargo_list = Config(allow=("*",), allow_subcommand={})
+    with pytest.raises(Refused, match="requires an explicit allow_subcommand entry"):
+        admit("cargo fetch", no_cargo_list)
+
+
 def test_project_can_drop_prefixes() -> None:
     config = Config(prefixes=())
     with pytest.raises(Refused, match="not allowlisted"):
@@ -236,8 +275,8 @@ def test_leading_tilde_is_expanded_so_git_c_works(config: Config) -> None:
     import os
 
     home = os.path.expanduser("~")
-    admission = admit("with-proxy git -C ~/work/dev-hermit/hermit ls-remote origin main", config)
-    assert f"{home}/work/dev-hermit/hermit" in admission.rendered
+    admission = admit("with-proxy git -C ~/work/dev-widget/widget ls-remote origin main", config)
+    assert f"{home}/work/dev-widget/widget" in admission.rendered
     assert "~" not in admission.rendered
 
 

@@ -1,7 +1,7 @@
 """Impure layer: cgroup bring-up, one boxed round, and the calibration-ramp orchestrator.
 
 Containment is NOT reimplemented here — it is the exact two-level cgroup-v2 machinery from
-``safe-ci-dag-runner``, re-branded with an experiment-specific :class:`ScopeNaming` so a sweep's
+``dagrun``, re-branded with an experiment-specific :class:`ScopeNaming` so a sweep's
 scope/slice are named distinctly from a CI run's. That is the whole point: N concurrent seed VMs
 run under the SAME boxing that CI steps do, with real per-worker ``memory.max`` / ``cpu.max`` /
 CPU-second / wall caps and a clean ``cgroup.kill`` on breach.
@@ -16,8 +16,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from safe_ci_dag_runner import CgroupManager, RunResult, StepOutcome, run_dag
-from safe_ci_dag_runner.cgroup import ScopeNaming
+from dagrun import CgroupManager, RunResult, StepOutcome, run_dag_limited
+from dagrun.cgroup import ScopeNaming
 
 from parallel_experiment_runner.calibrate import (
     LiveCapacity,
@@ -52,7 +52,7 @@ from parallel_experiment_runner.profile import (
     profile_identity,
 )
 
-#: The experiment scope's names — distinct from ``safe-ci.slice`` so a sweep and a CI run box
+#: The experiment scope's names — distinct from ``dagrun.slice`` so a sweep and a CI run box
 #: under separate slices/scopes and never share a CPUQuota by accident.
 EXPERIMENT_NAMING = ScopeNaming(
     slice_name="parallel-experiment.slice",
@@ -74,8 +74,8 @@ Emit = Callable[[str], None]
 
 
 def resolve_cgroup_manager(allow_failure: bool) -> tuple[CgroupManager | None, int]:
-    """Establish the two-level cgroup-v2 RESOURCE CONTAINMENT for a sweep (mirrors safe-ci's CLI
-    bring-up).
+    """Establish the two-level cgroup-v2 RESOURCE CONTAINMENT for a sweep (mirrors ``dagrun``'s
+    CLI bring-up).
 
     This is a resource box, not a security sandbox: it defends against a BUG in our own code
     (leak memory, run forever, fork bomb) via cgroup CPU-time / memory / PID caps, and does NOT
@@ -85,7 +85,7 @@ def resolve_cgroup_manager(allow_failure: bool) -> tuple[CgroupManager | None, i
     DEFAULT: an uncontained sweep is the very failure mode this tool exists to prevent, so it
     happens only with an explicit opt-out.
     """
-    from safe_ci_dag_runner import cgroup as cg
+    from dagrun import cgroup as cg
 
     naming = EXPERIMENT_NAMING
     if os.environ.get(naming.env_in_scope) == "1":
@@ -112,14 +112,15 @@ def resolve_cgroup_manager(allow_failure: bool) -> tuple[CgroupManager | None, i
         )
         return None, 3
     # OUTER process (not yet in a scope): re-exec into a fresh transient scope. We do NOT try to
-    # "reap abandoned prior-run scopes" here — reproduction (hermit-ci, 5 abandonment scenarios)
-    # showed abandonment strands NOTHING: a SIGKILLed launcher's direct children die with it, and
-    # install_scope_teardown's SIGTERM/SIGKILL/atexit hook cgroup.kill's the whole scope on the
-    # exits that DO run a handler. The zombie pile-up that motivated this tool was a LIVE hung
-    # `hermit run --strict --verify` (main parked in tokio epoll_wait) holding a PID namespace
-    # open, NOT a leaked appender thread — and a live hang is exactly what the per-worker cpu-time
-    # / wall backstop kills, via a cgroup-subtree cgroup.kill that reclaims the namespace (see
-    # safe_ci_dag_runner.teardown.reap). Containment IS the fix; a next-run reaper is not needed.
+    # "reap abandoned prior-run scopes" here — reproduction (a consuming repository's CI, five
+    # abandonment scenarios) showed abandonment strands NOTHING: a SIGKILLed launcher's direct
+    # children die with it, and install_scope_teardown's SIGTERM/SIGKILL/atexit hook cgroup.kill's
+    # the whole scope on the exits that DO run a handler. The zombie pile-up that motivated this
+    # tool was a LIVE hung `run --strict --verify` of a consuming repository's own tool (main
+    # parked in tokio epoll_wait) holding a PID namespace open, NOT a leaked appender thread — and
+    # a live hang is exactly what the per-worker cpu-time / wall backstop kills, via a
+    # cgroup-subtree cgroup.kill that reclaims the namespace (see
+    # dagrun.teardown.reap). Containment IS the fix; a next-run reaper is not needed.
     if allow_failure:
         print(
             f"{PROG}: warning: resource containment not established (--allow-cgroup-failure); "
@@ -199,7 +200,7 @@ def _classify_outcome(
     row: Mapping[str, object],
     log_path: Path,
 ) -> SeedOutcome:
-    """Fold a safe-ci ``StepOutcome`` + its profile row into a :class:`SeedOutcome`.
+    """Fold a ``dagrun`` ``StepOutcome`` and its profile row into a :class:`SeedOutcome`.
 
     Breach precedence (cancel > cpu-timeout > memory-cap > pids-cap > timeout) is applied BEFORE
     any hit/miss decision, so an infrastructure kill is never counted as a discovered hit. The
@@ -265,24 +266,24 @@ def _classify_outcome(
 def execute_round(plan: RoundPlan, *, cgroups: CgroupManager | None) -> RoundResult:
     """Execute one round: lower to a DAG, run it BOXED at the declared width, map every worker.
 
-    ``jobs`` (and the ``core_budget``) come from the plan's width, so the round runs EXACTLY the
-    declared number of workers concurrently — never however many the caller happened to enqueue.
+    ``max_steps`` is the plan's worker width and ``max_cpus`` is that width times the declared
+    per-worker cores, so worker concurrency and total CPU capacity remain independent.
     ``keep_going=True`` because a hit/crash in one seed must not cancel its siblings: the whole
     point is to sweep every seed in the batch.
     """
     plan.log_dir.mkdir(parents=True, exist_ok=True)
     dag = generate_round_dag(plan)
     jobs = max(1, min(plan.width, len(plan.seeds)))
-    core_budget = jobs * plan.spec.worker_limits.cpu_cores
+    max_cpus = jobs * plan.spec.worker_limits.cpu_cores
 
     start = time.time()
-    result: RunResult = run_dag(
+    result: RunResult = run_dag_limited(
         dag,
-        jobs=jobs,
+        max_steps=jobs,
+        max_cpus=max_cpus,
         cgroups=cgroups,
         keep_going=True,
         verbosity=1,
-        core_budget=core_budget,
     )
     wall_s = time.time() - start
 

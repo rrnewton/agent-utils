@@ -1,8 +1,8 @@
 {
-  "description": "A step with internal parallelism: preferred_inner_jobs declares the step's own width, and jobs_flag controls whether the runner appends an inner -j flag.",
+  "description": "A self-managed fixed-width step: preferred_inner_jobs declares its actual width and jobs_flag is empty because the command hardcodes that width. Runs below eight total CPUs are refused rather than silently oversubscribed.",
   "steps": [
     {"group": "build", "job": "app", "desc": "parallel compile that runs its own make -j8",
-     "description": "Parallel compile that already runs its own make -j8, so jobs_flag is \"\" to opt out of the runner appending a redundant flag.",
+     "description": "Parallel compile that hardcodes make -j8. An empty jobs_flag makes width eight fixed: --max-cpus below eight refuses before spawn.",
      "cmd": "echo '[build] make -j8 build' && sleep 3",
      "hint": {"classification": "cpu-bound", "preferred_inner_jobs": 8,
               "rss_baseline_bytes": 2147483648},
