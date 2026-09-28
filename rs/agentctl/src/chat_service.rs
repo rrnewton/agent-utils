@@ -1093,6 +1093,26 @@ fn capture_recovery_snapshot<A: ManagedApi + ?Sized>(
         snapshot_revision: snapshot.revision,
         ..CycleReport::default()
     };
+    if !capture.suppressed_ids.is_empty() {
+        // Visible markers the coordinator already received are not reported twice. Log them,
+        // since a marker that stays on screen is otherwise silent after its one report.
+        let hidden = capture.suppressed_ids.len().saturating_sub(8);
+        eprintln!(
+            "agentctl: chat reply fence feedback: already reported, so not repeated: {}{}",
+            capture
+                .suppressed_ids
+                .iter()
+                .take(8)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+            if hidden > 0 {
+                format!(" and {hidden} more")
+            } else {
+                String::new()
+            }
+        );
+    }
     if !capture.unknown_ids.is_empty() {
         match deliver_feedback(state, manager, &capture.unknown_ids, delivery, control.stop) {
             Ok(CoordinatorDeliveryResult::Pending(_)) => report.more_work = true,
