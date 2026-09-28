@@ -177,11 +177,37 @@ def _is_rule(line: str) -> bool:
     return len(stripped) >= 3 and all(character in _RULE_CHARACTERS for character in stripped)
 
 
+def _is_labelled_rule(line: str) -> bool:
+    """Return whether ``line`` is a rule, possibly with a label drawn into it.
+
+    Claude can draw session state into the top border of its composer, as in
+    ``──────── ultracode ─``. Such a row still starts and ends with rule
+    characters; whatever lies between the two runs is the label.
+    """
+    stripped = line.strip()
+    leading = len(stripped) - len(stripped.lstrip("".join(_RULE_CHARACTERS)))
+    trailing = len(stripped) - len(stripped.rstrip("".join(_RULE_CHARACTERS)))
+    return len(stripped) >= 3 and leading >= 1 and trailing >= 1 and leading + trailing >= 3
+
+
 def _claude_view(rows: list[tuple[str, str]]) -> ComposerView | None:
-    rules = [index for index, (plain, _) in enumerate(rows) if _is_rule(plain)]
-    if len(rules) < 2:
+    # A labelled top border is tried only when two plain rules do not already
+    # frame a composer, so a draft row that happens to look like a labelled
+    # rule cannot change how an unlabelled screen is split.
+    view = _claude_view_framed(rows, _is_rule)
+    return view if view is not None else _claude_view_framed(rows, _is_labelled_rule)
+
+
+def _claude_view_framed(
+    rows: list[tuple[str, str]], is_top: Callable[[str], bool],
+) -> ComposerView | None:
+    """Split ``rows`` at the last plain rule and the nearest row above it accepted by ``is_top``."""
+    bottom = next((index for index in range(len(rows) - 1, -1, -1) if _is_rule(rows[index][0])), None)
+    if bottom is None:
         return None
-    top, bottom = rules[-2], rules[-1]
+    top = next((index for index in range(bottom - 1, -1, -1) if is_top(rows[index][0])), None)
+    if top is None:
+        return None
     body = rows[top + 1:bottom]
     if not body or not body[0][0].lstrip().startswith("❯"):
         return None

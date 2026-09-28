@@ -260,10 +260,31 @@ fn text_of(row: &[char]) -> String {
     row.iter().collect()
 }
 
+fn is_rule_char(character: char) -> bool {
+    matches!(character, '─' | '━' | '═')
+}
+
 fn is_rule(line: &[char]) -> bool {
     let text = text_of(line);
     let stripped = text.trim();
-    stripped.chars().count() >= 3 && stripped.chars().all(|c| matches!(c, '─' | '━' | '═'))
+    stripped.chars().count() >= 3 && stripped.chars().all(is_rule_char)
+}
+
+/// Return whether `line` is a rule, possibly with a label drawn into it.
+///
+/// Claude can draw session state into the top border of its composer, as in
+/// `──────── ultracode ─`. Such a row still starts and ends with rule
+/// characters; whatever lies between the two runs is the label.
+fn is_labelled_rule(line: &[char]) -> bool {
+    let text = text_of(line);
+    let stripped: Vec<char> = text.trim().chars().collect();
+    let leading = stripped.iter().take_while(|c| is_rule_char(**c)).count();
+    let trailing = stripped
+        .iter()
+        .rev()
+        .take_while(|c| is_rule_char(**c))
+        .count();
+    stripped.len() >= 3 && leading >= 1 && trailing >= 1 && leading + trailing >= 3
 }
 
 fn join_rows(rows: &[(Vec<char>, Vec<char>)]) -> String {
@@ -282,16 +303,21 @@ fn composer_from(body: &[(Vec<char>, Vec<char>)], marker_end: usize) -> (String,
 }
 
 fn claude_view(rows: &[(Vec<char>, Vec<char>)]) -> Option<ComposerView> {
-    let rules: Vec<usize> = rows
+    // A labelled top border is tried only when two plain rules do not already
+    // frame a composer, so a draft row that happens to look like a labelled
+    // rule cannot change how an unlabelled screen is split.
+    claude_view_framed(rows, is_rule).or_else(|| claude_view_framed(rows, is_labelled_rule))
+}
+
+/// Split `rows` at the last plain rule and the nearest row above it accepted by `is_top`.
+fn claude_view_framed(
+    rows: &[(Vec<char>, Vec<char>)],
+    is_top: fn(&[char]) -> bool,
+) -> Option<ComposerView> {
+    let bottom = rows.iter().rposition(|(plain, _)| is_rule(plain))?;
+    let top = rows[..bottom]
         .iter()
-        .enumerate()
-        .filter(|(_, (plain, _))| is_rule(plain))
-        .map(|(index, _)| index)
-        .collect();
-    if rules.len() < 2 {
-        return None;
-    }
-    let (top, bottom) = (rules[rules.len() - 2], rules[rules.len() - 1]);
+        .rposition(|(plain, _)| is_top(plain))?;
     let body = &rows[top + 1..bottom];
     let first = body.first()?;
     let offset = first.0.iter().take_while(|c| c.is_whitespace()).count();
@@ -609,6 +635,8 @@ pub(crate) mod fake {
         pub paste_visible_after_reads: u32,
         pub redraw_lag_reads: u32,
         pub dialog: bool,
+        /// Label Claude draws into the composer's top border, such as a mode name.
+        pub top_border_label: Option<String>,
         stale_screen: Option<String>,
         pending_reads: u32,
         paste_counter: u32,
@@ -658,7 +686,13 @@ pub(crate) mod fake {
             if state.busy && !lines.iter().any(|line| line.contains("Working")) {
                 lines.push("✻ Working… (running PreToolUse hooks…)".to_owned());
             }
-            lines.push(RULE.to_owned());
+            lines.push(match &state.top_border_label {
+                // Coloured as Claude draws it: grey rule, violet label, grey tail.
+                Some(label) => format!(
+                    "\u{1b}[38;5;244m{RULE}\u{1b}[0m \u{1b}[38;5;147m{label} \u{1b}[38;5;244m─\u{1b}[0m"
+                ),
+                None => RULE.to_owned(),
+            });
             match (&state.placeholder, composer.is_empty()) {
                 (Some(placeholder), false) => lines.push(format!("❯ {placeholder}")),
                 (None, false) => composer_lines("❯", &mut lines),
@@ -1003,6 +1037,56 @@ mod tests {
         let reason = refusal(submit(&screen, "hello"));
         assert!(reason.contains("recognisable codex composer"), "{reason}");
         assert!(screen.state().pastes.is_empty());
+    }
+
+    #[test]
+    fn labelled_claude_top_border_still_frames_the_composer() {
+        let screen = FakeScreen::new("claude", false);
+        screen.state().top_border_label = Some("ultracode".to_owned());
+        let view = composer_view("claude", &screen.render())
+            .expect("a label in the top border must not hide the composer");
+        assert_eq!(view.composer_solid.trim(), "");
+        assert!(!view.transcript.contains("ultracode"), "{view:?}");
+        assert!(view.footer.contains("auto mode on"), "{view:?}");
+
+        let submitted = receipt(submit(&screen, "reply to the owner"));
+        assert_eq!(submitted.key_presses, 1);
+        assert_eq!(screen.state().submitted, ["reply to the owner"]);
+
+        let busy = FakeScreen::new("claude", true);
+        busy.state().top_border_label = Some("ultracode".to_owned());
+        receipt(submit(&busy, "after this turn"));
+        assert_eq!(busy.state().queued, ["after this turn"]);
+
+        let drafted = FakeScreen::new("claude", false);
+        drafted.state().top_border_label = Some("ultracode".to_owned());
+        drafted.state().composer = "someone else's words".to_owned();
+        let reason = refusal(submit(&drafted, "mine"));
+        assert!(reason.contains("refusing to append"), "{reason}");
+        assert!(drafted.state().pastes.is_empty());
+    }
+
+    #[test]
+    fn labelled_rules_only_frame_a_composer_that_plain_rules_do_not() {
+        let rule = "─".repeat(40);
+        // Plain rules win: a draft row shaped like a labelled rule stays part of the draft.
+        let screen = format!("• earlier\n{rule}\n❯ first line\n  ── notes ──\n{rule}\n  footer\n");
+        let view = composer_view("claude", &screen).unwrap();
+        assert!(view.composer_solid.contains("── notes ──"), "{view:?}");
+        assert_eq!(view.transcript, "• earlier");
+
+        // A labelled rule with no composer marker below it frames nothing.
+        let no_composer = format!("{rule} label ─\n  Replace goal?\n{rule}\n");
+        assert!(composer_view("claude", &no_composer).is_none());
+        // Edge runs of rule characters are required on both sides of a label.
+        for row in ["label ───", "─── label", "─ x", "──"] {
+            let chars: Vec<char> = row.chars().collect();
+            assert!(!is_labelled_rule(&chars), "{row:?}");
+        }
+        for row in ["─── label ─", "── label ─────", "───"] {
+            let chars: Vec<char> = row.chars().collect();
+            assert!(is_labelled_rule(&chars), "{row:?}");
+        }
     }
 
     #[test]

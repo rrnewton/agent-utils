@@ -16,6 +16,7 @@ from agentctl.errors import HerdrUnavailable
 from agentctl.submission import (
     PromptNotStaged,
     PromptStagedNotSubmitted,
+    _is_labelled_rule,
     composer_view,
     submit_verified,
 )
@@ -47,6 +48,8 @@ class FakeAgent:
         self.redraw_lag_reads = 0
         self.stale_screen: str | None = None
         self.dialog = False
+        # Label Claude draws into the composer's top border, such as a mode name.
+        self.top_border_label: str | None = None
         self._pending_reads = 0
         self._paste_counter = 0
         self._placeholder: str | None = None
@@ -115,7 +118,14 @@ class FakeAgent:
         if self.harness == "claude":
             if self.busy and not any("Working" in line for line in lines):
                 lines.append("✻ Working… (running PreToolUse hooks…)")
-            lines.append(_RULE)
+            if self.top_border_label is None:
+                lines.append(_RULE)
+            else:
+                # Coloured as Claude draws it: grey rule, violet label, grey tail.
+                lines.append(
+                    f"\x1b[38;5;244m{_RULE}\x1b[0m \x1b[38;5;147m{self.top_border_label} "
+                    "\x1b[38;5;244m─\x1b[0m"
+                )
             if composer and self._placeholder and not hide_composer:
                 lines.append(f"❯ {self._placeholder}")
             elif composer:
@@ -272,6 +282,47 @@ def test_unrecognised_screen_is_refused_before_typing() -> None:
     with pytest.raises(PromptNotStaged, match="recognisable codex composer"):
         _submit(agent, "new prompt")
     assert agent.pastes == [] and agent.keys == []
+
+
+def test_labelled_claude_top_border_still_frames_the_composer() -> None:
+    agent = FakeAgent("claude")
+    agent.top_border_label = "ultracode"
+    view = composer_view("claude", agent._render())
+    assert view is not None, "a label in the top border must not hide the composer"
+    assert view.composer_solid.strip() == ""
+    assert "ultracode" not in view.transcript
+    assert "auto mode on" in view.footer
+
+    receipt = _submit(agent, "reply to the owner")
+    assert getattr(receipt, "key_presses") == 1
+    assert agent.submitted == ["reply to the owner"]
+
+    busy = FakeAgent("claude", busy=True)
+    busy.top_border_label = "ultracode"
+    _submit(busy, "after this turn")
+    assert busy.queued == ["after this turn"]
+
+    drafted = FakeAgent("claude")
+    drafted.top_border_label = "ultracode"
+    drafted.composer = "someone else's words"
+    with pytest.raises(PromptNotStaged, match="refusing to append"):
+        _submit(drafted, "mine")
+    assert drafted.pastes == []
+
+
+def test_labelled_rules_only_frame_a_composer_that_plain_rules_do_not() -> None:
+    rule = "─" * 40
+    # Plain rules win: a draft row shaped like a labelled rule stays part of the draft.
+    view = composer_view("claude", f"• earlier\n{rule}\n❯ first line\n  ── notes ──\n{rule}\n  footer\n")
+    assert view is not None and "── notes ──" in view.composer_solid
+    assert view.transcript == "• earlier"
+    # A labelled rule with no composer marker below it frames nothing.
+    assert composer_view("claude", f"{rule} label ─\n  Replace goal?\n{rule}\n") is None
+    # Edge runs of rule characters are required on both sides of a label.
+    for row in ("label ───", "─── label", "─ x", "──"):
+        assert not _is_labelled_rule(row), row
+    for row in ("─── label ─", "── label ─────", "───"):
+        assert _is_labelled_rule(row), row
 
 
 def test_escape_characters_are_refused_before_typing() -> None:
