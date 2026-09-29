@@ -64,8 +64,11 @@ snapshot. Stop `run` before `agentctl chat tick --bridge-state DIR`, which runs
 one bounded recovery pass. `agentctl chat publish --bridge-state DIR
 --channel-id CHANNEL --request-id UUID TEXT` is the explicit operator-only way
 to send a root message; it does not mutate bridge state or act as an event-loop
-reply. `agentctl chat userguide` documents plugin safety,
-the outbound NDJSON contract, exact local commit receipts, explicit route
-closure and bounded retirement, fail-closed provider gaps, recovery, and
-service-manager limits. A status with `healthy: false` and an unresolved gap is
-not live success; protocol v1 intentionally refuses automatic reconnect.
+reply. `agentctl chat thread --bridge-state DIR --thread THREAD` prints one
+thread's retained messages, oldest first; a request prompt for a reply in an
+existing thread prints this exact command. `agentctl chat userguide` documents
+plugin safety, the outbound NDJSON contract, exact local commit receipts,
+explicit route closure and bounded retirement, fail-closed provider gaps,
+recovery, and service-manager limits. A status with `healthy: false` and an
+unresolved gap is not live success; protocol v1 intentionally refuses automatic
+reconnect.

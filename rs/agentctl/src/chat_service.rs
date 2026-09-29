@@ -222,6 +222,15 @@ pub fn inspect_request(state_root: &Path, key: &str) -> Result<Value, ChatServic
     Ok(BridgeState::inspect(state_root)?.inspect_request(key)?)
 }
 
+/// Render one thread's retained messages without writes or external service access.
+pub fn thread_history(
+    state_root: &Path,
+    thread: &str,
+    last: u32,
+) -> Result<String, ChatServiceError> {
+    Ok(BridgeState::inspect(state_root)?.thread_history(thread, last)?)
+}
+
 /// Publish one explicit owner/operator root message without mutating durable bridge state.
 ///
 /// The configured channel authority and request are validated before the exact configured helper

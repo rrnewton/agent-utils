@@ -244,6 +244,53 @@ Herdr/provider evidence. The command accepts one exact key and reports only an
 active retained request. An acceptance harness that later calls `chat close`
 must copy and fsync this inspection document first.
 
+After one line saying that the request arrived through the chat bridge, each
+request prompt gives the message's `Source:` ID, its `Sender:`, and its
+`Thread:` ID, and says whether the message starts a new thread or replies in an
+existing one. When a provider payload with schema `google.chat.message.v1`
+quotes an earlier message, a `Quoted message:` line names that message and its
+text follows with every line prefixed by `> `. A long quote keeps its beginning
+and end joined by ` ... `, and the line then states how many characters the
+provider's quoted text has. Identifiers stay on one line and control characters
+are replaced, so this text cannot break a later terminal capture. In
+identifiers and quoted text, the `<` of a reply-marker token such as
+`<CHAT_REPLY_` is printed as `‹`, and each character of a run of three or more
+backticks or tildes as `ˋ` or `˜`, so no row can form a reply marker or open a
+code fence however the terminal wraps a long line. These tokens are found as if
+every non-ASCII character and every tab were absent, because a terminal program
+may drop a character it draws with no width. The look-alikes count as absent
+too, so when replacing one token joins its neighbours into another, as in
+`<<CHAT_REPLY_`, that one is replaced as well, and no marker or fence forms
+whichever of these characters a terminal drops. The message's own text follows
+the front matter as sent. For a reply in an existing thread, the prompt also
+prints the exact command that shows the thread's earlier messages. The command
+is left out when a word of it cannot be printed on one line or holds such a
+token, because a rewritten word would name a different thread or state
+directory. The command starts with the absolute path of the service's own
+executable, because a service need not have `agentctl` on `PATH`:
+
+```sh
+/opt/agentctl/bin/agentctl chat thread \
+  --bridge-state /home/me/.local/state/agentctl/project-chat \
+  --thread spaces/example/threads/one --last 10
+```
+
+If that executable's file has been deleted, the command names the file now at
+the same path, normally the build that replaced it; with no file there, it
+starts with plain `agentctl`.
+
+`thread` prints the thread's retained requests and the replies captured for
+them, oldest first, each with its UTC time, its age, and whether a reply was
+sent, and prefixes every line of message text with `> `, rewriting reply-marker
+tokens and fence runs the same way as the prompt. Times come from the bridge
+host's clock, and the entries are ordered by them. `--last` selects how many of
+the most recent messages to show (default 10, at most 100). The bridge retains
+only requests it admitted from allowed senders that have not been retired, so
+retired requests, other senders' messages, and anything the bridge never
+received are absent; the provider's own thread is the complete record. Like
+`inspect`, it reads under the shared state lock and never writes state or
+contacts Herdr, a helper, or a provider.
+
 An owner or operator can explicitly publish a new root message through the
 configured outbound helper without pretending it is a reply:
 

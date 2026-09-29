@@ -655,6 +655,52 @@ PINS: tuple[Pin, ...] = (
             ),
         ),
     ),
+    Pin(
+        "chat-thread-history-default",
+        "the messages `agentctl chat thread` prints, and a request prompt's command asks for",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_runtime.rs",
+                r"(?m)^pub const DEFAULT_THREAD_HISTORY_MESSAGES: u32 = (?P<value>[\d_]+);$",
+                "the Rust default",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"\(default\s+(?P<value>[A-Za-z\d,]+),\s+at\s+most\s+[A-Za-z\d,]+\)",
+                "the --last default the chat guide states",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"--thread\s+spaces/example/threads/one\s+--last\s+(?P<value>\d+)\n```",
+                "the prompt's history command the chat guide shows",
+            ),
+        ),
+    ),
+    Pin(
+        "chat-thread-history-maximum",
+        "the most messages `agentctl chat thread --last` accepts",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_runtime.rs",
+                r"(?m)^pub const MAX_THREAD_HISTORY_MESSAGES: u32 = (?P<value>[\d_]+);$",
+                "the Rust maximum",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"\(default\s+[A-Za-z\d,]+,\s+at\s+most\s+(?P<value>[A-Za-z\d,]+)\)",
+                "the --last maximum the chat guide states",
+            ),
+            Site(
+                "rs/agentctl/src/cli.rs",
+                r"retained\s+messages,\s+oldest\s+first\s+\(1-(?P<value>\d+)\)",
+                "the --last help",
+            ),
+        ),
+    ),
 )
 
 

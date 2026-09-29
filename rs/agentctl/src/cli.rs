@@ -469,6 +469,11 @@ enum ChatCommand {
     RetryBoundaryGap(ChatRetryGap),
     /// Inspect one exact active retained request without writes or external access
     Inspect(ChatInspect),
+    /// Print one thread's retained messages as quoted text, oldest first, without writes
+    #[command(
+        after_help = "Example:\n  agentctl chat thread --bridge-state ~/.local/state/agentctl/chat \\\n    --thread spaces/example/threads/one --last 20\n\nA request prompt for a reply in an existing thread prints this command with the service's own\nexecutable, its exact state directory, and the thread. The output lists the thread's retained requests and the replies captured\nfor them, each with its UTC time and age, and prefixes every line of message text with `> `.\nThe bridge retains only requests it admitted from allowed senders that have not been retired, so\nthe provider's own thread remains the complete record. It reads under the shared state lock\nand never writes state or contacts Herdr, a helper, or a provider."
+    )]
+    Thread(ChatThread),
     /// Publish one explicit operator root message through the configured helper
     Publish(ChatPublish),
     /// Run one bounded delivery, terminal-capture, and outbound recovery pass
@@ -505,6 +510,24 @@ struct ChatInspect {
     /// Exact 64-character lowercase hexadecimal request key
     #[arg(long)]
     request: String,
+}
+
+#[derive(Args)]
+struct ChatThread {
+    #[command(flatten)]
+    state: ChatState,
+    /// Exact provider thread ID; the command a request prompt prints already quotes it for the shell
+    #[arg(long, value_name = "THREAD", allow_hyphen_values = true)]
+    thread: String,
+    /// Print this many of the thread's most recent retained messages, oldest first (1-100)
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = crate::chat_runtime::DEFAULT_THREAD_HISTORY_MESSAGES,
+        value_parser = clap::value_parser!(u32)
+            .range(1..=i64::from(crate::chat_runtime::MAX_THREAD_HISTORY_MESSAGES))
+    )]
+    last: u32,
 }
 
 #[derive(Args)]
@@ -754,6 +777,12 @@ fn write_json(value: &impl Serialize) -> io::Result<()> {
     let mut output = io::stdout().lock();
     serde_json::to_writer_pretty(&mut output, value)?;
     output.write_all(b"\n")
+}
+
+fn write_text(text: &str) -> io::Result<()> {
+    let mut output = io::stdout().lock();
+    output.write_all(text.as_bytes())?;
+    output.flush()
 }
 
 fn plugin_discovery_required(command: &Commands) -> bool {
@@ -1170,6 +1199,16 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             write_json(&result).map_err(Failure::Output)?;
             Ok(0)
         }
+        ChatCommand::Thread(value) => {
+            let history = crate::chat_service::thread_history(
+                &value.state.bridge_state,
+                &value.thread,
+                value.last,
+            )
+            .map_err(Failure::Chat)?;
+            write_text(&history).map_err(Failure::Output)?;
+            Ok(0)
+        }
         ChatCommand::Publish(value) => {
             let body = value.read_message().map_err(Failure::Usage)?;
             let result = crate::chat_service::publish(
@@ -1519,6 +1558,48 @@ mod tests {
                 command: ChatCommand::Inspect(ChatInspect { .. })
             }))
         ));
+        let thread_last = |arguments: &[&str]| {
+            let mut argv = vec![
+                "agentctl",
+                "chat",
+                "thread",
+                "--bridge-state",
+                "/tmp/chat-state",
+            ];
+            argv.extend_from_slice(arguments);
+            match Cli::try_parse_from(argv).map(|parsed| parsed.command) {
+                Ok(Some(Commands::Chat(Chat {
+                    command: ChatCommand::Thread(thread),
+                }))) => Ok((thread.thread, thread.last)),
+                Ok(_) => panic!("chat thread parsed as another command"),
+                Err(error) => Err(error.to_string()),
+            }
+        };
+        assert_eq!(
+            thread_last(&["--thread", "spaces/example/threads/one"]),
+            Ok(("spaces/example/threads/one".to_owned(), 10))
+        );
+        assert_eq!(
+            thread_last(&["--thread", "-leading-hyphen", "--last", "100"]),
+            Ok(("-leading-hyphen".to_owned(), 100))
+        );
+        assert!(thread_last(&["--thread", "t", "--last", "0"]).is_err());
+        assert!(thread_last(&["--thread", "t", "--last", "101"]).is_err());
+        assert!(thread_last(&["--last", "5"]).is_err());
+        let error = Cli::try_parse_from(["agentctl", "chat", "thread", "--help"])
+            .err()
+            .expect("chat thread help");
+        let help = error.to_string();
+        for required in [
+            "--bridge-state",
+            "--thread",
+            "--last",
+            "(1-100)",
+            "[default: 10]",
+            "Example:",
+        ] {
+            assert!(help.contains(required), "{required} missing from:\n{help}");
+        }
         let parsed = Cli::try_parse_from([
             "agentctl",
             "chat",
