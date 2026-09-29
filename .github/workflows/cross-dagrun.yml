@@ -74,6 +74,9 @@ jobs:
     needs: plan
     if: needs.plan.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    # With its test step (30 runs, 2026-09-21..25) this job took 2.9-25.1 min in its 21 green
+    # runs, median 6.8; the longest of 9 red runs took 30.0. 45 bounds a hang, not a slow build.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.85.0
@@ -148,6 +151,8 @@ jobs:
     needs: plan
     if: needs.plan.outputs.python == 'true'
     runs-on: ubuntu-latest
+    # With its test step (30 runs, 2026-09-21..25) this job took 12.4-19.1 min, median 16.2.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
