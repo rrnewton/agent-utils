@@ -182,6 +182,9 @@ PROJECTS: tuple[Project, ...] = (
             "examples/liveness_probe.py",
         ),
         required_dependencies=(),
+        # A coordinator box (`wrkslots box`) keeps the agent launcher's registry writable
+        # (a directory it names, never an import), so the guide names that launcher.
+        sibling_package_exemptions=("agentctl",),
     ),
 )
 
