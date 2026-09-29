@@ -525,11 +525,16 @@ _TRUSTED_EXECUTABLE_DIRECTORY = Path("/usr/bin")
 #   to more than 52 seconds.  A flat 120-second bound refused all eight items
 #   of each of three real eight-slot batches, so none made progress.
 #
-# A one-slot validation removal keeps _VALIDATE_REMOVE_BATCH_CENSUS_SECONDS, and
-# so do private-finish recovery and the ownerless-validation commands.  A
-# caller may run a one-slot removal from a service stop hook with a finite stop
-# timeout, so that bound stays small; a refusal there fails closed and a later
-# batch retries the slot.  remove-validate-batch adds
+# The base bound, _VALIDATE_REMOVE_BATCH_CENSUS_SECONDS, was raised from 22 to
+# 120 seconds, because 22 seconds is less than one privileged census at load
+# average 42 and above (the second bullet).  The base bound alone is the
+# whole census deadline of a one-slot validation removal (remove
+# --validate-complete and remove --validation-proof-manifest), of private-finish
+# recovery, and of recover-ownerless-validate-batch and
+# classify-ownerless-validate-batch, so each of those can now wait up to 120
+# seconds instead of 22.  It stays finite because a caller may run a one-slot
+# removal from a service stop hook with a finite stop timeout; a refusal there
+# fails closed and a later batch retries the slot.  remove-validate-batch adds
 # _VALIDATE_REMOVE_BATCH_ITEM_CENSUS_SECONDS for each sealed slot after the
 # first (eight slots: 540 seconds), so an expensive shared census still leaves
 # time for the first items to finish.  With this bound and the stderr bound
@@ -539,7 +544,9 @@ _TRUSTED_EXECUTABLE_DIRECTORY = Path("/usr/bin")
 # eight slots.  Two refused every slot because process evidence changed in each
 # of the privileged census's three attempts; that retry policy is separate
 # from these bounds.  The seal journal is outstanding for this whole window,
-# and clients that predate seal-aware heartbeat refuse while it exists, so the
+# and clients that predate seal-aware heartbeat refuse while it exists, so
+# raising the bound also lengthens the window in which such a client refuses
+# (one slot: up to 120 seconds instead of 22; eight slots: up to 540), and the
 # bound stays finite.
 _VALIDATE_REMOVE_BATCH_CENSUS_SECONDS = 120.0
 _VALIDATE_REMOVE_BATCH_ITEM_CENSUS_SECONDS = 60.0
