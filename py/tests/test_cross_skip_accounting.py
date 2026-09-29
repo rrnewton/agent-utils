@@ -13,6 +13,8 @@ These tests pin the replacement contract without running the minutes-long harnes
 * a run that declares itself partial prints PARTIAL, not OK, and still lists every skip;
 * a boxed leg that cannot be boxed is a skip, and one whose engines never announced an
   established box is a failure, never agreement;
+* the cpuset-alloc delegated, HARD-refusal and one-CPU branches list exactly the checks they did
+  not run;
 * ``--tool all`` ends with one line that is PARTIAL or FAILED whenever any tool was;
 * ``scripts/validate.py`` names a partial cross node in its summary, although dagrun shows that
   node as a plain PASS;
@@ -24,10 +26,12 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import stat
+import subprocess
 import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -503,6 +507,252 @@ def test_boxed_build_width_legs_count_only_when_both_engines_boxed(
             ["operator-build-width", "stated"],
             ["operator-build-width", "unstated"],
         ]
+
+
+# ------------------------------------------------------------------ cpuset-alloc branches
+
+_CPUSET_HELP = "run status reclaim selftest --cores --tag --sample-s --max-irq-rate --ledger\n"
+_CPUSET_SAMPLE_REFUSAL = "--sample-s must be > 0 when --max-irq-rate is set"
+_CPUSET_HARD_REFUSAL = "cpuset-alloc: HARD cpuset pin is unavailable on this host"
+_CPUSET_COMMON_CHECKS = 53
+_CPUSET_LIVE_LABELS = [
+    "selftest:mutation-verdict",
+    "interop:py-then-rs",
+    "interop:rs-then-py",
+    "run:wrapped-help-passthrough",
+    "run:signal-status",
+]
+
+
+def _cpuset_engine(differential: ModuleType, *, hard_refusal: bool) -> object:
+    """Fake both cpuset-alloc engines identically, optionally refusing every HARD pin.
+
+    The ledger cases read the real files the comparison writes; a FIFO is recognised by ``stat``
+    and never opened, so the non-blocking refusal case cannot hang the test.
+    """
+
+    outcome = differential.Outcome
+
+    def ledger(subcommand: str, path: str) -> object:
+        if not os.path.lexists(path):
+            return outcome(0, json.dumps({"reservations": []}), "")
+        if stat.S_ISFIFO(os.stat(path).st_mode):
+            return outcome(3, "", "refusing a ledger that is not a regular file")
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return outcome(3, "", "corrupt ledger")
+        reservations = payload.get("reservations", [])
+        if [record.get("tag") for record in reservations] not in (["cross-live"], ["dead"]):
+            return outcome(3, "", "invalid reservation record")
+        key = "reclaimed" if subcommand == "reclaim" else "reservations"
+        return outcome(0, json.dumps({key: reservations}), "")
+
+    def fake_run(_cmd: object, args: tuple[str, ...], *_rest: object, **_kw: object) -> object:
+        args = tuple(args)
+        if args == ("--version",):
+            return outcome(0, "cpuset-alloc 1.0.0\n", "")
+        if args in ((), ("--help",)) or args[1:] == ("--help",):
+            return outcome(0, _CPUSET_HELP, "")
+        if args[0] in ("status", "reclaim"):
+            if len(args) != 3 or args[1] != "--ledger":
+                return outcome(2, "", "usage error")
+            return ledger(args[0], args[2])
+        if args[0] == "selftest":
+            if "--tag" in args:
+                return outcome(2, "", "unrecognized arguments: --tag")
+            if "--max-irq-rate" in args:
+                return outcome(2, "", _CPUSET_SAMPLE_REFUSAL)
+            verdict = "hard-unavailable" if hard_refusal else "mutation-detected"
+            return outcome(3 if hard_refusal else 0, json.dumps({"verdict": verdict}), "")
+        if args[0] == "run":
+            if "--" not in args:
+                return outcome(2, "", "a command after -- is required")
+            options = args[1 : args.index("--")]
+            command = args[args.index("--") + 1 :]
+            if "--max-irq-rate" in options:
+                return outcome(2, "", _CPUSET_SAMPLE_REFUSAL)
+            if options[:2] == ("--cores", "0"):
+                return outcome(2, "", "--cores must be >= 1")
+            if "--sample-s" in options:
+                return outcome(2, "", "--sample-s must be finite and >= 0")
+            if command == ("/definitely/missing/command",):
+                return outcome(3, "", "cpuset-alloc: cannot execute /definitely/missing/command")
+            if hard_refusal:
+                return outcome(3, "", _CPUSET_HARD_REFUSAL)
+            if command[-1:] == ("--help",):
+                return outcome(0, "--help\n", "")
+            if "os.kill" in " ".join(command):
+                return outcome(143, "", "")
+            return outcome(0, "", 'cpuset-alloc: reserved {"cores":[1],"count":1}')
+        if args == ("not-a-command",):
+            return outcome(2, "", "invalid choice")
+        raise AssertionError(f"unexpected cpuset-alloc invocation {args!r}")
+
+    return fake_run
+
+
+class _HardRefusingPopen:
+    """The interop pair's first command, launched directly, refusing its HARD pin."""
+
+    def __init__(self, _argv: object, **_kw: object) -> None:
+        self.returncode: int | None = None
+
+    def poll(self) -> int:
+        self.returncode = 3
+        return 3
+
+    def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        self.returncode = 3
+        return "", _CPUSET_HARD_REFUSAL
+
+    def kill(self) -> None:
+        return None
+
+
+def _cpuset_alloc_run(
+    differential: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    hard_refusal: bool,
+    cpus: int,
+    environment: dict[str, str],
+    allowed: frozenset[str],
+) -> tuple[int, str, int | None, list[tuple[str, str]]]:
+    """Run the real ``compare_cpuset_alloc`` against fake engines.
+
+    Returns the exit status, the recorded verdict, the number of checks that ran, and each skipped
+    check's label and kind, in order.
+    """
+
+    _set_delegation(monkeypatch, environment)
+    monkeypatch.setattr(differential, "py_command_for", lambda _tool: ["python-engine"])
+    monkeypatch.setattr(differential, "rs_command", lambda _tool: ["rust-engine"])
+    monkeypatch.setattr(differential, "run", _cpuset_engine(differential, hard_refusal=hard_refusal))
+    monkeypatch.setattr(
+        differential,
+        "subprocess",
+        SimpleNamespace(
+            Popen=_HardRefusingPopen if hard_refusal else _unexpected_run,
+            PIPE=subprocess.PIPE,
+            TimeoutExpired=subprocess.TimeoutExpired,
+        ),
+    )
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: set(range(cpus)))
+
+    status = differential.compare_cpuset_alloc(allowed_skips=allowed)
+
+    assert len(differential._COVERAGE) == 1
+    recorded = differential._COVERAGE[0]
+    skipped = [(str(skip.label), str(skip.kind)) for skip in recorded.skipped]
+    return int(status), str(recorded.verdict), recorded.checks, skipped
+
+
+@pytest.mark.parametrize("cpus", [1, 4])
+@pytest.mark.parametrize(
+    "environment",
+    [
+        pytest.param({"DAGRUN_DELEGATED_CGROUP": "/delegated"}, id="delegated-cgroup"),
+        pytest.param(
+            {"DAGRUN_DELEGATED_UNBOXED": "1", "DAGRUN_OUTER_RUN": "outer-run"},
+            id="delegated-unboxed",
+        ),
+    ],
+)
+def test_delegated_cpuset_alloc_lists_its_five_live_scope_checks(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    cpus: int,
+    environment: dict[str, str],
+) -> None:
+    """Inside a delegated root no live scope runs, on one CPU or many; nothing else is skipped."""
+
+    differential = _differential()
+    status, verdict, checks, skipped = _cpuset_alloc_run(
+        differential,
+        monkeypatch,
+        hard_refusal=False,
+        cpus=cpus,
+        environment=environment,
+        allowed=frozenset({"delegated-live-scope"}),
+    )
+    out = capsys.readouterr().out
+
+    assert status == 0
+    assert "DIVERGENCE" not in out
+    assert verdict == "PARTIAL"
+    assert checks == _CPUSET_COMMON_CHECKS
+    assert skipped == [(label, "delegated-live-scope") for label in _CPUSET_LIVE_LABELS]
+    assert (
+        "cross[cpuset-alloc]: PARTIAL - 53 behavioral and ledger-schema checks agree; "
+        "5 check(s) were skipped and are UNVERIFIED (allowed skip kinds: delegated-live-scope)"
+    ) in out
+
+
+def test_a_refused_hard_cpuset_pin_skips_the_four_pinned_checks(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Identical HARD refusals are parity, but the pinned behaviour itself did not run."""
+
+    differential = _differential()
+    status, verdict, checks, skipped = _cpuset_alloc_run(
+        differential,
+        monkeypatch,
+        hard_refusal=True,
+        cpus=4,
+        environment={},
+        allowed=frozenset(),
+    )
+    out = capsys.readouterr().out
+
+    assert status == 1
+    assert "DIVERGENCE" not in out
+    assert verdict == "INCOMPLETE"
+    # The common checks, the selftest verdict, and one identical-refusal check for each of the two
+    # interop pairs, the wrapped --help and the signal status.
+    assert checks == _CPUSET_COMMON_CHECKS + 5
+    assert skipped == [
+        ("interop:py-then-rs", "hard-cpuset"),
+        ("interop:rs-then-py", "hard-cpuset"),
+        ("run:wrapped-help-passthrough", "hard-cpuset"),
+        ("run:signal-status", "hard-cpuset"),
+    ]
+    assert (
+        "cross[cpuset-alloc]: INCOMPLETE - 58 behavioral and ledger-schema checks agree, but 4 "
+        "required check(s) did not run: interop:py-then-rs, interop:rs-then-py, "
+        "run:wrapped-help-passthrough, run:signal-status."
+    ) in out
+
+
+def test_one_cpu_cpuset_alloc_skips_only_the_two_interop_pairs(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Two disjoint reservations need two CPUs; every other live case still runs on one."""
+
+    differential = _differential()
+    status, verdict, checks, skipped = _cpuset_alloc_run(
+        differential,
+        monkeypatch,
+        hard_refusal=False,
+        cpus=1,
+        environment={},
+        allowed=frozenset({"multi-cpu"}),
+    )
+    out = capsys.readouterr().out
+
+    assert status == 0
+    assert "DIVERGENCE" not in out
+    assert verdict == "PARTIAL"
+    # The common checks, the selftest verdict, the wrapped --help and the signal status.
+    assert checks == _CPUSET_COMMON_CHECKS + 3
+    assert skipped == [
+        ("interop:py-then-rs", "multi-cpu"),
+        ("interop:rs-then-py", "multi-cpu"),
+    ]
+    assert (
+        "cross[cpuset-alloc]: PARTIAL - 56 behavioral and ledger-schema checks agree; "
+        "2 check(s) were skipped and are UNVERIFIED (allowed skip kinds: multi-cpu)"
+    ) in out
 
 
 # ------------------------------------------------------------------ multi-tool final line
