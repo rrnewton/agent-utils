@@ -17,6 +17,7 @@ single place every child environment is built.
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -174,6 +175,16 @@ def test_dagrun_main_forwards_the_admitted_validation_width(
     assert differential.main(["--tool", "dagrun"]) == 0
     assert observed == {"validation_jobs": 4}
     assert observed_skips == [frozenset()]
+
+
+def test_main_cannot_leave_a_record_in_an_outer_validate_run() -> None:
+    """``scripts/validate.py`` exports the coverage directory to this suite's own node.
+
+    ``main`` above writes one record per verdict into that directory, which the outer run would
+    summarise as a cross node. The shared conftest removes the variable before every test.
+    """
+
+    assert "AGENT_UTILS_CROSS_COVERAGE_DIR" not in os.environ
 
 
 def test_boxed_cpu_bandwidth_case_scales_every_width_observable() -> None:

@@ -29,7 +29,7 @@ import os
 import stat
 import subprocess
 import sys
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -49,18 +49,6 @@ BOXING_LABELS = [
 NO_DELEGABLE_SUBTREE = "the outer scheduler has no cgroup subtree to delegate"
 COVERAGE_DIR_ENV = "AGENT_UTILS_CROSS_COVERAGE_DIR"
 DELEGATION_ENV = ("DAGRUN_DELEGATED_CGROUP", "DAGRUN_DELEGATED_UNBOXED", "DAGRUN_OUTER_RUN")
-
-
-@pytest.fixture(autouse=True)
-def _no_ambient_coverage_directory(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Keep these tests' verdicts out of an outer ``scripts/validate.py`` run's records.
-
-    ``validate.py`` exports the directory to every node, this pytest node included. A verdict
-    reached here would otherwise be summarised as a PARTIAL cross node of the outer run.
-    """
-
-    monkeypatch.delenv(COVERAGE_DIR_ENV, raising=False)
-    yield
 
 
 def _differential() -> ModuleType:
