@@ -17570,6 +17570,8 @@ def _allocated_open_directory(
     mount_id: int,
     *,
     allow_git_metadata: bool = False,
+    disposable_git: Mapping[Path, tuple[int, int]] | None = None,
+    git_metadata_found: list[Path] | None = None,
 ) -> int:
     try:
         metadata = os.fstat(directory_fd)
@@ -17581,7 +17583,12 @@ def _allocated_open_directory(
         names = _directory_names(directory_fd, path)
         for name in names:
             if name == ".git" and not allow_git_metadata:
-                raise Refusal(f"cache directory contains nested Git metadata: {path / name}")
+                if git_metadata_found is not None:
+                    git_metadata_found.append(path / name)
+                else:
+                    _assert_judged_git_metadata(
+                        directory_fd, path, name, disposable_git
+                    )
             try:
                 child = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             except FileNotFoundError:
@@ -17608,6 +17615,8 @@ def _allocated_open_directory(
                     device,
                     mount_id,
                     allow_git_metadata=allow_git_metadata,
+                    disposable_git=disposable_git,
+                    git_metadata_found=git_metadata_found,
                 )
             finally:
                 os.close(child_fd)
@@ -19790,6 +19799,7 @@ def _clear_open_directory(
     mount_id: int,
     *,
     allow_git_metadata: bool = False,
+    disposable_git: Mapping[Path, tuple[int, int]] | None = None,
 ) -> int:
     metadata = os.fstat(directory_fd)
     if metadata.st_dev != device:
@@ -19800,7 +19810,7 @@ def _clear_open_directory(
     names = _directory_names(directory_fd, path)
     for name in names:
         if name == ".git" and not allow_git_metadata:
-            raise Refusal(f"cache directory contains nested Git metadata: {path / name}")
+            _assert_judged_git_metadata(directory_fd, path, name, disposable_git)
         try:
             child = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         except FileNotFoundError:
@@ -19825,6 +19835,7 @@ def _clear_open_directory(
                     device,
                     mount_id,
                     allow_git_metadata=allow_git_metadata,
+                    disposable_git=disposable_git,
                 )
             finally:
                 os.close(child_fd)
@@ -19859,6 +19870,7 @@ def _remove_cache_directory(
     cache: CacheDirectory,
     *,
     allow_git_metadata: bool = False,
+    disposable_git: Mapping[Path, tuple[int, int]] | None = None,
     expected_identity: tuple[int, int, int] | None = None,
     expected_stable_identity: _PrivateCleanupIdentity | None = None,
     expected_absent_path: Path | None = None,
@@ -19877,6 +19889,7 @@ def _remove_cache_directory(
             cache_fd,
             path,
             allow_git_metadata=allow_git_metadata,
+            disposable_git=disposable_git,
             expected_identity=expected_identity,
             expected_stable_identity=expected_stable_identity,
         )
@@ -19914,6 +19927,7 @@ def _clear_bound_cache_directory(
     allow_git_metadata: bool,
     expected_identity: tuple[int, int, int] | None,
     expected_stable_identity: _PrivateCleanupIdentity | None,
+    disposable_git: Mapping[Path, tuple[int, int]] | None = None,
 ) -> tuple[os.stat_result, int, int]:
     """Validate and empty an already-open cache directory without reopening it."""
 
@@ -19941,6 +19955,7 @@ def _clear_bound_cache_directory(
         original.st_dev,
         mount_id,
         allow_git_metadata=allow_git_metadata,
+        disposable_git=disposable_git,
     )
     size = _clear_open_directory(
         directory_fd,
@@ -19948,8 +19963,410 @@ def _clear_bound_cache_directory(
         original.st_dev,
         mount_id,
         allow_git_metadata=allow_git_metadata,
+        disposable_git=disposable_git,
     )
     return original, mount_id, size
+
+
+# Nested Git repositories inside an agent slot's configured caches.
+#
+# A cache traversal refuses every entry named ``.git`` unless the caller
+# allows all of them (a completed validation) or has judged that exact entry
+# disposable here first.  Judgment happens only on the destructive step of an
+# otherwise authorized agent removal, before any cache is deleted, and asks Git
+# itself: no path name is ever treated as evidence.
+_NESTED_GIT_COMMAND_SECONDS = 120.0
+_NESTED_GIT_OPERATION_MARKERS = (
+    ("MERGE_HEAD", "a merge"),
+    ("CHERRY_PICK_HEAD", "a cherry-pick"),
+    ("REVERT_HEAD", "a revert"),
+    ("rebase-merge", "a rebase"),
+    ("rebase-apply", "a rebase or am"),
+    ("BISECT_LOG", "a bisect"),
+    ("BISECT_START", "a bisect"),
+    ("sequencer", "a sequencer operation"),
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class _DisposableNestedRepository:
+    """One nested repository whose every locally named commit is on a remote ref."""
+
+    path: Path
+    identity: tuple[int, int]
+    head: str | None
+    remote_ref: str | None
+
+
+def _assert_judged_git_metadata(
+    directory_fd: int,
+    path: Path,
+    name: str,
+    disposable_git: Mapping[Path, tuple[int, int]] | None,
+) -> None:
+    """Refuse a cache's ``.git`` entry unless it is the exact one judged disposable."""
+
+    entry = path / name
+    expected = None if disposable_git is None else disposable_git.get(entry)
+    if expected is None:
+        raise Refusal(f"cache directory contains nested Git metadata: {entry}")
+    try:
+        observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise Refusal(
+            f"cannot inspect nested Git metadata judged disposable: {entry}: {exc}"
+        ) from exc
+    if not stat.S_ISDIR(observed.st_mode) or (
+        observed.st_dev,
+        observed.st_ino,
+    ) != expected:
+        raise Refusal(
+            f"nested Git repository changed after it was judged disposable: {entry}"
+        )
+
+
+def _nested_git_metadata_paths(config: Config, cache: CacheDirectory) -> list[Path]:
+    """List every ``.git`` entry a removal of ``cache`` would reach, read-only."""
+
+    opened = _open_cache_directory(config, cache)
+    if opened is None:
+        return []
+    parent_fd, cache_fd, _name = opened
+    try:
+        found: list[Path] = []
+        _allocated_open_directory(
+            cache_fd,
+            cache.path,
+            os.fstat(cache_fd).st_dev,
+            _fd_mount_id(cache_fd, str(cache.path)),
+            git_metadata_found=found,
+        )
+        return found
+    finally:
+        os.close(cache_fd)
+        os.close(parent_fd)
+
+
+def _local_remote_path(url: str, base: Path) -> Path | None:
+    """Return the filesystem path a local remote URL names, or None for a network URL."""
+
+    if url.startswith("file://"):
+        rest = url[len("file://") :]
+        _authority, separator, remainder = rest.partition("/")
+        return Path("/" + urllib.parse.unquote(remainder)) if separator else Path("/")
+    if "://" in url:
+        return None
+    colon = url.find(":")
+    slash = url.find("/")
+    if colon != -1 and (slash == -1 or colon < slash):
+        return None
+    return Path(url) if os.path.isabs(url) else base / url
+
+
+def _judge_nested_git_repository(
+    dotgit: Path, removed_roots: Sequence[Path], *, display: Path | None = None
+) -> _DisposableNestedRepository:
+    """Prove that the repository at ``dotgit`` holds nothing that exists only here.
+
+    The proof requires a well-formed non-linked repository whose ``.git`` is a
+    directory; a worktree with no uncommitted or untracked non-ignored changes,
+    no stash, no index flag that hides changes and no operation in progress;
+    and every commit named by HEAD or by any local ref outside refs/remotes/*
+    and refs/tags/* reachable from a counted refs/remotes/<name>/* ref.  A
+    remote-tracking ref counts only when remote.<name>.url is configured and
+    is not a local path that is missing or lies inside ``removed_roots``: a
+    clone of a sibling deleted by the same removal, or of a path that no longer
+    exists, proves nothing.  Git runs with no global or
+    system configuration, no optional locks, no fsmonitor, no transport, and a
+    bound on every command.  Anything else refuses and names the condition
+    that failed, reporting the entry as ``display`` (its canonical path while
+    the slot is fenced).
+    """
+
+    def refuse(condition: str) -> Refusal:
+        return Refusal(
+            f"cache directory contains nested Git metadata: {display or dotgit}: "
+            f"not provably disposable: {condition}"
+        )
+
+    try:
+        metadata = os.lstat(dotgit)
+    except OSError as exc:
+        raise refuse(f"cannot inspect .git: {exc}") from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise refuse(".git is a symbolic link, not a repository directory")
+    if stat.S_ISREG(metadata.st_mode):
+        raise refuse(
+            ".git is a file, not a repository directory "
+            "(a linked worktree or submodule pointer)"
+        )
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise refuse(".git is not a directory")
+    work_tree = dotgit.parent
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update(
+        {
+            "LC_ALL": "C",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_ATTR_NOSYSTEM": "1",
+        }
+    )
+
+    def run(
+        args: Sequence[str], *, work: bool = False, stdin: bytes | None = None
+    ) -> subprocess.CompletedProcess[bytes]:
+        command = [
+            "git",
+            "--no-pager",
+            "--no-replace-objects",
+            "-c",
+            "core.useReplaceRefs=false",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            "core.excludesFile=/dev/null",
+            "-c",
+            "core.ignoreStat=false",
+            "-c",
+            "protocol.allow=never",
+            f"--git-dir={dotgit}",
+            *((f"--work-tree={work_tree}",) if work else ()),
+            *args,
+        ]
+        try:
+            return subprocess.run(
+                command,
+                input=stdin,
+                capture_output=True,
+                check=False,
+                env=env,
+                cwd="/",
+                timeout=_NESTED_GIT_COMMAND_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise refuse(
+                f"git {' '.join(args)} did not finish within "
+                f"{_NESTED_GIT_COMMAND_SECONDS:g} seconds"
+            ) from exc
+        except OSError as exc:
+            raise refuse(f"cannot execute Git: {exc}") from exc
+
+    def detail(completed: subprocess.CompletedProcess[bytes]) -> str:
+        text = (completed.stderr or completed.stdout).decode(errors="replace").strip()
+        return text.splitlines()[0][:300] if text else f"exit {completed.returncode}"
+
+    def output(args: Sequence[str], *, work: bool = False, stdin: bytes | None = None) -> str:
+        completed = run(args, work=work, stdin=stdin)
+        if completed.returncode != 0:
+            raise refuse(f"git {' '.join(args)} failed: {detail(completed)}")
+        return completed.stdout.decode(errors="surrogateescape")
+
+    # (a) A well-formed repository whose Git directory is this .git itself.
+    located = run(["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"])
+    if located.returncode != 0:
+        raise refuse(f"not a well-formed Git repository: {detail(located)}")
+    for reported in located.stdout.decode(errors="surrogateescape").splitlines():
+        try:
+            same = os.path.samefile(reported, dotgit)
+        except OSError:
+            same = False
+        if not same:
+            raise refuse(
+                f"Git reports repository directory {reported}, not this .git directory"
+            )
+    for config_name in ("config", "config.worktree"):
+        config_path = dotgit / config_name
+        if config_name != "config" and not config_path.exists():
+            continue
+        names = output(["config", "--file", str(config_path), "--null", "--list", "--name-only"])
+        for key in sorted({item for item in names.split("\0") if item}):
+            lowered = key.lower()
+            if lowered.startswith(("include.", "includeif.")):
+                raise refuse(
+                    f"repository config sets {key}, which could load configuration "
+                    "this check does not inspect"
+                )
+            if lowered.startswith("filter."):
+                raise refuse(
+                    f"repository config defines content filter {key}, which Git "
+                    "status could execute"
+                )
+            if lowered == "core.worktree":
+                raise refuse(
+                    "repository config sets core.worktree, so its worktree may lie "
+                    "outside this cache"
+                )
+        bare = run(["config", "--file", str(config_path), "--type=bool", "--get", "core.bare"])
+        if bare.returncode == 0 and bare.stdout.strip() == b"true":
+            raise refuse(
+                ".git is configured as a bare repository (core.bare=true), so Git "
+                "cannot report the files around it"
+            )
+        if bare.returncode not in {0, 1}:
+            raise refuse(f"cannot read core.bare: {detail(bare)}")
+    for subdirectory, what in (
+        ("worktrees", "registered linked worktrees"),
+        ("modules", "submodule repositories under .git/modules"),
+    ):
+        try:
+            held = sorted(os.listdir(dotgit / subdirectory))
+        except FileNotFoundError:
+            held = []
+        except OSError as exc:
+            raise refuse(f"cannot inspect .git/{subdirectory}: {exc}") from exc
+        if held:
+            raise refuse(f"repository has {what}: {', '.join(held[:5])}")
+    # (b) Nothing uncommitted, stashed, hidden, or in progress.
+    for marker, operation in _NESTED_GIT_OPERATION_MARKERS:
+        if os.path.lexists(dotgit / marker):
+            raise refuse(f"{operation} is in progress (.git/{marker} exists)")
+    stash = run(["rev-parse", "-q", "--verify", "refs/stash"])
+    if stash.returncode == 0:
+        raise refuse("stash entries exist (refs/stash)")
+    if stash.returncode != 1:
+        raise refuse(f"cannot read refs/stash: {detail(stash)}")
+    status = output(
+        [
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+            "--no-renames",
+        ],
+        work=True,
+    )
+    changes = [item for item in status.split("\0") if item]
+    if changes:
+        raise refuse(
+            f"worktree has {len(changes)} uncommitted or untracked change(s), "
+            f"first: {changes[0]!r}"
+        )
+    hidden = [
+        item
+        for item in output(["ls-files", "-v", "-z"], work=True).split("\0")
+        if item and (item[0].islower() or item[0] == "S")
+    ]
+    if hidden:
+        raise refuse(
+            f"index marks {len(hidden)} path(s) assume-unchanged or skip-worktree, "
+            f"which hides changes from status; first: {hidden[0]!r}"
+        )
+    # (c) Every locally named commit is reachable from a remote-tracking ref.
+    head_probe = run(["rev-parse", "-q", "--verify", "HEAD^{commit}"])
+    head: str | None = None
+    if head_probe.returncode == 0:
+        head = head_probe.stdout.decode().strip()
+    else:
+        symbolic = run(["symbolic-ref", "-q", "HEAD"])
+        target = symbolic.stdout.decode(errors="surrogateescape").strip()
+        unborn = (
+            symbolic.returncode == 0
+            and bool(target)
+            and run(["rev-parse", "-q", "--verify", target]).returncode == 1
+        )
+        if not unborn:
+            raise refuse("HEAD does not name a commit")
+    remote_urls: dict[str, str] = {}
+    listed_urls = run(
+        [
+            "config",
+            "--file",
+            str(dotgit / "config"),
+            "--null",
+            "--get-regexp",
+            r"^remote\..*\.url$",
+        ]
+    )
+    if listed_urls.returncode not in {0, 1}:
+        raise refuse(f"cannot read remote URLs: {detail(listed_urls)}")
+    for item in listed_urls.stdout.decode(errors="surrogateescape").split("\0"):
+        key, _newline, url = item.partition("\n")
+        if key.startswith("remote.") and key.endswith(".url"):
+            remote_urls[key[len("remote.") : -len(".url")]] = url
+    resolved_roots = [root.resolve(strict=False) for root in removed_roots]
+    counted_remotes: set[str] = set()
+    for remote_name, url in remote_urls.items():
+        local = _local_remote_path(url, work_tree)
+        if local is not None:
+            remote_target = local.resolve(strict=False)
+            if not remote_target.exists() or any(
+                remote_target == root or remote_target.is_relative_to(root)
+                for root in resolved_roots
+            ):
+                continue
+        counted_remotes.add(remote_name)
+    tips: dict[str, str] = {} if head is None else {head: "HEAD"}
+    counted_refs: dict[str, str] = {}
+    for line in output(["for-each-ref", "--format=%(objectname) %(refname)"]).splitlines():
+        sha, _space, refname = line.partition(" ")
+        if refname.startswith("refs/remotes/"):
+            remote_name = refname[len("refs/remotes/") :].split("/", 1)[0]
+            if remote_name in counted_remotes:
+                counted_refs.setdefault(refname, sha)
+            continue
+        if refname.startswith("refs/tags/"):
+            continue
+        tips.setdefault(sha, refname)
+    negatives = "".join(f"^{sha}\n" for sha in sorted(set(counted_refs.values())))
+    if tips:
+        stdin = ("".join(f"{sha}\n" for sha in tips) + negatives).encode()
+        total = output(["rev-list", "--count", "--stdin"], stdin=stdin)
+        if int(total.strip() or "0") != 0:
+            for sha, label in tips.items():
+                count = int(
+                    output(
+                        ["rev-list", "--count", "--stdin"],
+                        stdin=(f"{sha}\n" + negatives).encode(),
+                    ).strip()
+                    or "0"
+                )
+                if count:
+                    uncounted = sorted(set(remote_urls) - counted_remotes)
+                    raise refuse(
+                        f"{label} names commit {sha}, which no counted refs/remotes/* "
+                        f"ref contains ({count} commit(s) exist only in this "
+                        "repository"
+                        + (
+                            f"; remote(s) {', '.join(uncounted)} do not count because "
+                            "each URL is a local path that is missing or that this "
+                            "removal deletes"
+                            if uncounted
+                            else ""
+                        )
+                        + ")"
+                    )
+            raise refuse("commits named locally are not all on a remote-tracking ref")
+    remote_ref: str | None = None
+    if head is not None:
+        containing = output(
+            [
+                "for-each-ref",
+                "--format=%(refname) %(symref)",
+                "--contains",
+                head,
+                "refs/remotes/",
+            ]
+        ).splitlines()
+        direct = [
+            line.split(" ", 1)[0]
+            for line in containing
+            if line.endswith(" ") and line.split(" ", 1)[0] in counted_refs
+        ]
+        if not direct:
+            raise refuse(f"no counted refs/remotes/* ref reports containing HEAD {head}")
+        remote_ref = direct[0]
+    return _DisposableNestedRepository(
+        dotgit, (metadata.st_dev, metadata.st_ino), head, remote_ref
+    )
 
 
 def _cache_slot_holds(
@@ -22808,6 +23225,32 @@ def _finish_remove_paths(
                     expected_head=record.checkouts[0].head,
                 )
                 _interrupt_for_test("after-validation-removal-proof-recheck")
+            disposable_git: dict[Path, tuple[int, int]] = {}
+            if record.slot_type == "agent":
+                # Every guard above has passed.  Judge each nested repository
+                # in every cache before the first deletion, so a refusal
+                # leaves all of them in place.
+                canonical_slot = _slot_directory(config, record.slot, record.slot_type)
+                for checkout in moved_checkouts:
+                    for cache in _cache_directories_for_checkout(config, checkout):
+                        for dotgit in _nested_git_metadata_paths(config, cache):
+                            canonical_dotgit = canonical_slot / dotgit.relative_to(
+                                fenced_slot
+                            )
+                            judged = _judge_nested_git_repository(
+                                dotgit,
+                                (canonical_slot, fenced_slot),
+                                display=canonical_dotgit,
+                            )
+                            disposable_git[judged.path] = judged.identity
+                            finish.nested_git_evidence.append(
+                                {
+                                    "checkout": checkout.name,
+                                    "path": str(canonical_dotgit),
+                                    "head": judged.head,
+                                    "remote_ref": judged.remote_ref,
+                                }
+                            )
             for checkout in moved_checkouts:
                 for cache in _cache_directories_for_checkout(config, checkout):
                     _remove_cache_directory(
@@ -22816,6 +23259,7 @@ def _finish_remove_paths(
                         allow_git_metadata=(
                             record.slot_type == "validate" and finish.validate_complete
                         ),
+                        disposable_git=disposable_git or None,
                     )
         except Refusal as exc:
             if not removed:
@@ -23012,6 +23456,7 @@ def _finish_state_update(
     journal: Mapping[str, object],
     *,
     journal_path: Path,
+    nested_git_evidence: Sequence[Mapping[str, object]] = (),
 ) -> None:
     current_slots = {item.slot: item for item in state.slots}
     current = current_slots.get(record.slot)
@@ -23031,7 +23476,18 @@ def _finish_state_update(
             updated_state,
             action="slot-removed",
             slot=record.slot,
-            evidence={"archive_id": entry["archive_id"]},
+            evidence={
+                "archive_id": entry["archive_id"],
+                **(
+                    {
+                        "disposable_nested_repositories": [
+                            dict(item) for item in nested_git_evidence
+                        ]
+                    }
+                    if nested_git_evidence
+                    else {}
+                ),
+            },
             require_repository=False,
         )
     _remove_handoff_sidecar_after_archive(config, record)
@@ -23144,6 +23600,7 @@ def _begin_finish(
         final_record,
         journal,
         journal_path=journal_path,
+        nested_git_evidence=finish.nested_git_evidence,
     )
     return None
 
@@ -23265,6 +23722,7 @@ def _complete_prepared_private_finish(
         current,
         journal,
         journal_path=prepared.journal_path,
+        nested_git_evidence=resumed_finish.nested_git_evidence,
     )
     after_states, after_archives = _validate_global_state(
         config, require_repository=False
@@ -23843,7 +24301,17 @@ def _cmd_remove(
                 raise
     if emit:
         print(f"removed and archived slot={record.slot} generation={record.generation}")
+        if finish_context is not None:
+            _print_nested_git_evidence(finish_context.nested_git_evidence)
     return 0
+
+
+def _print_nested_git_evidence(evidence: Sequence[Mapping[str, object]]) -> None:
+    for item in evidence:
+        print(
+            f"removed disposable nested Git repository {item['path']} "
+            f"head={item['head']} contained-by={item['remote_ref']}"
+        )
 
 
 def _parse_validate_batch_slot(raw: str) -> tuple[str, int]:
@@ -25845,6 +26313,7 @@ def _recover_finish(
     selected_live_use_recheck = live_use_recheck or _LiveUseRecheckBudget()
     if phase not in ("prepared", "fenced", "removed"):
         raise StateError(f"unknown finish journal phase {phase!r}")
+    nested_git_evidence: Sequence[Mapping[str, object]] = ()
     if phase in ("prepared", "fenced"):
         private_cleanup: _PrivateCleanupContext | None = None
         if private_identity is not None:
@@ -25913,22 +26382,24 @@ def _recover_finish(
                     recovery_budget,
                     live_use_recheck=selected_live_use_recheck,
                 )
+        recovery_finish = _FinishContext(
+            mode=mode,
+            actor=actor,
+            salvage=salvage,
+            validate_complete=validate_complete,
+            allow_live_validate_owner=live_validate_owner,
+            private_cleanup=private_cleanup,
+            validation_removal_proof=removal_proof,
+            live_use_recheck=selected_live_use_recheck,
+            owner_consented=owner_consent is not None,
+        )
+        nested_git_evidence = recovery_finish.nested_git_evidence
         journal = _finish_remove_paths(
             config,
             record,
             journal,
             _GitVcs(),
-            _FinishContext(
-                mode=mode,
-                actor=actor,
-                salvage=salvage,
-                validate_complete=validate_complete,
-                allow_live_validate_owner=live_validate_owner,
-                private_cleanup=private_cleanup,
-                validation_removal_proof=removal_proof,
-                live_use_recheck=selected_live_use_recheck,
-                owner_consented=owner_consent is not None,
-            ),
+            recovery_finish,
             journal_path=path,
         )
     else:
@@ -25941,8 +26412,10 @@ def _recover_finish(
         record,
         journal,
         journal_path=path,
+        nested_git_evidence=nested_git_evidence,
     )
     print(f"recovered finish: archived and removed slot={record.slot}")
+    _print_nested_git_evidence(nested_git_evidence)
 
 
 def _restore_interrupted_private_finish_after_refusal(
@@ -34098,6 +34571,11 @@ class _FinishContext:
     validation_removal_proof: _ValidationRemovalProof | None = None
     live_use_recheck: _LiveUseRecheckBudget | None = None
     owner_consented: bool = False
+    # Filled by the cache-removal step: one entry per nested repository judged
+    # disposable (checkout, canonical .git path, HEAD, containing remote ref).
+    nested_git_evidence: list[dict[str, object]] = dataclasses.field(
+        default_factory=list
+    )
 
 
 @dataclasses.dataclass(frozen=True)
