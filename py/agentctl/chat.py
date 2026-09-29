@@ -1188,7 +1188,12 @@ def _run_command(
             return None
         previous: tuple[tuple[int, int], ...] | None = None
         members: tuple[_CommandAnchorIdentity, ...] = ()
-        while time.monotonic() < end:
+        census_count = 0
+        # Stability requires two observations.  A large host can make one
+        # complete /proc census outlast the nominal retry window, so the
+        # deadline bounds additional retries rather than silently weakening
+        # the proof to one snapshot.
+        while census_count < 2 or time.monotonic() < end:
             if pinned() is None:
                 return None
             try:
@@ -1196,6 +1201,7 @@ def _run_command(
             except ProcessLookupError:
                 return None
             members = _command_group_members(anchor)
+            census_count += 1
             signature = tuple((member.pid, member.starttime) for member in members)
             if (signature == previous and members
                     and all(member.state in ("T", "t", "Z") for member in members)):

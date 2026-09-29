@@ -1004,6 +1004,10 @@ def test_command_timeout_contains_group_when_supervisor_is_stopped(
         def observe_census(
             anchor: chat_module._CommandAnchorIdentity,
         ) -> tuple[chat_module._CommandAnchorIdentity, ...]:
+            if cleanup == "emergency":
+                # One census may exceed the nominal retry window on a large
+                # host.  The containment proof still needs two snapshots.
+                time.sleep(0.55)
             members = original_census(anchor)
             censuses.append(members)
             if cleanup == "census-error":
