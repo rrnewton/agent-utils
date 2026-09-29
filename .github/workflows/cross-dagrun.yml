@@ -78,10 +78,13 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.85.0
       - name: check the declared Rust 1.85 MSRV
-        # `--all-targets` compiles the tests as well as libraries and binaries. Runtime regressions
-        # belong to the selected stable-toolchain graph; rerunning every test and package smoke on
-        # the older compiler spent minutes without increasing the compatibility surface.
         run: cargo check --locked --workspace --all-targets --manifest-path rs/Cargo.toml
+      # rs/Cargo.toml declares rust-version 1.85. Compiling the tests on it does not show that they
+      # pass on it: the selected graph runs them only on the stable toolchain.
+      - name: test all targets on the declared MSRV
+        run: cargo test --locked --workspace --all-targets --manifest-path rs/Cargo.toml
+      - name: verify registry artifacts on the declared MSRV
+        run: python3 scripts/check_rust_packages.py
 
   validate:
     # The same selector and the same flattened graph as `make validate` locally. Compatibility
@@ -151,13 +154,15 @@ jobs:
         with:
           python-version: '3.10'
       - name: install minimum-runtime test tooling
-        run: python -m pip install --upgrade 'setuptools>=77' pyyaml
+        run: python -m pip install --upgrade 'setuptools>=77' pytest pyyaml
       - name: parse every Python module on the declared minimum
         run: python -m compileall -q py
       - name: dependency-free startup contract
         run: make check-deps
+      # Every distribution declares requires-python >=3.10. Parsing a module and starting its
+      # entry points on 3.10 does not show that it behaves correctly there: the selected graph runs
+      # the tests only on 3.12.
+      - name: tests on declared minimum Python
+        run: cd py && python -m pytest -q
       - name: wheel and sdist contract on declared minimum Python
-        # Runtime regression belongs to the selected 3.12 DAG. Parsing all modules plus building
-        # and executing every installable artifact retains the 3.10 compatibility signal without
-        # serially repeating the formerly 46-minute Python test contract.
         run: make check-python-packages
