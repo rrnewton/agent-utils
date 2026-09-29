@@ -21621,6 +21621,10 @@ def _slot_removed_evidence(project: Path) -> list[object]:
     evidence = wrkslots._as_mapping(
         removal_events[0]["evidence"], "test slot-removed evidence"
     )
+    # Every event that lists deleted repositories also says what was not judged.
+    assert evidence["nested_git_scope"] == wrkslots._NESTED_GIT_SCOPE
+    assert "bare Git repository under any other name" in evidence["nested_git_scope"]
+    assert "filesystem image" in evidence["nested_git_scope"]
     return wrkslots._as_list(
         evidence["disposable_nested_repositories"], "test nested evidence"
     )
@@ -21698,6 +21702,14 @@ def test_agent_removal_deletes_provably_disposable_nested_clone_and_records_it(
         "info-exclude",
         "self-ignored-gitignore",
         "unresolvable-remote",
+        "pushurl-deleted-local",
+        "pushurl-inside-removal-root",
+        "short-destination-uncounted",
+        "mirror-refspec-uncounted",
+        "symref-laundering",
+        "remote-receive-pack",
+        "global-insteadof-missing",
+        "legacy-remotes-file",
     ),
 )
 def test_agent_removal_refuses_nested_repository_not_provably_disposable(
@@ -21713,9 +21725,20 @@ def test_agent_removal_refuses_nested_repository_not_provably_disposable(
     clone = deps / "clean"
     dotgit = clone / ".git"
     only_here = "1 commit(s) exist only in this repository"
+    remove_env: dict[str, str] | None = None
     # Any one of these conditions satisfies the case; only the unreferenced
     # dropped stash has two equally first commits.
     conditions: tuple[str, ...]
+
+    def nothing_counted(sha: str, remote_name: str, reason: str) -> tuple[str, ...]:
+        # With the remote uncounted no ref counts, so every commit is "only here".
+        count = git(clone, "rev-list", "--count", "--all").stdout.strip()
+        return (
+            f"HEAD names commit {sha}, which no counted refs/remotes/* ref contains "
+            f"({count} commit(s) exist only in this repository; uncounted remote(s): "
+            f"{remote_name} ({reason}))",
+        )
+
     if case == "git-file":
         clone.mkdir(parents=True)
         dotgit.write_text("gitdir: /nonexistent/worktrees/clean\n", encoding="utf-8")
@@ -21885,6 +21908,120 @@ def test_agent_removal_refuses_nested_repository_not_provably_disposable(
                 "'hide/.gitignore' is ignored by its own rules, which no commit "
                 "records, so files it hides from status may be work",
             )
+        elif case in {"pushurl-deleted-local", "pushurl-inside-removal-root"}:
+            # git push sends commits to the push URL and then updates
+            # refs/remotes/origin/main as if they had reached the URL.
+            pushed = (
+                tmp_path / "pushed.git"
+                if case == "pushurl-deleted-local"
+                else deps / "pushed.git"
+            )
+            subprocess.run(
+                ["git", "init", "--bare", "--initial-branch=main", str(pushed)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            git(clone, "remote", "set-url", "--push", "origin", str(pushed))
+            local = commit_local(clone, "local.txt", "local\n", "local only")
+            git(clone, "push", "origin", "main")
+            assert git(clone, "rev-parse", "refs/remotes/origin/main").stdout.strip() == local
+            if case == "pushurl-deleted-local":
+                shutil.rmtree(pushed)
+                reason = "its push URL is a local path that does not exist"
+            else:
+                reason = "its push URL is a local path inside this removal"
+            conditions = nothing_counted(local, "origin", reason)
+        elif case == "short-destination-uncounted":
+            # Git qualifies remotes/origin/main to refs/remotes/origin/main, so
+            # fetching from the since-deleted 'evil' wrote origin's ref.
+            local = commit_local(clone, "local.txt", "local\n", "local only")
+            evil = tmp_path / "evil"
+            subprocess.run(
+                ["git", "clone", str(clone), str(evil)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            git(clone, "remote", "add", "evil", str(evil))
+            git(clone, "config", "--replace-all", "remote.evil.fetch", "+refs/heads/main:remotes/origin/main")
+            git(clone, "fetch", "evil")
+            assert git(clone, "rev-parse", "refs/remotes/origin/main").stdout.strip() == local
+            shutil.rmtree(evil)
+            # origin's other remote-tracking refs still count; only the one
+            # 'evil' could write does not.
+            still_counted = [
+                refname
+                for refname in git(
+                    clone, "for-each-ref", "--format=%(refname)", "refs/remotes/origin/"
+                ).stdout.split()
+                if refname not in {"refs/remotes/origin/main", "refs/remotes/origin/HEAD"}
+            ]
+            assert still_counted
+            count = git(
+                clone, "rev-list", "--count", "--all", "--not", *still_counted
+            ).stdout.strip()
+            conditions = (
+                f"HEAD names commit {local}, which no counted refs/remotes/* ref "
+                f"contains ({count} commit(s) exist only in this repository; "
+                "uncounted remote(s): evil (its URL is a local path that does not exist))",
+            )
+        elif case == "mirror-refspec-uncounted":
+            # refs/*:refs/* lets 'evil' write refs/remotes/origin/main too.
+            local = commit_local(clone, "local.txt", "local\n", "local only")
+            git(clone, "remote", "add", "evil", str(tmp_path / "gone"))
+            git(clone, "config", "--replace-all", "remote.evil.fetch", "+refs/*:refs/*")
+            git(clone, "update-ref", "refs/remotes/origin/main", local)
+            conditions = nothing_counted(
+                local, "evil", "its URL is a local path that does not exist"
+            )
+        elif case == "symref-laundering":
+            # refs/remotes/origin/HEAD resolves to a local branch; its value
+            # is not evidence that origin holds anything.
+            git(clone, "checkout", "-b", "side")
+            local = commit_local(clone, "local.txt", "local\n", "local only")
+            git(clone, "checkout", "main")
+            git(clone, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/heads/side")
+            conditions = tuple(
+                f"{refname} names commit {local}, which no counted refs/remotes/* "
+                f"ref contains ({only_here})"
+                for refname in ("refs/heads/side", "refs/remotes/origin/HEAD")
+            )
+        elif case == "remote-receive-pack":
+            git(clone, "config", "remote.origin.receivepack", "git-receive-pack")
+            conditions = nothing_counted(
+                head,
+                "origin",
+                "it sets remote.origin.receivepack, so a receive-pack program this "
+                "check cannot inspect carried its transfers",
+            )
+        elif case == "global-insteadof-missing":
+            # The invoking user's configuration sent every transfer for this
+            # remote to a mirror that no longer exists.
+            upstream = _bare_upstream(tmp_path, "dependency", {"dep.txt": "dep\n"})
+            shutil.rmtree(clone)
+            head = _nested_clone(upstream, clone)
+            gone = tmp_path / "gone-mirror.git"
+            user_config = tmp_path / "user.gitconfig"
+            user_config.write_text(
+                f'[url "{gone}"]\n\tinsteadOf = {upstream}\n', encoding="utf-8"
+            )
+            remove_env = {"GIT_CONFIG_GLOBAL": str(user_config)}
+            conditions = nothing_counted(
+                head,
+                "origin",
+                f"its effective URL {str(gone)!r} is a local path that does not exist",
+            )
+        elif case == "legacy-remotes-file":
+            (dotgit / "remotes").mkdir()
+            (dotgit / "remotes" / "evil").write_text(
+                "URL: /gone\nPull: +refs/heads/main:refs/remotes/origin/main\n",
+                encoding="utf-8",
+            )
+            conditions = (
+                "repository has remotes defined in legacy .git/remotes files, which "
+                "this check does not read: evil",
+            )
         else:
             assert case == "unresolvable-remote"
             # Path.resolve raises RuntimeError on a symbolic-link loop; the
@@ -21916,7 +22053,16 @@ def test_agent_removal_refuses_nested_repository_not_provably_disposable(
     assert "not provably disposable" not in cleaned.stderr
 
     _prepare_removable_agent_slot(project)
-    removed = remove(project)
+    removed = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env=remove_env,
+    )
 
     assert removed.returncode == 3, removed.stdout + removed.stderr
     assert any(
@@ -22155,6 +22301,60 @@ def test_agent_removal_refuses_nested_repositories_that_change_after_judgment(
     assert len(active_slots(project)) == 1
 
 
+def test_agent_removal_rejudges_every_cache_before_deleting_any(
+    tmp_path: Path,
+) -> None:
+    project, repository, remote = make_project(tmp_path, cache_globs=("target", "vendor"))
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    commit_task(repository, tree, "codex/task")
+    for cache in ("target", "vendor"):
+        _nested_clone(remote, tree / cache / "deps" / "clean")
+    _prepare_removable_agent_slot(project)
+
+    # The first judgment pass visits both caches and passes.  As the second
+    # pass starts, commit in the cache it visits last: the refusal must come
+    # before the first cache is deleted, not after.
+    refused = _remove_with_patch(
+        project,
+        """
+        import subprocess
+
+        original_judge = cli._judge_cache_nested_repositories
+        order = []
+
+        def judge(config, cache, **kwargs):
+            order.append(cache.path)
+            if len(order) == 3:
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(order[1] / "deps" / "clean"),
+                        "commit",
+                        "--allow-empty",
+                        "-m",
+                        "late",
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+            return original_judge(config, cache, **kwargs)
+
+        cli._judge_cache_nested_repositories = judge
+        """,
+    )
+
+    assert refused.returncode == 3, refused.stdout + refused.stderr
+    assert "not provably disposable: HEAD names commit " in refused.stderr
+    assert "before this refusal the removal deleted" not in refused.stderr
+    assert "removed disposable nested Git repository" not in refused.stdout
+    for cache in ("target", "vendor"):
+        assert (tree / cache / "deps" / "clean" / ".git").is_dir(), cache
+    assert not _finish_journal(project).exists()
+    assert len(active_slots(project)) == 1
+
+
 def test_agent_removal_refusal_names_nested_repositories_it_already_deleted(
     tmp_path: Path,
 ) -> None:
@@ -22198,14 +22398,26 @@ def test_agent_removal_refusal_names_nested_repositories_it_already_deleted(
         "simulated cache deletion failure; before this refusal the removal deleted "
         f"disposable nested Git repositories: {item(gone[0])}; the refusal "
         "interrupted deleting a cache holding disposable nested Git repositories, "
-        f"which may be partly deleted: {item(kept[0])}"
+        f"which may be partly deleted: {item(kept[0])}; each listed head is in the "
+        "listed remote-tracking ref, and every other commit of those repositories "
+        "was in one of their counted remote-tracking refs, so fetching from the "
+        "remote that ref names (its URL was in the deleted repository's "
+        "configuration) and checking out the listed head restores the head's "
+        "commits, but not uncommitted files, hooks or unreferenced objects; keep "
+        "this message: the path fence was rolled back, which cleared the journal "
+        "that listed these repositories"
     ) in refused.stderr
     assert not _finish_journal(project).exists()
     assert len(active_slots(project)) == 1
 
 
 @pytest.mark.parametrize(
-    "point", ("after-nested-git-evidence-journaled", "after-remove-worktree")
+    "point",
+    (
+        "after-nested-git-evidence-journaled",
+        "after-nested-git-rejudged",
+        "after-remove-worktree",
+    ),
 )
 def test_interrupted_agent_removal_keeps_and_reports_nested_evidence(
     tmp_path: Path, point: str
@@ -22362,6 +22574,15 @@ def test_nested_git_budget_bounds_each_command_and_the_whole_removal(
     )
     assert wrkslots._NestedGitBudget(total_seconds=5.0).command_seconds() == 5.0
     assert wrkslots._NestedGitBudget(total_seconds=0.0).command_seconds() == 0.0
+    # Only time spent inside Git commands is charged; deleting caches between
+    # judgments costs nothing, however long it takes.
+    charged = wrkslots._NestedGitBudget(total_seconds=5.0)
+    charged.charge(2.0)
+    assert charged.command_seconds() == 3.0
+    charged.charge(-1.0)
+    assert charged.command_seconds() == 3.0
+    charged.charge(10.0)
+    assert charged.command_seconds() == 0.0
     repository = tmp_path / "repository"
     repository.mkdir()
     git(repository, "init", "--initial-branch=main")
@@ -22422,6 +22643,9 @@ def test_nested_remote_exclusion_names_why_a_remote_does_not_count(
     assert wrkslots._nested_remote_exclusion("../dependency", work_tree, roots) == (
         "its URL is a local path inside this removal"
     )
+    assert wrkslots._nested_remote_exclusion(
+        str(tmp_path / "missing"), work_tree, roots, label="push URL"
+    ) == "its push URL is a local path that does not exist"
     loop = tmp_path / "loop"
     loop.symlink_to(loop)
     looped = wrkslots._nested_remote_exclusion(str(loop), work_tree, roots)
@@ -22439,18 +22663,44 @@ def test_nested_remote_exclusion_names_why_a_remote_does_not_count(
 
 
 def test_refspec_destinations_and_matching_follow_git_fetch() -> None:
-    assert wrkslots._refspec_destinations(
-        [
-            "+refs/heads/*:refs/remotes/origin/*",
-            "refs/heads/main:refs/remotes/mirror/main",
-            "refs/heads/x:refs/heads/y",
-            "refs/tags/*:refs/tags/*",
-            "^refs/heads/skip",
-            "+^refs/heads/skip-too",
-            "refs/heads/no-destination",
-        ]
-    ) == ["refs/remotes/origin/*", "refs/remotes/mirror/main"]
+    refspecs = [
+        "+refs/heads/*:refs/remotes/origin/*",
+        "refs/heads/main:refs/remotes/mirror/main",
+        "refs/heads/x:refs/heads/y",
+        "refs/tags/*:refs/tags/*",
+        "^refs/heads/skip",
+        "+^refs/heads/skip-too",
+        "refs/heads/no-destination",
+        "+refs/*:refs/*",
+        # Git qualifies a destination without a wildcard (remote.c
+        # get_local_ref) and ignores a wildcard one outside refs/.
+        "+refs/heads/main:remotes/origin/short",
+        "refs/heads/a:heads/b",
+        "refs/tags/v1:tags/v1",
+        "refs/heads/c:plain",
+        "refs/heads/*:remotes/wild/*",
+        "refs/heads/d:",
+    ]
+    qualified = [
+        "refs/remotes/origin/*",
+        "refs/remotes/mirror/main",
+        "refs/heads/y",
+        "refs/tags/*",
+        "refs/*",
+        "refs/remotes/origin/short",
+        "refs/heads/b",
+        "refs/tags/v1",
+        "refs/heads/plain",
+    ]
+    assert wrkslots._refspec_destinations(refspecs) == qualified
+    # An uncounted remote is charged with everything it could write.
+    assert wrkslots._refspec_destinations(refspecs, over_approximate=True) == [
+        *qualified,
+        "refs/remotes/wild/*",
+    ]
     for destination, refname, expected in (
+        ("refs/*", "refs/remotes/origin/main", True),
+        ("refs/*", "refs/heads/main", True),
         ("refs/remotes/origin/*", "refs/remotes/origin/main", True),
         ("refs/remotes/origin/*", "refs/remotes/origin/team/topic", True),
         ("refs/remotes/origin/*", "refs/remotes/origin2/main", False),
