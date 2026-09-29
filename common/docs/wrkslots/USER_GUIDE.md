@@ -48,7 +48,14 @@ type, task and purpose, owner process identity, coordinator history, heartbeat t
    owner's cgroup is skipped, because the consenting owner is still alive there by definition. Each
    missing condition is named in the refusal. The accepted basis is recorded in the event log as an
    `owner-consented-release-recorded` active-state event with `owner_state: live`,
-   `basis: owner-consented-handoff`, and the handoff path and SHA-256 digest.
+   `basis: owner-consented-handoff`, and the handoff path and SHA-256 digest. A handoff is also how
+   an owner leaves resumption notes, so reading one does not by itself mean the owner released the
+   slot: run `remove` only for a slot whose owner said it is done with it. `retire-pending` applies
+   this release only when given `--include-owner-consented`; without that flag a scheduled batch
+   keeps retaining live-owner slots even when it passes `--coordinator-authorized`. An interrupted
+   owner-consented removal must be finished by a `recover` from a `wrkslots` version that has this
+   release. An older version refuses because the owner is still alive, and until a newer `recover`
+   runs or the owner exits, the interrupted removal's journal blocks every other mutation.
 7. Before removing an agent slot, `remove` publishes unpushed commits and tracked and ordinary
    untracked files outside configured regenerable cache paths to the recorded remote. It never
    uploads gitignored content. It records and rechecks the exact remote ref and commit before
@@ -180,10 +187,10 @@ outside this destructive workflow before a fresh slot can provide new retirement
 
 Inspect the queue with `wrkslots retirement-queue --format json`. A coordinator may attempt a
 bounded group with `wrkslots retire-pending --limit N --coordinator-pid PID --format json`. Each
-item runs the ordinary removal state machine independently; a live owner without an
-owner-consented handoff (step 6 above), fresh heartbeat, hold, process use, changed handoff, dirty
-or unpublished work that cannot be salvaged, remote mismatch, or path-fence race retains the slot in
-the queue. Successful archived removal clears its sidecar.
+item runs the ordinary removal state machine independently; a live owner (unless
+`--include-owner-consented` is given and step 6 above holds), fresh heartbeat, hold, process use,
+changed handoff, dirty or unpublished work that cannot be salvaged, remote mismatch, or path-fence
+race retains the slot in the queue. Successful archived removal clears its sidecar.
 Attempt events rotate blocked entries behind never-attempted and less-recently-attempted entries, so
 one retained slot cannot starve the rest of a bounded queue. Lock contention is deferred; corrupt,
 partial, or indeterminate state stops the batch and requires recovery instead of being mislabeled as

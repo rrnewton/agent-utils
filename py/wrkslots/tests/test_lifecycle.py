@@ -28497,9 +28497,17 @@ def test_live_owner_without_an_owner_handoff_keeps_the_original_refusal(
     _assert_slot_retained(project)
 
 
-def test_retire_pending_releases_an_owner_consented_slot_only_when_authorized(
+def test_retire_pending_releases_an_owner_consented_slot_only_when_opted_in(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """A scheduled batch keeps retaining live-owner slots unless it opts in.
+
+    A scheduler may pass --coordinator-authorized to retire-pending for its own
+    ordinary removals, and a handoff is also how an owner leaves resumption
+    notes. So neither the flag nor a read handoff alone lets a batch remove a
+    live owner's slot; the batch must also be given --include-owner-consented.
+    """
+
     project, digest = _owner_consent_ready(tmp_path)
     base = [
         "--project-root",
@@ -28513,14 +28521,38 @@ def test_retire_pending_releases_an_owner_consented_slot_only_when_authorized(
         "json",
     ]
 
-    assert wrkslots.main(base) == 0
-    unauthorized = json.loads(capsys.readouterr().out)
-    assert unauthorized["removed"] == []
-    assert unauthorized["retained"][0]["slot"] == "slot01"
-    assert "missing: coordinator authorization" in unauthorized["retained"][0]["reason"]
-    _assert_slot_retained(project)
+    def retained_reason(arguments: list[str]) -> str:
+        assert wrkslots.main(arguments) == 0
+        result = json.loads(capsys.readouterr().out)
+        assert result["removed"] == []
+        assert result["could_not_determine"] == []
+        assert [item["slot"] for item in result["retained"]] == ["slot01"]
+        _assert_slot_retained(project)
+        return str(result["retained"][0]["reason"])
 
-    assert wrkslots.main([*base, "--coordinator-authorized"]) == 0
+    # Without the opt-in the batch behaves exactly as before owner consent
+    # existed, with or without --coordinator-authorized: the registered
+    # liveness authority reports the owner alive and the slot is retained.
+    for arguments in (base, [*base, "--coordinator-authorized"]):
+        reason = retained_reason(arguments)
+        assert reason.startswith("registered liveness authority reports owner alive"), reason
+        assert "owner-consented" not in reason
+    # With that authority silenced, the original live-owner refusal is what
+    # retains it, word for word.
+    set_liveness(project, "dead")
+    legacy = _OWNER_CONSENT_LEGACY_REFUSAL.format(pid=os.getpid())
+    assert retained_reason([*base, "--coordinator-authorized"]) == legacy
+    set_liveness(project, "alive")
+
+    # Opting in does not waive any consent condition.
+    unauthorized = retained_reason([*base, "--include-owner-consented"])
+    assert unauthorized.startswith(_owner_consent_prefix()), unauthorized
+    assert _owner_consent_missing(unauthorized) == ["coordinator authorization"]
+
+    assert (
+        wrkslots.main([*base, "--coordinator-authorized", "--include-owner-consented"])
+        == 0
+    )
     authorized = json.loads(capsys.readouterr().out)
     assert authorized["removed"] == [
         {
