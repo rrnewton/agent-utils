@@ -40846,7 +40846,9 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "attempted. Exit status is 0 only when no row was refused: in a plan every row "
             "would be recovered or resumed or was already recovered, and with --apply every "
             "row was recovered or already recovered. It is 1 when any row was refused, and "
-            "3 when the whole batch was refused."
+            "3 when the whole batch was refused. --apply is idempotent: rerun over rows "
+            "that are all already recovered, it changes nothing and exits 0, so an "
+            "interrupted batch can be rerun unchanged."
         ),
         formatter_class=_HelpFormatter,
     )

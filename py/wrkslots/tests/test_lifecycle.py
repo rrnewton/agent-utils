@@ -40507,6 +40507,14 @@ def test_recover_absent_agent_rows_plans_then_recovers_every_row_like_the_single
         assert git(remote, "rev-parse", rescue_ref).stdout.strip() == record.checkouts[0].head
     assert registry_journals(project) == []
 
+    # --apply is idempotent: a rerun over rows that are all already recovered
+    # changes nothing and still exits 0, as its help states.
+    control = project / "worktrees"
+    before = {
+        path.relative_to(control): path.read_bytes()
+        for path in sorted(control.rglob("*"))
+        if path.is_file() and not path.name.endswith(".lock")
+    }
     returncode, stdout, stderr = run_absent_agent_rows(
         project,
         *(f"--row={absent_row_argument(record)}" for record in records),
@@ -40515,8 +40523,25 @@ def test_recover_absent_agent_rows_plans_then_recovers_every_row_like_the_single
         apply=True,
     )
     assert returncode == 0, stderr
-    _payload, outcomes = absent_rows_payload(stdout)
+    payload, outcomes = absent_rows_payload(stdout)
     assert set(outcomes.values()) == {"already-recovered"}
+    assert payload["counts"] == {
+        "would-recover": 0,
+        "would-resume": 0,
+        "recovered": 0,
+        "already-recovered": 3,
+        "refused": 0,
+    }
+    assert {
+        path.relative_to(control): path.read_bytes()
+        for path in sorted(control.rglob("*"))
+        if path.is_file() and not path.name.endswith(".lock")
+    } == before
+    helped = raw_command(project, "recover-absent-agent-rows", "--help")
+    assert helped.returncode == 0, helped.stderr
+    assert "--apply is idempotent: rerun over rows that are all already recovered, it " in (
+        " ".join(helped.stdout.split())
+    )
 
 
 def test_recover_absent_agent_rows_refuses_one_row_and_recovers_the_others(
