@@ -477,6 +477,11 @@ def test_delegated_nested_run_keeps_descendants_in_outer_owned_subtree(
     import os
     import time
 
+    if inherited_runner_authority_env.get("DAGRUN_DELEGATED_UNBOXED") == "1":
+        pytest.skip(
+            "parent validation is explicitly unboxed; no kernel subtree exists to verify"
+        )
+
     pid_marker = tmp_path / "descendant.pid"
     cgroup_marker = tmp_path / "descendant.cgroup"
     coordinator_cgroup_marker = tmp_path / "coordinator.cgroup"
