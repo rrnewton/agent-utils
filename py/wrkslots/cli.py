@@ -17347,8 +17347,17 @@ def _cmd_remove(
             and record.owner == coordinator
         )
         owner_consent: _OwnerConsent | None = None
+        # An explicit remove names one slot, so running it is the coordinator's
+        # decision for that slot. A retire-pending batch selects slots itself
+        # and a scheduler may pass --coordinator-authorized for it, so it may
+        # use owner consent only when the caller opted in for the batch.
+        # Otherwise a live owner keeps the original refusal and is retained.
+        owner_consent_allowed = retirement_candidate is None or (
+            getattr(args, "include_owner_consented", False) is True
+        )
         if (
-            record.slot_type == "agent"
+            owner_consent_allowed
+            and record.slot_type == "agent"
             and owner_state == "live"
             and not args.validate_complete
             and not _owner_record_is_absent(record)
@@ -29139,9 +29148,10 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "Attempt one bounded group of handoff-read agent slots. Each target runs the "
             "ordinary remove state machine under its own lock scope; every liveness, hold, "
             "process-use, Git salvage, remote, digest, and path-fence refusal remains active."
-            " A target whose recorded owner is still alive is removed only under the "
-            "owner-consented-handoff conditions documented for remove, which include "
-            "--coordinator-authorized and an expired heartbeat; otherwise it is retained."
+            " A target whose recorded owner is still alive keeps the ordinary refusal and"
+            " is retained unless --include-owner-consented is given; only then is it removed,"
+            " and only under the owner-consented-handoff conditions documented for remove,"
+            " which include --coordinator-authorized and an expired heartbeat."
             " The default end-to-end lock-wait budget is 5 seconds and any global "
             "--wait-lock value is capped at 30 seconds for this bounded command."
         ),
@@ -29166,8 +29176,20 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--coordinator-authorized",
         action="store_true",
         help=(
-            "record coordinator authorization with each ordinary removal attempt; required "
-            "for a target whose recorded owner is still alive (see remove --help)"
+            "record coordinator authorization with each ordinary removal attempt; required, "
+            "with --include-owner-consented, for a target whose recorded owner is still alive "
+            "(see remove --help)"
+        ),
+    )
+    retire_pending.add_argument(
+        "--include-owner-consented",
+        action="store_true",
+        help=(
+            "also attempt owner-consented release (see remove --help) for a target whose "
+            "recorded owner is still alive; without this flag such a target keeps the "
+            "ordinary live-owner refusal and is retained, even with --coordinator-authorized. "
+            "A handoff is also how an owner leaves resumption notes, so pass this only when "
+            "every queued live-owner handoff is known to be a release"
         ),
     )
     retire_pending.add_argument(
@@ -29250,7 +29272,8 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "carries a completed write-handoff whose recorded writer is exactly the recorded "
             "owner process, and the coordinator has read that handoff with read-handoff. Every "
             "process-use, path, Git, and salvage check still runs, and the basis is recorded in "
-            "the event log as owner-consented-handoff."
+            "the event log as owner-consented-handoff. retire-pending applies this exception "
+            "only when given --include-owner-consented."
         ),
         formatter_class=_HelpFormatter,
     )
