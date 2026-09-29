@@ -10,7 +10,7 @@ labels:
 depends_on:
   agent-utils-1: parent-child
 created_at: 2026-09-25T03:55:15.315366091+00:00
-updated_at: 2026-09-29T20:13:18.635140250+00:00
+updated_at: 2026-09-29T23:56:12.369891852+00:00
 claimed_at: 2026-09-25T04:17:03.192733505+00:00
 claimed_until: 2026-09-27T04:17:03.192544933+00:00
 ---
@@ -43,3 +43,18 @@ All useful old-checkout and registered agent-worktree work is landed or proven s
 No worktree, branch, recovery reference or bundle was deleted in this audit. The remaining action
 is destructive and needs an owner decision about the unmerged stacks and the two dirty negative-
 control/review worktrees.
+
+[gpt-5] Follow-up reconciliation on 2026-09-29:
+
+- The exact committed-boundary retry is now in `origin/main` as `d458192c`; both retained source
+  commits are patch-equivalent to it. The normal reply-burst fix and its consolidated follow-up are
+  likewise patch-equivalent to landed commits. Older alternate reply-breaker variants are
+  superseded by that consolidated implementation.
+- The old `main` checkout was clean and strictly behind `origin/main`; it was fast-forwarded to
+  `797f57d0` and remains clean. No local work was discarded.
+- New chat/inbox work appeared while this audit was running. Its active worktrees, the two dirty
+  review/negative-control worktrees, every branch, and every recovery reference remain untouched.
+
+Useful historical work is therefore reconciled without disturbing concurrent work. Final branch
+and worktree removal still awaits an owner decision about the dirty and currently active targets;
+the durable recovery bundle remains retained.
