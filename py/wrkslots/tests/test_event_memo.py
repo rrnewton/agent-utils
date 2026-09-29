@@ -722,3 +722,318 @@ def test_unrequired_repository_record_check_touches_storage_only_for_the_reposit
         cli._assert_record_paths(config, record, require_repository=False)
 
     assert references == [checkout.repository for checkout in record.checkouts]
+
+
+# The tests below pin the verified-chain memo.  A read-only
+# classify-create-journals loads the whole log seven times in one invocation.
+
+
+def _classify_argv(project: Path) -> list[str]:
+    return [
+        "--project-root",
+        str(project),
+        "classify-create-journals",
+        "probe-slot",
+        "--slot-type",
+        "validate",
+        "--agent",
+        "validate-probe-slot",
+        "--format",
+        "json",
+    ]
+
+
+def _cold(action: Callable[[], T]) -> T:
+    """Run an action with no memo scope, as a fresh command would."""
+
+    memo_stack = list(cli._ACTIVE_EVENT_MEMO)
+    cli._ACTIVE_EVENT_MEMO.clear()
+    try:
+        return action()
+    finally:
+        cli._ACTIVE_EVENT_MEMO.extend(memo_stack)
+
+
+def _chain_key(config: cli.Config) -> tuple[str, str]:
+    return (str(cli._event_directory(config)), config.machine)
+
+
+def test_classify_create_journals_parses_each_event_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The read-only entry command parses each event file once however often it loads.
+
+    A production report counted seven parses of every one of 16,155 event files
+    in one invocation of an older release, which spent most of a caller's
+    30-second entry budget.
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    prepare_dead_validate_slots(project, ("memo-a", "memo-b"))
+    events = _event_paths(project)
+    _treat_every_event_as_settled(monkeypatch)
+    work = _Work(monkeypatch)
+    loads = 0
+    load = cli._load_events
+
+    def counted_load(
+        config: cli.Config, machine: str | None = None
+    ) -> tuple[dict[str, object], ...]:
+        nonlocal loads
+        loads += 1
+        return load(config, machine)
+
+    monkeypatch.setattr(cli, "_load_events", counted_load)
+
+    assert cli.main(_classify_argv(project)) == 0
+
+    assert json.loads(capsys.readouterr().out)["journals"] == []
+    assert loads >= 6
+    assert work.parses == len(events)
+
+
+def test_classify_create_journals_reuses_the_verified_chain_and_still_stats_every_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Later loads return the chain the first load verified, after an lstat of every file.
+
+    The first load checks each file's identity before and after parsing it;
+    every later load checks each file once.  Checking fewer files would let an
+    earlier event rewritten between two loads go unnoticed until the next
+    command.
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    prepare_dead_validate_slots(project, ("memo-a", "memo-b"))
+    events = _event_paths(project)
+    _treat_every_event_as_settled(monkeypatch)
+    loaded: list[tuple[dict[str, object], ...]] = []
+    load = cli._load_events
+    identity = cli._event_file_identity
+    identity_checks = 0
+
+    def recorded_load(
+        config: cli.Config, machine: str | None = None
+    ) -> tuple[dict[str, object], ...]:
+        result = load(config, machine)
+        loaded.append(result)
+        return result
+
+    def counted_identity(path: str | Path) -> tuple[int, int, int, int, int] | None:
+        nonlocal identity_checks
+        identity_checks += 1
+        return identity(path)
+
+    monkeypatch.setattr(cli, "_load_events", recorded_load)
+    monkeypatch.setattr(cli, "_event_file_identity", counted_identity)
+
+    assert cli.main(_classify_argv(project)) == 0
+
+    assert json.loads(capsys.readouterr().out)["journals"] == []
+    config = cli._load_config(str(project), "testhost")
+    cold = load(config, config.machine)
+    assert len(loaded) >= 6
+    assert all(result == cold for result in loaded)
+    assert all(result is loaded[0] for result in loaded)
+    assert identity_checks == (len(loaded) + 1) * len(events)
+
+
+def test_an_append_inside_a_command_loads_exactly_what_a_cold_load_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    prepare_dead_validate_slots(project, ("memo",))
+    config = cli._load_config(str(project), "testhost")
+    _treat_every_event_as_settled(monkeypatch)
+    key = _chain_key(config)
+
+    with cli._event_memo_scope() as memo:
+        before = cli._load_events(config)
+        assert memo.chains[key].events is before
+        record = next(item for item in cli._load_active(config).slots if item.slot == "memo")
+        changed = dataclasses.replace(record, heartbeat_at="2030-01-01T00:00:00+00:00")
+        _append_active_record(config, changed, record)
+        # The writer forgets the chain before the directory changes.
+        assert key not in memo.chains
+
+        warm = cli._load_events(config)
+        cold = _cold(lambda: cli._load_events(config))
+        assert warm == cold
+        assert len(warm) == len(before) + 1 and warm[:-1] == before
+        assert warm[-1]["kind"] == "active-state-recorded"
+        assert memo.chains[key].events is warm
+        assert cli._load_events(config) is warm
+        assert cli._states_from_events(config, config.machine) == _cold(
+            lambda: cli._states_from_events(config, config.machine)
+        )
+        assert next(
+            item for item in cli._load_active(config).slots if item.slot == "memo"
+        ).heartbeat_at == "2030-01-01T00:00:00+00:00"
+
+
+def test_a_recovered_event_inside_a_command_loads_exactly_what_a_cold_load_loads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Recovery renames an event into place without the writer; the load must see it."""
+
+    project, _repository, _remote = make_project(tmp_path)
+    config = cli._load_config(str(project), "testhost")
+    written = cli._write_event_file(
+        config, config.machine, "test-observation", {"fact": "complete before rename"}
+    )
+    event_path = cli._event_directory(config) / f"{written['sequence']:020d}.json"
+    event_path.rename(event_path.with_name(f"{event_path.name}.tmp.crash"))
+    _treat_every_event_as_settled(monkeypatch)
+    key = _chain_key(config)
+
+    with cli._event_memo_scope() as memo:
+        before = cli._load_events(config)
+        assert memo.chains[key].events is before
+        assert cli._recover_partial_updates(config, True)
+        warm = cli._load_events(config)
+        cold = _cold(lambda: cli._load_events(config))
+
+    assert "recovered append-only event" in capsys.readouterr().out
+    assert warm == cold
+    assert len(warm) == len(before) + 1 and warm[:-1] == before
+    assert warm[-1] == written
+
+
+def _rewrite_in_place(path: Path, original: bytes, replacement: bytes) -> None:
+    """Rewrite an event file in place, keeping its inode, size and mtime."""
+
+    before = os.lstat(path)
+    contents = path.read_bytes()
+    assert contents.count(original) == 1
+    rewritten = contents.replace(original, replacement)
+    assert len(rewritten) == len(contents) and rewritten != contents
+    with path.open("r+b") as handle:
+        handle.write(rewritten)
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = os.lstat(path)
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+
+
+def _corrupt(paths: Sequence[Path], events: Sequence[dict[str, object]], kind: str) -> str:
+    """Corrupt the second event of the chain and return the refusal a load must give."""
+
+    target = paths[1]
+    digest = cast(str, events[1]["sha256"])
+    if kind == "digest":
+        other = ("0" if digest[0] != "0" else "1") + digest[1:]
+        _rewrite_in_place(target, digest.encode(), other.encode())
+        return f"append-only event digest does not match its content: {target}"
+    if kind == "link":
+        # Keep the event's own digest valid so only the link to its predecessor breaks.
+        previous = cast(str, events[1]["previous_sha256"])
+        other_previous = ("0" if previous[0] != "0" else "1") + previous[1:]
+        core = {
+            key: value
+            for key, value in events[1].items()
+            if key != "sha256"
+        }
+        core["previous_sha256"] = other_previous
+        _rewrite_in_place(target, previous.encode(), other_previous.encode())
+        _rewrite_in_place(target, digest.encode(), cli._event_digest(core).encode())
+        return f"append-only event hash chain is broken at {target}"
+    if kind == "gap":
+        target.unlink()
+        return (
+            f"append-only event log has a sequence gap at {paths[2]}; "
+            "preserve the log and run 'wrkslots doctor'"
+        )
+    assert kind == "stray-entry"
+    stray = target.with_name("stray")
+    stray.write_text("not an event\n", encoding="utf-8")
+    return (
+        f"append-only event log contains an unexpected entry: {stray}; "
+        "preserve it and run 'wrkslots doctor' before changing slot state"
+    )
+
+
+@pytest.mark.parametrize("kept_chain", (False, True), ids=("first-load", "after-kept-chain"))
+@pytest.mark.parametrize("kind", ("digest", "link", "gap", "stray-entry"))
+def test_a_corrupted_chain_is_refused_on_the_first_load_and_after_a_kept_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, kept_chain: bool
+) -> None:
+    """Every refusal a cold load gives is given inside a command, before or after a kept chain.
+
+    The corrupted event is not the last one: a kept chain must not be trusted on
+    the identity of its tail alone.
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    prepare_dead_validate_slots(project, ("memo",))
+    config = cli._load_config(str(project), "testhost")
+    paths = _event_paths(project)
+    assert len(paths) >= 3
+    events = cli._load_events(config)
+    _treat_every_event_as_settled(monkeypatch)
+    key = _chain_key(config)
+
+    with cli._event_memo_scope() as memo:
+        if kept_chain:
+            assert cli._load_events(config) == events
+            assert memo.chains[key].events == events
+        expected = _corrupt(paths, events, kind)
+        with pytest.raises(cli.StateError) as warm:
+            cli._load_events(config)
+        if kind != "stray-entry":
+            # A refused verification keeps no chain.  A stray entry is refused
+            # by the listing, which every load performs before any chain lookup.
+            assert key not in memo.chains
+        with pytest.raises(cli.StateError) as again:
+            cli._load_events(config)
+        with pytest.raises(cli.StateError) as cold:
+            _cold(lambda: cli._load_events(config))
+
+    assert str(cold.value) == expected
+    assert str(warm.value) == expected
+    assert str(again.value) == expected
+
+
+def test_a_verified_chain_is_kept_only_when_every_event_has_settled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The chain inherits the per-file change-time window."""
+
+    project, _repository, _remote = make_project(tmp_path)
+    prepare_dead_validate_slots(project, ("memo",))
+    config = cli._load_config(str(project), "testhost")
+    paths = _event_paths(project)
+    changed = [os.lstat(path).st_ctime_ns for path in paths]
+    clock = [max(changed) + cli._EVENT_MEMO_STABLE_NS - 1]
+    monkeypatch.setattr(cli, "_event_memo_clock_ns", lambda: clock[0])
+    recent = sum(1 for ns in changed if ns + cli._EVENT_MEMO_STABLE_NS > clock[0])
+    assert 1 <= recent < len(paths)
+    work = _Work(monkeypatch)
+    key = _chain_key(config)
+
+    with cli._event_memo_scope() as memo:
+        first = cli._load_events(config)
+        assert work.parses == len(paths)
+        assert memo.chains == {}
+        work.parses = 0
+        assert cli._load_events(config) == first
+        assert work.parses == recent
+        assert memo.chains == {}
+
+        clock[0] = max(changed) + cli._EVENT_MEMO_STABLE_NS
+        work.parses = 0
+        kept = cli._load_events(config)
+        assert kept == first
+        assert work.parses == recent
+        assert memo.chains[key].events is kept
+        work.parses = 0
+        assert cli._load_events(config) is kept
+        assert work.parses == 0

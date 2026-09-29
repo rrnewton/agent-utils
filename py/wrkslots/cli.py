@@ -5323,26 +5323,38 @@ def _event_digest(value: Mapping[str, object]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _event_files(directory: Path) -> list[Path]:
+def _event_file_names(directory: Path) -> tuple[str, ...]:
+    """Return the complete event file names in chain order.
+
+    Names are listed and sorted as strings.  Sorting one Path per entry cost
+    about 140 ms per load on a 16,000-event log on a loaded host, and one
+    command loads the log several times; for entries of one directory the
+    string order is the order the Paths had.
+    """
+
     if not directory.exists():
-        return []
+        return ()
     if directory.is_symlink() or not directory.is_dir():
         raise StateError(f"append-only event log is not a real directory: {directory}")
-    entries = tuple(directory.iterdir())
+    names = os.listdir(directory)
     complete_pattern = re.compile(r"[0-9]{20}\.json")
     partial_pattern = re.compile(r"[0-9]{20}\.json\.tmp\..+")
     unexpected = sorted(
-        entry
-        for entry in entries
-        if complete_pattern.fullmatch(entry.name) is None
-        and partial_pattern.fullmatch(entry.name) is None
+        name
+        for name in names
+        if complete_pattern.fullmatch(name) is None
+        and partial_pattern.fullmatch(name) is None
     )
     if unexpected:
         raise StateError(
-            f"append-only event log contains an unexpected entry: {unexpected[0]}; "
+            f"append-only event log contains an unexpected entry: {directory / unexpected[0]}; "
             "preserve it and run 'wrkslots doctor' before changing slot state"
         )
-    return sorted(entry for entry in entries if complete_pattern.fullmatch(entry.name))
+    return tuple(sorted(name for name in names if complete_pattern.fullmatch(name)))
+
+
+def _event_files(directory: Path) -> list[Path]:
+    return [directory / name for name in _event_file_names(directory)]
 
 
 def _event_from_path(
@@ -5407,9 +5419,33 @@ def _event_from_path(
 # assumes the kernel stamps change times from this host's realtime clock, as a
 # local filesystem does; a clock stepped backwards only stops events being kept.
 # Loaded events are shared, never mutated, and consumers copy what they retain.
+#
+# The kept events alone still left every repeated load listing the directory
+# and walking the memo file by file; a read-only classify-create-journals loads
+# the log seven times.  So the complete verified chain is kept as well, keyed by
+# its directory and machine, with every file name and the identity each file
+# was verified with.  A load answers from the kept chain only when the
+# directory lists exactly those names and every file still has exactly that
+# identity.  That is the per-file test applied to every position at once, so
+# every file is still lstat'ed on every load, and an earlier event rewritten or
+# replaced between two loads is read and verified again exactly as before.  A
+# chain is kept only when every one of its events was kept or reused under the
+# per-file rule, so it inherits the change-time window.  Every writer forgets
+# the chain before it changes the directory.
 _EVENT_MEMO_STABLE_NS = 2_000_000_000
 _EVENT_MEMO_ENTRIES_LIMIT = 1 << 17
 _REPLAY_MEMO_ENTRIES_LIMIT = 8
+
+_EventFileIdentity = tuple[int, int, int, int, int]
+
+
+@dataclasses.dataclass(frozen=True)
+class _VerifiedEventChain:
+    """One complete verified chain and the file identities it was verified with."""
+
+    names: tuple[str, ...]
+    identities: tuple[_EventFileIdentity, ...]
+    events: tuple[dict[str, object], ...]
 
 
 @dataclasses.dataclass
@@ -5422,6 +5458,9 @@ class _EventMemo:
     ] = dataclasses.field(default_factory=dict)
     replays: dict[tuple[Config, str, bool], tuple[int, str, _ReplayFold]] = (
         dataclasses.field(default_factory=dict)
+    )
+    chains: dict[tuple[str, str], _VerifiedEventChain] = dataclasses.field(
+        default_factory=dict
     )
 
 
@@ -5445,7 +5484,7 @@ def _event_memo_clock_ns() -> int:
     return time.time_ns()
 
 
-def _event_file_identity(path: Path) -> tuple[int, int, int, int, int] | None:
+def _event_file_identity(path: str | Path) -> tuple[int, int, int, int, int] | None:
     try:
         status = os.lstat(path)
     except OSError:
@@ -5464,26 +5503,42 @@ def _event_file_identity(path: Path) -> tuple[int, int, int, int, int] | None:
 def _load_event_paths(
     paths: Sequence[Path], machine: str
 ) -> tuple[dict[str, object], ...]:
+    return _verify_event_paths(paths, machine)[0]
+
+
+def _verify_event_paths(
+    paths: Sequence[Path], machine: str
+) -> tuple[tuple[dict[str, object], ...], tuple[_EventFileIdentity | None, ...]]:
+    """Verify one chain and return each event's reusable file identity.
+
+    An identity is returned only for an event the per-file memo reused or kept
+    during this load, never for one outside a memo scope.
+    """
+
     events: list[dict[str, object]] = []
+    trusted: list[_EventFileIdentity | None] = []
     previous = "0" * 64
     if not _ACTIVE_EVENT_MEMO:
         for expected_sequence, path in enumerate(paths, start=1):
             raw = _event_from_path(path, machine, expected_sequence, previous)
             previous = _as_str(raw["sha256"], "append-only event.sha256")
             events.append(raw)
-        return tuple(events)
+            trusted.append(None)
+        return tuple(events), tuple(trusted)
     memo = _ACTIVE_EVENT_MEMO[-1].files
     observed_ns = _event_memo_clock_ns()
     for expected_sequence, path in enumerate(paths, start=1):
         key = (str(path), machine)
         identity = _event_file_identity(path)
         cached = memo.get(key)
+        kept: _EventFileIdentity | None = None
         if (
             identity is not None
             and cached is not None
             and cached[:3] == (identity, expected_sequence, previous)
         ):
             raw = cached[3]
+            kept = identity
         else:
             raw = _event_from_path(path, machine, expected_sequence, previous)
             if (
@@ -5494,15 +5549,44 @@ def _load_event_paths(
                 if len(memo) >= _EVENT_MEMO_ENTRIES_LIMIT:
                     memo.clear()
                 memo[key] = (identity, expected_sequence, previous, raw)
+                kept = identity
         previous = _as_str(raw["sha256"], "append-only event.sha256")
         events.append(raw)
-    return tuple(events)
+        trusted.append(kept)
+    return tuple(events), tuple(trusted)
+
+
+def _forget_event_chain(directory: Path, machine: str) -> None:
+    """Drop the kept chain of a log that is about to change."""
+
+    if _ACTIVE_EVENT_MEMO:
+        _ACTIVE_EVENT_MEMO[-1].chains.pop((str(directory), machine), None)
 
 
 def _load_events(config: Config, machine: str | None = None) -> tuple[dict[str, object], ...]:
     selected = machine or config.machine
     directory = _event_directory(config, selected)
-    return _load_event_paths(_event_files(directory), selected)
+    names = _event_file_names(directory)
+    if not _ACTIVE_EVENT_MEMO:
+        return _load_event_paths([directory / name for name in names], selected)
+    chains = _ACTIVE_EVENT_MEMO[-1].chains
+    key = (str(directory), selected)
+    chain = chains.get(key)
+    if chain is not None:
+        prefix = os.path.join(directory, "")
+        if chain.names == names and all(
+            _event_file_identity(prefix + name) == identity
+            for name, identity in zip(names, chain.identities)
+        ):
+            return chain.events
+        del chains[key]
+    events, trusted = _verify_event_paths(
+        [directory / name for name in names], selected
+    )
+    identities = tuple(identity for identity in trusted if identity is not None)
+    if len(identities) == len(names):
+        chains[key] = _VerifiedEventChain(names, identities, events)
+    return events
 
 
 @dataclasses.dataclass
@@ -5527,6 +5611,7 @@ class _EventWriter:
         path = self.directory / f"{self.sequence:020d}.json"
         if path.exists() or path.is_symlink():
             raise StateError(f"append-only event already exists and will not be replaced: {path}")
+        _forget_event_chain(self.directory, self.machine)
         _atomic_write_json(path, event)
         self.previous_sha256 = _as_str(event["sha256"], "append-only event.sha256")
         return event
@@ -24287,6 +24372,7 @@ def _recover_partial_updates(config: Config, discard: bool) -> bool:
                 previous,
                 require_filename=False,
             )
+            _forget_event_chain(_event_directory(config, machine), machine)
             os.replace(leftover, target)
             _fsync_directory(target.parent)
             _load_events(config, machine)
