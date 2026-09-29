@@ -111,6 +111,43 @@ should require it merely because a dashboard offers it.
 
 License: [AGPL-3.0](https://github.com/smtg-ai/claude-squad/blob/ce1ffb4392b01f38e2c4599c7c84d2a93973b138/LICENSE.md).
 
+## Coordinator inbox: telling a supervisor that workers need it
+
+Reviewed 2026-09-29 for `agentctl inbox`. These systems solve the reverse
+direction of prompt delivery: letting a supervising agent learn that workers
+went idle, got stuck, or reported, without polling every worker and without
+several writers typing into the supervisor at once. Sources were read from
+package-registry snapshots, not from the live repositories, and the licenses
+were not re-checked for this section.
+
+- [Gas Town](https://github.com/steveyegge/gastown) (Go module snapshot at
+  commit `649b832b7672`, 2026-07-23). `gt nudge` waits until the target pane
+  shows an idle prompt on two polls 200 ms apart. After 15 s it falls back to
+  a file queue, one timestamp-named JSON file per nudge, claimed by atomic
+  rename, with a TTL and a depth cap. A Claude hook drains that queue at the
+  next turn boundary, rendering everything as one block with urgent items
+  first. Stuck detection is deliberately slow (30 minutes without progress),
+  because false positives cost more than late detection.
+- [CLI Agent Orchestrator](https://github.com/awslabs/cli-agent-orchestrator)
+  (PyPI 2.5.0). Inbox messages stay pending in a database until the receiver's
+  terminal is idle or completed. An immediate attempt, a log watchdog, and a
+  30-second reconciliation sweep all feed the same gate; the sweep exists
+  because an already-idle receiver produces no output to trigger the others.
+  Messages are marked delivered before the paste, so a crash cannot deliver
+  twice.
+- Claude Code's own cross-session messaging, teammate mailboxes and channels
+  (public documentation at `code.claude.com/docs`). Messages are queued
+  natively and read between tool calls, or start a turn when the receiver is
+  idle. Several channel events arriving during one turn are handed over
+  together.
+
+**Implication:** the inbox adopts the shared lessons: deliver as one batch in
+priority order, keep one live state per worker instead of a history of
+transitions, make retries idempotent by batch, and keep the queue on disk so
+that a restart loses nothing. It deliberately stores notices only. Detecting
+idle workers and choosing work for them stay with the caller: a watcher, the
+coordinator, or a person.
+
 ## Lifecycle guarantees and component boundaries
 
 `agentctl` separates the caller (CLI, MCP, or Chat), the named-session manager,

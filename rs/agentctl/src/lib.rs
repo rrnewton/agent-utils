@@ -11,6 +11,7 @@ pub mod cli;
 pub mod client;
 pub mod codex_goal;
 pub mod error;
+pub(crate) mod inbox;
 pub mod legacy_cli;
 pub mod plugins;
 pub(crate) mod profiles;
@@ -30,3 +31,7 @@ pub const CHAT_USER_GUIDE: &str = include_str!("embedded_chat_userguide.md");
 pub const CHAT_QUICKSTART: &str = include_str!("embedded_chat_quickstart.md");
 /// Harness skill installed by `agentctl skill install`.
 pub const AGENTCTL_SKILL: &str = include_str!("embedded_agentctl_skill.md");
+/// Operator reference for the coordinator inbox.
+pub const INBOX_USER_GUIDE: &str = include_str!("embedded_inbox_userguide.md");
+/// One-screen introduction to the coordinator inbox.
+pub const INBOX_QUICKSTART: &str = include_str!("embedded_inbox_quickstart.md");

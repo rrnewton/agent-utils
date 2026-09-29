@@ -137,6 +137,11 @@ enum Commands {
         after_help = "Example: agentctl chat status --bridge-state ~/.local/state/agentctl/chat"
     )]
     Chat(Chat),
+    /// Queue notices about workers for a coordinator and deliver them as one prioritized batch
+    #[command(
+        after_help = "Examples:\n  agentctl inbox quickstart\n  agentctl inbox post --to coord --from reviewer --kind idle --text 'Review done'\n  agentctl inbox deliver --to coord --via print"
+    )]
+    Inbox(crate::inbox::InboxArgs),
     /// Print a short, runnable introduction to starting and controlling a worker
     Quickstart,
     /// Print the operator reference, including dependencies and delivery guarantees
@@ -726,6 +731,10 @@ pub(crate) fn main_with_environment<I: IntoIterator<Item = OsString>>(
             eprintln!("agentctl: {error}");
             1
         }
+        Err(Failure::Inbox(error)) => {
+            eprintln!("agentctl: {error}");
+            error.exit_code()
+        }
     }
 }
 
@@ -734,6 +743,7 @@ enum Failure {
     Usage(String),
     Output(io::Error),
     Chat(crate::chat_service::ChatServiceError),
+    Inbox(crate::inbox::InboxError),
 }
 impl From<AgentError> for Failure {
     fn from(error: AgentError) -> Self {
@@ -783,6 +793,10 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         }
         Commands::Chat(value) => {
             return run_chat(args.registry, args.herdr_bin, value);
+        }
+        Commands::Inbox(value) => {
+            return crate::inbox::run(&args.registry, &args.agentcloudctl_bin, value)
+                .map_err(Failure::Inbox);
         }
         Commands::Profiles(value) => {
             let (path, profiles, workspace) =
@@ -1080,6 +1094,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         | Commands::Quickstart
         | Commands::Userguide
         | Commands::Chat(_)
+        | Commands::Inbox(_)
         | Commands::Profiles(_)
         | Commands::Skill(_) => {
             unreachable!()
