@@ -85,7 +85,8 @@ cross[dagrun]: SKIPPED/UNVERIFIED 4 check(s), not counted as passes:
 | `boxing` | no cgroup-v2 boxing: no working systemd `--user` scope, or an outer scheduler with no cgroup subtree to delegate |
 | `delegated-live-scope` | the harness runs inside a parent-owned delegated cgroup, where creating a live systemd scope could escape the outer step |
 | `hard-cpuset` | both engines refused a HARD cpuset pin on this host |
-| `multi-cpu` | the host exposes only one usable CPU |
+| `multi-cpu` | fewer than two usable CPUs: one in the CPU affinity mask, or a cgroup CPU quota below two cores |
+| `eight-cpu` | a core budget below eight CPUs (the tighter of the CPU affinity mask and any cgroup CPU quota), so the CPA planner's memory cap cannot be shown to bind |
 
 By default a run claims full coverage, so any skip makes it exit nonzero with an
 `INCOMPLETE` line. A lane that is partial by design declares which kinds it
@@ -98,7 +99,11 @@ refused.
 |---|---|
 | `make cross` | full: every skip fails |
 | validation nodes `cross.dagrun.differential` and `cross.dagrun.cpuset-differential` | partial for `delegated-live-scope` only; boxing stays required |
-| hosted repository CI and the nightly full run | additionally partial for `boxing`, because hosted runners run the graph with `--allow-cgroup-failure` |
+| hosted repository CI and the nightly full run | additionally partial for `boxing`, because hosted runners run the graph with `--allow-cgroup-failure`, and for `eight-cpu`, because hosted runners have fewer than eight CPUs |
+
+A local run on a host with fewer than eight usable CPUs, or with
+`VALIDATE_MAX_CPUS` below eight, skips the CPA memory-cap check and ends
+`INCOMPLETE` until it declares `AGENT_UTILS_CROSS_ALLOW_SKIP=eight-cpu`.
 
 A boxed check counts only when both engines print `cgroup boxing ACTIVE`, which
 they do exactly when they have set up per-step cgroups. When the outer scheduler

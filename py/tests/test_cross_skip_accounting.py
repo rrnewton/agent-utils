@@ -2,9 +2,10 @@
 
 ``cross/differential.py`` cannot run every case everywhere: some need cgroup-v2 boxing, some must
 not create a live systemd scope from inside a parent-owned delegated cgroup, some need a HARD
-cpuset pin, and some need two online CPUs. Such a check used to be recorded with ``Report.ok``,
-so a run in which none of those checks executed printed the same ``OK - N checks`` line and exit
-status as a run in which they all passed.
+cpuset pin, and some need two usable CPUs or, for the CPA planner's memory cap, a core budget of
+eight. Such a check used to be recorded with ``Report.ok``, so a run in which none of those checks
+executed printed the same ``OK - N checks`` line and exit status as a run in which they all
+passed.
 
 These tests pin the replacement contract without running the minutes-long harness:
 
@@ -15,6 +16,8 @@ These tests pin the replacement contract without running the minutes-long harnes
   established box is a failure, never agreement;
 * the cpuset-alloc delegated, HARD-refusal and one-CPU branches list exactly the checks they did
   not run;
+* the CPA planner's one-core and four-core budgets list the checks they could not run, and an
+  eight-core budget runs them all;
 * ``--tool all`` ends with one line that is PARTIAL or FAILED whenever any tool was;
 * ``scripts/validate.py`` names a partial cross node in its summary, although dagrun shows that
   node as a plain PASS;
@@ -743,6 +746,305 @@ def test_one_cpu_cpuset_alloc_skips_only_the_two_interop_pairs(
     ) in out
 
 
+# ------------------------------------------------------------------ CPA planner core budgets
+
+_CPA_ALL_CHECKS = [
+    "cpa:text",
+    "cpa:json",
+    "cpa:widened",
+    "cpa:modeled-ge-lower-bound",
+    "cpa:beats-fixed",
+    "cpa:mem-byte-identical",
+    "cpa:mem-capped",
+    "cpa:infeasible-fixed-width",
+    "cpa:intentional-skip-zero-demand",
+    "cpa:self-managed-curve-source",
+]
+_CPA_ONE_CORE_SKIPS = [
+    ("cpa:widened", "multi-cpu"),
+    ("cpa:beats-fixed", "multi-cpu"),
+    ("cpa:mem-capped", "eight-cpu"),
+]
+
+
+def _cpa_engine(
+    differential: ModuleType,
+    *,
+    core_budget: int,
+    capped_budget: int,
+    throttled: bool,
+    capped_stdout: str | None,
+) -> object:
+    """Fake both engines identically for ``compare_cpa_planner``; nothing else may spawn.
+
+    ``core_budget`` is the budget the main plan reports and ``capped_budget`` the one the two
+    memory-store plans report, so each budget gate can be driven on its own. A plan widens only
+    as far as its budget allows. With ``throttled`` set, a capped plan with at least eight cores
+    narrows ``m.heavy`` and reports ``mem-capped``; unset, the cap has no effect, which the
+    comparison must report as a failure. ``capped_stdout`` replaces the capped plan's output.
+    """
+
+    outcome = differential.Outcome
+
+    def plan(dag: str, args: tuple[str, ...]) -> str:
+        if dag == "dag.json":
+            if "text" in args:
+                return f"cpa plan, core budget {core_budget}\n"
+            wide = core_budget >= 2
+            return json.dumps(
+                {
+                    "allocation": {
+                        "core_budget": core_budget,
+                        "modeled_makespan_s": 40.0 if wide else 58.0,
+                        "lower_bound_s": 30.0 if wide else 58.0,
+                    },
+                    "steps": [{"tag": "c.build", "alloc_inner_jobs": min(core_budget, 4)}],
+                }
+            )
+        if dag == "mdag.json":
+            free = min(capped_budget, 8)
+            if "--max-mem" not in args:
+                width, reason = free, "core-budget"
+            elif capped_stdout is not None:
+                return capped_stdout
+            elif throttled and capped_budget >= 8:
+                width, reason = 4, "mem-capped"
+            else:
+                width, reason = free, "core-budget"
+            return json.dumps(
+                {
+                    "allocation": {"core_budget": capped_budget, "stop_reason": reason},
+                    "steps": [{"tag": "m.heavy", "alloc_inner_jobs": width}],
+                }
+            )
+        if dag == "fixed-width.json":
+            return json.dumps(
+                {
+                    "allocation": {
+                        "stop_reason": "infeasible-fixed-width",
+                        "modeled_makespan_s": "inf",
+                    },
+                    "steps": [{"tag": "f.fixed", "alloc_inner_jobs": None}],
+                }
+            )
+        live = {"tag": "c.build", "alloc_inner_jobs": 1}
+        if dag == "skip-control.json":
+            return json.dumps({"steps": [live]})
+        if dag == "skip-present.json":
+            skipped = {
+                "tag": "c.skipped",
+                "est_duration_s": "0.000",
+                "est_source": "skip",
+                "alloc_inner_jobs": None,
+            }
+            return json.dumps({"steps": [skipped, live]})
+        if dag == "fixed-curve-source.json":
+            return json.dumps(
+                {
+                    "steps": [
+                        {
+                            "tag": "c.build",
+                            "est_duration_s": "20.000",
+                            "est_source": "store",
+                            "alloc_inner_jobs": None,
+                        },
+                        {
+                            "tag": "c.test",
+                            "est_duration_s": "8.000",
+                            "est_source": "store",
+                            "alloc_inner_jobs": None,
+                        },
+                    ]
+                }
+            )
+        raise AssertionError(f"unexpected CPA plan DAG {dag!r}")
+
+    def fake_run(
+        _cmd: object, args: tuple[str, ...] | list[str], *_rest: object, **_kw: object
+    ) -> object:
+        args = tuple(args)
+        if args[:1] != ("plan",) or "--dag" not in args:
+            raise AssertionError(f"only the CPA planner comparison may spawn here: {args!r}")
+        return outcome(0, plan(Path(args[args.index("--dag") + 1]).name, args), "")
+
+    return fake_run
+
+
+def _cpa_run(
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str],
+    *,
+    core_budget: int,
+    capped_budget: int,
+    throttled: bool = True,
+    capped_stdout: str | None = None,
+    environment: dict[str, str] | None = None,
+) -> tuple[int, str, int | None, list[tuple[str, str]]]:
+    """Drive the real ``main`` -> ``compare_dagrun`` path with only the CPA comparison live.
+
+    The run is a top-level one with no outer scheduler and, unless ``environment`` or ``argv``
+    declares one, no allowance, so only the CPA planner's own budget gates can produce a skip.
+    Returns the exit status, the recorded verdict, the checks that ran, and each skip's label
+    and kind, in order.
+    """
+
+    differential = _differential()
+    for name in dir(differential):
+        if name.startswith("compare_") and name not in {"compare_dagrun", "compare_cpa_planner"}:
+            monkeypatch.setattr(differential, name, _noop)
+    for name in (
+        "representative_fixtures",
+        "randomized_fixtures",
+        "example_fixtures",
+        "yaml_fixture_paths",
+    ):
+        monkeypatch.setattr(differential, name, lambda *_args: [])
+    monkeypatch.setattr(differential, "rs_command", lambda _tool: ["rust"])
+    monkeypatch.setattr(
+        differential,
+        "run",
+        _cpa_engine(
+            differential,
+            core_budget=core_budget,
+            capped_budget=capped_budget,
+            throttled=throttled,
+            capped_stdout=capped_stdout,
+        ),
+    )
+    monkeypatch.setattr(differential, "_effective_validation_jobs", lambda: 4)
+    monkeypatch.delenv("AGENT_UTILS_VALIDATION_JOBS", raising=False)
+    monkeypatch.delenv("AGENT_UTILS_CROSS_ALLOW_SKIP", raising=False)
+    _set_delegation(monkeypatch, {})
+    for key, value in (environment or {}).items():
+        monkeypatch.setenv(key, value)
+
+    status = differential.main(["--tool", "dagrun", *argv])
+
+    assert len(differential._COVERAGE) == 1
+    recorded = differential._COVERAGE[0]
+    skipped = [(str(skip.label), str(skip.kind)) for skip in recorded.skipped]
+    return int(status), str(recorded.verdict), recorded.checks, skipped
+
+
+@pytest.mark.parametrize("capped_budget", [1, 4])
+def test_a_one_core_cpa_budget_skips_the_three_checks_it_cannot_run(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], capped_budget: int
+) -> None:
+    """With one core no plan can widen, so the widening, beats-fixed and memory-cap checks did
+    not run. They used to be counted as passes; without an allowance the run is INCOMPLETE."""
+
+    status, verdict, checks, skipped = _cpa_run(
+        monkeypatch, [], core_budget=1, capped_budget=capped_budget
+    )
+    out = capsys.readouterr().out
+
+    assert (status, verdict) == (1, "INCOMPLETE")
+    assert checks == len(_CPA_ALL_CHECKS) - 3 == 7
+    assert skipped == _CPA_ONE_CORE_SKIPS
+    assert "cross[dagrun]: SKIPPED/UNVERIFIED 3 check(s), not counted as passes:" in out
+    assert "SKIPPED [multi-cpu; REQUIRED] cpa:widened: the core budget is 1;" in out
+    assert "SKIPPED [multi-cpu; REQUIRED] cpa:beats-fixed: the core budget is 1;" in out
+    assert (
+        f"SKIPPED [eight-cpu; REQUIRED] cpa:mem-capped: the core budget is {capped_budget};"
+    ) in out
+    assert "cross[dagrun]: INCOMPLETE - 7 checks across 0 fixtures agree" in out
+    assert "3 required check(s) did not run: cpa:widened, cpa:beats-fixed, cpa:mem-capped." in out
+    assert "DIVERGENCE" not in out
+    assert "cross[dagrun]: OK" not in out
+
+
+def test_a_one_core_cpa_run_is_partial_only_when_both_kinds_are_declared(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    result = _cpa_run(
+        monkeypatch, ["--allow-skip", "multi-cpu,eight-cpu"], core_budget=1, capped_budget=1
+    )
+    out = capsys.readouterr().out
+
+    assert result == (0, "PARTIAL", 7, _CPA_ONE_CORE_SKIPS)
+    assert "cross[dagrun]: PARTIAL - 7 checks across 0 fixtures agree" in out
+    assert (
+        "3 check(s) were skipped and are UNVERIFIED (allowed skip kinds: eight-cpu, multi-cpu)"
+    ) in out
+
+    # One of the two kinds is not enough: the multi-cpu skips stay required.
+    result = _cpa_run(monkeypatch, ["--allow-skip", "eight-cpu"], core_budget=1, capped_budget=1)
+    out = capsys.readouterr().out
+
+    assert result == (1, "INCOMPLETE", 7, _CPA_ONE_CORE_SKIPS)
+    assert "SKIPPED [eight-cpu; allowed] cpa:mem-capped:" in out
+    assert "2 required check(s) did not run: cpa:widened, cpa:beats-fixed." in out
+
+
+def test_a_four_core_cpa_budget_skips_only_the_memory_cap(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Four cores can widen, but the 5G cap binds only once m.heavy could reach eight."""
+
+    result = _cpa_run(monkeypatch, [], core_budget=4, capped_budget=4)
+    out = capsys.readouterr().out
+
+    assert result == (1, "INCOMPLETE", 9, [("cpa:mem-capped", "eight-cpu")])
+    assert "SKIPPED [eight-cpu; REQUIRED] cpa:mem-capped: the core budget is 4;" in out
+    assert "cross[dagrun]: INCOMPLETE - 9 checks across 0 fixtures agree" in out
+    assert "1 required check(s) did not run: cpa:mem-capped." in out
+
+    # The hosted lanes declare the kind through the environment.
+    result = _cpa_run(
+        monkeypatch,
+        [],
+        core_budget=4,
+        capped_budget=4,
+        environment={"AGENT_UTILS_CROSS_ALLOW_SKIP": "boxing,eight-cpu"},
+    )
+    out = capsys.readouterr().out
+
+    assert result == (0, "PARTIAL", 9, [("cpa:mem-capped", "eight-cpu")])
+    assert "cross[dagrun]: PARTIAL - 9 checks across 0 fixtures agree" in out
+    assert "1 check(s) were skipped and are UNVERIFIED (allowed skip kinds: eight-cpu)" in out
+
+
+def test_an_eight_core_cpa_budget_runs_every_check(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    result = _cpa_run(monkeypatch, [], core_budget=8, capped_budget=8)
+    out = capsys.readouterr().out
+
+    assert result == (0, "OK", len(_CPA_ALL_CHECKS), [])
+    assert "cross[dagrun]: OK - 10 checks across 0 fixtures agree" in out
+    assert "SKIPPED" not in out
+
+
+def test_an_eight_core_memory_cap_that_does_not_bind_is_a_failure(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    result = _cpa_run(monkeypatch, [], core_budget=8, capped_budget=8, throttled=False)
+    out = capsys.readouterr().out
+
+    # A failed check is counted among the checks that ran; nothing was skipped.
+    assert result == (1, "FAILED", len(_CPA_ALL_CHECKS), [])
+    assert "DIVERGENCE [cpa:mem-capped: expected --max-mem to throttle m.heavy below the " in out
+    assert "cross[dagrun]: 1 divergence(s) out of 10 checks" in out
+
+
+def test_an_unreadable_capped_allocation_is_a_failure_not_a_skip(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An allocation that cannot be read says nothing about the core budget, so it cannot be
+    excused as a small-budget skip, and it used to read as budget 0 and pass."""
+
+    result = _cpa_run(
+        monkeypatch, [], core_budget=8, capped_budget=8, capped_stdout="not a plan\n"
+    )
+    out = capsys.readouterr().out
+
+    assert result == (1, "FAILED", len(_CPA_ALL_CHECKS), [])
+    assert (
+        "DIVERGENCE [cpa:mem-capped: unparseable --max-mem allocation (py exit 0, rs exit 0)"
+    ) in out
+    assert "cross[dagrun]: 1 divergence(s) out of 10 checks" in out
+
+
 # ------------------------------------------------------------------ multi-tool final line
 
 
@@ -1099,8 +1401,15 @@ def test_each_validation_lane_states_its_coverage_policy() -> None:
 
 
 def test_hosted_lanes_that_cannot_box_declare_themselves_partial() -> None:
+    """Hosted runners cannot box and have fewer than eight CPUs; they declare exactly that."""
+
     workflows = REPO_ROOT / ".github" / "workflows"
     for name in ("cross-dagrun.yml", "nightly-all.yml"):
         text = (workflows / name).read_text(encoding="utf-8")
         assert "BOX_FLAGS: --allow-cgroup-failure" in text, name
-        assert "AGENT_UTILS_CROSS_ALLOW_SKIP: boxing" in text, name
+        allowances = [
+            line.split(":", 1)[1].strip()
+            for line in text.splitlines()
+            if line.strip().startswith("AGENT_UTILS_CROSS_ALLOW_SKIP:")
+        ]
+        assert allowances == ["boxing,eight-cpu"], name

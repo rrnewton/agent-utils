@@ -115,10 +115,12 @@ jobs:
       # The lost bound also means cross/differential.py cannot run its boxing checks here. The
       # lane declares that it is partial for them: they are listed as SKIPPED/UNVERIFIED and the
       # run ends with PARTIAL rather than OK. Boxing coverage comes from local boxed validation.
+      # Hosted runners also have fewer than eight CPUs, so the CPA planner's memory-cap check
+      # (which needs a core budget of eight) is skipped as eight-cpu and is covered locally.
       - name: the entire portable current-toolchain contract
         env:
           BOX_FLAGS: --allow-cgroup-failure
-          AGENT_UTILS_CROSS_ALLOW_SKIP: boxing
+          AGENT_UTILS_CROSS_ALLOW_SKIP: boxing,eight-cpu
         run: make validate-all
 
       # Same reasoning as the per-push workflow: the gate is a completely-broken detector, so the

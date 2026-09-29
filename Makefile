@@ -125,9 +125,10 @@ ifneq ($(TEST_SUITE),python)
 endif
 
 # Cross-language observable behavior for every paired command. Full coverage: a check the host
-# cannot run (no cgroup-v2 boxing, a refused HARD cpuset pin, one CPU) is listed as SKIPPED and
-# fails the target. A host that knowingly lacks a capability can declare a partial run, which is
-# printed as PARTIAL, with e.g. AGENT_UTILS_CROSS_ALLOW_SKIP=boxing make cross.
+# cannot run (no cgroup-v2 boxing, a refused HARD cpuset pin, fewer than two usable CPUs, a core
+# budget below eight CPUs) is listed as SKIPPED and fails the target. A host that knowingly lacks
+# a capability can declare a partial run, which is printed as PARTIAL, with e.g.
+# AGENT_UTILS_CROSS_ALLOW_SKIP=boxing make cross.
 cross:
 	python3 -m pytest -q cross/test_cpu_footprint.py
 	python3 cross/differential.py --tool all

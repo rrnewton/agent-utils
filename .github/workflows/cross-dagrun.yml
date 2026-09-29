@@ -133,7 +133,9 @@ jobs:
           # The same degradation makes this lane PARTIAL for cross/differential.py's boxing
           # checks. They are listed as SKIPPED/UNVERIFIED, never counted as passes, and the run
           # ends with PARTIAL rather than OK. Boxing coverage comes from local boxed validation.
-          AGENT_UTILS_CROSS_ALLOW_SKIP: boxing
+          # Hosted runners also have fewer than eight CPUs, so the CPA planner's memory-cap check
+          # (which needs a core budget of eight) is skipped as eight-cpu and is covered locally.
+          AGENT_UTILS_CROSS_ALLOW_SKIP: boxing,eight-cpu
           VALIDATE_ARGS: ${{ needs.plan.outputs.validate_args }}
         run: python3 scripts/validate.py $VALIDATE_ARGS
       - name: keep selected browser benchmark measurements

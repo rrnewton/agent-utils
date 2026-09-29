@@ -77,10 +77,11 @@ It also keeps the bootstrap ``--version`` / ``--help`` / no-args exit-code check
 ``--userguide`` stdout is BYTE-IDENTICAL across builds (both embed the same single-source guide).
 
 A check that cannot run on the current host or lane (no cgroup-v2 boxing, a parent-owned delegated
-cgroup that must not spawn live scopes, a refused HARD cpuset pin, a single online CPU) is recorded
-as SKIPPED, a result class of its own: it is never counted as a pass, and each skipped check is
-listed by name with a total. Where both engines refuse a capability identically, that parity is
-counted as a pass and the check the capability would have enabled is still listed as skipped.
+cgroup that must not spawn live scopes, a refused HARD cpuset pin, fewer than two usable CPUs, or a
+core budget below the eight CPUs the CPA memory-cap check needs) is recorded as SKIPPED, a result
+class of its own: it is never counted as a pass, and each skipped check is listed by name with a
+total. Where both engines refuse a capability identically, that parity is counted as a pass and the
+check the capability would have enabled is still listed as skipped.
 
 Exit status is nonzero on any divergence, and also on any skip unless the run declared that kind of
 skip acceptable with ``--allow-skip KIND`` or ``AGENT_UTILS_CROSS_ALLOW_SKIP=KIND[,KIND]``. Such a
@@ -312,7 +313,14 @@ SKIP_KINDS: dict[str, str] = {
         "would create a live systemd scope from inside a parent-owned delegated cgroup"
     ),
     "hard-cpuset": "needs a HARD cpuset pin, which both engines refused on this host",
-    "multi-cpu": "needs at least two online CPUs",
+    "multi-cpu": (
+        "needs at least two usable CPUs: two in the CPU affinity mask and a cgroup CPU quota of "
+        "at least two cores"
+    ),
+    "eight-cpu": (
+        "needs a core budget of at least eight CPUs, the tighter of the CPU affinity mask and "
+        "any cgroup CPU quota"
+    ),
 }
 
 #: Comma-separated skip kinds a lane declares acceptable, in addition to ``--allow-skip``. A lane
@@ -5027,6 +5035,10 @@ def compare_cpa_planner(py: list[str], rs: list[str], rep: Report) -> None:
       critical path (whenever the core budget allows any widening, i.e. P >= 2).
     * the MEMORY cap binds: with a tight ``--max-mem`` the memory-heavy step is widened LESS than
       with no budget (and the run reports ``mem-capped``) — provided cores were not the limit.
+
+    ``P`` is the ambient core budget, the tighter of the CPU affinity mask and any cgroup CPU
+    quota. Below two cores the widening and beats-fixed checks are skipped as ``multi-cpu``;
+    below eight the memory-cap check is skipped as ``eight-cpu``. None of them counts as a pass.
     """
     extra = {
         "DAGRUN_MACHINE_ID": _CPA_MACHINE,
@@ -5073,11 +5085,18 @@ def compare_cpa_planner(py: list[str], rs: list[str], rep: Report) -> None:
             rep.bad("cpa:allocation", f"unparseable allocation in\n{json_out}")
             return
 
+        # Standalone CPA plans for the ambient core budget (the tighter of the CPU affinity mask
+        # and any cgroup CPU quota). Below two cores no step can be widened, so the two checks
+        # that need a widening did not run: they are skips, never passes.
+        cannot_widen = (
+            f"the core budget is {core_budget}; a plan can widen a step only with at least two"
+        )
+
         # The allocator actually allocated: the scaling chain head widened past 1 (needs P >= 2).
-        if core_budget >= 2 and widths.get("c.build", 0) > 1:
+        if core_budget < 2:
+            rep.skip("cpa:widened", "multi-cpu", cannot_widen)
+        elif widths.get("c.build", 0) > 1:
             rep.ok("cpa:widened")
-        elif core_budget < 2:
-            rep.ok("cpa:widened")  # a 1-core box cannot widen; not a divergence
         else:
             rep.bad("cpa:widened",
                     f"expected c.build to be widened past 1 (P={core_budget}); widths={widths}")
@@ -5090,7 +5109,9 @@ def compare_cpa_planner(py: list[str], rs: list[str], rep: Report) -> None:
                     f"modeled {modeled} < lower_bound {lower_bound}")
 
         # CPA beats the fixed-inner-jobs=1 baseline (58s width-1 critical path) once it can widen.
-        if core_budget < 2 or modeled < _CPA_WIDTH1_CRITICAL_PATH_S:
+        if core_budget < 2:
+            rep.skip("cpa:beats-fixed", "multi-cpu", cannot_widen)
+        elif modeled < _CPA_WIDTH1_CRITICAL_PATH_S:
             rep.ok("cpa:beats-fixed")
         else:
             rep.bad("cpa:beats-fixed",
@@ -5117,15 +5138,27 @@ def compare_cpa_planner(py: list[str], rs: list[str], rep: Report) -> None:
             rep.ok("cpa:mem-byte-identical")
             free_w = (_cpa_widths_from_json(pf.stdout) or {}).get("m.heavy", 0)
             capped_w = (_cpa_widths_from_json(pc.stdout) or {}).get("m.heavy", 0)
+            capped_budget: int | None
             try:
                 capped_reason = json.loads(pc.stdout)["allocation"]["stop_reason"]
                 capped_budget = int(json.loads(pc.stdout)["allocation"]["core_budget"])
             except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                capped_reason, capped_budget = "", 0
-            # Only assert the memory throttle when cores were not the binding constraint (P >= 8, so
-            # the unbounded run could actually reach width 8 where the footprint doubles).
-            if capped_budget < 8:
-                rep.ok("cpa:mem-capped")  # core-limited box; memory never got to bind
+                capped_reason, capped_budget = "", None
+            # The memory throttle can be observed only when cores were not the binding constraint
+            # (P >= 8, so the unbounded run could actually reach width 8 where the footprint
+            # doubles). Below that the assertion did not run, so it is a skip, never a pass. An
+            # allocation that cannot be read is a failure: it says nothing about the core budget.
+            if capped_budget is None:
+                rep.bad("cpa:mem-capped",
+                        f"unparseable --max-mem allocation (py exit {pc.returncode}, rs exit "
+                        f"{rc.returncode}) in\n{pc.stdout}")
+            elif capped_budget < 8:
+                rep.skip(
+                    "cpa:mem-capped",
+                    "eight-cpu",
+                    f"the core budget is {capped_budget}; the 5G memory cap can bind only when "
+                    "the unbounded plan could widen m.heavy to 8",
+                )
             elif capped_w < free_w and capped_reason == "mem-capped":
                 rep.ok("cpa:mem-capped")
             else:
