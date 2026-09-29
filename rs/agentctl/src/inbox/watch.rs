@@ -3,15 +3,17 @@
 //! One sample lists Herdr panes, asks Claude Code for the busy or idle state of each Claude
 //! session, and joins the two by process id through `HERDR_PANE_ID` in `/proc/<pid>/environ`.
 //! Claude's own state is used for Claude panes because Herdr's screen rules can classify a working
-//! Claude pane as idle. Other panes use Herdr's state, and an idle edge must hold for
-//! `--idle-samples` consecutive samples before it is announced.
+//! Claude pane as idle; when Claude cannot be asked, a Claude pane's state is unknown for that
+//! sample rather than taken from the screen. Other panes use Herdr's state, and an idle edge must
+//! hold for `--idle-samples` consecutive samples before it is announced.
 //!
 //! The pure core is [`step`]: previous watch state plus one sample gives the notices to post. The
 //! caller adds text (the last assistant message of a Claude transcript since the last notice, or
 //! the tail of the terminal) and posts through the inbox, so all coalescing rules apply.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read as _, Seek as _, SeekFrom};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -21,17 +23,21 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     check_name, cut, now_ms, print_json, Cursor, Inbox, InboxError, NoticeKind, PostRequest,
-    Result, Target, DEFAULT_MAX_LIVE, DEFAULT_STALE_SECONDS, MAX_TEXT_BYTES,
+    Result, Target, DEFAULT_MAX_LIVE, DEFAULT_STALE_SECONDS, EXIT_BUSY, MAX_TEXT_BYTES,
 };
 
 /// Default seconds between samples.
 pub(crate) const DEFAULT_INTERVAL_SECONDS: u64 = 30;
 /// Default consecutive idle samples required before a non-Claude pane is announced idle.
 pub(crate) const DEFAULT_IDLE_SAMPLES: u32 = 2;
+/// Default consecutive samples a worker must be missing before it is announced as exited.
+pub(crate) const DEFAULT_EXIT_SAMPLES: u32 = 3;
 /// Default minutes before the first still-idle reminder; each later one waits twice as long.
 pub(crate) const DEFAULT_REMIND_MINUTES: u64 = 30;
 /// Most still-idle reminders for one idle period.
 pub(crate) const MAX_REMINDERS: u32 = 3;
+/// How long an exited worker is remembered, so its return withdraws the exited notice.
+const EXITED_MEMORY_MS: u64 = 86_400_000;
 /// Most transcript bytes read to find the last assistant message.
 const TRANSCRIPT_TAIL_BYTES: u64 = 8 * 1024 * 1024;
 /// Seconds one `herdr` or `claude` query may run.
@@ -51,6 +57,9 @@ pub(crate) struct WatchArgs {
     /// Consecutive idle samples before a pane without Claude state is announced idle
     #[arg(long, default_value_t = DEFAULT_IDLE_SAMPLES, value_name = "N")]
     idle_samples: u32,
+    /// Consecutive samples a worker must be missing from Herdr before it is announced as exited
+    #[arg(long, default_value_t = DEFAULT_EXIT_SAMPLES, value_name = "N")]
+    exit_samples: u32,
     /// Minutes an announced idle worker waits before the first still-idle reminder (then 2x, 4x; at most three)
     #[arg(long, default_value_t = DEFAULT_REMIND_MINUTES, value_name = "MINUTES")]
     remind_minutes: u64,
@@ -85,7 +94,8 @@ pub(crate) enum WorkerState {
 pub(crate) struct Observation {
     agent: String,
     pane: String,
-    state: WorkerState,
+    /// `None` when this sample cannot tell (for example, Claude could not be asked).
+    state: Option<WorkerState>,
     /// True when the state came from Claude Code itself rather than from screen rules.
     authoritative: bool,
     transcript: Option<PathBuf>,
@@ -98,14 +108,21 @@ pub(crate) struct WorkerRecord {
     state: WorkerState,
     since_unix_ms: u64,
     idle_samples: u32,
-    /// The state most recently announced; `None` after `working` was posted.
-    announced: Option<WorkerState>,
+    /// The notice kind that currently stands for this worker in the inbox: `idle`, `blocked`, or
+    /// `exited`; `None` after `working` withdrew it.
+    announced: Option<NoticeKind>,
     reminders: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transcript: Option<PathBuf>,
     /// Transcript bytes already covered by an earlier notice.
     #[serde(default)]
     offset: u64,
+    /// Consecutive samples in which the worker was missing.
+    #[serde(default)]
+    missing: u32,
+    /// Set once the worker was announced as exited; kept so that its return is announced too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exited_unix_ms: Option<u64>,
 }
 
 /// Everything the watcher remembers for one coordinator.
@@ -126,14 +143,22 @@ pub(crate) struct Decision {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Policy {
     idle_samples: u32,
+    exit_samples: u32,
     remind_after_ms: u64,
+}
+
+fn file_length(path: Option<&Path>) -> u64 {
+    path.and_then(|path| fs::metadata(path).ok())
+        .map_or(0, |metadata| metadata.len())
 }
 
 /// Advance the watch state by one sample and decide which notices to post.
 ///
 /// A worker seen for the first time is recorded without a notice unless it is blocked, so starting
-/// the watcher does not announce every idle worker at once. A worker that disappears is announced
-/// as exited once and forgotten.
+/// the watcher does not announce every idle worker at once; its current idle period earns no
+/// reminders either. A worker missing for `exit_samples` samples in a row is announced as exited,
+/// and remembered for a day so that its return withdraws or replaces that notice. A sample in
+/// which Herdr listed no worker at all is treated as unknown, not as every worker leaving.
 pub(crate) fn step(
     state: &mut WatchState,
     sample: &[Observation],
@@ -154,69 +179,92 @@ pub(crate) fn step(
             policy.idle_samples.max(1)
         };
         let Some(record) = state.workers.get_mut(&observation.agent) else {
-            let announced = (observation.state == WorkerState::Blocked).then(|| {
-                decide(&observation.agent, NoticeKind::Blocked);
-                WorkerState::Blocked
-            });
+            let observed = observation.state.unwrap_or(WorkerState::Working);
+            let announced = match observed {
+                WorkerState::Blocked => {
+                    decide(&observation.agent, NoticeKind::Blocked);
+                    Some(NoticeKind::Blocked)
+                }
+                // Already idle when first seen: its idle period began before the watcher could
+                // observe it, so it is neither announced nor reminded.
+                WorkerState::Idle => Some(NoticeKind::Idle),
+                WorkerState::Working => None,
+            };
             state.workers.insert(
                 observation.agent.clone(),
                 WorkerRecord {
                     pane: observation.pane.clone(),
-                    state: observation.state,
+                    state: observed,
                     since_unix_ms: now,
-                    idle_samples: u32::from(observation.state == WorkerState::Idle),
-                    // A worker first seen idle counts as already announced: its idle period began
-                    // before the watcher could observe it.
-                    announced: announced
-                        .or((observation.state == WorkerState::Idle).then_some(WorkerState::Idle)),
-                    reminders: 0,
+                    idle_samples: u32::from(observed == WorkerState::Idle),
+                    announced,
+                    reminders: if observed == WorkerState::Idle {
+                        MAX_REMINDERS
+                    } else {
+                        0
+                    },
                     transcript: observation.transcript.clone(),
-                    offset: observation
-                        .transcript
-                        .as_deref()
-                        .and_then(|path| fs::metadata(path).ok())
-                        .map_or(0, |metadata| metadata.len()),
+                    offset: file_length(observation.transcript.as_deref()),
+                    missing: 0,
+                    exited_unix_ms: None,
                 },
             );
             continue;
         };
+        record.missing = 0;
         record.pane.clone_from(&observation.pane);
-        if record.transcript != observation.transcript {
-            record.transcript.clone_from(&observation.transcript);
-            record.offset = 0;
+        if let Some(path) = &observation.transcript {
+            match &record.transcript {
+                Some(previous) if previous == path => {}
+                // A different transcript is a new conversation: all of it is unread.
+                Some(_) => {
+                    record.transcript = Some(path.clone());
+                    record.offset = 0;
+                }
+                // First learned now: what is already there predates the watcher's knowledge.
+                None => {
+                    record.transcript = Some(path.clone());
+                    record.offset = file_length(Some(path));
+                }
+            }
         }
-        if observation.state != record.state {
-            record.state = observation.state;
+        let Some(observed) = observation.state else {
+            continue;
+        };
+        let returned = record.exited_unix_ms.take().is_some();
+        if observed != record.state || returned {
+            record.state = observed;
             record.since_unix_ms = now;
             record.reminders = 0;
-            record.idle_samples = u32::from(observation.state == WorkerState::Idle);
-            match observation.state {
+            record.idle_samples = u32::from(observed == WorkerState::Idle);
+            match observed {
                 WorkerState::Working => {
                     if record.announced.take().is_some() {
                         decide(&observation.agent, NoticeKind::Working);
                     }
                 }
                 WorkerState::Blocked => {
-                    record.announced = Some(WorkerState::Blocked);
+                    record.announced = Some(NoticeKind::Blocked);
                     decide(&observation.agent, NoticeKind::Blocked);
                 }
+                // An unconfirmed idle edge leaves any standing notice in place, so a later
+                // `working` still withdraws a blocked or exited notice.
                 WorkerState::Idle => {
-                    record.announced = None;
                     if record.idle_samples >= required {
-                        record.announced = Some(WorkerState::Idle);
+                        record.announced = Some(NoticeKind::Idle);
                         decide(&observation.agent, NoticeKind::Idle);
                     }
                 }
             }
             continue;
         }
-        if observation.state != WorkerState::Idle {
+        if observed != WorkerState::Idle {
             continue;
         }
         record.idle_samples = record.idle_samples.saturating_add(1);
-        if record.announced != Some(WorkerState::Idle) {
+        if record.announced != Some(NoticeKind::Idle) {
             if record.idle_samples >= required {
-                record.announced = Some(WorkerState::Idle);
+                record.announced = Some(NoticeKind::Idle);
                 decide(&observation.agent, NoticeKind::Idle);
             }
             continue;
@@ -224,40 +272,54 @@ pub(crate) fn step(
         let wait = policy
             .remind_after_ms
             .saturating_mul(1_u64 << record.reminders.min(16));
-        let elapsed_since_last = now.saturating_sub(record.since_unix_ms);
         if record.reminders < MAX_REMINDERS
             && policy.remind_after_ms > 0
-            && elapsed_since_last >= wait
+            && now.saturating_sub(record.since_unix_ms) >= wait
         {
             record.reminders += 1;
             record.since_unix_ms = now;
             decide(&observation.agent, NoticeKind::StillIdle);
         }
     }
+    let listed_nobody = sample.is_empty()
+        && state
+            .workers
+            .values()
+            .any(|record| record.exited_unix_ms.is_none());
     let seen = sample
         .iter()
         .map(|observation| observation.agent.as_str())
-        .collect::<std::collections::HashSet<_>>();
-    let gone = state
-        .workers
-        .keys()
-        .filter(|agent| !seen.contains(agent.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    for agent in gone {
+        .collect::<HashSet<_>>();
+    let mut forget = Vec::new();
+    for (agent, record) in &mut state.workers {
+        if seen.contains(agent.as_str()) {
+            continue;
+        }
+        if let Some(exited) = record.exited_unix_ms {
+            if now.saturating_sub(exited) > EXITED_MEMORY_MS {
+                forget.push(agent.clone());
+            }
+            continue;
+        }
+        if listed_nobody {
+            continue;
+        }
+        record.missing = record.missing.saturating_add(1);
+        if record.missing >= policy.exit_samples.max(1) {
+            record.exited_unix_ms = Some(now);
+            record.announced = Some(NoticeKind::Exited);
+            decide(agent, NoticeKind::Exited);
+        }
+    }
+    for agent in forget {
         state.workers.remove(&agent);
-        decide(&agent, NoticeKind::Exited);
     }
     decisions
 }
 
-/// Inbox worker name for a Herdr pane: its agent name when that is a valid inbox name, else a
-/// name derived from the pane id.
-fn worker_name(name: Option<&str>, pane: &str) -> String {
-    if let Some(name) = name.filter(|name| check_name("--from", name).is_ok()) {
-        return name.to_owned();
-    }
-    let derived = pane
+/// Name characters allowed by the inbox, with everything else turned into hyphens.
+fn sanitize(value: &str) -> String {
+    value
         .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() {
@@ -266,8 +328,44 @@ fn worker_name(name: Option<&str>, pane: &str) -> String {
                 '-'
             }
         })
-        .collect::<String>();
-    format!("pane-{derived}")
+        .collect()
+}
+
+/// Inbox worker name for a Herdr pane: its agent name when that is a valid inbox name, else a
+/// name derived from the pane id.
+fn worker_name(name: Option<&str>, pane: &str) -> String {
+    match name.filter(|name| check_name("--from", name).is_ok()) {
+        Some(name) => name.to_owned(),
+        None => format!("pane-{}", sanitize(pane)),
+    }
+}
+
+/// Make worker names unique within one sample: every member of a colliding group gets its pane
+/// id appended, and a counter if that still collides.
+fn disambiguate(observations: &mut [Observation]) {
+    let mut counts = HashMap::new();
+    for observation in observations.iter() {
+        *counts.entry(observation.agent.clone()).or_insert(0_u32) += 1;
+    }
+    let mut used = observations
+        .iter()
+        .filter(|observation| counts[&observation.agent] == 1)
+        .map(|observation| observation.agent.clone())
+        .collect::<HashSet<_>>();
+    for observation in observations.iter_mut() {
+        if counts[&observation.agent] == 1 {
+            continue;
+        }
+        let base = format!("{}-{}", observation.agent, sanitize(&observation.pane));
+        let mut candidate = base.chars().take(64).collect::<String>();
+        let mut index = 2;
+        while !used.insert(candidate.clone()) {
+            let suffix = format!("-{index}");
+            candidate = base.chars().take(64 - suffix.len()).collect::<String>() + &suffix;
+            index += 1;
+        }
+        observation.agent = candidate;
+    }
 }
 
 #[derive(Deserialize)]
@@ -301,34 +399,46 @@ struct ClaudeSession {
     status: Option<String>,
 }
 
-/// Run a query command with a deadline and return its stdout.
-fn query(program: &Path, arguments: &[&str]) -> Result<Vec<u8>> {
+/// Run a query command in its own process group with a deadline and return its stdout. On the
+/// deadline the whole group is killed, so a grandchild holding stdout open cannot outlive it.
+fn query(program: &Path, arguments: &[&str], timeout: Duration) -> Result<Vec<u8>> {
     let mut child = Command::new(program)
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn()
         .map_err(|error| {
             InboxError::unavailable(format!("cannot run {}: {error}", program.display()))
         })?;
+    let group = i32::try_from(child.id()).unwrap_or(0);
+    let kill_group = || {
+        if group > 0 {
+            // SAFETY: signalling our own child's process group; no memory is involved.
+            unsafe {
+                libc::kill(-group, libc::SIGKILL);
+            }
+        }
+    };
     let mut stdout = child.stdout.take().expect("stdout is piped");
-    let reader = std::thread::spawn(move || {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).map(|_| bytes)
+        let _ = sender.send(stdout.read_to_end(&mut bytes).map(|_| bytes));
     });
-    let deadline = Instant::now() + QUERY_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
+                kill_group();
                 let _ = child.wait();
                 break None;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(error) => {
-                let _ = child.kill();
+                kill_group();
                 let _ = child.wait();
                 return Err(InboxError::unavailable(format!(
                     "cannot wait for {}: {error}",
@@ -337,9 +447,21 @@ fn query(program: &Path, arguments: &[&str]) -> Result<Vec<u8>> {
             }
         }
     };
-    let bytes = reader
-        .join()
-        .map_err(|_| InboxError::unavailable("query reader panicked"))?
+    // A descendant may still hold the pipe after the direct child exits. Only then is the group
+    // killed: while it holds the pipe the group exists, so its id cannot have been reused.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let (read, status) = match receiver.recv_timeout(remaining) {
+        Ok(read) => (read, status),
+        Err(_) => {
+            kill_group();
+            let read = receiver
+                .recv()
+                .map_err(|_| InboxError::unavailable("query reader stopped"))?;
+            // Output cut off by the kill is not a complete answer.
+            (read, None)
+        }
+    };
+    let bytes = read
         .map_err(|error| InboxError::io(&format!("cannot read {}", program.display()), &error))?;
     match status {
         Some(status) if status.success() => Ok(bytes),
@@ -352,7 +474,7 @@ fn query(program: &Path, arguments: &[&str]) -> Result<Vec<u8>> {
             "{} {} did not finish within {} seconds",
             program.display(),
             arguments.join(" "),
-            QUERY_TIMEOUT.as_secs()
+            timeout.as_secs()
         ))),
     }
 }
@@ -381,56 +503,75 @@ struct Sources<'a> {
     claude: &'a Path,
     projects: &'a Path,
     proc_root: &'a Path,
+    timeout: Duration,
+}
+
+/// Claude sessions keyed by pane; `None` when Claude could not be asked. When two sessions claim
+/// one pane, the lowest process id (normally the parent) wins, so the choice is stable.
+fn claude_sessions(sources: &Sources<'_>) -> Option<BTreeMap<String, ClaudeSession>> {
+    let bytes = query(sources.claude, &["agents", "--json"], sources.timeout).ok()?;
+    let sessions = serde_json::from_slice::<Vec<ClaudeSession>>(&bytes).ok()?;
+    let mut by_pane: BTreeMap<String, (u64, ClaudeSession)> = BTreeMap::new();
+    for session in sessions {
+        let pid = match &session.pid {
+            Some(serde_json::Value::String(pid)) => pid.clone(),
+            Some(serde_json::Value::Number(pid)) => pid.to_string(),
+            _ => continue,
+        };
+        let Ok(number) = pid.parse::<u64>() else {
+            continue;
+        };
+        let Some(pane) = pane_of_process(sources.proc_root, &pid) else {
+            continue;
+        };
+        if by_pane.get(&pane).is_none_or(|(held, _)| number < *held) {
+            by_pane.insert(pane, (number, session));
+        }
+    }
+    Some(
+        by_pane
+            .into_iter()
+            .map(|(pane, (_, session))| (pane, session))
+            .collect(),
+    )
 }
 
 /// Take one sample of every Herdr pane that hosts an agent.
 fn sample(sources: &Sources<'_>, ignored: &[String]) -> Result<Vec<Observation>> {
-    let listing: HerdrList = serde_json::from_slice(&query(sources.herdr, &["agent", "list"])?)
-        .map_err(|error| {
-            InboxError::unavailable(format!("cannot parse `herdr agent list`: {error}"))
-        })?;
-    // Claude's view is best-effort: without it every pane falls back to Herdr's state.
-    let mut claude_by_pane = BTreeMap::new();
-    if let Ok(bytes) = query(sources.claude, &["agents", "--json"]) {
-        if let Ok(sessions) = serde_json::from_slice::<Vec<ClaudeSession>>(&bytes) {
-            for session in sessions {
-                let pid = match &session.pid {
-                    Some(serde_json::Value::String(pid)) => pid.clone(),
-                    Some(serde_json::Value::Number(pid)) => pid.to_string(),
-                    _ => continue,
-                };
-                if let Some(pane) = pane_of_process(sources.proc_root, &pid) {
-                    claude_by_pane.insert(pane, session);
-                }
-            }
-        }
-    }
+    let listing: HerdrList =
+        serde_json::from_slice(&query(sources.herdr, &["agent", "list"], sources.timeout)?)
+            .map_err(|error| {
+                InboxError::unavailable(format!("cannot parse `herdr agent list`: {error}"))
+            })?;
+    let claude = claude_sessions(sources);
     let mut observations = Vec::new();
     for agent in listing.result.agents {
-        let Some(status) = agent.agent_status.as_deref() else {
+        let (Some(status), Some(harness)) = (agent.agent_status.as_deref(), agent.agent.as_deref())
+        else {
             continue;
         };
-        if agent.agent.is_none() {
-            continue;
-        }
         let name = worker_name(agent.name.as_deref(), &agent.pane_id);
         if ignored.contains(&name) {
             continue;
         }
         let herdr_state = match status {
-            "blocked" => WorkerState::Blocked,
-            "idle" | "done" => WorkerState::Idle,
-            _ => WorkerState::Working,
+            "blocked" => Some(WorkerState::Blocked),
+            "idle" | "done" => Some(WorkerState::Idle),
+            "working" => Some(WorkerState::Working),
+            _ => None,
         };
-        let claude = claude_by_pane.get(&agent.pane_id);
-        let (state, authoritative) = match claude.and_then(|session| session.status.as_deref()) {
-            Some("idle") if herdr_state == WorkerState::Blocked => (WorkerState::Blocked, true),
-            Some("idle") => (WorkerState::Idle, true),
-            Some(_) if herdr_state == WorkerState::Blocked => (WorkerState::Blocked, true),
-            Some(_) => (WorkerState::Working, true),
-            None => (herdr_state, false),
+        let session = claude
+            .as_ref()
+            .and_then(|sessions| sessions.get(&agent.pane_id));
+        let (state, authoritative) = match session.and_then(|session| session.status.as_deref()) {
+            _ if herdr_state == Some(WorkerState::Blocked) => (herdr_state, session.is_some()),
+            Some("idle") => (Some(WorkerState::Idle), true),
+            Some("busy") => (Some(WorkerState::Working), true),
+            // Claude could not be asked, so its screen state is not trusted this sample.
+            _ if claude.is_none() && harness == "claude" => (None, false),
+            _ => (herdr_state, false),
         };
-        let transcript = claude
+        let transcript = session
             .and_then(|session| session.session_id.as_deref())
             .and_then(|session| transcript_of_session(sources.projects, session));
         observations.push(Observation {
@@ -441,11 +582,13 @@ fn sample(sources: &Sources<'_>, ignored: &[String]) -> Result<Vec<Observation>>
             transcript,
         });
     }
+    disambiguate(&mut observations);
     Ok(observations)
 }
 
 /// The last assistant prose in a Claude transcript between `start` and its end, and the end
-/// offset (the byte after the last complete line). Reads at most the final 8 MiB of the range.
+/// offset (the byte after the last complete line). Reads at most the final 8 MiB of the range;
+/// a line cut by that limit is skipped because it does not parse.
 pub(crate) fn last_assistant_text(path: &Path, start: u64) -> io::Result<(Option<String>, u64)> {
     let mut file = fs::File::open(path)?;
     let length = file.metadata()?.len();
@@ -486,7 +629,7 @@ pub(crate) fn last_assistant_text(path: &Path, start: u64) -> io::Result<(Option
 }
 
 /// The last non-empty lines of a pane, above its bottom rows (prompt box and footer).
-fn terminal_tail(herdr: &Path, pane: &str) -> Option<String> {
+fn terminal_tail(herdr: &Path, pane: &str, timeout: Duration) -> Option<String> {
     let bytes = query(
         herdr,
         &[
@@ -498,6 +641,7 @@ fn terminal_tail(herdr: &Path, pane: &str) -> Option<String> {
             "--lines",
             "80",
         ],
+        timeout,
     )
     .ok()?;
     let text = String::from_utf8_lossy(&bytes);
@@ -514,15 +658,10 @@ fn terminal_tail(herdr: &Path, pane: &str) -> Option<String> {
 
 fn notice_text(
     decision: &Decision,
-    record: Option<&mut WorkerRecord>,
-    herdr: &Path,
+    record: &mut WorkerRecord,
+    sources: &Sources<'_>,
+    exit_samples: u32,
 ) -> (String, Option<Cursor>) {
-    let Some(record) = record else {
-        return (
-            "the worker's pane is no longer listed by Herdr".to_owned(),
-            None,
-        );
-    };
     let header = match decision.kind {
         NoticeKind::Idle => "finished its turn and is waiting for input".to_owned(),
         NoticeKind::Blocked => {
@@ -532,6 +671,9 @@ fn notice_text(
             "is still idle (reminder {} of {MAX_REMINDERS})",
             record.reminders
         ),
+        NoticeKind::Exited => {
+            format!("has not been listed by Herdr for {exit_samples} samples in a row")
+        }
         _ => String::new(),
     };
     let mut cursor = None;
@@ -551,8 +693,9 @@ fn notice_text(
             }
         }
     }
-    if body.is_none() && decision.kind != NoticeKind::StillIdle {
-        body = terminal_tail(herdr, &record.pane).map(|tail| format!("terminal tail:\n{tail}"));
+    if body.is_none() && matches!(decision.kind, NoticeKind::Idle | NoticeKind::Blocked) {
+        body = terminal_tail(sources.herdr, &record.pane, sources.timeout)
+            .map(|tail| format!("terminal tail:\n{tail}"));
     }
     let mut text = format!("pane {}: {header}", record.pane);
     if let Some(body) = body {
@@ -570,14 +713,67 @@ struct Posted {
     outcome: &'static str,
 }
 
+/// One sample: read state, observe, decide, post, and save state after every post.
+fn cycle(
+    inbox: &Inbox,
+    sources: &Sources<'_>,
+    ignored: &[String],
+    policy: Policy,
+) -> Result<serde_json::Value> {
+    let state_path = inbox.root.join("watch.json");
+    let mut state = fs::read(&state_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<WatchState>(&bytes).ok())
+        .unwrap_or_default();
+    state.schema = 1;
+    let now = now_ms()?;
+    let observations = sample(sources, ignored)?;
+    let decisions = step(&mut state, &observations, now, policy);
+    let mut posted = Vec::new();
+    for decision in &decisions {
+        let (text, cursor) = match (decision.kind, state.workers.get_mut(&decision.agent)) {
+            (NoticeKind::Working, _) | (_, None) => (String::new(), None),
+            (_, Some(record)) => notice_text(decision, record, sources, policy.exit_samples),
+        };
+        let outcome = inbox.post(
+            &PostRequest {
+                agent: &decision.agent,
+                kind: decision.kind,
+                text: &text,
+                key: None,
+                cursor,
+                max_live: DEFAULT_MAX_LIVE,
+                stale_after: DEFAULT_STALE_SECONDS,
+            },
+            now,
+        )?;
+        inbox.write_json(".", "watch.json", &state)?;
+        posted.push(Posted {
+            agent: decision.agent.clone(),
+            kind: decision.kind,
+            outcome: outcome.outcome,
+        });
+    }
+    inbox.write_json(".", "watch.json", &state)?;
+    Ok(serde_json::json!({
+        "sampled_unix_ms": now,
+        "workers": observations.len(),
+        "posted": posted,
+    }))
+}
+
 /// Run `agentctl inbox watch`.
 pub(crate) fn run(registry: &Path, herdr: &Path, args: WatchArgs) -> Result<i32> {
     let inbox = Inbox::open(registry, &args.target.coordinator)?;
-    let _watching = inbox.lock(".watch.lock", false).map_err(|_| {
-        InboxError::busy(format!(
-            "another watcher already runs for {}",
-            args.target.coordinator
-        ))
+    let _watching = inbox.lock(".watch.lock", false).map_err(|error| {
+        if error.exit_code() == EXIT_BUSY {
+            InboxError::busy(format!(
+                "another watcher already runs for {}",
+                args.target.coordinator
+            ))
+        } else {
+            error
+        }
     })?;
     let projects = match args.claude_projects {
         Some(path) => path,
@@ -592,54 +788,25 @@ pub(crate) fn run(registry: &Path, herdr: &Path, args: WatchArgs) -> Result<i32>
         claude: &args.claude_bin,
         projects: &projects,
         proc_root: &args.proc_root,
+        timeout: QUERY_TIMEOUT,
     };
     let mut ignored = args.exclude.clone();
     ignored.push(args.target.coordinator.clone());
     let policy = Policy {
         idle_samples: args.idle_samples,
+        exit_samples: args.exit_samples,
         remind_after_ms: args.remind_minutes.saturating_mul(60_000),
     };
-    let state_path = inbox.root.join("watch.json");
     loop {
-        let mut state = fs::read(&state_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<WatchState>(&bytes).ok())
-            .unwrap_or_default();
-        state.schema = 1;
-        let now = now_ms()?;
-        let observations = sample(&sources, &ignored)?;
-        let decisions = step(&mut state, &observations, now, policy);
-        let mut posted = Vec::new();
-        for decision in &decisions {
-            let (text, cursor) = if decision.kind == NoticeKind::Working {
-                (String::new(), None)
-            } else {
-                notice_text(decision, state.workers.get_mut(&decision.agent), herdr)
-            };
-            let outcome = inbox.post(
-                &PostRequest {
-                    agent: &decision.agent,
-                    kind: decision.kind,
-                    text: &text,
-                    key: None,
-                    cursor,
-                    max_live: DEFAULT_MAX_LIVE,
-                    stale_after: DEFAULT_STALE_SECONDS,
-                },
-                now,
-            )?;
-            posted.push(Posted {
-                agent: decision.agent.clone(),
-                kind: decision.kind,
-                outcome: outcome.outcome,
-            });
+        match cycle(&inbox, &sources, &ignored, policy) {
+            Ok(report) => print_json(&report)?,
+            Err(error) if !args.once => {
+                // A continuous watcher outlives transient failures; the next sample retries.
+                eprintln!("agentctl: inbox watch sample failed: {error}");
+                print_json(&serde_json::json!({ "error": error.to_string() }))?;
+            }
+            Err(error) => return Err(error),
         }
-        inbox.write_json(".", "watch.json", &state)?;
-        print_json(&serde_json::json!({
-            "sampled_unix_ms": now,
-            "workers": observations.len(),
-            "posted": posted,
-        }))?;
         if args.once {
             return Ok(0);
         }
@@ -654,6 +821,7 @@ mod tests {
 
     const POLICY: Policy = Policy {
         idle_samples: 2,
+        exit_samples: 3,
         remind_after_ms: 1_000,
     };
 
@@ -661,7 +829,7 @@ mod tests {
         Observation {
             agent: agent.into(),
             pane: format!("w:{agent}"),
-            state,
+            state: Some(state),
             authoritative,
             transcript: None,
         }
@@ -674,8 +842,26 @@ mod tests {
             .collect()
     }
 
+    fn run_states(
+        state: &mut WatchState,
+        agent: &str,
+        authoritative: bool,
+        states: &[WorkerState],
+    ) -> Vec<NoticeKind> {
+        let mut all = Vec::new();
+        for (index, observed) in states.iter().enumerate() {
+            let now = 10 * index as u64;
+            all.extend(
+                step(state, &[seen(agent, *observed, authoritative)], now, POLICY)
+                    .into_iter()
+                    .map(|decision| decision.kind),
+            );
+        }
+        all
+    }
+
     #[test]
-    fn a_first_sample_announces_only_blocked_workers() {
+    fn a_first_sample_announces_only_blocked_workers_and_first_seen_idle_is_not_reminded() {
         let mut state = WatchState::default();
         let sample = [
             seen("a", WorkerState::Idle, true),
@@ -686,88 +872,61 @@ mod tests {
             kinds(&step(&mut state, &sample, 0, POLICY)),
             [("c", NoticeKind::Blocked)]
         );
-        assert_eq!(state.workers.len(), 3);
+        let later = step(&mut state, &sample, 100_000, POLICY);
+        assert!(
+            later.is_empty(),
+            "no reminder for an idle period never announced: {later:?}"
+        );
     }
 
     #[test]
     fn a_claude_idle_edge_is_announced_at_once_and_a_resume_withdraws_it() {
+        use WorkerState::{Idle, Working};
         let mut state = WatchState::default();
-        step(
+        let kinds = run_states(
             &mut state,
-            &[seen("a", WorkerState::Working, true)],
-            0,
-            POLICY,
+            "a",
+            true,
+            &[Working, Idle, Idle, Working, Working],
         );
-        let decisions = step(
-            &mut state,
-            &[seen("a", WorkerState::Idle, true)],
-            10,
-            POLICY,
-        );
-        assert_eq!(kinds(&decisions), [("a", NoticeKind::Idle)]);
-        let decisions = step(
-            &mut state,
-            &[seen("a", WorkerState::Idle, true)],
-            20,
-            POLICY,
-        );
-        assert!(decisions.is_empty(), "one idle period is announced once");
-        let decisions = step(
-            &mut state,
-            &[seen("a", WorkerState::Working, true)],
-            30,
-            POLICY,
-        );
-        assert_eq!(kinds(&decisions), [("a", NoticeKind::Working)]);
-        let decisions = step(
-            &mut state,
-            &[seen("a", WorkerState::Working, true)],
-            40,
-            POLICY,
-        );
-        assert!(decisions.is_empty());
+        assert_eq!(kinds, [NoticeKind::Idle, NoticeKind::Working]);
     }
 
     #[test]
     fn a_screen_rule_idle_edge_must_hold_for_the_required_samples() {
+        use WorkerState::{Idle, Working};
         let mut state = WatchState::default();
-        step(
+        let kinds = run_states(
             &mut state,
-            &[seen("x", WorkerState::Working, false)],
-            0,
-            POLICY,
+            "x",
+            false,
+            &[Working, Idle, Working, Idle, Idle],
         );
-        assert!(step(
-            &mut state,
-            &[seen("x", WorkerState::Idle, false)],
-            10,
-            POLICY
-        )
-        .is_empty());
-        let flicker = step(
-            &mut state,
-            &[seen("x", WorkerState::Working, false)],
-            20,
-            POLICY,
+        assert_eq!(
+            kinds,
+            [NoticeKind::Idle],
+            "the one-sample blip is neither announced nor withdrawn"
         );
-        assert!(
-            flicker.is_empty(),
-            "an unannounced idle blip withdraws nothing"
-        );
-        assert!(step(
+    }
+
+    #[test]
+    fn a_blocked_notice_is_withdrawn_even_after_an_unconfirmed_idle_blip() {
+        use WorkerState::{Blocked, Idle, Working};
+        let mut state = WatchState::default();
+        let kinds = run_states(
             &mut state,
-            &[seen("x", WorkerState::Idle, false)],
-            30,
-            POLICY
-        )
-        .is_empty());
-        let decisions = step(
-            &mut state,
-            &[seen("x", WorkerState::Idle, false)],
-            40,
-            POLICY,
+            "x",
+            false,
+            &[Working, Blocked, Idle, Working, Working],
         );
-        assert_eq!(kinds(&decisions), [("x", NoticeKind::Idle)]);
+        assert_eq!(kinds, [NoticeKind::Blocked, NoticeKind::Working]);
+        let mut state = WatchState::default();
+        let kinds = run_states(&mut state, "x", false, &[Working, Blocked, Idle, Idle]);
+        assert_eq!(
+            kinds,
+            [NoticeKind::Blocked, NoticeKind::Idle],
+            "a confirmed idle replaces it"
+        );
     }
 
     #[test]
@@ -801,7 +960,49 @@ mod tests {
     }
 
     #[test]
-    fn blocked_and_exited_are_announced_and_a_vanished_worker_is_forgotten() {
+    fn exited_needs_consecutive_absences_and_a_return_is_announced() {
+        let mut state = WatchState::default();
+        let working = [
+            seen("a", WorkerState::Working, true),
+            seen("b", WorkerState::Working, true),
+        ];
+        step(&mut state, &working, 0, POLICY);
+        let only_b = [seen("b", WorkerState::Working, true)];
+        assert!(step(&mut state, &only_b, 10, POLICY).is_empty());
+        assert!(
+            step(&mut state, &working, 20, POLICY).is_empty(),
+            "a return resets the count"
+        );
+        assert!(step(&mut state, &only_b, 30, POLICY).is_empty());
+        assert!(step(&mut state, &only_b, 40, POLICY).is_empty());
+        assert_eq!(
+            kinds(&step(&mut state, &only_b, 50, POLICY)),
+            [("a", NoticeKind::Exited)]
+        );
+        assert!(
+            step(&mut state, &only_b, 60, POLICY).is_empty(),
+            "exited is announced once"
+        );
+        let back_idle = [
+            seen("a", WorkerState::Idle, true),
+            seen("b", WorkerState::Working, true),
+        ];
+        assert_eq!(
+            kinds(&step(&mut state, &back_idle, 70, POLICY)),
+            [("a", NoticeKind::Idle)]
+        );
+        for now in [80, 90, 100] {
+            step(&mut state, &only_b, now, POLICY);
+        }
+        assert_eq!(
+            kinds(&step(&mut state, &working, 110, POLICY)),
+            [("a", NoticeKind::Working)],
+            "a return while working withdraws the exited notice"
+        );
+    }
+
+    #[test]
+    fn an_empty_listing_is_unknown_not_everyone_leaving() {
         let mut state = WatchState::default();
         step(
             &mut state,
@@ -809,24 +1010,109 @@ mod tests {
             0,
             POLICY,
         );
-        let decisions = step(
-            &mut state,
-            &[seen("a", WorkerState::Blocked, true)],
-            10,
-            POLICY,
-        );
-        assert_eq!(kinds(&decisions), [("a", NoticeKind::Blocked)]);
-        let decisions = step(&mut state, &[], 20, POLICY);
-        assert_eq!(kinds(&decisions), [("a", NoticeKind::Exited)]);
-        assert!(state.workers.is_empty());
-        assert!(step(&mut state, &[], 30, POLICY).is_empty());
+        for now in [10, 20, 30, 40, 50] {
+            assert!(step(&mut state, &[], now, POLICY).is_empty());
+        }
+        assert_eq!(state.workers["a"].missing, 0);
     }
 
     #[test]
-    fn worker_names_fall_back_to_the_pane_id() {
+    fn an_unknown_state_changes_nothing() {
+        let mut state = WatchState::default();
+        step(
+            &mut state,
+            &[seen("a", WorkerState::Working, true)],
+            0,
+            POLICY,
+        );
+        step(
+            &mut state,
+            &[seen("a", WorkerState::Idle, true)],
+            10,
+            POLICY,
+        );
+        let unknown = Observation {
+            state: None,
+            ..seen("a", WorkerState::Idle, false)
+        };
+        for now in [20, 30, 40] {
+            assert!(step(&mut state, std::slice::from_ref(&unknown), now, POLICY).is_empty());
+        }
+        assert_eq!(
+            kinds(&step(
+                &mut state,
+                &[seen("a", WorkerState::Working, true)],
+                50,
+                POLICY
+            )),
+            [("a", NoticeKind::Working)]
+        );
+    }
+
+    #[test]
+    fn a_transcript_offset_survives_a_missing_path_and_resets_for_a_new_one() {
+        let directory = scratch();
+        let first = directory.join("one.jsonl");
+        let second = directory.join("two.jsonl");
+        fs::write(&first, b"0123456789\n").unwrap();
+        fs::write(&second, b"abc\n").unwrap();
+        let mut state = WatchState::default();
+        let with = |path: &Path| Observation {
+            transcript: Some(path.to_path_buf()),
+            ..seen("a", WorkerState::Working, true)
+        };
+        step(&mut state, &[with(&first)], 0, POLICY);
+        assert_eq!(
+            state.workers["a"].offset, 11,
+            "a first sighting starts at the current end"
+        );
+        step(
+            &mut state,
+            &[seen("a", WorkerState::Working, true)],
+            10,
+            POLICY,
+        );
+        assert_eq!(
+            (
+                state.workers["a"].transcript.as_deref(),
+                state.workers["a"].offset
+            ),
+            (Some(first.as_path()), 11)
+        );
+        step(&mut state, &[with(&second)], 20, POLICY);
+        assert_eq!(
+            state.workers["a"].offset, 0,
+            "a different transcript is unread from the start"
+        );
+    }
+
+    #[test]
+    fn worker_names_fall_back_to_the_pane_id_and_collisions_are_split() {
         assert_eq!(worker_name(Some("kvm"), "wJ:p38"), "kvm");
         assert_eq!(worker_name(None, "wJ:p3A"), "pane-wj-p3a");
         assert_eq!(worker_name(Some("Has Space"), "w1:p2"), "pane-w1-p2");
+        let mut observations = vec![
+            seen("worker", WorkerState::Blocked, false),
+            seen("worker", WorkerState::Working, false),
+            seen("solo", WorkerState::Idle, false),
+        ];
+        observations[0].pane = "w:p5".into();
+        observations[1].pane = "w:p6".into();
+        disambiguate(&mut observations);
+        let names = observations
+            .iter()
+            .map(|o| o.agent.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["worker-w-p5", "worker-w-p6", "solo"]);
+        let mut clash = vec![
+            seen("pane-w-p3", WorkerState::Idle, false),
+            seen("pane-w-p3", WorkerState::Idle, false),
+        ];
+        clash[0].pane = "w:p3".into();
+        clash[1].pane = "w-p3".into();
+        disambiguate(&mut clash);
+        assert_ne!(clash[0].agent, clash[1].agent);
+        assert!(clash.iter().all(|o| check_name("--from", &o.agent).is_ok()));
     }
 
     fn scratch() -> PathBuf {
@@ -840,6 +1126,11 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn executable(path: &Path, body: &str) {
+        fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
@@ -861,14 +1152,11 @@ mod tests {
         );
         let (text, again) = last_assistant_text(&path, end).unwrap();
         assert_eq!((text, again), (None, end));
-        let after_first = (first.len() + 1) as u64;
-        let (text, _) = last_assistant_text(&path, after_first).unwrap();
-        assert_eq!(text.as_deref(), Some("Pushed 3f2a9c1."));
+        let (text, _) = last_assistant_text(&path, u64::MAX).unwrap();
+        assert_eq!(text, None, "an offset past the end reads nothing");
     }
 
-    #[test]
-    fn a_sample_joins_claude_state_to_herdr_panes_through_proc() {
-        let directory = scratch();
+    fn fixture(directory: &Path, claude_body: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
         let herdr = directory.join("herdr");
         let claude = directory.join("claude");
         let listing = r#"{"result":{"agents":[
@@ -878,54 +1166,120 @@ mod tests {
             {"pane_id":"w:p4","agent_status":"idle"}
         ]}}"#;
         fs::write(directory.join("list.json"), listing).unwrap();
-        fs::write(
+        executable(
             &herdr,
-            format!("#!/bin/sh\ncat {}\n", directory.join("list.json").display()),
-        )
-        .unwrap();
-        fs::write(
-            &claude,
-            "#!/bin/sh\necho '[{\"pid\":\"101\",\"sessionId\":\"s-1\",\"status\":\"busy\"},{\"id\":\"bg\",\"state\":\"blocked\"}]'\n",
-        )
-        .unwrap();
-        for program in [&herdr, &claude] {
-            fs::set_permissions(program, fs::Permissions::from_mode(0o755)).unwrap();
-        }
+            &format!("cat {}", directory.join("list.json").display()),
+        );
+        executable(&claude, claude_body);
         let proc_root = directory.join("proc");
-        fs::create_dir_all(proc_root.join("101")).unwrap();
-        fs::write(
-            proc_root.join("101/environ"),
-            b"A=1\0HERDR_PANE_ID=w:p2\0B=2\0",
-        )
-        .unwrap();
+        for (pid, pane) in [("101", "w:p2"), ("250", "w:p2")] {
+            fs::create_dir_all(proc_root.join(pid)).unwrap();
+            fs::write(
+                proc_root.join(pid).join("environ"),
+                format!("A=1\0HERDR_PANE_ID={pane}\0B=2\0"),
+            )
+            .unwrap();
+        }
         let projects = directory.join("projects");
         fs::create_dir_all(projects.join("p")).unwrap();
         fs::write(projects.join("p/s-1.jsonl"), b"").unwrap();
+        (herdr, claude, proc_root, projects)
+    }
+
+    fn summary(observations: &[Observation]) -> Vec<(&str, Option<WorkerState>, bool, bool)> {
+        observations
+            .iter()
+            .map(|o| {
+                (
+                    o.agent.as_str(),
+                    o.state,
+                    o.authoritative,
+                    o.transcript.is_some(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_sample_joins_claude_state_to_herdr_panes_through_proc() {
+        let directory = scratch();
+        let (herdr, claude, proc_root, projects) = fixture(
+            &directory,
+            "echo '[{\"pid\":\"250\",\"sessionId\":\"s-child\",\"status\":\"idle\"},{\"pid\":101,\"sessionId\":\"s-1\",\"status\":\"busy\"},{\"id\":\"bg\",\"state\":\"blocked\"}]'",
+        );
         let sources = Sources {
             herdr: &herdr,
             claude: &claude,
             projects: &projects,
             proc_root: &proc_root,
+            timeout: Duration::from_secs(10),
         };
         let observations = sample(&sources, &["coord".to_owned()]).unwrap();
-        let summary = observations
-            .iter()
-            .map(|observation| {
-                (
-                    observation.agent.as_str(),
-                    observation.state,
-                    observation.authoritative,
-                    observation.transcript.is_some(),
-                )
-            })
-            .collect::<Vec<_>>();
         assert_eq!(
-            summary,
+            summary(&observations),
             [
-                ("busy-one", WorkerState::Working, true, true),
-                ("codex-one", WorkerState::Blocked, false, false)
+                ("busy-one", Some(WorkerState::Working), true, true),
+                ("codex-one", Some(WorkerState::Blocked), false, false)
             ],
-            "Claude's busy overrides Herdr's idle; the coordinator and agentless panes are skipped"
+            "the lower pid wins the pane; Claude's busy overrides Herdr's idle; the coordinator and agentless panes are skipped"
+        );
+    }
+
+    #[test]
+    fn without_claude_a_claude_pane_is_unknown_rather_than_herdr_idle() {
+        let directory = scratch();
+        let (herdr, claude, proc_root, projects) = fixture(&directory, "exit 1");
+        let sources = Sources {
+            herdr: &herdr,
+            claude: &claude,
+            projects: &projects,
+            proc_root: &proc_root,
+            timeout: Duration::from_secs(10),
+        };
+        let observations = sample(&sources, &["coord".to_owned()]).unwrap();
+        assert_eq!(
+            summary(&observations),
+            [
+                ("busy-one", None, false, false),
+                ("codex-one", Some(WorkerState::Blocked), false, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_descendant_left_holding_the_pipe_after_a_clean_exit_is_killed_at_the_deadline() {
+        let directory = scratch();
+        let lingering = directory.join("lingering");
+        executable(&lingering, "echo partial\n(sleep 30) &\nexit 0");
+        let started = Instant::now();
+        let error = query(&lingering, &[], Duration::from_secs(1)).unwrap_err();
+        assert!(error.to_string().contains("did not finish"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let quick = directory.join("quick");
+        executable(&quick, "echo done");
+        assert_eq!(
+            query(&quick, &[], Duration::from_secs(5)).unwrap(),
+            b"done\n"
+        );
+    }
+
+    #[test]
+    fn a_query_timeout_kills_descendants_holding_the_pipe() {
+        let directory = scratch();
+        let slow = directory.join("slow");
+        executable(&slow, "(sleep 30; echo late) &\nwait");
+        let started = Instant::now();
+        let error = query(&slow, &[], Duration::from_secs(1)).unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            error
+                .to_string()
+                .contains("did not finish within 1 seconds"),
+            "{error}"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(10),
+            "{elapsed:?}"
         );
     }
 }

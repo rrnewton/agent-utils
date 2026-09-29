@@ -55,6 +55,8 @@ const BATCH_ID_PLACEHOLDER: &str = "????????????????";
 /// Batch id shown by `render`; the same length as a real id, so render and deliver choose the
 /// same notices under the same budget.
 const PREVIEW_BATCH_ID: &str = "preview-not-sent";
+/// How long a non-blocking lock keeps retrying before it reports busy.
+const LOCK_GRACE: Duration = Duration::from_millis(500);
 /// Busy: the queue is full or another delivery is running.
 const EXIT_BUSY: i32 = crate::error::EXIT_BUSY;
 /// The delivery adapter failed; the batch stays claimed for a retry with the same key.
@@ -240,7 +242,7 @@ enum InboxCommand {
     Deliver(DeliverArgs),
     /// Give up on a claimed batch: move it aside, or put its notices back in the queue
     #[command(
-        after_help = "Examples:\n  agentctl inbox release --to coord --batch 5e0c7a9d31f2b8a4\n  agentctl inbox release --to coord --batch 5e0c7a9d31f2b8a4 --requeue\n\nUse this when a claimed batch can no longer reach its adapter or session. Without --requeue the\nbatch moves to released/ and its notices are not delivered. With --requeue its notices return\nto the queue and may reach the coordinator twice if the failed attempt actually landed; a\nrequeued state notice is dropped when its worker already has a newer one."
+        after_help = "Examples:\n  agentctl inbox release --to coord --batch 5e0c7a9d31f2b8a4\n  agentctl inbox release --to coord --batch 5e0c7a9d31f2b8a4 --requeue\n\nUse this when a claimed batch can no longer reach its adapter or session. Without --requeue the\nbatch moves to released/ and its notices are not delivered. With --requeue its notices return\nto the queue and may reach the coordinator twice if the failed attempt actually landed; a\nrequeued state notice is folded into its worker's newer one at the higher priority."
     )]
     Release(ReleaseArgs),
     /// Watch Herdr workers and post idle, blocked, exited, and reminder notices as their state changes
@@ -548,11 +550,19 @@ impl Inbox {
             file.lock_exclusive().map_err(|error| {
                 InboxError::io(&format!("cannot lock {}", path.display()), &error)
             })?;
-        } else if file.try_lock_exclusive().is_err() {
-            return Err(InboxError::busy(format!(
-                "another delivery holds {}; retry later",
-                path.display()
-            )));
+            return Ok(file);
+        }
+        // A holder that is just finishing, or a lock briefly kept alive by a descriptor that a
+        // concurrently spawned child inherited before its exec, is given a short grace period.
+        let deadline = std::time::Instant::now() + LOCK_GRACE;
+        while file.try_lock_exclusive().is_err() {
+            if std::time::Instant::now() >= deadline {
+                return Err(InboxError::busy(format!(
+                    "another process holds {}; retry later",
+                    path.display()
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
         Ok(file)
     }

@@ -29,7 +29,7 @@ Everything lives under `<registry>/.inbox/<coordinator>/` (the registry is the g
 | `delivered/<claim-ms>-<batch>.json` | delivered batches; the newest 200 are kept, and an unreadable one is skipped rather than blocking posts or deliveries |
 | `released/<claim-ms>-<batch>.json` | claimed batches given up with `release` |
 | `.lock` | held for every change to the queue |
-| `.deliver.lock` | held for a whole delivery; a second concurrent delivery exits 75 |
+| `.deliver.lock` | held for a whole delivery; a second concurrent delivery waits up to half a second, then exits 75 |
 
 Coordinator (`--to`) and worker (`--from`) names are 1-64 lowercase letters, digits, dots,
 underscores or hyphens, starting with a letter or digit.
@@ -136,24 +136,38 @@ Each sample takes these steps:
    coordinator's own pane (a worker named like `--to`), and every `--exclude NAME` are skipped. A
    pane whose Herdr name is not a valid inbox name is called `pane-<pane id>`.
 2. `claude agents --json` reports `busy` or `idle` for every interactive Claude Code session with
-   its process id. `HERDR_PANE_ID` in `<proc-root>/<pid>/environ` names the pane. For those panes
-   Claude's state is used, because Herdr's screen rules can show a working Claude pane as idle.
-   Herdr's `blocked` still wins, because a permission dialog is visible on screen.
-3. Other panes use Herdr's state. `idle` or `done` must hold for `--idle-samples` samples in a row
-   (2 by default) before it counts, so a brief pause between tool calls is not announced.
+   its process id. `HERDR_PANE_ID` in `<proc-root>/<pid>/environ` names the pane; if two sessions
+   name one pane, the lower process id wins. For those panes Claude's state is used, because
+   Herdr's screen rules can show a working Claude pane as idle. Herdr's `blocked` still wins,
+   because a permission dialog is visible on screen. If `claude` cannot be run or answers
+   something unreadable, a pane Herdr identifies as Claude has an unknown state for that sample:
+   nothing about it changes, and nothing is posted for it.
+3. Other panes, and Claude sessions reporting a status other than `busy` or `idle`, use Herdr's
+   state. `idle` or `done` must hold for `--idle-samples` samples in a row (2 by default) before it
+   counts, so a brief pause between tool calls is not announced. Herdr's `unknown` is unknown.
+4. Two panes that would get the same worker name are both renamed `<name>-<pane id>`, with a
+   counter if that still collides.
 
 Transitions become notices:
 
 | Transition | Notice |
 |---|---|
 | to blocked | `blocked` |
-| to idle (after the required samples) | `idle` |
-| back to working after an announced idle or blocked | `working`, which withdraws it |
+| to idle (after the required samples) | `idle`, which replaces a standing blocked or exited notice |
+| back to working while an idle, blocked or exited notice stands | `working`, which withdraws it |
 | still idle `--remind-minutes` after the idle notice (30 by default), then twice and four times as long | `still-idle`, at most three times |
-| no longer listed | `exited` |
+| missing from Herdr's list for `--exit-samples` samples in a row (3 by default) | `exited` |
+| back in the list after `exited` | `working`, `idle` or `blocked`, by its state |
+
+An unconfirmed one-sample idle leaves a standing notice in place, so a blocked notice is still
+withdrawn when the worker resumes. A sample in which Herdr lists no worker at all is treated as
+unknown, not as every worker leaving. An exited worker is remembered for a day. Removing a worker
+from view with a new `--exclude` counts as it leaving.
 
 A worker seen for the first time is recorded without a notice unless it is blocked, so starting
-the watcher does not announce every idle worker at once.
+the watcher does not announce every idle worker at once; an idle period already under way when
+it is first seen earns no reminders either. If `watch.json` is unreadable, the watcher starts
+over this way, so workers that left in the meantime are not announced.
 
 An `idle` notice carries the last assistant message the worker wrote to its Claude transcript
 (`<claude-projects>/<project>/<session-id>.jsonl`, found from the session id) since its previous
@@ -162,11 +176,17 @@ are read, and a partial final line is left for the next notice. Without a transc
 `blocked`, the notice carries the last 12 non-empty terminal lines above the pane's bottom six
 rows.
 
-State lives in `watch.json` under the inbox directory. One watcher runs per coordinator
-(`.watch.lock`; a second exits 75). `--once` takes one sample, posts, saves, and exits, for use
-from a cron job or a harness loop; otherwise it samples every `--interval` seconds (30 by
-default). Each sample prints one JSON object: its time, the number of workers seen, and each
-posted notice with its outcome.
+State lives in `watch.json` under the inbox directory, saved after every posted notice. One
+watcher runs per coordinator (`.watch.lock`; a second exits 75). `--once` takes one sample,
+posts, saves, and exits, for use from a cron job or a harness loop; otherwise it samples every
+`--interval` seconds (30 by default). Each sample prints one JSON object: its time, the number of
+workers seen, and each posted notice with its outcome. In continuous mode a failed sample prints
+`{"error": ...}`, reports on stderr, and the watcher tries again at the next interval. Each
+`herdr` or `claude` query is killed with its whole process group after 60 seconds.
+
+`watch` exits 0 after a `--once` sample, 1 when its files cannot be read or written, 2 for
+invalid arguments, 69 when `--once` cannot query Herdr, and 75 when another watcher holds the
+lock.
 
 ## Exit codes
 
