@@ -30,6 +30,7 @@ RUN mkdir -p src/bin \
 
 COPY src ./src
 COPY web ./web
+COPY prompts ./prompts
 # Touch the entry points so cargo cannot reuse the placeholder build above. Only the server is
 # built: the image ships a bridge, not a machine that can mint fake conversations.
 RUN touch src/main.rs src/lib.rs && cargo build --release --locked --bin vibe-talk
