@@ -97,7 +97,7 @@ refused.
 
 | Lane | Coverage |
 |---|---|
-| `make cross` | full: every skip fails |
+| `make cross`, invoked by hand | full: every skip fails. No workflow or scheduled job runs it, so the live-scope checks the validation nodes skip run only here ([agent-utils issue 165](https://github.com/rrnewton/agent-utils/issues/165)) |
 | validation nodes `cross.dagrun.differential` and `cross.dagrun.cpuset-differential` | partial for `delegated-live-scope` only; boxing stays required |
 | hosted repository CI and the nightly full run | additionally partial for `boxing`, because hosted runners run the graph with `--allow-cgroup-failure`, and for `eight-cpu`, because hosted runners have fewer than eight CPUs |
 

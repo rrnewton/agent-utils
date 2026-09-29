@@ -34,8 +34,10 @@ steps:
     desc: dagrun Python and Rust commands agree
     # Partial by declaration, and only for one structural reason: this node runs inside the
     # parent-owned delegated cgroup, where the harness must not create a live systemd scope, so
-    # the live pin-run cases are listed as skipped rather than run. Boxing stays required here; a
-    # lane that cannot box must declare that itself (AGENT_UTILS_CROSS_ALLOW_SKIP=boxing).
+    # the live pin-run cases are listed as skipped rather than run. They run only when someone
+    # invokes `make cross` by hand at top level; no automated lane does
+    # (https://github.com/rrnewton/agent-utils/issues/165). Boxing stays required here; a lane
+    # that cannot box must declare that itself (AGENT_UTILS_CROSS_ALLOW_SKIP=boxing).
     # A partial run exits 0, so dagrun shows this node as a plain PASS with the PARTIAL line only
     # in its brackets; scripts/validate.py lists the skipped checks in its own summary.
     cmd: python3 cross/differential.py --tool dagrun --allow-skip delegated-live-scope
@@ -62,7 +64,9 @@ steps:
     desc: cpuset allocator Python and Rust commands agree
     # Partial for the same structural reason as dagrun.differential: the live-scope cases
     # (selftest, interop, wrapped help, signal status) are listed as skipped inside the
-    # delegated cgroup. `make cross` runs them at top level with full coverage.
+    # delegated cgroup. They run, with full coverage, only when someone invokes `make cross` by
+    # hand at top level; no automated lane does
+    # (https://github.com/rrnewton/agent-utils/issues/165).
     cmd: python3 cross/differential.py --tool cpuset-alloc --allow-skip delegated-live-scope
     jobs_flag: ""
     labels: [validation-cross, component-dagrun]
