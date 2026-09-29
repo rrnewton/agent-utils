@@ -13,6 +13,9 @@ agentctl inbox post --to coord --from builder --kind blocked --text 'Needs appro
 # See what would be delivered, in order: blocked and exited first, then idle and messages.
 agentctl inbox render --to coord
 
+# Or let a watcher post idle, blocked, exited and reminder notices for every Herdr worker.
+agentctl inbox watch --to coord --once
+
 # Deliver: print for a cron or loop to read, or notify an agentcloud session exactly once.
 agentctl inbox deliver --to coord --via print
 agentctl inbox deliver --to coord --via agentcloud-notify --session SESSION_ID

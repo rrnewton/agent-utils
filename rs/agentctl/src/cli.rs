@@ -839,8 +839,13 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             return run_chat(args.registry, args.herdr_bin, value);
         }
         Commands::Inbox(value) => {
-            return crate::inbox::run(&args.registry, &args.agentcloudctl_bin, value)
-                .map_err(Failure::Inbox);
+            return crate::inbox::run(
+                &args.registry,
+                &args.herdr_bin,
+                &args.agentcloudctl_bin,
+                value,
+            )
+            .map_err(Failure::Inbox);
         }
         Commands::Profiles(value) => {
             let (path, profiles, workspace) =

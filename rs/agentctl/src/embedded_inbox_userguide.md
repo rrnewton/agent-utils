@@ -15,7 +15,7 @@ for them. They are coalesced, and then delivered to the coordinator as one batch
 
 None for `post`, `list`, `render` and `deliver --via print`: they only read and write files under
 the registry. `deliver --via agentcloud-notify` runs `agentcloudctl` (override with the global
-`--agentcloudctl-bin`).
+`--agentcloudctl-bin`). `watch` runs `herdr` and, when present, `claude`.
 
 ## Layout
 
@@ -122,6 +122,51 @@ requeued batch reuses the old key only when the next batch goes to the same sess
 exactly the same notices; then agentcloud delivers it at most once. Otherwise (another adapter
 or session, a notice posted meanwhile, or a merged state notice) it goes out under a new key and
 may reach the coordinator twice if the failed attempt actually landed.
+
+## Watching workers
+
+`agentctl inbox watch --to COORDINATOR` produces notices automatically from the workers visible
+in Herdr. It only posts; delivery stays with `deliver`, so the two can run on different
+schedules. It needs `herdr` (global `--herdr-bin`) and, for Claude Code workers, `claude`
+(`--claude-bin`).
+
+Each sample takes these steps:
+
+1. `herdr agent list` names every pane that hosts an agent. Panes without an agent, the
+   coordinator's own pane (a worker named like `--to`), and every `--exclude NAME` are skipped. A
+   pane whose Herdr name is not a valid inbox name is called `pane-<pane id>`.
+2. `claude agents --json` reports `busy` or `idle` for every interactive Claude Code session with
+   its process id. `HERDR_PANE_ID` in `<proc-root>/<pid>/environ` names the pane. For those panes
+   Claude's state is used, because Herdr's screen rules can show a working Claude pane as idle.
+   Herdr's `blocked` still wins, because a permission dialog is visible on screen.
+3. Other panes use Herdr's state. `idle` or `done` must hold for `--idle-samples` samples in a row
+   (2 by default) before it counts, so a brief pause between tool calls is not announced.
+
+Transitions become notices:
+
+| Transition | Notice |
+|---|---|
+| to blocked | `blocked` |
+| to idle (after the required samples) | `idle` |
+| back to working after an announced idle or blocked | `working`, which withdraws it |
+| still idle `--remind-minutes` after the idle notice (30 by default), then twice and four times as long | `still-idle`, at most three times |
+| no longer listed | `exited` |
+
+A worker seen for the first time is recorded without a notice unless it is blocked, so starting
+the watcher does not announce every idle worker at once.
+
+An `idle` notice carries the last assistant message the worker wrote to its Claude transcript
+(`<claude-projects>/<project>/<session-id>.jsonl`, found from the session id) since its previous
+notice. The byte range is recorded as the notice's cursor. At most the last 8 MiB of that range
+are read, and a partial final line is left for the next notice. Without a transcript, and for
+`blocked`, the notice carries the last 12 non-empty terminal lines above the pane's bottom six
+rows.
+
+State lives in `watch.json` under the inbox directory. One watcher runs per coordinator
+(`.watch.lock`; a second exits 75). `--once` takes one sample, posts, saves, and exits, for use
+from a cron job or a harness loop; otherwise it samples every `--interval` seconds (30 by
+default). Each sample prints one JSON object: its time, the number of workers seen, and each
+posted notice with its outcome.
 
 ## Exit codes
 

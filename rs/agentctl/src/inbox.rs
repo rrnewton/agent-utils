@@ -30,6 +30,8 @@ use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+mod watch;
+
 /// Most notices one coordinator's queue holds; further posts are refused as busy.
 pub(crate) const DEFAULT_MAX_LIVE: usize = 200;
 /// Default byte budget for one rendered batch, header and trailer included.
@@ -241,6 +243,11 @@ enum InboxCommand {
         after_help = "Examples:\n  agentctl inbox release --to coord --batch 5e0c7a9d31f2b8a4\n  agentctl inbox release --to coord --batch 5e0c7a9d31f2b8a4 --requeue\n\nUse this when a claimed batch can no longer reach its adapter or session. Without --requeue the\nbatch moves to released/ and its notices are not delivered. With --requeue its notices return\nto the queue and may reach the coordinator twice if the failed attempt actually landed; a\nrequeued state notice is dropped when its worker already has a newer one."
     )]
     Release(ReleaseArgs),
+    /// Watch Herdr workers and post idle, blocked, exited, and reminder notices as their state changes
+    #[command(
+        after_help = "Examples:\n  agentctl inbox watch --to coord --once\n  agentctl inbox watch --to coord --interval 30 --exclude chat-bridge\n\nEach sample lists Herdr panes and asks `claude agents --json` for the busy or idle state of\nevery Claude session, joined to its pane through HERDR_PANE_ID in /proc/<pid>/environ. Claude's\nstate is used for Claude panes; other panes use Herdr's state and must look idle for\n--idle-samples samples in a row. Workers seen for the first time are recorded without a notice\nunless blocked. An idle notice carries the last assistant message written to the worker's Claude\ntranscript since its previous notice, with that byte range as its cursor, or else the tail of the\nterminal. State lives in <registry>/.inbox/<coordinator>/watch.json; one watcher runs per\ncoordinator (a second exits 75). Each sample prints one JSON line of what it posted. The watcher\nonly posts: deliver batches with `agentctl inbox deliver`."
+    )]
+    Watch(watch::WatchArgs),
 }
 
 #[derive(Args)]
@@ -346,7 +353,12 @@ struct ReleaseArgs {
 }
 
 /// Run `agentctl inbox`.
-pub(crate) fn run(registry: &Path, agentcloudctl: &Path, args: InboxArgs) -> Result<i32> {
+pub(crate) fn run(
+    registry: &Path,
+    herdr: &Path,
+    agentcloudctl: &Path,
+    args: InboxArgs,
+) -> Result<i32> {
     let now = now_ms()?;
     match args.command {
         InboxCommand::Quickstart => {
@@ -457,6 +469,7 @@ pub(crate) fn run(registry: &Path, agentcloudctl: &Path, args: InboxArgs) -> Res
             }
             Ok(0)
         }
+        InboxCommand::Watch(value) => watch::run(registry, herdr, value),
         InboxCommand::Release(release) => {
             let inbox = Inbox::open(registry, &release.target.coordinator)?;
             let outcome = inbox.release(&release.batch, release.requeue)?;
