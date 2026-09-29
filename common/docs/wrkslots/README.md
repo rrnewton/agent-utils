@@ -11,7 +11,9 @@ Git, and path checks to agree. Unavailable evidence refuses. `agent` slots publi
 unpushed work, including initialized Git submodules, before deletion; `validate` slots skip salvage because their evidence must live
 outside the disposable checkout. `remove --validate-complete` lets the exact owner clean up a
 completed validation slot immediately, or lets a later participant skip only the heartbeat wait
-after owner death.
+after owner death. An agent owner that is done with a slot but keeps running can give it back with
+`release` after writing a handoff; removal then stops waiting for the owner's exit and the
+time-to-live, and every other check still runs.
 
 Slots can be stored as plain directories or, the default for new projects, as one sparse disk
 image per slot, so an agent's build trees never become host file-system metadata and reclaim
@@ -160,6 +162,23 @@ anything. `retirement-queue` inspects pending items, and `retire-pending --limit
 through the unchanged ordinary remove state machine, retaining every refusal for a later retry.
 Existing direct-child `HANDOFF.md` files are copied only when read, must agree with any sidecar, and
 remain in place until the slot is successfully archived and removed.
+
+An owner that is done with a slot but keeps running gives it back explicitly:
+
+```sh
+wrkslots write-handoff slot01 --agent codex-1 --owner-pid "$OWNER_PID" \
+  --expected-generation 1 --from-file /path/to/HANDOFF.md
+wrkslots release slot01 --agent codex-1 --owner-pid "$OWNER_PID" --expected-generation 1
+```
+
+Only the exact recorded owner process generation or its descendant can release, and only a slot
+that has a handoff and no hold. The release is bound to the owner identity, the generation, the
+heartbeat stamp, and the handoff digest, and it stops that generation's heartbeat. After the
+coordinator reads the handoff, `remove` and `retire-pending` no longer wait for the owner to exit
+or for the time-to-live; they still refuse while any process, the owner included, uses the slot,
+and they still salvage before deleting. `status`, `doctor`, `audit`, and `retirement-queue` show
+`RELEASED by live owner at <time>`. See the user guide's "Giving a slot back while the owner keeps
+running".
 
 If a command reports an interrupted operation, preserve the paths and run:
 

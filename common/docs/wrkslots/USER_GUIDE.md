@@ -61,11 +61,15 @@ type, task and purpose, owner process identity, coordinator history, heartbeat t
    owner-consented removal must be finished by a `recover` from a `wrkslots` version that has this
    release. An older version refuses because the owner is still alive, and until a newer `recover`
    runs or the owner exits, the interrupted removal's journal blocks every other mutation.
-7. Before removing an agent slot, `remove` publishes unpushed commits and tracked and ordinary
+7. A live owner that is done with an agent slot can give it back itself, without exiting, by
+   running `release` after `write-handoff`. See "Giving a slot back while the owner keeps running"
+   below. The release replaces only the owner-exit, registered-liveness, and time-to-live
+   conditions of `remove`; the handoff read, the process-use census, salvage, and holds still apply.
+8. Before removing an agent slot, `remove` publishes unpushed commits and tracked and ordinary
    untracked files outside configured regenerable cache paths to the recorded remote. It never
    uploads gitignored content. It records and rechecks the exact remote ref and commit before
    deletion. A validate slot skips this step.
-8. `recover` lets any later participant complete an interrupted create or removal from the durable
+9. `recover` lets any later participant complete an interrupted create or removal from the durable
    history. It is not tied to the participant that began the operation.
 
 Run `wrkslots quickstart` for copyable commands and `wrkslots COMMAND --help` for exact effects and
@@ -382,8 +386,8 @@ outside this destructive workflow before a fresh slot can provide new retirement
 
 Inspect the queue with `wrkslots retirement-queue --format json`. A coordinator may attempt a
 bounded group with `wrkslots retire-pending --limit N --coordinator-pid PID --format json`. Each
-item runs the ordinary removal state machine independently; a live owner (unless
-`--include-owner-consented` is given and step 6 above holds), fresh heartbeat, hold, process use,
+item runs the ordinary removal state machine independently; a live owner (unless it released the
+slot, or `--include-owner-consented` is given and step 6 above holds), fresh heartbeat, hold, process use,
 changed handoff, dirty or unpublished work that cannot be salvaged, remote mismatch, or path-fence
 race retains the slot in the queue. Successful archived removal clears its sidecar.
 Attempt events rotate blocked entries behind never-attempted and less-recently-attempted entries, so
@@ -394,6 +398,72 @@ storage and never unlinks that retired pathname, so a same-UID replacement canno
 the acknowledged artifact. A direct-child checkout handoff is likewise moved by no-replace into an
 identity-bound retired path before its fenced slot is removed; pathname recreation preserves both
 copies and refuses. The exact handoff bytes remain in append-only history.
+
+## Giving a slot back while the owner keeps running
+
+An agent that finishes with a slot often keeps running, for example to take its next task in a new
+slot. Without an explicit release its old slot stays until the process exits and the heartbeat
+time-to-live expires. `release` lets the exact live owner give one slot generation back at once:
+
+```sh
+wrkslots write-handoff SLOT --agent AGENT --owner-pid PID \
+  --expected-generation N --from-file /path/to/HANDOFF.md
+wrkslots release SLOT --agent AGENT --owner-pid PID --expected-generation N
+cd /a/directory/outside/the/slot
+```
+
+Who can release. The caller must be the recorded owner process generation or one of its
+descendants, proven the same way as for `heartbeat`: the agent name and the full process identity
+(PID, process start time, boot identity, and cgroup) must match, and `--expected-generation` must
+name the current generation. `release` refuses a validate slot, a held slot, and a slot whose current
+generation has no completed `write-handoff` (a direct-child `HANDOFF.md` alone names no writer, so it does
+not qualify). It takes the state lock briefly, appends one event, and runs no process census.
+
+What it records. One `owner-released` event bound to the slot, the generation, the agent, the owner
+process identity, the heartbeat stamp at that moment, and the path, SHA-256 digest, and write intent
+of the handoff sidecar. Rerunning `release` for the same handoff prints `already released` and
+records nothing. A release stops applying, and removal returns to the ordinary conditions, as soon as
+any of those bindings changes: another owner (for example after `adopt`), a renewed heartbeat, or a
+sidecar that is missing or no longer those bytes.
+
+What changes afterwards.
+
+- The heartbeat stops for that generation. `heartbeat` refuses while the release applies, so a
+  released slot cannot quietly return to use. A release cannot be withdrawn: the sidecar is
+  immutable and the heartbeat stays stopped. To keep working, create a new slot.
+- `remove` and `retire-pending` treat the released owner like an exited one for the owner-liveness
+  condition only. They do not wait for the owner to exit, for the registered running command to
+  report dead, or for the heartbeat time-to-live to expire; the time-to-live would only re-prove
+  what the owner already declared, and the heartbeat cannot be renewed. `retire-pending` needs no
+  extra flag for released slots.
+- Everything that protects work still runs. The coordinator must first read the handoff with
+  `read-handoff`, and the read must match the released digest. `remove` refuses while any process,
+  the owner and its children included, has its working directory, root, executable, an open file,
+  or a mapping inside the slot; only the comparison against the recorded owner's cgroup is skipped,
+  because the releasing owner is alive there by definition. Slot contents, uncommitted handoffs, Git
+  operation and remote checks, salvage before deletion, holds, and journals are unchanged.
+
+Before deleting anything, `remove` appends an `owner-release-honored` active-state event recording
+the release event it relied on, the owner state it observed, the registered running command's answer,
+the heartbeat age, and the handoff digest. An interrupted removal of a released slot is resumed by
+`recover` only when that record exists and the release still applies.
+
+Where it shows. `status` adds `owner_release` to the JSON row and an indented
+`RELEASED by live owner at <time> (event N)` line in text; `doctor` reports an `owner-released`
+finding; `audit` reports the release on the row and judges it like `remove` does, so a released and
+read slot that passes every other check is `DELETABLE`; `retirement-queue` adds `owner_release` to
+the JSON entry and `owner=RELEASED by live owner at <time>` to the text line. A release that no
+longer applies is shown with the reason instead (`owner-release-void` in `doctor`). None of these
+outputs change for a slot that was never released.
+
+Mixed versions. The release is a separate event kind, so versions of `wrkslots` without `release`
+skip it when replaying history and keep working on every slot. They also keep their stricter rules
+for a released slot: an older `remove` still waits for the owner to exit and the time-to-live to
+expire, and a heartbeat renewed by an older `heartbeat` changes the bound heartbeat stamp, which
+voids the release rather than being overridden by it. As with an owner-consented removal, an
+interrupted removal of a released slot whose owner is still alive must be finished by a `recover`
+from a version that has `release`; an older `recover` refuses and the journal blocks other mutations
+until a newer `recover` runs or the owner exits.
 
 ## Git remotes and salvage
 
