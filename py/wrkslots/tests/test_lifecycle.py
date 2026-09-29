@@ -38382,3 +38382,868 @@ def test_interrupted_owner_consented_removal_recovers_while_the_owner_lives(
         (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
     )
     assert len(archive["records"]) == 1
+
+
+# Explicit owner release: the exact live owner gives its agent slot generation
+# back with 'wrkslots release' and keeps running. Removal then no longer waits
+# for the owner's exit or the heartbeat time-to-live, and every other guard runs.
+
+
+def _release(
+    project: Path,
+    *,
+    slot: str = "slot01",
+    agent: str = "codex-1",
+    pid: int | None = None,
+    generation: str = "1",
+) -> subprocess.CompletedProcess[str]:
+    return raw_command(
+        project,
+        "release",
+        slot,
+        "--agent",
+        agent,
+        "--owner-pid",
+        str(os.getpid() if pid is None else pid),
+        "--expected-generation",
+        generation,
+    )
+
+
+def _write_slot_handoff(
+    project: Path, tmp_path: Path, *, slot: str, agent: str, text: str
+) -> str:
+    source = tmp_path / f"handoff-{slot}.md"
+    source.write_text(text, encoding="utf-8")
+    written = raw_command(
+        project,
+        "write-handoff",
+        slot,
+        "--agent",
+        agent,
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--from-file",
+        str(source),
+    )
+    assert written.returncode == 0, written.stderr
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _owner_release_events(project: Path) -> list[dict[str, object]]:
+    events = wrkslots._load_events(wrkslots._load_config(str(project), "testhost"))
+    return [event for event in events if event["kind"] == wrkslots.OWNER_RELEASE_EVENT]
+
+
+def _owner_release_honored(project: Path) -> list[dict[str, object]]:
+    events = wrkslots._load_events(wrkslots._load_config(str(project), "testhost"))
+    return [
+        event
+        for event in events
+        if event["kind"] == "active-state-recorded"
+        and wrkslots._as_mapping(event["payload"], "payload")["action"]
+        == wrkslots.OWNER_RELEASE_ACTION
+    ]
+
+
+def _owner_release_ready(tmp_path: Path, *, read: bool = True) -> tuple[Path, str]:
+    """An agent slot whose live owner (this test process) wrote a handoff and released it.
+
+    The heartbeat is fresh and the registered liveness authority reports the
+    owner alive, so nothing but the release lets remove proceed.
+    """
+
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    commit_task(repository, checkout(project), "codex/task")
+    digest = _write_owner_handoff(project, tmp_path)
+    released = _release(project)
+    assert released.returncode == 0, released.stderr
+    if read:
+        _read_owner_handoff(project)
+    return project, digest
+
+
+def _assert_release_retained(project: Path) -> None:
+    assert checkout(project).is_dir()
+    assert len(active_slots(project)) == 1
+    assert _owner_release_honored(project) == []
+
+
+def _rewrite_slot(project: Path, slot: str, **changes: object) -> None:
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+    record = wrkslots._find_record(state, slot)
+    wrkslots._write_active_state(
+        config,
+        wrkslots._replace_record(state, replace(record, **changes)),  # type: ignore[arg-type]
+        action="test-slot-rewritten",
+        slot=slot,
+    )
+
+
+def _status_rows(project: Path) -> dict[str, dict[str, object]]:
+    status = raw_command(project, "status", "--format", "json")
+    assert status.returncode == 0, status.stderr
+    return {str(row["slot"]): row for row in json.loads(status.stdout)["active"]}
+
+
+def test_owner_release_lets_remove_proceed_while_the_owner_lives(tmp_path: Path) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    commit_task(repository, checkout(project), "codex/task")
+    digest = _write_owner_handoff(project, tmp_path)
+    config = wrkslots._load_config(str(project), "testhost")
+    before = wrkslots._load_active(config).slots[0]
+    owner = wrkslots._read_process_identity(os.getpid())
+
+    released = _release(project)
+
+    assert released.returncode == 0, released.stderr
+    assert released.stderr == ""
+    events = _owner_release_events(project)
+    assert len(events) == 1
+    event = events[0]
+    assert released.stdout.splitlines() == [
+        f"released slot=slot01 generation=1 sha256={digest} at={event['recorded_at']} "
+        f"event={event['sequence']}",
+        "heartbeat: stopped for this generation; 'wrkslots heartbeat' now refuses for it",
+        "removal: no longer waits for the owner to exit or for the heartbeat "
+        "time-to-live; the handoff read, the unused-slot check, salvage and holds "
+        "still apply",
+        "next: coordinator runs 'wrkslots read-handoff slot01 --coordinator-pid <pid>', "
+        "then 'wrkslots remove slot01 --coordinator-pid <pid> --expected-generation 1' "
+        "or 'wrkslots retire-pending --limit <n> --coordinator-pid <pid>'",
+        "note: leave the slot now; remove refuses while any process, yours included, "
+        "has its working directory, an open file or a mapping inside it",
+    ]
+    assert event["payload"] == {
+        "slot": "slot01",
+        "generation": 1,
+        "agent": "codex-1",
+        "owner": wrkslots._identity_to_obj(owner),
+        "heartbeat_at": before.heartbeat_at,
+        "handoff": {
+            "path": str(wrkslots._handoff_sidecar_path(config, "slot01", 1)),
+            "sha256": digest,
+            "source": "write-handoff",
+            "intent_sequence": event["payload"]["handoff"]["intent_sequence"],  # type: ignore[index]
+        },
+    }
+    # The release deletes nothing and leaves the active row byte-identical.
+    assert wrkslots._record_to_obj(
+        wrkslots._load_active(config).slots[0]
+    ) == wrkslots._record_to_obj(before)
+    _read_owner_handoff(project)
+    tree = checkout(project)
+    # The owner is alive, its heartbeat is fresh and the registered liveness
+    # authority reports it alive. A live process in the owner's cgroup that
+    # touches nothing in the slot does not block; only direct use does.
+    sibling = subprocess.Popen(["sleep", "600"], cwd=tmp_path, text=True)
+    try:
+        assert (
+            wrkslots._read_process_identity(sibling.pid).cgroup_path == owner.cgroup_path
+        )
+        removed = raw_command(
+            project,
+            "remove",
+            "slot01",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        )
+        assert removed.returncode == 0, removed.stderr
+        assert sibling.poll() is None
+    finally:
+        terminate_process(sibling)
+
+    assert not tree.exists()
+    assert active_slots(project) == []
+    honored = _owner_release_honored(project)
+    assert len(honored) == 1
+    evidence = wrkslots._as_mapping(
+        wrkslots._as_mapping(honored[0]["payload"], "payload")["evidence"], "evidence"
+    )
+    assert evidence["basis"] == "owner-released"
+    assert evidence["owner_state"] == "live"
+    assert evidence["owner"] == wrkslots._identity_to_obj(owner)
+    assert evidence["coordinator_authorized"] is False
+    assert evidence["registered_liveness"] == "alive"
+    assert int(str(evidence["heartbeat_age_seconds"])) < int(
+        str(evidence["heartbeat_ttl_seconds"])
+    )
+    assert evidence["release"] == {
+        "sequence": event["sequence"],
+        "recorded_at": event["recorded_at"],
+        "heartbeat_at": before.heartbeat_at,
+    }
+    assert wrkslots._as_mapping(evidence["handoff"], "handoff")["sha256"] == digest
+    all_events = wrkslots._load_events(config)
+    started = [item for item in all_events if item["kind"] == "reclaim-started"]
+    assert len(started) == 1
+    started_payload = wrkslots._as_mapping(started[0]["payload"], "payload")
+    assert started_payload["owner_state"] == "live"
+    assert started_payload["registered_liveness"] == "alive"
+    assert int(str(honored[0]["sequence"])) < int(str(started[0]["sequence"]))
+    reclaim = [
+        wrkslots._as_mapping(item["payload"], "payload")
+        for item in all_events
+        if item["kind"] == "active-state-recorded"
+        and wrkslots._as_mapping(item["payload"], "payload")["action"]
+        == "reclaim-evidence-recorded"
+    ]
+    assert len(reclaim) == 1
+    reclaim_evidence = wrkslots._as_mapping(reclaim[0]["evidence"], "evidence")
+    assert reclaim_evidence["basis"] == "owner-released"
+    assert reclaim_evidence["release_sequence"] == event["sequence"]
+    assert reclaim_evidence["handoff_sha256"] == digest
+    archive = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
+    )
+    assert len(archive["records"]) == 1
+
+
+def test_owner_release_refuses_every_caller_but_the_exact_owner(tmp_path: Path) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    commit_task(repository, checkout(project), "codex/task")
+    _write_owner_handoff(project, tmp_path)
+    tail = "state: REFUSED -- the slot was not released and its owner still holds it."
+
+    stranger = subprocess.Popen(["sleep", "600"], cwd=tmp_path, text=True)
+    try:
+        # A process that is not the caller's ancestor cannot be named as owner.
+        outsider = _release(project, pid=stranger.pid)
+        assert outsider.returncode == 3
+        assert (
+            f"owner PID {stranger.pid} is not in the invoking process ancestry"
+            in outsider.stderr
+        )
+        # The caller's own process is not the recorded owner generation.
+        config = wrkslots._load_config(str(project), "testhost")
+        original = wrkslots._load_active(config).slots[0].owner
+        assert original is not None
+        replace_owner(project, wrkslots._read_process_identity(stranger.pid))
+        impostor = _release(project)
+        assert impostor.returncode == 3
+        assert "owner process generation mismatch for slot slot01" in impostor.stderr
+        replace_owner(project, original)
+    finally:
+        terminate_process(stranger)
+
+    wrong_agent = _release(project, agent="codex-2")
+    assert wrong_agent.returncode == 3
+    assert "ownership mismatch for slot slot01: expected codex-1, got codex-2" in (
+        wrong_agent.stderr
+    )
+    stale = _release(project, generation="2")
+    assert stale.returncode == 3
+    assert "stale generation for slot slot01: expected 2, current 1" in stale.stderr
+
+    held = command(project, "hold", "slot01", "--reason", "keep for inspection")
+    assert held.returncode == 0, held.stderr
+    blocked = _release(project)
+    assert blocked.returncode == 3
+    assert (
+        "slot slot01 is held: keep for inspection. A hold keeps a slot on purpose, so it "
+        f"cannot be released while held. {tail} remedy: ask whoever placed the hold to "
+        "run 'wrkslots unhold slot01' once it is no longer needed, then retry release"
+    ) in blocked.stderr
+    assert command(project, "unhold", "slot01").returncode == 0
+
+    assert _owner_release_events(project) == []
+    # The exact owner succeeds once nothing stands in the way.
+    accepted = _release(project)
+    assert accepted.returncode == 0, accepted.stderr
+    assert len(_owner_release_events(project)) == 1
+
+
+def test_owner_release_requires_a_published_owner_handoff(tmp_path: Path) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    commit_task(repository, checkout(project), "codex/task")
+    remedy = (
+        "state: REFUSED -- the slot was not released and its owner still holds it. "
+        "remedy: write your notes to a file outside the slot, run 'wrkslots write-handoff "
+        "slot01 --agent codex-1 --owner-pid <owner-pid> --expected-generation 1 "
+        "--from-file <notes>', then retry release"
+    )
+
+    missing = _release(project)
+
+    assert missing.returncode == 3
+    assert (
+        "slot slot01 generation 1 has no handoff sidecar; release requires a handoff "
+        "published with write-handoff so the coordinator can read what is left in the "
+        f"slot before removing it. {remedy}"
+    ) in missing.stderr
+    # A legacy HANDOFF.md names no writer, so it cannot stand for the owner's
+    # decision either.
+    (checkout(project).parent / "HANDOFF.md").write_text(
+        "legacy notes without a writer\n", encoding="utf-8"
+    )
+    legacy = _release(project)
+    assert legacy.returncode == 3
+    assert (
+        "slot slot01 generation 1 has only a legacy HANDOFF.md, which names no writer; "
+        "release requires a handoff published with write-handoff"
+    ) in legacy.stderr
+    assert remedy in legacy.stderr
+    assert _owner_release_events(project) == []
+
+
+def test_owner_release_applies_only_to_agent_slots(tmp_path: Path) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot="target", slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+
+    refused = _release(project, slot="target")
+
+    assert refused.returncode == 3
+    assert (
+        "release applies only to agent slots; slot target is a validate slot. state: "
+        "REFUSED -- the slot was not released and its owner still holds it. remedy: "
+        "remove a validation slot with 'wrkslots remove target --validate-complete "
+        "--coordinator-pid <pid> --expected-generation 1' once its run completed"
+    ) in refused.stderr
+    assert _owner_release_events(project) == []
+
+
+def test_owner_release_stops_the_heartbeat(tmp_path: Path) -> None:
+    project, _digest = _owner_release_ready(tmp_path, read=False)
+    config = wrkslots._load_config(str(project), "testhost")
+    before = wrkslots._load_active(config).slots[0]
+    release = _owner_release_events(project)[0]
+
+    renewed = raw_command(
+        project,
+        "heartbeat",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+
+    assert renewed.returncode == 3
+    assert renewed.stderr.startswith(
+        f"REFUSED: slot slot01 generation 1 was released by its owner at "
+        f"{release['recorded_at']} (event {release['sequence']}), which stopped this "
+        "generation's heartbeat. state: REFUSED -- the heartbeat was not renewed and the "
+        "slot stays released for removal. remedy: stop using this slot and leave it; if "
+        "more work is needed, create a new slot with 'wrkslots create'"
+    ), renewed.stderr
+    assert wrkslots._load_active(config).slots[0].heartbeat_at == before.heartbeat_at
+    assert not any(
+        event["kind"] == "active-state-recorded"
+        and wrkslots._as_mapping(event["payload"], "payload")["action"] == "ttl-renewed"
+        for event in wrkslots._load_events(config)
+    )
+
+
+def test_owner_release_is_idempotent_for_the_same_handoff(tmp_path: Path) -> None:
+    project, digest = _owner_release_ready(tmp_path)
+    first = _owner_release_events(project)[0]
+
+    again = _release(project)
+
+    assert again.returncode == 0, again.stderr
+    assert again.stdout.splitlines()[0] == (
+        f"already released slot=slot01 generation=1 sha256={digest} "
+        f"at={first['recorded_at']} event={first['sequence']}"
+    )
+    assert "next: coordinator runs 'wrkslots remove slot01" in again.stdout
+    assert _owner_release_events(project) == [first]
+
+
+def test_remove_after_owner_release_still_requires_the_handoff_read(
+    tmp_path: Path,
+) -> None:
+    project, _digest = _owner_release_ready(tmp_path, read=False)
+
+    refused = remove(project)
+
+    assert refused.returncode == 3
+    assert "slot slot01 contains an unread HANDOFF.md or handoff sidecar" in refused.stderr
+    _assert_release_retained(project)
+    _read_owner_handoff(project)
+    read = remove(project)
+    assert read.returncode == 0, read.stderr
+    assert not checkout(project).exists()
+
+
+def test_remove_after_owner_release_refuses_the_owners_process_in_the_slot(
+    tmp_path: Path,
+) -> None:
+    """The owner's own descendants get no exemption from the direct-use check."""
+
+    project, _digest = _owner_release_ready(tmp_path)
+    tree = checkout(project)
+    # A child of the owner (this test process) still working in the checkout.
+    child = subprocess.Popen(["sleep", "600"], cwd=tree, text=True)
+    try:
+        refused = remove(project)
+
+        assert refused.returncode == 3
+        assert f"live process {child.pid} uses slot" in refused.stderr
+        _assert_release_retained(project)
+    finally:
+        terminate_process(child)
+    removed = remove(project)
+    assert removed.returncode == 0, removed.stderr
+    assert not tree.exists()
+
+
+_OWNER_IN_SLOT = textwrap.dedent(
+    """
+    import json, os, subprocess, sys
+    sys.stdin.readline()
+    for arguments in json.loads(sys.argv[1]):
+        done = subprocess.run(
+            [sys.executable, "-m", "wrkslots", *arguments, "--owner-pid", str(os.getpid())],
+            text=True, capture_output=True, check=False,
+        )
+        print(json.dumps([done.returncode, done.stdout, done.stderr]), flush=True)
+    sys.stdin.readline()
+    os.chdir(sys.argv[2])
+    print(json.dumps(["left", os.getcwd()]), flush=True)
+    sys.stdin.readline()
+    """
+)
+
+
+def test_remove_after_owner_release_refuses_while_the_owner_itself_uses_the_slot(
+    tmp_path: Path,
+) -> None:
+    """The releasing owner is refused while its working directory is in the slot.
+
+    The owner here is a separate process whose working directory is the
+    checkout; it writes its handoff and releases from there. Removal refuses
+    until that exact owner leaves the slot, and then succeeds while it is still
+    running.
+    """
+
+    project, repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    commit_task(repository, tree, "codex/task")
+    notes = tmp_path / "owner-notes.md"
+    notes.write_text("owner in slot: every commit is published\n", encoding="utf-8")
+    base = ["--project-root", str(project)]
+    steps = [
+        [*base, "write-handoff", "slot01", "--agent", "codex-1", "--expected-generation",
+         "1", "--from-file", str(notes)],
+        [*base, "release", "slot01", "--agent", "codex-1", "--expected-generation", "1"],
+    ]
+    owner = subprocess.Popen(
+        [sys.executable, "-c", _OWNER_IN_SLOT, json.dumps(steps), str(tmp_path)],
+        cwd=tree,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        env=source_environment(),
+    )
+    assert owner.stdin is not None and owner.stdout is not None
+    try:
+        replace_owner(project, wrkslots._read_process_identity(owner.pid))
+        owner.stdin.write("\n")
+        owner.stdin.flush()
+        for _step in steps:
+            code, _out, err = json.loads(owner.stdout.readline())
+            assert code == 0, err
+        assert len(_owner_release_events(project)) == 1
+        _read_owner_handoff(project)
+
+        refused = remove(project)
+
+        assert refused.returncode == 3
+        assert f"live process {owner.pid} uses slot" in refused.stderr
+        _assert_release_retained(project)
+        owner.stdin.write("\n")
+        owner.stdin.flush()
+        assert json.loads(owner.stdout.readline()) == ["left", str(tmp_path)]
+        left = remove(project)
+        assert left.returncode == 0, left.stderr
+        assert owner.poll() is None
+    finally:
+        terminate_process(owner)
+    assert not tree.exists()
+    honored = _owner_release_honored(project)
+    assert len(honored) == 1
+    evidence = wrkslots._as_mapping(
+        wrkslots._as_mapping(honored[0]["payload"], "payload")["evidence"], "evidence"
+    )
+    assert evidence["owner_state"] == "live"
+
+
+def test_retire_pending_removes_an_owner_released_slot_without_an_opt_in(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, digest = _owner_release_ready(tmp_path)
+
+    queued = raw_command(project, "retirement-queue", "--format", "json")
+    assert queued.returncode == 0, queued.stderr
+    pending = json.loads(queued.stdout)["pending"]
+    assert [item["slot"] for item in pending] == ["slot01"]
+    assert pending[0]["owner_release"]["state"] == "released"
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "retire-pending",
+                "--limit",
+                "1",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
+    result = json.loads(capsys.readouterr().out)
+    assert result["removed"] == [
+        {
+            "generation": 1,
+            "machine": "testhost",
+            "outcome": "removed",
+            "reason": "ordinary remove completed",
+            "sha256": digest,
+            "slot": "slot01",
+        }
+    ]
+    assert not checkout(project).exists()
+    assert len(_owner_release_honored(project)) == 1
+    assert _owner_consent_events(project) == []
+
+
+def test_interrupted_owner_released_removal_recovers_while_the_owner_lives(
+    tmp_path: Path,
+) -> None:
+    project, _digest = _owner_release_ready(tmp_path)
+    interrupted = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-remove-worktree"},
+    )
+    assert interrupted.returncode == 86
+    assert not checkout(project).exists()
+    assert len(active_slots(project)) == 1
+
+    recovered = command(project, "recover", "--coordinator-pid", str(os.getpid()))
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert active_slots(project) == []
+    archive = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
+    )
+    assert len(archive["records"]) == 1
+
+
+def test_owner_release_is_void_after_a_renewed_heartbeat_or_a_new_owner(
+    tmp_path: Path,
+) -> None:
+    """Anything a release is bound to changing restores the ordinary refusal."""
+
+    project, _digest = _owner_release_ready(tmp_path)
+    config = wrkslots._load_config(str(project), "testhost")
+    released_at = wrkslots._load_active(config).slots[0].heartbeat_at
+    renewed_at = (
+        dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=5)
+    ).isoformat(timespec="seconds")
+    # An older client that does not know about releases can still renew the
+    # heartbeat; the renewal voids the release instead of being overridden.
+    _rewrite_slot(project, "slot01", heartbeat_at=renewed_at)
+
+    row = _status_rows(project)["slot01"]
+    reason = (
+        f"the heartbeat was renewed after the release (released at heartbeat "
+        f"{released_at}, now {renewed_at})"
+    )
+    assert row["owner_release"]["state"] == "void"  # type: ignore[index]
+    assert row["owner_release"]["void_reason"] == reason  # type: ignore[index]
+    # What remains is exactly the refusal a never-released live owner with a
+    # read handoff gets.
+    refused = remove(project)
+    assert refused.returncode == 3
+    assert _owner_consent_prefix() in refused.stderr
+    assert _owner_consent_missing(refused.stderr) == ["expired heartbeat"]
+    assert "owner-released" not in refused.stderr
+    _assert_release_retained(project)
+
+    # The owner may release again; the new event binds the current heartbeat.
+    again = _release(project)
+    assert again.returncode == 0, again.stderr
+    assert again.stdout.startswith("released slot=slot01 ")
+    events = _owner_release_events(project)
+    assert len(events) == 2
+    assert events[1]["payload"]["heartbeat_at"] == renewed_at  # type: ignore[index]
+    assert _status_rows(project)["slot01"]["owner_release"]["state"] == "released"  # type: ignore[index]
+
+    # A different owner process generation is not the one that released.
+    successor = subprocess.Popen(["sleep", "600"], cwd=tmp_path, text=True)
+    try:
+        replace_owner(project, wrkslots._read_process_identity(successor.pid))
+        row = _status_rows(project)["slot01"]
+        assert row["owner_release"]["void_reason"] == (  # type: ignore[index]
+            "the recorded owner process generation changed after the release"
+        )
+        blocked = remove(project)
+        assert blocked.returncode == 3
+        assert _owner_consent_prefix(pid=successor.pid) in blocked.stderr
+        assert "handoff writer mismatch" in blocked.stderr
+        assert "owner-released" not in blocked.stderr
+        _assert_release_retained(project)
+    finally:
+        terminate_process(successor)
+
+
+def test_owner_release_is_shown_by_every_read_only_view(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    for slot, agent in (("slot01", "codex-1"), ("slot02", "codex-2")):
+        made = create(project, slot=slot, agent=agent, branch=f"codex/{slot}")
+        assert made.returncode == 0, made.stderr
+        commit_task(repository, checkout(project, slot), f"codex/{slot}")
+        _write_slot_handoff(project, tmp_path, slot=slot, agent=agent, text=f"{slot}\n")
+        read = raw_command(
+            project, "read-handoff", slot, "--coordinator-pid", str(os.getpid())
+        )
+        assert read.returncode == 0, read.stderr
+    never_released = {
+        "status": raw_command(project, "status", "--format", "json").stdout,
+        "doctor": raw_command(project, "doctor", "--format", "json").stdout,
+        "queue": raw_command(project, "retirement-queue", "--format", "json").stdout,
+    }
+    released = _release(project)
+    assert released.returncode == 0, released.stderr
+    event = _owner_release_events(project)[0]
+    summary = f"RELEASED by live owner at {event['recorded_at']}"
+
+    status = raw_command(project, "status")
+    assert status.returncode == 0, status.stderr
+    lines = status.stdout.splitlines()
+    row = next(index for index, line in enumerate(lines) if line.startswith("testhost/slot01:"))
+    assert lines[row + 1] == f"  {summary} (event {event['sequence']})"
+    assert status.stdout.count("RELEASED by live owner") == 1
+    rows = _status_rows(project)
+    assert rows["slot01"]["owner_release"] == {
+        "state": "released",
+        "summary": summary,
+        "event_sequence": event["sequence"],
+        "recorded_at": event["recorded_at"],
+        "heartbeat_at": event["payload"]["heartbeat_at"],  # type: ignore[index]
+        "owner": event["payload"]["owner"],  # type: ignore[index]
+        "handoff_sha256": event["payload"]["handoff"]["sha256"],  # type: ignore[index]
+        "void_reason": None,
+    }
+    assert "owner_release" not in rows["slot02"]
+    before = {
+        str(item["slot"]): item for item in json.loads(never_released["status"])["active"]
+    }
+    after_slot02 = dict(rows["slot02"])
+    for volatile in ("heartbeat_age_seconds", "heartbeat_expired"):
+        after_slot02.pop(volatile, None)
+        before["slot02"].pop(volatile, None)
+    assert after_slot02 == before["slot02"]
+
+    doctor = raw_command(project, "doctor", "--format", "json")
+    assert doctor.returncode == 0, doctor.stderr
+    doctor_value = json.loads(doctor.stdout)
+    findings = [item for item in doctor_value["findings"] if item["kind"].startswith("owner-")]
+    assert [(item["kind"], item["slot"]) for item in findings] == [
+        ("owner-released", "slot01")
+    ]
+    assert findings[0]["detail"].startswith(f"{summary} (event {event['sequence']}")
+    assert json.loads(never_released["doctor"])["findings"] == [
+        item for item in doctor_value["findings"] if item["slot"] != "slot01"
+    ]
+    doctor_text = raw_command(project, "doctor")
+    assert f"owner-released: slot01: {summary}" in doctor_text.stdout
+
+    # The host process census is not available inside every test sandbox, so
+    # audit runs in process against an empty census: no process uses a slot.
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_process_path_census",
+        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+    )
+    assert wrkslots.main(["--project-root", str(project), "audit", "--format", "json"]) == 0
+    audit_rows = {
+        str(item["slot"]): item for item in json.loads(capsys.readouterr().out)["slots"]
+    }
+    assert audit_rows["slot01"]["verdict"] == "DELETABLE", audit_rows["slot01"]["reasons"]
+    assert audit_rows["slot01"]["owner_release"]["summary"] == summary
+    assert audit_rows["slot02"]["verdict"] == "BLOCKED"
+    assert "owner_release" not in audit_rows["slot02"]
+    assert any(
+        "has not exceeded" in str(reason) for reason in audit_rows["slot02"]["reasons"]
+    )
+    assert wrkslots.main(["--project-root", str(project), "audit"]) == 0
+    assert f"DELETABLE: slot01: all removal proofs pass; {summary}" in capsys.readouterr().out
+
+    queue = raw_command(project, "retirement-queue", "--format", "json")
+    assert queue.returncode == 0, queue.stderr
+    pending = {str(item["slot"]): item for item in json.loads(queue.stdout)["pending"]}
+    assert pending["slot01"]["owner_release"]["summary"] == summary
+    assert pending["slot02"] == {
+        str(item["slot"]): item for item in json.loads(never_released["queue"])["pending"]
+    }["slot02"]
+    queue_text = raw_command(project, "retirement-queue")
+    assert f"owner={summary}" in queue_text.stdout
+    assert queue_text.stdout.count("owner=RELEASED") == 1
+
+
+_OLDER_CLIENT_COMMIT = "26dd3eaa34ea9b22a825201f1ddc37018fb0ed22"
+
+
+def _older_client(tmp_path: Path) -> Path:
+    """Extract the package of a client released before 'wrkslots release' existed."""
+
+    repository_root = PY_ROOT.parent
+    present = subprocess.run(
+        ["git", "-C", str(repository_root), "cat-file", "-e", f"{_OLDER_CLIENT_COMMIT}^{{commit}}"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if present.returncode != 0:
+        pytest.skip(
+            f"older client commit {_OLDER_CLIENT_COMMIT} is not in this clone "
+            f"({present.stderr.strip() or 'absent'}); fetch the full history to run "
+            "the mixed-version test"
+        )
+    archive = subprocess.run(
+        ["git", "-C", str(repository_root), "archive", "--format=tar",
+         _OLDER_CLIENT_COMMIT, "py/wrkslots"],
+        capture_output=True,
+        check=True,
+    )
+    target = tmp_path / "older-client"
+    target.mkdir()
+    subprocess.run(["tar", "-x", "-C", str(target)], input=archive.stdout, check=True)
+    assert not (target / "py" / "wrkslots" / "cli.py").read_text(
+        encoding="utf-8"
+    ).count("owner-released")
+    return target / "py"
+
+
+def test_an_older_client_keeps_working_beside_an_owner_release(tmp_path: Path) -> None:
+    """Old and new clients share one registry; a release must not break the old one.
+
+    The older client predates the YAML configuration reader and the sandbox
+    setting, both unrelated to release, so it is given the same configuration
+    as JSON without that key.
+    """
+
+    older = _older_client(tmp_path)
+    project, repository, _remote = make_project(tmp_path)
+    for slot, agent in (("slot01", "codex-1"), ("slot03", "codex-3")):
+        made = create(project, slot=slot, agent=agent, branch=f"codex/{slot}")
+        assert made.returncode == 0, made.stderr
+        commit_task(repository, checkout(project, slot), f"codex/{slot}")
+    converted = raw_command(project, "config", "convert", "--to", "json")
+    assert converted.returncode == 0, converted.stderr
+    settings_path = project / ".wrkslots.yml"
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    settings.pop("sandbox", None)
+    settings_path.write_text(json.dumps(settings, indent=2, sort_keys=True) + "\n")
+    _write_slot_handoff(project, tmp_path, slot="slot01", agent="codex-1", text="done\n")
+    released = _release(project)
+    assert released.returncode == 0, released.stderr
+    assert len(_owner_release_events(project)) == 1
+
+    def old(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "wrkslots", "--project-root", str(project), *arguments],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=source_environment({"PYTHONPATH": str(older)}),
+            # 'python -m' puts the working directory first on sys.path, so run
+            # from the older tree to be sure it is the older package that runs.
+            cwd=older,
+        )
+
+    # This really is a client without the release command.
+    unknown = old("release", "--help")
+    assert unknown.returncode == 2
+    assert "invalid choice: 'release'" in unknown.stderr
+    status = old("status")
+    assert status.returncode == 0, status.stderr
+    assert "testhost/slot01:" in status.stdout and "testhost/slot03:" in status.stdout
+    assert "RELEASED" not in status.stdout
+    created = old(
+        "create", "slot02", "--slot-type", "agent", "--agent", "codex-2", "--task", "t2",
+        "--purpose", "p", "--owner-pid", str(os.getpid()), "--coordinator-pid",
+        str(os.getpid()), "--repo", "product=repo", "--branch", "product=codex/slot02",
+        "--coordinator-authorized",
+    )
+    assert created.returncode == 0, created.stderr
+    beat = old(
+        "heartbeat", "slot02", "--agent", "codex-2", "--owner-pid", str(os.getpid()),
+        "--expected-generation", "1",
+    )
+    assert beat.returncode == 0, beat.stderr
+    # slot03's owner has exited and its time-to-live expired; the older client
+    # removes it through the ordinary dead-owner path.
+    exited = subprocess.Popen(["true"])
+    exited.wait()
+    config = wrkslots._load_config(str(project), "testhost")
+    slot03 = wrkslots._find_record(wrkslots._load_active(config), "slot03")
+    assert slot03.owner is not None
+    _rewrite_slot(
+        project,
+        "slot03",
+        owner=replace(slot03.owner, pid=exited.pid, start_ticks=1),
+        heartbeat_at=(
+            dt.datetime.now(dt.timezone.utc)
+            - dt.timedelta(seconds=slot03.heartbeat_ttl_seconds + 1)
+        ).isoformat(timespec="seconds"),
+    )
+    set_liveness(project, "dead")
+    removed = old(
+        "remove", "slot03", "--coordinator-pid", str(os.getpid()),
+        "--expected-generation", "1", "--coordinator-authorized",
+    )
+    assert removed.returncode == 0, removed.stderr
+    assert not checkout(project, "slot03").exists()
+    again = old("status")
+    assert again.returncode == 0, again.stderr
+
+    # None of that touched the released slot, so the new client still honours it.
+    assert _status_rows(project)["slot01"]["owner_release"]["state"] == "released"  # type: ignore[index]
+    # The older client keeps its stricter rule for the released slot...
+    strict = old(
+        "remove", "slot01", "--coordinator-pid", str(os.getpid()),
+        "--expected-generation", "1", "--coordinator-authorized",
+    )
+    assert strict.returncode == 3
+    assert checkout(project, "slot01").is_dir()
+    # ...and a heartbeat it renews voids the release instead of being ignored.
+    renewed = old(
+        "heartbeat", "slot01", "--agent", "codex-1", "--owner-pid", str(os.getpid()),
+        "--expected-generation", "1",
+    )
+    assert renewed.returncode == 0, renewed.stderr
+    row = _status_rows(project)["slot01"]
+    assert row["owner_release"]["state"] == "void"  # type: ignore[index]
+    assert str(row["owner_release"]["void_reason"]).startswith(  # type: ignore[index]
+        "the heartbeat was renewed after the release"
+    )

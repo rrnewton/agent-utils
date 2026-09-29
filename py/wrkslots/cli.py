@@ -1000,6 +1000,28 @@ class _OwnerConsent:
 
 
 @dataclasses.dataclass(frozen=True)
+class _OwnerRelease:
+    """One ``owner-released`` event: a live owner gave its slot generation back.
+
+    The event binds the release to everything the owner could see when it gave
+    the slot back: the exact owner process generation, the heartbeat stamp it
+    stopped renewing, and the generation-bound handoff sidecar it left for the
+    coordinator. A later change to any of them voids the release.
+    """
+
+    sequence: int
+    recorded_at: str
+    slot: str
+    generation: int
+    agent: str
+    owner: ProcessIdentity
+    heartbeat_at: str
+    handoff_path: Path
+    sha256: str
+    intent_sequence: int
+
+
+@dataclasses.dataclass(frozen=True)
 class _RetirementCandidate:
     """One exact handoff read whose current slot awaits safe retirement."""
 
@@ -1013,9 +1035,15 @@ class _RetirementCandidate:
     artifact_path: str | None
     artifact_source: str | None
     blocked_reason: str | None
+    # Present only for a generation its owner released; omitted from to_obj()
+    # otherwise so that queue output for never-released slots is unchanged.
+    owner_release: Mapping[str, object] | None = None
 
     def to_obj(self) -> dict[str, object]:
-        return dataclasses.asdict(self)
+        value = dataclasses.asdict(self)
+        if value["owner_release"] is None:
+            del value["owner_release"]
+        return value
 
 
 @dataclasses.dataclass(frozen=True)
@@ -6798,6 +6826,14 @@ def _retirement_candidates(
             event["sequence"], "retirement-attempted event sequence", minimum=1
         )
     candidates: list[_RetirementCandidate] = []
+    releases = _latest_owner_releases(
+        events,
+        {
+            (record.slot, record.generation)
+            for record in state.slots
+            if record.slot_type == "agent"
+        },
+    )
     for record in state.slots:
         if record.slot_type != "agent":
             continue
@@ -6834,6 +6870,7 @@ def _retirement_candidates(
             raise
         except Refusal as exc:
             blocked_reason = str(exc)
+        release, release_void = _owner_release_state(config, record, events, releases)
         candidates.append(
             _RetirementCandidate(
                 machine=record.machine,
@@ -6848,6 +6885,11 @@ def _retirement_candidates(
                 artifact_path=artifact_path,
                 artifact_source=artifact_source,
                 blocked_reason=blocked_reason,
+                owner_release=(
+                    None
+                    if release is None
+                    else _owner_release_obj(release, release_void)
+                ),
             )
         )
     return tuple(
@@ -13902,6 +13944,283 @@ def _owner_consent_was_recorded(
     return False
 
 
+# Explicit owner release: the live owner gives one agent slot generation back.
+#
+# ENCODED AS ITS OWN EVENT KIND, NOT AS A RECORD FIELD. The active record
+# schema is read with exact keys by every client that shares this registry, so
+# a new record field would make an older client refuse the whole registry.
+# Replay in older clients branches on the event kinds it knows and skips the
+# rest; an ``owner-released`` event is therefore invisible to them. They keep
+# their original, stricter behaviour for the released slot (removal waits for
+# the owner's death), and a heartbeat they renew changes the bound heartbeat
+# stamp, which voids the release instead of being silently overridden by it.
+# The read-only wrkslotsd replay refuses event kinds it does not list, so it
+# lists this one too; the writer in _cmd_release spells the kind as a literal
+# so that the source contract test can compare the two lists.
+OWNER_RELEASE_EVENT = "owner-released"
+OWNER_RELEASE_ACTION = "owner-release-honored"
+OWNER_RELEASE_BASIS = "owner-released"
+_OWNER_RELEASE_KEYS = frozenset(
+    {"slot", "generation", "agent", "owner", "heartbeat_at", "handoff"}
+)
+_OWNER_RELEASE_HANDOFF_KEYS = frozenset({"path", "sha256", "source", "intent_sequence"})
+
+
+def _owner_release_from_event(event: Mapping[str, object]) -> _OwnerRelease:
+    label = "owner-released event"
+    payload = _as_mapping(event["payload"], f"{label} payload")
+    _exact_keys(payload, _OWNER_RELEASE_KEYS, set(), f"{label} payload")
+    handoff = _as_mapping(payload["handoff"], f"{label} handoff")
+    _exact_keys(handoff, _OWNER_RELEASE_HANDOFF_KEYS, set(), f"{label} handoff")
+    if handoff["source"] != "write-handoff":
+        raise StateError(f"{label} handoff source must be write-handoff")
+    digest = _as_str(handoff["sha256"], f"{label} handoff sha256")
+    if not DIGEST_RE.fullmatch(digest):
+        raise StateError(f"{label} handoff sha256 is not a SHA-256 digest")
+    owner = _identity_from_obj(payload["owner"], f"{label} owner")
+    if owner is None:
+        raise StateError(f"{label} lacks an owner identity")
+    slot = _as_str(payload["slot"], f"{label} slot")
+    _validate_name(slot, "slot")
+    agent = _as_str(payload["agent"], f"{label} agent")
+    heartbeat_at = _as_str(payload["heartbeat_at"], f"{label} heartbeat_at")
+    _parse_timestamp(heartbeat_at, f"{label} heartbeat_at")
+    recorded_at = _as_str(event["recorded_at"], f"{label} recorded_at")
+    return _OwnerRelease(
+        sequence=_as_int(event["sequence"], f"{label} sequence", minimum=1),
+        recorded_at=recorded_at,
+        slot=slot,
+        generation=_as_int(payload["generation"], f"{label} generation", minimum=1),
+        agent=agent,
+        owner=owner,
+        heartbeat_at=heartbeat_at,
+        handoff_path=Path(_as_str(handoff["path"], f"{label} handoff path")),
+        sha256=digest,
+        intent_sequence=_as_int(
+            handoff["intent_sequence"], f"{label} handoff intent_sequence", minimum=1
+        ),
+    )
+
+
+def _latest_owner_releases(
+    events: Sequence[Mapping[str, object]],
+    wanted: AbstractSet[tuple[str, int]] | None = None,
+) -> dict[tuple[str, int], _OwnerRelease]:
+    """The latest ``owner-released`` event of each (slot, generation), in one pass.
+
+    Only the generations in ``wanted`` are parsed when it is given, so one
+    slot's release history cannot affect a command about another slot.
+    """
+
+    latest: dict[tuple[str, int], _OwnerRelease] = {}
+    for event in events:
+        if event.get("kind") != OWNER_RELEASE_EVENT:
+            continue
+        if wanted is not None:
+            payload = event.get("payload")
+            if not isinstance(payload, Mapping) or (
+                payload.get("slot"),
+                payload.get("generation"),
+            ) not in wanted:
+                continue
+        release = _owner_release_from_event(event)
+        latest[(release.slot, release.generation)] = release
+    return latest
+
+
+def _owner_release_void_reason(
+    config: Config,
+    record: ActiveRecord,
+    release: _OwnerRelease,
+    events: Sequence[Mapping[str, object]],
+) -> str | None:
+    """Why a recorded release no longer describes this slot, or ``None`` if it does.
+
+    A release is the exact owner's statement about the slot as it was at that
+    moment. It stops applying the moment anything it was bound to changes:
+    another owner process generation, a renewed heartbeat, another agent, or a
+    handoff sidecar that is missing or no longer the released bytes.
+    """
+
+    if release.agent != record.agent:
+        return f"the slot now belongs to agent {record.agent}, not {release.agent}"
+    if record.owner != release.owner:
+        return "the recorded owner process generation changed after the release"
+    if record.heartbeat_at != release.heartbeat_at:
+        return (
+            f"the heartbeat was renewed after the release (released at heartbeat "
+            f"{release.heartbeat_at}, now {record.heartbeat_at})"
+        )
+    publication = _handoff_write_publication(record, events)
+    if publication is None or publication[0] != release.intent_sequence or not publication[2]:
+        return "the handoff publication changed after the release"
+    try:
+        artifact = _load_handoff_sidecar(config, record)
+    except Refusal as exc:
+        return f"the released handoff sidecar cannot be read: {exc}"
+    if artifact is None:
+        return "the released handoff sidecar is missing"
+    if (
+        artifact.source != "write-handoff"
+        or artifact.path != release.handoff_path
+        or artifact.sha256 != release.sha256
+        or not _json_equal(_handoff_artifact_to_obj(artifact), publication[1])
+    ):
+        return "the handoff sidecar no longer matches the released bytes"
+    return None
+
+
+def _owner_release_state(
+    config: Config,
+    record: ActiveRecord,
+    events: Sequence[Mapping[str, object]],
+    releases: Mapping[tuple[str, int], _OwnerRelease] | None = None,
+) -> tuple[_OwnerRelease | None, str | None]:
+    """This generation's latest release and, if it no longer applies, why not."""
+
+    if record.slot_type != "agent":
+        return None, None
+    selected = (
+        _latest_owner_releases(events, {(record.slot, record.generation)})
+        if releases is None
+        else releases
+    )
+    release = selected.get((record.slot, record.generation))
+    if release is None:
+        return None, None
+    return release, _owner_release_void_reason(config, record, release, events)
+
+
+def _owner_release_in_effect(
+    config: Config,
+    record: ActiveRecord,
+    events: Sequence[Mapping[str, object]],
+) -> _OwnerRelease | None:
+    release, void_reason = _owner_release_state(config, record, events)
+    return release if release is not None and void_reason is None else None
+
+
+def _owner_release_evidence(
+    record: ActiveRecord,
+    release: _OwnerRelease,
+    *,
+    coordinator: ProcessIdentity,
+    coordinator_authorized: bool,
+    owner_state: str,
+    age: float,
+    registered_liveness: tuple[str, str],
+) -> dict[str, object]:
+    return {
+        "basis": OWNER_RELEASE_BASIS,
+        "owner_state": owner_state,
+        "generation": record.generation,
+        "owner": _identity_to_obj(record.owner),
+        "actor": _identity_to_obj(coordinator),
+        "coordinator_authorized": coordinator_authorized,
+        "heartbeat_age_seconds": int(age),
+        "heartbeat_ttl_seconds": record.heartbeat_ttl_seconds,
+        "registered_liveness": registered_liveness[0],
+        "registered_liveness_detail": registered_liveness[1],
+        "release": {
+            "sequence": release.sequence,
+            "recorded_at": release.recorded_at,
+            "heartbeat_at": release.heartbeat_at,
+        },
+        "handoff": {
+            "path": str(release.handoff_path),
+            "sha256": release.sha256,
+            "source": "write-handoff",
+            "intent_sequence": release.intent_sequence,
+        },
+    }
+
+
+def _owner_release_was_recorded(
+    record: ActiveRecord,
+    release: _OwnerRelease,
+    events: Sequence[Mapping[str, object]],
+) -> bool:
+    """Whether remove durably recorded that it honoured this exact release."""
+
+    for event in events:
+        if event.get("kind") != "active-state-recorded":
+            continue
+        payload = _as_mapping(event["payload"], "active-state-recorded payload")
+        if payload.get("action") != OWNER_RELEASE_ACTION or payload.get("slot") != record.slot:
+            continue
+        evidence = _as_mapping(payload.get("evidence"), "owner release evidence")
+        recorded = evidence.get("release")
+        handoff = evidence.get("handoff")
+        if (
+            evidence.get("basis") == OWNER_RELEASE_BASIS
+            and evidence.get("generation") == record.generation
+            and _json_equal(evidence.get("owner"), _identity_to_obj(record.owner))
+            and isinstance(recorded, Mapping)
+            and recorded.get("sequence") == release.sequence
+            and isinstance(handoff, Mapping)
+            and handoff.get("sha256") == release.sha256
+            and handoff.get("intent_sequence") == release.intent_sequence
+        ):
+            return True
+    return False
+
+
+def _owner_release_summary(release: _OwnerRelease) -> str:
+    return f"RELEASED by live owner at {release.recorded_at}"
+
+
+def _owner_release_obj(
+    release: _OwnerRelease, void_reason: str | None
+) -> dict[str, object]:
+    """The display form of one generation's latest release, in effect or void."""
+
+    return {
+        "state": "released" if void_reason is None else "void",
+        "summary": (
+            _owner_release_summary(release)
+            if void_reason is None
+            else f"release at {release.recorded_at} no longer applies: {void_reason}"
+        ),
+        "event_sequence": release.sequence,
+        "recorded_at": release.recorded_at,
+        "heartbeat_at": release.heartbeat_at,
+        "owner": _identity_to_obj(release.owner),
+        "handoff_sha256": release.sha256,
+        "void_reason": void_reason,
+    }
+
+
+def _owner_release_states(
+    config: Config, states: Sequence[ActiveState]
+) -> dict[tuple[str, str], tuple[_OwnerRelease, str | None]]:
+    """Every active agent generation that has a release, keyed by (machine, slot).
+
+    Only generations that are active now are parsed, and a slot that was
+    never released is absent, so display commands add nothing for it.
+    """
+
+    found: dict[tuple[str, str], tuple[_OwnerRelease, str | None]] = {}
+    for state in states:
+        wanted = {
+            (record.slot, record.generation)
+            for record in state.slots
+            if record.slot_type == "agent"
+        }
+        if not wanted:
+            continue
+        events = _load_events(config, state.machine)
+        releases = _latest_owner_releases(events, wanted)
+        if not releases:
+            continue
+        for record in state.slots:
+            release, void_reason = _owner_release_state(
+                config, record, events, releases
+            )
+            if release is not None:
+                found[(record.machine, record.slot)] = (release, void_reason)
+    return found
+
+
 def _handoff_preconditions(
     config: Config,
     record: ActiveRecord,
@@ -16206,6 +16525,18 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
             action="heartbeat",
         )
         _assert_command_registry_storage(config, states, args)
+        release = _owner_release_in_effect(
+            config, record, _load_events(config, record.machine)
+        )
+        if release is not None:
+            raise Refusal(
+                f"slot {record.slot} generation {record.generation} was released by its "
+                f"owner at {release.recorded_at} (event {release.sequence}), which "
+                "stopped this generation's heartbeat. state: REFUSED -- the heartbeat was "
+                "not renewed and the slot stays released for removal. remedy: stop using "
+                "this slot and leave it; if more work is needed, create a new slot with "
+                "'wrkslots create'"
+            )
         before = _global_rows(states, archives)
         updated = dataclasses.replace(record, heartbeat_at=_utc_now())
         _write_active_state(
@@ -16223,6 +16554,162 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
         )
     print(
         f"heartbeat slot={updated.slot} generation={updated.generation} at={updated.heartbeat_at}"
+    )
+    return 0
+
+
+def _cmd_release(args: argparse.Namespace) -> int:
+    """Give one agent slot generation back while its owner process keeps running.
+
+    Only the exact recorded owner process generation (or a process it started)
+    can release, and only after it published a handoff with ``write-handoff``.
+    The release is one appended event: it deletes nothing and runs no process
+    census, so it returns promptly. The coordinator later removes the slot with
+    the ordinary ``remove`` or ``retire-pending``, where every guard that
+    protects work still runs; the release substitutes only for the owner's death
+    and the heartbeat time-to-live.
+    """
+
+    config = _load_config(args.project_root, args.machine)
+    _validate_name(args.slot, "slot")
+    _validate_name(args.agent, "agent")
+    owner = _capture_caller_process(args.owner_pid, "owner")
+    tail = "state: REFUSED -- the slot was not released and its owner still holds it."
+    with _mutation_locks(config, args.wait_lock):
+        _refuse_partial_state(config, allow_validate_batch_seals=True)
+        states, archives = _validate_global_state(config)
+        state = _load_active(config)
+        record = _find_record(state, args.slot)
+        _assert_owner_auth(record, args.agent, owner, args.expected_generation)
+        if record.slot_type != "agent":
+            raise Refusal(
+                f"release applies only to agent slots; slot {record.slot} is a "
+                f"{record.slot_type} slot. {tail} remedy: remove a validation slot with "
+                f"'wrkslots remove {record.slot} --validate-complete --coordinator-pid "
+                f"<pid> --expected-generation {record.generation}' once its run completed"
+            )
+        _assert_validate_batch_seals_disjoint_from_record(
+            config, record, action="release"
+        )
+        _assert_validate_cleanup_journals_disjoint_from_record(
+            config,
+            states,
+            archives,
+            record,
+            action="release",
+        )
+        _assert_command_registry_storage(config, states, args)
+        events = _load_events(config, record.machine)
+        hold = _load_hold(config, record.slot, record.machine, events=events)
+        if hold is not None:
+            raise Refusal(
+                f"slot {record.slot} is held: "
+                f"{_as_str(hold['reason'], 'slot hold.reason')}. A hold keeps a slot on "
+                f"purpose, so it cannot be released while held. {tail} remedy: ask "
+                f"whoever placed the hold to run 'wrkslots unhold {record.slot}' once it is "
+                "no longer needed, then retry release"
+            )
+        slot_path = _slot_directory(config, record.slot, record.slot_type)
+        write_handoff = (
+            f"'wrkslots write-handoff {record.slot} --agent {record.agent} --owner-pid "
+            f"<owner-pid> --expected-generation {record.generation} --from-file <notes>'"
+        )
+        try:
+            artifact = _resolve_handoff_artifact(
+                config, record, slot_path, events=events
+            )
+        except Refusal as exc:
+            raise Refusal(
+                f"cannot release slot {record.slot}: {exc}. {tail}"
+            ) from exc
+        publication = _handoff_write_publication(record, events)
+        if artifact is None or publication is None:
+            found = (
+                "has no handoff sidecar"
+                if artifact is None
+                else "has only a legacy HANDOFF.md, which names no writer"
+            )
+            raise Refusal(
+                f"slot {record.slot} generation {record.generation} {found}; release "
+                "requires a handoff published with write-handoff so the coordinator can "
+                f"read what is left in the slot before removing it. {tail} remedy: write "
+                f"your notes to a file outside the slot, run {write_handoff}, then retry "
+                "release"
+            )
+        intent_sequence, intended, completed = publication
+        if (
+            artifact.source != "write-handoff"
+            or not completed
+            or not _json_equal(_handoff_artifact_to_obj(artifact), intended)
+        ):
+            raise Refusal(
+                f"slot {record.slot} handoff publication is incomplete: the sidecar does "
+                f"not match the completed write-handoff intent {intent_sequence}. {tail} "
+                f"remedy: rerun the same {write_handoff} command with the same file, then "
+                "retry release"
+            )
+        latest_read = _latest_handoff_read(record, events)
+        handoff_read = latest_read is not None and _handoff_read_matches_artifact(
+            latest_read, artifact
+        )
+        previous, void_reason = _owner_release_state(config, record, events)
+        if (
+            previous is not None
+            and void_reason is None
+            and previous.sha256 == artifact.sha256
+        ):
+            release = previous
+            outcome = "already released"
+        else:
+            _ensure_event_log(config, record.machine)
+            event = _write_event_file(
+                config,
+                record.machine,
+                "owner-released",
+                {
+                    "slot": record.slot,
+                    "generation": record.generation,
+                    "agent": record.agent,
+                    "owner": _identity_to_obj(record.owner),
+                    "heartbeat_at": record.heartbeat_at,
+                    "handoff": {
+                        "path": str(artifact.path),
+                        "sha256": artifact.sha256,
+                        "source": "write-handoff",
+                        "intent_sequence": intent_sequence,
+                    },
+                },
+            )
+            release = _owner_release_from_event(event)
+            outcome = "released"
+    print(
+        f"{outcome} slot={record.slot} generation={record.generation} "
+        f"sha256={release.sha256} at={release.recorded_at} event={release.sequence}"
+    )
+    print(
+        "heartbeat: stopped for this generation; 'wrkslots heartbeat' now refuses for it"
+    )
+    print(
+        "removal: no longer waits for the owner to exit or for the heartbeat "
+        "time-to-live; the handoff read, the unused-slot check, salvage and holds "
+        "still apply"
+    )
+    if handoff_read:
+        print(
+            f"next: coordinator runs 'wrkslots remove {record.slot} --coordinator-pid "
+            f"<pid> --expected-generation {record.generation}' or 'wrkslots "
+            "retire-pending --limit <n> --coordinator-pid <pid>'"
+        )
+    else:
+        print(
+            f"next: coordinator runs 'wrkslots read-handoff {record.slot} "
+            f"--coordinator-pid <pid>', then 'wrkslots remove {record.slot} "
+            f"--coordinator-pid <pid> --expected-generation {record.generation}' or "
+            "'wrkslots retire-pending --limit <n> --coordinator-pid <pid>'"
+        )
+    print(
+        "note: leave the slot now; remove refuses while any process, yours included, "
+        "has its working directory, an open file or a mapping inside it"
     )
     return 0
 
@@ -16716,6 +17203,8 @@ def _emit_retirement_queue(
             if candidate.blocked_reason is not None
             else ""
         )
+        if candidate.owner_release is not None:
+            suffix += f" owner={candidate.owner_release['summary']}"
         print(
             f"{state}: {candidate.machine}/{candidate.slot} "
             f"generation={candidate.generation} sha256={candidate.sha256}{suffix}"
@@ -21080,6 +21569,19 @@ def _audit_record(
         and owner_state == "dead"
     )
     hold = _load_hold(config, record.slot, record.machine, events=events)
+    release, release_void = _owner_release_state(config, record, events)
+    # Remove honours a release exactly when this is true; audit must agree
+    # with it so that DELETABLE never names a slot remove would refuse and a
+    # released slot is not reported as waiting for its owner's exit.
+    release_honoured = (
+        release is not None
+        and release_void is None
+        and owner_state in ("live", "dead")
+        and not _owner_record_is_absent(record)
+    )
+    release_fields: dict[str, object] = (
+        {} if release is None else {"owner_release": _owner_release_obj(release, release_void)}
+    )
     if cache_measurement is None:
         cache_bytes: int | None = 0
         cache_error: str | None = None
@@ -21117,22 +21619,24 @@ def _audit_record(
                 "cache_bytes": cache_bytes,
                 "cache_error": cache_error,
                 "cache_status": cache_status,
+                **release_fields,
             },
             agent_running,
         )
     reasons: list[str] = []
     process_census_unknown = False
-    if not heartbeat_expired:
-        reasons.append(
-            f"heartbeat age {int(heartbeat_age)}s has not exceeded the "
-            f"{record.heartbeat_ttl_seconds}s time-to-live"
-        )
-    if liveness_state != "dead":
-        reasons.append(f"liveness is {liveness_state}: {liveness_detail}")
-    if record.owner is None:
-        reasons.append("no owner process generation is recorded, so death is unknown")
-    elif owner_state != "dead":
-        reasons.append(f"recorded owner is {owner_state}: {owner_detail}")
+    if not release_honoured:
+        if not heartbeat_expired:
+            reasons.append(
+                f"heartbeat age {int(heartbeat_age)}s has not exceeded the "
+                f"{record.heartbeat_ttl_seconds}s time-to-live"
+            )
+        if liveness_state != "dead":
+            reasons.append(f"liveness is {liveness_state}: {liveness_detail}")
+        if record.owner is None:
+            reasons.append("no owner process generation is recorded, so death is unknown")
+        elif owner_state != "dead":
+            reasons.append(f"recorded owner is {owner_state}: {owner_detail}")
     slot_path = _slot_directory(config, record.slot, record.slot_type)
     try:
         _assert_record_paths(config, record)
@@ -21167,11 +21671,13 @@ def _audit_record(
     except Refusal as exc:
         reasons.append(str(exc))
     if (
-        heartbeat_expired
-        and liveness_state == "dead"
-        and owner_state == "dead"
-        and not reasons
-    ):
+        release_honoured
+        or (
+            heartbeat_expired
+            and liveness_state == "dead"
+            and owner_state == "dead"
+        )
+    ) and not reasons:
         if process_census_error is not None:
             reasons.append(process_census_error)
             process_census_unknown = True
@@ -21183,6 +21689,7 @@ def _audit_record(
                         record,
                         validate_complete=record.slot_type == "validate",
                         allow_live_validate_owner=False,
+                        owner_consented=release_honoured,
                     ),
                     census=process_census,
                 )
@@ -21219,6 +21726,7 @@ def _audit_record(
             "cache_bytes": cache_bytes,
             "cache_error": cache_error,
             "cache_status": cache_status,
+            **release_fields,
         },
         agent_running,
     )
@@ -21728,6 +22236,10 @@ def _cmd_audit(args: argparse.Namespace) -> int:
             detail = "; ".join(str(reason) for reason in reasons) or "all removal proofs pass"
             if row["cache_error"] is not None:
                 detail += f"; cache inspection: {row['cache_error']}"
+            release_value = row.get("owner_release")
+            if release_value is not None:
+                release_obj = _as_mapping(release_value, "audit owner_release")
+                detail += f"; {release_obj['summary']}"
             print(f"{row['verdict']}: {row['slot']}: {detail}")
         if args.gate:
             print(f"state={gate_state}")
@@ -21832,10 +22344,13 @@ def _status_record(
     hold_result: _HoldResult,
     tolerate_hold_error: bool = False,
     storage_inconsistencies: Sequence[StorageInconsistency] = (),
+    owner_release: tuple[_OwnerRelease, str | None] | None = None,
 ) -> dict[str, object]:
     process_state, process_detail = _process_state(record.owner)
     age, expired = _heartbeat_diagnosis(record)
     value = _record_to_obj(record)
+    if owner_release is not None:
+        value["owner_release"] = _owner_release_obj(*owner_release)
     value["owner_state"] = process_state
     value["owner_detail"] = process_detail
     value["heartbeat_age_seconds"] = int(age)
@@ -21881,6 +22396,7 @@ def _slot_findings(
             }
         )
 
+    releases = _owner_release_states(config, states)
     for state in states:
         for record in state.slots:
             hold_result = hold_results[(record.machine, record.slot)]
@@ -21893,6 +22409,24 @@ def _slot_findings(
                     f"recorded owner is not running ({process_detail}); the slot "
                     "is held by a row whose owner has exited",
                 )
+            released = releases.get((record.machine, record.slot))
+            if released is not None:
+                release, void_reason = released
+                if void_reason is None:
+                    note(
+                        "owner-released", record.slot, state.machine,
+                        f"{_owner_release_summary(release)} (event "
+                        f"{release.sequence}, generation {release.generation}); "
+                        "remove no longer waits for the owner's exit or the "
+                        "heartbeat time-to-live, and still requires the handoff "
+                        "read and an unused slot",
+                    )
+                else:
+                    note(
+                        "owner-release-void", record.slot, state.machine,
+                        f"release at {release.recorded_at} (event "
+                        f"{release.sequence}) no longer applies: {void_reason}",
+                    )
 
     for path in _outstanding_journals(config):
         note("unfinished-journal", None, None, f"recovery required: {path.name}")
@@ -21941,6 +22475,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         )
         hold_results = _load_record_holds(config, all_states)
         all_findings = _slot_findings(config, all_states, hold_results)
+        doctor_releases = _owner_release_states(config, states)
         findings = (
             all_findings
             if args.all_machines
@@ -21956,6 +22491,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
                 record,
                 hold_result=hold_results[(record.machine, record.slot)],
                 tolerate_hold_error=True,
+                owner_release=doctor_releases.get((record.machine, record.slot)),
             )
             for state in states
             for record in state.slots
@@ -22023,6 +22559,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
             else [state for state in all_states if state.machine == config.machine]
         )
         hold_results = _load_record_holds(config, states)
+        status_releases = _owner_release_states(config, states)
         ordinary_journals = _outstanding_journals(config)
         seal_journals = _validate_batch_seal_journals(config)
         journals = [
@@ -22044,6 +22581,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
                     for item in storage_inconsistencies
                     if item.machine == record.machine and item.slot == record.slot
                 ),
+                owner_release=status_releases.get((record.machine, record.slot)),
             )
             for state in states
             for record in state.slots
@@ -22098,6 +22636,13 @@ def _cmd_status(args: argparse.Namespace) -> int:
             f"held={'yes' if value['held'] is True else 'no'} "
             f"inconsistencies={len(row_inconsistencies)}"
         )
+        release_value = value.get("owner_release")
+        if release_value is not None:
+            release_obj = _as_mapping(release_value, "status owner_release")
+            print(
+                f"  {release_obj['summary']} "
+                f"(event {release_obj['event_sequence']})"
+            )
     for item in storage_inconsistencies:
         print(f"INCONSISTENT {_format_storage_inconsistency(item)}")
         print(f"  REMEDY: {item.remedy}")
@@ -24550,6 +25095,22 @@ def _cmd_remove(
             and record.owner == coordinator
         )
         owner_consent: _OwnerConsent | None = None
+        owner_release: _OwnerRelease | None = None
+        owner_unrecorded = _owner_record_is_absent(record)
+        # An explicit release by the exact owner process generation is the
+        # owner's own decision to give this generation back, so it is honoured
+        # by an explicit remove and by a retire-pending batch alike. It stands
+        # in for the owner's death and the heartbeat time-to-live only; the
+        # handoff read, the direct-use check, salvage and holds still apply.
+        if (
+            record.slot_type == "agent"
+            and owner_state in ("live", "dead")
+            and not args.validate_complete
+            and not owner_unrecorded
+        ):
+            owner_release = _owner_release_in_effect(
+                config, record, _load_events(config, record.machine)
+            )
         # An explicit remove names one slot, so running it is the coordinator's
         # decision for that slot. A retire-pending batch selects slots itself
         # and a scheduler may pass --coordinator-authorized for it, so it may
@@ -24559,7 +25120,8 @@ def _cmd_remove(
             getattr(args, "include_owner_consented", False) is True
         )
         if (
-            owner_consent_allowed
+            owner_release is None
+            and owner_consent_allowed
             and record.slot_type == "agent"
             and owner_state == "live"
             and not args.validate_complete
@@ -24578,14 +25140,19 @@ def _cmd_remove(
         if live_validate_owner:
             if handoff_writer is None:
                 _assert_caller_process(coordinator, "validate owner")
-        elif owner_consent is not None:
+        elif owner_consent is not None or owner_release is not None:
             # The registered liveness authority answers "is the owner still
-            # running?", and for a consenting owner the answer is yes by
-            # construction. Record its answer as evidence; do not gate on it.
+            # running?", and for a consenting or releasing owner the answer may
+            # be yes by construction. Record its answer as evidence; do not
+            # gate on it.
             consent_liveness = _registered_liveness_state(config, record)
         else:
             _assert_registered_liveness(config, record)
-        if not expired and not args.validate_complete:
+        # A release stops this generation's heartbeat (heartbeat refuses while
+        # it is in effect) and is bound to the heartbeat stamp, so any renewal
+        # voids it. Waiting for the time-to-live would only re-prove what the
+        # exact owner already declared.
+        if not expired and not args.validate_complete and owner_release is None:
             remaining = max(1, record.heartbeat_ttl_seconds - int(age))
             raise Refusal(
                 f"slot {record.slot} heartbeat is {int(age)}s old and its "
@@ -24598,12 +25165,12 @@ def _cmd_remove(
         # heartbeat has already expired above, and every guard that actually
         # protects work still runs below: the handoff read, the direct-use
         # check, and salvage before delete. See _owner_record_is_absent.
-        owner_unrecorded = _owner_record_is_absent(record)
         if (
             owner_state != "dead"
             and not live_validate_owner
             and not owner_unrecorded
             and owner_consent is None
+            and owner_release is None
         ):
             raise Refusal(
                 f"remove requires a proven-dead recorded owner; owner is {owner_state}: {detail}. "
@@ -24632,7 +25199,7 @@ def _cmd_remove(
                 record,
                 validate_complete=bool(args.validate_complete),
                 allow_live_validate_owner=live_validate_owner,
-                owner_consented=owner_consent is not None,
+                owner_consented=owner_consent is not None or owner_release is not None,
             ),
             use_lsof=not live_validate_owner,
             ignore_invoking_ancestry=live_validate_owner,
@@ -24680,6 +25247,27 @@ def _cmd_remove(
                     owner_consent,
                     coordinator=coordinator,
                     coordinator_authorized=bool(args.coordinator_authorized),
+                    age=age,
+                    registered_liveness=consent_liveness,
+                ),
+                require_repository=False,
+            )
+        elif owner_release is not None:
+            # Same reason as for consent: the basis is durable before any
+            # salvage or deletion, and recovery resumes only this exact release.
+            assert consent_liveness is not None
+            state = _replace_record(state, record)
+            _write_active_state(
+                config,
+                state,
+                action=OWNER_RELEASE_ACTION,
+                slot=record.slot,
+                evidence=_owner_release_evidence(
+                    record,
+                    owner_release,
+                    coordinator=coordinator,
+                    coordinator_authorized=bool(args.coordinator_authorized),
+                    owner_state=owner_state,
                     age=age,
                     registered_liveness=consent_liveness,
                 ),
@@ -24778,6 +25366,15 @@ def _cmd_remove(
                             "handoff_sha256": owner_consent.sha256,
                         }
                     ),
+                    **(
+                        {}
+                        if owner_release is None
+                        else {
+                            "basis": OWNER_RELEASE_BASIS,
+                            "release_sequence": owner_release.sequence,
+                            "handoff_sha256": owner_release.sha256,
+                        }
+                    ),
                 },
                 require_repository=False,
             )
@@ -24790,7 +25387,7 @@ def _cmd_remove(
             private_cleanup=private_cleanup,
             validation_removal_proof=validation_removal_proof,
             live_use_recheck=live_use_recheck,
-            owner_consented=owner_consent is not None,
+            owner_consented=owner_consent is not None or owner_release is not None,
         )
         prepared_private_finish = _begin_finish(
             config,
@@ -26850,8 +27447,25 @@ def _recover_finish(
         and current.owner == coordinator
     )
     owner_consent: _OwnerConsent | None = None
+    owner_release: _OwnerRelease | None = None
     if (
         current.slot_type == "agent"
+        and owner_state in ("live", "dead")
+        and not validate_complete
+        and not _owner_record_is_absent(current)
+    ):
+        # Resume a removal that began on an explicit owner release only if
+        # remove durably recorded that exact release before it started, and
+        # only while the release still matches current state.
+        release_events = _load_events(config, current.machine)
+        release_candidate = _owner_release_in_effect(config, current, release_events)
+        if release_candidate is not None and _owner_release_was_recorded(
+            current, release_candidate, release_events
+        ):
+            owner_release = release_candidate
+    if (
+        owner_release is None
+        and current.slot_type == "agent"
         and owner_state == "live"
         and not validate_complete
         and not _owner_record_is_absent(current)
@@ -26877,9 +27491,9 @@ def _recover_finish(
             owner_consent = candidate
     if live_validate_owner:
         _assert_recovery_processes(coordinator, processes, "validate owner")
-    elif owner_consent is None:
+    elif owner_consent is None and owner_release is None:
         _assert_registered_liveness(config, current)
-    if not expired and not validate_complete:
+    if not expired and not validate_complete and owner_release is None:
         raise Refusal(
             f"slot {current.slot} time-to-live is no longer expired after renewal; "
             "preserve it and do not resume deletion"
@@ -26890,8 +27504,10 @@ def _recover_finish(
         and not live_validate_owner
         and not owner_unrecorded
         and owner_consent is None
+        and owner_release is None
     ):
         raise Refusal(f"recorded owner is {owner_state}: {detail}")
+    owner_waived = owner_consent is not None or owner_release is not None
     journal = dict(raw)
     phase = _as_str(journal["phase"], "finish journal.phase")
     selected_live_use_recheck = live_use_recheck or _LiveUseRecheckBudget()
@@ -26936,7 +27552,7 @@ def _recover_finish(
                             record,
                             validate_complete=validate_complete,
                             allow_live_validate_owner=live_validate_owner,
-                            owner_consented=owner_consent is not None,
+                            owner_consented=owner_waived,
                         ),
                         ignore_invoking_ancestry=(
                             live_validate_owner and record.slot_type == "validate"
@@ -26974,7 +27590,7 @@ def _recover_finish(
             private_cleanup=private_cleanup,
             validation_removal_proof=removal_proof,
             live_use_recheck=selected_live_use_recheck,
-            owner_consented=owner_consent is not None,
+            owner_consented=owner_waived,
         )
         journal = _finish_remove_paths(
             config,
@@ -37729,13 +38345,23 @@ wrkslots manages durable agent and validation worktree slots.
        --agent codex-1 --owner-pid "$OWNER_PID" --expected-generation 1 \\
        --validation "make test: pass"
 
+   An owner that is done with the slot but keeps running gives it back after writing the
+   handoff. The release is bound to that owner process, the generation, the current heartbeat,
+   and the handoff digest. It stops this generation's heartbeat, and removal then no longer waits
+   for the owner to exit or for the time-to-live. Leave the slot first: removal still refuses
+   while any process, the owner included, uses it.
+
+     wrkslots release slot01 \\
+       --agent codex-1 --owner-pid "$OWNER_PID" --expected-generation 1
+
 5. Reading a handoff prints its exact contents and enqueues that generation without removing it.
 
      wrkslots read-handoff slot01 \\
        --coordinator-pid "$CURRENT_COORDINATOR_PID"
 
 6. After the registered running command and exact process identity prove the owner dead, and the
-   recorded time-to-live expires without renewal, any later coordinator may remove the slot.
+   recorded time-to-live expires without renewal, any later coordinator may remove the slot. A
+   slot its owner released needs only the handoff read from step 5.
    Agent slots publish dirty and unpushed work first; validate slots skip salvage. If remote
    publication refuses and an operator explicitly approves durable local custody, pass an existing
    absolute directory outside the project. Remote publication is still attempted first, and
@@ -37800,8 +38426,8 @@ clean-caches without --only or --yes. unpushed refreshes remote-tracking refs
 but does not mutate registry state.
 Mutating: init, create, register, import-existing --apply, adopt,
 recover-unbound-owner, heartbeat, hold, unhold, clean-caches deletion, finish,
-write-handoff, read-handoff, retire-pending, remove, recover-absent-validate-rows
---apply, and recover. Registry mutations take a state lock and append
+write-handoff, release, read-handoff, retire-pending, remove,
+recover-absent-validate-rows --apply, and recover. Registry mutations take a state lock and append
 hash-linked events. ACTIVE and ARCHIVED are compatibility views derived from those events.
 Configuration: config convert (literate YAML or JSON .wrkslots.yml).
 Storage and boxing: image (slot disk images), run and shell-command (box a command
@@ -37828,7 +38454,9 @@ paths, no unfinished Git operation, remote durability, exact landed ancestry, an
 then records the owner-alive handoff while retaining physical storage. Any later participant may
 run remove. It proceeds only after the heartbeat TTL expires, the registered liveness command
 returns rc 0, the exact owner process generation is dead, and independent process/cgroup/mount
-checks prove the slot unused. rc 1, rc 2, and unavailable evidence all refuse.
+checks prove the slot unused. rc 1, rc 2, and unavailable evidence all refuse. An owner that keeps
+running may instead give the slot back with 'wrkslots release' after write-handoff; that replaces
+only the owner-exit, liveness, and TTL conditions, never the handoff read or the use checks.
 
 Any failed precondition leaves every worktree in place. If a process stops during create or
 remove, later mutations refuse and 'wrkslots recover' resumes from the append-only history and
@@ -38468,7 +39096,8 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help="refresh diagnosis data for the exact owner",
         description=(
             "Refresh the heartbeat only when the caller, agent, PID, and process start identity "
-            "still match the recorded owner. Expiry is necessary for reclaim but never sufficient."
+            "still match the recorded owner. Expiry is necessary for reclaim but never sufficient. "
+            "Refuses for a generation its owner released with 'wrkslots release'."
         ),
         formatter_class=_HelpFormatter,
     )
@@ -38489,6 +39118,57 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help="current slot generation",
     )
     heartbeat.set_defaults(handler=_cmd_heartbeat)
+
+    release = subparsers.add_parser(
+        "release",
+        help="give a slot generation back while its owner keeps running",
+        description=(
+            "Give one agent slot generation back without exiting. The caller must be the exact\n"
+            "recorded owner process generation or its descendant, name the current generation,\n"
+            "and have written a handoff with write-handoff first. The release is bound to the\n"
+            "owner identity, the generation, the current heartbeat stamp, and the handoff digest.\n"
+            "\n"
+            "Effects: this generation's heartbeat stops ('wrkslots heartbeat' refuses for it), and\n"
+            "remove and retire-pending no longer wait for the owner to exit or for the time-to-live\n"
+            "to expire. Everything else still applies: the coordinator must read the handoff,\n"
+            "remove refuses while any process -- the owner included -- has its working directory,\n"
+            "an open file, or a mapping inside the slot, Git work is salvaged before deletion, and\n"
+            "a hold keeps the slot. A held slot cannot be released. This command never removes,\n"
+            "salvages, or changes a checkout."
+        ),
+        epilog=(
+            "Example:\n"
+            "  wrkslots write-handoff slot01 --agent codex-1 --owner-pid \"$OWNER_PID\" \\\n"
+            "    --expected-generation 1 --from-file /path/to/HANDOFF.md\n"
+            "  wrkslots release slot01 --agent codex-1 --owner-pid \"$OWNER_PID\" \\\n"
+            "    --expected-generation 1\n"
+            "  cd /a/directory/outside/the/slot\n"
+            "\n"
+            "A release cannot be withdrawn: the handoff is immutable and the heartbeat stays\n"
+            "stopped, so create a new slot to keep working. Rerunning release for the same\n"
+            "handoff reports 'already released' and changes nothing. A heartbeat renewed by an\n"
+            "older wrkslots client, or any change of owner, voids the release and restores the\n"
+            "ordinary removal conditions."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    release.add_argument("slot", help="active agent slot name")
+    release.add_argument("--agent", required=True, metavar="AGENT", help="recorded agent name")
+    release.add_argument(
+        "--owner-pid",
+        type=int,
+        required=True,
+        metavar="PID",
+        help="exact live owner PID; the caller must be this process or its descendant",
+    )
+    release.add_argument(
+        "--expected-generation",
+        type=int,
+        required=True,
+        metavar="N",
+        help="current slot generation",
+    )
+    release.set_defaults(handler=_cmd_release)
 
     hold = subparsers.add_parser(
         "hold",
@@ -38598,6 +39278,9 @@ usage or audit gate unknown, 3 fail-closed refusal.
             " is retained unless --include-owner-consented is given; only then is it removed,"
             " and only under the owner-consented-handoff conditions documented for remove,"
             " which include --coordinator-authorized and an expired heartbeat."
+            " A target whose exact owner released it with 'wrkslots release' needs no"
+            " opt-in: that release is the owner's own decision, and it stands in only for"
+            " the owner's exit and the heartbeat time-to-live."
             " The default end-to-end lock-wait budget is 5 seconds and any global "
             "--wait-lock value is capped at 30 seconds for this bounded command."
         ),
@@ -38737,7 +39420,11 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "the recorded owner process, and the coordinator has read that handoff with "
             "read-handoff. Every process-use, path, Git, and salvage check still runs, and the "
             "basis is recorded in the event log as owner-consented-handoff. retire-pending "
-            "applies this exception only when given --include-owner-consented."
+            "applies this exception only when given --include-owner-consented. A slot whose "
+            "exact owner ran 'wrkslots release' needs neither the owner's exit nor an expired "
+            "heartbeat nor --coordinator-authorized while that release still applies; the "
+            "handoff read and every process-use, path, Git, and salvage check still run, and "
+            "the basis is recorded as owner-released."
         ),
         formatter_class=_HelpFormatter,
     )

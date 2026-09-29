@@ -1581,6 +1581,7 @@ fn known_non_state_event_kinds_are_tolerated_after_envelope_validation() {
         "handoff-write-intended",
         "handoff-written",
         "legacy-validate-checkout-removed",
+        "owner-released",
         "ownerless-agent-cache-relocated",
         "ownerless-agent-worktree-removed",
         "ownerless-validate-path-removed",
@@ -1596,7 +1597,7 @@ fn known_non_state_event_kinds_are_tolerated_after_envelope_validation() {
         );
     }
     let summary = replay(&events).expect("known non-state kinds replay");
-    assert_eq!(summary.replay_count, 11);
+    assert_eq!(summary.replay_count, 12);
     assert_eq!(summary.tip_sha256, previous);
     assert_eq!(summary.active_revision, 3);
     assert_eq!(summary.archive_revision, 7);
