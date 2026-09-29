@@ -280,6 +280,15 @@ Review fixes (2026-09-29):
   refuses both for a directory that is a mount point in the caller's own namespace. It detaches
   copies in other namespaces when the host does it, which also frees their loop devices. A mount
   that fails its check is undone.
+- Those copies also keep the unmounted file system alive: a loop device stays bound and, for
+  FUSE, fuse2fs never exits, so an unmount from a userns box waited forever on a slot that was
+  mounted before the box started. After a host-side unmount, the empty mount-point directory is
+  now replaced on the host by a fresh one (mkdir beside it, then rename over it). The kernel
+  detaches every mount on a removed directory entry in every namespace, locked copies in user
+  namespaces included. The same step runs on the host for FUSE when the servers do not exit
+  within 10 s, which also covers copies held by unrelated namespaces (concurrent test harnesses).
+  e2e_coordinator_images.sh checks that the box releases the loop devices and servers while it is
+  still running.
 - Detaching those copies inside the box when it is built is not possible in a userns box, where
   mounts inherited from the parent namespace are locked. Keeping their parents slaves would let
   every later host mount under those parents (sibling projects' slots, for example) appear in the

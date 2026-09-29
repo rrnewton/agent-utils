@@ -117,6 +117,12 @@ step() {
 }
 mark() { echo "\$1" >> "$BASE/scratch/steps.done"; }
 step "unmount s0 (mounted before this box started)" W image unmount s0 && mark unmount-s0
+# The box's own copies of s0's mounts must not keep its loop devices (or FUSE servers) alive.
+held=0
+for f in /sys/block/loop*/loop/backing_file; do [ -f "\$f" ] && grep -qF "$PROJECT/worktrees/slot-images/agent/s0/" "\$f" && held=\$((held + 1)); done
+fuse=\$(pgrep -u "\$(id -u)" -f "fuse2fs.*$PROJECT/worktrees/slot-images/agent/s0/" | wc -l)
+echo "s0 loop devices still bound: \$held; s0 fuse2fs servers: \$fuse"
+[ "\$held" = 0 ] && [ "\$fuse" = 0 ] && mark s0-released
 step "mount s0 again" W image mount && mark mount-s0
 # s1's owner descends from this coordinator, as create requires.
 setsid sleep 100000 </dev/null >/dev/null 2>&1 & echo \$! > $BASE/scratch/owner1.pid
@@ -133,7 +139,7 @@ EOF
     box --name e2e --isolation "$ISOLATION" --tmp-size 64M --read-write "$BASE/remote.git" --read-write "$BASE/scratch" --cwd "$PROJECT/worktrees" \
     -- bash "$BASE/coordinator.sh" ) </dev/null 2>&1 | grep --line-buffered -v '^wrkslots run: limits' | tee "$BASE/box.log"
 check "every step inside the box succeeded" \
-  "unmount-s0 mount-s0 create-s1 to-worktree to-image remove-s1 remove-s0" \
+  "unmount-s0 s0-released mount-s0 create-s1 to-worktree to-image remove-s1 remove-s0" \
   "$(tr '\n' ' ' < "$BASE/scratch/steps.done" 2>/dev/null | sed 's/ $//')"
 published=no
 for ref in $(git -C "$BASE/remote.git" for-each-ref --format='%(refname)'); do

@@ -484,11 +484,28 @@ def _run_on_host(argv: Sequence[str], *, anchor: Path | None = None, timeout: fl
         _forget_host_table()
 
 
-_PATH_OPERATION = (
-    "import os, sys\n"
-    "operation, *paths = sys.argv[1:]\n"
-    "os.rmdir(paths[0]) if operation == 'rmdir' else os.rename(paths[0], paths[1])\n"
-)
+_PATH_OPERATION = """\
+import os, stat, sys
+operation, *paths = sys.argv[1:]
+if operation == "rmdir":
+    os.rmdir(paths[0])
+elif operation == "rename":
+    os.rename(paths[0], paths[1])
+else:  # replace: a fresh empty directory with the same mode takes the old one's place
+    target = paths[0]
+    info = os.lstat(target)
+    if not stat.S_ISDIR(info.st_mode):
+        raise SystemExit(f"{target} is not a directory")
+    parent, name = os.path.split(target)
+    fresh = os.path.join(parent, f".{name}.replace-{os.getpid()}")
+    os.mkdir(fresh, stat.S_IMODE(info.st_mode))
+    try:
+        os.chmod(fresh, stat.S_IMODE(info.st_mode))
+        os.rename(fresh, target)
+    except BaseException:
+        os.rmdir(fresh)
+        raise
+"""
 
 
 def _host_path_operation(operation: str, *paths: Path, anchor: Path | None) -> None:
@@ -503,8 +520,10 @@ def _host_path_operation(operation: str, *paths: Path, anchor: Path | None) -> N
     if not _via_user_manager(anchor):
         if operation == "rmdir":
             os.rmdir(paths[0])
-        else:
+        elif operation == "rename":
             os.rename(paths[0], paths[1])
+        else:
+            _run([os.path.realpath(sys.executable), "-I", "-c", _PATH_OPERATION, operation, *map(str, paths)])
         return
     try:
         _run(_user_manager_argv([os.path.realpath(sys.executable), "-I", "-c", _PATH_OPERATION, operation, *map(str, paths)]))
@@ -518,6 +537,23 @@ def remove_mount_point(path: Path, anchor: Path | None = None) -> None:
     """Remove an empty slot mount-point directory (on the host from a coordinator box)."""
 
     _host_path_operation("rmdir", path, anchor=anchor)
+
+
+def release_mount_point_copies(mount_point: Path, anchor: Path | None = None) -> None:
+    """Detach every copy of an unmounted slot mount that another namespace still holds.
+
+    The kernel does not propagate an unmount into every mount namespace: a box
+    keeps copies under parents it made private, and so can unrelated namespaces
+    on the host. Such a copy keeps a FUSE server alive and a loop device bound.
+    Replacing the (empty, now unmounted) mount-point directory with a fresh one
+    removes its old directory entry, and the kernel detaches every mount on a
+    removed entry, in every namespace. Runs on the host from a coordinator box.
+    """
+
+    try:
+        _host_path_operation("replace", mount_point, anchor=anchor)
+    except (OSError, ImageError):
+        pass  # best effort: the caller's own checks decide what failed
 
 
 def rename_mount_point(source: Path, destination: Path, anchor: Path | None = None) -> None:
@@ -941,8 +977,14 @@ def unmount(image_file: Path, mount_point: Path) -> None:
     if mounted is None or not _same_file(mounted[1], image_file):
         return
     backend = mounted[0]
+    routed = _via_user_manager(image_file.parent)
     if backend == "kernel":
         _privileged("umount", str(mount_point), anchor=image_file.parent)
+        _forget_host_table()
+        if routed and not is_mounted(image_file, mount_point):
+            # The box's own copies of this mount outlive the host unmount and keep
+            # the loop device bound; detach them.
+            release_mount_point_copies(mount_point, image_file.parent)
     else:
         # The kernel detaches the mount before the FUSE server has written its
         # cached metadata back to the image. Mounting the image again while the
@@ -952,8 +994,15 @@ def unmount(image_file: Path, mount_point: Path) -> None:
         subprocess.run(["fstrim", str(mount_point)], capture_output=True, check=False)
         _run_on_host([shutil.which("fusermount") or "fusermount", "-u", str(mount_point)], anchor=image_file.parent)
         _wait_until(lambda: not is_mounted(image_file, mount_point), 10)
-        if not _wait_for_exit(servers, 120):
-            raise ImageError(f"fuse2fs for {image_file} did not exit after unmount")
+        # A copy of the mount in another namespace (a box's, or an unrelated one)
+        # keeps the file system, and so its server, alive: detach such copies
+        # when the servers do not exit promptly (at once from a coordinator box).
+        if not _wait_for_exit(servers, 0 if routed else 10):
+            _forget_host_table()
+            if not is_mounted(image_file, mount_point):
+                release_mount_point_copies(mount_point, image_file.parent)
+            if not _wait_for_exit(servers, 120):
+                raise ImageError(f"fuse2fs for {image_file} did not exit after unmount")
     _forget_host_table()
     if is_mounted(image_file, mount_point):
         raise ImageError(f"{mount_point} is still mounted after unmount")

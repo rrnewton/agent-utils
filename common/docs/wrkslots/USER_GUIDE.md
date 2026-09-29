@@ -1057,8 +1057,10 @@ rules make that work:
    --wait --pipe`), which starts the same root image helper through `sudo -n`. The helper checks
    every path again there. The result is verified in the host's mount table, read through the
    same user manager, because the box's own table can keep copies of a slot mount the host has
-   already removed. Removing or renaming a slot's mount-point directory happens on the host too,
-   which also clears such copies. Unmounting is idempotent, so a sequence interrupted halfway is
+   already removed. Such a copy would keep the loop device bound (or the FUSE server running), so
+   after unmounting, wrkslots replaces the empty mount-point directory with a fresh one on the
+   host; the kernel then detaches every copy of the old mount, in every namespace. Removing or
+   renaming a slot's mount-point directory happens on the host too. Unmounting is idempotent, so a sequence interrupted halfway is
    finished by running the command again. This works from `userns` boxes too, where sudo itself
    cannot run. If the user manager is unreachable from the box, image commands fail with a
    message saying so; create image slots outside the box in that case.

@@ -1007,3 +1007,22 @@ def test_coordinator_box_refuses_a_bare_slot_and_a_symlinked_agent_registry(
     boxed = shell_command("--box", "--format", "json", "--", "/bin/echo", "x")
     assert boxed.returncode == 0, boxed.stderr
     assert json.loads(boxed.stdout)["command"].endswith(" -- /bin/echo x")
+
+
+def test_releasing_mount_point_copies_replaces_the_empty_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in ("WRKSLOTS_SANDBOX", "WRKSLOTS_BOX"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(slotimage, "_IN_BOX_NAMESPACE", False)
+    point = tmp_path / "slot"
+    point.mkdir(mode=0o750)
+    point.chmod(0o750)
+    before = point.stat()
+    slotimage.release_mount_point_copies(point)
+    after = point.stat()
+    assert after.st_ino != before.st_ino and oct(after.st_mode & 0o777) == oct(0o750)
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == ["slot"]
+    (point / "content").write_text("x", encoding="utf-8")
+    slotimage.release_mount_point_copies(point)  # never replaces a directory that has content
+    assert (point / "content").exists() and sorted(entry.name for entry in tmp_path.iterdir()) == ["slot"]
