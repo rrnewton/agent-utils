@@ -384,6 +384,9 @@ def test_cross_cutting_python_contracts_follow_every_observed_input() -> None:
         "python.repository-infrastructure.cross-environment": (
             "test_cross_env_is_hermetic.py"
         ),
+        "python.repository-infrastructure.cross-skip-accounting": (
+            "test_cross_skip_accounting.py"
+        ),
         "python.repository-infrastructure.dispatch-wiring": "test_repo_dispatch_wiring.py",
         "python.repository-infrastructure.package-contract": (
             "test_packaging_infrastructure.py"
@@ -417,6 +420,9 @@ def test_cross_cutting_python_contracts_follow_every_observed_input() -> None:
         "python.repository-infrastructure.cross-environment",
         "python.repository-infrastructure.validation-graph",
     } <= cross_harness
+    assert "python.repository-infrastructure.cross-skip-accounting" in _selected_tags_for_paths(
+        ["cross/differential.py"]
+    )
 
 
 def test_python_and_rust_package_checkers_select_only_their_artifact_family() -> None:

@@ -212,6 +212,20 @@ steps:
       rss_baseline_bytes: 268435456
 
   - group: repository-infrastructure
+    job: cross-skip-accounting
+    desc: a skipped cross-language check is never counted as a pass, and each lane states its coverage
+    cmd: cd py && python3 -m pytest -q tests/test_cross_skip_accounting.py
+    jobs_flag: ""
+    labels: [validation-python, validation-cross, validation-python-component-tests, component-repository-infrastructure]
+    timeout: 120
+    cpu_timeout: 120
+    hint:
+      est_duration_s: 3
+      classification: light
+      preferred_inner_jobs: 1
+      rss_baseline_bytes: 268435456
+
+  - group: repository-infrastructure
     job: package-contract
     desc: package validation and lifecycle partitions remain complete
     cmd: cd py && python3 -m pytest -q tests/test_packaging_infrastructure.py

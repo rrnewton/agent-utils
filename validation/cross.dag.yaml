@@ -32,7 +32,11 @@ steps:
   - group: dagrun
     job: differential
     desc: dagrun Python and Rust commands agree
-    cmd: python3 cross/differential.py --tool dagrun
+    # Partial by declaration, and only for one structural reason: this node runs inside the
+    # parent-owned delegated cgroup, where the harness must not create a live systemd scope, so
+    # the live pin-run cases are listed as skipped rather than run. Boxing stays required here; a
+    # lane that cannot box must declare that itself (AGENT_UTILS_CROSS_ALLOW_SKIP=boxing).
+    cmd: python3 cross/differential.py --tool dagrun --allow-skip delegated-live-scope
     jobs_flag: ""
     # The harness has one live boxed CPU-bandwidth case. Let the outer scheduler deliver the
     # admitted width explicitly so that case scales to a smaller runner instead of claiming an
@@ -54,7 +58,10 @@ steps:
   - group: dagrun
     job: cpuset-differential
     desc: cpuset allocator Python and Rust commands agree
-    cmd: python3 cross/differential.py --tool cpuset-alloc
+    # Partial for the same structural reason as dagrun.differential: the live-scope cases
+    # (selftest, interop, wrapped help, signal status) are listed as skipped inside the
+    # delegated cgroup. `make cross` runs them at top level with full coverage.
+    cmd: python3 cross/differential.py --tool cpuset-alloc --allow-skip delegated-live-scope
     jobs_flag: ""
     labels: [validation-cross, component-dagrun]
     delegated_children: true

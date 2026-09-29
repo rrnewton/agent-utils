@@ -40,7 +40,7 @@ the non-contractual uncontained fallback remains active despite its deliberately
     ==============  ================================================================
     cpu_timeout     exact cgroup ``cpu.stat`` guard; uncontained fallback is non-contractual
     wall_timeout    the scheduler's per-step wait deadline
-    oom_detection   the post-step ``memory.events`` ``oom_kill`` read
+    oom_detection   the post-step ``memory.events`` read: any positive ``oom``, ``oom_kill`` or ``oom_group_kill``
     memory_max      the per-step inner ``memory.max`` write in the cgroup manager
     pids_guard      the per-step inner ``pids.max`` write in the cgroup manager
     ==============  ================================================================
@@ -147,7 +147,10 @@ ENFORCEMENT_REGISTRY: tuple[Capability, ...] = (
         key="oom_detection",
         contained=True,
         uncontained=False,
-        summary="failure attributed to OOM via cgroup memory.events oom_kill count",
+        summary=(
+            "failure attributed to OOM when any cgroup memory.events oom, oom_kill or "
+            "oom_group_kill count is positive"
+        ),
     ),
     Capability(
         key="pids_guard",

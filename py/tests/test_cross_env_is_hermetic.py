@@ -153,16 +153,27 @@ def test_dagrun_main_forwards_the_admitted_validation_width(
     differential = _differential()
     observed: dict[str, int] = {}
 
-    def compare(_random: int, _seed: int, *, validation_jobs: int = 8) -> int:
+    observed_skips: list[frozenset[str]] = []
+
+    def compare(
+        _random: int,
+        _seed: int,
+        *,
+        validation_jobs: int = 8,
+        allowed_skips: frozenset[str] = frozenset(),
+    ) -> int:
         observed["validation_jobs"] = validation_jobs
+        observed_skips.append(allowed_skips)
         return 0
 
     monkeypatch.setenv("AGENT_UTILS_VALIDATION_JOBS", "4")
+    monkeypatch.delenv("AGENT_UTILS_CROSS_ALLOW_SKIP", raising=False)
     monkeypatch.setattr(differential, "_effective_validation_jobs", lambda: 16)
     monkeypatch.setattr(differential, "compare_dagrun", compare)
 
     assert differential.main(["--tool", "dagrun"]) == 0
     assert observed == {"validation_jobs": 4}
+    assert observed_skips == [frozenset()]
 
 
 def test_boxed_cpu_bandwidth_case_scales_every_width_observable() -> None:
@@ -197,8 +208,15 @@ def test_boxing_only_checks_skip_exact_unboxed_delegation_without_spawning(
     differential.compare_operator_build_width(["python"], ["rust"], report)
     differential.compare_boxed_cpu_bandwidth(["python"], ["rust"], report)
 
-    assert report.checks == 4
+    # None of the four checks ran, so none of them may be counted as a pass.
+    assert report.checks == 0
     assert report.failures == []
+    assert [(skip.label, skip.kind) for skip in report.skipped] == [
+        ("profile-timeseries", "boxing"),
+        ("operator-build-width:stated", "boxing"),
+        ("operator-build-width:unstated", "boxing"),
+        ("boxed-cpu-bandwidth", "boxing"),
+    ]
 
 
 def test_delegated_cgroup_does_not_disable_boxing_only_checks(

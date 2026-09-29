@@ -111,9 +111,14 @@ jobs:
       # test at all. The degradation is partial, not total: `dagrun capabilities` reports
       # `wall_timeout` available uncontained, so the ceiling that catches a hang still holds and
       # only the memory/CPU bound is lost, which the runner enforces its own way.
+      #
+      # The lost bound also means cross/differential.py cannot run its boxing checks here. The
+      # lane declares that it is partial for them: they are listed as SKIPPED/UNVERIFIED and the
+      # run ends with PARTIAL rather than OK. Boxing coverage comes from local boxed validation.
       - name: the entire portable current-toolchain contract
         env:
           BOX_FLAGS: --allow-cgroup-failure
+          AGENT_UTILS_CROSS_ALLOW_SKIP: boxing
         run: make validate-all
 
       # Same reasoning as the per-push workflow: the gate is a completely-broken detector, so the

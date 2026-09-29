@@ -76,7 +76,16 @@ asserts:
 It also keeps the bootstrap ``--version`` / ``--help`` / no-args exit-code checks, and asserts
 ``--userguide`` stdout is BYTE-IDENTICAL across builds (both embed the same single-source guide).
 
-Exit status is nonzero on any divergence. The module is kept mypy-strict clean.
+A check that cannot run on the current host or lane (no cgroup-v2 boxing, a parent-owned delegated
+cgroup that must not spawn live scopes, a refused HARD cpuset pin, a single online CPU) is recorded
+as SKIPPED, a result class of its own: it is never counted as a pass, and each skipped check is
+listed by name with a total. Where both engines refuse a capability identically, that parity is
+counted as a pass and the check the capability would have enabled is still listed as skipped.
+
+Exit status is nonzero on any divergence, and also on any skip unless the run declared that kind of
+skip acceptable with ``--allow-skip KIND`` or ``AGENT_UTILS_CROSS_ALLOW_SKIP=KIND[,KIND]``. Such a
+run is partial by declaration; it says so on its first line and ends with ``PARTIAL`` instead of
+``OK``. The module is kept mypy-strict clean.
 """
 
 from __future__ import annotations
@@ -293,6 +302,31 @@ class CpuFootprintFacts:
     max_live_workers: int
 
 
+#: Why a check can be skipped instead of executed. A skip is its own result class: it is never a
+#: pass, never increments ``Report.checks``, is listed by name in the summary, and makes the run
+#: exit nonzero unless its kind was explicitly allowed for a partial run (``--allow-skip`` or
+#: ``ALLOW_SKIP_ENV``).
+SKIP_KINDS: dict[str, str] = {
+    "boxing": "needs cgroup-v2 boxing: a working systemd --user scope or a delegated cgroup subtree",
+    "delegated-live-scope": (
+        "would create a live systemd scope from inside a parent-owned delegated cgroup"
+    ),
+    "hard-cpuset": "needs a HARD cpuset pin, which both engines refused on this host",
+    "multi-cpu": "needs at least two online CPUs",
+}
+
+#: Comma-separated skip kinds a lane declares acceptable, in addition to ``--allow-skip``. A lane
+#: that sets it is partial by design and the harness says so in its final line.
+ALLOW_SKIP_ENV = "AGENT_UTILS_CROSS_ALLOW_SKIP"
+
+
+@dataclass(frozen=True)
+class Skip:
+    label: str
+    kind: str
+    reason: str
+
+
 @dataclass
 class Report:
     checks: int = 0
@@ -300,6 +334,7 @@ class Report:
     json_byte_identical: int = 0
     yaml_isomorphic: int = 0
     scalar_parity: int = 0
+    skipped: list[Skip] = field(default_factory=list)
 
     def ok(self, _label: str) -> None:
         self.checks += 1
@@ -307,6 +342,58 @@ class Report:
     def bad(self, label: str, detail: str) -> None:
         self.checks += 1
         self.failures.append(f"{label}: {detail}")
+
+    def skip(self, label: str, kind: str, reason: str) -> None:
+        """Record a check that did NOT run. It is not a pass and is not counted in ``checks``."""
+        if kind not in SKIP_KINDS:
+            raise ValueError(f"unknown skip kind {kind!r}; expected one of {sorted(SKIP_KINDS)}")
+        self.skipped.append(Skip(label, kind, reason))
+
+
+def report_skips(tool: str, rep: Report, allowed_skips: frozenset[str]) -> None:
+    """List every skipped check by name, apart from and never mixed into the pass count."""
+
+    if not rep.skipped:
+        return
+    print(
+        f"cross[{tool}]: SKIPPED/UNVERIFIED {len(rep.skipped)} check(s), "
+        "not counted as passes:"
+    )
+    for skip in rep.skipped:
+        status = "allowed" if skip.kind in allowed_skips else "REQUIRED"
+        print(f"  SKIPPED [{skip.kind}; {status}] {skip.label}: {skip.reason}")
+
+
+def coverage_verdict(
+    tool: str, rep: Report, summary: str, allowed_skips: frozenset[str]
+) -> int:
+    """Print the final line of a run without divergences and return its exit status.
+
+    ``summary`` describes the checks that actually ran. Without an allowance every skip is a
+    required check that did not run, so the run cannot claim full coverage and exits 1. Skips of
+    allowed kinds make the run PARTIAL, which exits 0 and says so.
+    """
+
+    report_skips(tool, rep, allowed_skips)
+    required = [skip for skip in rep.skipped if skip.kind not in allowed_skips]
+    if required:
+        kinds = ",".join(sorted({skip.kind for skip in required}))
+        print(
+            f"cross[{tool}]: INCOMPLETE - {summary}, but {len(required)} required check(s) "
+            f"did not run: {', '.join(skip.label for skip in required)}. Full coverage cannot "
+            f"pass with a skipped check; a lane that is partial by design must declare it with "
+            f"--allow-skip {kinds} or {ALLOW_SKIP_ENV}={kinds}"
+        )
+        return 1
+    if rep.skipped:
+        kinds = ", ".join(sorted({skip.kind for skip in rep.skipped}))
+        print(
+            f"cross[{tool}]: PARTIAL - {summary}; {len(rep.skipped)} check(s) were skipped and "
+            f"are UNVERIFIED (allowed skip kinds: {kinds})"
+        )
+        return 0
+    print(f"cross[{tool}]: OK - {summary}")
+    return 0
 
 
 def _deterministic_run_output(output: str) -> str:
@@ -3716,7 +3803,11 @@ def compare_profile_timeseries_trace(py: list[str], rs: list[str], rep: Report) 
             "cross[dagrun]: SKIP time-series trace differential: "
             "the outer scheduler has no cgroup subtree to delegate"
         )
-        rep.ok("profile-timeseries:capability-unavailable")
+        rep.skip(
+            "profile-timeseries",
+            "boxing",
+            "the outer scheduler has no cgroup subtree to delegate",
+        )
         return
 
     with tempfile.TemporaryDirectory(prefix="dagrun-trace-cross-") as tmp:
@@ -3778,7 +3869,11 @@ def compare_profile_timeseries_trace(py: list[str], rs: list[str], rep: Report) 
                 "cross[dagrun]: SKIP time-series trace differential: "
                 "cgroup-v2 + a working systemd --user scope are unavailable"
             )
-            rep.ok("profile-timeseries:capability-unavailable")
+            rep.skip(
+                "profile-timeseries",
+                "boxing",
+                "cgroup-v2 + a working systemd --user scope are unavailable",
+            )
             return
         if any(unavailable.values()) or any(outcome.returncode != 0 for outcome in outcomes.values()):
             rep.bad(
@@ -5271,7 +5366,11 @@ def compare_memory_hardening(py: list[str], rs: list[str], rep: Report) -> None:
                 "cross[dagrun]: SKIP strict nonbinding max-mem proof: "
                 "host exposes only one online CPU"
             )
-            rep.ok("memory:nonbinding-max-mem-one-cpu-capability")
+            rep.skip(
+                "memory:nonbinding-max-mem-keeps-cpu-base",
+                "multi-cpu",
+                "host exposes only one online CPU",
+            )
         else:
             rep.bad(
                 "memory:nonbinding-max-mem-keeps-cpu-base",
@@ -7404,7 +7503,11 @@ def compare_operator_build_width(py: list[str], rs: list[str], rep: Report) -> N
                 f"cross[dagrun]: SKIP boxed build-width differential ({leg}): "
                 "the outer scheduler has no cgroup subtree to delegate"
             )
-            rep.ok(f"operator-build-width:{leg}:capability-unavailable")
+            rep.skip(
+                f"operator-build-width:{leg}",
+                "boxing",
+                "the outer scheduler has no cgroup subtree to delegate",
+            )
         return
 
     with tempfile.TemporaryDirectory(prefix="dagrun-cross-build-width-") as td:
@@ -7437,7 +7540,11 @@ def compare_operator_build_width(py: list[str], rs: list[str], rep: Report) -> N
                     f"cross[dagrun]: SKIP boxed build-width differential ({leg}): "
                     "cgroup-v2 + a working systemd --user scope are unavailable"
                 )
-                rep.ok(f"{label}:capability-unavailable")
+                rep.skip(
+                    label,
+                    "boxing",
+                    "cgroup-v2 + a working systemd --user scope are unavailable",
+                )
                 continue
             combined = {name: out.stdout + out.stderr for name, out in outcomes.items()}
             said = {name: _BUILD_WIDTH_RE.findall(text) for name, text in combined.items()}
@@ -7559,7 +7666,11 @@ def compare_jobs_env_width(py: list[str], rs: list[str], rep: Report) -> None:
                     "cross[dagrun]: SKIP boxed jobs-env differential: "
                     "cgroup-v2 + a working systemd --user scope are unavailable"
                 )
-                rep.ok(f"{check}:capability-unavailable")
+                rep.skip(
+                    check,
+                    "boxing",
+                    "cgroup-v2 + a working systemd --user scope are unavailable",
+                )
             elif (
                 all(out.returncode == 0 for out in outcomes.values())
                 and observed == {"py": expected, "rs": expected}
@@ -7613,7 +7724,11 @@ def compare_jobs_env_width(py: list[str], rs: list[str], rep: Report) -> None:
                     "cross[dagrun]: SKIP boxed readonly jobs-env differential: "
                     "cgroup-v2 + a working systemd --user scope are unavailable"
                 )
-                rep.ok(f"{check}:capability-unavailable")
+                rep.skip(
+                    check,
+                    "boxing",
+                    "cgroup-v2 + a working systemd --user scope are unavailable",
+                )
                 return
             combined = {name: out.stdout + out.stderr for name, out in outcomes.items()}
             if (
@@ -7736,7 +7851,11 @@ def compare_boxed_cpu_bandwidth(
             "cross[dagrun]: SKIP boxed CPU-bandwidth differential: "
             "the outer scheduler has no cgroup subtree to delegate"
         )
-        rep.ok("boxed-cpu-bandwidth:capability-unavailable")
+        rep.skip(
+            "boxed-cpu-bandwidth",
+            "boxing",
+            "the outer scheduler has no cgroup subtree to delegate",
+        )
         return
 
     with tempfile.TemporaryDirectory(prefix="dagrun-cross-boxed-cpu-") as td:
@@ -7780,7 +7899,11 @@ def compare_boxed_cpu_bandwidth(
                 "cross[dagrun]: SKIP boxed CPU-bandwidth differential: "
                 "cgroup-v2 + a working systemd --user scope are unavailable"
             )
-            rep.ok("boxed-cpu-bandwidth:capability-unavailable")
+            rep.skip(
+                "boxed-cpu-bandwidth",
+                "boxing",
+                "cgroup-v2 + a working systemd --user scope are unavailable",
+            )
             return
         if any(unavailable.values()) or any(out.returncode != 0 for out in outcomes.values()):
             rep.bad("boxed-cpu-bandwidth", f"py={outcomes['py']}\nrs={outcomes['rs']}")
@@ -7852,7 +7975,12 @@ def compare_pin_run(py: list[str], rs: list[str], rep: Report) -> None:
                 "cross[dagrun]: SKIP pin-run live execution: the differential is itself "
                 "inside a parent-owned delegated cgroup; tracked by #28 delegated-cpuset"
             )
-            rep.ok("pin-run:delegated-parent-safety-skip")
+            for label in ("pin-run:reserve-apply-release", "pin-run:signal-status"):
+                rep.skip(
+                    label,
+                    "delegated-live-scope",
+                    "the differential is itself inside a parent-owned delegated cgroup",
+                )
         else:
             po, ro = run(py, valid, extra), run(rs, valid, extra)
             if po.returncode == ro.returncode == 0:
@@ -7862,7 +7990,13 @@ def compare_pin_run(py: list[str], rs: list[str], rep: Report) -> None:
                 and "HARD" in po.stderr
                 and "HARD" in ro.stderr
             ):
+                # The identical refusal is a real parity check. The pin itself never ran.
                 rep.ok("pin-run:hard-capability-unavailable-refused")
+                rep.skip(
+                    "pin-run:reserve-apply-release",
+                    "hard-cpuset",
+                    "both engines refused the HARD pin with exit 3",
+                )
             else:
                 rep.bad(
                     "pin-run:reserve-apply-release",
@@ -7896,12 +8030,21 @@ def compare_pin_run(py: list[str], rs: list[str], rep: Report) -> None:
                 and "HARD" in ro.stderr
             ):
                 rep.ok("pin-run:signal-status-hard-capability-unavailable")
+                rep.skip(
+                    "pin-run:signal-status",
+                    "hard-cpuset",
+                    "both engines refused the HARD pin with exit 3",
+                )
             else:
                 rep.bad("pin-run:signal-status", f"py={po}\nrs={ro}")
 
 
 def compare_dagrun(
-    rand_count: int, seed: int, *, validation_jobs: int = DEFAULT_VALIDATION_JOBS
+    rand_count: int,
+    seed: int,
+    *,
+    validation_jobs: int = DEFAULT_VALIDATION_JOBS,
+    allowed_skips: frozenset[str] = frozenset(),
 ) -> int:
     tool = "dagrun"
     py = py_command()
@@ -7963,6 +8106,7 @@ def compare_dagrun(
     if rep.failures:
         for failure in rep.failures:
             print(f"DIVERGENCE [{failure}")
+        report_skips(tool, rep, allowed_skips)
         print(
             f"cross[{tool}]: {len(rep.failures)} divergence(s) out of {rep.checks} checks "
             f"across {n_fixtures} fixtures ({len(examples)} shipped JSON examples static-only; "
@@ -7970,14 +8114,16 @@ def compare_dagrun(
         )
         return 1
 
-    print(
-        f"cross[{tool}]: OK - {rep.checks} checks across {n_fixtures} fixtures agree "
+    return coverage_verdict(
+        tool,
+        rep,
+        f"{rep.checks} checks across {n_fixtures} fixtures agree "
         f"({len(examples)} shipped JSON examples static-only; "
         f"{len(yaml_paths)} YAML fixtures isomorphic to JSON; "
         f"json byte-identical: {rep.json_byte_identical}, yaml isomorphic: {rep.yaml_isomorphic}, "
-        f"scalar-resolution parity cases: {rep.scalar_parity})"
+        f"scalar-resolution parity cases: {rep.scalar_parity})",
+        allowed_skips,
     )
-    return 0
 
 
 def py_command_for(tool: str) -> list[str]:
@@ -8093,7 +8239,7 @@ def compare_package_guides(
             rep.ok(f"guide:{language}")
 
 
-def compare_cpuset_alloc() -> int:
+def compare_cpuset_alloc(*, allowed_skips: frozenset[str] = frozenset()) -> int:
     tool = "cpuset-alloc"
     py = py_command_for(tool)
     rs = rs_command(tool)
@@ -8104,7 +8250,18 @@ def compare_cpuset_alloc() -> int:
             "cross[cpuset-alloc]: SKIP live systemd-scope cases: the differential is itself "
             "inside a parent-owned delegated cgroup; tracked by #28 delegated-cpuset"
         )
-        rep.ok("live-scope:delegated-parent-safety-skip")
+        for label in (
+            "selftest:mutation-verdict",
+            "interop:py-then-rs",
+            "interop:rs-then-py",
+            "run:wrapped-help-passthrough",
+            "run:signal-status",
+        ):
+            rep.skip(
+                label,
+                "delegated-live-scope",
+                "the differential is itself inside a parent-owned delegated cgroup",
+            )
 
     _record_exact(rep, "version", py, rs, ("--version",))
     for args, required in (
@@ -8428,11 +8585,23 @@ def compare_cpuset_alloc() -> int:
                     and "HARD" in second_outcome.stderr
                 ):
                     rep.ok(f"interop:{label}:hard-capability-unavailable")
+                    rep.skip(
+                        f"interop:{label}",
+                        "hard-cpuset",
+                        "both engines refused the HARD pin with exit 3",
+                    )
                 else:
                     rep.bad(
                         f"interop:{label}",
                         f"first={first_outcome}\nsecond={second_outcome}",
                     )
+        elif live_scope_allowed:
+            for label in ("py-then-rs", "rs-then-py"):
+                rep.skip(
+                    f"interop:{label}",
+                    "multi-cpu",
+                    "two disjoint reservations need at least two usable CPUs",
+                )
 
     _record_same_exit(rep, "run:missing-command", py, rs, ("run", "--cores", "1"), 2)
     _record_same_exit(
@@ -8474,6 +8643,11 @@ def compare_cpuset_alloc() -> int:
             and "HARD" in ro.stderr
         ):
             rep.ok("run:wrapped-help-hard-capability-unavailable")
+            rep.skip(
+                "run:wrapped-help-passthrough",
+                "hard-cpuset",
+                "both engines refused the HARD pin with exit 3",
+            )
         else:
             rep.bad("run:wrapped-help-passthrough", f"py={po}\nrs={ro}")
 
@@ -8507,6 +8681,11 @@ def compare_cpuset_alloc() -> int:
             and "HARD" in ro.stderr
         ):
             rep.ok("run:signal-status-hard-capability-unavailable")
+            rep.skip(
+                "run:signal-status",
+                "hard-cpuset",
+                "both engines refused the HARD pin with exit 3",
+            )
         else:
             rep.bad("run:signal-status", f"py={po}\nrs={ro}")
     _record_same_exit(rep, "cli:abbreviation-refused", py, rs, ("status", "--ledg", "x"), 2)
@@ -8515,10 +8694,12 @@ def compare_cpuset_alloc() -> int:
     if rep.failures:
         for failure in rep.failures:
             print(f"DIVERGENCE [{failure}]")
+        report_skips(tool, rep, allowed_skips)
         print(f"cross[{tool}]: {len(rep.failures)} divergence(s) out of {rep.checks} checks")
         return 1
-    print(f"cross[{tool}]: OK - {rep.checks} behavioral and ledger-schema checks agree")
-    return 0
+    return coverage_verdict(
+        tool, rep, f"{rep.checks} behavioral and ledger-schema checks agree", allowed_skips
+    )
 
 
 def compare_tick_hub_phased_cadence(
@@ -9330,10 +9511,13 @@ def compare_tick_hub(rand_count: int, seed: int) -> int:
     if rep.failures:
         for failure in rep.failures:
             print(f"DIVERGENCE [{failure}]")
+        report_skips(tool, rep, frozenset())
         print(f"cross[{tool}]: {len(rep.failures)} divergence(s) out of {rep.checks} checks")
         return 1
-    print(f"cross[{tool}]: OK - {rep.checks} deterministic, randomized, and adversarial checks agree")
-    return 0
+    # No case here may skip; if one ever does, the default verdict refuses to call it a pass.
+    return coverage_verdict(
+        tool, rep, f"{rep.checks} deterministic, randomized, and adversarial checks agree", frozenset()
+    )
 
 
 def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
@@ -12136,10 +12320,13 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
     if rep.failures:
         for failure in rep.failures:
             print(f"DIVERGENCE [{failure}]")
+        report_skips(tool, rep, frozenset())
         print(f"cross[{tool}]: {len(rep.failures)} divergence(s) out of {rep.checks} checks")
         return 1
-    print(f"cross[{tool}]: OK - {rep.checks} graph, CI, randomized, and adversarial checks agree")
-    return 0
+    # No case here may skip; if one ever does, the default verdict refuses to call it a pass.
+    return coverage_verdict(
+        tool, rep, f"{rep.checks} graph, CI, randomized, and adversarial checks agree", frozenset()
+    )
 
 
 DIFFERENTIAL_TOOLS = (
@@ -12151,6 +12338,31 @@ DIFFERENTIAL_TOOLS = (
     "herdr-agent",
     "agentctl",
 )
+
+
+def allowed_skip_kinds(flags: Sequence[str], environ: Mapping[str, str]) -> dict[str, str]:
+    """Map each skip kind a lane declared acceptable to where it was declared.
+
+    Kinds come from repeated or comma-separated ``--allow-skip`` values and from
+    ``ALLOW_SKIP_ENV``. An unknown kind is refused rather than ignored, so a misspelled allowance
+    cannot turn into an unnoticed full-coverage claim or an unnoticed partial one.
+    """
+
+    declared: list[tuple[str, str]] = [("--allow-skip", value) for value in flags]
+    declared.append((ALLOW_SKIP_ENV, environ.get(ALLOW_SKIP_ENV, "")))
+    sources: dict[str, str] = {}
+    for source, raw in declared:
+        for item in raw.split(","):
+            kind = item.strip()
+            if not kind:
+                continue
+            if kind not in SKIP_KINDS:
+                raise ValueError(
+                    f"{source}: unknown skip kind {kind!r}; expected one of "
+                    f"{', '.join(sorted(SKIP_KINDS))}"
+                )
+            sources.setdefault(kind, source)
+    return sources
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -12167,11 +12379,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--random", type=int, default=24, help="number of randomized fixtures")
     parser.add_argument("--seed", type=int, default=1234, help="RNG seed for randomized fixtures")
+    parser.add_argument(
+        "--allow-skip",
+        action="append",
+        default=[],
+        metavar="KIND[,KIND]",
+        help=(
+            "declare a partial run: skipped checks of these kinds are still listed and never "
+            "counted as passes, but no longer make the run fail. Without it every skip fails "
+            f"the run. Kinds: {', '.join(sorted(SKIP_KINDS))}. {ALLOW_SKIP_ENV} adds kinds "
+            "the same way"
+        ),
+    )
     ns = parser.parse_args(list(argv) if argv is not None else None)
     if ns.list_tools:
         for name in DIFFERENTIAL_TOOLS:
             print(name)
         return 0
+    try:
+        allowance = allowed_skip_kinds([str(value) for value in ns.allow_skip], os.environ)
+    except ValueError as exc:
+        parser.error(str(exc))
+    allowed_skips = frozenset(allowance)
+    if allowance:
+        declared = ", ".join(f"{kind} (from {source})" for kind, source in sorted(allowance.items()))
+        print(
+            "cross: PARTIAL-coverage run declared; skips of these kinds are allowed, listed, and "
+            f"never counted as passes: {declared}"
+        )
     tool = str(ns.tool)
     rand_count = int(ns.random)
     seed = int(ns.seed)
@@ -12181,9 +12416,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(str(exc))
     if tool == "dagrun":
         assert validation_jobs is not None
-        return compare_dagrun(rand_count, seed, validation_jobs=validation_jobs)
+        return compare_dagrun(
+            rand_count, seed, validation_jobs=validation_jobs, allowed_skips=allowed_skips
+        )
     if tool == "cpuset-alloc":
-        return compare_cpuset_alloc()
+        return compare_cpuset_alloc(allowed_skips=allowed_skips)
     if tool == "tick-hub":
         return compare_tick_hub(rand_count, seed)
     if tool == "pr-landing-planner":
@@ -12201,8 +12438,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             validation_jobs=(
                 validation_jobs if validation_jobs is not None else DEFAULT_VALIDATION_JOBS
             ),
+            allowed_skips=allowed_skips,
         ),
-        compare_cpuset_alloc(),
+        compare_cpuset_alloc(allowed_skips=allowed_skips),
         compare_tick_hub(rand_count, seed),
         compare_pr_landing_planner(rand_count, seed),
         compare_herdr_run(py_command_for("herdr-run"), rs_command("herdr-run")),

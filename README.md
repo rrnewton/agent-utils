@@ -121,8 +121,12 @@ make check-packages
 The differential harness runs matching commands over valid, invalid, boundary,
 and randomized inputs. Human-oriented help may use idiomatic wording, while
 machine schemas, normalized results, exit behavior, and state transitions are
-cross-checked as part of the contract. Independent findings and reproducible
-evidence are recorded under [`reviews/`](reviews/README.md).
+cross-checked as part of the contract. A check that cannot run on the current
+host is reported as skipped, is never counted as a pass, and fails these
+full-coverage commands; see
+[skipped checks and partial runs](cross/README.md#skipped-checks-and-partial-runs).
+Independent findings and reproducible evidence are recorded under
+[`reviews/`](reviews/README.md).
 
 ## Services
 

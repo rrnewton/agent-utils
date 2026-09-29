@@ -2,7 +2,9 @@
 
 `differential.py` runs the independently implemented Python and Rust commands
 against the same representative, adversarial, boundary, and seeded-random
-inputs. A nonzero exit means the observable contracts diverged.
+inputs. A nonzero exit means the observable contracts diverged, or that a
+check did not run in a run that claims full coverage (see "Skipped checks and
+partial runs" below).
 
 Run the complete paired-tool contract:
 
@@ -63,7 +65,40 @@ Hard CPU-set wrappers do not degrade to process affinity. When a host cannot
 create and mutation-verify an inescapable subtree scope, both editions must
 refuse to launch the workload with the same operational status. On a capable
 host, the differential additionally verifies successful reserve/apply/release
-behavior.
+behavior. On a host that refuses, the identical refusal counts as a pass and the
+reserve/apply/release check is listed as skipped (`hard-cpuset`).
+
+## Skipped checks and partial runs
+
+Some checks cannot run everywhere. A skipped check is its own result: it is
+never counted as a pass, and the summary lists every skipped check by name with
+a total:
+
+```text
+cross[dagrun]: SKIPPED/UNVERIFIED 4 check(s), not counted as passes:
+  SKIPPED [boxing; REQUIRED] profile-timeseries: the outer scheduler has no cgroup subtree to delegate
+  ...
+```
+
+| Kind | Why the check did not run |
+|---|---|
+| `boxing` | no cgroup-v2 boxing: no working systemd `--user` scope, or an outer scheduler with no cgroup subtree to delegate |
+| `delegated-live-scope` | the harness runs inside a parent-owned delegated cgroup, where creating a live systemd scope could escape the outer step |
+| `hard-cpuset` | both engines refused a HARD cpuset pin on this host |
+| `multi-cpu` | the host exposes only one usable CPU |
+
+By default a run claims full coverage, so any skip makes it exit nonzero with an
+`INCOMPLETE` line. A lane that is partial by design declares which kinds it
+accepts, with `--allow-skip KIND[,KIND]` or
+`AGENT_UTILS_CROSS_ALLOW_SKIP=KIND[,KIND]`. It says so on its first line, still
+lists every skip, and ends with `PARTIAL` instead of `OK`. An unknown kind is
+refused.
+
+| Lane | Coverage |
+|---|---|
+| `make cross` | full: every skip fails |
+| validation nodes `cross.dagrun.differential` and `cross.dagrun.cpuset-differential` | partial for `delegated-live-scope` only; boxing stays required |
+| hosted repository CI and the nightly full run | additionally partial for `boxing`, because hosted runners run the graph with `--allow-cgroup-failure` |
 
 ## Fixtures and reproducibility
 

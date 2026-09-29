@@ -37,7 +37,7 @@
 //! |-----------------|---------------------------------------------------------------------|
 //! | `cpu_timeout`   | exact cgroup `cpu.stat`; uncontained fallback is non-contractual       |
 //! | `wall_timeout`  | the scheduler's per-step wait deadline                               |
-//! | `oom_detection` | the post-step `memory.events` `oom_kill` read                        |
+//! | `oom_detection` | the post-step `memory.events` read: any positive `oom`, `oom_kill` or `oom_group_kill` |
 //! | `memory_max`    | the per-step inner `memory.max` write in the cgroup manager          |
 //!
 //! `pids_guard` gates the per-step `pids.max` write in the companion reference engine, which is
@@ -151,7 +151,8 @@ pub const ENFORCEMENT_REGISTRY: &[Capability] = &[
         key: "oom_detection",
         contained: true,
         uncontained: false,
-        summary: "failure attributed to OOM via cgroup memory.events oom_kill count",
+        summary: "failure attributed to OOM when any cgroup memory.events oom, oom_kill or \
+                  oom_group_kill count is positive",
     },
     Capability {
         key: "pids_guard",

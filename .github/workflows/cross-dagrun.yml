@@ -124,6 +124,10 @@ jobs:
           # Hosted runners do not consistently delegate cgroup v2. Wall limits and the runner's
           # own container remain active; dagrun reports the degraded capability explicitly.
           BOX_FLAGS: --allow-cgroup-failure
+          # The same degradation makes this lane PARTIAL for cross/differential.py's boxing
+          # checks. They are listed as SKIPPED/UNVERIFIED, never counted as passes, and the run
+          # ends with PARTIAL rather than OK. Boxing coverage comes from local boxed validation.
+          AGENT_UTILS_CROSS_ALLOW_SKIP: boxing
           VALIDATE_ARGS: ${{ needs.plan.outputs.validate_args }}
         run: python3 scripts/validate.py $VALIDATE_ARGS
       - name: keep selected browser benchmark measurements
