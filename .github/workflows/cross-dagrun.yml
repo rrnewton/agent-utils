@@ -85,8 +85,11 @@ jobs:
       # rs/Cargo.toml declares rust-version 1.85. Compiling the tests on it does not show that they
       # pass on it: the selected graph runs them only on the stable toolchain.
       - name: test all targets on the declared MSRV
+        id: msrv-tests
         run: cargo test --locked --workspace --all-targets --manifest-path rs/Cargo.toml
       - name: verify registry artifacts on the declared MSRV
+        # Also runs when only the test step failed, so a test failure does not hide this result.
+        if: ${{ !cancelled() && (success() || steps.msrv-tests.outcome == 'failure') }}
         run: python3 scripts/check_rust_packages.py
 
   validate:
@@ -171,7 +174,16 @@ jobs:
       # Every distribution declares requires-python >=3.10. Parsing a module and starting its
       # entry points on 3.10 does not show that it behaves correctly there: the selected graph runs
       # the tests only on 3.12.
+      # This step is expected to fail until https://github.com/rrnewton/agent-utils/issues/163 is
+      # fixed: 8 tests fail on 3.10 (one wrkslots argument-parsing defect, seven tests whose
+      # expected value comes from a version-dependent Path.glob). It is deliberately not skipped
+      # or marked continue-on-error. Until the issue is closed, a red job is expected; a failure
+      # outside those 8 tests is a new regression.
       - name: tests on declared minimum Python
+        id: minimum-tests
         run: cd py && python -m pytest -q
       - name: wheel and sdist contract on declared minimum Python
+        # Also runs when only the test step failed. Without this, the expected test failure above
+        # would stop the package contract that ran here before the tests were restored.
+        if: ${{ !cancelled() && (success() || steps.minimum-tests.outcome == 'failure') }}
         run: make check-python-packages
