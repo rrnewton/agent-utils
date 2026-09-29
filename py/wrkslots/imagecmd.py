@@ -715,7 +715,7 @@ def _convert_to_worktree(
         print(f"kept the pre-conversion image directory at {kept}")
     else:
         slotimage.discard_files(image)
-    slot_path.rmdir()
+    slotimage.remove_mount_point(slot_path, image.directory.parent)
     os.rename(staging, slot_path)
 
 
@@ -848,6 +848,8 @@ def _agent_registry(view: sandbox.SlotView, cwd: Path, *, create: bool = True) -
     covered = [view.slot_path, *view.writable]
     if any(registry == path or path in registry.parents for path in covered):
         return view
+    if registry.is_symlink():
+        raise _refuse(f"the agent registry {registry} is a symbolic link; remove it or use a real directory")
     if not registry.exists():
         if not create:
             return dataclasses.replace(view, writable=(*view.writable, registry))
@@ -942,6 +944,14 @@ def _cmd_shell_command(args: argparse.Namespace) -> int:
     if args.box:
         if args.slot is not None:
             # With --box there is no SLOT: argparse hands the first word after -- to it.
+            # A word before -- is a mistaken SLOT, not a program to run boxed.
+            raw = list(getattr(args, "raw_arguments", []) or [])
+            after = raw[raw.index("--") + 1 :] if "--" in raw else []
+            if not after or after[0] != args.slot:
+                raise _refuse(
+                    f"shell-command --box takes no SLOT ({args.slot!r}); put a program to run "
+                    "boxed after a literal --"
+                )
             command = [args.slot, *command]
         cli._validate_name(args.name, "box name")
     else:

@@ -1051,16 +1051,21 @@ rules make that work:
    directory, so an image slot mounted on the host after the box started appears inside it.
    Everywhere else its mounts are private: a mount made elsewhere on the host is not visible in
    the box. Nothing mounted inside any box ever reaches the host.
-2. When `wrkslots create`, `remove`, `image mount|unmount|grow|trim`, or any other command mounts
-   or unmounts a slot image from inside a box, the mount runs in the host's mount namespace, as a
-   transient service of your systemd user manager (`systemd-run --user --wait --pipe`), which
-   starts the same root image helper through `sudo -n`. The helper checks every path again there.
-   This works from `userns` boxes too, where sudo itself cannot run. If the user manager is
-   unreachable from the box, image commands fail with a message saying so; create image slots
-   outside the box in that case.
+2. When `wrkslots create`, `remove`, `image mount|unmount|convert|grow|trim`, or any other command
+   mounts or unmounts a slot image from inside a coordinator box, the mount runs in the host's
+   mount namespace, as a transient service of your systemd user manager (`systemd-run --user
+   --wait --pipe`), which starts the same root image helper through `sudo -n`. The helper checks
+   every path again there. The result is verified in the host's mount table, read through the
+   same user manager, because the box's own table can keep copies of a slot mount the host has
+   already removed. Removing or renaming a slot's mount-point directory happens on the host too,
+   which also clears such copies. Unmounting is idempotent, so a sequence interrupted halfway is
+   finished by running the command again. This works from `userns` boxes too, where sudo itself
+   cannot run. If the user manager is unreachable from the box, image commands fail with a
+   message saying so; create image slots outside the box in that case.
 
-Slot boxes keep all their mounts private, as before: a slot's box needs no mount made after it
-started.
+A slot's box keeps all its mounts private, as before: it needs no mount made after it started,
+and it refuses to mount, unmount, convert, or remove slot images (a mount made on the host would
+be invisible to it). Run those from outside the box or from a coordinator box.
 
 **Subagents start outside the box.** A worker the coordinator launches through a terminal
 multiplexer (`agentctl start --slot`) runs in a pane whose shell the multiplexer's server spawns,

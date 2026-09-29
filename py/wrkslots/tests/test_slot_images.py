@@ -851,22 +851,64 @@ def test_coordinator_box_spec_scopes(tmp_path: Path, monkeypatch: pytest.MonkeyP
         imagecmd.box_view(config, "../escape", "worktrees")
 
 
-def test_image_mounts_from_inside_a_box_go_through_the_user_manager(
+def test_image_mounts_route_to_the_host_only_from_a_coordinator_box(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    monkeypatch.delenv("WRKSLOTS_SANDBOX", raising=False)
-    assert not slotimage.in_box()
+    monkeypatch.setattr(slotimage, "_IN_BOX_NAMESPACE", False)
+    for name in ("WRKSLOTS_SANDBOX", "WRKSLOTS_BOX"):
+        monkeypatch.delenv(name, raising=False)
+    assert slotimage.box_kind() is None
     assert slotimage._host_argv(["sudo", "-n", "true"]) == ["sudo", "-n", "true"]
+    monkeypatch.setenv("WRKSLOTS_SANDBOX", "cgroup")  # limits only: the host namespace
+    assert slotimage.box_kind() is None
+    # A slot's box refuses every image mount operation: its mounts are private.
     monkeypatch.setenv("WRKSLOTS_SANDBOX", "root")
-    assert slotimage.in_box()
+    assert slotimage.box_kind() == "slot"
+    with pytest.raises(slotimage.ImageError, match="inside a slot's box"):
+        slotimage._host_argv(["sudo", "-n", "true"])
+    with pytest.raises(slotimage.ImageError, match="inside a slot's box"):
+        slotimage.resolve_backend("auto")
+    with pytest.raises(slotimage.ImageError, match="inside a slot's box"):
+        slotimage.remove_mount_point(tmp_path / "nothing")
+    assert not slotimage.sudo_available()
+    # A coordinator box routes them through the user manager, but only where it can write.
+    monkeypatch.setenv("WRKSLOTS_BOX", "lead")
+    assert slotimage.box_kind() == "coordinator"
     if shutil.which("systemd-run") is None:
         pytest.skip("needs systemd-run")
-    argv = slotimage._host_argv(["sudo", "-n", "true"])
+    argv = slotimage._host_argv(["sudo", "-n", "true"], tmp_path)
     assert argv[1:4] == ["--user", "--quiet", "--collect"] and "--wait" in argv and "--pipe" in argv
     assert argv[-3:] == ["sudo", "-n", "true"]
-    monkeypatch.setenv("WRKSLOTS_SANDBOX", "cgroup")  # limits only: the host namespace
-    assert not slotimage.in_box()
+    read_only = tmp_path / "ro"
+    read_only.mkdir(mode=0o555)
+    if not os.access(read_only, os.W_OK):
+        with pytest.raises(slotimage.ImageError, match="inside a slot's box"):
+            slotimage._host_argv(["true"], read_only)
+    # The host mount table read through the user manager matches this host's own.
+    monkeypatch.setattr(slotimage, "_HOST_TABLE", None)
+    if runtime:
+        monkeypatch.setenv("XDG_RUNTIME_DIR", runtime)
+    if subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True, check=False).returncode:
+        pytest.skip("the systemd user manager is not reachable")
+    host = {entry.mount_point for entry in slotimage.verification_table()}
+    assert Path("/") in host and Path("/proc") in host
+
+
+def test_wait_for_exit_uses_the_processes_found_once() -> None:
+    child = subprocess.Popen(["sleep", "0.3"])
+    try:
+        assert slotimage._wait_for_exit([child.pid], 10)
+    finally:
+        child.wait()
+    lingering = subprocess.Popen(["sleep", "30"])
+    try:
+        assert not slotimage._wait_for_exit([lingering.pid], 0.2)
+    finally:
+        lingering.kill()
+        lingering.wait()
+    assert slotimage._wait_for_exit([], 0)
 
 
 _BOX_PROBE = r"""
@@ -936,3 +978,32 @@ def test_coordinator_box_confines_writes(box_base: Path, isolation: str, scope: 
     assert not (home / "work" / "probe").exists()
     status = wrkslots("status")
     assert "directory-without-row" not in status.stdout + status.stderr, status.stdout
+
+
+def test_coordinator_box_refuses_a_bare_slot_and_a_symlinked_agent_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = _fake_home(tmp_path)
+    project, environment = _small_project(tmp_path, home)
+    monkeypatch.setenv("HOME", str(home))
+    config = cli._load_config(str(project), "testhost")
+    view = imagecmd.box_view(config, "lead", "worktrees")
+    (project / ".agentctl").symlink_to(tmp_path / "missing")
+    with pytest.raises(cli.Refusal, match="symbolic link"):
+        imagecmd._agent_registry(view, project)
+    if not sandbox.scope_in_place_available():
+        pytest.skip("shell-command needs the user manager's D-Bus API")
+
+    def shell_command(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "wrkslots", "--machine", "testhost", "shell-command", *arguments],
+            cwd=project, capture_output=True, text=True, timeout=120, env=environment, check=False,
+        )
+
+    bare = shell_command("--box", "slot01", "--format", "json")
+    assert bare.returncode != 0 and "takes no SLOT" in bare.stderr, bare.stderr
+    misplaced = shell_command("slot01", "--box", "--format", "json", "--", "/bin/true")
+    assert misplaced.returncode != 0 and "takes no SLOT" in misplaced.stderr, misplaced.stderr
+    boxed = shell_command("--box", "--format", "json", "--", "/bin/echo", "x")
+    assert boxed.returncode == 0, boxed.stderr
+    assert json.loads(boxed.stdout)["command"].endswith(" -- /bin/echo x")

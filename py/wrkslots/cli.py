@@ -39986,6 +39986,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.print_help()
         return 0
     args = parser.parse_args(values)
+    # The raw words, for handlers that must know which side of `--` a word was on.
+    args.raw_arguments = values
     if args.userguide:
         guide = _load_userguide()
         print(guide, end="" if guide.endswith("\n") else "\n")

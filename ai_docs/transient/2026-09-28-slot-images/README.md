@@ -264,6 +264,33 @@ Mount propagation, verified on this host rather than assumed:
   in PID 1's namespace (`nsenter -t 1 -m findmnt`), the box sees it at once, and a slot created on
   the host after the box started appears inside and is writable.
 
+Review fixes (2026-09-29):
+
+- Only a coordinator box routes image operations to the host (it sets WRKSLOTS_BOX, and the
+  image directory must be writable from it). A slot's box refuses them: its view is private,
+  so a host-side mount was invisible to it, and the failed check left the mount and its loop
+  device behind.
+- Every image operation requested from a coordinator box is verified in the HOST mount table,
+  read through the user manager (`systemd-run --user --pipe cat /proc/self/mountinfo`) and
+  cached until the next host-side operation. The box's own table keeps copies of mounts that
+  existed when it started, under parents the box made private. Host-side umount events never
+  reach those copies, so they outlive the host mount. Observed: a state image unmounted on the
+  host stayed listed in the box, and the old check refused halfway through `image unmount`.
+  Removing or renaming a mount-point directory also runs on the host, because the kernel
+  refuses both for a directory that is a mount point in the caller's own namespace. It detaches
+  copies in other namespaces when the host does it, which also frees their loop devices. A mount
+  that fails its check is undone.
+- Detaching those copies inside the box when it is built is not possible in a userns box, where
+  mounts inherited from the parent namespace are locked. Keeping their parents slaves would let
+  every later host mount under those parents (sibling projects' slots, for example) appear in the
+  box, so the host-side verification above was chosen.
+- FUSE unmount scans /proc once for the image's fuse2fs servers (about 1.3 s on a 4,000-process
+  host) and then waits on those PIDs by pidfd, instead of rescanning every 50 ms.
+
+Follow-up, not done: the Python agentctl edition has no `--project-box`; the Rust edition does.
+Add it if the cross-language differential ever needs the flag, or if Python-only hosts need
+coordinator boxes.
+
 Real runs: `accept_coordinator_box.sh` passes (phase 1 creates both kinds of slot; phase 2 is
 agentctl-launched claude workers under root slot isolation, each confined to its slot). A Herdr
 pane test of `agentctl start sub --harness claude --project-box --box-isolation root`: the boxed

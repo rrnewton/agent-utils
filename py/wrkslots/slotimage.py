@@ -33,10 +33,12 @@ host (``discard`` for kernel mounts, ``fstrim`` on unmount for FUSE mounts).
 from __future__ import annotations
 
 import dataclasses
+import errno
 import datetime as _dt
 import hashlib
 import json
 import os
+import select
 import shutil
 import stat as _stat
 import subprocess
@@ -337,39 +339,80 @@ def _run(argv: Sequence[str], *, cwd: Path | None = None, timeout: float = 120.0
     return result.stdout
 
 
-def in_box() -> bool:
-    """Whether this process runs in a wrkslots box's own mount namespace.
+_IN_BOX_NAMESPACE: bool | None = None
+
+
+def _spec_directory_is_mounted() -> bool:
+    """Whether the root launcher's spec directory is a mount point here (true only in a box)."""
+
+    global _IN_BOX_NAMESPACE
+    if _IN_BOX_NAMESPACE is None:
+        directory = sandbox.spec_directory()
+        found = False
+        if directory is not None:
+            try:
+                found = any(entry.mount_point == directory for entry in mount_table())
+            except ImageError:
+                found = False
+        _IN_BOX_NAMESPACE = found
+    return _IN_BOX_NAMESPACE
+
+
+def box_kind() -> str | None:
+    """None outside any wrkslots box; ``coordinator`` or ``slot`` inside one.
 
     A box binds the root launcher's spec directory onto itself, so that path is
-    a mount point only inside a box; the environment marker covers a box built
-    without a per-user runtime directory.
+    a mount point only inside a box, and a box sets WRKSLOTS_SANDBOX; a
+    coordinator box (`wrkslots box`) also sets WRKSLOTS_BOX. Limits-only
+    (cgroup) runs stay in the host namespace and count as no box.
     """
 
-    if os.environ.get("WRKSLOTS_SANDBOX") in ("userns", "root"):
-        return True
-    directory = sandbox.spec_directory()
-    return directory is not None and os.path.ismount(directory)
+    sandboxed = os.environ.get("WRKSLOTS_SANDBOX")
+    if sandboxed == "cgroup":
+        return None
+    if sandboxed not in ("userns", "root") and not _spec_directory_is_mounted():
+        return None
+    return "coordinator" if os.environ.get("WRKSLOTS_BOX") else "slot"
+
+
+def in_box() -> bool:
+    """Whether this process runs in a wrkslots box's own mount namespace."""
+
+    return box_kind() is not None
 
 
 _BOX_MOUNT_HINT = (
-    "image mounts requested from inside a box run in the host's mount namespace through the "
-    "user's systemd manager (systemd-run --user); if that is unavailable, create and remove "
-    "image slots outside the box"
+    "image mounts requested from inside a coordinator box run in the host's mount namespace "
+    "through the user's systemd manager (systemd-run --user); if that is unavailable, create "
+    "and remove image slots outside the box"
+)
+_SLOT_BOX_REFUSAL = (
+    "slot images cannot be mounted, unmounted, converted, or removed from inside a slot's box "
+    "(its mounts are private to it); run this outside the box, or from a coordinator box "
+    "(`wrkslots box`)"
 )
 
 
-def _host_argv(argv: Sequence[str]) -> list[str]:
-    """``argv``, run in the host's mount namespace.
+def _via_user_manager(anchor: Path | None = None) -> bool:
+    """Whether a mount operation must run in the host namespace through the user manager.
 
-    Outside a box that is simply here. Inside one, a mount made here would land
-    in the box's private namespace, invisible to the host and to every worker
-    launched into the slot, so the command runs as a transient service of the
-    user's systemd manager, which lives in the host namespace. The box's slave
-    propagation then shows the result inside the box too.
+    False outside any box (the operation runs here). True in a coordinator box,
+    whose view receives the host's mounts under the worktrees directory. A
+    slot's box keeps its mounts private, so a mount made on the host would be
+    invisible to it and one made in it invisible to everyone else: refused.
+    ``anchor`` (an image directory) must also be writable here, which only a
+    coordinator box allows.
     """
 
-    if not in_box():
-        return list(argv)
+    kind = box_kind()
+    if kind is None:
+        return False
+    if kind == "coordinator" and (anchor is None or os.access(anchor, os.W_OK)):
+        return True
+    raise ImageError(_SLOT_BOX_REFUSAL)
+
+
+def _user_manager_argv(argv: Sequence[str]) -> list[str]:
     systemd_run = shutil.which("systemd-run")
     if systemd_run is None:
         raise ImageError(f"systemd-run is not installed; {_BOX_MOUNT_HINT}")
@@ -386,13 +429,101 @@ def _host_argv(argv: Sequence[str]) -> list[str]:
     ]
 
 
-def _run_on_host(argv: Sequence[str], *, timeout: float = 120.0) -> str:
+def _host_argv(argv: Sequence[str], anchor: Path | None = None) -> list[str]:
+    """``argv``, run in the host's mount namespace.
+
+    Outside a box that is simply here. In a coordinator box, a mount made here
+    would land in the box's own namespace, invisible to the host and to every
+    worker launched into the slot, so the command runs as a transient service of
+    the user's systemd manager, which lives in the host namespace; the box's
+    slave propagation then shows the result inside the box too.
+    """
+
+    return _user_manager_argv(argv) if _via_user_manager(anchor) else list(argv)
+
+
+#: The host mount table as read through the user manager, while nothing has
+#: changed it since (every host-side operation forgets it).
+_HOST_TABLE: list[MountEntry] | None = None
+
+
+def _forget_host_table() -> None:
+    global _HOST_TABLE
+    _HOST_TABLE = None
+
+
+def verification_table() -> list[MountEntry]:
+    """The mount table that decides whether an image is mounted: the host's.
+
+    Outside a box that is this process's own table. In a coordinator box it is
+    read in the host namespace through the user manager, because the box's own
+    table can keep copies of mounts that are gone on the host (a copy under a
+    mount whose propagation the box cut off) and so cannot verify a host-side
+    operation.
+    """
+
+    global _HOST_TABLE
+    if box_kind() != "coordinator":
+        return mount_table()
+    if _HOST_TABLE is None:
+        cat = shutil.which("cat") or "/bin/cat"
+        text = _run(_user_manager_argv([cat, "/proc/self/mountinfo"]))
+        _HOST_TABLE = _parse_mount_table(text)
+    return _HOST_TABLE
+
+
+def _run_on_host(argv: Sequence[str], *, anchor: Path | None = None, timeout: float = 120.0) -> str:
+    routed = _via_user_manager(anchor)
     try:
-        return _run(_host_argv(argv), timeout=timeout)
+        return _run(_user_manager_argv(argv) if routed else list(argv), timeout=timeout)
     except ImageError as exc:
-        if in_box():
+        if routed:
             raise ImageError(f"{exc} ({_BOX_MOUNT_HINT})") from exc
         raise
+    finally:
+        _forget_host_table()
+
+
+_PATH_OPERATION = (
+    "import os, sys\n"
+    "operation, *paths = sys.argv[1:]\n"
+    "os.rmdir(paths[0]) if operation == 'rmdir' else os.rename(paths[0], paths[1])\n"
+)
+
+
+def _host_path_operation(operation: str, *paths: Path, anchor: Path | None) -> None:
+    """rmdir or rename a slot mount point, in the host namespace when in a coordinator box.
+
+    A box can keep copies of a slot's mount that the host has already removed
+    (see :func:`verification_table`); the kernel refuses to remove or rename a
+    directory that is a mount point in the caller's own namespace, but detaches
+    such copies when the host removes it. Outside a box this is a plain call.
+    """
+
+    if not _via_user_manager(anchor):
+        if operation == "rmdir":
+            os.rmdir(paths[0])
+        else:
+            os.rename(paths[0], paths[1])
+        return
+    try:
+        _run(_user_manager_argv([os.path.realpath(sys.executable), "-I", "-c", _PATH_OPERATION, operation, *map(str, paths)]))
+    except ImageError as exc:
+        raise OSError(errno.EBUSY, f"{operation} {' '.join(map(str, paths))} on the host failed: {exc}") from exc
+    finally:
+        _forget_host_table()
+
+
+def remove_mount_point(path: Path, anchor: Path | None = None) -> None:
+    """Remove an empty slot mount-point directory (on the host from a coordinator box)."""
+
+    _host_path_operation("rmdir", path, anchor=anchor)
+
+
+def rename_mount_point(source: Path, destination: Path, anchor: Path | None = None) -> None:
+    """Rename an unmounted slot mount-point directory (on the host from a coordinator box)."""
+
+    _host_path_operation("rename", source, destination, anchor=anchor)
 
 
 def _privileged_argv() -> list[str]:
@@ -401,10 +532,10 @@ def _privileged_argv() -> list[str]:
     return [sudo, "-n", "--", os.path.realpath(sys.executable), "-I", str(helper)]
 
 
-def _privileged(operation: str, *arguments: str, timeout: float = 120.0) -> str:
+def _privileged(operation: str, *arguments: str, anchor: Path | None = None, timeout: float = 120.0) -> str:
     """Run one kernel-backend operation through the checking helper as root, in the host namespace."""
 
-    return _run_on_host([*_privileged_argv(), operation, *arguments], timeout=timeout)
+    return _run_on_host([*_privileged_argv(), operation, *arguments], anchor=anchor, timeout=timeout)
 
 
 def sudo_available() -> bool:
@@ -415,6 +546,20 @@ def sudo_available() -> bool:
         return subprocess.run(argv, capture_output=True, timeout=30, check=False).returncode == 0
     except (OSError, subprocess.TimeoutExpired, ImageError):
         return False
+
+
+def _wait_until(condition: Callable[[], bool], timeout: float) -> bool:
+    """Poll ``condition`` (host-side in a coordinator box) until it holds or ``timeout`` passes."""
+
+    interval = 0.25 if box_kind() == "coordinator" else 0.05
+    deadline = time.monotonic() + timeout
+    while True:
+        _forget_host_table()
+        if condition():
+            return True
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(interval)
 
 
 def fuse_available() -> bool:
@@ -431,6 +576,7 @@ def resolve_backend(preference: str) -> str:
         preference = override
     if preference not in BACKENDS:
         raise ImageError(f"image backend must be one of {', '.join(BACKENDS)}, not {preference!r}")
+    _via_user_manager()  # a slot's box refuses before any backend is probed
     if preference in ("auto", "kernel") and sudo_available():
         return "kernel"
     if preference == "kernel":
@@ -454,11 +600,15 @@ def _unescape(value: str) -> str:
 def mount_table(mountinfo: Path = Path("/proc/self/mountinfo")) -> list[MountEntry]:
     """Parse the calling process's mount table."""
 
-    entries: list[MountEntry] = []
     try:
         text = mountinfo.read_text(encoding="utf-8", errors="surrogateescape")
     except OSError as exc:
         raise ImageError(f"cannot read {mountinfo}: {exc}") from exc
+    return _parse_mount_table(text)
+
+
+def _parse_mount_table(text: str) -> list[MountEntry]:
+    entries: list[MountEntry] = []
     for line in text.splitlines():
         left, separator, right = line.partition(" - ")
         if not separator:
@@ -488,6 +638,22 @@ def _loop_backing_file(device: str) -> Path | None:
     return Path(backing.removesuffix(" (deleted)"))
 
 
+def _loop_devices() -> list[tuple[str, Path]]:
+    """Every bound loop device and its backing file, as (``/dev/loopN``, path)."""
+
+    found: list[tuple[str, Path]] = []
+    try:
+        names = os.listdir("/sys/block")
+    except OSError:
+        return found
+    for name in names:
+        if name.startswith("loop"):
+            backing = _loop_backing_file(name)
+            if backing is not None:
+                found.append((f"/dev/{name}", backing))
+    return found
+
+
 def _same_file(left: Path, right: Path) -> bool:
     try:
         a = os.stat(left)
@@ -503,7 +669,7 @@ def mounted_image_at(
     """Return ``(backend, image)`` for the topmost image mount at ``mount_point``."""
 
     target = Path(os.path.abspath(mount_point))
-    entries = table if table is not None else mount_table()
+    entries = table if table is not None else verification_table()
     result: tuple[str, Path] | None = None
     for entry in entries:
         if entry.mount_point != target:
@@ -538,12 +704,20 @@ def owned_mounts(control: Path) -> frozenset[tuple[Path, str]]:
         table = mount_table()
     except ImageError:
         return frozenset()
+    loops = _loop_devices()
     for image in images:
         for image_file, mount_point in (
             (image.slot_image, image.location),
             (image.state_image, image.state_mount),
         ):
             target = Path(os.path.abspath(mount_point))
+            # Another mount namespace can keep a copy of an earlier mount of this
+            # same image at its mount point after the host unmounted it (the kernel
+            # does not propagate an unmount into every namespace). That copy is
+            # still this slot's own storage, not a process using the slot.
+            for device, loop_file in loops:
+                if _same_file(loop_file, image_file):
+                    owned.add((target, device))
             for entry in table:
                 if entry.mount_point != target:
                     continue
@@ -589,9 +763,11 @@ def make_image_file(path: Path, size_bytes: int) -> None:
 
 
 def _fuse_mount(image_file: Path, mount_point: Path) -> None:
+    routed = _via_user_manager(image_file.parent)
     argv = ["fuse2fs", str(image_file), str(mount_point)]
     # Run the FUSE server in its own transient user service so it outlives the
-    # command (or agent sandbox) that mounted it.
+    # command (or agent sandbox) that mounted it. A user service also runs in
+    # the host's mount namespace, which a coordinator box needs.
     if shutil.which("systemd-run") is not None:
         digest = hashlib.sha256(os.path.abspath(image_file).encode()).hexdigest()[:12]
         unit = f"wrkslots-fuse-{digest}"
@@ -618,13 +794,12 @@ def _fuse_mount(image_file: Path, mount_point: Path) -> None:
             check=False,
             timeout=30,
         )
+        _forget_host_table()
         if probe.returncode == 0:
-            for _ in range(200):
-                if is_mounted(image_file, mount_point):
-                    return
-                time.sleep(0.05)
-            raise ImageError(f"fuse2fs did not mount {image_file} at {mount_point} within 10s")
-    if in_box():
+            if _wait_until(lambda: is_mounted(image_file, mount_point), 30):
+                return
+            raise ImageError(f"fuse2fs did not mount {image_file} at {mount_point} within 30s")
+    if routed:
         # A daemonizing fuse2fs run here would mount into the box's own namespace.
         raise ImageError(f"cannot start fuse2fs as a user service for {image_file}; {_BOX_MOUNT_HINT}")
     _run(argv, cwd=image_file.parent)
@@ -632,8 +807,22 @@ def _fuse_mount(image_file: Path, mount_point: Path) -> None:
         raise ImageError(f"fuse2fs exited without mounting {image_file} at {mount_point}")
 
 
+def _undo_mount(image_file: Path, mount_point: Path) -> str:
+    """Best-effort removal of a mount that failed its check; returns what happened."""
+
+    try:
+        unmount(image_file, mount_point)
+    except (ImageError, OSError) as exc:
+        return f"; undoing it failed too: {exc}"
+    return "; it was unmounted again"
+
+
 def mount(image_file: Path, mount_point: Path, backend_preference: str) -> str:
-    """Mount ``image_file`` at ``mount_point``; return the backend used."""
+    """Mount ``image_file`` at ``mount_point``; return the backend used.
+
+    Every check reads the host's mount table (:func:`verification_table`). A
+    mount that was made but fails its check is undone before the refusal.
+    """
 
     if is_mounted(image_file, mount_point):
         mounted = mounted_image_at(mount_point)
@@ -647,17 +836,25 @@ def mount(image_file: Path, mount_point: Path, backend_preference: str) -> str:
     backend = resolve_backend(backend_preference)
     if _fuse_servers(image_file):
         raise ImageError(f"a fuse2fs process still serves {image_file}; refusing a second mount")
-    if backend == "kernel":
-        _privileged("mount", str(image_file), str(mount_point))
-    else:
-        _fuse_mount(image_file, mount_point)
+    try:
+        if backend == "kernel":
+            _privileged("mount", str(image_file), str(mount_point), anchor=image_file.parent)
+        else:
+            _fuse_mount(image_file, mount_point)
+    except ImageError as exc:
+        _forget_host_table()
+        if is_mounted(image_file, mount_point):
+            raise ImageError(f"{exc}{_undo_mount(image_file, mount_point)}") from exc
+        raise
+    _forget_host_table()
     if not is_mounted(image_file, mount_point):
-        raise ImageError(f"mount reported success but {image_file} is not mounted at {mount_point}")
+        undone = _undo_mount(image_file, mount_point) if mounted_image_at(mount_point) is not None else ""
+        raise ImageError(f"mount reported success but {image_file} is not mounted at {mount_point}{undone}")
     return backend
 
 
 def _fuse_servers(image_file: Path) -> list[int]:
-    """PIDs of fuse2fs processes serving ``image_file``."""
+    """PIDs of fuse2fs processes serving ``image_file`` (one scan of /proc; slow on busy hosts)."""
 
     target = os.path.abspath(image_file)
     found: list[int] = []
@@ -683,36 +880,86 @@ def _fuse_servers(image_file: Path) -> list[int]:
     return found
 
 
+def _wait_for_exit(pids: Sequence[int], timeout: float) -> bool:
+    """Wait until every process in ``pids`` has exited; False on timeout.
+
+    Each process is pinned by a pidfd where the kernel offers one, so a reused
+    PID is never mistaken for the old process; otherwise it is probed with
+    signal 0.
+    """
+
+    handles: list[tuple[int, int | None]] = []
+    for pid in pids:
+        try:
+            handles.append((pid, os.pidfd_open(pid)))
+        except ProcessLookupError:
+            continue
+        except (AttributeError, OSError):
+            handles.append((pid, None))
+    deadline = time.monotonic() + timeout
+    try:
+        while handles:
+            remaining: list[tuple[int, int | None]] = []
+            for pid, descriptor in handles:
+                if descriptor is not None:
+                    alive = not select.select([descriptor], [], [], 0)[0]
+                else:
+                    try:
+                        os.kill(pid, 0)
+                        alive = True
+                    except ProcessLookupError:
+                        alive = False
+                    except PermissionError:
+                        alive = True
+                if alive:
+                    remaining.append((pid, descriptor))
+                elif descriptor is not None:
+                    os.close(descriptor)
+            handles = remaining
+            if not handles:
+                return True
+            if time.monotonic() > deadline:
+                return False
+            time.sleep(0.05)
+        return True
+    finally:
+        for _pid, descriptor in handles:
+            if descriptor is not None:
+                os.close(descriptor)
+
+
 def unmount(image_file: Path, mount_point: Path) -> None:
-    """Unmount ``image_file`` from ``mount_point`` if it is mounted there."""
+    """Unmount ``image_file`` from ``mount_point`` if it is mounted there.
+
+    Idempotent: an image that is not mounted there is left alone, so a
+    sequence interrupted halfway (state image unmounted, slot image not) is
+    finished by running it again. The result is verified in the host's mount
+    table.
+    """
 
     mounted = mounted_image_at(mount_point)
     if mounted is None or not _same_file(mounted[1], image_file):
         return
     backend = mounted[0]
     if backend == "kernel":
-        _privileged("umount", str(mount_point))
+        _privileged("umount", str(mount_point), anchor=image_file.parent)
     else:
+        # The kernel detaches the mount before the FUSE server has written its
+        # cached metadata back to the image. Mounting the image again while the
+        # old server is still flushing loses those writes (a file deleted just
+        # before unmount reappears), so wait for the servers found now to exit.
+        servers = _fuse_servers(image_file)
         subprocess.run(["fstrim", str(mount_point)], capture_output=True, check=False)
-        _run_on_host([shutil.which("fusermount") or "fusermount", "-u", str(mount_point)])
-        for _ in range(200):
-            if not is_mounted(image_file, mount_point):
-                break
-            time.sleep(0.05)
-        # The kernel detaches the mount before the FUSE server has written
-        # its cached metadata back to the image. Mounting the image again
-        # while the old server is still flushing loses those writes (a file
-        # deleted just before unmount reappears), so wait for it to exit.
-        deadline = time.monotonic() + 120
-        while _fuse_servers(image_file):
-            if time.monotonic() > deadline:
-                raise ImageError(f"fuse2fs for {image_file} did not exit after unmount")
-            time.sleep(0.05)
+        _run_on_host([shutil.which("fusermount") or "fusermount", "-u", str(mount_point)], anchor=image_file.parent)
+        _wait_until(lambda: not is_mounted(image_file, mount_point), 10)
+        if not _wait_for_exit(servers, 120):
+            raise ImageError(f"fuse2fs for {image_file} did not exit after unmount")
+    _forget_host_table()
     if is_mounted(image_file, mount_point):
         raise ImageError(f"{mount_point} is still mounted after unmount")
 
 
-def _prepare_fresh_root(mount_point: Path) -> None:
+def _prepare_fresh_root(mount_point: Path, anchor: Path | None = None) -> None:
     lost = mount_point / "lost+found"
     if lost.is_dir() and not lost.is_symlink():
         try:
@@ -721,7 +968,7 @@ def _prepare_fresh_root(mount_point: Path) -> None:
             # lost+found belongs to root on a kernel mount. It is harmless
             # residue, but a nested checkout or `git worktree add` needs an
             # empty root, so remove it with the same privilege that mounted it.
-            _privileged("rmdir-lost-found", str(mount_point))
+            _privileged("rmdir-lost-found", str(mount_point), anchor=anchor)
 
 
 def provision(
@@ -761,9 +1008,9 @@ def provision(
     image.state_mount.mkdir(mode=0o700)
     location.mkdir(mode=0o755)
     mount(image.slot_image, image.location, backend)
-    _prepare_fresh_root(image.location)
+    _prepare_fresh_root(image.location, image.directory)
     mount(image.state_image, image.state_mount, backend)
-    _prepare_fresh_root(image.state_mount)
+    _prepare_fresh_root(image.state_mount, image.directory)
     for name in STATE_SUBDIRECTORIES:
         (image.state_mount / name).mkdir(mode=0o700, exist_ok=True)
     ready = dataclasses.replace(image, phase="ready")
@@ -818,7 +1065,7 @@ def relocate(image: SlotImage, destination: Path) -> SlotImage:
         raise ImageError(f"slot mount point {source} is not empty after unmount")
     moved = dataclasses.replace(image, location=destination)
     _write_record(moved)
-    os.rename(source, destination)
+    rename_mount_point(source, destination, image.directory)
     mount(moved.slot_image, destination, image.backend)
     return moved
 
@@ -851,7 +1098,7 @@ def destroy(image: SlotImage, *, allow_content: bool = False) -> None:
     if image.location.exists() and not image.location.is_symlink():
         if any(image.location.iterdir()):
             raise ImageError(f"slot mount point {image.location} has content on the host side")
-        image.location.rmdir()
+        remove_mount_point(image.location, image.directory)
     for path in (image.slot_image, image.state_image, image.record_path):
         try:
             path.unlink()
@@ -861,7 +1108,7 @@ def destroy(image: SlotImage, *, allow_content: bool = False) -> None:
     if tmp_record.exists():
         tmp_record.unlink()
     if image.state_mount.exists():
-        image.state_mount.rmdir()
+        remove_mount_point(image.state_mount, image.directory)
     image.directory.rmdir()
 
 
@@ -909,7 +1156,7 @@ def trim(image: SlotImage) -> list[str]:
         if mounted is None:
             continue
         if mounted[0] == "kernel":
-            argv = _host_argv([*_privileged_argv(), "trim", str(mount_point)])
+            argv = _host_argv([*_privileged_argv(), "trim", str(mount_point)], image.directory)
         else:
             argv = ["fstrim", str(mount_point)]
         result = subprocess.run(argv, capture_output=True, text=True, check=False)
@@ -932,7 +1179,7 @@ def grow(image: SlotImage, new_ceiling_bytes: int) -> SlotImage:
         mounted = None
     os.truncate(image.slot_image, new_ceiling_bytes)
     if mounted is not None and mounted[0] == "kernel":
-        _privileged("grow", str(image.location), timeout=600)
+        _privileged("grow", str(image.location), anchor=image.directory, timeout=600)
     else:
         _run(["e2fsck", "-p", "-f", str(image.slot_image)], timeout=600)
         _run(["resize2fs", str(image.slot_image)], timeout=600)
@@ -957,7 +1204,7 @@ def discard_files(image: SlotImage) -> None:
         except FileNotFoundError:
             pass
     if image.state_mount.exists():
-        image.state_mount.rmdir()
+        remove_mount_point(image.state_mount, image.directory)
     image.directory.rmdir()
 
 
