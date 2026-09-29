@@ -37,6 +37,7 @@ import urllib.parse
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Set as AbstractSet
 from pathlib import Path
+from typing import TypedDict
 
 from wrkslots import __version__, imagecmd, sandbox, slotimage, yamlconfig
 
@@ -51,6 +52,8 @@ RETIRE_PENDING_LIMIT = 32
 RETIRE_PENDING_WAIT_LOCK_SECONDS = 5.0
 RETIRE_PENDING_MAX_WAIT_LOCK_SECONDS = 30.0
 VALIDATE_REMOVE_BATCH_LIMIT = 8
+AGENT_REMOVE_BATCH_LIMIT = 128
+AGENT_REMOVE_BATCH_WAIT_LOCK_SECONDS = 30.0
 _VALIDATE_BATCH_SEAL_SCHEMA = 1
 _VALIDATION_REMOVAL_PROOF_SCHEMA = 1
 _VALIDATION_REMOVAL_PROOF_BYTES_LIMIT = 64 * 1024
@@ -519,6 +522,17 @@ _TRUSTED_EXECUTABLE_DIRECTORY = Path("/usr/bin")
 # heartbeat refuse while it exists, so the bound stays finite and close to the
 # measured worst case.
 _VALIDATE_REMOVE_BATCH_CENSUS_SECONDS = 120.0
+# remove-agent-batch reuses its shared lsof evidence for at most this long.
+# The fresh per-check scan covers path, mapping, mount, and cgroup use at the
+# moment of each check; only inode-alias use relies on the shared scan, so
+# its age bounds how long such use could have been established unseen.  One
+# shared scan costs 10 to 36 seconds on a 4,000-process host (measured
+# 2026-08-27 and 2026-09-29; 35 s for three slots at load average 42 to 68),
+# and an item then costs 12 to 18 seconds, so a batch pays for a new scan
+# roughly once per 20 items.
+_AGENT_REMOVE_BATCH_CENSUS_MAX_AGE_SECONDS = 300.0
+_AGENT_REMOVE_BATCH_LSOF_SECONDS = 600.0
+_AGENT_REMOVE_BATCH_YIELD_SECONDS = 0.25
 _READ_ONLY_COMMAND_REAP_SECONDS = 1.0
 _RECLAIM_LIVE_USE_RECHECK_SECONDS = 0.25
 _LIVENESS_BATCH_REQUEST_SCHEMA = "wrkslots-liveness-batch-request/v1"
@@ -12141,6 +12155,8 @@ def _assert_slot_unused(
     proc_root: Path = Path("/proc"),
     ignore_current_process: bool = True,
     live_use_recheck: _LiveUseRecheckBudget | None = None,
+    agent_batch: _AgentRemoveBatchContext | None = None,
+    canonical_path: Path | None = None,
 ) -> None:
     while True:
         observation = _observe_slot_use_once(
@@ -12153,6 +12169,7 @@ def _assert_slot_unused(
             proc_root=proc_root,
             ignore_current_process=ignore_current_process,
             capture_generation=live_use_recheck is not None,
+            **_agent_batch_use_check(agent_batch, canonical_path),
         )
         if observation is None:
             return
@@ -12177,6 +12194,8 @@ def _observe_slot_use_once(
     proc_root: Path = Path("/proc"),
     ignore_current_process: bool = True,
     capture_generation: bool = False,
+    agent_batch: _AgentRemoveBatchContext | None = None,
+    canonical_path: Path | None = None,
 ) -> _LiveUseObservation | None:
     try:
         current_directory = Path.cwd().resolve(strict=True)
@@ -12185,6 +12204,24 @@ def _observe_slot_use_once(
     if _path_is_within(current_directory, slot_path):
         raise Refusal(
             f"the wrkslots process is running from inside slot {slot_path}; change directory and retry"
+        )
+    if agent_batch is not None:
+        if (
+            census is not None
+            or fallback_census is not None
+            or not use_lsof
+            or ignore_invoking_ancestry
+            or proc_root != Path("/proc")
+            or not ignore_current_process
+        ):
+            raise StateError(
+                "an agent removal batch replaces only the ordinary lsof process check"
+            )
+        return agent_batch.observe(
+            slot_path,
+            record,
+            canonical_path=slot_path if canonical_path is None else canonical_path,
+            capture_generation=capture_generation,
         )
     if census is not None:
         census.assert_slot_unused(
@@ -14255,6 +14292,7 @@ def _remove_preconditions(
     *,
     live_use_recheck: _LiveUseRecheckBudget | None = None,
     owner_consented: bool = False,
+    agent_batch: _AgentRemoveBatchContext | None = None,
 ) -> tuple[Path, tuple[Checkout, ...]]:
     if record.handoff is None:
         raise Refusal(
@@ -14274,6 +14312,7 @@ def _remove_preconditions(
             owner_consented=owner_consented,
         ),
         live_use_recheck=live_use_recheck,
+        **_agent_batch_use_check(agent_batch, slot_path),
     )
     return slot_path, final_checkouts
 
@@ -14315,6 +14354,7 @@ def _reclaim_preconditions(
                 finish.allow_live_validate_owner and record.slot_type == "validate"
             ),
             live_use_recheck=finish.live_use_recheck,
+            **_agent_batch_use_check(finish.agent_batch, slot_path),
         )
     final: list[Checkout] = []
     for checkout in record.checkouts:
@@ -14354,6 +14394,7 @@ def _reclaim_preconditions(
             vcs,
             live_use_recheck=finish.live_use_recheck,
             owner_consented=finish.owner_consented,
+            agent_batch=finish.agent_batch,
         )
     else:
         raise StateError("agent slot reclaim has neither salvage nor an owner handoff")
@@ -24250,6 +24291,10 @@ def _finish_remove_paths(
                         and record.slot_type == "validate"
                     ),
                     live_use_recheck=finish.live_use_recheck,
+                    **_agent_batch_use_check(
+                        finish.agent_batch,
+                        _slot_directory(config, record.slot, record.slot_type),
+                    ),
                 )
             if finish.validation_removal_proof is not None:
                 canonical_checkout, _active_checkout = _single_validation_checkout(
@@ -24322,6 +24367,7 @@ def _finish_remove_paths(
                             and record.slot_type == "validate"
                         ),
                         live_use_recheck=finish.live_use_recheck,
+                        **_agent_batch_use_check(finish.agent_batch, canonical_slot),
                     )
                 # Judge every cache again, after the use check and before the
                 # first deletion, so neither a change nor an exhausted budget
@@ -24947,9 +24993,16 @@ def _cmd_remove(
     private_cleanup: _PrivateCleanupContext | None = None,
     validation_removal_proof: _ValidationRemovalProof | None = None,
     emit: bool = True,
+    agent_batch: _AgentRemoveBatchContext | None = None,
 ) -> int:
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
+    if agent_batch is not None and (
+        private_cleanup is not None
+        or validation_removal_proof is not None
+        or bool(args.validate_complete)
+    ):
+        raise StateError("an agent removal batch cannot carry validation cleanup")
     salvage_archive_root = _local_salvage_archive_root(
         config, getattr(args, "salvage_archive_root", None)
     )
@@ -25090,6 +25143,11 @@ def _cmd_remove(
             raise Refusal(
                 "--salvage-archive-root applies only to agent slots that require Git salvage"
             )
+        if agent_batch is not None and record.slot_type != "agent":
+            raise Refusal(
+                "remove-agent-batch accepts only agent slots; use remove-validate-batch "
+                "for validation slots"
+            )
         create_rows: tuple[_CreateJournalClassification, ...] = ()
         if scoped_validation_finish:
             create_rows = _classify_disjoint_create_journals_for_record(
@@ -25214,6 +25272,7 @@ def _cmd_remove(
             ignore_invoking_ancestry=live_validate_owner,
             census=None if private_cleanup is None else private_cleanup.shared_census,
             live_use_recheck=live_use_recheck,
+            **_agent_batch_use_check(agent_batch, slot_path),
         )
         if scoped_validation_finish:
             boundary_states, boundary_archives = _validate_global_state(
@@ -25397,6 +25456,7 @@ def _cmd_remove(
             validation_removal_proof=validation_removal_proof,
             live_use_recheck=live_use_recheck,
             owner_consented=owner_consent is not None or owner_release is not None,
+            agent_batch=agent_batch,
         )
         prepared_private_finish = _begin_finish(
             config,
@@ -25955,6 +26015,657 @@ def _cmd_remove_validate_batch(args: argparse.Namespace) -> int:
     # A retained item is a refusal of that item.  Success means every requested
     # slot was removed; a batch that removed nothing never reports success.
     return 0 if removed and not retained else 1
+
+
+# ---------------------------------------------------------------------------
+# remove-agent-batch
+#
+# The ordinary `remove` of one agent slot runs its process-use check four or
+# five times inside one registry-lock hold: before salvage, twice before the
+# path fence, after the fence, and again after nested Git repositories are
+# judged.  Each check starts `lsof +D`, whose cost is the system-wide scan of
+# every process's open descriptors rather than the slot's tree (about 10
+# seconds on an idle 4,000-process host and 20 to 36 seconds under load), so
+# one slot held the lock for minutes.  The batch runs that lsof scan once for
+# every target, outside any lock, and keeps every other check.  At each of
+# the ordinary check points it (1) confirms the slot directory is still the
+# directory the shared scan covered, (2) refuses on any shared-scan match, and
+# (3) runs a fresh in-process scan of /proc for path, mapping, mount, and
+# owner-cgroup use, which costs about one second on the same host.  The
+# fresh scan is what catches a process that began using the slot after the
+# shared scan; the shared scan is what catches use through a hardlink or
+# other inode alias that no path names.
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class _LsofUseRecord:
+    """One complete ``p``/``c``/``f``/``n`` record from an ``lsof -F`` stream."""
+
+    pid: int
+    command: str
+    descriptor: str
+    name: str
+
+
+def _parse_lsof_use_records(
+    output: str,
+) -> tuple[tuple[_LsofUseRecord, ...], bool]:
+    """Return every complete file record and whether the stream was malformed.
+
+    This applies the same stream rules as `_parse_lsof_use_diagnostic`: each
+    unique ``p`` set carries one ``c`` before one or more complete ``f``/``n``
+    pairs.  Unlike that parser it keeps every record, because a shared scan of
+    several slots must attribute each record to the slot it names.
+    """
+
+    records: list[_LsofUseRecord] = []
+    malformed = False
+    seen: set[int] = set()
+    pid: int | None = None
+    command: str | None = None
+    descriptor: str | None = None
+    complete_file = False
+
+    def finish_process() -> None:
+        nonlocal malformed
+        if pid is not None and (
+            command is None or descriptor is not None or not complete_file
+        ):
+            malformed = True
+
+    for line in output.splitlines():
+        if not line:
+            malformed = True
+            descriptor = None
+            continue
+        field, value = line[0], line[1:]
+        if field == "p":
+            finish_process()
+            command = None
+            descriptor = None
+            complete_file = False
+            if not re.fullmatch(r"[0-9]{1,20}", value):
+                malformed = True
+                pid = None
+                continue
+            pid = int(value)
+            if pid in seen:
+                malformed = True
+            seen.add(pid)
+        elif field == "c":
+            if pid is None or not value or command is not None or complete_file or descriptor is not None:
+                malformed = True
+                continue
+            command = value
+        elif field == "f":
+            if pid is None or not value or command is None or descriptor is not None:
+                malformed = True
+            descriptor = value if pid is not None and value else None
+        elif field == "n":
+            if pid is None or command is None or descriptor is None or not value:
+                malformed = True
+                descriptor = None
+                continue
+            records.append(_LsofUseRecord(pid, command, descriptor, value))
+            descriptor = None
+            complete_file = True
+        else:
+            malformed = True
+            descriptor = None
+    finish_process()
+    return tuple(records), malformed
+
+
+def _lsof_executable() -> Path | None:
+    return next(
+        (
+            candidate
+            for candidate in (Path("/usr/bin/lsof"), Path("/usr/sbin/lsof"))
+            if candidate.is_file() and os.access(candidate, os.X_OK)
+        ),
+        None,
+    )
+
+
+def _directory_identity(path: Path) -> tuple[int, int] | None:
+    """Return a real directory's device and inode, or None for anything else."""
+
+    try:
+        observed = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise Refusal(f"cannot inspect slot directory {path}: {exc}") from exc
+    if not stat.S_ISDIR(observed.st_mode):
+        return None
+    return observed.st_dev, observed.st_ino
+
+
+def _capture_agent_remove_batch_census(
+    targets: Sequence[Path],
+) -> _ProcessPathCensus:
+    """Run one ``lsof +D`` over every target and attribute each record.
+
+    lsof runs as the invoking user, exactly as the ordinary check does, so it
+    covers the same processes.  A record whose name is not below exactly one
+    requested target is attributed to every target: an unattributable record
+    must never make a slot look unused.
+    """
+
+    if not targets:
+        return _ProcessPathCensus((), (), owner_cgroup_complete=False)
+    lsof = _lsof_executable()
+    if lsof is None:
+        raise Refusal(
+            "remove-agent-batch needs lsof for its shared process census; "
+            "use single-slot remove on this host"
+        )
+    command = [str(lsof), "-nP", "-Fpcfn"]
+    for target in targets:
+        command.extend(("+D", str(target)))
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            check=False,
+            timeout=_AGENT_REMOVE_BATCH_LSOF_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise Refusal(
+            "process use is indeterminate because the shared lsof census exceeded "
+            f"its {_AGENT_REMOVE_BATCH_LSOF_SECONDS:.0f} s bound"
+        ) from exc
+    except OSError as exc:
+        raise Refusal(f"process use is indeterminate because lsof failed: {exc}") from exc
+    stdout = completed.stdout.decode("utf-8", errors="surrogateescape")
+    stderr = completed.stderr.decode("utf-8", errors="replace")
+    for target in targets:
+        if not _unrelated_lsof_warnings(stderr, target):
+            raise Refusal(
+                "process use is indeterminate because lsof reported: "
+                f"{stderr.strip().splitlines()[0]}"
+            )
+    records, malformed = _parse_lsof_use_records(stdout)
+    if malformed:
+        raise Refusal(
+            "process use is indeterminate because lsof returned malformed field output"
+        )
+    if completed.returncode not in (0, 1):
+        raise Refusal(
+            f"process use is indeterminate because lsof exited {completed.returncode}"
+        )
+    matches: list[tuple[int, str, str, str]] = []
+    for item in records:
+        name = item.name.removesuffix(" (deleted)")
+        owners = (
+            [target for target in targets if _path_is_within(Path(name), target)]
+            if name.startswith("/")
+            else []
+        )
+        detail = (
+            f"command={_lsof_diagnostic_excerpt(item.command)} "
+            f"fd={_lsof_diagnostic_excerpt(item.descriptor)} "
+            f"file={_lsof_diagnostic_excerpt(item.name)}"
+        )
+        for target in owners if len(owners) == 1 else targets:
+            matches.append((item.pid, str(target), "shared-lsof", detail))
+    return _ProcessPathCensus((), tuple(matches), owner_cgroup_complete=False)
+
+
+def _readable_link_target(path: Path) -> str | None:
+    """Return an absolute link target, or None when absent or unreadable.
+
+    A link the invoking user may not read is also invisible to lsof run as
+    that user, which is what the ordinary check relies on, so it is not
+    evidence either way.  Other failures still refuse.
+    """
+
+    try:
+        raw = os.readlink(path)
+    except OSError as exc:
+        if exc.errno in (
+            errno.ENOENT, errno.ESRCH, errno.EINVAL, errno.EACCES, errno.EPERM,
+        ):
+            return None
+        raise Refusal(f"process use is indeterminate because {path} failed: {exc}") from exc
+    raw = raw.removesuffix(" (deleted)")
+    if not raw.startswith("/"):
+        return None
+    return os.path.normpath(raw)
+
+
+def _agent_batch_fresh_use(
+    slot_path: Path,
+    record: ActiveRecord | None,
+    *,
+    capture_generation: bool,
+    proc_root: Path = Path("/proc"),
+) -> _LiveUseObservation | None:
+    """Scan /proc once for current use of ``slot_path`` without starting lsof.
+
+    For every process it reads the owner cgroup when that is evidence for the
+    record, every mount table (as the ordinary check does after lsof), and the
+    cwd, root, exe, descriptor, and mapping paths it may read.  It stops at the
+    first use found; the caller may wait for that exact process generation
+    and then repeat the whole scan.
+    """
+
+    base = str(slot_path)
+    prefix = base + "/"
+
+    def within(target: str | None) -> bool:
+        return target is not None and (target == base or target.startswith(prefix))
+
+    try:
+        pid_dirs = [path for path in proc_root.iterdir() if path.name.isdigit()]
+    except OSError as exc:
+        raise Refusal(f"cannot inspect live processes: {exc}") from exc
+    current_pid = os.getpid()
+    mount_verdicts = _MountTableVerdicts(slot_path)
+    owner_cgroup = (
+        record.owner.cgroup_path
+        if record is not None
+        and record.owner is not None
+        and _owner_cgroup_is_evidence(record)
+        else None
+    )
+    slot_bytes = base.encode("utf-8", errors="surrogateescape")
+    for pid_dir in sorted(pid_dirs, key=lambda item: int(item.name)):
+        pid = int(pid_dir.name)
+        if pid == current_pid:
+            continue
+        start_ticks: int | None = None
+        if capture_generation:
+            try:
+                generation = _read_process_stat(pid_dir)
+            except Refusal:
+                generation = None
+            start_ticks = None if generation is None else generation.start_ticks
+        if _process_uids(pid_dir) is None:
+            continue
+        uses: list[str] = []
+        if owner_cgroup is not None:
+            try:
+                cgroup = _read_process_cgroup(pid_dir)
+            except Refusal as exc:
+                if not pid_dir.exists():
+                    continue
+                raise Refusal(
+                    f"recorded cgroup use is indeterminate for PID {pid}: {exc}"
+                ) from exc
+            if cgroup == owner_cgroup:
+                raise Refusal(
+                    f"live process {pid} remains in recorded owner cgroup {cgroup}"
+                )
+        uses.extend(mount_verdicts.uses(pid_dir))
+        if not uses:
+            for name in ("cwd", "root", "exe"):
+                target = _readable_link_target(pid_dir / name)
+                if within(target):
+                    uses.append(f"{name}={target}")
+                    break
+        if not uses:
+            fd_dir = pid_dir / "fd"
+            try:
+                descriptors = os.listdir(fd_dir)
+            except OSError as exc:
+                if exc.errno not in (
+                    errno.ENOENT, errno.ESRCH, errno.EACCES, errno.EPERM,
+                ):
+                    raise Refusal(
+                        f"process use is indeterminate because {fd_dir} cannot be read: {exc}"
+                    ) from exc
+                descriptors = []
+            for descriptor in descriptors:
+                target = _readable_link_target(fd_dir / descriptor)
+                if within(target):
+                    uses.append(f"fd/{descriptor}={target}")
+                    break
+        if not uses:
+            maps_path = pid_dir / "maps"
+            try:
+                maps = maps_path.read_bytes()
+            except OSError as exc:
+                if exc.errno not in (
+                    errno.ENOENT, errno.ESRCH, errno.EACCES, errno.EPERM,
+                ):
+                    raise Refusal(
+                        f"process use is indeterminate because {maps_path} cannot be read: {exc}"
+                    ) from exc
+                maps = b""
+            if slot_bytes in maps:
+                for line in maps.split(b"\n"):
+                    if slot_bytes not in line:
+                        continue
+                    fields = line.split(maxsplit=5)
+                    if len(fields) != 6:
+                        continue
+                    mapped = fields[5].decode(
+                        "utf-8", errors="surrogateescape"
+                    ).removesuffix(" (deleted)")
+                    if within(os.path.normpath(mapped) if mapped.startswith("/") else None):
+                        uses.append(f"map={mapped}")
+                        break
+        if uses:
+            refusal = Refusal(
+                f"live process {pid} uses slot {slot_path}: {uses[0]}; stop it and retry"
+            )
+            if not capture_generation:
+                raise refusal
+            return _LiveUseObservation(pid, start_ticks, proc_root, refusal)
+    return None
+
+
+@dataclasses.dataclass
+class _AgentRemoveBatchContext:
+    """Shared lsof evidence for one agent removal batch and its fresh checks.
+
+    ``identities`` holds each target directory's device and inode from before
+    the shared scan; a rename keeps them, so the fenced path is checked too.
+    ``censused`` names the targets whose identity was unchanged across the
+    scan that produced ``census``.
+
+    An image-backed slot is the one exception to identity preservation: its
+    path fence unmounts the image, renames the empty mount point, and mounts
+    the image again, so the fenced directory is a new mount.  That unmount is
+    refused while any process holds a descriptor, working directory, root, or
+    mapping in the file system, and no hard link can cross into it, so a
+    completed relocation proves there was no use at a moment after the shared
+    scan.  The fresh scan still runs at the fenced path.
+    """
+
+    identities: dict[Path, tuple[int, int]]
+    config: Config | None = None
+    census: _ProcessPathCensus = dataclasses.field(
+        default_factory=lambda: _ProcessPathCensus((), (), owner_cgroup_complete=False)
+    )
+    censused: frozenset[Path] = frozenset()
+    captured_at: float = 0.0
+    shared_census_count: int = 0
+    shared_census_seconds: float = 0.0
+    fresh_scan_count: int = 0
+    fresh_scan_seconds: float = 0.0
+
+    def capture(self, targets: Sequence[Path]) -> None:
+        """Replace the shared evidence with one new scan of ``targets``."""
+
+        selected = [
+            target
+            for target in targets
+            if _directory_identity(target) == self.identities[target]
+        ]
+        self.census = _ProcessPathCensus((), (), owner_cgroup_complete=False)
+        self.censused = frozenset()
+        started = time.monotonic()
+        self.shared_census_count += 1
+        try:
+            census = _capture_agent_remove_batch_census(selected)
+        finally:
+            self.shared_census_seconds += time.monotonic() - started
+        self.census = census
+        self.censused = frozenset(
+            target
+            for target in selected
+            if _directory_identity(target) == self.identities[target]
+        )
+        self.captured_at = time.monotonic()
+        _interrupt_for_test("after-agent-batch-shared-census")
+
+    def observe(
+        self,
+        check_path: Path,
+        record: ActiveRecord | None,
+        *,
+        canonical_path: Path,
+        capture_generation: bool,
+    ) -> _LiveUseObservation | None:
+        if canonical_path not in self.censused:
+            raise Refusal(
+                f"slot {canonical_path} was not covered by this batch's shared "
+                "process census"
+            )
+        if _directory_identity(check_path) != self.identities[
+            canonical_path
+        ] and not self._relocated_image(check_path, canonical_path):
+            raise Refusal(
+                f"slot directory {check_path} is not the directory this batch's "
+                "shared process census covered"
+            )
+        self.census.assert_slot_unused(canonical_path, None)
+        started = time.monotonic()
+        self.fresh_scan_count += 1
+        try:
+            return _agent_batch_fresh_use(
+                check_path, record, capture_generation=capture_generation
+            )
+        finally:
+            self.fresh_scan_seconds += time.monotonic() - started
+
+    def _relocated_image(self, check_path: Path, canonical_path: Path) -> bool:
+        """Whether ``check_path`` is the fenced remount of the slot's own image."""
+
+        if self.config is None or check_path == canonical_path:
+            return False
+        image = _slot_image_at(self.config, check_path)
+        return (
+            image is not None
+            and image.slot_type == "agent"
+            and image.slot == canonical_path.name
+            and slotimage.is_mounted(image.slot_image, check_path)
+        )
+
+
+class _AgentBatchUseCheck(TypedDict, total=False):
+    agent_batch: _AgentRemoveBatchContext
+    canonical_path: Path
+
+
+def _agent_batch_use_check(
+    agent_batch: _AgentRemoveBatchContext | None,
+    canonical_path: Path | None,
+) -> _AgentBatchUseCheck:
+    """Keywords that route one slot-use check through an agent removal batch.
+
+    Outside a batch this is empty, so every ordinary use check receives
+    exactly the arguments it always has, and so does any replacement
+    installed for it.
+    """
+
+    if agent_batch is None:
+        return {}
+    if canonical_path is None:
+        return {"agent_batch": agent_batch}
+    return {"agent_batch": agent_batch, "canonical_path": canonical_path}
+
+
+def _read_agent_batch_items(args: argparse.Namespace) -> tuple[tuple[str, int], ...]:
+    raw: list[str] = list(getattr(args, "slots", None) or ())
+    input_path = getattr(args, "input", None)
+    if input_path is not None:
+        try:
+            text = Path(input_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise Refusal(f"cannot read --input {input_path}: {exc}") from exc
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                raw.append(stripped)
+    if not raw:
+        raise Refusal("remove-agent-batch needs at least one --slot or a non-empty --input")
+    requested = tuple(_parse_validate_batch_slot(value) for value in raw)
+    if len(requested) > AGENT_REMOVE_BATCH_LIMIT:
+        raise Refusal(
+            f"remove-agent-batch accepts at most {AGENT_REMOVE_BATCH_LIMIT} slots; "
+            "run another bounded batch for the remainder"
+        )
+    if len({slot for slot, _generation in requested}) != len(requested):
+        raise Refusal("remove-agent-batch received the same slot more than once")
+    return requested
+
+
+def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
+    requested = _read_agent_batch_items(args)
+    config = _load_config(args.project_root, args.machine)
+    if getattr(args, "salvage_archive_root", None) is not None:
+        _local_salvage_archive_root(config, args.salvage_archive_root)
+    started = time.monotonic()
+    removed: list[dict[str, object]] = []
+    refused: list[dict[str, object]] = []
+    recovery_required = False
+
+    def refuse(slot: str, generation: int, reason: str, **extra: object) -> None:
+        refused.append(
+            {"slot": slot, "generation": generation, "reason": reason, **extra}
+        )
+
+    # Read-only preflight.  It selects the paths the shared scan must cover;
+    # every item is decided again under the registry lock by ordinary remove.
+    state = _load_active(config, require_repository=False)
+    records = {record.slot: record for record in state.slots}
+    eligible: list[tuple[str, int, Path]] = []
+    identities: dict[Path, tuple[int, int]] = {}
+    for slot, generation in requested:
+        record = records.get(slot)
+        if record is None:
+            refuse(slot, generation, f"slot {slot!r} is not active on machine {config.machine}")
+            continue
+        if record.generation != generation:
+            refuse(
+                slot,
+                generation,
+                f"slot {slot} generation is {record.generation}, not {generation}",
+            )
+            continue
+        if record.slot_type != "agent":
+            refuse(
+                slot,
+                generation,
+                "remove-agent-batch accepts only agent slots; use remove-validate-batch "
+                "for validation slots",
+            )
+            continue
+        slot_path = _slot_directory(config, slot, record.slot_type)
+        identity = _directory_identity(slot_path)
+        if identity is None:
+            refuse(
+                slot,
+                generation,
+                f"slot directory is missing or unsafe: {slot_path}; use "
+                "recover-absent-agent-row for a row whose storage is absent",
+            )
+            continue
+        identities[slot_path] = identity
+        eligible.append((slot, generation, slot_path))
+    context = _AgentRemoveBatchContext(identities, config=config)
+    remaining_targets = [slot_path for _slot, _generation, slot_path in eligible]
+    wait_seconds = (
+        args.wait_lock if args.wait_lock > 0 else AGENT_REMOVE_BATCH_WAIT_LOCK_SECONDS
+    )
+    for index, (slot, generation, slot_path) in enumerate(eligible):
+        if context.shared_census_count == 0 or (
+            time.monotonic() - context.captured_at
+            > _AGENT_REMOVE_BATCH_CENSUS_MAX_AGE_SECONDS
+        ):
+            try:
+                context.capture(remaining_targets[index:])
+            except Refusal as exc:
+                for later_slot, later_generation, _path in eligible[index:]:
+                    refuse(later_slot, later_generation, str(exc))
+                break
+        if index:
+            # Waiters poll the registry lock every 50 ms; leave them a window
+            # between items so a batch never starves heartbeats.
+            time.sleep(_AGENT_REMOVE_BATCH_YIELD_SECONDS)
+        item_args = argparse.Namespace(**vars(args))
+        item_args.command = "remove"
+        item_args.slot = slot
+        item_args.expected_generation = generation
+        item_args.validate_complete = False
+        item_args.validation_proof_manifest = None
+        item_args.completed_record = None
+        item_args.wait_lock = wait_seconds
+        item_started = time.monotonic()
+        try:
+            _cmd_remove(item_args, emit=False, agent_batch=context)
+        except StateError as exc:
+            recovery_required = True
+            refuse(
+                slot,
+                generation,
+                str(exc),
+                seconds=round(time.monotonic() - item_started, 3),
+                recovery_required=True,
+            )
+            for later_slot, later_generation, _path in eligible[index + 1 :]:
+                refuse(
+                    later_slot,
+                    later_generation,
+                    "batch stopped after a state error; run 'wrkslots recover' and "
+                    "retry the remaining slots",
+                )
+            break
+        except Refusal as exc:
+            refuse(
+                slot,
+                generation,
+                str(exc),
+                seconds=round(time.monotonic() - item_started, 3),
+            )
+        else:
+            removed.append(
+                {
+                    "slot": slot,
+                    "generation": generation,
+                    "seconds": round(time.monotonic() - item_started, 3),
+                }
+            )
+        _interrupt_for_test("after-agent-batch-item")
+    order = {slot: position for position, (slot, _generation) in enumerate(requested)}
+    refused.sort(key=lambda item: order[_as_str(item["slot"], "refused slot")])
+    return {
+        "schema": 1,
+        "batch_limit": AGENT_REMOVE_BATCH_LIMIT,
+        "requested": len(requested),
+        "removed": removed,
+        "refused": refused,
+        "recovery_required": recovery_required,
+        "shared_process_censuses": context.shared_census_count,
+        "shared_process_census_seconds": round(context.shared_census_seconds, 3),
+        "fresh_process_scans": context.fresh_scan_count,
+        "fresh_process_scan_seconds": round(context.fresh_scan_seconds, 3),
+        "seconds": round(time.monotonic() - started, 3),
+    }
+
+
+def _cmd_remove_agent_batch(args: argparse.Namespace) -> int:
+    payload = _remove_agent_batch(args)
+    removed = _as_list(payload["removed"], "removed")
+    refused = _as_list(payload["refused"], "refused")
+    if args.format == "json":
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        print(
+            f"requested={payload['requested']} removed={len(removed)} "
+            f"refused={len(refused)} "
+            f"shared_process_censuses={payload['shared_process_censuses']} "
+            f"fresh_process_scans={payload['fresh_process_scans']} "
+            f"seconds={payload['seconds']}"
+        )
+        for value in removed:
+            row = _as_mapping(value, "removed item")
+            print(f"REMOVED: {row['slot']} generation={row['generation']}")
+        for value in refused:
+            row = _as_mapping(value, "refused item")
+            print(
+                f"REFUSED: {row['slot']} generation={row['generation']} "
+                f"reason={row['reason']}"
+            )
+        if payload["recovery_required"]:
+            print("RECOVERY REQUIRED: run 'wrkslots recover' before another removal")
+    # Success means every requested slot was removed.  Any refusal, including
+    # a batch that removed nothing, is exit status 1.
+    return 0 if removed and not refused else 1
 
 
 def _recover_partial_updates(config: Config, discard: bool) -> bool:
@@ -35798,6 +36509,11 @@ class _FinishContext:
     validation_removal_proof: _ValidationRemovalProof | None = None
     live_use_recheck: _LiveUseRecheckBudget | None = None
     owner_consented: bool = False
+    # Set only by remove-agent-batch.  It replaces the ordinary per-check lsof
+    # run with the batch's shared lsof evidence plus a fresh in-process scan,
+    # and is never written to the finish journal: recovery of an interrupted
+    # item runs the ordinary checks.
+    agent_batch: _AgentRemoveBatchContext | None = None
     # Filled by the cache-removal step from the finish journal: one entry per
     # nested repository judged disposable (checkout, canonical .git path, HEAD,
     # containing remote ref, and the ignored entries deleted with it).
@@ -39587,6 +40303,71 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--format", choices=("human", "json"), default="human"
     )
     remove_validate_batch.set_defaults(handler=_cmd_remove_validate_batch)
+
+    remove_agent_batch = subparsers.add_parser(
+        "remove-agent-batch",
+        help="remove a bounded batch of reclaimable agent slots",
+        description=(
+            "Attempt ordinary remove for each requested agent slot, at most "
+            f"{AGENT_REMOVE_BATCH_LIMIT} per batch, with the same authority as remove (an "
+            "expired heartbeat and a proven-dead recorded owner, a 'wrkslots release' by "
+            "the exact owner that still applies, or the owner-consented handoff exception) "
+            "and the same per-slot checks: registered liveness, handoff read, Git "
+            "salvage to the recorded remote with read-back, path fence, and archive. "
+            "Only the lsof part of the process-use check is shared: one lsof scan covers "
+            "every requested slot, runs before any registry lock is taken, and is "
+            f"repeated when it is older than {_AGENT_REMOVE_BATCH_CENSUS_MAX_AGE_SECONDS:.0f} "
+            "seconds. At every point where remove checks process use, the batch confirms "
+            "the slot directory is the one that scan covered, refuses on any use that scan "
+            "saw, and scans /proc afresh for path, mapping, mount, and owner-cgroup use. "
+            "Each slot is removed in its own registry-lock hold, and the lock is released "
+            "between slots. A refused slot is reported with its reason and left in place; "
+            "the remaining slots are still attempted. Exit status is 0 only when every "
+            "requested slot was removed, 1 when any slot was refused (including a batch "
+            "that removed nothing), and 3 when the whole batch was refused."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    remove_agent_batch.add_argument(
+        "--slot",
+        dest="slots",
+        action="append",
+        metavar="SLOT=GENERATION",
+        help="exact agent slot and current generation (repeatable)",
+    )
+    remove_agent_batch.add_argument(
+        "--input",
+        metavar="FILE",
+        help=(
+            "file with one SLOT=GENERATION per line; blank lines and lines starting "
+            "with # are ignored; combined with any --slot"
+        ),
+    )
+    remove_agent_batch.add_argument(
+        "--coordinator-authorized",
+        action="store_true",
+        help=(
+            "record that each removal was coordinator-authorized; required, as for remove, "
+            "for the owner-consented handoff exception, which removes an agent slot whose "
+            "recorded owner is still alive and has not run 'wrkslots release'"
+        ),
+    )
+    remove_agent_batch.add_argument(
+        "--coordinator-pid",
+        type=int,
+        required=True,
+        metavar="PID",
+        help="live current coordinator PID recorded with each operation",
+    )
+    remove_agent_batch.add_argument(
+        "--salvage-archive-root",
+        metavar="ABSOLUTE_PATH",
+        help="as for remove: verified local bundle fallback when the remote salvage push refuses",
+    )
+    remove_agent_batch.add_argument(
+        "--format", choices=("human", "json"), default="human"
+    )
+    remove_agent_batch.set_defaults(handler=_cmd_remove_agent_batch)
 
     recover_absent = subparsers.add_parser(
         "recover-absent-validate-rows",

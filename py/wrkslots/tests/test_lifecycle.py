@@ -39312,3 +39312,569 @@ def test_an_older_client_keeps_working_beside_an_owner_release(tmp_path: Path) -
     assert str(row["owner_release"]["void_reason"]).startswith(  # type: ignore[index]
         "the heartbeat was renewed after the release"
     )
+
+
+# ---------------------------------------------------------------------------
+# remove-agent-batch
+# ---------------------------------------------------------------------------
+
+
+def dead_agent_batch_project(
+    tmp_path: Path, count: int = 3
+) -> tuple[Path, Path, list[str]]:
+    """Create ``count`` finished agent slots whose recorded owners are dead."""
+
+    project, repository, _remote = make_project(tmp_path)
+    slots = [f"slot{index:02d}" for index in range(1, count + 1)]
+    for index, slot in enumerate(slots, start=1):
+        made = create(project, slot=slot, agent=f"codex-{index}", branch=f"codex/{slot}")
+        assert made.returncode == 0, made.stderr
+        commit_task(repository, checkout(project, slot), f"codex/{slot}")
+        handed_off = finish(project, slot, f"codex-{index}")
+        assert handed_off.returncode == 0, handed_off.stderr
+    for slot in slots:
+        mark_owner_dead(project, slot=slot)
+    set_liveness(project, "dead")
+    return project, repository, slots
+
+
+def agent_batch_arguments(project: Path, slots: Sequence[str], *extra: str) -> list[str]:
+    return [
+        "--project-root",
+        str(project),
+        "remove-agent-batch",
+        "--coordinator-pid",
+        str(os.getpid()),
+        *(f"--slot={slot}=1" for slot in slots),
+        "--format",
+        "json",
+        *extra,
+    ]
+
+
+def remove_agent_batch(
+    project: Path,
+    slots: Sequence[str],
+    *extra: str,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return raw_command(project, *agent_batch_arguments(project, slots, *extra)[2:], env=env)
+
+
+def in_process_agent_batch(
+    project: Path, slots: Sequence[str], *extra: str
+) -> tuple[int, dict[str, object], str]:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        returncode = wrkslots.main(agent_batch_arguments(project, slots, *extra))
+    text = stdout.getvalue()
+    payload = json.loads(text) if text.strip() else {}
+    return returncode, payload, stderr.getvalue()
+
+
+def batch_slots(payload: Mapping[str, object], key: str) -> list[str]:
+    rows = payload[key]
+    assert isinstance(rows, list)
+    return [str(cast(Mapping[str, object], row)["slot"]) for row in rows]
+
+
+def active_slot_names(project: Path) -> list[str]:
+    return [str(cast(Mapping[str, object], row)["slot"]) for row in active_slots(project)]
+
+
+def registry_journals(project: Path) -> list[str]:
+    control = project / "worktrees"
+    names: list[str] = []
+    for pattern in ("*.journal", "*.journal.tmp.*", "*.json.tmp.*"):
+        names.extend(path.name for path in control.glob(pattern))
+    for events in control.glob("EVENTS.*"):
+        names.extend(path.name for path in events.glob("*.tmp.*"))
+    return sorted(names)
+
+
+def test_remove_agent_batch_refuses_only_the_slot_a_live_process_uses(
+    tmp_path: Path,
+) -> None:
+    project, _repository, slots = dead_agent_batch_project(tmp_path)
+    held = checkout(project, "slot02")
+    sleeper = subprocess.Popen(["sleep", "60"], cwd=held, text=True)
+    try:
+        result = remove_agent_batch(project, slots)
+    finally:
+        terminate_process(sleeper)
+
+    assert result.returncode == 1, result.stderr
+    payload = json.loads(result.stdout)
+    assert batch_slots(payload, "removed") == ["slot01", "slot03"]
+    assert batch_slots(payload, "refused") == ["slot02"]
+    refused = cast(list[Mapping[str, object]], payload["refused"])[0]
+    assert f"live process {sleeper.pid} uses slot" in str(refused["reason"])
+    # Refused by the shared lsof scan at the first check, before the fresh scan.
+    assert 'shared-lsof=command="sleep" fd="cwd"' in str(refused["reason"])
+    assert payload["shared_process_censuses"] == 1
+    assert payload["recovery_required"] is False
+    assert held.is_dir()
+    assert not checkout(project, "slot01").exists()
+    assert not checkout(project, "slot03").exists()
+    assert active_slot_names(project) == ["slot02"]
+    assert registry_journals(project) == []
+
+
+def test_remove_agent_batch_shared_census_catches_use_through_an_outside_hardlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the shared lsof scan sees a descriptor opened through an alias.
+
+    The descriptor's /proc link names the alias outside the slot, so the fresh
+    path scan cannot see it; lsof matches the file's identity inside the slot.
+    """
+
+    project, _repository, slots = dead_agent_batch_project(tmp_path)
+    inside = checkout(project, "slot02") / "seed.txt"
+    alias = tmp_path / "outside-alias.txt"
+    os.link(inside, alias)
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys, time; handle = open(sys.argv[1]); "
+            "print('ready', flush=True); time.sleep(60)",
+            str(alias),
+        ],
+        cwd=tmp_path,
+        text=True,
+        stdout=subprocess.PIPE,
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "ready"
+        assert wrkslots._agent_batch_fresh_use(
+            checkout(project, "slot02").parent, None, capture_generation=False
+        ) is None
+        returncode, payload, stderr = in_process_agent_batch(project, slots)
+    finally:
+        terminate_process(holder)
+
+    assert returncode == 1, stderr
+    assert batch_slots(payload, "removed") == ["slot01", "slot03"]
+    assert batch_slots(payload, "refused") == ["slot02"]
+    reason = str(cast(list[Mapping[str, object]], payload["refused"])[0]["reason"])
+    assert f"live process {holder.pid} uses slot" in reason
+    assert "shared-lsof" in reason
+    assert checkout(project, "slot02").is_dir()
+    assert active_slot_names(project) == ["slot02"]
+
+
+def test_remove_agent_batch_fresh_scan_catches_a_process_that_starts_after_the_census(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _repository, slots = dead_agent_batch_project(tmp_path)
+    held = checkout(project, "slot03")
+    late: list[subprocess.Popen[str]] = []
+    original = wrkslots._interrupt_for_test
+
+    def start_late_entrant(point: str) -> None:
+        if point == "after-agent-batch-shared-census" and not late:
+            late.append(subprocess.Popen(["sleep", "60"], cwd=held, text=True))
+        original(point)
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", start_late_entrant)
+    try:
+        returncode, payload, stderr = in_process_agent_batch(project, slots)
+    finally:
+        for process in late:
+            terminate_process(process)
+
+    assert len(late) == 1
+    assert returncode == 1, stderr
+    assert payload["shared_process_censuses"] == 1
+    assert batch_slots(payload, "removed") == ["slot01", "slot02"]
+    assert batch_slots(payload, "refused") == ["slot03"]
+    reason = str(cast(list[Mapping[str, object]], payload["refused"])[0]["reason"])
+    assert f"live process {late[0].pid} uses slot" in reason
+    assert "cwd=" in reason
+    assert held.is_dir()
+    assert active_slot_names(project) == ["slot03"]
+
+
+def test_remove_agent_batch_exit_status_counts_and_input_file(tmp_path: Path) -> None:
+    project, _repository, slots = dead_agent_batch_project(tmp_path)
+
+    duplicate = raw_command(
+        project,
+        "remove-agent-batch",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot=slot01=1",
+        "--slot=slot01=1",
+    )
+    assert duplicate.returncode == 3
+    assert "same slot more than once" in duplicate.stderr
+    empty = raw_command(
+        project, "remove-agent-batch", "--coordinator-pid", str(os.getpid())
+    )
+    assert empty.returncode == 3
+    assert "at least one --slot" in empty.stderr
+
+    stale = remove_agent_batch(project, ["slot01"], env=None)
+    stale_generation = raw_command(
+        project,
+        "remove-agent-batch",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot=slot02=7",
+        "--slot=missing=1",
+    )
+    # The first call removed slot01; the second removed nothing and must fail.
+    assert stale.returncode == 0, stale.stderr
+    assert stale_generation.returncode == 1, stale_generation.stderr
+    assert "requested=2 removed=0 refused=2" in stale_generation.stdout
+    assert "REFUSED: slot02 generation=7 reason=slot slot02 generation is 1, not 7" in (
+        stale_generation.stdout
+    )
+    assert "REFUSED: missing generation=1" in stale_generation.stdout
+
+    listing = tmp_path / "slots.txt"
+    listing.write_text("# dead-owner rows\n\nslot02=1\n  slot03=1  \n", encoding="utf-8")
+    from_file = raw_command(
+        project,
+        "remove-agent-batch",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--input",
+        str(listing),
+    )
+    assert from_file.returncode == 0, from_file.stderr + from_file.stdout
+    assert "requested=2 removed=2 refused=0 shared_process_censuses=1" in from_file.stdout
+    assert "REMOVED: slot02 generation=1" in from_file.stdout
+    assert "REMOVED: slot03 generation=1" in from_file.stdout
+    assert active_slot_names(project) == []
+    assert all(not checkout(project, slot).exists() for slot in slots)
+    archive = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
+    )
+    assert sorted(str(row["slot"]) for row in archive["records"]) == slots
+
+
+def test_remove_agent_batch_refuses_validation_and_absent_rows_per_item(
+    tmp_path: Path,
+) -> None:
+    project, _repository, slots = dead_agent_batch_project(tmp_path, count=2)
+    shutil.rmtree(checkout(project, "slot02").parent)
+
+    result = remove_agent_batch(project, slots)
+
+    assert result.returncode == 1, result.stderr
+    payload = json.loads(result.stdout)
+    assert batch_slots(payload, "removed") == ["slot01"]
+    assert batch_slots(payload, "refused") == ["slot02"]
+    reason = str(cast(list[Mapping[str, object]], payload["refused"])[0]["reason"])
+    assert "recover-absent-agent-row" in reason
+    assert active_slot_names(project) == ["slot02"]
+
+
+def test_remove_agent_batch_leaves_no_state_an_older_client_refuses_between_items(
+    tmp_path: Path,
+) -> None:
+    """A batch killed between items leaves only ordinary single-slot state.
+
+    Each item's journal and events are written and retired inside that item's
+    own registry-lock hold, exactly as by `remove`, so no batch-level file can
+    make a client that predates this command refuse.
+    """
+
+    project, _repository, slots = dead_agent_batch_project(tmp_path)
+    before = registry_journals(project)
+
+    census_only = remove_agent_batch(
+        project, slots, env={"WRKSLOTS_TEST_INTERRUPT": "after-agent-batch-shared-census"}
+    )
+    assert census_only.returncode == 86
+    assert active_slot_names(project) == slots
+    assert registry_journals(project) == before == []
+
+    interrupted = remove_agent_batch(
+        project, slots, env={"WRKSLOTS_TEST_INTERRUPT": "after-agent-batch-item"}
+    )
+    assert interrupted.returncode == 86
+    assert active_slot_names(project) == ["slot02", "slot03"]
+    assert not checkout(project, "slot01").exists()
+    assert registry_journals(project) == []
+    config = wrkslots._load_config(str(project), "testhost")
+    wrkslots._refuse_partial_state(config)
+    wrkslots._assert_no_journal(config)
+
+    single = remove(project, "slot02")
+    assert single.returncode == 0, single.stderr
+    made = create(project, slot="slot04", agent="codex-4", branch="codex/slot04")
+    assert made.returncode == 0, made.stderr
+    renewed = command(
+        project,
+        "heartbeat",
+        "slot04",
+        "--agent",
+        "codex-4",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+    assert renewed.returncode == 0, renewed.stderr
+    status = command(project, "status")
+    assert status.returncode == 0, status.stderr
+
+
+def test_remove_agent_batch_runs_lsof_once_while_serial_remove_runs_it_per_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The batch replaces every per-check lsof scan with one shared scan."""
+
+    project, _repository, slots = dead_agent_batch_project(tmp_path, count=4)
+    ordinary_calls: list[Path] = []
+    shared_calls: list[tuple[Path, ...]] = []
+    original_ordinary = wrkslots._lsof_slot_use
+    original_shared = wrkslots._capture_agent_remove_batch_census
+
+    def count_ordinary(executable: Path, slot_path: Path) -> object:
+        ordinary_calls.append(slot_path)
+        return original_ordinary(executable, slot_path)
+
+    def count_shared(targets: Sequence[Path]) -> object:
+        shared_calls.append(tuple(targets))
+        return original_shared(targets)
+
+    monkeypatch.setattr(wrkslots, "_lsof_slot_use", count_ordinary)
+    monkeypatch.setattr(wrkslots, "_capture_agent_remove_batch_census", count_shared)
+
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+        serial = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "remove",
+                "slot01",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--expected-generation",
+                "1",
+            ]
+        )
+    assert serial == 0
+    per_slot = len(ordinary_calls)
+    assert per_slot >= 4
+    assert shared_calls == []
+
+    ordinary_calls.clear()
+    returncode, payload, stderr = in_process_agent_batch(project, slots[1:])
+
+    assert returncode == 0, stderr
+    assert batch_slots(payload, "removed") == slots[1:]
+    assert ordinary_calls == []
+    assert len(shared_calls) == 1
+    assert len(shared_calls[0]) == 3
+    assert payload["shared_process_censuses"] == 1
+    assert payload["fresh_process_scans"] == per_slot * 3
+
+
+def test_parse_lsof_use_records_keeps_every_record_and_flags_malformed_streams() -> None:
+    records, malformed = wrkslots._parse_lsof_use_records(
+        "p10\ncsleep\nfcwd\nn/w/slots/a\nf3r\nn/w/slots/a/f\np11\ncpython\nf4\nn/w/slots/b/g\n"
+    )
+    assert not malformed
+    assert [(item.pid, item.descriptor, item.name) for item in records] == [
+        (10, "cwd", "/w/slots/a"),
+        (10, "3r", "/w/slots/a/f"),
+        (11, "4", "/w/slots/b/g"),
+    ]
+    for stream in (
+        "p10\nfcwd\nn/w/slots/a\n",  # no command
+        "p10\ncsleep\nn/w/slots/a\n",  # name without descriptor
+        "p10\ncsleep\nfcwd\n",  # descriptor without name
+        "p10\ncsleep\nfcwd\nn/a\np10\ncsleep\nfcwd\nn/a\n",  # repeated process set
+        "p10\ncsleep\nfcwd\nn/a\nx?\n",  # unknown field
+        "pX\ncsleep\nfcwd\nn/a\n",  # invalid PID
+    ):
+        assert wrkslots._parse_lsof_use_records(stream)[1], stream
+
+
+def test_shared_agent_census_attributes_each_record_to_one_slot_or_all(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = tmp_path / "slots" / "a"
+    second = tmp_path / "slots" / "ab"
+    first.mkdir(parents=True)
+    second.mkdir()
+    output = (
+        f"p10\ncsleep\nfcwd\nn{first}\n"
+        f"p11\ncsleep\nf3r\nn{second}/f\n"
+        "p12\ncsleep\nf4r\nnunattributable\n"
+    )
+
+    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        assert command[-4:] == ["+D", str(first), "+D", str(second)]
+        return subprocess.CompletedProcess(command, 0, output.encode(), b"")
+
+    monkeypatch.setattr(wrkslots, "_lsof_executable", lambda: Path("/usr/bin/lsof"))
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    census = wrkslots._capture_agent_remove_batch_census([first, second])
+
+    by_slot: dict[str, set[int]] = {}
+    for pid, slot, kind, _detail in census.matches:
+        assert kind == "shared-lsof"
+        by_slot.setdefault(slot, set()).add(pid)
+    assert by_slot == {str(first): {10, 12}, str(second): {11, 12}}
+
+    def failing_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(command, 2, b"", b"")
+
+    monkeypatch.setattr(subprocess, "run", failing_run)
+    with pytest.raises(wrkslots.Refusal, match="lsof exited 2"):
+        wrkslots._capture_agent_remove_batch_census([first])
+
+
+def test_agent_batch_context_accepts_only_the_fenced_remount_of_the_slots_own_image(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An image-backed slot's fence unmounts, renames, and remounts the image,
+    # so the fenced directory has a new identity.  Only a remount of the
+    # slot's own agent image at exactly the fenced path may stand in for it.
+    canonical = tmp_path / "worktrees" / "slot02"
+    fenced = tmp_path / "worktrees" / ".slot02.fenced.1.test"
+    canonical.mkdir(parents=True)
+    fenced.mkdir()
+    identity = wrkslots._directory_identity(canonical)
+    assert identity is not None
+    assert wrkslots._directory_identity(fenced) != identity
+    image_file = tmp_path / "slot.img"
+    image = argparse.Namespace(slot_type="agent", slot="slot02", slot_image=image_file)
+    mounted: dict[Path, Path] = {fenced: image_file}
+    fresh_paths: list[Path] = []
+    monkeypatch.setattr(wrkslots, "_slot_image_at", lambda _config, path: image)
+    monkeypatch.setattr(
+        "wrkslots.slotimage.is_mounted",
+        lambda image_path, mount_point, table=None: mounted.get(mount_point) == image_path,
+    )
+
+    def fake_fresh_use(
+        slot_path: Path, _record: object, *, capture_generation: bool,
+    ) -> None:
+        fresh_paths.append(slot_path)
+
+    monkeypatch.setattr(wrkslots, "_agent_batch_fresh_use", fake_fresh_use)
+    config = cast(wrkslots.Config, argparse.Namespace())
+
+    def context(
+        *, with_config: bool = True, census: object | None = None,
+    ) -> wrkslots._AgentRemoveBatchContext:
+        value = wrkslots._AgentRemoveBatchContext(
+            {canonical: identity}, config=config if with_config else None
+        )
+        value.censused = frozenset({canonical})
+        if census is not None:
+            value.census = cast(wrkslots._ProcessPathCensus, census)
+        return value
+
+    def observe(value: wrkslots._AgentRemoveBatchContext, path: Path) -> object:
+        return value.observe(path, None, canonical_path=canonical, capture_generation=False)
+
+    assert observe(context(), fenced) is None
+    assert fresh_paths == [fenced]
+    # The unchanged canonical directory needs no image evidence.
+    assert observe(context(with_config=False), canonical) is None
+    assert fresh_paths == [fenced, canonical]
+
+    covered = "is not the directory this batch's shared process census covered"
+    with pytest.raises(wrkslots.Refusal, match=covered):
+        observe(context(with_config=False), fenced)
+    for changed in (
+        argparse.Namespace(slot_type="agent", slot="slot03", slot_image=image_file),
+        argparse.Namespace(slot_type="validate", slot="slot02", slot_image=image_file),
+        argparse.Namespace(slot_type="agent", slot="slot02", slot_image=tmp_path / "other.img"),
+        None,
+    ):
+        monkeypatch.setattr(wrkslots, "_slot_image_at", lambda _config, path, found=changed: found)
+        with pytest.raises(wrkslots.Refusal, match=covered):
+            observe(context(), fenced)
+    monkeypatch.setattr(wrkslots, "_slot_image_at", lambda _config, path: image)
+    mounted.clear()
+    with pytest.raises(wrkslots.Refusal, match=covered):
+        observe(context(), fenced)
+    assert fresh_paths == [fenced, canonical]
+
+    # A remount does not waive the shared scan's evidence for the slot.
+    mounted[fenced] = image_file
+    census = wrkslots._ProcessPathCensus(
+        (), ((4242, str(canonical), "shared-lsof", 'command="sleep"'),),
+        owner_cgroup_complete=False,
+    )
+    with pytest.raises(wrkslots.Refusal, match="live process 4242 uses slot"):
+        observe(context(census=census), fenced)
+    assert fresh_paths == [fenced, canonical]
+
+
+def test_remove_agent_batch_honors_a_live_owners_release_like_remove(
+    tmp_path: Path,
+) -> None:
+    """A release by the live owner authorizes a batch item exactly as it does remove.
+
+    Before the release the owner is alive and its heartbeat is fresh, so the
+    batch refuses the slot. After it, the batch removes the slot without
+    --coordinator-authorized and records the same owner-release-honored
+    evidence, and a live process in the owner's cgroup that touches nothing in
+    the slot does not block.
+    """
+
+    project, repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    commit_task(repository, checkout(project), "codex/task")
+    _write_owner_handoff(project, tmp_path)
+    tree = checkout(project)
+
+    before = remove_agent_batch(project, ["slot01"])
+
+    assert before.returncode == 1, before.stderr
+    payload = json.loads(before.stdout)
+    assert batch_slots(payload, "removed") == []
+    assert batch_slots(payload, "refused") == ["slot01"]
+    reason = str(cast(list[Mapping[str, object]], payload["refused"])[0]["reason"])
+    assert reason.startswith(
+        "remove requires a proven-dead recorded owner or an owner-consented handoff; "
+        "owner is live"
+    )
+    assert tree.is_dir()
+    assert active_slot_names(project) == ["slot01"]
+    assert _owner_release_honored(project) == []
+
+    released = _release(project)
+    assert released.returncode == 0, released.stderr
+    _read_owner_handoff(project)
+    owner = wrkslots._read_process_identity(os.getpid())
+    sibling = subprocess.Popen(["sleep", "600"], cwd=tmp_path, text=True)
+    try:
+        assert (
+            wrkslots._read_process_identity(sibling.pid).cgroup_path == owner.cgroup_path
+        )
+        after = remove_agent_batch(project, ["slot01"])
+        assert sibling.poll() is None
+    finally:
+        terminate_process(sibling)
+
+    assert after.returncode == 0, after.stderr
+    payload = json.loads(after.stdout)
+    assert batch_slots(payload, "removed") == ["slot01"]
+    assert payload["refused"] == []
+    assert payload["shared_process_censuses"] == 1
+    assert not tree.exists()
+    assert active_slot_names(project) == []
+    honored = _owner_release_honored(project)
+    assert len(honored) == 1
+    evidence = wrkslots._as_mapping(
+        wrkslots._as_mapping(honored[0]["payload"], "payload")["evidence"], "evidence"
+    )
+    assert evidence["basis"] == "owner-released"
+    assert evidence["owner_state"] == "live"
+    assert evidence["owner"] == wrkslots._identity_to_obj(owner)
+    assert evidence["coordinator_authorized"] is False
+    assert registry_journals(project) == []

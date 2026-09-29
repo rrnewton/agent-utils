@@ -465,6 +465,72 @@ interrupted removal of a released slot whose owner is still alive must be finish
 from a version that has `release`; an older `recover` refuses and the journal blocks other mutations
 until a newer `recover` runs or the owner exits.
 
+## Remove a batch of agent slots
+
+`wrkslots remove` checks process use several times for one agent slot, and each check runs
+`lsof +D` while the registry lock is held. The cost of `lsof +D` follows the number of open
+descriptors on the whole machine, not the size of the slot, so on a busy machine one removal can
+hold the lock for minutes. To remove many reclaimable agent slots, name each exact slot and its
+current generation:
+
+```sh
+wrkslots remove-agent-batch --coordinator-pid "$COORDINATOR_PID" \
+  --slot example-a=3 --slot example-b=1
+wrkslots remove-agent-batch --coordinator-pid "$COORDINATOR_PID" --input /path/to/slots.txt
+```
+
+The input file holds one `SLOT=GENERATION` per line; blank lines and lines starting with `#` are
+ignored, and `--slot` may be combined with it. A batch accepts at most 128 distinct slots.
+
+Authority and every per-slot check are those of `remove`. Each slot goes through the ordinary
+removal state machine in its own registry-lock hold: expired heartbeat, registered liveness, a
+proven-dead recorded owner (or instead a release by the live owner, as described above, or, with
+`--coordinator-authorized`, the owner-consented handoff exception), holds, handoff checks, salvage
+of every commit to the recorded remote with read-back, the path fence, the nested-repository checks,
+and the archive. The lock is released between slots, followed by a 0.25-second pause so that a
+waiting heartbeat can take it. Each slot waits up to 30 seconds for the lock, or for `--wait-lock`
+seconds when that is given.
+
+Only the `lsof` scan is shared. Before taking any lock, the batch runs one `lsof +D` over every
+requested slot directory and attributes each open file to the slot that contains it; a file it
+cannot attribute counts against every slot. Wherever `remove` would run `lsof`, the batch instead:
+
+1. confirms that the slot directory, or its fenced name, is still the directory the shared scan
+   covered, by device and inode. An image-backed slot's fence unmounts the image, renames the
+   mount point, and mounts the image again, which gives the fenced directory a new device and
+   inode; the fenced path is accepted only when it is that slot's own agent image, mounted there.
+   The unmount fails while any process uses the file system, and no hard link crosses into it;
+2. refuses the slot if the shared scan saw any process using it;
+3. scans `/proc` afresh for a process whose working directory, root, executable, open descriptor,
+   memory mapping, or mount table names the slot, and for a live process in the recorded owner's
+   cgroup when that cgroup is evidence.
+
+The fresh scan catches use that began after the shared scan. The shared scan catches a descriptor
+opened through a hard link outside the slot, which no `/proc` path names; it is repeated when it is
+older than 300 seconds. As with `remove`, descriptors of other users' processes are visible to
+neither scan without privilege, and every process's mount table is read. A slot that the shared scan
+saw in use is refused even if that process has since exited; run another batch or `remove` for it.
+
+A refused slot is left in place and reported with its reason, and the remaining slots are still
+attempted. A missing row, a changed generation, a validation slot, and a row whose directory is
+absent are refused before any scan; use `recover-absent-agent-row` for the last. Corrupt or
+interrupted registry state stops the batch, refuses the remaining slots, and prints
+`RECOVERY REQUIRED`. The human output is one summary line,
+
+```text
+requested=3 removed=2 refused=1 shared_process_censuses=1 fresh_process_scans=10 seconds=14.2
+```
+
+followed by one `REMOVED:` or `REFUSED:` line per slot; `--format json` prints the same content as
+one object. Exit status is 0 only when every requested slot was removed, 1 when any slot was
+refused (including a batch that removed nothing), and 3 when the whole command was refused, for
+example for a malformed or repeated item.
+
+The batch writes no state of its own. Each slot's journal and events are written and retired
+inside that slot's lock hold in exactly the form `remove` uses, so an interrupted batch leaves at
+most the state of one interrupted `remove`, which `wrkslots recover` resumes, and no file that an
+older client does not recognize.
+
 ## Git remotes and salvage
 
 For each `--repo NAME=PATH`, `create` uses the configured `origin` by default. Supply
