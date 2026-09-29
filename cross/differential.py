@@ -7471,6 +7471,41 @@ def _boxing_capability_unavailable(outcome: Outcome) -> bool:
     )
 
 
+#: What a skipped boxed leg says when the parent scheduler is itself unboxed.
+_NO_DELEGABLE_SUBTREE = "the outer scheduler has no cgroup subtree to delegate"
+
+#: Both engines print this on stderr exactly when they have established per-step cgroups, in
+#: their own two-level scope or in a parent-owned delegated root. Nothing else prints it.
+_BOXING_ACTIVE_BANNER = "cgroup boxing ACTIVE"
+
+
+def _skip_without_delegable_subtree(check: str, rep: Report, what: str) -> bool:
+    """Record a boxed leg as a boxing skip, without running it, when no box can exist.
+
+    Under an unboxed outer scheduler a nested engine honours ``DAGRUN_DELEGATED_UNBOXED=1`` and
+    runs the step uncontained whatever the fixture asks for, so the leg would compare two unboxed
+    runs. Counting that as agreement would claim boxed coverage that was never exercised.
+    """
+
+    if not _parent_offers_only_unboxed_delegation():
+        return False
+    print(f"cross[dagrun]: SKIP {what} ({check}): {_NO_DELEGABLE_SUBTREE}")
+    rep.skip(check, "boxing", _NO_DELEGABLE_SUBTREE)
+    return True
+
+
+def _engines_that_did_not_box(outcomes: Mapping[str, Outcome]) -> list[str]:
+    """Name the engines whose boxed run never announced an established cgroup box.
+
+    A boxed leg whose engines agree without the banner has compared unboxed runs. That must be a
+    failure rather than coverage, whatever the reason the box was missing.
+    """
+
+    return sorted(
+        name for name, out in outcomes.items() if _BOXING_ACTIVE_BANNER not in out.stderr
+    )
+
+
 _BUILD_WIDTH_RE = re.compile(r"build width: (.+)$", re.MULTILINE)
 #: The width the STEP received, echoed by the step's own command.
 _STEP_WIDTH_RE = re.compile(r"WIDTH=(\d+)")
@@ -7546,6 +7581,14 @@ def compare_operator_build_width(py: list[str], rs: list[str], rep: Report) -> N
                     "cgroup-v2 + a working systemd --user scope are unavailable",
                 )
                 continue
+            unboxed = _engines_that_did_not_box(outcomes)
+            if unboxed:
+                rep.bad(
+                    label,
+                    f"a boxed leg must run boxed; no {_BOXING_ACTIVE_BANNER!r} from {unboxed}: "
+                    f"outcomes={outcomes}",
+                )
+                continue
             combined = {name: out.stdout + out.stderr for name, out in outcomes.items()}
             said = {name: _BUILD_WIDTH_RE.findall(text) for name, text in combined.items()}
             applied = {name: _STEP_WIDTH_RE.findall(text) for name, text in combined.items()}
@@ -7600,6 +7643,12 @@ def compare_jobs_env_width(py: list[str], rs: list[str], rep: Report) -> None:
     one), the roomy leg catches implementations that always collapse to one, and the boxed leg
     catches the late scope-wide ``CARGO_BUILD_JOBS`` export overwriting the step allocation.
     Refusal cases prove missing or malformed channels fail before spawning the child.
+
+    The two boxed legs count only when both engines announce an established cgroup box. Under an
+    unboxed outer scheduler no box can exist, so they are recorded as boxing skips and not run.
+    Inside a parent-owned delegated root the systemd ``--setenv`` export never runs, but the
+    fixture's own ``CARGO_BUILD_JOBS=8`` still reaches the step unless the jobs-env export wins, so
+    the boxed narrow leg keeps its meaning there.
     """
 
     with tempfile.TemporaryDirectory(prefix="dagrun-cross-jobs-env-") as td:
@@ -7624,6 +7673,9 @@ def compare_jobs_env_width(py: list[str], rs: list[str], rep: Report) -> None:
         )
 
         def width_leg(label: str, max_cpus: int, expected: str, *, boxed: bool) -> None:
+            check = f"jobs-env:{label}"
+            if boxed and _skip_without_delegable_subtree(check, rep, "boxed jobs-env differential"):
+                return
             outcomes: dict[str, Outcome] = {}
             observed: dict[str, str | None] = {}
             for name, command in (("py", py), ("rs", rs)):
@@ -7660,7 +7712,6 @@ def compare_jobs_env_width(py: list[str], rs: list[str], rep: Report) -> None:
                 )
                 observed[name] = output.read_text(encoding="utf-8") if output.exists() else None
 
-            check = f"jobs-env:{label}"
             if boxed and all(_boxing_capability_unavailable(out) for out in outcomes.values()):
                 print(
                     "cross[dagrun]: SKIP boxed jobs-env differential: "
@@ -7670,6 +7721,12 @@ def compare_jobs_env_width(py: list[str], rs: list[str], rep: Report) -> None:
                     check,
                     "boxing",
                     "cgroup-v2 + a working systemd --user scope are unavailable",
+                )
+            elif boxed and (unboxed := _engines_that_did_not_box(outcomes)):
+                rep.bad(
+                    check,
+                    f"a boxed leg must run boxed; no {_BOXING_ACTIVE_BANNER!r} from {unboxed}: "
+                    f"outcomes={outcomes} observed={observed}",
                 )
             elif (
                 all(out.returncode == 0 for out in outcomes.values())
@@ -7687,6 +7744,11 @@ def compare_jobs_env_width(py: list[str], rs: list[str], rep: Report) -> None:
         width_leg("boxed-narrow", 1, "1", boxed=True)
 
         def readonly_leg(label: str, channel: str = "BASHOPTS", *, boxed: bool) -> None:
+            check = f"jobs-env:{label}"
+            if boxed and _skip_without_delegable_subtree(
+                check, rep, "boxed readonly jobs-env differential"
+            ):
+                return
             outcomes: dict[str, Outcome] = {}
             spawned: dict[str, bool] = {}
             for name, command in (("py", py), ("rs", rs)):
@@ -7718,7 +7780,6 @@ def compare_jobs_env_width(py: list[str], rs: list[str], rep: Report) -> None:
                 )
                 spawned[name] = output.exists()
 
-            check = f"jobs-env:{label}"
             if boxed and all(_boxing_capability_unavailable(out) for out in outcomes.values()):
                 print(
                     "cross[dagrun]: SKIP boxed readonly jobs-env differential: "
@@ -7728,6 +7789,13 @@ def compare_jobs_env_width(py: list[str], rs: list[str], rep: Report) -> None:
                     check,
                     "boxing",
                     "cgroup-v2 + a working systemd --user scope are unavailable",
+                )
+                return
+            if boxed and (unboxed := _engines_that_did_not_box(outcomes)):
+                rep.bad(
+                    check,
+                    f"a boxed leg must run boxed; no {_BOXING_ACTIVE_BANNER!r} from {unboxed}: "
+                    f"outcomes={outcomes} spawned={spawned}",
                 )
                 return
             combined = {name: out.stdout + out.stderr for name, out in outcomes.items()}

@@ -11,6 +11,8 @@ These tests pin the replacement contract without running the minutes-long harnes
 * a skip never increments the pass count and is listed by name with a total;
 * a run that claims full coverage (no ``--allow-skip``) exits nonzero when anything was skipped;
 * a run that declares itself partial prints PARTIAL, not OK, and still lists every skip;
+* a boxed leg that cannot be boxed is a skip, and one whose engines never announced an
+  established box is a failure, never agreement;
 * each lane that runs the harness states its coverage policy explicitly.
 """
 
@@ -32,7 +34,11 @@ BOXING_LABELS = [
     "operator-build-width:stated",
     "operator-build-width:unstated",
     "boxed-cpu-bandwidth",
+    "jobs-env:boxed-narrow",
+    "jobs-env:boxed-readonly",
 ]
+NO_DELEGABLE_SUBTREE = "the outer scheduler has no cgroup subtree to delegate"
+DELEGATION_ENV = ("DAGRUN_DELEGATED_CGROUP", "DAGRUN_DELEGATED_UNBOXED", "DAGRUN_OUTER_RUN")
 
 
 def _differential() -> ModuleType:
@@ -58,14 +64,80 @@ def _noop(*_args: object, **_kwargs: object) -> None:
     return None
 
 
+_SHELL_STARTUP_CHANNELS = frozenset(
+    {
+        "BASH_COMPAT",
+        "BASH_ENV",
+        "BASH_XTRACEFD",
+        "CDPATH",
+        "ENV",
+        "EXECIGNORE",
+        "GLOBIGNORE",
+        "PATH",
+        "POSIXLY_CORRECT",
+    }
+)
+
+
+def _jobs_env_engine(differential: ModuleType, *, boxed_allowed: bool, banner: bool) -> object:
+    """Fake both engines for ``compare_jobs_env_width``; nothing else may spawn through it.
+
+    The fake grants ``min(-j, preferred 4)`` through ``CARGO_BUILD_JOBS``, refuses the same
+    channels the engines refuse, and prints the boxing banner on a boxed leg only when
+    ``banner`` is set. With ``boxed_allowed`` unset, running any boxed leg fails the test.
+    """
+
+    outcome = differential.Outcome
+
+    def fake_run(
+        _cmd: object, args: tuple[str, ...] | list[str], extra_env: dict[str, str] | None = None,
+        **_kw: object,
+    ) -> object:
+        env = dict(extra_env or {})
+        if "OBSERVED_PATH" not in env or "dagrun-cross-jobs-env-" not in args[2]:
+            raise AssertionError(f"only the jobs-env comparison may spawn here: {args!r}")
+        boxed = "--unsafe-no-cgroups" not in args
+        if boxed:
+            if not boxed_allowed:
+                raise AssertionError(f"a boxed jobs-env leg ran where no box can exist: {args!r}")
+            assert env.get("DAGRUN_FORCE_SCOPE_ATTEMPT") == "1", env
+        announced = (
+            "dagrun: cgroup boxing ACTIVE in parent-owned delegated step root /fake\n"
+            if boxed and banner
+            else ""
+        )
+        channel = env.get("DAGRUN_JOBS_ENV")
+        if channel is None:
+            return outcome(2, "", "dagrun: no width channel is configured")
+        if channel == "NOT=A=NAME":
+            return outcome(2, "", "DAGRUN_JOBS_ENV must be a valid environment variable name")
+        if channel in _SHELL_STARTUP_CHANNELS:
+            return outcome(2, "", f"DAGRUN_JOBS_ENV={channel} is a shell startup/control variable")
+        if channel != "CARGO_BUILD_JOBS":
+            return outcome(1, "", f"{announced}{channel} did not retain assigned width 1")
+        width = int(next(arg for arg in args if arg.startswith("-j"))[2:])
+        Path(env["OBSERVED_PATH"]).write_text(str(min(width, 4)), encoding="utf-8")
+        return outcome(0, "", announced)
+
+    return fake_run
+
+
+def _set_delegation(monkeypatch: pytest.MonkeyPatch, environment: dict[str, str]) -> None:
+    for name in DELEGATION_ENV:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+
 def _dagrun_with_only_boxing_checks(
     differential: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Drive the real ``main`` -> ``compare_dagrun`` summary with every non-boxing case stubbed.
 
     The outer scheduler is made to say that it has no cgroup subtree to delegate, which is the
-    state of a hosted runner started with ``--allow-cgroup-failure``. The three boxing-only
-    comparisons then take their real skip paths, and nothing may spawn an engine.
+    state of a hosted runner started with ``--allow-cgroup-failure``. The boxing-only comparisons
+    then take their real skip paths without spawning an engine. The jobs-env comparison runs its
+    17 unboxed cases through a fake engine and records its two boxed legs as skips.
     """
 
     kept = {
@@ -73,6 +145,7 @@ def _dagrun_with_only_boxing_checks(
         "compare_profile_timeseries_trace",
         "compare_operator_build_width",
         "compare_boxed_cpu_bandwidth",
+        "compare_jobs_env_width",
     }
     for name in dir(differential):
         if name.startswith("compare_") and name not in kept:
@@ -85,7 +158,9 @@ def _dagrun_with_only_boxing_checks(
     ):
         monkeypatch.setattr(differential, name, lambda *_args: [])
     monkeypatch.setattr(differential, "rs_command", lambda _tool: ["rust"])
-    monkeypatch.setattr(differential, "run", _unexpected_run)
+    monkeypatch.setattr(
+        differential, "run", _jobs_env_engine(differential, boxed_allowed=False, banner=False)
+    )
     monkeypatch.setattr(differential, "_effective_validation_jobs", lambda: 4)
     monkeypatch.delenv("AGENT_UTILS_VALIDATION_JOBS", raising=False)
     monkeypatch.delenv("AGENT_UTILS_CROSS_ALLOW_SKIP", raising=False)
@@ -160,10 +235,10 @@ def test_full_dagrun_run_with_skipped_boxing_checks_exits_nonzero(
     out = capsys.readouterr().out
 
     assert status == 1
-    assert "cross[dagrun]: SKIPPED/UNVERIFIED 4 check(s), not counted as passes:" in out
+    assert "cross[dagrun]: SKIPPED/UNVERIFIED 6 check(s), not counted as passes:" in out
     for label in BOXING_LABELS:
         assert f"SKIPPED [boxing; REQUIRED] {label}:" in out
-    assert "cross[dagrun]: INCOMPLETE - 0 checks across 0 fixtures agree" in out
+    assert "cross[dagrun]: INCOMPLETE - 17 checks across 0 fixtures agree" in out
     assert "cross[dagrun]: OK" not in out
 
 
@@ -193,11 +268,11 @@ def test_partial_dagrun_run_says_partial_and_prints_its_skips(
     assert status == 0
     assert out.startswith("cross: PARTIAL-coverage run declared;")
     assert f"boxing (from {source})" in out
-    assert "cross[dagrun]: SKIPPED/UNVERIFIED 4 check(s), not counted as passes:" in out
+    assert "cross[dagrun]: SKIPPED/UNVERIFIED 6 check(s), not counted as passes:" in out
     for label in BOXING_LABELS:
         assert f"SKIPPED [boxing; allowed] {label}:" in out
-    assert "cross[dagrun]: PARTIAL - 0 checks across 0 fixtures agree" in out
-    assert "4 check(s) were skipped and are UNVERIFIED (allowed skip kinds: boxing)" in out
+    assert "cross[dagrun]: PARTIAL - 17 checks across 0 fixtures agree" in out
+    assert "6 check(s) were skipped and are UNVERIFIED (allowed skip kinds: boxing)" in out
     assert "cross[dagrun]: OK" not in out
 
 
@@ -293,6 +368,123 @@ def test_delegated_pin_run_lists_both_live_checks_it_did_not_run(
         ("pin-run:reserve-apply-release", "delegated-live-scope"),
         ("pin-run:signal-status", "delegated-live-scope"),
     ]
+
+
+# ------------------------------------------------------------------ boxed jobs-env legs
+
+
+def test_boxed_jobs_env_legs_are_skipped_without_a_delegable_subtree(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Under an unboxed outer scheduler both boxed jobs-env legs are boxing skips, not passes.
+
+    A nested engine then honours ``DAGRUN_DELEGATED_UNBOXED=1`` and runs the step uncontained,
+    so running these legs would compare two unboxed runs and count them as boxed agreement.
+    """
+
+    differential = _differential()
+    _set_delegation(
+        monkeypatch, {"DAGRUN_DELEGATED_UNBOXED": "1", "DAGRUN_OUTER_RUN": "outer-run"}
+    )
+    monkeypatch.setattr(
+        differential, "run", _jobs_env_engine(differential, boxed_allowed=False, banner=False)
+    )
+    report = differential.Report()
+
+    differential.compare_jobs_env_width(["python"], ["rust"], report)
+    out = capsys.readouterr().out
+
+    # 2 unboxed width legs, 3 unboxed readonly legs, 12 pre-spawn refusals.
+    assert report.checks == 17
+    assert report.failures == []
+    assert [(skip.label, skip.kind, skip.reason) for skip in report.skipped] == [
+        ("jobs-env:boxed-narrow", "boxing", NO_DELEGABLE_SUBTREE),
+        ("jobs-env:boxed-readonly", "boxing", NO_DELEGABLE_SUBTREE),
+    ]
+    assert (
+        "cross[dagrun]: SKIP boxed jobs-env differential (jobs-env:boxed-narrow): "
+        f"{NO_DELEGABLE_SUBTREE}"
+    ) in out
+    assert (
+        "cross[dagrun]: SKIP boxed readonly jobs-env differential (jobs-env:boxed-readonly): "
+        f"{NO_DELEGABLE_SUBTREE}"
+    ) in out
+
+
+@pytest.mark.parametrize(
+    "environment",
+    [
+        pytest.param({}, id="top-level"),
+        pytest.param(
+            {"DAGRUN_DELEGATED_CGROUP": "/delegated", "DAGRUN_OUTER_RUN": "outer-run"},
+            id="delegated-cgroup",
+        ),
+    ],
+)
+def test_boxed_jobs_env_legs_count_only_when_both_engines_boxed(
+    monkeypatch: pytest.MonkeyPatch, environment: dict[str, str]
+) -> None:
+    """Where a box can exist the boxed legs run, and agreement counts only with the banner."""
+
+    differential = _differential()
+    _set_delegation(monkeypatch, environment)
+
+    monkeypatch.setattr(
+        differential, "run", _jobs_env_engine(differential, boxed_allowed=True, banner=True)
+    )
+    boxed = differential.Report()
+    differential.compare_jobs_env_width(["python"], ["rust"], boxed)
+    assert (boxed.checks, boxed.failures, boxed.skipped) == (19, [], [])
+
+    monkeypatch.setattr(
+        differential, "run", _jobs_env_engine(differential, boxed_allowed=True, banner=False)
+    )
+    unboxed = differential.Report()
+    differential.compare_jobs_env_width(["python"], ["rust"], unboxed)
+    assert unboxed.checks == 19
+    assert unboxed.skipped == []
+    assert [failure.split(":", 2)[:2] for failure in unboxed.failures] == [
+        ["jobs-env", "boxed-narrow"],
+        ["jobs-env", "boxed-readonly"],
+    ]
+    for failure in unboxed.failures:
+        assert "a boxed leg must run boxed; no 'cgroup boxing ACTIVE' from ['py', 'rs']" in failure
+
+
+@pytest.mark.parametrize("banner", [True, False])
+def test_boxed_build_width_legs_count_only_when_both_engines_boxed(
+    monkeypatch: pytest.MonkeyPatch, banner: bool
+) -> None:
+    differential = _differential()
+    _set_delegation(monkeypatch, {})
+    outcome = differential.Outcome
+    announced = "dagrun: cgroup boxing ACTIVE (two-level cgroup-v2 scope)\n" if banner else ""
+
+    def fake_run(
+        _cmd: object, _args: object, extra_env: dict[str, str] | None = None, **_kw: object
+    ) -> object:
+        stated = (extra_env or {}).get("CARGO_BUILD_JOBS")
+        sentence = (
+            f"honouring CARGO_BUILD_JOBS={stated}"
+            if stated
+            else "no CARGO_BUILD_JOBS in the environment; derived 16"
+        )
+        return outcome(0, f"WIDTH={stated or 2}\n", f"{announced}build width: {sentence}\n")
+
+    monkeypatch.setattr(differential, "run", fake_run)
+    report = differential.Report()
+
+    differential.compare_operator_build_width(["python"], ["rust"], report)
+
+    assert report.checks == 2
+    assert report.skipped == []
+    if banner:
+        assert report.failures == []
+    else:
+        assert [failure.split(":", 2)[:2] for failure in report.failures] == [
+            ["operator-build-width", "stated"],
+            ["operator-build-width", "unstated"],
+        ]
 
 
 def test_each_validation_lane_states_its_coverage_policy() -> None:

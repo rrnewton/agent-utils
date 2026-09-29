@@ -100,6 +100,11 @@ refused.
 | validation nodes `cross.dagrun.differential` and `cross.dagrun.cpuset-differential` | partial for `delegated-live-scope` only; boxing stays required |
 | hosted repository CI and the nightly full run | additionally partial for `boxing`, because hosted runners run the graph with `--allow-cgroup-failure` |
 
+A boxed check counts only when both engines print `cgroup boxing ACTIVE`, which
+they do exactly when they have set up per-step cgroups. When the outer scheduler
+has no cgroup subtree to delegate, the boxed checks are listed as `boxing` skips
+and not run, because a nested engine would run them uncontained.
+
 ## Fixtures and reproducibility
 
 `cross/yaml_fixtures/` contains YAML scalar, quoting, block-text, duplicate-key,
