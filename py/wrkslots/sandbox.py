@@ -59,6 +59,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 ISOLATIONS = ("userns", "cgroup", "root")
+COORDINATOR_SCOPES = ("worktrees", "project")
 HOME_MODES = ("ro", "hidden")
 #: Agent harness state that must stay shared with the host and writable:
 #: credentials, settings, and session transcripts. A private copy per slot
@@ -180,6 +181,7 @@ class SandboxSettings:
     env: tuple[tuple[str, str], ...] = DEFAULT_ENV
     tmp_size: str = DEFAULT_TMP_SIZE
     protect_system: bool = True
+    coordinator_writable: str = "worktrees"
     limits: SandboxLimits = SandboxLimits()
 
 
@@ -251,6 +253,15 @@ SETTING_DOCS: dict[str, str] = {
     "protect_system": (
         "true (default): every mount outside the writable paths above is read-only. false "
         "leaves the rest of the file system writable; $HOME stays read-only either way."
+    ),
+    "coordinator_writable": (
+        "What a coordinator box (`wrkslots box`, `agentctl start --project-box`) may write "
+        "besides the paths above. worktrees (default): the managed worktrees directory "
+        "(every slot, the registry, slot images and state, validate slots) and the Git "
+        "directories the project's slots commit into. project: the whole project root. A "
+        "coordinator box can write the registry and every slot by design. A project that "
+        "keeps validation logs or other coordinator output outside the worktrees directory "
+        "chooses project, or lists those paths in read_write."
     ),
     "limits": (
         "systemd limits for the slot's slice, shared by everything run against the slot. "
@@ -377,6 +388,11 @@ def settings_from_obj(raw: Mapping[str, object]) -> SandboxSettings:
     tmp_size = raw.get("tmp_size", defaults.tmp_size)
     if not isinstance(tmp_size, str) or not _TMP_SIZE_RE.match(tmp_size):
         raise SandboxError(f"configuration.sandbox.tmp_size must look like 16G or 50%, not {tmp_size!r}")
+    scope = raw.get("coordinator_writable", defaults.coordinator_writable)
+    if scope not in COORDINATOR_SCOPES:
+        raise SandboxError(
+            f"configuration.sandbox.coordinator_writable must be one of {', '.join(COORDINATOR_SCOPES)}"
+        )
     env = _env_pairs(raw["env"]) if "env" in raw else defaults.env
     limits = limits_from_obj(raw["limits"]) if "limits" in raw else defaults.limits
     return SandboxSettings(
@@ -392,6 +408,7 @@ def settings_from_obj(raw: Mapping[str, object]) -> SandboxSettings:
         env=env,
         tmp_size=tmp_size,
         protect_system=protect,
+        coordinator_writable=str(scope),
         limits=limits,
     )
 
@@ -412,6 +429,7 @@ def settings_to_obj(settings: SandboxSettings) -> dict[str, object]:
         "env": dict(settings.env),
         "tmp_size": settings.tmp_size,
         "protect_system": settings.protect_system,
+        "coordinator_writable": settings.coordinator_writable,
         "limits": {key: getattr(settings.limits, key) for key in LIMIT_KEYS},
     }
 
@@ -467,6 +485,14 @@ class SlotView:
     control_directory: Path
     representation: str
     project_root: Path | None = None
+    #: A coordinator box (``wrkslots box``) rather than one slot's box: the
+    #: registry and slots are writable, and ``slot`` is the box name.
+    coordinator: bool = False
+    #: Extra writable roots (a coordinator box's scope and Git directories).
+    writable: tuple[Path, ...] = ()
+    #: Roots whose mounts made on the host after the box starts (image slots)
+    #: appear inside it; everything else is cut off from host mount events.
+    propagate: tuple[Path, ...] = ()
 
 
 # ------------------------------------------------------------------ slices
@@ -521,6 +547,9 @@ def slice_name(slot_type: str, slot: str, parent: str | None = None) -> str:
 
     # A dash in a slice name means nesting, so the slot name is escaped: slot
     # "kvm-foo" becomes one child of the wrkslots slice, not three levels.
+    if slot_type == "box":
+        # Coordinator boxes nest under <root>-box.slice, apart from the slots.
+        return root_slice(parent).removesuffix(".slice") + f"-box-{systemd_escape(slot)}.slice"
     label = slot if slot_type == "agent" else f"{slot_type}:{slot}"
     return root_slice(parent).removesuffix(".slice") + f"-{systemd_escape(label)}.slice"
 
@@ -641,15 +670,24 @@ def child_environment(view: SlotView, settings: SandboxSettings, environ: Mappin
     home = environ.get("HOME", str(Path.home()))
     if private_tmp:
         environment["TMPDIR"] = "/tmp"
-    environment.update(
-        {
-            "WRKSLOTS_SANDBOX": settings.isolation,
-            "WRKSLOTS_SLOT": view.slot,
-            "WRKSLOTS_SLOT_TYPE": view.slot_type,
-            "WRKSLOTS_SLOT_PATH": str(view.slot_path),
-            "WRKSLOTS_SLOT_REPRESENTATION": view.representation,
-        }
-    )
+    environment["WRKSLOTS_SANDBOX"] = settings.isolation
+    if view.coordinator:
+        environment.update(
+            {
+                "WRKSLOTS_BOX": view.slot,
+                "WRKSLOTS_BOX_WRITABLE": view.representation,
+                "WRKSLOTS_PROJECT_ROOT": str(view.project_root or ""),
+            }
+        )
+    else:
+        environment.update(
+            {
+                "WRKSLOTS_SLOT": view.slot,
+                "WRKSLOTS_SLOT_TYPE": view.slot_type,
+                "WRKSLOTS_SLOT_PATH": str(view.slot_path),
+                "WRKSLOTS_SLOT_REPRESENTATION": view.representation,
+            }
+        )
     for key, value in settings.env:
         environment[key] = _expand_home(value, home)
     return environment
@@ -833,11 +871,12 @@ def build_spec(view: SlotView, settings: SandboxSettings, home: Path, cwd: Path)
             # Top-level private directories are simply part of the layer.
             add(private_home_directory(view, relative), home / relative)
     add(view.slot_path, view.slot_path)
-    for directory in view.git_directories:
+    for directory in (*view.git_directories, *view.writable):
         add(directory, directory)
-    # The wrkslots control directory (registry, journals, other slots, slot images,
-    # private HOME layers) is never writable from a box: registry commands such as
-    # heartbeat, finish, and write-handoff run outside it.
+    # A slot's box never writes the wrkslots control directory (registry,
+    # journals, other slots, slot images, private HOME layers): registry commands
+    # such as heartbeat, finish, and write-handoff run outside it. A coordinator
+    # box is the one exception: its scope includes the control directory.
     if view.project_root is not None:
         for relative in settings.outputs:
             path = view.project_root / relative
@@ -848,7 +887,7 @@ def build_spec(view: SlotView, settings: SandboxSettings, home: Path, cwd: Path)
         if path.exists():
             add(path, path)
     entries = home_entries(settings, home)
-    read_only = [str(view.control_directory)]
+    read_only = [] if view.coordinator else [str(view.control_directory)]
     runtime = spec_directory()
     if runtime is not None:
         # Create it now: the view makes it read-only only if it exists, and a
@@ -857,9 +896,12 @@ def build_spec(view: SlotView, settings: SandboxSettings, home: Path, cwd: Path)
         ensure_spec_directory(runtime)
         read_only.append(str(runtime))
     masks = [str(base / relative) for base in aliases for relative in settings.home_hidden]
-    # Other slots' images and private HOME layers (which hold private copies of
-    # credential files). This slot's own layer is bound over $HOME beforehand.
-    masks += [str(view.control_directory / name) for name in ("slot-images", "slot-state")]
+    # Other slots' and boxes' private HOME layers (which hold private copies of
+    # credential files), and in a slot's box the image directory too. This box's
+    # own layer is bound over $HOME beforehand. A coordinator box keeps
+    # slot-images visible: it creates and removes image slots.
+    private_state = ("slot-state", "box-state") if view.coordinator else ("slot-images", "slot-state", "box-state")
+    masks += [str(view.control_directory / name) for name in private_state]
     return {
         "home": str(home),
         "home_aliases": [str(alias) for alias in aliases[1:]],
@@ -871,6 +913,7 @@ def build_spec(view: SlotView, settings: SandboxSettings, home: Path, cwd: Path)
         "masks": masks,
         "tmp_size": settings.tmp_size,
         "protect_system": settings.protect_system,
+        "propagate": [str(path) for path in view.propagate],
         "cwd": str(cwd),
     }
 
@@ -889,6 +932,7 @@ _MS_NODIRATIME = 2048
 _MS_BIND = 4096
 _MS_REC = 16384
 _MS_PRIVATE = 1 << 18
+_MS_SLAVE = 1 << 19
 _MS_RELATIME = 1 << 21
 _MS_STRICTATIME = 1 << 24
 _O_PATH = 0o10000000
@@ -1059,7 +1103,11 @@ def build_view(spec: Mapping[str, object]) -> None:
         assert isinstance(value, list)
         return [str(item) for item in value]
 
-    _mount(None, "/", None, _MS_REC | _MS_PRIVATE)
+    propagate = strings("propagate")
+    # Slave propagation keeps host mount events flowing in (a coordinator box
+    # sees image slots mounted after it started) while nothing mounted in the
+    # box ever reaches the host. Without roots to propagate, everything is private.
+    _mount(None, "/", None, _MS_REC | (_MS_SLAVE if propagate else _MS_PRIVATE))
     home = str(spec["home"])
     layer = str(spec["home_layer"])
     mode = str(spec.get("home_mode", "ro"))
@@ -1146,9 +1194,36 @@ def build_view(spec: Mapping[str, object]) -> None:
                 "could not make every mount read-only (refusing to run unprotected): "
                 + "; ".join(failures[:3])
             )
+    if propagate:
+        _limit_propagation(propagate)
     for descriptor in pinned.values():
         os.close(descriptor)
     os.chdir(str(spec.get("cwd", "/")))
+
+
+def _limit_propagation(roots: Sequence[str]) -> None:
+    """Keep host mount events only where ``roots`` are visible; make every other mount private.
+
+    The mount each root resolves through in the view (the topmost mount whose
+    mount point is the longest prefix of the root) and every mount below a root
+    stay slaves, so an image slot mounted on the host appears at its slot path.
+    Any other mount, such as ``/`` itself or a read-only bind of $HOME, stops
+    receiving host mounts, which would otherwise arrive writable.
+    """
+
+    points = list(dict.fromkeys(point for point, _flags in _mounts()))
+    keep: set[str] = set()
+    for root in roots:
+        covering = [point for point in points if _under(root, [point])]
+        if covering:
+            keep.add(max(covering, key=len))
+    for point in points:
+        if point in keep or _under(point, roots) or not os.path.lexists(point):
+            continue
+        try:
+            _mount(None, point, None, _MS_PRIVATE)
+        except MountError:
+            continue  # shadowed by a mount above it: unreachable
 
 
 # ------------------------------------------------------------- userns helper
@@ -1551,7 +1626,10 @@ def run(
     print_only: bool = False,
     unit: str | None = None,
 ) -> int:
-    """Replace this process with ``command`` boxed to the slot; returns only for ``print_only``."""
+    """Replace this process with ``command`` boxed to the slot (or coordinator box).
+
+    Returns only for ``print_only``.
+    """
 
     isolation = settings.isolation
     if isolation not in ISOLATIONS:
@@ -1561,7 +1639,8 @@ def run(
     if shutil.which("systemd-run") is None:
         raise SandboxError("systemd-run is not available; the sandbox needs a systemd user manager")
     home = Path(os.environ.get("HOME", str(Path.home())))
-    unit_name = unit or f"wrkslots-run-{systemd_escape(view.slot)}-{os.getpid()}.scope"
+    kind = "box" if view.coordinator else "run"
+    unit_name = unit or f"wrkslots-{kind}-{systemd_escape(view.slot)}-{os.getpid()}.scope"
     slot_slice = slice_name(view.slot_type, view.slot)
     workdir = cwd or view.slot_path
     if print_only:

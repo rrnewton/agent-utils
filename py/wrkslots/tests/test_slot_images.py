@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from wrkslots import cli, sandbox, slotimage
+from wrkslots import cli, imagecmd, sandbox, slotimage
 
 
 def _init_args(**overrides: object) -> argparse.Namespace:
@@ -759,3 +759,180 @@ def test_image_helper_resolves_system_tools_without_path(monkeypatch: pytest.Mon
     except imagehelper.HelperError:
         pytest.skip("resize2fs is not installed in a system directory")
     assert resolved != str(decoy) and resolved.startswith(("/usr/sbin/", "/sbin/", "/usr/bin/", "/bin/"))
+
+
+# ------------------------------------------------------------ coordinator box
+
+
+def _small_project(base: Path, home: Path) -> tuple[Path, dict[str, str]]:
+    """A wrkslots project at base/project with one source repository, src, and no slots."""
+
+    remote, project = base / "remote.git", base / "project"
+    repository = project / "src"
+    git_env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "HOME": str(home)}
+
+    def git(*arguments: str, cwd: Path | None = None) -> None:
+        subprocess.run(["git", *arguments], cwd=cwd, check=True, capture_output=True, text=True, env=git_env)
+
+    git("init", "--bare", "--initial-branch=main", str(remote))
+    project.mkdir()
+    git("clone", str(remote), str(repository))
+    for key, value in (("user.name", "t"), ("user.email", "t@example.invalid")):
+        git("config", key, value, cwd=repository)
+    (repository / "seed").write_text("seed\n", encoding="utf-8")
+    git("add", "seed", cwd=repository)
+    git("commit", "-m", "seed", cwd=repository)
+    git("push", "-u", "origin", "main", cwd=repository)
+    (project / "ai_docs").mkdir()
+    (project / "logs").mkdir()
+    liveness = project / "liveness.py"
+    liveness.write_text("#!/usr/bin/env python3\nraise SystemExit(1)\n", encoding="utf-8")
+    liveness.chmod(0o755)
+    environment = {
+        **git_env,
+        "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+        "WRKSLOTS_INIT_REPRESENTATION": "worktree",
+    }
+    initialized = subprocess.run(
+        [sys.executable, "-m", "wrkslots", "--machine", "testhost", "init", str(project),
+         "--worktrees-dir", "worktrees", "--liveness-command", "liveness.py"],
+        cwd=project, capture_output=True, text=True, timeout=120, env=environment, check=False,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    return project, environment
+
+
+def test_coordinator_box_spec_scopes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = _fake_home(tmp_path)
+    project, _environment = _small_project(tmp_path, home)
+    monkeypatch.setenv("HOME", str(home))
+    config = cli._load_config(str(project), "testhost")
+    control = config.control
+    settings = sandbox.SandboxSettings()
+    worktrees = imagecmd.box_view(config, "lead", "worktrees")
+    assert worktrees.coordinator and worktrees.slot_type == "box"
+    assert worktrees.state_directory == control / "box-state" / "lead"
+    spec = sandbox.build_spec(worktrees, settings, home, project)
+    binds = spec["binds"]
+    assert isinstance(binds, list)
+    targets = [target for _source, target in binds]
+    # The registry and every slot (the worktrees directory) and the source
+    # repository's Git directory are writable; the rest of the project is not.
+    assert str(project / "worktrees") in targets
+    assert str(project / "src" / ".git") in targets
+    assert str(project / "ai_docs") in targets  # blessed output
+    for read_only in (project, project / "src", project / "logs", home / "work"):
+        assert str(read_only) not in targets
+    assert str(control) not in spec["read_only"]  # type: ignore[operator]
+    masks = spec["masks"]
+    assert isinstance(masks, list)
+    assert str(control / "box-state") in masks and str(control / "slot-state") in masks
+    assert str(control / "slot-images") not in masks  # a coordinator creates image slots
+    assert str(home / ".ssh") in masks and str(home / ".netrc") in masks  # credentials stay masked
+    assert spec["home_layer"] == str(control / "box-state" / "lead" / "home")
+    assert str(control) in spec["propagate"]  # type: ignore[operator]
+    assert sandbox.slice_name("box", "lead", parent=None).endswith("wrkslots-box-lead.slice")
+    whole = imagecmd.box_view(config, "lead", "project")
+    spec = sandbox.build_spec(whole, settings, home, project)
+    binds = spec["binds"]
+    assert isinstance(binds, list)
+    targets = [target for _source, target in binds]
+    assert str(project) in targets
+    assert str(home / "work") not in targets
+    # A slot's box still masks the images and every private layer, boxes' included.
+    slot_spec = sandbox.build_spec(_view(tmp_path), settings, home, tmp_path / "slot")
+    for name in ("slot-images", "slot-state", "box-state"):
+        assert str(tmp_path / "control" / name) in slot_spec["masks"]  # type: ignore[operator]
+    assert slot_spec["propagate"] == []
+    environment = sandbox.child_environment(worktrees, settings, {"HOME": str(home)})
+    assert environment["WRKSLOTS_BOX"] == "lead" and environment["WRKSLOTS_BOX_WRITABLE"] == "worktrees"
+    assert "WRKSLOTS_SLOT" not in environment
+    with pytest.raises(cli.Refusal):
+        imagecmd.box_view(config, "../escape", "worktrees")
+
+
+def test_image_mounts_from_inside_a_box_go_through_the_user_manager(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.delenv("WRKSLOTS_SANDBOX", raising=False)
+    assert not slotimage.in_box()
+    assert slotimage._host_argv(["sudo", "-n", "true"]) == ["sudo", "-n", "true"]
+    monkeypatch.setenv("WRKSLOTS_SANDBOX", "root")
+    assert slotimage.in_box()
+    if shutil.which("systemd-run") is None:
+        pytest.skip("needs systemd-run")
+    argv = slotimage._host_argv(["sudo", "-n", "true"])
+    assert argv[1:4] == ["--user", "--quiet", "--collect"] and "--wait" in argv and "--pipe" in argv
+    assert argv[-3:] == ["sudo", "-n", "true"]
+    monkeypatch.setenv("WRKSLOTS_SANDBOX", "cgroup")  # limits only: the host namespace
+    assert not slotimage.in_box()
+
+
+_BOX_PROBE = r"""
+report() { if eval "$2" >/dev/null 2>&1; then echo "$1=yes"; else echo "$1=no"; fi; }
+report registry_write 'echo x > "$PROJECT/worktrees/probe-registry"'
+report slot_write 'echo x > "$PROJECT/worktrees/$SLOT/src/probe-coordinator"'
+report slot_commit 'cd "$PROJECT/worktrees/$SLOT/src" && git -c user.name=t -c user.email=t@e commit -q --allow-empty -m c'
+report project_file_write 'echo x > "$PROJECT/logs/probe"'
+report primary_checkout_write 'echo x > "$PROJECT/src/probe"'
+report output_write 'echo x > "$PROJECT/ai_docs/probe"'
+report agent_registry_write 'mkdir -p "$PROJECT/.agentctl" && echo x > "$PROJECT/.agentctl/probe"'
+report home_work_write 'echo x > ~/work/probe'
+report home_new_file 'echo x > ~/probe-top'
+report ssh_hidden '[ -z "$(ls -A ~/.ssh)" ]'
+report tmp_write 'echo x > /tmp/probe'
+"""
+
+
+@pytest.mark.parametrize("isolation", ["userns", "root"])
+@pytest.mark.parametrize("scope", ["worktrees", "project"])
+def test_coordinator_box_confines_writes(box_base: Path, isolation: str, scope: str) -> None:
+    _sandbox_host_or_skip(isolation)
+    home = _fake_home(box_base)
+    project, environment = _small_project(box_base, home)
+
+    def wrkslots(*arguments: str, timeout: int = 300) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "wrkslots", "--machine", "testhost", *arguments],
+            cwd=project, capture_output=True, text=True, timeout=timeout,
+            env={**environment, "PROJECT": str(project), "SLOT": "cs1"}, check=False,
+        )
+
+    created = wrkslots(
+        "create", "cs1", "--slot-type", "agent", "--coordinator-authorized", "--agent", "a1", "--task", "t",
+        "--purpose", "coordinator box test", "--owner-pid", str(os.getpid()), "--coordinator-pid", str(os.getpid()),
+        "--repo", "src=src", "--branch", "src=agent/cs1",
+    )
+    assert created.returncode == 0, created.stderr
+    shell = wrkslots("shell-command", "--box", "--name", "lead", "--writable", scope, "--format", "json", "--", "/bin/echo", "x")
+    assert shell.returncode == 0, shell.stderr
+    document = json.loads(shell.stdout)
+    assert document["box"] == "lead" and document["slot_path"] == str(project)
+    assert f" box --name lead --cwd {project} --writable {scope} -- /bin/echo x" in document["command"]
+    name = f"pytest-{isolation}-{scope}-{os.getpid()}"
+    try:
+        boxed = wrkslots("box", "--name", name, "--writable", scope, "--isolation", isolation, "--tmp-size", "64M",
+                         "--", "bash", "-c", _BOX_PROBE)
+    finally:
+        subprocess.run(["systemctl", "--user", "stop", sandbox.slice_name("box", name)], capture_output=True, check=False)
+    assert boxed.returncode == 0, boxed.stderr
+    whole = scope == "project"
+    assert _probe_results(boxed.stdout) == {
+        "registry_write": True,
+        "slot_write": True,
+        "slot_commit": True,
+        "project_file_write": whole,
+        "primary_checkout_write": whole,
+        "output_write": True,
+        "agent_registry_write": True,
+        "home_work_write": False,
+        "home_new_file": True,
+        "ssh_hidden": True,
+        "tmp_write": True,
+    }, boxed.stdout + boxed.stderr
+    layer = project / "worktrees" / "box-state" / name / "home"
+    assert (layer / "probe-top").exists() and not (home / "probe-top").exists()
+    assert not (home / "work" / "probe").exists()
+    status = wrkslots("status")
+    assert "directory-without-row" not in status.stdout + status.stderr, status.stdout

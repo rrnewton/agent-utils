@@ -23,8 +23,11 @@ slot. The box applies per-slot memory, CPU, and task limits, a fresh `/tmp`, and
 view with the real `$HOME` read-only under a per-slot private layer and credentials masked. Only
 the slot, its Git directories, the project's blessed output directories, and shared harness state
 are writable. The box is identical for plain and image slots, is configured in the project's
-`sandbox` section, and needs no host configuration. See the user guide's "Disk-image slots" and
-"Running commands and agents inside a slot's box".
+`sandbox` section, and needs no host configuration. `wrkslots box -- COMMAND` is the coordinator
+variant: the same view with no slot, but every slot and the registry writable, for an agent that
+creates slots and launches subagents into them; image slots it creates are mounted on the host.
+See the user guide's "Disk-image slots", "Running commands and agents inside a slot's box", and
+"Boxing a (sub)coordinator".
 
 ## Install
 

@@ -337,28 +337,83 @@ def _run(argv: Sequence[str], *, cwd: Path | None = None, timeout: float = 120.0
     return result.stdout
 
 
+def in_box() -> bool:
+    """Whether this process runs in a wrkslots box's own mount namespace.
+
+    A box binds the root launcher's spec directory onto itself, so that path is
+    a mount point only inside a box; the environment marker covers a box built
+    without a per-user runtime directory.
+    """
+
+    if os.environ.get("WRKSLOTS_SANDBOX") in ("userns", "root"):
+        return True
+    directory = sandbox.spec_directory()
+    return directory is not None and os.path.ismount(directory)
+
+
+_BOX_MOUNT_HINT = (
+    "image mounts requested from inside a box run in the host's mount namespace through the "
+    "user's systemd manager (systemd-run --user); if that is unavailable, create and remove "
+    "image slots outside the box"
+)
+
+
+def _host_argv(argv: Sequence[str]) -> list[str]:
+    """``argv``, run in the host's mount namespace.
+
+    Outside a box that is simply here. Inside one, a mount made here would land
+    in the box's private namespace, invisible to the host and to every worker
+    launched into the slot, so the command runs as a transient service of the
+    user's systemd manager, which lives in the host namespace. The box's slave
+    propagation then shows the result inside the box too.
+    """
+
+    if not in_box():
+        return list(argv)
+    systemd_run = shutil.which("systemd-run")
+    if systemd_run is None:
+        raise ImageError(f"systemd-run is not installed; {_BOX_MOUNT_HINT}")
+    return [
+        systemd_run,
+        "--user",
+        "--quiet",
+        "--collect",
+        "--wait",
+        "--pipe",
+        "--service-type=exec",
+        "--",
+        *argv,
+    ]
+
+
+def _run_on_host(argv: Sequence[str], *, timeout: float = 120.0) -> str:
+    try:
+        return _run(_host_argv(argv), timeout=timeout)
+    except ImageError as exc:
+        if in_box():
+            raise ImageError(f"{exc} ({_BOX_MOUNT_HINT})") from exc
+        raise
+
+
 def _privileged_argv() -> list[str]:
     helper = Path(__file__).resolve().with_name("imagehelper.py")
-    return ["sudo", "-n", "--", os.path.realpath(sys.executable), "-I", str(helper)]
+    sudo = shutil.which("sudo") or "sudo"
+    return [sudo, "-n", "--", os.path.realpath(sys.executable), "-I", str(helper)]
 
 
 def _privileged(operation: str, *arguments: str, timeout: float = 120.0) -> str:
-    """Run one kernel-backend operation through the checking helper as root."""
+    """Run one kernel-backend operation through the checking helper as root, in the host namespace."""
 
-    return _run([*_privileged_argv(), operation, *arguments], timeout=timeout)
+    return _run_on_host([*_privileged_argv(), operation, *arguments], timeout=timeout)
 
 
 def sudo_available() -> bool:
-    """Whether `sudo -n` works without a password prompt."""
+    """Whether `sudo -n` works without a password prompt (where image mounts run)."""
 
     try:
-        return (
-            subprocess.run(
-                ["sudo", "-n", "true"], capture_output=True, timeout=10, check=False
-            ).returncode
-            == 0
-        )
-    except (OSError, subprocess.TimeoutExpired):
+        argv = _host_argv([shutil.which("sudo") or "sudo", "-n", "true"])
+        return subprocess.run(argv, capture_output=True, timeout=30, check=False).returncode == 0
+    except (OSError, subprocess.TimeoutExpired, ImageError):
         return False
 
 
@@ -569,6 +624,9 @@ def _fuse_mount(image_file: Path, mount_point: Path) -> None:
                     return
                 time.sleep(0.05)
             raise ImageError(f"fuse2fs did not mount {image_file} at {mount_point} within 10s")
+    if in_box():
+        # A daemonizing fuse2fs run here would mount into the box's own namespace.
+        raise ImageError(f"cannot start fuse2fs as a user service for {image_file}; {_BOX_MOUNT_HINT}")
     _run(argv, cwd=image_file.parent)
     if not is_mounted(image_file, mount_point):
         raise ImageError(f"fuse2fs exited without mounting {image_file} at {mount_point}")
@@ -636,7 +694,7 @@ def unmount(image_file: Path, mount_point: Path) -> None:
         _privileged("umount", str(mount_point))
     else:
         subprocess.run(["fstrim", str(mount_point)], capture_output=True, check=False)
-        _run(["fusermount", "-u", str(mount_point)])
+        _run_on_host([shutil.which("fusermount") or "fusermount", "-u", str(mount_point)])
         for _ in range(200):
             if not is_mounted(image_file, mount_point):
                 break
@@ -851,7 +909,7 @@ def trim(image: SlotImage) -> list[str]:
         if mounted is None:
             continue
         if mounted[0] == "kernel":
-            argv = [*_privileged_argv(), "trim", str(mount_point)]
+            argv = _host_argv([*_privileged_argv(), "trim", str(mount_point)])
         else:
             argv = ["fstrim", str(mount_point)]
         result = subprocess.run(argv, capture_output=True, text=True, check=False)

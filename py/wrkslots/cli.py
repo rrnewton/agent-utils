@@ -3287,7 +3287,7 @@ def _owned_mount_line(line: str) -> bool:
 #: Control-directory entries that hold slot storage rather than being slots:
 #: the disk images and the box's per-slot private state. In the nested layout
 #: they sit beside the slot directories.
-_REPRESENTATION_DIRECTORIES = (slotimage.IMAGES_DIRECTORY, "slot-state")
+_REPRESENTATION_DIRECTORIES = (slotimage.IMAGES_DIRECTORY, "slot-state", "box-state")
 
 
 def _is_representation_directory(config: Config, entry: Path) -> bool:
@@ -38387,6 +38387,13 @@ every default into the configuration's sandbox section; inspect it with `sandbox
      wrkslots shell-command slot01 --format json            # for agent launchers
      wrkslots sandbox write-defaults                        # older projects: add missing keys
 
+Box a (sub)coordinator that creates slots and launches subagents into them: the same view,
+but every slot, the registry, and the slots' Git directories writable (--writable project: the
+whole project root), with no slot. Image slots it creates are mounted on the host.
+
+     wrkslots box --isolation root --cwd worktrees -- HARNESS ...
+     wrkslots shell-command --box --cwd worktrees --format json   # for agent launchers
+
 Use `wrkslots COMMAND --help` for the exact effects and inputs of one command.
 """
 
@@ -38431,7 +38438,8 @@ recover-absent-validate-rows --apply, and recover. Registry mutations take a sta
 hash-linked events. ACTIVE and ARCHIVED are compatibility views derived from those events.
 Configuration: config convert (literate YAML or JSON .wrkslots.yml).
 Storage and boxing: image (slot disk images), run and shell-command (box a command
-or agent to a slot, for plain and image slots alike), sandbox (show or complete the
+or agent to a slot, for plain and image slots alike), box (a coordinator box: all slots
+and the registry writable, no slot), sandbox (show or complete the
 configuration's sandbox section), and limits (the machine-wide guard).
 Each slot binds an agent identity, coordinator process generation, and one or more linked Git
 worktrees to durable machine-sharded state. Removal fails closed unless the time-to-live,

@@ -236,6 +236,44 @@ Follow-ups, not done:
   by `wrkslots recover`. Until then the guide says to convert only idle slots and to keep
   `--keep-original` for the first conversions.
 
+### Coordinator box (project-box, 2026-09-29)
+
+`wrkslots box` reuses the slot view with a `SlotView(coordinator=True)`: no slot, a writable scope
+(`worktrees` or `project`), the private layer at `<control>/box-state/NAME/home`, and a list of
+propagation roots (the control directory and the slot roots).
+
+Mount propagation, verified on this host rather than assumed:
+
+- A box built with `MS_REC|MS_SLAVE` on `/` receives host mounts. A bind of a slave source onto
+  a non-shared target is a slave of the same master, so the control-directory bind inside the box
+  receives image mounts made on the host after the box started. After the view is built, every
+  mount except the one each root resolves through (and mounts below the roots) is made private.
+  So a tmpfs mounted on the host in a sibling directory is not visible in the box. `findmnt -T`
+  still lists it, because the copy lands on a shadowed slave mount; `stat` shows the directory's
+  own device. Slot boxes stay `MS_REC|MS_PRIVATE`.
+- A mount made from inside a box (root mode: sudo works; the helper's mount lands in the box's
+  namespace) was invisible to the host. The image helper therefore runs in the host namespace
+  whenever wrkslots detects a box (the spec directory is a mount point, or `WRKSLOTS_SANDBOX` is
+  userns/root), as `systemd-run --user --wait --pipe --collect -- sudo -n python -I
+  imagehelper.py ...`. The user manager lives in PID 1's mount namespace (checked: same `mnt:`
+  inode as PID 1 and the Herdr server). The helper re-checks every path there; no new root code
+  was needed, and userns boxes, where sudo cannot run, work too. Setns into the user manager's
+  namespace from the helper was the alternative. It needs root-side PID pinning of the manager
+  and re-opening every path after setns, and it would not help userns boxes.
+- Verified: in root and userns boxes, `wrkslots create --representation image` mounts the slot
+  in PID 1's namespace (`nsenter -t 1 -m findmnt`), the box sees it at once, and a slot created on
+  the host after the box started appears inside and is writable.
+
+Real runs: `accept_coordinator_box.sh` passes (phase 1 creates both kinds of slot; phase 2 is
+agentctl-launched claude workers under root slot isolation, each confined to its slot). A Herdr
+pane test of `agentctl start sub --harness claude --project-box --box-isolation root`: the boxed
+claude ran the write probe (registry, image and worktree slots writable; primary checkout, a
+sibling directory, and `~/work` read-only; the Herdr socket and the agentctl registry reachable)
+and launched a codex worker with `agentctl start --slot wt1 --slot-isolation root` from inside its
+box. The worker wrote only its slot. Codex's folder-trust question had to be answered once by a
+human, and the first attempt with `--slot-isolation userns` failed as expected (the Meta codex
+launcher's setuid step).
+
 ## Verification
 
 - `py/wrkslots/tests/test_slot_images.py`: configuration defaults and migration rules, sandbox

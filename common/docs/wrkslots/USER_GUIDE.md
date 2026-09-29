@@ -961,6 +961,8 @@ The box stops accidents, not a process that sets out to leave it:
   a linked worktree: a boxed process can write `.git/hooks/*` (and `config`), which Git runs later
   in other checkouts of the same repository, outside the box.
 - **`cgroup` isolation** applies limits only.
+- **A coordinator box can write the registry and every slot, by design** (see "Boxing a
+  (sub)coordinator"). It is the one box in which the "registry is read-only" rule does not hold.
 
 ### Configuring the box
 
@@ -985,6 +987,7 @@ sandbox:
   env: {}
   tmp_size: 16G
   protect_system: true
+  coordinator_writable: worktrees
   limits: {memory_max: null, memory_high: null, cpu_quota: null, tasks_max: 8192,
            io_weight: null, all_slots_memory_max: null, all_slots_cpu_quota: null}
 ```
@@ -1007,6 +1010,67 @@ waits until the pane's own shell PID is again the foreground shell inside a wrks
 registers the slot directory as the agent's working directory, and then starts the harness. The
 agent and everything it runs stay in the slot's box. Under `root` isolation the launcher instead
 runs the COMMAND form with the harness, because the multiplexer cannot start an agent behind sudo.
+
+### Boxing a (sub)coordinator
+
+A coordinator agent creates slots and launches its own subagents into them. It needs the registry
+and the slots writable, which no slot's box allows, but it should not be able to write anywhere
+else in `$HOME`. `wrkslots box` gives it that box, for any wrkslots project:
+
+```sh
+wrkslots box --isolation root --cwd worktrees -- claude      # from the project root
+wrkslots shell-command --box --cwd worktrees --format json  # the same, for launchers
+agentctl start lead --harness claude --cwd PROJECT/worktrees --project-box --box-isolation root
+```
+
+The view is the one `run` builds, with the same flags and defaults, but with no slot and a
+different writable set, chosen by `--writable` (default `configuration.sandbox.coordinator_writable`,
+else `worktrees`):
+
+| Scope | Writable besides home_shared, outputs, read_write, and /tmp |
+|---|---|
+| `worktrees` | the managed worktrees directory: every slot, the registry and journals, slot images and state, validate slots; plus the Git directories slots commit into (the project root's repository with its `modules/` and `worktrees/`, every repository directly below the project root, and every repository an active slot uses) |
+| `project` | the whole project root, plus Git directories outside it |
+
+In both scopes the agentctl registry in the working directory (`.agentctl`, agentctl's default)
+is writable, so the coordinator can launch agents; it is created if missing. A project that keeps
+validation logs or other coordinator output outside the worktrees directory either chooses
+`project` or lists those paths in `read_write`. Everything else under `$HOME`, including sibling
+projects, stays read-only, and the `home_hidden` credentials stay masked.
+
+`$HOME` is the box's own persistent private layer, `<control>/box-state/NAME/home` (`--name`,
+default `coordinator`; agentctl uses the agent name), built exactly like a slot's; other boxes'
+and slots' private layers are masked. `/tmp` is fresh per launch. Limits apply to the box's own
+slice, `wrkslots-box-NAME.slice` below the all-slots slice.
+
+**Image slots and mount propagation.** A coordinator that creates an image slot needs its mount to
+be real on the host: workers launched into the slot must see it, and so must the coordinator. Two
+rules make that work:
+
+1. A coordinator box receives host mount events (slave propagation) under the worktrees
+   directory, so an image slot mounted on the host after the box started appears inside it.
+   Everywhere else its mounts are private: a mount made elsewhere on the host is not visible in
+   the box. Nothing mounted inside any box ever reaches the host.
+2. When `wrkslots create`, `remove`, `image mount|unmount|grow|trim`, or any other command mounts
+   or unmounts a slot image from inside a box, the mount runs in the host's mount namespace, as a
+   transient service of your systemd user manager (`systemd-run --user --wait --pipe`), which
+   starts the same root image helper through `sudo -n`. The helper checks every path again there.
+   This works from `userns` boxes too, where sudo itself cannot run. If the user manager is
+   unreachable from the box, image commands fail with a message saying so; create image slots
+   outside the box in that case.
+
+Slot boxes keep all their mounts private, as before: a slot's box needs no mount made after it
+started.
+
+**Subagents start outside the box.** A worker the coordinator launches through a terminal
+multiplexer (`agentctl start --slot`) runs in a pane whose shell the multiplexer's server spawns,
+outside the coordinator's box and slice. The worker then boxes itself into its own slot. The
+coordinator's box needs only the multiplexer's socket, which is under `/run/user` or in the
+shared harness state.
+
+**Harness trust prompts.** A harness that asks whether to trust a folder (Claude, Codex) asks
+once per box: Claude keeps the answer in the box's private copy of `~/.claude.json`, Codex in the
+shared `~/.codex`. agentctl stops at the prompt for a human to answer.
 
 ### Builds with a shared action cache
 
