@@ -505,11 +505,20 @@ _AT_SYMLINK_FOLLOW = 0x400
 _MOUNTINFO_CENSUS_BYTES_LIMIT = 256 * 1024 * 1024
 _ABSENT_PROCESS_CENSUS_SECONDS = 60.0
 _TRUSTED_EXECUTABLE_DIRECTORY = Path("/usr/bin")
-# Keep post-seal census work inside the intended 30-second integration envelope:
-# one evidence deadline leaves eight seconds for rollback, Git removal, and
-# durable state restoration. Phase A selects and seals the evidence paths before
-# this clock starts; the parent batch caller still needs end-to-end timing.
-_VALIDATE_REMOVE_BATCH_CENSUS_SECONDS = 22.0
+# One operation-wide deadline covers the shared privileged census and every
+# per-item same-UID census of a validation batch.  Phase A selects and seals the
+# evidence paths before this clock starts, and rollback, Git removal, and state
+# restoration run after it.  The bound is sized from measured host cost, not
+# from a target envelope.  On 2026-09-29, on a 316-CPU host with about 4,000
+# processes, one privileged census took 3.7 to 5.7 seconds at load average 28,
+# and 25 to 29 seconds at a higher load.  At that higher load, the former
+# 22-second bound refused every item of a real three-slot batch.  One same-UID
+# census took 1.1 to 1.3 seconds and 11 seconds at the same two loads.  A full
+# batch at the higher cost is 29 + 8 * 11 = 117 seconds.  The seal journal is
+# outstanding for this whole window, and clients that predate seal-aware
+# heartbeat refuse while it exists, so the bound stays finite and close to the
+# measured worst case.
+_VALIDATE_REMOVE_BATCH_CENSUS_SECONDS = 120.0
 _READ_ONLY_COMMAND_REAP_SECONDS = 1.0
 _RECLAIM_LIVE_USE_RECHECK_SECONDS = 0.25
 _LIVENESS_BATCH_REQUEST_SCHEMA = "wrkslots-liveness-batch-request/v1"
@@ -25930,18 +25939,22 @@ def _remove_validate_batch(
 
 def _cmd_remove_validate_batch(args: argparse.Namespace) -> int:
     payload = _remove_validate_batch(args)
+    removed = _as_list(payload["removed"], "removed")
+    retained = _as_list(payload["retained"], "retained")
     if args.format == "json":
         print(json.dumps(payload, sort_keys=True))
     else:
         print(
-            f"requested={payload['requested']} removed={len(_as_list(payload['removed'], 'removed'))} "
-            f"retained={len(_as_list(payload['retained'], 'retained'))} "
+            f"requested={payload['requested']} removed={len(removed)} "
+            f"retained={len(retained)} "
             f"process_censuses={payload['process_censuses']}"
         )
-        for value in _as_list(payload["retained"], "retained"):
+        for value in retained:
             row = _as_mapping(value, "retained item")
             print(f"RETAINED: {row['slot']} reason={row['reason']}")
-    return 0
+    # A retained item is a refusal of that item.  Success means every requested
+    # slot was removed; a batch that removed nothing never reports success.
+    return 0 if removed and not retained else 1
 
 
 def _recover_partial_updates(config: Config, discard: bool) -> bool:
@@ -33820,6 +33833,9 @@ class _ReadOnlyCommandBudget:
     stderr_remaining: int
     input_remaining: int
     observations_remaining: int
+    # The configured bound, kept so a deadline refusal can say how large the
+    # bound was and how long the census actually ran.  Zero means unknown.
+    timeout_seconds: float = 0.0
 
     @classmethod
     def start(
@@ -33837,12 +33853,23 @@ class _ReadOnlyCommandBudget:
             stderr_remaining=stderr_limit,
             input_remaining=input_limit,
             observations_remaining=observation_limit,
+            timeout_seconds=timeout_seconds,
         )
 
     def remaining_seconds(self) -> float:
-        remaining = self.deadline - time.monotonic()
+        now = time.monotonic()
+        remaining = self.deadline - now
         if remaining <= 0:
-            raise Refusal("read-only census exceeded its operation-wide time bound")
+            detail = ""
+            if self.timeout_seconds > 0:
+                elapsed = now - (self.deadline - self.timeout_seconds)
+                detail = (
+                    f" (bound {self.timeout_seconds:.1f} s, "
+                    f"elapsed {elapsed:.1f} s)"
+                )
+            raise Refusal(
+                "read-only census exceeded its operation-wide time bound" + detail
+            )
         return remaining
 
     def reserve_input(self, size: int) -> None:
@@ -39510,7 +39537,9 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "without preventing other requested slots from being considered. Sealing prevents "
             "later entry by ordinary processes under another UID. The post-fence scan detects "
             "existing or cooperative use under the same UID; it is not isolation from a "
-            "same-UID process deliberately racing cleanup."
+            "same-UID process deliberately racing cleanup. Exit status is 0 only when "
+            "every requested slot was removed, 1 when any slot was retained (including "
+            "a batch that removed nothing), and 3 when the whole batch was refused."
         ),
         formatter_class=_HelpFormatter,
     )

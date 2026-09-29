@@ -15779,7 +15779,7 @@ def test_validate_batch_rechecks_external_proof_after_private_seal(
         format="json",
     )
 
-    assert wrkslots._cmd_remove_validate_batch(args) == 0
+    assert wrkslots._cmd_remove_validate_batch(args) == 1
     report = json.loads(capsys.readouterr().out)
     assert report["removed"] == []
     assert len(report["retained"]) == 1
@@ -15856,7 +15856,7 @@ def test_validate_batch_shares_one_census_and_retains_each_refusal(
         ]
     )
 
-    assert rc == 0
+    assert rc == 1
     report = json.loads(capsys.readouterr().out)
     assert report["process_censuses"] == 1
     assert report["shared_process_censuses"] == 1
@@ -15869,6 +15869,65 @@ def test_validate_batch_shares_one_census_and_retains_each_refusal(
     assert census_order == ["privileged"]
     assert not slot_paths["unused"].exists()
     assert in_use.is_dir()
+
+
+def test_validate_batch_that_retains_every_item_exits_nonzero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A batch that removed nothing must not report success.
+
+    A production batch printed ``removed=0 retained=3`` and still exited 0, so
+    a caller that checked only the status recorded three removals that never
+    happened.
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    slot_paths = prepare_dead_validate_slots(project, ("first", "second"))
+
+    def census(
+        paths: Sequence[Path],
+        *,
+        budget: wrkslots._ReadOnlyCommandBudget | None = None,
+        include_owner_cgroups: bool = True,
+    ) -> wrkslots._ProcessPathCensus:
+        del budget, include_owner_cgroups
+        return wrkslots._ProcessPathCensus(
+            (),
+            tuple(
+                (20000 + index, str(path), "cwd", str(path))
+                for index, path in enumerate(sorted(paths))
+            ),
+        )
+
+    monkeypatch.setattr(wrkslots, "_capture_process_path_census", census)
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_same_uid_process_path_census",
+        lambda _paths, **_kwargs: wrkslots._ProcessPathCensus((), ()),
+    )
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove-validate-batch",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--slot",
+            "first=1",
+            "--slot",
+            "second=1",
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 1, out
+    assert "requested=2 removed=0 retained=2" in out
+    assert "RETAINED: first reason=" in out
+    assert "RETAINED: second reason=" in out
+    assert all(path.is_dir() for path in slot_paths.values())
 
 
 def test_validate_batch_removes_nested_git_metadata_in_configured_cache(
@@ -15971,7 +16030,7 @@ def test_validate_batch_all_ineligible_reports_zero_censuses(
                 "json",
             ]
         )
-        == 0
+        == 1
     )
 
     report = json.loads(capsys.readouterr().out)
@@ -16122,7 +16181,7 @@ def test_validate_batch_census_deadline_restores_seals_before_outer_bound(
         arguments.extend(("--slot", f"{slot}=1"))
     arguments.extend(("--format", "json"))
     started = time.perf_counter()
-    assert wrkslots.main(arguments) == 0
+    assert wrkslots.main(arguments) == 1
     rollback_seconds = time.perf_counter() - started
 
     report = json.loads(capsys.readouterr().out)
@@ -16132,8 +16191,14 @@ def test_validate_batch_census_deadline_restores_seals_before_outer_bound(
     assert all(
         "operation-wide time bound" in row["reason"] for row in report["retained"]
     )
-    rollback_reserve = 30.0 - wrkslots._VALIDATE_REMOVE_BATCH_CENSUS_SECONDS
-    assert rollback_reserve == 8.0
+    bound = wrkslots._VALIDATE_REMOVE_BATCH_CENSUS_SECONDS
+    assert all(
+        f"(bound {bound:.1f} s, elapsed {bound + 1.0:.1f} s)" in row["reason"]
+        for row in report["retained"]
+    )
+    # Rollback after an expired census deadline has its own fixed reserve; it
+    # does not scale with the measured census bound.
+    rollback_reserve = 8.0
     assert rollback_seconds < rollback_reserve
     assert all(path.is_dir() for path in slot_paths.values())
     assert {
@@ -16219,7 +16284,7 @@ def test_validate_batch_deadline_between_targets_never_enters_later_removals(
         arguments.extend(("--slot", f"{slot}=1"))
     arguments.extend(("--format", "json"))
 
-    assert wrkslots.main(arguments) == 0
+    assert wrkslots.main(arguments) == 1
 
     report = json.loads(capsys.readouterr().out)
     assert entered == [slots[0]]
@@ -16889,7 +16954,7 @@ def test_validate_batch_rechecks_later_slot_use_after_shared_census(
         if late_user is not None:
             terminate_process(late_user)
 
-    assert rc == 0
+    assert rc == 1
     report = json.loads(capsys.readouterr().out)
     assert report["removed"] == [{"generation": 1, "slot": "first"}], json.dumps(
         report, sort_keys=True
@@ -16985,7 +17050,7 @@ def test_validate_batch_fresh_privileged_census_refuses_foreign_uid_late_use(
                 "json",
             ]
         )
-        == 0
+        == 1
     )
 
     report = json.loads(capsys.readouterr().out)
@@ -17040,7 +17105,7 @@ def test_validate_batch_refuses_untrusted_cleanup_fence_root(
                 "json",
             ]
         )
-        == 0
+        == 1
     )
 
     report = json.loads(capsys.readouterr().out)
