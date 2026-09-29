@@ -491,25 +491,27 @@ and the archive. The lock is released between slots, followed by a 0.25-second p
 waiting heartbeat can take it. Each slot waits up to 30 seconds for the lock, or for `--wait-lock`
 seconds when that is given.
 
-Only the `lsof` scan is shared. Before taking any lock, the batch runs one `lsof +D` over every
-requested slot directory and attributes each open file to the slot that contains it; a file it
-cannot attribute counts against every slot. Wherever `remove` would run `lsof`, the batch instead:
+Only the `lsof` scan is shared, and only for the process-use checks made before the path fence.
+Before taking any lock, the batch runs one `lsof +D` over every requested slot directory and
+attributes each open file to the slot that contains it; a file it cannot attribute counts against
+every slot. Where `remove` would run `lsof` before the fence, the batch instead:
 
-1. confirms that the slot directory, or its fenced name, is still the directory the shared scan
-   covered, by device and inode. An image-backed slot's fence unmounts the image, renames the
-   mount point, and mounts the image again, which gives the fenced directory a new device and
-   inode; the fenced path is accepted only when it is that slot's own agent image, mounted there.
-   The unmount fails while any process uses the file system, and no hard link crosses into it;
-2. refuses the slot if the shared scan saw any process using it;
+1. confirms that the slot directory is still the directory the shared scan covered, by device and
+   inode;
+2. refuses the slot if the shared scan saw any process using it, or if `lsof` printed a warning
+   that may concern the slot, exactly as `remove` would refuse on that warning;
 3. scans `/proc` afresh for a process whose working directory, root, executable, open descriptor,
    memory mapping, or mount table names the slot, and for a live process in the recorded owner's
    cgroup when that cgroup is evidence.
 
 The fresh scan catches use that began after the shared scan. The shared scan catches a descriptor
 opened through a hard link outside the slot, which no `/proc` path names; it is repeated when it is
-older than 300 seconds. As with `remove`, descriptors of other users' processes are visible to
-neither scan without privilege, and every process's mount table is read. A slot that the shared scan
-saw in use is refused even if that process has since exited; run another batch or `remove` for it.
+older than 300 seconds. Nothing is deleted before the fence. Every process-use check after the
+fence, which guards deletion, runs `lsof +D` exactly as `remove` does, so each slot's lock hold
+contains one or two `lsof` runs instead of four or five. As with `remove`, descriptors of other
+users' processes are visible to neither scan without privilege, and every process's mount table is
+read. A slot that the shared scan saw in use is refused even if that process has since exited; run
+another batch or `remove` for it.
 
 A refused slot is left in place and reported with its reason, and the remaining slots are still
 attempted. A missing row, a changed generation, a validation slot, and a row whose directory is
@@ -518,7 +520,7 @@ interrupted registry state stops the batch, refuses the remaining slots, and pri
 `RECOVERY REQUIRED`. The human output is one summary line,
 
 ```text
-requested=3 removed=2 refused=1 shared_process_censuses=1 fresh_process_scans=10 seconds=14.2
+requested=3 removed=2 refused=1 shared_process_censuses=1 fresh_process_scans=7 seconds=131.4
 ```
 
 followed by one `REMOVED:` or `REFUSED:` line per slot; `--format json` prints the same content as

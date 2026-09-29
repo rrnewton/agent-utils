@@ -13,6 +13,7 @@ import io
 import itertools
 import json
 import os
+import re
 import select
 import selectors
 import signal
@@ -39585,6 +39586,301 @@ def test_remove_agent_batch_fresh_scan_catches_a_process_that_starts_after_the_c
     assert active_slot_names(project) == ["slot03"]
 
 
+def fenced_slot_path(project: Path, slot: str) -> Path | None:
+    """Return the one fenced directory of ``slot`` generation 1, if it exists."""
+
+    fenced = sorted(checkout(project, slot).parent.parent.glob(f".{slot}.fenced.1.*"))
+    assert len(fenced) <= 1
+    return fenced[0] if fenced else None
+
+
+def test_remove_agent_batch_checks_the_fenced_path_with_lsof_before_deleting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A use that begins after the fence, through an outside hard link, blocks.
+
+    The descriptor's /proc link names the alias outside the slot, so no
+    path comparison can see it.  The check after the fence is the ordinary
+    lsof scan of the fenced path, which matches the file's identity, so the
+    slot is refused and its fence rolled back, as by single-slot remove.
+    """
+
+    project, _repository, slots = dead_agent_batch_project(tmp_path)
+    alias = tmp_path / "outside-alias.txt"
+    os.link(checkout(project, "slot02") / "seed.txt", alias)
+    holders: list[subprocess.Popen[str]] = []
+    unseen_by_path_scan: list[bool] = []
+    original = wrkslots._interrupt_for_test
+
+    def start_holder_after_fence(point: str) -> None:
+        fenced = fenced_slot_path(project, "slot02")
+        if point == "after-path-fence" and fenced is not None and not holders:
+            holder = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys, time; handle = open(sys.argv[1]); "
+                    "print('ready', flush=True); time.sleep(60)",
+                    str(alias),
+                ],
+                cwd=tmp_path,
+                text=True,
+                stdout=subprocess.PIPE,
+            )
+            holders.append(holder)
+            assert holder.stdout is not None
+            assert holder.stdout.readline().strip() == "ready"
+            unseen_by_path_scan.append(
+                wrkslots._agent_batch_fresh_use(fenced, None, capture_generation=False)
+                is None
+            )
+        original(point)
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", start_holder_after_fence)
+    try:
+        returncode, payload, stderr = in_process_agent_batch(project, slots)
+    finally:
+        for holder in holders:
+            terminate_process(holder)
+
+    assert len(holders) == 1
+    assert unseen_by_path_scan == [True]
+    assert returncode == 1, stderr
+    assert batch_slots(payload, "removed") == ["slot01", "slot03"]
+    assert batch_slots(payload, "refused") == ["slot02"]
+    reason = str(cast(list[Mapping[str, object]], payload["refused"])[0]["reason"])
+    assert f"live process {holders[0].pid} uses slot" in reason
+    assert ".slot02.fenced.1." in reason
+    assert payload["recovery_required"] is False
+    assert checkout(project, "slot02").is_dir()
+    assert fenced_slot_path(project, "slot02") is None
+    assert active_slot_names(project) == ["slot02"]
+    assert registry_journals(project) == []
+
+
+def test_remove_agent_batch_checks_the_fenced_path_against_other_mount_namespaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A process working in a bind alias of the fenced slot blocks deletion.
+
+    The alias exists only in the process's own mount namespace, so its /proc
+    cwd names a path the batch's fresh path scan cannot relate to the slot.
+    The ordinary lsof scan after the fence matches the directory's identity.
+    """
+
+    probe = subprocess.run(
+        ["unshare", "--user", "--map-root-user", "--mount", "true"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if probe.returncode != 0:
+        pytest.skip(f"unprivileged mount namespaces are unavailable: {probe.stderr.strip()}")
+    project, _repository, slots = dead_agent_batch_project(tmp_path, count=2)
+    alias = tmp_path / "alias-mount-point"
+    alias.mkdir()
+    holders: list[subprocess.Popen[str]] = []
+    unseen_by_path_scan: list[bool] = []
+    original = wrkslots._interrupt_for_test
+
+    def start_holder_after_fence(point: str) -> None:
+        fenced = fenced_slot_path(project, "slot01")
+        if point == "after-path-fence" and fenced is not None and not holders:
+            holder = subprocess.Popen(
+                [
+                    "unshare",
+                    "--user",
+                    "--map-root-user",
+                    "--mount",
+                    "sh",
+                    "-c",
+                    'mount --bind "$1" "$2" && cd "$2" && echo ready && exec sleep 60',
+                    "sh",
+                    str(fenced),
+                    str(alias),
+                ],
+                cwd=tmp_path,
+                text=True,
+                stdout=subprocess.PIPE,
+            )
+            holders.append(holder)
+            assert holder.stdout is not None
+            assert holder.stdout.readline().strip() == "ready"
+            assert os.readlink(f"/proc/{holder.pid}/cwd") == str(alias)
+            unseen_by_path_scan.append(
+                wrkslots._agent_batch_fresh_use(fenced, None, capture_generation=False)
+                is None
+            )
+        original(point)
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", start_holder_after_fence)
+    try:
+        returncode, payload, stderr = in_process_agent_batch(project, slots)
+    finally:
+        for holder in holders:
+            terminate_process(holder)
+
+    assert len(holders) == 1
+    assert unseen_by_path_scan == [True]
+    assert returncode == 1, stderr
+    assert batch_slots(payload, "removed") == ["slot02"]
+    assert batch_slots(payload, "refused") == ["slot01"]
+    reason = str(cast(list[Mapping[str, object]], payload["refused"])[0]["reason"])
+    assert f"live process {holders[0].pid} uses slot" in reason
+    assert 'fd="cwd"' in reason
+    assert checkout(project, "slot01").is_dir()
+    assert fenced_slot_path(project, "slot01") is None
+    assert active_slot_names(project) == ["slot01"]
+    assert registry_journals(project) == []
+
+
+def test_remove_agent_batch_stops_and_names_recover_when_an_item_leaves_its_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refusal whose fence cannot be rolled back stops the batch.
+
+    The item's finish journal stays for 'wrkslots recover'; the batch reports
+    recovery_required, refuses every later item without trying it, and a
+    later batch naming the slot refuses before its shared scan.
+    """
+
+    project, _repository, slots = dead_agent_batch_project(tmp_path)
+    holders: list[subprocess.Popen[str]] = []
+    original = wrkslots._interrupt_for_test
+
+    def hold_fenced_slot(point: str) -> None:
+        fenced = fenced_slot_path(project, "slot02")
+        if point == "after-path-fence" and fenced is not None and not holders:
+            holders.append(subprocess.Popen(["sleep", "60"], cwd=fenced, text=True))
+        original(point)
+
+    def failing_rollback(*_args: object, **_kwargs: object) -> None:
+        raise wrkslots.Refusal("injected rollback failure")
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", hold_fenced_slot)
+    monkeypatch.setattr(wrkslots, "_rollback_path_fence", failing_rollback)
+    try:
+        returncode, payload, stderr = in_process_agent_batch(project, slots)
+    finally:
+        for holder in holders:
+            terminate_process(holder)
+
+    journal = project / "worktrees" / "ACTIVE.testhost.journal"
+    assert returncode == 1, stderr
+    assert batch_slots(payload, "removed") == ["slot01"]
+    assert batch_slots(payload, "refused") == ["slot02", "slot03"]
+    assert payload["recovery_required"] is True
+    first, later = cast(list[Mapping[str, object]], payload["refused"])
+    assert first["recovery_required"] is True
+    assert "path-fence rollback failed: injected rollback failure" in str(first["reason"])
+    assert str(first["reason"]).endswith(
+        f"an interrupted removal is recorded in {journal}; run 'wrkslots recover' "
+        "before another removal"
+    )
+    assert "recovery_required" not in later
+    assert later["reason"] == (
+        "batch stopped: an earlier item left an interrupted removal; run "
+        "'wrkslots recover' and retry the remaining slots"
+    )
+    assert "seconds" not in later
+    assert journal.exists()
+    assert checkout(project, "slot03").is_dir()
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", original)
+    again_code, again, again_stderr = in_process_agent_batch(project, ["slot03", "slot02"])
+    assert again_code == 1, again_stderr
+    assert again["recovery_required"] is True
+    assert again["shared_process_censuses"] == 0
+    assert batch_slots(again, "refused") == ["slot03", "slot02"]
+    by_slot = {
+        str(row["slot"]): row for row in cast(list[Mapping[str, object]], again["refused"])
+    }
+    assert by_slot["slot02"]["reason"] == (
+        f"an interrupted removal is recorded in {journal}; run 'wrkslots recover' "
+        "before another removal"
+    )
+    assert "run 'wrkslots recover'" in str(by_slot["slot03"]["reason"])
+    text = raw_command(
+        project,
+        "remove-agent-batch",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot=slot02=1",
+    )
+    assert text.returncode == 1, text.stderr
+    assert "RECOVERY REQUIRED: run 'wrkslots recover' before another removal" in (
+        text.stdout
+    )
+
+    # The named remedy works: recovery settles the item, and the rest proceed.
+    recovered = command(project, "recover", "--coordinator-pid", str(os.getpid()))
+    assert recovered.returncode == 0, recovered.stderr + recovered.stdout
+    assert not journal.exists()
+    finished_code, finished, finished_stderr = in_process_agent_batch(
+        project, active_slot_names(project)
+    )
+    assert finished_code == 0, finished_stderr
+    assert active_slot_names(project) == []
+
+
+def test_remove_agent_batch_reports_each_items_disposable_nested_repositories(
+    tmp_path: Path,
+) -> None:
+    project, repository, remote = make_project(tmp_path, cache_globs=("target",))
+    slots = ["slot01", "slot02", "slot03"]
+    heads: dict[str, str] = {}
+    for index, slot in enumerate(slots, start=1):
+        made = create(project, slot=slot, agent=f"codex-{index}", branch=f"codex/{slot}")
+        assert made.returncode == 0, made.stderr
+        tree = checkout(project, slot)
+        commit_task(repository, tree, f"codex/{slot}")
+        if slot != "slot02":
+            heads[slot] = _nested_clone(remote, tree / "target" / "deps" / "clean")
+        handed_off = finish(project, slot, f"codex-{index}")
+        assert handed_off.returncode == 0, handed_off.stderr
+    for slot in slots:
+        mark_owner_dead(project, slot=slot)
+    set_liveness(project, "dead")
+
+    def evidence(slot: str) -> dict[str, object]:
+        return {
+            "checkout": "product",
+            "path": str(checkout(project, slot) / "target" / "deps" / "clean" / ".git"),
+            "head": heads[slot],
+            "remote_ref": "refs/remotes/origin/main",
+            "ignored_entries": 0,
+            "ignored_sample": [],
+        }
+
+    returncode, payload, stderr = in_process_agent_batch(project, ["slot01", "slot02"])
+
+    assert returncode == 0, stderr
+    rows = {
+        str(row["slot"]): row for row in cast(list[Mapping[str, object]], payload["removed"])
+    }
+    assert rows["slot01"]["disposable_nested_repositories"] == [evidence("slot01")]
+    assert rows["slot02"]["disposable_nested_repositories"] == []
+
+    text = raw_command(
+        project,
+        "remove-agent-batch",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot=slot03=1",
+    )
+    assert text.returncode == 0, text.stderr
+    lines = text.stdout.splitlines()
+    removed_at = lines.index("REMOVED: slot03 generation=1")
+    nested = evidence("slot03")
+    # The same line single-slot remove prints, directly under its item.
+    assert lines[removed_at + 1] == (
+        f"removed disposable nested Git repository {nested['path']} "
+        f"head={nested['head']} contained-by=refs/remotes/origin/main "
+        "ignored-entries=0"
+    )
+    assert active_slot_names(project) == []
+
+
 def test_remove_agent_batch_exit_status_counts_and_input_file(tmp_path: Path) -> None:
     project, _repository, slots = dead_agent_batch_project(tmp_path)
 
@@ -39712,10 +40008,14 @@ def test_remove_agent_batch_leaves_no_state_an_older_client_refuses_between_item
     assert status.returncode == 0, status.stderr
 
 
-def test_remove_agent_batch_runs_lsof_once_while_serial_remove_runs_it_per_check(
+def test_remove_agent_batch_shares_lsof_before_the_fence_and_runs_it_after_like_remove(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The batch replaces every per-check lsof scan with one shared scan."""
+    """The batch shares one lsof scan among the checks made before the fence.
+
+    Every check made after the fence, which guards deletion, runs the same
+    per-slot lsof scan of the fenced path as single-slot remove.
+    """
 
     project, _repository, slots = dead_agent_batch_project(tmp_path, count=4)
     ordinary_calls: list[Path] = []
@@ -39734,6 +40034,9 @@ def test_remove_agent_batch_runs_lsof_once_while_serial_remove_runs_it_per_check
     monkeypatch.setattr(wrkslots, "_lsof_slot_use", count_ordinary)
     monkeypatch.setattr(wrkslots, "_capture_agent_remove_batch_census", count_shared)
 
+    def fenced(path: Path, slot: str) -> bool:
+        return path.name.startswith(f".{slot}.fenced.1.")
+
     stdout = io.StringIO()
     with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
         serial = wrkslots.main(
@@ -39749,8 +40052,10 @@ def test_remove_agent_batch_runs_lsof_once_while_serial_remove_runs_it_per_check
             ]
         )
     assert serial == 0
-    per_slot = len(ordinary_calls)
-    assert per_slot >= 4
+    serial_fenced = [path for path in ordinary_calls if fenced(path, "slot01")]
+    unfenced_per_slot = len(ordinary_calls) - len(serial_fenced)
+    assert len(serial_fenced) == 1
+    assert unfenced_per_slot >= 3
     assert shared_calls == []
 
     ordinary_calls.clear()
@@ -39758,11 +40063,15 @@ def test_remove_agent_batch_runs_lsof_once_while_serial_remove_runs_it_per_check
 
     assert returncode == 0, stderr
     assert batch_slots(payload, "removed") == slots[1:]
-    assert ordinary_calls == []
+    # One ordinary scan per item, of that item's fenced path, exactly as remove.
+    assert len(ordinary_calls) == 3
+    assert [
+        next(slot for slot in slots[1:] if fenced(path, slot)) for path in ordinary_calls
+    ] == slots[1:]
     assert len(shared_calls) == 1
     assert len(shared_calls[0]) == 3
     assert payload["shared_process_censuses"] == 1
-    assert payload["fresh_process_scans"] == per_slot * 3
+    assert payload["fresh_process_scans"] == unfenced_per_slot * 3
 
 
 def test_parse_lsof_use_records_keeps_every_record_and_flags_malformed_streams() -> None:
@@ -39805,10 +40114,11 @@ def test_shared_agent_census_attributes_each_record_to_one_slot_or_all(
 
     monkeypatch.setattr(wrkslots, "_lsof_executable", lambda: Path("/usr/bin/lsof"))
     monkeypatch.setattr(subprocess, "run", fake_run)
-    census = wrkslots._capture_agent_remove_batch_census([first, second])
+    shared = wrkslots._capture_agent_remove_batch_census([first, second])
 
+    assert shared.unobservable == {}
     by_slot: dict[str, set[int]] = {}
-    for pid, slot, kind, _detail in census.matches:
+    for pid, slot, kind, _detail in shared.census.matches:
         assert kind == "shared-lsof"
         by_slot.setdefault(slot, set()).add(pid)
     assert by_slot == {str(first): {10, 12}, str(second): {11, 12}}
@@ -39821,28 +40131,131 @@ def test_shared_agent_census_attributes_each_record_to_one_slot_or_all(
         wrkslots._capture_agent_remove_batch_census([first])
 
 
-def test_agent_batch_context_accepts_only_the_fenced_remount_of_the_slots_own_image(
+def test_shared_agent_census_makes_only_the_slot_an_lsof_warning_concerns_unobservable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # An image-backed slot's fence unmounts, renames, and remounts the image,
-    # so the fenced directory has a new identity.  Only a remount of the
-    # slot's own agent image at exactly the fenced path may stand in for it.
+    """A diagnostic about one target withholds evidence for that target alone.
+
+    Each target is judged exactly as the ordinary single-slot check judges its
+    one slot: a diagnostic naming one path inside or above the target concerns
+    it, and a diagnostic that names no path, or several, concerns every target.
+    """
+
+    first = tmp_path / "slots" / "a"
+    second = tmp_path / "slots" / "b"
+    (first / "sub").mkdir(parents=True)
+    second.mkdir()
+    output = f"p11\ncsleep\nf3r\nn{second}/f\n"
+    stderr = {"value": b""}
+
+    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(command, 0, output.encode(), stderr["value"])
+
+    monkeypatch.setattr(wrkslots, "_lsof_executable", lambda: Path("/usr/bin/lsof"))
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    about_first = f"lsof: WARNING: can't opendir({first}/sub): Permission denied"
+    stderr["value"] = (about_first + "\nOutput information may be incomplete.\n").encode()
+    shared = wrkslots._capture_agent_remove_batch_census([first, second])
+    assert shared.unobservable == {first: about_first}
+    assert [slot for _pid, slot, _kind, _detail in shared.census.matches] == [str(second)]
+    # The ordinary check reaches the same verdict for each slot on its own.
+    assert not wrkslots._unrelated_lsof_warnings(about_first, first)
+    assert wrkslots._unrelated_lsof_warnings(about_first, second)
+
+    above_both = "lsof: WARNING: can't stat() fuse file system " + str(tmp_path)
+    stderr["value"] = above_both.encode()
+    assert wrkslots._capture_agent_remove_batch_census(
+        [first, second]
+    ).unobservable == {first: above_both, second: above_both}
+
+    unattributable = "lsof: WARNING: something went wrong"
+    stderr["value"] = unattributable.encode()
+    assert wrkslots._capture_agent_remove_batch_census(
+        [first, second]
+    ).unobservable == {first: unattributable, second: unattributable}
+
+    unrelated = "lsof: WARNING: can't stat() fuse file system /elsewhere/mount"
+    stderr["value"] = unrelated.encode()
+    assert wrkslots._capture_agent_remove_batch_census(
+        [first, second]
+    ).unobservable == {}
+
+    # The batch refuses only the slot the diagnostic concerns.
+    context = wrkslots._AgentRemoveBatchContext(
+        {
+            first: cast(tuple[int, int], wrkslots._directory_identity(first)),
+            second: cast(tuple[int, int], wrkslots._directory_identity(second)),
+        }
+    )
+    stderr["value"] = about_first.encode()
+    fresh: list[Path] = []
+    monkeypatch.setattr(
+        wrkslots,
+        "_agent_batch_fresh_use",
+        lambda path, _record, *, capture_generation: fresh.append(path),
+    )
+    context.capture([first, second])
+    assert context.censused == frozenset({second})
+    with pytest.raises(
+        wrkslots.Refusal,
+        match=re.escape(f"process use is indeterminate because lsof reported: {about_first}"),
+    ):
+        context.observe(first, None, canonical_path=first, capture_generation=False)
+    with pytest.raises(wrkslots.Refusal, match="live process 11 uses slot"):
+        context.observe(second, None, canonical_path=second, capture_generation=False)
+    assert fresh == []
+
+
+def test_remove_agent_batch_refuses_only_the_slot_an_lsof_warning_concerns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _repository, slots = dead_agent_batch_project(tmp_path, count=2)
+    warned = checkout(project, "slot01") / "sub"
+    line = f"lsof: WARNING: can't opendir({warned}): Permission denied"
+    real_lsof = wrkslots._lsof_executable()
+    assert real_lsof is not None
+    # Only the shared census uses this lookup: the real scan, plus one
+    # diagnostic about slot01, as lsof prints when it cannot read a directory.
+    wrapper = tmp_path / "lsof-with-warning"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        f'{shlex.quote(str(real_lsof))} "$@"\n'
+        "status=$?\n"
+        f"printf '%s\\n' {shlex.quote(line)} >&2\n"
+        "echo \"$*\" >> \"$0.calls\"\n"
+        "exit $status\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setattr(wrkslots, "_lsof_executable", lambda: wrapper)
+    returncode, payload, stderr = in_process_agent_batch(project, slots)
+
+    assert returncode == 1, stderr
+    calls = (tmp_path / "lsof-with-warning.calls").read_text(encoding="utf-8").splitlines()
+    assert len(calls) == 1 and calls[0].count("+D") == 2
+    assert batch_slots(payload, "removed") == ["slot02"]
+    assert batch_slots(payload, "refused") == ["slot01"]
+    refused = cast(list[Mapping[str, object]], payload["refused"])[0]
+    assert refused["reason"] == f"process use is indeterminate because lsof reported: {line}"
+    assert payload["recovery_required"] is False
+    assert checkout(project, "slot01").is_dir()
+    assert active_slot_names(project) == ["slot01"]
+    assert registry_journals(project) == []
+
+
+def test_agent_batch_context_serves_only_checks_at_the_unfenced_slot_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Checks after the path fence guard deletion and stay ordinary, so the
+    # batch evidence must never answer for any path but the unfenced one.
     canonical = tmp_path / "worktrees" / "slot02"
     fenced = tmp_path / "worktrees" / ".slot02.fenced.1.test"
     canonical.mkdir(parents=True)
     fenced.mkdir()
     identity = wrkslots._directory_identity(canonical)
     assert identity is not None
-    assert wrkslots._directory_identity(fenced) != identity
-    image_file = tmp_path / "slot.img"
-    image = argparse.Namespace(slot_type="agent", slot="slot02", slot_image=image_file)
-    mounted: dict[Path, Path] = {fenced: image_file}
     fresh_paths: list[Path] = []
-    monkeypatch.setattr(wrkslots, "_slot_image_at", lambda _config, path: image)
-    monkeypatch.setattr(
-        "wrkslots.slotimage.is_mounted",
-        lambda image_path, mount_point, table=None: mounted.get(mount_point) == image_path,
-    )
 
     def fake_fresh_use(
         slot_path: Path, _record: object, *, capture_generation: bool,
@@ -39850,14 +40263,9 @@ def test_agent_batch_context_accepts_only_the_fenced_remount_of_the_slots_own_im
         fresh_paths.append(slot_path)
 
     monkeypatch.setattr(wrkslots, "_agent_batch_fresh_use", fake_fresh_use)
-    config = cast(wrkslots.Config, argparse.Namespace())
 
-    def context(
-        *, with_config: bool = True, census: object | None = None,
-    ) -> wrkslots._AgentRemoveBatchContext:
-        value = wrkslots._AgentRemoveBatchContext(
-            {canonical: identity}, config=config if with_config else None
-        )
+    def context(census: object | None = None) -> wrkslots._AgentRemoveBatchContext:
+        value = wrkslots._AgentRemoveBatchContext({canonical: identity})
         value.censused = frozenset({canonical})
         if census is not None:
             value.census = cast(wrkslots._ProcessPathCensus, census)
@@ -39866,39 +40274,41 @@ def test_agent_batch_context_accepts_only_the_fenced_remount_of_the_slots_own_im
     def observe(value: wrkslots._AgentRemoveBatchContext, path: Path) -> object:
         return value.observe(path, None, canonical_path=canonical, capture_generation=False)
 
-    assert observe(context(), fenced) is None
-    assert fresh_paths == [fenced]
-    # The unchanged canonical directory needs no image evidence.
-    assert observe(context(with_config=False), canonical) is None
-    assert fresh_paths == [fenced, canonical]
-
-    covered = "is not the directory this batch's shared process census covered"
-    with pytest.raises(wrkslots.Refusal, match=covered):
-        observe(context(with_config=False), fenced)
-    for changed in (
-        argparse.Namespace(slot_type="agent", slot="slot03", slot_image=image_file),
-        argparse.Namespace(slot_type="validate", slot="slot02", slot_image=image_file),
-        argparse.Namespace(slot_type="agent", slot="slot02", slot_image=tmp_path / "other.img"),
-        None,
-    ):
-        monkeypatch.setattr(wrkslots, "_slot_image_at", lambda _config, path, found=changed: found)
-        with pytest.raises(wrkslots.Refusal, match=covered):
-            observe(context(), fenced)
-    monkeypatch.setattr(wrkslots, "_slot_image_at", lambda _config, path: image)
-    mounted.clear()
-    with pytest.raises(wrkslots.Refusal, match=covered):
+    assert observe(context(), canonical) is None
+    assert fresh_paths == [canonical]
+    with pytest.raises(wrkslots.StateError, match="checks only the unfenced slot path"):
         observe(context(), fenced)
-    assert fresh_paths == [fenced, canonical]
+    # The ordinary check entry point refuses the same way.
+    with pytest.raises(wrkslots.StateError, match="checks only the unfenced slot path"):
+        wrkslots._assert_slot_unused(
+            fenced, None, agent_batch=context(), canonical_path=canonical
+        )
+    uncovered = context()
+    uncovered.censused = frozenset()
+    with pytest.raises(wrkslots.Refusal, match="was not covered by this batch"):
+        observe(uncovered, canonical)
+    replaced = tmp_path / "worktrees" / "replaced"
+    replaced.mkdir()
+    canonical.rmdir()
+    replaced.rename(canonical)
+    with pytest.raises(
+        wrkslots.Refusal, match="is not the directory this batch's shared process census"
+    ):
+        observe(context(), canonical)
+    assert fresh_paths == [canonical]
 
-    # A remount does not waive the shared scan's evidence for the slot.
-    mounted[fenced] = image_file
     census = wrkslots._ProcessPathCensus(
         (), ((4242, str(canonical), "shared-lsof", 'command="sleep"'),),
         owner_cgroup_complete=False,
     )
+    changed = wrkslots._directory_identity(canonical)
+    assert changed is not None
+    value = wrkslots._AgentRemoveBatchContext({canonical: changed})
+    value.censused = frozenset({canonical})
+    value.census = census
     with pytest.raises(wrkslots.Refusal, match="live process 4242 uses slot"):
-        observe(context(census=census), fenced)
-    assert fresh_paths == [fenced, canonical]
+        observe(value, canonical)
+    assert fresh_paths == [canonical]
 
 
 def test_remove_agent_batch_honors_a_live_owners_release_like_remove(
