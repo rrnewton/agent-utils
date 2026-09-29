@@ -514,16 +514,46 @@ _TRUSTED_EXECUTABLE_DIRECTORY = Path("/usr/bin")
 # per-item same-UID census of a validation batch.  Phase A selects and seals the
 # evidence paths before this clock starts, and rollback, Git removal, and state
 # restoration run after it.  The bound is sized from measured host cost, not
-# from a target envelope.  On 2026-09-29, on a 316-CPU host with about 4,000
-# processes, one privileged census took 3.7 to 5.7 seconds at load average 28,
-# and 25 to 29 seconds at a higher load.  At that higher load, the former
-# 22-second bound refused every item of a real three-slot batch.  One same-UID
-# census took 1.1 to 1.3 seconds and 11 seconds at the same two loads.  A full
-# batch at the higher cost is 29 + 8 * 11 = 117 seconds.  The seal journal is
-# outstanding for this whole window, and clients that predate seal-aware
-# heartbeat refuse while it exists, so the bound stays finite and close to the
-# measured worst case.
+# from a target envelope.  On 2026-09-29, on a 316-CPU host:
+#
+# * load average 28, about 4,000 processes: a privileged census took 3.7 to
+#   5.7 seconds and a same-UID census 1.1 to 1.3 seconds;
+# * load average 42 to 68: 25 to 29 seconds and 11 seconds; the former
+#   22-second bound refused every item of a real three-slot batch;
+# * load average 170 to 222, 4,700 to 5,000 processes: a privileged census
+#   took 36 to 63 seconds, and twice more than 120; a same-UID census took 32
+#   to more than 52 seconds.  A flat 120-second bound refused all eight items
+#   of each of three real eight-slot batches, so none made progress.
+#
+# A one-slot validation removal keeps _VALIDATE_REMOVE_BATCH_CENSUS_SECONDS, and
+# so do private-finish recovery and the ownerless-validation commands.  A
+# caller may run a one-slot removal from a service stop hook with a finite stop
+# timeout, so that bound stays small; a refusal there fails closed and a later
+# batch retries the slot.  remove-validate-batch adds
+# _VALIDATE_REMOVE_BATCH_ITEM_CENSUS_SECONDS for each sealed slot after the
+# first (eight slots: 540 seconds), so an expensive shared census still leaves
+# time for the first items to finish.  With this bound and the stderr bound
+# below, six real eight-slot batches at load average 92 to 191 never reached
+# either bound: the privileged census took 29 to 69 seconds, a same-UID census
+# at most 23 seconds, and a whole batch at most 108 seconds.  Four removed all
+# eight slots.  Two refused every slot because process evidence changed in each
+# of the privileged census's three attempts; that retry policy is separate
+# from these bounds.  The seal journal is outstanding for this whole window,
+# and clients that predate seal-aware heartbeat refuse while it exists, so the
+# bound stays finite.
 _VALIDATE_REMOVE_BATCH_CENSUS_SECONDS = 120.0
+_VALIDATE_REMOVE_BATCH_ITEM_CENSUS_SECONDS = 60.0
+# The same batch budget also bounds the census commands' combined stderr.  Under
+# process churn, find reports each process that exits during the scan on
+# stderr, and the census parses those lines to classify the vanished process.
+# On the same host at load average 92 to 191 with 4,400 to 5,500 processes,
+# one privileged find wrote up to 29 KiB, one privileged census's attempts
+# together up to 56 KiB, and a whole eight-slot batch up to 83 KiB.  A single
+# 64 KiB budget ran out partway through three of four eight-slot batches at
+# load average 135 to 183 and retained their remaining slots.  A one-slot
+# removal keeps 64 KiB; each further sealed slot adds 64 KiB (512 KiB for
+# eight).
+_VALIDATE_REMOVE_BATCH_CENSUS_STDERR_BYTES = 64 * 1024
 # remove-agent-batch reuses its shared lsof evidence for at most this long.
 # The fresh per-check scan covers path, mapping, mount, and cgroup use at the
 # moment of each check; only inode-alias use relies on the shared scan, so
@@ -25769,6 +25799,27 @@ def _seal_validate_batch_targets(
             )
 
 
+def _validate_remove_batch_census_seconds(sealed_slots: int) -> float:
+    """Return the census deadline for a validation batch of sealed slots.
+
+    One slot, or none, gets the single-census bound.  Each further slot adds
+    one same-UID census allowance.
+    """
+
+    return _VALIDATE_REMOVE_BATCH_CENSUS_SECONDS + (
+        _VALIDATE_REMOVE_BATCH_ITEM_CENSUS_SECONDS * max(0, sealed_slots - 1)
+    )
+
+
+def _validate_remove_batch_census_stderr_bytes(sealed_slots: int) -> int:
+    """Return the combined census stderr bound for a validation batch.
+
+    One slot, or none, gets one allowance.  Each further slot adds one more.
+    """
+
+    return _VALIDATE_REMOVE_BATCH_CENSUS_STDERR_BYTES * max(1, sealed_slots)
+
+
 def _remove_validate_batch(
     args: argparse.Namespace, *, single_validate_complete: bool = False
 ) -> dict[str, object]:
@@ -25866,9 +25917,13 @@ def _remove_validate_batch(
         # before Phase A made a slow registry preflight consume most or all of
         # the bounded evidence window before the first observer ran.
         census_budget = _ReadOnlyCommandBudget.start(
-            timeout_seconds=_VALIDATE_REMOVE_BATCH_CENSUS_SECONDS,
+            timeout_seconds=_validate_remove_batch_census_seconds(
+                len(private_targets)
+            ),
             stdout_limit=_PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
-            stderr_limit=64 * 1024,
+            stderr_limit=_validate_remove_batch_census_stderr_bytes(
+                len(private_targets)
+            ),
             input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
         )
         private_paths = [

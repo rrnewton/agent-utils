@@ -16112,6 +16112,7 @@ def test_validate_batch_census_deadline_starts_after_seal_preflight(
     assert observed_budgets[0].stdout_remaining == (
         wrkslots._PROCESS_CENSUS_OUTPUT_BYTES_LIMIT
     )
+    assert observed_budgets[0].stderr_remaining == 64 * 1024
     assert observed_budgets[0].input_remaining == (
         wrkslots._MOUNTINFO_CENSUS_BYTES_LIMIT
     )
@@ -16146,9 +16147,10 @@ def test_validate_batch_census_deadline_restores_seals_before_outer_bound(
         nonlocal monotonic_now
         assert budget is not None
         assert include_owner_cgroups is False
-        assert budget.deadline == pytest.approx(
-            100.0 + wrkslots._VALIDATE_REMOVE_BATCH_CENSUS_SECONDS
-        )
+        # Eight sealed slots: 120 s for the first plus 60 s for each other,
+        # and 64 KiB of census stderr for each slot.
+        assert budget.deadline == pytest.approx(100.0 + 540.0)
+        assert budget.stderr_remaining == 8 * 64 * 1024
         if expiry_point == "shared":
             monotonic_now = budget.deadline + 1.0
         return wrkslots._ProcessPathCensus((), ())
@@ -16191,9 +16193,8 @@ def test_validate_batch_census_deadline_restores_seals_before_outer_bound(
     assert all(
         "operation-wide time bound" in row["reason"] for row in report["retained"]
     )
-    bound = wrkslots._VALIDATE_REMOVE_BATCH_CENSUS_SECONDS
     assert all(
-        f"(bound {bound:.1f} s, elapsed {bound + 1.0:.1f} s)" in row["reason"]
+        "(bound 540.0 s, elapsed 541.0 s)" in row["reason"]
         for row in report["retained"]
     )
     # Rollback after an expired census deadline has its own fixed reserve; it
@@ -16211,6 +16212,92 @@ def test_validate_batch_census_deadline_restores_seals_before_outer_bound(
         list(path.parent.glob(f".{slot}.fenced.*"))
         for slot, path in slot_paths.items()
     )
+
+
+@pytest.mark.parametrize(
+    ("sealed_slots", "bound"),
+    ((0, 120.0), (1, 120.0), (2, 180.0), (wrkslots.VALIDATE_REMOVE_BATCH_LIMIT, 540.0)),
+)
+def test_validate_batch_census_bound_adds_one_allowance_per_further_slot(
+    sealed_slots: int, bound: float
+) -> None:
+    assert wrkslots.VALIDATE_REMOVE_BATCH_LIMIT == 8
+    assert wrkslots._validate_remove_batch_census_seconds(sealed_slots) == bound
+    assert wrkslots._validate_remove_batch_census_stderr_bytes(sealed_slots) == (
+        max(1, sealed_slots) * 64 * 1024
+    )
+
+
+def test_single_validate_complete_remove_shares_the_batch_census_bound_and_refusal_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A single 'remove --validate-complete' runs as a one-slot validation
+    # batch, so it has the batch's census bound and its deadline refusal.  The
+    # refusal keeps its old prefix and appends the bound and the elapsed time.
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    original_mode = stat.S_IMODE(slot_path.stat().st_mode)
+    monotonic_now = 100.0
+    observed_deadlines: list[float] = []
+
+    def expire_during_shared_census(
+        _paths: Sequence[Path],
+        *,
+        budget: wrkslots._ReadOnlyCommandBudget | None = None,
+        include_owner_cgroups: bool = True,
+    ) -> wrkslots._ProcessPathCensus:
+        nonlocal monotonic_now
+        assert budget is not None
+        assert include_owner_cgroups is False
+        observed_deadlines.append(budget.deadline)
+        monotonic_now = budget.deadline + 1.0
+        return wrkslots._ProcessPathCensus((), ())
+
+    def fresh_census(
+        _paths: Sequence[Path], *, budget: wrkslots._ReadOnlyCommandBudget
+    ) -> wrkslots._ProcessPathCensus:
+        del budget
+        raise AssertionError("an expired census must not reach the fresh scan")
+
+    monkeypatch.setattr(time, "monotonic", lambda: monotonic_now)
+    monkeypatch.setattr(
+        wrkslots, "_capture_process_path_census", expire_during_shared_census
+    )
+    monkeypatch.setattr(wrkslots, "_capture_same_uid_process_path_census", fresh_census)
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove",
+            "slot01",
+            "--validate-complete",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 3, captured.err
+    assert wrkslots._VALIDATE_REMOVE_BATCH_CENSUS_SECONDS == 120.0
+    assert observed_deadlines == [pytest.approx(220.0)]
+    assert (
+        "REFUSED: read-only census exceeded its operation-wide time bound "
+        "(bound 120.0 s, elapsed 121.0 s)"
+    ) in captured.err
+    assert captured.out == ""
+    assert slot_path.is_dir()
+    assert stat.S_IMODE(slot_path.stat().st_mode) == original_mode
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._journal_path(config).exists()
+    assert not wrkslots._validate_batch_seal_journal_path(config).exists()
+    assert not list(slot_path.parent.glob(".slot01.fenced.*"))
+    state = wrkslots._load_active(config)
+    assert [record.slot for record in state.slots] == ["slot01"]
 
 
 def test_validate_batch_deadline_between_targets_never_enters_later_removals(
