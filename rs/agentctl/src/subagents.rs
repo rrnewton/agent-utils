@@ -2002,7 +2002,17 @@ pub struct SlotLaunch {
     pub project: Option<PathBuf>,
     /// Explicit wrkslots executable; `None` uses `AGENTCTL_WRKSLOTS_BIN`, else `PATH`.
     pub executable: Option<PathBuf>,
+    /// A coordinator box (`agentctl start --project-box`) instead of a slot's box: `slot` is
+    /// then the box name, and the registry and every slot are writable inside it.
+    pub project_box: bool,
+    /// With `project_box`: `worktrees` or `project`; `None` uses the project's configured scope.
+    pub box_writable: Option<String>,
+    /// With `project_box`: the box's working directory (the agent's `--cwd`).
+    pub box_cwd: Option<PathBuf>,
 }
+
+/// What a coordinator box may write besides the usual paths (`wrkslots box --writable`).
+pub const BOX_SCOPES: [&str; 2] = ["worktrees", "project"];
 
 /// Isolation modes `wrkslots run` accepts.
 pub const SLOT_ISOLATIONS: [&str; 3] = ["userns", "cgroup", "root"];
@@ -2036,15 +2046,27 @@ fn wrkslots_executable() -> Option<PathBuf> {
 /// Returns the command line, the slot directory (the agent's working directory), and the
 /// effective isolation. Runs `wrkslots [--project-root DIR] shell-command SLOT
 /// [--isolation MODE] --format json [-- COMMAND...]` in `project`, bounded at 60 seconds; a
-/// `command` replaces the interactive shell in the line.
+/// `command` replaces the interactive shell in the line. For a coordinator box it runs
+/// `shell-command --box --name NAME --cwd DIR [--writable SCOPE]` instead, and the returned
+/// directory is the box's working directory.
 pub fn slot_shell_command(
     launch: &SlotLaunch,
     project: &Path,
     command_argv: &[String],
 ) -> Result<(String, PathBuf, String)> {
+    let flag = if launch.project_box {
+        "--box-isolation"
+    } else {
+        "--slot-isolation"
+    };
     if let Some(isolation) = launch.isolation.as_deref() {
         if !SLOT_ISOLATIONS.contains(&isolation) {
-            return Err(fail("--slot-isolation must be userns, cgroup, or root"));
+            return Err(fail(format!("{flag} must be userns, cgroup, or root")));
+        }
+    }
+    if let Some(scope) = launch.box_writable.as_deref() {
+        if !BOX_SCOPES.contains(&scope) {
+            return Err(fail("--box-writable must be worktrees or project"));
         }
     }
     let executable = launch
@@ -2052,14 +2074,28 @@ pub fn slot_shell_command(
         .clone()
         .or_else(wrkslots_executable)
         .ok_or_else(|| {
-            fail("--slot needs wrkslots on PATH (or AGENTCTL_WRKSLOTS_BIN naming it)")
+            fail(if launch.project_box {
+                "--project-box needs wrkslots on PATH (or AGENTCTL_WRKSLOTS_BIN naming it)"
+            } else {
+                "--slot needs wrkslots on PATH (or AGENTCTL_WRKSLOTS_BIN naming it)"
+            })
         })?;
     let slot = launch.slot.as_str();
     let mut command = std::process::Command::new(&executable);
     if launch.project.is_some() {
         command.arg("--project-root").arg(project);
     }
-    command.args(["shell-command", slot]);
+    if launch.project_box {
+        command.args(["shell-command", "--box", "--name", slot]);
+        if let Some(cwd) = launch.box_cwd.as_ref() {
+            command.arg("--cwd").arg(cwd);
+        }
+        if let Some(scope) = launch.box_writable.as_deref() {
+            command.args(["--writable", scope]);
+        }
+    } else {
+        command.args(["shell-command", slot]);
+    }
     if let Some(isolation) = launch.isolation.as_deref() {
         command.args(["--isolation", isolation]);
     }
@@ -2932,6 +2968,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let (cwd, slot_command) = match options.slot.as_ref() {
             Some(launch) => {
                 let project = launch.project.clone().unwrap_or_else(|| cwd.clone());
+                let mut launch = launch.clone();
+                if launch.project_box && launch.box_cwd.is_none() {
+                    // A coordinator box starts where the agent was asked to work.
+                    launch.box_cwd = Some(cwd.clone());
+                }
+                let launch = &launch;
                 let (line, slot_path, isolation) = slot_shell_command(launch, &project, &[])?;
                 let slot_path = fs::canonicalize(&slot_path).map_err(|_| {
                     fail(format!(
@@ -2945,7 +2987,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     // directly and agentctl owns its lifecycle state.
                     if !RELAY_HARNESSES.contains(&options.harness.as_str()) {
                         return Err(fail(format!(
-                            "--slot with root isolation supports {}, not {:?}",
+                            "{} with root isolation supports {}, not {:?}",
+                            if launch.project_box {
+                                "--project-box"
+                            } else {
+                                "--slot"
+                            },
                             RELAY_HARNESSES.join(", "),
                             options.harness
                         )));
@@ -6709,6 +6756,7 @@ mod tests {
                         isolation: Some("cgroup".to_owned()),
                         project: Some(project.clone()),
                         executable: Some(executable),
+                        ..SlotLaunch::default()
                     }),
                     ..StartOptions::default()
                 },
@@ -6738,6 +6786,96 @@ mod tests {
             fs::canonicalize(lines[0]).unwrap(),
             fs::canonicalize(&project).unwrap()
         );
+    }
+
+    #[test]
+    fn project_box_start_asks_for_a_coordinator_box_in_the_agent_cwd() {
+        let fixture = Fixture::new();
+        // The fake Herdr reports every pane at the fixture root: the box cwd is there.
+        let executable = fake_wrkslots(&fixture.root, &fixture.root, "ok");
+        let status = fixture
+            .manager()
+            .start(
+                "planner",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    slot: Some(SlotLaunch {
+                        slot: "planner".to_owned(),
+                        isolation: Some("userns".to_owned()),
+                        project_box: true,
+                        box_writable: Some("project".to_owned()),
+                        executable: Some(executable),
+                        ..SlotLaunch::default()
+                    }),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(status["lifecycle"], "running");
+        let commands = fixture.client.slot_commands.lock().unwrap().clone();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].1, "exec boxed-shell");
+        let argv = fs::read_to_string(fixture.root.join("argv-ok")).unwrap();
+        assert_eq!(
+            argv.lines().skip(1).collect::<Vec<_>>(),
+            [
+                "shell-command",
+                "--box",
+                "--name",
+                "planner",
+                "--cwd",
+                fixture.root.to_str().unwrap(),
+                "--writable",
+                "project",
+                "--isolation",
+                "userns",
+                "--format",
+                "json"
+            ]
+        );
+    }
+
+    #[test]
+    fn root_project_box_runs_the_harness_behind_the_relay() {
+        let fixture = Fixture::new();
+        let executable = fake_wrkslots(&fixture.root, &fixture.root, "root");
+        let status = fixture
+            .manager()
+            .start(
+                "planner",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    slot: Some(SlotLaunch {
+                        slot: "planner".to_owned(),
+                        project_box: true,
+                        executable: Some(executable),
+                        ..SlotLaunch::default()
+                    }),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(status["adapter"], "herdr-relay");
+        let argv = fs::read_to_string(fixture.root.join("argv-root")).unwrap();
+        let argv: Vec<&str> = argv.lines().collect();
+        assert_eq!(argv[1..4], ["shell-command", "--box", "--name"]);
+        let separator = argv.iter().position(|item| *item == "--").unwrap();
+        assert_eq!(argv[separator + 1], "/opt/bin/codex");
+        let error = slot_shell_command(
+            &SlotLaunch {
+                slot: "planner".to_owned(),
+                project_box: true,
+                box_writable: Some("everything".to_owned()),
+                executable: Some(fixture.root.join("fake-wrkslots-root")),
+                ..SlotLaunch::default()
+            },
+            &fixture.root,
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--box-writable"));
     }
 
     #[test]

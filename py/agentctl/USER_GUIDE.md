@@ -532,6 +532,26 @@ Slash commands, and therefore goals, are refused. A workspace trust dialog
 stops the launch for human attention. The pane closes when the harness exits.
 Slot problems are refused before any registry record or tab is created.
 
+## Boxing a (sub)coordinator
+
+```sh
+agentctl start lead --harness claude --cwd /work/project/worktrees --project-box \
+  --box-isolation root --brief 'Plan the release and launch one worker per slot'
+```
+
+`--project-box` (Rust edition, interactive Herdr sessions only) runs the agent in a wrkslots
+coordinator box instead of a slot's box (see "Boxing a (sub)coordinator" in the wrkslots user
+guide). It shares the `--slot` launch path. agentctl asks `wrkslots shell-command --box --name NAME
+--cwd DIR --format json` for the command line (`--box-name`, default: the agent name; DIR is
+`--cwd`, which is also the agent's working directory), and `--box-project DIR` names the project
+root when `--cwd` is not inside it. Inside the box every slot, the wrkslots registry, the slots'
+Git directories, and the agentctl registry in `--cwd` are writable (`--box-writable project`: the
+whole project root), so the agent can run `wrkslots create` and launch its own workers with
+`agentctl start --slot`. Those workers start in panes the Herdr server spawns, outside the
+coordinator's box, and box themselves into their own slot. `--box-isolation root` uses the
+`herdr-relay` adapter exactly as root slot isolation does, pinning the harness by the box scope's
+cgroup. It conflicts with `--slot`.
+
 ## Agentcloud sessions
 
 The Rust distribution can also launch a worker whose session runs in

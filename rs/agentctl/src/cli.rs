@@ -265,6 +265,21 @@ struct Start {
     /// With --slot: wrkslots project root (default: --cwd, searched upward for .wrkslots.yml)
     #[arg(long, value_name = "DIR", requires = "slot")]
     slot_project: Option<PathBuf>,
+    /// Interactive only: run the agent as a (sub)coordinator in a wrkslots coordinator box (`wrkslots shell-command --box`): the same limits and file-system view as --slot, but with no slot, starting in --cwd, with every slot, the wrkslots registry, the slots' Git directories, and the agentctl registry in --cwd writable (or the whole project root with --box-writable project), so it can create slots and launch its own subagents into them. Subagents it launches start outside its box and box themselves into their own slot. Conflicts with --slot. Needs wrkslots on PATH or AGENTCTL_WRKSLOTS_BIN
+    #[arg(long, conflicts_with = "slot")]
+    project_box: bool,
+    /// With --project-box: worktrees = the managed worktrees directory and the slots' Git directories; project = the whole project root (default: the project's configuration.sandbox.coordinator_writable, else worktrees)
+    #[arg(long, value_name = "SCOPE", value_parser = ["worktrees", "project"], requires = "project_box")]
+    box_writable: Option<String>,
+    /// With --project-box: userns, root, or cgroup, as for --slot-isolation; root supports claude and codex only (default: the project's configuration.sandbox.isolation, else userns)
+    #[arg(long, value_name = "MODE", value_parser = ["userns", "cgroup", "root"], requires = "project_box")]
+    box_isolation: Option<String>,
+    /// With --project-box: wrkslots project root (default: --cwd, searched upward for .wrkslots.yml)
+    #[arg(long, value_name = "DIR", requires = "project_box")]
+    box_project: Option<PathBuf>,
+    /// With --project-box: box name, which names its slice and its persistent private $HOME layer (default: the agent name)
+    #[arg(long, value_name = "NAME", requires = "project_box")]
+    box_name: Option<String>,
     /// Seconds to wait for harness startup, greater than zero and at most 300
     #[arg(long, default_value = "30", value_parser = startup_seconds)]
     startup_timeout: f64,
@@ -978,12 +993,26 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 ),
                 None => value.brief,
             };
-            let slot = value.slot.clone().map(|slot| SlotLaunch {
-                slot,
-                isolation: value.slot_isolation.clone(),
-                project: value.slot_project.clone(),
-                executable: None,
-            });
+            let slot = if value.project_box {
+                Some(SlotLaunch {
+                    slot: value
+                        .box_name
+                        .clone()
+                        .unwrap_or_else(|| value.agent.name.clone()),
+                    isolation: value.box_isolation.clone(),
+                    project: value.box_project.clone(),
+                    project_box: true,
+                    box_writable: value.box_writable.clone(),
+                    ..SlotLaunch::default()
+                })
+            } else {
+                value.slot.clone().map(|slot| SlotLaunch {
+                    slot,
+                    isolation: value.slot_isolation.clone(),
+                    project: value.slot_project.clone(),
+                    ..SlotLaunch::default()
+                })
+            };
             let options = StartOptions {
                 workspace_id: value.workspace_id,
                 harness,
@@ -1701,6 +1730,45 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(arguments).is_err());
         }
+        let parsed = Cli::try_parse_from([
+            "agentctl",
+            "start",
+            "planner",
+            "--project-box",
+            "--box-writable",
+            "project",
+            "--box-isolation",
+            "root",
+            "--box-project",
+            "/p",
+            "--box-name",
+            "lead",
+        ])
+        .unwrap();
+        let Some(Commands::Start(start)) = parsed.command else {
+            panic!("expected start");
+        };
+        assert!(start.project_box);
+        assert_eq!(start.box_writable.as_deref(), Some("project"));
+        assert_eq!(start.box_isolation.as_deref(), Some("root"));
+        assert_eq!(start.box_project, Some(PathBuf::from("/p")));
+        assert_eq!(start.box_name.as_deref(), Some("lead"));
+        for arguments in [
+            vec!["agentctl", "start", "w", "--box-writable", "project"],
+            vec!["agentctl", "start", "w", "--box-isolation", "root"],
+            vec!["agentctl", "start", "w", "--box-name", "lead"],
+            vec!["agentctl", "start", "w", "--project-box", "--slot", "s1"],
+            vec![
+                "agentctl",
+                "start",
+                "w",
+                "--project-box",
+                "--box-writable",
+                "all",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_err());
+        }
         let help = Cli::try_parse_from(["agentctl", "start", "--help"])
             .err()
             .unwrap()
@@ -1709,6 +1777,11 @@ mod tests {
             "--slot <SLOT>",
             "--slot-isolation",
             "--slot-project",
+            "--project-box",
+            "--box-writable",
+            "--box-isolation",
+            "--box-project",
+            "--box-name",
             "AGENTCTL_WRKSLOTS_BIN",
         ] {
             assert!(help.contains(flag), "{flag} missing from start help");
