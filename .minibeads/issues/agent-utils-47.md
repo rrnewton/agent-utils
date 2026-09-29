@@ -10,7 +10,7 @@ labels:
 depends_on:
   agent-utils-37: discovered-from
 created_at: 2026-09-26T09:35:28.961358042+00:00
-updated_at: 2026-09-26T09:35:28.963597195+00:00
+updated_at: 2026-09-29T20:16:01.283304793+00:00
 claimed_at: 2026-09-26T09:35:28.963597195+00:00
 claimed_until: 2026-09-28T09:35:28.963455011+00:00
 ---
@@ -49,3 +49,22 @@ Run live on the deployed stack and report content-free:
 - Every read ends with a completed response.
 - Audio seconds per transcript character stays at or below 0.09. The post-cut reads measured 0.068 and the stalled control 0.157.
 - The #37 read-aloud-cut-truncation re-answer probe still reports 0 of 2.
+
+# Notes
+
+[gpt-5] A provider-side fix is prepared, rebased onto current source and preserved in a verified
+recovery bundle. Review found one additional cached-context edge case: the teacher-forced opening
+token was counted as heard even when fewer than the measured 80 audio tokens followed it. The fix
+puts that token through the same voice-lag accounting as generated text, so a budget cut re-says
+an opening word whose audio never arrived.
+
+Validation on the final local successor:
+
+- runaway-guard target: 30 passed, 0 failed;
+- companion session-setup target: 22 passed, 0 failed;
+- changed-target type check: five targets, no errors;
+- lint: no issues;
+- mutation: restoring the old accounting drops the opening word and fails only the new regression.
+
+The private change remains unpublished, has no reviewers, and has not been deployed. The 10-read
+live acceptance and the 0-of-2 re-answer probe therefore remain required before this issue closes.
