@@ -662,6 +662,10 @@ def forwarded_environment(environ: Mapping[str, str], *, private_tmp: bool) -> d
     }
 
 
+_COORDINATOR_ENV_KEYS = ("WRKSLOTS_BOX", "WRKSLOTS_BOX_WRITABLE", "WRKSLOTS_PROJECT_ROOT")
+_SLOT_ENV_KEYS = ("WRKSLOTS_SLOT", "WRKSLOTS_SLOT_TYPE", "WRKSLOTS_SLOT_PATH", "WRKSLOTS_SLOT_REPRESENTATION")
+
+
 def child_environment(view: SlotView, settings: SandboxSettings, environ: Mapping[str, str]) -> dict[str, str]:
     """The complete environment COMMAND starts with."""
 
@@ -671,6 +675,12 @@ def child_environment(view: SlotView, settings: SandboxSettings, environ: Mappin
     if private_tmp:
         environment["TMPDIR"] = "/tmp"
     environment["WRKSLOTS_SANDBOX"] = settings.isolation
+    # A box launched from inside another box must describe only itself: a slot
+    # box started from a coordinator box must not inherit WRKSLOTS_BOX (which
+    # would make it look like a coordinator box to image commands), and a
+    # coordinator box must not carry a slot identity.
+    for key in (*_COORDINATOR_ENV_KEYS, *_SLOT_ENV_KEYS):
+        environment.pop(key, None)
     if view.coordinator:
         environment.update(
             {
@@ -1658,10 +1668,23 @@ def run(
         else:
             print(" ".join(_quote(part) for part in command))
         return 0
+    if not view.coordinator and isolation != "cgroup" and os.environ.get("WRKSLOTS_BOX"):
+        # The coordinator box masks slot-state (other slots' private $HOME
+        # layers, which hold seeded credential copies), so a slot's layer cannot
+        # be prepared from inside it.
+        raise SandboxError(
+            f"cannot box a command into slot {view.slot} from inside a coordinator box: the "
+            "coordinator box hides every slot's private state. Launch slot agents with "
+            "`agentctl start ... --slot` (their terminal panes start outside this box), or run "
+            "`wrkslots run` outside the box"
+        )
     if isolation == "root":
         check_sudo()
     if isolation != "cgroup":
-        prepare_state(view, settings, home)
+        try:
+            prepare_state(view, settings, home)
+        except OSError as exc:
+            raise SandboxError(f"cannot prepare the private state of {view.slot}: {exc}") from exc
     for line in apply_slice_limits(view, settings.limits):
         print(f"wrkslots run: limits {line}", file=sys.stderr)
     environment = child_environment(view, settings, os.environ)

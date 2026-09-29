@@ -552,8 +552,10 @@ def release_mount_point_copies(mount_point: Path, anchor: Path | None = None) ->
 
     try:
         _host_path_operation("replace", mount_point, anchor=anchor)
-    except (OSError, ImageError):
-        pass  # best effort: the caller's own checks decide what failed
+    except (OSError, ImageError) as exc:
+        # Best effort: the caller's own checks decide what failed. Say so, so a
+        # copy left behind (a bound loop device, a lingering fuse2fs) has a trace.
+        print(f"wrkslots: note: could not release stale copies of {mount_point}: {exc}", file=sys.stderr)
 
 
 def rename_mount_point(source: Path, destination: Path, anchor: Path | None = None) -> None:

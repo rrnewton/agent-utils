@@ -963,6 +963,13 @@ The box stops accidents, not a process that sets out to leave it:
 - **`cgroup` isolation** applies limits only.
 - **A coordinator box can write the registry and every slot, by design** (see "Boxing a
   (sub)coordinator"). It is the one box in which the "registry is read-only" rule does not hold.
+  It cannot box a command into a slot itself (`wrkslots run` refuses there, because the
+  coordinator box hides every slot's private state); slot agents it launches through agentctl
+  start in their own terminal panes, outside the coordinator box.
+- **The box's own identity is an environment variable.** A process that deliberately sets
+  `WRKSLOTS_BOX`, or forges a mount table, can change how image commands and the slot-in-use
+  census treat it; that is outside what the box guards against. Real use of a slot (a working
+  directory or an open file inside it) is still found either way.
 
 ### Configuring the box
 

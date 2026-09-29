@@ -1026,3 +1026,32 @@ def test_releasing_mount_point_copies_replaces_the_empty_directory(
     (point / "content").write_text("x", encoding="utf-8")
     slotimage.release_mount_point_copies(point)  # never replaces a directory that has content
     assert (point / "content").exists() and sorted(entry.name for entry in tmp_path.iterdir()) == ["slot"]
+
+
+def test_a_box_describes_only_itself_in_its_environment(tmp_path: Path) -> None:
+    # A slot box started from inside a coordinator box must not inherit the
+    # coordinator identity (image commands would treat it as a coordinator box),
+    # and a coordinator box must not carry a slot identity.
+    parent = {
+        "HOME": str(tmp_path),
+        "PATH": "/usr/bin:/bin",
+        "WRKSLOTS_BOX": "sub",
+        "WRKSLOTS_BOX_WRITABLE": "worktrees",
+        "WRKSLOTS_PROJECT_ROOT": str(tmp_path / "project"),
+        "WRKSLOTS_SLOT": "stale",
+    }
+    slot_env = sandbox.child_environment(_view(tmp_path), sandbox.SandboxSettings(isolation="userns"), parent)
+    assert "WRKSLOTS_BOX" not in slot_env and "WRKSLOTS_BOX_WRITABLE" not in slot_env
+    assert slot_env["WRKSLOTS_SLOT"] == "s1"
+    coordinator = dataclasses.replace(_view(tmp_path), coordinator=True)
+    box_env = sandbox.child_environment(coordinator, sandbox.SandboxSettings(isolation="userns"), parent)
+    assert "WRKSLOTS_SLOT" not in box_env and box_env["WRKSLOTS_BOX"] == "s1"
+
+
+def test_run_refuses_a_slot_box_from_inside_a_coordinator_box(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WRKSLOTS_BOX", "sub")
+    monkeypatch.setattr(sandbox, "prepare_state", lambda *args: pytest.fail("must refuse before preparing state"))
+    with pytest.raises(sandbox.SandboxError, match="from inside a coordinator box"):
+        sandbox.run(_view(tmp_path), sandbox.SandboxSettings(isolation="userns"), ["true"])
