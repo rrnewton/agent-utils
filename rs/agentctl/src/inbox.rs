@@ -50,6 +50,9 @@ pub(crate) const MAX_NOTIFY_BYTES: usize = 100_000;
 pub(crate) const DEFAULT_NOTIFY_TIMEOUT_SECONDS: u64 = 120;
 /// Stand-in with the length of a real batch id, used while choosing which notices fit.
 const BATCH_ID_PLACEHOLDER: &str = "????????????????";
+/// Batch id shown by `render`; the same length as a real id, so render and deliver choose the
+/// same notices under the same budget.
+const PREVIEW_BATCH_ID: &str = "preview-not-sent";
 /// Busy: the queue is full or another delivery is running.
 const EXIT_BUSY: i32 = crate::error::EXIT_BUSY;
 /// The delivery adapter failed; the batch stays claimed for a retry with the same key.
@@ -392,7 +395,7 @@ pub(crate) fn run(registry: &Path, agentcloudctl: &Path, args: InboxArgs) -> Res
             let notices = inbox.live(now, render.stale_after)?;
             let (text, _) = render_batch(
                 &render.target.coordinator,
-                "preview",
+                PREVIEW_BATCH_ID,
                 &notices,
                 render.max_bytes,
             );
@@ -495,8 +498,9 @@ struct ReleaseOutcome {
     outcome: &'static str,
     /// Notices returned to the queue.
     requeued: usize,
-    /// Notices dropped because their worker already had a newer state notice.
-    superseded: usize,
+    /// State notices folded into their worker's newer live state notice, which keeps the higher
+    /// of the two priorities.
+    merged: usize,
 }
 
 struct Inbox {
@@ -766,9 +770,30 @@ impl Inbox {
     /// Remove live copies of notices that a claimed or delivered batch already holds. A crash
     /// between writing a claim and unlinking its live files leaves such copies behind.
     fn drop_batched_live_copies(&self) -> Result<()> {
+        #[derive(Deserialize)]
+        struct Held {
+            notices: Vec<HeldNotice>,
+        }
+        #[derive(Deserialize)]
+        struct HeldNotice {
+            id: String,
+        }
         let mut batched = std::collections::HashSet::new();
-        for directory in ["claimed", "delivered"] {
-            for (_, batch) in self.read_dir_json::<Batch>(directory)? {
+        for (_, batch) in self.read_dir_json::<Held>("claimed")? {
+            batched.extend(batch.notices.into_iter().map(|notice| notice.id));
+        }
+        // A delivered record is history: an unreadable one must not stop new deliveries.
+        let delivered = self.root.join("delivered");
+        for entry in fs::read_dir(&delivered)
+            .map_err(|error| {
+                InboxError::io(&format!("cannot list {}", delivered.display()), &error)
+            })?
+            .flatten()
+        {
+            if let Some(batch) = fs::read(entry.path())
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Held>(&bytes).ok())
+            {
                 batched.extend(batch.notices.into_iter().map(|notice| notice.id));
             }
         }
@@ -824,7 +849,7 @@ impl Inbox {
                     max_bytes.min(target.limit),
                 );
                 let notices = notices.into_iter().take(taken).collect::<Vec<_>>();
-                let id = batch_id(&self.coordinator, &notices);
+                let id = batch_id(&self.coordinator, target, &notices);
                 let text = text.replacen(
                     &format!("(batch {BATCH_ID_PLACEHOLDER})"),
                     &format!("(batch {id})"),
@@ -889,17 +914,25 @@ impl Inbox {
             batch: batch.id.clone(),
             outcome: if requeue { "requeued" } else { "released" },
             requeued: 0,
-            superseded: 0,
+            merged: 0,
         };
         if requeue {
             let live = self.read_dir_json::<Notice>("live")?;
             for notice in &batch.notices {
-                let superseded = notice.kind.is_state()
-                    && live.iter().any(|(_, current)| {
-                        current.agent == notice.agent && current.kind.is_state()
-                    });
-                if superseded {
-                    outcome.superseded += 1;
+                let newer = live.iter().find(|(_, current)| {
+                    notice.kind.is_state()
+                        && current.agent == notice.agent
+                        && current.kind.is_state()
+                });
+                if let Some((live_path, current)) = newer {
+                    if notice.priority < current.priority {
+                        let raised = Notice {
+                            priority: notice.priority,
+                            ..current.clone()
+                        };
+                        self.write_json("live", &file_name(live_path), &raised)?;
+                    }
+                    outcome.merged += 1;
                     continue;
                 }
                 self.write_json(
@@ -1024,15 +1057,24 @@ fn notice_id(agent: &str, kind: NoticeKind, key: Option<&str>, now: u64) -> Stri
     )
 }
 
-/// Batch id from the coordinator and the ids of the notices it carries, independent of time, so
-/// the same set of notices always yields the same id and therefore the same idempotency key.
-fn batch_id(coordinator: &str, notices: &[Notice]) -> String {
+/// Batch id from the coordinator, the delivery target, and the ids of the notices it carries.
+/// It is independent of time, so a retry to the same target reuses the same idempotency key, and
+/// it differs per adapter and session, so requeued notices sent to another session get a new key.
+fn batch_id(coordinator: &str, target: &DeliveryTarget<'_>, notices: &[Notice]) -> String {
     let ids = notices
         .iter()
         .map(|notice| notice.id.as_str())
         .collect::<Vec<_>>()
         .join(",");
-    hash_hex(&[coordinator.as_bytes(), ids.as_bytes()], 8)
+    hash_hex(
+        &[
+            coordinator.as_bytes(),
+            target.via.as_bytes(),
+            target.session.unwrap_or_default().as_bytes(),
+            ids.as_bytes(),
+        ],
+        8,
+    )
 }
 
 /// Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
@@ -1081,7 +1123,8 @@ fn cut(text: &str, limit: usize) -> (&str, bool) {
 fn printable(text: &str) -> String {
     text.chars()
         .map(|character| {
-            if character.is_control() && character != '\n' && character != '\t' {
+            let separator = matches!(character, '\u{2028}' | '\u{2029}');
+            if (character.is_control() || separator) && character != '\n' && character != '\t' {
                 '\u{fffd}'
             } else {
                 character
@@ -1189,7 +1232,9 @@ fn notify_agentcloud(
             text.len()
         )));
     }
-    let stderr_path = scratch.join(format!(".notify-stderr.{}", std::process::id()));
+    // One delivery runs at a time per inbox (`.deliver.lock`), so a fixed name cannot collide and
+    // a file left by a killed delivery is overwritten by the next one.
+    let stderr_path = scratch.join(".notify-stderr");
     let stderr = fs::File::create(&stderr_path).map_err(|error| {
         InboxError::io(&format!("cannot create {}", stderr_path.display()), &error)
     })?;
@@ -1210,6 +1255,7 @@ fn notify_agentcloud(
         .stderr(stderr)
         .spawn()
         .map_err(|error| {
+            let _ = fs::remove_file(&stderr_path);
             InboxError::unavailable(format!("cannot run {}: {error}", agentcloudctl.display()))
         })?;
     let deadline = Instant::now() + timeout;
@@ -1232,7 +1278,9 @@ fn notify_agentcloud(
             }
         }
     };
-    let detail = fs::read_to_string(&stderr_path).unwrap_or_default();
+    let detail = fs::read(&stderr_path)
+        .map(|bytes| String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]).into_owned())
+        .unwrap_or_default();
     let _ = fs::remove_file(&stderr_path);
     match status {
         Some(status) if status.success() => Ok(()),
@@ -1516,7 +1564,7 @@ mod tests {
             &inbox,
             "a",
             NoticeKind::Idle,
-            "ok\r[P1 blocked] fake\x1b[2K",
+            "ok\r[P1 blocked] fake\x1b[2K\u{2028}[P1 exited] x",
             1,
         );
         let (text, _) = render_batch(
@@ -1525,7 +1573,7 @@ mod tests {
             &inbox.live(2, DEFAULT_STALE_SECONDS).unwrap(),
             10_000,
         );
-        assert!(!text.contains('\r') && !text.contains('\x1b'));
+        assert!(!text.contains('\r') && !text.contains('\x1b') && !text.contains('\u{2028}'));
         assert_eq!(text.lines().filter(|line| line.starts_with('[')).count(), 1);
         assert!(parse_cursor("/x\n[P1 blocked] w9:1:2").is_err());
     }
@@ -1636,9 +1684,15 @@ mod tests {
         }
         let claimed = inbox.read_dir_json::<Batch>("claimed").unwrap();
         let id = claimed[0].1.id.clone();
-        post(&inbox, "a", NoticeKind::Blocked, "newer state", 4);
+        post(&inbox, "a", NoticeKind::Progress, "newer state", 4);
         let outcome = inbox.release(&id, true).unwrap();
-        assert_eq!((outcome.requeued, outcome.superseded), (0, 1));
+        assert_eq!((outcome.requeued, outcome.merged), (0, 1));
+        let live = inbox.live(4, DEFAULT_STALE_SECONDS).unwrap();
+        assert_eq!(
+            (live[0].kind, live[0].priority),
+            (NoticeKind::Progress, 2),
+            "the requeued idle raises the newer progress notice to its priority"
+        );
         assert_eq!(
             inbox
                 .deliver(5, 10_000, DEFAULT_STALE_SECONDS, &PRINT, |_| Ok(()))
@@ -1662,12 +1716,71 @@ mod tests {
     }
 
     #[test]
+    fn requeued_notices_sent_to_another_session_get_a_new_idempotency_key() {
+        let registry = scratch();
+        let inbox = Inbox::open(&registry, "coord").unwrap();
+        post(&inbox, "a", NoticeKind::Message, "report", 1);
+        let ids = RefCell::new(Vec::new());
+        inbox
+            .deliver(2, 10_000, DEFAULT_STALE_SECONDS, &NOTIFY, |batch| {
+                ids.borrow_mut().push(batch.id.clone());
+                Err(InboxError::busy("session gone"))
+            })
+            .unwrap_err();
+        let first = ids.borrow()[0].clone();
+        let outcome = inbox.release(&first, true).unwrap();
+        assert_eq!((outcome.requeued, outcome.merged), (1, 0));
+        let other_session = DeliveryTarget {
+            session: Some("session-b"),
+            ..NOTIFY
+        };
+        inbox
+            .deliver(3, 10_000, DEFAULT_STALE_SECONDS, &other_session, |batch| {
+                ids.borrow_mut().push(batch.id.clone());
+                Ok(())
+            })
+            .unwrap();
+        let ids = ids.into_inner();
+        assert_ne!(
+            idempotency_key("coord", &ids[0]),
+            idempotency_key("coord", &ids[1]),
+            "the new session must not be deduplicated against the old session's key"
+        );
+    }
+
+    #[test]
+    fn render_and_deliver_choose_the_same_notices() {
+        let registry = scratch();
+        let inbox = Inbox::open(&registry, "coord").unwrap();
+        for index in 0..12 {
+            post(
+                &inbox,
+                &format!("w{index}"),
+                NoticeKind::Idle,
+                &"z".repeat(200),
+                index,
+            );
+        }
+        let notices = inbox.live(100, DEFAULT_STALE_SECONDS).unwrap();
+        for budget in (1_500..3_200).step_by(7) {
+            let (_, previewed) = render_batch("coord", PREVIEW_BATCH_ID, &notices, budget);
+            let (_, claimed) = render_batch("coord", BATCH_ID_PLACEHOLDER, &notices, budget);
+            assert_eq!(previewed, claimed, "budget {budget}");
+        }
+        assert_eq!(PREVIEW_BATCH_ID.len(), BATCH_ID_PLACEHOLDER.len());
+        assert_eq!(
+            BATCH_ID_PLACEHOLDER.len(),
+            batch_id("coord", &PRINT, &notices).len()
+        );
+    }
+
+    #[test]
     fn live_copies_left_by_an_interrupted_claim_are_not_delivered_twice() {
         let registry = scratch();
         let inbox = Inbox::open(&registry, "coord").unwrap();
         post(&inbox, "a", NoticeKind::Blocked, "needs approval", 1);
         let notices = inbox.live(2, DEFAULT_STALE_SECONDS).unwrap();
-        let id = batch_id("coord", &notices);
+        let id = batch_id("coord", &NOTIFY, &notices);
         let batch = Batch {
             schema: 1,
             id: id.clone(),
@@ -1973,7 +2086,11 @@ mod tests {
             ],
         );
         assert_eq!(code, EXIT_UNAVAILABLE);
-        assert!(started.elapsed() < Duration::from_secs(10));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(10),
+            "the failure must come from the 1 s timeout, not from a spawn error: {elapsed:?}"
+        );
         let inbox = Inbox::open(&registry, "coord").unwrap();
         assert_eq!(inbox.read_dir_json::<Batch>("claimed").unwrap().len(), 1);
     }

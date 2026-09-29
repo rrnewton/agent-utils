@@ -73,11 +73,12 @@ underscores or hyphens, starting with a letter or digit.
 
 Delivery order is priority, then creation time. A batch starts with one header line, followed by
 one block per notice. Each block shows the kind, worker, UTC date and time, text cut at 600
-bytes, and the transcript range. Control characters other than newline and tab are shown as
-U+FFFD, and every text line is indented, so a notice cannot forge another notice's header.
+bytes, and the transcript range. Control characters other than newline and tab, and the Unicode
+line and paragraph separators, are shown as U+FFFD, and every text line is indented, so a
+notice cannot forge another notice's header.
 Notices are added while the whole batch, header and trailer included, stays within `--max-bytes`
 (3000 bytes by default). The first notice is always included, so one large notice cannot stall
-the queue; a notice renders to at most about 2 KB. Notices that do not fit stay queued, and the
+the queue; a notice renders to at most about 3.5 KB. Notices that do not fit stay queued, and the
 batch ends with a line saying how many.
 
 `render` prints the next batch without claiming anything. `list` prints the queue as JSON.
@@ -92,7 +93,9 @@ batch ends with a line saying how many.
    only to the adapter and session it was claimed for. Any other `--via` or `--session` exits 2
    until the batch is delivered or released.
 3. Otherwise the next batch is rendered, written to `claimed/`, and its notices leave `live/`.
-   The batch id is derived from the coordinator and the ids of the notices it carries.
+   The batch id is derived from the coordinator, the adapter and session, and the ids of the
+   notices it carries, so a retry to the same session reuses its idempotency key and a delivery
+   to a different session never does.
 4. The adapter runs. On success the batch moves to `delivered/`. On failure it stays in
    `claimed/`, `deliver` exits 69, and the next `deliver` re-sends the same batch.
 
@@ -113,8 +116,11 @@ Adapters (`--via`):
 
 `release --batch ID` gives up on a claimed batch that can no longer reach its adapter. Without
 `--requeue` the batch moves to `released/` and its notices are not delivered. With `--requeue`
-its notices return to the queue; they may reach the coordinator twice if the failed attempt
-actually landed, and a requeued state notice is dropped when its worker already has a newer one.
+its notices return to the queue, even beyond `--max-live`. A requeued state notice is folded
+into its worker's newer live state notice, which takes the higher of the two priorities. A
+requeued batch sent to the same session reuses the old key, so agentcloud delivers it at most
+once; sent to another adapter or session it gets a new batch id and key, so it may reach the
+coordinator twice if the failed attempt actually landed.
 
 ## Exit codes
 
