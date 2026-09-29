@@ -19985,9 +19985,10 @@ def _clear_bound_cache_directory(
 # otherwise authorized agent removal, before any cache is deleted, and asks Git
 # itself: no path name is ever treated as evidence.
 _NESTED_GIT_COMMAND_SECONDS = 120.0
-# One allowance shared by every Git command a single removal runs to judge and
-# re-judge nested repositories, so a slot full of clones cannot hold the lock
-# for hours: 120 s per command, 900 s in total.
+# One allowance of time spent inside the Git commands a single removal runs to
+# judge and re-judge nested repositories, so a slot full of clones cannot hold
+# the lock for hours: 120 s per command, 900 s in total.  Deleting caches and
+# every other step between commands is not charged.
 _NESTED_GIT_REMOVAL_SECONDS = 900.0
 _NESTED_GIT_IGNORED_SAMPLE = 20
 _NESTED_GIT_OPERATION_MARKERS = (
@@ -20003,22 +20004,48 @@ _NESTED_GIT_OPERATION_MARKERS = (
 _NESTED_GIT_EVIDENCE_KEYS = frozenset(
     {"checkout", "path", "head", "remote_ref", "ignored_entries", "ignored_sample"}
 )
+# Recorded beside the judged repositories in the slot-removed event: what the
+# judgment did not cover, so the evidence is not read as more than it is.
+_NESTED_GIT_SCOPE = (
+    "Only directories named .git were judged. Everything else in the cache was "
+    "deleted as ordinary cache files without inspection, including a bare Git "
+    "repository under any other name and a filesystem image with repositories "
+    "inside it. A judged repository was deleted with material no ref, reflog or "
+    "commit reaches: dangling blobs and trees, hooks, .git/info files other than "
+    "exclude, and Git LFS objects."
+)
+# Remote settings that route a transfer through a program this check cannot
+# inspect, so a remote-tracking ref may not reflect what the remote's URL holds.
+_NESTED_GIT_REMOTE_PROGRAMS = (
+    ("vcs", "a remote helper"),
+    ("uploadpack", "an upload-pack program"),
+    ("receivepack", "a receive-pack program"),
+)
 
 
 @dataclasses.dataclass
 class _NestedGitBudget:
-    """One removal-wide time allowance for nested repository judgment."""
+    """One removal-wide allowance of time spent inside nested-judgment Git commands.
+
+    Only time inside those commands is charged, so a removal that deletes a
+    large cache between two judgments does not spend the allowance deleting.
+    """
 
     total_seconds: float = _NESTED_GIT_REMOVAL_SECONDS
-    _deadline: float | None = dataclasses.field(init=False, default=None, repr=False)
+    spent_seconds: float = dataclasses.field(init=False, default=0.0)
 
     def command_seconds(self) -> float:
         """Return the bound for the next Git command, or zero once the allowance is spent."""
 
-        now = time.monotonic()
-        if self._deadline is None:
-            self._deadline = now + self.total_seconds
-        return max(0.0, min(_NESTED_GIT_COMMAND_SECONDS, self._deadline - now))
+        return max(
+            0.0,
+            min(_NESTED_GIT_COMMAND_SECONDS, self.total_seconds - self.spent_seconds),
+        )
+
+    def charge(self, seconds: float) -> None:
+        """Charge the wall time one Git command took."""
+
+        self.spent_seconds += max(0.0, seconds)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -20099,18 +20126,20 @@ def _local_remote_path(url: str, base: Path) -> Path | None:
 
 
 def _nested_remote_exclusion(
-    url: str, work_tree: Path, resolved_roots: Sequence[Path]
+    url: str, work_tree: Path, resolved_roots: Sequence[Path], *, label: str = "URL"
 ) -> str | None:
     """Say why one remote URL proves nothing, or return None when it counts.
 
     A network URL counts.  A local path counts only when it exists and lies
     outside every root this removal deletes.  Nothing here raises: a path that
     cannot be resolved (a symbolic-link loop, a name too long, a permission
-    error) is itself the reason the remote does not count.
+    error) is itself the reason the remote does not count.  ``label`` names
+    which of the remote's URLs this is (its URL, its push URL, or one of them
+    as the invoking user's Git configuration rewrites it).
     """
 
     if "::" in url:
-        return "its URL names a remote helper, whose source this check cannot locate"
+        return f"its {label} names a remote helper, whose source this check cannot locate"
     try:
         local = _local_remote_path(url, work_tree)
         if local is None:
@@ -20119,19 +20148,49 @@ def _nested_remote_exclusion(
         # Checked first: while the slot is fenced its canonical paths no
         # longer exist, and "inside this removal" is the more exact reason.
         if any(target == root or target.is_relative_to(root) for root in resolved_roots):
-            return "its URL is a local path inside this removal"
+            return f"its {label} is a local path inside this removal"
         if not target.exists():
-            return "its URL is a local path that does not exist"
+            return f"its {label} is a local path that does not exist"
     except (OSError, RuntimeError, ValueError) as exc:
         return (
-            "its URL is a local path that cannot be resolved "
+            f"its {label} is a local path that cannot be resolved "
             f"({type(exc).__name__}: {exc})"
         )
     return None
 
 
-def _refspec_destinations(refspecs: Sequence[str]) -> list[str]:
-    """Return the refs/remotes/* destinations of positive fetch refspecs."""
+def _qualified_fetch_destination(
+    destination: str, *, expand_patterns: bool
+) -> str | None:
+    """Spell one fetch refspec destination as the ref Git writes, or None if it writes none.
+
+    For a destination without a wildcard Git does what remote.c get_local_ref
+    does: a name under refs/ is kept, heads/, tags/ and remotes/ gain refs/,
+    and any other name becomes refs/heads/<name>, so ``remotes/origin/main``
+    writes refs/remotes/origin/main.  Git ignores a wildcard destination
+    outside refs/ as a "funny ref"; ``expand_patterns`` expands it the same
+    way anyway, which over-approximates what it could write.
+    """
+
+    if not destination:
+        return None
+    if destination.startswith("refs/"):
+        return destination
+    if "*" in destination and not expand_patterns:
+        return None
+    if destination.startswith(("heads/", "tags/", "remotes/")):
+        return "refs/" + destination
+    return "refs/heads/" + destination
+
+
+def _refspec_destinations(
+    refspecs: Sequence[str], *, over_approximate: bool = False
+) -> list[str]:
+    """Return the local refs that positive fetch refspecs write, fully qualified.
+
+    With ``over_approximate`` a wildcard destination outside refs/ is expanded
+    too, for remotes whose every possible write must be accounted for.
+    """
 
     destinations: list[str] = []
     for refspec in refspecs:
@@ -20139,8 +20198,13 @@ def _refspec_destinations(refspecs: Sequence[str]) -> list[str]:
         if body.startswith("^"):
             continue
         _source, separator, destination = body.partition(":")
-        if separator and destination.startswith("refs/remotes/"):
-            destinations.append(destination)
+        if not separator:
+            continue
+        qualified = _qualified_fetch_destination(
+            destination, expand_patterns=over_approximate
+        )
+        if qualified is not None:
+            destinations.append(qualified)
     return destinations
 
 
@@ -20197,25 +20261,37 @@ def _judge_nested_git_repository_unchecked(
 ) -> _DisposableNestedRepository:
     """Prove that the repository at ``dotgit`` holds nothing that exists only here.
 
-    The proof requires a well-formed non-linked repository whose ``.git`` is a
-    directory, that borrows no objects through alternates and whose config
-    sets no include, content filter, core.worktree or url.* rewrite; an index
+    The proof requires a well-formed, non-linked, non-bare repository whose
+    ``.git`` is a directory with no linked worktrees, no submodule
+    repositories and no legacy .git/remotes or .git/branches files, that
+    borrows no objects through alternates and whose config sets no include,
+    content filter, core.worktree or url.* rewrite; an index
     with no gitlink and no entry hidden by assume-unchanged or skip-worktree;
     a worktree with no uncommitted or untracked non-ignored change, no ignore
     rule in .git/info/exclude and no .gitignore that ignores itself; no stash
     and no operation in progress; and every commit object in the repository,
     whether named by HEAD, a branch, a tag, a pseudo-ref, a reflog entry or
     nothing at all (a dropped stash, a deleted branch), reachable from a
-    counted remote-tracking ref.  A ref counts only when a fetch refspec of a
-    counted remote, and of no uncounted one, maps to it.  A remote counts only
-    when it has a URL, its name has no '/', and every URL is a network URL or
-    an existing local path outside ``removed_roots``: a clone of a sibling
-    deleted by the same removal, or of a path that no longer exists, proves
-    nothing.  Git runs with no global or system configuration, no grafts,
-    replace refs or commit-graph, no optional locks, no fsmonitor, no
-    transport, and a bound on every command drawn from ``budget``.  Anything
-    else refuses and names the condition that failed, reporting the entry as
-    ``display`` (its canonical path while the slot is fenced).
+    counted remote-tracking ref.  A ref counts only when it is not a symbolic
+    ref and a fetch refspec of a counted remote, and of no uncounted one, maps
+    to it; an uncounted remote's destinations are qualified the way Git
+    qualifies them and cover every namespace, so neither ``remotes/origin/main``
+    nor ``refs/*:refs/*`` lets it write a counted ref unnoticed.  A remote
+    counts only when it has a URL, its name has no '/', it routes no transfer
+    through a remote helper, upload-pack or receive-pack program, and every URL
+    and push URL, as configured and as the invoking user's Git configuration
+    rewrites them (insteadOf, pushInsteadOf), is a network URL or an existing
+    local path outside ``removed_roots``: ``git push`` sends commits to the
+    push URL and then updates the remote-tracking ref as if they had reached
+    the URL, and a clone of a sibling deleted by the same removal, or of a
+    path that no longer exists, proves nothing.  Git runs with no global or
+    system configuration, no grafts, replace refs or commit-graph, no optional
+    locks, no fsmonitor, no transport, and a bound on every command drawn from
+    ``budget``; only the commands that read remote settings and report
+    effective URLs (``git config`` and ``git remote get-url``) see the
+    invoking user's configuration, and neither runs a program.  Anything else refuses and names the condition that failed,
+    reporting the entry as ``display`` (its canonical path while the slot is
+    fenced).
     """
 
     def refuse(condition: str) -> Refusal:
@@ -20255,9 +20331,30 @@ def _judge_nested_git_repository_unchecked(
             "GIT_ATTR_NOSYSTEM": "1",
         }
     )
+    # Remote settings and effective URLs are read under the invoking user's
+    # global and system configuration, the configuration a push or fetch in
+    # this repository would have used, so a remote defined or rewritten there
+    # is judged by where its transfers actually went.
+    user_env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_") or key.startswith("GIT_CONFIG_")
+    }
+    user_env.update(
+        {
+            "LC_ALL": "C",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_NO_LAZY_FETCH": "1",
+        }
+    )
 
     def run(
-        args: Sequence[str], *, work: bool = False, stdin: bytes | None = None
+        args: Sequence[str],
+        *,
+        work: bool = False,
+        stdin: bytes | None = None,
+        user_config: bool = False,
     ) -> subprocess.CompletedProcess[bytes]:
         seconds = budget.command_seconds()
         if seconds <= 0:
@@ -20289,13 +20386,14 @@ def _judge_nested_git_repository_unchecked(
             *((f"--work-tree={work_tree}",) if work else ()),
             *args,
         ]
+        started = time.monotonic()
         try:
             return subprocess.run(
                 command,
                 input=stdin,
                 capture_output=True,
                 check=False,
-                env=env,
+                env=user_env if user_config else env,
                 cwd="/",
                 timeout=seconds,
             )
@@ -20305,6 +20403,8 @@ def _judge_nested_git_repository_unchecked(
             ) from exc
         except OSError as exc:
             raise refuse(f"cannot execute Git: {exc}") from exc
+        finally:
+            budget.charge(time.monotonic() - started)
 
     def detail(completed: subprocess.CompletedProcess[bytes]) -> str:
         text = (completed.stderr or completed.stdout).decode(errors="replace").strip()
@@ -20375,6 +20475,10 @@ def _judge_nested_git_repository_unchecked(
     for subdirectory, what in (
         ("worktrees", "registered linked worktrees"),
         ("modules", "submodule repositories under .git/modules"),
+        # Fetch and push still read remotes from these legacy files, which the
+        # remote configuration below does not include.
+        ("remotes", "remotes defined in legacy .git/remotes files, which this check does not read"),
+        ("branches", "remotes defined in legacy .git/branches files, which this check does not read"),
     ):
         try:
             held = sorted(os.listdir(dotgit / subdirectory))
@@ -20484,22 +20588,25 @@ def _judge_nested_git_repository_unchecked(
         )
         if not unborn:
             raise refuse("HEAD does not name a commit")
-    listed_remotes = run(["config", "--null", "--get-regexp", r"^remote\..*\.(url|fetch)$"])
+    listed_remotes = run(
+        [
+            "config",
+            "--null",
+            "--get-regexp",
+            r"^remote\..*\.(url|pushurl|fetch|vcs|uploadpack|receivepack)$",
+        ],
+        user_config=True,
+    )
     if listed_remotes.returncode not in {0, 1}:
         raise refuse(f"cannot read remote configuration: {detail(listed_remotes)}")
-    remote_urls: dict[str, list[str]] = {}
-    remote_refspecs: dict[str, list[str]] = {}
+    remote_settings: dict[str, dict[str, list[str]]] = {}
     for item in listed_remotes.stdout.decode(errors="surrogateescape").split("\0"):
         key, _newline, value = item.partition("\n")
         if not key.startswith("remote."):
             continue
-        if key.endswith(".url"):
-            remote_urls.setdefault(key[len("remote.") : -len(".url")], []).append(value)
-        elif key.endswith(".fetch"):
-            remote_refspecs.setdefault(key[len("remote.") : -len(".fetch")], []).append(
-                value
-            )
-    remote_names = sorted(set(remote_urls) | set(remote_refspecs))
+        name, _dot, variable = key[len("remote.") :].rpartition(".")
+        remote_settings.setdefault(name, {}).setdefault(variable, []).append(value)
+    remote_names = sorted(remote_settings)
     for remote_name in remote_names:
         if "/" in remote_name:
             raise refuse(
@@ -20510,30 +20617,77 @@ def _judge_nested_git_repository_unchecked(
         resolved_roots = [root.resolve(strict=False) for root in removed_roots]
     except (OSError, RuntimeError) as exc:
         raise refuse(f"cannot resolve the paths this removal deletes: {exc}") from exc
+
+    def remote_exclusion(remote_name: str, settings: Mapping[str, list[str]]) -> str | None:
+        urls = settings.get("url", [])
+        if not urls:
+            return "it has no URL"
+        for variable, program in _NESTED_GIT_REMOTE_PROGRAMS:
+            if any(settings.get(variable, [])):
+                return (
+                    f"it sets remote.{remote_name}.{variable}, so {program} this "
+                    "check cannot inspect carried its transfers"
+                )
+        configured = [("URL", url) for url in urls] + [
+            ("push URL", url) for url in settings.get("pushurl", [])
+        ]
+        seen = {url for _label, url in configured}
+        for kind, flags in (("URL", ()), ("push URL", ("--push",))):
+            effective = run(
+                ["remote", "get-url", *flags, "--all", remote_name], user_config=True
+            )
+            if effective.returncode != 0:
+                return f"Git cannot report its effective {kind}: {detail(effective)}"
+            for url in effective.stdout.decode(errors="surrogateescape").splitlines():
+                if url not in seen:
+                    seen.add(url)
+                    configured.append((f"effective {kind} {url!r}", url))
+        for label, url in configured:
+            reason = _nested_remote_exclusion(url, work_tree, resolved_roots, label=label)
+            if reason is not None:
+                return reason
+        return None
+
     uncounted: dict[str, str] = {}
     counted_destinations: list[str] = []
     uncounted_destinations: list[str] = []
     for remote_name in remote_names:
-        urls = remote_urls.get(remote_name, [])
-        reason = None if urls else "it has no URL"
-        for url in urls:
-            reason = reason or _nested_remote_exclusion(url, work_tree, resolved_roots)
-        destinations = _refspec_destinations(remote_refspecs.get(remote_name, []))
+        settings = remote_settings[remote_name]
+        reason = remote_exclusion(remote_name, settings)
+        refspecs = settings.get("fetch", [])
         if reason is None:
-            counted_destinations.extend(destinations)
+            counted_destinations.extend(
+                destination
+                for destination in _refspec_destinations(refspecs)
+                if destination.startswith("refs/remotes/")
+            )
         else:
             uncounted[remote_name] = reason
-            uncounted_destinations.extend(destinations)
+            # Every ref an uncounted remote could write, in any namespace:
+            # refs/*:refs/* writes refs/remotes/origin/main as surely as
+            # remotes/origin/main does.
+            uncounted_destinations.extend(
+                _refspec_destinations(refspecs, over_approximate=True)
+            )
     counted_refs: dict[str, str] = {}
     local_tips: list[tuple[str, str]] = []
-    for line in output(["for-each-ref", "--format=%(objectname) %(refname)"]).splitlines():
-        sha, _space, refname = line.partition(" ")
-        if any(
-            _refspec_destination_matches(destination, refname)
-            for destination in counted_destinations
-        ) and not any(
-            _refspec_destination_matches(destination, refname)
-            for destination in uncounted_destinations
+    for line in output(
+        ["for-each-ref", "--format=%(objectname) %(refname) %(symref)"]
+    ).splitlines():
+        sha, refname, symref = line.split(" ", 2)
+        # A symbolic ref proves nothing by itself: refs/remotes/origin/HEAD
+        # can point at a ref an uncounted remote wrote, or at a local branch.
+        # Its target, when that is a ref, is listed and judged on its own.
+        if (
+            not symref
+            and any(
+                _refspec_destination_matches(destination, refname)
+                for destination in counted_destinations
+            )
+            and not any(
+                _refspec_destination_matches(destination, refname)
+                for destination in uncounted_destinations
+            )
         ):
             counted_refs[refname] = sha
         else:
@@ -23615,10 +23769,13 @@ def _finish_remove_paths(
                         ),
                         live_use_recheck=finish.live_use_recheck,
                     )
-            for checkout in moved_checkouts:
-                for cache in _cache_directories_for_checkout(config, checkout):
-                    judged_here = nested_by_cache.get(cache.path, ())
-                    if judged_here:
+                # Judge every cache again, after the use check and before the
+                # first deletion, so neither a change nor an exhausted budget
+                # can refuse once a cache is partly gone.  Deleting is not
+                # charged to the budget.
+                for checkout in moved_checkouts:
+                    for cache in _cache_directories_for_checkout(config, checkout):
+                        judged_here = nested_by_cache.get(cache.path, ())
                         rejudged = _judge_cache_nested_repositories(
                             config,
                             cache,
@@ -23633,6 +23790,10 @@ def _finish_remove_paths(
                                 "changed after they were judged disposable; preserve "
                                 "the slot and rerun remove"
                             )
+                _interrupt_for_test("after-nested-git-rejudged")
+            for checkout in moved_checkouts:
+                for cache in _cache_directories_for_checkout(config, checkout):
+                    judged_here = nested_by_cache.get(cache.path, ())
                     deleting_nested[:] = [
                         nested_evidence[nested.path] for nested in judged_here
                     ]
@@ -23667,6 +23828,16 @@ def _finish_remove_paths(
                 if deleting_nested
                 else ""
             )
+            if already:
+                already += (
+                    "; each listed head is in the listed remote-tracking ref, and "
+                    "every other commit of those repositories was in one of their "
+                    "counted remote-tracking refs, so fetching from the remote that "
+                    "ref names (its URL was in the deleted repository's "
+                    "configuration) and checking out the listed head restores the "
+                    "head's commits, but not uncommitted files, hooks or "
+                    "unreferenced objects"
+                )
             if not removed:
                 try:
                     _rollback_path_fence(
@@ -23681,6 +23852,11 @@ def _finish_remove_paths(
                         f"{exc}{already}; path-fence rollback failed: {rollback}; "
                         "run 'wrkslots recover'"
                     ) from rollback
+                if already:
+                    already += (
+                        "; keep this message: the path fence was rolled back, "
+                        "which cleared the journal that listed these repositories"
+                    )
             if already:
                 raise Refusal(f"{exc}{already}") from exc
             raise
@@ -23890,7 +24066,8 @@ def _finish_state_update(
                 "archive_id": entry["archive_id"],
                 **(
                     {
-                        "disposable_nested_repositories": nested_git_evidence
+                        "disposable_nested_repositories": nested_git_evidence,
+                        "nested_git_scope": _NESTED_GIT_SCOPE,
                     }
                     if nested_git_evidence
                     else {}
