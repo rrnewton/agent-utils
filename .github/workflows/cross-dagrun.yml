@@ -79,6 +79,14 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
+      # Several Rust interoperability tests execute the real Python recovery fixtures.  They
+      # import pytest even though this job's primary toolchain is Rust, so install that explicit
+      # test dependency instead of depending on the runner image's ambient Python packages.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: install Python fixture dependencies
+        run: python -m pip install pytest
       - uses: dtolnay/rust-toolchain@1.85.0
       - name: check the declared Rust 1.85 MSRV
         run: cargo check --locked --workspace --all-targets --manifest-path rs/Cargo.toml
