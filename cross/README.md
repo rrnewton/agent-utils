@@ -105,6 +105,21 @@ they do exactly when they have set up per-step cgroups. When the outer scheduler
 has no cgroup subtree to delegate, the boxed checks are listed as `boxing` skips
 and not run, because a nested engine would run them uncontained.
 
+`--tool all` ends with one line for the whole run, after each tool's own
+verdict: `cross: OK - ...`, `cross: PARTIAL - N skipped across tools (TOOL N,
+...)`, or `cross: FAILED - ...` naming each tool that did not pass.
+
+dagrun reports a node by its exit status, so a partial cross node that exits 0
+is shown as `✓ PASS`, and the run's last line counts it among the passes. The
+node's own `PARTIAL` line appears only in the brackets after that `PASS`.
+`scripts/validate.py` therefore sets `AGENT_UTILS_CROSS_COVERAGE_DIR` for the
+graph. Each cross verdict leaves a JSON record there, and when any node skipped
+checks the run ends with `validate: PARTIAL - every selected node passed, but N
+cross check(s) were skipped and are UNVERIFIED`, listing each node, instead of
+`validate: OK`. Its exit status stays 0. A graph run directly with
+`common/bin/dagrun run` has no such summary: read the bracketed line of each
+cross node.
+
 ## Fixtures and reproducibility
 
 `cross/yaml_fixtures/` contains YAML scalar, quoting, block-text, duplicate-key,

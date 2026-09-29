@@ -13,14 +13,19 @@ These tests pin the replacement contract without running the minutes-long harnes
 * a run that declares itself partial prints PARTIAL, not OK, and still lists every skip;
 * a boxed leg that cannot be boxed is a skip, and one whose engines never announced an
   established box is a failure, never agreement;
+* ``--tool all`` ends with one line that is PARTIAL or FAILED whenever any tool was;
+* ``scripts/validate.py`` names a partial cross node in its summary, although dagrun shows that
+  node as a plain PASS;
 * each lane that runs the harness states its coverage policy explicitly.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import ModuleType
 
@@ -38,7 +43,20 @@ BOXING_LABELS = [
     "jobs-env:boxed-readonly",
 ]
 NO_DELEGABLE_SUBTREE = "the outer scheduler has no cgroup subtree to delegate"
+COVERAGE_DIR_ENV = "AGENT_UTILS_CROSS_COVERAGE_DIR"
 DELEGATION_ENV = ("DAGRUN_DELEGATED_CGROUP", "DAGRUN_DELEGATED_UNBOXED", "DAGRUN_OUTER_RUN")
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_coverage_directory(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Keep these tests' verdicts out of an outer ``scripts/validate.py`` run's records.
+
+    ``validate.py`` exports the directory to every node, this pytest node included. A verdict
+    reached here would otherwise be summarised as a PARTIAL cross node of the outer run.
+    """
+
+    monkeypatch.delenv(COVERAGE_DIR_ENV, raising=False)
+    yield
 
 
 def _differential() -> ModuleType:
@@ -485,6 +503,334 @@ def test_boxed_build_width_legs_count_only_when_both_engines_boxed(
             ["operator-build-width", "stated"],
             ["operator-build-width", "unstated"],
         ]
+
+
+# ------------------------------------------------------------------ multi-tool final line
+
+
+def _coverage(differential: ModuleType, tool: str, verdict: str, skips: int) -> object:
+    skipped = tuple(
+        differential.Skip(f"{tool}-skip-{index}", "boxing", "no box") for index in range(skips)
+    )
+    return differential.ToolCoverage(tool, verdict, 10, skipped)
+
+
+def test_the_multi_tool_line_is_ok_only_with_no_skip_and_no_failure() -> None:
+    differential = _differential()
+    clean = [(0, _coverage(differential, tool, "OK", 0)) for tool in ("a", "b", "c")]
+    partial = [
+        (0, _coverage(differential, "a", "OK", 0)),
+        (0, _coverage(differential, "b", "PARTIAL", 2)),
+        (0, _coverage(differential, "c", "PARTIAL", 1)),
+    ]
+    failed = [
+        (1, _coverage(differential, "a", "INCOMPLETE", 3)),
+        (0, _coverage(differential, "b", "OK", 0)),
+        (1, _coverage(differential, "c", "FAILED", 0)),
+    ]
+
+    assert differential.coverage_aggregate(clean) == (
+        "cross: OK - all 3 tools agree with no skipped checks",
+        0,
+    )
+    assert differential.coverage_aggregate(partial) == (
+        "cross: PARTIAL - 3 skipped across tools (b 2, c 1); no tool diverged, but the skipped "
+        "checks are UNVERIFIED and listed above",
+        0,
+    )
+    assert differential.coverage_aggregate(failed) == (
+        "cross: FAILED - 2 of 3 tool(s) did not pass: a INCOMPLETE, c FAILED; "
+        "3 skipped across tools (a 3)",
+        1,
+    )
+
+
+def _all_tools_stubbed(
+    differential: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    dagrun_skips: int = 0,
+    diverging: str | None = None,
+) -> list[str]:
+    """Replace every tool's differential with a fast one that reaches the real verdict code."""
+
+    ran: list[str] = []
+
+    def verdict(tool: str, allowed_skips: frozenset[str], skips: int = 0) -> int:
+        ran.append(tool)
+        report = differential.Report()
+        report.ok("ran")
+        for index in range(skips):
+            report.skip(f"boxed-{index}", "boxing", "no box")
+        if diverging == tool:
+            report.bad("case", "engines differ")
+            return int(differential.divergence_verdict(tool, report, "2 checks", allowed_skips))
+        return int(differential.coverage_verdict(tool, report, "1 checks agree", allowed_skips))
+
+    def own_count(tool: str) -> Callable[[object, object], int]:
+        def compare(_py: object, _rs: object) -> int:
+            ran.append(tool)
+            return 1 if diverging == tool else 0
+
+        return compare
+
+    def compare_dagrun(
+        _rand: int, _seed: int, *, validation_jobs: int, allowed_skips: frozenset[str]
+    ) -> int:
+        assert validation_jobs == 4
+        return verdict("dagrun", allowed_skips, dagrun_skips)
+
+    def compare_cpuset_alloc(*, allowed_skips: frozenset[str]) -> int:
+        return verdict("cpuset-alloc", allowed_skips)
+
+    monkeypatch.setattr(differential, "compare_dagrun", compare_dagrun)
+    monkeypatch.setattr(differential, "compare_cpuset_alloc", compare_cpuset_alloc)
+    monkeypatch.setattr(
+        differential, "compare_tick_hub", lambda _rand, _seed: verdict("tick-hub", frozenset())
+    )
+    monkeypatch.setattr(
+        differential,
+        "compare_pr_landing_planner",
+        lambda _rand, _seed: verdict("pr-landing-planner", frozenset()),
+    )
+    monkeypatch.setattr(differential, "compare_herdr_run", own_count("herdr-run"))
+    monkeypatch.setattr(differential, "compare_herdr_agent", own_count("herdr-agent"))
+    monkeypatch.setattr(differential, "compare_agentctl", own_count("agentctl"))
+    monkeypatch.setattr(differential, "py_command_for", lambda tool: [f"python-{tool}"])
+    monkeypatch.setattr(differential, "rs_command", lambda tool: [f"rust-{tool}"])
+    monkeypatch.setattr(differential, "_effective_validation_jobs", lambda: 4)
+    monkeypatch.delenv("AGENT_UTILS_VALIDATION_JOBS", raising=False)
+    monkeypatch.delenv("AGENT_UTILS_CROSS_ALLOW_SKIP", raising=False)
+    return ran
+
+
+@pytest.mark.parametrize(
+    ("argv", "dagrun_skips", "diverging", "status", "final"),
+    [
+        pytest.param([], 0, None, 0, "cross: OK - all 7 tools agree with no skipped checks", id="ok"),
+        pytest.param(
+            ["--allow-skip", "boxing"],
+            2,
+            None,
+            0,
+            "cross: PARTIAL - 2 skipped across tools (dagrun 2); no tool diverged, but the "
+            "skipped checks are UNVERIFIED and listed above",
+            id="partial",
+        ),
+        pytest.param(
+            [],
+            2,
+            None,
+            1,
+            "cross: FAILED - 1 of 7 tool(s) did not pass: dagrun INCOMPLETE; "
+            "2 skipped across tools (dagrun 2)",
+            id="incomplete",
+        ),
+        pytest.param(
+            ["--allow-skip", "boxing"],
+            1,
+            "tick-hub",
+            1,
+            "cross: FAILED - 1 of 7 tool(s) did not pass: tick-hub FAILED; "
+            "1 skipped across tools (dagrun 1)",
+            id="diverged",
+        ),
+        pytest.param(
+            [],
+            0,
+            "herdr-run",
+            1,
+            "cross: FAILED - 1 of 7 tool(s) did not pass: herdr-run FAILED; 0 skipped across tools",
+            id="own-count-tool-failed",
+        ),
+    ],
+)
+def test_tool_all_ends_with_one_line_for_the_whole_run(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+    dagrun_skips: int,
+    diverging: str | None,
+    status: int,
+    final: str,
+) -> None:
+    differential = _differential()
+    ran = _all_tools_stubbed(
+        differential, monkeypatch, dagrun_skips=dagrun_skips, diverging=diverging
+    )
+
+    assert differential.main(["--tool", "all", *argv]) == status
+    out = capsys.readouterr().out
+
+    assert ran == list(differential.DIFFERENTIAL_TOOLS)
+    assert out.splitlines()[-1] == final
+
+
+def test_a_single_tool_run_prints_no_multi_tool_line(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    differential = _differential()
+    ran = _all_tools_stubbed(differential, monkeypatch)
+
+    assert differential.main(["--tool", "tick-hub"]) == 0
+    out = capsys.readouterr().out
+
+    assert ran == ["tick-hub"]
+    assert out == "cross[tick-hub]: OK - 1 checks agree\n"
+
+
+# ------------------------------------------------------------------ validate.py summary
+
+
+def _validate() -> ModuleType:
+    scripts = str(REPO_ROOT / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    spec = importlib.util.spec_from_file_location(
+        "_validate_cross_coverage_under_test", REPO_ROOT / "scripts" / "validate.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_each_verdict_leaves_a_record_naming_the_node_that_ran_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    differential = _differential()
+    monkeypatch.setenv(COVERAGE_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv("DAGRUN_OUTER_RUN", "cross.dagrun.differential")
+    report = differential.Report()
+    report.ok("ran")
+    report.skip("boxed", "boxing", "no box")
+    report.skip("pinned", "hard-cpuset", "refused")
+
+    assert differential.coverage_verdict("demo", report, "1 checks", frozenset({"boxing"})) == 1
+
+    records = sorted(tmp_path.iterdir())
+    assert [path.name for path in records] == [f"demo-{os.getpid()}-1.json"]
+    assert json.loads(records[0].read_text(encoding="utf-8")) == {
+        "schema": 1,
+        "tool": "demo",
+        "node": "cross.dagrun.differential",
+        "verdict": "INCOMPLETE",
+        "checks": 1,
+        "skipped": [
+            {"label": "boxed", "kind": "boxing", "reason": "no box", "allowed": True},
+            {"label": "pinned", "kind": "hard-cpuset", "reason": "refused", "allowed": False},
+        ],
+    }
+
+
+def test_a_record_that_cannot_be_written_ends_the_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    differential = _differential()
+    monkeypatch.setenv(COVERAGE_DIR_ENV, str(tmp_path / "missing"))
+    report = differential.Report()
+    report.ok("ran")
+
+    with pytest.raises(SystemExit, match="cannot write the coverage record"):
+        differential.coverage_verdict("demo", report, "1 checks agree", frozenset())
+
+
+def test_validate_summarises_only_records_that_skipped(tmp_path: Path) -> None:
+    validate = _validate()
+    (tmp_path / "complete.json").write_text(
+        json.dumps({"tool": "tick-hub", "verdict": "OK", "checks": 9, "skipped": []}),
+        encoding="utf-8",
+    )
+    (tmp_path / "partial.json").write_text(
+        json.dumps(
+            {
+                "tool": "cpuset-alloc",
+                "node": "cross.dagrun.cpuset-differential",
+                "verdict": "PARTIAL",
+                "checks": 53,
+                "skipped": [
+                    {"label": "run:signal-status", "kind": "delegated-live-scope"},
+                    {"label": "interop:py-then-rs", "kind": "delegated-live-scope"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "truncated.json").write_text('{"tool": ', encoding="utf-8")
+    (tmp_path / "wrong-shape.json").write_text("[]", encoding="utf-8")
+
+    lines, skipped, unreadable = validate.cross_coverage_report(tmp_path)
+
+    assert skipped == 2
+    assert unreadable == 2
+    assert lines[0] == (
+        "  cross.dagrun.cpuset-differential (cpuset-alloc, PARTIAL): 53 check(s) ran; 2 skipped "
+        "[delegated-live-scope]: run:signal-status, interop:py-then-rs"
+    )
+    assert lines[1].startswith("  unreadable cross coverage record truncated.json:")
+    assert lines[2] == "  malformed cross coverage record wrong-shape.json: []"
+
+
+@pytest.mark.parametrize("skips", [0, 1])
+def test_validate_says_partial_when_a_passing_cross_node_skipped_checks(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    skips: int,
+) -> None:
+    """The records the differential writes are the ones ``validate.py`` reads."""
+
+    differential = _differential()
+    validate = _validate()
+    seen: list[Path] = []
+
+    def fake_run(
+        _selected: object, _components: object, *, all_contract: bool, coverage_dir: Path
+    ) -> int:
+        assert all_contract
+        seen.append(coverage_dir)
+        monkeypatch.setenv(COVERAGE_DIR_ENV, str(coverage_dir))
+        monkeypatch.setenv("DAGRUN_OUTER_RUN", "cross.dagrun.cpuset-differential")
+        report = differential.Report()
+        report.ok("ran")
+        for _ in range(skips):
+            report.skip("run:signal-status", "delegated-live-scope", "delegated root")
+        allowed = frozenset({"delegated-live-scope"})
+        assert differential.coverage_verdict("cpuset-alloc", report, "1 checks", allowed) == 0
+        return 0
+
+    monkeypatch.setattr(validate, "run", fake_run)
+
+    assert validate.main(["--all"]) == 0
+    out = capsys.readouterr().out
+
+    assert len(seen) == 1 and not seen[0].exists()
+    if skips:
+        assert (
+            "  cross.dagrun.cpuset-differential (cpuset-alloc, PARTIAL): 1 check(s) ran; "
+            "1 skipped [delegated-live-scope]: run:signal-status"
+        ) in out
+        assert out.rstrip().endswith(
+            "validate: PARTIAL - every selected node passed, but 1 cross check(s) were skipped "
+            "and are UNVERIFIED"
+        )
+        assert "validate: OK" not in out
+    else:
+        assert out.rstrip().endswith("validate: OK")
+        assert "PARTIAL" not in out
+
+
+def test_validate_prints_no_summary_after_a_failed_graph(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    validate = _validate()
+    monkeypatch.setattr(validate, "run", lambda *_args, **_kw: 3)
+
+    assert validate.main(["--all"]) == 3
+    out = capsys.readouterr().out
+
+    assert "validate: OK" not in out
+    assert "validate: PARTIAL" not in out
 
 
 def test_each_validation_lane_states_its_coverage_policy() -> None:

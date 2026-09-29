@@ -36,6 +36,8 @@ steps:
     # parent-owned delegated cgroup, where the harness must not create a live systemd scope, so
     # the live pin-run cases are listed as skipped rather than run. Boxing stays required here; a
     # lane that cannot box must declare that itself (AGENT_UTILS_CROSS_ALLOW_SKIP=boxing).
+    # A partial run exits 0, so dagrun shows this node as a plain PASS with the PARTIAL line only
+    # in its brackets; scripts/validate.py lists the skipped checks in its own summary.
     cmd: python3 cross/differential.py --tool dagrun --allow-skip delegated-live-scope
     jobs_flag: ""
     # The harness has one live boxed CPU-bandwidth case. Let the outer scheduler deliver the

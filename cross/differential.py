@@ -107,7 +107,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -364,6 +364,134 @@ def report_skips(tool: str, rep: Report, allowed_skips: frozenset[str]) -> None:
         print(f"  SKIPPED [{skip.kind}; {status}] {skip.label}: {skip.reason}")
 
 
+#: A caller that needs each tool's final verdict as data, not only as a printed line, names a
+#: directory here and every verdict leaves one JSON record in it. ``scripts/validate.py`` does
+#: this, so that a validation node which passed with allowed skips shows up as PARTIAL in its
+#: summary rather than as a plain pass.
+COVERAGE_DIR_ENV = "AGENT_UTILS_CROSS_COVERAGE_DIR"
+
+#: The verdicts a tool can end with. FAILED means at least one divergence; INCOMPLETE means no
+#: divergence but a required check did not run. Both exit nonzero.
+COVERAGE_VERDICTS = ("OK", "PARTIAL", "INCOMPLETE", "FAILED")
+
+
+@dataclass(frozen=True)
+class ToolCoverage:
+    """One tool's final verdict: how many checks ran and which were skipped instead.
+
+    ``checks`` is None for a tool whose differential keeps its own count and skips nothing
+    through ``Report`` (herdr-run, herdr-agent, agentctl).
+    """
+
+    tool: str
+    verdict: str
+    checks: int | None
+    skipped: tuple[Skip, ...] = ()
+
+
+#: Every verdict this process has reached, in order.
+_COVERAGE: list[ToolCoverage] = []
+
+
+def record_coverage(
+    tool: str, verdict: str, rep: Report | None, allowed_skips: frozenset[str]
+) -> ToolCoverage:
+    """Remember a tool's verdict and, when ``COVERAGE_DIR_ENV`` names a directory, write it out.
+
+    A record that was asked for and cannot be written ends the run: a caller that summarises
+    the records would otherwise report full coverage for a tool that skipped checks.
+    """
+
+    if verdict not in COVERAGE_VERDICTS:
+        raise ValueError(f"unknown coverage verdict {verdict!r}")
+    coverage = ToolCoverage(
+        tool,
+        verdict,
+        None if rep is None else rep.checks,
+        () if rep is None else tuple(rep.skipped),
+    )
+    _COVERAGE.append(coverage)
+    directory = os.environ.get(COVERAGE_DIR_ENV)
+    if not directory:
+        return coverage
+    record: dict[str, object] = {
+        "schema": 1,
+        "tool": tool,
+        # The outer dagrun names the node that launched this process; absent at top level.
+        "node": os.environ.get("DAGRUN_OUTER_RUN") or None,
+        "verdict": verdict,
+        "checks": coverage.checks,
+        "skipped": [
+            {
+                "label": skip.label,
+                "kind": skip.kind,
+                "reason": skip.reason,
+                "allowed": skip.kind in allowed_skips,
+            }
+            for skip in coverage.skipped
+        ],
+    }
+    try:
+        fd, temporary = tempfile.mkstemp(prefix=f".{tool}-", suffix=".tmp", dir=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, sort_keys=True)
+            handle.write("\n")
+        os.replace(
+            temporary, os.path.join(directory, f"{tool}-{os.getpid()}-{len(_COVERAGE)}.json")
+        )
+    except OSError as exc:
+        raise SystemExit(
+            f"cross[{tool}]: cannot write the coverage record {COVERAGE_DIR_ENV}={directory} "
+            f"asked for: {exc}"
+        ) from exc
+    return coverage
+
+
+def divergence_verdict(
+    tool: str, rep: Report, summary: str, allowed_skips: frozenset[str]
+) -> int:
+    """Print the final lines of a run that diverged, record it as FAILED, and return 1."""
+
+    for failure in rep.failures:
+        print(f"DIVERGENCE [{failure}]")
+    report_skips(tool, rep, allowed_skips)
+    print(f"cross[{tool}]: {len(rep.failures)} divergence(s) out of {summary}")
+    record_coverage(tool, "FAILED", rep, allowed_skips)
+    return 1
+
+
+def coverage_aggregate(results: Sequence[tuple[int, ToolCoverage]]) -> tuple[str, int]:
+    """Summarise a multi-tool run in one final line and return it with the run's exit status.
+
+    Each tool has already printed its own verdict and listed its skips; this line exists so
+    that the last thing a multi-tool run prints cannot read as a clean pass when any tool
+    skipped checks or failed.
+    """
+
+    per_tool = [
+        (coverage.tool, len(coverage.skipped)) for _, coverage in results if coverage.skipped
+    ]
+    total = sum(count for _, count in per_tool)
+    skips = f"{total} skipped across tools"
+    if per_tool:
+        skips += " (" + ", ".join(f"{tool} {count}" for tool, count in per_tool) + ")"
+    failed = [(status, coverage) for status, coverage in results if status != 0]
+    if failed:
+        names = ", ".join(f"{coverage.tool} {coverage.verdict}" for _, coverage in failed)
+        return (
+            f"cross: FAILED - {len(failed)} of {len(results)} tool(s) did not pass: {names}; "
+            f"{skips}",
+            1,
+        )
+    if total:
+        return (
+            f"cross: PARTIAL - {skips}; no tool diverged, but the skipped checks are UNVERIFIED "
+            "and listed above",
+            0,
+        )
+    return f"cross: OK - all {len(results)} tools agree with no skipped checks", 0
+
+
 def coverage_verdict(
     tool: str, rep: Report, summary: str, allowed_skips: frozenset[str]
 ) -> int:
@@ -384,6 +512,7 @@ def coverage_verdict(
             f"pass with a skipped check; a lane that is partial by design must declare it with "
             f"--allow-skip {kinds} or {ALLOW_SKIP_ENV}={kinds}"
         )
+        record_coverage(tool, "INCOMPLETE", rep, allowed_skips)
         return 1
     if rep.skipped:
         kinds = ", ".join(sorted({skip.kind for skip in rep.skipped}))
@@ -391,8 +520,10 @@ def coverage_verdict(
             f"cross[{tool}]: PARTIAL - {summary}; {len(rep.skipped)} check(s) were skipped and "
             f"are UNVERIFIED (allowed skip kinds: {kinds})"
         )
+        record_coverage(tool, "PARTIAL", rep, allowed_skips)
         return 0
     print(f"cross[{tool}]: OK - {summary}")
+    record_coverage(tool, "OK", rep, allowed_skips)
     return 0
 
 
@@ -8172,15 +8303,13 @@ def compare_dagrun(
     n_fixtures = len(fixtures) + len(examples) + len(yaml_paths)
 
     if rep.failures:
-        for failure in rep.failures:
-            print(f"DIVERGENCE [{failure}")
-        report_skips(tool, rep, allowed_skips)
-        print(
-            f"cross[{tool}]: {len(rep.failures)} divergence(s) out of {rep.checks} checks "
-            f"across {n_fixtures} fixtures ({len(examples)} shipped JSON examples static-only; "
-            f"{len(yaml_paths)} YAML fixtures for isomorphism)"
+        return divergence_verdict(
+            tool,
+            rep,
+            f"{rep.checks} checks across {n_fixtures} fixtures ({len(examples)} shipped JSON "
+            f"examples static-only; {len(yaml_paths)} YAML fixtures for isomorphism)",
+            allowed_skips,
         )
-        return 1
 
     return coverage_verdict(
         tool,
@@ -8760,11 +8889,7 @@ def compare_cpuset_alloc(*, allowed_skips: frozenset[str] = frozenset()) -> int:
     _record_same_exit(rep, "unknown-command", py, rs, ("not-a-command",), 2)
 
     if rep.failures:
-        for failure in rep.failures:
-            print(f"DIVERGENCE [{failure}]")
-        report_skips(tool, rep, allowed_skips)
-        print(f"cross[{tool}]: {len(rep.failures)} divergence(s) out of {rep.checks} checks")
-        return 1
+        return divergence_verdict(tool, rep, f"{rep.checks} checks", allowed_skips)
     return coverage_verdict(
         tool, rep, f"{rep.checks} behavioral and ledger-schema checks agree", allowed_skips
     )
@@ -9577,11 +9702,7 @@ def compare_tick_hub(rand_count: int, seed: int) -> int:
             )
 
     if rep.failures:
-        for failure in rep.failures:
-            print(f"DIVERGENCE [{failure}]")
-        report_skips(tool, rep, frozenset())
-        print(f"cross[{tool}]: {len(rep.failures)} divergence(s) out of {rep.checks} checks")
-        return 1
+        return divergence_verdict(tool, rep, f"{rep.checks} checks", frozenset())
     # No case here may skip; if one ever does, the default verdict refuses to call it a pass.
     return coverage_verdict(
         tool, rep, f"{rep.checks} deterministic, randomized, and adversarial checks agree", frozenset()
@@ -12386,11 +12507,7 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
             )
 
     if rep.failures:
-        for failure in rep.failures:
-            print(f"DIVERGENCE [{failure}]")
-        report_skips(tool, rep, frozenset())
-        print(f"cross[{tool}]: {len(rep.failures)} divergence(s) out of {rep.checks} checks")
-        return 1
+        return divergence_verdict(tool, rep, f"{rep.checks} checks", frozenset())
     # No case here may skip; if one ever does, the default verdict refuses to call it a pass.
     return coverage_verdict(
         tool, rep, f"{rep.checks} graph, CI, randomized, and adversarial checks agree", frozenset()
@@ -12482,40 +12599,41 @@ def main(argv: Sequence[str] | None = None) -> int:
         validation_jobs = _validation_jobs() if tool in ("dagrun", "all") else None
     except ValueError as exc:
         parser.error(str(exc))
-    if tool == "dagrun":
-        assert validation_jobs is not None
-        return compare_dagrun(
-            rand_count, seed, validation_jobs=validation_jobs, allowed_skips=allowed_skips
-        )
-    if tool == "cpuset-alloc":
-        return compare_cpuset_alloc(allowed_skips=allowed_skips)
-    if tool == "tick-hub":
-        return compare_tick_hub(rand_count, seed)
-    if tool == "pr-landing-planner":
-        return compare_pr_landing_planner(rand_count, seed)
-    if tool == "herdr-run":
-        return compare_herdr_run(py_command_for(tool), rs_command(tool))
-    if tool == "herdr-agent":
-        return compare_herdr_agent(py_command_for(tool), rs_command(tool))
-    if tool == "agentctl":
-        return compare_agentctl(py_command_for(tool), rs_command(tool))
-    results = (
-        compare_dagrun(
-            rand_count,
-            seed,
-            validation_jobs=(
-                validation_jobs if validation_jobs is not None else DEFAULT_VALIDATION_JOBS
-            ),
-            allowed_skips=allowed_skips,
+    jobs = validation_jobs if validation_jobs is not None else DEFAULT_VALIDATION_JOBS
+    runners: dict[str, Callable[[], int]] = {
+        "dagrun": lambda: compare_dagrun(
+            rand_count, seed, validation_jobs=jobs, allowed_skips=allowed_skips
         ),
-        compare_cpuset_alloc(allowed_skips=allowed_skips),
-        compare_tick_hub(rand_count, seed),
-        compare_pr_landing_planner(rand_count, seed),
-        compare_herdr_run(py_command_for("herdr-run"), rs_command("herdr-run")),
-        compare_herdr_agent(py_command_for("herdr-agent"), rs_command("herdr-agent")),
-        compare_agentctl(py_command_for("agentctl"), rs_command("agentctl")),
-    )
-    return 1 if any(results) else 0
+        "cpuset-alloc": lambda: compare_cpuset_alloc(allowed_skips=allowed_skips),
+        "tick-hub": lambda: compare_tick_hub(rand_count, seed),
+        "pr-landing-planner": lambda: compare_pr_landing_planner(rand_count, seed),
+        "herdr-run": lambda: compare_herdr_run(
+            py_command_for("herdr-run"), rs_command("herdr-run")
+        ),
+        "herdr-agent": lambda: compare_herdr_agent(
+            py_command_for("herdr-agent"), rs_command("herdr-agent")
+        ),
+        "agentctl": lambda: compare_agentctl(py_command_for("agentctl"), rs_command("agentctl")),
+    }
+    assert tuple(runners) == DIFFERENTIAL_TOOLS
+
+    def run_tool(name: str) -> tuple[int, ToolCoverage]:
+        recorded = len(_COVERAGE)
+        status = runners[name]()
+        if len(_COVERAGE) == recorded:
+            # The herdr and agentctl differentials print their own verdict and skip nothing
+            # through Report, so their exit status is the whole of what they report here.
+            return status, record_coverage(
+                name, "OK" if status == 0 else "FAILED", None, allowed_skips
+            )
+        return status, _COVERAGE[-1]
+
+    if tool != "all":
+        return run_tool(tool)[0]
+    results = [run_tool(name) for name in DIFFERENTIAL_TOOLS]
+    line, status = coverage_aggregate(results)
+    print(line)
+    return status
 
 
 if __name__ == "__main__":

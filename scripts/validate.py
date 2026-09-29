@@ -325,8 +325,67 @@ def changed_paths(base: str, *, repo_root: Path = REPO_ROOT) -> list[str]:
     return sorted(out)
 
 
-def run(selected: frozenset[str], components: frozenset[str], *, all_contract: bool) -> int:
-    """Execute one flattened dagrun graph for the selected contract."""
+#: The cross-language differential writes one JSON verdict record per tool into this directory
+#: (``COVERAGE_DIR_ENV`` in ``cross/differential.py``). dagrun reports a node that passed with
+#: allowed skips as a plain PASS, so these records are the only way this summary can tell a
+#: PARTIAL cross node from a complete one.
+CROSS_COVERAGE_ENV = "AGENT_UTILS_CROSS_COVERAGE_DIR"
+
+
+def cross_coverage_report(directory: Path) -> tuple[list[str], int, int]:
+    """Describe every cross verdict record in `directory` that skipped checks.
+
+    Returns the lines to print, the number of skipped checks, and the number of records that
+    could not be read. A record that cannot be read is counted rather than ignored: it may have
+    been the one PARTIAL node, so the summary must not claim full coverage without it.
+    """
+
+    lines: list[str] = []
+    skipped_total = 0
+    unreadable = 0
+    for path in sorted(directory.glob("*.json")):
+        try:
+            value: object = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            lines.append(f"  unreadable cross coverage record {path.name}: {exc}")
+            unreadable += 1
+            continue
+        skipped = value.get("skipped") if isinstance(value, dict) else None
+        if not isinstance(value, dict) or not isinstance(skipped, list):
+            lines.append(f"  malformed cross coverage record {path.name}: {value!r}")
+            unreadable += 1
+            continue
+        if not skipped:
+            continue
+        labels: list[str] = []
+        kinds: set[str] = set()
+        for item in skipped:
+            if isinstance(item, dict):
+                labels.append(str(item.get("label")))
+                kinds.add(str(item.get("kind")))
+            else:
+                labels.append(repr(item))
+        skipped_total += len(skipped)
+        where = value.get("node") or "top level"
+        lines.append(
+            f"  {where} ({value.get('tool')}, {value.get('verdict')}): {value.get('checks')} "
+            f"check(s) ran; {len(skipped)} skipped [{', '.join(sorted(kinds))}]: "
+            f"{', '.join(labels)}"
+        )
+    return lines, skipped_total, unreadable
+
+
+def run(
+    selected: frozenset[str],
+    components: frozenset[str],
+    *,
+    all_contract: bool,
+    coverage_dir: Path | None = None,
+) -> int:
+    """Execute one flattened dagrun graph for the selected contract.
+
+    With `coverage_dir`, every cross differential node writes its verdict record there.
+    """
 
     cpu_count = os.cpu_count() or 1
     max_cpus = os.environ.get("VALIDATE_MAX_CPUS", str(min(32, cpu_count)))
@@ -351,7 +410,10 @@ def run(selected: frozenset[str], components: frozenset[str], *, all_contract: b
     extra = os.environ.get("VALIDATE_DAGRUN_FLAGS", os.environ.get("BOX_FLAGS", ""))
     command.extend(shlex.split(extra))
     print(f"\n=== flattened validation DAG ({len(command)} argv entries) ===", flush=True)
-    done = subprocess.run(command, cwd=REPO_ROOT, check=False)
+    env = dict(os.environ)
+    if coverage_dir is not None:
+        env[CROSS_COVERAGE_ENV] = str(coverage_dir)
+    done = subprocess.run(command, cwd=REPO_ROOT, check=False, env=env)
     if done.returncode != 0:
         print("\nvalidate: FAILED in flattened validation DAG", file=sys.stderr)
     return done.returncode
@@ -925,9 +987,29 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    code = run(selected, components, all_contract=args.all or selected == ALL_GROUPS)
-    if code != 0:
-        return code
+    with tempfile.TemporaryDirectory(prefix="validate-cross-coverage-") as coverage:
+        code = run(
+            selected,
+            components,
+            all_contract=args.all or selected == ALL_GROUPS,
+            coverage_dir=Path(coverage),
+        )
+        if code != 0:
+            return code
+        lines, skipped, unreadable = cross_coverage_report(Path(coverage))
+    if skipped or unreadable:
+        # Every selected node passed, but a cross node that declared itself partial passes with
+        # checks that never ran. Say so here, where "OK" would otherwise be the last word.
+        state = "PARTIAL or could not be confirmed" if unreadable else "PARTIAL"
+        print(f"\nvalidate: cross-language coverage was {state}:")
+        for line in lines:
+            print(line)
+        unread = f"; {unreadable} coverage record(s) could not be read" if unreadable else ""
+        print(
+            f"\nvalidate: PARTIAL - every selected node passed, but {skipped} cross check(s) "
+            f"were skipped and are UNVERIFIED{unread}"
+        )
+        return 0
     print("\nvalidate: OK")
     return 0
 
