@@ -61,7 +61,12 @@ class _Rpc:
             )
         except OSError as exc:
             self._selector.close()
-            raise CodexGoalError(f"cannot start Codex goal transport: {exc}") from exc
+            detail = (
+                f"{exc.strerror} (os error {exc.errno})"
+                if exc.errno is not None and exc.strerror is not None
+                else str(exc)
+            )
+            raise CodexGoalError(f"cannot start Codex goal transport: {detail}") from exc
         assert self._process.stdin is not None
         assert self._process.stdout is not None
         assert self._process.stderr is not None

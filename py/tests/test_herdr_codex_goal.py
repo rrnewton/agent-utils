@@ -192,6 +192,14 @@ def test_timeout_reaps_transport_descendants(tmp_path: Path) -> None:
     pytest.fail(f"timed-out transport child {pid} remains running")
 
 
+def test_missing_transport_uses_cross_language_os_error() -> None:
+    with pytest.raises(
+        CodexGoalError,
+        match=r"cannot start Codex goal transport: No such file or directory \(os error 2\)",
+    ):
+        get_goal("thread-fixture", ("/definitely/missing/codex-goal-transport",))
+
+
 def test_cli_writes_one_json_result(
     tmp_path: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
