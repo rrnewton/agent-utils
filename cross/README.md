@@ -101,8 +101,9 @@ By default a run claims full coverage, so any skip makes it exit nonzero with an
 `INCOMPLETE` line. A lane that is partial by design declares which kinds it
 accepts, with `--allow-skip KIND[,KIND]` or
 `AGENT_UTILS_CROSS_ALLOW_SKIP=KIND[,KIND]`. It says so on its first line, still
-lists every skip, and ends with `PARTIAL` instead of `OK`. An unknown kind is
-refused.
+lists every skip, and ends with `PARTIAL` instead of `OK`, counting the skips
+of each kind: `... 3 check(s) were skipped and are UNVERIFIED (allowed skips by
+kind: eight-cpu 1, multi-cpu 2)`. An unknown kind is refused.
 
 | Lane | Coverage |
 |---|---|
@@ -121,7 +122,8 @@ and not run, because a nested engine would run them uncontained.
 
 `--tool all` ends with one line for the whole run, after each tool's own
 verdict: `cross: OK - ...`, `cross: PARTIAL - N skipped across tools (TOOL N,
-...)`, or `cross: FAILED - ...` naming each tool that did not pass.
+...; by kind: KIND N, ...)`, or `cross: FAILED - ...` naming each tool that did
+not pass.
 
 dagrun reports a node by its exit status, so a partial cross node that exits 0
 is shown as `✓ PASS`, and the run's last line counts it among the passes. The
@@ -129,8 +131,9 @@ node's own `PARTIAL` line appears only in the brackets after that `PASS`.
 `scripts/validate.py` therefore sets `AGENT_UTILS_CROSS_COVERAGE_DIR` for the
 graph. Each cross verdict leaves a JSON record there, and when any node skipped
 checks the run ends with `validate: PARTIAL - every selected node passed, but N
-cross check(s) were skipped and are UNVERIFIED`, listing each node, instead of
-`validate: OK`. Its exit status stays 0. Every selected cross node must leave a
+cross check(s) were skipped and are UNVERIFIED (KIND N, ...)`, listing each node
+with its own count per kind, instead of `validate: OK`. Its exit status stays 0.
+Every selected cross node must leave a
 record: a record that cannot be read, or a selected node that left none (for
 example one that `VALIDATE_DAGRUN_FLAGS` narrowed out of the run), is listed as
 could not be confirmed and also ends the run with `PARTIAL`. Under GitHub

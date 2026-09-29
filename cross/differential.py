@@ -358,6 +358,19 @@ class Report:
         self.skipped.append(Skip(label, kind, reason))
 
 
+def skip_kind_counts(skips: Sequence[Skip]) -> str:
+    """Each skip kind present with its count, sorted by kind: ``boxing 3, multi-cpu 2``.
+
+    A partial verdict prints this so that a change in the mix of skips, such as a newly allowed
+    kind, is visible in its final line and not only in the list above it.
+    """
+
+    counts: dict[str, int] = {}
+    for skip in skips:
+        counts[skip.kind] = counts.get(skip.kind, 0) + 1
+    return ", ".join(f"{kind} {counts[kind]}" for kind in sorted(counts))
+
+
 def report_skips(tool: str, rep: Report, allowed_skips: frozenset[str]) -> None:
     """List every skipped check by name, apart from and never mixed into the pass count."""
 
@@ -482,7 +495,12 @@ def coverage_aggregate(results: Sequence[tuple[int, ToolCoverage]]) -> tuple[str
     total = sum(count for _, count in per_tool)
     skips = f"{total} skipped across tools"
     if per_tool:
-        skips += " (" + ", ".join(f"{tool} {count}" for tool, count in per_tool) + ")"
+        by_kind = skip_kind_counts([skip for _, coverage in results for skip in coverage.skipped])
+        skips += (
+            " ("
+            + ", ".join(f"{tool} {count}" for tool, count in per_tool)
+            + f"; by kind: {by_kind})"
+        )
     failed = [(status, coverage) for status, coverage in results if status != 0]
     if failed:
         names = ", ".join(f"{coverage.tool} {coverage.verdict}" for _, coverage in failed)
@@ -523,10 +541,9 @@ def coverage_verdict(
         record_coverage(tool, "INCOMPLETE", rep, allowed_skips)
         return 1
     if rep.skipped:
-        kinds = ", ".join(sorted({skip.kind for skip in rep.skipped}))
         print(
             f"cross[{tool}]: PARTIAL - {summary}; {len(rep.skipped)} check(s) were skipped and "
-            f"are UNVERIFIED (allowed skip kinds: {kinds})"
+            f"are UNVERIFIED (allowed skips by kind: {skip_kind_counts(rep.skipped)})"
         )
         record_coverage(tool, "PARTIAL", rep, allowed_skips)
         return 0

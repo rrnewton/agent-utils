@@ -346,6 +346,14 @@ class CrossCoverage(NamedTuple):
     unreadable: int
     #: Selected cross nodes, in the order given, with no readable record naming them.
     missing: list[str]
+    #: Skipped checks across all readable records, counted per skip kind and sorted by kind.
+    by_kind: tuple[tuple[str, int], ...] = ()
+
+
+def _kind_counts(counts: Mapping[str, int]) -> str:
+    """``kind N`` for each skip kind, sorted by kind: ``boxing 3, delegated-live-scope 2``."""
+
+    return ", ".join(f"{kind} {counts[kind]}" for kind in sorted(counts))
 
 
 def cross_coverage_report(directory: Path, expected_nodes: Sequence[str]) -> CrossCoverage:
@@ -362,6 +370,7 @@ def cross_coverage_report(directory: Path, expected_nodes: Sequence[str]) -> Cro
     skipped_total = 0
     unreadable = 0
     recorded_nodes: set[str] = set()
+    by_kind: dict[str, int] = {}
     for path in sorted(directory.glob("*.json")):
         try:
             value: object = json.loads(path.read_text(encoding="utf-8"))
@@ -380,18 +389,21 @@ def cross_coverage_report(directory: Path, expected_nodes: Sequence[str]) -> Cro
         if not skipped:
             continue
         labels: list[str] = []
-        kinds: set[str] = set()
+        kinds: dict[str, int] = {}
         for item in skipped:
             if isinstance(item, dict):
                 labels.append(str(item.get("label")))
-                kinds.add(str(item.get("kind")))
+                kind = str(item.get("kind"))
             else:
                 labels.append(repr(item))
+                kind = "malformed"
+            kinds[kind] = kinds.get(kind, 0) + 1
+            by_kind[kind] = by_kind.get(kind, 0) + 1
         skipped_total += len(skipped)
         where = value.get("node") or "top level"
         lines.append(
             f"  {where} ({value.get('tool')}, {value.get('verdict')}): {value.get('checks')} "
-            f"check(s) ran; {len(skipped)} skipped [{', '.join(sorted(kinds))}]: "
+            f"check(s) ran; {len(skipped)} skipped [{_kind_counts(kinds)}]: "
             f"{', '.join(labels)}"
         )
     missing = [node for node in expected_nodes if node not in recorded_nodes]
@@ -399,7 +411,9 @@ def cross_coverage_report(directory: Path, expected_nodes: Sequence[str]) -> Cro
         lines.append(
             f"  {node}: no readable coverage record, so its coverage could not be confirmed"
         )
-    return CrossCoverage(lines, skipped_total, unreadable, missing)
+    return CrossCoverage(
+        lines, skipped_total, unreadable, missing, tuple(sorted(by_kind.items()))
+    )
 
 
 def _workflow_command_data(text: str) -> str:
@@ -1094,7 +1108,8 @@ def main(argv: list[str] | None = None) -> int:
         reasons: list[str] = []
         if coverage_state.skipped:
             reasons.append(
-                f"{coverage_state.skipped} cross check(s) were skipped and are UNVERIFIED"
+                f"{coverage_state.skipped} cross check(s) were skipped and are UNVERIFIED "
+                f"({_kind_counts(dict(coverage_state.by_kind))})"
             )
         if coverage_state.unreadable:
             reasons.append(f"{coverage_state.unreadable} coverage record(s) could not be read")

@@ -298,7 +298,7 @@ def test_partial_dagrun_run_says_partial_and_prints_its_skips(
     for label in BOXING_LABELS:
         assert f"SKIPPED [boxing; allowed] {label}:" in out
     assert "cross[dagrun]: PARTIAL - 17 checks across 0 fixtures agree" in out
-    assert "6 check(s) were skipped and are UNVERIFIED (allowed skip kinds: boxing)" in out
+    assert "6 check(s) were skipped and are UNVERIFIED (allowed skips by kind: boxing 6)" in out
     assert "cross[dagrun]: OK" not in out
 
 
@@ -716,7 +716,7 @@ def test_delegated_cpuset_alloc_lists_its_five_live_scope_checks(
     assert skipped == [(label, "delegated-live-scope") for label in _CPUSET_LIVE_LABELS]
     assert (
         "cross[cpuset-alloc]: PARTIAL - 53 behavioral and ledger-schema checks agree; "
-        "5 check(s) were skipped and are UNVERIFIED (allowed skip kinds: delegated-live-scope)"
+        "5 check(s) were skipped and are UNVERIFIED (allowed skips by kind: delegated-live-scope 5)"
     ) in out
 
 
@@ -787,7 +787,7 @@ def test_one_cpu_cpuset_alloc_skips_the_selftest_and_the_two_interop_pairs(
     ]
     assert (
         "cross[cpuset-alloc]: PARTIAL - 56 behavioral and ledger-schema checks agree; "
-        "3 check(s) were skipped and are UNVERIFIED (allowed skip kinds: multi-cpu)"
+        "3 check(s) were skipped and are UNVERIFIED (allowed skips by kind: multi-cpu 3)"
     ) in out
 
 
@@ -1182,7 +1182,8 @@ def test_a_one_core_cpa_run_is_partial_only_when_both_kinds_are_declared(
     assert result == (0, "PARTIAL", 7, _CPA_ONE_CORE_SKIPS)
     assert "cross[dagrun]: PARTIAL - 7 checks across 0 fixtures agree" in out
     assert (
-        "3 check(s) were skipped and are UNVERIFIED (allowed skip kinds: eight-cpu, multi-cpu)"
+        "3 check(s) were skipped and are UNVERIFIED "
+        "(allowed skips by kind: eight-cpu 1, multi-cpu 2)"
     ) in out
 
     # One of the two kinds is not enough: the multi-cpu skips stay required.
@@ -1219,7 +1220,7 @@ def test_a_four_core_cpa_budget_skips_only_the_memory_cap(
 
     assert result == (0, "PARTIAL", 9, [("cpa:mem-capped", "eight-cpu")])
     assert "cross[dagrun]: PARTIAL - 9 checks across 0 fixtures agree" in out
-    assert "1 check(s) were skipped and are UNVERIFIED (allowed skip kinds: eight-cpu)" in out
+    assert "1 check(s) were skipped and are UNVERIFIED (allowed skips by kind: eight-cpu 1)" in out
 
 
 def test_an_eight_core_cpa_budget_runs_every_check(
@@ -1266,9 +1267,11 @@ def test_an_unreadable_capped_allocation_is_a_failure_not_a_skip(
 # ------------------------------------------------------------------ multi-tool final line
 
 
-def _coverage(differential: ModuleType, tool: str, verdict: str, skips: int) -> object:
+def _coverage(
+    differential: ModuleType, tool: str, verdict: str, skips: int, kind: str = "boxing"
+) -> object:
     skipped = tuple(
-        differential.Skip(f"{tool}-skip-{index}", "boxing", "no box") for index in range(skips)
+        differential.Skip(f"{tool}-skip-{index}", kind, "no box") for index in range(skips)
     )
     return differential.ToolCoverage(tool, verdict, 10, skipped)
 
@@ -1279,7 +1282,7 @@ def test_the_multi_tool_line_is_ok_only_with_no_skip_and_no_failure() -> None:
     partial = [
         (0, _coverage(differential, "a", "OK", 0)),
         (0, _coverage(differential, "b", "PARTIAL", 2)),
-        (0, _coverage(differential, "c", "PARTIAL", 1)),
+        (0, _coverage(differential, "c", "PARTIAL", 1, "multi-cpu")),
     ]
     failed = [
         (1, _coverage(differential, "a", "INCOMPLETE", 3)),
@@ -1292,13 +1295,13 @@ def test_the_multi_tool_line_is_ok_only_with_no_skip_and_no_failure() -> None:
         0,
     )
     assert differential.coverage_aggregate(partial) == (
-        "cross: PARTIAL - 3 skipped across tools (b 2, c 1); no tool diverged, but the skipped "
-        "checks are UNVERIFIED and listed above",
+        "cross: PARTIAL - 3 skipped across tools (b 2, c 1; by kind: boxing 2, multi-cpu 1); "
+        "no tool diverged, but the skipped checks are UNVERIFIED and listed above",
         0,
     )
     assert differential.coverage_aggregate(failed) == (
         "cross: FAILED - 2 of 3 tool(s) did not pass: a INCOMPLETE, c FAILED; "
-        "3 skipped across tools (a 3)",
+        "3 skipped across tools (a 3; by kind: boxing 3)",
         1,
     )
 
@@ -1371,8 +1374,8 @@ def _all_tools_stubbed(
             2,
             None,
             0,
-            "cross: PARTIAL - 2 skipped across tools (dagrun 2); no tool diverged, but the "
-            "skipped checks are UNVERIFIED and listed above",
+            "cross: PARTIAL - 2 skipped across tools (dagrun 2; by kind: boxing 2); no tool "
+            "diverged, but the skipped checks are UNVERIFIED and listed above",
             id="partial",
         ),
         pytest.param(
@@ -1381,7 +1384,7 @@ def _all_tools_stubbed(
             None,
             1,
             "cross: FAILED - 1 of 7 tool(s) did not pass: dagrun INCOMPLETE; "
-            "2 skipped across tools (dagrun 2)",
+            "2 skipped across tools (dagrun 2; by kind: boxing 2)",
             id="incomplete",
         ),
         pytest.param(
@@ -1390,7 +1393,7 @@ def _all_tools_stubbed(
             "tick-hub",
             1,
             "cross: FAILED - 1 of 7 tool(s) did not pass: tick-hub FAILED; "
-            "1 skipped across tools (dagrun 1)",
+            "1 skipped across tools (dagrun 1; by kind: boxing 1)",
             id="diverged",
         ),
         pytest.param(
@@ -1525,21 +1528,43 @@ def test_validate_summarises_only_records_that_skipped(tmp_path: Path) -> None:
     )
     (tmp_path / "truncated.json").write_text('{"tool": ', encoding="utf-8")
     (tmp_path / "wrong-shape.json").write_text("[]", encoding="utf-8")
-
-    lines, skipped, unreadable, missing = validate.cross_coverage_report(
-        tmp_path, ["cross.tick-hub.differential", "cross.dagrun.cpuset-differential"]
+    (tmp_path / "zz-mixed.json").write_text(
+        json.dumps(
+            {
+                "tool": "dagrun",
+                "node": "cross.dagrun.differential",
+                "verdict": "PARTIAL",
+                "checks": 17,
+                "skipped": [{"label": "profile-timeseries", "kind": "boxing"}, "not-a-dict"],
+            }
+        ),
+        encoding="utf-8",
     )
 
-    assert skipped == 2
+    lines, skipped, unreadable, missing, by_kind = validate.cross_coverage_report(
+        tmp_path,
+        [
+            "cross.tick-hub.differential",
+            "cross.dagrun.cpuset-differential",
+            "cross.dagrun.differential",
+        ],
+    )
+
+    assert skipped == 4
+    assert by_kind == (("boxing", 1), ("delegated-live-scope", 2), ("malformed", 1))
     assert unreadable == 2
     assert missing == []
-    assert len(lines) == 3
+    assert len(lines) == 4
     assert lines[0] == (
         "  cross.dagrun.cpuset-differential (cpuset-alloc, PARTIAL): 53 check(s) ran; 2 skipped "
-        "[delegated-live-scope]: run:signal-status, interop:py-then-rs"
+        "[delegated-live-scope 2]: run:signal-status, interop:py-then-rs"
     )
     assert lines[1].startswith("  unreadable cross coverage record truncated.json:")
     assert lines[2] == "  malformed cross coverage record wrong-shape.json: []"
+    assert lines[3] == (
+        "  cross.dagrun.differential (dagrun, PARTIAL): 17 check(s) ran; 2 skipped "
+        "[boxing 1, malformed 1]: profile-timeseries, 'not-a-dict'"
+    )
 
 
 def test_a_selected_cross_node_without_a_record_is_not_full_coverage(tmp_path: Path) -> None:
@@ -1647,11 +1672,11 @@ def test_validate_says_partial_when_a_passing_cross_node_skipped_checks(
     if skips:
         assert (
             "  cross.dagrun.cpuset-differential (cpuset-alloc, PARTIAL): 1 check(s) ran; "
-            "1 skipped [delegated-live-scope]: run:signal-status"
+            "1 skipped [delegated-live-scope 1]: run:signal-status"
         ) in out
         assert out.rstrip().endswith(
             "validate: PARTIAL - every selected node passed, but 1 cross check(s) were skipped "
-            "and are UNVERIFIED"
+            "and are UNVERIFIED (delegated-live-scope 1)"
         )
         assert "validate: OK" not in out
     else:
@@ -1700,11 +1725,11 @@ def test_a_partial_run_under_github_actions_is_annotated_and_summarised(
 
     verdict = (
         "validate: PARTIAL - every selected node passed, but 1 cross check(s) were skipped and "
-        "are UNVERIFIED"
+        "are UNVERIFIED (delegated-live-scope 1)"
     )
     node = (
         "  cross.dagrun.cpuset-differential (cpuset-alloc, PARTIAL): 1 check(s) ran; 1 skipped "
-        "[delegated-live-scope]: run:signal-status"
+        "[delegated-live-scope 1]: run:signal-status"
     )
     assert f"\n::warning title=validate PARTIAL::{verdict}%0A{node}\n" in out
     assert out.rstrip().endswith(verdict)
@@ -1747,7 +1772,7 @@ def test_an_unwritable_job_summary_does_not_change_the_verdict(
     assert "validate: cannot append the PARTIAL verdict to GITHUB_STEP_SUMMARY:" in captured.err
     assert captured.out.rstrip().endswith(
         "validate: PARTIAL - every selected node passed, but 1 cross check(s) were skipped and "
-        "are UNVERIFIED"
+        "are UNVERIFIED (delegated-live-scope 1)"
     )
 
 
