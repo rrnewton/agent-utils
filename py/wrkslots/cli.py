@@ -16,6 +16,7 @@ import fnmatch
 import functools
 import hashlib
 import hmac
+import io
 import json
 import math
 import mmap
@@ -54,6 +55,7 @@ RETIRE_PENDING_MAX_WAIT_LOCK_SECONDS = 30.0
 VALIDATE_REMOVE_BATCH_LIMIT = 8
 AGENT_REMOVE_BATCH_LIMIT = 128
 AGENT_REMOVE_BATCH_WAIT_LOCK_SECONDS = 30.0
+ABSENT_AGENT_ROW_BATCH_LIMIT = 128
 _VALIDATE_BATCH_SEAL_SCHEMA = 1
 _VALIDATION_REMOVAL_PROOF_SCHEMA = 1
 _VALIDATION_REMOVAL_PROOF_BYTES_LIMIT = 64 * 1024
@@ -26552,7 +26554,8 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
                 slot,
                 generation,
                 f"slot directory is missing or unsafe: {slot_path}; use "
-                "recover-absent-agent-row for a row whose storage is absent",
+                "recover-absent-agent-rows (or recover-absent-agent-row) for a row "
+                "whose storage is absent",
             )
             continue
         identities[slot_path] = identity
@@ -33767,26 +33770,37 @@ def _recover_absent_agent_row(
     print(f"recovered absent agent row={item.slot}")
 
 
-def _cmd_recover_absent_agent_row(args: argparse.Namespace) -> int:
-    config = _load_config(args.project_root, args.machine)
-    item = AbsentAgentRow(
-        machine=config.machine,
-        slot=_validate_name(args.slot, "slot"),
-        generation=args.expected_generation,
-        record_sha256=args.record_sha256,
-    )
-    if not DIGEST_RE.fullmatch(item.record_sha256):
-        raise Refusal("--record-sha256 must be one lowercase SHA-256 digest")
+def _absent_agent_recovery_coordinator(
+    config: Config, args: argparse.Namespace
+) -> ProcessIdentity | None:
+    """Check the host and, for --apply, capture the authorizing coordinator."""
+
     if config.machine != _short_hostname():
         raise Refusal("absent agent row recovery must run on the row's machine")
     if args.apply:
         _require_coordinator_authorized(args, "absent agent row recovery")
         if args.coordinator_pid is None:
             raise Refusal("--apply requires --coordinator-pid")
-        coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
-    else:
-        coordinator = None
-    with _mutation_locks(config, args.wait_lock):
+        return _capture_caller_process(args.coordinator_pid, "coordinator")
+    return None
+
+
+def _recover_absent_agent_row_item(
+    config: Config,
+    item: AbsentAgentRow,
+    *,
+    apply: bool,
+    coordinator: ProcessIdentity | None,
+    wait_seconds: float,
+) -> str:
+    """Plan or recover one exact absent agent row inside one registry-lock hold.
+
+    Returns ``would-recover`` or ``would-resume`` for a plan, and
+    ``already-recovered`` or ``recovered``; any refusal is raised.
+    Everything it prints is the single-row command's output.
+    """
+
+    with _mutation_locks(config, wait_seconds):
         _refuse_partial_state(config)
         if _outstanding_journals(config):
             path, raw = _load_journal(config)
@@ -33797,12 +33811,12 @@ def _cmd_recover_absent_agent_row(args: argparse.Namespace) -> int:
             )
             if journal_item != item:
                 raise Refusal("requested agent row differs from the interrupted recovery")
-            if not args.apply:
+            if not apply:
                 print(f"ROW machine={item.machine} slot={item.slot} outcome=planned detail=resume")
-                return 0
+                return "would-resume"
             assert coordinator is not None
             _recover_absent_agent_row(config, path, raw, coordinator)
-            return 0
+            return "recovered"
         states, archives = _validate_global_state(config)
         before = _global_rows(states, archives)
         state = next(value for value in states if value.machine == config.machine)
@@ -33823,7 +33837,7 @@ def _cmd_recover_absent_agent_row(args: argparse.Namespace) -> int:
                     f"ROW machine={item.machine} slot={item.slot} "
                     f"generation={item.generation} outcome=already-recovered"
                 )
-                return 0
+                return "already-recovered"
             raise Refusal(
                 f"agent row {item.machine}/{item.slot} is neither active nor an exact prior recovery"
             )
@@ -33831,7 +33845,7 @@ def _cmd_recover_absent_agent_row(args: argparse.Namespace) -> int:
         _paths, branch_witnesses, receipts = _assert_absent_agent_safe(
             config, record
         )
-        if not args.apply:
+        if not apply:
             rendered_witnesses = json.dumps(
                 [
                     _absent_agent_branch_witness_to_obj(witness)
@@ -33845,7 +33859,7 @@ def _cmd_recover_absent_agent_row(args: argparse.Namespace) -> int:
                 "outcome=planned detail=physical-storage-absent "
                 f"branch_witnesses={rendered_witnesses}"
             )
-            return 0
+            return "would-recover"
         assert coordinator is not None
         finished_at = _utc_now()
         journal = {
@@ -33873,7 +33887,221 @@ def _cmd_recover_absent_agent_row(args: argparse.Namespace) -> int:
         _recover_absent_agent_row(config, _journal_path(config), journal, coordinator)
         after_states, after_archives = _validate_global_state(config)
         _assert_only_slot_changed(before, _global_rows(after_states, after_archives), item.slot)
+    return "recovered"
+
+
+def _cmd_recover_absent_agent_row(args: argparse.Namespace) -> int:
+    config = _load_config(args.project_root, args.machine)
+    item = AbsentAgentRow(
+        machine=config.machine,
+        slot=_validate_name(args.slot, "slot"),
+        generation=args.expected_generation,
+        record_sha256=args.record_sha256,
+    )
+    if not DIGEST_RE.fullmatch(item.record_sha256):
+        raise Refusal("--record-sha256 must be one lowercase SHA-256 digest")
+    coordinator = _absent_agent_recovery_coordinator(config, args)
+    _recover_absent_agent_row_item(
+        config,
+        item,
+        apply=bool(args.apply),
+        coordinator=coordinator,
+        wait_seconds=args.wait_lock,
+    )
     return 0
+
+
+# recover-absent-agent-rows runs the single-row recovery above, unchanged, for
+# each exact row: every row gets its own registry-lock hold, its own journal,
+# and all three of its safety proofs.  Measured 2026-09-29 on a 4,000-process
+# host at load average 42 to 55, one row's plan took 6 to 18 seconds and its
+# apply 22 to 37 seconds, all inside the lock, whether run singly or in this
+# batch; about 95 percent of an apply was the all-process and user-systemd
+# censuses, which it runs three times as its time-of-check proof.  Sharing
+# those censuses across rows would move that proof away from the destructive
+# steps it guards, so the batch shares nothing.  It releases the lock between
+# rows and reports every row.
+
+
+def _parse_absent_agent_row(value: str, machine: str) -> AbsentAgentRow:
+    parts = value.split("=")
+    if len(parts) != 3:
+        raise Refusal(f"absent agent row must be SLOT=GENERATION=SHA256: {value!r}")
+    slot, generation_text, digest = parts
+    slot = _validate_name(slot, "slot")
+    try:
+        generation = int(generation_text, 10)
+    except ValueError as exc:
+        raise Refusal(f"absent agent row generation is not an integer: {value!r}") from exc
+    if generation < 1:
+        raise Refusal(f"absent agent row generation must be positive: {value!r}")
+    if not DIGEST_RE.fullmatch(digest):
+        raise Refusal(
+            f"absent agent row record SHA-256 must be one lowercase digest: {value!r}"
+        )
+    return AbsentAgentRow(
+        machine=machine, slot=slot, generation=generation, record_sha256=digest
+    )
+
+
+def _read_absent_agent_rows(
+    args: argparse.Namespace, machine: str
+) -> tuple[AbsentAgentRow, ...]:
+    raw: list[str] = list(getattr(args, "rows", None) or ())
+    input_path = getattr(args, "input", None)
+    if input_path is not None:
+        try:
+            text = Path(input_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise Refusal(f"cannot read --input {input_path}: {exc}") from exc
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                raw.append(stripped)
+    if not raw:
+        raise Refusal(
+            "recover-absent-agent-rows needs at least one --row or a non-empty --input"
+        )
+    if len(raw) > ABSENT_AGENT_ROW_BATCH_LIMIT:
+        raise Refusal(
+            f"recover-absent-agent-rows accepts at most {ABSENT_AGENT_ROW_BATCH_LIMIT} "
+            "rows; run another bounded batch for the remainder"
+        )
+    rows = tuple(_parse_absent_agent_row(value, machine) for value in raw)
+    if len({row.slot for row in rows}) != len(rows):
+        raise Refusal("recover-absent-agent-rows received the same slot more than once")
+    return rows
+
+
+def _interrupted_absent_agent_row_first(
+    config: Config, requested: tuple[AbsentAgentRow, ...]
+) -> tuple[AbsentAgentRow, ...]:
+    """Order a row with an interrupted single-row recovery journal first.
+
+    While that journal exists every other row refuses, so a rerun of an
+    interrupted batch resumes it before the rest.  This read is only an
+    ordering hint taken without the lock; each row is decided under it.
+    """
+
+    try:
+        if not _outstanding_journals(config):
+            return requested
+        _path, raw = _load_journal(config)
+    except Refusal:
+        return requested
+    if raw.get("kind") != "recover-absent-agent-row":
+        return requested
+    first = [row for row in requested if row.slot == raw.get("slot")]
+    return (*first, *(row for row in requested if row.slot != raw.get("slot")))
+
+
+def _recover_absent_agent_rows(args: argparse.Namespace) -> dict[str, object]:
+    config = _load_config(args.project_root, args.machine)
+    requested = _read_absent_agent_rows(args, config.machine)
+    coordinator = _absent_agent_recovery_coordinator(config, args)
+    apply = bool(args.apply)
+    order = {row.slot: position for position, row in enumerate(requested)}
+    wait_seconds = (
+        args.wait_lock if args.wait_lock > 0 else AGENT_REMOVE_BATCH_WAIT_LOCK_SECONDS
+    )
+    started = time.monotonic()
+    rows: list[dict[str, object]] = []
+    recovery_required = False
+    attempts = _interrupted_absent_agent_row_first(config, requested)
+    for index, item in enumerate(attempts):
+        if index:
+            # Waiters poll the registry lock every 50 ms; leave them a window
+            # between rows so a batch never starves heartbeats.
+            time.sleep(_AGENT_REMOVE_BATCH_YIELD_SECONDS)
+        output = io.StringIO()
+        item_started = time.monotonic()
+        row: dict[str, object] = {"slot": item.slot, "generation": item.generation}
+        try:
+            with contextlib.redirect_stdout(output):
+                outcome = _recover_absent_agent_row_item(
+                    config,
+                    item,
+                    apply=apply,
+                    coordinator=coordinator,
+                    wait_seconds=wait_seconds,
+                )
+        except StateError as exc:
+            recovery_required = True
+            row.update(outcome="refused", reason=str(exc), recovery_required=True)
+        except Refusal as exc:
+            row.update(outcome="refused", reason=str(exc))
+        else:
+            row["outcome"] = outcome
+        row["seconds"] = round(time.monotonic() - item_started, 3)
+        row["output"] = output.getvalue().splitlines()
+        rows.append(row)
+        _interrupt_for_test("after-absent-agent-rows-item")
+        if recovery_required:
+            for later in attempts[index + 1 :]:
+                rows.append(
+                    {
+                        "slot": later.slot,
+                        "generation": later.generation,
+                        "outcome": "refused",
+                        "reason": "batch stopped after a state error; run 'wrkslots recover' "
+                        "and retry the remaining rows",
+                        "seconds": 0.0,
+                        "output": [],
+                    }
+                )
+            break
+    rows.sort(key=lambda row: order[_as_str(row["slot"], "absent agent row slot")])
+    counts = {
+        name: sum(1 for row in rows if row["outcome"] == name)
+        for name in (
+            "would-recover", "would-resume", "recovered", "already-recovered", "refused",
+        )
+    }
+    return {
+        "schema": 1,
+        "batch_limit": ABSENT_AGENT_ROW_BATCH_LIMIT,
+        "mode": "apply" if apply else "plan",
+        "requested": len(requested),
+        "counts": counts,
+        "rows": rows,
+        "recovery_required": recovery_required,
+        "seconds": round(time.monotonic() - started, 3),
+    }
+
+
+def _cmd_recover_absent_agent_rows(args: argparse.Namespace) -> int:
+    payload = _recover_absent_agent_rows(args)
+    rows = [
+        _as_mapping(value, "absent agent row result")
+        for value in _as_list(payload["rows"], "rows")
+    ]
+    counts = _as_mapping(payload["counts"], "counts")
+    if args.format == "json":
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        print(
+            f"mode={payload['mode']} requested={payload['requested']} "
+            f"would_recover={counts['would-recover']} "
+            f"would_resume={counts['would-resume']} "
+            f"recovered={counts['recovered']} "
+            f"already_recovered={counts['already-recovered']} "
+            f"refused={counts['refused']} seconds={payload['seconds']}"
+        )
+        for row in rows:
+            label = _as_str(row["outcome"], "outcome").upper()
+            line = f"{label}: {row['slot']} generation={row['generation']}"
+            if row["outcome"] == "refused":
+                line += f" reason={row['reason']}"
+            print(line)
+            for text in _as_list(row["output"], "output"):
+                print(f"  {text}")
+        if payload["recovery_required"]:
+            print("RECOVERY REQUIRED: run 'wrkslots recover' before another recovery")
+    # Success means every requested row reached the requested mode's outcome:
+    # would recover or resume in a plan, recovered or already recovered by
+    # --apply.  Any refusal is exit status 1; a refusal of the whole batch
+    # raises (exit 3).
+    return 1 if counts["refused"] else 0
 
 
 def _record_sha256(record: ActiveRecord) -> str:
@@ -40442,6 +40670,50 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--coordinator-pid", type=int, metavar="PID"
     )
     recover_absent_agent.set_defaults(handler=_cmd_recover_absent_agent_row)
+
+    recover_absent_agents = subparsers.add_parser(
+        "recover-absent-agent-rows",
+        help="plan or recover a bounded batch of exact absent agent rows",
+        description=(
+            "Run recover-absent-agent-row, unchanged, for each exact SLOT=GENERATION=SHA256 "
+            f"row, at most {ABSENT_AGENT_ROW_BATCH_LIMIT} per batch. The default is a "
+            "read-only plan of every row; --apply recovers each row with the single-row "
+            "command's authority, journal, and proofs. Each row is decided in its own "
+            "registry-lock hold, and the lock is released between rows. A refused row is "
+            "reported with its reason and left in place; the remaining rows are still "
+            "attempted. Exit status is 0 only when no row was refused: in a plan every row "
+            "would be recovered or resumed or was already recovered, and with --apply every "
+            "row was recovered or already recovered. It is 1 when any row was refused, and "
+            "3 when the whole batch was refused."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    recover_absent_agents.add_argument(
+        "--row",
+        dest="rows",
+        action="append",
+        metavar="SLOT=GENERATION=SHA256",
+        help="exact agent slot, generation, and ACTIVE-record SHA-256 (repeatable)",
+    )
+    recover_absent_agents.add_argument(
+        "--input",
+        metavar="FILE",
+        help=(
+            "file with one SLOT=GENERATION=SHA256 per line; blank lines and lines "
+            "starting with # are ignored; combined with any --row"
+        ),
+    )
+    recover_absent_agents.add_argument("--apply", action="store_true")
+    recover_absent_agents.add_argument(
+        "--coordinator-authorized", action="store_true"
+    )
+    recover_absent_agents.add_argument(
+        "--coordinator-pid", type=int, metavar="PID"
+    )
+    recover_absent_agents.add_argument(
+        "--format", choices=("human", "json"), default="human"
+    )
+    recover_absent_agents.set_defaults(handler=_cmd_recover_absent_agent_rows)
 
     recover_ownerless_agent = subparsers.add_parser(
         "recover-ownerless-agent-worktree",

@@ -39878,3 +39878,328 @@ def test_remove_agent_batch_honors_a_live_owners_release_like_remove(
     assert evidence["owner"] == wrkslots._identity_to_obj(owner)
     assert evidence["coordinator_authorized"] is False
     assert registry_journals(project) == []
+
+
+# ---------------------------------------------------------------------------
+# recover-absent-agent-rows
+# ---------------------------------------------------------------------------
+
+
+def absent_agent_rows_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, count: int = 3
+) -> tuple[Path, Path, Path, list[wrkslots.ActiveRecord]]:
+    project, repository, remote = make_project(tmp_path)
+    records = [
+        prepare_absent_agent_row(project, repository, slot=f"gone{index:02d}")
+        for index in range(1, count + 1)
+    ]
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    return project, repository, remote, records
+
+
+def absent_row_argument(record: wrkslots.ActiveRecord, digest: str | None = None) -> str:
+    return (
+        f"{record.slot}={record.generation}="
+        f"{digest if digest is not None else wrkslots._record_sha256(record)}"
+    )
+
+
+def run_absent_agent_rows(
+    project: Path, *extra: str, apply: bool = False
+) -> tuple[int, str, str]:
+    arguments = ["--project-root", str(project), "recover-absent-agent-rows", *extra]
+    if apply:
+        arguments.extend(
+            ("--apply", "--coordinator-authorized", "--coordinator-pid", str(os.getpid()))
+        )
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        returncode = wrkslots.main(arguments)
+    return returncode, stdout.getvalue(), stderr.getvalue()
+
+
+def absent_rows_payload(text: str) -> tuple[dict[str, object], dict[str, str]]:
+    payload = cast(dict[str, object], json.loads(text))
+    outcomes = {
+        str(row["slot"]): str(row["outcome"])
+        for row in cast(list[Mapping[str, object]], payload["rows"])
+    }
+    return payload, outcomes
+
+
+def test_recover_absent_agent_rows_plans_then_recovers_every_row_like_the_single_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, remote, records = absent_agent_rows_project(tmp_path, monkeypatch)
+    config = wrkslots._load_config(str(project), "testhost")
+    archive_before = wrkslots._load_archive(config).records
+    input_file = tmp_path / "rows.txt"
+    input_file.write_text(
+        "# exact rows from the audit\n\n"
+        + "\n".join(absent_row_argument(record) for record in records[1:])
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert run_absent_agent_recovery(project, records[0], apply=False) == 0
+    single_plan = capsys.readouterr().out.splitlines()
+    returncode, stdout, stderr = run_absent_agent_rows(
+        project,
+        f"--row={absent_row_argument(records[0])}",
+        "--input",
+        str(input_file),
+        "--format",
+        "json",
+    )
+    assert returncode == 0, stderr
+    payload, outcomes = absent_rows_payload(stdout)
+    assert payload["mode"] == "plan"
+    assert outcomes == {
+        "gone01": "would-recover",
+        "gone02": "would-recover",
+        "gone03": "would-recover",
+    }
+    rows = cast(list[Mapping[str, object]], payload["rows"])
+    assert rows[0]["output"] == single_plan
+    assert wrkslots._load_active(config).slots == tuple(records)
+    assert wrkslots._load_archive(config).records == archive_before
+    assert registry_journals(project) == []
+
+    returncode, stdout, stderr = run_absent_agent_rows(
+        project, *(f"--row={absent_row_argument(record)}" for record in records)
+    )
+    assert returncode == 0, stderr
+    lines = stdout.splitlines()
+    assert lines[0].startswith(
+        "mode=plan requested=3 would_recover=3 would_resume=0 recovered=0 "
+        "already_recovered=0 refused=0 seconds="
+    )
+    assert [line for line in lines if not line.startswith("  ")][1:] == [
+        "WOULD-RECOVER: gone01 generation=1",
+        "WOULD-RECOVER: gone02 generation=1",
+        "WOULD-RECOVER: gone03 generation=1",
+    ]
+    assert wrkslots._load_active(config).slots == tuple(records)
+
+    returncode, stdout, stderr = run_absent_agent_rows(
+        project,
+        *(f"--row={absent_row_argument(record)}" for record in records),
+        apply=True,
+    )
+    assert returncode == 0, stderr
+    lines = stdout.splitlines()
+    assert lines[0].startswith(
+        "mode=apply requested=3 would_recover=0 would_resume=0 recovered=3 "
+        "already_recovered=0 refused=0 seconds="
+    )
+    assert [line for line in lines if not line.startswith("  ")][1:] == [
+        "RECOVERED: gone01 generation=1",
+        "RECOVERED: gone02 generation=1",
+        "RECOVERED: gone03 generation=1",
+    ]
+    assert "  recovered absent agent row=gone02" in lines
+    assert not wrkslots._load_active(config).slots
+    assert [row["slot"] for row in wrkslots._load_archive(config).records[-3:]] == [
+        "gone01", "gone02", "gone03",
+    ]
+    for record in records:
+        rescue_ref = wrkslots._absent_agent_rescue_ref(record, record.checkouts[0])
+        assert git(remote, "rev-parse", rescue_ref).stdout.strip() == record.checkouts[0].head
+    assert registry_journals(project) == []
+
+    returncode, stdout, stderr = run_absent_agent_rows(
+        project,
+        *(f"--row={absent_row_argument(record)}" for record in records),
+        "--format",
+        "json",
+        apply=True,
+    )
+    assert returncode == 0, stderr
+    _payload, outcomes = absent_rows_payload(stdout)
+    assert set(outcomes.values()) == {"already-recovered"}
+
+
+def test_recover_absent_agent_rows_refuses_one_row_and_recovers_the_others(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, repository, _remote, records = absent_agent_rows_project(tmp_path, monkeypatch)
+    config = wrkslots._load_config(str(project), "testhost")
+    reappeared = wrkslots._slot_directory(config, "gone02", "agent")
+    reappeared.mkdir()
+    changed = "0" * 64
+
+    returncode, stdout, stderr = run_absent_agent_rows(
+        project,
+        f"--row={absent_row_argument(records[0], changed)}",
+        f"--row={absent_row_argument(records[1])}",
+        f"--row={absent_row_argument(records[2])}",
+        "--format",
+        "json",
+        apply=True,
+    )
+
+    assert returncode == 1, stderr
+    payload, outcomes = absent_rows_payload(stdout)
+    assert outcomes == {"gone01": "refused", "gone02": "refused", "gone03": "recovered"}
+    reasons = {
+        str(row["slot"]): str(row.get("reason"))
+        for row in cast(list[Mapping[str, object]], payload["rows"])
+    }
+    assert f"expected {changed}" in reasons["gone01"]
+    assert "gone02 still has physical storage" in reasons["gone02"]
+    assert payload["recovery_required"] is False
+    remaining = wrkslots._load_active(config).slots
+    assert remaining == (records[0], records[1])
+    for record in remaining:
+        path = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
+        assert wrkslots._GitVcs().worktree_registration(repository, path) is not None
+    assert reappeared.is_dir()
+    assert registry_journals(project) == []
+
+
+def test_recover_absent_agent_rows_leaves_only_a_single_row_journal_and_resumes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An interrupted batch leaves exactly one single-row recovery journal.
+
+    That journal is the kind recover-absent-agent-row has always written, so
+    ordinary `recover`, the single-row command, and a rerun of the batch all
+    resume it; the batch itself writes no file.
+    """
+
+    project, _repository, _remote, records = absent_agent_rows_project(tmp_path, monkeypatch)
+    config = wrkslots._load_config(str(project), "testhost")
+    rows = [f"--row={absent_row_argument(record)}" for record in records]
+
+    class Interrupted(RuntimeError):
+        pass
+
+    seen: list[str] = []
+
+    def interrupt(point: str) -> None:
+        seen.append(point)
+        if point == "after-absent-agent-rescue-ref" and seen.count(point) == 2:
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_absent_agent_rows(project, *rows, apply=True)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    assert seen.count("after-absent-agent-rows-item") == 1
+    assert [record.slot for record in wrkslots._load_active(config).slots] == [
+        "gone02", "gone03",
+    ]
+    assert registry_journals(project) == ["ACTIVE.testhost.journal"]
+    _path, raw = wrkslots._load_journal(config)
+    assert raw["kind"] == "recover-absent-agent-row"
+    assert raw["slot"] == "gone02"
+
+    # Single-row semantics are unchanged: while gone02's journal exists every
+    # other row refuses, including gone01, which is already archived.
+    capture = io.StringIO()
+    with contextlib.redirect_stderr(capture):
+        assert run_absent_agent_recovery(project, records[0], apply=False) == 3
+    assert "differs from the interrupted recovery" in capture.getvalue()
+
+    # A plan does not retire gone02's journal, so it reports gone02 as
+    # would-resume and refuses both other rows, as the single-row command
+    # would.  Rows are still reported in the requested order.
+    returncode, stdout, stderr = run_absent_agent_rows(project, *rows, "--format", "json")
+    assert returncode == 1, stderr
+    payload, outcomes = absent_rows_payload(stdout)
+    assert list(outcomes) == ["gone01", "gone02", "gone03"]
+    assert outcomes == {
+        "gone01": "refused",
+        "gone02": "would-resume",
+        "gone03": "refused",
+    }
+    for index in (0, 2):
+        assert "differs from the interrupted recovery" in str(
+            cast(list[Mapping[str, object]], payload["rows"])[index]["reason"]
+        )
+
+    # The batch orders the interrupted row first, so --apply resumes gone02
+    # before it reaches gone01, which is then already recovered.
+    returncode, stdout, stderr = run_absent_agent_rows(
+        project, *rows, "--format", "json", apply=True
+    )
+    assert returncode == 0, stderr
+    _payload, outcomes = absent_rows_payload(stdout)
+    assert outcomes == {
+        "gone01": "already-recovered",
+        "gone02": "recovered",
+        "gone03": "recovered",
+    }
+    assert not wrkslots._load_active(config).slots
+    assert registry_journals(project) == []
+
+
+def test_recover_absent_agent_rows_interrupted_between_rows_leaves_no_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _repository, _remote, records = absent_agent_rows_project(tmp_path, monkeypatch)
+    config = wrkslots._load_config(str(project), "testhost")
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(point: str) -> None:
+        if point == "after-absent-agent-rows-item":
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_absent_agent_rows(
+            project,
+            *(f"--row={absent_row_argument(record)}" for record in records),
+            apply=True,
+        )
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    assert [record.slot for record in wrkslots._load_active(config).slots] == [
+        "gone02", "gone03",
+    ]
+    assert registry_journals(project) == []
+    wrkslots._refuse_partial_state(config)
+    wrkslots._assert_no_journal(config)
+    assert run_absent_agent_recovery(project, records[1], apply=True) == 0
+    status = command(project, "status")
+    assert status.returncode == 0, status.stderr
+
+
+def test_recover_absent_agent_rows_refuses_the_whole_batch_before_any_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _repository, _remote, records = absent_agent_rows_project(
+        tmp_path, monkeypatch, count=2
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    good = [f"--row={absent_row_argument(record)}" for record in records]
+    too_many = tmp_path / "too-many.txt"
+    too_many.write_text(
+        "".join(f"extra{index:03d}=1={'a' * 64}\n" for index in range(128)),
+        encoding="utf-8",
+    )
+    cases: list[tuple[list[str], bool, str]] = [
+        ([], False, "needs at least one --row"),
+        ([good[0], good[0]], False, "same slot more than once"),
+        ([f"--row={records[0].slot}=1"], False, "must be SLOT=GENERATION=SHA256"),
+        ([f"--row={records[0].slot}=0={'a' * 64}"], False, "generation must be positive"),
+        ([f"--row={records[0].slot}=1={'A' * 64}"], False, "one lowercase digest"),
+        ([good[0], "--input", str(too_many)], False, "at most 128 rows"),
+        ([*good, "--apply", "--coordinator-pid", str(os.getpid())], False, "is coordinator-owned"),
+        ([*good, "--apply", "--coordinator-authorized"], False, "--apply requires --coordinator-pid"),
+    ]
+    for arguments, apply, expected in cases:
+        returncode, stdout, stderr = run_absent_agent_rows(project, *arguments, apply=apply)
+        assert returncode == 3, (arguments, stdout, stderr)
+        assert expected in stderr, (arguments, stderr)
+        assert stdout == ""
+    monkeypatch.setattr(wrkslots, "_short_hostname", lambda: "otherhost")
+    returncode, _stdout, stderr = run_absent_agent_rows(project, *good, apply=True)
+    assert returncode == 3
+    assert "must run on the row's machine" in stderr
+    assert wrkslots._load_active(config).slots == tuple(records)
+    assert registry_journals(project) == []

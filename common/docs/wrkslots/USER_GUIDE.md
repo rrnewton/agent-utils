@@ -513,7 +513,7 @@ saw in use is refused even if that process has since exited; run another batch o
 
 A refused slot is left in place and reported with its reason, and the remaining slots are still
 attempted. A missing row, a changed generation, a validation slot, and a row whose directory is
-absent are refused before any scan; use `recover-absent-agent-row` for the last. Corrupt or
+absent are refused before any scan; use `recover-absent-agent-rows` for the last. Corrupt or
 interrupted registry state stops the batch, refuses the remaining slots, and prints
 `RECOVERY REQUIRED`. The human output is one summary line,
 
@@ -766,6 +766,42 @@ recorded checkout commit is pushed individually to a dedicated rescue ref and re
 remote before the exact stale Git worktree registration is removed. The archive is durable before
 ACTIVE is changed and explicitly records that uncommitted, untracked, ignored, and HANDOFF contents
 could not be inspected because storage was already absent.
+
+To plan or recover many such rows, name each exact row as `SLOT=GENERATION=SHA256`, with the
+generation and `record_sha256` from the same audit:
+
+```sh
+wrkslots recover-absent-agent-rows --row example-a=3=SHA256 --row example-b=1=SHA256
+wrkslots recover-absent-agent-rows --input /path/to/rows.txt --apply \
+  --coordinator-authorized --coordinator-pid "$COORDINATOR_PID"
+```
+
+The input file holds one row per line; blank lines and lines starting with `#` are ignored, and
+`--row` may be combined with it. A batch accepts at most 128 distinct slots, all on this project's
+machine. Each row goes through `recover-absent-agent-row` unchanged, with the same authority,
+journal, and proofs, in its own registry-lock hold; nothing is shared between rows. The lock is
+released between rows, followed by a 0.25-second pause, and each row waits up to 30 seconds for the
+lock, or for `--wait-lock` seconds when that is given. On a busy machine one row's plan takes 5 to
+20 seconds and its apply 20 to 40 seconds, all of it inside the lock and most of it the full-host
+process and user-systemd censuses, which each apply runs three times.
+
+A refused row is left in place and reported with its reason, and the remaining rows are still
+attempted. Corrupt or interrupted registry state stops the batch, refuses the remaining rows, and
+prints `RECOVERY REQUIRED`; a rerun of the same batch resumes an interrupted row's recovery and then
+continues. The human output is one summary line,
+
+```text
+mode=apply requested=3 would_recover=0 would_resume=0 recovered=2 already_recovered=0 refused=1 seconds=71.4
+```
+
+followed by one `WOULD-RECOVER:`, `WOULD-RESUME:`, `RECOVERED:`, `ALREADY-RECOVERED:`, or
+`REFUSED:` line per row, each followed by that row's single-row output indented by two spaces;
+`--format json` prints the same content as one object. The two `WOULD-` outcomes appear only
+without `--apply`: `WOULD-RESUME:` names the row whose interrupted recovery an `--apply` run would
+finish first. Exit status is 0 only when no row was refused: without `--apply` every row would be
+recovered or resumed or was already recovered, and with `--apply` every row was recovered or
+already recovered. It is 1 when any row was refused, and 3 when the whole command was refused,
+for example for a malformed or repeated row.
 
 The local branch is separate evidence, not the salvage authority. It may be absent or may directly
 name the recorded commit, an ancestor, a descendant, or a divergent commit. Recovery records that
