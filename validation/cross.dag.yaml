@@ -56,6 +56,15 @@ steps:
       # Eight remains the preferred/full-strength width. jobs_env makes four-core CI a real
       # four-core version of the same aggregate-bandwidth contract rather than an oversubscribed
       # or falsely described eight-core run.
+      # The CPA memory-cap check needs all eight cores. scripts/validate.py plans with
+      # --planner critical-path, which never changes this width from profile history, so the node
+      # gets fewer only from an input the caller sets: a host with fewer than eight usable CPUs,
+      # VALIDATE_MAX_CPUS below eight, --cores below eight or --planner cpa in
+      # VALIDATE_DAGRUN_FLAGS, or a smaller CPU ceiling inherited from an outer dagrun. The check
+      # is then an eight-cpu skip, which this command does not allow, so the node ends INCOMPLETE
+      # until the caller sets AGENT_UTILS_CROSS_ALLOW_SKIP=eight-cpu, as the hosted lanes do. The
+      # width is left resizable rather than fixed at eight: a fixed width over the run's
+      # --max-cpus is refused, which would stop four-core hosted runners from running the node.
       preferred_inner_jobs: 8
       rss_baseline_bytes: 2147483648
 

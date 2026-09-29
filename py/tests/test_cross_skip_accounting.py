@@ -38,7 +38,9 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from dagrun.estimates import Planner, apply_plan_to_config, build_plan
 from dagrun.io import dag_from_path
+from dagrun.scheduler import cap_config_max_cpus
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BOXING_LABELS = [
@@ -1832,3 +1834,47 @@ def test_hosted_lanes_that_cannot_box_declare_themselves_partial() -> None:
             if line.strip().startswith("AGENT_UTILS_CROSS_ALLOW_SKIP:")
         ]
         assert allowances == ["boxing,eight-cpu"], name
+
+
+def test_the_memory_cap_node_gets_fewer_than_eight_cores_only_from_explicit_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``cpa:mem-capped`` needs eight cores in ``cross.dagrun.differential``, which does not
+    allow ``eight-cpu``. Pin the parts of the contract that keep that node at eight on a local run
+    of at least eight CPUs: the node asks for eight through a resizable width, validate plans with
+    the critical-path planner, and that planner does not change widths. Only a run budget below
+    eight narrows it, and then visibly.
+    """
+
+    cfg = dag_from_path(REPO_ROOT / "validation.dag.yaml")
+    node = cfg.by_tag()["cross.dagrun.differential"]
+    assert node.hint.preferred_inner_jobs == 8
+    assert node.jobs_env == "AGENT_UTILS_VALIDATION_JOBS"
+    assert "eight-cpu" not in node.cmd
+    assert "AGENT_UTILS_CROSS_ALLOW_SKIP" not in node.env
+
+    validate = _validate()
+    commands: list[list[str]] = []
+
+    def capture(command: list[str], **_kw: object) -> SimpleNamespace:
+        commands.append(list(command))
+        return SimpleNamespace(returncode=0)
+
+    for name in ("VALIDATE_DAGRUN_FLAGS", "BOX_FLAGS", "VALIDATE_MAX_CPUS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(validate.subprocess, "run", capture)
+    assert validate.run(frozenset(), frozenset(), all_contract=True) == 0
+    [command] = commands
+    assert command[command.index("--planner") + 1] == "critical-path"
+    assert command.count("--planner") == 1
+    assert command[command.index("--max-cpus") + 1] == str(min(32, os.cpu_count() or 1))
+
+    # The critical-path plan publishes no width allocation, so applying it keeps eight.
+    plan = build_plan(cfg, {}, planner=Planner.CRITICAL_PATH, core_budget=8)
+    assert all(entry.alloc_inner_jobs is None for entry in plan.entries)
+    planned = apply_plan_to_config(cfg, plan).by_tag()["cross.dagrun.differential"]
+    assert planned.hint.preferred_inner_jobs == 8
+
+    # A run budget of eight keeps the width; one below eight narrows it.
+    assert cap_config_max_cpus(cfg, 8).by_tag()[node.tag].hint.preferred_inner_jobs == 8
+    assert cap_config_max_cpus(cfg, 7).by_tag()[node.tag].hint.preferred_inner_jobs == 7

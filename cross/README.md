@@ -111,9 +111,19 @@ kind: eight-cpu 1, multi-cpu 2)`. An unknown kind is refused.
 | validation nodes `cross.dagrun.differential` and `cross.dagrun.cpuset-differential` | partial for `delegated-live-scope` only; boxing stays required |
 | hosted repository CI and the nightly full run | additionally partial for `boxing`, because hosted runners run the graph with `--allow-cgroup-failure`, and for `eight-cpu`, because hosted runners have fewer than eight CPUs |
 
-A local run on a host with fewer than eight usable CPUs, or with
-`VALIDATE_MAX_CPUS` below eight, skips the CPA memory-cap check and ends
-`INCOMPLETE` until it declares `AGENT_UTILS_CROSS_ALLOW_SKIP=eight-cpu`.
+The CPA memory-cap check needs a core budget of eight inside the
+`cross.dagrun.differential` node. The node asks for eight
+(`preferred_inner_jobs: 8`), and `scripts/validate.py` plans with
+`--planner critical-path`, which never changes a step's width from profile
+history; only `--planner cpa` does. The node therefore gets fewer than eight
+cores only from an input the caller sets: a host with fewer than eight usable
+CPUs, `VALIDATE_MAX_CPUS` below eight, `--cores` below eight or `--planner cpa`
+in `VALIDATE_DAGRUN_FLAGS`, or a smaller CPU ceiling inherited from an outer
+dagrun. Any of these skips the check as `eight-cpu`, and the node, and with it
+the local validate run, fails `INCOMPLETE` until the caller declares
+`AGENT_UTILS_CROSS_ALLOW_SKIP=eight-cpu`. The node's width stays resizable
+rather than fixed at eight, because dagrun refuses a fixed width above the
+run's `--max-cpus`, and four-core hosted runners must still run it.
 
 A boxed check counts only when both engines print `cgroup boxing ACTIVE`, which
 they do exactly when they have set up per-step cgroups. When the outer scheduler
