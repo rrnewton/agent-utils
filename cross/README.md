@@ -121,9 +121,14 @@ node's own `PARTIAL` line appears only in the brackets after that `PASS`.
 graph. Each cross verdict leaves a JSON record there, and when any node skipped
 checks the run ends with `validate: PARTIAL - every selected node passed, but N
 cross check(s) were skipped and are UNVERIFIED`, listing each node, instead of
-`validate: OK`. Its exit status stays 0. A graph run directly with
-`common/bin/dagrun run` has no such summary: read the bracketed line of each
-cross node.
+`validate: OK`. Its exit status stays 0. Every selected cross node must leave a
+record: a record that cannot be read, or a selected node that left none (for
+example one that `VALIDATE_DAGRUN_FLAGS` narrowed out of the run), is listed as
+could not be confirmed and also ends the run with `PARTIAL`. Under GitHub
+Actions, where the job still shows a green tick, a `PARTIAL` run also emits a
+`::warning` annotation and appends the verdict to the job summary. A graph run
+directly with `common/bin/dagrun run` has no such summary: read the bracketed
+line of each cross node.
 
 ## Fixtures and reproducibility
 

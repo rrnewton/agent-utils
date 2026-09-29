@@ -37,7 +37,9 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import NamedTuple
 
 from run_component_tests import Manifest, components_for_paths, load_manifest
 
@@ -332,17 +334,34 @@ def changed_paths(base: str, *, repo_root: Path = REPO_ROOT) -> list[str]:
 CROSS_COVERAGE_ENV = "AGENT_UTILS_CROSS_COVERAGE_DIR"
 
 
-def cross_coverage_report(directory: Path) -> tuple[list[str], int, int]:
-    """Describe every cross verdict record in `directory` that skipped checks.
+class CrossCoverage(NamedTuple):
+    """What the cross verdict records of one validation run show."""
 
-    Returns the lines to print, the number of skipped checks, and the number of records that
-    could not be read. A record that cannot be read is counted rather than ignored: it may have
-    been the one PARTIAL node, so the summary must not claim full coverage without it.
+    #: Lines to print, one per record that skipped checks, record that could not be read, or
+    #: selected cross node that left no readable record.
+    lines: list[str]
+    #: Skipped checks across all readable records.
+    skipped: int
+    #: Records that could not be read or did not have the expected shape.
+    unreadable: int
+    #: Selected cross nodes, in the order given, with no readable record naming them.
+    missing: list[str]
+
+
+def cross_coverage_report(directory: Path, expected_nodes: Sequence[str]) -> CrossCoverage:
+    """Describe the cross verdict records in `directory` against the nodes that should write them.
+
+    Each node in `expected_nodes` runs ``cross/differential.py`` and must leave a record naming it.
+    A record that cannot be read, and a node with no readable record, are counted rather than
+    ignored: either may have been the one PARTIAL node, so the summary must not claim full
+    coverage without it. Among the readable records, those that skipped checks are listed,
+    including a record from a node that was not expected.
     """
 
     lines: list[str] = []
     skipped_total = 0
     unreadable = 0
+    recorded_nodes: set[str] = set()
     for path in sorted(directory.glob("*.json")):
         try:
             value: object = json.loads(path.read_text(encoding="utf-8"))
@@ -355,6 +374,9 @@ def cross_coverage_report(directory: Path) -> tuple[list[str], int, int]:
             lines.append(f"  malformed cross coverage record {path.name}: {value!r}")
             unreadable += 1
             continue
+        node = value.get("node")
+        if isinstance(node, str):
+            recorded_nodes.add(node)
         if not skipped:
             continue
         labels: list[str] = []
@@ -372,7 +394,42 @@ def cross_coverage_report(directory: Path) -> tuple[list[str], int, int]:
             f"check(s) ran; {len(skipped)} skipped [{', '.join(sorted(kinds))}]: "
             f"{', '.join(labels)}"
         )
-    return lines, skipped_total, unreadable
+    missing = [node for node in expected_nodes if node not in recorded_nodes]
+    for node in missing:
+        lines.append(
+            f"  {node}: no readable coverage record, so its coverage could not be confirmed"
+        )
+    return CrossCoverage(lines, skipped_total, unreadable, missing)
+
+
+def _workflow_command_data(text: str) -> str:
+    """Escape `text` as the message of a GitHub Actions workflow command."""
+
+    return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def announce_partial(verdict: str, lines: Sequence[str], environ: Mapping[str, str]) -> None:
+    """Surface a PARTIAL verdict where a hosted job would otherwise show only a green tick.
+
+    A PARTIAL run exits 0, so GitHub Actions marks its step as passed. Under Actions this emits a
+    warning annotation and appends the verdict and its per-node lines to the job summary. Outside
+    Actions it does nothing. A summary that cannot be written is reported, not fatal: the caller
+    still prints the verdict and exits 0.
+    """
+
+    detail = "\n".join([verdict, *lines])
+    if environ.get("GITHUB_ACTIONS") == "true":
+        print(f"::warning title=validate PARTIAL::{_workflow_command_data(detail)}", flush=True)
+    summary_path = environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_path:
+        return
+    body = "\n".join(lines)
+    try:
+        with open(summary_path, "a", encoding="utf-8") as handle:
+            handle.write(f"### validate: PARTIAL\n\n{verdict}\n\n```text\n{body}\n```\n")
+    except OSError as exc:
+        print(f"validate: cannot append the PARTIAL verdict to GITHUB_STEP_SUMMARY: {exc}",
+              file=sys.stderr)
 
 
 def run(
@@ -446,14 +503,13 @@ def report(
         print("  (nothing selected by path: every changed path is prose or configuration)")
 
 
-def report_selected_graph(
+def selected_graph(
     selected: frozenset[str], components: frozenset[str], *, all_contract: bool
-) -> None:
-    """Print the exact flattened nodes and resources selected by the public graph loader.
+) -> tuple[dict[str, dict[str, object]], set[str]]:
+    """Load the canonical graph with the public loader and select what `run` would run.
 
-    CI consumes the ``NEED resource:*`` lines when provisioning optional runtimes. Deriving them
-    from the selected graph prevents a component label from activating (for example) a browser
-    gate while a second, coarser group-name heuristic incorrectly skips browser installation.
+    Returns every step by tag, in graph order, and the tags selected by the same labels `run`
+    passes to dagrun, closed over dependencies.
     """
 
     completed = subprocess.run(
@@ -517,7 +573,39 @@ def report_selected_graph(
                 if dependency not in chosen:
                     chosen.add(dependency)
                     pending.append(dependency)
+    return steps, chosen
 
+
+def selected_cross_nodes(
+    selected: frozenset[str], components: frozenset[str], *, all_contract: bool
+) -> list[str]:
+    """Tags of the selected nodes that run ``cross/differential.py``, in graph order.
+
+    Each of them writes a coverage record when it reaches a verdict, so after a passing run a
+    missing record means that node's coverage cannot be confirmed.
+    """
+
+    steps, chosen = selected_graph(selected, components, all_contract=all_contract)
+    return [
+        tag
+        for tag, step in steps.items()
+        if tag in chosen
+        and isinstance(command := step.get("cmd"), str)
+        and "cross/differential.py" in command
+    ]
+
+
+def report_selected_graph(
+    selected: frozenset[str], components: frozenset[str], *, all_contract: bool
+) -> None:
+    """Print the exact flattened nodes and resources selected by the public graph loader.
+
+    CI consumes the ``NEED resource:*`` lines when provisioning optional runtimes. Deriving them
+    from the selected graph prevents a component label from activating (for example) a browser
+    gate while a second, coarser group-name heuristic incorrectly skips browser installation.
+    """
+
+    steps, chosen = selected_graph(selected, components, all_contract=all_contract)
     resources = sorted(
         {
             resource
@@ -987,28 +1075,37 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    all_contract = args.all or selected == ALL_GROUPS
+    # Every selected cross node must leave a record; one that does not cannot be confirmed.
+    expected = selected_cross_nodes(selected, components, all_contract=all_contract)
     with tempfile.TemporaryDirectory(prefix="validate-cross-coverage-") as coverage:
-        code = run(
-            selected,
-            components,
-            all_contract=args.all or selected == ALL_GROUPS,
-            coverage_dir=Path(coverage),
-        )
+        code = run(selected, components, all_contract=all_contract, coverage_dir=Path(coverage))
         if code != 0:
             return code
-        lines, skipped, unreadable = cross_coverage_report(Path(coverage))
-    if skipped or unreadable:
+        coverage_state = cross_coverage_report(Path(coverage), expected)
+    if coverage_state.skipped or coverage_state.unreadable or coverage_state.missing:
         # Every selected node passed, but a cross node that declared itself partial passes with
         # checks that never ran. Say so here, where "OK" would otherwise be the last word.
-        state = "PARTIAL or could not be confirmed" if unreadable else "PARTIAL"
+        unconfirmed = coverage_state.unreadable or coverage_state.missing
+        state = "PARTIAL or could not be confirmed" if unconfirmed else "PARTIAL"
         print(f"\nvalidate: cross-language coverage was {state}:")
-        for line in lines:
+        for line in coverage_state.lines:
             print(line)
-        unread = f"; {unreadable} coverage record(s) could not be read" if unreadable else ""
-        print(
-            f"\nvalidate: PARTIAL - every selected node passed, but {skipped} cross check(s) "
-            f"were skipped and are UNVERIFIED{unread}"
-        )
+        reasons: list[str] = []
+        if coverage_state.skipped:
+            reasons.append(
+                f"{coverage_state.skipped} cross check(s) were skipped and are UNVERIFIED"
+            )
+        if coverage_state.unreadable:
+            reasons.append(f"{coverage_state.unreadable} coverage record(s) could not be read")
+        if coverage_state.missing:
+            reasons.append(
+                f"{len(coverage_state.missing)} selected cross node(s) left no readable "
+                "coverage record"
+            )
+        verdict = f"validate: PARTIAL - every selected node passed, but {'; '.join(reasons)}"
+        announce_partial(verdict, coverage_state.lines, os.environ)
+        print(f"\n{verdict}")
         return 0
     print("\nvalidate: OK")
     return 0

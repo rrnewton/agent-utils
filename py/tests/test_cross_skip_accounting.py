@@ -54,6 +54,19 @@ COVERAGE_DIR_ENV = "AGENT_UTILS_CROSS_COVERAGE_DIR"
 DELEGATION_ENV = ("DAGRUN_DELEGATED_CGROUP", "DAGRUN_DELEGATED_UNBOXED", "DAGRUN_OUTER_RUN")
 
 
+@pytest.fixture(autouse=True)
+def _outside_github_actions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run every case as a local run, even when this suite itself runs under GitHub Actions.
+
+    ``scripts/validate.py`` annotates a PARTIAL run and appends it to the job summary under
+    Actions. Inherited, that would add this suite's fixtures to the real job's summary. The tests
+    that are about the annotation set both variables themselves.
+    """
+
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+
+
 def _differential() -> ModuleType:
     # differential.py imports its sibling modules by bare name, as the harness runs it by path.
     cross = str(REPO_ROOT / "cross")
@@ -1279,7 +1292,15 @@ def test_a_record_that_cannot_be_written_ends_the_run(
 def test_validate_summarises_only_records_that_skipped(tmp_path: Path) -> None:
     validate = _validate()
     (tmp_path / "complete.json").write_text(
-        json.dumps({"tool": "tick-hub", "verdict": "OK", "checks": 9, "skipped": []}),
+        json.dumps(
+            {
+                "tool": "tick-hub",
+                "node": "cross.tick-hub.differential",
+                "verdict": "OK",
+                "checks": 9,
+                "skipped": [],
+            }
+        ),
         encoding="utf-8",
     )
     (tmp_path / "partial.json").write_text(
@@ -1300,10 +1321,14 @@ def test_validate_summarises_only_records_that_skipped(tmp_path: Path) -> None:
     (tmp_path / "truncated.json").write_text('{"tool": ', encoding="utf-8")
     (tmp_path / "wrong-shape.json").write_text("[]", encoding="utf-8")
 
-    lines, skipped, unreadable = validate.cross_coverage_report(tmp_path)
+    lines, skipped, unreadable, missing = validate.cross_coverage_report(
+        tmp_path, ["cross.tick-hub.differential", "cross.dagrun.cpuset-differential"]
+    )
 
     assert skipped == 2
     assert unreadable == 2
+    assert missing == []
+    assert len(lines) == 3
     assert lines[0] == (
         "  cross.dagrun.cpuset-differential (cpuset-alloc, PARTIAL): 53 check(s) ran; 2 skipped "
         "[delegated-live-scope]: run:signal-status, interop:py-then-rs"
@@ -1312,13 +1337,68 @@ def test_validate_summarises_only_records_that_skipped(tmp_path: Path) -> None:
     assert lines[2] == "  malformed cross coverage record wrong-shape.json: []"
 
 
-@pytest.mark.parametrize("skips", [0, 1])
-def test_validate_says_partial_when_a_passing_cross_node_skipped_checks(
+def test_a_selected_cross_node_without_a_record_is_not_full_coverage(tmp_path: Path) -> None:
+    """A node that left no record may have been the PARTIAL one, exactly like a corrupt record.
+
+    A record from a top-level run, or one that names a different node, does not stand in for it.
+    """
+
+    validate = _validate()
+    for name, node in (("ran.json", "cross.tick-hub.differential"), ("top.json", None)):
+        (tmp_path / name).write_text(
+            json.dumps({"tool": "t", "node": node, "verdict": "OK", "checks": 1, "skipped": []}),
+            encoding="utf-8",
+        )
+    expected = [
+        "cross.dagrun.differential",
+        "cross.tick-hub.differential",
+        "cross.planner.differential",
+    ]
+
+    coverage = validate.cross_coverage_report(tmp_path, expected)
+
+    assert (coverage.skipped, coverage.unreadable) == (0, 0)
+    assert coverage.missing == ["cross.dagrun.differential", "cross.planner.differential"]
+    assert coverage.lines == [
+        "  cross.dagrun.differential: no readable coverage record, so its coverage could not be "
+        "confirmed",
+        "  cross.planner.differential: no readable coverage record, so its coverage could not be "
+        "confirmed",
+    ]
+
+    # An empty directory confirms nothing, and no expected node confirms everything.
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert validate.cross_coverage_report(empty, expected).missing == expected
+    assert validate.cross_coverage_report(empty, []) == validate.CrossCoverage([], 0, 0, [])
+
+
+def test_validate_expects_a_record_from_exactly_the_selected_cross_nodes() -> None:
+    validate = _validate()
+    by_tag = dag_from_path(REPO_ROOT / "validation.dag.yaml").by_tag()
+    every_cross_node = [tag for tag, step in by_tag.items() if "cross/differential.py" in step.cmd]
+
+    assert len(every_cross_node) == 7
+    assert validate.selected_cross_nodes(frozenset(), frozenset(), all_contract=True) == (
+        every_cross_node
+    )
+    # A component-narrowed run expects only the cross node that component owns.
+    assert validate.selected_cross_nodes(
+        frozenset(), frozenset({"tick-hub"}), all_contract=False
+    ) == ["cross.tick-hub.differential"]
+
+
+def _validate_with_one_cross_node(
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+    *,
     skips: int,
-) -> None:
-    """The records the differential writes are the ones ``validate.py`` reads."""
+    expected: list[str] | None = None,
+) -> tuple[ModuleType, list[Path]]:
+    """Make ``validate.main`` run a fake graph whose one cross node writes a real record.
+
+    The node is ``cross.dagrun.cpuset-differential`` and it skips ``skips`` checks. ``expected``
+    replaces the selected cross nodes, which otherwise are just that one node.
+    """
 
     differential = _differential()
     validate = _validate()
@@ -1339,7 +1419,21 @@ def test_validate_says_partial_when_a_passing_cross_node_skipped_checks(
         assert differential.coverage_verdict("cpuset-alloc", report, "1 checks", allowed) == 0
         return 0
 
+    nodes = ["cross.dagrun.cpuset-differential"] if expected is None else expected
     monkeypatch.setattr(validate, "run", fake_run)
+    monkeypatch.setattr(validate, "selected_cross_nodes", lambda *_args, **_kw: nodes)
+    return validate, seen
+
+
+@pytest.mark.parametrize("skips", [0, 1])
+def test_validate_says_partial_when_a_passing_cross_node_skipped_checks(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    skips: int,
+) -> None:
+    """The records the differential writes are the ones ``validate.py`` reads."""
+
+    validate, seen = _validate_with_one_cross_node(monkeypatch, skips=skips)
 
     assert validate.main(["--all"]) == 0
     out = capsys.readouterr().out
@@ -1358,6 +1452,98 @@ def test_validate_says_partial_when_a_passing_cross_node_skipped_checks(
     else:
         assert out.rstrip().endswith("validate: OK")
         assert "PARTIAL" not in out
+    assert "::warning" not in out
+
+
+def test_validate_cannot_confirm_a_selected_cross_node_that_left_no_record(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    validate, _seen = _validate_with_one_cross_node(
+        monkeypatch,
+        skips=0,
+        expected=["cross.dagrun.differential", "cross.dagrun.cpuset-differential"],
+    )
+
+    assert validate.main(["--all"]) == 0
+    out = capsys.readouterr().out
+
+    assert "validate: cross-language coverage was PARTIAL or could not be confirmed:" in out
+    assert (
+        "  cross.dagrun.differential: no readable coverage record, so its coverage could not be "
+        "confirmed"
+    ) in out
+    assert out.rstrip().endswith(
+        "validate: PARTIAL - every selected node passed, but 1 selected cross node(s) left no "
+        "readable coverage record"
+    )
+    assert "validate: OK" not in out
+
+
+def test_a_partial_run_under_github_actions_is_annotated_and_summarised(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """A PARTIAL run exits 0, which a hosted job shows as a green tick; it must not read as OK."""
+
+    validate, _seen = _validate_with_one_cross_node(monkeypatch, skips=1)
+    summary = tmp_path / "step-summary.md"
+    summary.write_text("earlier step\n", encoding="utf-8")
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+
+    assert validate.main(["--all"]) == 0
+    out = capsys.readouterr().out
+
+    verdict = (
+        "validate: PARTIAL - every selected node passed, but 1 cross check(s) were skipped and "
+        "are UNVERIFIED"
+    )
+    node = (
+        "  cross.dagrun.cpuset-differential (cpuset-alloc, PARTIAL): 1 check(s) ran; 1 skipped "
+        "[delegated-live-scope]: run:signal-status"
+    )
+    assert f"\n::warning title=validate PARTIAL::{verdict}%0A{node}\n" in out
+    assert out.rstrip().endswith(verdict)
+    assert summary.read_text(encoding="utf-8") == (
+        f"earlier step\n### validate: PARTIAL\n\n{verdict}\n\n```text\n{node}\n```\n"
+    )
+
+
+def test_a_complete_run_under_github_actions_is_not_annotated(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    validate, _seen = _validate_with_one_cross_node(monkeypatch, skips=0)
+    summary = tmp_path / "step-summary.md"
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+
+    assert validate.main(["--all"]) == 0
+    out = capsys.readouterr().out
+
+    assert out.rstrip().endswith("validate: OK")
+    assert "::warning" not in out
+    assert not summary.exists()
+
+
+def test_a_workflow_annotation_escapes_its_message() -> None:
+    validate = _validate()
+
+    assert validate._workflow_command_data("100% done\r\nnext") == "100%25 done%0D%0Anext"
+
+
+def test_an_unwritable_job_summary_does_not_change_the_verdict(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    validate, _seen = _validate_with_one_cross_node(monkeypatch, skips=1)
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "missing" / "summary.md"))
+
+    assert validate.main(["--all"]) == 0
+    captured = capsys.readouterr()
+
+    assert "validate: cannot append the PARTIAL verdict to GITHUB_STEP_SUMMARY:" in captured.err
+    assert captured.out.rstrip().endswith(
+        "validate: PARTIAL - every selected node passed, but 1 cross check(s) were skipped and "
+        "are UNVERIFIED"
+    )
 
 
 def test_validate_prints_no_summary_after_a_failed_graph(
@@ -1365,6 +1551,9 @@ def test_validate_prints_no_summary_after_a_failed_graph(
 ) -> None:
     validate = _validate()
     monkeypatch.setattr(validate, "run", lambda *_args, **_kw: 3)
+    monkeypatch.setattr(
+        validate, "selected_cross_nodes", lambda *_args, **_kw: ["cross.dagrun.differential"]
+    )
 
     assert validate.main(["--all"]) == 3
     out = capsys.readouterr().out

@@ -132,7 +132,9 @@ jobs:
           BOX_FLAGS: --allow-cgroup-failure
           # The same degradation makes this lane PARTIAL for cross/differential.py's boxing
           # checks. They are listed as SKIPPED/UNVERIFIED, never counted as passes, and the run
-          # ends with PARTIAL rather than OK. Boxing coverage comes from local boxed validation.
+          # ends with PARTIAL rather than OK. The step still passes, so validate.py also emits a
+          # warning annotation and a job-summary entry for PARTIAL. Boxing coverage comes from
+          # local boxed validation.
           # Hosted runners also have fewer than eight CPUs, so the CPA planner's memory-cap check
           # (which needs a core budget of eight) is skipped as eight-cpu and is covered locally.
           AGENT_UTILS_CROSS_ALLOW_SKIP: boxing,eight-cpu
