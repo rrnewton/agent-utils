@@ -15,7 +15,7 @@ These tests pin the replacement contract without running the minutes-long harnes
 * a boxed leg that cannot be boxed is a skip, and one whose engines never announced an
   established box is a failure, never agreement;
 * the cpuset-alloc delegated, HARD-refusal and one-CPU branches list exactly the checks they did
-  not run;
+  not run, and a selftest that reports UNTESTABLE is a skip, never a counted mutation verdict;
 * the CPA planner's one-core and four-core budgets list the checks they could not run, and an
   eight-core budget runs them all;
 * ``--tool all`` ends with one line that is PARTIAL or FAILED whenever any tool was;
@@ -528,14 +528,36 @@ _CPUSET_LIVE_LABELS = [
 ]
 
 
-def _cpuset_engine(differential: ModuleType, *, hard_refusal: bool) -> object:
+_SELFTEST_NO_SPARE_CORE = {"verdict": "UNTESTABLE", "reason": "no core outside the reserved set"}
+_SELFTEST_NO_SCOPE = {"verdict": "UNTESTABLE", "reason": "systemd-run --user --scope unavailable"}
+
+
+def _cpuset_engine(
+    differential: ModuleType,
+    *,
+    hard_refusal: bool,
+    selftest: tuple[int, dict[str, str]] | None = None,
+) -> object:
     """Fake both cpuset-alloc engines identically, optionally refusing every HARD pin.
+
+    ``selftest`` prints the verdicts the real engines print. By default a host that refuses HARD
+    pins reports SOFT_OR_INERT, a one-CPU host has no core to escape to and reports UNTESTABLE,
+    and any other host reports HARD; ``selftest`` overrides that with an exit status and a verdict.
 
     The ledger cases read the real files the comparison writes; a FIFO is recognised by ``stat``
     and never opened, so the non-blocking refusal case cannot hang the test.
     """
 
     outcome = differential.Outcome
+
+    def selftest_verdict() -> tuple[int, dict[str, str]]:
+        if selftest is not None:
+            return selftest
+        if hard_refusal:
+            return 1, {"verdict": "SOFT_OR_INERT"}
+        if len(os.sched_getaffinity(0)) < 2:
+            return 3, _SELFTEST_NO_SPARE_CORE
+        return 0, {"verdict": "HARD"}
 
     def ledger(subcommand: str, path: str) -> object:
         if not os.path.lexists(path):
@@ -567,8 +589,8 @@ def _cpuset_engine(differential: ModuleType, *, hard_refusal: bool) -> object:
                 return outcome(2, "", "unrecognized arguments: --tag")
             if "--max-irq-rate" in args:
                 return outcome(2, "", _CPUSET_SAMPLE_REFUSAL)
-            verdict = "hard-unavailable" if hard_refusal else "mutation-detected"
-            return outcome(3 if hard_refusal else 0, json.dumps({"verdict": verdict}), "")
+            returncode, verdict = selftest_verdict()
+            return outcome(returncode, json.dumps(verdict), "")
         if args[0] == "run":
             if "--" not in args:
                 return outcome(2, "", "a command after -- is required")
@@ -622,6 +644,7 @@ def _cpuset_alloc_run(
     cpus: int,
     environment: dict[str, str],
     allowed: frozenset[str],
+    selftest: tuple[int, dict[str, str]] | None = None,
 ) -> tuple[int, str, int | None, list[tuple[str, str]]]:
     """Run the real ``compare_cpuset_alloc`` against fake engines.
 
@@ -632,7 +655,11 @@ def _cpuset_alloc_run(
     _set_delegation(monkeypatch, environment)
     monkeypatch.setattr(differential, "py_command_for", lambda _tool: ["python-engine"])
     monkeypatch.setattr(differential, "rs_command", lambda _tool: ["rust-engine"])
-    monkeypatch.setattr(differential, "run", _cpuset_engine(differential, hard_refusal=hard_refusal))
+    monkeypatch.setattr(
+        differential,
+        "run",
+        _cpuset_engine(differential, hard_refusal=hard_refusal, selftest=selftest),
+    )
     monkeypatch.setattr(
         differential,
         "subprocess",
@@ -728,10 +755,14 @@ def test_a_refused_hard_cpuset_pin_skips_the_four_pinned_checks(
     ) in out
 
 
-def test_one_cpu_cpuset_alloc_skips_only_the_two_interop_pairs(
+def test_one_cpu_cpuset_alloc_skips_the_selftest_and_the_two_interop_pairs(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Two disjoint reservations need two CPUs; every other live case still runs on one."""
+    """The mutation probe and two disjoint reservations need two CPUs; the rest runs on one.
+
+    On one CPU both engines' selftest reports UNTESTABLE because no core is left to escape to.
+    That agreement is one parity check, and the mutation verdict itself is a multi-cpu skip.
+    """
 
     differential = _differential()
     status, verdict, checks, skipped = _cpuset_alloc_run(
@@ -747,16 +778,190 @@ def test_one_cpu_cpuset_alloc_skips_only_the_two_interop_pairs(
     assert status == 0
     assert "DIVERGENCE" not in out
     assert verdict == "PARTIAL"
-    # The common checks, the selftest verdict, the wrapped --help and the signal status.
+    # The common checks, the agreed UNTESTABLE refusal, the wrapped --help and the signal status.
     assert checks == _CPUSET_COMMON_CHECKS + 3
     assert skipped == [
+        ("selftest:mutation-verdict", "multi-cpu"),
         ("interop:py-then-rs", "multi-cpu"),
         ("interop:rs-then-py", "multi-cpu"),
     ]
     assert (
         "cross[cpuset-alloc]: PARTIAL - 56 behavioral and ledger-schema checks agree; "
-        "2 check(s) were skipped and are UNVERIFIED (allowed skip kinds: multi-cpu)"
+        "3 check(s) were skipped and are UNVERIFIED (allowed skip kinds: multi-cpu)"
     ) in out
+
+
+def test_a_host_without_a_user_scope_skips_the_selftest_as_boxing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without ``systemd-run --user --scope`` the mutation probe never runs and no pin is HARD.
+
+    Both engines' selftest reports UNTESTABLE for that reason, so the mutation verdict is a boxing
+    skip beside the four hard-cpuset skips, and a full-coverage run ends INCOMPLETE naming it.
+    """
+
+    differential = _differential()
+    status, verdict, checks, skipped = _cpuset_alloc_run(
+        differential,
+        monkeypatch,
+        hard_refusal=True,
+        cpus=4,
+        environment={},
+        allowed=frozenset(),
+        selftest=(3, _SELFTEST_NO_SCOPE),
+    )
+    out = capsys.readouterr().out
+
+    assert status == 1
+    assert "DIVERGENCE" not in out
+    assert verdict == "INCOMPLETE"
+    # The common checks, the agreed UNTESTABLE refusal, and one identical-refusal check for each
+    # of the two interop pairs, the wrapped --help and the signal status.
+    assert checks == _CPUSET_COMMON_CHECKS + 5
+    assert skipped == [
+        ("selftest:mutation-verdict", "boxing"),
+        ("interop:py-then-rs", "hard-cpuset"),
+        ("interop:rs-then-py", "hard-cpuset"),
+        ("run:wrapped-help-passthrough", "hard-cpuset"),
+        ("run:signal-status", "hard-cpuset"),
+    ]
+    assert (
+        "cross[cpuset-alloc]: INCOMPLETE - 58 behavioral and ledger-schema checks agree, but 5 "
+        "required check(s) did not run: selftest:mutation-verdict, interop:py-then-rs, "
+        "interop:rs-then-py, run:wrapped-help-passthrough, run:signal-status."
+    ) in out
+
+
+def _selftest_outcome(differential: ModuleType, returncode: int, result: object) -> object:
+    """One engine's ``selftest`` outcome: its exit status and the JSON it printed, if any."""
+
+    stdout = "" if result is None else json.dumps(result, indent=2)
+    return differential.Outcome(returncode, stdout, "")
+
+
+@pytest.mark.parametrize(
+    ("result", "kind"),
+    [
+        pytest.param(_SELFTEST_NO_SCOPE, "boxing", id="no-user-scope"),
+        pytest.param(_SELFTEST_NO_SPARE_CORE, "multi-cpu", id="no-spare-core"),
+    ],
+)
+def test_an_agreed_untestable_selftest_is_a_skip_not_a_check(
+    capsys: pytest.CaptureFixture[str], result: dict[str, str], kind: str
+) -> None:
+    """UNTESTABLE means the mutation probe never ran: parity of the refusal, and a skip."""
+
+    differential = _differential()
+    report = differential.Report()
+    engine = _selftest_outcome(differential, 3, result)
+
+    differential._record_selftest_verdict(report, engine, engine)
+
+    assert report.failures == []
+    assert report.checks == 1
+    assert [(skip.label, skip.kind) for skip in report.skipped] == [
+        ("selftest:mutation-verdict", kind)
+    ]
+    assert report.skipped[0].reason == f"both engines reported UNTESTABLE: {result['reason']}"
+
+    status = differential.coverage_verdict("cpuset-alloc", report, "1 checks agree", frozenset())
+    out = capsys.readouterr().out
+    assert status == 1
+    assert (
+        "cross[cpuset-alloc]: INCOMPLETE - 1 checks agree, but 1 required check(s) did not run: "
+        "selftest:mutation-verdict."
+    ) in out
+
+    allowed = frozenset({kind})
+    assert differential.coverage_verdict("cpuset-alloc", report, "1 checks agree", allowed) == 0
+    assert "cross[cpuset-alloc]: PARTIAL - 1 checks agree;" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("returncode", "verdict"), [pytest.param(0, "HARD"), pytest.param(1, "SOFT_OR_INERT")]
+)
+def test_an_agreed_probe_verdict_is_a_check(returncode: int, verdict: str) -> None:
+    """HARD and SOFT_OR_INERT come from a probe that ran; agreement on either is a check."""
+
+    differential = _differential()
+    report = differential.Report()
+    engine = _selftest_outcome(differential, returncode, {"verdict": verdict})
+
+    differential._record_selftest_verdict(report, engine, engine)
+
+    assert (report.checks, report.failures, report.skipped) == (1, [], [])
+
+
+@pytest.mark.parametrize(
+    ("py", "rs", "message"),
+    [
+        pytest.param(
+            (3, {"verdict": "ERROR", "reason": "scope probe produced no result"}),
+            (3, {"verdict": "ERROR", "reason": "scope probe produced no result"}),
+            "both engines reported ERROR",
+            id="agreed-error",
+        ),
+        pytest.param(
+            (3, {"verdict": "ERROR", "reason": "scope probe timed out"}),
+            (3, {"verdict": "ERROR", "reason": "scope probe produced no result"}),
+            "both engines reported ERROR",
+            id="agreed-error-different-reasons",
+        ),
+        pytest.param(
+            (3, _SELFTEST_NO_SCOPE),
+            (3, _SELFTEST_NO_SPARE_CORE),
+            "UNTESTABLE with a differing or unrecognised reason",
+            id="untestable-reasons-differ",
+        ),
+        pytest.param(
+            (3, {"verdict": "UNTESTABLE", "reason": "cosmic rays"}),
+            (3, {"verdict": "UNTESTABLE", "reason": "cosmic rays"}),
+            "UNTESTABLE with a differing or unrecognised reason",
+            id="untestable-reason-unrecognised",
+        ),
+        pytest.param(
+            (3, {"verdict": "UNTESTABLE"}),
+            (3, {"verdict": "UNTESTABLE"}),
+            "UNTESTABLE with a differing or unrecognised reason",
+            id="untestable-without-reason",
+        ),
+        pytest.param(
+            (0, {"verdict": "HARD"}),
+            (1, {"verdict": "SOFT_OR_INERT"}),
+            "py=0",
+            id="verdicts-differ",
+        ),
+        pytest.param(
+            (3, {"verdict": "HARD"}), (3, {"verdict": "HARD"}), "py=3", id="hard-with-exit-3"
+        ),
+        pytest.param(
+            (0, _SELFTEST_NO_SPARE_CORE),
+            (0, _SELFTEST_NO_SPARE_CORE),
+            "py=0",
+            id="untestable-with-exit-0",
+        ),
+        pytest.param((3, None), (3, None), "py=3", id="reservation-failed-before-the-probe"),
+        pytest.param(
+            (0, {"verdict": "MAYBE"}), (0, {"verdict": "MAYBE"}), "py=0", id="unknown-verdict"
+        ),
+    ],
+)
+def test_a_selftest_without_an_agreed_result_is_a_failure(
+    py: tuple[int, object], rs: tuple[int, object], message: str
+) -> None:
+    """An ERROR, a mismatched exit status, or an UNTESTABLE the harness cannot classify fails."""
+
+    differential = _differential()
+    report = differential.Report()
+
+    differential._record_selftest_verdict(
+        report, _selftest_outcome(differential, *py), _selftest_outcome(differential, *rs)
+    )
+
+    assert report.skipped == []
+    assert report.checks == 1
+    assert len(report.failures) == 1
+    assert report.failures[0].startswith(f"selftest:mutation-verdict: {message}")
 
 
 # ------------------------------------------------------------------ CPA planner core budgets

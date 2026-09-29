@@ -8425,6 +8425,65 @@ def _parsed_json(text_value: str) -> tuple[bool, object]:
     return True, value
 
 
+#: The verdicts ``cpuset-alloc selftest`` prints, each with the exit status it must carry.
+_SELFTEST_EXIT_BY_VERDICT: dict[str, int] = {
+    "HARD": 0,
+    "SOFT_OR_INERT": 1,
+    "UNTESTABLE": 3,
+    "ERROR": 3,
+}
+
+#: The reasons ``selftest`` gives for UNTESTABLE, and the skip kind each one stands for. In both
+#: cases the mutation probe never ran.
+_SELFTEST_UNTESTABLE_KINDS: dict[str, str] = {
+    "systemd-run --user --scope unavailable": "boxing",
+    "no core outside the reserved set": "multi-cpu",
+}
+
+
+def _record_selftest_verdict(rep: Report, po: Outcome, ro: Outcome) -> None:
+    """Record ``selftest:mutation-verdict`` from both engines' ``selftest`` outcomes.
+
+    HARD and SOFT_OR_INERT come from a probe that ran, so agreement on either is a check. An agreed
+    UNTESTABLE is parity of the refusal, recorded under its own label; the mutation check itself
+    did not run and is a skip of the kind its reason names. An agreed ERROR means the probe
+    produced no result, which is a failure. So is a missing verdict (a reservation that failed
+    before the probe prints none), a verdict that does not carry its documented exit status, and
+    an UNTESTABLE whose reason differs between the engines or is not recognised.
+    """
+
+    label = "selftest:mutation-verdict"
+    po_parsed, po_value = _parsed_json(po.stdout)
+    ro_parsed, ro_value = _parsed_json(ro.stdout)
+    py_result: dict[object, object] = (
+        po_value if po_parsed and isinstance(po_value, dict) else {}
+    )
+    rs_result: dict[object, object] = (
+        ro_value if ro_parsed and isinstance(ro_value, dict) else {}
+    )
+    verdict = py_result.get("verdict")
+    detail = f"py={po.returncode}:{po_value!r}; rs={ro.returncode}:{ro_value!r}"
+    if (
+        po.returncode != ro.returncode
+        or verdict != rs_result.get("verdict")
+        or not isinstance(verdict, str)
+        or _SELFTEST_EXIT_BY_VERDICT.get(verdict) != po.returncode
+    ):
+        rep.bad(label, detail)
+    elif verdict in ("HARD", "SOFT_OR_INERT"):
+        rep.ok(label)
+    elif verdict == "ERROR":
+        rep.bad(label, f"both engines reported ERROR: the mutation probe gave no result; {detail}")
+    else:
+        reason = py_result.get("reason")
+        kind = _SELFTEST_UNTESTABLE_KINDS.get(reason) if isinstance(reason, str) else None
+        if kind is None or reason != rs_result.get("reason"):
+            rep.bad(label, f"UNTESTABLE with a differing or unrecognised reason; {detail}")
+        else:
+            rep.ok(f"{label}-untestable")
+            rep.skip(label, kind, f"both engines reported UNTESTABLE: {reason}")
+
+
 def _transient_user_bus_refusal(*outcomes: Outcome) -> bool:
     """Return whether a child failed before launch on the systemd user-bus transport.
 
@@ -8537,25 +8596,7 @@ def compare_cpuset_alloc(*, allowed_skips: frozenset[str] = frozenset()) -> int:
 
     if live_scope_allowed:
         selftest_args = ("selftest", "--cores", "1", "--sample-s", "0")
-        py_selftest = run(py, selftest_args)
-        rs_selftest = run(rs, selftest_args)
-        py_ok, py_value = _parsed_json(py_selftest.stdout)
-        rs_ok, rs_value = _parsed_json(rs_selftest.stdout)
-        py_verdict = py_value.get("verdict") if py_ok and isinstance(py_value, dict) else None
-        rs_verdict = rs_value.get("verdict") if rs_ok and isinstance(rs_value, dict) else None
-        if (
-            py_selftest.returncode == rs_selftest.returncode
-            and py_selftest.returncode in (0, 1, 3)
-            and py_verdict == rs_verdict
-            and isinstance(py_verdict, str)
-        ):
-            rep.ok("selftest:mutation-verdict")
-        else:
-            rep.bad(
-                "selftest:mutation-verdict",
-                f"py={py_selftest.returncode}:{py_value!r}; "
-                f"rs={rs_selftest.returncode}:{rs_value!r}",
-            )
+        _record_selftest_verdict(rep, run(py, selftest_args), run(rs, selftest_args))
 
     with tempfile.TemporaryDirectory(prefix="cpuset-cross-") as tmp:
         py_ledger = os.path.join(tmp, "py.json")

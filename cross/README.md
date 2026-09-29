@@ -68,6 +68,15 @@ host, the differential additionally verifies successful reserve/apply/release
 behavior. On a host that refuses, the identical refusal counts as a pass and the
 reserve/apply/release check is listed as skipped (`hard-cpuset`).
 
+The `selftest` mutation verdict counts only when the probe ran, that is when
+both editions report `HARD` or both report `SOFT_OR_INERT`. When both report
+`UNTESTABLE`, the identical refusal counts as a pass and
+`selftest:mutation-verdict` is listed as skipped: `boxing` when
+`systemd-run --user --scope` is unavailable, `multi-cpu` when no core is left
+outside the reservation to escape to. An agreed `ERROR`, an `UNTESTABLE` whose
+reason differs or is not one of those two, and a verdict whose exit status does
+not match it are failures.
+
 ## Skipped checks and partial runs
 
 Some checks cannot run everywhere. A skipped check is its own result: it is
