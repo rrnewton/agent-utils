@@ -309,7 +309,8 @@ fn delegated_nested_run_keeps_descendants_in_the_outer_owned_subtree() {
     );
     if output.status.code() == Some(3)
         && (text.contains("cgroup boxing could not be established")
-            || text.contains("cgroup setup failed"))
+            || text.contains("cgroup setup failed")
+            || text.contains("cgroup boxing was NOT ESTABLISHED"))
     {
         eprintln!("SKIP delegated nested cgroup smoke: {text}");
         let _ = std::fs::remove_dir_all(&dir);
