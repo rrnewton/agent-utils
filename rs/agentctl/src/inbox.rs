@@ -574,6 +574,40 @@ impl Inbox {
         Ok(entries)
     }
 
+    /// Record files in a directory, in name order, without parsing them.
+    fn record_paths(&self, directory: &str) -> Result<Vec<PathBuf>> {
+        let path = self.root.join(directory);
+        let mut paths = Vec::new();
+        for entry in fs::read_dir(&path)
+            .map_err(|error| InboxError::io(&format!("cannot list {}", path.display()), &error))?
+        {
+            let entry = entry.map_err(|error| {
+                InboxError::io(&format!("cannot list {}", path.display()), &error)
+            })?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with('.') && name.ends_with(".json") {
+                paths.push(entry.path());
+            }
+        }
+        paths.sort();
+        Ok(paths)
+    }
+
+    /// Delivered records that parse as `T`. Delivered records are history: an unreadable one is
+    /// skipped so that it cannot stop new posts or deliveries.
+    fn delivered_records<T: for<'de> Deserialize<'de>>(&self) -> Result<Vec<T>> {
+        Ok(self
+            .record_paths("delivered")?
+            .into_iter()
+            .filter_map(|path| {
+                fs::read(path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            })
+            .collect())
+    }
+
     /// Write a record by rename, then sync the directory so the rename itself is durable.
     fn write_json(&self, directory: &str, name: &str, value: &impl Serialize) -> Result<PathBuf> {
         let bytes = serde_json::to_vec_pretty(value).map_err(|error| InboxError {
@@ -753,15 +787,17 @@ impl Inbox {
 
     /// Id of the notice that already carries `key` in a claimed or kept delivered batch.
     fn batched_key(&self, key: &str) -> Result<Option<String>> {
-        for directory in ["claimed", "delivered"] {
-            for (_, batch) in self.read_dir_json::<Batch>(directory)? {
-                if let Some(notice) = batch
-                    .notices
-                    .iter()
-                    .find(|notice| notice.key.as_deref() == Some(key))
-                {
-                    return Ok(Some(notice.id.clone()));
-                }
+        let claimed = self
+            .read_dir_json::<Batch>("claimed")?
+            .into_iter()
+            .map(|(_, batch)| batch);
+        for batch in claimed.chain(self.delivered_records::<Batch>()?) {
+            if let Some(notice) = batch
+                .notices
+                .iter()
+                .find(|notice| notice.key.as_deref() == Some(key))
+            {
+                return Ok(Some(notice.id.clone()));
             }
         }
         Ok(None)
@@ -782,20 +818,8 @@ impl Inbox {
         for (_, batch) in self.read_dir_json::<Held>("claimed")? {
             batched.extend(batch.notices.into_iter().map(|notice| notice.id));
         }
-        // A delivered record is history: an unreadable one must not stop new deliveries.
-        let delivered = self.root.join("delivered");
-        for entry in fs::read_dir(&delivered)
-            .map_err(|error| {
-                InboxError::io(&format!("cannot list {}", delivered.display()), &error)
-            })?
-            .flatten()
-        {
-            if let Some(batch) = fs::read(entry.path())
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<Held>(&bytes).ok())
-            {
-                batched.extend(batch.notices.into_iter().map(|notice| notice.id));
-            }
+        for batch in self.delivered_records::<Held>()? {
+            batched.extend(batch.notices.into_iter().map(|notice| notice.id));
         }
         for (path, notice) in self.read_dir_json::<Notice>("live")? {
             if batched.contains(&notice.id) {
@@ -951,9 +975,9 @@ impl Inbox {
     }
 
     fn prune_delivered(&self) -> Result<()> {
-        let delivered = self.read_dir_json::<serde_json::Value>("delivered")?;
+        let delivered = self.record_paths("delivered")?;
         let excess = delivered.len().saturating_sub(DELIVERED_KEEP);
-        for (path, _) in delivered.into_iter().take(excess) {
+        for path in delivered.into_iter().take(excess) {
             Self::remove(&path, "prune")?;
         }
         Ok(())
@@ -1278,9 +1302,11 @@ fn notify_agentcloud(
             }
         }
     };
-    let detail = fs::read(&stderr_path)
-        .map(|bytes| String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]).into_owned())
-        .unwrap_or_default();
+    let mut detail = Vec::new();
+    if let Ok(file) = fs::File::open(&stderr_path) {
+        let _ = io::Read::read_to_end(&mut io::Read::take(file, 4096), &mut detail);
+    }
+    let detail = String::from_utf8_lossy(&detail);
     let _ = fs::remove_file(&stderr_path);
     match status {
         Some(status) if status.success() => Ok(()),
@@ -1693,6 +1719,23 @@ mod tests {
             (NoticeKind::Progress, 2),
             "the requeued idle raises the newer progress notice to its priority"
         );
+        inbox
+            .deliver(5, 10_000, DEFAULT_STALE_SECONDS, &NOTIFY, |_| {
+                Err(InboxError::busy("adapter down"))
+            })
+            .unwrap_err();
+        let id = inbox.read_dir_json::<Batch>("claimed").unwrap()[0]
+            .1
+            .id
+            .clone();
+        post(&inbox, "a", NoticeKind::Blocked, "needs approval", 5);
+        assert_eq!(inbox.release(&id, true).unwrap().merged, 1);
+        let live = inbox.live(5, DEFAULT_STALE_SECONDS).unwrap();
+        assert_eq!(
+            (live.len(), live[0].kind, live[0].priority),
+            (1, NoticeKind::Blocked, 1),
+            "a requeued priority-2 notice never lowers the newer priority-1 notice"
+        );
         assert_eq!(
             inbox
                 .deliver(5, 10_000, DEFAULT_STALE_SECONDS, &PRINT, |_| Ok(()))
@@ -1812,6 +1855,30 @@ mod tests {
             "the leftover live copy must not become a second batch"
         );
         assert_eq!(sent.into_inner(), [id]);
+    }
+
+    #[test]
+    fn an_unreadable_delivered_record_does_not_block_posts_or_deliveries() {
+        let registry = scratch();
+        let inbox = Inbox::open(&registry, "coord").unwrap();
+        fs::write(
+            inbox.root.join("delivered/0000000000001-bad.json"),
+            b"{not json",
+        )
+        .unwrap();
+        let keyed = PostRequest {
+            key: Some("k"),
+            ..request("a", NoticeKind::Message, "m")
+        };
+        assert_eq!(inbox.post(&keyed, 1).unwrap().outcome, "stored");
+        assert_eq!(
+            inbox
+                .deliver(2, 10_000, DEFAULT_STALE_SECONDS, &PRINT, |_| Ok(()))
+                .unwrap(),
+            1,
+            "a successful delivery must report success despite the unreadable record"
+        );
+        assert_eq!(inbox.post(&keyed, 3).unwrap().outcome, "duplicate");
     }
 
     #[test]

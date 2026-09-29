@@ -26,7 +26,7 @@ Everything lives under `<registry>/.inbox/<coordinator>/` (the registry is the g
 |---|---|
 | `live/<created-ms>-<id>.json` | one queued notice |
 | `claimed/<claim-ms>-<batch>.json` | a batch handed to an adapter whose outcome is unknown |
-| `delivered/<claim-ms>-<batch>.json` | delivered batches; the newest 200 are kept |
+| `delivered/<claim-ms>-<batch>.json` | delivered batches; the newest 200 are kept, and an unreadable one is skipped rather than blocking posts or deliveries |
 | `released/<claim-ms>-<batch>.json` | claimed batches given up with `release` |
 | `.lock` | held for every change to the queue |
 | `.deliver.lock` | held for a whole delivery; a second concurrent delivery exits 75 |
@@ -118,9 +118,10 @@ Adapters (`--via`):
 `--requeue` the batch moves to `released/` and its notices are not delivered. With `--requeue`
 its notices return to the queue, even beyond `--max-live`. A requeued state notice is folded
 into its worker's newer live state notice, which takes the higher of the two priorities. A
-requeued batch sent to the same session reuses the old key, so agentcloud delivers it at most
-once; sent to another adapter or session it gets a new batch id and key, so it may reach the
-coordinator twice if the failed attempt actually landed.
+requeued batch reuses the old key only when the next batch goes to the same session and carries
+exactly the same notices; then agentcloud delivers it at most once. Otherwise (another adapter
+or session, a notice posted meanwhile, or a merged state notice) it goes out under a new key and
+may reach the coordinator twice if the failed attempt actually landed.
 
 ## Exit codes
 
