@@ -27,6 +27,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping, Sequence, Set as AbstractSet
 from dataclasses import replace
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 
@@ -21579,35 +21580,35 @@ def _prepare_removable_agent_slot(project: Path) -> None:
     set_liveness(project, "dead")
 
 
-def test_agent_removal_deletes_provably_disposable_nested_clone_and_records_it(
-    tmp_path: Path,
-) -> None:
-    project, repository, remote = make_project(
-        tmp_path, cache_globs=("node_modules", "target")
+def _bare_upstream(tmp_path: Path, name: str, files: Mapping[str, str]) -> Path:
+    """A bare repository outside every slot whose main branch commits ``files``."""
+
+    bare = tmp_path / f"{name}.git"
+    source = tmp_path / f"{name}-source"
+    subprocess.run(
+        ["git", "init", "--bare", "--initial-branch=main", str(bare)],
+        check=True,
+        capture_output=True,
+        text=True,
     )
-    assert create(project).returncode == 0
-    tree = checkout(project)
-    commit_task(repository, tree, "codex/task")
-    clone = tree / "target" / "deps" / "clean"
-    head = _nested_clone(remote, clone)
-    # Ignored build output is not work; only untracked non-ignored files are.
-    (clone / ".git" / "info" / "exclude").write_text("build/\n", encoding="utf-8")
-    (clone / "build").mkdir()
-    (clone / "build" / "out.o").write_text("object\n", encoding="utf-8")
-    (tree / "node_modules").mkdir()
-    (tree / "node_modules" / "sentinel").write_text("cache\n", encoding="utf-8")
-    _prepare_removable_agent_slot(project)
+    subprocess.run(
+        ["git", "clone", str(bare), str(source)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git(source, "config", "user.name", "Wrkslots Test")
+    git(source, "config", "user.email", "wrkslots@example.invalid")
+    for relative, content in files.items():
+        (source / relative).parent.mkdir(parents=True, exist_ok=True)
+        (source / relative).write_text(content, encoding="utf-8")
+        git(source, "add", relative)
+    git(source, "commit", "-m", f"{name} upstream")
+    git(source, "push", "origin", "main")
+    return bare
 
-    removed = remove(project)
 
-    assert removed.returncode == 0, removed.stderr
-    dotgit = tree / "target" / "deps" / "clean" / ".git"
-    assert (
-        f"removed disposable nested Git repository {dotgit} head={head} "
-        "contained-by=refs/remotes/origin/main"
-    ) in removed.stdout.splitlines()
-    assert not tree.exists()
-    assert active_slots(project) == []
+def _slot_removed_evidence(project: Path) -> list[object]:
     config = wrkslots._load_config(str(project), "testhost")
     removal_events = [
         wrkslots._as_mapping(item["payload"], "test slot-removed payload")
@@ -21620,12 +21621,53 @@ def test_agent_removal_deletes_provably_disposable_nested_clone_and_records_it(
     evidence = wrkslots._as_mapping(
         removal_events[0]["evidence"], "test slot-removed evidence"
     )
-    assert evidence["disposable_nested_repositories"] == [
+    return wrkslots._as_list(
+        evidence["disposable_nested_repositories"], "test nested evidence"
+    )
+
+
+def _finish_journal(project: Path) -> Path:
+    return project / "worktrees" / "ACTIVE.testhost.journal"
+
+
+def test_agent_removal_deletes_provably_disposable_nested_clone_and_records_it(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path, cache_globs=("node_modules", "target")
+    )
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    commit_task(repository, tree, "codex/task")
+    # Ignored build output is not work when a committed rule ignores it.
+    upstream = _bare_upstream(tmp_path, "dependency", {".gitignore": "build/\n"})
+    clone = tree / "target" / "deps" / "clean"
+    head = _nested_clone(upstream, clone)
+    (clone / "build").mkdir()
+    (clone / "build" / "out.o").write_text("object\n", encoding="utf-8")
+    (tree / "node_modules").mkdir()
+    (tree / "node_modules" / "sentinel").write_text("cache\n", encoding="utf-8")
+    _prepare_removable_agent_slot(project)
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stderr
+    dotgit = tree / "target" / "deps" / "clean" / ".git"
+    assert (
+        f"removed disposable nested Git repository {dotgit} head={head} "
+        "contained-by=refs/remotes/origin/main ignored-entries=1"
+    ) in removed.stdout.splitlines()
+    assert not tree.exists()
+    assert active_slots(project) == []
+    assert not _finish_journal(project).exists()
+    assert _slot_removed_evidence(project) == [
         {
             "checkout": "product",
             "path": str(dotgit),
             "head": head,
             "remote_ref": "refs/remotes/origin/main",
+            "ignored_entries": 1,
+            "ignored_sample": ["build/"],
         }
     ]
 
@@ -21641,6 +21683,21 @@ def test_agent_removal_deletes_provably_disposable_nested_clone_and_records_it(
         "git-file",
         "sibling-origin",
         "malformed",
+        "reflog-only-commit",
+        "tag-only-commit",
+        "non-head-branch",
+        "dropped-stash",
+        "unmapped-remote-ref",
+        "remote-name-with-slash",
+        "url-insteadof",
+        "graft",
+        "replace-ref",
+        "alternates",
+        "gitlink",
+        "skip-worktree",
+        "info-exclude",
+        "self-ignored-gitignore",
+        "unresolvable-remote",
     ),
 )
 def test_agent_removal_refuses_nested_repository_not_provably_disposable(
@@ -21655,17 +21712,21 @@ def test_agent_removal_refuses_nested_repository_not_provably_disposable(
     deps = tree / "target" / "deps"
     clone = deps / "clean"
     dotgit = clone / ".git"
+    only_here = "1 commit(s) exist only in this repository"
+    # Any one of these conditions satisfies the case; only the unreferenced
+    # dropped stash has two equally first commits.
+    conditions: tuple[str, ...]
     if case == "git-file":
         clone.mkdir(parents=True)
         dotgit.write_text("gitdir: /nonexistent/worktrees/clean\n", encoding="utf-8")
-        condition = (
+        conditions = (
             ".git is a file, not a repository directory "
-            "(a linked worktree or submodule pointer)"
+            "(a linked worktree or submodule pointer)",
         )
     elif case == "malformed":
         dotgit.mkdir(parents=True)
         (dotgit / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
-        condition = "not a well-formed Git repository: fatal: not a git repository"
+        conditions = ("not a well-formed Git repository: fatal: not a git repository",)
     elif case == "sibling-origin":
         upstream = deps / "upstream"
         upstream.mkdir(parents=True)
@@ -21674,41 +21735,170 @@ def test_agent_removal_refuses_nested_repository_not_provably_disposable(
         git(upstream, "config", "user.email", "wrkslots@example.invalid")
         head = commit_local(upstream, "file.txt", "upstream\n", "upstream")
         _nested_clone(upstream, clone)
-        condition = (
+        conditions = (
             f"HEAD names commit {head}, which no counted refs/remotes/* ref contains "
-            "(1 commit(s) exist only in this repository; remote(s) origin do not "
-            "count because each URL is a local path that is missing or that this "
-            "removal deletes)"
+            f"({only_here}; uncounted remote(s): origin (its URL is a local path "
+            "inside this removal))",
         )
     else:
-        _nested_clone(remote, clone)
+        head = _nested_clone(remote, clone)
         if case == "local-only-commit":
-            head = commit_local(clone, "local.txt", "local\n", "local only")
-            condition = (
-                f"HEAD names commit {head}, which no counted refs/remotes/* ref "
-                "contains (1 commit(s) exist only in this repository)"
+            local = commit_local(clone, "local.txt", "local\n", "local only")
+            conditions = (
+                f"HEAD names commit {local}, which no counted refs/remotes/* ref "
+                f"contains ({only_here})",
             )
         elif case == "modified-file":
             (clone / "seed.txt").write_text("edited\n", encoding="utf-8")
-            condition = (
-                "worktree has 1 uncommitted or untracked change(s), first: ' M seed.txt'"
+            conditions = (
+                "worktree has 1 uncommitted or untracked change(s), first: ' M seed.txt'",
             )
         elif case == "untracked-file":
             (clone / "notes.txt").write_text("draft\n", encoding="utf-8")
-            condition = (
-                "worktree has 1 uncommitted or untracked change(s), first: '?? notes.txt'"
+            conditions = (
+                "worktree has 1 uncommitted or untracked change(s), first: '?? notes.txt'",
             )
         elif case == "stash":
             (clone / "seed.txt").write_text("stashed\n", encoding="utf-8")
             git(clone, "stash")
             assert git(clone, "status", "--porcelain").stdout == ""
-            condition = "stash entries exist (refs/stash)"
-        else:
-            assert case == "rebase-in-progress"
+            conditions = ("stash entries exist (refs/stash)",)
+        elif case == "rebase-in-progress":
             git(clone, "-c", "sequence.editor=printf 'break\\n' >", "rebase", "-i", "HEAD")
             assert (dotgit / "rebase-merge").is_dir()
             assert git(clone, "status", "--porcelain").stdout == ""
-            condition = "a rebase is in progress (.git/rebase-merge exists)"
+            conditions = ("a rebase is in progress (.git/rebase-merge exists)",)
+        elif case == "reflog-only-commit":
+            local = commit_local(clone, "local.txt", "local\n", "local only")
+            git(clone, "reset", "--hard", "origin/main")
+            conditions = (
+                f"a reflog entry reaches commit {local}, which no counted "
+                f"refs/remotes/* ref contains ({only_here})",
+            )
+        elif case == "tag-only-commit":
+            local = commit_local(clone, "local.txt", "local\n", "local only")
+            git(clone, "tag", "keep")
+            git(clone, "reset", "--hard", "origin/main")
+            conditions = (
+                f"refs/tags/keep names commit {local}, which no counted "
+                f"refs/remotes/* ref contains ({only_here})",
+            )
+        elif case == "non-head-branch":
+            git(clone, "checkout", "-b", "side")
+            local = commit_local(clone, "local.txt", "local\n", "local only")
+            git(clone, "checkout", "main")
+            conditions = (
+                f"refs/heads/side names commit {local}, which no counted "
+                f"refs/remotes/* ref contains ({only_here})",
+            )
+        elif case == "dropped-stash":
+            (clone / "seed.txt").write_text("stashed\n", encoding="utf-8")
+            git(clone, "stash")
+            stashed = git(clone, "rev-parse", "refs/stash", "refs/stash^2").stdout.split()
+            git(clone, "stash", "drop")
+            assert git(clone, "rev-parse", "-q", "--verify", "refs/stash", check=False).returncode == 1
+            conditions = tuple(
+                f"commit {sha} is named by no ref, HEAD or reflog entry (for example "
+                "a dropped stash or a deleted branch) and no counted refs/remotes/* "
+                "ref contains it (2 commit(s) exist only in this repository)"
+                for sha in stashed
+            )
+        elif case == "unmapped-remote-ref":
+            # A ref under refs/remotes/origin/ that origin's fetch refspec does
+            # not write is not evidence that origin holds the commit.
+            git(clone, "config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main")
+            local = git(clone, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "local").stdout.strip()
+            git(clone, "update-ref", "refs/remotes/origin/local", local)
+            conditions = (
+                f"refs/remotes/origin/local names commit {local}, which no counted "
+                f"refs/remotes/* ref contains ({only_here})",
+            )
+        elif case == "remote-name-with-slash":
+            git(clone, "remote", "add", "up/stream", str(remote))
+            conditions = (
+                "remote 'up/stream' has a name containing '/', so its "
+                "remote-tracking refs can be mistaken for another remote's",
+            )
+        elif case == "url-insteadof":
+            git(clone, "config", "url./elsewhere.insteadOf", str(remote))
+            conditions = (
+                "repository config sets url./elsewhere.insteadof, which rewrites "
+                "remote URLs, so a remote's configured URL may not be where its refs "
+                "came from",
+            )
+        elif case == "graft":
+            # Honoring the graft would make the dangling commit an ancestor of
+            # origin/main and so look contained.
+            dangling = git(clone, "commit-tree", "HEAD^{tree}", "-m", "dangling").stdout.strip()
+            (dotgit / "info" / "grafts").write_text(f"{head} {dangling}\n", encoding="utf-8")
+            conditions = (
+                f"commit {dangling} is named by no ref, HEAD or reflog entry (for "
+                "example a dropped stash or a deleted branch) and no counted "
+                f"refs/remotes/* ref contains it ({only_here})",
+            )
+        elif case == "replace-ref":
+            dangling = git(clone, "commit-tree", "HEAD^{tree}", "-m", "dangling").stdout.strip()
+            replacement = git(
+                clone, "commit-tree", "HEAD^{tree}", "-p", dangling, "-m", "replacement"
+            ).stdout.strip()
+            git(clone, "replace", head, replacement)
+            conditions = (
+                f"refs/replace/{head} names commit {replacement}, which no counted "
+                "refs/remotes/* ref contains (2 commit(s) exist only in this repository)",
+            )
+        elif case == "alternates":
+            (dotgit / "objects" / "info" / "alternates").write_text(
+                f"{remote / 'objects'}\n", encoding="utf-8"
+            )
+            conditions = (
+                "repository borrows objects through .git/objects/info/alternates, so "
+                "its own commits cannot be told apart from another repository's",
+            )
+        elif case == "gitlink":
+            git(clone, "update-index", "--add", "--cacheinfo", f"160000,{head},sub")
+            conditions = (
+                "index records 1 submodule gitlink(s), whose checkouts this check "
+                "does not judge; first: 'sub'",
+            )
+        elif case == "skip-worktree":
+            git(clone, "update-index", "--skip-worktree", "seed.txt")
+            (clone / "seed.txt").write_text("hidden edit\n", encoding="utf-8")
+            assert git(clone, "status", "--porcelain").stdout == ""
+            conditions = (
+                "index marks 1 path(s) assume-unchanged or skip-worktree, which hides "
+                "changes from status; first: 'S seed.txt'",
+            )
+        elif case == "info-exclude":
+            (dotgit / "info" / "exclude").write_text("build/\n", encoding="utf-8")
+            (clone / "build").mkdir()
+            (clone / "build" / "notes.txt").write_text("draft\n", encoding="utf-8")
+            conditions = (
+                ".git/info/exclude ignores 'build/', a local rule no commit records, "
+                "so files it hides from status may be work",
+            )
+        elif case == "self-ignored-gitignore":
+            (clone / "hide").mkdir()
+            (clone / "hide" / ".gitignore").write_text("*\n", encoding="utf-8")
+            (clone / "hide" / "notes.txt").write_text("draft\n", encoding="utf-8")
+            assert git(clone, "status", "--porcelain").stdout == ""
+            conditions = (
+                "'hide/.gitignore' is ignored by its own rules, which no commit "
+                "records, so files it hides from status may be work",
+            )
+        else:
+            assert case == "unresolvable-remote"
+            # Path.resolve raises RuntimeError on a symbolic-link loop; the
+            # judgment must refuse and roll back rather than escape.
+            loop = tmp_path / "loop"
+            loop.symlink_to(loop)
+            git(clone, "remote", "set-url", "origin", str(loop))
+            count = git(clone, "rev-list", "--count", "--all").stdout.strip()
+            conditions = (
+                f"HEAD names commit {head}, which no counted refs/remotes/* ref "
+                f"contains ({count} commit(s) exist only in this repository; "
+                "uncounted remote(s): origin (its URL is a local path that cannot be "
+                "resolved (RuntimeError: Symlink loop from ",
+            )
     (tree / "node_modules").mkdir()
     sentinel = tree / "node_modules" / "sentinel"
     sentinel.write_text("cache\n", encoding="utf-8")
@@ -21729,16 +21919,20 @@ def test_agent_removal_refuses_nested_repository_not_provably_disposable(
     removed = remove(project)
 
     assert removed.returncode == 3, removed.stdout + removed.stderr
-    assert (
+    assert any(
         f"cache directory contains nested Git metadata: {dotgit}: "
-        f"not provably disposable: {condition}"
-    ) in removed.stderr
+        f"not provably disposable: {condition}" in removed.stderr
+        for condition in conditions
+    ), removed.stderr
     assert "removed disposable nested Git repository" not in removed.stdout
+    assert "before this refusal the removal deleted" not in removed.stderr
     # Nothing was deleted: not the refused repository, not a cache the loop
-    # would have reached first, not the slot.
+    # would have reached first, not the slot.  The path fence rolled back and
+    # the finish journal is gone, so the slot is not wedged.
     assert sentinel.read_text(encoding="utf-8") == "cache\n"
     assert sorted(str(path.relative_to(tree)) for path in tree.rglob("*")) == before
     assert active_slots(project)
+    assert not _finish_journal(project).exists()
 
 
 def test_validate_complete_still_removes_nested_repository_the_agent_rule_refuses(
@@ -21789,6 +21983,487 @@ def test_local_remote_path_classifies_git_url_forms(
     url: str, expected: Path | None
 ) -> None:
     assert wrkslots._local_remote_path(url, Path("/work/tree")) == expected
+
+
+def _remove_with_patch(
+    project: Path, patch: str, *, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run one agent removal in a process whose cli module ``patch`` altered first."""
+
+    launcher = (
+        "import sys\nfrom wrkslots import cli\n"
+        + textwrap.dedent(patch)
+        + "\nraise SystemExit(cli.main(sys.argv[1:]))\n"
+    )
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            launcher,
+            "--project-root",
+            str(project),
+            "remove",
+            "slot01",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        env=source_environment(env),
+    )
+
+
+def _slot_with_clean_nested_clone(tmp_path: Path) -> tuple[Path, Path, Path, str]:
+    project, repository, remote = make_project(tmp_path, cache_globs=("target",))
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    commit_task(repository, tree, "codex/task")
+    head = _nested_clone(remote, tree / "target" / "deps" / "clean")
+    return project, remote, tree, head
+
+
+@pytest.mark.parametrize(
+    ("target", "expected"),
+    (
+        (
+            "_judge_nested_git_repository_unchecked",
+            "not provably disposable: judgment failed: PermissionError: "
+            "[Errno 13] Permission denied: '/denied'",
+        ),
+        (
+            "_nested_git_metadata_paths",
+            "PermissionError: [Errno 13] Permission denied: '/denied'",
+        ),
+    ),
+)
+def test_agent_removal_rolls_back_when_nested_judgment_raises_any_exception(
+    tmp_path: Path, target: str, expected: str
+) -> None:
+    project, _remote, tree, head = _slot_with_clean_nested_clone(tmp_path)
+    dotgit = tree / "target" / "deps" / "clean" / ".git"
+    _prepare_removable_agent_slot(project)
+
+    refused = _remove_with_patch(
+        project,
+        f"""
+        def denied(*_args, **_kwargs):
+            raise PermissionError(13, "Permission denied", "/denied")
+        cli.{target} = denied
+        """,
+    )
+
+    assert refused.returncode == 3, refused.stdout + refused.stderr
+    assert expected in refused.stderr
+    if target == "_judge_nested_git_repository_unchecked":
+        assert f"cache directory contains nested Git metadata: {dotgit}: " in refused.stderr
+    else:
+        assert "cannot judge nested Git metadata in cache " in refused.stderr
+    # A non-Refusal exception rolled the fence back like any refusal: the
+    # slot is at its canonical path, the journal is gone, and an ordinary
+    # removal then succeeds.
+    assert dotgit.is_dir()
+    assert not _finish_journal(project).exists()
+    assert len(active_slots(project)) == 1
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stderr
+    assert not tree.exists()
+    assert [
+        wrkslots._as_mapping(item, "evidence")["head"]
+        for item in _slot_removed_evidence(project)
+    ] == [head]
+
+
+@pytest.mark.parametrize("change", ("late-clone", "replaced-git-directory", "late-commit"))
+def test_agent_removal_refuses_nested_repositories_that_change_after_judgment(
+    tmp_path: Path, change: str
+) -> None:
+    project, remote, tree, _head = _slot_with_clean_nested_clone(tmp_path)
+    deps = tree / "target" / "deps"
+    dotgit = deps / "clean" / ".git"
+    _prepare_removable_agent_slot(project)
+    mutations = {
+        "late-clone": f"""
+            subprocess.run(
+                ["git", "clone", {str(remote)!r}, str(deps / "late")],
+                check=True,
+                capture_output=True,
+            )
+        """,
+        "replaced-git-directory": """
+            copy = deps / "clean" / ".git-copy"
+            shutil.copytree(deps / "clean" / ".git", copy, symlinks=True)
+            shutil.rmtree(deps / "clean" / ".git")
+            copy.rename(deps / "clean" / ".git")
+        """,
+        "late-commit": """
+            subprocess.run(
+                ["git", "-C", str(deps / "clean"), "commit", "--allow-empty", "-m", "late"],
+                check=True,
+                capture_output=True,
+            )
+        """,
+    }
+
+    # Change the fenced slot once, right after the judged evidence is
+    # journaled and before the first cache is deleted.
+    refused = _remove_with_patch(
+        project,
+        """
+        import shutil
+        import subprocess
+
+        original_write_journal = cli._write_journal
+        fired = []
+
+        def mutate(deps):
+        """
+        + textwrap.indent(textwrap.dedent(mutations[change]), " " * 12)
+        + """
+        def write_journal(config, payload, *args, **kwargs):
+            original_write_journal(config, payload, *args, **kwargs)
+            if not fired and payload.get("nested_git_evidence"):
+                fired.append(True)
+                record = cli._record_from_obj(payload["record"], "record")
+                fenced = cli._finish_fenced_slot(config, record, payload)
+                mutate(fenced / "product" / "target" / "deps")
+
+        cli._write_journal = write_journal
+        """,
+    )
+
+    assert refused.returncode == 3, refused.stdout + refused.stderr
+    if change == "late-commit":
+        assert (
+            f"cache directory contains nested Git metadata: {dotgit}: not provably "
+            "disposable: HEAD names commit "
+        ) in refused.stderr
+    else:
+        assert (
+            f"nested Git repositories in cache {tree / 'target'} changed after they "
+            "were judged disposable; preserve the slot and rerun remove"
+        ) in refused.stderr
+    assert "removed disposable nested Git repository" not in refused.stdout
+    assert dotgit.is_dir()
+    assert (deps / "late" / ".git").is_dir() == (change == "late-clone")
+    assert not _finish_journal(project).exists()
+    assert len(active_slots(project)) == 1
+
+
+def test_agent_removal_refusal_names_nested_repositories_it_already_deleted(
+    tmp_path: Path,
+) -> None:
+    project, repository, remote = make_project(tmp_path, cache_globs=("target", "vendor"))
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    commit_task(repository, tree, "codex/task")
+    heads = {
+        cache: _nested_clone(remote, tree / cache / "deps" / "clean")
+        for cache in ("target", "vendor")
+    }
+    _prepare_removable_agent_slot(project)
+
+    # The first cache is deleted; deleting the second one refuses.
+    refused = _remove_with_patch(
+        project,
+        """
+        original_remove_cache_directory = cli._remove_cache_directory
+        calls = []
+
+        def remove_cache_directory(*args, **kwargs):
+            calls.append(True)
+            if len(calls) == 2:
+                raise cli.Refusal("simulated cache deletion failure")
+            return original_remove_cache_directory(*args, **kwargs)
+
+        cli._remove_cache_directory = remove_cache_directory
+        """,
+    )
+
+    assert refused.returncode == 3, refused.stdout + refused.stderr
+    gone = [cache for cache in heads if not (tree / cache).exists()]
+    kept = [cache for cache in heads if (tree / cache / "deps" / "clean" / ".git").is_dir()]
+    assert len(gone) == 1 and len(kept) == 1, (gone, kept)
+
+    def item(cache: str) -> str:
+        dotgit = tree / cache / "deps" / "clean" / ".git"
+        return f"{dotgit} head={heads[cache]} contained-by=refs/remotes/origin/main"
+
+    assert (
+        "simulated cache deletion failure; before this refusal the removal deleted "
+        f"disposable nested Git repositories: {item(gone[0])}; the refusal "
+        "interrupted deleting a cache holding disposable nested Git repositories, "
+        f"which may be partly deleted: {item(kept[0])}"
+    ) in refused.stderr
+    assert not _finish_journal(project).exists()
+    assert len(active_slots(project)) == 1
+
+
+@pytest.mark.parametrize(
+    "point", ("after-nested-git-evidence-journaled", "after-remove-worktree")
+)
+def test_interrupted_agent_removal_keeps_and_reports_nested_evidence(
+    tmp_path: Path, point: str
+) -> None:
+    project, _remote, tree, head = _slot_with_clean_nested_clone(tmp_path)
+    dotgit = tree / "target" / "deps" / "clean" / ".git"
+    expected = {
+        "checkout": "product",
+        "path": str(dotgit),
+        "head": head,
+        "remote_ref": "refs/remotes/origin/main",
+        "ignored_entries": 0,
+        "ignored_sample": [],
+    }
+    _prepare_removable_agent_slot(project)
+
+    interrupted = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env={"WRKSLOTS_TEST_INTERRUPT": point},
+    )
+
+    assert interrupted.returncode == 86, interrupted.stdout + interrupted.stderr
+    journal = json.loads(_finish_journal(project).read_text(encoding="utf-8"))
+    # The evidence is durable before anything it describes is deleted.
+    assert journal["nested_git_evidence"] == [expected]
+    assert len(active_slots(project)) == 1
+
+    recovered = command(project, "recover", "--coordinator-pid", str(os.getpid()))
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert (
+        f"removed disposable nested Git repository {dotgit} head={head} "
+        "contained-by=refs/remotes/origin/main ignored-entries=0"
+    ) in recovered.stdout.splitlines()
+    assert active_slots(project) == []
+    assert not tree.exists()
+    assert not _finish_journal(project).exists()
+    assert _slot_removed_evidence(project) == [expected]
+
+
+def test_flat_layout_agent_removal_deletes_disposable_nested_clone(
+    tmp_path: Path,
+) -> None:
+    project, repository, remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+        cache_globs=("target",),
+    )
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    assert tree == project / "worktrees" / "slots" / "slot01"
+    commit_task(repository, tree, "codex/task")
+    head = _nested_clone(remote, tree / "target" / "deps" / "clean")
+    row = active_slots(project)[0]
+    assert isinstance(row, dict)
+    checkout_name = row["checkouts"][0]["name"]
+    _prepare_removable_agent_slot(project)
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stderr
+    dotgit = tree / "target" / "deps" / "clean" / ".git"
+    assert (
+        f"removed disposable nested Git repository {dotgit} head={head} "
+        "contained-by=refs/remotes/origin/main ignored-entries=0"
+    ) in removed.stdout.splitlines()
+    assert not tree.exists()
+    assert active_slots(project) == []
+    assert _slot_removed_evidence(project) == [
+        {
+            "checkout": checkout_name,
+            "path": str(dotgit),
+            "head": head,
+            "remote_ref": "refs/remotes/origin/main",
+            "ignored_entries": 0,
+            "ignored_sample": [],
+        }
+    ]
+
+
+def test_owner_consented_release_deletes_disposable_nested_clone(
+    tmp_path: Path,
+) -> None:
+    project, _remote, tree, head = _slot_with_clean_nested_clone(tmp_path)
+    _write_owner_handoff(project, tmp_path)
+    _read_owner_handoff(project)
+    expire_heartbeat(project)
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stderr
+    dotgit = tree / "target" / "deps" / "clean" / ".git"
+    assert (
+        f"removed disposable nested Git repository {dotgit} head={head} "
+        "contained-by=refs/remotes/origin/main ignored-entries=0"
+    ) in removed.stdout.splitlines()
+    assert not tree.exists()
+    assert len(_owner_consent_events(project)) == 1
+    assert [
+        wrkslots._as_mapping(item, "evidence")["path"]
+        for item in _slot_removed_evidence(project)
+    ] == [str(dotgit)]
+
+
+def test_assert_judged_git_metadata_requires_the_exact_judged_directory(
+    tmp_path: Path,
+) -> None:
+    cache = tmp_path / "cache"
+    dotgit = cache / ".git"
+    dotgit.mkdir(parents=True)
+    observed = dotgit.stat()
+    identity = (observed.st_dev, observed.st_ino)
+    unjudged = f"cache directory contains nested Git metadata: {dotgit}"
+    changed = f"nested Git repository changed after it was judged disposable: {dotgit}"
+    directory_fd = os.open(cache, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for disposable, message in (
+            (None, unjudged),
+            ({}, unjudged),
+            ({cache / "other" / ".git": identity}, unjudged),
+            ({dotgit: (identity[0], identity[1] + 1)}, changed),
+        ):
+            with pytest.raises(wrkslots.Refusal) as refused:
+                wrkslots._assert_judged_git_metadata(
+                    directory_fd, cache, ".git", disposable
+                )
+            assert str(refused.value) == message
+        wrkslots._assert_judged_git_metadata(directory_fd, cache, ".git", {dotgit: identity})
+        dotgit.rmdir()
+        dotgit.write_text("gitdir: /elsewhere\n", encoding="utf-8")
+        with pytest.raises(wrkslots.Refusal) as replaced:
+            wrkslots._assert_judged_git_metadata(
+                directory_fd, cache, ".git", {dotgit: identity}
+            )
+        assert str(replaced.value) == changed
+    finally:
+        os.close(directory_fd)
+
+
+def test_nested_git_budget_bounds_each_command_and_the_whole_removal(
+    tmp_path: Path,
+) -> None:
+    assert wrkslots._NestedGitBudget().total_seconds == 900.0
+    assert (
+        wrkslots._NestedGitBudget(total_seconds=1000.0).command_seconds()
+        == wrkslots._NESTED_GIT_COMMAND_SECONDS
+    )
+    assert wrkslots._NestedGitBudget(total_seconds=5.0).command_seconds() == 5.0
+    assert wrkslots._NestedGitBudget(total_seconds=0.0).command_seconds() == 0.0
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    git(repository, "init", "--initial-branch=main")
+    dotgit = repository / ".git"
+
+    with pytest.raises(wrkslots.Refusal) as refused:
+        wrkslots._judge_nested_git_repository(
+            dotgit, (), budget=wrkslots._NestedGitBudget(total_seconds=0.0)
+        )
+
+    assert str(refused.value) == (
+        f"cache directory contains nested Git metadata: {dotgit}: not provably "
+        "disposable: nested Git judgment spent its 0-second allowance for this "
+        "removal before git rev-parse --path-format=absolute --git-dir "
+        "--git-common-dir"
+    )
+
+
+def test_nested_judgment_converts_every_exception_into_a_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*_args: object, **_kwargs: object) -> NoReturn:
+        raise OSError(5, "Input/output error", "/broken")
+
+    monkeypatch.setattr(wrkslots, "_judge_nested_git_repository_unchecked", broken)
+    dotgit = tmp_path / "clone" / ".git"
+    display = tmp_path / "canonical" / ".git"
+
+    with pytest.raises(wrkslots.Refusal) as refused:
+        wrkslots._judge_nested_git_repository(dotgit, (), display=display)
+
+    assert str(refused.value) == (
+        f"cache directory contains nested Git metadata: {display}: not provably "
+        "disposable: judgment failed: OSError: [Errno 5] Input/output error: '/broken'"
+    )
+
+
+def test_nested_remote_exclusion_names_why_a_remote_does_not_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    removed_root = tmp_path / "slot"
+    inside = removed_root / "dependency"
+    inside.mkdir(parents=True)
+    outside = tmp_path / "upstream.git"
+    outside.mkdir()
+    roots = (removed_root.resolve(),)
+    work_tree = removed_root / "clone"
+
+    assert wrkslots._nested_remote_exclusion("https://example.invalid/r", work_tree, roots) is None
+    assert wrkslots._nested_remote_exclusion(str(outside), work_tree, roots) is None
+    assert wrkslots._nested_remote_exclusion(f"file://{outside}", work_tree, roots) is None
+    assert wrkslots._nested_remote_exclusion("hg::https://example.invalid/r", work_tree, roots) == (
+        "its URL names a remote helper, whose source this check cannot locate"
+    )
+    assert wrkslots._nested_remote_exclusion(str(tmp_path / "missing"), work_tree, roots) == (
+        "its URL is a local path that does not exist"
+    )
+    assert wrkslots._nested_remote_exclusion("../dependency", work_tree, roots) == (
+        "its URL is a local path inside this removal"
+    )
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+    looped = wrkslots._nested_remote_exclusion(str(loop), work_tree, roots)
+    assert looped is not None
+    assert looped.startswith("its URL is a local path that ")
+
+    def denied(_self: Path, strict: bool = False) -> Path:
+        raise PermissionError(13, "Permission denied", "/denied")
+
+    monkeypatch.setattr(Path, "resolve", denied)
+    assert wrkslots._nested_remote_exclusion(str(outside), work_tree, roots) == (
+        "its URL is a local path that cannot be resolved "
+        "(PermissionError: [Errno 13] Permission denied: '/denied')"
+    )
+
+
+def test_refspec_destinations_and_matching_follow_git_fetch() -> None:
+    assert wrkslots._refspec_destinations(
+        [
+            "+refs/heads/*:refs/remotes/origin/*",
+            "refs/heads/main:refs/remotes/mirror/main",
+            "refs/heads/x:refs/heads/y",
+            "refs/tags/*:refs/tags/*",
+            "^refs/heads/skip",
+            "+^refs/heads/skip-too",
+            "refs/heads/no-destination",
+        ]
+    ) == ["refs/remotes/origin/*", "refs/remotes/mirror/main"]
+    for destination, refname, expected in (
+        ("refs/remotes/origin/*", "refs/remotes/origin/main", True),
+        ("refs/remotes/origin/*", "refs/remotes/origin/team/topic", True),
+        ("refs/remotes/origin/*", "refs/remotes/origin2/main", False),
+        ("refs/remotes/origin/*", "refs/remotes/origin", False),
+        ("refs/remotes/mirror/main", "refs/remotes/mirror/main", True),
+        ("refs/remotes/mirror/main", "refs/remotes/mirror/main2", False),
+        ("refs/remotes/o/*/x", "refs/remotes/o/a/x", True),
+        ("refs/remotes/o/*/x", "refs/remotes/o/x", False),
+        ("refs/remotes/o/*/x", "refs/remotes/o/a/y", False),
+    ):
+        assert (
+            wrkslots._refspec_destination_matches(destination, refname) is expected
+        ), (destination, refname)
 
 
 def test_repository_specific_cache_globs_do_not_apply_to_sibling_checkouts(

@@ -198,6 +198,7 @@ _FINISH_JOURNAL_OPTIONAL = frozenset(
         "original_mode",
         "private_census_identity",
         "validation_removal_proof",
+        "nested_git_evidence",
     }
 )
 _LEGACY_VALIDATE_JOURNAL_REQUIRED = frozenset(
@@ -6566,6 +6567,14 @@ def _validate_journal_shape(
             raw["validate_complete"], bool
         ):
             raise StateError("finish journal.validate_complete must be boolean")
+        if "nested_git_evidence" in raw:
+            _nested_git_evidence_from_obj(
+                raw["nested_git_evidence"], "finish journal.nested_git_evidence"
+            )
+            if record.slot_type != "agent":
+                raise StateError(
+                    "finish journal records nested Git evidence for a non-agent slot"
+                )
         if "original_mode" in raw:
             original_mode = _as_int(
                 raw["original_mode"], "finish journal.original_mode"
@@ -14556,6 +14565,11 @@ def _clear_bound_cache_directory(
 # otherwise authorized agent removal, before any cache is deleted, and asks Git
 # itself: no path name is ever treated as evidence.
 _NESTED_GIT_COMMAND_SECONDS = 120.0
+# One allowance shared by every Git command a single removal runs to judge and
+# re-judge nested repositories, so a slot full of clones cannot hold the lock
+# for hours: 120 s per command, 900 s in total.
+_NESTED_GIT_REMOVAL_SECONDS = 900.0
+_NESTED_GIT_IGNORED_SAMPLE = 20
 _NESTED_GIT_OPERATION_MARKERS = (
     ("MERGE_HEAD", "a merge"),
     ("CHERRY_PICK_HEAD", "a cherry-pick"),
@@ -14566,16 +14580,37 @@ _NESTED_GIT_OPERATION_MARKERS = (
     ("BISECT_START", "a bisect"),
     ("sequencer", "a sequencer operation"),
 )
+_NESTED_GIT_EVIDENCE_KEYS = frozenset(
+    {"checkout", "path", "head", "remote_ref", "ignored_entries", "ignored_sample"}
+)
+
+
+@dataclasses.dataclass
+class _NestedGitBudget:
+    """One removal-wide time allowance for nested repository judgment."""
+
+    total_seconds: float = _NESTED_GIT_REMOVAL_SECONDS
+    _deadline: float | None = dataclasses.field(init=False, default=None, repr=False)
+
+    def command_seconds(self) -> float:
+        """Return the bound for the next Git command, or zero once the allowance is spent."""
+
+        now = time.monotonic()
+        if self._deadline is None:
+            self._deadline = now + self.total_seconds
+        return max(0.0, min(_NESTED_GIT_COMMAND_SECONDS, self._deadline - now))
 
 
 @dataclasses.dataclass(frozen=True)
 class _DisposableNestedRepository:
-    """One nested repository whose every locally named commit is on a remote ref."""
+    """One nested repository holding no commit or change that exists only there."""
 
     path: Path
     identity: tuple[int, int]
     head: str | None
     remote_ref: str | None
+    ignored_entries: int
+    ignored_sample: tuple[str, ...]
 
 
 def _assert_judged_git_metadata(
@@ -14643,24 +14678,124 @@ def _local_remote_path(url: str, base: Path) -> Path | None:
     return Path(url) if os.path.isabs(url) else base / url
 
 
+def _nested_remote_exclusion(
+    url: str, work_tree: Path, resolved_roots: Sequence[Path]
+) -> str | None:
+    """Say why one remote URL proves nothing, or return None when it counts.
+
+    A network URL counts.  A local path counts only when it exists and lies
+    outside every root this removal deletes.  Nothing here raises: a path that
+    cannot be resolved (a symbolic-link loop, a name too long, a permission
+    error) is itself the reason the remote does not count.
+    """
+
+    if "::" in url:
+        return "its URL names a remote helper, whose source this check cannot locate"
+    try:
+        local = _local_remote_path(url, work_tree)
+        if local is None:
+            return None
+        target = local.resolve(strict=False)
+        # Checked first: while the slot is fenced its canonical paths no
+        # longer exist, and "inside this removal" is the more exact reason.
+        if any(target == root or target.is_relative_to(root) for root in resolved_roots):
+            return "its URL is a local path inside this removal"
+        if not target.exists():
+            return "its URL is a local path that does not exist"
+    except (OSError, RuntimeError, ValueError) as exc:
+        return (
+            "its URL is a local path that cannot be resolved "
+            f"({type(exc).__name__}: {exc})"
+        )
+    return None
+
+
+def _refspec_destinations(refspecs: Sequence[str]) -> list[str]:
+    """Return the refs/remotes/* destinations of positive fetch refspecs."""
+
+    destinations: list[str] = []
+    for refspec in refspecs:
+        body = refspec[1:] if refspec.startswith("+") else refspec
+        if body.startswith("^"):
+            continue
+        _source, separator, destination = body.partition(":")
+        if separator and destination.startswith("refs/remotes/"):
+            destinations.append(destination)
+    return destinations
+
+
+def _refspec_destination_matches(destination: str, refname: str) -> bool:
+    """Match ``refname`` against one refspec destination the way ``git fetch`` does."""
+
+    if "*" not in destination:
+        return refname == destination
+    prefix, _star, suffix = destination.partition("*")
+    return (
+        len(refname) >= len(prefix) + len(suffix)
+        and refname.startswith(prefix)
+        and refname.endswith(suffix)
+    )
+
+
 def _judge_nested_git_repository(
-    dotgit: Path, removed_roots: Sequence[Path], *, display: Path | None = None
+    dotgit: Path,
+    removed_roots: Sequence[Path],
+    *,
+    display: Path | None = None,
+    budget: _NestedGitBudget | None = None,
+) -> _DisposableNestedRepository:
+    """Judge one nested repository; every failure, of any exception type, refuses.
+
+    A removal rolls its path fence back only on a Refusal, so an OSError or
+    RuntimeError escaping judgment would leave the slot fenced and the finish
+    journal in place.  Converting here keeps every judgment failure on the
+    rollback path.
+    """
+
+    try:
+        return _judge_nested_git_repository_unchecked(
+            dotgit,
+            removed_roots,
+            display=display,
+            budget=_NestedGitBudget() if budget is None else budget,
+        )
+    except Refusal:
+        raise
+    except Exception as exc:
+        raise Refusal(
+            f"cache directory contains nested Git metadata: {display or dotgit}: "
+            f"not provably disposable: judgment failed: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _judge_nested_git_repository_unchecked(
+    dotgit: Path,
+    removed_roots: Sequence[Path],
+    *,
+    display: Path | None,
+    budget: _NestedGitBudget,
 ) -> _DisposableNestedRepository:
     """Prove that the repository at ``dotgit`` holds nothing that exists only here.
 
     The proof requires a well-formed non-linked repository whose ``.git`` is a
-    directory; a worktree with no uncommitted or untracked non-ignored changes,
-    no stash, no index flag that hides changes and no operation in progress;
-    and every commit named by HEAD or by any local ref outside refs/remotes/*
-    and refs/tags/* reachable from a counted refs/remotes/<name>/* ref.  A
-    remote-tracking ref counts only when remote.<name>.url is configured and
-    is not a local path that is missing or lies inside ``removed_roots``: a
-    clone of a sibling deleted by the same removal, or of a path that no longer
-    exists, proves nothing.  Git runs with no global or
-    system configuration, no optional locks, no fsmonitor, no transport, and a
-    bound on every command.  Anything else refuses and names the condition
-    that failed, reporting the entry as ``display`` (its canonical path while
-    the slot is fenced).
+    directory, that borrows no objects through alternates and whose config
+    sets no include, content filter, core.worktree or url.* rewrite; an index
+    with no gitlink and no entry hidden by assume-unchanged or skip-worktree;
+    a worktree with no uncommitted or untracked non-ignored change, no ignore
+    rule in .git/info/exclude and no .gitignore that ignores itself; no stash
+    and no operation in progress; and every commit object in the repository,
+    whether named by HEAD, a branch, a tag, a pseudo-ref, a reflog entry or
+    nothing at all (a dropped stash, a deleted branch), reachable from a
+    counted remote-tracking ref.  A ref counts only when a fetch refspec of a
+    counted remote, and of no uncounted one, maps to it.  A remote counts only
+    when it has a URL, its name has no '/', and every URL is a network URL or
+    an existing local path outside ``removed_roots``: a clone of a sibling
+    deleted by the same removal, or of a path that no longer exists, proves
+    nothing.  Git runs with no global or system configuration, no grafts,
+    replace refs or commit-graph, no optional locks, no fsmonitor, no
+    transport, and a bound on every command drawn from ``budget``.  Anything
+    else refuses and names the condition that failed, reporting the entry as
+    ``display`` (its canonical path while the slot is fenced).
     """
 
     def refuse(condition: str) -> Refusal:
@@ -14690,6 +14825,9 @@ def _judge_nested_git_repository(
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_CONFIG_SYSTEM": "/dev/null",
+            # Grafts rewrite parentage, so a graft could make a local-only
+            # commit look like an ancestor of a remote-tracking ref.
+            "GIT_GRAFT_FILE": "/dev/null",
             "GIT_NO_REPLACE_OBJECTS": "1",
             "GIT_OPTIONAL_LOCKS": "0",
             "GIT_TERMINAL_PROMPT": "0",
@@ -14701,12 +14839,22 @@ def _judge_nested_git_repository(
     def run(
         args: Sequence[str], *, work: bool = False, stdin: bytes | None = None
     ) -> subprocess.CompletedProcess[bytes]:
+        seconds = budget.command_seconds()
+        if seconds <= 0:
+            raise refuse(
+                f"nested Git judgment spent its {budget.total_seconds:g}-second "
+                f"allowance for this removal before git {' '.join(args)}"
+            )
         command = [
             "git",
             "--no-pager",
             "--no-replace-objects",
             "-c",
             "core.useReplaceRefs=false",
+            "-c",
+            "core.commitGraph=false",
+            "-c",
+            "advice.graftFileDeprecated=false",
             "-c",
             "core.fsmonitor=false",
             "-c",
@@ -14729,12 +14877,11 @@ def _judge_nested_git_repository(
                 check=False,
                 env=env,
                 cwd="/",
-                timeout=_NESTED_GIT_COMMAND_SECONDS,
+                timeout=seconds,
             )
         except subprocess.TimeoutExpired as exc:
             raise refuse(
-                f"git {' '.join(args)} did not finish within "
-                f"{_NESTED_GIT_COMMAND_SECONDS:g} seconds"
+                f"git {' '.join(args)} did not finish within {seconds:g} seconds"
             ) from exc
         except OSError as exc:
             raise refuse(f"cannot execute Git: {exc}") from exc
@@ -14748,6 +14895,14 @@ def _judge_nested_git_repository(
         if completed.returncode != 0:
             raise refuse(f"git {' '.join(args)} failed: {detail(completed)}")
         return completed.stdout.decode(errors="surrogateescape")
+
+    def read_optional(relative: str) -> bytes | None:
+        try:
+            return (dotgit / relative).read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise refuse(f"cannot inspect .git/{relative}: {exc}") from exc
 
     # (a) A well-formed repository whose Git directory is this .git itself.
     located = run(["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"])
@@ -14784,6 +14939,11 @@ def _judge_nested_git_repository(
                     "repository config sets core.worktree, so its worktree may lie "
                     "outside this cache"
                 )
+            if lowered.startswith("url."):
+                raise refuse(
+                    f"repository config sets {key}, which rewrites remote URLs, so a "
+                    "remote's configured URL may not be where its refs came from"
+                )
         bare = run(["config", "--file", str(config_path), "--type=bool", "--get", "core.bare"])
         if bare.returncode == 0 and bare.stdout.strip() == b"true":
             raise refuse(
@@ -14804,6 +14964,13 @@ def _judge_nested_git_repository(
             raise refuse(f"cannot inspect .git/{subdirectory}: {exc}") from exc
         if held:
             raise refuse(f"repository has {what}: {', '.join(held[:5])}")
+    for alternates in ("objects/info/alternates", "objects/info/http-alternates"):
+        borrowed = read_optional(alternates)
+        if borrowed is not None and borrowed.strip():
+            raise refuse(
+                f"repository borrows objects through .git/{alternates}, so its own "
+                "commits cannot be told apart from another repository's"
+            )
     # (b) Nothing uncommitted, stashed, hidden, or in progress.
     for marker, operation in _NESTED_GIT_OPERATION_MARKERS:
         if os.path.lexists(dotgit / marker):
@@ -14813,34 +14980,76 @@ def _judge_nested_git_repository(
         raise refuse("stash entries exist (refs/stash)")
     if stash.returncode != 1:
         raise refuse(f"cannot read refs/stash: {detail(stash)}")
+    hidden: list[str] = []
+    gitlinks: list[str] = []
+    for item in output(["ls-files", "-v", "-s", "-z"], work=True).split("\0"):
+        if not item:
+            continue
+        tag, _space, entry = item.partition(" ")
+        mode = entry.split(" ", 1)[0]
+        path = entry.partition("\t")[2]
+        if tag.islower() or tag == "S":
+            hidden.append(f"{tag} {path}")
+        if mode == "160000":
+            gitlinks.append(path)
+    if gitlinks:
+        # Checked before status, which would otherwise run Git inside the
+        # submodule under a configuration this check never inspected.
+        raise refuse(
+            f"index records {len(gitlinks)} submodule gitlink(s), whose checkouts "
+            f"this check does not judge; first: {gitlinks[0]!r}"
+        )
+    if hidden:
+        raise refuse(
+            f"index marks {len(hidden)} path(s) assume-unchanged or skip-worktree, "
+            f"which hides changes from status; first: {hidden[0]!r}"
+        )
+    exclude = read_optional("info/exclude")
+    exclude_rules = [
+        line
+        for line in (b"" if exclude is None else exclude)
+        .decode(errors="surrogateescape")
+        .splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    if exclude_rules:
+        raise refuse(
+            f".git/info/exclude ignores {exclude_rules[0]!r}, a local rule no commit "
+            "records, so files it hides from status may be work"
+        )
     status = output(
         [
             "status",
             "--porcelain=v1",
             "-z",
             "--untracked-files=all",
+            "--ignored=matching",
             "--ignore-submodules=none",
             "--no-renames",
         ],
         work=True,
     )
-    changes = [item for item in status.split("\0") if item]
+    changes: list[str] = []
+    ignored: list[str] = []
+    for item in status.split("\0"):
+        if item.startswith("!! "):
+            ignored.append(item[3:])
+        elif item:
+            changes.append(item)
     if changes:
         raise refuse(
             f"worktree has {len(changes)} uncommitted or untracked change(s), "
             f"first: {changes[0]!r}"
         )
-    hidden = [
-        item
-        for item in output(["ls-files", "-v", "-z"], work=True).split("\0")
-        if item and (item[0].islower() or item[0] == "S")
+    self_hidden = [
+        item for item in ignored if item.rstrip("/").rsplit("/", 1)[-1] == ".gitignore"
     ]
-    if hidden:
+    if self_hidden:
         raise refuse(
-            f"index marks {len(hidden)} path(s) assume-unchanged or skip-worktree, "
-            f"which hides changes from status; first: {hidden[0]!r}"
+            f"{self_hidden[0]!r} is ignored by its own rules, which no commit "
+            "records, so files it hides from status may be work"
         )
-    # (c) Every locally named commit is reachable from a remote-tracking ref.
+    # (c) Every commit object is reachable from a counted remote-tracking ref.
     head_probe = run(["rev-parse", "-q", "--verify", "HEAD^{commit}"])
     head: str | None = None
     if head_probe.returncode == 0:
@@ -14855,76 +15064,116 @@ def _judge_nested_git_repository(
         )
         if not unborn:
             raise refuse("HEAD does not name a commit")
-    remote_urls: dict[str, str] = {}
-    listed_urls = run(
-        [
-            "config",
-            "--file",
-            str(dotgit / "config"),
-            "--null",
-            "--get-regexp",
-            r"^remote\..*\.url$",
-        ]
-    )
-    if listed_urls.returncode not in {0, 1}:
-        raise refuse(f"cannot read remote URLs: {detail(listed_urls)}")
-    for item in listed_urls.stdout.decode(errors="surrogateescape").split("\0"):
-        key, _newline, url = item.partition("\n")
-        if key.startswith("remote.") and key.endswith(".url"):
-            remote_urls[key[len("remote.") : -len(".url")]] = url
-    resolved_roots = [root.resolve(strict=False) for root in removed_roots]
-    counted_remotes: set[str] = set()
-    for remote_name, url in remote_urls.items():
-        local = _local_remote_path(url, work_tree)
-        if local is not None:
-            remote_target = local.resolve(strict=False)
-            if not remote_target.exists() or any(
-                remote_target == root or remote_target.is_relative_to(root)
-                for root in resolved_roots
-            ):
-                continue
-        counted_remotes.add(remote_name)
-    tips: dict[str, str] = {} if head is None else {head: "HEAD"}
+    listed_remotes = run(["config", "--null", "--get-regexp", r"^remote\..*\.(url|fetch)$"])
+    if listed_remotes.returncode not in {0, 1}:
+        raise refuse(f"cannot read remote configuration: {detail(listed_remotes)}")
+    remote_urls: dict[str, list[str]] = {}
+    remote_refspecs: dict[str, list[str]] = {}
+    for item in listed_remotes.stdout.decode(errors="surrogateescape").split("\0"):
+        key, _newline, value = item.partition("\n")
+        if not key.startswith("remote."):
+            continue
+        if key.endswith(".url"):
+            remote_urls.setdefault(key[len("remote.") : -len(".url")], []).append(value)
+        elif key.endswith(".fetch"):
+            remote_refspecs.setdefault(key[len("remote.") : -len(".fetch")], []).append(
+                value
+            )
+    remote_names = sorted(set(remote_urls) | set(remote_refspecs))
+    for remote_name in remote_names:
+        if "/" in remote_name:
+            raise refuse(
+                f"remote {remote_name!r} has a name containing '/', so its "
+                "remote-tracking refs can be mistaken for another remote's"
+            )
+    try:
+        resolved_roots = [root.resolve(strict=False) for root in removed_roots]
+    except (OSError, RuntimeError) as exc:
+        raise refuse(f"cannot resolve the paths this removal deletes: {exc}") from exc
+    uncounted: dict[str, str] = {}
+    counted_destinations: list[str] = []
+    uncounted_destinations: list[str] = []
+    for remote_name in remote_names:
+        urls = remote_urls.get(remote_name, [])
+        reason = None if urls else "it has no URL"
+        for url in urls:
+            reason = reason or _nested_remote_exclusion(url, work_tree, resolved_roots)
+        destinations = _refspec_destinations(remote_refspecs.get(remote_name, []))
+        if reason is None:
+            counted_destinations.extend(destinations)
+        else:
+            uncounted[remote_name] = reason
+            uncounted_destinations.extend(destinations)
     counted_refs: dict[str, str] = {}
+    local_tips: list[tuple[str, str]] = []
     for line in output(["for-each-ref", "--format=%(objectname) %(refname)"]).splitlines():
         sha, _space, refname = line.partition(" ")
-        if refname.startswith("refs/remotes/"):
-            remote_name = refname[len("refs/remotes/") :].split("/", 1)[0]
-            if remote_name in counted_remotes:
-                counted_refs.setdefault(refname, sha)
-            continue
-        if refname.startswith("refs/tags/"):
-            continue
-        tips.setdefault(sha, refname)
+        if any(
+            _refspec_destination_matches(destination, refname)
+            for destination in counted_destinations
+        ) and not any(
+            _refspec_destination_matches(destination, refname)
+            for destination in uncounted_destinations
+        ):
+            counted_refs[refname] = sha
+        else:
+            local_tips.append((refname, sha))
     negatives = "".join(f"^{sha}\n" for sha in sorted(set(counted_refs.values())))
-    if tips:
-        stdin = ("".join(f"{sha}\n" for sha in tips) + negatives).encode()
-        total = output(["rev-list", "--count", "--stdin"], stdin=stdin)
-        if int(total.strip() or "0") != 0:
-            for sha, label in tips.items():
-                count = int(
-                    output(
-                        ["rev-list", "--count", "--stdin"],
-                        stdin=(f"{sha}\n" + negatives).encode(),
-                    ).strip()
-                    or "0"
-                )
-                if count:
-                    uncounted = sorted(set(remote_urls) - counted_remotes)
-                    raise refuse(
-                        f"{label} names commit {sha}, which no counted refs/remotes/* "
-                        f"ref contains ({count} commit(s) exist only in this "
-                        "repository"
-                        + (
-                            f"; remote(s) {', '.join(uncounted)} do not count because "
-                            "each URL is a local path that is missing or that this "
-                            "removal deletes"
-                            if uncounted
-                            else ""
-                        )
-                        + ")"
-                    )
-            raise refuse("commits named locally are not all on a remote-tracking ref")
+    commit_objects = output(
+        [
+            "cat-file",
+            "--batch-all-objects",
+            "--unordered",
+            "--batch-check=%(objectname)",
+            "--filter=object:type=commit",
+        ]
+    )
+
+    def uncontained(flags: Sequence[str], positives: str) -> int:
+        counted = output(
+            ["rev-list", "--count", *flags, "--stdin"],
+            stdin=(positives + negatives).encode(),
+        )
+        return int(counted.strip() or "0")
+
+    total = uncontained(["--all", "--reflog"], commit_objects)
+    if total:
+        note = f"{total} commit(s) exist only in this repository" + (
+            "; uncounted remote(s): "
+            + ", ".join(f"{name} ({reason})" for name, reason in uncounted.items())
+            if uncounted
+            else ""
+        )
+
+        def named(label: str, sha: str) -> Refusal:
+            return refuse(
+                f"{label} names commit {sha}, which no counted refs/remotes/* ref "
+                f"contains ({note})"
+            )
+
+        if head is not None and uncontained([], f"{head}\n"):
+            raise named("HEAD", head)
+        if uncontained([], "".join(f"{sha}\n" for _refname, sha in local_tips)):
+            for refname, sha in local_tips:
+                if uncontained([], f"{sha}\n"):
+                    raise named(refname, sha)
+        if uncontained(["--reflog"], ""):
+            first = output(
+                ["rev-list", "-n", "1", "--reflog", "--stdin"], stdin=negatives.encode()
+            ).strip()
+            raise refuse(
+                f"a reflog entry reaches commit {first}, which no counted "
+                f"refs/remotes/* ref contains ({note})"
+            )
+        first = output(
+            ["rev-list", "-n", "1", "--stdin"],
+            stdin=(commit_objects + negatives).encode(),
+        ).strip()
+        raise refuse(
+            f"commit {first} is named by no ref, HEAD or reflog entry (for example "
+            "a dropped stash or a deleted branch) and no counted refs/remotes/* ref "
+            f"contains it ({note})"
+        )
     remote_ref: str | None = None
     if head is not None:
         containing = output(
@@ -14945,8 +15194,88 @@ def _judge_nested_git_repository(
             raise refuse(f"no counted refs/remotes/* ref reports containing HEAD {head}")
         remote_ref = direct[0]
     return _DisposableNestedRepository(
-        dotgit, (metadata.st_dev, metadata.st_ino), head, remote_ref
+        dotgit,
+        (metadata.st_dev, metadata.st_ino),
+        head,
+        remote_ref,
+        len(ignored),
+        tuple(
+            item.encode(errors="surrogateescape").decode(errors="backslashreplace")
+            for item in ignored[:_NESTED_GIT_IGNORED_SAMPLE]
+        ),
     )
+
+
+def _judge_cache_nested_repositories(
+    config: Config,
+    cache: CacheDirectory,
+    *,
+    fenced_slot: Path,
+    canonical_slot: Path,
+    budget: _NestedGitBudget,
+) -> tuple[_DisposableNestedRepository, ...]:
+    """Judge every nested repository a removal of ``cache`` would reach, in order."""
+
+    try:
+        judged: list[_DisposableNestedRepository] = []
+        for dotgit in _nested_git_metadata_paths(config, cache):
+            judged.append(
+                _judge_nested_git_repository(
+                    dotgit,
+                    (canonical_slot, fenced_slot),
+                    display=canonical_slot / dotgit.relative_to(fenced_slot),
+                    budget=budget,
+                )
+            )
+        return tuple(judged)
+    except Refusal:
+        raise
+    except Exception as exc:
+        raise Refusal(
+            f"cannot judge nested Git metadata in cache {cache.path}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _nested_git_evidence_item(
+    checkout: str,
+    repository: _DisposableNestedRepository,
+    *,
+    fenced_slot: Path,
+    canonical_slot: Path,
+) -> dict[str, object]:
+    """Describe one repository judged disposable by its canonical path."""
+
+    return {
+        "checkout": checkout,
+        "path": str(canonical_slot / repository.path.relative_to(fenced_slot)),
+        "head": repository.head,
+        "remote_ref": repository.remote_ref,
+        "ignored_entries": repository.ignored_entries,
+        "ignored_sample": list(repository.ignored_sample),
+    }
+
+
+def _nested_git_evidence_from_obj(value: object, label: str) -> list[dict[str, object]]:
+    """Parse journaled nested-repository evidence, refusing any other shape."""
+
+    parsed: list[dict[str, object]] = []
+    for index, raw in enumerate(_as_list(value, label)):
+        item_label = f"{label}[{index}]"
+        item = _as_mapping(raw, item_label)
+        _exact_keys(item, _NESTED_GIT_EVIDENCE_KEYS, set(), item_label)
+        _as_str(item["checkout"], f"{item_label}.checkout")
+        _as_str(item["path"], f"{item_label}.path")
+        for key in ("head", "remote_ref"):
+            if item[key] is not None:
+                _as_str(item[key], f"{item_label}.{key}")
+        _as_int(item["ignored_entries"], f"{item_label}.ignored_entries")
+        for sample_index, sample in enumerate(
+            _as_list(item["ignored_sample"], f"{item_label}.ignored_sample")
+        ):
+            _as_str(sample, f"{item_label}.ignored_sample[{sample_index}]")
+        parsed.append(dict(item))
+    return parsed
 
 
 def _cmd_clean_caches(args: argparse.Namespace) -> int:
@@ -17102,6 +17431,10 @@ def _finish_remove_paths(
         finish,
         journal_path=journal_path,
     )
+    # A resumed removal keeps what an interrupted one already journaled.
+    finish.nested_git_evidence[:] = _nested_git_evidence_from_obj(
+        journal.get("nested_git_evidence", []), "finish journal.nested_git_evidence"
+    )
     private_fence_identity = (
         None
         if finish.private_cleanup is None
@@ -17160,6 +17493,8 @@ def _finish_remove_paths(
                 )
         elif len(remaining) != 1:
             raise StateError("flat-layout removal has more than one remaining checkout")
+        deleted_nested: list[dict[str, object]] = []
+        deleting_nested: list[dict[str, object]] = []
         try:
             moved_checkouts: list[Checkout] = []
             moved_paths: dict[str, Path] = {}
@@ -17258,33 +17593,80 @@ def _finish_remove_paths(
                 )
                 _interrupt_for_test("after-validation-removal-proof-recheck")
             disposable_git: dict[Path, tuple[int, int]] = {}
+            nested_by_cache: dict[Path, tuple[_DisposableNestedRepository, ...]] = {}
+            nested_evidence: dict[Path, dict[str, object]] = {}
+            nested_budget = _NestedGitBudget()
+            canonical_slot = _slot_directory(config, record.slot, record.slot_type)
             if record.slot_type == "agent":
                 # Every guard above has passed.  Judge each nested repository
                 # in every cache before the first deletion, so a refusal
                 # leaves all of them in place.
-                canonical_slot = _slot_directory(config, record.slot, record.slot_type)
                 for checkout in moved_checkouts:
                     for cache in _cache_directories_for_checkout(config, checkout):
-                        for dotgit in _nested_git_metadata_paths(config, cache):
-                            canonical_dotgit = canonical_slot / dotgit.relative_to(
-                                fenced_slot
+                        judged = _judge_cache_nested_repositories(
+                            config,
+                            cache,
+                            fenced_slot=fenced_slot,
+                            canonical_slot=canonical_slot,
+                            budget=nested_budget,
+                        )
+                        if not judged:
+                            continue
+                        nested_by_cache[cache.path] = judged
+                        for nested in judged:
+                            disposable_git[nested.path] = nested.identity
+                            nested_evidence[nested.path] = _nested_git_evidence_item(
+                                checkout.name,
+                                nested,
+                                fenced_slot=fenced_slot,
+                                canonical_slot=canonical_slot,
                             )
-                            judged = _judge_nested_git_repository(
-                                dotgit,
-                                (canonical_slot, fenced_slot),
-                                display=canonical_dotgit,
-                            )
-                            disposable_git[judged.path] = judged.identity
-                            finish.nested_git_evidence.append(
-                                {
-                                    "checkout": checkout.name,
-                                    "path": str(canonical_dotgit),
-                                    "head": judged.head,
-                                    "remote_ref": judged.remote_ref,
-                                }
-                            )
+            if nested_evidence:
+                # Journal what is about to be deleted before deleting any of
+                # it, so an interrupted removal still records it on recovery.
+                judged_paths = {item["path"] for item in nested_evidence.values()}
+                merged = [
+                    item
+                    for item in finish.nested_git_evidence
+                    if item["path"] not in judged_paths
+                ] + list(nested_evidence.values())
+                journal["nested_git_evidence"] = merged
+                _write_journal(config, journal, journal_path=journal_path)
+                finish.nested_git_evidence[:] = merged
+                _interrupt_for_test("after-nested-git-evidence-journaled")
+                if private_fence_identity is None:
+                    # Judgment can take minutes; confirm nothing began using
+                    # the fenced slot meanwhile.
+                    _assert_slot_unused(
+                        fenced_slot,
+                        use_check_record,
+                        use_lsof=use_check_record is not None,
+                        ignore_invoking_ancestry=(
+                            finish.allow_live_validate_owner
+                            and record.slot_type == "validate"
+                        ),
+                    )
             for checkout in moved_checkouts:
                 for cache in _cache_directories_for_checkout(config, checkout):
+                    judged_here = nested_by_cache.get(cache.path, ())
+                    if judged_here:
+                        rejudged = _judge_cache_nested_repositories(
+                            config,
+                            cache,
+                            fenced_slot=fenced_slot,
+                            canonical_slot=canonical_slot,
+                            budget=nested_budget,
+                        )
+                        if rejudged != judged_here:
+                            raise Refusal(
+                                "nested Git repositories in cache "
+                                f"{canonical_slot / cache.path.relative_to(fenced_slot)} "
+                                "changed after they were judged disposable; preserve "
+                                "the slot and rerun remove"
+                            )
+                    deleting_nested[:] = [
+                        nested_evidence[nested.path] for nested in judged_here
+                    ]
                     _remove_cache_directory(
                         config,
                         cache,
@@ -17293,7 +17675,29 @@ def _finish_remove_paths(
                         ),
                         disposable_git=disposable_git or None,
                     )
+                    deleted_nested.extend(deleting_nested)
+                    deleting_nested.clear()
         except Refusal as exc:
+
+            def described(items: Sequence[Mapping[str, object]]) -> str:
+                return ", ".join(
+                    f"{item['path']} head={item['head']} "
+                    f"contained-by={item['remote_ref']}"
+                    for item in items
+                )
+
+            already = (
+                "; before this refusal the removal deleted disposable nested Git "
+                f"repositories: {described(deleted_nested)}"
+                if deleted_nested
+                else ""
+            ) + (
+                "; the refusal interrupted deleting a cache holding disposable "
+                "nested Git repositories, which may be partly deleted: "
+                f"{described(deleting_nested)}"
+                if deleting_nested
+                else ""
+            )
             if not removed:
                 try:
                     _rollback_path_fence(
@@ -17305,8 +17709,11 @@ def _finish_remove_paths(
                     )
                 except Refusal as rollback:
                     raise Refusal(
-                        f"{exc}; path-fence rollback failed: {rollback}; run 'wrkslots recover'"
+                        f"{exc}{already}; path-fence rollback failed: {rollback}; "
+                        "run 'wrkslots recover'"
                     ) from rollback
+            if already:
+                raise Refusal(f"{exc}{already}") from exc
             raise
     elif fenced_slot.exists():
         remaining_entries = {entry.name for entry in fenced_slot.iterdir()}
@@ -17488,8 +17895,10 @@ def _finish_state_update(
     journal: Mapping[str, object],
     *,
     journal_path: Path,
-    nested_git_evidence: Sequence[Mapping[str, object]] = (),
 ) -> None:
+    nested_git_evidence = _nested_git_evidence_from_obj(
+        journal.get("nested_git_evidence", []), "finish journal.nested_git_evidence"
+    )
     current_slots = {item.slot: item for item in state.slots}
     current = current_slots.get(record.slot)
     if current is not None and _record_to_obj(current) != _record_to_obj(record):
@@ -17512,9 +17921,7 @@ def _finish_state_update(
                 "archive_id": entry["archive_id"],
                 **(
                     {
-                        "disposable_nested_repositories": [
-                            dict(item) for item in nested_git_evidence
-                        ]
+                        "disposable_nested_repositories": nested_git_evidence
                     }
                     if nested_git_evidence
                     else {}
@@ -17604,7 +18011,6 @@ def _begin_finish(
         final_record,
         journal,
         journal_path=journal_path,
-        nested_git_evidence=finish.nested_git_evidence,
     )
 
 
@@ -18067,7 +18473,8 @@ def _print_nested_git_evidence(evidence: Sequence[Mapping[str, object]]) -> None
     for item in evidence:
         print(
             f"removed disposable nested Git repository {item['path']} "
-            f"head={item['head']} contained-by={item['remote_ref']}"
+            f"head={item['head']} contained-by={item['remote_ref']} "
+            f"ignored-entries={item['ignored_entries']}"
         )
 
 
@@ -19506,7 +19913,6 @@ def _recover_finish(
     phase = _as_str(journal["phase"], "finish journal.phase")
     if phase not in ("prepared", "fenced", "removed"):
         raise StateError(f"unknown finish journal phase {phase!r}")
-    nested_git_evidence: Sequence[Mapping[str, object]] = ()
     if phase in ("prepared", "fenced"):
         private_cleanup: _PrivateCleanupContext | None = None
         if private_identity is not None:
@@ -19584,7 +19990,6 @@ def _recover_finish(
             validation_removal_proof=removal_proof,
             owner_consented=owner_consent is not None,
         )
-        nested_git_evidence = recovery_finish.nested_git_evidence
         journal = _finish_remove_paths(
             config,
             record,
@@ -19597,13 +20002,15 @@ def _recover_finish(
         if set(removed_names) != {checkout.name for checkout in record.checkouts}:
             raise StateError("removed finish phase does not name every checkout")
         _assert_physical_slot_removed(config, record, _GitVcs(), journal)
+    nested_git_evidence = _nested_git_evidence_from_obj(
+        journal.get("nested_git_evidence", []), "finish journal.nested_git_evidence"
+    )
     _finish_state_update(
         config,
         state,
         record,
         journal,
         journal_path=path,
-        nested_git_evidence=nested_git_evidence,
     )
     print(f"recovered finish: archived and removed slot={record.slot}")
     _print_nested_git_evidence(nested_git_evidence)
@@ -26840,8 +27247,9 @@ class _FinishContext:
     private_cleanup: _PrivateCleanupContext | None = None
     validation_removal_proof: _ValidationRemovalProof | None = None
     owner_consented: bool = False
-    # Filled by the cache-removal step: one entry per nested repository judged
-    # disposable (checkout, canonical .git path, HEAD, containing remote ref).
+    # Filled by the cache-removal step from the finish journal: one entry per
+    # nested repository judged disposable (checkout, canonical .git path, HEAD,
+    # containing remote ref, and the ignored entries deleted with it).
     nested_git_evidence: list[dict[str, object]] = dataclasses.field(
         default_factory=list
     )
