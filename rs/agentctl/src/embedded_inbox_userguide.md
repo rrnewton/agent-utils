@@ -25,8 +25,9 @@ Everything lives under `<registry>/.inbox/<coordinator>/` (the registry is the g
 | Path | Meaning |
 |---|---|
 | `live/<created-ms>-<id>.json` | one queued notice |
-| `claimed/<batch>.json` | a batch handed to an adapter whose outcome is not yet known |
-| `delivered/<batch>.json` | delivered batches; the newest 200 are kept |
+| `claimed/<claim-ms>-<batch>.json` | a batch handed to an adapter whose outcome is unknown |
+| `delivered/<claim-ms>-<batch>.json` | delivered batches; the newest 200 are kept |
+| `released/<claim-ms>-<batch>.json` | claimed batches given up with `release` |
 | `.lock` | held for every change to the queue |
 | `.deliver.lock` | held for a whole delivery; a second concurrent delivery exits 75 |
 
@@ -48,27 +49,36 @@ underscores or hyphens, starting with a letter or digit.
 - **One live state notice per worker.** `blocked`, `exited`, `idle`, `still-idle` and `progress`
   are state notices. Posting one replaces the worker's current live state notice, keeps the
   original creation time, counts the replacement, and widens the transcript range when both name
-  the same file. The latest state is the true one.
+  the same file. The latest state is the true one, but a replacement **never lowers the
+  priority** of a notice the coordinator has not seen: an undelivered `blocked` followed by
+  `progress` is still delivered at priority 1, and an undelivered `idle` followed by `still-idle`
+  keeps priority 2 and so does not expire.
 - **`working` withdraws** the worker's live state notice: the worker picked up work on its own,
   so the coordinator does not need to hear that it was idle. Messages stay.
-- **Messages are never coalesced.** Give `--id KEY` to make a repeated post a no-op; the key is
-  remembered through delivery, so a retry after delivery is also a no-op.
+- **Messages are never coalesced.** Give `--id KEY` to make a repeated post a no-op that prints
+  the id of the notice already holding that key. The key is recognized while the notice is
+  queued, claimed, or in one of the 200 kept delivered batches; after its batch record is pruned
+  the same key would be queued again.
 - **Stale reminders expire.** An undelivered priority-3 notice older than `--stale-after`
   (86400 seconds by default) is dropped when the queue is read. Priority 1 and 2 notices never
   expire.
-- **Capacity.** A queue holds at most `--max-live` notices (200 by default). A post that would
-  add a notice beyond that exits 75; a post that replaces an existing state notice is still
-  accepted.
+- **Capacity.** A queue holds at most `--max-live` notices (200 by default). Stale notices are
+  expired before counting. A post that would add a notice beyond the limit exits 75; a post that
+  replaces an existing state notice is still accepted.
 - Notice text is at most 4000 bytes. `--cursor PATH:START:END` records the transcript byte range
-  the notice covers, so the coordinator can read the source instead of trusting a summary.
+  the notice covers, so the coordinator can read the source instead of trusting a summary. PATH
+  is at most 1024 bytes and may not contain control characters.
 
 ## Ordering and rendering
 
 Delivery order is priority, then creation time. A batch starts with one header line, followed by
-one block per notice. Each block shows the kind, worker, time, text cut at 600 bytes, and the
-transcript range. Notices are added while the batch stays within `--max-bytes` (3000 bytes by
-default). The first notice is always included, so one oversized notice cannot stall the queue.
-Notices that do not fit stay queued, and the batch ends with a line saying how many.
+one block per notice. Each block shows the kind, worker, UTC date and time, text cut at 600
+bytes, and the transcript range. Control characters other than newline and tab are shown as
+U+FFFD, and every text line is indented, so a notice cannot forge another notice's header.
+Notices are added while the whole batch, header and trailer included, stays within `--max-bytes`
+(3000 bytes by default). The first notice is always included, so one large notice cannot stall
+the queue; a notice renders to at most about 2 KB. Notices that do not fit stay queued, and the
+batch ends with a line saying how many.
 
 `render` prints the next batch without claiming anything. `list` prints the queue as JSON.
 
@@ -76,22 +86,35 @@ Notices that do not fit stay queued, and the batch ends with a line saying how m
 
 `deliver` holds `.deliver.lock` for its whole run and follows these steps:
 
-1. If a claimed batch exists from an earlier failed attempt, it is re-sent first, unchanged.
-2. Otherwise the next batch is rendered, written to `claimed/`, and its notices leave `live/`.
-3. The adapter runs. On success the batch moves to `delivered/`. On failure it stays in
+1. Live copies of notices that a claimed or delivered batch already holds are removed. A crash
+   between writing a claim and removing its live files leaves such copies behind.
+2. If a claimed batch exists from an earlier failed attempt, it is re-sent first, unchanged, but
+   only to the adapter and session it was claimed for. Any other `--via` or `--session` exits 2
+   until the batch is delivered or released.
+3. Otherwise the next batch is rendered, written to `claimed/`, and its notices leave `live/`.
+   The batch id is derived from the coordinator and the ids of the notices it carries.
+4. The adapter runs. On success the batch moves to `delivered/`. On failure it stays in
    `claimed/`, `deliver` exits 69, and the next `deliver` re-sends the same batch.
 
 Adapters (`--via`):
 
-- `print` writes the batch to stdout and counts that as delivered. Use it from a cron job, a
-  harness loop, or any reader that consumes stdout.
+- `print` writes the batch to stdout and counts that as delivered; an empty queue prints nothing.
+  It is at-least-once: if the batch record cannot be written after printing, the next `deliver`
+  prints the same batch again. Use it from a cron job, a harness loop, or any reader that
+  consumes stdout.
 - `agentcloud-notify` runs
-  `agentcloudctl notify --session ID --mode cli-script --idempotency-key agentctl-inbox-<coordinator>-<batch> --text BATCH`.
-  The session receives the batch as a peer message from `cli-script`, even in the middle of a
-  turn. Because a retried batch keeps its id, a retry after an ambiguous failure cannot deliver
-  twice. Batches over 100000 bytes are refused.
+  `agentcloudctl notify --session ID --mode cli-script --idempotency-key agentctl-inbox-<coordinator>-<batch> --text BATCH`
+  and prints `{"delivered": N}` (N is 0 for an empty queue). The session receives the batch as a
+  peer message from `cli-script`, even in the middle of a turn. The batch budget is capped at
+  100000 bytes whatever `--max-bytes` says. A notify that runs longer than `--notify-timeout`
+  (120 seconds by default) is killed and counts as a failure. Because a retried batch keeps its
+  id and its session, a retry after an ambiguous failure reaches agentcloud with the same key and
+  is delivered once.
 
-An empty queue delivers nothing and exits 0.
+`release --batch ID` gives up on a claimed batch that can no longer reach its adapter. Without
+`--requeue` the batch moves to `released/` and its notices are not delivered. With `--requeue`
+its notices return to the queue; they may reach the coordinator twice if the failed attempt
+actually landed, and a requeued state notice is dropped when its worker already has a newer one.
 
 ## Exit codes
 
@@ -99,7 +122,7 @@ An empty queue delivers nothing and exits 0.
 |---|---|
 | 0 | success (including an empty delivery and a duplicate post) |
 | 1 | a file could not be read or written, or a record is corrupt |
-| 2 | invalid arguments |
+| 2 | invalid arguments, or a retry that names a different adapter or session than the claimed batch |
 | 69 | the delivery adapter failed; the batch stays claimed for a retry |
 | 75 | busy: the queue is full, or another delivery is running |
 
@@ -113,4 +136,5 @@ agentctl inbox post --to coord --from builder --kind message --id builder-final 
 agentctl inbox list --to coord
 agentctl inbox render --to coord --max-bytes 2000
 agentctl inbox deliver --to coord --via print
+agentctl inbox release --to coord --batch 5e0c7a9d31f2b8a4 --requeue
 ```

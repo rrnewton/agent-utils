@@ -9,20 +9,21 @@
 //! Layout under `<registry>/.inbox/<coordinator>/`:
 //!
 //! * `live/<created-ms>-<id>.json` — one queued notice per file.
-//! * `claimed/<batch>.json` — a batch handed to a delivery adapter whose outcome is not yet known.
-//!   A later `deliver` re-sends it with the same idempotency key before taking new notices.
-//! * `delivered/<batch>.json` — delivered batches, newest [`DELIVERED_KEEP`] kept.
+//! * `claimed/<claim-ms>-<batch>.json` — a batch handed to an adapter whose outcome is unknown.
+//!   The next `deliver` re-sends it, unchanged and to the same adapter, before new notices.
+//! * `delivered/<claim-ms>-<batch>.json` — delivered batches, newest [`DELIVERED_KEEP`] kept.
+//! * `released/<claim-ms>-<batch>.json` — claimed batches an operator gave up on.
 //! * `.lock` — held for every mutation; `.deliver.lock` — held for a whole delivery.
 //!
 //! Coalescing: a worker has at most one live *state* notice (`blocked`, `exited`, `idle`,
-//! `still-idle`, `progress`); a newer one replaces it and widens its transcript range. Posting
-//! `working` withdraws the live state notice, because the worker resumed on its own. `message`
-//! notices are never coalesced; `--id` makes a repeated post a no-op.
+//! `still-idle`, `progress`); a newer one replaces it, widens its transcript range, and never
+//! lowers its priority. Posting `working` withdraws the live state notice, because the worker
+//! resumed on its own. `message` notices are never coalesced; `--id` makes a repeat a no-op.
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand, ValueEnum};
 use fs2::FileExt as _;
@@ -31,18 +32,24 @@ use sha2::{Digest as _, Sha256};
 
 /// Most notices one coordinator's queue holds; further posts are refused as busy.
 pub(crate) const DEFAULT_MAX_LIVE: usize = 200;
-/// Default byte budget for one rendered batch.
+/// Default byte budget for one rendered batch, header and trailer included.
 pub(crate) const DEFAULT_RENDER_BYTES: usize = 3000;
 /// Largest notice text accepted, in bytes.
 pub(crate) const MAX_TEXT_BYTES: usize = 4000;
+/// Largest transcript path accepted in `--cursor`, in bytes.
+pub(crate) const MAX_CURSOR_PATH_BYTES: usize = 1024;
 /// Bytes of one notice's text shown in a rendered batch before it is cut.
 pub(crate) const RENDER_TEXT_BYTES: usize = 600;
 /// Seconds after which an undelivered priority-3 notice expires.
 pub(crate) const DEFAULT_STALE_SECONDS: u64 = 86_400;
-/// Delivered batch records kept for inspection.
+/// Delivered batch records kept; duplicate `--id` keys are recognized while their batch is kept.
 pub(crate) const DELIVERED_KEEP: usize = 200;
-/// Largest text `agentcloudctl notify` is given, in bytes.
-const MAX_NOTIFY_BYTES: usize = 100_000;
+/// Largest batch `agentcloudctl notify` is given, in bytes; the batch budget is capped to it.
+pub(crate) const MAX_NOTIFY_BYTES: usize = 100_000;
+/// Default seconds one `agentcloudctl notify` may run before it is killed.
+pub(crate) const DEFAULT_NOTIFY_TIMEOUT_SECONDS: u64 = 120;
+/// Stand-in with the length of a real batch id, used while choosing which notices fit.
+const BATCH_ID_PLACEHOLDER: &str = "????????????????";
 /// Busy: the queue is full or another delivery is running.
 const EXIT_BUSY: i32 = crate::error::EXIT_BUSY;
 /// The delivery adapter failed; the batch stays claimed for a retry with the same key.
@@ -130,11 +137,21 @@ struct Batch {
     created_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     delivered_unix_ms: Option<u64>,
+    via: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    via: Option<String>,
+    session: Option<String>,
     attempts: u32,
     text: String,
     notices: Vec<Notice>,
+}
+
+/// Where a delivery goes; a claimed batch is only ever re-sent to the same target.
+#[derive(Clone, Copy, Debug)]
+struct DeliveryTarget<'a> {
+    via: &'a str,
+    session: Option<&'a str>,
+    /// Largest batch the adapter accepts, in bytes.
+    limit: usize,
 }
 
 /// Failure with the process exit code the CLI returns.
@@ -162,6 +179,13 @@ impl InboxError {
     fn busy(message: impl Into<String>) -> Self {
         Self {
             code: EXIT_BUSY,
+            message: message.into(),
+        }
+    }
+
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            code: EXIT_UNAVAILABLE,
             message: message.into(),
         }
     }
@@ -195,7 +219,7 @@ enum InboxCommand {
     Userguide,
     /// Queue a notice about a worker for a coordinator
     #[command(
-        after_help = "Examples:\n  agentctl inbox post --to coord --from kvm --kind idle --text 'Pushed 3f2a9c1; tests green'\n  agentctl inbox post --to coord --from kvm --kind message --id kvm-report-7 --text-file report.txt\n  agentctl inbox post --to coord --from kvm --kind working\n\nA worker keeps at most one live state notice (blocked, exited, idle, still-idle, progress): a\nnewer one replaces it. --kind working withdraws it and stores nothing. message notices are never\ncoalesced, and a repeated --id is a no-op that prints the existing notice id."
+        after_help = "Examples:\n  agentctl inbox post --to coord --from kvm --kind idle --text 'Pushed 3f2a9c1; tests green'\n  agentctl inbox post --to coord --from kvm --kind message --id kvm-report-7 --text-file report.txt\n  agentctl inbox post --to coord --from kvm --kind working\n\nA worker keeps at most one live state notice (blocked, exited, idle, still-idle, progress): a\nnewer one replaces it and never lowers its priority. --kind working withdraws it and stores\nnothing. message notices are never coalesced; a repeated --id is a no-op that prints the id of\nthe notice already queued or delivered under that key."
     )]
     Post(Post),
     /// List queued notices as JSON, in delivery order
@@ -206,9 +230,14 @@ enum InboxCommand {
     Render(RenderArgs),
     /// Claim the next batch, hand it to an adapter, and record the outcome
     #[command(
-        after_help = "Examples:\n  agentctl inbox deliver --to coord --via print\n  agentctl inbox deliver --to coord --via agentcloud-notify --session SESSION_ID\n\nprint writes the batch to stdout and counts that as delivered. agentcloud-notify runs\n`agentcloudctl notify --mode cli-script` with the idempotency key agentctl-inbox-<coordinator>-<batch>.\nIf that fails the batch stays claimed and the next deliver re-sends it with the same key, so the\nsession receives it once. An empty queue prints nothing and exits 0."
+        after_help = "Examples:\n  agentctl inbox deliver --to coord --via print\n  agentctl inbox deliver --to coord --via agentcloud-notify --session SESSION_ID\n\nprint writes the batch to stdout (nothing for an empty queue); it is at-least-once, because a\nbatch whose record cannot be written after printing is printed again next time.\nagentcloud-notify runs `agentcloudctl notify --mode cli-script` with the idempotency key\nagentctl-inbox-<coordinator>-<batch>, caps the batch at 100000 bytes, and prints\n{\"delivered\": N}. If notify fails or times out the batch stays claimed, deliver exits 69, and\nthe next deliver re-sends the same batch with the same key to the same session. A claimed batch\nis never re-sent to a different adapter or session: that exits 2 until the batch is delivered\nor released with `agentctl inbox release`."
     )]
     Deliver(DeliverArgs),
+    /// Give up on a claimed batch: move it aside, or put its notices back in the queue
+    #[command(
+        after_help = "Examples:\n  agentctl inbox release --to coord --batch 5e0c7a9d31f2b8a4\n  agentctl inbox release --to coord --batch 5e0c7a9d31f2b8a4 --requeue\n\nUse this when a claimed batch can no longer reach its adapter or session. Without --requeue the\nbatch moves to released/ and its notices are not delivered. With --requeue its notices return\nto the queue and may reach the coordinator twice if the failed attempt actually landed; a\nrequeued state notice is dropped when its worker already has a newer one."
+    )]
+    Release(ReleaseArgs),
 }
 
 #[derive(Args)]
@@ -237,12 +266,15 @@ struct Post {
     /// Idempotency key for a message notice; posting the same key again changes nothing
     #[arg(long, value_name = "KEY")]
     id: Option<String>,
-    /// Transcript range covered, as PATH:START:END byte offsets (START <= END)
+    /// Transcript range covered, as PATH:START:END byte offsets (START <= END; PATH up to 1024 bytes, no control characters)
     #[arg(long, value_name = "PATH:START:END")]
     cursor: Option<String>,
     /// Most live notices the queue may hold before posts are refused with exit 75
     #[arg(long, default_value_t = DEFAULT_MAX_LIVE, value_name = "N")]
     max_live: usize,
+    /// Seconds after which an undelivered priority-3 notice is dropped as stale
+    #[arg(long, default_value_t = DEFAULT_STALE_SECONDS, value_name = "SECONDS")]
+    stale_after: u64,
 }
 
 #[derive(Args)]
@@ -258,7 +290,7 @@ struct ListArgs {
 struct RenderArgs {
     #[command(flatten)]
     target: Target,
-    /// Byte budget for the batch; notices that do not fit stay queued (the first always fits)
+    /// Byte budget for the batch including its header and trailer; notices that do not fit stay queued (the first always fits)
     #[arg(long, default_value_t = DEFAULT_RENDER_BYTES, value_name = "BYTES")]
     max_bytes: usize,
     /// Seconds after which an undelivered priority-3 notice is dropped as stale
@@ -268,10 +300,19 @@ struct RenderArgs {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum Via {
-    /// Write the batch to stdout; printing counts as delivery
+    /// Write the batch to stdout; printing counts as delivery (at-least-once)
     Print,
     /// Deliver into an agentcloud session with `agentcloudctl notify --mode cli-script`
     AgentcloudNotify,
+}
+
+impl Via {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Print => "print",
+            Self::AgentcloudNotify => "agentcloud-notify",
+        }
+    }
 }
 
 #[derive(Args)]
@@ -284,6 +325,21 @@ struct DeliverArgs {
     /// agentcloud session that receives the batch (agentcloud-notify only)
     #[arg(long, value_name = "ID")]
     session: Option<String>,
+    /// Seconds one agentcloudctl notify may run before it is killed and the batch stays claimed (agentcloud-notify only)
+    #[arg(long, default_value_t = DEFAULT_NOTIFY_TIMEOUT_SECONDS, value_name = "SECONDS")]
+    notify_timeout: u64,
+}
+
+#[derive(Args)]
+struct ReleaseArgs {
+    #[command(flatten)]
+    target: Target,
+    /// Id of the claimed batch (the part after the claim time in its claimed/ file name)
+    #[arg(long, value_name = "BATCH")]
+    batch: String,
+    /// Put the batch's notices back in the queue instead of moving the batch to released/
+    #[arg(long)]
+    requeue: bool,
 }
 
 /// Run `agentctl inbox`.
@@ -318,6 +374,7 @@ pub(crate) fn run(registry: &Path, agentcloudctl: &Path, args: InboxArgs) -> Res
                     key: post.id.as_deref(),
                     cursor,
                     max_live: post.max_live,
+                    stale_after: post.stale_after,
                 },
                 now,
             )?;
@@ -344,17 +401,20 @@ pub(crate) fn run(registry: &Path, agentcloudctl: &Path, args: InboxArgs) -> Res
         }
         InboxCommand::Deliver(deliver) => {
             let coordinator = deliver.render.target.coordinator.clone();
-            if deliver.via == Via::AgentcloudNotify
-                && deliver.session.as_deref().is_none_or(str::is_empty)
-            {
-                return Err(InboxError::usage("--via agentcloud-notify needs --session"));
-            }
-            if deliver.via == Via::Print && deliver.session.is_some() {
-                return Err(InboxError::usage(
-                    "--session applies only to --via agentcloud-notify",
-                ));
+            let session = deliver.session.as_deref().filter(|value| !value.is_empty());
+            match (deliver.via, session) {
+                (Via::AgentcloudNotify, None) => {
+                    return Err(InboxError::usage("--via agentcloud-notify needs --session"));
+                }
+                (Via::Print, Some(_)) => {
+                    return Err(InboxError::usage(
+                        "--session applies only to --via agentcloud-notify",
+                    ));
+                }
+                _ => {}
             }
             let inbox = Inbox::open(registry, &coordinator)?;
+            let timeout = Duration::from_secs(deliver.notify_timeout);
             let adapter = |batch: &Batch| -> Result<()> {
                 match deliver.via {
                     Via::Print => {
@@ -365,22 +425,28 @@ pub(crate) fn run(registry: &Path, agentcloudctl: &Path, args: InboxArgs) -> Res
                             .map_err(|error| InboxError::io("cannot write batch", &error))
                     }
                     Via::AgentcloudNotify => notify_agentcloud(
+                        &inbox.root,
                         agentcloudctl,
-                        deliver.session.as_deref().unwrap_or_default(),
-                        &format!("agentctl-inbox-{coordinator}-{}", batch.id),
+                        session.unwrap_or_default(),
+                        &idempotency_key(&coordinator, &batch.id),
                         &batch.text,
+                        timeout,
                     ),
                 }
             };
-            let via = match deliver.via {
-                Via::Print => "print",
-                Via::AgentcloudNotify => "agentcloud-notify",
+            let target = DeliveryTarget {
+                via: deliver.via.name(),
+                session,
+                limit: match deliver.via {
+                    Via::Print => usize::MAX,
+                    Via::AgentcloudNotify => MAX_NOTIFY_BYTES,
+                },
             };
             let delivered = inbox.deliver(
                 now,
                 deliver.render.max_bytes,
                 deliver.render.stale_after,
-                via,
+                &target,
                 adapter,
             )?;
             if deliver.via != Via::Print {
@@ -388,7 +454,17 @@ pub(crate) fn run(registry: &Path, agentcloudctl: &Path, args: InboxArgs) -> Res
             }
             Ok(0)
         }
+        InboxCommand::Release(release) => {
+            let inbox = Inbox::open(registry, &release.target.coordinator)?;
+            let outcome = inbox.release(&release.batch, release.requeue)?;
+            print_json(&outcome)?;
+            Ok(0)
+        }
     }
+}
+
+fn idempotency_key(coordinator: &str, batch: &str) -> String {
+    format!("agentctl-inbox-{coordinator}-{batch}")
 }
 
 struct PostRequest<'a> {
@@ -398,17 +474,29 @@ struct PostRequest<'a> {
     key: Option<&'a str>,
     cursor: Option<Cursor>,
     max_live: usize,
+    stale_after: u64,
 }
 
-#[derive(Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct PostOutcome {
-    /// Id of the stored notice, or of the existing one for a repeated key.
+    /// Id of the stored notice, or of the notice already holding a repeated key.
     id: Option<String>,
     /// `stored`, `replaced`, `duplicate`, `withdrawn`, or `nothing-to-withdraw`.
     outcome: &'static str,
     /// Id of the notice this one replaced or withdrew.
     #[serde(skip_serializing_if = "Option::is_none")]
     previous: Option<String>,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+struct ReleaseOutcome {
+    batch: String,
+    /// `released` or `requeued`.
+    outcome: &'static str,
+    /// Notices returned to the queue.
+    requeued: usize,
+    /// Notices dropped because their worker already had a newer state notice.
+    superseded: usize,
 }
 
 struct Inbox {
@@ -420,7 +508,7 @@ impl Inbox {
     fn open(registry: &Path, coordinator: &str) -> Result<Self> {
         check_name("--to", coordinator)?;
         let root = registry.join(".inbox").join(coordinator);
-        for directory in ["live", "claimed", "delivered"] {
+        for directory in ["live", "claimed", "delivered", "released"] {
             fs::create_dir_all(root.join(directory)).map_err(|error| {
                 InboxError::io(&format!("cannot create {}", root.display()), &error)
             })?;
@@ -482,16 +570,15 @@ impl Inbox {
         Ok(entries)
     }
 
+    /// Write a record by rename, then sync the directory so the rename itself is durable.
     fn write_json(&self, directory: &str, name: &str, value: &impl Serialize) -> Result<PathBuf> {
         let bytes = serde_json::to_vec_pretty(value).map_err(|error| InboxError {
             code: 1,
             message: format!("cannot encode inbox record: {error}"),
         })?;
-        let final_path = self.root.join(directory).join(name);
-        let staging = self
-            .root
-            .join(directory)
-            .join(format!(".{name}.{}.tmp", std::process::id()));
+        let parent = self.root.join(directory);
+        let final_path = parent.join(name);
+        let staging = parent.join(format!(".{name}.{}.tmp", std::process::id()));
         let mut file = fs::File::create(&staging).map_err(|error| {
             InboxError::io(&format!("cannot write {}", staging.display()), &error)
         })?;
@@ -503,7 +590,17 @@ impl Inbox {
         fs::rename(&staging, &final_path).map_err(|error| {
             InboxError::io(&format!("cannot publish {}", final_path.display()), &error)
         })?;
+        fs::File::open(&parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                InboxError::io(&format!("cannot sync {}", parent.display()), &error)
+            })?;
         Ok(final_path)
+    }
+
+    fn remove(path: &Path, what: &str) -> Result<()> {
+        fs::remove_file(path)
+            .map_err(|error| InboxError::io(&format!("cannot {what} {}", path.display()), &error))
     }
 
     /// Live notices in delivery order, after dropping stale priority-3 notices.
@@ -513,18 +610,11 @@ impl Inbox {
     }
 
     fn live_locked(&self, now: u64, stale_after: u64) -> Result<Vec<Notice>> {
-        let mut notices = Vec::new();
-        for (path, notice) in self.read_dir_json::<Notice>("live")? {
-            if notice.priority == 3
-                && now.saturating_sub(notice.updated_unix_ms) > stale_after.saturating_mul(1000)
-            {
-                fs::remove_file(&path).map_err(|error| {
-                    InboxError::io(&format!("cannot expire {}", path.display()), &error)
-                })?;
-                continue;
-            }
-            notices.push(notice);
-        }
+        let mut notices = self
+            .unexpired_locked(now, stale_after)?
+            .into_iter()
+            .map(|(_, notice)| notice)
+            .collect::<Vec<_>>();
         notices.sort_by(|left, right| {
             (left.priority, left.created_unix_ms, &left.id).cmp(&(
                 right.priority,
@@ -532,6 +622,21 @@ impl Inbox {
                 &right.id,
             ))
         });
+        Ok(notices)
+    }
+
+    /// Live notice files, after removing stale priority-3 notices; caller holds `.lock`.
+    fn unexpired_locked(&self, now: u64, stale_after: u64) -> Result<Vec<(PathBuf, Notice)>> {
+        let mut notices = Vec::new();
+        for (path, notice) in self.read_dir_json::<Notice>("live")? {
+            if notice.priority == 3
+                && now.saturating_sub(notice.updated_unix_ms) > stale_after.saturating_mul(1000)
+            {
+                Self::remove(&path, "expire")?;
+                continue;
+            }
+            notices.push((path, notice));
+        }
         Ok(notices)
     }
 
@@ -552,7 +657,7 @@ impl Inbox {
             return Err(InboxError::usage("--kind working takes no text or cursor"));
         }
         let _guard = self.lock(".lock", true)?;
-        let live = self.read_dir_json::<Notice>("live")?;
+        let live = self.unexpired_locked(now, request.stale_after)?;
         if let Some(key) = request.key {
             if let Some((_, existing)) = live
                 .iter()
@@ -564,16 +669,15 @@ impl Inbox {
                     previous: None,
                 });
             }
-            if self.key_already_delivered(key)? {
+            if let Some(id) = self.batched_key(key)? {
                 return Ok(PostOutcome {
-                    id: None,
+                    id: Some(id),
                     outcome: "duplicate",
                     previous: None,
                 });
             }
         }
-        let previous = request.kind.is_state() || request.kind == NoticeKind::Working;
-        let previous = previous
+        let previous = (request.kind.is_state() || request.kind == NoticeKind::Working)
             .then(|| {
                 live.iter()
                     .find(|(_, notice)| notice.agent == request.agent && notice.kind.is_state())
@@ -582,9 +686,7 @@ impl Inbox {
         if request.kind == NoticeKind::Working {
             return Ok(match previous {
                 Some((path, notice)) => {
-                    fs::remove_file(path).map_err(|error| {
-                        InboxError::io(&format!("cannot withdraw {}", path.display()), &error)
-                    })?;
+                    Self::remove(path, "withdraw")?;
                     PostOutcome {
                         id: None,
                         outcome: "withdrawn",
@@ -607,13 +709,14 @@ impl Inbox {
             )));
         }
         let id = notice_id(request.agent, request.kind, request.key, now);
-        let (created, cursor, replaced) = match previous {
+        let (created, cursor, replaced, priority) = match previous {
             Some((_, old)) => (
                 old.created_unix_ms,
                 merge_cursor(old.cursor.as_ref(), request.cursor.as_ref()),
                 old.replaced.saturating_add(1),
+                old.priority.min(request.kind.priority()),
             ),
-            None => (now, request.cursor.clone(), 0),
+            None => (now, request.cursor.clone(), 0, request.kind.priority()),
         };
         let notice = Notice {
             schema: 1,
@@ -621,7 +724,7 @@ impl Inbox {
             created_unix_ms: created,
             updated_unix_ms: now,
             kind: request.kind,
-            priority: request.kind.priority(),
+            priority,
             agent: request.agent.to_owned(),
             text: request.text.to_owned(),
             cursor,
@@ -630,9 +733,7 @@ impl Inbox {
         };
         self.write_json("live", &format!("{created:013}-{id}.json"), &notice)?;
         if let Some((path, old)) = previous {
-            fs::remove_file(path).map_err(|error| {
-                InboxError::io(&format!("cannot replace {}", path.display()), &error)
-            })?;
+            Self::remove(path, "replace")?;
             return Ok(PostOutcome {
                 id: Some(id),
                 outcome: "replaced",
@@ -646,19 +747,37 @@ impl Inbox {
         })
     }
 
-    fn key_already_delivered(&self, key: &str) -> Result<bool> {
+    /// Id of the notice that already carries `key` in a claimed or kept delivered batch.
+    fn batched_key(&self, key: &str) -> Result<Option<String>> {
         for directory in ["claimed", "delivered"] {
             for (_, batch) in self.read_dir_json::<Batch>(directory)? {
-                if batch
+                if let Some(notice) = batch
                     .notices
                     .iter()
-                    .any(|notice| notice.key.as_deref() == Some(key))
+                    .find(|notice| notice.key.as_deref() == Some(key))
                 {
-                    return Ok(true);
+                    return Ok(Some(notice.id.clone()));
                 }
             }
         }
-        Ok(false)
+        Ok(None)
+    }
+
+    /// Remove live copies of notices that a claimed or delivered batch already holds. A crash
+    /// between writing a claim and unlinking its live files leaves such copies behind.
+    fn drop_batched_live_copies(&self) -> Result<()> {
+        let mut batched = std::collections::HashSet::new();
+        for directory in ["claimed", "delivered"] {
+            for (_, batch) in self.read_dir_json::<Batch>(directory)? {
+                batched.extend(batch.notices.into_iter().map(|notice| notice.id));
+            }
+        }
+        for (path, notice) in self.read_dir_json::<Notice>("live")? {
+            if batched.contains(&notice.id) {
+                Self::remove(&path, "drop duplicate")?;
+            }
+        }
+        Ok(())
     }
 
     /// Claim, deliver, and record one batch; returns the number of notices delivered.
@@ -667,42 +786,72 @@ impl Inbox {
         now: u64,
         max_bytes: usize,
         stale_after: u64,
-        via: &str,
+        target: &DeliveryTarget<'_>,
         adapter: impl Fn(&Batch) -> Result<()>,
     ) -> Result<usize> {
         let _delivery = self.lock(".deliver.lock", false)?;
         let (path, mut batch) = {
             let _guard = self.lock(".lock", true)?;
+            self.drop_batched_live_copies()?;
             if let Some((path, batch)) = self.read_dir_json::<Batch>("claimed")?.into_iter().next()
             {
+                if batch.via != target.via || batch.session.as_deref() != target.session {
+                    return Err(InboxError::usage(format!(
+                        "batch {} is claimed for {}{}; re-run deliver with that adapter and session, or run `agentctl inbox release --to {} --batch {}`",
+                        batch.id,
+                        batch.via,
+                        batch
+                            .session
+                            .as_deref()
+                            .map(|session| format!(" session {session}"))
+                            .unwrap_or_default(),
+                        self.coordinator,
+                        batch.id
+                    )));
+                }
                 (path, batch)
             } else {
                 let notices = self.live_locked(now, stale_after)?;
                 if notices.is_empty() {
                     return Ok(0);
                 }
-                let id = batch_id(&self.coordinator, now, &notices);
-                let (text, taken) = render_batch(&self.coordinator, &id, &notices, max_bytes);
+                // The id depends on which notices fit, so render with a placeholder of the same
+                // length first; the budget arithmetic is unchanged by the substitution.
+                let (text, taken) = render_batch(
+                    &self.coordinator,
+                    BATCH_ID_PLACEHOLDER,
+                    &notices,
+                    max_bytes.min(target.limit),
+                );
+                let notices = notices.into_iter().take(taken).collect::<Vec<_>>();
+                let id = batch_id(&self.coordinator, &notices);
+                let text = text.replacen(
+                    &format!("(batch {BATCH_ID_PLACEHOLDER})"),
+                    &format!("(batch {id})"),
+                    1,
+                );
+                if text.len() > target.limit {
+                    return Err(InboxError::usage(format!(
+                        "the first notice alone renders to {} bytes, over the {} limit of {} bytes",
+                        text.len(),
+                        target.via,
+                        target.limit
+                    )));
+                }
                 let batch = Batch {
                     schema: 1,
                     id: id.clone(),
                     coordinator: self.coordinator.clone(),
                     created_unix_ms: now,
                     delivered_unix_ms: None,
-                    via: Some(via.to_owned()),
+                    via: target.via.to_owned(),
+                    session: target.session.map(str::to_owned),
                     attempts: 0,
                     text,
-                    notices: notices.into_iter().take(taken).collect(),
+                    notices,
                 };
                 let path = self.write_json("claimed", &format!("{now:013}-{id}.json"), &batch)?;
-                let live = self.read_dir_json::<Notice>("live")?;
-                for (live_path, notice) in live {
-                    if batch.notices.iter().any(|taken| taken.id == notice.id) {
-                        fs::remove_file(&live_path).map_err(|error| {
-                            InboxError::io(&format!("cannot claim {}", live_path.display()), &error)
-                        })?;
-                    }
-                }
+                self.drop_batched_live_copies()?;
                 (path, batch)
             }
         };
@@ -711,30 +860,68 @@ impl Inbox {
         let _guard = self.lock(".lock", true)?;
         if let Err(error) = attempt {
             self.write_json("claimed", &file_name(&path), &batch)?;
-            return Err(InboxError {
-                code: EXIT_UNAVAILABLE,
-                message: format!(
-                    "batch {} stays claimed after attempt {} and is re-sent with the same key next time: {error}",
-                    batch.id, batch.attempts
-                ),
-            });
+            return Err(InboxError::unavailable(format!(
+                "batch {} stays claimed after attempt {} and the next deliver re-sends it with the same key: {error}",
+                batch.id, batch.attempts
+            )));
         }
         batch.delivered_unix_ms = Some(now_ms()?);
         self.write_json("delivered", &file_name(&path), &batch)?;
-        fs::remove_file(&path).map_err(|error| {
-            InboxError::io(&format!("cannot retire {}", path.display()), &error)
-        })?;
+        Self::remove(&path, "retire")?;
         self.prune_delivered()?;
         Ok(batch.notices.len())
+    }
+
+    fn release(&self, batch_id: &str, requeue: bool) -> Result<ReleaseOutcome> {
+        let _delivery = self.lock(".deliver.lock", false)?;
+        let _guard = self.lock(".lock", true)?;
+        let Some((path, batch)) = self
+            .read_dir_json::<Batch>("claimed")?
+            .into_iter()
+            .find(|(_, batch)| batch.id == batch_id)
+        else {
+            return Err(InboxError::usage(format!(
+                "no claimed batch {batch_id} in the inbox for {}",
+                self.coordinator
+            )));
+        };
+        let mut outcome = ReleaseOutcome {
+            batch: batch.id.clone(),
+            outcome: if requeue { "requeued" } else { "released" },
+            requeued: 0,
+            superseded: 0,
+        };
+        if requeue {
+            let live = self.read_dir_json::<Notice>("live")?;
+            for notice in &batch.notices {
+                let superseded = notice.kind.is_state()
+                    && live.iter().any(|(_, current)| {
+                        current.agent == notice.agent && current.kind.is_state()
+                    });
+                if superseded {
+                    outcome.superseded += 1;
+                    continue;
+                }
+                self.write_json(
+                    "live",
+                    &format!("{:013}-{}.json", notice.created_unix_ms, notice.id),
+                    notice,
+                )?;
+                outcome.requeued += 1;
+            }
+            Self::remove(&path, "requeue")?;
+        } else {
+            self.write_json("released", &file_name(&path), &batch)?;
+            Self::remove(&path, "release")?;
+        }
+        Ok(outcome)
     }
 
     fn prune_delivered(&self) -> Result<()> {
         let delivered = self.read_dir_json::<serde_json::Value>("delivered")?;
         let excess = delivered.len().saturating_sub(DELIVERED_KEEP);
         for (path, _) in delivered.into_iter().take(excess) {
-            fs::remove_file(&path).map_err(|error| {
-                InboxError::io(&format!("cannot prune {}", path.display()), &error)
-            })?;
+            Self::remove(&path, "prune")?;
         }
         Ok(())
     }
@@ -769,14 +956,18 @@ fn check_name(flag: &str, value: &str) -> Result<()> {
 fn parse_cursor(value: &str) -> Result<Cursor> {
     let invalid = || {
         InboxError::usage(format!(
-            "--cursor must be PATH:START:END with START <= END: {value:?}"
+            "--cursor must be PATH:START:END with START <= END, and PATH at most {MAX_CURSOR_PATH_BYTES} bytes without control characters"
         ))
     };
     let (rest, end) = value.rsplit_once(':').ok_or_else(invalid)?;
     let (path, start) = rest.rsplit_once(':').ok_or_else(invalid)?;
     let start: u64 = start.parse().map_err(|_| invalid())?;
     let end: u64 = end.parse().map_err(|_| invalid())?;
-    if path.is_empty() || start > end {
+    if path.is_empty()
+        || path.len() > MAX_CURSOR_PATH_BYTES
+        || path.chars().any(char::is_control)
+        || start > end
+    {
         return Err(invalid());
     }
     Ok(Cursor {
@@ -808,13 +999,13 @@ fn now_ms() -> Result<u64> {
     Ok(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
 }
 
-fn short_hash(parts: &[&[u8]]) -> String {
+fn hash_hex(parts: &[&[u8]], bytes: usize) -> String {
     let mut hasher = Sha256::new();
     for part in parts {
         hasher.update((part.len() as u64).to_le_bytes());
         hasher.update(part);
     }
-    hasher.finalize()[..6]
+    hasher.finalize()[..bytes]
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
@@ -822,25 +1013,26 @@ fn short_hash(parts: &[&[u8]]) -> String {
 
 fn notice_id(agent: &str, kind: NoticeKind, key: Option<&str>, now: u64) -> String {
     let nonce = format!("{}-{now}-{:?}", std::process::id(), SystemTime::now());
-    short_hash(&[
-        agent.as_bytes(),
-        kind.label().as_bytes(),
-        key.unwrap_or_default().as_bytes(),
-        nonce.as_bytes(),
-    ])
+    hash_hex(
+        &[
+            agent.as_bytes(),
+            kind.label().as_bytes(),
+            key.unwrap_or_default().as_bytes(),
+            nonce.as_bytes(),
+        ],
+        6,
+    )
 }
 
-fn batch_id(coordinator: &str, now: u64, notices: &[Notice]) -> String {
+/// Batch id from the coordinator and the ids of the notices it carries, independent of time, so
+/// the same set of notices always yields the same id and therefore the same idempotency key.
+fn batch_id(coordinator: &str, notices: &[Notice]) -> String {
     let ids = notices
         .iter()
         .map(|notice| notice.id.as_str())
         .collect::<Vec<_>>()
         .join(",");
-    format!(
-        "{}-{}",
-        utc_compact(now),
-        short_hash(&[coordinator.as_bytes(), ids.as_bytes()])
-    )
+    hash_hex(&[coordinator.as_bytes(), ids.as_bytes()], 8)
 }
 
 /// Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
@@ -857,21 +1049,20 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
-fn utc_parts(ms: u64) -> (i64, u32, u32, u64, u64, u64) {
-    let seconds = ms / 1000;
-    let (year, month, day) = civil_from_days(i64::try_from(seconds / 86_400).unwrap_or(0));
-    let rest = seconds % 86_400;
-    (year, month, day, rest / 3600, rest % 3600 / 60, rest % 60)
-}
-
-fn utc_compact(ms: u64) -> String {
-    let (year, month, day, hour, minute, second) = utc_parts(ms);
-    format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
-}
-
 fn utc_clock(ms: u64) -> String {
-    let (_, _, _, hour, minute, second) = utc_parts(ms);
-    format!("{hour:02}:{minute:02}:{second:02}Z")
+    let seconds = ms / 1000;
+    let rest = seconds % 86_400;
+    format!(
+        "{:02}:{:02}:{:02}Z",
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60
+    )
+}
+
+fn utc_date(ms: u64) -> String {
+    let (year, month, day) = civil_from_days(i64::try_from(ms / 86_400_000).unwrap_or(0));
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 fn cut(text: &str, limit: usize) -> (&str, bool) {
@@ -885,12 +1076,27 @@ fn cut(text: &str, limit: usize) -> (&str, bool) {
     (&text[..end], true)
 }
 
+/// Replace control characters other than newline and tab, so notice text cannot move the cursor
+/// or overwrite earlier lines when the batch is shown in a terminal.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() && character != '\n' && character != '\t' {
+                '\u{fffd}'
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
 fn render_notice(notice: &Notice) -> String {
     let mut block = format!(
-        "[P{} {}] {} at {}",
+        "[P{} {}] {} at {} {}",
         notice.priority,
         notice.kind.label(),
         notice.agent,
+        utc_date(notice.updated_unix_ms),
         utc_clock(notice.updated_unix_ms)
     );
     if notice.replaced > 0 {
@@ -902,7 +1108,7 @@ fn render_notice(notice: &Notice) -> String {
     }
     block.push('\n');
     let (text, truncated) = cut(notice.text.trim_end(), RENDER_TEXT_BYTES);
-    for line in text.lines() {
+    for line in printable(text).lines() {
         block.push_str("  ");
         block.push_str(line);
         block.push('\n');
@@ -916,15 +1122,29 @@ fn render_notice(notice: &Notice) -> String {
     if let Some(cursor) = &notice.cursor {
         block.push_str(&format!(
             "  transcript: {} bytes {}..{}\n",
-            cursor.path, cursor.start, cursor.end
+            printable(&cursor.path),
+            cursor.start,
+            cursor.end
         ));
     }
     block
 }
 
+fn render_header(coordinator: &str, batch: &str, taken: usize, total: usize) -> String {
+    format!("agentctl inbox for {coordinator}: {taken} of {total} notices (batch {batch})\n")
+}
+
+fn render_trailer(coordinator: &str, remaining: usize) -> String {
+    if remaining == 0 {
+        String::new()
+    } else {
+        format!("{remaining} more stay queued: agentctl inbox list --to {coordinator}\n")
+    }
+}
+
 /// Render notices (already in delivery order) into one batch; returns the text and how many
-/// notices it includes. The first notice is always included; later ones only while the text
-/// stays within `max_bytes`.
+/// notices it includes. The first notice is always included; each later one only while the whole
+/// text, header and trailer included, stays within `max_bytes`.
 fn render_batch(
     coordinator: &str,
     batch: &str,
@@ -934,38 +1154,46 @@ fn render_batch(
     if notices.is_empty() {
         return (String::new(), 0);
     }
-    let blocks = notices.iter().map(render_notice).collect::<Vec<_>>();
-    let mut taken = 0;
-    let mut body = String::new();
-    for block in &blocks {
-        if taken > 0 && body.len() + block.len() > max_bytes {
+    let total = notices.len();
+    let mut body = render_notice(&notices[0]);
+    let mut taken = 1;
+    for notice in &notices[1..] {
+        let block = render_notice(notice);
+        let size = render_header(coordinator, batch, taken + 1, total).len()
+            + body.len()
+            + block.len()
+            + render_trailer(coordinator, total - taken - 1).len();
+        if size > max_bytes {
             break;
         }
-        body.push_str(block);
+        body.push_str(&block);
         taken += 1;
     }
-    let mut text = format!(
-        "agentctl inbox for {coordinator}: {taken} of {} notices (batch {batch})\n",
-        notices.len()
-    );
+    let mut text = render_header(coordinator, batch, taken, total);
     text.push_str(&body);
-    if taken < notices.len() {
-        text.push_str(&format!(
-            "{} more stay queued: agentctl inbox list --to {coordinator}\n",
-            notices.len() - taken
-        ));
-    }
+    text.push_str(&render_trailer(coordinator, total - taken));
     (text, taken)
 }
 
-fn notify_agentcloud(agentcloudctl: &Path, session: &str, key: &str, text: &str) -> Result<()> {
+fn notify_agentcloud(
+    scratch: &Path,
+    agentcloudctl: &Path,
+    session: &str,
+    key: &str,
+    text: &str,
+    timeout: Duration,
+) -> Result<()> {
     if text.len() > MAX_NOTIFY_BYTES {
-        return Err(InboxError::usage(format!(
+        return Err(InboxError::unavailable(format!(
             "batch is {} bytes; notify accepts {MAX_NOTIFY_BYTES}",
             text.len()
         )));
     }
-    let output = Command::new(agentcloudctl)
+    let stderr_path = scratch.join(format!(".notify-stderr.{}", std::process::id()));
+    let stderr = fs::File::create(&stderr_path).map_err(|error| {
+        InboxError::io(&format!("cannot create {}", stderr_path.display()), &error)
+    })?;
+    let mut child = Command::new(agentcloudctl)
         .args([
             "notify",
             "--session",
@@ -977,23 +1205,47 @@ fn notify_agentcloud(agentcloudctl: &Path, session: &str, key: &str, text: &str)
             "--text",
             text,
         ])
-        .output()
-        .map_err(|error| InboxError {
-            code: EXIT_UNAVAILABLE,
-            message: format!("cannot run {}: {error}", agentcloudctl.display()),
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr)
+        .spawn()
+        .map_err(|error| {
+            InboxError::unavailable(format!("cannot run {}: {error}", agentcloudctl.display()))
         })?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(InboxError {
-            code: EXIT_UNAVAILABLE,
-            message: format!(
-                "{} notify exited {}: {}",
-                agentcloudctl.display(),
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-        })
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(InboxError::unavailable(format!(
+                    "cannot wait for {}: {error}",
+                    agentcloudctl.display()
+                )));
+            }
+        }
+    };
+    let detail = fs::read_to_string(&stderr_path).unwrap_or_default();
+    let _ = fs::remove_file(&stderr_path);
+    match status {
+        Some(status) if status.success() => Ok(()),
+        Some(status) => Err(InboxError::unavailable(format!(
+            "{} notify exited {status}: {}",
+            agentcloudctl.display(),
+            detail.trim()
+        ))),
+        None => Err(InboxError::unavailable(format!(
+            "{} notify did not finish within {} seconds and was killed",
+            agentcloudctl.display(),
+            timeout.as_secs()
+        ))),
     }
 }
 
@@ -1008,32 +1260,49 @@ fn print_json(value: &impl Serialize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    const PRINT: DeliveryTarget<'static> = DeliveryTarget {
+        via: "print",
+        session: None,
+        limit: usize::MAX,
+    };
+    const NOTIFY: DeliveryTarget<'static> = DeliveryTarget {
+        via: "agentcloud-notify",
+        session: Some("session-a"),
+        limit: MAX_NOTIFY_BYTES,
+    };
 
     fn scratch() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "agentctl-inbox-test-{}-{}",
             std::process::id(),
-            short_hash(&[format!("{:?}", SystemTime::now()).as_bytes()])
+            hash_hex(&[format!("{:?}", SystemTime::now()).as_bytes()], 6)
         ));
         fs::create_dir_all(&path).unwrap();
         path
     }
 
+    fn request<'a>(agent: &'a str, kind: NoticeKind, text: &'a str) -> PostRequest<'a> {
+        PostRequest {
+            agent,
+            kind,
+            text,
+            key: None,
+            cursor: None,
+            max_live: DEFAULT_MAX_LIVE,
+            stale_after: DEFAULT_STALE_SECONDS,
+        }
+    }
+
     fn post(inbox: &Inbox, agent: &str, kind: NoticeKind, text: &str, now: u64) -> PostOutcome {
-        inbox
-            .post(
-                &PostRequest {
-                    agent,
-                    kind,
-                    text,
-                    key: None,
-                    cursor: None,
-                    max_live: DEFAULT_MAX_LIVE,
-                },
-                now,
-            )
-            .unwrap()
+        inbox.post(&request(agent, kind, text), now).unwrap()
+    }
+
+    fn agents(notices: &[Notice]) -> Vec<&str> {
+        notices.iter().map(|notice| notice.agent.as_str()).collect()
     }
 
     #[test]
@@ -1041,12 +1310,8 @@ mod tests {
         let registry = scratch();
         let inbox = Inbox::open(&registry, "coord").unwrap();
         let first = PostRequest {
-            agent: "kvm",
-            kind: NoticeKind::Progress,
-            text: "running tests",
-            key: None,
             cursor: Some(parse_cursor("/t.jsonl:100:200").unwrap()),
-            max_live: DEFAULT_MAX_LIVE,
+            ..request("kvm", NoticeKind::Progress, "running tests")
         };
         assert_eq!(inbox.post(&first, 1_000).unwrap().outcome, "stored");
         let second = PostRequest {
@@ -1055,13 +1320,18 @@ mod tests {
             cursor: Some(parse_cursor("/t.jsonl:200:400").unwrap()),
             ..first
         };
-        let outcome = inbox.post(&second, 2_000).unwrap();
-        assert_eq!(outcome.outcome, "replaced");
+        assert_eq!(inbox.post(&second, 2_000).unwrap().outcome, "replaced");
         let live = inbox.live(2_000, DEFAULT_STALE_SECONDS).unwrap();
         assert_eq!(live.len(), 1);
-        assert_eq!(live[0].kind, NoticeKind::Idle);
-        assert_eq!(live[0].created_unix_ms, 1_000);
-        assert_eq!(live[0].replaced, 1);
+        assert_eq!(
+            (
+                live[0].kind,
+                live[0].priority,
+                live[0].created_unix_ms,
+                live[0].replaced
+            ),
+            (NoticeKind::Idle, 2, 1_000, 1)
+        );
         assert_eq!(
             live[0].cursor,
             Some(Cursor {
@@ -1069,6 +1339,28 @@ mod tests {
                 start: 100,
                 end: 400
             })
+        );
+    }
+
+    #[test]
+    fn a_replacement_never_lowers_priority_so_it_cannot_expire_away() {
+        let registry = scratch();
+        let inbox = Inbox::open(&registry, "coord").unwrap();
+        post(&inbox, "kvm", NoticeKind::Idle, "idle", 0);
+        post(&inbox, "kvm", NoticeKind::StillIdle, "still idle", 1);
+        post(&inbox, "b", NoticeKind::Blocked, "needs approval", 2);
+        post(&inbox, "b", NoticeKind::Progress, "moving again", 3);
+        let live = inbox.live(1_000_000, 0).unwrap();
+        let summary = live
+            .iter()
+            .map(|notice| (notice.agent.as_str(), notice.kind, notice.priority))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            [
+                ("b", NoticeKind::Progress, 1),
+                ("kvm", NoticeKind::StillIdle, 2)
+            ]
         );
     }
 
@@ -1098,34 +1390,36 @@ mod tests {
         let registry = scratch();
         let inbox = Inbox::open(&registry, "coord").unwrap();
         let keyed = |now| {
-            inbox
-                .post(
-                    &PostRequest {
-                        agent: "kvm",
-                        kind: NoticeKind::Message,
-                        text: "report",
-                        key: Some("kvm-report-1"),
-                        cursor: None,
-                        max_live: DEFAULT_MAX_LIVE,
-                    },
-                    now,
-                )
-                .unwrap()
+            let request = PostRequest {
+                key: Some("kvm-report-1"),
+                ..request("kvm", NoticeKind::Message, "report")
+            };
+            inbox.post(&request, now).unwrap()
         };
-        assert_eq!(keyed(1).outcome, "stored");
-        assert_eq!(keyed(2).outcome, "duplicate");
+        let stored = keyed(1);
+        assert_eq!(stored.outcome, "stored");
+        assert_eq!(
+            keyed(2),
+            PostOutcome {
+                outcome: "duplicate",
+                ..stored.clone()
+            }
+        );
         post(&inbox, "kvm", NoticeKind::Message, "second", 3);
         assert_eq!(inbox.live(4, DEFAULT_STALE_SECONDS).unwrap().len(), 2);
         assert_eq!(
             inbox
-                .deliver(5, 10_000, DEFAULT_STALE_SECONDS, "print", |_| Ok(()))
+                .deliver(5, 10_000, DEFAULT_STALE_SECONDS, &PRINT, |_| Ok(()))
                 .unwrap(),
             2
         );
         assert_eq!(
-            keyed(6).outcome,
-            "duplicate",
-            "a delivered key must not be re-queued"
+            keyed(6),
+            PostOutcome {
+                outcome: "duplicate",
+                ..stored
+            },
+            "a delivered key must not be queued again, and must name the delivered notice"
         );
         assert!(inbox.live(7, DEFAULT_STALE_SECONDS).unwrap().is_empty());
     }
@@ -1138,13 +1432,10 @@ mod tests {
         post(&inbox, "b", NoticeKind::Idle, "p2 older", 2);
         post(&inbox, "c", NoticeKind::Blocked, "p1", 3);
         post(&inbox, "d", NoticeKind::Message, "p2 newer", 4);
-        let agents = inbox
-            .live(5, DEFAULT_STALE_SECONDS)
-            .unwrap()
-            .into_iter()
-            .map(|notice| notice.agent)
-            .collect::<Vec<_>>();
-        assert_eq!(agents, ["c", "b", "d", "a"]);
+        assert_eq!(
+            agents(&inbox.live(5, DEFAULT_STALE_SECONDS).unwrap()),
+            ["c", "b", "d", "a"]
+        );
     }
 
     #[test]
@@ -1153,35 +1444,42 @@ mod tests {
         let inbox = Inbox::open(&registry, "coord").unwrap();
         post(&inbox, "a", NoticeKind::StillIdle, "old reminder", 0);
         post(&inbox, "b", NoticeKind::Idle, "old idle", 0);
-        let live = inbox.live(10_001, 10).unwrap();
+        assert_eq!(agents(&inbox.live(10_001, 10).unwrap()), ["b"]);
+    }
+
+    #[test]
+    fn a_full_queue_refuses_new_workers_but_accepts_replacements_and_ignores_stale_notices() {
+        let registry = scratch();
+        let inbox = Inbox::open(&registry, "coord").unwrap();
+        let limited = |agent, kind| PostRequest {
+            max_live: 1,
+            stale_after: 10,
+            ..request(agent, kind, "x")
+        };
+        inbox.post(&limited("a", NoticeKind::Idle), 1).unwrap();
+        let refused = inbox.post(&limited("b", NoticeKind::Idle), 2).unwrap_err();
+        assert_eq!(refused.exit_code(), EXIT_BUSY);
         assert_eq!(
-            live.iter()
-                .map(|notice| notice.agent.as_str())
-                .collect::<Vec<_>>(),
-            ["b"]
+            inbox
+                .post(&limited("a", NoticeKind::Idle), 3)
+                .unwrap()
+                .outcome,
+            "replaced"
+        );
+        let registry = scratch();
+        let inbox = Inbox::open(&registry, "coord").unwrap();
+        inbox.post(&limited("a", NoticeKind::Progress), 0).unwrap();
+        let outcome = inbox
+            .post(&limited("b", NoticeKind::Blocked), 10_001)
+            .unwrap();
+        assert_eq!(
+            outcome.outcome, "stored",
+            "a stale notice must not hold capacity"
         );
     }
 
     #[test]
-    fn a_full_queue_refuses_new_workers_but_still_accepts_replacements() {
-        let registry = scratch();
-        let inbox = Inbox::open(&registry, "coord").unwrap();
-        let request = |agent, max_live| PostRequest {
-            agent,
-            kind: NoticeKind::Idle,
-            text: "x",
-            key: None,
-            cursor: None,
-            max_live,
-        };
-        inbox.post(&request("a", 1), 1).unwrap();
-        let refused = inbox.post(&request("b", 1), 2).unwrap_err();
-        assert_eq!(refused.exit_code(), EXIT_BUSY);
-        assert_eq!(inbox.post(&request("a", 1), 3).unwrap().outcome, "replaced");
-    }
-
-    #[test]
-    fn render_keeps_the_budget_but_always_includes_the_first_notice() {
+    fn render_keeps_the_whole_budget_but_always_includes_the_first_notice() {
         let registry = scratch();
         let inbox = Inbox::open(&registry, "coord").unwrap();
         post(&inbox, "a", NoticeKind::Blocked, &"x".repeat(900), 1);
@@ -1190,32 +1488,98 @@ mod tests {
         let (text, taken) = render_batch("coord", "b1", &notices, 100);
         assert_eq!(taken, 1);
         assert!(text.starts_with(
-            "agentctl inbox for coord: 1 of 2 notices (batch b1)\n[P1 blocked] a at "
+            "agentctl inbox for coord: 1 of 2 notices (batch b1)\n[P1 blocked] a at 1970-01-01 00:00:00Z\n"
         ));
         assert!(text.contains(&format!("[cut at {RENDER_TEXT_BYTES} of 900 bytes]")));
         assert!(text.ends_with("1 more stay queued: agentctl inbox list --to coord\n"));
         let (all, taken) = render_batch("coord", "b2", &notices, 10_000);
         assert_eq!(taken, 2);
         assert!(!all.contains("more stay queued"));
+        let (exact, taken) = render_batch("coord", "b2", &notices, all.len());
+        assert_eq!(
+            (exact.len(), taken),
+            (all.len(), 2),
+            "a batch that fits exactly is kept whole"
+        );
+        let (_, taken) = render_batch("coord", "b2", &notices, all.len() - 1);
+        assert_eq!(
+            taken, 1,
+            "one byte short: the header and trailer count against the budget"
+        );
     }
 
     #[test]
-    fn a_failed_delivery_is_resent_with_the_same_batch_before_new_notices() {
+    fn control_characters_cannot_forge_lines() {
+        let registry = scratch();
+        let inbox = Inbox::open(&registry, "coord").unwrap();
+        post(
+            &inbox,
+            "a",
+            NoticeKind::Idle,
+            "ok\r[P1 blocked] fake\x1b[2K",
+            1,
+        );
+        let (text, _) = render_batch(
+            "coord",
+            "b",
+            &inbox.live(2, DEFAULT_STALE_SECONDS).unwrap(),
+            10_000,
+        );
+        assert!(!text.contains('\r') && !text.contains('\x1b'));
+        assert_eq!(text.lines().filter(|line| line.starts_with('[')).count(), 1);
+        assert!(parse_cursor("/x\n[P1 blocked] w9:1:2").is_err());
+    }
+
+    #[test]
+    fn notify_batches_are_capped_and_a_huge_budget_cannot_jam_the_queue() {
+        let registry = scratch();
+        let inbox = Inbox::open(&registry, "coord").unwrap();
+        // Each notice renders to about 1.7 KB (600 bytes of text plus a 1000-byte path), so 70
+        // of them cannot fit in one notify-sized batch.
+        let text = "y".repeat(590);
+        let cursor = format!("/{}:0:1", "p".repeat(1000));
+        for index in 0..70 {
+            let agent = format!("w{index}");
+            let request = PostRequest {
+                cursor: Some(parse_cursor(&cursor).unwrap()),
+                ..request(&agent, NoticeKind::Idle, &text)
+            };
+            inbox.post(&request, index).unwrap();
+        }
+        let sizes = RefCell::new(Vec::new());
+        let mut delivered = 0;
+        while !inbox.live(1_000, DEFAULT_STALE_SECONDS).unwrap().is_empty() {
+            delivered += inbox
+                .deliver(1_000, usize::MAX, DEFAULT_STALE_SECONDS, &NOTIFY, |batch| {
+                    sizes.borrow_mut().push(batch.text.len());
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(delivered, 70);
+        let sizes = sizes.into_inner();
+        assert!(
+            sizes.len() >= 2,
+            "70 notices of ~1.7 KB need more than one batch"
+        );
+        assert!(
+            sizes.iter().all(|size| *size <= MAX_NOTIFY_BYTES),
+            "{sizes:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_delivery_is_resent_unchanged_before_new_notices() {
         let registry = scratch();
         let inbox = Inbox::open(&registry, "coord").unwrap();
         post(&inbox, "a", NoticeKind::Idle, "first", 1);
-        let seen = std::cell::RefCell::new(Vec::new());
+        let seen = RefCell::new(Vec::new());
         let failed = inbox
-            .deliver(
-                2,
-                10_000,
-                DEFAULT_STALE_SECONDS,
-                "agentcloud-notify",
-                |batch| {
-                    seen.borrow_mut().push(batch.id.clone());
-                    Err(InboxError::busy("adapter down"))
-                },
-            )
+            .deliver(2, 10_000, DEFAULT_STALE_SECONDS, &NOTIFY, |batch| {
+                seen.borrow_mut()
+                    .push((batch.id.clone(), batch.text.clone()));
+                Err(InboxError::busy("adapter down"))
+            })
             .unwrap_err();
         assert_eq!(failed.exit_code(), EXIT_UNAVAILABLE);
         post(
@@ -1227,33 +1591,114 @@ mod tests {
         );
         let count = Cell::new(0);
         let delivered = inbox
-            .deliver(
-                4,
-                10_000,
-                DEFAULT_STALE_SECONDS,
-                "agentcloud-notify",
-                |batch| {
-                    seen.borrow_mut().push(batch.id.clone());
-                    count.set(batch.notices.len());
-                    assert_eq!(batch.attempts, 2);
-                    Ok(())
-                },
-            )
+            .deliver(4_000, 10_000, DEFAULT_STALE_SECONDS, &NOTIFY, |batch| {
+                seen.borrow_mut()
+                    .push((batch.id.clone(), batch.text.clone()));
+                count.set(batch.notices.len());
+                assert_eq!(batch.attempts, 2);
+                Ok(())
+            })
             .unwrap();
         assert_eq!((delivered, count.get()), (1, 1));
-        let ids = seen.into_inner();
+        let seen = seen.into_inner();
         assert_eq!(
-            ids[0], ids[1],
-            "the retry must reuse the batch id, and so the idempotency key"
+            seen[0], seen[1],
+            "the retry must reuse the batch id and text"
         );
-        let remaining = inbox.live(5, DEFAULT_STALE_SECONDS).unwrap();
         assert_eq!(
-            remaining
-                .iter()
-                .map(|notice| notice.agent.as_str())
-                .collect::<Vec<_>>(),
+            agents(&inbox.live(5, DEFAULT_STALE_SECONDS).unwrap()),
             ["b"]
         );
+    }
+
+    #[test]
+    fn a_claimed_batch_is_not_resent_to_another_adapter_or_session_until_released() {
+        let registry = scratch();
+        let inbox = Inbox::open(&registry, "coord").unwrap();
+        post(&inbox, "a", NoticeKind::Idle, "first", 1);
+        inbox
+            .deliver(2, 10_000, DEFAULT_STALE_SECONDS, &NOTIFY, |_| {
+                Err(InboxError::busy("adapter down"))
+            })
+            .unwrap_err();
+        let other_session = DeliveryTarget {
+            session: Some("session-b"),
+            ..NOTIFY
+        };
+        for target in [PRINT, other_session] {
+            let error = inbox
+                .deliver(3, 10_000, DEFAULT_STALE_SECONDS, &target, |_| {
+                    panic!("a mismatched retry must not reach the adapter")
+                })
+                .unwrap_err();
+            assert_eq!(error.exit_code(), 2);
+            assert!(error.to_string().contains("agentctl inbox release"));
+        }
+        let claimed = inbox.read_dir_json::<Batch>("claimed").unwrap();
+        let id = claimed[0].1.id.clone();
+        post(&inbox, "a", NoticeKind::Blocked, "newer state", 4);
+        let outcome = inbox.release(&id, true).unwrap();
+        assert_eq!((outcome.requeued, outcome.superseded), (0, 1));
+        assert_eq!(
+            inbox
+                .deliver(5, 10_000, DEFAULT_STALE_SECONDS, &PRINT, |_| Ok(()))
+                .unwrap(),
+            1
+        );
+        post(&inbox, "c", NoticeKind::Message, "m", 6);
+        inbox
+            .deliver(7, 10_000, DEFAULT_STALE_SECONDS, &NOTIFY, |_| {
+                Err(InboxError::busy("adapter down"))
+            })
+            .unwrap_err();
+        let id = inbox.read_dir_json::<Batch>("claimed").unwrap()[0]
+            .1
+            .id
+            .clone();
+        assert_eq!(inbox.release(&id, false).unwrap().outcome, "released");
+        assert_eq!(inbox.read_dir_json::<Batch>("released").unwrap().len(), 1);
+        assert!(inbox.live(8, DEFAULT_STALE_SECONDS).unwrap().is_empty());
+        assert_eq!(inbox.release("absent", false).unwrap_err().exit_code(), 2);
+    }
+
+    #[test]
+    fn live_copies_left_by_an_interrupted_claim_are_not_delivered_twice() {
+        let registry = scratch();
+        let inbox = Inbox::open(&registry, "coord").unwrap();
+        post(&inbox, "a", NoticeKind::Blocked, "needs approval", 1);
+        let notices = inbox.live(2, DEFAULT_STALE_SECONDS).unwrap();
+        let id = batch_id("coord", &notices);
+        let batch = Batch {
+            schema: 1,
+            id: id.clone(),
+            coordinator: "coord".into(),
+            created_unix_ms: 2,
+            delivered_unix_ms: None,
+            via: "agentcloud-notify".into(),
+            session: Some("session-a".into()),
+            attempts: 0,
+            text: render_batch("coord", &id, &notices, 10_000).0,
+            notices,
+        };
+        inbox
+            .write_json("claimed", &format!("{:013}-{id}.json", 2), &batch)
+            .unwrap();
+        let sent = RefCell::new(Vec::new());
+        let deliver = || {
+            inbox
+                .deliver(3, 10_000, DEFAULT_STALE_SECONDS, &NOTIFY, |batch| {
+                    sent.borrow_mut().push(batch.id.clone());
+                    Ok(())
+                })
+                .unwrap()
+        };
+        assert_eq!(deliver(), 1);
+        assert_eq!(
+            deliver(),
+            0,
+            "the leftover live copy must not become a second batch"
+        );
+        assert_eq!(sent.into_inner(), [id]);
     }
 
     #[test]
@@ -1262,16 +1707,16 @@ mod tests {
         let inbox = Inbox::open(&registry, "coord").unwrap();
         post(&inbox, "a", NoticeKind::Idle, "x", 1);
         let other = Inbox::open(&registry, "coord").unwrap();
-        let refused = inbox
-            .deliver(2, 10_000, DEFAULT_STALE_SECONDS, "print", |_| {
+        let delivered = inbox
+            .deliver(2, 10_000, DEFAULT_STALE_SECONDS, &PRINT, |_| {
                 let error = other
-                    .deliver(2, 10_000, DEFAULT_STALE_SECONDS, "print", |_| Ok(()))
+                    .deliver(2, 10_000, DEFAULT_STALE_SECONDS, &PRINT, |_| Ok(()))
                     .unwrap_err();
                 assert_eq!(error.exit_code(), EXIT_BUSY);
                 Ok(())
             })
             .unwrap();
-        assert_eq!(refused, 1);
+        assert_eq!(delivered, 1);
     }
 
     #[test]
@@ -1293,28 +1738,243 @@ mod tests {
                 end: 2
             }
         );
-        for bad in ["/a:2:1", "/a:1", ":1:2", "/a:x:2"] {
+        let long = format!("/{}:1:2", "p".repeat(MAX_CURSOR_PATH_BYTES));
+        for bad in [
+            "/a:2:1",
+            "/a:1",
+            ":1:2",
+            "/a:x:2",
+            "/a\t:1:2",
+            long.as_str(),
+        ] {
             assert!(parse_cursor(bad).is_err(), "{bad:?}");
         }
         let registry = scratch();
         let inbox = Inbox::open(&registry, "coord").unwrap();
         let big = "x".repeat(MAX_TEXT_BYTES + 1);
-        let request = PostRequest {
-            agent: "a",
-            kind: NoticeKind::Idle,
-            text: &big,
-            key: None,
-            cursor: None,
-            max_live: DEFAULT_MAX_LIVE,
-        };
-        assert_eq!(inbox.post(&request, 1).unwrap_err().exit_code(), 2);
+        assert_eq!(
+            inbox
+                .post(&request("a", NoticeKind::Idle, &big), 1)
+                .unwrap_err()
+                .exit_code(),
+            2
+        );
     }
 
     #[test]
     fn utc_formatting_matches_known_instants() {
-        assert_eq!(utc_compact(0), "19700101T000000Z");
-        assert_eq!(utc_compact(1_790_712_924_000), "20260929T201524Z");
+        assert_eq!(utc_date(0), "1970-01-01");
+        assert_eq!(utc_date(1_790_712_924_000), "2026-09-29");
+        assert_eq!(utc_clock(1_790_712_924_000), "20:15:24Z");
         assert_eq!(utc_clock(1_709_210_096_000), "12:34:56Z");
-        assert_eq!(utc_compact(951_782_400_000), "20000229T000000Z");
+        assert_eq!(utc_date(951_782_400_000), "2000-02-29");
+    }
+
+    fn cli(registry: &Path, arguments: &[&str]) -> i32 {
+        let mut all = vec![
+            OsString::from("--registry"),
+            registry.as_os_str().to_owned(),
+        ];
+        all.extend(arguments.iter().map(OsString::from));
+        crate::cli::main(all)
+    }
+
+    fn fake_agentcloudctl(directory: &Path, body: &str) -> PathBuf {
+        let path = directory.join("fake-agentcloudctl");
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn cli_exit_codes_match_the_userguide() {
+        let registry = scratch();
+        let post = ["inbox", "post", "--to", "coord", "--from", "a", "--kind"];
+        assert_eq!(
+            cli(&registry, &[&post[..], &["idle", "--text", "x"]].concat()),
+            0
+        );
+        assert_eq!(cli(&registry, &[&post[..], &["idle"]].concat()), 2);
+        assert_eq!(
+            cli(
+                &registry,
+                &[&post[..], &["idle", "--text", "x", "--id", "k"]].concat()
+            ),
+            2
+        );
+        assert_eq!(
+            cli(
+                &registry,
+                &[
+                    "inbox",
+                    "deliver",
+                    "--to",
+                    "coord",
+                    "--via",
+                    "agentcloud-notify"
+                ]
+            ),
+            2
+        );
+        assert_eq!(
+            cli(
+                &registry,
+                &[
+                    "inbox",
+                    "deliver",
+                    "--to",
+                    "coord",
+                    "--via",
+                    "print",
+                    "--session",
+                    "s"
+                ]
+            ),
+            2
+        );
+        assert_eq!(
+            cli(
+                &registry,
+                &[&post[..], &["idle", "--text", "x", "--max-live", "1"]].concat()
+            ),
+            0,
+            "a replacement is accepted at capacity"
+        );
+        assert_eq!(
+            cli(
+                &registry,
+                &[
+                    "inbox",
+                    "post",
+                    "--to",
+                    "coord",
+                    "--from",
+                    "b",
+                    "--kind",
+                    "idle",
+                    "--text",
+                    "x",
+                    "--max-live",
+                    "1"
+                ]
+            ),
+            EXIT_BUSY
+        );
+        assert_eq!(
+            cli(
+                &registry,
+                &["inbox", "deliver", "--to", "coord", "--via", "print"]
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn cli_notify_passes_the_documented_argv_and_retries_with_the_same_key() {
+        let registry = scratch();
+        let log = registry.join("argv.log");
+        let flag = registry.join("fail");
+        let fake = fake_agentcloudctl(
+            &registry,
+            &format!(
+                "printf '%s\\n' \"$@\" >> {log}; echo --- >> {log}; if [ -e {flag} ]; then echo boom >&2; exit 3; fi",
+                log = log.display(),
+                flag = flag.display()
+            ),
+        );
+        let fake = fake.to_str().unwrap();
+        assert_eq!(
+            cli(
+                &registry,
+                &[
+                    "inbox",
+                    "post",
+                    "--to",
+                    "coord",
+                    "--from",
+                    "a",
+                    "--kind",
+                    "blocked",
+                    "--text",
+                    "needs approval"
+                ]
+            ),
+            0
+        );
+        fs::write(&flag, "").unwrap();
+        let deliver = [
+            "--agentcloudctl-bin",
+            fake,
+            "inbox",
+            "deliver",
+            "--to",
+            "coord",
+            "--via",
+            "agentcloud-notify",
+            "--session",
+            "session-a",
+        ];
+        assert_eq!(cli(&registry, &deliver), EXIT_UNAVAILABLE);
+        fs::remove_file(&flag).unwrap();
+        assert_eq!(cli(&registry, &deliver), 0);
+        assert_eq!(cli(&registry, &deliver), 0, "an empty queue sends nothing");
+        let calls = fs::read_to_string(&log).unwrap();
+        let calls = calls
+            .split("---\n")
+            .filter(|call| !call.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[0], calls[1]);
+        let argv = calls[0].lines().collect::<Vec<_>>();
+        assert_eq!(
+            &argv[..7],
+            [
+                "notify",
+                "--session",
+                "session-a",
+                "--mode",
+                "cli-script",
+                "--idempotency-key",
+                argv[6]
+            ]
+        );
+        assert!(argv[6].starts_with("agentctl-inbox-coord-") && argv[6].len() == 21 + 16);
+        assert_eq!(argv[7], "--text");
+        assert!(argv[8].starts_with("agentctl inbox for coord: 1 of 1 notices (batch "));
+    }
+
+    #[test]
+    fn cli_notify_times_out_and_keeps_the_batch_claimed() {
+        let registry = scratch();
+        let fake = fake_agentcloudctl(&registry, "exec sleep 30");
+        let fake = fake.to_str().unwrap();
+        cli(
+            &registry,
+            &[
+                "inbox", "post", "--to", "coord", "--from", "a", "--kind", "idle", "--text", "x",
+            ],
+        );
+        let started = Instant::now();
+        let code = cli(
+            &registry,
+            &[
+                "--agentcloudctl-bin",
+                fake,
+                "inbox",
+                "deliver",
+                "--to",
+                "coord",
+                "--via",
+                "agentcloud-notify",
+                "--session",
+                "s",
+                "--notify-timeout",
+                "1",
+            ],
+        );
+        assert_eq!(code, EXIT_UNAVAILABLE);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let inbox = Inbox::open(&registry, "coord").unwrap();
+        assert_eq!(inbox.read_dir_json::<Batch>("claimed").unwrap().len(), 1);
     }
 }
