@@ -73,15 +73,16 @@ distinct text, compared as the userguide describes, whichever of that request's
 reply IDs it uses. Rows that start like a prompt the agent received, or like a
 tool call's output, are skipped with the rows that continue them, so a reply
 block quoted in a message to the agent is not posted; the userguide describes
-these rules and where they fail. For a Claude Code pane herdr usually returns
-about one screen, so a block is posted only when a capture shows the first row
-of its message and the whole block, and a block taller than the screen is
-usually not posted. A block under a reply ID that matches no request the bridge
-knows, or one a capture shows only in part, is not posted, and the agent gets a
-routing-error prompt about it, usually once, as the userguide describes. A block
-under a well-formed ID of a closed request is ignored. For an unmatched ID, the
-prompt lists the open requests whose prompts reached the agent's queue: first
-those with no reply yet, most recent first, and then those already answered.
+these rules and where they fail. The bridge reads only the screen of a pane that
+herdr reports keeps no scrollback, such as a Claude Code pane, so there a block
+is posted only when a capture shows the first row of its message and the whole
+block, and a block taller than the screen is not posted. A block under a reply
+ID that matches no request the bridge knows, or one a capture shows only in
+part, is not posted, and the agent gets a routing-error prompt about it, usually
+once, as the userguide describes. A block under a well-formed ID of a closed
+request is ignored. For an unmatched ID, the prompt lists the open requests
+whose prompts reached the agent's queue: first those with no reply yet, most
+recent first, and then those already answered.
 A block that cannot be posted, such as an empty or oversized one, is skipped
 with one log line that begins with the UTC time and then
 `agentctl: chat reply capture:`; nothing the agent prints stops `run`.

@@ -18891,31 +18891,26 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
     }
 
     #[test]
-    fn a_joined_read_of_a_claude_code_pane_posts_a_quoted_block_known_gap() {
-        // KNOWN GAP, https://github.com/rrnewton/agent-utils/issues/191: a block quoted in an
-        // agent's prompt must never be posted, but a read longer than the screen of an idle Claude
-        // Code pane can still post one. Herdr 0.8.0 builds such a read by scrolling the agent's
-        // view up and joining the screens it sees: a row of a new screen is kept only when it
-        // differs from the row at the same position on the screen before (`merge_scrolled_up`,
-        // src/terminal/history_read.rs at herdr 346411fa). Below, the screen's top row is Claude
-        // Code's pinned copy of the prompt's first row, drawn over the prompt's closing marker.
-        // The first scroll, of three rows, brings the prompt's real first row to the top row,
-        // where it matches that copy, so the join keeps only the three rows under it: the quoted
-        // block. The second scroll adds the coordinator's rows above them. So the joined text
-        // shows the quoted block right after a row of the coordinator's message, and the bridge
-        // posts it. The screen alone posts nothing. This joined read is worked out by hand and
-        // needs all of these: the pane is idle and takes wheel input, the read asks for more rows
-        // than the screen has, the scroll that first shows the prompt's first row puts it on the
-        // top row, where the copy was drawn, and the pinned copy is identical to the prompt's
-        // first row once trailing spaces are trimmed. That last condition has not
-        // been seen: in one 271-line read of a Claude Code pane, each of its 12
-        // pinned copies was the whole prompt flattened into one row and cut with `…`. With such
-        // a copy the join keeps the prompt's first row above the quote, and nothing is posted. A
-        // change that reads only the screen of a pane that keeps no scrollback must turn the
-        // assertions marked as the known gap below into "posts nothing"; the rule itself stays
-        // as it is. `agentctl chat tick` reads through `agent::read`, not
-        // `CHAT_CAPTURE_SOURCE`, so this test does not cover its reads.
-        let (state, key, nonce, root) = open_request("joined-read-known-gap");
+    fn the_bridge_reads_only_the_screen_of_a_claude_code_pane_and_posts_no_quoted_block() {
+        // https://github.com/rrnewton/agent-utils/issues/191: a block quoted in an agent's prompt
+        // must never be posted, and a read longer than the screen of an idle Claude Code pane can
+        // hold one right after a row of the coordinator's. Herdr 0.8.0 builds such a read by
+        // scrolling the agent's view up and joining the screens it sees: a row of a new screen is
+        // kept only when it differs from the row at the same position on the screen before
+        // (`merge_scrolled_up`, src/terminal/history_read.rs at herdr 346411fa). Below, the
+        // screen's top row is Claude Code's pinned copy of the prompt's first row, drawn over the
+        // prompt's closing marker. The first scroll, of three rows, brings the prompt's real first
+        // row to the top row, where it matches that copy, so the join keeps only the three rows
+        // under it: the quoted block. The second scroll adds the coordinator's rows above them.
+        // This joined read is worked out by hand and needs all of these: the pane is idle and
+        // takes wheel input, the read asks for more rows than the screen has, the scroll that
+        // first shows the prompt's first row puts it on the top row, where the copy was drawn,
+        // and the pinned copy is identical to the prompt's first row once trailing spaces are
+        // trimmed. Observed copies are the whole prompt flattened into one row and cut with `…`;
+        // with such a copy the join keeps the prompt's first row above the quote, and even the
+        // joined read posts nothing. Claude Code keeps no scrollback, so the bridge reads only
+        // its screen, and nothing is posted.
+        let (state, key, nonce, root) = open_request("joined-read");
         let id = format!("{nonce}_1");
         let open = format!("  <CHAT_REPLY_{id}>");
         let close = format!("  </CHAT_REPLY_{id}>");
@@ -18949,16 +18944,39 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             "recent" | "recent-unwrapped" => joined.clone(),
             other => panic!("unexpected read source {other}"),
         };
+        // The joined read holds the quoted block right after a row of the coordinator's message,
+        // so a capture of it would post the block as the coordinator's reply.
+        assert_eq!(
+            scan_reply_blocks(&herdr_read("recent"), &nonce).expect("scan the joined read"),
+            one_block(&id, "quoted answer"),
+            "{joined}"
+        );
+        // Herdr reports that the Claude Code pane keeps no scrollback.
+        let pane = crate::client::AgentPaneInfo {
+            pane_id: "w1:p1".to_owned(),
+            workspace_id: "w1".to_owned(),
+            cwd: "/".to_owned(),
+            agent: Some("claude".to_owned()),
+            status: "idle".to_owned(),
+            session_agent: None,
+            session_value: None,
+            scroll: Some(crate::client::PaneScroll {
+                offset_from_bottom: 0,
+                max_offset_from_bottom: 0,
+                viewport_rows: 52,
+            }),
+        };
+        let captured = herdr_read(crate::subagents::chat_capture_source(&pane));
         let capture = state
-            .capture_snapshot(&herdr_read("visible"))
-            .expect("capture the screen");
+            .capture_snapshot(&captured)
+            .expect("capture the bridge's read");
         assert!(
             capture.replies.is_empty()
                 && capture.unknown_ids.is_empty()
                 && capture.suppressed_ids.is_empty()
                 && capture.refused.is_empty()
                 && !capture.overflowed,
-            "{screen}"
+            "{captured}"
         );
         // A pinned copy that differs from the prompt's first row, as observed, leaves that row
         // above the quote in the joined read, so the quote is read as part of the prompt.
@@ -18991,33 +19009,12 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                 && !capture.overflowed,
             "{joined_past_copy}"
         );
-        // The known gap, in every assertion from here to the end: the bridge's read holds the
-        // quoted block right after a row of the coordinator's, so the block is stored and posted
-        // as the coordinator's reply.
-        let captured = herdr_read(crate::subagents::CHAT_CAPTURE_SOURCE);
-        assert_eq!(
-            scan_reply_blocks(&captured, &nonce).expect("scan the joined read"),
-            one_block(&id, "quoted answer"),
-            "{captured}"
-        );
-        let capture = state
-            .capture_snapshot(&captured)
-            .expect("capture the joined read");
-        assert_eq!(capture.replies, [(key.clone(), vec![1])], "{captured}");
         let mut transport = FakeReplyTransport::default();
-        while state
+        assert!(state
             .publish_one(&key, &mut transport)
-            .expect("publish captured reply")
-            .is_some()
-        {}
-        assert_eq!(
-            transport
-                .submissions
-                .iter()
-                .map(|submission| submission.2.as_str())
-                .collect::<Vec<_>>(),
-            ["[codex coordinator] quoted answer"]
-        );
+            .expect("publish nothing")
+            .is_none());
+        assert!(transport.submissions.is_empty());
         fs::remove_dir_all(root).expect("cleanup");
     }
 

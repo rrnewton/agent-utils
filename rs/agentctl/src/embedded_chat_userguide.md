@@ -345,19 +345,20 @@ Reply markers count only on rows that can be the agent's own output. A terminal
 agent draws each prompt it receives, and the output of each tool call it makes,
 as an item of its own, and the rows of those items are skipped, so a reply block
 that another agent quotes in a message to this one, or that a tool prints from a
-file, is not posted, except in a read longer than the screen, as described
-below. It is not reported either, unless the first row of that item is out of
-view, the item is a Claude Code message whose first row is the top row of the
-read, or the read is longer than the screen, as described below. A prompt starts
-at a row whose text after its indentation is `❯`, `›`, `↳` or `»`, alone or
-followed by a space or a no-break space, and its wrapped rows continue two or
-more columns further right. Claude Code draws a prompt and its input box after
-`❯`; Codex draws a prompt after `›`, a prompt it holds until a running tool call
-ends and a hook's notice after `↳`, and its input box after `»`. Tool output
-starts at a row whose text after its indentation begins with `⎿`, or is `└`
-alone or followed by a space, and its later rows continue right of that
-character. Codex draws `└` alone when the output's first line is empty. A code
-fence in tool output neither opens nor closes a fence.
+file, is not posted, except in a read of an idle Claude Code pane longer than
+its screen, as described below. It is not reported either, unless the first row
+of that item is out of view, the item is a Claude Code prompt whose first row is
+the first nonblank row of the read, or the read is such a longer read, as
+described below. A prompt starts at a row whose text after its indentation is
+`❯`, `›`, `↳` or `»`, alone or followed by a space or a no-break space, and its
+wrapped rows continue two or more columns further right. Claude Code draws a
+prompt and its input box after `❯`; Codex draws a prompt after `›`, a prompt it
+holds until a running tool call ends and a hook's notice after `↳`, and its
+input box after `»`. Tool output starts at a row whose text after its
+indentation begins with `⎿`, or is `└` alone or followed by a space, and its
+later rows continue right of that character. Codex draws `└` alone when the
+output's first line is empty. A code fence in tool output neither opens nor
+closes a fence.
 
 Inside an open block these characters are reply text, such as a tree drawn with
 `└`, except on a row that starts a new item: a row whose text starts with a
@@ -381,37 +382,54 @@ not write: Codex's `Goal active` notice shows the goal the agent was given,
 wrapped to the left edge, and a reply block quoted in that goal is read as the
 agent's own.
 
-The bridge asks herdr for the newest 4,000 lines of the pane. For a Claude Code
-pane herdr usually returns the rows on the screen, and for a Codex pane at most
-about 1,000 lines. The rows above the first nonblank row that starts at the left
-edge continue an item whose first row is out of view, which can be a prompt or
-tool output, so an opening marker there opens no block, although an unavailable
-ID in it is still reported, and a code fence that opens there ends at that row.
-Once a prompt has scrolled off the top of the screen, Claude Code can draw a
-copy of it over the screen's top row, at the left edge and cut to one row, above
-rows of whatever item the screen starts in. So a `❯` row at the left edge that
-is the first nonblank row of a capture is skipped: it starts no prompt, and it
-is not the first row at the left edge. A Claude Code prompt that really starts
-at the top of a capture is then read as rows above the first row at the left
-edge, so a block it quotes is not posted, but it is reported unless its text is
-the end of a stored reply. Codex draws no such copy, so a Codex prompt row at
-the top of a capture starts a prompt, as it does anywhere else. A block is
-therefore posted only by a capture that shows both
-the first row of the message that holds it and the whole block. A block that
-starts its message needs only the whole block in view; a block after other text
-in its message also needs the message's first row, which leaves the screen
-sooner. A block taller than the screen is usually not posted from a Claude Code
-pane. A capture that sees only part of a block handles that part as a partial
-block, as described below, except in the longer reads described next.
+The bridge reads only the rows on the screen of a pane that herdr reports keeps
+no scrollback, one whose `scroll.max_offset_from_bottom` is 0, such as a Claude
+Code pane, for the reason given two paragraphs below. For any other pane it asks
+herdr for the newest 4,000 lines, and herdr returns at most 1,000, as it does
+for a Codex pane. It looks the pane up again before each read, so a pane that
+starts or stops keeping scrollback between the lookup and the read, as a program
+does when it enters or leaves the terminal's alternate screen, is read the old
+way once, and for a pane that has just entered the alternate screen, that one
+read can be the joined read described below. A `scroll` value that is not an
+object of those three counts fails every lookup that reads that pane, for prompt
+delivery as well as for reads, rather than let the bridge guess. A lookup by
+session reads every pane, so one pane's malformed value fails every lookup by
+session. The rows above the first nonblank row that starts at the left edge
+continue an item whose first row is out of view, which can be a prompt or tool
+output, so an opening marker there opens no block, although an unavailable ID in
+it is still reported, and a code fence that opens there ends at that row. Once a
+prompt has scrolled off the top of the screen, Claude Code can draw a copy of it
+over the screen's top row, at the left edge and cut to one row, above rows of
+whatever item the screen starts in. So a `❯` row at the left edge that is the
+first nonblank row of a capture is skipped: it starts no prompt, and it is not
+the first row at the left edge. A Claude Code prompt that really starts at the
+top of a capture is then read as rows above the first row at the left edge, so a
+block it quotes is not posted, but it is reported unless its text is the end of
+a stored reply. Codex draws no such copy, so a Codex prompt row at the top of a
+capture starts a prompt, as it does anywhere else. A block is therefore posted
+only by a capture that shows both the first row of the message that holds it and
+the whole block. A block that starts its message needs only the whole block in
+view; a block after other text in its message also needs the message's first
+row, which leaves the screen sooner. So from a Claude Code pane a block is not
+posted if it is taller than the screen, or if its closing marker is more than a
+screen below the first row of its message, as in a long message that ends with
+the block; a recovery scan that sees its closing marker reports it instead, as
+described below. A capture that sees only part of a block handles that part as a
+partial block, as described below, except in the longer reads described next.
 
-A Claude Code pane keeps no scrollback, yet herdr can return more lines than
-its screen has rows. Herdr 0.8.0 builds such a read of an agent that is idle and
-takes mouse wheel input: it scrolls the agent's view up with wheel events, joins
-the screens it sees where they overlap, and scrolls the view back down. That
-can take up to 20 seconds, and anyone watching the pane sees the view move. The
-join keeps each row that differs from the row at the same position on the
-screen before, so each time the copy of a prompt that Claude Code draws over
-the top row changes, the copy lands between rows of the conversation. The extra
+A Claude Code pane keeps no scrollback, yet a read of more lines than its screen
+has rows can return more. Herdr 0.8.0 builds such a read of an agent that is
+idle and takes mouse wheel input: it scrolls the agent's view up with wheel
+events, joins the screens it sees where they overlap, and scrolls the view back
+down. That can take up to 20 seconds, and anyone watching the pane sees the view
+move. The join keeps each row that differs from the row at the same position on
+the screen before, so each time the copy of a prompt that Claude Code draws over
+the top row changes, the copy lands between rows of the conversation. That is
+why the bridge reads only the screen of a pane that keeps no scrollback. Herdr's
+output subscriptions never scroll the view, so an output event never carries
+such a read, but the bridge's own reads of a pane still get one when herdr does
+not report whether the pane keeps scrollback, and can get one once when the pane
+enters the alternate screen between the bridge's lookup and its read. The extra
 rows come before the screen's rows, so in every such read they decide how the
 screen's top rows are read, and the screen's own pinned row is no longer the
 first row of the capture: it starts a prompt, which hides the agent's rows under
@@ -422,11 +440,29 @@ follow a pinned prompt row, a stale prompt row, or a tool output row. Where they
 are indented far enough to read as that item's rows, two or more columns right
 of the prompt character or right of the `⎿` or `└`, a block in them is skipped,
 neither posted nor reported, and a block of the agent's that such a row lands
-inside is reported as having no closing marker, although
-the agent wrote one. A later read that shows only
-the screen reads the block by the rules above, if it is still in view: it is
-posted if that read also shows the first row of its message, and otherwise
-reported, unless it was already reported.
+inside is reported as having no closing marker, although the agent wrote one. A
+later read that shows only the screen reads the block by the rules above, if it
+is still in view: it is posted if that read also shows the first row of its
+message, and otherwise reported, unless it was already reported.
+
+Reading only the screen has a cost. For a Claude Code pane, the bridge's reads
+when it starts, at each reconciliation, when the pane settles idle or done, and
+after an output event names an unknown reply ID see only the screen. An output
+event carries herdr's read of the pane taken when the matched line appears,
+which for such a pane is its screen, so a block that fits on the screen is
+normally caught when its closing marker appears. If that event is missed, for
+example while the bridge waits to subscribe again after losing its connection to
+herdr, or while it restarts, and the block leaves the screen before the bridge's
+next read, the block is neither posted nor reported. A joined read could have
+recovered it. Before herdr 0.8.0 added those reads, a read of such a pane
+returned only its screen, so the bridge lost such a block then too. The bridge
+accepts that loss rather than scan rows joined from different times, which can
+post a block the agent did not write. A block that the screen cannot show whole
+together with the first row of its message, as described above, can be lost even
+when no event is missed: only recovery scans report a partial block, and during
+a busy turn a recovery scan normally comes only when the pane settles, so if the
+agent writes more than a screen after such a block before then, the block is
+neither posted nor reported.
 
 Replies are recognized by their text, not by the number in their reply ID. A
 reply ID is the request's nonce, an underscore, and a number from 1 to 999999
@@ -559,17 +595,18 @@ block. The prompt then asks the agent to send the block again, starting a
 message with its opening line and writing the whole block in that message, with
 no tool call inside it, and not to send a block it did not write, such as one
 quoted in a message it received. A block another agent quoted in a message whose
-first row is out of view, including a Claude Code message under the copy of its
-first row or one whose first row is the top row of the read, and a block a tool
-printed in output whose first row is out of view, are reported too, as described
-above. So, in a read longer than the screen, are a quoted block and the agent's
-own block with a copied prompt row or a tool-output row inside it, which reads
-as a block with no closing line. When a closing line was missing, it first says
-that a block still being written goes out once it is complete, if the screen
-then shows the first row of its message and its closing line, since the agent
-may not have finished the block when the pane was read. A complete block under
-that ID is still posted if its text is new. One prompt can report both
-unavailable IDs and partial blocks.
+first row is out of view, including a Claude Code prompt under the copy of its
+first row, or in a Claude Code prompt whose first row is the first nonblank row
+of the read, and a block a tool printed in output whose first row is out of
+view, are reported too, as described above. So, in a read of an idle Claude Code
+pane longer than its screen, are a quoted block and the agent's own block with a
+copied prompt row or a tool-output row inside it, which reads as a block with no
+closing line. When a closing line was missing, it first says that a block still
+being written goes out once it is complete, if the screen then shows the first
+row of its message and its closing line, since the agent may not have finished
+the block when the pane was read. A complete block under that ID is still posted
+if its text is new. One prompt can report both unavailable IDs and partial
+blocks.
 
 A partial block is identified by its ID, by which end of it was missing, and by
 a digest of 64 characters of it, not counting whitespace or box-drawing

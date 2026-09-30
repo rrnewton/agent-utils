@@ -1057,6 +1057,29 @@ pub struct AgentPaneInfo {
     pub session_agent: Option<String>,
     /// Stable session value, when present.
     pub session_value: Option<String>,
+    /// Scrollback geometry, when Herdr reports it.
+    pub scroll: Option<PaneScroll>,
+}
+
+impl AgentPaneInfo {
+    /// Whether Herdr reports that the pane keeps no scrollback, so its visible screen is all it
+    /// holds. A full-screen program such as Claude Code redraws one screen in place and keeps
+    /// none. An unreported geometry is unknown, not none.
+    pub fn keeps_no_scrollback(&self) -> bool {
+        self.scroll
+            .is_some_and(|scroll| scroll.max_offset_from_bottom == 0)
+    }
+}
+
+/// Scrollback geometry of one pane, in terminal rows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PaneScroll {
+    /// Rows the view is scrolled up from the bottom.
+    pub offset_from_bottom: u64,
+    /// Most rows the view can scroll up: the scrollback the pane keeps.
+    pub max_offset_from_bottom: u64,
+    /// Rows on the visible screen.
+    pub viewport_rows: u64,
 }
 
 /// Captured result of one external command invocation.
@@ -2446,6 +2469,19 @@ fn parse_pane_info(result: &Map<String, Value>, pane_id: &str) -> Result<AgentPa
             ));
         }
     };
+    let scroll = match pane.get("scroll") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(scroll)) => Some(PaneScroll {
+            offset_from_bottom: required_u64(scroll, "offset_from_bottom", "pane scroll")?,
+            max_offset_from_bottom: required_u64(scroll, "max_offset_from_bottom", "pane scroll")?,
+            viewport_rows: required_u64(scroll, "viewport_rows", "pane scroll")?,
+        }),
+        Some(_) => {
+            return Err(AdapterError::unavailable(
+                "pane get: 'scroll' is not an object",
+            ));
+        }
+    };
     Ok(AgentPaneInfo {
         pane_id: returned,
         workspace_id: required_string(pane, "workspace_id", "pane get")?,
@@ -2455,6 +2491,7 @@ fn parse_pane_info(result: &Map<String, Value>, pane_id: &str) -> Result<AgentPa
             .unwrap_or_else(|| "unknown".to_owned()),
         session_agent,
         session_value,
+        scroll,
     })
 }
 
@@ -2694,6 +2731,12 @@ fn required_string(object: &Map<String, Value>, key: &str, what: &str) -> Result
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| AdapterError::unavailable(format!("{what}: {key:?} is not a string")))
+}
+
+fn required_u64(object: &Map<String, Value>, key: &str, what: &str) -> Result<u64> {
+    object.get(key).and_then(Value::as_u64).ok_or_else(|| {
+        AdapterError::unavailable(format!("{what}: {key:?} is not a non-negative integer"))
+    })
 }
 
 fn optional_string(object: &Map<String, Value>, key: &str, what: &str) -> Result<Option<String>> {
@@ -3188,6 +3231,102 @@ mod tests {
         let error = parse_pane_info(result, "expected").expect_err("mismatch must be refused");
         assert!(error.to_string().contains("other"));
         assert!(error.to_string().contains("expected"));
+    }
+
+    #[test]
+    fn pane_info_parser_reads_scroll_geometry_and_refuses_a_malformed_one() {
+        let parse = |scroll: Option<Value>| {
+            let mut pane = serde_json::json!({
+                "pane_id": "pane",
+                "workspace_id": "workspace",
+                "cwd": "/tmp",
+                "agent": "claude",
+                "agent_status": "idle"
+            });
+            if let Some(scroll) = scroll {
+                pane["scroll"] = scroll;
+            }
+            let document = serde_json::json!({ "pane": pane });
+            parse_pane_info(document.as_object().expect("fixture object"), "pane")
+        };
+
+        // Claude Code redraws one screen in place, so Herdr reports that it keeps no scrollback.
+        let info = parse(Some(serde_json::json!({
+            "offset_from_bottom": 0,
+            "max_offset_from_bottom": 0,
+            "viewport_rows": 52
+        })))
+        .expect("screen-only pane");
+        assert_eq!(
+            info.scroll,
+            Some(PaneScroll {
+                offset_from_bottom: 0,
+                max_offset_from_bottom: 0,
+                viewport_rows: 52,
+            })
+        );
+        assert!(info.keeps_no_scrollback());
+
+        let info = parse(Some(serde_json::json!({
+            "offset_from_bottom": 3,
+            "max_offset_from_bottom": 120,
+            "viewport_rows": 40
+        })))
+        .expect("pane with scrollback");
+        assert_eq!(
+            info.scroll,
+            Some(PaneScroll {
+                offset_from_bottom: 3,
+                max_offset_from_bottom: 120,
+                viewport_rows: 40,
+            })
+        );
+        assert!(!info.keeps_no_scrollback());
+
+        // A Herdr that reports no geometry leaves it unknown, which is not the same as none.
+        for scroll in [None, Some(Value::Null)] {
+            let info = parse(scroll).expect("pane without geometry");
+            assert_eq!(info.scroll, None);
+            assert!(!info.keeps_no_scrollback());
+        }
+
+        for (scroll, named) in [
+            (serde_json::json!(0), "'scroll' is not an object"),
+            (
+                serde_json::json!({ "offset_from_bottom": 0, "viewport_rows": 52 }),
+                "\"max_offset_from_bottom\"",
+            ),
+            (
+                serde_json::json!({
+                    "offset_from_bottom": 0,
+                    "max_offset_from_bottom": -1,
+                    "viewport_rows": 52
+                }),
+                "\"max_offset_from_bottom\"",
+            ),
+            (
+                serde_json::json!({
+                    "offset_from_bottom": "0",
+                    "max_offset_from_bottom": 0,
+                    "viewport_rows": 52
+                }),
+                "\"offset_from_bottom\"",
+            ),
+            (
+                serde_json::json!({
+                    "offset_from_bottom": 0,
+                    "max_offset_from_bottom": 0,
+                    "viewport_rows": 52.5
+                }),
+                "\"viewport_rows\"",
+            ),
+        ] {
+            let error = parse(Some(scroll.clone())).expect_err("malformed geometry is refused");
+            assert!(
+                error.to_string().contains(named),
+                "{scroll}: {error} does not name {named}"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

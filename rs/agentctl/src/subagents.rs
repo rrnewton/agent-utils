@@ -37,14 +37,27 @@ pub use cloud::{CloudLaunch, CloudTools};
 
 const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
 const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
-/// The herdr read source of the chat service's snapshot reads of its agent's pane: the startup,
-/// reconciliation and idle scans that recover replies. The service's other capture path, its
-/// `pane.output_matched` subscriptions, asks for `recent_unwrapped` rows, which herdr serves as
-/// passive reads. `agentctl chat tick` does not use this constant either: it reads through
-/// `agent::read`, which asks for `recent-unwrapped` rows and falls back to `recent`.
-pub(crate) const CHAT_CAPTURE_SOURCE: &str = "recent";
 const MAX_AGENT_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+
+/// The herdr read source of the chat service's snapshot reads of its agent's pane, the reads that
+/// recover replies when the service starts, at each reconciliation, when the pane settles idle or
+/// done, and after an output event names a reply ID the service does not know: the screen of a
+/// pane that herdr reports keeps no scrollback, otherwise the recent rows. Claude Code redraws one
+/// screen in place and keeps none; a recent read of it while it is idle can return more than one
+/// screen, joined from what it drew at different times, and scrolls the pane's view as it reads.
+/// The service's other capture path, its `pane.output_matched` subscriptions, asks for
+/// `recent_unwrapped` rows, which herdr serves as passive reads that never scroll the view.
+/// `agentctl chat tick` makes the same choice by the same test,
+/// [`AgentPaneInfo::keeps_no_scrollback`], in a second copy, [`agent::read_capture`], which for
+/// any other pane asks for `recent-unwrapped` rows and falls back to `recent`.
+pub(crate) fn chat_capture_source(info: &AgentPaneInfo) -> &'static str {
+    if info.keeps_no_scrollback() {
+        "visible"
+    } else {
+        "recent"
+    }
+}
 
 fn rename_directory_noreplace_at(
     source_parent: &File,
@@ -4318,8 +4331,20 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         Ok(text)
     }
 
-    /// Read and persist a snapshot while allowing service cancellation during locks and control.
-    pub(crate) fn read_with_runtime(
+    /// Read what a chat bridge scans for replies and persist it as the latest bounded snapshot:
+    /// see [`agent::read_capture`].
+    pub(crate) fn read_capture(&self, agent_name: &str, lines: usize) -> Result<String> {
+        let _lock = self.lock(agent_name)?;
+        let record = self.load(agent_name)?;
+        self.checked_policy(&record, false)?;
+        let text = agent::read_capture(self.client, &self.target(&record)?, lines)?;
+        self.snapshot(&record, &text)?;
+        Ok(text)
+    }
+
+    /// Read what a chat bridge scans for replies, as [`Self::read_capture`] does, while allowing
+    /// service cancellation during locks and control.
+    pub(crate) fn read_capture_with_runtime(
         &self,
         agent_name: &str,
         lines: usize,
@@ -4343,7 +4368,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         )?;
         let text = self.client.read_with_runtime(
             &info.pane_id,
-            CHAT_CAPTURE_SOURCE,
+            chat_capture_source(&info),
             Some(lines),
             runtime,
         )?;
@@ -5869,7 +5894,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::error::{AdapterError, Result as AdapterResult};
     use std::os::unix::fs::PermissionsExt;
@@ -5895,12 +5920,13 @@ mod tests {
             self.cancelled.load(Ordering::SeqCst)
         }
     }
-    struct Fixture {
-        root: PathBuf,
-        client: Fake,
+    /// A registry over a fake Herdr client; the chat service's tests use it too.
+    pub(crate) struct Fixture {
+        pub(crate) root: PathBuf,
+        pub(crate) client: Fake,
     }
     impl Fixture {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let root = std::env::temp_dir().join(format!(
                 "agentctl-managed-{}-{}",
                 std::process::id(),
@@ -5956,16 +5982,18 @@ mod tests {
                     move_return_matches: AtomicBool::new(true),
                     move_fails_before_change: AtomicBool::new(false),
                     fail_first_wait: AtomicBool::new(false),
+                    scroll: Mutex::new(None),
+                    read_sources: Mutex::new(Vec::new()),
                 },
                 root,
             }
         }
-        fn manager(&self) -> ManagedAgents<'_, Fake> {
+        pub(crate) fn manager(&self) -> ManagedAgents<'_, Fake> {
             ManagedAgents::new(&self.client, &self.root.join("registry"))
                 .unwrap()
                 .with_inherited_workspace(None)
         }
-        fn start(&self, brief: Option<String>) -> Value {
+        pub(crate) fn start(&self, brief: Option<String>) -> Value {
             self.manager()
                 .start(
                     "worker",
@@ -6050,7 +6078,7 @@ mod tests {
             let _ = fs::remove_dir_all(&self.root);
         }
     }
-    struct Fake {
+    pub(crate) struct Fake {
         root: PathBuf,
         panes: Mutex<Vec<Pane>>,
         named_pane: Mutex<String>,
@@ -6097,6 +6125,8 @@ mod tests {
         move_return_matches: AtomicBool,
         move_fails_before_change: AtomicBool,
         fail_first_wait: AtomicBool,
+        pub(crate) scroll: Mutex<Option<crate::client::PaneScroll>>,
+        pub(crate) read_sources: Mutex<Vec<String>>,
     }
     impl Fake {
         fn pane(id: &str) -> Pane {
@@ -6220,6 +6250,7 @@ mod tests {
                     }
                     .to_owned()
                 }),
+                scroll: *self.scroll.lock().unwrap(),
             })
         }
         fn workspace_label(&self, workspace: &str) -> AdapterResult<String> {
@@ -6240,7 +6271,8 @@ mod tests {
             }
             Ok(())
         }
-        fn read(&self, _: &str, _: &str, _: Option<usize>) -> AdapterResult<String> {
+        fn read(&self, _: &str, source: &str, _: Option<usize>) -> AdapterResult<String> {
+            self.read_sources.lock().unwrap().push(source.to_owned());
             if self.fail_read.load(Ordering::Relaxed) {
                 return Err(AdapterError::unavailable("capture failed"));
             }
@@ -10984,6 +11016,66 @@ mod tests {
             .send_identified("worker", "task", DrainOptions::default(), Some("request-1"))
             .is_err());
         assert_eq!(*fixture.client.runs.lock().unwrap(), ["task"]);
+    }
+
+    #[test]
+    fn capture_reads_take_only_the_screen_of_a_pane_that_keeps_no_scrollback() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let manager = fixture.manager();
+        let runtime = agent::SystemRuntime::default();
+        let scroll = |max_offset_from_bottom| crate::client::PaneScroll {
+            offset_from_bottom: 0,
+            max_offset_from_bottom,
+            viewport_rows: 52,
+        };
+        // Each read persists what it read as the agent's latest snapshot.
+        let snapshot = fixture.root.join("registry/worker/output.json");
+        let took_snapshot = || {
+            let written = agent::read_private_json(&snapshot).unwrap();
+            fs::remove_file(&snapshot).unwrap();
+            written["text"] == "visible output"
+        };
+        let _ = fs::remove_file(&snapshot);
+        for (reported, service_source, command_sources) in [
+            (Some(scroll(0)), "visible", &["visible"][..]),
+            (Some(scroll(120)), "recent", &["recent-unwrapped"][..]),
+            (None, "recent", &["recent-unwrapped"][..]),
+        ] {
+            *fixture.client.scroll.lock().unwrap() = reported;
+            fixture.client.read_sources.lock().unwrap().clear();
+            assert_eq!(
+                manager
+                    .read_capture_with_runtime("worker", 10, &runtime)
+                    .unwrap(),
+                "visible output"
+            );
+            assert!(took_snapshot());
+            assert_eq!(
+                *fixture.client.read_sources.lock().unwrap(),
+                [service_source],
+                "{reported:?}"
+            );
+            fixture.client.read_sources.lock().unwrap().clear();
+            assert_eq!(
+                manager.read_capture("worker", 10).unwrap(),
+                "visible output"
+            );
+            assert!(took_snapshot());
+            assert_eq!(
+                *fixture.client.read_sources.lock().unwrap(),
+                command_sources,
+                "{reported:?}"
+            );
+            // The `agentctl read` command keeps reading recent rows whatever the pane keeps.
+            fixture.client.read_sources.lock().unwrap().clear();
+            assert_eq!(manager.read("worker", 10).unwrap(), "visible output");
+            assert!(took_snapshot());
+            assert_eq!(
+                *fixture.client.read_sources.lock().unwrap(),
+                ["recent-unwrapped"]
+            );
+        }
     }
 
     #[test]

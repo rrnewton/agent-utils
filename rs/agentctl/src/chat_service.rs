@@ -424,7 +424,7 @@ pub fn tick<A: ManagedApi + ?Sized>(
     validate_service_outbound(state.config())?;
     let _lease = state.acquire_runner_lease()?;
     let info = manager.pane_info(&state.config().agent_name)?;
-    let snapshot = manager.read(&state.config().agent_name, SNAPSHOT_LINES)?;
+    let snapshot = manager.read_capture(&state.config().agent_name, SNAPSHOT_LINES)?;
     let mut routes = RouteCache::from_entries(state.reply_route_entries()?);
     let mut transport = state.outbound_transport()?;
     let mut control = PassControl {
@@ -2452,8 +2452,11 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     };
     let mut direct_keys = DirectKeyQueue::default();
     let mut notes = NoteLog::default();
-    let initial =
-        manager.read_with_runtime(&state.config().agent_name, SNAPSHOT_LINES, &owner_runtime)?;
+    let initial = manager.read_capture_with_runtime(
+        &state.config().agent_name,
+        SNAPSHOT_LINES,
+        &owner_runtime,
+    )?;
     let initial_report = capture_recovery_snapshot(
         state,
         manager,
@@ -2503,7 +2506,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
             let info =
                 manager.pane_info_with_runtime(&state.config().agent_name, &owner_runtime)?;
             if matches!(info.status.as_str(), "idle" | "done") {
-                let snapshot = manager.read_with_runtime(
+                let snapshot = manager.read_capture_with_runtime(
                     &state.config().agent_name,
                     SNAPSHOT_LINES,
                     &owner_runtime,
@@ -2615,7 +2618,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                                 if info.status == status
                                     && matches!(status.as_str(), "idle" | "done") =>
                             {
-                                let snapshot = manager.read_with_runtime(
+                                let snapshot = manager.read_capture_with_runtime(
                                     &state.config().agent_name,
                                     SNAPSHOT_LINES,
                                     &owner_runtime,
@@ -2648,7 +2651,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                         }
                     }
                     if unknown_route_seen {
-                        let snapshot = manager.read_with_runtime(
+                        let snapshot = manager.read_capture_with_runtime(
                             &state.config().agent_name,
                             SNAPSHOT_LINES,
                             &owner_runtime,
@@ -6337,5 +6340,300 @@ esac
         assert!(report.more_work);
         assert!(!marker.exists());
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The scroll geometry herdr reports for a pane that keeps no scrollback, such as a Claude
+    /// Code pane.
+    const SCREEN_ONLY: crate::client::PaneScroll = crate::client::PaneScroll {
+        offset_from_bottom: 0,
+        max_offset_from_bottom: 0,
+        viewport_rows: 52,
+    };
+
+    /// A new bridge state, in a private directory under the fixture's root, for the fixture's
+    /// agent `worker`.
+    fn worker_bridge_state(
+        fixture: &crate::subagents::tests::Fixture,
+        outbound_enabled: bool,
+    ) -> (std::path::PathBuf, BridgeState) {
+        let root = fixture.root.join("chat");
+        fs::create_dir(&root).expect("create state root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("private state");
+        let state = BridgeState::initialize(
+            &root,
+            BridgeConfiguration {
+                subscription_plugin: "fixture".to_owned(),
+                subscription_environment: Vec::new(),
+                channel_ids: vec!["spaces/example".to_owned()],
+                allowed_senders: vec!["users/owner".to_owned()],
+                agent_name: "worker".to_owned(),
+                agent_label: "worker".to_owned(),
+                outbound_enabled,
+                ack_reaction: None,
+                backend_configuration: None,
+                outbound_command: None,
+            },
+        )
+        .expect("initialize state");
+        (root, state)
+    }
+
+    /// A stand-in for the Herdr binary and server the owner loop talks to. Its
+    /// `status server --json` names a socket on which a thread acknowledges each output
+    /// subscription, sends it the events `events` builds for the subscribed pane, and keeps the
+    /// connection open until `release` is sent or dropped.
+    struct OwnerLoopHerdr {
+        client: HerdrClient,
+        release: mpsc::Sender<()>,
+        server: thread::JoinHandle<()>,
+    }
+
+    fn owner_loop_herdr(root: &Path, name: &str, events: fn(&str) -> Vec<Value>) -> OwnerLoopHerdr {
+        let socket = root.join(format!("{name}.sock"));
+        let executable = root.join(format!("{name}-herdr"));
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{}'\n",
+                json!({"running": true, "compatible": true, "socket": socket})
+            ),
+        )
+        .expect("write herdr stand-in");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+            .expect("herdr stand-in mode");
+        let listener = UnixListener::bind(&socket).expect("bind herdr events");
+        listener
+            .set_nonblocking(true)
+            .expect("poll for herdr event clients");
+        let (release, released) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut connections = Vec::new();
+            while released.try_recv() == Err(mpsc::TryRecvError::Empty) {
+                let mut connection = match listener.accept() {
+                    Ok((connection, _)) => connection,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("accept herdr event client: {error}"),
+                };
+                connection
+                    .set_nonblocking(false)
+                    .expect("blocking herdr event connection");
+                let mut request = String::new();
+                BufReader::new(
+                    connection
+                        .try_clone()
+                        .expect("clone herdr event connection"),
+                )
+                .read_line(&mut request)
+                .expect("read herdr event subscription");
+                let request: Value =
+                    serde_json::from_str(&request).expect("decode herdr event subscription");
+                let pane = request["params"]["subscriptions"][0]["pane_id"]
+                    .as_str()
+                    .expect("subscribed pane")
+                    .to_owned();
+                writeln!(
+                    connection,
+                    "{}",
+                    json!({"id": request["id"], "result": {"type": "subscription_started"}})
+                )
+                .expect("acknowledge herdr event subscription");
+                for event in events(&pane) {
+                    writeln!(connection, "{event}").expect("write herdr event");
+                }
+                connections.push(connection);
+            }
+        });
+        OwnerLoopHerdr {
+            client: HerdrClient::with_executable("direct", &executable).expect("herdr client"),
+            release,
+            server,
+        }
+    }
+
+    /// Run the owner loop for `state`'s agent until the fixture's fake Herdr client has served
+    /// `reads` pane reads, let it run on briefly so a further read is recorded too, stop it, and
+    /// return the source of every read it made.
+    fn owner_loop_read_sources(
+        fixture: &crate::subagents::tests::Fixture,
+        state: &BridgeState,
+        herdr: &OwnerLoopHerdr,
+        reconciliation_interval: Duration,
+        reads: usize,
+    ) -> Vec<String> {
+        let manager = fixture.manager();
+        let stop = StopState::default();
+        let cancellation: SharedCancellation = Arc::default();
+        let output_wake: SharedWake = Arc::default();
+        let overflowed = AtomicBool::new(false);
+        let (_notices, notice_receiver) = mpsc::sync_channel(PROVIDER_NOTICE_CAPACITY);
+        let mut transport = None;
+        let read_sources = &fixture.client.read_sources;
+        read_sources.lock().expect("read sources").clear();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while read_sources.lock().expect("read sources").len() < reads
+                    && Instant::now() < deadline
+                {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                thread::sleep(Duration::from_millis(300));
+                stop.stop();
+                wake_output(&output_wake);
+            });
+            let result = run_owner_loop(
+                state,
+                &herdr.client,
+                &manager,
+                ServiceOptions {
+                    delivery: DrainOptions::default(),
+                    reconciliation_interval,
+                },
+                &stop,
+                &cancellation,
+                &output_wake,
+                &overflowed,
+                &notice_receiver,
+                &mut transport,
+            );
+            // The loop ends at its next check of the stop, or with a cancelled Herdr call when
+            // the stop interrupts one, as it does in `chat run`.
+            if let Err(error) = result {
+                assert!(
+                    stop.is_stopped() && error.to_string().contains("cancelled"),
+                    "owner loop failed: {error}"
+                );
+            }
+        });
+        let sources = read_sources.lock().expect("read sources");
+        sources.clone()
+    }
+
+    #[test]
+    fn every_recovery_read_of_the_owner_loop_takes_only_the_screen_of_a_pane_without_scrollback() {
+        // Herdr answers a read of more rows than a Claude Code pane's screen by scrolling the
+        // pane's own view up and joining the screens it sees, so every snapshot read the service
+        // makes of such a pane must take the screen. The loop reads at startup, at each
+        // reconciliation, when the agent settles, and after an output event names a reply ID it
+        // does not know. The fixture's fake client records the source of each read.
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        *fixture.client.scroll.lock().expect("scroll") = Some(SCREEN_ONLY);
+        let (_, state) = worker_bridge_state(&fixture, true);
+        // One open request gives the loop a reply route to subscribe for. It is delivered
+        // first, so the loop has no prompt to deliver: delivery reads the screen for checks of
+        // its own, which would hide a snapshot read among them.
+        let message = InboundMessage::new(
+            ChannelId::new("spaces/example").expect("channel"),
+            MessageId::new("spaces/example/messages/one").expect("message"),
+            ThreadId::new("spaces/example/threads/one").expect("thread"),
+            SenderId::new("users/owner").expect("sender"),
+            "request",
+            "2026-09-30T12:00:00Z",
+            false,
+        )
+        .expect("inbound message");
+        let batch = DeliveryBatch::new(
+            EventSequence::new(1).expect("sequence"),
+            ProviderCursor::new("cursor").expect("cursor"),
+            DeliveryId::new("delivery").expect("delivery"),
+            vec![CommittableEvent::message_created(message)],
+        )
+        .expect("delivery batch");
+        let key = state
+            .admit_batch(&batch)
+            .expect("admit request")
+            .new_request_keys
+            .remove(0);
+        chat_runtime::deliver_request_with(
+            &state,
+            &RecordingDelivery::default(),
+            &key,
+            DrainOptions::default(),
+        )
+        .expect("deliver request");
+        assert!(state.pending_work_keys().expect("pending work").is_empty());
+
+        // With no reconciliation due within the hour, the loop reads once at startup, once when
+        // the agent settles, and once after the unknown reply ID.
+        let events = owner_loop_herdr(&fixture.root, "events", |pane| {
+            vec![
+                json!({
+                    "event": "pane.agent_status_changed",
+                    "data": {"pane_id": pane, "agent_status": "idle"},
+                }),
+                json!({
+                    "event": "pane.output_matched",
+                    "data": {
+                        "pane_id": pane,
+                        "matched_line": "</CHAT_REPLY_unknownnonce00_1>",
+                        "read": {
+                            "pane_id": pane,
+                            "workspace_id": "workspace",
+                            "tab_id": "tab",
+                            "source": "recent_unwrapped",
+                            "format": "text",
+                            "text": "</CHAT_REPLY_unknownnonce00_1>",
+                            "revision": 1,
+                            "truncated": false,
+                        },
+                    },
+                }),
+            ]
+        });
+        assert_eq!(
+            owner_loop_read_sources(&fixture, &state, &events, Duration::from_secs(3_600), 3),
+            ["visible"; 3]
+        );
+        // With no events, every read after the startup one is a reconciliation.
+        let quiet = owner_loop_herdr(&fixture.root, "quiet", |_| Vec::new());
+        let sources =
+            owner_loop_read_sources(&fixture, &state, &quiet, Duration::from_millis(50), 3);
+        assert!(
+            sources.len() >= 3 && sources.iter().all(|source| source == "visible"),
+            "{sources:?}"
+        );
+        for herdr in [events, quiet] {
+            drop(herdr.release);
+            herdr.server.join().expect("herdr stand-in");
+        }
+    }
+
+    #[test]
+    fn a_chat_tick_reads_only_the_screen_of_a_pane_without_scrollback() {
+        // `agentctl chat tick` makes the service's choice of read source in a second place,
+        // `agent::read_capture`. Its outbound stays off, which a tick without an outbound helper
+        // requires.
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        let (root, _) = worker_bridge_state(&fixture, false);
+        let read_sources = &fixture.client.read_sources;
+        let tick_read_sources = |scroll| {
+            *fixture.client.scroll.lock().expect("scroll") = scroll;
+            read_sources.lock().expect("read sources").clear();
+            tick(
+                &root,
+                &fixture.manager(),
+                ServiceOptions {
+                    delivery: DrainOptions::default(),
+                    reconciliation_interval: Duration::from_secs(1),
+                },
+            )
+            .expect("tick");
+            read_sources.lock().expect("read sources").clone()
+        };
+        assert_eq!(tick_read_sources(Some(SCREEN_ONLY)), ["visible"]);
+        // Any other pane is read as `agentctl read` reads it, as recent rows unwrapped; the fake
+        // returns some, so there is no fallback read of plain recent rows.
+        let with_scrollback = crate::client::PaneScroll {
+            max_offset_from_bottom: 120,
+            ..SCREEN_ONLY
+        };
+        for scroll in [Some(with_scrollback), None] {
+            assert_eq!(tick_read_sources(scroll), ["recent-unwrapped"]);
+        }
     }
 }

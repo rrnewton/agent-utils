@@ -1191,12 +1191,39 @@ pub fn read<A: AgentApi + ?Sized>(
     lines: usize,
 ) -> AgentResult<String> {
     let info = resolve_target(client, target)?;
+    read_recent(client, &info.pane_id, lines)
+}
+
+/// Read what a chat bridge scans for replies from a validated interactive-agent target: the
+/// screen of a pane that herdr reports keeps no scrollback, otherwise the same recent rows as
+/// [`read`]. A recent read of such a pane can return more than one screen, joined from what the
+/// program drew at different times.
+pub fn read_capture<A: AgentApi + ?Sized>(
+    client: &A,
+    target: &Target,
+    lines: usize,
+) -> AgentResult<String> {
+    let info = resolve_target(client, target)?;
+    if info.keeps_no_scrollback() {
+        client
+            .read(&info.pane_id, "visible", Some(lines))
+            .map_err(client_error)
+    } else {
+        read_recent(client, &info.pane_id, lines)
+    }
+}
+
+fn read_recent<A: AgentApi + ?Sized>(
+    client: &A,
+    pane_id: &str,
+    lines: usize,
+) -> AgentResult<String> {
     let text = client
-        .read(&info.pane_id, "recent-unwrapped", Some(lines))
+        .read(pane_id, "recent-unwrapped", Some(lines))
         .map_err(client_error)?;
     if text.is_empty() {
         client
-            .read(&info.pane_id, "recent", Some(lines))
+            .read(pane_id, "recent", Some(lines))
             .map_err(client_error)
     } else {
         Ok(text)
@@ -2690,6 +2717,7 @@ mod tests {
             status: "idle".to_owned(),
             session_agent: Some("codex".to_owned()),
             session_value: Some(session.to_owned()),
+            scroll: None,
         }
     }
 
@@ -3277,6 +3305,42 @@ mod tests {
             fake.state.lock().unwrap().reads,
             ["recent-unwrapped", "recent"]
         );
+    }
+
+    #[test]
+    fn read_capture_reads_only_the_screen_of_a_pane_that_keeps_no_scrollback() {
+        let scroll = |max_offset_from_bottom| crate::client::PaneScroll {
+            offset_from_bottom: 0,
+            max_offset_from_bottom,
+            viewport_rows: 52,
+        };
+        // Herdr reports no scrollback for Claude Code, which redraws one screen in place. Some
+        // for a program such as Codex that writes into the scrollback, and none from an older
+        // Herdr, which leaves the reads as they were.
+        for (reported, reads) in [
+            (Some(scroll(0)), &["visible"][..]),
+            (Some(scroll(120)), &["recent-unwrapped", "recent"][..]),
+            (None, &["recent-unwrapped", "recent"][..]),
+        ] {
+            let fake = FakeAgent::new(&["idle"]);
+            {
+                let mut state = fake.state.lock().unwrap();
+                state.unwrapped_empty = true;
+                state.infos.get_mut("w1:p1").unwrap().scroll = reported;
+            }
+            assert_eq!(
+                read_capture(&fake, &target(), 17).unwrap(),
+                "agent transcript\n"
+            );
+            assert_eq!(fake.state.lock().unwrap().reads, reads, "{reported:?}");
+            // The `agentctl read` command keeps reading recent rows, which a person may want.
+            fake.state.lock().unwrap().reads.clear();
+            read(&fake, &target(), 17).unwrap();
+            assert_eq!(
+                fake.state.lock().unwrap().reads,
+                ["recent-unwrapped", "recent"]
+            );
+        }
     }
 
     #[test]
