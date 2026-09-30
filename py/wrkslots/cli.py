@@ -33,6 +33,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import unicodedata
 import urllib.parse
 import uuid
@@ -26599,6 +26600,22 @@ def _removal_journal_candidate(config: Config, slot: str) -> Path | None:
     return None
 
 
+def _agent_row_still_active(config: Config, slot: str, generation: int) -> bool | None:
+    """Return whether this machine's registry still holds ``slot`` at ``generation``.
+
+    Returns None when the registry cannot be read.  remove-agent-batch uses
+    this only to describe an item that an unexpected error interrupted.
+    """
+
+    try:
+        state = _load_active(config, require_repository=False)
+    except Exception:
+        return None
+    return any(
+        record.slot == slot and record.generation == generation for record in state.slots
+    )
+
+
 def _interrupted_removal_journal(
     config: Config, slot: str, wait_seconds: float
 ) -> Path | None:
@@ -26671,7 +26688,7 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
             "recover' before another removal"
         )
 
-    def unconfirmed_reason(exc: Refusal) -> str:
+    def unconfirmed_reason(exc: Exception) -> str:
         return (
             "a removal journal for this slot exists, and whether an interrupted "
             f"removal left it could not be checked under the registry lock: {exc}"
@@ -26748,79 +26765,135 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
         eligible.append((slot, generation, slot_path))
     context = _AgentRemoveBatchContext(identities)
     remaining_targets = [slot_path for _slot, _generation, slot_path in eligible]
-    for index, (slot, generation, slot_path) in enumerate(eligible):
-        if context.shared_census_count == 0 or (
-            time.monotonic() - context.captured_at
-            > _AGENT_REMOVE_BATCH_CENSUS_MAX_AGE_SECONDS
-        ):
+    error: str | None = None
+    # The item being attempted, so that an unexpected error can name it.
+    current: tuple[str, int, float] | None = None
+    try:
+        for index, (slot, generation, slot_path) in enumerate(eligible):
+            if context.shared_census_count == 0 or (
+                time.monotonic() - context.captured_at
+                > _AGENT_REMOVE_BATCH_CENSUS_MAX_AGE_SECONDS
+            ):
+                try:
+                    context.capture(remaining_targets[index:])
+                except Refusal as exc:
+                    stop_remaining(str(exc))
+                    break
+            if index:
+                # Waiters poll the registry lock every 50 ms; leave them a window
+                # between items so a batch never starves heartbeats.
+                time.sleep(_AGENT_REMOVE_BATCH_YIELD_SECONDS)
+            item_args = argparse.Namespace(**vars(args))
+            item_args.command = "remove"
+            item_args.slot = slot
+            item_args.expected_generation = generation
+            item_args.validate_complete = False
+            item_args.validation_proof_manifest = None
+            item_args.completed_record = None
+            item_args.wait_lock = wait_seconds
+            item_started = time.monotonic()
+            current = (slot, generation, item_started)
+            context.nested_git_evidence.clear()
             try:
-                context.capture(remaining_targets[index:])
+                _cmd_remove(item_args, emit=False, agent_batch=context)
             except Refusal as exc:
-                stop_remaining(str(exc))
-                break
-        if index:
-            # Waiters poll the registry lock every 50 ms; leave them a window
-            # between items so a batch never starves heartbeats.
-            time.sleep(_AGENT_REMOVE_BATCH_YIELD_SECONDS)
-        item_args = argparse.Namespace(**vars(args))
-        item_args.command = "remove"
-        item_args.slot = slot
-        item_args.expected_generation = generation
-        item_args.validate_complete = False
-        item_args.validation_proof_manifest = None
-        item_args.completed_record = None
-        item_args.wait_lock = wait_seconds
-        item_started = time.monotonic()
-        context.nested_git_evidence.clear()
-        try:
-            _cmd_remove(item_args, emit=False, agent_batch=context)
-        except Refusal as exc:
-            seconds = round(time.monotonic() - item_started, 3)
-            # StateError is a Refusal too.  Whether the batch can go on
-            # depends only on whether the item left an interrupted removal,
-            # not on the class of the exception: an invariant check raises
-            # StateError before any journal exists, and a refusal after the
-            # finish journal was written normally rolls the journal back.
-            # When it cannot, the journal stays for 'wrkslots recover' and no
-            # later item can proceed.
-            try:
-                interrupted = _interrupted_removal_journal(config, slot, wait_seconds)
-            except Refusal as check:
-                refuse(
-                    slot,
-                    generation,
-                    f"{exc}; {unconfirmed_reason(check)}",
-                    seconds=seconds,
-                )
-                stop_remaining(unconfirmed_stop)
-                break
-            if interrupted is None:
-                refuse(slot, generation, str(exc), seconds=seconds)
+                seconds = round(time.monotonic() - item_started, 3)
+                # StateError is a Refusal too.  Whether the batch can go on
+                # depends only on whether the item left an interrupted removal,
+                # not on the class of the exception: an invariant check raises
+                # StateError before any journal exists, and a refusal after the
+                # finish journal was written normally rolls the journal back.
+                # When it cannot, the journal stays for 'wrkslots recover' and no
+                # later item can proceed.
+                try:
+                    interrupted = _interrupted_removal_journal(config, slot, wait_seconds)
+                except Refusal as check:
+                    refuse(
+                        slot,
+                        generation,
+                        f"{exc}; {unconfirmed_reason(check)}",
+                        seconds=seconds,
+                    )
+                    stop_remaining(unconfirmed_stop)
+                    break
+                if interrupted is None:
+                    refuse(slot, generation, str(exc), seconds=seconds)
+                else:
+                    recovery_required = True
+                    refuse(
+                        slot,
+                        generation,
+                        f"{exc}; {recovery_reason(interrupted)}",
+                        seconds=seconds,
+                        recovery_required=True,
+                    )
+                    stop_remaining(
+                        "batch stopped: an earlier item left an interrupted removal; run "
+                        "'wrkslots recover' and retry the remaining slots"
+                    )
+                    break
             else:
-                recovery_required = True
-                refuse(
-                    slot,
-                    generation,
-                    f"{exc}; {recovery_reason(interrupted)}",
-                    seconds=seconds,
-                    recovery_required=True,
+                decided.add(slot)
+                removed.append(
+                    {
+                        "slot": slot,
+                        "generation": generation,
+                        "seconds": round(time.monotonic() - item_started, 3),
+                        "disposable_nested_repositories": list(context.nested_git_evidence),
+                    }
                 )
-                stop_remaining(
-                    "batch stopped: an earlier item left an interrupted removal; run "
-                    "'wrkslots recover' and retry the remaining slots"
+            current = None
+            _interrupt_for_test("after-agent-batch-item")
+    except Exception as exc:  # the report must survive any failure
+        # Each item is atomic in the registry, so the removals already made
+        # stand.  Report them, the item that failed, and the slots not yet
+        # attempted, instead of losing the report with the traceback.
+        error = f"{type(exc).__name__}: {exc}"
+        print("wrkslots: remove-agent-batch stopped on an unexpected error:", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        if current is not None and current[0] not in decided:
+            failed_slot, failed_generation, failed_started = current
+            reason = f"unexpected error: {error}"
+            extra: dict[str, object] = {}
+            try:
+                interrupted = _interrupted_removal_journal(
+                    config, failed_slot, wait_seconds
                 )
-                break
-        else:
-            decided.add(slot)
-            removed.append(
-                {
-                    "slot": slot,
-                    "generation": generation,
-                    "seconds": round(time.monotonic() - item_started, 3),
-                    "disposable_nested_repositories": list(context.nested_git_evidence),
-                }
+            except Exception as check:
+                reason += f"; {unconfirmed_reason(check)}"
+            else:
+                if interrupted is not None:
+                    recovery_required = True
+                    reason += f"; {recovery_reason(interrupted)}"
+                    extra["recovery_required"] = True
+                else:
+                    still_active = _agent_row_still_active(
+                        config, failed_slot, failed_generation
+                    )
+                    if still_active is None:
+                        reason += (
+                            "; the registry could not be read to tell whether the slot "
+                            "is still active; read 'wrkslots status'"
+                        )
+                    elif still_active:
+                        reason += (
+                            f"; the slot is still active at generation {failed_generation} "
+                            "and no interrupted removal is recorded"
+                        )
+                    else:
+                        reason += (
+                            f"; the slot is no longer active at generation "
+                            f"{failed_generation}, so its removal may have completed "
+                            "before the error; read 'wrkslots status'"
+                        )
+            refuse(
+                failed_slot,
+                failed_generation,
+                reason,
+                seconds=round(time.monotonic() - failed_started, 3),
+                **extra,
             )
-        _interrupt_for_test("after-agent-batch-item")
+        stop_remaining("batch stopped after an unexpected error; retry the remaining slots")
     order = {slot: position for position, (slot, _generation) in enumerate(requested)}
     refused.sort(key=lambda item: order[_as_str(item["slot"], "refused slot")])
     return {
@@ -26830,6 +26903,7 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
         "removed": removed,
         "refused": refused,
         "recovery_required": recovery_required,
+        "error": error,
         "shared_process_censuses": context.shared_census_count,
         "shared_process_census_seconds": round(context.shared_census_seconds, 3),
         "fresh_process_scans": context.fresh_scan_count,
@@ -26870,11 +26944,13 @@ def _cmd_remove_agent_batch(args: argparse.Namespace) -> int:
                 f"REFUSED: {row['slot']} generation={row['generation']} "
                 f"reason={row['reason']}"
             )
+        if payload["error"] is not None:
+            print(f"ERROR: {payload['error']}")
         if payload["recovery_required"]:
             print("RECOVERY REQUIRED: run 'wrkslots recover' before another removal")
     # Success means every requested slot was removed.  Any refusal, including
-    # a batch that removed nothing, is exit status 1.
-    return 0 if removed and not refused else 1
+    # a batch that removed nothing, and any unexpected error is exit status 1.
+    return 0 if removed and not refused and payload["error"] is None else 1
 
 
 def _recover_partial_updates(config: Config, discard: bool) -> bool:
@@ -40760,9 +40836,15 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "after it runs lsof exactly as remove does. "
             "Each slot is removed in its own registry-lock hold, and the lock is released "
             "between slots. A refused slot is reported with its reason and left in place; "
-            "the remaining slots are still attempted. Exit status is 0 only when every "
+            "the remaining slots are still attempted. A slot that leaves an interrupted "
+            "removal journal stops the batch and names 'wrkslots recover'. An "
+            "unexpected error during the shared scan or a slot's removal stops the batch "
+            "but still prints the report: the error is in its error field (an ERROR: line "
+            "in human output), the traceback is on stderr, and the slot being removed and "
+            "every later slot are reported refused. Exit status is 0 only when every "
             "requested slot was removed, 1 when any slot was refused (including a batch "
-            "that removed nothing), and 3 when the whole batch was refused."
+            "that removed nothing) or an unexpected error occurred, and 3 when the whole "
+            "batch was refused."
         ),
         formatter_class=_HelpFormatter,
     )

@@ -40032,6 +40032,143 @@ def test_remove_agent_batch_decides_recovery_by_the_journal_not_the_state_error(
     assert active_slot_names(project) == ["slot02", "slot03", "slot04"]
 
 
+def test_remove_agent_batch_still_reports_its_removals_after_an_unexpected_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exception that is not a refusal stops the batch but keeps the report.
+
+    The slots already removed are listed, the failing slot and every later
+    slot are refused, the error is in the batch's error field and ERROR: line,
+    the traceback is on stderr, and the exit status is 1.
+    """
+
+    project, _repository, slots = dead_agent_batch_project(tmp_path)
+    original = wrkslots._cmd_remove
+
+    def fail_slot02(args: argparse.Namespace, **kwargs: object) -> int:
+        if args.slot == "slot02":
+            raise OSError("injected disk error")
+        return original(args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(wrkslots, "_cmd_remove", fail_slot02)
+    returncode, payload, stderr = in_process_agent_batch(project, slots)
+
+    assert returncode == 1, stderr
+    assert batch_slots(payload, "removed") == ["slot01"]
+    assert batch_slots(payload, "refused") == ["slot02", "slot03"]
+    assert payload["error"] == "OSError: injected disk error"
+    assert payload["recovery_required"] is False
+    failed, later = cast(list[Mapping[str, object]], payload["refused"])
+    assert failed["reason"] == (
+        "unexpected error: OSError: injected disk error; the slot is still active at "
+        "generation 1 and no interrupted removal is recorded"
+    )
+    assert "recovery_required" not in failed
+    assert isinstance(failed["seconds"], float)
+    assert later["reason"] == (
+        "batch stopped after an unexpected error; retry the remaining slots"
+    )
+    assert "wrkslots: remove-agent-batch stopped on an unexpected error:" in stderr
+    assert "Traceback (most recent call last):" in stderr
+    assert "OSError: injected disk error" in stderr
+    assert active_slot_names(project) == ["slot02", "slot03"]
+    assert registry_journals(project) == []
+
+    human = io.StringIO()
+    human_stderr = io.StringIO()
+    arguments = agent_batch_arguments(project, ["slot02"])
+    arguments[arguments.index("json")] = "human"
+    with contextlib.redirect_stdout(human), contextlib.redirect_stderr(human_stderr):
+        human_code = wrkslots.main(arguments)
+    assert human_code == 1, human_stderr.getvalue()
+    lines = human.getvalue().splitlines()
+    assert lines[0].startswith("requested=1 removed=0 refused=1 ")
+    assert lines[-1] == "ERROR: OSError: injected disk error"
+
+    monkeypatch.setattr(wrkslots, "_cmd_remove", original)
+    finished_code, finished, finished_stderr = in_process_agent_batch(
+        project, ["slot02", "slot03"]
+    )
+    assert finished_code == 0, finished_stderr
+    assert finished["error"] is None
+    assert active_slot_names(project) == []
+
+
+def test_remove_agent_batch_reports_an_unexpected_error_in_its_shared_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _repository, slots = dead_agent_batch_project(tmp_path)
+
+    def crash(_targets: Sequence[Path]) -> object:
+        raise ValueError("injected scan crash")
+
+    monkeypatch.setattr(wrkslots, "_capture_agent_remove_batch_census", crash)
+    returncode, payload, stderr = in_process_agent_batch(project, slots)
+
+    assert returncode == 1, stderr
+    assert payload["removed"] == []
+    assert batch_slots(payload, "refused") == slots
+    assert payload["error"] == "ValueError: injected scan crash"
+    assert payload["shared_process_censuses"] == 1
+    for row in cast(list[Mapping[str, object]], payload["refused"]):
+        assert row["reason"] == (
+            "batch stopped after an unexpected error; retry the remaining slots"
+        )
+    assert "ValueError: injected scan crash" in stderr
+    assert active_slot_names(project) == slots
+
+
+def test_remove_agent_batch_describes_the_item_an_unexpected_error_interrupted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failing item's reason says what the registry shows afterwards.
+
+    A removal that completed before the error is named as possibly complete;
+    one that left its journal names 'wrkslots recover'.
+    """
+
+    project, _repository, slots = dead_agent_batch_project(tmp_path)
+    original = wrkslots._cmd_remove
+    config = wrkslots._load_config(str(project), "testhost")
+    journal = wrkslots._journal_path(config)
+
+    def fail_after(args: argparse.Namespace, **kwargs: object) -> int:
+        if args.slot == "slot02":
+            original(args, **kwargs)  # type: ignore[arg-type]
+            raise OSError("injected error after the removal")
+        if args.slot == "slot03":
+            journal.write_text(
+                json.dumps({"kind": "remove", "slot": "slot03"}), encoding="utf-8"
+            )
+            raise OSError("injected error after the journal")
+        return original(args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(wrkslots, "_cmd_remove", fail_after)
+    returncode, payload, stderr = in_process_agent_batch(project, ["slot01", "slot02"])
+
+    assert returncode == 1, stderr
+    assert batch_slots(payload, "removed") == ["slot01"]
+    assert batch_slots(payload, "refused") == ["slot02"]
+    failed = cast(list[Mapping[str, object]], payload["refused"])[0]
+    assert failed["reason"] == (
+        "unexpected error: OSError: injected error after the removal; the slot is no "
+        "longer active at generation 1, so its removal may have completed before the "
+        "error; read 'wrkslots status'"
+    )
+    assert active_slot_names(project) == ["slot03"]
+
+    returncode, payload, stderr = in_process_agent_batch(project, ["slot03"])
+
+    assert returncode == 1, stderr
+    assert payload["recovery_required"] is True
+    failed = cast(list[Mapping[str, object]], payload["refused"])[0]
+    assert failed["reason"] == (
+        "unexpected error: OSError: injected error after the journal; an interrupted "
+        f"removal is recorded in {journal}; run 'wrkslots recover' before another removal"
+    )
+    assert failed["recovery_required"] is True
+
+
 def test_remove_agent_batch_reports_each_items_disposable_nested_repositories(
     tmp_path: Path,
 ) -> None:

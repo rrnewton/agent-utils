@@ -529,9 +529,14 @@ requested=3 removed=2 refused=1 shared_process_censuses=1 fresh_process_scans=7 
 ```
 
 followed by one `REMOVED:` or `REFUSED:` line per slot; `--format json` prints the same content as
-one object. Exit status is 0 only when every requested slot was removed, 1 when any slot was
-refused (including a batch that removed nothing), and 3 when the whole command was refused, for
-example for a malformed or repeated item.
+one object. An unexpected error, meaning anything other than a refusal, during the shared scan or
+a slot's removal stops the batch but still prints the report. The removals already made stand and
+are listed; the slot being removed and every later slot are refused; the error appears in an
+`ERROR:` line and in the JSON `error` field, which is otherwise `null`; and the traceback goes to
+stderr. An unexpected error before the shared scan prints only the traceback and exits 1; nothing
+has been removed at that point. Exit status is 0 only when every requested slot was removed, 1 when
+any slot was refused (including a batch that removed nothing) or an unexpected error occurred, and
+3 when the whole command was refused, for example for a malformed or repeated item.
 
 The batch writes no state of its own. Each slot's journal and events are written and retired
 inside that slot's lock hold in exactly the form `remove` uses, so an interrupted batch leaves at
