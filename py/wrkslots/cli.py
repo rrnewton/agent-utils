@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import contextlib
+import contextvars
 import ctypes
 import dataclasses
 import datetime as dt
@@ -32,6 +33,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import unicodedata
@@ -39,7 +41,7 @@ import urllib.parse
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Set as AbstractSet
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, TypeVar
 
 from wrkslots import __version__, imagecmd, sandbox, slotimage, yamlconfig
 
@@ -564,19 +566,54 @@ _VALIDATE_REMOVE_BATCH_ITEM_CENSUS_SECONDS = 60.0
 _VALIDATE_REMOVE_BATCH_CENSUS_STDERR_BYTES = 64 * 1024
 # remove-agent-batch reuses its shared lsof evidence for at most this long.
 # That evidence serves only the use checks an item makes before its path
-# fence, and nothing is deleted before the fence; every check after the fence
-# runs the ordinary single-slot lsof.  Before the fence, a fresh /proc scan
-# covers path, mapping, mount, and cgroup use at the moment of each check and
-# only inode-alias use relies on the shared scan, so this age bounds how long
-# such use could go unseen before an item fences its slot.  On a 4,200-process
-# host at load average 95, with small test slots, one shared scan of three
-# slots took 39 seconds and each item then held the registry lock for 41 to 55
-# seconds, 24 to 38 of them in its post-fence lsof; a batch pays for a new scan
-# roughly once per six items.  A single-slot remove of the same kind of slot
-# on that host held the lock for 169 seconds across four ordinary lsof runs.
+# fence, and nothing is deleted before the fence.  Before the fence, a fresh
+# /proc scan covers path, mapping, mount, and cgroup use at the moment of each
+# check and only inode-alias use relies on the shared scan, so this age bounds
+# how long such use could go unseen before an item fences its slot.  On a
+# 4,200-process host at load average 95, with small test slots, one shared
+# scan of three slots took 39 seconds; a batch pays for a new scan roughly
+# once per six items.
 _AGENT_REMOVE_BATCH_CENSUS_MAX_AGE_SECONDS = 300.0
 _AGENT_REMOVE_BATCH_LSOF_SECONDS = 600.0
 _AGENT_REMOVE_BATCH_YIELD_SECONDS = 0.25
+# The registry-lock hold of one remove-agent-batch item, before its first
+# deletion, is bounded by this budget.  Other clients wait for the lock with
+# their own finite bound (a fleet heartbeat waits 110 seconds), so an item that
+# held the lock longer than that would make their writes fail.  The clock
+# starts when the item takes the lock.  Each step that can take long before
+# the first deletion receives at most the budget that remains: every Git
+# command, the registered liveness command, each in-process /proc scan, the
+# lsof fallback, and each nested-repository judgment command.  A command that
+# is still running when the budget runs out receives SIGTERM, then SIGKILL
+# after _AGENT_REMOVE_BATCH_TERM_GRACE_SECONDS, and is then waited for up to
+# _AGENT_REMOVE_BATCH_REAP_SECONDS.  The item is refused.  It is checked again
+# immediately before the path fence and immediately before the first deletion;
+# a refusal after the fence rolls the fence back, so a refused item leaves its
+# slot in place.  Two stretches are not interrupted, because a refusal inside
+# them would leave a removal that only 'wrkslots recover' can finish: the local
+# Git registration repair that follows the path-fence rename, and a fence
+# rollback.  Deleting the slot is not bounded either.  Once the first file is
+# deleted the item runs to completion, since stopping partway would leave a
+# partly deleted slot, and its duration grows with the number of files in the
+# slot.  Nested-repository judgment is held to this budget too, where
+# ordinary remove allows it _NESTED_GIT_REMOVAL_SECONDS (900 seconds), so a
+# slot with slow nested checks can be refused here and removed by 'wrkslots
+# remove'.
+#
+# Measured on 2026-09-30 on one host.  With 4,100 to 4,300 processes at load
+# average 65 to 127, three small worktree slots held the lock for 17.3, 21.5
+# and 28.5 seconds before deletion, and one ordinary remove of the same kind
+# of slot held it for 98 seconds, running lsof four times (19 to 25 seconds
+# each).  With 4,760 processes at load average 118 to 159, on a synthetic
+# 121,575-entry tree, the post-fence /proc scan (_agent_batch_fenced_use)
+# took 6.7 to 10.1 seconds and the lsof +D it replaces took 34 to 53 seconds;
+# deleting that tree with shutil.rmtree took 10.8 seconds.
+_AGENT_REMOVE_BATCH_ITEM_SECONDS = 60.0
+# The bound on one in-process /proc scan, which is also held to the remaining
+# item budget.
+_AGENT_REMOVE_BATCH_SCAN_SECONDS = 30.0
+_AGENT_REMOVE_BATCH_TERM_GRACE_SECONDS = 5.0
+_AGENT_REMOVE_BATCH_REAP_SECONDS = 5.0
 _READ_ONLY_COMMAND_REAP_SECONDS = 1.0
 _RECLAIM_LIVE_USE_RECHECK_SECONDS = 0.25
 _LIVENESS_BATCH_REQUEST_SCHEMA = "wrkslots-liveness-batch-request/v1"
@@ -9412,6 +9449,173 @@ def _git_failure_detail(result: subprocess.CompletedProcess[str]) -> str:
     return f" ({status})" + (f": {detail}" if detail else "")
 
 
+@dataclasses.dataclass
+class _ItemDeadline:
+    """The pre-deletion budget of one remove-agent-batch item.
+
+    See _AGENT_REMOVE_BATCH_ITEM_SECONDS.  ``state`` is ``active`` while the
+    budget bounds work, ``paused`` across a stretch that must not be
+    interrupted, and ``ended`` once deletion may begin.
+    """
+
+    seconds: float
+    started_at: float
+    state: str = "active"
+    seconds_before_deletion: float | None = None
+
+    @property
+    def expires_at(self) -> float:
+        return self.started_at + self.seconds
+
+
+# Set only while one remove-agent-batch item holds the registry lock.
+_ITEM_DEADLINE: contextvars.ContextVar[_ItemDeadline | None] = contextvars.ContextVar(
+    "wrkslots_agent_batch_item_deadline", default=None
+)
+
+
+def _item_budget_refusal(what: str) -> Refusal:
+    deadline = _ITEM_DEADLINE.get()
+    seconds = _AGENT_REMOVE_BATCH_ITEM_SECONDS if deadline is None else deadline.seconds
+    return Refusal(
+        f"this remove-agent-batch item used its {seconds:g}-second budget for work "
+        f"before deletion at {what}; nothing in the slot was deleted and the slot "
+        "was kept; retry it in a later batch, or remove it alone with 'wrkslots "
+        "remove', which has no such budget"
+    )
+
+
+def _item_seconds_left(what: str) -> float | None:
+    """Return the item budget left for ``what``, or None when no budget applies.
+
+    Raises Refusal when the budget of the current remove-agent-batch item is
+    already spent.
+    """
+
+    deadline = _ITEM_DEADLINE.get()
+    if deadline is None or deadline.state != "active":
+        return None
+    remaining = deadline.expires_at - time.monotonic()
+    if remaining <= 0:
+        raise _item_budget_refusal(what)
+    return remaining
+
+
+def _pause_item_deadline() -> None:
+    """Stop bounding work until _resume_item_deadline; the clock keeps running."""
+
+    deadline = _ITEM_DEADLINE.get()
+    if deadline is not None and deadline.state == "active":
+        deadline.state = "paused"
+
+
+def _resume_item_deadline() -> None:
+    deadline = _ITEM_DEADLINE.get()
+    if deadline is not None and deadline.state == "paused":
+        deadline.state = "active"
+
+
+def _end_item_deadline() -> None:
+    """Refuse if the budget is spent, then stop bounding the item: deletion follows."""
+
+    deadline = _ITEM_DEADLINE.get()
+    if deadline is None or deadline.state == "ended":
+        return
+    if deadline.state == "active":
+        _item_seconds_left("the first deletion")
+    deadline.seconds_before_deletion = time.monotonic() - deadline.started_at
+    deadline.state = "ended"
+
+
+def _stop_process_group(process: subprocess.Popen[str]) -> None:
+    """Terminate, then kill, the process group of ``process``, and reap it."""
+
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except OSError:
+        pass
+    try:
+        process.communicate(timeout=_AGENT_REMOVE_BATCH_TERM_GRACE_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    # Only an unreaped leader keeps its process-group ID from being reused.
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        process.communicate(timeout=_AGENT_REMOVE_BATCH_REAP_SECONDS)
+    except subprocess.TimeoutExpired:
+        # A descendant that left the process group still holds the pipes.
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                with contextlib.suppress(OSError):
+                    stream.close()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=0)
+
+
+def _run_within_item_budget(
+    command: Sequence[str],
+    *,
+    seconds: float,
+    what: str,
+    env: Mapping[str, str] | None = None,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run ``command`` as subprocess.run would, for at most ``seconds``.
+
+    The command runs in its own session so that both signals reach every
+    process it starts.  When the time runs out it receives SIGTERM first,
+    because Git removes its lock files when SIGTERM stops it and leaves them
+    when SIGKILL does, then SIGKILL after a grace period, and the item is
+    refused.  An OSError from starting the command propagates.
+    """
+
+    process = subprocess.Popen(
+        list(command),
+        stdin=subprocess.PIPE if input_text is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=None if env is None else dict(env),
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(input_text, timeout=max(0.0, seconds))
+    except subprocess.TimeoutExpired:
+        _stop_process_group(process)
+        raise _item_budget_refusal(what) from None
+    except BaseException:
+        _stop_process_group(process)
+        raise
+    return subprocess.CompletedProcess(list(command), process.returncode, stdout, stderr)
+
+
+@contextlib.contextmanager
+def _agent_batch_item_deadline(
+    agent_batch: _AgentRemoveBatchContext | None,
+) -> Iterator[None]:
+    """Bound the pre-deletion work of one remove-agent-batch item.
+
+    Entered once the item holds the registry lock.  Outside a batch it does
+    nothing.
+    """
+
+    if agent_batch is None:
+        yield
+        return
+    deadline = _ItemDeadline(agent_batch.item_seconds, time.monotonic())
+    token = _ITEM_DEADLINE.set(deadline)
+    try:
+        yield
+    finally:
+        _ITEM_DEADLINE.reset(token)
+        agent_batch.last_seconds_before_deletion = deadline.seconds_before_deletion
+
+
 class _GitVcs:
     """The small Git boundary used by slot operations."""
 
@@ -9470,15 +9674,22 @@ class _GitVcs:
         ]
         if network_operation:
             command = _with_proxy(command, env)
+        what = f"git {' '.join(args[:3])} in {repository}"
+        seconds = _item_seconds_left(what)
         try:
-            completed = subprocess.run(
-                command,
-                text=True,
-                capture_output=True,
-                check=False,
-                env=env,
-                input=input_text,
-            )
+            if seconds is None:
+                completed = subprocess.run(
+                    command,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    env=env,
+                    input=input_text,
+                )
+            else:
+                completed = _run_within_item_budget(
+                    command, seconds=seconds, what=what, env=env, input_text=input_text
+                )
         except OSError as exc:
             raise Refusal(f"cannot execute Git: {exc}") from exc
         if check and completed.returncode != 0:
@@ -10467,24 +10678,32 @@ class _GitVcs:
                 "GIT_NO_REPLACE_OBJECTS": "1",
             }
         )
+        repair_command = [
+            "git",
+            "--no-replace-objects",
+            "-c",
+            "core.useReplaceRefs=false",
+            f"--git-dir={admin}",
+            f"--work-tree={checkout}",
+            "config",
+            "core.worktree",
+            str(checkout),
+        ]
+        what = f"git config core.worktree for {checkout}"
+        seconds = _item_seconds_left(what)
         try:
-            completed = subprocess.run(
-                [
-                    "git",
-                    "--no-replace-objects",
-                    "-c",
-                    "core.useReplaceRefs=false",
-                    f"--git-dir={admin}",
-                    f"--work-tree={checkout}",
-                    "config",
-                    "core.worktree",
-                    str(checkout),
-                ],
-                text=True,
-                capture_output=True,
-                check=False,
-                env=environment,
-            )
+            if seconds is None:
+                completed = subprocess.run(
+                    repair_command,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    env=environment,
+                )
+            else:
+                completed = _run_within_item_budget(
+                    repair_command, seconds=seconds, what=what, env=environment
+                )
         except OSError as exc:
             raise Refusal(f"cannot execute Git while repairing {checkout}: {exc}") from exc
         if completed.returncode != 0:
@@ -11488,20 +11707,34 @@ def _registered_liveness_states(
 
 
 def _registered_liveness_state(config: Config, record: ActiveRecord) -> tuple[str, str]:
+    """Ask the registered liveness command about ``record``'s owner.
+
+    Returns ``dead``, ``alive`` or ``unverifiable`` with a detail line.  Within a
+    remove-agent-batch item the command receives at most the item's remaining
+    budget and raises Refusal when that runs out.
+    """
+
     env = _liveness_environment(config, record)
+    what = "the registered liveness command"
+    seconds = _item_seconds_left(what)
     try:
         command = (
             [sys.executable, str(config.liveness_command), record.agent]
             if config.liveness_command.suffix == ".py"
             else [str(config.liveness_command), record.agent]
         )
-        completed = subprocess.run(
-            command,
-            text=True,
-            capture_output=True,
-            check=False,
-            env=env,
-        )
+        if seconds is None:
+            completed = subprocess.run(
+                command,
+                text=True,
+                capture_output=True,
+                check=False,
+                env=env,
+            )
+        else:
+            completed = _run_within_item_budget(
+                command, seconds=seconds, what=what, env=env
+            )
     except OSError as exc:
         return "unverifiable", f"registered liveness command could not run: {exc}"
     detail = (completed.stderr or completed.stdout).strip().splitlines()
@@ -12152,13 +12385,19 @@ class _LiveUseObservation:
 def _lsof_slot_use(
     executable: Path, slot_path: Path
 ) -> tuple[_LsofUseDiagnostic | None, bool, int]:
+    lsof_command = [str(executable), "-nP", "-Fpcfn", "+D", str(slot_path)]
+    what = f"lsof +D {slot_path}"
+    seconds = _item_seconds_left(what)
     try:
-        completed = subprocess.run(
-            [str(executable), "-nP", "-Fpcfn", "+D", str(slot_path)],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        if seconds is None:
+            completed = subprocess.run(
+                lsof_command,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        else:
+            completed = _run_within_item_budget(lsof_command, seconds=seconds, what=what)
     except OSError as exc:
         raise Refusal(
             f"process use is indeterminate because lsof failed: {exc}"
@@ -12209,6 +12448,7 @@ def _assert_slot_unused(
     live_use_recheck: _LiveUseRecheckBudget | None = None,
     agent_batch: _AgentRemoveBatchContext | None = None,
     canonical_path: Path | None = None,
+    after_fence: bool = False,
 ) -> None:
     while True:
         observation = _observe_slot_use_once(
@@ -12221,7 +12461,9 @@ def _assert_slot_unused(
             proc_root=proc_root,
             ignore_current_process=ignore_current_process,
             capture_generation=live_use_recheck is not None,
-            **_agent_batch_use_check(agent_batch, canonical_path),
+            **_agent_batch_use_check(
+                agent_batch, canonical_path, after_fence=after_fence
+            ),
         )
         if observation is None:
             return
@@ -12248,6 +12490,7 @@ def _observe_slot_use_once(
     capture_generation: bool = False,
     agent_batch: _AgentRemoveBatchContext | None = None,
     canonical_path: Path | None = None,
+    after_fence: bool = False,
 ) -> _LiveUseObservation | None:
     try:
         current_directory = Path.cwd().resolve(strict=True)
@@ -12268,6 +12511,18 @@ def _observe_slot_use_once(
         ):
             raise StateError(
                 "an agent removal batch replaces only the ordinary lsof process check"
+            )
+        if after_fence:
+            if canonical_path is None:
+                raise StateError(
+                    "an agent removal batch check after the path fence must name "
+                    "the canonical slot path"
+                )
+            return agent_batch.observe_fenced(
+                slot_path,
+                record,
+                canonical_path=canonical_path,
+                capture_generation=capture_generation,
             )
         return agent_batch.observe(
             slot_path,
@@ -20953,6 +21208,11 @@ def _judge_nested_git_repository_unchecked(
                 f"nested Git judgment spent its {budget.total_seconds:g}-second "
                 f"allowance for this removal before git {' '.join(args)}"
             )
+        item_what = f"git {' '.join(args[:3])} in {dotgit}"
+        item_seconds = _item_seconds_left(item_what)
+        limited_by_item = item_seconds is not None and item_seconds < seconds
+        if item_seconds is not None and limited_by_item:
+            seconds = item_seconds
         command = [
             "git",
             "--no-pager",
@@ -20989,6 +21249,8 @@ def _judge_nested_git_repository_unchecked(
                 timeout=seconds,
             )
         except subprocess.TimeoutExpired as exc:
+            if limited_by_item:
+                raise _item_budget_refusal(item_what) from exc
             raise refuse(
                 f"git {' '.join(args)} did not finish within {seconds:g} seconds"
             ) from exc
@@ -24076,6 +24338,9 @@ def _rollback_path_fence(
     *,
     journal_path: Path,
 ) -> None:
+    # A rollback interrupted partway would leave the removal for 'wrkslots
+    # recover', so a remove-agent-batch item budget does not bound it.
+    _pause_item_deadline()
     removed = {
         _as_str(item, "journal.removed item")
         for item in _as_list(journal["removed"], "journal.removed")
@@ -24156,6 +24421,11 @@ def _begin_or_resume_path_fence(
         _interrupt_for_test("after-path-fence-before-journal")
         fenced_present = True
         newly_fenced = True
+    # From here until _finish_remove_paths enters the block that rolls the
+    # fence back, a refusal would leave the removal for 'wrkslots recover', so
+    # a remove-agent-batch item budget does not interrupt the Git
+    # registration repair below.
+    _pause_item_deadline()
     if not fenced_present:
         return journal, fenced
     if fenced.is_symlink() or not fenced.is_dir():
@@ -24194,6 +24464,8 @@ def _finish_remove_paths(
     all_names = {item.name for item in record.checkouts}
     if not removed <= all_names:
         raise StateError("finish journal names a checkout that is not in the active record")
+    # A remove-agent-batch item whose budget is spent stops before its fence.
+    _item_seconds_left("the path fence")
     journal, fenced_slot = _begin_or_resume_path_fence(
         config,
         record,
@@ -24295,6 +24567,9 @@ def _finish_remove_paths(
         deleted_nested: list[dict[str, object]] = []
         deleting_nested: list[dict[str, object]] = []
         try:
+            # A refusal from here on rolls the fence back, so a
+            # remove-agent-batch item budget bounds this work again.
+            _resume_item_deadline()
             moved_checkouts: list[Checkout] = []
             moved_paths: dict[str, Path] = {}
             salvage = finish.salvage
@@ -24343,6 +24618,11 @@ def _finish_remove_paths(
                         and record.slot_type == "validate"
                     ),
                     live_use_recheck=finish.live_use_recheck,
+                    **_agent_batch_use_check(
+                        finish.agent_batch,
+                        _slot_directory(config, record.slot, record.slot_type),
+                        after_fence=True,
+                    ),
                 )
             if finish.validation_removal_proof is not None:
                 canonical_checkout, _active_checkout = _single_validation_checkout(
@@ -24415,6 +24695,9 @@ def _finish_remove_paths(
                             and record.slot_type == "validate"
                         ),
                         live_use_recheck=finish.live_use_recheck,
+                        **_agent_batch_use_check(
+                            finish.agent_batch, canonical_slot, after_fence=True
+                        ),
                     )
                 # Judge every cache again, after the use check and before the
                 # first deletion, so neither a change nor an exhausted budget
@@ -24438,6 +24721,10 @@ def _finish_remove_paths(
                                 "the slot and rerun remove"
                             )
                 _interrupt_for_test("after-nested-git-rejudged")
+            # The last point at which a remove-agent-batch item refuses for
+            # its budget.  Deleting runs to completion: stopping partway would
+            # leave a partly deleted slot.
+            _end_item_deadline()
             for checkout in moved_checkouts:
                 for cache in _cache_directories_for_checkout(config, checkout):
                     judged_here = nested_by_cache.get(cache.path, ())
@@ -25116,7 +25403,7 @@ def _cmd_remove(
     )
     prepared_private_finish: _PreparedPrivateFinish | None = None
     finish_context: _FinishContext | None = None
-    with lock_scope:
+    with lock_scope, _agent_batch_item_deadline(agent_batch):
         _refuse_partial_state(
             config,
             allow_validate_batch_seals=private_cleanup is not None,
@@ -26111,10 +26398,17 @@ def _cmd_remove_validate_batch(args: argparse.Namespace) -> int:
 # which costs about one second on the same host.  The fresh scan is what
 # catches a process that began using the slot after the shared scan; the
 # shared scan is what catches use through a hardlink or other inode alias
-# that no path names.  Nothing is deleted before the fence.  Every check
-# after the fence, which guards deletion, is the ordinary check with its own
-# lsof run, so an item's lock hold contains one or two lsof runs instead of
-# four or five.
+# that no path names.  Nothing is deleted before the fence.  The checks after
+# the fence, which guard deletion, run no lsof when they can decide without
+# it: one in-process /proc scan records the device and inode of every entry
+# of the fenced tree and compares every process's cwd, root, exe, descriptors
+# and mappings with it by path and by identity, which is what lsof compares
+# (see _agent_batch_fenced_use).  When that scan cannot decide, because the
+# tree spans devices, is on a filesystem the scan does not compare, or a
+# process's evidence is unreadable in an unexpected way, the ordinary lsof
+# check of the fenced path decides instead.  Each item's work before its
+# first deletion is held to _AGENT_REMOVE_BATCH_ITEM_SECONDS, which bounds
+# how long it keeps the registry lock from other clients.
 # ---------------------------------------------------------------------------
 
 
@@ -26455,13 +26749,512 @@ def _agent_batch_fresh_use(
     return None
 
 
+_AT_STATX_DONT_SYNC = 0x4000
+_STATX_TYPE = 0x1
+_STATX_INO = 0x100
+# A process or link that vanished, or one the invoking user may not inspect,
+# is skipped, as lsof run as that user skips it.
+_FENCED_SCAN_SKIPPED_ERRNOS = frozenset(
+    {errno.ENOENT, errno.ESRCH, errno.EACCES, errno.EPERM}
+)
+
+
+class _StatxTimestamp(ctypes.Structure):
+    _fields_ = (
+        ("tv_sec", ctypes.c_int64),
+        ("tv_nsec", ctypes.c_uint32),
+        ("reserved", ctypes.c_int32),
+    )
+
+
+class _Statx(ctypes.Structure):
+    """The kernel's ``struct statx``, which is 256 bytes on every architecture."""
+
+    _fields_ = (
+        ("stx_mask", ctypes.c_uint32),
+        ("stx_blksize", ctypes.c_uint32),
+        ("stx_attributes", ctypes.c_uint64),
+        ("stx_nlink", ctypes.c_uint32),
+        ("stx_uid", ctypes.c_uint32),
+        ("stx_gid", ctypes.c_uint32),
+        ("stx_mode", ctypes.c_uint16),
+        ("spare0", ctypes.c_uint16),
+        ("stx_ino", ctypes.c_uint64),
+        ("stx_size", ctypes.c_uint64),
+        ("stx_blocks", ctypes.c_uint64),
+        ("stx_attributes_mask", ctypes.c_uint64),
+        ("stx_atime", _StatxTimestamp),
+        ("stx_btime", _StatxTimestamp),
+        ("stx_ctime", _StatxTimestamp),
+        ("stx_mtime", _StatxTimestamp),
+        ("stx_rdev_major", ctypes.c_uint32),
+        ("stx_rdev_minor", ctypes.c_uint32),
+        ("stx_dev_major", ctypes.c_uint32),
+        ("stx_dev_minor", ctypes.c_uint32),
+        ("spare2", ctypes.c_uint64 * 14),
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _statx_library() -> ctypes.CDLL | None:
+    """Return the C library with its statx prototype set, or None without statx."""
+
+    if ctypes.sizeof(_Statx) != 256:
+        return None
+    library = ctypes.CDLL(None, use_errno=True)
+    try:
+        # The library object keeps this function object, prototype included.
+        function = library.statx
+    except AttributeError:
+        return None
+    function.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_uint,
+        ctypes.POINTER(_Statx),
+    )
+    function.restype = ctypes.c_int
+    return library
+
+
+def _cached_file_identity(path: str) -> tuple[int, int]:
+    """Return the device and inode of the file ``path`` resolves to.
+
+    It asks statx for cached attributes (AT_STATX_DONT_SYNC), so a network or
+    FUSE filesystem answers without asking its server, which can take
+    unbounded time; the device and inode never come from the server.  Where
+    statx is unavailable it falls back to os.stat.  Raises OSError.
+    """
+
+    library = _statx_library()
+    if library is not None:
+        buffer = _Statx()
+        ctypes.set_errno(0)
+        result = library.statx(
+            _AT_FDCWD,
+            os.fsencode(path),
+            _AT_STATX_DONT_SYNC,
+            _STATX_TYPE | _STATX_INO,
+            ctypes.byref(buffer),
+        )
+        if result == 0:
+            return (
+                os.makedev(buffer.stx_dev_major, buffer.stx_dev_minor),
+                int(buffer.stx_ino),
+            )
+        error = ctypes.get_errno()
+        if error != errno.ENOSYS:
+            raise OSError(error, os.strerror(error), path)
+    observed = os.stat(path)
+    return observed.st_dev, observed.st_ino
+
+
+class _ScanCancelled(Exception):
+    """The caller of a bounded scan stopped waiting for it."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _UndecidedFencedUse:
+    """The post-fence /proc scan could not decide; lsof must."""
+
+    reason: str
+
+
+def _fenced_tree_inodes(
+    fenced: Path, cancel: threading.Event
+) -> tuple[int, frozenset[int]] | _UndecidedFencedUse:
+    """Return the device and every inode number of the tree at ``fenced``.
+
+    Any entry on another device (a mount or a nested filesystem volume), and
+    any entry that cannot be read, leaves the scan undecided.
+    """
+
+    try:
+        top = os.lstat(fenced)
+    except OSError as exc:
+        return _UndecidedFencedUse(f"cannot inspect {fenced}: {exc}")
+    if not stat.S_ISDIR(top.st_mode):
+        return _UndecidedFencedUse(f"{fenced} is not a directory")
+    device = top.st_dev
+    inodes = {top.st_ino}
+    pending = [str(fenced)]
+    while pending:
+        if cancel.is_set():
+            raise _ScanCancelled
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    observed = entry.stat(follow_symlinks=False)
+                    if observed.st_dev != device:
+                        return _UndecidedFencedUse(
+                            f"{entry.path} is on another device than {fenced}"
+                        )
+                    inodes.add(observed.st_ino)
+                    if stat.S_ISDIR(observed.st_mode):
+                        pending.append(entry.path)
+        except OSError as exc:
+            return _UndecidedFencedUse(f"cannot read {directory}: {exc}")
+    return device, frozenset(inodes)
+
+
+# Filesystems whose mappings in /proc/<pid>/maps name the same inode, with
+# the same inode number, as stat does.  Their mapping device is the device
+# stat reports, except on btrfs, where stat gives each volume a device of its
+# own (see _agent_batch_fenced_use).  On any other filesystem, such as
+# overlayfs, where a mapping can name an underlying inode, the post-fence scan
+# leaves the decision to lsof.
+_FENCED_SCAN_FILESYSTEMS = frozenset({"btrfs", "ext2", "ext3", "ext4", "tmpfs", "xfs"})
+
+
+def _mount_device(path: Path) -> tuple[int, str] | None:
+    """Return the device and type of the filesystem ``path`` is on.
+
+    The device is the one /proc/<pid>/maps shows for a file on that
+    filesystem.  Returns None when the mount cannot be identified.
+    """
+
+    try:
+        _device, _inode, mount_id = _open_directory_identity(path, "fenced slot")
+        mountinfo = Path("/proc/self/mountinfo").read_text(
+            encoding="utf-8", errors="surrogateescape"
+        )
+    except (Refusal, OSError):
+        return None
+    for line in mountinfo.split("\n"):
+        fields = line.split(" ")
+        if len(fields) < 3 or fields[0] != str(mount_id):
+            continue
+        major, separator, minor = fields[2].partition(":")
+        if not (separator and major.isdigit() and minor.isdigit()):
+            return None
+        try:
+            filesystem = fields[fields.index("-", 6) + 1]
+        except (ValueError, IndexError):
+            return None
+        return os.makedev(int(major), int(minor)), filesystem
+    return None
+
+
+def _unix_socket_inodes_within(paths: Sequence[Path]) -> frozenset[int] | _UndecidedFencedUse:
+    """Return the inodes of this network namespace's sockets bound below ``paths``.
+
+    /proc/net/unix keeps the path a socket was bound to, so a socket bound
+    before the path fence still names the canonical slot path.
+    """
+
+    try:
+        text = Path("/proc/net/unix").read_bytes().decode("utf-8", errors="surrogateescape")
+    except OSError as exc:
+        return _UndecidedFencedUse(f"cannot read /proc/net/unix: {exc}")
+    inodes: set[int] = set()
+    for line in text.split("\n")[1:]:
+        fields = line.split(None, 7)
+        if len(fields) < 8 or not fields[7].startswith("/"):
+            continue
+        bound = Path(os.path.normpath(fields[7]))
+        if any(_path_is_within(bound, path) for path in paths):
+            if not fields[6].isdigit():
+                return _UndecidedFencedUse(f"malformed /proc/net/unix line: {line!r}")
+            inodes.add(int(fields[6]))
+    return frozenset(inodes)
+
+
+def _agent_batch_fenced_use(
+    fenced_path: Path,
+    canonical_path: Path,
+    record: ActiveRecord | None,
+    *,
+    capture_generation: bool,
+    cancel: threading.Event | None = None,
+    proc_root: Path = Path("/proc"),
+) -> _LiveUseObservation | _UndecidedFencedUse | None:
+    """Scan /proc once for use of a fenced agent slot, without starting lsof.
+
+    It first records the device and inode of every entry of the fenced tree.
+    For every process it may inspect, it then reads the owner cgroup when that
+    is evidence for the record and every mount table, as
+    `_agent_batch_fresh_use` does, and compares each of the process's cwd,
+    root, exe and descriptors with the fenced tree by path and by device and
+    inode, so a use through a hard link, or through a bind mount in another
+    mount namespace, is found although no path names the slot.  A socket
+    descriptor matches a socket bound below the slot's canonical or fenced
+    path in this network namespace.  A mapping matches by path, or by inode
+    on the filesystem's device.
+
+    Returns the first use found (with ``capture_generation``) or raises it,
+    returns None when there is none, and returns _UndecidedFencedUse when the
+    scan cannot decide: when the tree spans devices or cannot be read, when
+    the tree is on a filesystem outside _FENCED_SCAN_FILESYSTEMS, when a
+    process's evidence fails with an unexpected error, or when a mapping on a
+    filesystem that stat reports under another device (btrfs) has an inode
+    number found in the tree.  An undecided scan stops at once; the caller
+    falls back to lsof.
+    """
+
+    stop = threading.Event() if cancel is None else cancel
+    tree = _fenced_tree_inodes(fenced_path, stop)
+    if isinstance(tree, _UndecidedFencedUse):
+        return tree
+    tree_device, tree_inodes = tree
+    sockets = _unix_socket_inodes_within((canonical_path, fenced_path))
+    if isinstance(sockets, _UndecidedFencedUse):
+        return sockets
+    mount = _mount_device(fenced_path)
+    if mount is None:
+        return _UndecidedFencedUse(f"cannot identify the filesystem of {fenced_path}")
+    mapping_device, filesystem = mount
+    if filesystem not in _FENCED_SCAN_FILESYSTEMS:
+        return _UndecidedFencedUse(
+            f"{fenced_path} is on a {filesystem} filesystem, whose mappings this "
+            "scan does not compare"
+        )
+    mapping_major = os.major(mapping_device)
+    mapping_minor = os.minor(mapping_device)
+    base = str(fenced_path)
+    prefix = base + "/"
+
+    def within(target: str) -> bool:
+        return target == base or target.startswith(prefix)
+
+    def in_tree(link: str) -> bool:
+        device, inode = _cached_file_identity(link)
+        return device == tree_device and inode in tree_inodes
+
+    identity_match = ", which is an entry of the fenced slot by device and inode"
+
+    try:
+        pid_dirs = [path for path in proc_root.iterdir() if path.name.isdigit()]
+    except OSError as exc:
+        raise Refusal(f"cannot inspect live processes: {exc}") from exc
+    current_pid = os.getpid()
+    mount_verdicts = _MountTableVerdicts(fenced_path)
+    owner_cgroup = (
+        record.owner.cgroup_path
+        if record is not None
+        and record.owner is not None
+        and _owner_cgroup_is_evidence(record)
+        else None
+    )
+    for pid_dir in sorted(pid_dirs, key=lambda item: int(item.name)):
+        if stop.is_set():
+            raise _ScanCancelled
+        pid = int(pid_dir.name)
+        if pid == current_pid:
+            continue
+        start_ticks: int | None = None
+        if capture_generation:
+            try:
+                generation = _read_process_stat(pid_dir)
+            except Refusal:
+                generation = None
+            start_ticks = None if generation is None else generation.start_ticks
+        if _process_uids(pid_dir) is None:
+            continue
+        if owner_cgroup is not None:
+            try:
+                cgroup = _read_process_cgroup(pid_dir)
+            except Refusal as exc:
+                if not pid_dir.exists():
+                    continue
+                raise Refusal(
+                    f"recorded cgroup use is indeterminate for PID {pid}: {exc}"
+                ) from exc
+            if cgroup == owner_cgroup:
+                raise Refusal(
+                    f"live process {pid} remains in recorded owner cgroup {cgroup}"
+                )
+        uses = mount_verdicts.uses(pid_dir)
+        current = pid_dir
+        try:
+            for name in ("cwd", "root", "exe"):
+                if uses:
+                    break
+                current = pid_dir / name
+                try:
+                    raw = os.readlink(current)
+                    target = raw.removesuffix(" (deleted)")
+                    if target.startswith("/") and within(os.path.normpath(target)):
+                        uses.append(f"{name}={target}")
+                    elif in_tree(str(current)):
+                        uses.append(f"{name}={raw}{identity_match}")
+                except OSError as exc:
+                    if exc.errno not in _FENCED_SCAN_SKIPPED_ERRNOS:
+                        raise
+            current = pid_dir / "fd"
+            try:
+                descriptors = [] if uses else os.listdir(current)
+            except OSError as exc:
+                if exc.errno not in _FENCED_SCAN_SKIPPED_ERRNOS:
+                    raise
+                descriptors = []
+            for descriptor in descriptors:
+                current = pid_dir / "fd" / descriptor
+                try:
+                    raw = os.readlink(current)
+                except OSError as exc:
+                    if exc.errno not in _FENCED_SCAN_SKIPPED_ERRNOS:
+                        raise
+                    continue
+                if raw.startswith("socket:[") and raw.endswith("]"):
+                    inode_text = raw[len("socket:["):-1]
+                    if inode_text.isdigit() and int(inode_text) in sockets:
+                        uses.append(f"fd/{descriptor}={raw} is bound below the slot")
+                        break
+                    continue
+                if not raw.startswith("/"):
+                    continue
+                target = raw.removesuffix(" (deleted)")
+                try:
+                    if within(os.path.normpath(target)):
+                        uses.append(f"fd/{descriptor}={raw}")
+                        break
+                    if in_tree(str(current)):
+                        uses.append(f"fd/{descriptor}={raw}{identity_match}")
+                        break
+                except OSError as exc:
+                    if exc.errno not in _FENCED_SCAN_SKIPPED_ERRNOS:
+                        raise
+            current = pid_dir / "maps"
+            try:
+                maps = b"" if uses else current.read_bytes()
+            except OSError as exc:
+                if exc.errno not in _FENCED_SCAN_SKIPPED_ERRNOS:
+                    raise
+                maps = b""
+        except OSError as exc:
+            return _UndecidedFencedUse(f"{current}: {exc}")
+        seen: set[bytes] = set()
+        for line in maps.split(b"\n") if maps else ():
+            fields = line.split(maxsplit=5)
+            if len(fields) < 5 or fields[4] == b"0":
+                continue
+            if len(fields) == 6:
+                mapped = fields[5].decode("utf-8", errors="surrogateescape")
+                target = mapped.removesuffix(" (deleted)")
+                if target.startswith("/") and within(os.path.normpath(target)):
+                    uses.append(f"map={mapped}")
+                    break
+            key = fields[3] + b" " + fields[4]
+            if key in seen:
+                continue
+            seen.add(key)
+            major, _separator, minor = fields[3].partition(b":")
+            try:
+                same_filesystem = (int(major, 16), int(minor, 16)) == (
+                    mapping_major,
+                    mapping_minor,
+                )
+                inode = int(fields[4])
+            except ValueError:
+                return _UndecidedFencedUse(f"malformed mapping in {pid_dir / 'maps'}")
+            if not same_filesystem or inode not in tree_inodes:
+                continue
+            if mapping_device != tree_device:
+                return _UndecidedFencedUse(
+                    f"process {pid} maps inode {inode} on the fenced slot's filesystem, "
+                    "whose volumes stat reports under their own devices"
+                )
+            uses.append(
+                f"map={line.decode('utf-8', errors='surrogateescape')}{identity_match}"
+            )
+            break
+        if uses:
+            refusal = Refusal(
+                f"live process {pid} uses slot {fenced_path}: {uses[0]}; stop it and retry"
+            )
+            if not capture_generation:
+                raise refusal
+            return _LiveUseObservation(pid, start_ticks, proc_root, refusal)
+    return None
+
+
+_ScanResult = TypeVar("_ScanResult")
+
+
+def _run_bounded_scan(
+    work: Callable[[threading.Event], _ScanResult],
+    *,
+    seconds: float,
+    on_timeout: Callable[[], Refusal],
+) -> _ScanResult:
+    """Run ``work`` on a daemon thread and wait for it at most ``seconds``.
+
+    The thread runs in a copy of the caller's context, so it sees the
+    caller's remove-agent-batch item budget.  ``work`` receives an event that
+    is set when the wait ends; a scan that checks it stops, and a scan
+    blocked in a system call is abandoned and ends on its own.  Its exception
+    is raised here.
+    """
+
+    cancel = threading.Event()
+    results: list[_ScanResult] = []
+    failures: list[BaseException] = []
+
+    def target() -> None:
+        try:
+            results.append(work(cancel))
+        except BaseException as exc:  # re-raised in the caller's thread
+            failures.append(exc)
+
+    thread = threading.Thread(
+        target=contextvars.copy_context().run,
+        args=(target,),
+        name="wrkslots-bounded-scan",
+        daemon=True,
+    )
+    thread.start()
+    thread.join(max(0.0, seconds))
+    if thread.is_alive():
+        cancel.set()
+        raise on_timeout()
+    if failures:
+        raise failures[0]
+    return results[0]
+
+
+def _run_item_scan(
+    work: Callable[[threading.Event], _ScanResult],
+    what: str,
+    *,
+    seconds: float | None = None,
+    grace: float = 0.0,
+) -> _ScanResult:
+    """Run one process-use scan of a remove-agent-batch item within its bounds.
+
+    The scan receives ``seconds`` (by default _AGENT_REMOVE_BATCH_SCAN_SECONDS),
+    or the item budget that remains when that is less, plus ``grace``.  When
+    the item budget is what runs out, the item is refused for its budget.
+    """
+
+    if seconds is None:
+        seconds = _AGENT_REMOVE_BATCH_SCAN_SECONDS
+    item_left = _item_seconds_left(what)
+    limited_by_item = item_left is not None and item_left < seconds
+    wait = (item_left if limited_by_item and item_left is not None else seconds) + grace
+
+    def timed_out() -> Refusal:
+        if limited_by_item:
+            return _item_budget_refusal(what)
+        return Refusal(
+            f"process use is indeterminate because {what} exceeded its "
+            f"{seconds:g}-second bound"
+        )
+
+    return _run_bounded_scan(work, seconds=wait, on_timeout=timed_out)
+
+
 @dataclasses.dataclass
 class _AgentRemoveBatchContext:
-    """Shared lsof evidence for one agent removal batch and its fresh checks.
+    """The process-use evidence and item budget of one agent removal batch.
 
-    It serves only the use checks an item makes at its unfenced slot path,
-    before the path fence.  Nothing is deleted before the fence, and every
-    check after it, which guards deletion, is the ordinary single-slot check.
+    Before an item's path fence, ``observe`` serves its use checks at the
+    unfenced slot path from the shared lsof scan and a fresh /proc scan.
+    After the fence, ``observe_fenced`` serves the checks that guard deletion
+    with one /proc scan that compares identities with the fenced tree, and
+    runs the ordinary lsof check of the fenced path when that scan cannot
+    decide.
 
     ``identities`` holds each target directory's device and inode from before
     the shared scan.  ``censused`` names the targets whose identity was
@@ -26469,6 +27262,10 @@ class _AgentRemoveBatchContext:
     reported nothing; ``unobservable`` holds the lsof diagnostic for each
     target it did report on.  ``nested_git_evidence`` is filled by each
     item's removal with the disposable nested repositories it deleted.
+    ``item_seconds`` is the budget of each item's work before deletion (see
+    _AGENT_REMOVE_BATCH_ITEM_SECONDS), and ``last_seconds_before_deletion``
+    is how long the last item held the registry lock before it began
+    deleting, or None when it did not reach deletion.
     """
 
     identities: dict[Path, tuple[int, int]]
@@ -26482,9 +27279,17 @@ class _AgentRemoveBatchContext:
     shared_census_seconds: float = 0.0
     fresh_scan_count: int = 0
     fresh_scan_seconds: float = 0.0
+    fenced_scan_count: int = 0
+    fenced_scan_seconds: float = 0.0
+    fenced_lsof_fallbacks: list[str] = dataclasses.field(default_factory=list)
+    fenced_lsof_fallback_seconds: float = 0.0
     nested_git_evidence: list[dict[str, object]] = dataclasses.field(
         default_factory=list
     )
+    item_seconds: float = dataclasses.field(
+        default_factory=lambda: _AGENT_REMOVE_BATCH_ITEM_SECONDS
+    )
+    last_seconds_before_deletion: float | None = None
 
     def capture(self, targets: Sequence[Path]) -> None:
         """Replace the shared evidence with one new scan of ``targets``."""
@@ -26546,34 +27351,109 @@ class _AgentRemoveBatchContext:
         started = time.monotonic()
         self.fresh_scan_count += 1
         try:
-            return _agent_batch_fresh_use(
-                check_path, record, capture_generation=capture_generation
+            return _run_item_scan(
+                lambda _cancel: _agent_batch_fresh_use(
+                    check_path, record, capture_generation=capture_generation
+                ),
+                "the /proc scan before the path fence",
             )
         finally:
             self.fresh_scan_seconds += time.monotonic() - started
+
+    def observe_fenced(
+        self,
+        check_path: Path,
+        record: ActiveRecord | None,
+        *,
+        canonical_path: Path,
+        capture_generation: bool,
+    ) -> _LiveUseObservation | None:
+        """Check a fenced slot for use, as the ordinary check after the fence does.
+
+        A /proc scan compares every process's cwd, root, exe, descriptors and
+        mappings with the fenced tree by path and by device and inode, which
+        is what lsof compares; see _agent_batch_fenced_use.  When that scan
+        cannot decide, the ordinary lsof check of the fenced path decides.
+        """
+
+        if check_path == canonical_path:
+            raise StateError(
+                f"an agent removal batch check after the path fence must name the "
+                f"fenced path, not the canonical slot path {canonical_path}"
+            )
+        expected = self.identities.get(canonical_path)
+        if expected is None:
+            raise StateError(
+                f"slot {canonical_path} is not a target of this agent removal batch"
+            )
+        if _directory_identity(check_path) != expected:
+            raise Refusal(
+                f"fenced slot {check_path} is not the directory this batch set out "
+                f"to remove from {canonical_path}"
+            )
+        started = time.monotonic()
+        self.fenced_scan_count += 1
+        try:
+            verdict = _run_item_scan(
+                lambda cancel: _agent_batch_fenced_use(
+                    check_path,
+                    canonical_path,
+                    record,
+                    capture_generation=capture_generation,
+                    cancel=cancel,
+                ),
+                "the /proc scan after the path fence",
+            )
+        finally:
+            self.fenced_scan_seconds += time.monotonic() - started
+        if not isinstance(verdict, _UndecidedFencedUse):
+            return verdict
+        self.fenced_lsof_fallbacks.append(verdict.reason)
+        started = time.monotonic()
+        try:
+            # lsof is itself held to the item budget and stopped when it runs
+            # out; this wait bounds the in-process scan that follows it.
+            return _run_item_scan(
+                lambda _cancel: _observe_slot_use_once(
+                    check_path, record, capture_generation=capture_generation
+                ),
+                "the lsof check after the path fence",
+                seconds=_AGENT_REMOVE_BATCH_LSOF_SECONDS,
+                grace=_AGENT_REMOVE_BATCH_TERM_GRACE_SECONDS
+                + _AGENT_REMOVE_BATCH_REAP_SECONDS,
+            )
+        finally:
+            self.fenced_lsof_fallback_seconds += time.monotonic() - started
 
 
 class _AgentBatchUseCheck(TypedDict, total=False):
     agent_batch: _AgentRemoveBatchContext
     canonical_path: Path
+    after_fence: bool
 
 
 def _agent_batch_use_check(
     agent_batch: _AgentRemoveBatchContext | None,
     canonical_path: Path | None,
+    *,
+    after_fence: bool = False,
 ) -> _AgentBatchUseCheck:
     """Keywords that route one slot-use check through an agent removal batch.
 
     Outside a batch this is empty, so every ordinary use check receives
     exactly the arguments it always has, and so does any replacement
-    installed for it.
+    installed for it.  ``after_fence`` marks a check of the fenced path,
+    whose ``canonical_path`` names the slot's unfenced path.
     """
 
     if agent_batch is None:
         return {}
-    if canonical_path is None:
-        return {"agent_batch": agent_batch}
-    return {"agent_batch": agent_batch, "canonical_path": canonical_path}
+    keywords: _AgentBatchUseCheck = {"agent_batch": agent_batch}
+    if canonical_path is not None:
+        keywords["canonical_path"] = canonical_path
+    if after_fence:
+        keywords["after_fence"] = True
+    return keywords
 
 
 def _removal_journal_candidate(config: Config, slot: str) -> Path | None:
@@ -26794,6 +27674,7 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
             item_started = time.monotonic()
             current = (slot, generation, item_started)
             context.nested_git_evidence.clear()
+            context.last_seconds_before_deletion = None
             try:
                 _cmd_remove(item_args, emit=False, agent_batch=context)
             except Refusal as exc:
@@ -26834,11 +27715,15 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
                     break
             else:
                 decided.add(slot)
+                before_deletion = context.last_seconds_before_deletion
                 removed.append(
                     {
                         "slot": slot,
                         "generation": generation,
                         "seconds": round(time.monotonic() - item_started, 3),
+                        "seconds_before_deletion": (
+                            None if before_deletion is None else round(before_deletion, 3)
+                        ),
                         "disposable_nested_repositories": list(context.nested_git_evidence),
                     }
                 )
@@ -26908,6 +27793,12 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
         "shared_process_census_seconds": round(context.shared_census_seconds, 3),
         "fresh_process_scans": context.fresh_scan_count,
         "fresh_process_scan_seconds": round(context.fresh_scan_seconds, 3),
+        "fenced_process_scans": context.fenced_scan_count,
+        "fenced_process_scan_seconds": round(context.fenced_scan_seconds, 3),
+        "fenced_lsof_fallbacks": len(context.fenced_lsof_fallbacks),
+        "fenced_lsof_fallback_reasons": list(context.fenced_lsof_fallbacks),
+        "fenced_lsof_fallback_seconds": round(context.fenced_lsof_fallback_seconds, 3),
+        "item_budget_seconds": context.item_seconds,
         "seconds": round(time.monotonic() - started, 3),
     }
 
@@ -26924,6 +27815,9 @@ def _cmd_remove_agent_batch(args: argparse.Namespace) -> int:
             f"refused={len(refused)} "
             f"shared_process_censuses={payload['shared_process_censuses']} "
             f"fresh_process_scans={payload['fresh_process_scans']} "
+            f"fenced_process_scans={payload['fenced_process_scans']} "
+            f"fenced_lsof_fallbacks={payload['fenced_lsof_fallbacks']} "
+            f"item_budget_seconds={payload['item_budget_seconds']:g} "
             f"seconds={payload['seconds']}"
         )
         for value in removed:
@@ -40832,10 +41726,25 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "check before the fence, the batch confirms the slot directory is the one that "
             "scan covered, refuses on any use that scan saw or any lsof warning that may "
             "concern the slot, and scans /proc afresh for path, mapping, mount, and "
-            "owner-cgroup use. Nothing is deleted before the fence; every process-use check "
-            "after it runs lsof exactly as remove does. "
+            "owner-cgroup use. Nothing is deleted before the fence. Each process-use check "
+            "after it scans /proc once, comparing every process's working directory, root, "
+            "executable, open files, and mappings with the fenced tree by path and by "
+            "device and inode; when that scan cannot decide (for example, the tree spans "
+            "devices, is on a filesystem other than btrfs, ext2, ext3, ext4, tmpfs, or xfs, "
+            "or reading a "
+            "process fails for a reason other than its exit or a permission lsof would also "
+            "lack), lsof decides exactly as remove does. "
             "Each slot is removed in its own registry-lock hold, and the lock is released "
-            "between slots. A refused slot is reported with its reason and left in place; "
+            "between slots. A slot's work before its first deletion is limited to "
+            f"{_AGENT_REMOVE_BATCH_ITEM_SECONDS:.0f} seconds of that hold, so other clients "
+            "waiting for the lock are not kept past their own limits: a command still "
+            "running when the limit is reached is stopped (SIGTERM, then SIGKILL after "
+            f"{_AGENT_REMOVE_BATCH_TERM_GRACE_SECONDS:.0f} seconds) and the slot is refused "
+            "and left in place, to be retried later or removed alone with remove, which has "
+            "no such limit. The Git registration repair right after the path fence, a "
+            "rollback of the fence, and the deletion itself are not limited, since stopping "
+            "them would leave a removal that only 'wrkslots recover' can finish. "
+            "A refused slot is reported with its reason and left in place; "
             "the remaining slots are still attempted. A slot that leaves an interrupted "
             "removal journal stops the batch and names 'wrkslots recover'. An "
             "unexpected error during the shared scan or a slot's removal stops the batch "

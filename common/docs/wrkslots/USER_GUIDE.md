@@ -506,12 +506,48 @@ every slot. Where `remove` would run `lsof` before the fence, the batch instead:
 
 The fresh scan catches use that began after the shared scan. The shared scan catches a descriptor
 opened through a hard link outside the slot, which no `/proc` path names; it is repeated when it is
-older than 300 seconds. Nothing is deleted before the fence. Every process-use check after the
-fence, which guards deletion, runs `lsof +D` exactly as `remove` does, so each slot's lock hold
-contains one or two `lsof` runs instead of four or five. As with `remove`, descriptors of other
-users' processes are visible to neither scan without privilege, and every process's mount table is
-read. A slot that the shared scan saw in use is refused even if that process has since exited; run
-another batch or `remove` for it.
+older than 300 seconds. Nothing is deleted before the fence. A slot that the shared scan saw in use
+is refused even if that process has since exited; run another batch or `remove` for it.
+
+The process-use checks after the fence guard deletion. `remove` runs `lsof +D` on the fenced path
+for each of them. The batch first scans `/proc` once instead. It records the device and inode of
+every file and directory in the fenced slot, then compares each process's working directory, root,
+executable, open descriptors, and memory mappings with the slot, both by path and by device and
+inode. That is the comparison `lsof +D` makes, so a descriptor opened through a hard link, or a
+directory reached through a bind mount in another mount namespace, is found although no path names
+the slot. A Unix socket bound below the slot's path counts as use as well. When the scan cannot
+decide, `lsof +D` decides exactly as in `remove`. The scan cannot decide when:
+
+- the slot spans more than one device, or part of it cannot be read;
+- the slot is on a filesystem other than btrfs, ext2, ext3, ext4, tmpfs, or xfs, since on others,
+  such as overlayfs, a memory mapping can name a different inode from the one `stat` reports;
+- on btrfs, a process maps a file whose inode number matches a file in the slot, since btrfs
+  reports each subvolume under its own device and the mapping alone does not tell them apart;
+- reading a process fails for a reason other than the process having exited or belonging to a user
+  the caller may not inspect.
+
+Processes that have exited, and processes the caller may not inspect, are skipped, as `lsof` run by
+the same user skips them. As with `remove`, descriptors of other users' processes are visible to
+neither check without privilege, and every process's mount table is read. The JSON report counts the
+scans after the fence in `fenced_process_scans`, their total time in `fenced_process_scan_seconds`,
+and the checks that `lsof` decided in `fenced_lsof_fallbacks`, with each reason in
+`fenced_lsof_fallback_reasons` and their total time in `fenced_lsof_fallback_seconds`.
+
+Each slot's work before its first deletion is limited to 60 seconds, counted from when the slot
+takes the registry lock, so that other clients waiting for the lock are not kept waiting past their
+own limits. Each Git command, the registered liveness command, each nested-repository check, each
+`/proc` scan, and `lsof` receive at most the time that remains. A command still running when the
+limit is reached receives SIGTERM, then SIGKILL 5 seconds later if it has not exited, and is then
+waited for up to 5 more seconds. The slot is refused and left in place, with its path fence rolled
+back if it had been made; retry it in a later batch or remove it alone with `remove`, which has no
+such limit. A slot whose nested repositories take long to check can therefore be
+refused by the batch and removed by `remove`. Three stretches are not limited, because stopping them
+partway would leave a removal that only `wrkslots recover` can finish: the local Git registration
+repair that follows the path-fence rename, a rollback of the path fence, and the deletion of the
+slot. Once the first file is deleted, the slot's removal runs to completion, and its duration grows
+with the number of files in the slot. The JSON report gives the limit in `item_budget_seconds` and,
+for each removed slot, `seconds_before_deletion`: how long it held the lock before it began
+deleting.
 
 A refused slot is left in place and reported with its reason, and the remaining slots are still
 attempted. A missing row, a changed generation, a validation slot, and a row whose directory is
@@ -525,7 +561,7 @@ lock is not taken within the lock wait, the batch stops without naming `wrkslots
 human output is one summary line,
 
 ```text
-requested=3 removed=2 refused=1 shared_process_censuses=1 fresh_process_scans=7 seconds=131.4
+requested=3 removed=2 refused=1 shared_process_censuses=1 fresh_process_scans=7 fenced_process_scans=2 fenced_lsof_fallbacks=0 item_budget_seconds=60 seconds=131.4
 ```
 
 followed by one `REMOVED:` or `REFUSED:` line per slot; `--format json` prints the same content as

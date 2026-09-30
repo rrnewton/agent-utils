@@ -39594,15 +39594,17 @@ def fenced_slot_path(project: Path, slot: str) -> Path | None:
     return fenced[0] if fenced else None
 
 
-def test_remove_agent_batch_checks_the_fenced_path_with_lsof_before_deleting(
+def test_remove_agent_batch_checks_the_fenced_path_by_identity_before_deleting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A use that begins after the fence, through an outside hard link, blocks.
 
     The descriptor's /proc link names the alias outside the slot, so no
-    path comparison can see it.  The check after the fence is the ordinary
-    lsof scan of the fenced path, which matches the file's identity, so the
-    slot is refused and its fence rolled back, as by single-slot remove.
+    path comparison can see it.  The check after the fence compares the
+    descriptor's device and inode with every entry of the fenced tree, as
+    lsof does, so the slot is refused and its fence rolled back, as by
+    single-slot remove.  When that scan cannot decide, the ordinary lsof
+    check of the fenced path decides instead.
     """
 
     project, _repository, slots = dead_agent_batch_project(tmp_path)
@@ -39651,6 +39653,9 @@ def test_remove_agent_batch_checks_the_fenced_path_with_lsof_before_deleting(
     reason = str(cast(list[Mapping[str, object]], payload["refused"])[0]["reason"])
     assert f"live process {holders[0].pid} uses slot" in reason
     assert ".slot02.fenced.1." in reason
+    assert payload["fenced_process_scans"] == 3
+    if payload["fenced_lsof_fallbacks"] == 0:
+        assert f"={alias}, which is an entry of the fenced slot by device and inode" in reason
     assert payload["recovery_required"] is False
     assert checkout(project, "slot02").is_dir()
     assert fenced_slot_path(project, "slot02") is None
@@ -39665,7 +39670,8 @@ def test_remove_agent_batch_checks_the_fenced_path_against_other_mount_namespace
 
     The alias exists only in the process's own mount namespace, so its /proc
     cwd names a path the batch's fresh path scan cannot relate to the slot.
-    The ordinary lsof scan after the fence matches the directory's identity.
+    The scan after the fence matches the directory's device and inode, and
+    so does the ordinary lsof check it falls back to when it cannot decide.
     """
 
     probe = subprocess.run(
@@ -39727,7 +39733,12 @@ def test_remove_agent_batch_checks_the_fenced_path_against_other_mount_namespace
     assert batch_slots(payload, "refused") == ["slot01"]
     reason = str(cast(list[Mapping[str, object]], payload["refused"])[0]["reason"])
     assert f"live process {holders[0].pid} uses slot" in reason
-    assert 'fd="cwd"' in reason
+    if payload["fenced_lsof_fallbacks"] == 0:
+        assert f"cwd={alias}, which is an entry of the fenced slot by device and inode" in reason
+    else:
+        assert 'fd="cwd"' in reason
+    checked = cast(list[str], payload["fenced_lsof_fallback_reasons"])
+    assert len(checked) == payload["fenced_lsof_fallbacks"]
     assert checkout(project, "slot01").is_dir()
     assert fenced_slot_path(project, "slot01") is None
     assert active_slot_names(project) == ["slot01"]
@@ -40354,13 +40365,15 @@ def test_remove_agent_batch_leaves_no_state_an_older_client_refuses_between_item
     assert status.returncode == 0, status.stderr
 
 
-def test_remove_agent_batch_shares_lsof_before_the_fence_and_runs_it_after_like_remove(
+def test_remove_agent_batch_shares_lsof_before_the_fence_and_scans_proc_after_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The batch shares one lsof scan among the checks made before the fence.
 
-    Every check made after the fence, which guards deletion, runs the same
-    per-slot lsof scan of the fenced path as single-slot remove.
+    Single-slot remove runs the per-slot lsof scan of the fenced path for the
+    check made after the fence, which guards deletion.  The batch makes that
+    check with one /proc scan per item, and runs the same lsof scan only for
+    an item whose /proc scan cannot decide.
     """
 
     project, _repository, slots = dead_agent_batch_project(tmp_path, count=4)
@@ -40409,11 +40422,20 @@ def test_remove_agent_batch_shares_lsof_before_the_fence_and_runs_it_after_like_
 
     assert returncode == 0, stderr
     assert batch_slots(payload, "removed") == slots[1:]
-    # One ordinary scan per item, of that item's fenced path, exactly as remove.
-    assert len(ordinary_calls) == 3
-    assert [
-        next(slot for slot in slots[1:] if fenced(path, slot)) for path in ordinary_calls
-    ] == slots[1:]
+    # One /proc scan per item after its fence.  An ordinary lsof scan, of that
+    # item's fenced path, runs only for each scan that could not decide.
+    assert payload["fenced_process_scans"] == 3
+    fallbacks = payload["fenced_lsof_fallbacks"]
+    assert isinstance(fallbacks, int) and 0 <= fallbacks <= 3
+    assert len(ordinary_calls) == fallbacks
+    assert all(any(fenced(path, slot) for slot in slots[1:]) for path in ordinary_calls)
+    assert len(cast(list[str], payload["fenced_lsof_fallback_reasons"])) == fallbacks
+    removed_rows = cast(list[Mapping[str, object]], payload["removed"])
+    assert all(
+        0 <= cast(float, row["seconds_before_deletion"]) <= cast(float, row["seconds"])
+        for row in removed_rows
+    )
+    assert payload["item_budget_seconds"] == wrkslots._AGENT_REMOVE_BATCH_ITEM_SECONDS
     assert len(shared_calls) == 1
     assert len(shared_calls[0]) == 3
     assert payload["shared_process_censuses"] == 1
@@ -40655,6 +40677,609 @@ def test_agent_batch_context_serves_only_checks_at_the_unfenced_slot_path(
     with pytest.raises(wrkslots.Refusal, match="live process 4242 uses slot"):
         observe(value, canonical)
     assert fresh_paths == [canonical]
+
+
+def test_agent_batch_context_routes_checks_after_the_fence_to_the_fenced_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A check after the fence is served by the fenced scan, or by lsof when it cannot decide."""
+
+    canonical = tmp_path / "worktrees" / "slot02"
+    fenced = tmp_path / "worktrees" / ".slot02.fenced.1.test"
+    canonical.mkdir(parents=True)
+    identity = wrkslots._directory_identity(canonical)
+    assert identity is not None
+    canonical.rename(fenced)
+    scans: list[tuple[Path, Path]] = []
+    verdicts: list[object] = [None]
+    ordinary: list[Path] = []
+
+    def fake_fenced_use(
+        fenced_path: Path,
+        canonical_path: Path,
+        _record: object,
+        *,
+        capture_generation: bool,
+        cancel: threading.Event | None = None,
+    ) -> object:
+        scans.append((fenced_path, canonical_path))
+        return verdicts[0]
+
+    def fake_ordinary(
+        slot_path: Path, _record: object, *, capture_generation: bool
+    ) -> None:
+        ordinary.append(slot_path)
+
+    def no_unfenced_scan(*_args: object, **_kwargs: object) -> NoReturn:
+        raise AssertionError("the scan of the unfenced path served a check after the fence")
+
+    monkeypatch.setattr(wrkslots, "_agent_batch_fenced_use", fake_fenced_use)
+    monkeypatch.setattr(wrkslots, "_agent_batch_fresh_use", no_unfenced_scan)
+    context = wrkslots._AgentRemoveBatchContext({canonical: identity})
+    wrkslots._assert_slot_unused(
+        fenced, None, agent_batch=context, canonical_path=canonical, after_fence=True
+    )
+    assert scans == [(fenced, canonical)]
+    assert context.fenced_scan_count == 1
+    assert context.fenced_lsof_fallbacks == []
+
+    # The ordinary lsof check decides what the fenced scan cannot.
+    verdicts[0] = wrkslots._UndecidedFencedUse("test: cannot decide")
+    monkeypatch.setattr(wrkslots, "_observe_slot_use_once", fake_ordinary)
+    context.observe_fenced(fenced, None, canonical_path=canonical, capture_generation=False)
+    assert ordinary == [fenced]
+    assert context.fenced_scan_count == 2
+    assert context.fenced_lsof_fallbacks == ["test: cannot decide"]
+
+    with pytest.raises(wrkslots.StateError, match="must name the fenced path"):
+        context.observe_fenced(
+            canonical, None, canonical_path=canonical, capture_generation=False
+        )
+    with pytest.raises(wrkslots.StateError, match="is not a target of this agent removal batch"):
+        context.observe_fenced(
+            fenced, None, canonical_path=tmp_path / "other", capture_generation=False
+        )
+    replaced = tmp_path / "worktrees" / ".slot02.fenced.1.replaced"
+    fenced.rename(replaced)
+    fenced.mkdir()
+    with pytest.raises(wrkslots.Refusal, match="is not the directory this batch set out to remove"):
+        context.observe_fenced(
+            fenced, None, canonical_path=canonical, capture_generation=False
+        )
+    assert scans == [(fenced, canonical), (fenced, canonical)]
+    assert ordinary == [fenced]
+
+
+def fenced_scan_of(
+    tmp_path: Path, fenced: Path, canonical: Path, process: subprocess.Popen[str]
+) -> object:
+    """Run the fenced scan over ``process`` alone, through a one-process /proc view."""
+
+    proc_root = Path(tempfile.mkdtemp(prefix=f"proc-view-{process.pid}-", dir=tmp_path))
+    (proc_root / str(process.pid)).symlink_to(f"/proc/{process.pid}")
+    return wrkslots._agent_batch_fenced_use(
+        fenced, canonical, None, capture_generation=True, proc_root=proc_root
+    )
+
+
+def start_ready_holder(
+    script: str, *args: object, cwd: Path, holders: list[subprocess.Popen[str]]
+) -> subprocess.Popen[str]:
+    holder = subprocess.Popen(
+        [sys.executable, "-c", script, *(str(arg) for arg in args)],
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+    )
+    holders.append(holder)
+    assert holder.stdout is not None
+    assert holder.stdout.readline().strip() == "ready"
+    return holder
+
+
+def refusal_of(observation: object) -> str:
+    assert isinstance(observation, wrkslots._LiveUseObservation), observation
+    return str(observation.refusal)
+
+
+def test_agent_batch_fenced_scan_matches_paths_and_hard_links_by_identity(
+    tmp_path: Path,
+) -> None:
+    canonical = tmp_path / "worktrees" / "slot01"
+    fenced = tmp_path / "worktrees" / ".slot01.fenced.1.test"
+    (canonical / "sub").mkdir(parents=True)
+    (canonical / "seed.txt").write_text("seed\n", encoding="utf-8")
+    alias = tmp_path / "outside-alias.txt"
+    os.link(canonical / "seed.txt", alias)
+    unrelated = tmp_path / "unrelated.txt"
+    unrelated.write_text("unrelated\n", encoding="utf-8")
+    canonical.rename(fenced)
+    holders: list[subprocess.Popen[str]] = []
+    opener = (
+        "import sys, time; handle = open(sys.argv[1]); "
+        "print('ready', flush=True); time.sleep(60)"
+    )
+    idler = "import time; print('ready', flush=True); time.sleep(60)"
+    try:
+        through_alias = start_ready_holder(opener, alias, cwd=tmp_path, holders=holders)
+        inside = start_ready_holder(idler, cwd=fenced / "sub", holders=holders)
+        by_path = start_ready_holder(opener, fenced / "seed.txt", cwd=tmp_path, holders=holders)
+        elsewhere = start_ready_holder(opener, unrelated, cwd=tmp_path, holders=holders)
+
+        alias_use = refusal_of(fenced_scan_of(tmp_path, fenced, canonical, through_alias))
+        cwd_use = refusal_of(fenced_scan_of(tmp_path, fenced, canonical, inside))
+        path_use = refusal_of(fenced_scan_of(tmp_path, fenced, canonical, by_path))
+        no_use = fenced_scan_of(tmp_path, fenced, canonical, elsewhere)
+    finally:
+        for holder in holders:
+            terminate_process(holder)
+
+    assert alias_use.startswith(f"live process {through_alias.pid} uses slot {fenced}: fd/")
+    assert alias_use.endswith(
+        f"={alias}, which is an entry of the fenced slot by device and inode; "
+        "stop it and retry"
+    )
+    assert cwd_use == (
+        f"live process {inside.pid} uses slot {fenced}: cwd={fenced / 'sub'}; "
+        "stop it and retry"
+    )
+    assert f"={fenced / 'seed.txt'}; stop it and retry" in path_use
+    assert no_use is None
+
+
+def test_agent_batch_fenced_scan_matches_a_socket_bound_before_the_fence(
+    tmp_path: Path,
+) -> None:
+    """/proc/net/unix keeps the path a socket was bound to, from before the fence."""
+
+    base = tmp_path
+    if len(os.fsencode(base / "w" / "slot01" / "agent.sock")) >= 100:
+        base = Path(tempfile.mkdtemp(prefix="wsk-", dir="/tmp"))
+    try:
+        canonical = base / "w" / "slot01"
+        fenced = base / "w" / ".slot01.fenced.1.t"
+        canonical.mkdir(parents=True)
+        holders: list[subprocess.Popen[str]] = []
+        try:
+            holder = start_ready_holder(
+                "import socket, sys, time; s = socket.socket(socket.AF_UNIX); "
+                "s.bind(sys.argv[1]); s.listen(); print('ready', flush=True); time.sleep(60)",
+                canonical / "agent.sock",
+                cwd=tmp_path,
+                holders=holders,
+            )
+            canonical.rename(fenced)
+            use = refusal_of(fenced_scan_of(tmp_path, fenced, canonical, holder))
+        finally:
+            for holder in holders:
+                terminate_process(holder)
+    finally:
+        if base != tmp_path:
+            shutil.rmtree(base)
+
+    assert re.fullmatch(
+        rf"live process {holder.pid} uses slot {re.escape(str(fenced))}: "
+        r"fd/[0-9]+=socket:\[[0-9]+\] is bound below the slot; stop it and retry",
+        use,
+    ), use
+
+
+def mapping_only_holder(
+    target: Path, cwd: Path, holders: list[subprocess.Popen[str]]
+) -> subprocess.Popen[str]:
+    """Start a process whose only use of ``target`` is a mapping, its descriptor closed.
+
+    Python's mmap module keeps a duplicate descriptor, so libc maps the file.
+    """
+
+    return start_ready_holder(
+        textwrap.dedent(
+            """\
+            import ctypes, os, sys, time
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.mmap.restype = ctypes.c_void_p
+            libc.mmap.argtypes = (
+                ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_long,
+            )
+            fd = os.open(sys.argv[1], os.O_RDONLY)
+            address = libc.mmap(None, 4096, 1, 2, fd, 0)  # PROT_READ, MAP_PRIVATE
+            assert address not in (None, ctypes.c_void_p(-1).value)
+            os.close(fd)
+            print("ready", flush=True)
+            time.sleep(60)
+            """
+        ),
+        target,
+        cwd=cwd,
+        holders=holders,
+    )
+
+
+def test_agent_batch_fenced_scan_decides_a_mapping_only_where_stat_names_its_device(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mapping through an outside hard link is matched by inode, or left to lsof.
+
+    /proc/<pid>/maps names the alias path and the filesystem's device.  Where
+    stat reports that same device for the slot (ext4, xfs, tmpfs), an inode of
+    the fenced tree is a use.  On btrfs stat reports a device per volume, so
+    the inode alone cannot decide, and the scan leaves the check to lsof.
+    """
+
+    canonical = tmp_path / "worktrees" / "slot01"
+    fenced = tmp_path / "worktrees" / ".slot01.fenced.1.test"
+    canonical.mkdir(parents=True)
+    (canonical / "seed.bin").write_bytes(b"x" * 4096)
+    alias = tmp_path / "outside-alias.bin"
+    os.link(canonical / "seed.bin", alias)
+    canonical.rename(fenced)
+    mount = wrkslots._mount_device(fenced)
+    assert mount is not None
+    mapping_device, filesystem = mount
+    holders: list[subprocess.Popen[str]] = []
+    try:
+        holder = mapping_only_holder(alias, tmp_path, holders)
+        assert sorted(os.listdir(f"/proc/{holder.pid}/fd")) == ["0", "1", "2"]
+        verdict = fenced_scan_of(tmp_path, fenced, canonical, holder)
+        # A filesystem the scan does not know is always left to lsof.
+        monkeypatch.setattr(
+            wrkslots, "_mount_device", lambda _path: (mapping_device, "overlay")
+        )
+        unknown = fenced_scan_of(tmp_path, fenced, canonical, holder)
+    finally:
+        for holder in holders:
+            terminate_process(holder)
+
+    assert unknown == wrkslots._UndecidedFencedUse(
+        f"{fenced} is on a overlay filesystem, whose mappings this scan does not compare"
+    )
+    if mapping_device != os.lstat(fenced).st_dev:
+        assert filesystem == "btrfs"
+        assert verdict == wrkslots._UndecidedFencedUse(
+            f"process {holder.pid} maps inode {os.lstat(alias).st_ino} on the fenced "
+            "slot's filesystem, whose volumes stat reports under their own devices"
+        )
+    elif filesystem in wrkslots._FENCED_SCAN_FILESYSTEMS:
+        use = refusal_of(verdict)
+        assert f"live process {holder.pid} uses slot {fenced}: map=" in use
+        assert f"{alias}, which is an entry of the fenced slot by device and inode" in use
+    else:
+        assert isinstance(verdict, wrkslots._UndecidedFencedUse), verdict
+
+
+def test_agent_batch_fenced_scan_refuses_a_mapping_only_use_on_tmpfs(
+    tmp_path: Path,
+) -> None:
+    shm = Path("/dev/shm")
+    probe_mount = wrkslots._mount_device(shm) if shm.is_dir() else None
+    if probe_mount is None or probe_mount[1] != "tmpfs":
+        pytest.skip("/dev/shm is not a tmpfs mount here")
+    base = Path(tempfile.mkdtemp(prefix="wrkslots-fenced-", dir=shm))
+    try:
+        canonical = base / "slot01"
+        fenced = base / ".slot01.fenced.1.test"
+        canonical.mkdir()
+        (canonical / "seed.bin").write_bytes(b"x" * 4096)
+        alias = base / "outside-alias.bin"
+        os.link(canonical / "seed.bin", alias)
+        canonical.rename(fenced)
+        holders: list[subprocess.Popen[str]] = []
+        try:
+            holder = mapping_only_holder(alias, tmp_path, holders)
+            assert sorted(os.listdir(f"/proc/{holder.pid}/fd")) == ["0", "1", "2"]
+            use = refusal_of(fenced_scan_of(tmp_path, fenced, canonical, holder))
+        finally:
+            for holder in holders:
+                terminate_process(holder)
+    finally:
+        shutil.rmtree(base)
+
+    assert f"live process {holder.pid} uses slot {fenced}: map=" in use
+    assert use.endswith(
+        f"{alias}, which is an entry of the fenced slot by device and inode; "
+        "stop it and retry"
+    )
+
+
+def test_agent_batch_fenced_scan_is_undecided_for_a_tree_that_spans_devices(
+    tmp_path: Path,
+) -> None:
+    """A mount below the fenced tree leaves the decision to lsof."""
+
+    fenced = tmp_path / ".slot01.fenced.1.test"
+    (fenced / "cache").mkdir(parents=True)
+    (fenced / "seed.txt").write_text("seed\n", encoding="utf-8")
+    verdict = wrkslots._fenced_tree_inodes(fenced, threading.Event())
+    assert verdict == (
+        os.lstat(fenced).st_dev,
+        frozenset(
+            os.lstat(path).st_ino for path in (fenced, fenced / "cache", fenced / "seed.txt")
+        ),
+    )
+    mounted = subprocess.run(
+        ["mount", "-t", "tmpfs", "tmpfs", str(fenced / "cache")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if mounted.returncode != 0:
+        pytest.skip(f"cannot mount below the tree here: {mounted.stderr.strip()}")
+    try:
+        spanning = wrkslots._fenced_tree_inodes(fenced, threading.Event())
+    finally:
+        subprocess.run(["umount", str(fenced / "cache")], check=True)
+    assert spanning == wrkslots._UndecidedFencedUse(
+        f"{fenced / 'cache'} is on another device than {fenced}"
+    )
+
+
+def test_remove_agent_batch_falls_back_to_lsof_when_the_fenced_scan_cannot_decide(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An undecided scan runs the ordinary lsof check of the fenced path, which refuses a use."""
+
+    project, _repository, slots = dead_agent_batch_project(tmp_path, count=2)
+    alias = tmp_path / "outside-alias.txt"
+    os.link(checkout(project, "slot01") / "seed.txt", alias)
+    holders: list[subprocess.Popen[str]] = []
+    ordinary_calls: list[Path] = []
+    original_ordinary = wrkslots._lsof_slot_use
+    original = wrkslots._interrupt_for_test
+
+    def undecided(fenced_path: Path, *_args: object, **_kwargs: object) -> object:
+        return wrkslots._UndecidedFencedUse(f"test: cannot decide {fenced_path.name}")
+
+    def count_ordinary(executable: Path, slot_path: Path) -> object:
+        ordinary_calls.append(slot_path)
+        return original_ordinary(executable, slot_path)
+
+    def start_holder_after_fence(point: str) -> None:
+        if (
+            point == "after-path-fence"
+            and fenced_slot_path(project, "slot01") is not None
+            and not holders
+        ):
+            start_ready_holder(
+                "import sys, time; handle = open(sys.argv[1]); "
+                "print('ready', flush=True); time.sleep(60)",
+                alias,
+                cwd=tmp_path,
+                holders=holders,
+            )
+        original(point)
+
+    monkeypatch.setattr(wrkslots, "_agent_batch_fenced_use", undecided)
+    monkeypatch.setattr(wrkslots, "_lsof_slot_use", count_ordinary)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", start_holder_after_fence)
+    try:
+        returncode, payload, stderr = in_process_agent_batch(project, slots)
+    finally:
+        for holder in holders:
+            terminate_process(holder)
+
+    assert len(holders) == 1
+    assert returncode == 1, stderr
+    assert batch_slots(payload, "removed") == ["slot02"]
+    assert batch_slots(payload, "refused") == ["slot01"]
+    reason = str(cast(list[Mapping[str, object]], payload["refused"])[0]["reason"])
+    assert f"live process {holders[0].pid} uses slot" in reason
+    assert ".slot01.fenced.1." in reason
+    assert payload["fenced_process_scans"] == 2
+    assert payload["fenced_lsof_fallbacks"] == 2
+    fallback_reasons = cast(list[str], payload["fenced_lsof_fallback_reasons"])
+    assert [text.split(".fenced.")[0] for text in fallback_reasons] == [
+        "test: cannot decide .slot01",
+        "test: cannot decide .slot02",
+    ]
+    # The live-use recheck of slot01 runs lsof once more before it refuses.
+    assert [
+        name for name, _calls in itertools.groupby(
+            path.name.split(".fenced.")[0] for path in ordinary_calls
+        )
+    ] == [".slot01", ".slot02"]
+    assert payload["recovery_required"] is False
+    assert checkout(project, "slot01").is_dir()
+    assert fenced_slot_path(project, "slot01") is None
+    assert active_slot_names(project) == ["slot01"]
+    assert registry_journals(project) == []
+
+
+def expire_item_budget() -> None:
+    deadline = wrkslots._ITEM_DEADLINE.get()
+    assert deadline is not None
+    deadline.started_at -= deadline.seconds + 1.0
+
+
+def test_remove_agent_batch_refuses_an_item_whose_budget_runs_out_after_its_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The budget is not enforced across the Git repair after the fence, but next.
+
+    The first bounded step after that stretch refuses the item; the refusal
+    rolls the fence back, so the slot is kept and no journal is left, and the
+    next item runs with a budget of its own.
+    """
+
+    project, _repository, slots = dead_agent_batch_project(tmp_path, count=2)
+    expired: list[str] = []
+    original = wrkslots._interrupt_for_test
+
+    def expire_after_fence(point: str) -> None:
+        if (
+            point == "after-path-fence"
+            and fenced_slot_path(project, "slot01") is not None
+            and not expired
+        ):
+            expire_item_budget()
+            expired.append(point)
+        original(point)
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", expire_after_fence)
+    returncode, payload, stderr = in_process_agent_batch(project, slots)
+
+    assert expired == ["after-path-fence"]
+    assert returncode == 1, stderr
+    assert batch_slots(payload, "removed") == ["slot02"]
+    assert batch_slots(payload, "refused") == ["slot01"]
+    reason = str(cast(list[Mapping[str, object]], payload["refused"])[0]["reason"])
+    assert reason.startswith(
+        "this remove-agent-batch item used its 60-second budget for work before "
+        "deletion at "
+    )
+    assert reason.endswith(
+        "nothing in the slot was deleted and the slot was kept; retry it in a later "
+        "batch, or remove it alone with 'wrkslots remove', which has no such budget"
+    )
+    assert payload["recovery_required"] is False
+    assert checkout(project, "slot01").is_dir()
+    assert fenced_slot_path(project, "slot01") is None
+    assert active_slot_names(project) == ["slot01"]
+    assert registry_journals(project) == []
+    removed_rows = cast(list[Mapping[str, object]], payload["removed"])
+    assert cast(float, removed_rows[0]["seconds_before_deletion"]) < 60
+
+
+def test_remove_agent_batch_refuses_an_item_whose_budget_is_spent_before_its_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _repository, slots = dead_agent_batch_project(tmp_path, count=2)
+    monkeypatch.setattr(wrkslots, "_AGENT_REMOVE_BATCH_ITEM_SECONDS", 0.0)
+    returncode, payload, stderr = in_process_agent_batch(project, slots)
+
+    assert returncode == 1, stderr
+    assert batch_slots(payload, "removed") == []
+    assert batch_slots(payload, "refused") == slots
+    for row in cast(list[Mapping[str, object]], payload["refused"]):
+        assert str(row["reason"]).startswith(
+            "this remove-agent-batch item used its 0-second budget for work before "
+            "deletion at "
+        )
+    assert payload["fenced_process_scans"] == 0
+    assert payload["item_budget_seconds"] == 0.0
+    assert payload["recovery_required"] is False
+    for slot in slots:
+        assert checkout(project, slot).is_dir()
+        assert fenced_slot_path(project, slot) is None
+    assert active_slot_names(project) == slots
+    assert registry_journals(project) == []
+
+
+def test_remove_agent_batch_refuses_an_item_whose_budget_runs_out_just_before_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The last budget check sits between the final use check and the first deletion.
+
+    A budget spent after every bounded step has finished still refuses the
+    item there, and the refusal rolls the fence back before anything is
+    deleted.
+    """
+
+    project, _repository, slots = dead_agent_batch_project(tmp_path, count=2)
+    expired: list[str] = []
+    original = wrkslots._end_item_deadline
+
+    def expire_then_end() -> None:
+        deadline = wrkslots._ITEM_DEADLINE.get()
+        if deadline is not None and deadline.state == "active" and not expired:
+            assert fenced_slot_path(project, "slot01") is not None
+            expire_item_budget()
+            expired.append("slot01")
+        original()
+
+    monkeypatch.setattr(wrkslots, "_end_item_deadline", expire_then_end)
+    returncode, payload, stderr = in_process_agent_batch(project, slots)
+
+    assert expired == ["slot01"]
+    assert returncode == 1, stderr
+    assert batch_slots(payload, "removed") == ["slot02"]
+    assert batch_slots(payload, "refused") == ["slot01"]
+    reason = str(cast(list[Mapping[str, object]], payload["refused"])[0]["reason"])
+    assert reason.startswith(
+        "this remove-agent-batch item used its 60-second budget for work before "
+        "deletion at the first deletion; nothing in the slot was deleted"
+    )
+    assert payload["recovery_required"] is False
+    assert checkout(project, "slot01").is_dir()
+    assert fenced_slot_path(project, "slot01") is None
+    assert active_slot_names(project) == ["slot01"]
+    assert registry_journals(project) == []
+
+
+def test_item_budget_stops_git_with_sigterm_first_so_git_can_remove_its_locks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "signals"
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        f"trap 'echo TERM >> {shlex.quote(str(marker))}; exit 143' TERM\n"
+        "while :; do sleep 0.05; done\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    context = wrkslots._AgentRemoveBatchContext({}, item_seconds=0.5)
+    started = time.monotonic()
+    with wrkslots._agent_batch_item_deadline(context):
+        with pytest.raises(
+            wrkslots.Refusal,
+            match=re.escape(
+                "this remove-agent-batch item used its 0.5-second budget for work "
+                f"before deletion at git status --short in {tmp_path};"
+            ),
+        ):
+            wrkslots._GitVcs._run(tmp_path, ["status", "--short"])
+    elapsed = time.monotonic() - started
+
+    assert marker.read_text(encoding="utf-8") == "TERM\n"
+    assert elapsed < 0.5 + wrkslots._AGENT_REMOVE_BATCH_TERM_GRACE_SECONDS
+    assert context.last_seconds_before_deletion is None
+
+
+def process_has_exited(pid: int, seconds: float = 5.0) -> bool:
+    """Return whether ``pid`` is gone or a zombie within ``seconds``."""
+
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(") ", 1)[1][:1]
+        except (OSError, IndexError):
+            return True
+        if state in {"Z", "X"}:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def test_item_budget_kills_a_command_that_ignores_sigterm_and_its_descendants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(wrkslots, "_AGENT_REMOVE_BATCH_TERM_GRACE_SECONDS", 0.5)
+    pids = tmp_path / "pids"
+    script = (
+        "trap '' TERM; sleep 60 & echo $$ $! > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"; "
+        "while :; do sleep 0.05; done"
+    )
+    started = time.monotonic()
+    with pytest.raises(
+        wrkslots.Refusal,
+        match="used its 60-second budget for work before deletion at a test command;",
+    ):
+        wrkslots._run_within_item_budget(
+            ["sh", "-c", script, "sh", str(pids)], seconds=1.0, what="a test command"
+        )
+    elapsed = time.monotonic() - started
+
+    shell_pid, sleeper_pid = (int(value) for value in pids.read_text().split())
+    assert 1.0 <= elapsed < 1.0 + 0.5 + wrkslots._AGENT_REMOVE_BATCH_REAP_SECONDS
+    # The command itself was reaped; its background child, which ignored
+    # SIGTERM too, was killed with its process group.
+    assert not Path(f"/proc/{shell_pid}").exists()
+    assert process_has_exited(sleeper_pid)
 
 
 def test_remove_agent_batch_honors_a_live_owners_release_like_remove(
