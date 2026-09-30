@@ -575,7 +575,7 @@ def test_delegated_nested_run_keeps_descendants_in_outer_owned_subtree(
     if result.returncode == 3 and (
         "cgroup boxing could not be established" in output
         or "cgroup setup failed" in output
-        or "NOT ESTABLISHED AND NOT TESTED" in output
+        or "cgroup boxing was NOT ESTABLISHED" in output
     ):
         pytest.skip(f"cgroup delegation unavailable: {output}")
     assert result.returncode == 1, output
@@ -706,7 +706,7 @@ def test_delegated_process_can_run_twice_in_process_after_aggregate_migration(
     if result.returncode == 3 and (
         "cgroup boxing could not be established" in output
         or "cgroup setup failed" in output
-        or "NOT ESTABLISHED AND NOT TESTED" in output
+        or "cgroup boxing was NOT ESTABLISHED" in output
     ):
         pytest.skip(f"cgroup delegation unavailable: {output}")
     assert result.returncode == 0, output

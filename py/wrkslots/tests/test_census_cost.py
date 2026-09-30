@@ -8,10 +8,12 @@ never wall time, so they mean the same thing on a loaded box as on an idle one.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
 import subprocess
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
 
@@ -722,6 +724,7 @@ def test_cache_census_preserves_nested_git_metadata_refusal(
 
 def test_refused_cache_roots_debit_one_shared_budget_immediately(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config(tmp_path)
     planned: dict[str, tuple[cli.CacheDirectory, ...]] = {}
@@ -731,6 +734,28 @@ def test_refused_cache_roots_debit_one_shared_budget_immediately(
         (cache / ".git").mkdir(parents=True)
         identity = cli._open_directory_identity(checkout, "checkout")
         planned[str(index)] = (cli.CacheDirectory(cache, checkout, *identity),)
+
+    actual_directory_stream = cli._audit_directory_stream
+
+    @contextlib.contextmanager
+    def significant_directory_stream(
+        directory_fd: int,
+        cursor: int,
+        label: str,
+    ) -> Iterator[Callable[[], tuple[str, int] | None]]:
+        with actual_directory_stream(directory_fd, cursor, label) as next_entry:
+
+            def next_significant_entry() -> tuple[str, int] | None:
+                while True:
+                    item = next_entry()
+                    if item is None or item[0] not in {".", ".."}:
+                        return item
+
+            yield next_significant_entry
+
+    # Dot entries and their order are filesystem details, not part of this cost contract.
+    # Present only significant entries so every nested-Git refusal has the same one-unit cost.
+    monkeypatch.setattr(cli, "_audit_directory_stream", significant_directory_stream)
 
     measured, counters = cli._audit_cache_census(
         config,
@@ -744,9 +769,9 @@ def test_refused_cache_roots_debit_one_shared_budget_immediately(
 
     assert counters["work_consumed"] == 3
     assert counters["work_remaining"] == 0
-    assert counters["directories_visited"] == 1
-    assert sum(item.status == "error" for item in measured.values()) == 1
-    assert sum(item.status == "partial" for item in measured.values()) == 3
+    assert counters["directories_visited"] == 3
+    assert sum(item.status == "error" for item in measured.values()) == 3
+    assert sum(item.status == "partial" for item in measured.values()) == 1
 
 
 def test_cache_census_persisted_cursor_prevents_stable_root_starvation(
