@@ -121,13 +121,16 @@ stream; it does not poll a REST listing. Terminal reply capture blocks on
 Herdr's `events.subscribe` socket with bounded groups of current closing-fence
 IDs and a generic predicate for unavailable IDs. The current groups rearm when
 reply routes change, so a consumed closing fence left on screen cannot mask the
-next reply. Exact IDs route through the in-memory durable-state index; all
-2,048 active requests fit within the subscription budget of 128 predicates,
-32 KiB per predicate and 96 KiB total. Provider notices and SIGINT/SIGTERM
-interrupt that wait through
-a local wake descriptor. A disk-backed terminal and delivery reconciliation
-occurs every 300 seconds by default and can be changed with
-`--reconcile-interval`.
+next reply. A closing fence under an earlier ID of an open request routes to
+that request too, because the block may hold new text. Only the generic
+predicate matches such an ID, and it stays matched while any closing fence
+remains on screen, so such a block is usually captured at the next recovery
+scan rather than at once. Exact IDs route through the in-memory durable-state
+index; all 2,048 active requests fit within the subscription budget of 128
+predicates, 32 KiB per predicate and 96 KiB total. Provider notices and
+SIGINT/SIGTERM interrupt that wait through a local wake descriptor. A
+disk-backed terminal and delivery reconciliation occurs every 300 seconds by
+default and can be changed with `--reconcile-interval`.
 
 A provider `Gap` is a terminal continuity warning in protocol v1. Its reason does not
 contain a recoverable range or completeness proof, so the host journals the
@@ -338,47 +341,122 @@ inclusive monotone cursor; a cursor regression or a reused message identity
 with different content fails closed. This is bounded local retention, not a
 claim of infinite local audit history.
 
+Replies are recognized by their text, not by the number in their reply ID. A
+reply ID is the request's nonce, an underscore, and a number from 1 to 999999
+with no leading zero. When a block appears under any reply ID of an open
+request, the bridge compares its text with the replies it has already stored for
+that request. The comparison ignores whitespace and the box-drawing characters,
+U+2500 to U+257F, that a terminal draws for table borders, so a paragraph the
+terminal re-wraps or a border it redraws at another width still matches. Every
+other character counts, including the block elements of a progress bar. A block
+whose text matches a stored reply is not posted again; any other block is stored
+as the request's next reply and posted. So an answer the agent sends twice to
+one request, under one ID or under two, is posted once, and two identical short
+replies to one request, such as two `ok` progress notes, are posted as one. The
+same text sent to two requests is posted to each.
+
+A table cell that wraps onto several lines at one width and fits on one line at
+another changes the order of the characters, so tables are also compared column
+by column. A row line starts, ends, and divides its cells with `│`; a table
+drawn with other characters, such as `|` or `┃`, is always read in row order.
+Adjacent row lines are read column by column, as one row, only when a
+word-wrapping renderer could have drawn them from one row: every line has the
+same cell widths and a space at each side of each cell; each column's text sits
+at the top of the lines or is centred in them, with the odd line below; the
+text of at least one column fills the lines; and each line break was needed
+because the next word would not have fit. A renderer that keeps the space of a
+line break, such as Claude Code's, starts the line after an exactly full one
+with that space, or puts the space on a line of its own when the next word
+fills a whole line, and the space counts toward its line. Widths are counted in
+terminal columns, as a renderer pads cells: an emoji or a CJK character takes
+two columns, and a nonspacing mark such as a combining accent none. That match
+counts only when the stored reply's tables have other cell widths, since at the
+same widths a renderer wraps the same text the same way. The block is then
+skipped and logged, as described below. It is logged because one case reads the
+same without being a redraw: a table with no rule between its rows, drawn at
+other widths, whose rows all pass those tests and whose text differs from a
+stored reply only in how it divides into rows or where a space falls inside a
+cell.
+
+A table redrawn at another width can still be posted again. Adjacent row lines
+with the same number of cells are read as one group, which ends at any other
+line, such as a rule. A group that fails the tests above is read in row order,
+so a redraw that wraps it differently reads as new text. That can happen in
+four cases; a renderer that lays out tables unlike Claude Code, such as by
+centring text with the odd line above or drawing cells without a space at each
+side, can cause others:
+
+- a table with no rule between its rows, where one group holds several rows.
+  Claude Code draws a rule between every two rows, so this needs another
+  renderer;
+- a cell holding a character that the agent's renderer measures at another
+  width than the bridge does, such as some emoji sequences and most spacing
+  vowel signs of Indic scripts;
+- a cell holding a run of two or more spaces, or words joined by a no-break
+  space or a tab. A renderer can leave the extra spaces at the end of a line,
+  where they look like padding, and need not break a line at a no-break space
+  or a tab, so the bridge cannot tell that a break was needed;
+- a redraw that switches between a grid and one `Header: value` line per cell,
+  which a renderer can draw when a cell would need too many lines or the grid
+  would not fit the terminal.
+
+A block that cannot be posted is skipped, and the other blocks are still
+captured. That covers a block that is empty, holds terminal control characters,
+or exceeds 30,000 UTF-8 bytes once the agent label is added, a block beyond the
+request's reply limits, and a block that matches a stored reply only column by
+column. `chat run` logs such a block as
+`agentctl: chat reply capture: reply block ID (text HASH) was not sent: REASON`,
+where HASH is the first 12 hex digits of the SHA-256 of the block's text without
+whitespace or box-drawing characters. A process writes each distinct line once
+while it remembers it; it remembers the latest 4,096 distinct lines, and writes
+a forgotten one again. One capture pass logs at most 128 such lines, so on a
+screen with more refused blocks than that, the rest are not logged while they
+stay visible. The agent is not told. Nothing the agent prints stops the bridge:
+a snapshot larger than 2 MiB is read from its newest complete lines, with one
+log line, and a snapshot with more than 4,096 reply blocks is read from its
+newest 4,096, with one log line from a recovery scan. Only state, file system,
+and provider faults are errors.
+
 A reply marker in the pane whose ID is not available, such as a typo or a stale
 block left in scrollback by another bridge state, produces one routing-error
-prompt to the agent. The prompt names the unavailable ID and up to 32 of the
-reply IDs that were available when it was written, and counts the rest. It is
-never posted to chat. Reported IDs are kept in `fence-feedback.json` in the
-bridge state directory, so each unavailable ID is reported at most once per
-state directory, including after a restart. A new state directory starts with no
-reported IDs. A marker that stays visible after its report is left out of later
-prompts, and a later block that reuses a reported ID is not reported again. An
-ID reported because it was ahead of its open request's next reply ID becomes the
-next reply ID once the request's earlier replies are captured, and a block under
-it is then posted like any other reply, even the reported block if it is still
-on screen. So if the agent answers under such an ID and then, as the prompt
-asks, sends the answer again under an available ID while the first block is
-still on screen, the answer can be posted twice. The request's next reply ID is
-itself reported when a recovery scan sees a marker with that ID but no complete
-block under it, such as an opening marker before its closing one, or a closing
-marker whose opening one has scrolled away. The prompt then names that ID as
-unavailable, and also as available if it is among the available IDs it lists. A
-complete block under it is posted like any other reply. A block under any other
-reported ID is never posted. Its only trace is a log line, and only recovery
-scans write that line. Recovery scans run when `chat run` starts, at each
-`chat tick`, at each reconciliation while the agent pane is idle or done, when
-the pane settles idle or done, and after output names a reply ID that belongs to
-no request the bridge knows. Each recovery scan that sees reported IDs that are
-still unavailable logs one `already reported, so not repeated` line that names
-up to 8 of them and counts the rest, up to 128 per scan. Other captures log
-nothing, so a reused ID that leaves the screen before the next recovery scan
-leaves no trace. Already reported markers are set aside before the bound on new
-ones, so a screen full of old markers cannot hide a new one. While a
-routing-error prompt is still queued, newer unavailable IDs wait for it instead
-of producing a second prompt. The exact pending prompt is saved before
-submission, so recovery settles its original queue ID even if a crash hides the
-submission result or newer unavailable markers appear. A prompt whose queue
-outcome is uncertain counts as reported: it is not submitted again, even if it
-never reached the agent. The history retains up to 4,096 distinct reported or
-pending IDs. At that limit, new diagnostics stay held; reported IDs are never
-evicted or submitted again. Deleting `fence-feedback.json` clears the history,
-so the IDs it held can be reported once more. If the file cannot be read or is
-outside its bounds, the error names it and diagnostics stay held until it is
-repaired or deleted.
+prompt to the agent. An ID is unavailable when its number is malformed or it
+names no request the bridge knows. A well-formed ID of a closed request is
+ignored. The prompt names the unavailable ID and up to 32 of the reply IDs that
+were available when it was written, and counts the rest. It is never posted to
+chat. Reported IDs are kept in `fence-feedback.json` in the bridge state
+directory, so each unavailable ID is reported at most once per state directory,
+including after a restart. A new state directory starts with no reported IDs. A
+marker that stays visible after its report is left out of later prompts, and a
+later block that reuses a reported ID is not reported again. A recovery scan
+also reports the ID of an open request's block that it sees only in part, such
+as an opening marker before its closing one, or a closing marker whose opening
+one has scrolled away, unless the visible part holds no text or is the start or
+the end of a reply already stored for that request, read either way. A part cut
+inside a table row that wrapped at another width than the stored reply's is
+still reported, once. The prompt then names that ID as unavailable, and also as
+available if it is among the available IDs it lists. A complete block under that
+ID is still posted if its text is new. A block under an ID that belongs to no
+open request is never posted. Once its ID is reported, its only trace is a log
+line, and only recovery scans write that line. Recovery scans run when
+`chat run` starts, at each `chat tick`, at each reconciliation while the agent
+pane is idle or done, when the pane settles idle
+or done, and after output names a reply ID that belongs to no request the bridge
+knows. Each recovery scan that sees reported IDs that are still unavailable logs
+one `already reported, so not repeated` line that names up to 8 of them and
+counts the rest, up to 128 per scan. Other captures do not write that line, so a
+reused ID that leaves the screen before the next recovery scan leaves no trace.
+Already reported markers are set aside before the bound on new ones, so a screen
+full of old markers cannot hide a new one. While a routing-error prompt is still
+queued, newer unavailable IDs wait for it instead of producing a second prompt.
+The exact pending prompt is saved before submission, so recovery settles its
+original queue ID even if a crash hides the submission result or newer
+unavailable markers appear. A prompt whose queue outcome is uncertain counts as
+reported: it is not submitted again, even if it never reached the agent. The
+history retains up to 4,096 distinct reported or pending IDs. At that limit, new
+diagnostics stay held; reported IDs are never evicted or submitted again.
+Deleting `fence-feedback.json` clears the history, so the IDs it held can be
+reported once more. If the file cannot be read or is outside its bounds, the
+error names it and diagnostics stay held until it is repaired or deleted.
 
 A per-thread post-rate breaker bounds any remaining reply loop. One provider
 thread may reserve 8 distinct reply operations within 60 seconds. That leaves

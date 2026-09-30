@@ -35,6 +35,9 @@ use crate::subagents::{ManagedAgents, ManagedApi};
 const SNAPSHOT_LINES: usize = 4_000;
 const SNAPSHOT_LINES_U32: u32 = 4_000;
 const MAX_SNAPSHOT_BYTES: usize = 2 * 1_024 * 1_024;
+// Notes one pass report keeps, and distinct notes one service process remembers having logged.
+const MAX_REPORT_NOTES: usize = 128;
+const MAX_LOGGED_NOTES: usize = 4_096;
 const MAX_KEYS_PER_PASS: usize = 4;
 const MAX_SENDS_PER_PASS: usize = 64;
 const PROVIDER_NOTICE_CAPACITY: usize = 64;
@@ -138,6 +141,9 @@ pub struct CycleReport {
     pub snapshot_revision: Option<u64>,
     /// Bounded per-operation failures retained for explicit retry.
     pub errors: Vec<String>,
+    /// Bounded notes about coordinator output that was read but not sent, such as a refused
+    /// reply block. They are diagnostics: nothing is retried because of them.
+    pub notes: Vec<String>,
     /// More bounded work remains for a later event or recovery pass.
     pub more_work: bool,
     #[serde(skip)]
@@ -166,6 +172,8 @@ impl CycleReport {
         self.snapshot_truncated |= other.snapshot_truncated;
         self.snapshot_revision = other.snapshot_revision.or(self.snapshot_revision);
         self.errors.append(&mut other.errors);
+        self.notes.append(&mut other.notes);
+        self.notes.truncate(MAX_REPORT_NOTES);
         self.more_work |= other.more_work;
         self.deferred_keys.append(&mut other.deferred_keys);
         self.recovery_requested |= other.recovery_requested;
@@ -177,6 +185,12 @@ impl CycleReport {
             self.errors.push(format!("{operation} {key}: {error}"));
         }
         self.more_work = true;
+    }
+
+    fn note(&mut self, note: impl fmt::Display) {
+        if self.notes.len() < MAX_REPORT_NOTES {
+            self.notes.push(note.to_string());
+        }
     }
 }
 
@@ -408,7 +422,6 @@ pub fn tick<A: ManagedApi + ?Sized>(
     let _lease = state.acquire_runner_lease()?;
     let info = manager.pane_info(&state.config().agent_name)?;
     let snapshot = manager.read(&state.config().agent_name, SNAPSHOT_LINES)?;
-    validate_snapshot(&snapshot)?;
     let mut routes = RouteCache::from_entries(state.reply_route_entries()?);
     let mut transport = state.outbound_transport()?;
     let mut control = PassControl {
@@ -920,14 +933,24 @@ fn validate_service_outbound(configuration: &BridgeConfiguration) -> Result<(), 
     Ok(())
 }
 
-fn validate_snapshot(snapshot: &str) -> Result<(), ChatServiceError> {
-    if snapshot.len() > MAX_SNAPSHOT_BYTES {
-        return Err(ChatServiceError::Generation(format!(
-            "retained coordinator output exceeds {MAX_SNAPSHOT_BYTES} bytes"
-        )));
+/// The newest complete lines of a coordinator output snapshot that fit in `MAX_SNAPSHOT_BYTES`,
+/// and whether older output was left out. Replies are near the end of the output, and an
+/// oversized snapshot must not stop the service.
+fn bounded_snapshot(snapshot: &str) -> (&str, bool) {
+    if snapshot.len() <= MAX_SNAPSHOT_BYTES {
+        return (snapshot, false);
     }
-    Ok(())
+    // A line that starts at or after this byte fits.
+    let first_byte = snapshot.len() - MAX_SNAPSHOT_BYTES;
+    let kept = snapshot.as_bytes()[first_byte - 1..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or("", |newline| &snapshot[first_byte + newline..]);
+    (kept, true)
 }
+
+const SNAPSHOT_CUT_NOTE: &str =
+    "coordinator output exceeded the snapshot size limit, so only its newest complete lines were read";
 
 fn recover_pass<A: ManagedApi + ?Sized>(
     state: &BridgeState,
@@ -1103,8 +1126,8 @@ fn capture_recovery_snapshot<A: ManagedApi + ?Sized>(
     snapshot: SnapshotInput<'_>,
     control: &mut PassControl<'_>,
 ) -> Result<CycleReport, ChatServiceError> {
-    validate_snapshot(snapshot.text)?;
-    let capture = state.capture_snapshot(snapshot.text)?;
+    let (text, cut) = bounded_snapshot(snapshot.text);
+    let capture = state.capture_snapshot(text)?;
     let route_entries = capture.route_entries.clone();
     let mut report = CycleReport {
         captured: capture.replies.clone(),
@@ -1112,6 +1135,18 @@ fn capture_recovery_snapshot<A: ManagedApi + ?Sized>(
         snapshot_revision: snapshot.revision,
         ..CycleReport::default()
     };
+    if cut {
+        report.note(SNAPSHOT_CUT_NOTE);
+    }
+    if capture.overflowed {
+        report.note(format!(
+            "coordinator output held more than {} reply blocks, so the oldest were not read",
+            chat_runtime::MAX_VISIBLE_MARKERS
+        ));
+    }
+    for refusal in &capture.refused {
+        report.note(refusal);
+    }
     // Visible markers the coordinator already received are not reported twice. Log them, since
     // a marker that stays on screen is otherwise silent after its one report.
     if let Some(line) = already_reported_log_line(&capture.suppressed_ids) {
@@ -1152,7 +1187,6 @@ fn capture_direct<A: ManagedApi + ?Sized>(
     snapshot: SnapshotInput<'_>,
     control: &mut PassControl<'_>,
 ) -> Result<CycleReport, ChatServiceError> {
-    validate_snapshot(snapshot.text)?;
     let key = match refresh_matched_route(state, routes, identifier)? {
         MatchedRoute::Unknown => {
             return Ok(CycleReport {
@@ -1179,12 +1213,19 @@ fn capture_direct<A: ManagedApi + ?Sized>(
             ..CycleReport::default()
         });
     }
-    let capture = state.capture_replies(&key, snapshot.text)?;
+    let (text, cut) = bounded_snapshot(snapshot.text);
+    let capture = state.capture_replies(&key, text)?;
     let mut report = CycleReport {
         snapshot_truncated: snapshot.truncated,
         snapshot_revision: snapshot.revision,
         ..CycleReport::default()
     };
+    if cut {
+        report.note(SNAPSHOT_CUT_NOTE);
+    }
+    for refusal in &capture.refused {
+        report.note(refusal);
+    }
     if !capture.ordinals.is_empty() {
         report.captured.push((key.clone(), capture.ordinals));
         report.merge(process_keys(
@@ -1206,25 +1247,32 @@ enum MatchedRoute {
     Current(String),
 }
 
+/// Route one closing marker seen in the output. Any well-formed reply ID of an open request routes
+/// to that request, not only its next one: a block under an earlier ID may hold new text, and
+/// the capture decides by the text whether it does.
 fn refresh_matched_route(
     state: &BridgeState,
     routes: &mut RouteCache,
     identifier: &str,
 ) -> Result<MatchedRoute, ChatRuntimeError> {
-    let Some(key) = routes.key(identifier).map(str::to_owned) else {
-        return Ok(if routes.knows_identifier_nonce(identifier) {
-            MatchedRoute::Stale
-        } else {
-            MatchedRoute::Unknown
-        });
+    let Some((key, open)) = identifier
+        .rsplit_once('_')
+        .and_then(|(nonce, _)| routes.nonce_route(nonce))
+    else {
+        return Ok(MatchedRoute::Unknown);
     };
-    let current = state.next_reply_route(&key)?;
-    if current.as_ref().map(|route| route.identifier.as_str()) == Some(identifier) {
-        Ok(MatchedRoute::Current(key))
-    } else {
-        routes.replace(&key, current);
-        Ok(MatchedRoute::Stale)
+    let key = key.to_owned();
+    if !open || !chat_runtime::has_reply_ordinal(identifier) {
+        return Ok(MatchedRoute::Stale);
     }
+    let current = state.next_reply_route(&key)?;
+    let still_open = current.is_some();
+    routes.replace(&key, current);
+    Ok(if still_open {
+        MatchedRoute::Current(key)
+    } else {
+        MatchedRoute::Stale
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -1311,14 +1359,26 @@ impl RouteCache {
         }
     }
 
+    #[cfg(test)]
     fn key(&self, identifier: &str) -> Option<&str> {
         self.by_identifier.get(identifier).map(String::as_str)
     }
 
+    #[cfg(test)]
     fn knows_identifier_nonce(&self, identifier: &str) -> bool {
         identifier
             .rsplit_once('_')
-            .is_some_and(|(nonce, _)| self.by_nonce.contains_key(nonce))
+            .is_some_and(|(nonce, _)| self.nonce_route(nonce).is_some())
+    }
+
+    /// The request that owns a nonce, and whether its capture was open when last read.
+    fn nonce_route(&self, nonce: &str) -> Option<(&str, bool)> {
+        let key = self.by_nonce.get(nonce)?;
+        let open = self
+            .by_key
+            .get(key)
+            .is_some_and(|(_, current)| current.is_some());
+        Some((key.as_str(), open))
     }
 
     fn patterns(&self) -> Result<Vec<String>, ChatServiceError> {
@@ -2248,6 +2308,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
         stop: Some(stop),
     };
     let mut direct_keys = DirectKeyQueue::default();
+    let mut notes = NoteLog::default();
     let initial =
         manager.read_with_runtime(&state.config().agent_name, SNAPSHOT_LINES, &owner_runtime)?;
     let initial_report = capture_recovery_snapshot(
@@ -2263,10 +2324,10 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
         &mut control,
     )?;
     enqueue_report_backlog(&mut direct_keys, &initial_report, overflowed);
-    log_report(&initial_report);
+    notes.log(&initial_report);
     let recovery = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
     enqueue_report_backlog(&mut direct_keys, &recovery, overflowed);
-    log_report(&recovery);
+    notes.log(&recovery);
 
     let mut stream: Option<PaneEventStream> = None;
     let mut subscribed_patterns = Vec::new();
@@ -2296,7 +2357,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
         if direct_keys.is_empty() && overflowed.swap(false, Ordering::SeqCst) {
             let report = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
             enqueue_report_backlog(&mut direct_keys, &report, overflowed);
-            log_report(&report);
+            notes.log(&report);
         }
         if !direct_keys.is_empty() {
             let report = drain_immediate_backlog(
@@ -2307,7 +2368,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                 &mut control,
                 overflowed,
             )?;
-            log_report(&report);
+            notes.log(&report);
             for key in &report.processed_keys {
                 routes.replace(key, state.next_reply_route(key)?);
             }
@@ -2335,11 +2396,11 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                     &mut control,
                 )?;
                 enqueue_report_backlog(&mut direct_keys, &report, overflowed);
-                log_report(&report);
+                notes.log(&report);
             }
             let report = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
             enqueue_report_backlog(&mut direct_keys, &report, overflowed);
-            log_report(&report);
+            notes.log(&report);
             next_reconciliation = Instant::now() + options.reconciliation_interval;
         }
 
@@ -2420,7 +2481,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                                 )?;
                                 unknown_route_seen |= report.recovery_requested;
                                 enqueue_report_backlog(&mut direct_keys, &report, overflowed);
-                                log_report(&report);
+                                notes.log(&report);
                             }
                             PaneEvent::Settled { status }
                                 if info.status == status
@@ -2444,7 +2505,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                                     &mut control,
                                 )?;
                                 enqueue_report_backlog(&mut direct_keys, &report, overflowed);
-                                log_report(&report);
+                                notes.log(&report);
                                 let recovery = recover_pass(
                                     state,
                                     manager,
@@ -2453,7 +2514,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                                     &mut control,
                                 )?;
                                 enqueue_report_backlog(&mut direct_keys, &recovery, overflowed);
-                                log_report(&recovery);
+                                notes.log(&recovery);
                             }
                             PaneEvent::Settled { .. } => {}
                         }
@@ -2477,7 +2538,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                             &mut control,
                         )?;
                         enqueue_report_backlog(&mut direct_keys, &report, overflowed);
-                        log_report(&report);
+                        notes.log(&report);
                     }
                 }
                 Err(error) => {
@@ -2667,6 +2728,40 @@ fn log_report(report: &CycleReport) {
         for error in &report.errors {
             eprintln!("agentctl: chat operation: {error}");
         }
+    }
+}
+
+/// The notes this service process has logged. A refused block that stays on screen is read
+/// again at every capture, so each distinct note is logged once; the oldest are forgotten first.
+#[derive(Default)]
+struct NoteLog {
+    logged: BTreeSet<String>,
+    order: VecDeque<String>,
+}
+
+impl NoteLog {
+    /// Log a report's errors, and each of its notes that this process has not logged yet.
+    fn log(&mut self, report: &CycleReport) {
+        log_report(report);
+        for note in &report.notes {
+            if self.first_time(note) {
+                eprintln!("agentctl: chat reply capture: {note}");
+            }
+        }
+    }
+
+    fn first_time(&mut self, note: &str) -> bool {
+        if self.logged.contains(note) {
+            return false;
+        }
+        if self.order.len() == MAX_LOGGED_NOTES {
+            if let Some(oldest) = self.order.pop_front() {
+                self.logged.remove(&oldest);
+            }
+        }
+        self.logged.insert(note.to_owned());
+        self.order.push_back(note.to_owned());
+        true
     }
 }
 
@@ -4298,6 +4393,203 @@ stale_2, stale_3, stale_4, stale_5, stale_6, stale_7, stale_8 and 2 more"
             MatchedRoute::Stale
         );
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn bounded_snapshot_keeps_the_newest_whole_lines_that_fit() {
+        let small = "one\ntwo\n";
+        assert_eq!(bounded_snapshot(small), (small, false));
+        let exact = "x".repeat(MAX_SNAPSHOT_BYTES - 1) + "\n";
+        assert_eq!(bounded_snapshot(&exact), (exact.as_str(), false));
+        // One 16-byte line more than fits: only the oldest line is left out.
+        let line = "0123456789abcde\n";
+        let lines = line.repeat(MAX_SNAPSHOT_BYTES / line.len() + 1);
+        let (kept, cut) = bounded_snapshot(&lines);
+        assert!(cut);
+        assert_eq!(kept.len(), MAX_SNAPSHOT_BYTES);
+        assert_eq!(&lines[line.len()..], kept);
+        // A cut never splits a character or a line.
+        let wide = "é".repeat(100) + "\n";
+        let text = wide.repeat(MAX_SNAPSHOT_BYTES / wide.len() + 2);
+        let (kept, cut) = bounded_snapshot(&text);
+        assert!(cut);
+        assert!(kept.len() <= MAX_SNAPSHOT_BYTES);
+        assert!(kept.len() > MAX_SNAPSHOT_BYTES - wide.len());
+        assert!(kept.starts_with(&wide));
+        // One line longer than the bound leaves no complete line to read.
+        let long = "y".repeat(MAX_SNAPSHOT_BYTES + 1);
+        assert_eq!(bounded_snapshot(&long), ("", true));
+    }
+
+    #[test]
+    fn any_well_formed_reply_id_of_an_open_request_routes_to_it() {
+        let (state, key, root) = state_with_request();
+        let route = state
+            .next_reply_route(&key)
+            .expect("route")
+            .expect("active route");
+        let nonce = route
+            .identifier
+            .strip_suffix("_1")
+            .expect("first ID")
+            .to_owned();
+        let mut routes = RouteCache::new(vec![route]);
+        for ordinal in ["1", "2", "999999"] {
+            assert_eq!(
+                refresh_matched_route(&state, &mut routes, &format!("{nonce}_{ordinal}"))
+                    .expect("route"),
+                MatchedRoute::Current(key.clone()),
+                "ordinal {ordinal}"
+            );
+        }
+        for ordinal in ["0", "01", "1000000", "x", ""] {
+            assert_eq!(
+                refresh_matched_route(&state, &mut routes, &format!("{nonce}_{ordinal}"))
+                    .expect("route"),
+                MatchedRoute::Stale,
+                "ordinal {ordinal:?}"
+            );
+        }
+        assert_eq!(
+            refresh_matched_route(&state, &mut routes, "unknownnonce_1").expect("route"),
+            MatchedRoute::Unknown
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_new_answer_under_an_earlier_reply_id_is_captured_directly() {
+        let (state, key, root) = state_with_request();
+        let route = state
+            .next_reply_route(&key)
+            .expect("route")
+            .expect("active route");
+        let identifier = route.identifier.clone();
+        let mut routes = RouteCache::new(vec![route]);
+        let client = HerdrClient::with_executable("direct", Path::new("/missing/herdr"))
+            .expect("construct client");
+        let manager = ManagedAgents::new(&client, &root.join("registry")).expect("manager");
+        let mut transport = None;
+        let mut control = PassControl {
+            transport: &mut transport,
+            stop: None,
+        };
+        let first =
+            format!("<CHAT_REPLY_{identifier}>\nfirst answer\n</CHAT_REPLY_{identifier}>\n");
+        let second = format!(
+            "{first}<CHAT_REPLY_{identifier}>\nsecond answer\n</CHAT_REPLY_{identifier}>\n"
+        );
+        for (revision, text, ordinal) in [(1, &first, 1), (2, &second, 2)] {
+            let report = capture_direct(
+                &state,
+                &manager,
+                DrainOptions::default(),
+                &mut routes,
+                &identifier,
+                SnapshotInput {
+                    text,
+                    truncated: false,
+                    revision: Some(revision),
+                },
+                &mut control,
+            )
+            .expect("direct capture");
+            assert_eq!(report.captured, [(key.clone(), vec![ordinal])]);
+            assert!(report.notes.is_empty());
+        }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_refused_or_oversized_capture_is_noted_and_the_rest_is_captured() {
+        let (state, key, root) = state_with_request();
+        let route = state
+            .next_reply_route(&key)
+            .expect("route")
+            .expect("active route");
+        let nonce = route.identifier.strip_suffix("_1").expect("first ID");
+        let client = HerdrClient::with_executable("direct", Path::new("/missing/herdr"))
+            .expect("construct client");
+        let manager = ManagedAgents::new(&client, &root.join("registry")).expect("manager");
+        let mut routes = RouteCache::from_entries(Vec::new());
+        let mut transport = None;
+        let mut control = PassControl {
+            transport: &mut transport,
+            stop: None,
+        };
+        let block = |ordinal: u32, text: &str| {
+            format!("<CHAT_REPLY_{nonce}_{ordinal}>\n{text}\n</CHAT_REPLY_{nonce}_{ordinal}>\n")
+        };
+        let rendered = [
+            block(1, "first"),
+            block(2, "second"),
+            block(3, &"z".repeat(40_000)),
+            block(3, "first"),
+        ]
+        .concat();
+        let report = capture_recovery_snapshot(
+            &state,
+            &manager,
+            DrainOptions::default(),
+            &mut routes,
+            SnapshotInput {
+                text: &rendered,
+                truncated: false,
+                revision: Some(1),
+            },
+            &mut control,
+        )
+        .expect("a refused block does not fail the pass");
+        assert_eq!(report.captured, [(key.clone(), vec![1, 2])]);
+        assert_eq!(report.notes.len(), 1, "{:?}", report.notes);
+        assert!(
+            report.notes[0].starts_with(&format!("reply block {nonce}_3 (text "))
+                && report.notes[0].contains("was not sent"),
+            "{}",
+            report.notes[0]
+        );
+        // Older output past the snapshot bound is left out, and the newest block is still read.
+        let oversized = "old output\n".repeat(MAX_SNAPSHOT_BYTES / 10) + &block(3, "third");
+        let report = capture_recovery_snapshot(
+            &state,
+            &manager,
+            DrainOptions::default(),
+            &mut routes,
+            SnapshotInput {
+                text: &oversized,
+                truncated: false,
+                revision: Some(2),
+            },
+            &mut control,
+        )
+        .expect("an oversized snapshot does not fail the pass");
+        assert_eq!(report.captured, [(key.clone(), vec![3])]);
+        assert_eq!(report.notes, [SNAPSHOT_CUT_NOTE]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn notes_are_bounded_per_report_and_logged_once_per_process() {
+        let mut report = CycleReport::default();
+        for index in 0..MAX_REPORT_NOTES + 5 {
+            report.note(index);
+        }
+        assert_eq!(report.notes.len(), MAX_REPORT_NOTES);
+        let mut other = CycleReport::default();
+        other.note("more");
+        report.merge(other);
+        assert_eq!(report.notes.len(), MAX_REPORT_NOTES);
+        let mut log = NoteLog::default();
+        assert!(log.first_time("note 0"));
+        assert!(!log.first_time("note 0"));
+        for index in 1..MAX_LOGGED_NOTES {
+            assert!(log.first_time(&format!("note {index}")));
+        }
+        assert!(!log.first_time("note 0"));
+        // Remembering one more distinct note forgets the oldest.
+        assert!(log.first_time("one more"));
+        assert!(log.first_time("note 0"));
+        assert!(!log.first_time("one more"));
     }
 
     fn blocked_receive_after_owner_stop(failure_code: &'static str) -> ProviderGenerationError {

@@ -66,9 +66,15 @@ one bounded recovery pass. `agentctl chat publish --bridge-state DIR
 to send a root message; it does not mutate bridge state or act as an event-loop
 reply. `agentctl chat thread --bridge-state DIR --thread THREAD` prints one
 thread's retained messages, oldest first; a request prompt for a reply in an
-existing thread prints this exact command. `agentctl chat userguide` documents
-plugin safety, the outbound NDJSON contract, exact local commit receipts,
-explicit route closure and bounded retirement, fail-closed provider gaps,
-recovery, and service-manager limits. A status with `healthy: false` and an
-unresolved gap is not live success; protocol v1 intentionally refuses automatic
-reconnect.
+existing thread prints this command, with absolute paths.
+
+Each reply block the agent writes for an open request is posted once for each
+distinct text, compared as the userguide describes, whichever of that request's
+reply IDs it uses. A block that cannot be posted, such as an empty or oversized
+one, is skipped with one log line that begins `agentctl: chat reply capture:`;
+nothing the agent prints stops `run`. `agentctl chat userguide` documents
+plugin safety, the outbound NDJSON contract, exact local commit receipts, reply
+capture, explicit route closure and bounded retirement, fail-closed provider
+gaps, recovery, and service-manager limits. A status with `healthy: false` and
+an unresolved gap is not live success; protocol v1 intentionally refuses
+automatic reconnect.

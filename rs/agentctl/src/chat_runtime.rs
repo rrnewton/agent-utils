@@ -5,7 +5,7 @@
 //! ordering. Launching a process plugin is integrated separately so the runtime cannot accidentally
 //! grow a second process-group implementation beside the reviewed subscription supervisor.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::ffi::{CString, OsString};
 use std::fmt;
@@ -28,6 +28,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use unicode_width::UnicodeWidthStr;
 
 use crate::agent::{self, DrainOptions, QueueMessageState};
 use crate::subagents::{ManagedAgents, ManagedApi};
@@ -53,7 +54,7 @@ const MAX_REQUEST_REPLIES: u32 = 4_096;
 const MAX_REQUEST_REPLY_BYTES: u64 = 64 * 1_024 * 1_024;
 const MAX_STATE_REPLIES: u64 = 65_536;
 const MAX_STATE_REPLY_BYTES: u64 = 1_024 * 1_024 * 1_024;
-const MAX_VISIBLE_MARKERS: usize = 4_096;
+pub(crate) const MAX_VISIBLE_MARKERS: usize = 4_096;
 const MAX_FEEDBACK_AVAILABLE_IDS: usize = 32;
 const MAX_FEEDBACK_UNAVAILABLE_IDS: usize = 128;
 const MAX_FEEDBACK_ID_BYTES: usize = 256;
@@ -2862,12 +2863,14 @@ pub enum AckResult {
 }
 
 /// Newly captured replies plus unavailable fence identifiers for coordinator feedback.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ReplyCapture {
     /// Consecutive reply ordinals durably captured during this snapshot.
     pub ordinals: Vec<u32>,
     /// Unavailable marker identifiers that should be reported to the coordinator.
     pub unknown_ids: Vec<String>,
+    /// Complete blocks with new text that were not stored, for the service log.
+    pub refused: Vec<ReplyRefusal>,
 }
 
 /// One retained pane snapshot captured across all active request nonces.
@@ -2880,6 +2883,10 @@ pub struct SnapshotCapture {
     pub unknown_ids: Vec<String>,
     /// Visible unavailable identifiers left out because the coordinator already received them.
     pub suppressed_ids: Vec<String>,
+    /// Complete blocks with new text that were not stored, for the service log.
+    pub refused: Vec<ReplyRefusal>,
+    /// More reply blocks and markers were visible than one capture reads; the oldest were not.
+    pub overflowed: bool,
     /// Active and closed nonce index derived by this same bounded state scan.
     pub(crate) route_entries: Vec<ReplyRouteEntry>,
 }
@@ -4690,6 +4697,8 @@ and the replies captured for them. The provider's own thread is the complete rec
                 replies: Vec::new(),
                 unknown_ids: Vec::new(),
                 suppressed_ids: Vec::new(),
+                refused: Vec::new(),
+                overflowed: false,
                 route_entries: Vec::new(),
             });
         }
@@ -4724,46 +4733,28 @@ and the replies captured for them. The provider's own thread is the complete rec
             .filter(|(record, _)| !record.reply_closed)
             .map(|(record, _)| (record.reply_nonce.clone(), record.next_reply_ordinal))
             .collect::<BTreeMap<_, _>>();
-        let mut scan = scan_reply_blocks_for_nonces(rendered, &known_nonces, &reported)?;
-        let observed_ids = std::mem::take(&mut scan.observed_ids);
+        let scan = scan_reply_blocks_for_nonces(rendered, &known_nonces, &reported)?;
         let mut replies = Vec::new();
+        let mut refused = Vec::new();
         let mut unavailable = UnavailableIds {
             reported: &reported,
-            unknown: std::mem::take(&mut scan.unknown_ids),
-            suppressed: std::mem::take(&mut scan.suppressed_ids),
+            unknown: scan.unknown_ids,
+            suppressed: scan.suppressed_ids,
         };
-        for (nonce, blocks) in scan.blocks_by_nonce {
+        for (nonce, found) in scan.by_nonce {
             let Some(key) = nonce_to_key.get(&nonce) else {
                 // Closed retained requests stay recognized so a stale terminal marker is a no-op.
                 continue;
             };
-            let capture = self.capture_scanned_replies_locked(
-                key,
-                ReplyScan {
-                    blocks,
-                    unknown_ids: Vec::new(),
-                },
-            )?;
+            let capture = self.capture_scanned_replies_locked(key, &found.blocks, found.refused)?;
             if let Some(last) = capture.ordinals.last() {
                 next_by_nonce.insert(nonce, last.saturating_add(1));
             }
             if !capture.ordinals.is_empty() {
                 replies.push((key.clone(), capture.ordinals));
             }
-            for identifier in capture.unknown_ids {
-                unavailable.push(identifier);
-            }
-        }
-        for identifier in observed_ids {
-            let ahead = identifier
-                .rsplit_once('_')
-                .and_then(|(nonce, _)| {
-                    next_by_nonce.get(nonce).and_then(|next| {
-                        sequenced_ordinal(&identifier, nonce).map(|ordinal| ordinal >= *next)
-                    })
-                })
-                .unwrap_or(false);
-            if ahead {
+            refused.extend(capture.refused);
+            for identifier in self.unmatched_partials_locked(key, &found.partial)? {
                 unavailable.push(identifier);
             }
         }
@@ -4793,6 +4784,8 @@ and the replies captured for them. The provider's own thread is the complete rec
             replies,
             unknown_ids: unavailable.unknown,
             suppressed_ids: unavailable.suppressed,
+            refused,
+            overflowed: scan.overflowed,
             route_entries,
         })
     }
@@ -5620,56 +5613,82 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         Ok(AckResult::Acked(receipt))
     }
 
-    /// Capture every complete, consecutive reply block for one request from one retained snapshot.
-    /// No directory scan occurs: only the request and its next direct reply paths are touched.
+    /// Capture every complete reply block for one request from one retained snapshot whose text
+    /// the request has not stored yet. No directory scan occurs: only the request and its own
+    /// reply paths are touched.
     pub fn capture_replies(&self, key: &str, rendered: &str) -> Result<ReplyCapture> {
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
         let request = self.read_request(key)?;
         if request.reply_closed {
-            return Ok(ReplyCapture {
-                ordinals: Vec::new(),
-                unknown_ids: Vec::new(),
-            });
+            return Ok(ReplyCapture::default());
         }
         let scan = scan_reply_blocks(rendered, &request.reply_nonce)?;
-        self.capture_scanned_replies_locked(key, scan)
+        let mut capture =
+            self.capture_scanned_replies_locked(key, &scan.found.blocks, scan.found.refused)?;
+        capture.unknown_ids = scan.unknown_ids;
+        Ok(capture)
     }
 
+    /// Store each block whose text this request has not stored yet, in screen order, under the
+    /// request's next internal ordinal. The identifier's ordinal does not order or identify a
+    /// block: a block matching a stored reply is skipped, so one text is stored once per
+    /// request. A block that cannot be stored is refused for the log, and the rest continue;
+    /// only state and I/O faults are errors.
     fn capture_scanned_replies_locked(
         &self,
         key: &str,
-        mut scan: ReplyScan,
+        blocks: &[ScannedReply],
+        mut refused: Vec<ReplyRefusal>,
     ) -> Result<ReplyCapture> {
         let mut request = self.read_request(key)?;
         if request.reply_closed {
-            return Ok(ReplyCapture {
-                ordinals: Vec::new(),
-                unknown_ids: Vec::new(),
-            });
+            return Ok(ReplyCapture::default());
         }
+        let mut known = KnownReplies::new(request.next_reply_ordinal);
         let mut expected = request.next_reply_ordinal;
         let mut captured = Vec::new();
         let mut checkpoint = self.read_checkpoint()?;
 
-        loop {
-            let mut matching = scan.blocks.iter().filter(|block| block.ordinal == expected);
-            let Some(block) = matching.next() else {
-                break;
+        for block in blocks {
+            let identity = ReplyIdentity::of(&block.body);
+            let refusal = |reason: &dyn fmt::Display| {
+                ReplyRefusal::new(&block.identifier, &block.body, reason)
             };
-            if matching.next().is_some() {
-                return Err(ChatRuntimeError::invalid(format!(
-                    "reply ordinal {expected} appears more than once in one capture"
-                )));
+            match known.find(self, key, &identity)? {
+                Some(IdentityMatch::Text) => continue,
+                // The same table at other widths is most likely a redraw, but rows that only a
+                // table without row rules can show may also read this way, so say so.
+                Some(IdentityMatch::Columns) => {
+                    refused.push(refusal(
+                        &"its table reads, column by column, like a reply this request already \
+                          stored with other cell widths, as when a table is redrawn at another \
+                          width",
+                    ));
+                    continue;
+                }
+                None => {}
+            }
+            if expected > MAX_REPLY_ORDINAL {
+                refused.push(refusal(&"reply ordinal space is exhausted"));
+                continue;
             }
             if request.reply_count >= MAX_REQUEST_REPLIES {
-                return Err(ChatRuntimeError::invalid(
-                    "request reply count limit reached",
-                ));
+                refused.push(refusal(&"request reply count limit reached"));
+                continue;
             }
-            validate_outbound_body(&self.config.agent_label, &block.body)?;
-            let reply = ReplyRecord::new(key, expected, block.body.clone())?;
+            if let Err(error) = validate_outbound_body(&self.config.agent_label, &block.body) {
+                refused.push(refusal(&error));
+                continue;
+            }
+            let reply = match ReplyRecord::new(key, expected, block.body.clone()) {
+                Ok(reply) => reply,
+                Err(error) => {
+                    refused.push(refusal(&error));
+                    continue;
+                }
+            };
             let path = self.reply_path(key, expected);
             let (bytes, exists) = if fs::symlink_metadata(&path).is_ok() {
                 let (saved, _actual_bytes): (ReplyRecord, u64) =
@@ -5684,23 +5703,22 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             } else {
                 let encoded_bytes = encoded_document_bytes(&reply)?;
                 if encoded_bytes > MAX_REPLY_RECORD_BYTES {
-                    return Err(ChatRuntimeError::invalid(format!(
+                    refused.push(refusal(&format!(
                         "reply record exceeds {MAX_REPLY_RECORD_BYTES} bytes"
                     )));
+                    continue;
                 }
                 (reply.reserved_bytes, false)
             };
             let next_request_bytes = request.reply_bytes.saturating_add(bytes);
             let next_state_count = checkpoint.reply_count.saturating_add(1);
             let next_state_bytes = checkpoint.reply_bytes.saturating_add(bytes);
-            if request.reply_count >= MAX_REQUEST_REPLIES
-                || next_request_bytes > MAX_REQUEST_REPLY_BYTES
+            if next_request_bytes > MAX_REQUEST_REPLY_BYTES
                 || next_state_count > MAX_STATE_REPLIES
                 || next_state_bytes > MAX_STATE_REPLY_BYTES
             {
-                return Err(ChatRuntimeError::invalid(
-                    "chat reply population limit reached",
-                ));
+                refused.push(refusal(&"chat reply population limit reached"));
+                continue;
             }
             if !exists {
                 write_document(&path, &reply)?;
@@ -5710,13 +5728,9 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             request.reply_bytes = next_request_bytes;
             checkpoint.reply_count = next_state_count;
             checkpoint.reply_bytes = next_state_bytes;
+            known.insert(identity);
             captured.push(expected);
             expected = expected.saturating_add(1);
-            if expected > MAX_REPLY_ORDINAL.saturating_add(1) {
-                return Err(ChatRuntimeError::invalid(
-                    "reply ordinal space is exhausted",
-                ));
-            }
         }
 
         if !captured.is_empty() {
@@ -5727,18 +5741,64 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             checkpoint.updated_at_millis = unix_millis();
             write_document(&self.root.join("checkpoint.json"), &checkpoint)?;
         }
-        for block in &scan.blocks {
-            if block.ordinal >= expected {
-                let identifier = format!("{}_{}", request.reply_nonce, block.ordinal);
-                if scan.unknown_ids.len() < 128 && !scan.unknown_ids.contains(&identifier) {
-                    scan.unknown_ids.push(identifier);
-                }
-            }
-        }
         Ok(ReplyCapture {
             ordinals: captured,
-            unknown_ids: scan.unknown_ids,
+            unknown_ids: Vec::new(),
+            refused,
         })
+    }
+
+    /// Identifiers of partial blocks whose visible text is not part of any reply this request
+    /// stored, so the coordinator hears that the block did not go out. The visible end of a
+    /// stored reply cut by the top of the capture, or the start of one, is silent, in either
+    /// the plain or the column view, and so is a partial block with no text yet.
+    fn unmatched_partials_locked(
+        &self,
+        key: &str,
+        partial: &[PartialBlock],
+    ) -> Result<Vec<String>> {
+        let mut stored: Option<Vec<(String, String)>> = None;
+        let mut compared = BTreeSet::new();
+        let mut unmatched = Vec::<String>::new();
+        for block in partial {
+            let (unclosed, text) = match block {
+                PartialBlock::Unclosed { text, .. } => (true, text),
+                PartialBlock::Unopened { text, .. } => (false, text),
+            };
+            let view = plain_view(text);
+            if view.is_empty()
+                || unmatched
+                    .iter()
+                    .any(|identifier| identifier == block.identifier())
+                || !compared.insert((unclosed, view.clone()))
+            {
+                continue;
+            }
+            let stored = match stored.as_mut() {
+                Some(views) => views,
+                None => {
+                    let request = self.read_request(key)?;
+                    let mut views = Vec::new();
+                    for ordinal in (1..request.next_reply_ordinal).rev() {
+                        let body = self.read_reply(key, ordinal)?.body;
+                        views.push((plain_view(&body), ColumnView::of(&body).text));
+                    }
+                    stored.insert(views)
+                }
+            };
+            let columns = ColumnView::of(text).text;
+            let matched = stored.iter().any(|(plain, by_column)| {
+                if unclosed {
+                    plain.starts_with(&view) || by_column.starts_with(&columns)
+                } else {
+                    plain.ends_with(&view) || by_column.ends_with(&columns)
+                }
+            });
+            if !matched {
+                unmatched.push(block.identifier().to_owned());
+            }
+        }
+        Ok(unmatched)
     }
 
     /// Publish exactly one retained reply in ordinal order.
@@ -7470,22 +7530,93 @@ fn validate_reply_body(body: &str) -> Result<()> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ScannedReply {
-    ordinal: u32,
+    identifier: String,
     body: String,
+}
+
+/// The visible text of a recognized reply block whose opening or closing marker is missing from
+/// one capture: the opening scrolled off the top, the block is still being written, or another
+/// marker interrupted it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PartialBlock {
+    /// An opening marker and the lines after it, with no matching closing marker.
+    Unclosed { identifier: String, text: String },
+    /// A closing marker and the lines before it, back to the previous marker or the top of the
+    /// capture, with no opening marker.
+    Unopened { identifier: String, text: String },
+}
+
+impl PartialBlock {
+    fn identifier(&self) -> &str {
+        match self {
+            Self::Unclosed { identifier, .. } | Self::Unopened { identifier, .. } => identifier,
+        }
+    }
+}
+
+/// A complete reply block that was read but not stored, and why. The service logs it; nothing
+/// seen on screen stops the service.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplyRefusal {
+    /// Marker identifier of the refused block.
+    pub identifier: String,
+    /// Why the block was not stored.
+    pub reason: String,
+    /// First 12 hex digits of the SHA-256 of the block's text without whitespace or box drawing,
+    /// so repeated log lines about one block name the same block.
+    pub block: String,
+}
+
+impl ReplyRefusal {
+    fn new(identifier: &str, text: &str, reason: impl fmt::Display) -> Self {
+        let digest = format!("{:x}", Sha256::digest(plain_view(text).as_bytes()));
+        Self {
+            identifier: identifier.to_owned(),
+            reason: reason.to_string(),
+            block: digest[..12].to_owned(),
+        }
+    }
+}
+
+impl fmt::Display for ReplyRefusal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "reply block {} (text {}) was not sent: {}",
+            self.identifier, self.block, self.reason
+        )
+    }
+}
+
+/// What one capture shows for one request nonce, in screen order.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct NonceScan {
+    blocks: Vec<ScannedReply>,
+    refused: Vec<ReplyRefusal>,
+    partial: Vec<PartialBlock>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ReplyScan {
-    blocks: Vec<ScannedReply>,
+    found: NonceScan,
     unknown_ids: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct MultiReplyScan {
-    blocks_by_nonce: BTreeMap<String, Vec<ScannedReply>>,
-    observed_ids: Vec<String>,
+    by_nonce: BTreeMap<String, NonceScan>,
     unknown_ids: Vec<String>,
     suppressed_ids: Vec<String>,
+    /// More than `MAX_VISIBLE_MARKERS` blocks and partial blocks were visible, so the oldest
+    /// were left out.
+    overflowed: bool,
+}
+
+#[derive(Clone, Debug)]
+enum ScanEvent {
+    Block(ScannedReply),
+    Refused(ReplyRefusal),
+    Partial(PartialBlock),
 }
 
 /// Unavailable marker identifiers split by whether the coordinator already received them. Both
@@ -7515,23 +7646,48 @@ struct ActiveReply {
     protocol: &'static str,
     identifier: String,
     nonce: String,
-    ordinal: u32,
     opening_margin: String,
     body: Vec<String>,
+}
+
+impl ActiveReply {
+    fn unclosed(self) -> (String, ScanEvent) {
+        (
+            self.nonce,
+            ScanEvent::Partial(PartialBlock::Unclosed {
+                identifier: self.identifier,
+                text: self.body.join("\n"),
+            }),
+        )
+    }
+}
+
+/// Keep the newest `MAX_VISIBLE_MARKERS` scan events. Older ones are most likely replies that an
+/// earlier capture already stored.
+fn push_scan_event(
+    events: &mut VecDeque<(String, ScanEvent)>,
+    overflowed: &mut bool,
+    event: (String, ScanEvent),
+) {
+    if events.len() == MAX_VISIBLE_MARKERS {
+        events.pop_front();
+        *overflowed = true;
+    }
+    events.push_back(event);
 }
 
 fn scan_reply_blocks(rendered: &str, expected_nonce: &str) -> Result<ReplyScan> {
     let expected_nonces = BTreeSet::from([expected_nonce.to_owned()]);
     let mut scan = scan_reply_blocks_for_nonces(rendered, &expected_nonces, &BTreeSet::new())?;
     Ok(ReplyScan {
-        blocks: scan
-            .blocks_by_nonce
-            .remove(expected_nonce)
-            .unwrap_or_default(),
+        found: scan.by_nonce.remove(expected_nonce).unwrap_or_default(),
         unknown_ids: scan.unknown_ids,
     })
 }
 
+/// Read every reply block of the expected nonces in one capture. Only an invalid expected nonce
+/// is an error: a malformed, nested, oversized, or unterminated block is returned as a refusal
+/// or a partial block, so nothing the coordinator prints can stop the service.
 fn scan_reply_blocks_for_nonces(
     rendered: &str,
     expected_nonces: &BTreeSet<String>,
@@ -7542,22 +7698,19 @@ fn scan_reply_blocks_for_nonces(
             "expected reply nonce is not 22-character base64url",
         ));
     }
-    if rendered.chars().any(invalid_rendered_character) {
-        return Err(ChatRuntimeError::invalid(
-            "reply capture contains terminal control characters",
-        ));
-    }
     let normalized = rendered.replace("\r\n", "\n");
-    let mut blocks_by_nonce = BTreeMap::<String, Vec<ScannedReply>>::new();
-    let mut observed_ids = Vec::new();
+    let mut events = VecDeque::new();
+    let mut overflowed = false;
     let mut unavailable = UnavailableIds {
         reported,
         unknown: Vec::new(),
         suppressed: Vec::new(),
     };
     let mut seen_unknown_ids = BTreeSet::new();
-    let mut seen_identifiers = BTreeSet::new();
     let mut active: Option<ActiveReply> = None;
+    // Lines since the previous marker while no block is open: the visible text of a block whose
+    // opening marker is not in this capture.
+    let mut unopened = Vec::<&str>::new();
     let mut fence: Option<(char, usize)> = None;
     let mut prompt_margin: Option<usize> = None;
 
@@ -7567,6 +7720,7 @@ fn scan_reply_blocks_for_nonces(
         if active.is_none() {
             if stripped.starts_with("› ") || stripped.starts_with("❯ ") {
                 prompt_margin = Some(line.len() - stripped.len() + 2);
+                unopened.clear();
                 continue;
             }
             if let Some(expected_margin) = prompt_margin {
@@ -7575,6 +7729,7 @@ fn scan_reply_blocks_for_nonces(
                 }
                 prompt_margin = None;
             }
+            unopened.push(line);
         }
 
         if active.is_none()
@@ -7612,76 +7767,342 @@ fn scan_reply_blocks_for_nonces(
             }
             continue;
         };
-        if seen_identifiers.insert(marker.identifier.clone()) {
-            if seen_identifiers.len() > MAX_VISIBLE_MARKERS {
-                return Err(ChatRuntimeError::invalid(format!(
-                    "reply capture exceeds {MAX_VISIBLE_MARKERS} distinct visible markers"
-                )));
-            }
-            observed_ids.push(marker.identifier.clone());
-        }
+        let head = std::mem::take(&mut unopened);
         let expected = recognized_reply_marker(&marker.identifier, expected_nonces);
         if expected.is_none() && seen_unknown_ids.insert(marker.identifier.clone()) {
             unavailable.push(bounded_detail(&marker.identifier, MAX_FEEDBACK_ID_BYTES));
         }
+        let opening = |nonce: &str, margin: String| ActiveReply {
+            protocol: marker.protocol,
+            identifier: marker.identifier.clone(),
+            nonce: nonce.to_owned(),
+            opening_margin: margin,
+            body: Vec::new(),
+        };
 
-        match active.as_mut() {
-            None if !marker.closing => {
-                if let Some((nonce, ordinal)) = expected {
-                    let nonce = nonce.to_owned();
-                    active = Some(ActiveReply {
-                        protocol: marker.protocol,
-                        identifier: marker.identifier,
-                        nonce,
-                        ordinal,
-                        opening_margin: margin,
-                        body: Vec::new(),
-                    });
+        match (active.take(), marker.closing) {
+            (None, false) => active = expected.map(|nonce| opening(nonce, margin)),
+            (None, true) => {
+                if let Some(nonce) = expected {
+                    // `head` ends with this closing marker line.
+                    let text = head[..head.len().saturating_sub(1)].join("\n");
+                    push_scan_event(
+                        &mut events,
+                        &mut overflowed,
+                        (
+                            nonce.to_owned(),
+                            ScanEvent::Partial(PartialBlock::Unopened {
+                                identifier: marker.identifier.clone(),
+                                text,
+                            }),
+                        ),
+                    );
                 }
             }
-            None => {}
-            Some(_) if !marker.closing => {
-                return Err(ChatRuntimeError::invalid(
-                    "nested chat reply markers are ambiguous",
-                ));
+            (Some(opened), false) => {
+                push_scan_event(&mut events, &mut overflowed, opened.unclosed());
+                active = expected.map(|nonce| opening(nonce, margin));
             }
-            Some(opened)
+            (Some(opened), true)
                 if opened.identifier != marker.identifier || opened.protocol != marker.protocol =>
             {
-                return Err(ChatRuntimeError::invalid(
-                    "chat reply closing marker does not match its opening marker",
-                ));
+                push_scan_event(&mut events, &mut overflowed, opened.unclosed());
             }
-            Some(_) => {
-                let opened = active.take().expect("matched active reply");
-                blocks_by_nonce
-                    .entry(opened.nonce)
-                    .or_default()
-                    .push(ScannedReply {
-                        ordinal: opened.ordinal,
-                        body: reply_body(opened.body, &opened.opening_margin, &margin)?,
-                    });
+            (Some(opened), true) => {
+                let event = match reply_body(&opened.body, &opened.opening_margin, &margin) {
+                    Ok(body) => ScanEvent::Block(ScannedReply {
+                        identifier: opened.identifier,
+                        body,
+                    }),
+                    Err(error) => ScanEvent::Refused(ReplyRefusal::new(
+                        &opened.identifier,
+                        &opened.body.join("\n"),
+                        error,
+                    )),
+                };
+                push_scan_event(&mut events, &mut overflowed, (opened.nonce, event));
             }
         }
     }
+    if let Some(opened) = active {
+        push_scan_event(&mut events, &mut overflowed, opened.unclosed());
+    }
+    let mut by_nonce = BTreeMap::<String, NonceScan>::new();
+    for (nonce, event) in events {
+        let found = by_nonce.entry(nonce).or_default();
+        match event {
+            ScanEvent::Block(block) => found.blocks.push(block),
+            ScanEvent::Refused(refusal) => found.refused.push(refusal),
+            ScanEvent::Partial(partial) => found.partial.push(partial),
+        }
+    }
     Ok(MultiReplyScan {
-        blocks_by_nonce,
-        observed_ids,
+        by_nonce,
         unknown_ids: unavailable.unknown,
         suppressed_ids: unavailable.suppressed,
+        overflowed,
     })
 }
 
+/// Characters that count toward a reply's text identity: everything except whitespace and the
+/// box-drawing characters, U+2500 to U+257F, that a terminal uses for table borders and rules.
+/// Block elements such as the `█` and `░` of a progress bar count.
+fn identity_character(character: char) -> bool {
+    !character.is_whitespace() && !('\u{2500}'..='\u{257f}').contains(&character)
+}
+
+fn identity_characters(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.chars()
+        .filter(|character| identity_character(*character))
+}
+
+/// A reply's text without whitespace or box drawing, so a re-wrapped paragraph or a redrawn
+/// border reads the same.
+fn plain_view(text: &str) -> String {
+    identity_characters(text).collect()
+}
+
+/// The terminal columns a renderer gives the text when it pads a table cell: two for a wide
+/// character such as an emoji or a CJK ideograph, none for a nonspacing mark such as a
+/// combining accent or for a zero-width joiner, and one for most others.
+fn columns(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
+/// The cells of one table row line, `│ a │ b │`, or `None` for any other line.
+fn table_cells(line: &str) -> Option<Vec<&str>> {
+    let inner = line.trim().strip_prefix('│')?.strip_suffix('│')?;
+    Some(inner.split('│').collect())
+}
+
+/// A reply's text with each wrapped table row read back as one row, and the layout of its
+/// tables.
+struct ColumnView {
+    /// Like `plain_view`, except that each run of consecutive table row lines with the same
+    /// number of cells that `wrapped_row` accepts is read column by column, with a separator
+    /// after each column and after the run. The same row redrawn at another width, with its
+    /// cells wrapped differently, then reads the same.
+    text: String,
+    /// The cell widths, in terminal columns, of the first line of each run of table row lines.
+    layout: String,
+}
+
+impl ColumnView {
+    fn of(text: &str) -> Self {
+        let mut view = Self {
+            text: String::new(),
+            layout: String::new(),
+        };
+        let mut run = Vec::<Vec<&str>>::new();
+        for line in text.split('\n') {
+            match table_cells(line) {
+                Some(cells) if run.first().is_none_or(|first| first.len() == cells.len()) => {
+                    run.push(cells);
+                }
+                cells => {
+                    view.flush(&mut run);
+                    match cells {
+                        Some(cells) => run.push(cells),
+                        None => view.text.extend(identity_characters(line)),
+                    }
+                }
+            }
+        }
+        view.flush(&mut run);
+        view
+    }
+
+    fn flush(&mut self, run: &mut Vec<Vec<&str>>) {
+        let Some(first) = run.first() else {
+            return;
+        };
+        for cell in first {
+            self.layout.push_str(&format!("{},", columns(cell)));
+        }
+        self.layout.push(';');
+        if wrapped_row(run) {
+            for column in 0..first.len() {
+                for row in run.iter() {
+                    self.text.extend(identity_characters(row[column]));
+                }
+                self.text.push('\u{1f}');
+            }
+            self.text.push('\u{1e}');
+        } else {
+            for row in run.iter() {
+                for cell in row {
+                    self.text.extend(identity_characters(cell));
+                }
+            }
+        }
+        run.clear();
+    }
+}
+
+/// Whether a run of table row lines can be one table row whose cells a word-wrapping renderer
+/// wrapped over several lines. Every line has the same cell widths, in terminal columns, and
+/// every cell has a space on each side. In each column the text is at the top of the run or
+/// centred in it, with the odd line below, as Claude Code places a cell shorter than its row;
+/// the text of at least one column fills the run. Each line break was needed: the next word
+/// would not have fit on the line before. A renderer that keeps the spaces between words, as
+/// Claude Code's does, starts the line after an exactly full one with the space of the break,
+/// which counts toward that line, or puts the space on a line of its own when the next word
+/// fills a whole line. A single line always qualifies. Lines that fail are not one wrapped
+/// row, so they read as in `plain_view`. Separate rows that pass, which only a table without a
+/// rule between its rows can show, read as one row.
+fn wrapped_row(run: &[Vec<&str>]) -> bool {
+    let [first, _, ..] = run else {
+        return true;
+    };
+    let widths = first.iter().map(|cell| columns(cell)).collect::<Vec<_>>();
+    let uniform = run.iter().all(|row| {
+        row.iter()
+            .map(|cell| columns(cell))
+            .eq(widths.iter().copied())
+            && row
+                .iter()
+                .all(|cell| cell.starts_with(' ') && cell.ends_with(' '))
+    });
+    if !uniform {
+        return false;
+    }
+    let mut filled = false;
+    for (column, width) in widths.iter().enumerate() {
+        let room = width.saturating_sub(2);
+        // Each line of the column without the cell's padding: the space on its left and any
+        // spaces on its right. A line that holds only the space of a break reads as empty.
+        let lines = run
+            .iter()
+            .map(|row| row[column][1..].trim_end())
+            .collect::<Vec<_>>();
+        let Some(top) = lines.iter().position(|line| !line.is_empty()) else {
+            continue;
+        };
+        let bottom = lines
+            .iter()
+            .rposition(|line| !line.is_empty())
+            .unwrap_or(top);
+        let height = bottom - top + 1;
+        if top != 0 && top != (run.len() - height) / 2 {
+            return false;
+        }
+        filled |= height == run.len();
+        let mut previous: Option<(usize, &str)> = None;
+        for (index, line) in lines.iter().enumerate().take(bottom + 1).skip(top) {
+            if line.is_empty() {
+                continue;
+            }
+            if let Some((at, previous)) = previous {
+                // The columns the line before used, counting one space on its left.
+                let used = columns(previous.trim_start()) + usize::from(previous.starts_with(' '));
+                let word = columns(line.split_whitespace().next().unwrap_or_default());
+                let needed = match index - at {
+                    1 => used + 1 + word > room,
+                    2 => used >= room && word >= room,
+                    _ => false,
+                };
+                if !needed {
+                    return false;
+                }
+            }
+            previous = Some((index, line));
+        }
+    }
+    filled
+}
+
+/// SHA-256 digests of a reply's text views. The plain view survives re-wrapped text and
+/// redrawn borders. The column view also survives table cells that wrap at another width, and
+/// the layout tells whether they did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReplyIdentity {
+    plain: [u8; 32],
+    by_column: [u8; 32],
+    layout: [u8; 32],
+}
+
+impl ReplyIdentity {
+    fn of(text: &str) -> Self {
+        let columns = ColumnView::of(text);
+        Self {
+            plain: Sha256::digest(plain_view(text).as_bytes()).into(),
+            by_column: Sha256::digest(columns.text.as_bytes()).into(),
+            layout: Sha256::digest(columns.layout.as_bytes()).into(),
+        }
+    }
+}
+
+/// How a block matches a reply its request already stored.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdentityMatch {
+    /// The plain views are equal.
+    Text,
+    /// Only the column views are equal, and the stored reply's tables have other cell widths,
+    /// as when a table is redrawn at another width.
+    Columns,
+}
+
+/// Text identities of one open request's stored replies. They are read lazily and newest first,
+/// because a block still on screen is most likely one of the latest replies.
+struct KnownReplies {
+    /// Highest stored ordinal not read yet, or zero once every stored reply is read.
+    unread: u32,
+    plain: BTreeSet<[u8; 32]>,
+    /// Each column-view digest, with the table layouts stored under it.
+    by_column: BTreeMap<[u8; 32], BTreeSet<[u8; 32]>>,
+}
+
+impl KnownReplies {
+    fn new(next_reply_ordinal: u32) -> Self {
+        Self {
+            unread: next_reply_ordinal.saturating_sub(1),
+            plain: BTreeSet::new(),
+            by_column: BTreeMap::new(),
+        }
+    }
+
+    fn insert(&mut self, identity: ReplyIdentity) {
+        self.plain.insert(identity.plain);
+        self.by_column
+            .entry(identity.by_column)
+            .or_default()
+            .insert(identity.layout);
+    }
+
+    /// Reads stored replies until one has the same text, or all have been read.
+    fn find(
+        &mut self,
+        state: &BridgeState,
+        key: &str,
+        identity: &ReplyIdentity,
+    ) -> Result<Option<IdentityMatch>> {
+        while !self.plain.contains(&identity.plain) {
+            if self.unread == 0 {
+                // A column view that matches only at the same cell widths is different text: a
+                // renderer wraps the same text at the same widths the same way.
+                let redrawn = self
+                    .by_column
+                    .get(&identity.by_column)
+                    .is_some_and(|layouts| layouts.iter().any(|layout| *layout != identity.layout));
+                return Ok(redrawn.then_some(IdentityMatch::Columns));
+            }
+            let reply = state.read_reply(key, self.unread)?;
+            self.insert(ReplyIdentity::of(&reply.body));
+            self.unread -= 1;
+        }
+        Ok(Some(IdentityMatch::Text))
+    }
+}
+
+/// The request nonce of a marker identifier `<nonce>_<ordinal>` whose nonce is expected and whose
+/// ordinal is well formed. The ordinal only has to be valid: blocks are told apart by their text.
 fn recognized_reply_marker<'a>(
     identifier: &'a str,
     expected_nonces: &BTreeSet<String>,
-) -> Option<(&'a str, u32)> {
+) -> Option<&'a str> {
     let (nonce, _) = identifier.rsplit_once('_')?;
-    expected_nonces
-        .contains(nonce)
-        .then(|| sequenced_ordinal(identifier, nonce))
-        .flatten()
-        .map(|ordinal| (nonce, ordinal))
+    (expected_nonces.contains(nonce) && sequenced_ordinal(identifier, nonce).is_some())
+        .then_some(nonce)
 }
 
 #[derive(Clone, Debug)]
@@ -7702,9 +8123,9 @@ fn parse_marker(line: &str) -> Option<Marker> {
     } else {
         ("GCHAT", body.strip_prefix("GCHAT_REPLY_")?)
     };
-    if identifier
-        .contains(|character: char| character.is_whitespace() || matches!(character, '<' | '>'))
-    {
+    if identifier.contains(|character: char| {
+        character.is_whitespace() || character.is_control() || matches!(character, '<' | '>')
+    }) {
         return None;
     }
     Some(Marker {
@@ -7712,6 +8133,13 @@ fn parse_marker(line: &str) -> Option<Marker> {
         closing,
         identifier: identifier.to_owned(),
     })
+}
+
+/// Whether an identifier ends in a well-formed reply ordinal, `_1` through `_999999`.
+pub(crate) fn has_reply_ordinal(identifier: &str) -> bool {
+    identifier
+        .rsplit_once('_')
+        .is_some_and(|(nonce, _)| sequenced_ordinal(identifier, nonce).is_some())
 }
 
 fn sequenced_ordinal(identifier: &str, expected_nonce: &str) -> Option<u32> {
@@ -7769,7 +8197,7 @@ fn closing_fence(line: &str, character: char, minimum: usize) -> bool {
     length >= minimum && line[length..].trim().is_empty()
 }
 
-fn reply_body(lines: Vec<String>, opening_margin: &str, closing_margin: &str) -> Result<String> {
+fn reply_body(lines: &[String], opening_margin: &str, closing_margin: &str) -> Result<String> {
     let mut margin_length = opening_margin.len();
     for line in std::iter::once(closing_margin).chain(
         lines
@@ -7790,8 +8218,8 @@ fn reply_body(lines: Vec<String>, opening_margin: &str, closing_margin: &str) ->
     }
     let margin = &opening_margin[..margin_length];
     let body = lines
-        .into_iter()
-        .map(|line| line.strip_prefix(margin).unwrap_or(&line).to_owned())
+        .iter()
+        .map(|line| line.strip_prefix(margin).unwrap_or(line))
         .collect::<Vec<_>>()
         .join("\n");
     validate_reply_body(&body)?;
@@ -7901,12 +8329,13 @@ fn single_line(value: &str) -> String {
 /// A terminal can wrap a long line so that any word of it starts a row, and a capture reads a
 /// row holding only a marker as that marker and a row starting with such a run as the start of
 /// a code fence. A renderer may also drop characters it treats as zero-width, and which ones
-/// differs between renderers and Unicode versions, so tokens are found with every non-ASCII
-/// character and every tab treated as absent. Every character of a token is ASCII and no
-/// look-alike is, so the look-alikes count as absent too: replacing one token can join its
-/// neighbours into another, as three tildes between two backticks and one backtick leave three
-/// backticks, and that one is replaced as well. No token forms however many characters a
-/// renderer drops, and a second rewrite changes nothing.
+/// differs between renderers and Unicode versions, so tokens are found with every character
+/// outside printable ASCII treated as absent: non-ASCII characters, tabs, other control
+/// characters, and DEL. Every character of a token is printable ASCII and no look-alike is, so
+/// the look-alikes count as absent too: replacing one token can join its neighbours into
+/// another, as three tildes between two backticks and one backtick leave three backticks, and
+/// that one is replaced as well. No token forms however many characters a renderer drops, and a
+/// second rewrite changes nothing.
 fn neutral_capture_syntax(line: &str) -> String {
     let visible = line
         .char_indices()
@@ -7914,8 +8343,8 @@ fn neutral_capture_syntax(line: &str) -> String {
         .collect::<Vec<_>>();
     let mut replaced = BTreeMap::new();
     // Fence runs first, left to right. A run is replaced as soon as a different character ends
-    // it, so the runs on either side of it meet, and every run left below the last is shorter
-    // than three.
+    // it, so the runs on either side of it meet, and every backtick or tilde run left below the
+    // last is shorter than three.
     let mut runs: Vec<(char, Vec<usize>)> = Vec::new();
     for &(offset, character) in &visible {
         if runs.last().is_some_and(|(last, _)| *last != character) {
@@ -12509,11 +12938,21 @@ any further ones for 300 seconds, so combine short updates."
         );
         let scan = scan_reply_blocks_for_nonces(&rendered, &expected, &BTreeSet::new())
             .expect("scan once");
-        assert_eq!(scan.blocks_by_nonce.len(), 2);
-        assert_eq!(scan.blocks_by_nonce[first][0].body, "first");
-        assert_eq!(scan.blocks_by_nonce[second][0].body, "second");
-        assert_eq!(scan.observed_ids.len(), 3);
+        assert_eq!(scan.by_nonce.len(), 2);
+        for (nonce, body) in [(first, "first"), (second, "second")] {
+            assert_eq!(
+                scan.by_nonce[nonce],
+                NonceScan {
+                    blocks: vec![ScannedReply {
+                        identifier: format!("{nonce}_1"),
+                        body: body.to_owned(),
+                    }],
+                    ..NonceScan::default()
+                }
+            );
+        }
         assert_eq!(scan.unknown_ids, vec!["unknown_1"]);
+        assert!(scan.suppressed_ids.is_empty() && !scan.overflowed);
     }
 
     #[test]
@@ -12593,17 +13032,28 @@ any further ones for 300 seconds, so combine short updates."
         let key = &admission.new_request_keys[0];
         let nonce = state.read_request(key).expect("request").reply_nonce;
         let oversized = "x".repeat(MAX_REPLY_BYTES);
-        let error = state
+        // An oversized block is refused, not stored, and the capture itself still succeeds.
+        let refused = state
             .capture_replies(
                 key,
                 &format!("<CHAT_REPLY_{nonce}_1>\n{oversized}\n</CHAT_REPLY_{nonce}_1>"),
             )
-            .expect_err("label prefix must count toward transport bound");
-        assert!(error.to_string().contains("agent-labelled chat reply"));
+            .expect("an oversized block is refused without failing the capture");
+        assert!(refused.ordinals.is_empty());
+        assert_eq!(refused.refused.len(), 1);
+        assert_eq!(refused.refused[0].identifier, format!("{nonce}_1"));
+        assert!(
+            refused.refused[0]
+                .reason
+                .contains("agent-labelled chat reply"),
+            "label prefix must count toward transport bound: {}",
+            refused.refused[0]
+        );
         assert_eq!(
             state.read_request(key).expect("request").next_reply_ordinal,
             1
         );
+        assert!(state.read_reply(key, 1).is_err());
 
         let prefix = "[codex coordinator] ";
         let maximum = "y".repeat(MAX_REPLY_BYTES - prefix.len());
@@ -12720,10 +13170,11 @@ complete reply block using one exact available ID."
     }
 
     #[test]
-    fn reported_ahead_reply_block_is_posted_once_its_id_is_next() {
-        // An answer under an ID ahead of the request's next reply ID is reported. If the agent
-        // sends it again under the ID the notice names while the first block is still on screen,
-        // the next capture takes both blocks, so the answer is posted twice, as the guide says.
+    fn ahead_reply_id_is_captured_and_the_same_answer_sent_again_is_posted_once() {
+        // Any well-formed reply ID of an open request is that request's, so a block under an ID
+        // ahead of the next one is captured at once and nothing is reported. If the agent sends
+        // the same answer again under another of the request's IDs while the first block is still
+        // on screen, its text is already stored, so the answer is posted once.
         let root = temporary("ahead-marker-on-screen");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
         let key = state
@@ -12736,8 +13187,10 @@ complete reply block using one exact available ID."
         let mut transport = FakeReplyTransport::default();
         let mut rendered = format!("<CHAT_REPLY_{nonce}_2>\nanswer\n</CHAT_REPLY_{nonce}_2>\n");
         let capture = state.capture_snapshot(&rendered).expect("first scan");
-        assert!(capture.replies.is_empty());
-        assert_eq!(capture.unknown_ids, [format!("{nonce}_2")]);
+        assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+        assert!(capture.unknown_ids.is_empty());
+        assert!(capture.suppressed_ids.is_empty());
+        assert!(capture.refused.is_empty());
         deliver_fence_feedback_with(
             &state,
             &coordinator,
@@ -12745,21 +13198,22 @@ complete reply block using one exact available ID."
             DrainOptions::default(),
         )
         .expect("fence feedback");
-        assert_eq!(
-            coordinator.prompts(),
-            [format!(
-                "Chat reply routing error: your output referenced unavailable reply ID(s): \
-{nonce}_2. The reply ID(s) available when this notice was written are: {nonce}_1. Emit a \
-complete reply block using one exact available ID."
-            )]
-        );
         rendered.push_str(&format!(
             "<CHAT_REPLY_{nonce}_1>\nanswer\n</CHAT_REPLY_{nonce}_1>\n"
         ));
         let capture = state.capture_snapshot(&rendered).expect("second scan");
-        assert_eq!(capture.replies, [(key.clone(), vec![1, 2])]);
+        assert!(capture.replies.is_empty());
         assert!(capture.unknown_ids.is_empty());
         assert!(capture.suppressed_ids.is_empty());
+        assert!(capture.refused.is_empty());
+        deliver_fence_feedback_with(
+            &state,
+            &coordinator,
+            &capture.unknown_ids,
+            DrainOptions::default(),
+        )
+        .expect("fence feedback");
+        assert!(coordinator.prompts().is_empty());
         while state
             .publish_one(&key, &mut transport)
             .expect("publish captured reply")
@@ -12771,15 +13225,21 @@ complete reply block using one exact available ID."
                 .iter()
                 .map(|submission| submission.2.as_str())
                 .collect::<Vec<_>>(),
-            ["[codex coordinator] answer", "[codex coordinator] answer"]
+            ["[codex coordinator] answer"]
         );
+        assert!(state
+            .read_fence_feedback()
+            .expect("feedback record")
+            .reported
+            .is_empty());
         fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
-    fn reported_ahead_reply_id_is_posted_when_a_later_block_uses_it_as_next() {
-        // The reported block leaves the screen. Once the earlier reply is captured, the reported
-        // ID is the next one, and a new block under it is posted, though the ID stays reported.
+    fn each_distinct_answer_is_posted_once_whatever_reply_id_it_uses() {
+        // Blocks are told apart by their text, not by their reply ID. Three different answers
+        // under IDs 2, 1 and 2 again are three replies, posted in the order they were captured,
+        // and none of them is reported.
         let root = temporary("ahead-marker-later");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
         let key = state
@@ -12790,34 +13250,36 @@ complete reply block using one exact available ID."
         let nonce = state.read_request(&key).expect("request").reply_nonce;
         let coordinator = QueueDelivery::default();
         let mut transport = FakeReplyTransport::default();
-        let capture = state
-            .capture_snapshot(&format!(
-                "<CHAT_REPLY_{nonce}_2>\nearly\n</CHAT_REPLY_{nonce}_2>\n"
-            ))
-            .expect("first scan");
-        assert_eq!(capture.unknown_ids, [format!("{nonce}_2")]);
-        deliver_fence_feedback_with(
-            &state,
-            &coordinator,
-            &capture.unknown_ids,
-            DrainOptions::default(),
-        )
-        .expect("fence feedback");
         let first = format!("<CHAT_REPLY_{nonce}_1>\nfirst\n</CHAT_REPLY_{nonce}_1>\n");
-        let capture = state.capture_snapshot(&first).expect("second scan");
-        assert_eq!(capture.replies, [(key.clone(), vec![1])]);
         let later = format!("{first}<CHAT_REPLY_{nonce}_2>\nsecond\n</CHAT_REPLY_{nonce}_2>\n");
-        let capture = state.capture_snapshot(&later).expect("third scan");
-        assert_eq!(capture.replies, [(key.clone(), vec![2])]);
-        assert!(capture.unknown_ids.is_empty());
-        assert!(capture.suppressed_ids.is_empty());
-        assert_eq!(
-            state
-                .read_fence_feedback()
-                .expect("feedback record")
-                .reported,
-            [format!("{nonce}_2")]
-        );
+        for (scan, rendered, ordinal) in [
+            (
+                "first scan",
+                format!("<CHAT_REPLY_{nonce}_2>\nearly\n</CHAT_REPLY_{nonce}_2>\n"),
+                1,
+            ),
+            ("second scan", first, 2),
+            ("third scan", later, 3),
+        ] {
+            let capture = state.capture_snapshot(&rendered).expect(scan);
+            assert_eq!(capture.replies, [(key.clone(), vec![ordinal])], "{scan}");
+            assert!(capture.unknown_ids.is_empty(), "{scan}");
+            assert!(capture.suppressed_ids.is_empty(), "{scan}");
+            assert!(capture.refused.is_empty(), "{scan}");
+            deliver_fence_feedback_with(
+                &state,
+                &coordinator,
+                &capture.unknown_ids,
+                DrainOptions::default(),
+            )
+            .expect("fence feedback");
+        }
+        assert!(coordinator.prompts().is_empty());
+        assert!(state
+            .read_fence_feedback()
+            .expect("feedback record")
+            .reported
+            .is_empty());
         while state
             .publish_one(&key, &mut transport)
             .expect("publish captured reply")
@@ -12829,19 +13291,22 @@ complete reply block using one exact available ID."
                 .iter()
                 .map(|submission| submission.2.as_str())
                 .collect::<Vec<_>>(),
-            ["[codex coordinator] first", "[codex coordinator] second"]
+            [
+                "[codex coordinator] early",
+                "[codex coordinator] first",
+                "[codex coordinator] second"
+            ]
         );
-        assert_eq!(coordinator.prompts().len(), 1);
         fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
     fn next_reply_id_seen_in_part_is_reported_and_its_complete_block_posted() {
-        // A recovery scan that sees only part of the next reply's block, its opening marker
-        // before the closing one or its closing marker after the opening one has scrolled away,
-        // reports the request's own next reply ID. With only this request open, the notice names
-        // that ID as both unavailable and available. A complete block under it is posted, as the
-        // guide says.
+        // A recovery scan that sees only part of a block, its opening marker before the closing
+        // one or its closing marker after the opening one has scrolled away, reports the block's
+        // reply ID unless the visible part is the start or the end of a stored reply. With only
+        // this request open, the notice names that ID as both unavailable and available. A
+        // complete block under it is posted, as the guide says.
         let root = temporary("next-marker-in-part");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
         let key = state
@@ -12875,9 +13340,10 @@ complete reply block using one exact available ID."
             .expect("scan of the closed block");
         assert_eq!(capture.replies, [(key.clone(), vec![1])]);
         assert!(capture.unknown_ids.is_empty());
+        assert!(capture.suppressed_ids.is_empty());
 
-        // The closing marker, after the opening one has scrolled away. The agent sends the
-        // answer again under the same ID.
+        // The closing marker, after the opening one has scrolled away. The visible part is not
+        // the end of the stored reply, so it is reported. The agent sends the answer again.
         let closing = format!("end of the second answer\n</CHAT_REPLY_{nonce}_2>\n");
         let capture = state.capture_snapshot(&closing).expect("closing scan");
         assert!(capture.replies.is_empty());
@@ -12890,7 +13356,9 @@ complete reply block using one exact available ID."
             .expect("scan of the block sent again");
         assert_eq!(capture.replies, [(key.clone(), vec![2])]);
         assert!(capture.unknown_ids.is_empty());
-        assert!(capture.suppressed_ids.is_empty());
+        // The fragment is still on screen and still matches no stored reply, but its ID was
+        // reported once, so it is only logged.
+        assert_eq!(capture.suppressed_ids, [format!("{nonce}_2")]);
 
         assert_eq!(coordinator.prompts(), [notice(1), notice(2)]);
         while state
@@ -12910,6 +13378,630 @@ complete reply block using one exact available ID."
             ]
         );
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    fn reply_block(identifier: &str, text: &str) -> String {
+        format!("<CHAT_REPLY_{identifier}>\n{text}\n</CHAT_REPLY_{identifier}>\n")
+    }
+
+    fn open_request(name: &str) -> (BridgeState, String, String, PathBuf) {
+        let root = temporary(name);
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let key = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request")
+            .new_request_keys[0]
+            .clone();
+        let nonce = state.read_request(&key).expect("request").reply_nonce;
+        (state, key, nonce, root)
+    }
+
+    #[test]
+    fn one_reply_id_carries_each_distinct_answer_once() {
+        let (state, key, nonce, root) = open_request("one-id-many-answers");
+        let id = format!("{nonce}_1");
+        let rendered = [
+            reply_block(&id, "first answer"),
+            reply_block(&id, "second answer"),
+            // The first answer again, laid out differently.
+            reply_block(&id, "first\n  answer"),
+        ]
+        .concat();
+        let capture = state.capture_snapshot(&rendered).expect("capture");
+        assert_eq!(capture.replies, [(key.clone(), vec![1, 2])]);
+        assert!(capture.unknown_ids.is_empty());
+        assert!(capture.suppressed_ids.is_empty());
+        assert!(capture.refused.is_empty());
+        assert_eq!(
+            state.read_reply(&key, 1).expect("reply").body,
+            "first answer"
+        );
+        assert_eq!(
+            state.read_reply(&key, 2).expect("reply").body,
+            "second answer"
+        );
+        assert!(state
+            .capture_snapshot(&rendered)
+            .expect("capture again")
+            .replies
+            .is_empty());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn nested_and_mismatched_markers_are_reported_without_failing_the_capture() {
+        let (state, key, nonce, root) = open_request("nested-markers");
+        // An opening marker inside an open block: the outer block never closed.
+        let nested = format!(
+            "<CHAT_REPLY_{nonce}_1>\nouter start\n{}",
+            reply_block(&format!("{nonce}_1"), "inner answer")
+        );
+        let capture = state.capture_snapshot(&nested).expect("nested capture");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+        assert_eq!(capture.unknown_ids, [format!("{nonce}_1")]);
+        assert_eq!(
+            state.read_reply(&key, 1).expect("reply").body,
+            "inner answer"
+        );
+        // A closing marker that names another ID ends nothing, and the open block is reported.
+        let mismatched = format!("<CHAT_REPLY_{nonce}_2>\nsome text\n</CHAT_REPLY_{nonce}_3>\n");
+        let capture = state
+            .capture_snapshot(&mismatched)
+            .expect("mismatched capture");
+        assert!(capture.replies.is_empty());
+        assert_eq!(capture.unknown_ids, [format!("{nonce}_2")]);
+        assert!(capture.refused.is_empty());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_reply_redrawn_at_another_width_is_not_sent_again() {
+        let (state, key, nonce, root) = open_request("redrawn-reply");
+        let original = "Merged A and B, closed C.\n\
+┌────────────────┬────┐\n\
+│ Change         │ OK │\n\
+├────────────────┼────┤\n\
+│ Merged A and B │ ok │\n\
+└────────────────┴────┘";
+        let capture = state
+            .capture_snapshot(&reply_block(&format!("{nonce}_1"), original))
+            .expect("original");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+        // The paragraph re-wraps, the border is redrawn narrower, and the table cell wraps
+        // onto a second row. Only the column view matches, so the skip is logged.
+        let narrower = "Merged A and\n\
+B, closed C.\n\
+┌──────────┬────┐\n\
+│ Change   │ OK │\n\
+├──────────┼────┤\n\
+│ Merged A │ ok │\n\
+│ and B    │    │\n\
+└──────────┴────┘";
+        let capture = state
+            .capture_snapshot(&reply_block(&format!("{nonce}_2"), narrower))
+            .expect("narrower");
+        assert!(capture.replies.is_empty(), "sent again:\n{narrower}");
+        assert!(capture.unknown_ids.is_empty());
+        let [refusal] = capture.refused.as_slice() else {
+            panic!("one logged skip expected: {:?}", capture.refused);
+        };
+        assert_eq!(refusal.identifier, format!("{nonce}_2"));
+        assert!(
+            refusal.reason.contains("redrawn at another width"),
+            "{refusal}"
+        );
+        // The terminal soft-wraps the row line, so it no longer reads as a table row. The plain
+        // view matches, and nothing is logged.
+        let soft_wrapped = "Merged A and B, closed C.\n\
+┌────────────────┬────┐\n\
+│ Change         │ OK │\n\
+├────────────────┼────┤\n\
+│ Merged A and B │ o\n\
+k │\n\
+└────────────────┴────┘";
+        let capture = state
+            .capture_snapshot(&reply_block(&format!("{nonce}_3"), soft_wrapped))
+            .expect("soft wrapped");
+        assert!(capture.replies.is_empty(), "sent again:\n{soft_wrapped}");
+        assert!(capture.unknown_ids.is_empty());
+        assert!(capture.refused.is_empty());
+        // The end of the narrower redraw, with its opening marker above the capture, is the end
+        // of the stored reply read column by column, so it is not reported.
+        let cut = format!(
+            "│ Merged A │ ok │\n│ and B    │    │\n└──────────┴────┘\n</CHAT_REPLY_{nonce}_2>\n"
+        );
+        let capture = state.capture_snapshot(&cut).expect("cut");
+        assert!(capture.replies.is_empty());
+        assert!(capture.unknown_ids.is_empty());
+        assert!(capture.suppressed_ids.is_empty());
+        // Cells that trade places are a different reply in both views.
+        for (ordinal, table) in [
+            (4, "│ Merged │ A │\n│ Closed │ B │"),
+            (5, "│ Merged │ B │\n│ Closed │ A │"),
+        ] {
+            let capture = state
+                .capture_snapshot(&reply_block(&format!("{nonce}_{ordinal}"), table))
+                .expect("table");
+            assert_eq!(capture.replies.len(), 1, "not sent:\n{table}");
+            assert!(capture.refused.is_empty());
+        }
+        assert_eq!(
+            state
+                .read_request(&key)
+                .expect("request")
+                .next_reply_ordinal,
+            4
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_table_with_wide_characters_redrawn_at_another_width_is_not_sent_again() {
+        // A renderer pads cells by terminal columns, in which an emoji or a CJK ideograph takes
+        // two, so the lines of one wrapped row have the same widths in columns but not in
+        // characters.
+        let cases = [
+            (
+                "wide-emoji-redraw",
+                "┌─────────────────────────┬─────┐\n\
+│ Item                    │ PR  │\n\
+├─────────────────────────┼─────┤\n\
+│ ✅ merged the queue fix │ 101 │\n\
+└─────────────────────────┴─────┘",
+                "┌───────────────┬─────┐\n\
+│ Item          │ PR  │\n\
+├───────────────┼─────┤\n\
+│ ✅ merged the │ 101 │\n\
+│ queue fix     │     │\n\
+└───────────────┴─────┘",
+            ),
+            (
+                "wide-cjk-redraw",
+                "┌───────────────────────────┬─────┐\n\
+│ Item                      │ PR  │\n\
+├───────────────────────────┼─────┤\n\
+│ 修正 merged the queue fix │ 101 │\n\
+└───────────────────────────┴─────┘",
+                "┌───────────────┬─────┐\n\
+│ Item          │ PR  │\n\
+├───────────────┼─────┤\n\
+│ 修正 merged   │ 101 │\n\
+│ the queue fix │     │\n\
+└───────────────┴─────┘",
+            ),
+            (
+                "wide-status-column-redraw",
+                "┌────┬──────────────────────┬─────┐\n\
+│ S  │ Item                 │ PR  │\n\
+├────┼──────────────────────┼─────┤\n\
+│ ✅ │ merged the queue fix │ 101 │\n\
+└────┴──────────────────────┴─────┘",
+                "┌────┬────────────┬─────┐\n\
+│ S  │ Item       │ PR  │\n\
+├────┼────────────┼─────┤\n\
+│ ✅ │ merged the │ 101 │\n\
+│    │ queue fix  │     │\n\
+└────┴────────────┴─────┘",
+            ),
+        ];
+        for (name, stored, redrawn) in cases {
+            let (state, key, nonce, root) = open_request(name);
+            let id = format!("{nonce}_1");
+            let capture = state
+                .capture_snapshot(&reply_block(&id, stored))
+                .expect("stored");
+            assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+            let capture = state
+                .capture_snapshot(&reply_block(&id, redrawn))
+                .expect("redrawn");
+            assert!(capture.replies.is_empty(), "sent again:\n{redrawn}");
+            assert!(capture.unknown_ids.is_empty());
+            let [refusal] = capture.refused.as_slice() else {
+                panic!("one logged skip expected: {:?}", capture.refused);
+            };
+            assert_eq!(refusal.identifier, id);
+            assert!(
+                refusal.reason.contains("redrawn at another width"),
+                "{refusal}"
+            );
+            assert_eq!(
+                state
+                    .read_request(&key)
+                    .expect("request")
+                    .next_reply_ordinal,
+                2
+            );
+            fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn a_table_laid_out_by_claude_code_redrawn_at_another_width_is_not_sent_again() {
+        // Each pair is one table as Claude Code 2.1.284 lays it out at two terminal widths.
+        // It centres a cell that is shorter than its row, with the odd line below, and it keeps
+        // the space of a line break: after an exactly full line the next line starts with that
+        // space, or the space takes a line of its own when the next word fills a whole line.
+        let cases = [
+            (
+                "centred-cells-redraw",
+                "┌─────────┬────────┬─────────────────────────────────────────┐\n\
+│  check  │ status │                  note                   │\n\
+├─────────┼────────┼─────────────────────────────────────────┤\n\
+│ unit    │        │ a note that wraps onto several lines    │\n\
+│ tests   │ ok     │ when the terminal is narrow enough to   │\n\
+│         │        │ force it                                │\n\
+└─────────┴────────┴─────────────────────────────────────────┘",
+                "┌────────┬────────┬───────────────────────────┐\n\
+│ check  │ status │           note            │\n\
+├────────┼────────┼───────────────────────────┤\n\
+│        │        │ a note that wraps onto    │\n\
+│ unit   │ ok     │ several lines when the    │\n\
+│ tests  │        │ terminal is narrow enough │\n\
+│        │        │  to force it              │\n\
+└────────┴────────┴───────────────────────────┘",
+            ),
+            (
+                "break-space-starts-a-line-redraw",
+                "┌──────────┬────────────────────────┐\n\
+│  check   │          note          │\n\
+├──────────┼────────────────────────┤\n\
+│ unit     │ path every clone every │\n\
+│ tests    │  host every            │\n\
+└──────────┴────────────────────────┘",
+                "┌────────┬──────────────────┐\n\
+│ check  │       note       │\n\
+├────────┼──────────────────┤\n\
+│ unit   │ path every clone │\n\
+│ tests  │  every host      │\n\
+│        │ every            │\n\
+└────────┴──────────────────┘",
+            ),
+            (
+                "break-space-on-its-own-line-redraw",
+                "┌────────────┬─────────────┐\n\
+│   check    │    note     │\n\
+├────────────┼─────────────┤\n\
+│ unit tests │ hello world │\n\
+└────────────┴─────────────┘",
+                "┌───────┬───────┐\n\
+│ check │ note  │\n\
+├───────┼───────┤\n\
+│ unit  │ hello │\n\
+│ tests │       │\n\
+│       │ world │\n\
+└───────┴───────┘",
+            ),
+            (
+                "centred-cell-and-break-space-redraw",
+                "┌─────────┬───────────────────┐\n\
+│  check  │       note        │\n\
+├─────────┼───────────────────┤\n\
+│ unit    │ path every clone  │\n\
+│ tests   │ every host every  │\n\
+└─────────┴───────────────────┘",
+                "┌───────┬────────────┐\n\
+│ check │    note    │\n\
+├───────┼────────────┤\n\
+│       │ path every │\n\
+│ unit  │  clone     │\n\
+│ tests │ every host │\n\
+│       │  every     │\n\
+└───────┴────────────┘",
+            ),
+        ];
+        for (name, stored, redrawn) in cases {
+            let (state, key, nonce, root) = open_request(name);
+            let id = format!("{nonce}_1");
+            let capture = state
+                .capture_snapshot(&reply_block(&id, stored))
+                .expect("stored");
+            assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+            let capture = state
+                .capture_snapshot(&reply_block(&id, redrawn))
+                .expect("redrawn");
+            assert!(capture.replies.is_empty(), "sent again:\n{redrawn}");
+            assert!(capture.unknown_ids.is_empty());
+            let [refusal] = capture.refused.as_slice() else {
+                panic!("one logged skip expected: {:?}", capture.refused);
+            };
+            assert_eq!(refusal.identifier, id);
+            assert!(
+                refusal.reason.contains("redrawn at another width"),
+                "{refusal}"
+            );
+            assert_eq!(
+                state
+                    .read_request(&key)
+                    .expect("request")
+                    .next_reply_ordinal,
+                2
+            );
+            fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn a_status_that_moves_to_another_row_of_a_table_is_a_new_reply() {
+        let first = "Queue status:\n\
+┌─────┬────────────────┐\n\
+│ PR  │ Blocker        │\n\
+├─────┼────────────────┤\n\
+│ 101 │ waiting for CI │\n\
+│ 102 │                │\n\
+└─────┴────────────────┘";
+        let second = "Queue status:\n\
+┌─────┬────────────────┐\n\
+│ PR  │ Blocker        │\n\
+├─────┼────────────────┤\n\
+│ 101 │                │\n\
+│ 102 │ waiting for CI │\n\
+└─────┴────────────────┘";
+        // At other widths only the rows' layout tells the two apart.
+        let second_wider = "Queue status:\n\
+┌─────┬──────────────────┐\n\
+│ PR  │ Blocker          │\n\
+├─────┼──────────────────┤\n\
+│ 101 │                  │\n\
+│ 102 │ waiting for CI   │\n\
+└─────┴──────────────────┘";
+        for (name, earlier, later) in [
+            ("status-moves-down", first, second),
+            ("status-moves-up", second, first),
+            ("status-moves-down-wider", first, second_wider),
+        ] {
+            let (state, key, nonce, root) = open_request(name);
+            let capture = state
+                .capture_snapshot(&reply_block(&format!("{nonce}_1"), earlier))
+                .expect("earlier");
+            assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+            let capture = state
+                .capture_snapshot(&reply_block(&format!("{nonce}_2"), later))
+                .expect("later");
+            assert_eq!(
+                capture.replies,
+                [(key.clone(), vec![2])],
+                "not sent:\n{later}"
+            );
+            assert!(capture.unknown_ids.is_empty());
+            assert!(capture.refused.is_empty());
+            assert_eq!(state.read_reply(&key, 2).expect("reply").body, later);
+            fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn a_table_that_matches_only_column_by_column_needs_other_widths_and_is_logged() {
+        let (state, key, nonce, root) = open_request("column-only-match");
+        let stored = "│ 1 │ ab  │\n│ 2 │ cd  │";
+        let capture = state
+            .capture_snapshot(&reply_block(&format!("{nonce}_1"), stored))
+            .expect("stored");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+        // At the same cell widths a renderer wraps one text one way, so a table that reads the
+        // same only column by column holds other text, and is sent.
+        let same_widths = "│ 1 │ a   │\n│ 2 │ bcd │";
+        let capture = state
+            .capture_snapshot(&reply_block(&format!("{nonce}_2"), same_widths))
+            .expect("same widths");
+        assert_eq!(capture.replies, [(key.clone(), vec![2])]);
+        assert!(capture.refused.is_empty());
+        // At other widths the same reading is taken for a redraw. Text that differs only in
+        // where a space falls inside a cell cannot be told apart from one, so this skip is the
+        // documented limit of the reading, and it is logged rather than silent.
+        let other_widths = "│ 1 │ abc  │\n│ 2 │ d    │";
+        let capture = state
+            .capture_snapshot(&reply_block(&format!("{nonce}_3"), other_widths))
+            .expect("other widths");
+        assert!(capture.replies.is_empty());
+        let [refusal] = capture.refused.as_slice() else {
+            panic!("one logged skip expected: {:?}", capture.refused);
+        };
+        assert_eq!(refusal.identifier, format!("{nonce}_3"));
+        assert!(
+            refusal.reason.contains("redrawn at another width"),
+            "{refusal}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn progress_bars_that_differ_are_different_replies() {
+        let (state, key, nonce, root) = open_request("progress-bars");
+        let id = format!("{nonce}_1");
+        let rendered = [
+            reply_block(&id, "Rollout: ███░░░░░░░"),
+            reply_block(&id, "Rollout: ████████░░"),
+        ]
+        .concat();
+        let capture = state.capture_snapshot(&rendered).expect("capture");
+        assert_eq!(capture.replies, [(key.clone(), vec![1, 2])]);
+        assert!(capture.refused.is_empty());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn only_lines_a_word_wrapper_could_make_of_one_row_read_as_one_row() {
+        let run = |text: &'static str| {
+            text.split('\n')
+                .map(|line| table_cells(line).expect("table row"))
+                .collect::<Vec<_>>()
+        };
+        // Text at the top of each column, and every break needed.
+        assert!(wrapped_row(&run("│ Merged A │ ok │\n│ and B    │    │")));
+        // A single line is one row.
+        assert!(wrapped_row(&run("│a│b│")));
+        // Text below an empty line, lower than centred, starts another row.
+        assert!(!wrapped_row(&run(
+            "│ 101 │                │\n│ 102 │ waiting for CI │"
+        )));
+        // "and" would have fit after "Merged", so that break was not a wrap.
+        assert!(!wrapped_row(&run("│ Merged     │\n│ and B      │")));
+        // Lines of another width, or without padding, are not one renderer's row.
+        assert!(!wrapped_row(&run("│ Merged A │\n│ and B │")));
+        assert!(!wrapped_row(&run("│Merged A│\n│and B   │")));
+        // Widths are terminal columns: an emoji or a CJK ideograph takes two, and a nonspacing
+        // mark such as a combining accent none.
+        assert!(wrapped_row(&run(
+            "│ ✅ merged the │ 101 │\n│ queue fix     │     │"
+        )));
+        assert!(wrapped_row(&run("│ 修正 merged   │\n│ the queue fix │")));
+        assert!(wrapped_row(&run("│ cafe\u{301} au │\n│ lait    │")));
+        // Padded by characters instead, the emoji line is one column wider than the next.
+        assert!(!wrapped_row(&run("│ ✅ merged the │\n│ queue fix    │")));
+    }
+
+    #[test]
+    fn one_row_may_be_centred_and_keep_the_space_of_a_break_but_nothing_looser() {
+        let run = |text: &'static str| {
+            text.split('\n')
+                .map(|line| table_cells(line).expect("table row"))
+                .collect::<Vec<_>>()
+        };
+        // Claude Code centres a cell that is shorter than its row, with the odd line below.
+        assert!(wrapped_row(&run("│ a │   │\n│ b │ x │\n│ c │   │")));
+        assert!(wrapped_row(&run(
+            "│       │ path every │\n│ unit  │  clone     │\n│ tests │ every host │\n│       │  every     │"
+        )));
+        // Text lower than centred starts another row, and so do lines that no column's text
+        // fills.
+        assert!(!wrapped_row(&run("│ a │   │\n│ b │   │\n│ c │ x │")));
+        assert!(!wrapped_row(&run("│ a │   │\n│ b │ x │\n│   │   │")));
+        // After an exactly full line, the next line starts with the space of the break, and
+        // the space counts: "every" would not have fit after " every host" in 16 columns.
+        assert!(wrapped_row(&run(
+            "│ path every clone │\n│  every host      │\n│ every            │"
+        )));
+        // Without that space "every" would have fit, so the break was not a wrap.
+        assert!(!wrapped_row(&run(
+            "│ path every clone │\n│ every host       │\n│ every            │"
+        )));
+        // The space takes a line of its own when the line before is full and the next word
+        // fills a whole line.
+        assert!(wrapped_row(&run("│ hello │\n│       │\n│ world │")));
+        // An empty line after a line that is not full, or before a word that would have fit
+        // after the space, ends the text, and one break never leaves two empty lines.
+        assert!(!wrapped_row(&run("│ hello  │\n│        │\n│ world  │")));
+        assert!(!wrapped_row(&run("│ hello │\n│       │\n│ wor   │")));
+        assert!(!wrapped_row(&run(
+            "│ hello │\n│       │\n│       │\n│ world │"
+        )));
+    }
+
+    #[test]
+    fn identical_answers_collapse_within_a_request_but_not_across_requests() {
+        let root = temporary("identical-across-requests");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let keys = [1, 2].map(|index| {
+            state
+                .admit_batch(&indexed_delivery(index, index))
+                .expect("admit request")
+                .new_request_keys[0]
+                .clone()
+        });
+        let nonces = keys
+            .clone()
+            .map(|key| state.read_request(&key).expect("request").reply_nonce);
+        let rendered = [
+            reply_block(&format!("{}_1", nonces[0]), "ok"),
+            reply_block(&format!("{}_1", nonces[1]), "ok"),
+            reply_block(&format!("{}_2", nonces[0]), "ok"),
+            reply_block(&format!("{}_2", nonces[1]), " ok "),
+        ]
+        .concat();
+        let mut replies = state.capture_snapshot(&rendered).expect("capture").replies;
+        replies.sort();
+        let mut expected = keys.map(|key| (key, vec![1])).to_vec();
+        expected.sort();
+        assert_eq!(replies, expected);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_block_seen_in_part_is_silent_when_it_matches_a_stored_reply() {
+        let (state, key, nonce, root) = open_request("partial-block-match");
+        let id = format!("{nonce}_1");
+        let capture = state
+            .capture_snapshot(&reply_block(&id, "This is the end of the answer"))
+            .expect("store");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+        for (seen, reported) in [
+            // Its opening marker scrolled away, and the rest is the end of the stored reply.
+            (
+                format!("the end of\n  the answer\n</CHAT_REPLY_{id}>\n"),
+                false,
+            ),
+            // Its closing marker is not written yet, and the start matches the stored reply.
+            (format!("<CHAT_REPLY_{id}>\nThis is the\n"), false),
+            // Nothing of it is visible.
+            (format!("</CHAT_REPLY_{id}>\n"), false),
+            (format!("<CHAT_REPLY_{id}>\n"), false),
+            // What is visible matches no stored reply.
+            (format!("another ending\n</CHAT_REPLY_{id}>\n"), true),
+            (format!("<CHAT_REPLY_{id}>\nThat is\n"), true),
+        ] {
+            let capture = state.capture_snapshot(&seen).expect("partial capture");
+            assert!(capture.replies.is_empty(), "{seen:?}");
+            let expected = if reported {
+                vec![id.clone()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(capture.unknown_ids, expected, "{seen:?}");
+        }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn terminal_control_characters_refuse_only_the_block_that_holds_them() {
+        let (state, key, nonce, root) = open_request("control-characters");
+        let id = format!("{nonce}_1");
+        let rendered = format!(
+            "\u{1b}[2J noise outside any block\n{}{}",
+            reply_block(&id, "clean answer"),
+            reply_block(&id, "bell \u{7} inside")
+        );
+        let capture = state.capture_snapshot(&rendered).expect("capture");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+        assert_eq!(capture.refused.len(), 1);
+        assert_eq!(capture.refused[0].identifier, id);
+        assert!(
+            capture.refused[0]
+                .reason
+                .contains("terminal control characters"),
+            "{}",
+            capture.refused[0]
+        );
+        assert!(capture.unknown_ids.is_empty());
+        assert_eq!(
+            state
+                .read_request(&key)
+                .expect("request")
+                .next_reply_ordinal,
+            2
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn more_visible_blocks_than_the_bound_keeps_the_newest_without_failing() {
+        let nonce = "AAAAAAAAAAAAAAAAAAAAAA";
+        let rendered = (1..=MAX_VISIBLE_MARKERS + 1)
+            .map(|ordinal| reply_block(&format!("{nonce}_{ordinal}"), &format!("answer {ordinal}")))
+            .collect::<String>();
+        let scan = scan_reply_blocks_for_nonces(
+            &rendered,
+            &BTreeSet::from([nonce.to_owned()]),
+            &BTreeSet::new(),
+        )
+        .expect("an overfull capture is not an error");
+        assert!(scan.overflowed);
+        let blocks = &scan.by_nonce[nonce].blocks;
+        assert_eq!(blocks.len(), MAX_VISIBLE_MARKERS);
+        assert_eq!(blocks[0].body, "answer 2");
+        assert_eq!(
+            blocks[MAX_VISIBLE_MARKERS - 1].body,
+            format!("answer {}", MAX_VISIBLE_MARKERS + 1)
+        );
     }
 
     #[test]
@@ -13287,8 +14379,8 @@ complete reply block using one exact available ID."
             .clone();
         let nonce = state.read_request(&key).expect("request").reply_nonce;
         let foreign = "F".repeat(22);
-        // One full feedback round already reported a future ordinal of a live request and all
-        // but one of the foreign IDs below.
+        // One full feedback round already reported the ID of a live request's block seen in part
+        // and all but one of the foreign IDs below.
         let mut reported = (1..MAX_FEEDBACK_UNAVAILABLE_IDS)
             .map(|ordinal| format!("{foreign}_{ordinal}"))
             .collect::<Vec<_>>();
@@ -13305,10 +14397,10 @@ complete reply block using one exact available ID."
         );
         let rendered = (1..=MAX_FEEDBACK_UNAVAILABLE_IDS + 1)
             .map(|ordinal| format!("{foreign}_{ordinal}"))
-            .chain([format!("{nonce}_3")])
             .map(|identifier| {
                 format!("<CHAT_REPLY_{identifier}>\nstray\n</CHAT_REPLY_{identifier}>\n")
             })
+            .chain([format!("<CHAT_REPLY_{nonce}_3>\nstray\n")])
             .collect::<String>();
         let capture = state.capture_snapshot(&rendered).expect("capture");
         assert!(capture.replies.is_empty());
@@ -14416,6 +15508,8 @@ Thread: spaces/example/threads/one (this message starts a new thread)\n\nrun the
                 replies: Vec::new(),
                 unknown_ids: Vec::new(),
                 suppressed_ids: Vec::new(),
+                refused: Vec::new(),
+                overflowed: false,
                 route_entries: Vec::new(),
             }
         );
@@ -15172,10 +16266,12 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                     }
                     let scan = scan_reply_blocks_for_nonces(&rows, &nonces, &BTreeSet::new())
                         .expect("scan wrapped rows");
-                    assert!(
-                        scan.observed_ids.is_empty(),
-                        "width {width} formed {:?}:\n{rows}",
-                        scan.observed_ids
+                    // Every marker the scan parses leaves a block, a refusal, a partial block,
+                    // or an unknown ID, so an empty scan means no marker formed.
+                    assert_eq!(
+                        scan,
+                        MultiReplyScan::default(),
+                        "width {width} formed reply syntax:\n{rows}"
                     );
                 }
             }
@@ -15980,11 +17076,14 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             );
             let scan = scan_reply_blocks(&rendered, nonce).unwrap();
             assert_eq!(
-                scan.blocks,
-                vec![ScannedReply {
-                    ordinal: 1,
-                    body: "[model] answer".to_owned(),
-                }],
+                scan.found,
+                NonceScan {
+                    blocks: vec![ScannedReply {
+                        identifier: format!("{nonce}_1"),
+                        body: "[model] answer".to_owned(),
+                    }],
+                    ..NonceScan::default()
+                },
                 "{bullet}"
             );
         }
