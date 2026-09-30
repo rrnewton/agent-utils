@@ -515,9 +515,14 @@ another batch or `remove` for it.
 
 A refused slot is left in place and reported with its reason, and the remaining slots are still
 attempted. A missing row, a changed generation, a validation slot, and a row whose directory is
-absent are refused before any scan; use `recover-absent-agent-rows` for the last. Corrupt or
-interrupted registry state stops the batch, refuses the remaining slots, and prints
-`RECOVERY REQUIRED`. The human output is one summary line,
+absent are refused before any scan; use `recover-absent-agent-rows` for the last. Any other
+refusal, including one for corrupt registry state, also refuses only its own slot. A slot whose
+removal left an interrupted journal, which `wrkslots recover` must settle, stops the batch instead:
+the remaining slots are refused and the output ends with `RECOVERY REQUIRED`. The batch counts a
+journal only if it is still present while the batch holds the registry lock, so a journal that
+another client writes and retires inside its own lock hold is waited out, not reported. When the
+lock is not taken within the lock wait, the batch stops without naming `wrkslots recover`. The
+human output is one summary line,
 
 ```text
 requested=3 removed=2 refused=1 shared_process_censuses=1 fresh_process_scans=7 seconds=131.4

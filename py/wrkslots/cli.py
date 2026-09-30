@@ -26575,17 +26575,16 @@ def _agent_batch_use_check(
     return {"agent_batch": agent_batch, "canonical_path": canonical_path}
 
 
-def _interrupted_removal_journal(config: Config, slot: str) -> Path | None:
-    """Return a journal file that a removal of this machine's ``slot`` left.
+def _removal_journal_candidate(config: Config, slot: str) -> Path | None:
+    """Return a journal file that a removal of this machine's ``slot`` may have left.
 
-    A removal that fails after writing its finish journal and cannot roll it
-    back leaves that journal for 'wrkslots recover'.  Only the two files a
-    removal of ``slot`` writes are read: this machine's registry journal and
-    the slot's own finish journal.  The append-only history is not replayed
-    here; ordinary remove still refuses every outstanding journal, of any
-    kind, under the registry lock.  This read takes no lock, so a journal
-    another client holds open for the same slot also counts; the caller stops
-    either way.  A journal whose slot cannot be read counts.
+    Only the two files a removal of ``slot`` writes are read: this machine's
+    registry journal and the slot's own finish journal.  The append-only
+    history is not replayed here; ordinary remove still refuses every
+    outstanding journal, of any kind, under the registry lock.  A journal
+    whose slot cannot be read counts.  This read takes no lock, so it also
+    finds a journal that another client holds for an operation still in
+    progress; _interrupted_removal_journal rechecks under the lock.
     """
 
     for path in (_journal_path(config), _finish_journal_path(config, slot)):
@@ -26598,6 +26597,30 @@ def _interrupted_removal_journal(config: Config, slot: str) -> Path | None:
         if not isinstance(value, dict) or value.get("slot") in (slot, None):
             return path
     return None
+
+
+def _interrupted_removal_journal(
+    config: Config, slot: str, wait_seconds: float
+) -> Path | None:
+    """Return a journal that an interrupted removal of this machine's ``slot`` left.
+
+    A removal that fails after writing its finish journal and cannot roll it
+    back leaves that journal for 'wrkslots recover'.  A removal of an agent
+    slot writes and retires its journal inside one registry-lock hold, so a
+    journal that is still present while this call holds the lock was left by
+    an interrupted operation, not by one in progress.  The lock is taken only
+    when a lock-free read finds a candidate, so the common case waits for no
+    lock.  A validation removal can keep its journal across a lock release
+    while it runs its process census, so for a validation slot a journal found
+    here can still belong to a removal in progress; remove-agent-batch refuses
+    validation slots in any case.  Raises Refusal when the lock is not taken
+    within ``wait_seconds``.
+    """
+
+    if _removal_journal_candidate(config, slot) is None:
+        return None
+    with _mutation_locks(config, wait_seconds):
+        return _removal_journal_candidate(config, slot)
 
 
 def _read_agent_batch_items(args: argparse.Namespace) -> tuple[tuple[str, int], ...]:
@@ -26648,19 +26671,40 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
             "recover' before another removal"
         )
 
+    def unconfirmed_reason(exc: Refusal) -> str:
+        return (
+            "a removal journal for this slot exists, and whether an interrupted "
+            f"removal left it could not be checked under the registry lock: {exc}"
+        )
+
+    unconfirmed_stop = (
+        "batch stopped: a removal journal could not be checked under the registry "
+        "lock; retry the remaining slots"
+    )
+
     def stop_remaining(reason: str) -> None:
         for later_slot, later_generation in requested:
             if later_slot not in decided:
                 refuse(later_slot, later_generation, reason)
 
+    wait_seconds = (
+        args.wait_lock if args.wait_lock > 0 else AGENT_REMOVE_BATCH_WAIT_LOCK_SECONDS
+    )
     # Read-only preflight.  It selects the paths the shared scan must cover;
     # every item is decided again under the registry lock by ordinary remove.
+    # Only a journal found by the lock-free read is rechecked under the lock.
     state = _load_active(config, require_repository=False)
     records = {record.slot: record for record in state.slots}
     eligible: list[tuple[str, int, Path]] = []
     identities: dict[Path, tuple[int, int]] = {}
     for slot, generation in requested:
-        interrupted = _interrupted_removal_journal(config, slot)
+        try:
+            interrupted = _interrupted_removal_journal(config, slot, wait_seconds)
+        except Refusal as exc:
+            refuse(slot, generation, unconfirmed_reason(exc))
+            stop_remaining(unconfirmed_stop)
+            eligible.clear()
+            break
         if interrupted is not None:
             recovery_required = True
             refuse(slot, generation, recovery_reason(interrupted), recovery_required=True)
@@ -26704,9 +26748,6 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
         eligible.append((slot, generation, slot_path))
     context = _AgentRemoveBatchContext(identities)
     remaining_targets = [slot_path for _slot, _generation, slot_path in eligible]
-    wait_seconds = (
-        args.wait_lock if args.wait_lock > 0 else AGENT_REMOVE_BATCH_WAIT_LOCK_SECONDS
-    )
     for index, (slot, generation, slot_path) in enumerate(eligible):
         if context.shared_census_count == 0 or (
             time.monotonic() - context.captured_at
@@ -26733,26 +26774,26 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
         context.nested_git_evidence.clear()
         try:
             _cmd_remove(item_args, emit=False, agent_batch=context)
-        except StateError as exc:
-            recovery_required = True
-            refuse(
-                slot,
-                generation,
-                str(exc),
-                seconds=round(time.monotonic() - item_started, 3),
-                recovery_required=True,
-            )
-            stop_remaining(
-                "batch stopped after a state error; run 'wrkslots recover' and "
-                "retry the remaining slots"
-            )
-            break
         except Refusal as exc:
             seconds = round(time.monotonic() - item_started, 3)
-            # A refusal after the finish journal was written normally rolls
-            # the journal back.  When it cannot, the journal stays for
-            # 'wrkslots recover' and no later item can proceed.
-            interrupted = _interrupted_removal_journal(config, slot)
+            # StateError is a Refusal too.  Whether the batch can go on
+            # depends only on whether the item left an interrupted removal,
+            # not on the class of the exception: an invariant check raises
+            # StateError before any journal exists, and a refusal after the
+            # finish journal was written normally rolls the journal back.
+            # When it cannot, the journal stays for 'wrkslots recover' and no
+            # later item can proceed.
+            try:
+                interrupted = _interrupted_removal_journal(config, slot, wait_seconds)
+            except Refusal as check:
+                refuse(
+                    slot,
+                    generation,
+                    f"{exc}; {unconfirmed_reason(check)}",
+                    seconds=seconds,
+                )
+                stop_remaining(unconfirmed_stop)
+                break
             if interrupted is None:
                 refuse(slot, generation, str(exc), seconds=seconds)
             else:

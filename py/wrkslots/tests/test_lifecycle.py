@@ -39823,6 +39823,215 @@ def test_remove_agent_batch_stops_and_names_recover_when_an_item_leaves_its_jour
     assert active_slot_names(project) == []
 
 
+def in_process_agent_batch_waiting(
+    project: Path, slots: Sequence[str], wait_lock: float
+) -> tuple[int, dict[str, object], str]:
+    """Run remove-agent-batch in this process with the global --wait-lock."""
+
+    arguments = agent_batch_arguments(project, slots)
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        returncode = wrkslots.main(
+            [*arguments[:2], "--wait-lock", str(wait_lock), *arguments[2:]]
+        )
+    text = stdout.getvalue()
+    return returncode, json.loads(text) if text.strip() else {}, stderr.getvalue()
+
+
+def hold_registry_with_journal(project: Path, slot: str, seconds: float) -> threading.Thread:
+    """Act as another client with a removal of ``slot`` in progress.
+
+    The thread takes the registry mutation locks, writes this machine's
+    registry journal for ``slot``, holds both for ``seconds``, then retires the
+    journal and releases the locks, as one registry-lock hold of an ordinary
+    removal does.  It returns once the journal exists.
+    """
+
+    config = wrkslots._load_config(str(project), "testhost")
+    journal = wrkslots._journal_path(config)
+    ready = threading.Event()
+    failures: list[BaseException] = []
+
+    def hold() -> None:
+        try:
+            with wrkslots._mutation_locks(config, 10.0):
+                journal.write_text(
+                    json.dumps({"kind": "remove", "slot": slot}), encoding="utf-8"
+                )
+                ready.set()
+                time.sleep(seconds)
+                journal.unlink()
+        except BaseException as exc:  # reported by the assertion below
+            failures.append(exc)
+            ready.set()
+
+    thread = threading.Thread(target=hold, daemon=True)
+    thread.start()
+    assert ready.wait(10.0)
+    assert failures == []
+    return thread
+
+
+def test_remove_agent_batch_preflight_waits_out_a_journal_another_client_holds(
+    tmp_path: Path,
+) -> None:
+    """A journal that exists only inside another client's lock hold is not a recovery.
+
+    The lock-free preflight read finds the journal, and the recheck under the
+    registry lock finds it retired, so every slot is removed and the batch does
+    not tell the operator to run 'wrkslots recover'.
+    """
+
+    project, _repository, slots = dead_agent_batch_project(tmp_path)
+    holder = hold_registry_with_journal(project, "slot01", 1.0)
+    try:
+        returncode, payload, stderr = in_process_agent_batch(project, slots)
+    finally:
+        holder.join(15.0)
+
+    assert not holder.is_alive()
+    assert returncode == 0, stderr
+    assert batch_slots(payload, "removed") == slots
+    assert payload["refused"] == []
+    assert payload["recovery_required"] is False
+    assert active_slot_names(project) == []
+    assert registry_journals(project) == []
+
+
+def test_remove_agent_batch_keeps_going_when_a_refused_items_journal_was_in_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ordinary refusal stays one item's refusal when the journal was live.
+
+    Right after slot02 refuses, another client holds a registry journal for
+    slot02 inside its lock hold.  The recheck under the lock finds it retired,
+    so slot02 alone is refused and slot03 is still removed.
+    """
+
+    project, _repository, slots = dead_agent_batch_project(tmp_path)
+    original = wrkslots._cmd_remove
+    holders: list[threading.Thread] = []
+
+    def refuse_slot02_while_another_client_holds_its_journal(
+        args: argparse.Namespace, **kwargs: object
+    ) -> int:
+        if args.slot == "slot02":
+            holders.append(hold_registry_with_journal(project, "slot02", 1.0))
+            raise wrkslots.Refusal("injected ordinary refusal")
+        return original(args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        wrkslots, "_cmd_remove", refuse_slot02_while_another_client_holds_its_journal
+    )
+    try:
+        returncode, payload, stderr = in_process_agent_batch(project, slots)
+    finally:
+        for holder in holders:
+            holder.join(15.0)
+
+    assert len(holders) == 1 and not holders[0].is_alive()
+    assert returncode == 1, stderr
+    assert batch_slots(payload, "removed") == ["slot01", "slot03"]
+    assert batch_slots(payload, "refused") == ["slot02"]
+    refused = cast(list[Mapping[str, object]], payload["refused"])[0]
+    assert refused["reason"] == "injected ordinary refusal"
+    assert "recovery_required" not in refused
+    assert payload["recovery_required"] is False
+    assert active_slot_names(project) == ["slot02"]
+    assert registry_journals(project) == []
+
+
+def test_remove_agent_batch_stops_without_naming_recover_when_a_journal_cannot_be_checked(
+    tmp_path: Path,
+) -> None:
+    """A journal whose lock stays busy past --wait-lock stops the batch unconfirmed.
+
+    Nothing is removed, and the report neither claims an interrupted removal
+    nor names 'wrkslots recover'.
+    """
+
+    project, _repository, slots = dead_agent_batch_project(tmp_path)
+    holder = hold_registry_with_journal(project, "slot02", 3.0)
+    try:
+        returncode, payload, stderr = in_process_agent_batch_waiting(project, slots, 0.5)
+    finally:
+        holder.join(15.0)
+
+    assert not holder.is_alive()
+    assert returncode == 1, stderr
+    assert payload["removed"] == []
+    assert batch_slots(payload, "refused") == slots
+    assert payload["recovery_required"] is False
+    assert payload["shared_process_censuses"] == 0
+    by_slot = {
+        str(row["slot"]): row for row in cast(list[Mapping[str, object]], payload["refused"])
+    }
+    assert str(by_slot["slot02"]["reason"]).startswith(
+        "a removal journal for this slot exists, and whether an interrupted removal "
+        "left it could not be checked under the registry lock: configuration lock is "
+        "busy for "
+    )
+    stopped = (
+        "batch stopped: a removal journal could not be checked under the registry "
+        "lock; retry the remaining slots"
+    )
+    assert by_slot["slot03"]["reason"] == stopped
+    # slot01 passed its own check before slot02 stopped the batch.
+    assert by_slot["slot01"]["reason"] == stopped
+    for row in by_slot.values():
+        assert "recover" not in str(row["reason"])
+        assert "recovery_required" not in row
+    assert active_slot_names(project) == slots
+    assert registry_journals(project) == []
+
+
+def test_remove_agent_batch_decides_recovery_by_the_journal_not_the_state_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A StateError raised before any journal exists refuses only its item.
+
+    The same StateError after the item wrote its journal stops the batch and
+    names 'wrkslots recover', exactly as a Refusal that leaves the journal does.
+    """
+
+    project, _repository, slots = dead_agent_batch_project(tmp_path, count=4)
+    original = wrkslots._cmd_remove
+    config = wrkslots._load_config(str(project), "testhost")
+    journal = wrkslots._journal_path(config)
+
+    def state_errors(args: argparse.Namespace, **kwargs: object) -> int:
+        if args.slot == "slot02":
+            raise wrkslots.StateError("injected invariant check before any journal")
+        if args.slot == "slot03":
+            journal.write_text(
+                json.dumps({"kind": "remove", "slot": "slot03"}), encoding="utf-8"
+            )
+            raise wrkslots.StateError("injected state error after the journal")
+        return original(args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(wrkslots, "_cmd_remove", state_errors)
+    returncode, payload, stderr = in_process_agent_batch(project, slots)
+
+    assert returncode == 1, stderr
+    assert batch_slots(payload, "removed") == ["slot01"]
+    assert batch_slots(payload, "refused") == ["slot02", "slot03", "slot04"]
+    assert payload["recovery_required"] is True
+    invariant, interrupted, later = cast(list[Mapping[str, object]], payload["refused"])
+    assert invariant["reason"] == "injected invariant check before any journal"
+    assert "recovery_required" not in invariant
+    assert interrupted["reason"] == (
+        "injected state error after the journal; an interrupted removal is recorded "
+        f"in {journal}; run 'wrkslots recover' before another removal"
+    )
+    assert interrupted["recovery_required"] is True
+    assert later["reason"] == (
+        "batch stopped: an earlier item left an interrupted removal; run "
+        "'wrkslots recover' and retry the remaining slots"
+    )
+    assert active_slot_names(project) == ["slot02", "slot03", "slot04"]
+
+
 def test_remove_agent_batch_reports_each_items_disposable_nested_repositories(
     tmp_path: Path,
 ) -> None:
