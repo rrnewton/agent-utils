@@ -55,8 +55,6 @@ const BATCH_ID_PLACEHOLDER: &str = "????????????????";
 /// Batch id shown by `render`; the same length as a real id, so render and deliver choose the
 /// same notices under the same budget.
 const PREVIEW_BATCH_ID: &str = "preview-not-sent";
-/// How long a non-blocking lock keeps retrying before it reports busy.
-const LOCK_GRACE: Duration = Duration::from_millis(500);
 /// Busy: the queue is full or another delivery is running.
 const EXIT_BUSY: i32 = crate::error::EXIT_BUSY;
 /// The delivery adapter failed; the batch stays claimed for a retry with the same key.
@@ -550,19 +548,11 @@ impl Inbox {
             file.lock_exclusive().map_err(|error| {
                 InboxError::io(&format!("cannot lock {}", path.display()), &error)
             })?;
-            return Ok(file);
-        }
-        // A holder that is just finishing, or a lock briefly kept alive by a descriptor that a
-        // concurrently spawned child inherited before its exec, is given a short grace period.
-        let deadline = std::time::Instant::now() + LOCK_GRACE;
-        while file.try_lock_exclusive().is_err() {
-            if std::time::Instant::now() >= deadline {
-                return Err(InboxError::busy(format!(
-                    "another process holds {}; retry later",
-                    path.display()
-                )));
-            }
-            std::thread::sleep(Duration::from_millis(10));
+        } else if file.try_lock_exclusive().is_err() {
+            return Err(InboxError::busy(format!(
+                "another process holds {}; retry later",
+                path.display()
+            )));
         }
         Ok(file)
     }
@@ -1265,6 +1255,22 @@ fn render_batch(
     (text, taken)
 }
 
+/// Spawn a command, retrying briefly while its executable is busy for writing (`ETXTBSY`): that
+/// happens when the file is being replaced, or while a concurrently forked process still holds an
+/// inherited write descriptor to it before its own exec.
+pub(crate) fn spawn_retrying(command: &mut Command) -> io::Result<std::process::Child> {
+    let mut attempt = 0;
+    loop {
+        match command.spawn() {
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && attempt < 20 => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            result => return result,
+        }
+    }
+}
+
 fn notify_agentcloud(
     scratch: &Path,
     agentcloudctl: &Path,
@@ -1285,26 +1291,27 @@ fn notify_agentcloud(
     let stderr = fs::File::create(&stderr_path).map_err(|error| {
         InboxError::io(&format!("cannot create {}", stderr_path.display()), &error)
     })?;
-    let mut child = Command::new(agentcloudctl)
-        .args([
-            "notify",
-            "--session",
-            session,
-            "--mode",
-            "cli-script",
-            "--idempotency-key",
-            key,
-            "--text",
-            text,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(stderr)
-        .spawn()
-        .map_err(|error| {
-            let _ = fs::remove_file(&stderr_path);
-            InboxError::unavailable(format!("cannot run {}: {error}", agentcloudctl.display()))
-        })?;
+    let mut child = spawn_retrying(
+        Command::new(agentcloudctl)
+            .args([
+                "notify",
+                "--session",
+                session,
+                "--mode",
+                "cli-script",
+                "--idempotency-key",
+                key,
+                "--text",
+                text,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(stderr),
+    )
+    .map_err(|error| {
+        let _ = fs::remove_file(&stderr_path);
+        InboxError::unavailable(format!("cannot run {}: {error}", agentcloudctl.display()))
+    })?;
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -1354,8 +1361,45 @@ fn print_json(value: &impl Serialize) -> Result<()> {
         .map_err(|error| InboxError::io("cannot write output", &error))
 }
 
+/// Test-only coordination. Every test in this binary shares one process, and a child forked by one
+/// test thread briefly inherits the other threads' descriptors until its exec: an inbox lock stays
+/// held, or a freshly written fake executable stays open for writing. Tests that spawn processes
+/// take the guard exclusively; tests that depend on lock timing take it shared.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+    static PROCESS_GUARD: RwLock<()> = RwLock::new(());
+
+    pub(crate) fn shared() -> RwLockReadGuard<'static, ()> {
+        PROCESS_GUARD
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn exclusive() -> RwLockWriteGuard<'static, ()> {
+        PROCESS_GUARD
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A scratch directory unique across threads and runs.
+    pub(crate) fn scratch(prefix: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let index = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let path =
+            std::env::temp_dir().join(format!("{prefix}-{}-{nanos}-{index}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::{exclusive, shared};
     use super::*;
     use std::cell::{Cell, RefCell};
     use std::ffi::OsString;
@@ -1373,13 +1417,7 @@ mod tests {
     };
 
     fn scratch() -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "agentctl-inbox-test-{}-{}",
-            std::process::id(),
-            hash_hex(&[format!("{:?}", SystemTime::now()).as_bytes()], 6)
-        ));
-        fs::create_dir_all(&path).unwrap();
-        path
+        super::test_support::scratch("agentctl-inbox-test")
     }
 
     fn request<'a>(agent: &'a str, kind: NoticeKind, text: &'a str) -> PostRequest<'a> {
@@ -1404,6 +1442,7 @@ mod tests {
 
     #[test]
     fn newer_state_replaces_older_and_widens_the_range() {
+        let _serial = shared();
         let registry = scratch();
         let inbox = Inbox::open(&registry, "coord").unwrap();
         let first = PostRequest {
@@ -1441,6 +1480,7 @@ mod tests {
 
     #[test]
     fn a_replacement_never_lowers_priority_so_it_cannot_expire_away() {
+        let _serial = shared();
         let registry = scratch();
         let inbox = Inbox::open(&registry, "coord").unwrap();
         post(&inbox, "kvm", NoticeKind::Idle, "idle", 0);
@@ -1463,6 +1503,7 @@ mod tests {
 
     #[test]
     fn working_withdraws_the_state_notice_but_not_messages() {
+        let _serial = shared();
         let registry = scratch();
         let inbox = Inbox::open(&registry, "coord").unwrap();
         post(&inbox, "kvm", NoticeKind::Idle, "idle", 1);
@@ -1484,6 +1525,7 @@ mod tests {
 
     #[test]
     fn messages_are_never_coalesced_and_keys_are_idempotent_across_delivery() {
+        let _serial = shared();
         let registry = scratch();
         let inbox = Inbox::open(&registry, "coord").unwrap();
         let keyed = |now| {
@@ -1523,6 +1565,7 @@ mod tests {
 
     #[test]
     fn order_is_priority_then_age() {
+        let _serial = shared();
         let registry = scratch();
         let inbox = Inbox::open(&registry, "coord").unwrap();
         post(&inbox, "a", NoticeKind::Progress, "p3", 1);
@@ -1537,6 +1580,7 @@ mod tests {
 
     #[test]
     fn stale_priority_three_notices_expire_and_others_do_not() {
+        let _serial = shared();
         let registry = scratch();
         let inbox = Inbox::open(&registry, "coord").unwrap();
         post(&inbox, "a", NoticeKind::StillIdle, "old reminder", 0);
@@ -1546,6 +1590,7 @@ mod tests {
 
     #[test]
     fn a_full_queue_refuses_new_workers_but_accepts_replacements_and_ignores_stale_notices() {
+        let _serial = shared();
         let registry = scratch();
         let inbox = Inbox::open(&registry, "coord").unwrap();
         let limited = |agent, kind| PostRequest {
@@ -1577,6 +1622,7 @@ mod tests {
 
     #[test]
     fn render_keeps_the_whole_budget_but_always_includes_the_first_notice() {
+        let _serial = shared();
         let registry = scratch();
         let inbox = Inbox::open(&registry, "coord").unwrap();
         post(&inbox, "a", NoticeKind::Blocked, &"x".repeat(900), 1);
@@ -1607,6 +1653,7 @@ mod tests {
 
     #[test]
     fn control_characters_cannot_forge_lines() {
+        let _serial = shared();
         let registry = scratch();
         let inbox = Inbox::open(&registry, "coord").unwrap();
         post(
@@ -1629,6 +1676,7 @@ mod tests {
 
     #[test]
     fn notify_batches_are_capped_and_a_huge_budget_cannot_jam_the_queue() {
+        let _serial = shared();
         let registry = scratch();
         let inbox = Inbox::open(&registry, "coord").unwrap();
         // Each notice renders to about 1.7 KB (600 bytes of text plus a 1000-byte path), so 70
@@ -1667,6 +1715,7 @@ mod tests {
 
     #[test]
     fn a_failed_delivery_is_resent_unchanged_before_new_notices() {
+        let _serial = shared();
         let registry = scratch();
         let inbox = Inbox::open(&registry, "coord").unwrap();
         post(&inbox, "a", NoticeKind::Idle, "first", 1);
@@ -1710,6 +1759,7 @@ mod tests {
 
     #[test]
     fn a_claimed_batch_is_not_resent_to_another_adapter_or_session_until_released() {
+        let _serial = shared();
         let registry = scratch();
         let inbox = Inbox::open(&registry, "coord").unwrap();
         post(&inbox, "a", NoticeKind::Idle, "first", 1);
@@ -1783,6 +1833,7 @@ mod tests {
 
     #[test]
     fn requeued_notices_sent_to_another_session_get_a_new_idempotency_key() {
+        let _serial = shared();
         let registry = scratch();
         let inbox = Inbox::open(&registry, "coord").unwrap();
         post(&inbox, "a", NoticeKind::Message, "report", 1);
@@ -1816,6 +1867,7 @@ mod tests {
 
     #[test]
     fn render_and_deliver_choose_the_same_notices() {
+        let _serial = shared();
         let registry = scratch();
         let inbox = Inbox::open(&registry, "coord").unwrap();
         for index in 0..12 {
@@ -1842,6 +1894,7 @@ mod tests {
 
     #[test]
     fn live_copies_left_by_an_interrupted_claim_are_not_delivered_twice() {
+        let _serial = shared();
         let registry = scratch();
         let inbox = Inbox::open(&registry, "coord").unwrap();
         post(&inbox, "a", NoticeKind::Blocked, "needs approval", 1);
@@ -1882,6 +1935,7 @@ mod tests {
 
     #[test]
     fn an_unreadable_delivered_record_does_not_block_posts_or_deliveries() {
+        let _serial = shared();
         let registry = scratch();
         let inbox = Inbox::open(&registry, "coord").unwrap();
         fs::write(
@@ -1906,6 +1960,7 @@ mod tests {
 
     #[test]
     fn a_second_concurrent_delivery_is_refused_as_busy() {
+        let _serial = shared();
         let registry = scratch();
         let inbox = Inbox::open(&registry, "coord").unwrap();
         post(&inbox, "a", NoticeKind::Idle, "x", 1);
@@ -1924,6 +1979,7 @@ mod tests {
 
     #[test]
     fn names_cursors_and_sizes_are_validated() {
+        let _serial = shared();
         assert!(check_name("--to", "coord").is_ok());
         assert!(check_name("--to", "sub-worker_1.a").is_ok());
         for bad in ["", "Coord", "-x", "a/b", "a b", &"a".repeat(65)] {
@@ -1966,6 +2022,7 @@ mod tests {
 
     #[test]
     fn utc_formatting_matches_known_instants() {
+        let _serial = shared();
         assert_eq!(utc_date(0), "1970-01-01");
         assert_eq!(utc_date(1_790_712_924_000), "2026-09-29");
         assert_eq!(utc_clock(1_790_712_924_000), "20:15:24Z");
@@ -1991,6 +2048,7 @@ mod tests {
 
     #[test]
     fn cli_exit_codes_match_the_userguide() {
+        let _serial = exclusive();
         let registry = scratch();
         let post = ["inbox", "post", "--to", "coord", "--from", "a", "--kind"];
         assert_eq!(
@@ -2074,6 +2132,7 @@ mod tests {
 
     #[test]
     fn cli_notify_passes_the_documented_argv_and_retries_with_the_same_key() {
+        let _serial = exclusive();
         let registry = scratch();
         let log = registry.join("argv.log");
         let flag = registry.join("fail");
@@ -2148,6 +2207,7 @@ mod tests {
 
     #[test]
     fn cli_notify_times_out_and_keeps_the_batch_claimed() {
+        let _serial = exclusive();
         let registry = scratch();
         let fake = fake_agentcloudctl(&registry, "exec sleep 30");
         let fake = fake.to_str().unwrap();

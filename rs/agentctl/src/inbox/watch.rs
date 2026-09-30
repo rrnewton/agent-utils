@@ -42,6 +42,8 @@ const EXITED_MEMORY_MS: u64 = 86_400_000;
 const TRANSCRIPT_TAIL_BYTES: u64 = 8 * 1024 * 1024;
 /// Seconds one `herdr` or `claude` query may run.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a query's output may stay open after its process exits, and after a kill.
+const DESCENDANT_GRACE: Duration = Duration::from_secs(2);
 
 /// `agentctl inbox watch` arguments.
 #[derive(Args)]
@@ -158,10 +160,12 @@ fn file_length(path: Option<&Path>) -> u64 {
 /// the watcher does not announce every idle worker at once; its current idle period earns no
 /// reminders either. A worker missing for `exit_samples` samples in a row is announced as exited,
 /// and remembered for a day so that its return withdraws or replaces that notice. A sample in
-/// which Herdr listed no worker at all is treated as unknown, not as every worker leaving.
+/// which Herdr listed no pane at all (`listed_anything` false, judged before the coordinator and
+/// excluded panes are filtered out) is treated as unknown, not as every worker leaving.
 pub(crate) fn step(
     state: &mut WatchState,
     sample: &[Observation],
+    listed_anything: bool,
     now: u64,
     policy: Policy,
 ) -> Vec<Decision> {
@@ -179,7 +183,10 @@ pub(crate) fn step(
             policy.idle_samples.max(1)
         };
         let Some(record) = state.workers.get_mut(&observation.agent) else {
-            let observed = observation.state.unwrap_or(WorkerState::Working);
+            // A worker is first recorded once its state is known, so a quiet start stays quiet.
+            let Some(observed) = observation.state else {
+                continue;
+            };
             let announced = match observed {
                 WorkerState::Blocked => {
                     decide(&observation.agent, NoticeKind::Blocked);
@@ -281,11 +288,7 @@ pub(crate) fn step(
             decide(&observation.agent, NoticeKind::StillIdle);
         }
     }
-    let listed_nobody = sample.is_empty()
-        && state
-            .workers
-            .values()
-            .any(|record| record.exited_unix_ms.is_none());
+    let listed_nobody = !listed_anything;
     let seen = sample
         .iter()
         .map(|observation| observation.agent.as_str())
@@ -340,20 +343,29 @@ fn worker_name(name: Option<&str>, pane: &str) -> String {
     }
 }
 
-/// Make worker names unique within one sample: every member of a colliding group gets its pane
-/// id appended, and a counter if that still collides.
-fn disambiguate(observations: &mut [Observation]) {
+/// Make worker names unique within one sample. In a colliding group, the pane that already owns
+/// the worker record of that name keeps it; every other member gets its pane id appended, and a
+/// counter if that still collides. Renaming the owner would announce a live worker as exited.
+fn disambiguate(observations: &mut [Observation], state: &WatchState) {
     let mut counts = HashMap::new();
     for observation in observations.iter() {
         *counts.entry(observation.agent.clone()).or_insert(0_u32) += 1;
     }
+    let owns = |observation: &Observation| {
+        state
+            .workers
+            .get(&observation.agent)
+            .is_some_and(|record| record.pane == observation.pane)
+    };
+    let keeps = |observation: &Observation| counts[&observation.agent] == 1 || owns(observation);
     let mut used = observations
         .iter()
-        .filter(|observation| counts[&observation.agent] == 1)
+        .filter(|observation| keeps(observation))
         .map(|observation| observation.agent.clone())
         .collect::<HashSet<_>>();
-    for observation in observations.iter_mut() {
-        if counts[&observation.agent] == 1 {
+    let keep = observations.iter().map(keeps).collect::<Vec<_>>();
+    for (observation, keep) in observations.iter_mut().zip(keep) {
+        if keep {
             continue;
         }
         let base = format!("{}-{}", observation.agent, sanitize(&observation.pane));
@@ -402,16 +414,17 @@ struct ClaudeSession {
 /// Run a query command in its own process group with a deadline and return its stdout. On the
 /// deadline the whole group is killed, so a grandchild holding stdout open cannot outlive it.
 fn query(program: &Path, arguments: &[&str], timeout: Duration) -> Result<Vec<u8>> {
-    let mut child = Command::new(program)
-        .args(arguments)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .map_err(|error| {
-            InboxError::unavailable(format!("cannot run {}: {error}", program.display()))
-        })?;
+    let mut child = super::spawn_retrying(
+        Command::new(program)
+            .args(arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0),
+    )
+    .map_err(|error| {
+        InboxError::unavailable(format!("cannot run {}: {error}", program.display()))
+    })?;
     let group = i32::try_from(child.id()).unwrap_or(0);
     let kill_group = || {
         if group > 0 {
@@ -447,16 +460,22 @@ fn query(program: &Path, arguments: &[&str], timeout: Duration) -> Result<Vec<u8
             }
         }
     };
-    // A descendant may still hold the pipe after the direct child exits. Only then is the group
-    // killed: while it holds the pipe the group exists, so its id cannot have been reused.
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let (read, status) = match receiver.recv_timeout(remaining) {
+    // A descendant may still hold the pipe after the direct child exits. It gets a short grace,
+    // then the group is killed: while it holds the pipe the group exists, so its id cannot have
+    // been reused. A descendant that left the group and keeps the pipe is abandoned, not awaited.
+    let grace = deadline
+        .saturating_duration_since(Instant::now())
+        .min(DESCENDANT_GRACE);
+    let (read, status) = match receiver.recv_timeout(grace) {
         Ok(read) => (read, status),
         Err(_) => {
             kill_group();
-            let read = receiver
-                .recv()
-                .map_err(|_| InboxError::unavailable("query reader stopped"))?;
+            let read = receiver.recv_timeout(DESCENDANT_GRACE).map_err(|_| {
+                InboxError::unavailable(format!(
+                    "{} left a process holding its output open",
+                    program.display()
+                ))
+            })?;
             // Output cut off by the kill is not a complete answer.
             (read, None)
         }
@@ -537,13 +556,15 @@ fn claude_sessions(sources: &Sources<'_>) -> Option<BTreeMap<String, ClaudeSessi
 }
 
 /// Take one sample of every Herdr pane that hosts an agent.
-fn sample(sources: &Sources<'_>, ignored: &[String]) -> Result<Vec<Observation>> {
+/// Returns the observations and whether Herdr listed any pane at all.
+fn sample(sources: &Sources<'_>, ignored: &[String]) -> Result<(Vec<Observation>, bool)> {
     let listing: HerdrList =
         serde_json::from_slice(&query(sources.herdr, &["agent", "list"], sources.timeout)?)
             .map_err(|error| {
                 InboxError::unavailable(format!("cannot parse `herdr agent list`: {error}"))
             })?;
     let claude = claude_sessions(sources);
+    let listed_anything = !listing.result.agents.is_empty();
     let mut observations = Vec::new();
     for agent in listing.result.agents {
         let (Some(status), Some(harness)) = (agent.agent_status.as_deref(), agent.agent.as_deref())
@@ -582,8 +603,7 @@ fn sample(sources: &Sources<'_>, ignored: &[String]) -> Result<Vec<Observation>>
             transcript,
         });
     }
-    disambiguate(&mut observations);
-    Ok(observations)
+    Ok((observations, listed_anything))
 }
 
 /// The last assistant prose in a Claude transcript between `start` and its end, and the end
@@ -713,48 +733,87 @@ struct Posted {
     outcome: &'static str,
 }
 
-/// One sample: read state, observe, decide, post, and save state after every post.
+/// One sample: read state, observe, decide, and post.
+///
+/// A decision's effect on its worker's record is committed (and `watch.json` saved) only after its
+/// notice was posted. If a post fails, that worker and every worker whose notice was not posted
+/// yet keep their previous records, so the next sample decides the same notices again instead of
+/// believing they were sent.
 fn cycle(
     inbox: &Inbox,
     sources: &Sources<'_>,
     ignored: &[String],
     policy: Policy,
+    max_live: usize,
 ) -> Result<serde_json::Value> {
     let state_path = inbox.root.join("watch.json");
-    let mut state = fs::read(&state_path)
+    let previous = fs::read(&state_path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<WatchState>(&bytes).ok())
         .unwrap_or_default();
-    state.schema = 1;
     let now = now_ms()?;
-    let observations = sample(sources, ignored)?;
-    let decisions = step(&mut state, &observations, now, policy);
+    let (mut observations, listed_anything) = sample(sources, ignored)?;
+    disambiguate(&mut observations, &previous);
+    let mut next = previous.clone();
+    next.schema = 1;
+    let decisions = step(&mut next, &observations, listed_anything, now, policy);
+    // Start from the new state with every worker that has a pending notice rolled back.
+    let mut committed = next.clone();
+    for decision in &decisions {
+        match previous.workers.get(&decision.agent) {
+            Some(record) => {
+                committed
+                    .workers
+                    .insert(decision.agent.clone(), record.clone());
+            }
+            None => {
+                committed.workers.remove(&decision.agent);
+            }
+        }
+    }
     let mut posted = Vec::new();
     for decision in &decisions {
-        let (text, cursor) = match (decision.kind, state.workers.get_mut(&decision.agent)) {
+        let (text, cursor) = match (decision.kind, next.workers.get_mut(&decision.agent)) {
             (NoticeKind::Working, _) | (_, None) => (String::new(), None),
             (_, Some(record)) => notice_text(decision, record, sources, policy.exit_samples),
         };
-        let outcome = inbox.post(
+        let result = inbox.post(
             &PostRequest {
                 agent: &decision.agent,
                 kind: decision.kind,
                 text: &text,
                 key: None,
                 cursor,
-                max_live: DEFAULT_MAX_LIVE,
+                max_live,
                 stale_after: DEFAULT_STALE_SECONDS,
             },
             now,
-        )?;
-        inbox.write_json(".", "watch.json", &state)?;
+        );
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                inbox.write_json(".", "watch.json", &committed)?;
+                return Err(error);
+            }
+        };
+        match next.workers.get(&decision.agent) {
+            Some(record) => {
+                committed
+                    .workers
+                    .insert(decision.agent.clone(), record.clone());
+            }
+            None => {
+                committed.workers.remove(&decision.agent);
+            }
+        }
+        inbox.write_json(".", "watch.json", &committed)?;
         posted.push(Posted {
             agent: decision.agent.clone(),
             kind: decision.kind,
             outcome: outcome.outcome,
         });
     }
-    inbox.write_json(".", "watch.json", &state)?;
+    inbox.write_json(".", "watch.json", &committed)?;
     Ok(serde_json::json!({
         "sampled_unix_ms": now,
         "workers": observations.len(),
@@ -798,7 +857,7 @@ pub(crate) fn run(registry: &Path, herdr: &Path, args: WatchArgs) -> Result<i32>
         remind_after_ms: args.remind_minutes.saturating_mul(60_000),
     };
     loop {
-        match cycle(&inbox, &sources, &ignored, policy) {
+        match cycle(&inbox, &sources, &ignored, policy, DEFAULT_MAX_LIVE) {
             Ok(report) => print_json(&report)?,
             Err(error) if !args.once => {
                 // A continuous watcher outlives transient failures; the next sample retries.
@@ -816,8 +875,19 @@ pub(crate) fn run(registry: &Path, herdr: &Path, args: WatchArgs) -> Result<i32>
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::{exclusive, shared};
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
+
+    /// `step` for samples where Herdr listed exactly the observed panes.
+    fn step_listed(
+        state: &mut WatchState,
+        sample: &[Observation],
+        now: u64,
+        policy: Policy,
+    ) -> Vec<Decision> {
+        step(state, sample, !sample.is_empty(), now, policy)
+    }
 
     const POLICY: Policy = Policy {
         idle_samples: 2,
@@ -852,7 +922,7 @@ mod tests {
         for (index, observed) in states.iter().enumerate() {
             let now = 10 * index as u64;
             all.extend(
-                step(state, &[seen(agent, *observed, authoritative)], now, POLICY)
+                step_listed(state, &[seen(agent, *observed, authoritative)], now, POLICY)
                     .into_iter()
                     .map(|decision| decision.kind),
             );
@@ -862,6 +932,7 @@ mod tests {
 
     #[test]
     fn a_first_sample_announces_only_blocked_workers_and_first_seen_idle_is_not_reminded() {
+        let _serial = shared();
         let mut state = WatchState::default();
         let sample = [
             seen("a", WorkerState::Idle, true),
@@ -869,10 +940,11 @@ mod tests {
             seen("c", WorkerState::Blocked, false),
         ];
         assert_eq!(
-            kinds(&step(&mut state, &sample, 0, POLICY)),
+            kinds(&step_listed(&mut state, &sample, 0, POLICY)),
             [("c", NoticeKind::Blocked)]
         );
-        let later = step(&mut state, &sample, 100_000, POLICY);
+        assert_eq!(state.workers.len(), 3);
+        let later = step_listed(&mut state, &sample, 100_000, POLICY);
         assert!(
             later.is_empty(),
             "no reminder for an idle period never announced: {later:?}"
@@ -881,19 +953,39 @@ mod tests {
 
     #[test]
     fn a_claude_idle_edge_is_announced_at_once_and_a_resume_withdraws_it() {
-        use WorkerState::{Idle, Working};
+        let _serial = shared();
         let mut state = WatchState::default();
-        let kinds = run_states(
-            &mut state,
-            "a",
-            true,
-            &[Working, Idle, Idle, Working, Working],
+        let at = |state: &mut WatchState, observed, now| {
+            kinds(&step_listed(
+                state,
+                &[seen("a", observed, true)],
+                now,
+                POLICY,
+            ))
+            .into_iter()
+            .map(|(_, kind)| kind)
+            .collect::<Vec<_>>()
+        };
+        assert!(at(&mut state, WorkerState::Working, 0).is_empty());
+        assert_eq!(
+            at(&mut state, WorkerState::Idle, 10),
+            [NoticeKind::Idle],
+            "in the same sample"
         );
-        assert_eq!(kinds, [NoticeKind::Idle, NoticeKind::Working]);
+        assert!(
+            at(&mut state, WorkerState::Idle, 20).is_empty(),
+            "one idle period is announced once"
+        );
+        assert_eq!(
+            at(&mut state, WorkerState::Working, 30),
+            [NoticeKind::Working]
+        );
+        assert!(at(&mut state, WorkerState::Working, 40).is_empty());
     }
 
     #[test]
     fn a_screen_rule_idle_edge_must_hold_for_the_required_samples() {
+        let _serial = shared();
         use WorkerState::{Idle, Working};
         let mut state = WatchState::default();
         let kinds = run_states(
@@ -911,6 +1003,7 @@ mod tests {
 
     #[test]
     fn a_blocked_notice_is_withdrawn_even_after_an_unconfirmed_idle_blip() {
+        let _serial = shared();
         use WorkerState::{Blocked, Idle, Working};
         let mut state = WatchState::default();
         let kinds = run_states(
@@ -931,17 +1024,18 @@ mod tests {
 
     #[test]
     fn reminders_back_off_and_stop_after_three() {
+        let _serial = shared();
         let mut state = WatchState::default();
-        step(
+        step_listed(
             &mut state,
             &[seen("a", WorkerState::Working, true)],
             0,
             POLICY,
         );
-        step(&mut state, &[seen("a", WorkerState::Idle, true)], 0, POLICY);
+        step_listed(&mut state, &[seen("a", WorkerState::Idle, true)], 0, POLICY);
         let mut reminded_at = Vec::new();
         for now in (100..20_000).step_by(100) {
-            if !step(
+            if !step_listed(
                 &mut state,
                 &[seen("a", WorkerState::Idle, true)],
                 now,
@@ -961,26 +1055,27 @@ mod tests {
 
     #[test]
     fn exited_needs_consecutive_absences_and_a_return_is_announced() {
+        let _serial = shared();
         let mut state = WatchState::default();
         let working = [
             seen("a", WorkerState::Working, true),
             seen("b", WorkerState::Working, true),
         ];
-        step(&mut state, &working, 0, POLICY);
+        step_listed(&mut state, &working, 0, POLICY);
         let only_b = [seen("b", WorkerState::Working, true)];
-        assert!(step(&mut state, &only_b, 10, POLICY).is_empty());
+        assert!(step_listed(&mut state, &only_b, 10, POLICY).is_empty());
         assert!(
-            step(&mut state, &working, 20, POLICY).is_empty(),
+            step_listed(&mut state, &working, 20, POLICY).is_empty(),
             "a return resets the count"
         );
-        assert!(step(&mut state, &only_b, 30, POLICY).is_empty());
-        assert!(step(&mut state, &only_b, 40, POLICY).is_empty());
+        assert!(step_listed(&mut state, &only_b, 30, POLICY).is_empty());
+        assert!(step_listed(&mut state, &only_b, 40, POLICY).is_empty());
         assert_eq!(
-            kinds(&step(&mut state, &only_b, 50, POLICY)),
+            kinds(&step_listed(&mut state, &only_b, 50, POLICY)),
             [("a", NoticeKind::Exited)]
         );
         assert!(
-            step(&mut state, &only_b, 60, POLICY).is_empty(),
+            step_listed(&mut state, &only_b, 60, POLICY).is_empty(),
             "exited is announced once"
         );
         let back_idle = [
@@ -988,14 +1083,14 @@ mod tests {
             seen("b", WorkerState::Working, true),
         ];
         assert_eq!(
-            kinds(&step(&mut state, &back_idle, 70, POLICY)),
+            kinds(&step_listed(&mut state, &back_idle, 70, POLICY)),
             [("a", NoticeKind::Idle)]
         );
         for now in [80, 90, 100] {
-            step(&mut state, &only_b, now, POLICY);
+            step_listed(&mut state, &only_b, now, POLICY);
         }
         assert_eq!(
-            kinds(&step(&mut state, &working, 110, POLICY)),
+            kinds(&step_listed(&mut state, &working, 110, POLICY)),
             [("a", NoticeKind::Working)],
             "a return while working withdraws the exited notice"
         );
@@ -1003,29 +1098,31 @@ mod tests {
 
     #[test]
     fn an_empty_listing_is_unknown_not_everyone_leaving() {
+        let _serial = shared();
         let mut state = WatchState::default();
-        step(
+        step_listed(
             &mut state,
             &[seen("a", WorkerState::Working, true)],
             0,
             POLICY,
         );
         for now in [10, 20, 30, 40, 50] {
-            assert!(step(&mut state, &[], now, POLICY).is_empty());
+            assert!(step_listed(&mut state, &[], now, POLICY).is_empty());
         }
         assert_eq!(state.workers["a"].missing, 0);
     }
 
     #[test]
     fn an_unknown_state_changes_nothing() {
+        let _serial = shared();
         let mut state = WatchState::default();
-        step(
+        step_listed(
             &mut state,
             &[seen("a", WorkerState::Working, true)],
             0,
             POLICY,
         );
-        step(
+        step_listed(
             &mut state,
             &[seen("a", WorkerState::Idle, true)],
             10,
@@ -1036,10 +1133,12 @@ mod tests {
             ..seen("a", WorkerState::Idle, false)
         };
         for now in [20, 30, 40] {
-            assert!(step(&mut state, std::slice::from_ref(&unknown), now, POLICY).is_empty());
+            assert!(
+                step_listed(&mut state, std::slice::from_ref(&unknown), now, POLICY).is_empty()
+            );
         }
         assert_eq!(
-            kinds(&step(
+            kinds(&step_listed(
                 &mut state,
                 &[seen("a", WorkerState::Working, true)],
                 50,
@@ -1051,6 +1150,7 @@ mod tests {
 
     #[test]
     fn a_transcript_offset_survives_a_missing_path_and_resets_for_a_new_one() {
+        let _serial = shared();
         let directory = scratch();
         let first = directory.join("one.jsonl");
         let second = directory.join("two.jsonl");
@@ -1061,12 +1161,12 @@ mod tests {
             transcript: Some(path.to_path_buf()),
             ..seen("a", WorkerState::Working, true)
         };
-        step(&mut state, &[with(&first)], 0, POLICY);
+        step_listed(&mut state, &[with(&first)], 0, POLICY);
         assert_eq!(
             state.workers["a"].offset, 11,
             "a first sighting starts at the current end"
         );
-        step(
+        step_listed(
             &mut state,
             &[seen("a", WorkerState::Working, true)],
             10,
@@ -1079,7 +1179,7 @@ mod tests {
             ),
             (Some(first.as_path()), 11)
         );
-        step(&mut state, &[with(&second)], 20, POLICY);
+        step_listed(&mut state, &[with(&second)], 20, POLICY);
         assert_eq!(
             state.workers["a"].offset, 0,
             "a different transcript is unread from the start"
@@ -1088,6 +1188,7 @@ mod tests {
 
     #[test]
     fn worker_names_fall_back_to_the_pane_id_and_collisions_are_split() {
+        let _serial = shared();
         assert_eq!(worker_name(Some("kvm"), "wJ:p38"), "kvm");
         assert_eq!(worker_name(None, "wJ:p3A"), "pane-wj-p3a");
         assert_eq!(worker_name(Some("Has Space"), "w1:p2"), "pane-w1-p2");
@@ -1098,7 +1199,7 @@ mod tests {
         ];
         observations[0].pane = "w:p5".into();
         observations[1].pane = "w:p6".into();
-        disambiguate(&mut observations);
+        disambiguate(&mut observations, &WatchState::default());
         let names = observations
             .iter()
             .map(|o| o.agent.as_str())
@@ -1110,7 +1211,7 @@ mod tests {
         ];
         clash[0].pane = "w:p3".into();
         clash[1].pane = "w-p3".into();
-        disambiguate(&mut clash);
+        disambiguate(&mut clash, &WatchState::default());
         assert_ne!(clash[0].agent, clash[1].agent);
         assert!(clash.iter().all(|o| check_name("--from", &o.agent).is_ok()));
     }
@@ -1135,6 +1236,7 @@ mod tests {
 
     #[test]
     fn the_last_assistant_text_since_the_offset_is_extracted() {
+        let _serial = shared();
         let directory = scratch();
         let path = directory.join("s.jsonl");
         let first =
@@ -1202,6 +1304,7 @@ mod tests {
 
     #[test]
     fn a_sample_joins_claude_state_to_herdr_panes_through_proc() {
+        let _serial = exclusive();
         let directory = scratch();
         let (herdr, claude, proc_root, projects) = fixture(
             &directory,
@@ -1214,7 +1317,8 @@ mod tests {
             proc_root: &proc_root,
             timeout: Duration::from_secs(10),
         };
-        let observations = sample(&sources, &["coord".to_owned()]).unwrap();
+        let (observations, listed) = sample(&sources, &["coord".to_owned()]).unwrap();
+        assert!(listed);
         assert_eq!(
             summary(&observations),
             [
@@ -1227,6 +1331,7 @@ mod tests {
 
     #[test]
     fn without_claude_a_claude_pane_is_unknown_rather_than_herdr_idle() {
+        let _serial = exclusive();
         let directory = scratch();
         let (herdr, claude, proc_root, projects) = fixture(&directory, "exit 1");
         let sources = Sources {
@@ -1236,7 +1341,8 @@ mod tests {
             proc_root: &proc_root,
             timeout: Duration::from_secs(10),
         };
-        let observations = sample(&sources, &["coord".to_owned()]).unwrap();
+        let (observations, listed) = sample(&sources, &["coord".to_owned()]).unwrap();
+        assert!(listed);
         assert_eq!(
             summary(&observations),
             [
@@ -1248,6 +1354,7 @@ mod tests {
 
     #[test]
     fn a_descendant_left_holding_the_pipe_after_a_clean_exit_is_killed_at_the_deadline() {
+        let _serial = exclusive();
         let directory = scratch();
         let lingering = directory.join("lingering");
         executable(&lingering, "echo partial\n(sleep 30) &\nexit 0");
@@ -1265,6 +1372,7 @@ mod tests {
 
     #[test]
     fn a_query_timeout_kills_descendants_holding_the_pipe() {
+        let _serial = exclusive();
         let directory = scratch();
         let slow = directory.join("slow");
         executable(&slow, "(sleep 30; echo late) &\nwait");
@@ -1281,5 +1389,165 @@ mod tests {
             elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(10),
             "{elapsed:?}"
         );
+    }
+
+    #[test]
+    fn the_last_worker_leaving_is_announced_while_the_coordinator_is_still_listed() {
+        let _serial = shared();
+        let mut state = WatchState::default();
+        step_listed(
+            &mut state,
+            &[seen("a", WorkerState::Working, true)],
+            0,
+            POLICY,
+        );
+        let mut announced = Vec::new();
+        for now in [10, 20, 30, 40] {
+            announced.extend(step(&mut state, &[], true, now, POLICY));
+        }
+        assert_eq!(kinds(&announced), [("a", NoticeKind::Exited)]);
+    }
+
+    #[test]
+    fn an_exited_worker_is_forgotten_after_a_day() {
+        let _serial = shared();
+        let mut state = WatchState::default();
+        step_listed(
+            &mut state,
+            &[seen("a", WorkerState::Working, true)],
+            0,
+            POLICY,
+        );
+        for now in [10, 20, 30] {
+            step(&mut state, &[], true, now, POLICY);
+        }
+        assert!(state.workers["a"].exited_unix_ms.is_some());
+        step(&mut state, &[], true, 30 + EXITED_MEMORY_MS, POLICY);
+        assert!(state.workers.contains_key("a"), "kept for exactly a day");
+        step(&mut state, &[], true, 31 + EXITED_MEMORY_MS, POLICY);
+        assert!(!state.workers.contains_key("a"));
+    }
+
+    #[test]
+    fn a_worker_first_seen_with_an_unknown_state_starts_quietly_once_known() {
+        let _serial = shared();
+        let mut state = WatchState::default();
+        let unknown = Observation {
+            state: None,
+            ..seen("a", WorkerState::Idle, false)
+        };
+        assert!(step_listed(&mut state, &[unknown], 0, POLICY).is_empty());
+        assert!(
+            state.workers.is_empty(),
+            "nothing is recorded before the state is known"
+        );
+        assert!(step_listed(
+            &mut state,
+            &[seen("a", WorkerState::Idle, true)],
+            10,
+            POLICY
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_colliding_newcomer_is_renamed_and_the_owner_keeps_its_name() {
+        let _serial = shared();
+        let mut state = WatchState::default();
+        let mut owner = seen("worker", WorkerState::Working, true);
+        owner.pane = "w:p5".into();
+        step_listed(&mut state, std::slice::from_ref(&owner), 0, POLICY);
+        let mut newcomer = seen("worker", WorkerState::Idle, true);
+        newcomer.pane = "w:p6".into();
+        let mut sample = vec![newcomer, owner];
+        disambiguate(&mut sample, &state);
+        let names = sample.iter().map(|o| o.agent.as_str()).collect::<Vec<_>>();
+        assert_eq!(names, ["worker-w-p6", "worker"]);
+        for now in [10, 20, 30, 40] {
+            let decisions = step_listed(&mut state, &sample, now, POLICY);
+            assert!(
+                !decisions
+                    .iter()
+                    .any(|decision| decision.kind == NoticeKind::Exited),
+                "the owner is still listed: {decisions:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_post_leaves_its_worker_to_be_decided_again() {
+        let _serial = exclusive();
+        let directory = scratch();
+        let listing = directory.join("list.json");
+        let herdr = directory.join("herdr");
+        let claude = directory.join("claude");
+        executable(&herdr, &format!("cat {}", listing.display()));
+        executable(&claude, "exit 1");
+        let list = |status: &str| {
+            fs::write(
+                &listing,
+                format!(
+                    r#"{{"result":{{"agents":[{{"pane_id":"w:a","name":"wa","agent":"codex","agent_status":"{status}"}},{{"pane_id":"w:b","name":"wb","agent":"codex","agent_status":"{status}"}}]}}}}"#
+                ),
+            )
+            .unwrap();
+        };
+        let registry = directory.join("registry");
+        let inbox = Inbox::open(&registry, "coord").unwrap();
+        let sources = Sources {
+            herdr: &herdr,
+            claude: &claude,
+            projects: &directory,
+            proc_root: &directory,
+            timeout: Duration::from_secs(10),
+        };
+        let filler = PostRequest {
+            agent: "filler",
+            kind: NoticeKind::Message,
+            text: "occupies one slot",
+            key: None,
+            cursor: None,
+            max_live: 10,
+            stale_after: DEFAULT_STALE_SECONDS,
+        };
+        inbox.post(&filler, 1).unwrap();
+        list("working");
+        cycle(&inbox, &sources, &[], POLICY, 2).unwrap();
+        list("idle");
+        cycle(&inbox, &sources, &[], POLICY, 2).unwrap();
+        let error = cycle(&inbox, &sources, &[], POLICY, 2).unwrap_err();
+        assert_eq!(error.exit_code(), EXIT_BUSY, "wb's idle does not fit");
+        let posted = |inbox: &Inbox| {
+            inbox
+                .live(now_ms().unwrap(), DEFAULT_STALE_SECONDS)
+                .unwrap()
+                .into_iter()
+                .map(|notice| (notice.agent, notice.kind))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            posted(&inbox),
+            [
+                ("filler".to_owned(), NoticeKind::Message),
+                ("wa".to_owned(), NoticeKind::Idle)
+            ]
+        );
+        let delivered = super::super::DeliveryTarget {
+            via: "print",
+            session: None,
+            limit: usize::MAX,
+        };
+        inbox
+            .deliver(
+                now_ms().unwrap(),
+                100_000,
+                DEFAULT_STALE_SECONDS,
+                &delivered,
+                |_| Ok(()),
+            )
+            .unwrap();
+        let report = cycle(&inbox, &sources, &[], POLICY, 2).unwrap();
+        assert_eq!(report["posted"][0]["agent"], "wb", "{report}");
+        assert_eq!(posted(&inbox), [("wb".to_owned(), NoticeKind::Idle)]);
     }
 }
