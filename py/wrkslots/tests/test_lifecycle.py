@@ -26826,9 +26826,11 @@ def _slot_removed_evidence(project: Path) -> list[object]:
         removal_events[0]["evidence"], "test slot-removed evidence"
     )
     # Every event that lists deleted repositories also says what was not judged.
-    assert evidence["nested_git_scope"] == wrkslots._NESTED_GIT_SCOPE
-    assert "bare Git repository under any other name" in evidence["nested_git_scope"]
-    assert "filesystem image" in evidence["nested_git_scope"]
+    scope = evidence["nested_git_scope"]
+    assert isinstance(scope, str)
+    assert scope == wrkslots._NESTED_GIT_SCOPE
+    assert "bare Git repository under any other name" in scope
+    assert "filesystem image" in scope
     return wrkslots._as_list(
         evidence["disposable_nested_repositories"], "test nested evidence"
     )

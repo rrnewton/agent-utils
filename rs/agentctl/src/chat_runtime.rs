@@ -789,9 +789,7 @@ impl CheckpointGapRetryRecord {
             || !checkpoint.reconciliation_required
             || !checkpoint.boundary_ever_committed
             || receipt.phase != CommitReceiptPhase::Committed
-            || !evidence
-                .as_object()
-                .is_some_and(|object| !object.is_empty())
+            || evidence.as_object().is_none_or(|object| object.is_empty())
         {
             return Err(ChatRuntimeError::invalid(
                 "gap retry requires an unchanged committed boundary and explicit evidence",
