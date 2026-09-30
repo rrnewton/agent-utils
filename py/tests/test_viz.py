@@ -76,3 +76,155 @@ def test_dot_annotates_profiling_and_scaling() -> None:
     assert '"test.b" [label="test.b\\n[light]\\n60.0s, 3221MB"];' in dot
     # Graph-title scaling: serial 120 / critpath 90 = 1.3X.
     assert "|  1.3X max par-spdup" in dot
+
+
+# --------------------------------------------------------------------------- --labels / --group-by
+# The same three-group fixture and exact bytes as rs/dagrun/tests/viz_groups_cli.rs, so the two
+# editions are pinned to identical output.
+_GROUPS_DAG = """{"steps":[
+  {"group":"build","job":"app","cmd":"true","labels":["full"]},
+  {"group":"build","job":"lib","cmd":"true","deps":["build.app"]},
+  {"group":"test","job":"unit","cmd":"true","labels":["quick","full"],"deps":["build.app","build.lib"]},
+  {"group":"test","job":"lint","cmd":"true","labels":["quick"],"deps":["build.app"]},
+  {"group":"e2e","job":"smoke","cmd":"true","labels":["full"],"deps":["build.app","test.unit"]}
+]}
+"""
+
+_GROUPS_DEFAULT_DOT = r"""digraph dag {
+  rankdir=LR;
+  node [shape=box, style=rounded, fontsize=10];
+  labelloc="t";
+  label="DAG  (solid = dependency;  dashed = shared cap-1 resource -> serialized)";
+  subgraph cluster_0 {
+    label="build"; style=dashed; color=gray70;
+    "build.app" [label="build.app\n[light]"];
+    "build.lib" [label="build.lib\n[light]"];
+  }
+  subgraph cluster_1 {
+    label="e2e"; style=dashed; color=gray70;
+    "e2e.smoke" [label="e2e.smoke\n[light]"];
+  }
+  subgraph cluster_2 {
+    label="test"; style=dashed; color=gray70;
+    "test.lint" [label="test.lint\n[light]"];
+    "test.unit" [label="test.unit\n[light]"];
+  }
+  "build.app" -> "build.lib";
+  "build.app" -> "test.unit";
+  "build.lib" -> "test.unit";
+  "build.app" -> "test.lint";
+  "build.app" -> "e2e.smoke";
+  "test.unit" -> "e2e.smoke";
+}
+"""
+
+_GROUPS_ALL_DOT = r"""digraph dag {
+  rankdir=LR;
+  node [shape=box, style=rounded, fontsize=10];
+  labelloc="t";
+  label="DAG by group  (node = group and its step count;  edge label = step-level dependencies merged)";
+  "build" [label="build\n2 steps"];
+  "e2e" [label="e2e\n1 step"];
+  "test" [label="test\n2 steps"];
+  "build" -> "e2e" [label="1"];
+  "build" -> "test" [label="3"];
+  "test" -> "e2e" [label="1"];
+}
+"""
+
+_GROUPS_FULL_DOT = r"""digraph dag {
+  rankdir=LR;
+  node [shape=box, style=rounded, fontsize=10];
+  labelloc="t";
+  label="DAG by group  (node = group and its step count;  edge label = step-level dependencies merged)";
+  "build" [label="build\n2 steps"];
+  "e2e" [label="e2e\n1 step"];
+  "test" [label="test\n1 step"];
+  "build" -> "e2e" [label="1"];
+  "build" -> "test" [label="2"];
+  "test" -> "e2e" [label="1"];
+}
+"""
+
+
+def _view(args: list[str]) -> tuple[int, str, str]:
+    import contextlib
+    import io
+    import tempfile
+    from pathlib import Path
+
+    from dagrun.cli import main
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "dag.json"
+        path.write_text(_GROUPS_DAG, encoding="utf-8")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                rc = main([*args, "--dag", str(path)])
+            except SystemExit as exc:  # argparse refusals
+                rc = int(exc.code or 0)
+        return rc, out.getvalue(), err.getvalue()
+
+
+def test_default_dot_is_unchanged_on_group_fixture() -> None:
+    assert _view(["dot"]) == (0, _GROUPS_DEFAULT_DOT, "")
+
+
+def test_group_dot_counts_steps_and_merged_cross_group_edges() -> None:
+    assert _view(["dot", "--group-by", "group"]) == (0, _GROUPS_ALL_DOT, "")
+    assert _view(["dot", "--group-by=group"]) == (0, _GROUPS_ALL_DOT, "")
+
+
+def test_label_filter_keeps_labelled_steps_and_their_dependencies() -> None:
+    assert _view(["dot", "--labels", "full", "--group-by", "group"]) == (0, _GROUPS_FULL_DOT, "")
+    rc, out, _ = _view(["dot", "--labels=quick"])
+    assert rc == 0
+    assert '"e2e.smoke"' not in out and '"build.lib" -> "test.unit";' in out
+    assert _view(["dot", "--labels", "quick,full"]) == (0, _GROUPS_DEFAULT_DOT, "")
+
+
+def test_group_ascii_lists_counts_and_upstream_groups() -> None:
+    assert _view(["ascii", "--labels", "full", "--group-by", "group"]) == (
+        0,
+        "DAG by group - 3 groups, 4 steps, 3 group edges "
+        "(4 cross-group step edges merged; 1 within groups)\n"
+        "\n"
+        "  build  2 steps\n"
+        "  test   1 step   <- build (2)\n"
+        "  e2e    1 step   <- build (1), test (1)\n",
+        "",
+    )
+
+
+def test_bad_view_flags_exit_2() -> None:
+    assert _view(["dot", "--labels", "nope"]) == (
+        2,
+        "",
+        "dagrun: --labels: unknown label(s): nope. Known labels: full, quick\n",
+    )
+    assert _view(["ascii", "--labels", ","]) == (
+        2,
+        "",
+        "dagrun ascii: error: --labels requires at least one label\n",
+    )
+    assert _view(["dot", "--group-by", "job"])[0] == 2
+    assert _view(["list", "--group-by", "group"])[0] == 2
+
+
+def test_group_dot_quotes_names_and_draws_no_self_edges() -> None:
+    from dagrun.viz import to_ascii_groups, to_dot_groups
+
+    cfg = DagConfig(
+        steps=(
+            Step('we"ird\\grp', "a", "", "true"),
+            Step('we"ird\\grp', "b", "", "true", deps=['we"ird\\grp.a']),
+        ),
+    )
+    dot = to_dot_groups(cfg)
+    assert '  "we\\"ird\\\\grp" [label="we\\"ird\\\\grp\\n2 steps"];\n' in dot
+    assert "->" not in dot
+    assert to_ascii_groups(cfg).startswith(
+        "DAG by group - 1 groups, 2 steps, 0 group edges "
+        "(0 cross-group step edges merged; 1 within groups)\n"
+    )

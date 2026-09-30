@@ -136,7 +136,7 @@ pub use test_results::{
     TestResults, TestResultsErrorKind, TestResultsWriteError, CLASSIFIED_RESULTS_SCHEMA,
     CURRENT_SCHEMA, RETAINED_RESULTS_SCHEMA, TEST_RESULTS_RECOVERY_SUFFIX,
 };
-pub use viz::{to_ascii, to_dot};
+pub use viz::{to_ascii, to_ascii_groups, to_dot, to_dot_groups};
 
 /// Command name used in diagnostics and version output.
 pub const PROG: &str = "dagrun";

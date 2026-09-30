@@ -80,7 +80,7 @@ use crate::sweep::{
     parse_widths, stable_topological_order, workload_digest, MachineTopology,
 };
 use crate::sync::{self, SyncBackend};
-use crate::viz::{to_ascii, to_dot};
+use crate::viz::{to_ascii, to_ascii_groups, to_dot, to_dot_groups, GROUP_BY_KEYS};
 use crate::{PROG, VERSION};
 
 /// Environment variable overriding the default profile-store location (Feature D). An explicit
@@ -658,19 +658,33 @@ fn simple_help(c: &Palette, command: &str) -> String {
         "yaml" => "Re-emit the DAG as YAML.",
         _ => "Read a DAG and emit it.",
     };
+    let dag_flag = (
+        "--dag FILE",
+        "DAG file to read; .yaml/.yml load as YAML, else JSON; files may use namespaced include fragments ('-' = self-contained JSON stdin only) [required]",
+    );
+    let help_flag = ("-h, --help", "show this help and exit");
+    if matches!(command, "ascii" | "dot") {
+        let usage = format!("{command} --dag FILE [--labels LABEL[,LABEL...]] [--group-by group]");
+        return render_subcommand_help(
+            c,
+            &usage,
+            summary,
+            &[
+                dag_flag,
+                (
+                    "--labels LABEL[,LABEL...]",
+                    "show only steps carrying any named label, plus every dependency they require (the same selection as `run --labels`)",
+                ),
+                (
+                    "--group-by group",
+                    "collapse steps to one node per `group`, showing its step count; an edge per (upstream group -> group) pair shows how many step dependencies it merges",
+                ),
+                help_flag,
+            ],
+        );
+    }
     let usage = format!("{command} --dag FILE");
-    render_subcommand_help(
-        c,
-        &usage,
-        summary,
-        &[
-            (
-                "--dag FILE",
-                "DAG file to read; .yaml/.yml load as YAML, else JSON; files may use namespaced include fragments ('-' = self-contained JSON stdin only) [required]",
-            ),
-            ("-h, --help", "show this help and exit"),
-        ],
-    )
+    render_subcommand_help(c, &usage, summary, &[dag_flag, help_flag])
 }
 
 fn summary_help(c: &Palette) -> String {
@@ -5287,16 +5301,27 @@ fn run_inner(argv: &[String]) -> i32 {
                 print!("{}", simple_help(&c, command));
                 return 0;
             }
-            let dag_arg = match parse_simple_dag(rest) {
-                Ok(Some(d)) => d,
-                Ok(None) => {
+            let view = if matches!(command, "ascii" | "dot") {
+                parse_view_args(rest)
+            } else {
+                parse_simple_dag(rest).map(|dag| ViewArgs {
+                    dag,
+                    ..ViewArgs::default()
+                })
+            };
+            let view = match view {
+                Ok(v) => v,
+                Err(msg) => {
+                    eprintln!("{PROG} {command}: error: {msg}");
+                    return 2;
+                }
+            };
+            let dag_arg = match view.dag.clone() {
+                Some(d) => d,
+                None => {
                     eprintln!(
                         "{PROG} {command}: error: the following arguments are required: --dag"
                     );
-                    return 2;
-                }
-                Err(msg) => {
-                    eprintln!("{PROG} {command}: error: {msg}");
                     return 2;
                 }
             };
@@ -5307,9 +5332,22 @@ fn run_inner(argv: &[String]) -> i32 {
                     return 2;
                 }
             };
+            let cfg = match view.labels.as_deref() {
+                Some(labels) => match select_steps_by_labels(&cfg, labels) {
+                    Ok(selected) => selected,
+                    Err(e) => {
+                        eprintln!("{PROG}: {e}");
+                        return 2;
+                    }
+                },
+                None => cfg,
+            };
+            let grouped = view.group_by.is_some();
             match command {
                 "list" => println!("{}", render_list(&cfg, &c)),
+                "ascii" if grouped => print!("{}", to_ascii_groups(&cfg, None)),
                 "ascii" => print!("{}", to_ascii(&cfg, None)),
+                "dot" if grouped => print!("{}", to_dot_groups(&cfg, "dag", None)),
                 "dot" => print!("{}", to_dot(&cfg, "dag", None)),
                 "json" => println!("{}", dag_to_json(&cfg)),
                 // dag_to_yaml already ends with a trailing newline.
@@ -5670,6 +5708,66 @@ fn cmd_summary_stats(args: &[String]) -> i32 {
 }
 
 /// Parse the `--dag FILE` argument for the read-only subcommands.
+/// Parsed `ascii` / `dot` arguments. `list`, `json`, and `yaml` fill only `dag`.
+#[derive(Debug, Default, PartialEq)]
+struct ViewArgs {
+    dag: Option<String>,
+    /// Parsed, non-empty `--labels` list.
+    labels: Option<Vec<String>>,
+    /// Validated `--group-by` key (one of [`GROUP_BY_KEYS`]).
+    group_by: Option<String>,
+}
+
+// `ascii` / `dot` arguments: `--dag`, `--labels`, and `--group-by`, each as `--flag VALUE` or
+// `--flag=VALUE`. A repeated flag keeps its last value, as `--dag` always has.
+fn parse_view_args(rest: &[String]) -> Result<ViewArgs, String> {
+    let mut a = ViewArgs::default();
+    let mut i = 0;
+    while i < rest.len() {
+        let arg = &rest[i];
+        let (flag, inline) = match arg.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
+            _ => (arg.as_str(), None),
+        };
+        if !matches!(flag, "--dag" | "--labels" | "--group-by") {
+            return Err(format!("unrecognized argument: {arg}"));
+        }
+        let value = match inline {
+            Some(v) => v,
+            None => {
+                i += 1;
+                // `--labels --dag F` must not read `--dag` as a label (the `--dag` value itself
+                // keeps the long-standing take-next-argument behaviour of `parse_simple_dag`).
+                rest.get(i)
+                    .filter(|v| flag == "--dag" || !v.starts_with("--"))
+                    .cloned()
+                    .ok_or_else(|| format!("the argument {flag} requires a value"))?
+            }
+        };
+        match flag {
+            "--dag" => a.dag = Some(value),
+            "--labels" => {
+                let labels = parse_tag_list(&value);
+                if labels.is_empty() {
+                    return Err("--labels requires at least one label".to_string());
+                }
+                a.labels = Some(labels);
+            }
+            _ => {
+                if !GROUP_BY_KEYS.contains(&value.as_str()) {
+                    return Err(format!(
+                        "argument --group-by: invalid choice: '{value}' (choose from {})",
+                        GROUP_BY_KEYS.join(", ")
+                    ));
+                }
+                a.group_by = Some(value);
+            }
+        }
+        i += 1;
+    }
+    Ok(a)
+}
+
 fn parse_simple_dag(rest: &[String]) -> Result<Option<String>, String> {
     let mut dag: Option<String> = None;
     let mut i = 0;

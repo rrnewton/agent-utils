@@ -8,13 +8,18 @@ Pure functions over a :class:`~dagrun.model.DagConfig` — no I/O.
 * :func:`to_ascii` emits a compact topological-layer view for a glance in the terminal —
   each step on its layer (longest dependency depth), with its class, scarce-resource demand,
   and immediate dependencies.
+* :func:`to_dot_groups` / :func:`to_ascii_groups` collapse the steps to one node per ``group``,
+  with step counts and merged cross-group dependency-edge counts.
 """
 
 from __future__ import annotations
 
 from dagrun.model import DagConfig, Step, step_classification
 
-__all__ = ["to_dot", "to_ascii"]
+__all__ = ["GROUP_BY_KEYS", "to_ascii", "to_ascii_groups", "to_dot", "to_dot_groups"]
+
+#: The one ``--group-by`` key the renderers understand: a step's ``group`` field.
+GROUP_BY_KEYS: tuple[str, ...] = ("group",)
 
 
 def _selected_steps(cfg: DagConfig, selected: set[str] | None) -> list[Step]:
@@ -151,4 +156,99 @@ def to_ascii(cfg: DagConfig, *, selected: set[str] | None = None) -> str:
             res = "".join(f" {{{k}:{v}}}" for k, v in sorted(step.hint.resources.items()))
             dep = "  <- " + ", ".join(sorted(deps[step.tag])) if deps[step.tag] else ""
             out.append(f"  {step.tag:<{width}}  [{step_classification(step).value}]{res}{dep}")
+    return "\n".join(out) + "\n"
+
+
+def _dot_quote(s: str) -> str:
+    """Escape a name for a double-quoted DOT ID or label (group-level renderer only)."""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _step_count_text(n: int) -> str:
+    return "1 step" if n == 1 else f"{n} steps"
+
+
+def _group_graph(
+    steps: list[Step], deps: dict[str, list[str]]
+) -> tuple[dict[str, int], dict[tuple[str, str], int], int, int]:
+    """The step graph collapsed onto its groups.
+
+    Returns (step count per group, step-edge count per ordered (dependency group -> dependent
+    group) pair, cross-group step edges, within-group step edges). Edges inside one group are
+    counted separately and never become a group edge."""
+    group_of = {s.tag: s.group for s in steps}
+    counts: dict[str, int] = {}
+    edges: dict[tuple[str, str], int] = {}
+    cross = intra = 0
+    for step in steps:
+        counts[step.group] = counts.get(step.group, 0) + 1
+        for dep in deps[step.tag]:
+            src = group_of[dep]
+            if src == step.group:
+                intra += 1
+            else:
+                cross += 1
+                edges[(src, step.group)] = edges.get((src, step.group), 0) + 1
+    return counts, edges, cross, intra
+
+
+def to_dot_groups(cfg: DagConfig, *, name: str = "dag", selected: set[str] | None = None) -> str:
+    """Render the DAG collapsed to one node per ``group``, as Graphviz DOT.
+
+    Each node is labelled with its group name and step count. Each edge is one ordered
+    (dependency group -> dependent group) pair, labelled with the number of step-level
+    dependency edges it merges; dependencies inside one group draw no edge."""
+    steps = _selected_steps(cfg, selected)
+    deps = _kept_deps(steps)
+    counts, edges, _cross, _intra = _group_graph(steps, deps)
+    scaling = _scaling_suffix(steps, deps)
+    out: list[str] = [
+        f"digraph {name} {{",
+        "  rankdir=LR;",
+        "  node [shape=box, style=rounded, fontsize=10];",
+        '  labelloc="t";',
+        "  label=\"DAG by group  (node = group and its step count;  "
+        f'edge label = step-level dependencies merged){scaling}";',
+    ]
+    for group in sorted(counts):
+        q = _dot_quote(group)
+        out.append(f'  "{q}" [label="{q}\\n{_step_count_text(counts[group])}"];')
+    for (src, dst), n in sorted(edges.items()):
+        out.append(f'  "{_dot_quote(src)}" -> "{_dot_quote(dst)}" [label="{n}"];')
+    out.append("}")
+    return "\n".join(out) + "\n"
+
+
+def to_ascii_groups(cfg: DagConfig, *, selected: set[str] | None = None) -> str:
+    """Render the DAG collapsed to one line per ``group``, as compact ASCII.
+
+    Groups are ordered by the earliest dependency layer any of their steps occupies, then by
+    name. Each line shows the step count and the upstream groups with their merged edge counts."""
+    steps = _selected_steps(cfg, selected)
+    deps = _kept_deps(steps)
+    depth = _layers(steps, deps)
+    counts, edges, cross, intra = _group_graph(steps, deps)
+    first_layer: dict[str, int] = {}
+    for step in steps:
+        d = depth[step.tag]
+        first_layer[step.group] = min(d, first_layer.get(step.group, d))
+    upstream: dict[str, list[tuple[str, int]]] = {}
+    for (src, dst), n in sorted(edges.items()):
+        upstream.setdefault(dst, []).append((src, n))
+    order = sorted(first_layer, key=lambda g: (first_layer[g], g))
+    width = max((len(g) for g in counts), default=1)
+    count_width = max((len(_step_count_text(n)) for n in counts.values()), default=1)
+    out: list[str] = [
+        f"DAG by group - {len(counts)} groups, {len(steps)} steps, {len(edges)} group edges "
+        f"({cross} cross-group step edges merged; {intra} within groups)",
+        "",
+    ]
+    for group in order:
+        count = _step_count_text(counts[group])
+        ups = upstream.get(group)
+        if ups:
+            joined = ", ".join(f"{u} ({n})" for u, n in ups)
+            out.append(f"  {group:<{width}}  {count:<{count_width}}  <- {joined}")
+        else:
+            out.append(f"  {group:<{width}}  {count}")
     return "\n".join(out) + "\n"

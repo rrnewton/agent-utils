@@ -1797,10 +1797,10 @@ def _static_parity(py: list[str], rs: list[str], dag_path: str, name: str, rep: 
     Shared by the full-battery fixtures (:func:`compare_fixture`) and the shipped-example fixtures
     (:func:`compare_example_static`), so the two paths cannot drift apart.
     """
-    # list / ascii / dot: byte-identical stdout.
-    for mode in ("list", "ascii", "dot"):
-        po = run(py, (mode, "--dag", dag_path))
-        ro = run(rs, (mode, "--dag", dag_path))
+    # list / ascii / dot, and the group-level ascii / dot views: byte-identical stdout.
+    for mode in ("list", "ascii", "dot", "ascii --group-by group", "dot --group-by group"):
+        po = run(py, (*mode.split(), "--dag", dag_path))
+        ro = run(rs, (*mode.split(), "--dag", dag_path))
         label = f"{name}/{mode}"
         if po.returncode != ro.returncode:
             rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")

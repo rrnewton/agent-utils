@@ -145,7 +145,7 @@ from dagrun.cgroup import (
     policy_skip_reason,
 )
 from dagrun.teardown import reap
-from dagrun.viz import to_ascii, to_dot
+from dagrun.viz import to_ascii, to_ascii_groups, to_dot, to_dot_groups
 
 __version__: str = "0.15.0"
 
@@ -243,6 +243,8 @@ __all__ = [
     # visualization
     "to_dot",
     "to_ascii",
+    "to_dot_groups",
+    "to_ascii_groups",
     # profile analysis library helper (not a console command)
     "summarize",
     # profile-store feedback + planner

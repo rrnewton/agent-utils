@@ -124,7 +124,7 @@ from dagrun.sweep import (
     workload_digest,
     width_grid_for_pass,
 )
-from dagrun.viz import to_ascii, to_dot
+from dagrun.viz import GROUP_BY_KEYS, to_ascii, to_ascii_groups, to_dot, to_dot_groups
 
 PROG = "dagrun"
 CGROUP_SETUP_ENVIRONMENT_ERROR = (
@@ -957,6 +957,25 @@ Output:
                 "include fragments ('-' = self-contained JSON stdin only)"
             ),
         )
+        if cmd in ("ascii", "dot"):
+            sp.add_argument(
+                "--labels",
+                metavar="LABEL[,LABEL...]",
+                default=None,
+                help=(
+                    "show only steps carrying any named label, plus every dependency they "
+                    "require (the same selection as `run --labels`)"
+                ),
+            )
+            sp.add_argument(
+                "--group-by",
+                choices=GROUP_BY_KEYS,
+                default=None,
+                help=(
+                    "collapse steps to one node per `group`, showing its step count; an edge per "
+                    "(upstream group -> group) pair shows how many step dependencies it merges"
+                ),
+            )
 
     summary_p = sub.add_parser(
         "summary",
@@ -4561,14 +4580,29 @@ def _main(argv: Sequence[str] | None = None) -> int:
         print(f"{PROG}: {exc}", file=sys.stderr)
         return 2
 
+    if command in ("ascii", "dot"):
+        labels_raw = getattr(ns, "labels", None)
+        if labels_raw is not None:
+            labels = _parse_tag_list(labels_raw)
+            if not labels:
+                print(
+                    f"{PROG} {command}: error: --labels requires at least one label",
+                    file=sys.stderr,
+                )
+                return 2
+            try:
+                cfg = _select_steps_by_labels(cfg, labels)
+            except _SelectedError as exc:
+                print(f"{PROG}: {exc}", file=sys.stderr)
+                return 2
+        grouped = getattr(ns, "group_by", None) is not None
+        if command == "ascii":
+            sys.stdout.write(to_ascii_groups(cfg) if grouped else to_ascii(cfg))
+        else:
+            sys.stdout.write(to_dot_groups(cfg) if grouped else to_dot(cfg))
+        return 0
     if command == "list":
         print(_render_list(cfg, c))
-        return 0
-    if command == "ascii":
-        sys.stdout.write(to_ascii(cfg))
-        return 0
-    if command == "dot":
-        sys.stdout.write(to_dot(cfg))
         return 0
     if command == "json":
         print(dag_to_json(cfg))

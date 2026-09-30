@@ -300,6 +300,24 @@ dagrun yaml --dag pipeline.json > pipeline.yaml
 `list` is a compact inventory. `ascii` shows dependency layers. `dot` emits
 Graphviz input. `json` emits canonical JSON, while `yaml` emits stable YAML.
 
+A large graph reads better one level up. `ascii` and `dot` accept two view
+options:
+
+```sh
+dagrun dot --dag pipeline.yaml --group-by group | dot -Tpng -o groups.png
+dagrun dot --dag pipeline.yaml --labels full --group-by group > full.dot
+dagrun ascii --dag pipeline.yaml --labels quick --group-by group
+```
+
+- `--labels LABEL[,LABEL...]` keeps the steps carrying any named label, plus
+  every dependency they require: the same steps `run --labels` would run.
+- `--group-by group` draws one node per `group`, labelled with its step count,
+  and one edge per (upstream group -> group) pair, labelled with how many
+  step-level dependencies it merges. Dependencies inside a group draw no edge.
+  In `ascii`, each group line lists its upstream groups with those counts.
+
+Without either option the output is unchanged.
+
 ## Plan without running
 
 ```sh

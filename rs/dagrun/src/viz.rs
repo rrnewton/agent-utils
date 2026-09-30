@@ -169,6 +169,164 @@ pub fn to_dot(cfg: &DagConfig, name: &str, selected: Option<&HashSet<String>>) -
     out.join("\n") + "\n"
 }
 
+/// The one `--group-by` key the renderers understand: a step's `group` field.
+pub const GROUP_BY_KEYS: &[&str] = &["group"];
+
+// Escape a name for a double-quoted DOT ID or label (the group-level renderer only; the
+// step-level renderer's output is pinned byte-for-byte and is left exactly as it was).
+fn dot_quote(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn step_count_text(n: usize) -> String {
+    if n == 1 {
+        "1 step".to_string()
+    } else {
+        format!("{n} steps")
+    }
+}
+
+// The step graph collapsed onto its groups: step count per group, and the number of step-level
+// dependency edges behind each ordered (dependency group -> dependent group) pair. Edges inside
+// one group are counted separately and never become a group edge.
+struct GroupGraph {
+    counts: BTreeMap<String, usize>,
+    edges: BTreeMap<(String, String), usize>,
+    cross_edges: usize,
+    intra_edges: usize,
+}
+
+fn group_graph(steps: &[&Step], deps: &HashMap<String, Vec<String>>) -> GroupGraph {
+    let group_of: HashMap<String, &str> =
+        steps.iter().map(|s| (s.tag(), s.group.as_str())).collect();
+    let mut g = GroupGraph {
+        counts: BTreeMap::new(),
+        edges: BTreeMap::new(),
+        cross_edges: 0,
+        intra_edges: 0,
+    };
+    for step in steps {
+        *g.counts.entry(step.group.clone()).or_default() += 1;
+        for dep in &deps[&step.tag()] {
+            let from = group_of[dep];
+            if from == step.group {
+                g.intra_edges += 1;
+            } else {
+                g.cross_edges += 1;
+                *g.edges
+                    .entry((from.to_string(), step.group.clone()))
+                    .or_default() += 1;
+            }
+        }
+    }
+    g
+}
+
+/// Render the DAG collapsed to one node per `group`, as Graphviz DOT.
+///
+/// Each node is labelled with its group name and step count. Each edge is one ordered
+/// (dependency group -> dependent group) pair, labelled with the number of step-level dependency
+/// edges it merges; dependencies inside one group draw no edge.
+pub fn to_dot_groups(cfg: &DagConfig, name: &str, selected: Option<&HashSet<String>>) -> String {
+    let steps = selected_steps(cfg, selected);
+    let deps = kept_deps(&steps);
+    let g = group_graph(&steps, &deps);
+    let scaling = scaling_suffix(&steps, &deps);
+    let mut out: Vec<String> = vec![
+        format!("digraph {name} {{"),
+        "  rankdir=LR;".to_string(),
+        "  node [shape=box, style=rounded, fontsize=10];".to_string(),
+        "  labelloc=\"t\";".to_string(),
+        format!(
+            "  label=\"DAG by group  (node = group and its step count;  edge label = step-level dependencies merged){scaling}\";"
+        ),
+    ];
+    for (group, n) in &g.counts {
+        let q = dot_quote(group);
+        out.push(format!(
+            "  \"{q}\" [label=\"{q}\\n{}\"];",
+            step_count_text(*n)
+        ));
+    }
+    for ((from, to), n) in &g.edges {
+        out.push(format!(
+            "  \"{}\" -> \"{}\" [label=\"{n}\"];",
+            dot_quote(from),
+            dot_quote(to)
+        ));
+    }
+    out.push("}".to_string());
+    out.join("\n") + "\n"
+}
+
+/// Render the DAG collapsed to one line per `group`, as compact ASCII.
+///
+/// Groups are ordered by the earliest dependency layer any of their steps occupies, then by
+/// name. Each line shows the step count and the upstream groups with their merged edge counts.
+pub fn to_ascii_groups(cfg: &DagConfig, selected: Option<&HashSet<String>>) -> String {
+    let steps = selected_steps(cfg, selected);
+    let deps = kept_deps(&steps);
+    let depth = layers_of(&steps, &deps);
+    let g = group_graph(&steps, &deps);
+
+    let mut first_layer: BTreeMap<String, i64> = BTreeMap::new();
+    for step in &steps {
+        let d = depth[&step.tag()];
+        first_layer
+            .entry(step.group.clone())
+            .and_modify(|v| *v = (*v).min(d))
+            .or_insert(d);
+    }
+    let mut upstream: BTreeMap<String, Vec<(String, usize)>> = BTreeMap::new();
+    for ((from, to), n) in &g.edges {
+        upstream
+            .entry(to.clone())
+            .or_default()
+            .push((from.clone(), *n));
+    }
+    let mut order: Vec<(&String, i64)> = first_layer.iter().map(|(k, v)| (k, *v)).collect();
+    order.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
+
+    let width = g
+        .counts
+        .keys()
+        .map(|k| k.chars().count())
+        .max()
+        .unwrap_or(1);
+    let count_width = g
+        .counts
+        .values()
+        .map(|n| step_count_text(*n).chars().count())
+        .max()
+        .unwrap_or(1);
+
+    let mut out: Vec<String> = vec![
+        format!(
+            "DAG by group - {} groups, {} steps, {} group edges ({} cross-group step edges merged; {} within groups)",
+            g.counts.len(),
+            steps.len(),
+            g.edges.len(),
+            g.cross_edges,
+            g.intra_edges
+        ),
+        String::new(),
+    ];
+    for (group, _) in order {
+        let count = step_count_text(g.counts[group]);
+        match upstream.get(group) {
+            Some(ups) => {
+                let ups: Vec<String> = ups.iter().map(|(u, n)| format!("{u} ({n})")).collect();
+                out.push(format!(
+                    "  {group:<width$}  {count:<count_width$}  <- {}",
+                    ups.join(", ")
+                ));
+            }
+            None => out.push(format!("  {group:<width$}  {count}")),
+        }
+    }
+    out.join("\n") + "\n"
+}
+
 /// Longest-dependency-depth layer for each step tag.
 fn layers_of(steps: &[&Step], deps: &HashMap<String, Vec<String>>) -> HashMap<String, i64> {
     let mut depth: HashMap<String, i64> = HashMap::new();
@@ -325,6 +483,24 @@ mod tests {
         assert!(art.contains("build.app"));
         assert!(art.contains("<- build.app"));
         assert!(art.contains("{browser:1}"));
+    }
+
+    #[test]
+    fn group_dot_quotes_names_and_draws_no_self_edges() {
+        let mut cfg = cfg();
+        // Every dependency stays inside one group: no group edge at all.
+        for step in &mut cfg.steps {
+            step.group = "we\"ird\\grp".into();
+        }
+        let tags: Vec<String> = cfg.steps.iter().map(|s| s.tag()).collect();
+        cfg.steps[1].deps = vec![tags[0].clone()];
+        cfg.steps[2].deps = vec![tags[0].clone()];
+        cfg.steps[3].deps = vec![tags[0].clone()];
+        let dot = to_dot_groups(&cfg, "dag", None);
+        assert!(dot.contains("  \"we\\\"ird\\\\grp\" [label=\"we\\\"ird\\\\grp\\n4 steps\"];\n"));
+        assert!(!dot.contains("->"), "{dot}");
+        let art = to_ascii_groups(&cfg, None);
+        assert!(art.starts_with("DAG by group - 1 groups, 4 steps, 0 group edges (0 cross-group step edges merged; 3 within groups)\n"));
     }
 
     #[test]
