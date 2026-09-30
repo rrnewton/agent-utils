@@ -40,22 +40,25 @@ const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
 const MAX_AGENT_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 
-/// The herdr read source of the chat service's snapshot reads of its agent's pane, the reads that
-/// recover replies when the service starts, at each reconciliation, when the pane settles idle or
-/// done, and after an output event names a reply ID the service does not know: the screen of a
-/// pane that herdr reports keeps no scrollback, otherwise the recent rows. Claude Code redraws one
-/// screen in place and keeps none; a recent read of it while it is idle can return more than one
-/// screen, joined from what it drew at different times, and scrolls the pane's view as it reads.
-/// The service's other capture path, its `pane.output_matched` subscriptions, asks for
-/// `recent_unwrapped` rows, which herdr serves as passive reads that never scroll the view.
-/// `agentctl chat tick` makes the same choice by the same test,
-/// [`AgentPaneInfo::keeps_no_scrollback`], in a second copy, [`agent::read_capture`], which for
-/// any other pane asks for `recent-unwrapped` rows and falls back to `recent`.
+/// The herdr read source of the chat service's reads of its agent's pane: the reads that recover
+/// replies when the service starts, at each reconciliation, when the pane settles idle or done,
+/// and after an output event names a reply ID the service does not know; the read it repeats
+/// while a reply alias keeps an output pattern matched; and the read just before a request's
+/// prompt is written. It is the screen of a pane that herdr reports keeps no scrollback, and
+/// otherwise the recent lines with wrapped rows joined, or the recent rows when herdr returns no
+/// such lines. Claude Code redraws one screen in place and keeps none; a recent read of it while
+/// it is idle can return more than one screen, joined from what it drew at different times, and
+/// scrolls the pane's view as it reads. The service's other capture path, its
+/// `pane.output_matched` subscriptions, asks for `recent_unwrapped` lines, as many as these reads
+/// do, which herdr serves as passive reads that never scroll the view, so for a pane with
+/// scrollback a read here sees the lines herdr matches the subscriptions against. `agentctl chat
+/// tick` makes the same choice by the same test, [`AgentPaneInfo::keeps_no_scrollback`], in a
+/// second copy, [`agent::read_capture`].
 pub(crate) fn chat_capture_source(info: &AgentPaneInfo) -> &'static str {
     if info.keeps_no_scrollback() {
         "visible"
     } else {
-        "recent"
+        "recent-unwrapped"
     }
 }
 
@@ -4342,13 +4345,36 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         Ok(text)
     }
 
-    /// Read what a chat bridge scans for replies, as [`Self::read_capture`] does, while allowing
-    /// service cancellation during locks and control.
+    /// Read what a chat bridge scans for replies, from the source [`chat_capture_source`] picks,
+    /// and persist it as the latest bounded snapshot, while allowing service cancellation during
+    /// locks and control.
     pub(crate) fn read_capture_with_runtime(
         &self,
         agent_name: &str,
         lines: usize,
         runtime: &dyn agent::AgentRuntime,
+    ) -> Result<String> {
+        self.capture_with_runtime(agent_name, lines, runtime, true)
+    }
+
+    /// Read as [`Self::read_capture_with_runtime`] does, without persisting a snapshot: for a read
+    /// the service repeats every few seconds, where each snapshot would cost a file write and two
+    /// fsyncs.
+    pub(crate) fn peek_capture_with_runtime(
+        &self,
+        agent_name: &str,
+        lines: usize,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> Result<String> {
+        self.capture_with_runtime(agent_name, lines, runtime, false)
+    }
+
+    fn capture_with_runtime(
+        &self,
+        agent_name: &str,
+        lines: usize,
+        runtime: &dyn agent::AgentRuntime,
+        persist: bool,
     ) -> Result<String> {
         let _lock = self.lock_with_runtime(agent_name, runtime)?;
         let record = self.load(agent_name)?;
@@ -4366,13 +4392,18 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             &target,
             runtime,
         )?;
-        let text = self.client.read_with_runtime(
-            &info.pane_id,
-            chat_capture_source(&info),
-            Some(lines),
-            runtime,
-        )?;
-        self.snapshot(&record, &text)?;
+        let source = chat_capture_source(&info);
+        let mut text =
+            self.client
+                .read_with_runtime(&info.pane_id, source, Some(lines), runtime)?;
+        if text.is_empty() && source == "recent-unwrapped" {
+            text = self
+                .client
+                .read_with_runtime(&info.pane_id, "recent", Some(lines), runtime)?;
+        }
+        if persist {
+            self.snapshot(&record, &text)?;
+        }
         Ok(text)
     }
 
@@ -5984,6 +6015,9 @@ pub(crate) mod tests {
                     fail_first_wait: AtomicBool::new(false),
                     scroll: Mutex::new(None),
                     read_sources: Mutex::new(Vec::new()),
+                    screens: Mutex::new(std::collections::VecDeque::new()),
+                    screen: Mutex::new(None),
+                    unwrapped_empty: AtomicBool::new(false),
                 },
                 root,
             }
@@ -6085,7 +6119,9 @@ pub(crate) mod tests {
         moves: Mutex<Vec<(String, String, String)>>,
         panes_calls: AtomicU64,
         pane_info_calls: AtomicU64,
-        runs: Mutex<Vec<String>>,
+        /// Every text written to a pane with `run`, such as a prompt, in order, and a line for
+        /// each agent state reported to herdr.
+        pub(crate) runs: Mutex<Vec<String>>,
         slot_commands: Mutex<Vec<(String, String)>>,
         environments: Mutex<Vec<Vec<String>>>,
         closed: Mutex<Vec<String>>,
@@ -6113,7 +6149,8 @@ pub(crate) mod tests {
         change_record_token_on_read: AtomicBool,
         add_null_shell_identity_on_read: AtomicBool,
         replace_record_directory_on_read: AtomicBool,
-        fail_read: AtomicBool,
+        /// Whether every read fails.
+        pub(crate) fail_read: AtomicBool,
         fail_shell_proof: AtomicBool,
         shell_proof_mutation: AtomicU64,
         oversized_read: AtomicBool,
@@ -6127,6 +6164,13 @@ pub(crate) mod tests {
         fail_first_wait: AtomicBool,
         pub(crate) scroll: Mutex<Option<crate::client::PaneScroll>>,
         pub(crate) read_sources: Mutex<Vec<String>>,
+        /// The texts that successive reads return, first to last, before `screen` applies.
+        pub(crate) screens: Mutex<std::collections::VecDeque<String>>,
+        /// The text a read returns, when set; `visible output` otherwise.
+        pub(crate) screen: Mutex<Option<String>>,
+        /// Whether a `recent-unwrapped` read returns no text, as herdr's does for a pane it
+        /// cannot serve that source for.
+        pub(crate) unwrapped_empty: AtomicBool,
     }
     impl Fake {
         fn pane(id: &str) -> Pane {
@@ -6276,6 +6320,9 @@ pub(crate) mod tests {
             if self.fail_read.load(Ordering::Relaxed) {
                 return Err(AdapterError::unavailable("capture failed"));
             }
+            if source == "recent-unwrapped" && self.unwrapped_empty.load(Ordering::Relaxed) {
+                return Ok(String::new());
+            }
             if self.oversized_read.load(Ordering::Relaxed) {
                 return Ok("\0".repeat(3 << 20));
             }
@@ -6346,7 +6393,15 @@ pub(crate) mod tests {
                     }
                 }
             }
-            Ok("visible output".to_owned())
+            if let Some(text) = self.screens.lock().unwrap().pop_front() {
+                return Ok(text);
+            }
+            Ok(self
+                .screen
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "visible output".to_owned()))
         }
     }
     impl ManagedApi for Fake {
@@ -11037,12 +11092,21 @@ pub(crate) mod tests {
             written["text"] == "visible output"
         };
         let _ = fs::remove_file(&snapshot);
-        for (reported, service_source, command_sources) in [
-            (Some(scroll(0)), "visible", &["visible"][..]),
-            (Some(scroll(120)), "recent", &["recent-unwrapped"][..]),
-            (None, "recent", &["recent-unwrapped"][..]),
+        // The service reads the sources `chat tick` reads, and falls back the same way when a
+        // `recent-unwrapped` read returns nothing.
+        for (reported, unwrapped_empty, sources) in [
+            (Some(scroll(0)), false, &["visible"][..]),
+            (Some(scroll(0)), true, &["visible"][..]),
+            (Some(scroll(120)), false, &["recent-unwrapped"][..]),
+            (Some(scroll(120)), true, &["recent-unwrapped", "recent"][..]),
+            (None, false, &["recent-unwrapped"][..]),
+            (None, true, &["recent-unwrapped", "recent"][..]),
         ] {
             *fixture.client.scroll.lock().unwrap() = reported;
+            fixture
+                .client
+                .unwrapped_empty
+                .store(unwrapped_empty, Ordering::Relaxed);
             fixture.client.read_sources.lock().unwrap().clear();
             assert_eq!(
                 manager
@@ -11053,8 +11117,22 @@ pub(crate) mod tests {
             assert!(took_snapshot());
             assert_eq!(
                 *fixture.client.read_sources.lock().unwrap(),
-                [service_source],
-                "{reported:?}"
+                sources,
+                "{reported:?} {unwrapped_empty}"
+            );
+            // The read the service repeats reads the same way and persists nothing.
+            fixture.client.read_sources.lock().unwrap().clear();
+            assert_eq!(
+                manager
+                    .peek_capture_with_runtime("worker", 10, &runtime)
+                    .unwrap(),
+                "visible output"
+            );
+            assert!(!snapshot.exists());
+            assert_eq!(
+                *fixture.client.read_sources.lock().unwrap(),
+                sources,
+                "{reported:?} {unwrapped_empty}"
             );
             fixture.client.read_sources.lock().unwrap().clear();
             assert_eq!(
@@ -11064,8 +11142,8 @@ pub(crate) mod tests {
             assert!(took_snapshot());
             assert_eq!(
                 *fixture.client.read_sources.lock().unwrap(),
-                command_sources,
-                "{reported:?}"
+                sources,
+                "{reported:?} {unwrapped_empty}"
             );
             // The `agentctl read` command keeps reading recent rows whatever the pane keeps.
             fixture.client.read_sources.lock().unwrap().clear();
@@ -11073,7 +11151,11 @@ pub(crate) mod tests {
             assert!(took_snapshot());
             assert_eq!(
                 *fixture.client.read_sources.lock().unwrap(),
-                ["recent-unwrapped"]
+                if unwrapped_empty {
+                    &["recent-unwrapped", "recent"][..]
+                } else {
+                    &["recent-unwrapped"][..]
+                }
             );
         }
     }

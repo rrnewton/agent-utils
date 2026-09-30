@@ -384,38 +384,41 @@ agent's own.
 
 The bridge reads only the rows on the screen of a pane that herdr reports keeps
 no scrollback, one whose `scroll.max_offset_from_bottom` is 0, such as a Claude
-Code pane, for the reason given two paragraphs below. For any other pane it asks
-herdr for the newest 4,000 lines, and herdr returns at most 1,000, as it does
-for a Codex pane. It looks the pane up again before each read, so a pane that
-starts or stops keeping scrollback between the lookup and the read, as a program
-does when it enters or leaves the terminal's alternate screen, is read the old
-way once, and for a pane that has just entered the alternate screen, that one
-read can be the joined read described below. A `scroll` value that is not an
-object of those three counts fails every lookup that reads that pane, for prompt
-delivery as well as for reads, rather than let the bridge guess. A lookup by
-session reads every pane, so one pane's malformed value fails every lookup by
-session. The rows above the first nonblank row that starts at the left edge
-continue an item whose first row is out of view, which can be a prompt or tool
-output, so an opening marker there opens no block, although an unavailable ID in
-it is still reported, and a code fence that opens there ends at that row. Once a
-prompt has scrolled off the top of the screen, Claude Code can draw a copy of it
-over the screen's top row, at the left edge and cut to one row, above rows of
-whatever item the screen starts in. So a `❯` row at the left edge that is the
-first nonblank row of a capture is skipped: it starts no prompt, and it is not
-the first row at the left edge. A Claude Code prompt that really starts at the
-top of a capture is then read as rows above the first row at the left edge, so a
-block it quotes is not posted, but it is reported unless its text is the end of
-a stored reply. Codex draws no such copy, so a Codex prompt row at the top of a
-capture starts a prompt, as it does anywhere else. A block is therefore posted
-only by a capture that shows both the first row of the message that holds it and
-the whole block. A block that starts its message needs only the whole block in
-view; a block after other text in its message also needs the message's first
-row, which leaves the screen sooner. So from a Claude Code pane a block is not
-posted if it is taller than the screen, or if its closing marker is more than a
-screen below the first row of its message, as in a long message that ends with
-the block; a recovery scan that sees its closing marker reports it instead, as
-described below. A capture that sees only part of a block handles that part as a
-partial block, as described below, except in the longer reads described next.
+Code pane, for the reason given in the next paragraph. For any other pane, such
+as a Codex pane, it asks herdr for the newest 4,000 lines with each wrapped line
+joined into one, as herdr reads the pane for an output event; herdr returns at
+most 1,000 lines for either read. If that read returns no text, the bridge asks
+for the rows as the terminal draws them instead. It looks the pane up again
+before each read, so a pane that starts or stops keeping scrollback between the
+lookup and the read, as a program does when it enters or leaves the terminal's
+alternate screen, is read the old way once, and for a pane that has just entered
+the alternate screen, that one read can be the joined read described below. A
+`scroll` value that is not an object of those three counts fails every lookup
+that reads that pane, for prompt delivery as well as for reads, rather than let
+the bridge guess. A lookup by session reads every pane, so one pane's malformed
+value fails every lookup by session. The rows above the first nonblank row that
+starts at the left edge continue an item whose first row is out of view, which
+can be a prompt or tool output, so an opening marker there opens no block,
+although an unavailable ID in it is still reported, and a code fence that opens
+there ends at that row. Once a prompt has scrolled off the top of the screen,
+Claude Code can draw a copy of it over the screen's top row, at the left edge
+and cut to one row, above rows of whatever item the screen starts in. So a `❯`
+row at the left edge that is the first nonblank row of a capture is skipped: it
+starts no prompt, and it is not the first row at the left edge. A Claude Code
+prompt that really starts at the top of a capture is then read as rows above the
+first row at the left edge, so a block it quotes is not posted, but it is
+reported unless its text is the end of a stored reply. Codex draws no such copy,
+so a Codex prompt row at the top of a capture starts a prompt, as it does
+anywhere else. A block is therefore posted only by a capture that shows both the
+first row of the message that holds it and the whole block. A block that starts
+its message needs only the whole block in view; a block after other text in its
+message also needs the message's first row, which leaves the screen sooner. So
+from a Claude Code pane a block is not posted if it is taller than the screen,
+or if its closing marker is more than a screen below the first row of its
+message, as in a long message that ends with the block; a recovery scan that
+sees its closing marker reports it instead, as described below. A capture that
+sees only part of a block handles that part as a partial block, as described
+below, except in the longer reads described next.
 
 A Claude Code pane keeps no scrollback, yet a read of more lines than its screen
 has rows can return more. Herdr 0.8.0 builds such a read of an agent that is
@@ -464,19 +467,136 @@ a busy turn a recovery scan normally comes only when the pane settles, so if the
 agent writes more than a screen after such a block before then, the block is
 neither posted nor reported.
 
-Replies are recognized by their text, not by the number in their reply ID. A
-reply ID is the request's nonce, an underscore, and a number from 1 to 999999
-with no leading zero. When a block appears under any reply ID of an open
-request, the bridge compares its text with the replies it has already stored for
-that request. The comparison ignores whitespace and the box-drawing characters,
-U+2500 to U+257F, that a terminal draws for table borders, so a paragraph the
-terminal re-wraps or a border it redraws at another width still matches. Every
-other character counts, including the block elements of a progress bar. A block
-whose text matches a stored reply is not posted again; any other block is stored
-as the request's next reply and posted. So an answer the agent sends twice to
-one request, under one ID or under two, is posted once, and two identical short
-replies to one request, such as two `ok` progress notes, are posted as one. The
-same text sent to two requests is posted to each.
+Each request's prompt gives one reply ID, a short number, for every reply to
+that request: `001`, `002`, and so on, counting across all requests and past
+`999` with more digits. The prompt asks the agent to use that same ID for each
+reply and not to increment it. The bridge assigns a number when it first writes
+a prompt that shows it, and never assigns it again: the next number is kept in
+`reply-aliases.json` in the state directory and saved before the prompt is
+written, so a restart, a crash, or a rollback to an earlier release and back
+does not reuse one. A number that the agent writes in a marker line before the
+bridge assigns it, such as a guessed or example ID, is reported like any other
+unavailable ID and skipped when assignment reaches it; up to 1,024 such numbers
+are kept, the lowest ones. The number of a closed request stays recognized as
+long as that request's long ID does, so a late block under it is ignored rather
+than reported. An earlier release reports a short ID as belonging to no request.
+
+Just before it writes a prompt that gives a request its number, the bridge reads
+the agent's pane, as described above, and skips every number that the read shows
+written as a short reply ID anywhere: in a block, in running text, or in a
+prompt or tool output the agent received. These count toward the 1,024 skipped
+numbers kept for later requests, and the request whose prompt follows the read
+gets none of them, however many the read shows. So a block already in the pane
+when a request gets its number is never posted as that request's reply; where a
+capture reads it, it is reported as naming no open request. If the pane cannot
+be read, the prompt is not written and the request waits for the bridge's next
+attempt. A block that the read does not show can still be posted to a request
+that gets its number afterwards, if a later capture sees it: one that comes back
+into view, as when someone scrolls a Claude Code pane's view up, and one in an
+output event that herdr read before the block left the view but the bridge
+handles only after the prompt. Once a request's prompt has reached the agent, a
+block under its number is posted to it, even if the agent meant it for another
+request, as a block under a long ID is.
+
+A request gets its number when its prompt is written, but the prompt can then
+wait in the agent's queue, for example while the agent is busy, and the agent
+cannot know the number before the prompt is typed. A block under that number
+before then was written for another request, by an agent that guessed the next
+number or copied an example. While the queue holds the prompt in its inbox, or
+does not hold it at all, the bridge posts no block it reads under that number
+and remembers the text of each complete one in `reply-aliases.json`, so no block
+with that text is posted to the request after its prompt is typed either. That
+text is compared as a stored reply's is, as described below, so a paragraph the
+terminal re-wraps or a border it redraws still matches, but a table redrawn in
+one of the ways listed there can read as new text. A block with new text under
+the number is posted then. Up to 256 remembered blocks are kept, the newest.
+Each delivery, of a request's prompt or of a routing-error prompt, can type
+every prompt waiting in the queue, so before it types any, if a request whose
+prompt has not been typed has a number, the bridge reads the pane and remembers
+in the same way the blocks the read shows under such numbers. It reads the pane
+too while `reply-aliases.json` cannot be read, but then remembers nothing, as
+described below. If the pane cannot be read then, or a block it shows cannot be
+written to `reply-aliases.json`, the bridge types nothing and tries again later.
+When a recovery scan reads a block that is not posted for this reason, the agent
+gets a routing-error prompt that says the block was not sent, why, and that no
+block with its text will be sent to that request, and lists the open requests.
+It names the request the block was probably meant for in the same case as for a
+block under an unavailable ID, described below. While a request's queue entry
+cannot be read, a block under its number is held: it is not posted, remembered,
+or reported, and a later capture decides.
+
+These rules see only the bridge's own queue, and they have gaps. A prompt typed
+into a Claude Code session that is still working waits in that program's own
+queue, which the bridge cannot see, so a block under its number written then is
+posted. A block that first appears after the read before typing is posted unless
+a capture reads it before the prompt is typed, and a nonzero `--ready-timeout`
+widens that window, because the drain then waits for the agent before it types.
+A block written while the prompt waits that no capture reads, and that is out of
+view at the read before typing, is posted if a later capture sees it: one that
+comes back into view, as when someone scrolls a Claude Code pane's view up, and
+one in an output event that herdr read before the block left the view but the
+bridge handles only after the prompt is typed. A remembered table that the
+terminal redraws after the prompt is typed, in one of the ways listed below, can
+read as new text and is then posted. Each rendering of a table whose cells wrap
+differently is also reported as a block of its own, so it can bring the agent
+one more routing-error prompt. Other commands that type queued prompts do so
+without that read: `agentctl send`, `agentctl drain`, and `agentctl goal` given
+a goal, and the same three commands of the older `herdr-agent`. A request whose
+queue entry shows that typing its prompt started counts as reached, even if the
+typing then failed. While a request's queue entry cannot be read, the read
+before typing does not remember blocks under its number, so if its prompt was in
+fact waiting and is typed, a block under its number that is still in view once
+the entry can be read again is posted. A remembered block is forgotten once 256
+newer ones are remembered. While `reply-aliases.json` cannot be read, nothing is
+remembered, so once the file is repaired, a block still in view under the number
+of a request whose prompt was typed in that time is posted to it. Only a
+recovery scan reports such a block: one that the read before typing or the
+capture after an output event remembers is reported only if a recovery scan
+reads it too.
+
+A request prompted before short reply IDs, and every request prompted while
+`reply-aliases.json` cannot be read, gets a long reply ID instead: the request's
+nonce, an underscore, and a number from 1 to 999999 with no leading zero, which
+the agent increments for each reply. Long IDs stay accepted for every request.
+While the file cannot be read, the service logs that it is unusable, `chat tick`
+reports that among its notes, and `chat status` shows it in
+`reply_alias_problem`, which is otherwise null; blocks under short IDs are
+reported as naming no open chat request, and the file is left as it is for an
+operator to repair. Deleting it starts the numbering again at `001`, as a new
+state directory for the same pane does, and replacing it with an older copy
+starts it again at that copy's next number. The read before each prompt still
+skips the numbers the pane shows, but a block under an old number that is out of
+view then can reach the new request.
+
+Herdr reports an output pattern only when it starts to match, and a request
+keeps its short ID for every reply, so while the closing line of one reply is in
+view, the closing line of the next raises no event. While a closing line under
+an open request's short ID is in view, the service therefore reads the pane
+itself every 2 seconds, until no such line is left. In view means in the
+bridge's read, which is herdr's window for output events too: the screen of a
+Claude Code pane, and the newest 1,000 lines of a Codex pane. Each of these
+reads takes the lock that prompt delivery takes, looks the pane up in herdr, and
+reads it, up to 1,000 lines of a Codex pane, but saves no snapshot. A capture of
+the read follows for each open request whose closing line it shows, as for an
+output event, and reads that request's queue entry too when the bridge has not
+seen its prompt typed and the request has a number or `reply-aliases.json`
+cannot be read. A closing line inside a prompt or tool output the agent received
+keeps them going too, although it is never posted. A read that fails is logged
+once and retried every 2 seconds, and its first success after that is logged as
+well.
+
+Replies are recognized by their text, not by the number in their reply ID. When
+a block appears under any reply ID of an open request, the bridge compares its
+text with the replies it has already stored for that request. The comparison
+ignores whitespace and the box-drawing characters, U+2500 to U+257F, that a
+terminal draws for table borders, so a paragraph the terminal re-wraps or a
+border it redraws at another width still matches. Every other character counts,
+including the block elements of a progress bar. A block whose text matches a
+stored reply is not posted again; any other block is stored as the request's
+next reply and posted. So an answer the agent sends twice to one request, under
+one ID or under two, is posted once, and two identical short replies to one
+request, such as two `ok` progress notes, are posted as one. The same text sent
+to two requests is posted to each.
 
 A table cell that wraps onto several lines at one width and fits on one line at
 another changes the order of the characters, so tables are also compared column
@@ -575,10 +695,14 @@ had not seen it when it wrote the block. A request whose queue record cannot be
 read counts, since the agent may have seen it, but is never named, so while one
 with no reply yet is listed, no request is named. The bridge cannot tell when
 the block was written, so a request whose prompt left the inbox after the agent
-wrote the block, but before the bridge reported it, can still be named. When the
-prompt names a request, it also asks the agent not to send a block it did not
-write, such as one quoted in a message it received, since the agent could
-otherwise send such a block under that request's ID.
+wrote the block, but before the bridge reported it, can still be named. The
+exception is a request whose prompt reaches the agent when the bridge delivers
+an earlier routing-error prompt still waiting in the queue, which it does before
+writing a new one: the open requests are taken before that delivery, so such a
+request is listed but not named. When the prompt names a request, it also asks
+the agent not to send a block it did not write, such as one quoted in a message
+it received, since the agent could otherwise send such a block under that
+request's ID.
 
 A recovery scan also reports a partial block of an open request: an opening
 marker with no closing one after it, or an unopened block, which ends in a

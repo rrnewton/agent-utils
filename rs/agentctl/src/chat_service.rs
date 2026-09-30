@@ -27,13 +27,15 @@ use crate::chat_events::{self, PaneEvent, PaneEventStream, PaneEventWake};
 use crate::chat_runtime::{
     self, AckResult, BridgeConfiguration, BridgeState, ChatRuntimeError, CommandOutboundTransport,
     CoordinatorDeliveryResult, OutboundCancellation, OutboundFailure, ReplyRoute, ReplyRouteEntry,
-    RootMessageSubmission, RootMessageTransport,
+    RootMessageSubmission, RootMessageTransport, SNAPSHOT_LINES,
 };
 use crate::client::HerdrClient;
 use crate::subagents::{ManagedAgents, ManagedApi};
 
-const SNAPSHOT_LINES: usize = 4_000;
+// The lines of context each output subscription asks for: the rows the service's own reads of
+// the pane ask for.
 const SNAPSHOT_LINES_U32: u32 = 4_000;
+const _: () = assert!(SNAPSHOT_LINES_U32 as usize == SNAPSHOT_LINES);
 const MAX_SNAPSHOT_BYTES: usize = 2 * 1_024 * 1_024;
 // Notes one pass report keeps, and distinct notes one service process remembers having logged.
 const MAX_REPORT_NOTES: usize = 128;
@@ -49,6 +51,9 @@ const ACK_RETRY_DELAY: Duration = Duration::from_secs(60);
 const MAX_IMMEDIATE_BACKLOG_CHUNKS: usize = 64;
 const EVENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTPUT_RETRY_MAX: Duration = Duration::from_secs(60);
+// How often the service reads the pane itself while a reply alias keeps an output pattern
+// matched; see `RouteCache::saturated_by`.
+const SATURATED_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const PROVIDER_RETRY_MIN: Duration = Duration::from_secs(1);
 const PROVIDER_RETRY_MAX: Duration = Duration::from_secs(60);
 // Already reported reply IDs one recovery-scan log line names before it counts the rest.
@@ -431,8 +436,10 @@ pub fn tick<A: ManagedApi + ?Sized>(
         transport: &mut transport,
         stop: None,
     };
-    let mut report = recover_pass(&state, manager, options.delivery, &mut routes, &mut control)?;
-    report.merge(capture_recovery_snapshot(
+    // The read is captured before any request is prompted, as at service startup: a prompt
+    // written in this pass is newer than the read, so no block in the read answers it, and a
+    // reply alias assigned in this pass must not take a block in the read as its reply.
+    let mut report = capture_recovery_snapshot(
         &state,
         manager,
         options.delivery,
@@ -443,7 +450,17 @@ pub fn tick<A: ManagedApi + ?Sized>(
             revision: None,
         },
         &mut control,
+    )?;
+    report.merge(recover_pass(
+        &state,
+        manager,
+        options.delivery,
+        &mut routes,
+        &mut control,
     )?);
+    if let Some(problem) = state.reply_alias_problem() {
+        report.note(problem);
+    }
     if manager.pane_info(&state.config().agent_name)?.pane_id != info.pane_id {
         return Err(ChatServiceError::Generation(
             "coordinator pane moved during the bounded chat tick".to_owned(),
@@ -1142,7 +1159,8 @@ fn capture_recovery_snapshot<A: ManagedApi + ?Sized>(
     control: &mut PassControl<'_>,
 ) -> Result<CycleReport, ChatServiceError> {
     let (text, cut) = bounded_snapshot(snapshot.text);
-    let capture = state.capture_snapshot(text)?;
+    let gate = prompt_gate(state, manager, None, control.stop)?;
+    let capture = state.capture_snapshot_with_gate(text, &gate)?;
     let route_entries = capture.route_entries.clone();
     let mut report = CycleReport {
         captured: capture.replies.clone(),
@@ -1229,7 +1247,8 @@ fn capture_direct<A: ManagedApi + ?Sized>(
         });
     }
     let (text, cut) = bounded_snapshot(snapshot.text);
-    let capture = state.capture_replies(&key, text)?;
+    let gate = prompt_gate(state, manager, Some(&key), control.stop)?;
+    let capture = state.capture_replies_with_gate(&key, text, &gate)?;
     let mut report = CycleReport {
         snapshot_truncated: snapshot.truncated,
         snapshot_revision: snapshot.revision,
@@ -1255,6 +1274,27 @@ fn capture_direct<A: ManagedApi + ?Sized>(
     Ok(report)
 }
 
+/// The open requests whose prompt has not reached the coordinator, or may not have, as the queue
+/// shows them now, among all of them or only `only`: see [`chat_runtime::PromptGate`]. The pane
+/// text a capture scans must be read before this.
+fn prompt_gate<A: ManagedApi + ?Sized>(
+    state: &BridgeState,
+    manager: &ManagedAgents<'_, A>,
+    only: Option<&str>,
+    stop: Option<&StopState>,
+) -> Result<chat_runtime::PromptGate, ChatRuntimeError> {
+    match stop {
+        Some(stop) => state.prompt_gate(
+            &CancellableDelivery {
+                manager,
+                runtime: StopRuntime::new(stop),
+            },
+            only,
+        ),
+        None => state.prompt_gate(manager, only),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum MatchedRoute {
     Unknown,
@@ -1263,21 +1303,20 @@ enum MatchedRoute {
 }
 
 /// Route one closing marker seen in the output. Any well-formed reply ID of an open request routes
-/// to that request, not only its next one: a block under an earlier ID may hold new text, and
-/// the capture decides by the text whether it does.
+/// to that request: its reply alias, or any `<nonce>_<ordinal>`, not only its next one. A block
+/// under an earlier ID may hold new text, and the capture decides by the text whether it does.
 fn refresh_matched_route(
     state: &BridgeState,
     routes: &mut RouteCache,
     identifier: &str,
 ) -> Result<MatchedRoute, ChatRuntimeError> {
-    let Some((key, open)) = identifier
-        .rsplit_once('_')
-        .and_then(|(nonce, _)| routes.nonce_route(nonce))
-    else {
+    let Some((key, open)) = routes.identifier_route(identifier) else {
         return Ok(MatchedRoute::Unknown);
     };
     let key = key.to_owned();
-    if !open || !chat_runtime::has_reply_ordinal(identifier) {
+    let well_formed = chat_runtime::parse_reply_alias(identifier).is_some()
+        || chat_runtime::has_reply_ordinal(identifier);
+    if !open || !well_formed {
         return Ok(MatchedRoute::Stale);
     }
     let current = state.next_reply_route(&key)?;
@@ -1288,6 +1327,44 @@ fn refresh_matched_route(
     } else {
         MatchedRoute::Stale
     })
+}
+
+/// When to read the pane again because `text` shows a closing line that keeps an output pattern
+/// matched, as `RouteCache::saturated_by` describes; `None` when it shows none.
+fn next_saturated_poll(routes: &RouteCache, text: &str) -> Option<Instant> {
+    routes
+        .saturated_by(text)
+        .then(|| Instant::now() + SATURATED_POLL_INTERVAL)
+}
+
+/// Capture the replies of each open request whose current reply ID has a closing line in
+/// `text`, as an output event for that line would. This reports no partial block, so the
+/// service can run it while the agent is still writing.
+fn capture_visible_current<A: ManagedApi + ?Sized>(
+    state: &BridgeState,
+    manager: &ManagedAgents<'_, A>,
+    delivery: DrainOptions,
+    routes: &mut RouteCache,
+    text: &str,
+    control: &mut PassControl<'_>,
+) -> Result<CycleReport, ChatServiceError> {
+    let mut report = CycleReport::default();
+    for identifier in routes.visible_current_identifiers(text) {
+        report.merge(capture_direct(
+            state,
+            manager,
+            delivery,
+            routes,
+            &identifier,
+            SnapshotInput {
+                text,
+                truncated: false,
+                revision: None,
+            },
+            control,
+        )?);
+    }
+    Ok(report)
 }
 
 #[derive(Clone, Copy)]
@@ -1330,6 +1407,8 @@ struct RouteCache {
     by_identifier: BTreeMap<String, String>,
     by_key: BTreeMap<String, (String, Option<String>)>,
     by_nonce: BTreeMap<String, String>,
+    /// The reply aliases of open and closed requests, like `by_nonce`.
+    by_alias: BTreeMap<String, String>,
 }
 
 impl RouteCache {
@@ -1338,13 +1417,12 @@ impl RouteCache {
         Self::from_entries(
             routes
                 .into_iter()
-                .filter_map(|route| {
-                    let nonce = route.identifier.rsplit_once('_')?.0.to_owned();
-                    Some(ReplyRouteEntry {
-                        key: route.key,
-                        nonce,
-                        current_identifier: Some(route.identifier),
-                    })
+                .map(|route| ReplyRouteEntry {
+                    alias: chat_runtime::parse_reply_alias(&route.identifier)
+                        .map(|_| route.identifier.clone()),
+                    key: route.key,
+                    nonce: route.nonce,
+                    current_identifier: Some(route.identifier),
                 })
                 .collect(),
         )
@@ -1355,12 +1433,16 @@ impl RouteCache {
             by_identifier: BTreeMap::new(),
             by_key: BTreeMap::new(),
             by_nonce: BTreeMap::new(),
+            by_alias: BTreeMap::new(),
         };
         for entry in entries {
             if let Some(identifier) = entry.current_identifier.as_ref() {
                 result
                     .by_identifier
                     .insert(identifier.clone(), entry.key.clone());
+            }
+            if let Some(alias) = entry.alias {
+                result.by_alias.insert(alias, entry.key.clone());
             }
             result
                 .by_nonce
@@ -1378,13 +1460,16 @@ impl RouteCache {
             self.by_identifier.remove(identifier);
         }
         if let Some(route) = route {
-            if let Some((nonce, _)) = route.identifier.rsplit_once('_') {
-                let nonce = nonce.to_owned();
-                self.by_nonce.insert(nonce.clone(), route.key.clone());
-                self.by_key
-                    .insert(route.key.clone(), (nonce, Some(route.identifier.clone())));
-                self.by_identifier.insert(route.identifier, route.key);
+            self.by_nonce.insert(route.nonce.clone(), route.key.clone());
+            if chat_runtime::parse_reply_alias(&route.identifier).is_some() {
+                self.by_alias
+                    .insert(route.identifier.clone(), route.key.clone());
             }
+            self.by_key.insert(
+                route.key.clone(),
+                (route.nonce, Some(route.identifier.clone())),
+            );
+            self.by_identifier.insert(route.identifier, route.key);
         } else if let Some((nonce, _)) = previous {
             self.by_nonce.insert(nonce.clone(), key.to_owned());
             self.by_key.insert(key.to_owned(), (nonce, None));
@@ -1404,13 +1489,58 @@ impl RouteCache {
     }
 
     /// The request that owns a nonce, and whether its capture was open when last read.
+    #[cfg(test)]
     fn nonce_route(&self, nonce: &str) -> Option<(&str, bool)> {
         let key = self.by_nonce.get(nonce)?;
-        let open = self
-            .by_key
+        Some((key.as_str(), self.is_open(key)))
+    }
+
+    /// The request a reply ID names, and whether its capture was open when last read: the
+    /// owner of a reply alias, or of the nonce of `<nonce>_<ordinal>`.
+    fn identifier_route(&self, identifier: &str) -> Option<(&str, bool)> {
+        let key = if chat_runtime::parse_reply_alias(identifier).is_some() {
+            self.by_alias.get(identifier)?
+        } else {
+            self.by_nonce.get(identifier.rsplit_once('_')?.0)?
+        };
+        Some((key.as_str(), self.is_open(key)))
+    }
+
+    fn is_open(&self, key: &str) -> bool {
+        self.by_key
             .get(key)
-            .is_some_and(|(_, current)| current.is_some());
-        Some((key.as_str(), open))
+            .is_some_and(|(_, current)| current.is_some())
+    }
+
+    /// The current reply IDs of open requests whose closing line `text` shows, each once, in
+    /// the order of the lines.
+    fn visible_current_identifiers(&self, text: &str) -> Vec<String> {
+        let mut seen = BTreeSet::new();
+        text.lines()
+            .filter_map(matched_identifier)
+            .filter(|identifier| self.by_identifier.contains_key(*identifier))
+            .filter(|identifier| seen.insert(*identifier))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Whether `text` shows the closing line of an open request's reply alias. Herdr reports an
+    /// output pattern only when it starts to match, and a request keeps its alias for every
+    /// reply, so while such a line stays in the pane a later closing line under any ID of the
+    /// same pattern raises no event. The service reads the pane itself instead, every
+    /// `SATURATED_POLL_INTERVAL`, until no such line is left. A `<nonce>_<ordinal>` ID changes
+    /// once its reply is stored, which subscribes a new pattern that starts unmatched. A closing
+    /// line under a current `<nonce>_<ordinal>` ID that is not stored, because it has no opening
+    /// line or sits inside a prompt echo or tool output, keeps its pattern matched as well but
+    /// does not start these reads: a reply under another ID of that pattern then raises no event
+    /// and waits for a read of the whole pane, such as the one when the pane settles.
+    fn saturated_by(&self, text: &str) -> bool {
+        text.lines()
+            .filter_map(matched_identifier)
+            .any(|identifier| {
+                chat_runtime::parse_reply_alias(identifier).is_some()
+                    && self.by_identifier.contains_key(identifier)
+            })
     }
 
     fn patterns(&self) -> Result<Vec<String>, ChatServiceError> {
@@ -1660,6 +1790,12 @@ impl<A: ManagedApi + ?Sized> chat_runtime::CoordinatorDelivery for CancellableDe
         self.manager
             .drain_with_runtime(agent_name, options, &self.runtime)
             .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn screen(&self, agent_name: &str) -> std::result::Result<String, String> {
+        self.manager
+            .peek_capture_with_runtime(agent_name, SNAPSHOT_LINES, &self.runtime)
             .map_err(|error| error.to_string())
     }
 }
@@ -2452,6 +2588,10 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     };
     let mut direct_keys = DirectKeyQueue::default();
     let mut notes = NoteLog::default();
+    let mut alias_problem = state.reply_alias_problem();
+    if let Some(problem) = &alias_problem {
+        service_log(format_args!("agentctl: {problem}"));
+    }
     let initial = manager.read_capture_with_runtime(
         &state.config().agent_name,
         SNAPSHOT_LINES,
@@ -2474,6 +2614,9 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     let recovery = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
     enqueue_report_backlog(&mut direct_keys, &recovery, overflowed);
     notes.log(&recovery);
+    let mut poll_at = next_saturated_poll(&routes, &initial);
+    // Consecutive failed reads of the saturated poll, which logs the first and the recovery.
+    let mut poll_failures = 0_u64;
 
     let mut stream: Option<PaneEventStream> = None;
     let mut subscribed_patterns = Vec::new();
@@ -2503,6 +2646,14 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
         }
 
         if Instant::now() >= next_reconciliation {
+            let problem = state.reply_alias_problem();
+            if problem != alias_problem {
+                match &problem {
+                    Some(problem) => service_log(format_args!("agentctl: {problem}")),
+                    None => service_log("agentctl: the reply alias record is usable again"),
+                }
+                alias_problem = problem;
+            }
             let info =
                 manager.pane_info_with_runtime(&state.config().agent_name, &owner_runtime)?;
             if matches!(info.status.as_str(), "idle" | "done") {
@@ -2525,11 +2676,56 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                 )?;
                 enqueue_report_backlog(&mut direct_keys, &report, overflowed);
                 notes.log(&report);
+                poll_at = next_saturated_poll(&routes, &snapshot);
             }
             let report = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
             enqueue_report_backlog(&mut direct_keys, &report, overflowed);
             notes.log(&report);
             next_reconciliation = Instant::now() + options.reconciliation_interval;
+        }
+
+        if poll_at.is_some_and(|at| Instant::now() >= at) {
+            // This read runs every `SATURATED_POLL_INTERVAL` for as long as the pane shows the
+            // closing line, so it saves no snapshot, which would cost a file write and two fsyncs
+            // each time, and a failed read is tried again at the next interval. Every other read
+            // of the pane still stops the service when it fails.
+            match manager.peek_capture_with_runtime(
+                &state.config().agent_name,
+                SNAPSHOT_LINES,
+                &owner_runtime,
+            ) {
+                Ok(snapshot) => {
+                    if poll_failures > 0 {
+                        service_log(format_args!(
+                            "agentctl: the {}s read of the coordinator's pane works again after {poll_failures} failed reads",
+                            SATURATED_POLL_INTERVAL.as_secs()
+                        ));
+                        poll_failures = 0;
+                    }
+                    let report = capture_visible_current(
+                        state,
+                        manager,
+                        options.delivery,
+                        &mut routes,
+                        &snapshot,
+                        &mut control,
+                    )?;
+                    enqueue_report_backlog(&mut direct_keys, &report, overflowed);
+                    notes.log(&report);
+                    poll_at = next_saturated_poll(&routes, &snapshot);
+                }
+                Err(error) if stop.is_stopped() => return Err(error.into()),
+                Err(error) => {
+                    if poll_failures == 0 {
+                        service_log(format_args!(
+                            "agentctl: the {0}s read of the coordinator's pane failed; retrying every {0}s: {error}",
+                            SATURATED_POLL_INTERVAL.as_secs()
+                        ));
+                    }
+                    poll_failures = poll_failures.saturating_add(1);
+                    poll_at = Some(Instant::now() + SATURATED_POLL_INTERVAL);
+                }
+            }
         }
 
         let desired_patterns = if state.config().outbound_enabled {
@@ -2573,7 +2769,9 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
         if let Some(active) = stream.as_mut() {
             let subscribed_pane = active.pane_id().to_owned();
             let timeout = if direct_keys.is_empty() {
-                next_reconciliation.saturating_duration_since(Instant::now())
+                poll_at
+                    .map_or(next_reconciliation, |at| at.min(next_reconciliation))
+                    .saturating_duration_since(Instant::now())
             } else {
                 Duration::ZERO
             };
@@ -2613,6 +2811,9 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                                 unknown_route_seen |= report.recovery_requested;
                                 enqueue_report_backlog(&mut direct_keys, &report, overflowed);
                                 notes.log(&report);
+                                // This capture covers only the event's own reply ID, so an event
+                                // never puts off a poll that is already due for the others.
+                                poll_at = poll_at.or_else(|| next_saturated_poll(&routes, &text));
                             }
                             PaneEvent::Settled { status }
                                 if info.status == status
@@ -2637,6 +2838,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                                 )?;
                                 enqueue_report_backlog(&mut direct_keys, &report, overflowed);
                                 notes.log(&report);
+                                poll_at = next_saturated_poll(&routes, &snapshot);
                                 let recovery = recover_pass(
                                     state,
                                     manager,
@@ -2670,6 +2872,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                         )?;
                         enqueue_report_backlog(&mut direct_keys, &report, overflowed);
                         notes.log(&report);
+                        poll_at = next_saturated_poll(&routes, &snapshot);
                     }
                 }
                 Err(error) => {
@@ -2688,6 +2891,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
             }
         } else {
             let wait_until = next_reconciliation.min(output_retry_at.max(Instant::now()));
+            let wait_until = poll_at.map_or(wait_until, |at| at.min(wait_until));
             let timeout = if direct_keys.is_empty() {
                 wait_until
                     .saturating_duration_since(Instant::now())
@@ -2984,7 +3188,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::os::fd::RawFd;
     use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
     #[cfg(target_os = "linux")]
     use std::os::unix::process::CommandExt as _;
     #[cfg(target_os = "linux")]
@@ -3278,6 +3482,10 @@ mod tests {
         ) -> std::result::Result<(), String> {
             Ok(())
         }
+
+        fn screen(&self, _agent_name: &str) -> std::result::Result<String, String> {
+            Ok(String::new())
+        }
     }
 
     impl chat_runtime::CoordinatorDelivery for AckReleasingDelivery {
@@ -3335,6 +3543,10 @@ mod tests {
             _options: DrainOptions,
         ) -> std::result::Result<(), String> {
             Ok(())
+        }
+
+        fn screen(&self, _agent_name: &str) -> std::result::Result<String, String> {
+            Ok(String::new())
         }
     }
 
@@ -4150,14 +4362,17 @@ mod tests {
         let mut routes = RouteCache::new(vec![
             ReplyRoute {
                 key: first_key,
+                nonce: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
                 identifier: "AAAAAAAAAAAAAAAAAAAAAA_2".to_owned(),
             },
             ReplyRoute {
                 key: second_key.clone(),
+                nonce: "BBBBBBBBBBBBBBBBBBBBBB".to_owned(),
                 identifier: "BBBBBBBBBBBBBBBBBBBBBB_1".to_owned(),
             },
             ReplyRoute {
                 key: third_key.clone(),
+                nonce: "CCCCCCCCCCCCCCCCCCCCCC".to_owned(),
                 identifier: "CCCCCCCCCCCCCCCCCCCCCC_1".to_owned(),
             },
         ]);
@@ -4194,6 +4409,7 @@ mod tests {
             &second_key,
             Some(ReplyRoute {
                 key: second_key.clone(),
+                nonce: "BBBBBBBBBBBBBBBBBBBBBB".to_owned(),
                 identifier: "BBBBBBBBBBBBBBBBBBBBBB_2".to_owned(),
             }),
         );
@@ -4228,10 +4444,12 @@ mod tests {
         let mut routes = RouteCache::new(vec![
             ReplyRoute {
                 key: first_key.clone(),
+                nonce: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
                 identifier: "AAAAAAAAAAAAAAAAAAAAAA_1".to_owned(),
             },
             ReplyRoute {
                 key: second_key,
+                nonce: "BBBBBBBBBBBBBBBBBBBBBB".to_owned(),
                 identifier: "BBBBBBBBBBBBBBBBBBBBBB_7".to_owned(),
             },
         ]);
@@ -4248,6 +4466,7 @@ mod tests {
             &key,
             Some(ReplyRoute {
                 key: key.clone(),
+                nonce: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
                 identifier: "AAAAAAAAAAAAAAAAAAAAAA_2".to_owned(),
             }),
         );
@@ -4264,6 +4483,7 @@ mod tests {
             &"c".repeat(64),
             Some(ReplyRoute {
                 key: "c".repeat(64),
+                nonce: "CCCCCCCCCCCCCCCCCCCCCC".to_owned(),
                 identifier: "CCCCCCCCCCCCCCCCCCCCCC_1".to_owned(),
             }),
         );
@@ -4297,6 +4517,7 @@ mod tests {
         let routes = (1..=MAX_DIRECT_REQUEST_KEYS)
             .map(|index| ReplyRoute {
                 key: format!("{index:064x}"),
+                nonce: format!("{index:022x}"),
                 identifier: format!("{index:022x}_999999"),
             })
             .collect::<Vec<_>>();
@@ -4333,6 +4554,7 @@ mod tests {
     fn current_reply_patterns_reject_invalid_identifiers_and_excess_budget() {
         let invalid = RouteCache::new(vec![ReplyRoute {
             key: "a".repeat(64),
+            nonce: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             identifier: "AAAAAAAAAAAAAAAAAAAAAA_.*".to_owned(),
         }]);
         assert!(invalid.patterns().is_err());
@@ -4340,6 +4562,7 @@ mod tests {
             (0..4_096)
                 .map(|index| ReplyRoute {
                     key: format!("{index:064x}"),
+                    nonce: format!("{index:022x}"),
                     identifier: format!("{index:022x}_999999"),
                 })
                 .collect(),
@@ -4447,6 +4670,118 @@ mod tests {
             .pending_request_keys()
             .expect("durable pending keys")
             .is_empty());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_second_reply_under_one_alias_is_read_by_the_saturated_poll() {
+        // A request keeps its reply alias for every reply, so once its first closing line is in
+        // the pane the output pattern for that alias stays matched, and herdr raises no event for
+        // the second closing line. The service reads the pane itself instead, on the saturated
+        // poll, while such a line is in view.
+        let (state, key, root) = state_with_request();
+        let delivery = RecordingDelivery::default();
+        chat_runtime::deliver_request_with(&state, &delivery, &key, DrainOptions::default())
+            .expect("deliver request");
+        assert!(delivery.prompts.lock().expect("prompts")[0]
+            .contains("Your reply ID for this message is `001`."));
+        let route = state
+            .next_reply_route(&key)
+            .expect("route")
+            .expect("active route");
+        assert_eq!(route.identifier, "001");
+        let mut routes = RouteCache::new(vec![route]);
+        let first = "<CHAT_REPLY_001>\nfirst answer\n  </CHAT_REPLY_001>\n".to_owned();
+        let second = format!("{first}<CHAT_REPLY_001>\nsecond answer\n</CHAT_REPLY_001>\n");
+        let identifiers = |events: &[PaneEvent]| {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    PaneEvent::Output { matched_line, .. } => {
+                        matched_identifier(matched_line).map(str::to_owned)
+                    }
+                    PaneEvent::Settled { .. } => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let patterns = routes.patterns().expect("patterns");
+        let observed = edge_triggered_output_roundtrip(patterns.clone(), &[&first, &second]);
+        // The first closing line raises one event for each pattern it matches: its chunk of exact
+        // IDs and the pattern for any ID.
+        let first_events = identifiers(&observed[0]);
+        assert!(
+            !first_events.is_empty() && first_events.iter().all(|id| id == "001"),
+            "{first_events:?}"
+        );
+        assert!(
+            identifiers(&observed[1]).is_empty(),
+            "herdr raises no event for a second closing line under the same alias"
+        );
+        assert!(routes.saturated_by(&first) && routes.saturated_by(&second));
+        assert!(next_saturated_poll(&routes, &second).is_some());
+
+        let client = HerdrClient::with_executable("direct", Path::new("/missing/herdr"))
+            .expect("construct client");
+        let manager = ManagedAgents::new(&client, &root.join("registry")).expect("manager");
+        let mut transport = None;
+        let mut control = PassControl {
+            transport: &mut transport,
+            stop: None,
+        };
+        let report = capture_direct(
+            &state,
+            &manager,
+            DrainOptions::default(),
+            &mut routes,
+            "001",
+            SnapshotInput {
+                text: &first,
+                truncated: false,
+                revision: Some(1),
+            },
+            &mut control,
+        )
+        .expect("capture the first reply");
+        assert_eq!(report.captured, [(key.clone(), vec![1])]);
+        // The alias stays the same after a reply, so its pattern and the saturation do too.
+        assert_eq!(routes.patterns().expect("patterns"), patterns);
+        assert!(next_saturated_poll(&routes, &second).is_some());
+        let poll = |routes: &mut RouteCache, control: &mut PassControl<'_>| {
+            capture_visible_current(
+                &state,
+                &manager,
+                DrainOptions::default(),
+                routes,
+                &second,
+                control,
+            )
+            .expect("saturated poll")
+        };
+        assert_eq!(
+            poll(&mut routes, &mut control).captured,
+            [(key.clone(), vec![2])]
+        );
+        assert!(poll(&mut routes, &mut control).captured.is_empty());
+
+        // No poll for a block still being written, for an alias no open request holds, or for a
+        // long ID, whose pattern changes once its reply is stored.
+        assert!(!routes.saturated_by("<CHAT_REPLY_001>\nstill writing\n"));
+        for other in ["000", "002"] {
+            let text = format!("<CHAT_REPLY_{other}>\nanswer\n</CHAT_REPLY_{other}>\n");
+            assert!(!routes.saturated_by(&text), "{text}");
+        }
+        let long_id = "BBBBBBBBBBBBBBBBBBBBBB_1";
+        let legacy = RouteCache::new(vec![ReplyRoute {
+            key: "b".repeat(64),
+            nonce: "BBBBBBBBBBBBBBBBBBBBBB".to_owned(),
+            identifier: long_id.to_owned(),
+        }]);
+        let legacy_text = format!("<CHAT_REPLY_{long_id}>\nanswer\n</CHAT_REPLY_{long_id}>\n");
+        assert!(next_saturated_poll(&legacy, &legacy_text).is_none());
+        // Once the request closes, its alias no longer holds the poll.
+        state.close_replies(&key).expect("close replies");
+        routes.replace(&key, None);
+        assert!(next_saturated_poll(&routes, &second).is_none());
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -5091,6 +5426,7 @@ arrive after it; chat provider worker panicked"
         let mut routes = RouteCache::from_entries(vec![ReplyRouteEntry {
             key: key.clone(),
             nonce: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            alias: None,
             current_identifier: Some("AAAAAAAAAAAAAAAAAAAAAA_2".to_owned()),
         }]);
         routes.replace(&key, None);
@@ -6356,6 +6692,40 @@ esac
         fixture: &crate::subagents::tests::Fixture,
         outbound_enabled: bool,
     ) -> (std::path::PathBuf, BridgeState) {
+        worker_bridge_state_with(fixture, outbound_enabled, None)
+    }
+
+    /// A new bridge state with outbound on for the fixture's agent `worker`, as
+    /// `worker_bridge_state` makes one, with the outbound helper that `chat tick` requires. The
+    /// helper fails every operation, so a tick that must send nothing never gets to use it.
+    fn worker_tick_state(
+        fixture: &crate::subagents::tests::Fixture,
+    ) -> (std::path::PathBuf, BridgeState) {
+        let helper = fixture.root.join("outbound-helper");
+        fs::copy(
+            fs::canonicalize("/bin/sh").expect("canonical shell"),
+            &helper,
+        )
+        .expect("copy native helper");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).expect("private helper");
+        worker_bridge_state_with(
+            fixture,
+            true,
+            Some(chat_runtime::OutboundCommandConfiguration {
+                executable: helper,
+                arguments: vec!["-c".to_owned(), "exit 3".to_owned()],
+                environment: Vec::new(),
+                timeout_millis: 1_000,
+                shutdown_grace_millis: 0,
+            }),
+        )
+    }
+
+    fn worker_bridge_state_with(
+        fixture: &crate::subagents::tests::Fixture,
+        outbound_enabled: bool,
+        outbound_command: Option<chat_runtime::OutboundCommandConfiguration>,
+    ) -> (std::path::PathBuf, BridgeState) {
         let root = fixture.root.join("chat");
         fs::create_dir(&root).expect("create state root");
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("private state");
@@ -6371,7 +6741,7 @@ esac
                 outbound_enabled,
                 ack_reaction: None,
                 backend_configuration: None,
-                outbound_command: None,
+                outbound_command,
             },
         )
         .expect("initialize state");
@@ -6389,6 +6759,17 @@ esac
     }
 
     fn owner_loop_herdr(root: &Path, name: &str, events: fn(&str) -> Vec<Value>) -> OwnerLoopHerdr {
+        owner_loop_herdr_every(root, name, events, None)
+    }
+
+    /// `owner_loop_herdr`, which also sends the events again on every open subscription each
+    /// `every`, when set.
+    fn owner_loop_herdr_every(
+        root: &Path,
+        name: &str,
+        events: fn(&str) -> Vec<Value>,
+        every: Option<Duration>,
+    ) -> OwnerLoopHerdr {
         let socket = root.join(format!("{name}.sock"));
         let executable = root.join(format!("{name}-herdr"));
         fs::write(
@@ -6407,8 +6788,18 @@ esac
             .expect("poll for herdr event clients");
         let (release, released) = mpsc::channel();
         let server = thread::spawn(move || {
-            let mut connections = Vec::new();
+            let mut connections = Vec::<(UnixStream, String)>::new();
+            let mut sent_at = Instant::now();
             while released.try_recv() == Err(mpsc::TryRecvError::Empty) {
+                if every.is_some_and(|every| sent_at.elapsed() >= every) {
+                    // A write fails once the loop has dropped that subscription.
+                    for (connection, pane) in &mut connections {
+                        for event in events(pane) {
+                            let _ = writeln!(connection, "{event}");
+                        }
+                    }
+                    sent_at = Instant::now();
+                }
                 let mut connection = match listener.accept() {
                     Ok((connection, _)) => connection,
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -6443,7 +6834,7 @@ esac
                 for event in events(&pane) {
                     writeln!(connection, "{event}").expect("write herdr event");
                 }
-                connections.push(connection);
+                connections.push((connection, pane));
             }
         });
         OwnerLoopHerdr {
@@ -6451,6 +6842,44 @@ esac
             release,
             server,
         }
+    }
+
+    /// Admit one request from the owner to `state` and deliver its prompt. Returns the request's
+    /// key and the prompt.
+    fn delivered_worker_request(state: &BridgeState) -> (String, String) {
+        let key = admitted_worker_request(state);
+        let delivery = RecordingDelivery::default();
+        chat_runtime::deliver_request_with(state, &delivery, &key, DrainOptions::default())
+            .expect("deliver request");
+        assert!(state.pending_work_keys().expect("pending work").is_empty());
+        let prompt = delivery.prompts.lock().expect("prompts").remove(0);
+        (key, prompt)
+    }
+
+    /// Admit one request from the owner to `state`, and return its key.
+    fn admitted_worker_request(state: &BridgeState) -> String {
+        let message = InboundMessage::new(
+            ChannelId::new("spaces/example").expect("channel"),
+            MessageId::new("spaces/example/messages/one").expect("message"),
+            ThreadId::new("spaces/example/threads/one").expect("thread"),
+            SenderId::new("users/owner").expect("sender"),
+            "request",
+            "2026-09-30T12:00:00Z",
+            false,
+        )
+        .expect("inbound message");
+        let batch = DeliveryBatch::new(
+            EventSequence::new(1).expect("sequence"),
+            ProviderCursor::new("cursor").expect("cursor"),
+            DeliveryId::new("delivery").expect("delivery"),
+            vec![CommittableEvent::message_created(message)],
+        )
+        .expect("delivery batch");
+        state
+            .admit_batch(&batch)
+            .expect("admit request")
+            .new_request_keys
+            .remove(0)
     }
 
     /// Run the owner loop for `state`'s agent until the fixture's fake Herdr client has served
@@ -6463,6 +6892,30 @@ esac
         reconciliation_interval: Duration,
         reads: usize,
     ) -> Vec<String> {
+        let read_sources = &fixture.client.read_sources;
+        read_sources.lock().expect("read sources").clear();
+        run_owner_loop_until(
+            fixture,
+            state,
+            herdr,
+            reconciliation_interval,
+            Duration::from_secs(10),
+            || read_sources.lock().expect("read sources").len() >= reads,
+        );
+        let sources = read_sources.lock().expect("read sources");
+        sources.clone()
+    }
+
+    /// Run the owner loop for `state`'s agent until `done`, called every 5 ms from another
+    /// thread, returns true or `limit` has passed, let it run on for 300 ms, and stop it.
+    fn run_owner_loop_until(
+        fixture: &crate::subagents::tests::Fixture,
+        state: &BridgeState,
+        herdr: &OwnerLoopHerdr,
+        reconciliation_interval: Duration,
+        limit: Duration,
+        mut done: impl FnMut() -> bool + Send,
+    ) {
         let manager = fixture.manager();
         let stop = StopState::default();
         let cancellation: SharedCancellation = Arc::default();
@@ -6470,14 +6923,10 @@ esac
         let overflowed = AtomicBool::new(false);
         let (_notices, notice_receiver) = mpsc::sync_channel(PROVIDER_NOTICE_CAPACITY);
         let mut transport = None;
-        let read_sources = &fixture.client.read_sources;
-        read_sources.lock().expect("read sources").clear();
         thread::scope(|scope| {
             scope.spawn(|| {
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while read_sources.lock().expect("read sources").len() < reads
-                    && Instant::now() < deadline
-                {
+                let deadline = Instant::now() + limit;
+                while !done() && Instant::now() < deadline {
                     thread::sleep(Duration::from_millis(5));
                 }
                 thread::sleep(Duration::from_millis(300));
@@ -6508,8 +6957,6 @@ esac
                 );
             }
         });
-        let sources = read_sources.lock().expect("read sources");
-        sources.clone()
     }
 
     #[test]
@@ -6526,36 +6973,7 @@ esac
         // One open request gives the loop a reply route to subscribe for. It is delivered
         // first, so the loop has no prompt to deliver: delivery reads the screen for checks of
         // its own, which would hide a snapshot read among them.
-        let message = InboundMessage::new(
-            ChannelId::new("spaces/example").expect("channel"),
-            MessageId::new("spaces/example/messages/one").expect("message"),
-            ThreadId::new("spaces/example/threads/one").expect("thread"),
-            SenderId::new("users/owner").expect("sender"),
-            "request",
-            "2026-09-30T12:00:00Z",
-            false,
-        )
-        .expect("inbound message");
-        let batch = DeliveryBatch::new(
-            EventSequence::new(1).expect("sequence"),
-            ProviderCursor::new("cursor").expect("cursor"),
-            DeliveryId::new("delivery").expect("delivery"),
-            vec![CommittableEvent::message_created(message)],
-        )
-        .expect("delivery batch");
-        let key = state
-            .admit_batch(&batch)
-            .expect("admit request")
-            .new_request_keys
-            .remove(0);
-        chat_runtime::deliver_request_with(
-            &state,
-            &RecordingDelivery::default(),
-            &key,
-            DrainOptions::default(),
-        )
-        .expect("deliver request");
-        assert!(state.pending_work_keys().expect("pending work").is_empty());
+        delivered_worker_request(&state);
 
         // With no reconciliation due within the hour, the loop reads once at startup, once when
         // the agent settles, and once after the unknown reply ID.
@@ -6603,6 +7021,199 @@ esac
     }
 
     #[test]
+    fn the_owner_loop_reads_each_further_reply_under_one_alias_on_the_saturated_poll() {
+        further_replies_under_one_alias_on_the_saturated_poll(false, SCREEN_ONLY);
+    }
+
+    #[test]
+    fn after_an_output_event_the_owner_loop_reads_further_replies_on_the_saturated_poll() {
+        further_replies_under_one_alias_on_the_saturated_poll(true, SCREEN_ONLY);
+    }
+
+    #[test]
+    fn the_saturated_poll_reads_a_pane_with_scrollback_as_the_other_reads_of_the_owner_loop_do() {
+        further_replies_under_one_alias_on_the_saturated_poll(
+            false,
+            crate::client::PaneScroll {
+                max_offset_from_bottom: 120,
+                ..SCREEN_ONLY
+            },
+        );
+    }
+
+    /// Herdr raises an output event only when a pattern starts to match, so once a request's
+    /// first closing line is on the screen, a further reply under the same reply ID raises no
+    /// event. While such a line is in view the loop reads the pane itself, every
+    /// `SATURATED_POLL_INTERVAL`. Here no reconciliation is due within the hour and no event
+    /// reports a further reply, so only that poll can read the second and third replies. Each
+    /// reply appears on the screen only once the one before it is stored. The first reply is on
+    /// the screen when the loop starts, or with `first_from_event`, the screen is empty until
+    /// herdr reports the first reply in an output event. Herdr then sends that event again every
+    /// 500 ms, as events for other requests' reply IDs could arrive. An event's capture covers
+    /// only its own reply ID, so no event may put the poll off. `scroll` is the pane's scroll
+    /// geometry. Every read takes what the loop's other reads of that pane take: only the screen
+    /// of a pane that keeps no scrollback, whose view herdr would scroll to read more, and recent
+    /// rows unwrapped of any other pane.
+    fn further_replies_under_one_alias_on_the_saturated_poll(
+        first_from_event: bool,
+        scroll: crate::client::PaneScroll,
+    ) {
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        *fixture.client.scroll.lock().expect("scroll") = Some(scroll);
+        let (_, state) = worker_bridge_state(&fixture, true);
+        let (key, prompt) = delivered_worker_request(&state);
+        assert!(
+            prompt.contains("Your reply ID for this message is `001`."),
+            "{prompt}"
+        );
+        let answers = ["first answer", "second answer", "third answer"];
+        let show = |count: usize| {
+            *fixture.client.screen.lock().expect("screen") = Some(
+                answers[..count]
+                    .iter()
+                    .map(|answer| format!("<CHAT_REPLY_001>\n{answer}\n</CHAT_REPLY_001>\n"))
+                    .collect(),
+            );
+        };
+        let stored = || {
+            state.inspect_request(&key).expect("inspect request")["replies"]
+                .as_array()
+                .expect("replies")
+                .len()
+        };
+        let initial = usize::from(!first_from_event);
+        show(initial);
+        let read_sources = &fixture.client.read_sources;
+        read_sources.lock().expect("read sources").clear();
+        let events: fn(&str) -> Vec<Value> = if first_from_event {
+            |pane| {
+                vec![json!({
+                    "event": "pane.output_matched",
+                    "data": {
+                        "pane_id": pane,
+                        "matched_line": "</CHAT_REPLY_001>",
+                        "read": {
+                            "pane_id": pane,
+                            "workspace_id": "workspace",
+                            "tab_id": "tab",
+                            "source": "recent_unwrapped",
+                            "format": "text",
+                            "text": "<CHAT_REPLY_001>\nfirst answer\n</CHAT_REPLY_001>\n",
+                            "revision": 1,
+                            "truncated": false,
+                        },
+                    },
+                })]
+            }
+        } else {
+            |_| Vec::new()
+        };
+        let herdr = owner_loop_herdr_every(
+            &fixture.root,
+            "herdr",
+            events,
+            first_from_event.then_some(Duration::from_millis(500)),
+        );
+        let started = Instant::now();
+        run_owner_loop_until(
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_secs(3_600),
+            Duration::from_secs(30),
+            || {
+                let count = stored();
+                show(if count == 0 {
+                    initial
+                } else {
+                    (count + 1).min(answers.len())
+                });
+                count == answers.len()
+            },
+        );
+        let elapsed = started.elapsed();
+        assert_eq!(stored(), answers.len());
+        // The loop read the pane at startup and then at most once per interval.
+        let sources = read_sources.lock().expect("read sources").clone();
+        let reads = sources.len();
+        let intervals = elapsed.as_millis() / SATURATED_POLL_INTERVAL.as_millis();
+        assert!(
+            reads >= answers.len() && reads as u128 <= 2 + intervals,
+            "{reads} reads in {elapsed:?}"
+        );
+        let source = if scroll.max_offset_from_bottom == 0 {
+            "visible"
+        } else {
+            "recent-unwrapped"
+        };
+        assert!(sources.iter().all(|read| read == source), "{sources:?}");
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+    }
+
+    #[test]
+    fn a_failed_read_of_the_saturated_poll_is_retried_and_does_not_stop_the_owner_loop() {
+        // The poll reads the pane every `SATURATED_POLL_INTERVAL` while a closing line is in view,
+        // far more often than the reconciliation read, so a read that fails is logged and tried
+        // again at the next interval instead of ending the loop. Here the first reply is on the
+        // screen when the loop starts. Once it is stored, the next two reads fail; after that the
+        // second reply is on the screen as well. The log line itself goes to standard error and
+        // is not checked here.
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        *fixture.client.scroll.lock().expect("scroll") = Some(SCREEN_ONLY);
+        let (_, state) = worker_bridge_state(&fixture, true);
+        let (key, _) = delivered_worker_request(&state);
+        let block = |answer: &str| format!("<CHAT_REPLY_001>\n{answer}\n</CHAT_REPLY_001>\n");
+        *fixture.client.screen.lock().expect("screen") = Some(block("first answer"));
+        let stored = || {
+            state.inspect_request(&key).expect("inspect request")["replies"]
+                .as_array()
+                .expect("replies")
+                .len()
+        };
+        let read_sources = &fixture.client.read_sources;
+        let herdr = owner_loop_herdr(&fixture.root, "herdr", |_| Vec::new());
+        // The number of reads made before the reads began to fail, and whether they failed.
+        let mut failing_from = None;
+        let mut failed = false;
+        run_owner_loop_until(
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_secs(3_600),
+            Duration::from_secs(30),
+            || {
+                let count = stored();
+                if count == 1 && failing_from.is_none() {
+                    fixture
+                        .client
+                        .fail_read
+                        .store(true, AtomicOrdering::Relaxed);
+                    failing_from = Some(read_sources.lock().expect("read sources").len());
+                }
+                if let Some(from) = failing_from.filter(|_| !failed) {
+                    if read_sources.lock().expect("read sources").len() >= from + 2 {
+                        failed = true;
+                        *fixture.client.screen.lock().expect("screen") =
+                            Some([block("first answer"), block("second answer")].concat());
+                        fixture
+                            .client
+                            .fail_read
+                            .store(false, AtomicOrdering::Relaxed);
+                    }
+                }
+                count == 2
+            },
+        );
+        assert!(failed, "the reads never failed");
+        assert_eq!(stored(), 2);
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+    }
+
+    #[test]
     fn a_chat_tick_reads_only_the_screen_of_a_pane_without_scrollback() {
         // `agentctl chat tick` makes the service's choice of read source in a second place,
         // `agent::read_capture`. Its outbound stays off, which a tick without an outbound helper
@@ -6635,5 +7246,292 @@ esac
         for scroll in [Some(with_scrollback), None] {
             assert_eq!(tick_read_sources(scroll), ["recent-unwrapped"]);
         }
+    }
+
+    fn tick_options() -> ServiceOptions {
+        ServiceOptions {
+            delivery: DrainOptions::default(),
+            reconciliation_interval: Duration::from_secs(1),
+        }
+    }
+
+    #[test]
+    fn a_chat_tick_takes_no_block_in_its_read_as_the_reply_of_a_request_it_prompts() {
+        // `agentctl chat tick` reads the pane once, and prompts pending requests in the same
+        // pass. It takes the blocks in its read before any prompt gives a request its reply ID,
+        // so a block the read shows under the next number, here one an earlier bridge state left
+        // under 001, is reported as naming no open request, and that number is skipped. The read
+        // just before the prompt no longer shows the block, as when the agent's output has moved
+        // it out of view in between, so here only the order of the tick keeps the block from
+        // being taken as the new request's reply.
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        *fixture.client.scroll.lock().expect("scroll") = Some(SCREEN_ONLY);
+        let (root, state) = worker_tick_state(&fixture);
+        let key = admitted_worker_request(&state);
+        fixture.client.screens.lock().expect("screens").push_back(
+            "<CHAT_REPLY_001>\nan answer from an earlier bridge state\n</CHAT_REPLY_001>\n"
+                .to_owned(),
+        );
+        *fixture.client.screen.lock().expect("screen") = Some(String::new());
+        fixture.client.runs.lock().expect("runs").clear();
+        let report = tick(&root, &fixture.manager(), tick_options()).expect("tick");
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.delivered, std::slice::from_ref(&key));
+        assert!(report.captured.is_empty(), "{:?}", report.captured);
+        assert!(
+            state.inspect_request(&key).expect("inspect request")["replies"]
+                .as_array()
+                .expect("replies")
+                .is_empty()
+        );
+        let prompts = fixture.client.runs.lock().expect("runs").clone();
+        assert_eq!(prompts.len(), 2, "{prompts:#?}");
+        assert!(
+            prompts[0].starts_with("Chat reply routing error: 001 matches no open chat request"),
+            "{}",
+            prompts[0]
+        );
+        assert!(
+            prompts[1].contains("Your reply ID for this message is `002`."),
+            "{}",
+            prompts[1]
+        );
+        assert!(fixture.client.screens.lock().expect("screens").is_empty());
+    }
+
+    #[test]
+    fn the_reads_before_a_prompt_save_no_snapshot() {
+        // A delivery reads the coordinator's pane just before it writes a prompt that gives a
+        // reply ID, and before it types queued prompts while such a prompt waits, so these reads
+        // come once for each attempt, retry, drain and routing-error prompt. They save no
+        // snapshot, which would cost a file write and two fsyncs each time. Both deliveries are
+        // checked: the service's, and the one `chat tick` uses.
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        let (_, state) = worker_bridge_state(&fixture, true);
+        let snapshot = fixture.root.join("registry/worker/output.json");
+        assert!(!snapshot.exists(), "{}", snapshot.display());
+        let manager = fixture.manager();
+        let stop = StopState::default();
+        let service = CancellableDelivery {
+            manager: &manager,
+            runtime: StopRuntime::new(&stop),
+        };
+        let mut keys = vec![admitted_worker_request(&state)];
+        keys.extend(admit_more_requests(&state, 1));
+        let deliveries: [&dyn chat_runtime::CoordinatorDelivery; 2] = [&manager, &service];
+        for (index, (key, delivery)) in keys.iter().zip(deliveries).enumerate() {
+            fixture
+                .client
+                .read_sources
+                .lock()
+                .expect("read sources")
+                .clear();
+            assert_eq!(
+                chat_runtime::deliver_request_with(&state, delivery, key, DrainOptions::default())
+                    .expect("deliver request"),
+                CoordinatorDeliveryResult::Delivered
+            );
+            assert!(
+                !fixture
+                    .client
+                    .read_sources
+                    .lock()
+                    .expect("read sources")
+                    .is_empty(),
+                "delivery {index} did not read the pane before its prompt"
+            );
+            assert!(
+                !snapshot.exists(),
+                "delivery {index} saved a snapshot with its read before the prompt"
+            );
+        }
+        let prompts = fixture.client.runs.lock().expect("runs").clone();
+        assert!(
+            prompts
+                .iter()
+                .any(|prompt| prompt.contains("Your reply ID for this message is `002`.")),
+            "{prompts:#?}"
+        );
+        // A read that saves one, such as a capture's, shows that the check above can see it.
+        manager
+            .read_capture_with_runtime("worker", SNAPSHOT_LINES, &StopRuntime::new(&stop))
+            .expect("capture read");
+        assert!(snapshot.exists(), "{}", snapshot.display());
+    }
+
+    #[test]
+    fn a_chat_tick_notes_an_unusable_reply_alias_record() {
+        // While `reply-aliases.json` cannot be read, prompts give long reply IDs and blocks under
+        // short ones are not sent. The service logs that, and a tick reports it among its notes.
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        let (root, state) = worker_tick_state(&fixture);
+        let report = tick(&root, &fixture.manager(), tick_options()).expect("tick");
+        assert!(report.notes.is_empty(), "{:?}", report.notes);
+        fs::write(root.join("reply-aliases.json"), b"{").expect("spoil alias record");
+        let report = tick(&root, &fixture.manager(), tick_options()).expect("tick");
+        assert_eq!(
+            report.notes,
+            [state.reply_alias_problem().expect("alias problem")]
+        );
+        assert!(
+            report.notes[0].contains("reply-aliases.json is unusable"),
+            "{}",
+            report.notes[0]
+        );
+    }
+
+    #[test]
+    fn neither_capture_path_sends_a_block_under_the_id_of_a_request_whose_prompt_is_not_typed() {
+        // A request's prompt gives it reply ID 001, and nothing types the prompt. A block under
+        // 001 cannot be the coordinator's reply to it: the capture after an output event and the
+        // capture of a whole read both note the block and send nothing to the request, and the
+        // whole read reports the block to the coordinator.
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        let (_root, state) = worker_bridge_state(&fixture, true);
+        let key = admitted_worker_request(&state);
+        assert!(state
+            .prompt(&key, "")
+            .expect("prompt")
+            .contains("Your reply ID for this message is `001`."));
+        let block = "<CHAT_REPLY_001>\nan answer meant for another request\n</CHAT_REPLY_001>\n";
+        let mut routes = RouteCache::new(vec![state
+            .next_reply_route(&key)
+            .expect("route")
+            .expect("open route")]);
+        let manager = fixture.manager();
+        let mut transport = None;
+        let mut control = PassControl {
+            transport: &mut transport,
+            stop: None,
+        };
+        fixture.client.runs.lock().expect("runs").clear();
+        let report = capture_direct(
+            &state,
+            &manager,
+            DrainOptions::default(),
+            &mut routes,
+            "001",
+            SnapshotInput {
+                text: block,
+                truncated: false,
+                revision: Some(1),
+            },
+            &mut control,
+        )
+        .expect("capture after an output event");
+        assert!(report.captured.is_empty(), "{:?}", report.captured);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.notes.len(), 1, "{:?}", report.notes);
+        assert!(
+            report.notes[0]
+                .contains("was read before its request's prompt reached the coordinator"),
+            "{}",
+            report.notes[0]
+        );
+        assert!(fixture.client.runs.lock().expect("runs").is_empty());
+        let report = capture_recovery_snapshot(
+            &state,
+            &manager,
+            DrainOptions::default(),
+            &mut routes,
+            SnapshotInput {
+                text: block,
+                truncated: false,
+                revision: Some(2),
+            },
+            &mut control,
+        )
+        .expect("capture of a whole read");
+        assert!(report.captured.is_empty(), "{:?}", report.captured);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.notes.len(), 1, "{:?}", report.notes);
+        assert!(
+            report.notes[0]
+                .contains("was read before its request's prompt reached the coordinator"),
+            "{}",
+            report.notes[0]
+        );
+        assert_eq!(
+            *fixture.client.runs.lock().expect("runs"),
+            ["Chat reply not sent: the block marked 001 was written before the chat request with \
+that ID was sent to you, so it was not sent, and no block with the same text will be sent to that \
+request. No open chat request has been sent to you."]
+        );
+        assert!(
+            state.inspect_request(&key).expect("inspect request")["replies"]
+                .as_array()
+                .expect("replies")
+                .is_empty()
+        );
+
+        // While the coordinator's queue cannot be read, both paths hold the block the same way,
+        // and report nothing, since a later capture decides.
+        let (state, key, root) = state_with_request();
+        assert!(state
+            .prompt(&key, "")
+            .expect("prompt")
+            .contains("Your reply ID for this message is `001`."));
+        let mut routes = RouteCache::new(vec![state
+            .next_reply_route(&key)
+            .expect("route")
+            .expect("open route")]);
+        let client = HerdrClient::with_executable("direct", Path::new("/missing/herdr"))
+            .expect("construct client");
+        let manager = ManagedAgents::new(&client, &root.join("registry")).expect("manager");
+        let mut transport = None;
+        let mut control = PassControl {
+            transport: &mut transport,
+            stop: None,
+        };
+        let reports = [
+            capture_direct(
+                &state,
+                &manager,
+                DrainOptions::default(),
+                &mut routes,
+                "001",
+                SnapshotInput {
+                    text: block,
+                    truncated: false,
+                    revision: Some(1),
+                },
+                &mut control,
+            )
+            .expect("capture after an output event"),
+            capture_recovery_snapshot(
+                &state,
+                &manager,
+                DrainOptions::default(),
+                &mut routes,
+                SnapshotInput {
+                    text: block,
+                    truncated: false,
+                    revision: Some(2),
+                },
+                &mut control,
+            )
+            .expect("capture of a whole read"),
+        ];
+        for report in reports {
+            assert!(report.captured.is_empty(), "{:?}", report.captured);
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            assert_eq!(report.notes.len(), 1, "{:?}", report.notes);
+            assert!(
+                report.notes[0].contains("the coordinator's queue could not be read"),
+                "{}",
+                report.notes[0]
+            );
+        }
+        assert!(
+            state.inspect_request(&key).expect("inspect request")["replies"]
+                .as_array()
+                .expect("replies")
+                .is_empty()
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }

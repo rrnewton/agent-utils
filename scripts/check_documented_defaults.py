@@ -717,6 +717,84 @@ PINS: tuple[Pin, ...] = (
         ),
     ),
     Pin(
+        "chat-skipped-reply-aliases",
+        "the unassigned short reply IDs seen in chat reply markers that are kept so none is "
+        "assigned later",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_runtime.rs",
+                r"(?m)^const MAX_BURNED_REPLY_ALIASES: usize = (?P<value>[\d_]+);$",
+                "the Rust skip-list bound",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"up\s+to\s+(?P<value>[A-Za-z\d,]+)\s+such\s+numbers\s+are\s+kept",
+                "the skip-list bound the chat guide states",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"count\s+toward\s+the\s+(?P<value>[A-Za-z\d,]+)\s+skipped\s+numbers\s+kept",
+                "the skip-list bound the chat guide states for numbers seen before a prompt",
+            ),
+        ),
+    ),
+    Pin(
+        "chat-remembered-reply-blocks",
+        "the chat reply blocks read under the short reply ID of a request whose prompt has not "
+        "reached the agent that are remembered so their text is never sent to that request",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_runtime.rs",
+                r"(?m)^const MAX_WITHHELD_REPLIES: usize = (?P<value>[\d_]+);$",
+                "the Rust bound on remembered blocks",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"Up\s+to\s+(?P<value>[A-Za-z\d,]+)\s+remembered\s+blocks\s+are\s+kept",
+                "the bound on remembered blocks the chat guide states",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"forgotten\s+once\s+(?P<value>[A-Za-z\d,]+)\s+newer\s+ones\s+are\s+remembered",
+                "the bound on remembered blocks the chat guide states among the gaps",
+            ),
+        ),
+    ),
+    Pin(
+        "chat-saturated-poll-seconds",
+        "how often `chat run` reads the agent's pane while a closing line under an open request's "
+        "short reply ID is in view, in seconds",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_service.rs",
+                r"(?m)^const SATURATED_POLL_INTERVAL: Duration = "
+                r"Duration::from_secs\((?P<value>[\d_]+)\);$",
+                "the Rust poll interval",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"reads\s+the\s+pane\s+itself\s+every\s+(?P<value>[A-Za-z\d,]+)\s+seconds?\b",
+                "the poll interval the chat guide states",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"logged\s+once\s+and\s+retried\s+every\s+(?P<value>[A-Za-z\d,]+)\s+seconds?\b",
+                "the retry interval of a failed poll the chat guide states",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_quickstart.md",
+                r"`run`\s+reads\s+the\s+pane\s+every\s+(?P<value>[A-Za-z\d,]+)\s+seconds?\b",
+                "the poll interval the chat quickstart states",
+            ),
+        ),
+    ),
+    Pin(
         "chat-thread-history-default",
         "the messages `agentctl chat thread` prints, and a request prompt's command asks for",
         code=(

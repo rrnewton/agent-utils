@@ -68,14 +68,25 @@ reply. `agentctl chat thread --bridge-state DIR --thread THREAD` prints one
 thread's retained messages, oldest first; a request prompt for a reply in an
 existing thread prints this command, with absolute paths.
 
-Each reply block the agent writes for an open request is posted once for each
-distinct text, compared as the userguide describes, whichever of that request's
-reply IDs it uses. Rows that start like a prompt the agent received, or like a
-tool call's output, are skipped with the rows that continue them, so a reply
-block quoted in a message to the agent is not posted; the userguide describes
-these rules and where they fail. The bridge reads only the screen of a pane that
-herdr reports keeps no scrollback, such as a Claude Code pane, so there a block
-is posted only when a capture shows the first row of its message and the whole
+Each request prompt gives the agent one short reply ID, such as `001`, for every
+reply to that request. The numbers count up across requests and are kept in
+`reply-aliases.json` in the state directory; one that the agent's pane shows
+when a request gets its number is skipped, and none is reused unless that file
+is deleted or replaced by an older copy, or the bridge gets a new state
+directory. A block under the number of a request whose prompt still waits in the
+agent's queue is not posted to that request, then or later, apart from gaps the
+userguide lists, and the agent gets a routing-error prompt about it when a
+recovery scan reads it. While the closing line of a reply under a short ID is in
+view, `run` reads the pane every 2 seconds, because herdr raises no event for
+the next reply under the same ID. Each reply block the agent writes for an open
+request is posted once for each distinct text, compared as the userguide
+describes, whichever of that request's reply IDs it uses. Rows that start like a
+prompt the agent received, or like a tool call's output, are skipped with the
+rows that continue them, so a reply block quoted in a message to the agent is
+not posted; the userguide describes these rules and where they fail. The bridge
+reads only the screen of a pane that herdr reports keeps no scrollback, such as
+a Claude Code pane, with two exceptions the userguide gives, so there a block is
+posted only when a capture shows the first row of its message and the whole
 block, and a block taller than the screen is not posted. A block under a reply
 ID that matches no request the bridge knows, or one a capture shows only in
 part, is not posted, and the agent gets a routing-error prompt about it, usually
