@@ -317,6 +317,8 @@ pub(crate) fn step(
         if record.missing >= policy.exit_samples.max(1) {
             record.exited_unix_ms = Some(now);
             record.announced = Some(NoticeKind::Exited);
+            // The exited notice is posted, so the worker's return must withdraw or replace it.
+            record.quiet = false;
             decide(agent, NoticeKind::Exited);
         }
     }
@@ -980,6 +982,25 @@ mod tests {
             &mut state,
             &[seen("a", WorkerState::Working, true)],
             30,
+            POLICY,
+        );
+        assert_eq!(kinds(&back), [("a", NoticeKind::Working)]);
+    }
+
+    #[test]
+    fn a_quiet_worker_that_exits_and_returns_working_withdraws_the_exited_notice() {
+        let _serial = shared();
+        let mut state = WatchState::default();
+        step_listed(&mut state, &[seen("a", WorkerState::Idle, true)], 0, POLICY);
+        let mut decided = Vec::new();
+        for now in [10, 20, 30] {
+            decided.extend(step(&mut state, &[], true, now, POLICY));
+        }
+        assert_eq!(kinds(&decided), [("a", NoticeKind::Exited)]);
+        let back = step_listed(
+            &mut state,
+            &[seen("a", WorkerState::Working, true)],
+            40,
             POLICY,
         );
         assert_eq!(kinds(&back), [("a", NoticeKind::Working)]);
