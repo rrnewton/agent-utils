@@ -70,13 +70,20 @@ existing thread prints this command, with absolute paths.
 
 Each reply block the agent writes for an open request is posted once for each
 distinct text, compared as the userguide describes, whichever of that request's
-reply IDs it uses. A block that cannot be posted, such as an empty or oversized
-one, is skipped with one log line that begins with the UTC time and then
-`agentctl: chat reply capture:`; nothing the agent prints stops `run`. Every
-`run` log line begins with the time, and the provider logs each subscription it
-opens and each reconnect it waits for. `agentctl chat userguide` documents
-plugin safety, the outbound NDJSON contract, exact local commit receipts, reply
-capture, explicit route closure and bounded retirement, fail-closed provider
-gaps, recovery, and service-manager limits. A status with `healthy: false` and
-an unresolved gap is not live success; protocol v1 intentionally refuses
-automatic reconnect.
+reply IDs it uses. Rows that start like a prompt the agent received, or like a
+tool call's output, are skipped with the rows that continue them, so a reply
+block quoted in a message to the agent is not posted; the userguide describes
+these rules and where they fail. For a Claude Code pane herdr usually returns
+about one screen, so a block is posted only when a capture shows the first row
+of its message and the whole block, and a block taller than the screen is
+usually not posted.
+A block that cannot be posted, such as an empty or oversized one, is skipped
+with one log line that begins with the UTC time and then
+`agentctl: chat reply capture:`; nothing the agent prints stops `run`.
+Every `run` log line begins with the time, and the provider logs each
+subscription it opens and each reconnect it waits for.
+`agentctl chat userguide` documents plugin safety, the outbound NDJSON contract,
+exact local commit receipts, reply capture, explicit route closure and bounded
+retirement, fail-closed provider gaps, recovery, and service-manager limits. A
+status with `healthy: false` and an unresolved gap is not live success; protocol
+v1 intentionally refuses automatic reconnect.

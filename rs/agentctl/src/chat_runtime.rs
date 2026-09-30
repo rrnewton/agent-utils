@@ -4454,6 +4454,7 @@ Complete this request using your normal instructions and tools. Outbound chat is
 Complete this request using your normal instructions and tools. You may send one or multiple replies, including progress updates. \
 Your next reply ID is `{reply_id}`. Compose an opening line from the literal prefix `<CHAT_REPLY_`, that ID, and `>`; \
 compose its closing line from `</CHAT_REPLY_`, the same ID, and `>`. Keep both lines standalone and outside code fences. \
+Start a message with the opening line and write the whole block in that message, with no tool call inside it. \
 Increment the numeric suffix for every later reply. Each consecutive complete block is sent as a separate chat message. \
 The bridge sends at most {MAX_THREAD_REPLIES_PER_WINDOW} messages to one chat thread within {} seconds and holds any further ones \
 for {} seconds, so combine short updates.",
@@ -7712,23 +7713,95 @@ fn scan_reply_blocks_for_nonces(
     // opening marker is not in this capture.
     let mut unopened = Vec::<&str>::new();
     let mut fence: Option<(char, usize)> = None;
-    let mut prompt_margin: Option<usize> = None;
+    // While the rows of a prompt echo are read: the column its wrapped rows continue at.
+    let mut echo_column: Option<usize> = None;
+    // While the rows of a tool call's output are read: the column of its `⎿` or `└`.
+    let mut tool_column: Option<usize> = None;
+    // Whether a nonblank row at column 0 has been read. Rows above the first one continue an
+    // item whose first row is above the capture, which can be a prompt echo or tool output, so
+    // no block opens there, and a code fence opened there ends at that row.
+    let mut anchored = false;
+    // Whether no nonblank row has been read yet. Once a prompt has scrolled off the top of the
+    // screen, Claude Code can pin a copy of it there, at the left edge and cut to one row, over
+    // rows of whatever item the screen starts in. So a `❯` row at the left edge that is the
+    // first nonblank row of a capture is skipped: it starts no prompt echo, and it is not the
+    // first row at the left edge. Codex pins no such copy, so its prompt rows at the top of a
+    // capture start prompt echoes.
+    let mut at_top = true;
 
     for line in normalized.split('\n') {
-        let (undecorated, margin, decorated) = undecorate(line);
         let stripped = line.trim_start_matches([' ', '\t']);
-        if active.is_none() {
-            if stripped.starts_with("› ") || stripped.starts_with("❯ ") {
-                prompt_margin = Some(line.len() - stripped.len() + 2);
-                unopened.clear();
+        let indent = line.len() - stripped.len();
+        if at_top && !stripped.is_empty() {
+            at_top = false;
+            if indent == 0 && pinned_prompt_row(stripped) {
                 continue;
             }
-            if let Some(expected_margin) = prompt_margin {
-                if stripped.is_empty() || line.len() - stripped.len() >= expected_margin {
-                    continue;
-                }
-                prompt_margin = None;
+        }
+        if let Some(column) = echo_column {
+            if stripped.is_empty() || indent >= column {
+                continue;
             }
+            echo_column = None;
+        }
+        if let Some(column) = tool_column {
+            if stripped.is_empty() || indent > column {
+                continue;
+            }
+            tool_column = None;
+        }
+        if !anchored && indent == 0 && !stripped.is_empty() {
+            anchored = true;
+            fence = None;
+        }
+        // A prompt row left of an open block's margin starts a new item, so the block ends
+        // unclosed. A prompt row inside the margin is part of the block.
+        if prompt_row(stripped)
+            && active
+                .as_ref()
+                .is_none_or(|opened| indent < opened.opening_margin.len())
+        {
+            if let Some(opened) = active.take() {
+                push_scan_event(&mut events, &mut overflowed, opened.unclosed());
+                fence = None;
+            }
+            echo_column = Some(indent + 2);
+            unopened.clear();
+            continue;
+        }
+        // Tool output is never reply text, and a fence line in it neither opens nor closes a
+        // code fence. Claude Code's compact view draws a tool call as a row at the margin of the
+        // message with no bullet, and its output after `⎿` at the same column, so a `⎿` row at
+        // or left of an open block's margin ends the block unclosed. Right of the margin, and
+        // for `└`, the row is part of the block.
+        if tool_output_row(stripped)
+            && active.as_ref().is_none_or(|opened| {
+                stripped.starts_with('⎿') && indent <= opened.opening_margin.len()
+            })
+        {
+            if let Some(opened) = active.take() {
+                push_scan_event(&mut events, &mut overflowed, opened.unclosed());
+                fence = None;
+            }
+            tool_column = Some(indent);
+            unopened.clear();
+            continue;
+        }
+        let (undecorated, margin, decorated) = undecorate(line);
+        // A native bullet left of an open block's margin also starts a new item, unless it
+        // carries a closing marker.
+        if decorated
+            && active
+                .as_ref()
+                .is_some_and(|opened| indent < opened.opening_margin.len())
+            && !parse_marker(&undecorated).is_some_and(|marker| marker.closing)
+        {
+            if let Some(opened) = active.take() {
+                push_scan_event(&mut events, &mut overflowed, opened.unclosed());
+            }
+            fence = None;
+        }
+        if active.is_none() {
             unopened.push(line);
         }
 
@@ -7781,6 +7854,10 @@ fn scan_reply_blocks_for_nonces(
         };
 
         match (active.take(), marker.closing) {
+            // Above the first row at column 0, an opening marker can belong to a prompt echo or
+            // tool output whose first row is out of view, so it opens no block. A closing marker
+            // after it is read as a partial block, which is never sent.
+            (None, false) if !anchored => {}
             (None, false) => active = expected.map(|nonce| opening(nonce, margin)),
             (None, true) => {
                 if let Some(nonce) = expected {
@@ -8155,6 +8232,40 @@ fn sequenced_ordinal(identifier: &str, expected_nonce: &str) -> Option<u32> {
         .parse::<u32>()
         .ok()
         .filter(|ordinal| *ordinal <= MAX_REPLY_ORDINAL)
+}
+
+/// Whether a row, without its indentation, starts a prompt the agent received or its input box,
+/// followed by a space, a no-break space, or nothing: Claude Code draws both after `❯`, and
+/// Codex draws a prompt after `›`, a prompt queued while it works and a hook's notice after `↳`,
+/// and its input box after `»`. The prompt's wrapped rows continue two columns right of that
+/// character.
+fn prompt_row(stripped: &str) -> bool {
+    ["❯", "›", "↳", "»"]
+        .into_iter()
+        .any(|prompt| starts_with_prompt(stripped, prompt))
+}
+
+/// Whether a row, without its indentation, starts a Claude Code prompt or its input box. Of the
+/// agents whose prompt rows [`prompt_row`] reads, only Claude Code pins a copy of a prompt over
+/// the top row of its screen.
+fn pinned_prompt_row(stripped: &str) -> bool {
+    starts_with_prompt(stripped, "❯")
+}
+
+fn starts_with_prompt(stripped: &str, prompt: &str) -> bool {
+    stripped
+        .strip_prefix(prompt)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\u{a0}']))
+}
+
+/// Whether a row, without its indentation, starts the output of a tool call: Claude Code draws it
+/// after `⎿`, and Codex after `└` and a space, or `└` alone when the output's first line is empty.
+/// Its later rows continue right of that character.
+fn tool_output_row(stripped: &str) -> bool {
+    stripped.starts_with('⎿')
+        || stripped
+            .strip_prefix('└')
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
 }
 
 fn undecorate(line: &str) -> (String, String, bool) {
@@ -12739,6 +12850,10 @@ mod tests {
         let prompts = target.submitted_prompts.lock().expect("prompt lock");
         assert_eq!(prompts.len(), 1);
         assert!(prompts[0].contains("one or multiple replies"));
+        assert!(prompts[0].contains(
+            "Start a message with the opening line and write the whole block in that message, \
+with no tool call inside it."
+        ));
         assert!(prompts[0].ends_with(
             "The bridge sends at most 8 messages to one chat thread within 60 seconds and holds \
 any further ones for 300 seconds, so combine short updates."
@@ -17092,5 +17207,1005 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                 "{bullet}"
             );
         }
+    }
+
+    /// A capture made of these rows.
+    fn rows(rows: &[&str]) -> String {
+        let mut text = rows.join("\n");
+        text.push('\n');
+        text
+    }
+
+    /// What a capture shows of one request that holds none of its replies.
+    fn nothing_found() -> ReplyScan {
+        ReplyScan {
+            found: NonceScan::default(),
+            unknown_ids: Vec::new(),
+        }
+    }
+
+    /// What a capture shows of one request that holds exactly one complete block of it.
+    fn one_block(identifier: &str, body: &str) -> ReplyScan {
+        ReplyScan {
+            found: NonceScan {
+                blocks: vec![ScannedReply {
+                    identifier: identifier.to_owned(),
+                    body: body.to_owned(),
+                }],
+                ..NonceScan::default()
+            },
+            unknown_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_agent_prompt_quoting_a_reply_block_posts_nothing() {
+        // Agents message a coordinator by typing into its pane, so their text shows there as a
+        // user turn: the prompt character and the first line, then every later line indented
+        // under it. A reply block quoted in such a message is not the coordinator's reply, even
+        // when its marker lines stand alone, so nothing in it is posted, whether the
+        // coordinator's own block under the same ID is above it or below it. Below a row of the
+        // coordinator's, nothing in it is reported either. At the top of a capture, a message
+        // after Claude Code's `❯` is read as the pinned copy of a prompt, so the block it quotes
+        // is reported, though still not posted
+        // (a_prompt_row_at_the_top_of_a_capture_starts_nothing); a message after any other
+        // prompt character is skipped there too.
+        let (state, key, nonce, root) = open_request("prompt-echo-markers");
+        let id = format!("{nonce}_1");
+        let quoted = format!("<CHAT_REPLY_{id}>\n  quoted answer\n  </CHAT_REPLY_{id}>");
+        let queued = format!("<CHAT_REPLY_{id}>\n    quoted answer\n    </CHAT_REPLY_{id}>");
+        let echoes = [
+            // Claude Code.
+            format!("❯ [worker -> coord 18:50Z] the owner wants this:\n  {quoted}\n"),
+            // Codex.
+            format!("› [worker -> coord 18:50Z] the owner wants this:\n  {quoted}\n"),
+            // A no-break space after the prompt character, the opening marker on the first row,
+            // and a blank line inside the message.
+            format!("❯\u{a0}{quoted}\n\n  more quoted text\n"),
+            // A message whose first line is empty.
+            format!("❯\n  {quoted}\n"),
+            // A message Codex holds while it works, under the item that lists such messages.
+            format!(
+                "• Messages to be submitted after next tool call\n  \
+                 ↳ [worker -> coord 18:50Z] the owner wants this:\n    {queued}\n"
+            ),
+            // Codex's input box, holding a message not yet sent.
+            format!("» [worker -> coord 18:50Z] the owner wants this:\n  {quoted}\n"),
+        ];
+        let reported = ReplyScan {
+            found: NonceScan {
+                partial: vec![PartialBlock::Unopened {
+                    identifier: id.clone(),
+                    text: "  quoted answer".to_owned(),
+                }],
+                ..NonceScan::default()
+            },
+            unknown_ids: Vec::new(),
+        };
+        // Nothing is posted from any form at the top of a capture, checked for every form before
+        // anything else, so a scanner that posts one fails on that first.
+        let at_top: Vec<_> = echoes
+            .iter()
+            .map(|echo| {
+                let capture = state
+                    .capture_snapshot(echo)
+                    .expect("capture the message at the top");
+                assert!(
+                    capture.replies.is_empty(),
+                    "{echo}posted {:?}",
+                    capture.replies
+                );
+                assert!(
+                    capture.suppressed_ids.is_empty()
+                        && capture.refused.is_empty()
+                        && !capture.overflowed,
+                    "{echo}"
+                );
+                capture
+            })
+            .collect();
+        for (index, (echo, capture)) in echoes.iter().zip(at_top).enumerate() {
+            if echo.starts_with('❯') {
+                assert_eq!(
+                    scan_reply_blocks(echo, &nonce).expect("scan the message at the top"),
+                    reported,
+                    "{echo}"
+                );
+                assert_eq!(capture.unknown_ids, std::slice::from_ref(&id), "{echo}");
+            } else {
+                assert_eq!(
+                    scan_reply_blocks(echo, &nonce).expect("scan the message at the top"),
+                    nothing_found(),
+                    "{echo}"
+                );
+                assert!(capture.unknown_ids.is_empty(), "{echo}");
+            }
+            let echo = &format!("⏺ Working on it.\n{echo}");
+            assert_eq!(
+                scan_reply_blocks(echo, &nonce).expect("scan the message"),
+                nothing_found(),
+                "{echo}"
+            );
+            let answer = format!("real answer {index}");
+            let reply = format!("⏺ <CHAT_REPLY_{id}>\n  {answer}\n  </CHAT_REPLY_{id}>\n");
+            let ordinal = u32::try_from(index).expect("small index") + 1;
+            for (screen, replies) in [
+                (echo.clone(), Vec::new()),
+                (
+                    format!("{echo}\n{reply}"),
+                    vec![(key.clone(), vec![ordinal])],
+                ),
+                (format!("{reply}\n{echo}"), Vec::new()),
+            ] {
+                if screen != *echo {
+                    assert_eq!(
+                        scan_reply_blocks(&screen, &nonce).expect("scan the screen"),
+                        one_block(&id, &answer),
+                        "{screen}"
+                    );
+                }
+                let capture = state.capture_snapshot(&screen).expect("capture");
+                assert_eq!(capture.replies, replies, "{screen}");
+                assert!(
+                    capture.unknown_ids.is_empty()
+                        && capture.suppressed_ids.is_empty()
+                        && capture.refused.is_empty()
+                        && !capture.overflowed,
+                    "{screen}"
+                );
+            }
+        }
+        let mut transport = FakeReplyTransport::default();
+        while state
+            .publish_one(&key, &mut transport)
+            .expect("publish captured reply")
+            .is_some()
+        {}
+        assert_eq!(
+            transport
+                .submissions
+                .iter()
+                .map(|submission| submission.2.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "[codex coordinator] real answer 0",
+                "[codex coordinator] real answer 1",
+                "[codex coordinator] real answer 2",
+                "[codex coordinator] real answer 3",
+                "[codex coordinator] real answer 4",
+                "[codex coordinator] real answer 5",
+            ]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_joined_read_of_a_claude_code_pane_posts_a_quoted_block_known_gap() {
+        // KNOWN GAP, https://github.com/rrnewton/agent-utils/issues/191: a block quoted in an
+        // agent's prompt must never be posted, but a read longer than the screen of an idle Claude
+        // Code pane can still post one. Herdr 0.8.0 builds such a read by scrolling the agent's
+        // view up and joining the screens it sees: a row of a new screen is kept only when it
+        // differs from the row at the same position on the screen before (`merge_scrolled_up`,
+        // src/terminal/history_read.rs at herdr 346411fa). Below, the screen's top row is Claude
+        // Code's pinned copy of the prompt's first row, drawn over the prompt's closing marker.
+        // The first scroll, of three rows, brings the prompt's real first row to the top row,
+        // where it matches that copy, so the join keeps only the three rows under it: the quoted
+        // block. The second scroll adds the coordinator's rows above them. So the joined text
+        // shows the quoted block right after a row of the coordinator's message, and the bridge
+        // posts it. The screen alone posts nothing. This joined read is worked out by hand and
+        // needs all of these: the pane is idle and takes wheel input, the read asks for more rows
+        // than the screen has, the scroll that first shows the prompt's first row puts it on the
+        // top row, where the copy was drawn, and the pinned copy is identical to the prompt's
+        // first row once trailing spaces are trimmed. That last condition has not
+        // been seen: in one 271-line read of a Claude Code pane, each of its 12
+        // pinned copies was the whole prompt flattened into one row and cut with `…`. With such
+        // a copy the join keeps the prompt's first row above the quote, and nothing is posted. A
+        // change that reads only the screen of a pane that keeps no scrollback must turn the
+        // assertions marked as the known gap below into "posts nothing"; the rule itself stays
+        // as it is. `agentctl chat tick` reads through `agent::read`, not
+        // `CHAT_CAPTURE_SOURCE`, so this test does not cover its reads.
+        let (state, key, nonce, root) = open_request("joined-read-known-gap");
+        let id = format!("{nonce}_1");
+        let open = format!("  <CHAT_REPLY_{id}>");
+        let close = format!("  </CHAT_REPLY_{id}>");
+        let prompt_row = "❯ [worker -> coord 04:11Z] quoting it:";
+        let tail = [
+            "  is this right?",
+            "⏺ Done.",
+            "  The build is green.",
+            "  Nothing else is queued.",
+            "  Waiting for the next message.",
+            // Claude Code's input row, which stays at the bottom while the view scrolls.
+            "❯\u{a0}",
+        ];
+        let mut screen = vec![prompt_row];
+        screen.extend(tail);
+        let screen = rows(&screen);
+        let mut joined = vec![
+            "⏺ Checking the build.",
+            "  It passed.",
+            "⏺ Working on it.",
+            open.as_str(),
+            "  quoted answer",
+            close.as_str(),
+            prompt_row,
+        ];
+        joined.extend(tail);
+        let joined = rows(&joined);
+        // What herdr returns for each source while the pane shows that screen.
+        let herdr_read = |source: &str| match source {
+            "visible" => screen.clone(),
+            "recent" | "recent-unwrapped" => joined.clone(),
+            other => panic!("unexpected read source {other}"),
+        };
+        let capture = state
+            .capture_snapshot(&herdr_read("visible"))
+            .expect("capture the screen");
+        assert!(
+            capture.replies.is_empty()
+                && capture.unknown_ids.is_empty()
+                && capture.suppressed_ids.is_empty()
+                && capture.refused.is_empty()
+                && !capture.overflowed,
+            "{screen}"
+        );
+        // A pinned copy that differs from the prompt's first row, as observed, leaves that row
+        // above the quote in the joined read, so the quote is read as part of the prompt.
+        let flattened = format!("❯ [worker -> coord 04:11Z] quoting it: <CHAT_REPLY_{id}> quoted…");
+        let mut joined_past_copy = vec![
+            "⏺ Checking the build.",
+            "  It passed.",
+            "⏺ Working on it.",
+            prompt_row,
+            open.as_str(),
+            "  quoted answer",
+            close.as_str(),
+            flattened.as_str(),
+        ];
+        joined_past_copy.extend(tail);
+        let joined_past_copy = rows(&joined_past_copy);
+        assert_eq!(
+            scan_reply_blocks(&joined_past_copy, &nonce).expect("scan the joined read"),
+            nothing_found(),
+            "{joined_past_copy}"
+        );
+        let capture = state
+            .capture_snapshot(&joined_past_copy)
+            .expect("capture the joined read");
+        assert!(
+            capture.replies.is_empty()
+                && capture.unknown_ids.is_empty()
+                && capture.suppressed_ids.is_empty()
+                && capture.refused.is_empty()
+                && !capture.overflowed,
+            "{joined_past_copy}"
+        );
+        // The known gap, in every assertion from here to the end: the bridge's read holds the
+        // quoted block right after a row of the coordinator's, so the block is stored and posted
+        // as the coordinator's reply.
+        let captured = herdr_read(crate::subagents::CHAT_CAPTURE_SOURCE);
+        assert_eq!(
+            scan_reply_blocks(&captured, &nonce).expect("scan the joined read"),
+            one_block(&id, "quoted answer"),
+            "{captured}"
+        );
+        let capture = state
+            .capture_snapshot(&captured)
+            .expect("capture the joined read");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])], "{captured}");
+        let mut transport = FakeReplyTransport::default();
+        while state
+            .publish_one(&key, &mut transport)
+            .expect("publish captured reply")
+            .is_some()
+        {}
+        assert_eq!(
+            transport
+                .submissions
+                .iter()
+                .map(|submission| submission.2.as_str())
+                .collect::<Vec<_>>(),
+            ["[codex coordinator] quoted answer"]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_prompt_echo_left_of_an_open_block_ends_it_unfinished() {
+        // A user turn is a new item, so a block still open when one appears ends there, and a
+        // closing marker quoted in the message does not close it. Nothing is posted: the part of
+        // the block before the message, and the part after it, are each unfinished blocks, and
+        // a code fence left open in the first part hides nothing after the message.
+        let nonce = "AAAAAAAAAAAAAAAAAAAAAA";
+        let id = format!("{nonce}_1");
+        let open = format!("<CHAT_REPLY_{id}>");
+        let close = format!("</CHAT_REPLY_{id}>");
+        for prompt_row in [
+            "❯ [worker] quoting it:",
+            "› [worker] quoting it:",
+            "❯\u{a0}[worker] quoting it:",
+            "❯",
+            "» [worker] quoting it:",
+        ] {
+            let rendered = rows(&[
+                &format!("⏺ {open}"),
+                "  first half",
+                "  ```sh",
+                prompt_row,
+                "  second half",
+                &format!("  {close}"),
+                "",
+                "⏺ rest of the answer",
+                &format!("  {close}"),
+            ]);
+            assert_eq!(
+                scan_reply_blocks(&rendered, nonce).expect("scan"),
+                ReplyScan {
+                    found: NonceScan {
+                        partial: vec![
+                            PartialBlock::Unclosed {
+                                identifier: id.clone(),
+                                text: "  first half\n  ```sh".to_owned(),
+                            },
+                            PartialBlock::Unopened {
+                                identifier: id.clone(),
+                                text: "⏺ rest of the answer".to_owned(),
+                            },
+                        ],
+                        ..NonceScan::default()
+                    },
+                    unknown_ids: Vec::new(),
+                },
+                "{rendered}"
+            );
+            // With no block open, the visible part of a block that ends after the message starts
+            // after the message too.
+            let rendered = rows(&[
+                "⏺ Working on it.",
+                prompt_row,
+                &format!("  {close}"),
+                "⏺ the end of an answer",
+                &format!("  {close}"),
+            ]);
+            assert_eq!(
+                scan_reply_blocks(&rendered, nonce).expect("scan"),
+                ReplyScan {
+                    found: NonceScan {
+                        partial: vec![PartialBlock::Unopened {
+                            identifier: id.clone(),
+                            text: "⏺ the end of an answer".to_owned(),
+                        }],
+                        ..NonceScan::default()
+                    },
+                    unknown_ids: Vec::new(),
+                },
+                "{rendered}"
+            );
+            // Only rows two or more columns right of the prompt character continue the message,
+            // so a closing marker one column right of it is read: it ends a partial block with
+            // no text.
+            let rendered = rows(&["⏺ Working on it.", prompt_row, &format!(" {close}")]);
+            assert_eq!(
+                scan_reply_blocks(&rendered, nonce).expect("scan"),
+                ReplyScan {
+                    found: NonceScan {
+                        partial: vec![PartialBlock::Unopened {
+                            identifier: id.clone(),
+                            text: String::new(),
+                        }],
+                        ..NonceScan::default()
+                    },
+                    unknown_ids: Vec::new(),
+                },
+                "{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_output_holding_reply_markers_posts_nothing_and_hides_no_reply() {
+        // A tool call's output can show a file or a message that holds a reply block or an
+        // unclosed code fence. Claude Code draws the output after `⎿` and Codex after `└`, with
+        // its later lines indented further. None of it is reply text: nothing in it is posted or
+        // reported, and a fence in it does not hide the reply after it.
+        let nonce = "AAAAAAAAAAAAAAAAAAAAAA";
+        let id = format!("{nonce}_1");
+        let open = format!("<CHAT_REPLY_{id}>");
+        let close = format!("</CHAT_REPLY_{id}>");
+        let outputs = [
+            rows(&[
+                "⏺ Bash(cat notes.md)",
+                "  ⎿  # Notes",
+                &format!("     {open}"),
+                "     quoted answer",
+                &format!("     {close}"),
+                "     ```sh",
+            ]),
+            rows(&[
+                "• Ran cat notes.md",
+                "  └ # Notes",
+                &format!("    {open}"),
+                "    quoted answer",
+                &format!("    {close}"),
+                "    ```sh",
+            ]),
+            // The opening marker on the output's first row, and a blank line in the output.
+            rows(&[
+                "⏺ Bash(cat notes.md)",
+                &format!("  ⎿  {open}"),
+                "     quoted answer",
+                "",
+                &format!("     {close}"),
+            ]),
+            // Output whose first line is empty. Codex draws `└` alone on its row, as in the next
+            // output. This bare `⎿` row is synthetic: reads of Claude Code panes showed `⎿`
+            // followed by spaces, never alone, and the rule accepts both.
+            rows(&[
+                "⏺ Bash(sed -n 9,20p notes.md)",
+                "  ⎿",
+                &format!("     {open}"),
+                "     quoted answer",
+                &format!("     {close}"),
+                "     ```sh",
+            ]),
+            rows(&[
+                "• Ran sed -n 9,20p notes.md",
+                "  └",
+                &format!("    {open}"),
+                "    quoted answer",
+                &format!("    {close}"),
+                "    ```sh",
+            ]),
+            // Codex's default view shows the first rows of the output and counts the others, so
+            // a quoted block or a fence can be cut there.
+            rows(&[
+                "• Ran sed -n 9,60p notes.md",
+                "  └",
+                "    ```sh",
+                "    make validate",
+                "    +37 lines",
+            ]),
+            rows(&[
+                "• Ran sed -n 9,60p notes.md",
+                "  └",
+                &format!("    {open}"),
+                "    quoted answer",
+                "    +37 lines",
+            ]),
+        ];
+        let reply = rows(&[
+            "⏺ Here it is.",
+            &format!("  {open}"),
+            "  real answer",
+            &format!("  {close}"),
+        ]);
+        for output in outputs {
+            assert_eq!(
+                scan_reply_blocks(&output, nonce).expect("scan the output"),
+                nothing_found(),
+                "{output}"
+            );
+            assert_eq!(
+                scan_reply_blocks(&format!("{output}{reply}"), nonce).expect("scan the screen"),
+                one_block(&id, "real answer"),
+                "{output}"
+            );
+        }
+        // Only rows right of the `⎿` or `└` continue the output.
+        let beside = rows(&[
+            "• Ran ls",
+            "  └ notes.md",
+            &format!("  {open}"),
+            "  real answer",
+            &format!("  {close}"),
+        ]);
+        assert_eq!(
+            scan_reply_blocks(&beside, nonce).expect("scan the screen"),
+            one_block(&id, "real answer")
+        );
+        // Inside a block, `└` rows are reply text, and so are `⎿` rows right of the block's
+        // margin. A `⎿` row at the margin ends the block, as
+        // a_new_item_left_of_an_open_block_ends_it_unless_it_closes_the_block shows.
+        let tree = rows(&[
+            &format!("⏺ {open}"),
+            "  src/",
+            "  └ main.rs",
+            "    ⎿ lib.rs",
+            &format!("  {close}"),
+        ]);
+        assert_eq!(
+            scan_reply_blocks(&tree, nonce).expect("scan the tree"),
+            one_block(&id, "src/\n└ main.rs\n  ⎿ lib.rs")
+        );
+        // A `└` followed by a character other than a space, as in a tree drawn in a message,
+        // starts no tool output, so a block indented under it is read.
+        let drawn = rows(&[
+            "• The layout:",
+            "  └─ src/",
+            &format!("     {open}"),
+            "     real answer",
+            &format!("     {close}"),
+        ]);
+        assert_eq!(
+            scan_reply_blocks(&drawn, nonce).expect("scan the drawn tree"),
+            one_block(&id, "real answer")
+        );
+    }
+
+    #[test]
+    fn a_new_item_left_of_an_open_block_ends_it_unless_it_closes_the_block() {
+        // Claude Code and Codex start each message, and each tool call in their full views, with a
+        // bullet at the left edge and indent the rest of it. A bullet left of an open block's
+        // margin therefore starts another item: the block ends there unfinished, and a tool call
+        // made inside it is not posted as reply text. A code fence left open in the block hides
+        // nothing after it. A closing marker that starts a new message still closes the block.
+        let nonce = "AAAAAAAAAAAAAAAAAAAAAA";
+        let id = format!("{nonce}_1");
+        let open = format!("<CHAT_REPLY_{id}>");
+        let close = format!("</CHAT_REPLY_{id}>");
+        for (bullet, call, output) in [
+            ("⏺", "Bash(ls)", "  ⎿  notes.md"),
+            ("•", "Ran ls", "  └ notes.md"),
+        ] {
+            let rendered = rows(&[
+                &format!("{bullet} {open}"),
+                "  first half",
+                "  ```sh",
+                &format!("{bullet} {call}"),
+                output,
+                &format!("{bullet} second half"),
+                &format!("  {close}"),
+            ]);
+            assert_eq!(
+                scan_reply_blocks(&rendered, nonce).expect("scan"),
+                ReplyScan {
+                    found: NonceScan {
+                        partial: vec![
+                            PartialBlock::Unclosed {
+                                identifier: id.clone(),
+                                text: "  first half\n  ```sh".to_owned(),
+                            },
+                            PartialBlock::Unopened {
+                                identifier: id.clone(),
+                                text: format!("{bullet} second half"),
+                            },
+                        ],
+                        ..NonceScan::default()
+                    },
+                    unknown_ids: Vec::new(),
+                },
+                "{rendered}"
+            );
+            let closed = rows(&[
+                &format!("{bullet} {open}"),
+                "  answer",
+                &format!("{bullet} {close}"),
+            ]);
+            assert_eq!(
+                scan_reply_blocks(&closed, nonce).expect("scan"),
+                one_block(&id, "answer"),
+                "{closed}"
+            );
+        }
+        // Claude Code's compact view draws a tool call as a row at the margin of the message with
+        // no bullet, and its output after `⎿` at the same column. The `⎿` row ends the block, so
+        // a closing marker after the call does not post the call or its output, and a code fence
+        // left open in the block hides nothing after it.
+        let compact = rows(&[
+            &format!("● {open}"),
+            "  first half",
+            "  ```sh",
+            "",
+            "  Ran 1 shell command",
+            "  ⎿  PostToolUse:Bash says: hook output",
+            &format!("● {close}"),
+        ]);
+        assert_eq!(
+            scan_reply_blocks(&compact, nonce).expect("scan"),
+            ReplyScan {
+                found: NonceScan {
+                    partial: vec![
+                        PartialBlock::Unclosed {
+                            identifier: id.clone(),
+                            text: "  first half\n  ```sh\n\n  Ran 1 shell command".to_owned(),
+                        },
+                        PartialBlock::Unopened {
+                            identifier: id.clone(),
+                            text: String::new(),
+                        },
+                    ],
+                    ..NonceScan::default()
+                },
+                unknown_ids: Vec::new(),
+            },
+            "{compact}"
+        );
+    }
+
+    #[test]
+    fn a_prompt_character_or_bullet_inside_a_block_margin_is_reply_text() {
+        // A reply can show a shell prompt, a list, or a tree. Indented to the block's margin,
+        // those rows belong to the item the block is in, so they are reply text. A block that
+        // opens at the left edge, as a plain renderer draws it, has no margin, so nothing in it
+        // starts another item.
+        let nonce = "AAAAAAAAAAAAAAAAAAAAAA";
+        let id = format!("{nonce}_1");
+        let open = format!("<CHAT_REPLY_{id}>");
+        let close = format!("</CHAT_REPLY_{id}>");
+        let indented = rows(&[
+            &format!("⏺ {open}"),
+            "  Run it like this:",
+            "  ❯ npm test",
+            "  › cargo test",
+            "  • then read the log",
+            "  ⏺ and this",
+            &format!("  {close}"),
+        ]);
+        assert_eq!(
+            scan_reply_blocks(&indented, nonce).expect("scan"),
+            one_block(
+                &id,
+                "Run it like this:\n❯ npm test\n› cargo test\n• then read the log\n⏺ and this"
+            )
+        );
+        let plain = rows(&[&open, "❯ npm test", "• a point", "└ a leaf", &close]);
+        assert_eq!(
+            scan_reply_blocks(&plain, nonce).expect("scan"),
+            one_block(&id, "❯ npm test\n• a point\n└ a leaf")
+        );
+    }
+
+    #[test]
+    fn an_opening_marker_above_the_first_row_at_the_left_edge_opens_no_block() {
+        // A capture starts at an arbitrary row. Its rows above the first nonblank row at the left
+        // edge continue an item whose first row is out of view, which may be a user turn or tool
+        // output, so an opening marker there opens no block and nothing there is posted. A
+        // closing marker there still ends an unfinished block, which is reported unless it is the
+        // end of a stored reply, and an unknown reply ID there is still reported. The same block
+        // with its item in view is posted.
+        let (state, key, nonce, root) = open_request("orphan-opening-marker");
+        let id = format!("{nonce}_1");
+        let open = format!("<CHAT_REPLY_{id}>");
+        let close = format!("</CHAT_REPLY_{id}>");
+        let text = "an answer seen without its first row";
+        let cut = rows(&[
+            &format!("  {open}"),
+            &format!("  {text}"),
+            &format!("  {close}"),
+            "  <CHAT_REPLY_unknown_1>",
+            "⏺ Done.",
+        ]);
+        assert_eq!(
+            scan_reply_blocks(&cut, &nonce).expect("scan"),
+            ReplyScan {
+                found: NonceScan {
+                    partial: vec![PartialBlock::Unopened {
+                        identifier: id.clone(),
+                        text: format!("  {text}"),
+                    }],
+                    ..NonceScan::default()
+                },
+                unknown_ids: vec!["unknown_1".to_owned()],
+            }
+        );
+        let capture = state.capture_snapshot(&cut).expect("capture the cut item");
+        assert!(capture.replies.is_empty());
+        assert_eq!(capture.unknown_ids, ["unknown_1".to_owned(), id.clone()]);
+        // A row one column in is not at the left edge either.
+        let one_in = rows(&[
+            " a row one column in",
+            &format!("  {open}"),
+            &format!("  {text}"),
+            &format!("  {close}"),
+        ]);
+        assert_eq!(
+            scan_reply_blocks(&one_in, &nonce).expect("scan"),
+            ReplyScan {
+                found: NonceScan {
+                    partial: vec![PartialBlock::Unopened {
+                        identifier: id.clone(),
+                        text: format!("  {text}"),
+                    }],
+                    ..NonceScan::default()
+                },
+                unknown_ids: Vec::new(),
+            }
+        );
+
+        let whole = rows(&[
+            &format!("⏺ {open}"),
+            &format!("  {text}"),
+            &format!("  {close}"),
+        ]);
+        let capture = state
+            .capture_snapshot(&whole)
+            .expect("capture the whole item");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+        assert!(capture.unknown_ids.is_empty() && capture.suppressed_ids.is_empty());
+        assert_eq!(state.read_reply(&key, 1).expect("reply").body, text);
+
+        // The cut item is now the end of a stored reply, so only the unknown ID is reported.
+        let capture = state
+            .capture_snapshot(&cut)
+            .expect("capture the cut item again");
+        assert!(capture.replies.is_empty());
+        assert_eq!(capture.unknown_ids, ["unknown_1".to_owned()]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_code_fence_above_the_first_row_at_the_left_edge_hides_nothing() {
+        // The rows above the first row at the left edge belong to an item whose first row is out
+        // of view, such as tool output, so a code fence that opens there says nothing about the
+        // rows after it. It ends at that row, and a reply after it is posted.
+        let nonce = "AAAAAAAAAAAAAAAAAAAAAA";
+        let id = format!("{nonce}_1");
+        let rendered = rows(&[
+            "  echo code line",
+            "  ```",
+            "● Done.",
+            "❯ [coord -> agent] next question",
+            "● Here it is.",
+            &format!("  <CHAT_REPLY_{id}>"),
+            "  answer",
+            &format!("  </CHAT_REPLY_{id}>"),
+        ]);
+        assert_eq!(
+            scan_reply_blocks(&rendered, nonce).expect("scan"),
+            one_block(&id, "answer")
+        );
+    }
+
+    #[test]
+    fn a_prompt_row_at_the_top_of_a_capture_starts_nothing() {
+        // Once a prompt has scrolled off the top of the screen, Claude Code can pin a copy of it
+        // there, at the left edge and cut to one row, over rows of whatever item the screen
+        // starts in. So a `❯` row at the left edge that is the first nonblank row of a capture
+        // is skipped: it starts no prompt echo, and it is not the first row at the left edge. The
+        // rows under it are read as rows above the first row at the left edge, so a block of the
+        // coordinator's there is reported instead of hidden. A prompt that really starts at the
+        // top of the capture still posts nothing: a block it quotes is reported, unless its text
+        // is part of a stored reply. A `❯` row below another nonblank row, an indented prompt row
+        // at the top, and a Codex prompt row at the top still start prompt echoes.
+        let (state, key, nonce, root) = open_request("prompt-row-at-top");
+        let id = format!("{nonce}_1");
+        let open = format!("<CHAT_REPLY_{id}>");
+        let close = format!("</CHAT_REPLY_{id}>");
+        let pinned_row =
+            "❯ [worker -> coord 04:05Z] the owner wants this: check the build, then tell me which …";
+        let reported = |text: &str| ReplyScan {
+            found: NonceScan {
+                partial: vec![PartialBlock::Unopened {
+                    identifier: id.clone(),
+                    text: text.to_owned(),
+                }],
+                ..NonceScan::default()
+            },
+            unknown_ids: Vec::new(),
+        };
+        // The pinned row over the rest of a message whose first row is off the screen, with a
+        // block after text.
+        let pinned = rows(&[
+            pinned_row,
+            "  detail 10",
+            &format!("  {open}"),
+            "  late answer",
+            &format!("  {close}"),
+            "",
+            "❯\u{a0}",
+        ]);
+        assert_eq!(
+            scan_reply_blocks(&pinned, &nonce).expect("scan"),
+            reported("  late answer")
+        );
+        // Blank rows above it change nothing.
+        assert_eq!(
+            scan_reply_blocks(&format!("\n\n{pinned}"), &nonce).expect("scan"),
+            reported("  late answer")
+        );
+        let capture = state
+            .capture_snapshot(&pinned)
+            .expect("capture under the pinned row");
+        assert!(capture.replies.is_empty());
+        assert_eq!(capture.unknown_ids, std::slice::from_ref(&id));
+        // A prompt whose first row is the top of the capture, quoting a block.
+        let quoting = rows(&[
+            "❯ [worker -> coord 04:11Z] quoting it:",
+            &format!("  {open}"),
+            "  quoted answer",
+            &format!("  {close}"),
+            "⏺ Done.",
+        ]);
+        assert_eq!(
+            scan_reply_blocks(&quoting, &nonce).expect("scan"),
+            reported("  quoted answer")
+        );
+        let capture = state
+            .capture_snapshot(&quoting)
+            .expect("capture the quoting prompt");
+        assert!(capture.replies.is_empty());
+        assert_eq!(capture.unknown_ids, std::slice::from_ref(&id));
+        // Once the coordinator's own block with that text is stored, the quote is silent.
+        let own = rows(&[
+            "⏺ Here it is.",
+            &format!("  {open}"),
+            "  quoted answer",
+            &format!("  {close}"),
+        ]);
+        let capture = state.capture_snapshot(&own).expect("capture the reply");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+        let capture = state
+            .capture_snapshot(&quoting)
+            .expect("capture the quoting prompt again");
+        assert!(
+            capture.replies.is_empty()
+                && capture.unknown_ids.is_empty()
+                && capture.suppressed_ids.is_empty()
+        );
+        // Only the first nonblank row can be the pinned copy: a prompt row under rows that
+        // continue an item whose first row is above the capture starts a prompt echo.
+        let later = rows(&[
+            "  rest of an earlier message",
+            "❯ [worker -> coord 04:11Z] quoting it:",
+            &format!("  {open}"),
+            "  later quoted answer",
+            &format!("  {close}"),
+        ]);
+        assert_eq!(
+            scan_reply_blocks(&later, &nonce).expect("scan"),
+            nothing_found()
+        );
+        // Nor can an indented row: a `❯` row at the top that is not at the left edge starts a
+        // prompt echo.
+        let indented = rows(&[
+            "  ❯ [worker -> coord 04:11Z] quoting it:",
+            &format!("    {open}"),
+            "    indented answer",
+            &format!("    {close}"),
+            "⏺ Done.",
+        ]);
+        assert_eq!(
+            scan_reply_blocks(&indented, &nonce).expect("scan"),
+            nothing_found()
+        );
+        // Codex pins no copy of a prompt, so a Codex prompt row at the top of a capture starts a
+        // prompt echo, and the block it quotes is neither posted nor reported.
+        for prompt in ["›", "↳", "»"] {
+            let codex = rows(&[
+                &format!("{prompt} [worker -> coord 04:12Z] quoting it:"),
+                &format!("  {open}"),
+                "  codex answer",
+                &format!("  {close}"),
+                "• Done.",
+            ]);
+            assert_eq!(
+                scan_reply_blocks(&codex, &nonce).expect("scan"),
+                nothing_found(),
+                "{codex}"
+            );
+        }
+        // A prompt Codex holds, whose item's first row is above the capture, is still skipped.
+        let held = rows(&[
+            "",
+            "  ↳ [worker -> coord 04:12Z] quoting it:",
+            &format!("    {open}"),
+            "    held answer",
+            &format!("    {close}"),
+            "⏺ Done.",
+        ]);
+        assert_eq!(
+            scan_reply_blocks(&held, &nonce).expect("scan"),
+            nothing_found()
+        );
+        // A block that starts its message under the pinned row is posted.
+        let below = rows(&[
+            pinned_row,
+            "  detail 10",
+            &format!("⏺ {open}"),
+            "  second answer",
+            &format!("  {close}"),
+        ]);
+        let capture = state
+            .capture_snapshot(&below)
+            .expect("capture the block under the pinned row");
+        assert_eq!(capture.replies, [(key.clone(), vec![2])]);
+        assert_eq!(
+            state.read_reply(&key, 2).expect("reply").body,
+            "second answer"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_screen_sized_capture_posts_a_block_only_with_the_first_row_of_its_message() {
+        // For a Claude Code pane herdr usually returns only the rows on the screen, however many
+        // lines the bridge asks for, so this capture is one screen: 52 rows, ending with the
+        // input box. A block that starts its message is posted while the whole block is on the
+        // screen.
+        // Text above a block pushes the first row of its message off the screen sooner, and the
+        // block's opening marker is then above the first row at the left edge: that capture
+        // posts nothing and reports the block's reply ID to the agent, so it can send it again.
+        const SCREEN_ROWS: usize = 52;
+        let (state, key, nonce, root) = open_request("screen-sized-capture");
+        let id = format!("{nonce}_1");
+        let screen = |message: Vec<String>| {
+            let mut all =
+                vec!["❯ The user's request arrived through the configured chat bridge.".to_owned()];
+            all.extend((1..=20).map(|line| format!("  Line {line} of the request.")));
+            all.push(String::new());
+            all.extend(message);
+            all.extend(
+                [
+                    "",
+                    "────────────────────────────────────────",
+                    "❯\u{a0}",
+                    "────────────────────────────────────────",
+                    "  ⏵⏵ bypass permissions on · 1 shell",
+                ]
+                .map(str::to_owned),
+            );
+            let visible = &all[all.len().saturating_sub(SCREEN_ROWS)..];
+            assert_eq!(visible.len(), SCREEN_ROWS, "the capture fills the screen");
+            rows(&visible.iter().map(String::as_str).collect::<Vec<_>>())
+        };
+        let block = |label: &str| {
+            let mut block = vec![format!("<CHAT_REPLY_{id}>")];
+            block.extend((1..=40).map(|line| format!("{label} {line}")));
+            block.push(format!("</CHAT_REPLY_{id}>"));
+            block
+        };
+        // A first row and ten more rows of text before a 42-row block make a message of 53 rows,
+        // more than the 47 rows this fixture's screen has for it. Real 52-row screens had 40 to
+        // 48 rows for the conversation, depending on the rows below the input box and on a
+        // pinned prompt row.
+        let mut late = vec!["● Here is what I found.".to_owned()];
+        late.extend((1..=10).map(|line| format!("  detail {line}")));
+        late.extend(block("late").into_iter().map(|row| format!("  {row}")));
+        let late = screen(late);
+        let capture = state
+            .capture_snapshot(&late)
+            .expect("capture the block after text");
+        assert!(capture.replies.is_empty());
+        assert_eq!(capture.unknown_ids, std::slice::from_ref(&id));
+        // Claude Code can pin a copy of the prompt, cut to one row, over the top row once the
+        // prompt is off the screen. The block is still reported.
+        let (_, below) = late.split_once('\n').expect("more than one row");
+        let pinned = format!(
+            "❯ The user's request arrived through the configured chat bridge. Line 1 of the …\n\
+             {below}"
+        );
+        let capture = state
+            .capture_snapshot(&pinned)
+            .expect("capture the block after text under a pinned prompt row");
+        assert!(capture.replies.is_empty());
+        assert_eq!(capture.unknown_ids, std::slice::from_ref(&id));
+        // A block of the same size that starts its message is posted, even though the prompt
+        // row above it is off the screen, so the block's own first row is the first row at the
+        // left edge.
+        let first = screen(
+            block("first")
+                .into_iter()
+                .enumerate()
+                .map(|(row, text)| format!("{}{text}", if row == 0 { "● " } else { "  " }))
+                .collect(),
+        );
+        assert_eq!(
+            first
+                .lines()
+                .find(|row| !row.is_empty() && !row.starts_with(' ')),
+            Some(format!("● <CHAT_REPLY_{id}>").as_str())
+        );
+        let capture = state
+            .capture_snapshot(&first)
+            .expect("capture the block that starts its message");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+        assert_eq!(
+            state.read_reply(&key, 1).expect("reply").body,
+            (1..=40)
+                .map(|line| format!("first {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }

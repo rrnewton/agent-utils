@@ -37,6 +37,12 @@ pub use cloud::{CloudLaunch, CloudTools};
 
 const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
 const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
+/// The herdr read source of the chat service's snapshot reads of its agent's pane: the startup,
+/// reconciliation and idle scans that recover replies. The service's other capture path, its
+/// `pane.output_matched` subscriptions, asks for `recent_unwrapped` rows, which herdr serves as
+/// passive reads. `agentctl chat tick` does not use this constant either: it reads through
+/// `agent::read`, which asks for `recent-unwrapped` rows and falls back to `recent`.
+pub(crate) const CHAT_CAPTURE_SOURCE: &str = "recent";
 const MAX_AGENT_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 
@@ -4335,9 +4341,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             &target,
             runtime,
         )?;
-        let text = self
-            .client
-            .read_with_runtime(&info.pane_id, "recent", Some(lines), runtime)?;
+        let text = self.client.read_with_runtime(
+            &info.pane_id,
+            CHAT_CAPTURE_SOURCE,
+            Some(lines),
+            runtime,
+        )?;
         self.snapshot(&record, &text)?;
         Ok(text)
     }
