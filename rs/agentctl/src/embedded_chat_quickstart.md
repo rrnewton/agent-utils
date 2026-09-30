@@ -76,7 +76,12 @@ block quoted in a message to the agent is not posted; the userguide describes
 these rules and where they fail. For a Claude Code pane herdr usually returns
 about one screen, so a block is posted only when a capture shows the first row
 of its message and the whole block, and a block taller than the screen is
-usually not posted.
+usually not posted. A block under a reply ID that matches no request the bridge
+knows, or one a capture shows only in part, is not posted, and the agent gets a
+routing-error prompt about it, usually once, as the userguide describes. A block
+under a well-formed ID of a closed request is ignored. For an unmatched ID, the
+prompt lists the open requests whose prompts reached the agent's queue: first
+those with no reply yet, most recent first, and then those already answered.
 A block that cannot be posted, such as an empty or oversized one, is skipped
 with one log line that begins with the UTC time and then
 `agentctl: chat reply capture:`; nothing the agent prints stops `run`.

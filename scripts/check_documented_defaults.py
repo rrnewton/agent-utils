@@ -639,7 +639,7 @@ PINS: tuple[Pin, ...] = (
     ),
     Pin(
         "chat-feedback-available-ids",
-        "the available reply IDs one chat routing-error prompt names",
+        "the open requests with no reply yet that one chat routing-error prompt names",
         code=(
             Site(
                 "rs/agentctl/src/chat_runtime.rs",
@@ -650,8 +650,69 @@ PINS: tuple[Pin, ...] = (
         docs=(
             Site(
                 "rs/agentctl/src/embedded_chat_userguide.md",
-                r"up\s+to\s+(?P<value>[A-Za-z\d,]+)\s+of\s+the\s+reply\s+IDs\s+that\s+were\s+available",
+                r"The\s+first\s+list\s+names\s+up\s+to\s+(?P<value>[A-Za-z\d,]+)\s+requests",
                 "the prompt the chat guide describes",
+            ),
+        ),
+    ),
+    Pin(
+        "chat-feedback-replied-ids",
+        "the open requests with a reply that one chat routing-error prompt names",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_runtime.rs",
+                r"(?m)^const MAX_FEEDBACK_REPLIED_IDS: usize = (?P<value>[\d_]+);$",
+                "the Rust display bound",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"requests\s+and\s+the\s+second\s+up\s+to\s+(?P<value>[A-Za-z\d,]+),\s+and\s+each",
+                "the prompt the chat guide describes",
+            ),
+        ),
+    ),
+    Pin(
+        "chat-held-back-digest-chars",
+        "the characters of a partial chat reply block that identify it in a routing-error report",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_runtime.rs",
+                r"(?m)^const HELD_BACK_DIGEST_CHARS: usize = (?P<value>[\d_]+);$",
+                "the Rust digest span",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"a\s+digest\s+of\s+(?P<value>[A-Za-z\d,]+)\s+characters\s+of\s+it",
+                "the digest span the chat guide states",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"the\s+last\s+(?P<value>[A-Za-z\d,]+)\s+of\s+an\s+unopened\s+block",
+                "the end of a block the chat guide says the digest covers",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"the\s+first\s+(?P<value>[A-Za-z\d,]+)\s+of\s+a\s+block\s+with\s+no\s+closing",
+                "the start of a block the chat guide says the digest covers",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"at\s+least\s+(?P<value>[A-Za-z\d,]+)\s+characters\s+of\s+it\s+are\s+in\s+view",
+                "the scrolling bound the chat guide states",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"fewer\s+than\s+(?P<value>[A-Za-z\d,]+)\s+such\s+characters",
+                "the short block the chat guide describes",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"fewer\s+than\s+(?P<value>[A-Za-z\d,]+)\s+characters\s+of\s+one\s+at\s+the\s+top",
+                "the remnant the chat guide describes",
             ),
         ),
     ),

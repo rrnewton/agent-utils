@@ -346,10 +346,9 @@ agent draws each prompt it receives, and the output of each tool call it makes,
 as an item of its own, and the rows of those items are skipped, so a reply block
 that another agent quotes in a message to this one, or that a tool prints from a
 file, is not posted, except in a read longer than the screen, as described
-below. Its ID is not reported as unavailable either, unless the first row of
-that item is out of view, the item is a Claude Code message whose first row is
-the top row of the read, or the read is longer than the screen, as described
-below. A prompt starts
+below. It is not reported either, unless the first row of that item is out of
+view, the item is a Claude Code message whose first row is the top row of the
+read, or the read is longer than the screen, as described below. A prompt starts
 at a row whose text after its indentation is `❯`, `›`, `↳` or `»`, alone or
 followed by a space or a no-break space, and its wrapped rows continue two or
 more columns further right. Claude Code draws a prompt and its input box after
@@ -427,7 +426,7 @@ inside is reported as having no closing marker, although
 the agent wrote one. A later read that shows only
 the screen reads the block by the rules above, if it is still in view: it is
 posted if that read also shows the first row of its message, and otherwise
-reported, unless a block under its ID was already reported.
+reported, unless it was already reported.
 
 Replies are recognized by their text, not by the number in their reply ID. A
 reply ID is the request's nonce, an underscore, and a number from 1 to 999999
@@ -510,51 +509,124 @@ A reply marker in the pane whose ID is not available, such as a typo or a stale
 block left in scrollback by another bridge state, produces one routing-error
 prompt to the agent. An ID is unavailable when its number is malformed or it
 names no request the bridge knows. A well-formed ID of a closed request is
-ignored. The prompt names the unavailable ID and up to 32 of the reply IDs that
-were available when it was written, and counts the rest. It is never posted to
-chat. Reported IDs are kept in `fence-feedback.json` in the bridge state
-directory, so each unavailable ID is reported at most once per state directory,
-including after a restart. A new state directory starts with no reported IDs. A
-marker that stays visible after its report is left out of later prompts, and a
-later block that reuses a reported ID is not reported again. A recovery scan
-also reports the ID of an open request's block that it sees only in part, such
-as an opening marker before its closing one, or a closing marker whose opening
-one has scrolled away, unless the visible part holds no text or is the start or
-the end of a reply already stored for that request, read either way. A part cut
-inside a table row that wrapped at another width than the stored reply's is
-still reported, once. The prompt then names that ID as unavailable, and also as
-available if it is among the available IDs it lists. Since reports are kept by
-ID, the first partial block reported under an ID uses up that ID's report, even
-when the agent did not write that block or did finish it: a block another agent
-quoted in a message whose first row is out of view, including a Claude Code
-message under the copy of its first row or one whose first row is the top row of
-the read; a block a tool printed, in output whose first row is out of view; or,
-in a read longer than the screen, a quoted block, or the agent's own block with
-a copied prompt row or a tool-output row inside it. A later partial
-block under that ID, including the agent's own, is then only logged. A complete
-block under that
-ID is still posted if its text is new. A block under an ID that belongs to no
+ignored. The prompt is never posted to chat. It says that the block marked with
+the unavailable ID was not sent, and then lists the open requests, each by the
+ID of its next reply, as they stood when the prompt was written. First come
+those with no reply yet, most recent first, each with the time since the bridge
+admitted it, such as `10m ago`, because a mistyped ID was most likely meant for
+one of those. Then come those that already have a reply. The first list names up
+to 32 requests and the second up to 10, and each counts the rest, as in
+`... (+37 more)`. When every listed request has a reply, or none is listed, the
+prompt says so. It ends by asking the agent to send the block again with the ID
+of the request it answers. An open request is listed once delivery of its prompt
+to the agent is confirmed or uncertain, and before that while the agent's queue
+holds the prompt, as it does when a submission failed after queuing it and waits
+for a retry, since that prompt reaches the agent through the same queue as the
+routing-error prompt. A request whose prompt has not reached the queue, because
+the bridge has not yet submitted it or its submission was cancelled or failed
+before queuing, is not listed. Only a prompt that reports an unavailable ID
+looks for request prompts in the queue. A request whose record there cannot be
+read is listed too, since its prompt may have reached the agent, and the
+routing-error prompt is sent all the same.
+
+The prompt says that the block was probably meant for a request when that
+request is the only listed one with no reply yet that the agent may have seen
+when it wrote the block, and its prompt is known to have left the queue's inbox,
+where a prompt waits until the queue types it into the pane: its delivery is
+confirmed or uncertain, or the queue reports it past the inbox. A request whose
+prompt still waits in the inbox is listed but does not count, since the agent
+had not seen it when it wrote the block. A request whose queue record cannot be
+read counts, since the agent may have seen it, but is never named, so while one
+with no reply yet is listed, no request is named. The bridge cannot tell when
+the block was written, so a request whose prompt left the inbox after the agent
+wrote the block, but before the bridge reported it, can still be named. When the
+prompt names a request, it also asks the agent not to send a block it did not
+write, such as one quoted in a message it received, since the agent could
+otherwise send such a block under that request's ID.
+
+A recovery scan also reports a partial block of an open request: an opening
+marker with no closing one after it, or an unopened block, which ends in a
+closing marker in a message that shows no opening one before it or whose first
+row is out of view. It does not report a part that holds no text or is the start
+or the end of a reply already stored for that request, read in row order or
+column by column. A part cut inside a table row that wrapped at another width
+than the stored reply's is still reported, once. The prompt says what the
+capture was missing: the start of the message that holds the block or an opening
+line for the block, or the block's closing line. A block that a prompt or a tool
+call interrupts reads as both: the rows before the new item as a block with no
+closing line, and the rows after it, up to the closing line, as an unopened
+block. The prompt then asks the agent to send the block again, starting a
+message with its opening line and writing the whole block in that message, with
+no tool call inside it, and not to send a block it did not write, such as one
+quoted in a message it received. A block another agent quoted in a message whose
+first row is out of view, including a Claude Code message under the copy of its
+first row or one whose first row is the top row of the read, and a block a tool
+printed in output whose first row is out of view, are reported too, as described
+above. So, in a read longer than the screen, are a quoted block and the agent's
+own block with a copied prompt row or a tool-output row inside it, which reads
+as a block with no closing line. When a closing line was missing, it first says
+that a block still being written goes out once it is complete, if the screen
+then shows the first row of its message and its closing line, since the agent
+may not have finished the block when the pane was read. A complete block under
+that ID is still posted if its text is new. One prompt can report both
+unavailable IDs and partial blocks.
+
+A partial block is identified by its ID, by which end of it was missing, and by
+a digest of 64 characters of it, not counting whitespace or box-drawing
+characters: the last 64 of an unopened block, and the first 64 of a block with
+no closing line. A block with fewer than 64 such characters is identified by all
+of them. Those characters stay the same while the block scrolls, so a block
+leaving the top of the screen is not reported again while at least 64 characters
+of it are in view, and what is left of it after that is not reported if an
+unopened block under its ID was already reported. The rows of an unopened block
+begin no higher than the last row above its closing line that starts at the left
+edge with a bullet (`•`, `⏺` or `●`) and a space, as the first row of a message
+does, so while that row is in view, rows of an earlier item are not counted,
+even once the prompt or tool output row that started that item has left the
+screen or reads as Claude Code's copy of a prompt. Two different blocks under
+one ID are each reported. A partial block that only scrolls up the screen is
+therefore reported once. It can be reported again when a later recovery scan
+shows it differently, such as a block with no closing line and fewer than 64
+such characters that has grown; a block reported with no closing line while it
+was still being written, which is reported as an unopened block once a recovery
+scan sees it complete but not the first row of its message; and a block first
+reported when fewer than 64 such characters of it were in view, at the top of
+the capture, once a recovery scan shows the first row of its message or 64 such
+characters of it, as it can when rows move back down the screen.
+
+Reported entries are kept in `fence-feedback.json` in the bridge state
+directory, so each unavailable ID and each partial block entry is reported at
+most once per state directory, including after a restart. An unavailable ID is
+kept as the ID itself. A partial block is kept as `ID KIND HASH`: KIND is
+`unopened` for an unopened block, `remnant` for fewer than 64 characters of one
+at the top of the capture, and `unclosed` for a block with no closing line, and
+HASH is the first 12 hex digits of the SHA-256 of the characters its digest
+covers. A history written by an earlier release keeps the bare ID of a partial
+block, and that ID still covers every partial block under it. A new state
+directory starts with no reported entries. A marker that stays visible after its
+report is left out of later prompts, and a later block that reuses a reported
+unavailable ID is not reported again. A block under an ID that belongs to no
 open request is never posted. Once its ID is reported, its only trace is a log
 line, and only recovery scans write that line. Recovery scans run when
 `chat run` starts, at each `chat tick`, at each reconciliation while the agent
-pane is idle or done, when the pane settles idle
-or done, and after output names a reply ID that belongs to no request the bridge
-knows. Each recovery scan that sees reported IDs that are still unavailable logs
-one `already reported, so not repeated` line that names up to 8 of them and
-counts the rest, up to 128 per scan. Other captures do not write that line, so a
-reused ID that leaves the screen before the next recovery scan leaves no trace.
-Already reported markers are set aside before the bound on new ones, so a screen
-full of old markers cannot hide a new one. While a routing-error prompt is still
-queued, newer unavailable IDs wait for it instead of producing a second prompt.
-The exact pending prompt is saved before submission, so recovery settles its
-original queue ID even if a crash hides the submission result or newer
-unavailable markers appear. A prompt whose queue outcome is uncertain counts as
-reported: it is not submitted again, even if it never reached the agent. The
-history retains up to 4,096 distinct reported or pending IDs. At that limit, new
-diagnostics stay held; reported IDs are never evicted or submitted again.
-Deleting `fence-feedback.json` clears the history, so the IDs it held can be
-reported once more. If the file cannot be read or is outside its bounds, the
-error names it and diagnostics stay held until it is repaired or deleted.
+pane is idle or done, when the pane settles idle or done, and after output names
+a reply ID that belongs to no request the bridge knows. Each recovery scan that
+sees markers or partial blocks already reported logs one
+`already reported, so not repeated` line that names up to 8 of them and counts
+the rest, up to 128 per scan. Other captures do not write that line, so a reused
+ID that leaves the screen before the next recovery scan leaves no trace. Already
+reported entries are set aside before the bound on new ones, so a screen full of
+old markers cannot hide a new one. While a routing-error prompt is still queued,
+newer entries wait for it instead of producing a second prompt. The exact
+pending prompt is saved before submission, so recovery settles its original
+queue ID even if a crash hides the submission result or newer unavailable
+markers appear. A prompt whose queue outcome is uncertain counts as reported: it
+is not submitted again, even if it never reached the agent. The history retains
+up to 4,096 distinct reported or pending entries. At that limit, new diagnostics
+stay held; reported entries are never evicted or submitted again. Deleting
+`fence-feedback.json` clears the history, so the entries it held can be reported
+once more. If the file cannot be read or is outside its bounds, the error names
+it and diagnostics stay held until it is repaired or deleted.
 
 A per-thread post-rate breaker bounds any remaining reply loop. One provider
 thread may reserve 8 distinct reply operations within 60 seconds. That leaves

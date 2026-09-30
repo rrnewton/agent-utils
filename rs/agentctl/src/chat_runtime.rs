@@ -55,8 +55,17 @@ const MAX_REQUEST_REPLY_BYTES: u64 = 64 * 1_024 * 1_024;
 const MAX_STATE_REPLIES: u64 = 65_536;
 const MAX_STATE_REPLY_BYTES: u64 = 1_024 * 1_024 * 1_024;
 pub(crate) const MAX_VISIBLE_MARKERS: usize = 4_096;
+// A routing notice names up to this many open requests with no reply yet, and up to the
+// second bound of those with one, and counts the rest.
 const MAX_FEEDBACK_AVAILABLE_IDS: usize = 32;
+const MAX_FEEDBACK_REPLIED_IDS: usize = 10;
 const MAX_FEEDBACK_UNAVAILABLE_IDS: usize = 128;
+// Identity characters of a block seen only in part that its feedback entry covers: this many
+// from the end of a block seen with no opening line in its message, or without the first row of
+// its message, and from the start of one with no closing marker. Those ends stay put while the
+// block scrolls away, so a block keeps its entry while at least this much of it is in view. Less
+// of a block cut by the top of the capture is a remnant.
+const HELD_BACK_DIGEST_CHARS: usize = 64;
 const MAX_FEEDBACK_ID_BYTES: usize = 256;
 // Retain every reported marker. At this bound, hold new diagnostics instead of forgetting old
 // markers and allowing them to be submitted again.
@@ -4803,6 +4812,69 @@ and the replies captured for them. The provider's own thread is the complete rec
             .collect())
     }
 
+    /// Open requests whose prompt the coordinator may have seen by the time it reads a routing
+    /// notice, most recently admitted first, since it cannot answer a request it was never shown.
+    /// A request whose delivery is confirmed or uncertain is listed. One still pending or being
+    /// submitted is listed only while the queue has its prompt, in any state: each drain, such as
+    /// the one that delivers the notice, delivers the waiting prompts in turn until the
+    /// coordinator is not ready for one, and a prompt in any other state may already have reached
+    /// the coordinator. So a request never submitted, or whose submission failed before anything
+    /// was queued, as a cancelled one does, is left out. A request whose queue entry cannot be
+    /// read is listed, since its prompt may have reached the coordinator; the request's own
+    /// delivery records that fault. Each listed request says how far its prompt is known to have
+    /// gone, since only one that left the inbox can be the probable target. The queue is read
+    /// after the state lock is released.
+    fn open_requests(&self, delivery: &dyn CoordinatorDelivery) -> Result<Vec<OpenRequest>> {
+        if !self.config.outbound_enabled {
+            return Ok(Vec::new());
+        }
+        let records = {
+            let _snapshot = self.lock_state_snapshot()?;
+            self.request_records()?
+        };
+        let mut open = Vec::new();
+        for (record, _) in records {
+            if record.reply_closed {
+                continue;
+            }
+            let reach = match record.phase {
+                RequestPhase::Delivered | RequestPhase::DeliveryUncertain => {
+                    Some(PromptReach::Sent)
+                }
+                RequestPhase::Pending if record.delivery_started_at_millis.is_none() => None,
+                RequestPhase::Pending | RequestPhase::Submitting => {
+                    match delivery
+                        .message_state(&self.config.agent_name, &record.delivery_message_id)
+                    {
+                        Ok(None) => None,
+                        Ok(Some(QueueMessageState::Pending)) => Some(PromptReach::Queued),
+                        Ok(Some(
+                            QueueMessageState::Inflight
+                            | QueueMessageState::Processed
+                            | QueueMessageState::Failed,
+                        )) => Some(PromptReach::Sent),
+                        Err(_) => Some(PromptReach::Unknown),
+                    }
+                }
+            };
+            if let Some(reach) = reach {
+                open.push(OpenRequest {
+                    id: format!("{}_{}", record.reply_nonce, record.next_reply_ordinal),
+                    replied: record.reply_count > 0,
+                    admitted_at_millis: record.admitted_at_millis,
+                    reach,
+                });
+            }
+        }
+        open.sort_by(|left, right| {
+            right
+                .admitted_at_millis
+                .cmp(&left.admitted_at_millis)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(open)
+    }
+
     /// Record one fence feedback prompt. A prompt the queue still holds stays pending, so later
     /// scans settle it instead of composing another; a settled prompt marks its markers reported,
     /// so no later scan reports them again, even after a restart.
@@ -5747,10 +5819,11 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         })
     }
 
-    /// Identifiers of partial blocks whose visible text is not part of any reply this request
-    /// stored, so the coordinator hears that the block did not go out. The visible end of a
-    /// stored reply cut by the top of the capture, or the start of one, is silent, in either
-    /// the plain or the column view, and so is a partial block with no text yet.
+    /// Feedback entries, as `held_back_entry` writes them, for partial blocks whose visible text
+    /// is not part of any reply this request stored, so the coordinator hears that the block did
+    /// not go out. The visible end of a stored reply cut by the top of the capture, or the start
+    /// of one, is silent, in either the plain or the column view, and so is a partial block with
+    /// no text yet.
     fn unmatched_partials_locked(
         &self,
         key: &str,
@@ -5760,17 +5833,16 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let mut compared = BTreeSet::new();
         let mut unmatched = Vec::<String>::new();
         for block in partial {
-            let (unclosed, text) = match block {
-                PartialBlock::Unclosed { text, .. } => (true, text),
-                PartialBlock::Unopened { text, .. } => (false, text),
+            let (unclosed, cut, text) = match block {
+                PartialBlock::Unclosed { text, .. } => (true, false, text),
+                PartialBlock::Unopened { text, cut, .. } => (false, *cut, text),
             };
             let view = plain_view(text);
-            if view.is_empty()
-                || unmatched
-                    .iter()
-                    .any(|identifier| identifier == block.identifier())
-                || !compared.insert((unclosed, view.clone()))
-            {
+            if view.is_empty() || !compared.insert((unclosed, cut, view.clone())) {
+                continue;
+            }
+            let entry = held_back_entry(block.identifier(), unclosed, cut, &view);
+            if unmatched.contains(&entry) {
                 continue;
             }
             let stored = match stored.as_mut() {
@@ -5794,7 +5866,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                 }
             });
             if !matched {
-                unmatched.push(block.identifier().to_owned());
+                unmatched.push(entry);
             }
         }
         Ok(unmatched)
@@ -7033,7 +7105,7 @@ pub(crate) fn deliver_fence_feedback_with(
         .collect::<BTreeSet<_>>();
     let mut unavailable = unknown_ids
         .iter()
-        .filter(|identifier| !reported.contains(*identifier))
+        .filter(|identifier| !feedback_reported(&reported, identifier))
         .cloned()
         .collect::<Vec<_>>();
     unavailable.sort();
@@ -7041,13 +7113,17 @@ pub(crate) fn deliver_fence_feedback_with(
     if unavailable.is_empty() {
         return Ok(settled.unwrap_or(CoordinatorDeliveryResult::AlreadyDelivered));
     }
-    let available = state.available_reply_ids()?;
-    let prompt = format!(
-        "Chat reply routing error: your output referenced unavailable reply ID(s): {}. \
-The reply ID(s) available when this notice was written are: {}. Emit a complete reply block using one exact available ID.",
-        unavailable.join(", "),
-        format_available_reply_ids(&available)
-    );
+    // Only a notice about an unmatched ID lists the open requests, and only listing them looks
+    // for their prompts in the queue, so a notice about partial blocks alone never waits on that.
+    let open = if unavailable
+        .iter()
+        .any(|entry| matches!(FeedbackEntry::parse(entry), FeedbackEntry::Unknown(_)))
+    {
+        state.open_requests(delivery)?
+    } else {
+        Vec::new()
+    };
+    let prompt = routing_notice(&unavailable, &open, unix_millis());
     // The exact marker set and prompt must survive a crash after submission, before the queue
     // result can be recorded. Otherwise a later superset could report the same marker again.
     state.record_fence_feedback(&unavailable, &prompt, true)?;
@@ -7108,21 +7184,215 @@ fn drive_fence_feedback(
     }
 }
 
-fn format_available_reply_ids(available: &[String]) -> String {
-    if available.is_empty() {
-        return "<none>".to_owned();
+/// An open request as a routing notice names it: the ID its next reply uses, whether it has a
+/// reply already, when the bridge admitted it, and how far its prompt is known to have gone.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OpenRequest {
+    id: String,
+    replied: bool,
+    admitted_at_millis: u64,
+    reach: PromptReach,
+}
+
+/// How far a listed request's prompt is known to have gone toward the coordinator.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PromptReach {
+    /// Delivered, possibly delivered, or past the queue's inbox, so the coordinator may have
+    /// seen it.
+    Sent,
+    /// Still waiting in the queue's inbox, so the coordinator has not seen it yet. The queue
+    /// delivers in file-name order, which usually puts it before a routing notice queued later.
+    Queued,
+    /// In the queue, in a state that could not be read.
+    Unknown,
+}
+
+/// Compose the notice that tells the coordinator which reply blocks did not go out, and why.
+///
+/// A block whose ID matches no open request is answered with the open requests the coordinator
+/// may have seen by the time it reads the notice: first those with no reply yet, most recent
+/// first and with their age, since a mistyped ID was most likely meant for one of those, then
+/// the IDs of those already answered.
+/// A block seen only in part is answered with what the screen was missing. IDs are printed as
+/// the coordinator wrote them; none of this text forms a marker line.
+fn routing_notice(entries: &[String], open: &[OpenRequest], now: u64) -> String {
+    let mut unknown = Vec::new();
+    let mut unopened = Vec::new();
+    let mut unclosed = Vec::new();
+    for entry in entries {
+        match FeedbackEntry::parse(entry) {
+            FeedbackEntry::Unknown(identifier) => unknown.push(identifier),
+            FeedbackEntry::HeldBack {
+                identifier,
+                kind: HeldBackKind::Unopened | HeldBackKind::Remnant,
+            } => unopened.push(identifier),
+            FeedbackEntry::HeldBack {
+                identifier,
+                kind: HeldBackKind::Unclosed,
+            } => unclosed.push(identifier),
+        }
     }
-    let mut displayed = available
+    let mut lines = Vec::new();
+    if !unknown.is_empty() {
+        lines.push(unknown_id_notice(&unknown, open, now));
+    }
+    if !unopened.is_empty() {
+        lines.push(held_back_notice(
+            [
+                "the screen did not show the start of the message holding, or an opening line \
+for, the reply block",
+                "the screen did not show the start of the messages holding, or opening lines \
+for, the reply blocks",
+            ],
+            &unopened,
+        ));
+    }
+    if !unclosed.is_empty() {
+        lines.push(held_back_notice(
+            [
+                "the screen showed no closing line for the reply block",
+                "the screen showed no closing lines for the reply blocks",
+            ],
+            &unclosed,
+        ));
+    }
+    let blocks = unopened.len() + unclosed.len();
+    if blocks > 0 {
+        // A block with no closing line may only have been mid-stream when the screen was read.
+        // Once its closing line is written, a read that shows the first row of its message and
+        // that line posts it with no help.
+        lines.push(format!(
+            "{} {} again: start a message with its opening line and write the whole block in \
+that message, with no tool call inside it.",
+            if unclosed.is_empty() {
+                "Send"
+            } else {
+                "A block that was still being written goes out once it is complete, if the screen \
+then shows the first row of its message and its closing line. Otherwise, send"
+            },
+            if blocks == 1 { "it" } else { "each one" }
+        ));
+    }
+    // A block quoted in a prompt that starts at the top of a Claude Code screen is reported too,
+    // since that prompt row reads as the pinned copy of an earlier prompt, and naming the request
+    // a block under an unmatched ID was probably meant for invites the agent to send that block
+    // under its ID. So either notice asks the agent not to send a block it did not write, and a
+    // prompt that holds both asks once, at its end.
+    if blocks > 0 || (!unknown.is_empty() && probable_target(open).is_some()) {
+        if let Some(last) = lines.last_mut() {
+            last.push_str(
+                " Do not send a block you did not write, such as one quoted in a message you \
+received.",
+            );
+        }
+    }
+    lines.join("\n")
+}
+
+/// The request a block under an unmatched ID was probably meant for: the only open request with
+/// no reply yet whose prompt may have been seen, when there is exactly one and its prompt is
+/// known to have left the queue's inbox. A prompt still in the inbox cannot have been seen when
+/// the block was written. One whose queue state could not be read may have been, so neither its
+/// request nor another beside it is named.
+fn probable_target(open: &[OpenRequest]) -> Option<&OpenRequest> {
+    let mut candidates = open
         .iter()
-        .take(MAX_FEEDBACK_AVAILABLE_IDS)
+        .filter(|request| !request.replied && request.reach != PromptReach::Queued);
+    match (candidates.next(), candidates.next()) {
+        (Some(only), None) if only.reach == PromptReach::Sent => Some(only),
+        _ => None,
+    }
+}
+
+/// The part of a routing notice about blocks whose ID matches no open request.
+fn unknown_id_notice(unknown: &[&str], open: &[OpenRequest], now: u64) -> String {
+    let (one, verb, blocks) = if unknown.len() == 1 {
+        (true, "matches", "that block was")
+    } else {
+        (false, "match", "those blocks were")
+    };
+    let mut notice = format!(
+        "Chat reply routing error: {} {verb} no open chat request, so {blocks} not sent.",
+        unknown.join(", ")
+    );
+    if open.is_empty() {
+        notice.push_str(" No open chat request has been sent to you.");
+        return notice;
+    }
+    let (replied, waiting): (Vec<_>, Vec<_>) = open.iter().partition(|request| request.replied);
+    if waiting.is_empty() {
+        notice.push_str(" Every open request sent to you already has a reply.");
+    } else {
+        let aged = waiting
+            .iter()
+            .map(|request| {
+                format!(
+                    "{} {}",
+                    request.id,
+                    format_age(now, request.admitted_at_millis)
+                )
+            })
+            .collect::<Vec<_>>();
+        notice.push_str(&format!(
+            " No reply yet, most recent first: {}.",
+            bounded_list(&aged, MAX_FEEDBACK_AVAILABLE_IDS)
+        ));
+    }
+    if !replied.is_empty() {
+        let ids = replied
+            .iter()
+            .map(|request| request.id.clone())
+            .collect::<Vec<_>>();
+        notice.push_str(&format!(
+            " Already replied: {}.",
+            bounded_list(&ids, MAX_FEEDBACK_REPLIED_IDS)
+        ));
+    }
+    if let Some(only) = probable_target(open) {
+        notice.push_str(&format!(
+            " {} probably meant for {}.",
+            if one { "It was" } else { "They were" },
+            only.id
+        ));
+    }
+    notice.push_str(if one {
+        " Re-send it with the ID of the request it answers."
+    } else {
+        " Re-send each one with the ID of the request it answers."
+    });
+    notice
+}
+
+/// One line of a routing notice about blocks seen only in part: what the screen was missing, in
+/// the singular and the plural, and the ID of each block, each ID named once.
+fn held_back_notice(missing: [&str; 2], identifiers: &[&str]) -> String {
+    let mut named = Vec::new();
+    for identifier in identifiers {
+        if !named.contains(identifier) {
+            named.push(*identifier);
+        }
+    }
+    let (missing, those) = if identifiers.len() == 1 {
+        (missing[0], "that block was")
+    } else {
+        (missing[1], "those blocks were")
+    };
+    format!(
+        "Chat reply not sent: {missing} marked {}, so {those} not sent.",
+        named.join(", ")
+    )
+}
+
+/// Join `items`, naming at most `max` of them and counting the rest.
+fn bounded_list(items: &[String], max: usize) -> String {
+    let mut displayed = items
+        .iter()
+        .take(max)
         .cloned()
         .collect::<Vec<_>>()
         .join(", ");
-    if available.len() > MAX_FEEDBACK_AVAILABLE_IDS {
-        displayed.push_str(&format!(
-            " (and {} more; inspect chat status for the complete set)",
-            available.len() - MAX_FEEDBACK_AVAILABLE_IDS
-        ));
+    if items.len() > max {
+        displayed.push_str(&format!(" ... (+{} more)", items.len() - max));
     }
     displayed
 }
@@ -7541,8 +7811,13 @@ enum PartialBlock {
     /// An opening marker and the lines after it, with no matching closing marker.
     Unclosed { identifier: String, text: String },
     /// A closing marker and the lines before it, back to the previous marker or the top of the
-    /// capture, with no opening marker.
-    Unopened { identifier: String, text: String },
+    /// capture, with no opening marker. `cut` says the lines reach back to the top of the
+    /// capture, so they are the tail of a block that is scrolling away.
+    Unopened {
+        identifier: String,
+        text: String,
+        cut: bool,
+    },
 }
 
 impl PartialBlock {
@@ -7629,7 +7904,7 @@ struct UnavailableIds<'a> {
 
 impl UnavailableIds<'_> {
     fn push(&mut self, identifier: String) {
-        let list = if self.reported.contains(&identifier) {
+        let list = if feedback_reported(self.reported, &identifier) {
             &mut self.suppressed
         } else {
             &mut self.unknown
@@ -7638,6 +7913,128 @@ impl UnavailableIds<'_> {
             list.push(identifier);
         }
     }
+}
+
+/// How much of a block of an open request one capture showed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeldBackKind {
+    /// The end of the block, with no opening marker before it in its message, or without the
+    /// first row of that message.
+    Unopened,
+    /// Fewer than `HELD_BACK_DIGEST_CHARS` identity characters at the end of a block cut by the
+    /// top of the capture: what is left of it as it scrolls away.
+    Remnant,
+    /// The start of the block, with no closing marker after it.
+    Unclosed,
+}
+
+impl HeldBackKind {
+    const ALL: [Self; 3] = [Self::Unopened, Self::Remnant, Self::Unclosed];
+
+    fn word(self) -> &'static str {
+        match self {
+            Self::Unopened => "unopened",
+            Self::Remnant => "remnant",
+            Self::Unclosed => "unclosed",
+        }
+    }
+}
+
+/// The fence feedback entry for a block of an open request seen only in part, from the block's
+/// text without whitespace or box drawing: `<identifier> <kind> <digest>`, with the kind's word.
+/// The digest is the first 12 hex digits of the SHA-256 of the end `HELD_BACK_DIGEST_CHARS`
+/// describes, so blocks that share an identifier get entries of their own. A block keeps its
+/// entry while it scrolls: that end stays put, rows above the bullet row that starts its
+/// message do not join it, and what is left of it after that is covered as `feedback_reported`
+/// describes. It gets a second entry when a capture shows it otherwise: a block seen while it
+/// was still being written is unclosed, and unopened once a capture shows it complete but not
+/// its first row; a block with no closing line that is shorter than that end changes its entry
+/// as it grows; and a remnant is unopened once a capture shows the first row of its message or
+/// that many of its characters. An identifier never holds whitespace, so an entry of this form
+/// is never an identifier that matches no request.
+fn held_back_entry(identifier: &str, unclosed: bool, cut: bool, view: &str) -> String {
+    let characters = view.chars().collect::<Vec<_>>();
+    let (kind, covered) = if unclosed {
+        (
+            HeldBackKind::Unclosed,
+            &characters[..characters.len().min(HELD_BACK_DIGEST_CHARS)],
+        )
+    } else {
+        let covered = &characters[characters.len().saturating_sub(HELD_BACK_DIGEST_CHARS)..];
+        if cut && characters.len() < HELD_BACK_DIGEST_CHARS {
+            (HeldBackKind::Remnant, covered)
+        } else {
+            (HeldBackKind::Unopened, covered)
+        }
+    };
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(covered.iter().collect::<String>().as_bytes())
+    );
+    format!("{identifier} {} {}", kind.word(), &digest[..12])
+}
+
+/// One fence feedback entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FeedbackEntry<'a> {
+    /// A marker identifier that matches no request the bridge knows.
+    Unknown(&'a str),
+    /// A block of an open request seen only in part, as `held_back_entry` writes it.
+    HeldBack {
+        identifier: &'a str,
+        kind: HeldBackKind,
+    },
+}
+
+impl<'a> FeedbackEntry<'a> {
+    fn parse(entry: &'a str) -> Self {
+        let mut words = entry.split(' ');
+        let (Some(identifier), Some(word), Some(digest), None) =
+            (words.next(), words.next(), words.next(), words.next())
+        else {
+            return Self::Unknown(entry);
+        };
+        match HeldBackKind::ALL
+            .into_iter()
+            .find(|kind| kind.word() == word)
+        {
+            Some(kind)
+                if !identifier.is_empty()
+                    && digest.len() == 12
+                    && digest
+                        .bytes()
+                        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')) =>
+            {
+                Self::HeldBack { identifier, kind }
+            }
+            _ => Self::Unknown(entry),
+        }
+    }
+}
+
+/// Whether the coordinator already received a feedback entry. A block seen only in part also
+/// counts when its bare identifier was reported, as releases before per-block entries reported
+/// such a block. A remnant counts once any block under its identifier was reported from its
+/// end: it is most likely what is left of that block, and its entry changes each time it
+/// shrinks.
+fn feedback_reported(reported: &BTreeSet<String>, entry: &str) -> bool {
+    if reported.contains(entry) {
+        return true;
+    }
+    let FeedbackEntry::HeldBack { identifier, kind } = FeedbackEntry::parse(entry) else {
+        return false;
+    };
+    reported.contains(identifier)
+        || (kind == HeldBackKind::Remnant
+            && reported.iter().any(|earlier| {
+                matches!(
+                    FeedbackEntry::parse(earlier),
+                    FeedbackEntry::HeldBack {
+                        identifier: earlier,
+                        kind: HeldBackKind::Unopened | HeldBackKind::Remnant,
+                    } if earlier == identifier
+                )
+            }))
 }
 
 #[derive(Clone, Debug)]
@@ -7708,8 +8105,10 @@ fn scan_reply_blocks_for_nonces(
     let mut seen_unknown_ids = BTreeSet::new();
     let mut active: Option<ActiveReply> = None;
     // Lines since the previous marker while no block is open: the visible text of a block whose
-    // opening marker is not in this capture.
+    // opening marker is not in this capture. They reach back to the top of the capture until the
+    // first marker, prompt row, tool output row, or row that starts a new message.
     let mut unopened = Vec::<&str>::new();
+    let mut unopened_from_top = true;
     let mut fence: Option<(char, usize)> = None;
     // While the rows of a prompt echo are read: the column its wrapped rows continue at.
     let mut echo_column: Option<usize> = None;
@@ -7765,6 +8164,7 @@ fn scan_reply_blocks_for_nonces(
             }
             echo_column = Some(indent + 2);
             unopened.clear();
+            unopened_from_top = false;
             continue;
         }
         // Tool output is never reply text, and a fence line in it neither opens nor closes a
@@ -7783,6 +8183,7 @@ fn scan_reply_blocks_for_nonces(
             }
             tool_column = Some(indent);
             unopened.clear();
+            unopened_from_top = false;
             continue;
         }
         let (undecorated, margin, decorated) = undecorate(line);
@@ -7800,6 +8201,17 @@ fn scan_reply_blocks_for_nonces(
             fence = None;
         }
         if active.is_none() {
+            // A native bullet at the left edge starts a new message, so the rows above it belong
+            // to an earlier item, even once the prompt or tool output row that started that item
+            // is out of view or reads as a pinned prompt. A bullet row that carries a closing
+            // marker is the exception, as above: it can close a block begun above it.
+            if decorated
+                && indent == 0
+                && !parse_marker(&undecorated).is_some_and(|marker| marker.closing)
+            {
+                unopened.clear();
+                unopened_from_top = false;
+            }
             unopened.push(line);
         }
 
@@ -7839,6 +8251,7 @@ fn scan_reply_blocks_for_nonces(
             continue;
         };
         let head = std::mem::take(&mut unopened);
+        let cut = std::mem::replace(&mut unopened_from_top, false);
         let expected = recognized_reply_marker(&marker.identifier, expected_nonces);
         if expected.is_none() && seen_unknown_ids.insert(marker.identifier.clone()) {
             unavailable.push(bounded_detail(&marker.identifier, MAX_FEEDBACK_ID_BYTES));
@@ -7869,6 +8282,7 @@ fn scan_reply_blocks_for_nonces(
                             ScanEvent::Partial(PartialBlock::Unopened {
                                 identifier: marker.identifier.clone(),
                                 text,
+                                cut,
                             }),
                         ),
                     );
@@ -9017,6 +9431,10 @@ mod tests {
         states: Mutex<BTreeMap<String, QueueMessageState>>,
         submitted: Mutex<Vec<(String, String)>>,
         busy_drains: Mutex<u32>,
+        /// Submissions to refuse before anything is queued, as a cancelled one is refused.
+        refused_submits: Mutex<u32>,
+        /// Message IDs whose queue state cannot be read, as a damaged queue artifact's cannot.
+        unreadable: Mutex<BTreeSet<String>>,
     }
 
     impl QueueDelivery {
@@ -9050,6 +9468,14 @@ mod tests {
             _agent_name: &str,
             message_id: &str,
         ) -> std::result::Result<Option<QueueMessageState>, String> {
+            if self
+                .unreadable
+                .lock()
+                .expect("unreadable lock")
+                .contains(message_id)
+            {
+                return Err(format!("queue artifact {message_id} cannot be read"));
+            }
             Ok(self
                 .states
                 .lock()
@@ -9065,6 +9491,13 @@ mod tests {
             message_id: &str,
             _options: DrainOptions,
         ) -> std::result::Result<(), String> {
+            {
+                let mut refused = self.refused_submits.lock().expect("refusal lock");
+                if *refused > 0 {
+                    *refused -= 1;
+                    return Err("chat delivery was cancelled before prompt submission".to_owned());
+                }
+            }
             self.submitted
                 .lock()
                 .expect("submission lock")
@@ -13192,16 +13625,1048 @@ any further ones for 300 seconds, so combine short updates."
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    /// The feedback entry of a block seen in part, worked out here from the identity characters
+    /// it should cover rather than by the code under test.
+    fn held_back(identifier: &str, kind: &str, covered: &str) -> String {
+        let digest = format!("{:x}", Sha256::digest(covered.as_bytes()));
+        format!("{identifier} {kind} {}", &digest[..12])
+    }
+
+    fn open_at(id: &str, replied: bool, admitted_at_millis: u64) -> OpenRequest {
+        OpenRequest {
+            id: id.to_owned(),
+            replied,
+            admitted_at_millis,
+            reach: PromptReach::Sent,
+        }
+    }
+
+    /// A notice with each age it prints, such as `0s ago` or `12m ago`, replaced by `AGE`, so a
+    /// test can compare the whole text however long the test took to get there.
+    fn without_ages(notice: &str) -> String {
+        let mut text = String::new();
+        let mut rest = notice;
+        while let Some(position) = rest.find(" ago") {
+            let (before, after) = rest.split_at(position);
+            let number = before.strip_suffix(['s', 'm', 'h', 'd']).unwrap_or(before);
+            let lead = number.trim_end_matches(|character: char| character.is_ascii_digit());
+            if lead.len() < number.len() && lead.ends_with(' ') {
+                text.push_str(lead);
+                text.push_str("AGE");
+            } else {
+                text.push_str(before);
+                text.push_str(" ago");
+            }
+            rest = &after[" ago".len()..];
+        }
+        text.push_str(rest);
+        text
+    }
+
     #[test]
-    fn fence_feedback_bounds_display_without_changing_full_identity_set() {
-        let available = (0..(MAX_FEEDBACK_AVAILABLE_IDS + 3))
-            .map(|index| format!("reply-{index}"))
+    fn routing_notice_bounds_each_list_and_counts_the_rest() {
+        let now = 1_000_000_000;
+        let open = (0..(MAX_FEEDBACK_AVAILABLE_IDS + 3))
+            .map(|index| open_at(&format!("waiting-{index}"), false, now))
+            .chain(
+                (0..(MAX_FEEDBACK_REPLIED_IDS + 3))
+                    .map(|index| open_at(&format!("answered-{index}"), true, now)),
+            )
             .collect::<Vec<_>>();
-        let displayed = format_available_reply_ids(&available);
-        assert!(displayed.contains("reply-0"));
-        assert!(displayed.contains("reply-31"));
-        assert!(!displayed.contains("reply-32"));
-        assert!(displayed.contains("and 3 more"));
+        let notice = routing_notice(&["stray".to_owned()], &open, now);
+        let waiting = (0..MAX_FEEDBACK_AVAILABLE_IDS)
+            .map(|index| format!("waiting-{index} 0s ago"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let answered = (0..MAX_FEEDBACK_REPLIED_IDS)
+            .map(|index| format!("answered-{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(
+            notice,
+            format!(
+                "Chat reply routing error: stray matches no open chat request, so that block was \
+not sent. No reply yet, most recent first: {waiting} ... (+3 more). Already replied: {answered} \
+... (+3 more). Re-send it with the ID of the request it answers."
+            )
+        );
+        assert!(!notice.contains("waiting-32") && !notice.contains("answered-10"));
+    }
+
+    #[test]
+    fn routing_notice_lists_unanswered_requests_newest_first_with_their_age() {
+        // The owner's example: a block under 016, which matches nothing, was most likely meant
+        // for one of the requests still waiting for a reply, so those come first, newest first.
+        let now = 1_000_000_000;
+        let minute = 60_000;
+        let open = [
+            open_at("015", false, now - 10 * minute),
+            open_at("014", true, now - 12 * minute),
+            open_at("003", false, now - 15 * minute),
+            open_at("002", true, now - 2 * 60 * minute - 1),
+        ];
+        assert_eq!(
+            routing_notice(&["016".to_owned()], &open, now),
+            "Chat reply routing error: 016 matches no open chat request, so that block was not \
+sent. No reply yet, most recent first: 015 10m ago, 003 15m ago. Already replied: 014, 002. \
+Re-send it with the ID of the request it answers."
+        );
+        // With exactly one request waiting, the notice names it as the probable target, and so
+        // asks the agent not to send a block it did not write.
+        assert_eq!(
+            routing_notice(&["016".to_owned(), "017".to_owned()], &open[..2], now),
+            "Chat reply routing error: 016, 017 match no open chat request, so those blocks were \
+not sent. No reply yet, most recent first: 015 10m ago. Already replied: 014. They were probably \
+meant for 015. Re-send each one with the ID of the request it answers. Do not send a block you \
+did not write, such as one quoted in a message you received."
+        );
+        assert_eq!(
+            routing_notice(&["016".to_owned()], &open[..1], now),
+            "Chat reply routing error: 016 matches no open chat request, so that block was not \
+sent. No reply yet, most recent first: 015 10m ago. It was probably meant for 015. Re-send it \
+with the ID of the request it answers. Do not send a block you did not write, such as one quoted \
+in a message you received."
+        );
+        assert_eq!(
+            routing_notice(&["016".to_owned()], &open[1..2], now),
+            "Chat reply routing error: 016 matches no open chat request, so that block was not \
+sent. Every open request sent to you already has a reply. Already replied: 014. Re-send it with \
+the ID of the request it answers."
+        );
+        assert_eq!(
+            routing_notice(&["016".to_owned()], &[], now),
+            "Chat reply routing error: 016 matches no open chat request, so that block was not \
+sent. No open chat request has been sent to you."
+        );
+    }
+
+    #[test]
+    fn a_notice_that_names_a_probable_target_asks_for_no_block_the_agent_did_not_write() {
+        // Naming the request a block was probably meant for invites the agent to send that block
+        // again under its ID, so the notice asks it not to send a block it did not write, as the
+        // notice about a block seen in part does, and says so once when it is both.
+        let now = 1_000_000_000;
+        let caution =
+            "Do not send a block you did not write, such as one quoted in a message you received.";
+        let open = [open_at("015", false, now), open_at("014", true, now)];
+        let notice = routing_notice(&["016".to_owned()], &open, now);
+        assert!(
+            notice.contains(" It was probably meant for 015. "),
+            "{notice}"
+        );
+        assert!(notice.ends_with(&format!(" {caution}")), "{notice}");
+        let notice = routing_notice(
+            &["016".to_owned(), "015 unopened 0123456789ab".to_owned()],
+            &open,
+            now,
+        );
+        assert!(
+            notice.contains(" It was probably meant for 015. "),
+            "{notice}"
+        );
+        assert!(notice.ends_with(&format!(" {caution}")), "{notice}");
+        assert_eq!(notice.matches(caution).count(), 1, "{notice}");
+    }
+
+    #[test]
+    fn routing_notice_says_what_the_screen_was_missing_for_a_block_seen_in_part() {
+        let entries = [
+            "stray".to_owned(),
+            "X_1 unclosed 0123456789ab".to_owned(),
+            "X_1 unopened 0123456789ab".to_owned(),
+            "X_1 unopened ba9876543210".to_owned(),
+        ];
+        assert_eq!(
+            routing_notice(&entries, &[], 0),
+            "Chat reply routing error: stray matches no open chat request, so that block was not \
+sent. No open chat request has been sent to you.\n\
+Chat reply not sent: the screen did not show the start of the messages holding, or opening lines \
+for, the reply blocks marked X_1, so those blocks were not sent.\n\
+Chat reply not sent: the screen showed no closing line for the reply block marked X_1, so that \
+block was not sent.\n\
+A block that was still being written goes out once it is complete, if the screen then shows the \
+first row of its message and its closing line. Otherwise, send each one again: start a message \
+with its opening line and write the whole block in that message, with no tool call inside it. Do \
+not send a block you did not write, such as one quoted in a message you received."
+        );
+        // A block seen in part is not a routing error, so the open requests are not listed.
+        let open = [open_at("X_1", false, 0)];
+        assert_eq!(
+            routing_notice(&entries[2..3], &open, 0),
+            "Chat reply not sent: the screen did not show the start of the message holding, or an \
+opening line for, the reply block marked X_1, so that block was not sent.\nSend it again: start a \
+message with its opening line and write the whole block in that message, with no tool call inside \
+it. Do not send a block you did not write, such as one quoted in a message you received."
+        );
+    }
+
+    #[test]
+    fn feedback_entries_parse_strictly_and_a_bare_reported_id_covers_its_blocks() {
+        for (entry, kind) in [
+            ("X_1 unopened 0123456789ab", HeldBackKind::Unopened),
+            ("X_1 remnant 0123456789ab", HeldBackKind::Remnant),
+            ("X_1 unclosed 0123456789ab", HeldBackKind::Unclosed),
+        ] {
+            assert_eq!(
+                FeedbackEntry::parse(entry),
+                FeedbackEntry::HeldBack {
+                    identifier: "X_1",
+                    kind
+                }
+            );
+        }
+        for other in [
+            "X_1",
+            "X_1 unopened 0123456789AB",
+            "X_1 unopened 0123456789a",
+            "X_1 unopened 0123456789abc",
+            "X_1 sideways 0123456789ab",
+            "X_1 Remnant 0123456789ab",
+            "X_1 unopened 0123456789ab extra",
+            " unopened 0123456789ab",
+        ] {
+            assert_eq!(FeedbackEntry::parse(other), FeedbackEntry::Unknown(other));
+        }
+        // Releases before per-block entries reported a block seen in part by its bare ID, and
+        // that report still covers every such block under the ID.
+        let bare = BTreeSet::from(["X_1".to_owned()]);
+        assert!(feedback_reported(&bare, "X_1 unopened 0123456789ab"));
+        assert!(feedback_reported(&bare, "X_1 remnant 0123456789ab"));
+        assert!(feedback_reported(&bare, "X_1 unclosed ba9876543210"));
+        assert!(!feedback_reported(&bare, "X_2 unopened 0123456789ab"));
+        // A per-block entry covers only its own block, and never a bare unknown ID.
+        let entry = BTreeSet::from(["X_1 unopened 0123456789ab".to_owned()]);
+        assert!(feedback_reported(&entry, "X_1 unopened 0123456789ab"));
+        assert!(!feedback_reported(&entry, "X_1 unopened ba9876543210"));
+        assert!(!feedback_reported(&entry, "X_1 unclosed 0123456789ab"));
+        assert!(!feedback_reported(&entry, "X_1"));
+        // A remnant is most likely what is left of a block reported from its end as it scrolls
+        // away, so a report of any block under its ID from its end, or of a remnant, covers it.
+        // A report of a block's start does not.
+        assert!(feedback_reported(&entry, "X_1 remnant ba9876543210"));
+        assert!(!feedback_reported(&entry, "X_2 remnant ba9876543210"));
+        let remnant = BTreeSet::from(["X_1 remnant 0123456789ab".to_owned()]);
+        assert!(feedback_reported(&remnant, "X_1 remnant ba9876543210"));
+        assert!(!feedback_reported(&remnant, "X_1 unopened ba9876543210"));
+        let unclosed = BTreeSet::from(["X_1 unclosed 0123456789ab".to_owned()]);
+        assert!(!feedback_reported(&unclosed, "X_1 remnant ba9876543210"));
+    }
+
+    #[test]
+    fn each_block_seen_in_part_under_one_id_is_reported_once() {
+        // Two different answers under one reply ID, each seen without its opening marker, are
+        // two blocks: each is reported once, and seeing either again reports nothing new.
+        let (state, _key, nonce, root) = open_request("blocks-in-part-under-one-id");
+        let id = format!("{nonce}_1");
+        let coordinator = QueueDelivery::default();
+        // A prompt row at the top of a capture is read as Claude Code's pinned copy of a prompt,
+        // so the prompt here follows a row of the coordinator's.
+        let screen = |answer: &str| {
+            format!("⏺ Working on it.\n❯ question\n⏺ {answer}\n  </CHAT_REPLY_{id}>\n")
+        };
+        let first = held_back(&id, "unopened", "⏺firsttry");
+        let second = held_back(&id, "unopened", "⏺secondtry");
+        // On one screen they are still two blocks, and one read reports each.
+        let capture = state
+            .capture_snapshot(&format!("{}{}", screen("first try"), screen("second try")))
+            .expect("scan of both");
+        assert_eq!(capture.unknown_ids, [first.clone(), second.clone()]);
+        for (answer, entry) in [("first try", &first), ("second try", &second)] {
+            let capture = state.capture_snapshot(&screen(answer)).expect("scan");
+            assert_eq!(capture.unknown_ids, std::slice::from_ref(entry));
+            assert!(capture.suppressed_ids.is_empty());
+            deliver_fence_feedback_with(
+                &state,
+                &coordinator,
+                &capture.unknown_ids,
+                DrainOptions::default(),
+            )
+            .expect("fence feedback");
+            let capture = state.capture_snapshot(&screen(answer)).expect("scan again");
+            assert!(capture.unknown_ids.is_empty());
+            assert_eq!(capture.suppressed_ids, std::slice::from_ref(entry));
+        }
+        let capture = state
+            .capture_snapshot(&screen("first try"))
+            .expect("scan of the first answer again");
+        assert!(capture.unknown_ids.is_empty());
+        assert_eq!(capture.suppressed_ids, [first]);
+        let notice = format!(
+            "Chat reply not sent: the screen did not show the start of the message holding, or an \
+opening line for, the reply block marked {id}, so that block was not sent.\nSend it again: start a \
+message with its opening line and write the whole block in that message, with no tool call inside \
+it. Do not send a block you did not write, such as one quoted in a message you received."
+        );
+        assert_eq!(coordinator.prompts(), [notice.clone(), notice]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_block_cut_by_the_top_of_the_capture_is_reported_once_as_it_scrolls_away() {
+        // The end of a block whose start is above the capture is reported by its last
+        // HELD_BACK_DIGEST_CHARS identity characters, which stay the same while it scrolls. Once
+        // fewer are left, what remains is a remnant of the block already reported.
+        let (state, _key, nonce, root) = open_request("block-scrolls-away");
+        let id = format!("{nonce}_1");
+        let coordinator = QueueDelivery::default();
+        let lines = [
+            "alpha bravo charlie delta echo",
+            "foxtrot golf hotel india juliet",
+            "kilo lima mike november oscar",
+            "papa quebec romeo sierra tango",
+        ];
+        let screen = |from: usize| format!("{}\n</CHAT_REPLY_{id}>\n", lines[from..].join("\n"));
+        let view = |from: usize| lines[from..].concat().replace(' ', "");
+        assert_eq!((view(0).len(), view(1).len(), view(2).len()), (104, 78, 51));
+        let whole = view(0);
+        let entry = held_back(
+            &id,
+            "unopened",
+            &whole[whole.len() - HELD_BACK_DIGEST_CHARS..],
+        );
+        let capture = state.capture_snapshot(&screen(0)).expect("scan");
+        assert_eq!(capture.unknown_ids, std::slice::from_ref(&entry));
+        deliver_fence_feedback_with(
+            &state,
+            &coordinator,
+            &capture.unknown_ids,
+            DrainOptions::default(),
+        )
+        .expect("fence feedback");
+        let capture = state
+            .capture_snapshot(&screen(1))
+            .expect("scan a row later");
+        assert!(capture.unknown_ids.is_empty());
+        assert_eq!(capture.suppressed_ids, [entry]);
+        for from in [2, 3] {
+            let capture = state
+                .capture_snapshot(&screen(from))
+                .expect("scan of the remnant");
+            assert!(capture.unknown_ids.is_empty());
+            assert_eq!(
+                capture.suppressed_ids,
+                [held_back(&id, "remnant", &view(from))]
+            );
+        }
+        assert_eq!(
+            coordinator.prompts(),
+            [format!(
+                "Chat reply not sent: the screen did not show the start of the message holding, or \
+an opening line for, the reply block marked {id}, so that block was not sent.\nSend it again: \
+start a message with its opening line and write the whole block in that message, with no tool call \
+inside it. Do not send a block you did not write, such as one quoted in a message you received."
+            )]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_block_with_no_closing_line_is_reported_once_while_it_grows() {
+        // A block still being written grows at its end, so its entry covers its first
+        // HELD_BACK_DIGEST_CHARS identity characters, which stay the same while it grows.
+        let (state, _key, nonce, root) = open_request("unclosed-block-grows");
+        let id = format!("{nonce}_1");
+        let coordinator = QueueDelivery::default();
+        let lines = [
+            "alpha bravo charlie delta echo",
+            "foxtrot golf hotel india juliet",
+            "kilo lima mike november oscar",
+            "papa quebec romeo sierra tango",
+        ];
+        let screen = |to: usize| format!("<CHAT_REPLY_{id}>\n{}\n", lines[..to].join("\n"));
+        let view = |to: usize| lines[..to].concat().replace(' ', "");
+        assert_eq!((view(3).len(), view(4).len()), (78, 104));
+        let entry = held_back(&id, "unclosed", &view(3)[..HELD_BACK_DIGEST_CHARS]);
+        let capture = state.capture_snapshot(&screen(3)).expect("scan");
+        assert_eq!(capture.unknown_ids, std::slice::from_ref(&entry));
+        deliver_fence_feedback_with(
+            &state,
+            &coordinator,
+            &capture.unknown_ids,
+            DrainOptions::default(),
+        )
+        .expect("fence feedback");
+        let capture = state
+            .capture_snapshot(&screen(4))
+            .expect("scan of the grown block");
+        assert!(capture.unknown_ids.is_empty());
+        assert_eq!(capture.suppressed_ids, [entry]);
+        assert_eq!(
+            coordinator.prompts(),
+            [format!(
+                "Chat reply not sent: the screen showed no closing line for the reply block marked \
+{id}, so that block was not sent.\nA block that was still being written goes out once it is \
+complete, if the screen then shows the first row of its message and its closing line. Otherwise, \
+send it again: start a message with its opening line and write the whole block in that message, \
+with no tool call inside it. Do not send a block you did not write, such as one quoted in a message \
+you received."
+            )]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The notice about one block whose opening line the screen did not show.
+    fn unopened_notice(id: &str) -> String {
+        format!(
+            "Chat reply not sent: the screen did not show the start of the message holding, or an \
+opening line for, the reply block marked {id}, so that block was not sent.\nSend it again: start a \
+message with its opening line and write the whole block in that message, with no tool call inside \
+it. Do not send a block you did not write, such as one quoted in a message you received."
+        )
+    }
+
+    /// The prompts the coordinator receives while the rows `screen` gives for a reply ID scroll up
+    /// one row per capture, until the last row before its closing line reaches the top. Fence
+    /// feedback is delivered after each capture, as the service does.
+    fn prompts_while_scrolling(
+        name: &str,
+        screen: impl Fn(&str) -> Vec<String>,
+    ) -> (String, Vec<String>) {
+        let (state, _key, nonce, root) = open_request(name);
+        let id = format!("{nonce}_1");
+        let rows = screen(&id);
+        let coordinator = QueueDelivery::default();
+        for top in 0..rows.len() - 1 {
+            let capture = state
+                .capture_snapshot(&format!("{}\n", rows[top..].join("\n")))
+                .expect("scan");
+            deliver_fence_feedback_with(
+                &state,
+                &coordinator,
+                &capture.unknown_ids,
+                DrainOptions::default(),
+            )
+            .expect("fence feedback");
+        }
+        fs::remove_dir_all(root).expect("cleanup");
+        (id, coordinator.prompts())
+    }
+
+    /// An answer long enough that the entry of a block holding it covers none of the rows above.
+    const LONG_ANSWER: &str = "the whole workspace test suite passed: 543 tests, none failed, \
+none ignored, in 109 seconds";
+
+    #[test]
+    fn a_block_after_tool_output_is_reported_once_as_the_output_scrolls_away() {
+        // Rows of an earlier item do not join a block seen without its opening line while the
+        // bullet row that starts the block's message is in view. When they did, the rows of tool
+        // output under the row with its `⎿` or `└` joined the block once that row left the top
+        // of the screen. That changed the entry of a short block, which was then reported a
+        // second time.
+        let output =
+            "test result: ok. 543 passed; 0 failed; 0 ignored; 0 measured; finished in 108.69s";
+        assert!(plain_view(output).chars().count() >= HELD_BACK_DIGEST_CHARS);
+        assert!(plain_view(LONG_ANSWER).chars().count() >= HELD_BACK_DIGEST_CHARS);
+        for (variant, (bullet, call, elbow, indent)) in [
+            ("⏺", "Bash(cargo test)", "⎿ ", "     "),
+            ("•", "Ran cargo test", "└", "    "),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (index, answer) in [LONG_ANSWER, "an answer"].into_iter().enumerate() {
+                let (id, prompts) = prompts_while_scrolling(
+                    &format!("tool-output-scrolls-away-{variant}-{index}"),
+                    |id| {
+                        vec![
+                            format!("{bullet} {call}"),
+                            format!("  {elbow} running 543 tests"),
+                            format!("{indent}{output}"),
+                            format!("{bullet} {answer}"),
+                            format!("  </CHAT_REPLY_{id}>"),
+                        ]
+                    },
+                );
+                assert_eq!(prompts, [unopened_notice(&id)], "{call}: {answer}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_block_after_a_prompt_is_reported_once_as_the_prompt_scrolls_away() {
+        // The same for the rows of a prompt echo. In Claude Code its prompt row stops starting
+        // an echo once it reaches the top of the screen, where it reads as the pinned copy of a
+        // prompt; in Codex, once it leaves the screen.
+        let continued =
+            "  the result with the number of tests that passed, failed, and were ignored today";
+        assert!(plain_view(continued).chars().count() >= HELD_BACK_DIGEST_CHARS);
+        for (variant, (bullet, prompt)) in [("⏺", "❯"), ("•", "›")].into_iter().enumerate()
+        {
+            for (index, answer) in [LONG_ANSWER, "an answer"].into_iter().enumerate() {
+                let (id, prompts) = prompts_while_scrolling(
+                    &format!("prompt-scrolls-away-{variant}-{index}"),
+                    |id| {
+                        vec![
+                            format!("{bullet} Working on it."),
+                            format!(
+                                "{prompt} [worker -> coord 18:50Z] please run the whole workspace \
+test suite and report"
+                            ),
+                            continued.to_owned(),
+                            format!("{bullet} {answer}"),
+                            format!("  </CHAT_REPLY_{id}>"),
+                        ]
+                    },
+                );
+                assert_eq!(prompts, [unopened_notice(&id)], "{prompt}: {answer}");
+            }
+        }
+    }
+
+    #[test]
+    fn only_rows_that_reach_the_top_of_the_capture_are_a_remnant() {
+        // Few rows of a block seen without its opening marker are a remnant only when they reach
+        // the top of the capture. A prompt echo or tool output above them shows that the block
+        // did not scroll away. A prompt row at the top of a capture is read as Claude Code's
+        // pinned copy of a prompt, so the prompt here follows a row of the coordinator's, and
+        // rows under a pinned row still reach the top.
+        let (state, _key, nonce, root) = open_request("remnant-rows-reach-the-top");
+        let id = format!("{nonce}_1");
+        for above in [
+            "⏺ Working on it.\n❯ question",
+            "  ⎿  tool output",
+            "  └ tool output",
+        ] {
+            let capture = state
+                .capture_snapshot(&format!("{above}\n⏺ an answer\n  </CHAT_REPLY_{id}>\n"))
+                .expect("scan below another item");
+            assert_eq!(
+                capture.unknown_ids,
+                [held_back(&id, "unopened", "⏺ananswer")],
+                "{above}"
+            );
+        }
+        for top in ["", "❯ question\n"] {
+            let capture = state
+                .capture_snapshot(&format!(
+                    "{top}  the end of an answer\n  </CHAT_REPLY_{id}>\n"
+                ))
+                .expect("scan of rows from the top");
+            assert_eq!(
+                capture.unknown_ids,
+                [held_back(&id, "remnant", "theendofananswer")],
+                "{top}"
+            );
+        }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_remnant_is_not_reported_after_a_queued_notice_about_its_block() {
+        // A capture leaves out only the entries of notices already delivered, so while the queue
+        // holds the notice about a block, what is left of it as it scrolls away is captured
+        // again. Delivery settles the held notice before composing another, and that notice
+        // covers the remnant, so the remnant gets no notice of its own.
+        let (state, _key, nonce, root) = open_request("remnant-after-queued-notice");
+        let id = format!("{nonce}_1");
+        let screen = |end: &str| format!("{end}\n</CHAT_REPLY_{id}>\n");
+        let end = "x".repeat(HELD_BACK_DIGEST_CHARS);
+        let unopened = held_back(&id, "unopened", &end);
+        let capture = state.capture_snapshot(&screen(&end)).expect("scan");
+        assert_eq!(capture.unknown_ids, std::slice::from_ref(&unopened));
+        let busy = FakeDelivery {
+            submit_error: Mutex::new(Some("coordinator is busy".to_owned())),
+            ..FakeDelivery::default()
+        };
+        assert!(matches!(
+            deliver_fence_feedback_with(
+                &state,
+                &busy,
+                &capture.unknown_ids,
+                DrainOptions::default()
+            )
+            .expect("queue the notice"),
+            CoordinatorDeliveryResult::Pending(_)
+        ));
+        let capture = state
+            .capture_snapshot(&screen("xxxx"))
+            .expect("scan of the remnant");
+        assert_eq!(capture.unknown_ids, [held_back(&id, "remnant", "xxxx")]);
+        let coordinator = QueueDelivery::default();
+        assert_eq!(
+            deliver_fence_feedback_with(
+                &state,
+                &coordinator,
+                &capture.unknown_ids,
+                DrainOptions::default()
+            )
+            .expect("settle the queued notice"),
+            CoordinatorDeliveryResult::Delivered
+        );
+        assert_eq!(
+            coordinator.prompts(),
+            [format!(
+                "Chat reply not sent: the screen did not show the start of the message holding, or \
+an opening line for, the reply block marked {id}, so that block was not sent.\nSend it again: \
+start a message with its opening line and write the whole block in that message, with no tool call \
+inside it. Do not send a block you did not write, such as one quoted in a message you received."
+            )]
+        );
+        assert_eq!(
+            state
+                .read_fence_feedback()
+                .expect("feedback record")
+                .reported,
+            [unopened]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn open_requests_are_those_the_coordinator_may_have_seen_with_their_next_reply_id() {
+        // A routing notice lists the open requests the coordinator may have been shown. One the
+        // bridge never tried to deliver is left out. One whose prompt the queue still holds, as
+        // it does when the coordinator is busy, is listed as queued, since that prompt reaches
+        // the coordinator through the same queue as the notice, and one with a reply is listed as
+        // replied, under the ID its next reply uses. A closed request is left out, though its
+        // record stays until its replies are sent.
+        let root = temporary("open-requests");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let keys = (1..=3)
+            .map(|index| {
+                state
+                    .admit_batch(&indexed_delivery(index, index))
+                    .expect("admit request")
+                    .new_request_keys[0]
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        let record = |key: &str| state.read_request(key).expect("request");
+        let queued = QueueDelivery {
+            busy_drains: Mutex::new(1),
+            ..QueueDelivery::default()
+        };
+        assert!(state
+            .open_requests(&queued)
+            .expect("open requests")
+            .is_empty());
+        assert!(matches!(
+            deliver_request_with(&state, &queued, &keys[1], DrainOptions::default())
+                .expect("deliver request"),
+            CoordinatorDeliveryResult::Pending(_)
+        ));
+        assert_eq!(record(&keys[1]).phase, RequestPhase::Pending);
+        assert_eq!(
+            deliver_request_with(
+                &state,
+                &FakeDelivery::default(),
+                &keys[2],
+                DrainOptions::default()
+            )
+            .expect("deliver request"),
+            CoordinatorDeliveryResult::Delivered
+        );
+        let answered = record(&keys[2]).reply_nonce;
+        let capture = state
+            .capture_snapshot(&reply_block(&format!("{answered}_1"), "answer"))
+            .expect("capture the reply");
+        assert_eq!(capture.replies, [(keys[2].clone(), vec![1])]);
+        let mut open = state.open_requests(&queued).expect("open requests");
+        assert!(open
+            .windows(2)
+            .all(|pair| pair[0].admitted_at_millis >= pair[1].admitted_at_millis));
+        open.sort_by(|left, right| left.id.cmp(&right.id));
+        let waiting = OpenRequest {
+            reach: PromptReach::Queued,
+            ..open_at(
+                &format!("{}_1", record(&keys[1]).reply_nonce),
+                false,
+                record(&keys[1]).admitted_at_millis,
+            )
+        };
+        let mut expected = vec![
+            waiting.clone(),
+            open_at(
+                &format!("{answered}_2"),
+                true,
+                record(&keys[2]).admitted_at_millis,
+            ),
+        ];
+        expected.sort_by(|left, right| left.id.cmp(&right.id));
+        assert_eq!(open, expected);
+        state.close_replies(&keys[2]).expect("close replies");
+        assert!(record(&keys[2]).reply_closed);
+        assert_eq!(
+            state.open_requests(&queued).expect("open requests"),
+            [waiting]
+        );
+        assert!(!state
+            .available_reply_ids()
+            .expect("available reply IDs")
+            .contains(&format!("{answered}_2")));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_request_whose_prompt_never_reached_the_queue_is_not_listed() {
+        // A submission can fail before anything is queued, as one does once the service is told
+        // to stop. The coordinator never sees that prompt, so a routing notice neither lists the
+        // request nor names it as the probable target, though the bridge started to deliver it.
+        let (state, key, nonce, root) = open_request("prompt-never-queued");
+        let coordinator = QueueDelivery {
+            refused_submits: Mutex::new(1),
+            ..QueueDelivery::default()
+        };
+        assert!(matches!(
+            deliver_request_with(&state, &coordinator, &key, DrainOptions::default())
+                .expect("deliver request"),
+            CoordinatorDeliveryResult::Pending(_)
+        ));
+        let record = state.read_request(&key).expect("request");
+        assert_eq!(record.phase, RequestPhase::Pending);
+        assert!(record.delivery_started_at_millis.is_some());
+        assert_eq!(
+            coordinator
+                .message_state("coordinator", &record.delivery_message_id)
+                .expect("queue state"),
+            None
+        );
+        let foreign = "1glbtIyB9sddh4NmJtZhiA";
+        assert_ne!(nonce, foreign);
+        let capture = state
+            .capture_snapshot(&reply_block(&format!("{foreign}_1"), "an answer"))
+            .expect("scan");
+        assert_eq!(capture.unknown_ids, [format!("{foreign}_1")]);
+        assert_eq!(
+            deliver_fence_feedback_with(
+                &state,
+                &coordinator,
+                &capture.unknown_ids,
+                DrainOptions::default()
+            )
+            .expect("fence feedback"),
+            CoordinatorDeliveryResult::Delivered
+        );
+        assert_eq!(
+            coordinator.prompts(),
+            [format!(
+                "Chat reply routing error: {foreign}_1 matches no open chat request, so that block \
+was not sent. No open chat request has been sent to you."
+            )]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_request_whose_prompt_waits_in_the_queue_is_listed_but_not_named() {
+        // A prompt the queue holds reaches the coordinator through the same queue as a routing
+        // notice, so the notice lists that request. It does not name it as the probable target:
+        // the block under the unmatched ID was on the screen before the prompt left the queue,
+        // so the coordinator wrote that block before it could have seen the request.
+        let (state, key, nonce, root) = open_request("prompt-waits-in-queue");
+        let coordinator = QueueDelivery {
+            busy_drains: Mutex::new(1),
+            ..QueueDelivery::default()
+        };
+        assert!(matches!(
+            deliver_request_with(&state, &coordinator, &key, DrainOptions::default())
+                .expect("deliver request"),
+            CoordinatorDeliveryResult::Pending(_)
+        ));
+        let record = state.read_request(&key).expect("request");
+        assert_eq!(record.phase, RequestPhase::Pending);
+        assert_eq!(
+            coordinator
+                .message_state("coordinator", &record.delivery_message_id)
+                .expect("queue state"),
+            Some(QueueMessageState::Pending)
+        );
+        let foreign = "1glbtIyB9sddh4NmJtZhiA";
+        assert_ne!(nonce, foreign);
+        let capture = state
+            .capture_snapshot(&reply_block(&format!("{foreign}_1"), "an answer"))
+            .expect("scan");
+        assert_eq!(capture.unknown_ids, [format!("{foreign}_1")]);
+        assert_eq!(
+            deliver_fence_feedback_with(
+                &state,
+                &coordinator,
+                &capture.unknown_ids,
+                DrainOptions::default()
+            )
+            .expect("fence feedback"),
+            CoordinatorDeliveryResult::Delivered
+        );
+        let prompts = coordinator.prompts();
+        assert_eq!(prompts.len(), 2, "{prompts:?}");
+        assert_eq!(
+            without_ages(&prompts[1]),
+            format!(
+                "Chat reply routing error: {foreign}_1 matches no open chat request, so that block \
+was not sent. No reply yet, most recent first: {nonce}_1 AGE. Re-send it with the ID of the \
+request it answers."
+            )
+        );
+        // The drain that delivered the notice delivered the request's prompt too.
+        assert_eq!(
+            coordinator
+                .message_state("coordinator", &record.delivery_message_id)
+                .expect("queue state"),
+            Some(QueueMessageState::Processed)
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_request_whose_queue_entry_cannot_be_read_is_listed_but_not_named() {
+        // Listing the open requests reads the queue for a prompt that may wait there, and only a
+        // notice about an unmatched ID lists them. A request whose queue entry cannot be read is
+        // listed, since its prompt may have reached the coordinator, but the notice names no
+        // probable target, since it cannot tell whether that prompt left the queue's inbox. The
+        // notice still goes out, as does one about a partial block alone, so one damaged queue
+        // entry withholds neither.
+        let (state, key, nonce, root) = open_request("queue-read-fails");
+        let coordinator = QueueDelivery {
+            busy_drains: Mutex::new(1),
+            ..QueueDelivery::default()
+        };
+        assert!(matches!(
+            deliver_request_with(&state, &coordinator, &key, DrainOptions::default())
+                .expect("deliver request"),
+            CoordinatorDeliveryResult::Pending(_)
+        ));
+        let message_id = state
+            .read_request(&key)
+            .expect("request")
+            .delivery_message_id;
+        coordinator
+            .unreadable
+            .lock()
+            .expect("unreadable lock")
+            .insert(message_id.clone());
+        let unmatched = ["1glbtIyB9sddh4NmJtZhiA_1".to_owned()];
+        assert_eq!(
+            deliver_fence_feedback_with(&state, &coordinator, &unmatched, DrainOptions::default())
+                .expect("a notice that lists a request whose queue entry cannot be read"),
+            CoordinatorDeliveryResult::Delivered
+        );
+        let partial = [format!("{nonce}_1 unopened 0123456789ab")];
+        assert_eq!(
+            deliver_fence_feedback_with(&state, &coordinator, &partial, DrainOptions::default())
+                .expect("a notice about a partial block alone"),
+            CoordinatorDeliveryResult::Delivered
+        );
+        // Once the queue can be read again, and shows the prompt delivered, a notice about
+        // another unmatched ID names the request.
+        coordinator
+            .unreadable
+            .lock()
+            .expect("unreadable lock")
+            .clear();
+        assert_eq!(
+            coordinator
+                .message_state("coordinator", &message_id)
+                .expect("queue state"),
+            Some(QueueMessageState::Processed)
+        );
+        let later = ["2glbtIyB9sddh4NmJtZhiA_1".to_owned()];
+        assert_eq!(
+            deliver_fence_feedback_with(&state, &coordinator, &later, DrainOptions::default())
+                .expect("fence feedback"),
+            CoordinatorDeliveryResult::Delivered
+        );
+        let prompts = coordinator.prompts();
+        assert_eq!(prompts.len(), 4, "{prompts:?}");
+        assert_eq!(
+            without_ages(&prompts[1]),
+            format!(
+                "Chat reply routing error: 1glbtIyB9sddh4NmJtZhiA_1 matches no open chat request, \
+so that block was not sent. No reply yet, most recent first: {nonce}_1 AGE. Re-send it with the \
+ID of the request it answers."
+            )
+        );
+        assert_eq!(prompts[2], unopened_notice(&format!("{nonce}_1")));
+        assert_eq!(
+            without_ages(&prompts[3]),
+            format!(
+                "Chat reply routing error: 2glbtIyB9sddh4NmJtZhiA_1 matches no open chat request, \
+so that block was not sent. No reply yet, most recent first: {nonce}_1 AGE. It was probably meant \
+for {nonce}_1. Re-send it with the ID of the request it answers. Do not send a block you did not \
+write, such as one quoted in a message you received."
+            )
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn only_a_request_whose_prompt_left_the_queue_inbox_is_named() {
+        // How far each queue state says a started request's prompt went, and so whether a notice
+        // about an unmatched ID lists the request and names it as the probable target: a prompt
+        // the queue does not hold was never shown; one in its inbox is listed, since the queue
+        // delivers it before the notice, but it was not seen when the block was written; one past
+        // the inbox may have been seen; and one whose entry cannot be read may have been. A request
+        // whose delivery the bridge recorded as confirmed or uncertain is named on that record
+        // alone, even once the queue no longer holds its prompt.
+        let cases = [
+            (None, false, None),
+            (
+                Some(QueueMessageState::Pending),
+                false,
+                Some(PromptReach::Queued),
+            ),
+            (
+                Some(QueueMessageState::Inflight),
+                false,
+                Some(PromptReach::Sent),
+            ),
+            (
+                Some(QueueMessageState::Processed),
+                false,
+                Some(PromptReach::Sent),
+            ),
+            (
+                Some(QueueMessageState::Failed),
+                false,
+                Some(PromptReach::Sent),
+            ),
+            (
+                Some(QueueMessageState::Pending),
+                true,
+                Some(PromptReach::Unknown),
+            ),
+        ];
+        for (index, (queue_state, unreadable, reach)) in cases.into_iter().enumerate() {
+            let (state, key, nonce, root) = open_request(&format!("prompt-reach-{index}"));
+            let coordinator = QueueDelivery {
+                busy_drains: Mutex::new(1),
+                ..QueueDelivery::default()
+            };
+            assert!(matches!(
+                deliver_request_with(&state, &coordinator, &key, DrainOptions::default())
+                    .expect("deliver request"),
+                CoordinatorDeliveryResult::Pending(_)
+            ));
+            let record = state.read_request(&key).expect("request");
+            assert_eq!(record.phase, RequestPhase::Pending);
+            {
+                let mut states = coordinator.states.lock().expect("queue lock");
+                match queue_state {
+                    Some(queue_state) => {
+                        states.insert(record.delivery_message_id.clone(), queue_state);
+                    }
+                    None => {
+                        states.remove(&record.delivery_message_id);
+                    }
+                }
+            }
+            if unreadable {
+                coordinator
+                    .unreadable
+                    .lock()
+                    .expect("unreadable lock")
+                    .insert(record.delivery_message_id.clone());
+            }
+            let open = state.open_requests(&coordinator).expect("open requests");
+            let expected = reach
+                .map(|reach| OpenRequest {
+                    reach,
+                    ..open_at(&format!("{nonce}_1"), false, record.admitted_at_millis)
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
+            assert_eq!(open, expected, "case {index}");
+            assert_eq!(
+                probable_target(&open).map(|request| request.id.clone()),
+                (reach == Some(PromptReach::Sent)).then(|| format!("{nonce}_1")),
+                "case {index}"
+            );
+            fs::remove_dir_all(root).expect("cleanup");
+        }
+        for (index, (queue_state, phase)) in [
+            (QueueMessageState::Processed, RequestPhase::Delivered),
+            (QueueMessageState::Failed, RequestPhase::DeliveryUncertain),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (state, key, nonce, root) = open_request(&format!("prompt-reach-phase-{index}"));
+            let coordinator = QueueDelivery {
+                busy_drains: Mutex::new(1),
+                ..QueueDelivery::default()
+            };
+            assert!(matches!(
+                deliver_request_with(&state, &coordinator, &key, DrainOptions::default())
+                    .expect("deliver request"),
+                CoordinatorDeliveryResult::Pending(_)
+            ));
+            let message_id = state
+                .read_request(&key)
+                .expect("request")
+                .delivery_message_id;
+            coordinator
+                .states
+                .lock()
+                .expect("queue lock")
+                .insert(message_id.clone(), queue_state);
+            deliver_request_with(&state, &coordinator, &key, DrainOptions::default())
+                .expect("settle request");
+            let record = state.read_request(&key).expect("request");
+            assert_eq!(record.phase, phase, "phase case {index}");
+            coordinator
+                .states
+                .lock()
+                .expect("queue lock")
+                .remove(&message_id);
+            let open = state.open_requests(&coordinator).expect("open requests");
+            assert_eq!(
+                open,
+                vec![OpenRequest {
+                    reach: PromptReach::Sent,
+                    ..open_at(&format!("{nonce}_1"), false, record.admitted_at_millis)
+                }],
+                "phase case {index}"
+            );
+            assert_eq!(
+                probable_target(&open).map(|request| request.id.clone()),
+                Some(format!("{nonce}_1")),
+                "phase case {index}"
+            );
+            fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn a_request_whose_prompt_may_have_been_seen_stops_naming_another() {
+        // Only one request with no reply yet whose prompt left the queue's inbox is named. One
+        // whose prompt still waits there does not count, one whose queue entry cannot be read
+        // does, and one that already has a reply is never a candidate.
+        let now = 1_000_000_000;
+        let request = |id: &str, replied: bool, reach: PromptReach| OpenRequest {
+            reach,
+            ..open_at(id, replied, now)
+        };
+        let named = |open: &[OpenRequest]| probable_target(open).map(|request| request.id.clone());
+        let sent = request("015", false, PromptReach::Sent);
+        assert_eq!(named(std::slice::from_ref(&sent)), Some("015".to_owned()));
+        assert_eq!(
+            named(&[request("016", false, PromptReach::Queued), sent.clone()]),
+            Some("015".to_owned())
+        );
+        assert_eq!(
+            named(&[request("016", false, PromptReach::Unknown), sent.clone()]),
+            None
+        );
+        assert_eq!(
+            named(&[request("016", false, PromptReach::Sent), sent.clone()]),
+            None
+        );
+        assert_eq!(
+            named(&[request("016", true, PromptReach::Unknown), sent.clone()]),
+            Some("015".to_owned())
+        );
+        assert_eq!(named(&[request("016", false, PromptReach::Queued)]), None);
+        // The queued request is listed with its age, and only the other is named.
+        assert_eq!(
+            routing_notice(
+                &["017".to_owned()],
+                &[request("016", false, PromptReach::Queued), sent],
+                now
+            ),
+            "Chat reply routing error: 017 matches no open chat request, so that block was not \
+sent. No reply yet, most recent first: 016 0s ago, 015 0s ago. It was probably meant for 015. \
+Re-send it with the ID of the request it answers. Do not send a block you did not write, such as \
+one quoted in a message you received."
+        );
     }
 
     #[test]
@@ -13219,6 +14684,17 @@ any further ones for 300 seconds, so combine short updates."
             .new_request_keys[0]
             .clone();
         let nonce = state.read_request(&key).expect("request").reply_nonce;
+        // The coordinator answers a request it was shown.
+        assert_eq!(
+            deliver_request_with(
+                &state,
+                &FakeDelivery::default(),
+                &key,
+                DrainOptions::default()
+            )
+            .expect("deliver request"),
+            CoordinatorDeliveryResult::Delivered
+        );
         let foreign = "1glbtIyB9sddh4NmJtZhiA";
         assert_ne!(nonce, foreign);
         let mut rendered = format!(
@@ -13268,9 +14744,9 @@ any further ones for 300 seconds, so combine short updates."
         assert_eq!(
             prompts[0],
             format!(
-                "Chat reply routing error: your output referenced unavailable reply ID(s): \
-{foreign}_1. The reply ID(s) available when this notice was written are: {nonce}_2. Emit a \
-complete reply block using one exact available ID."
+                "Chat reply routing error: {foreign}_1 matches no open chat request, so that block \
+was not sent. Every open request sent to you already has a reply. Already replied: {nonce}_2. \
+Re-send it with the ID of the request it answers."
             )
         );
         assert_eq!(
@@ -13421,9 +14897,9 @@ complete reply block using one exact available ID."
     #[test]
     fn next_reply_id_seen_in_part_is_reported_and_its_complete_block_posted() {
         // A recovery scan that sees only part of a block, its opening marker before the closing
-        // one or its closing marker after the opening one has scrolled away, reports the block's
-        // reply ID unless the visible part is the start or the end of a stored reply. With only
-        // this request open, the notice names that ID as both unavailable and available. A
+        // one or its closing marker after the opening one has scrolled away, reports the block
+        // unless the visible part is the start or the end of a stored reply. The notice says what
+        // the screen was missing; it no longer calls the ID of the open request unavailable. A
         // complete block under it is posted, as the guide says.
         let root = temporary("next-marker-in-part");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
@@ -13439,19 +14915,28 @@ complete reply block using one exact available ID."
             deliver_fence_feedback_with(&state, &coordinator, identifiers, DrainOptions::default())
                 .expect("fence feedback")
         };
-        let notice = |ordinal: u32| {
-            format!(
-                "Chat reply routing error: your output referenced unavailable reply ID(s): \
-{nonce}_{ordinal}. The reply ID(s) available when this notice was written are: \
-{nonce}_{ordinal}. Emit a complete reply block using one exact available ID."
-            )
-        };
+        let resend = "start a message with its opening line and write the whole block in that \
+message, with no tool call inside it. Do not send a block you did not write, such as one quoted in a \
+message you received.";
+        let unclosed_notice = format!(
+            "Chat reply not sent: the screen showed no closing line for the reply block marked \
+{nonce}_1, so that block was not sent.\nA block that was still being written goes out once it is \
+complete, if the screen then shows the first row of its message and its closing line. Otherwise, \
+send it again: {resend}"
+        );
+        let unopened_notice = format!(
+            "Chat reply not sent: the screen did not show the start of the message holding, or an \
+opening line for, the reply block marked {nonce}_2, so that block was not sent.\nSend it again: \
+{resend}"
+        );
 
         // The opening marker, before the agent has written the closing one.
         let opening = format!("<CHAT_REPLY_{nonce}_1>\nfirst answer\n");
         let capture = state.capture_snapshot(&opening).expect("opening scan");
         assert!(capture.replies.is_empty());
-        assert_eq!(capture.unknown_ids, [format!("{nonce}_1")]);
+        let first = held_back(&format!("{nonce}_1"), "unclosed", "firstanswer");
+        assert_eq!(first, format!("{nonce}_1 unclosed 2f78a5c37fcf"));
+        assert_eq!(capture.unknown_ids, [first]);
         report(&capture.unknown_ids);
         let capture = state
             .capture_snapshot(&format!("{opening}</CHAT_REPLY_{nonce}_1>\n"))
@@ -13465,7 +14950,10 @@ complete reply block using one exact available ID."
         let closing = format!("end of the second answer\n</CHAT_REPLY_{nonce}_2>\n");
         let capture = state.capture_snapshot(&closing).expect("closing scan");
         assert!(capture.replies.is_empty());
-        assert_eq!(capture.unknown_ids, [format!("{nonce}_2")]);
+        // The capture starts at this block, and fewer than HELD_BACK_DIGEST_CHARS identity
+        // characters of it are visible, so it is reported as a remnant.
+        let second = held_back(&format!("{nonce}_2"), "remnant", "endofthesecondanswer");
+        assert_eq!(capture.unknown_ids, std::slice::from_ref(&second));
         report(&capture.unknown_ids);
         let capture = state
             .capture_snapshot(&format!(
@@ -13474,11 +14962,11 @@ complete reply block using one exact available ID."
             .expect("scan of the block sent again");
         assert_eq!(capture.replies, [(key.clone(), vec![2])]);
         assert!(capture.unknown_ids.is_empty());
-        // The fragment is still on screen and still matches no stored reply, but its ID was
+        // The fragment is still on screen and still matches no stored reply, but it was
         // reported once, so it is only logged.
-        assert_eq!(capture.suppressed_ids, [format!("{nonce}_2")]);
+        assert_eq!(capture.suppressed_ids, [second]);
 
-        assert_eq!(coordinator.prompts(), [notice(1), notice(2)]);
+        assert_eq!(coordinator.prompts(), [unclosed_notice, unopened_notice]);
         while state
             .publish_one(&key, &mut transport)
             .expect("publish captured reply")
@@ -13556,7 +15044,10 @@ complete reply block using one exact available ID."
         );
         let capture = state.capture_snapshot(&nested).expect("nested capture");
         assert_eq!(capture.replies, [(key.clone(), vec![1])]);
-        assert_eq!(capture.unknown_ids, [format!("{nonce}_1")]);
+        assert_eq!(
+            capture.unknown_ids,
+            [held_back(&format!("{nonce}_1"), "unclosed", "outerstart")]
+        );
         assert_eq!(
             state.read_reply(&key, 1).expect("reply").body,
             "inner answer"
@@ -13567,7 +15058,10 @@ complete reply block using one exact available ID."
             .capture_snapshot(&mismatched)
             .expect("mismatched capture");
         assert!(capture.replies.is_empty());
-        assert_eq!(capture.unknown_ids, [format!("{nonce}_2")]);
+        assert_eq!(
+            capture.unknown_ids,
+            [held_back(&format!("{nonce}_2"), "unclosed", "sometext")]
+        );
         assert!(capture.refused.is_empty());
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -14046,24 +15540,30 @@ k │\n\
             // Its opening marker scrolled away, and the rest is the end of the stored reply.
             (
                 format!("the end of\n  the answer\n</CHAT_REPLY_{id}>\n"),
-                false,
+                None,
             ),
             // Its closing marker is not written yet, and the start matches the stored reply.
-            (format!("<CHAT_REPLY_{id}>\nThis is the\n"), false),
+            (format!("<CHAT_REPLY_{id}>\nThis is the\n"), None),
             // Nothing of it is visible.
-            (format!("</CHAT_REPLY_{id}>\n"), false),
-            (format!("<CHAT_REPLY_{id}>\n"), false),
-            // What is visible matches no stored reply.
-            (format!("another ending\n</CHAT_REPLY_{id}>\n"), true),
-            (format!("<CHAT_REPLY_{id}>\nThat is\n"), true),
+            (format!("</CHAT_REPLY_{id}>\n"), None),
+            (format!("<CHAT_REPLY_{id}>\n"), None),
+            // What is visible matches no stored reply. The first is cut by the top of the capture
+            // and shows fewer than HELD_BACK_DIGEST_CHARS identity characters.
+            (
+                format!("another ending\n</CHAT_REPLY_{id}>\n"),
+                Some(("remnant", "anotherending")),
+            ),
+            (
+                format!("<CHAT_REPLY_{id}>\nThat is\n"),
+                Some(("unclosed", "Thatis")),
+            ),
         ] {
             let capture = state.capture_snapshot(&seen).expect("partial capture");
             assert!(capture.replies.is_empty(), "{seen:?}");
-            let expected = if reported {
-                vec![id.clone()]
-            } else {
-                Vec::new()
-            };
+            let expected = reported
+                .map(|(kind, covered)| held_back(&id, kind, covered))
+                .into_iter()
+                .collect::<Vec<_>>();
             assert_eq!(capture.unknown_ids, expected, "{seen:?}");
         }
         fs::remove_dir_all(root).expect("cleanup");
@@ -14497,12 +15997,12 @@ k │\n\
             .clone();
         let nonce = state.read_request(&key).expect("request").reply_nonce;
         let foreign = "F".repeat(22);
-        // One full feedback round already reported the ID of a live request's block seen in part
-        // and all but one of the foreign IDs below.
+        // One full feedback round already reported a live request's block seen in part and all
+        // but one of the foreign IDs below.
         let mut reported = (1..MAX_FEEDBACK_UNAVAILABLE_IDS)
             .map(|ordinal| format!("{foreign}_{ordinal}"))
             .collect::<Vec<_>>();
-        reported.push(format!("{nonce}_3"));
+        reported.push(held_back(&format!("{nonce}_3"), "unclosed", "stray"));
         assert_eq!(
             deliver_fence_feedback_with(
                 &state,
@@ -17270,11 +18770,15 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             // Codex's input box, holding a message not yet sent.
             format!("» [worker -> coord 18:50Z] the owner wants this:\n  {quoted}\n"),
         ];
-        let reported = ReplyScan {
+        // At the top of a capture a `❯` row is skipped as Claude Code's pinned copy of a prompt, so
+        // the block is read as one whose opening marker is out of view. Its rows reach back to the
+        // top of the capture when the opening marker is on the skipped row.
+        let reported = |cut: bool| ReplyScan {
             found: NonceScan {
                 partial: vec![PartialBlock::Unopened {
                     identifier: id.clone(),
                     text: "  quoted answer".to_owned(),
+                    cut,
                 }],
                 ..NonceScan::default()
             },
@@ -17304,12 +18808,21 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             .collect();
         for (index, (echo, capture)) in echoes.iter().zip(at_top).enumerate() {
             if echo.starts_with('❯') {
+                let cut = echo
+                    .lines()
+                    .next()
+                    .is_some_and(|row| row.contains("<CHAT_REPLY_"));
                 assert_eq!(
                     scan_reply_blocks(echo, &nonce).expect("scan the message at the top"),
-                    reported,
+                    reported(cut),
                     "{echo}"
                 );
-                assert_eq!(capture.unknown_ids, std::slice::from_ref(&id), "{echo}");
+                let kind = if cut { "remnant" } else { "unopened" };
+                assert_eq!(
+                    capture.unknown_ids,
+                    [held_back(&id, kind, "quotedanswer")],
+                    "{echo}"
+                );
             } else {
                 assert_eq!(
                     scan_reply_blocks(echo, &nonce).expect("scan the message at the top"),
@@ -17548,6 +19061,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                             PartialBlock::Unopened {
                                 identifier: id.clone(),
                                 text: "⏺ rest of the answer".to_owned(),
+                                cut: false,
                             },
                         ],
                         ..NonceScan::default()
@@ -17572,6 +19086,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                         partial: vec![PartialBlock::Unopened {
                             identifier: id.clone(),
                             text: "⏺ the end of an answer".to_owned(),
+                            cut: false,
                         }],
                         ..NonceScan::default()
                     },
@@ -17590,6 +19105,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                         partial: vec![PartialBlock::Unopened {
                             identifier: id.clone(),
                             text: String::new(),
+                            cut: false,
                         }],
                         ..NonceScan::default()
                     },
@@ -17766,6 +19282,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                             PartialBlock::Unopened {
                                 identifier: id.clone(),
                                 text: format!("{bullet} second half"),
+                                cut: false,
                             },
                         ],
                         ..NonceScan::default()
@@ -17810,6 +19327,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                         PartialBlock::Unopened {
                             identifier: id.clone(),
                             text: String::new(),
+                            cut: false,
                         },
                     ],
                     ..NonceScan::default()
@@ -17880,6 +19398,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                     partial: vec![PartialBlock::Unopened {
                         identifier: id.clone(),
                         text: format!("  {text}"),
+                        cut: false,
                     }],
                     ..NonceScan::default()
                 },
@@ -17888,7 +19407,13 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
         );
         let capture = state.capture_snapshot(&cut).expect("capture the cut item");
         assert!(capture.replies.is_empty());
-        assert_eq!(capture.unknown_ids, ["unknown_1".to_owned(), id.clone()]);
+        assert_eq!(
+            capture.unknown_ids,
+            [
+                "unknown_1".to_owned(),
+                held_back(&id, "unopened", "ananswerseenwithoutitsfirstrow")
+            ]
+        );
         // A row one column in is not at the left edge either.
         let one_in = rows(&[
             " a row one column in",
@@ -17903,6 +19428,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                     partial: vec![PartialBlock::Unopened {
                         identifier: id.clone(),
                         text: format!("  {text}"),
+                        cut: false,
                     }],
                     ..NonceScan::default()
                 },
@@ -17976,6 +19502,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                 partial: vec![PartialBlock::Unopened {
                     identifier: id.clone(),
                     text: text.to_owned(),
+                    cut: false,
                 }],
                 ..NonceScan::default()
             },
@@ -18005,7 +19532,10 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             .capture_snapshot(&pinned)
             .expect("capture under the pinned row");
         assert!(capture.replies.is_empty());
-        assert_eq!(capture.unknown_ids, std::slice::from_ref(&id));
+        assert_eq!(
+            capture.unknown_ids,
+            [held_back(&id, "unopened", "lateanswer")]
+        );
         // A prompt whose first row is the top of the capture, quoting a block.
         let quoting = rows(&[
             "❯ [worker -> coord 04:11Z] quoting it:",
@@ -18022,7 +19552,10 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             .capture_snapshot(&quoting)
             .expect("capture the quoting prompt");
         assert!(capture.replies.is_empty());
-        assert_eq!(capture.unknown_ids, std::slice::from_ref(&id));
+        assert_eq!(
+            capture.unknown_ids,
+            [held_back(&id, "unopened", "quotedanswer")]
+        );
         // Once the coordinator's own block with that text is stored, the quote is silent.
         let own = rows(&[
             "⏺ Here it is.",
@@ -18164,7 +19697,17 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             .capture_snapshot(&late)
             .expect("capture the block after text");
         assert!(capture.replies.is_empty());
-        assert_eq!(capture.unknown_ids, std::slice::from_ref(&id));
+        // It is reported by the last HELD_BACK_DIGEST_CHARS identity characters of the rows
+        // after its opening marker.
+        let late_view = (1..=40)
+            .map(|line| format!("late{line}"))
+            .collect::<String>();
+        let late_entry = held_back(
+            &id,
+            "unopened",
+            &late_view[late_view.len() - HELD_BACK_DIGEST_CHARS..],
+        );
+        assert_eq!(capture.unknown_ids, std::slice::from_ref(&late_entry));
         // Claude Code can pin a copy of the prompt, cut to one row, over the top row once the
         // prompt is off the screen. The block is still reported.
         let (_, below) = late.split_once('\n').expect("more than one row");
@@ -18176,7 +19719,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             .capture_snapshot(&pinned)
             .expect("capture the block after text under a pinned prompt row");
         assert!(capture.replies.is_empty());
-        assert_eq!(capture.unknown_ids, std::slice::from_ref(&id));
+        assert_eq!(capture.unknown_ids, std::slice::from_ref(&late_entry));
         // A block of the same size that starts its message is posted, even though the prompt
         // row above it is off the screen, so the block's own first row is the first row at the
         // left edge.
