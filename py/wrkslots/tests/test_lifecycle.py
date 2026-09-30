@@ -42,6 +42,7 @@ WRKSLOTS = PACKAGE_ROOT / "__main__.py"
 COMPATIBILITY_COMMAND = PY_ROOT / "wrkslots.py"
 sys.path.insert(0, str(PY_ROOT))
 from wrkslots import cli as wrkslots  # noqa: E402
+from wrkslots import slotimage  # noqa: E402
 from wrkslots import yamlconfig  # noqa: E402
 
 
@@ -41073,6 +41074,56 @@ def test_remove_agent_batch_removes_a_slot_whose_fence_changed_its_device_and_in
     assert fenced_slot_path(project, "slot01") is None
     assert not checkout(project, "slot01").parent.exists()
     assert registry_journals(project) == []
+
+
+@pytest.mark.ordinary_environment
+def test_remove_agent_batch_removes_disk_image_slots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The batch removes slots kept in disk images, the default for a new project.
+
+    The fence of an image-backed slot unmounts the image and mounts it again
+    at the fenced path.  With the kernel backend the new mount takes the first
+    free loop device, which is often one that removing the slot before it just
+    freed, so the fenced slot usually has another device number than before
+    the fence.  The checks after the fence must still accept it.  Whether the
+    number changes depends on the host's other loop devices, so this test does
+    not require it;
+    test_remove_agent_batch_removes_a_slot_whose_fence_changed_its_device_and_inode
+    changes the identity on every run.  Needs an image backend: passwordless
+    sudo, or fuse2fs with /dev/fuse.
+    """
+
+    try:
+        slotimage.resolve_backend("auto")
+    except slotimage.ImageError as exc:
+        pytest.skip(f"no slot image backend on this host: {exc}")
+    monkeypatch.setenv("WRKSLOTS_INIT_REPRESENTATION", "image")
+    project = tmp_path / "project"
+    try:
+        made, _repository, slots = dead_agent_batch_project(tmp_path, count=2)
+        assert made == project
+        control = wrkslots._load_config(str(project), "testhost").control
+        assert [image.slot for image in slotimage.all_images(control)] == slots
+        returncode, payload, stderr = in_process_agent_batch(project, slots)
+
+        assert returncode == 0, (stderr, payload)
+        assert batch_slots(payload, "removed") == slots
+        assert batch_slots(payload, "refused") == []
+        assert payload["fenced_process_scans"] == 2
+        assert payload["recovery_required"] is False
+        assert active_slot_names(project) == []
+        assert registry_journals(project) == []
+        assert slotimage.all_images(control) == []
+        mounts = Path("/proc/self/mountinfo").read_text(encoding="utf-8")
+        assert [line for line in mounts.splitlines() if str(project) in line] == []
+    finally:
+        # A slot image left mounted would outlive the test; unmount and delete
+        # whatever a failure left behind, the setup's included.
+        if slotimage.images_root(project / "worktrees").exists():
+            control = wrkslots._load_config(str(project), "testhost").control
+            for leftover in slotimage.all_images(control):
+                slotimage.destroy(leftover, allow_content=True)
 
 
 def test_remove_agent_batch_falls_back_to_lsof_when_the_fenced_scan_cannot_decide(

@@ -831,8 +831,8 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
 
     assert ordinary.isdisjoint(mapped)
     assert ordinary | mapped == all_tests
-    assert len(all_tests) == 1465
-    assert len(ordinary) == 284
+    assert len(all_tests) == 1466
+    assert len(ordinary) == 285
     assert len(mapped) == 1181
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
@@ -900,6 +900,7 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
         "test_lock_conflict_refuses_without_state_change",
         "test_ownerless_validate_batch_removes_terminal_frozen_checkout",
         "test_process_entering_after_final_scan_before_path_move_is_not_deleted",
+        "test_remove_agent_batch_removes_disk_image_slots",
         "test_remove_refuses_live_process_using_slot",
         "test_root_owned_executable_accepts_host_root_helper",
         "test_run1773_historical_frozen_checkout_is_retained_without_blocking_entry",
