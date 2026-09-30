@@ -27457,15 +27457,24 @@ def _agent_batch_use_check(
 
 
 def _removal_journal_candidate(config: Config, slot: str) -> Path | None:
-    """Return a journal file that a removal of this machine's ``slot`` may have left.
+    """Return a journal that a removal of this machine's ``slot`` may have left.
 
-    Only the two files a removal of ``slot`` writes are read: this machine's
-    registry journal and the slot's own finish journal.  The append-only
-    history is not replayed here; ordinary remove still refuses every
-    outstanding journal, of any kind, under the registry lock.  A journal
-    whose slot cannot be read counts.  This read takes no lock, so it also
-    finds a journal that another client holds for an operation still in
-    progress; _interrupted_removal_journal rechecks under the lock.
+    Two files are read: this machine's registry journal and the slot's own
+    finish journal.  A journal whose slot cannot be read counts.  This
+    machine's append-only history is then replayed, because a mutation
+    records its progress there before it writes the journal file: one
+    interrupted between the two leaves a pending operation and no file.  A
+    pending operation for ``slot``, or for no named slot, returns its
+    journal path, which need not exist.  A history that cannot be replayed
+    returns its event directory.  Ordinary remove still refuses every
+    outstanding journal, of any kind and on any machine, under the registry
+    lock.  This read takes no lock, so it also finds a journal that another
+    client holds for an operation still in progress;
+    _interrupted_removal_journal rechecks under the lock.
+
+    The replay reads every event file.  Within one command the verified
+    events are kept, so a later call only checks that each file is
+    unchanged.
     """
 
     for path in (_journal_path(config), _finish_journal_path(config, slot)):
@@ -27476,6 +27485,13 @@ def _removal_journal_candidate(config: Config, slot: str) -> Path | None:
         except (OSError, UnicodeError, ValueError):
             return path
         if not isinstance(value, dict) or value.get("slot") in (slot, None):
+            return path
+    try:
+        pending = _pending_operations_from_events(config, config.machine)
+    except (Refusal, OSError, UnicodeError, ValueError):
+        return _event_directory(config, config.machine)
+    for path, journal in sorted(pending.items()):
+        if journal.get("slot") in (slot, None):
             return path
     return None
 
@@ -27563,6 +27579,12 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
         )
 
     def recovery_reason(journal: Path) -> str:
+        if journal == _event_directory(config, config.machine):
+            return (
+                f"the append-only history in {journal} cannot be replayed, so an "
+                "interrupted removal cannot be ruled out; run 'wrkslots recover' "
+                "before another removal"
+            )
         return (
             f"an interrupted removal is recorded in {journal}; run 'wrkslots "
             "recover' before another removal"
@@ -41745,8 +41767,9 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "rollback of the fence, and the deletion itself are not limited, since stopping "
             "them would leave a removal that only 'wrkslots recover' can finish. "
             "A refused slot is reported with its reason and left in place; "
-            "the remaining slots are still attempted. A slot that leaves an interrupted "
-            "removal journal stops the batch and names 'wrkslots recover'. An "
+            "the remaining slots are still attempted. A slot with an interrupted removal "
+            "journal, or with an operation that this machine's history records as begun "
+            "and not finished, stops the batch and names 'wrkslots recover'. An "
             "unexpected error during the shared scan or a slot's removal stops the batch "
             "but still prints the report: the error is in its error field (an ERROR: line "
             "in human output), the traceback is on stderr, and the slot being removed and "

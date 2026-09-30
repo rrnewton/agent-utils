@@ -41282,6 +41282,97 @@ def test_item_budget_kills_a_command_that_ignores_sigterm_and_its_descendants(
     assert process_has_exited(sleeper_pid)
 
 
+def test_remove_agent_batch_stops_for_a_pending_operation_that_has_no_journal_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mutation records its progress before it writes its journal file.
+
+    One interrupted between the two leaves only the pending operation in the
+    append-only history.  The batch finds it, stops, and names recover.
+    """
+
+    project, _repository, slots = dead_agent_batch_project(tmp_path, count=2)
+    config = wrkslots._load_config(str(project), "testhost")
+    journal_path = wrkslots._journal_path(config)
+    original_write = wrkslots._atomic_write_json
+
+    def interrupted_write(path: Path, value: object) -> None:
+        if path == journal_path:
+            raise OSError(errno.EIO, "interrupted before the journal file was written")
+        original_write(path, value)
+
+    monkeypatch.setattr(wrkslots, "_atomic_write_json", interrupted_write)
+    with pytest.raises(OSError, match="interrupted before the journal file"):
+        wrkslots._write_journal(
+            config,
+            {"kind": "remove", "slot": "slot02", "machine": config.machine, "generation": 1},
+        )
+    monkeypatch.setattr(wrkslots, "_atomic_write_json", original_write)
+    assert not journal_path.exists()
+    assert wrkslots._removal_journal_candidate(config, "slot01") is None
+    assert wrkslots._removal_journal_candidate(config, "slot02") == journal_path
+
+    returncode, payload, stderr = in_process_agent_batch(project, slots)
+
+    assert returncode == 1, stderr
+    assert batch_slots(payload, "removed") == []
+    refused = {
+        str(row["slot"]): row for row in cast(list[Mapping[str, object]], payload["refused"])
+    }
+    assert set(refused) == set(slots)
+    assert refused["slot02"]["reason"] == (
+        f"an interrupted removal is recorded in {journal_path}; run 'wrkslots "
+        "recover' before another removal"
+    )
+    assert refused["slot02"]["recovery_required"] is True
+    assert str(refused["slot01"]["reason"]).startswith(
+        "batch stopped: an interrupted removal must be recovered first"
+    )
+    assert payload["recovery_required"] is True
+    assert active_slot_names(project) == slots
+
+
+def test_removal_journal_candidate_counts_a_history_that_cannot_be_replayed(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _slots = dead_agent_batch_project(tmp_path, count=1)
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._removal_journal_candidate(config, "slot01") is None
+    events = wrkslots._event_directory(config, config.machine)
+    # A pending operation whose embedded journal names another machine.
+    wrkslots._event_writer(config, config.machine).append(
+        "operation-progress-recorded",
+        {
+            "slot": "slot01",
+            "operation": "remove",
+            "journal_path": wrkslots._journal_path(config).name,
+            "journal": {"kind": "remove", "slot": "slot01", "machine": "elsewhere"},
+        },
+    )
+    with pytest.raises(wrkslots.StateError, match="does not match its embedded journal"):
+        wrkslots._pending_operations_from_events(config, config.machine)
+    assert wrkslots._removal_journal_candidate(config, "slot01") == events
+    assert wrkslots._removal_journal_candidate(config, "slot02") == events
+
+    returncode, payload, stderr = in_process_agent_batch(project, ["slot01"])
+    assert returncode == 1, stderr
+    assert payload["refused"] == [
+        {
+            "slot": "slot01",
+            "generation": 1,
+            "reason": (
+                f"the append-only history in {events} cannot be replayed, so an "
+                "interrupted removal cannot be ruled out; run 'wrkslots recover' "
+                "before another removal"
+            ),
+            "recovery_required": True,
+        }
+    ]
+    assert payload["recovery_required"] is True
+    assert active_slot_names(project) == ["slot01"]
+    assert checkout(project, "slot01").is_dir()
+
+
 def test_remove_agent_batch_honors_a_live_owners_release_like_remove(
     tmp_path: Path,
 ) -> None:

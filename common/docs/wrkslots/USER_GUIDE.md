@@ -554,11 +554,15 @@ attempted. A missing row, a changed generation, a validation slot, and a row who
 absent are refused before any scan; use `recover-absent-agent-rows` for the last. Any other
 refusal, including one for corrupt registry state, also refuses only its own slot. A slot whose
 removal left an interrupted journal, which `wrkslots recover` must settle, stops the batch instead:
-the remaining slots are refused and the output ends with `RECOVERY REQUIRED`. The batch counts a
-journal only if it is still present while the batch holds the registry lock, so a journal that
-another client writes and retires inside its own lock hold is waited out, not reported. When the
-lock is not taken within the lock wait, the batch stops without naming `wrkslots recover`. The
-human output is one summary line,
+the remaining slots are refused and the output ends with `RECOVERY REQUIRED`. Wrkslots records
+each operation's progress in this machine's append-only history before it writes the journal file,
+so an operation interrupted between the two leaves no file. The batch therefore also replays
+that history, and an operation it records as begun and not finished, for the slot or for no named
+slot, stops the batch in the same way. So does a history that cannot be replayed. The batch counts
+a journal or an unfinished operation only if it is still present while the batch holds the registry
+lock, so one that another client writes and retires inside its own lock hold is waited out, not
+reported. When the lock is not taken within the lock wait, the batch stops without naming
+`wrkslots recover`. The human output is one summary line,
 
 ```text
 requested=3 removed=2 refused=1 shared_process_censuses=1 fresh_process_scans=7 fenced_process_scans=2 fenced_lsof_fallbacks=0 item_budget_seconds=60 seconds=131.4
