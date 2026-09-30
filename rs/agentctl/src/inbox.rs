@@ -55,6 +55,16 @@ const BATCH_ID_PLACEHOLDER: &str = "????????????????";
 /// Batch id shown by `render`; the same length as a real id, so render and deliver choose the
 /// same notices under the same budget.
 const PREVIEW_BATCH_ID: &str = "preview-not-sent";
+/// How long a non-blocking lock retries before reporting busy: zero in production, where a busy
+/// lock means another process really holds it. In the crate's own tests every test shares one
+/// process, and a child forked by any test thread (in any module) inherits the other threads'
+/// lock descriptors until its exec, keeping a just-released lock held for a moment; tests
+/// therefore retry briefly. A lock that stays held still reports busy, which the concurrent
+/// delivery test asserts.
+#[cfg(not(test))]
+const TEST_LOCK_RETRY: Duration = Duration::ZERO;
+#[cfg(test)]
+const TEST_LOCK_RETRY: Duration = Duration::from_millis(500);
 /// Busy: the queue is full or another delivery is running.
 const EXIT_BUSY: i32 = crate::error::EXIT_BUSY;
 /// The delivery adapter failed; the batch stays claimed for a retry with the same key.
@@ -548,11 +558,17 @@ impl Inbox {
             file.lock_exclusive().map_err(|error| {
                 InboxError::io(&format!("cannot lock {}", path.display()), &error)
             })?;
-        } else if file.try_lock_exclusive().is_err() {
-            return Err(InboxError::busy(format!(
-                "another process holds {}; retry later",
-                path.display()
-            )));
+        } else {
+            let deadline = std::time::Instant::now() + TEST_LOCK_RETRY;
+            while file.try_lock_exclusive().is_err() {
+                if std::time::Instant::now() >= deadline {
+                    return Err(InboxError::busy(format!(
+                        "another process holds {}; retry later",
+                        path.display()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
         Ok(file)
     }

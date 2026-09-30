@@ -125,6 +125,10 @@ pub(crate) struct WorkerRecord {
     /// Set once the worker was announced as exited; kept so that its return is announced too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     exited_unix_ms: Option<u64>,
+    /// True while the worker is in the idle period it was first seen in, which was never
+    /// posted: its end needs no `working` notice.
+    #[serde(default)]
+    quiet: bool,
 }
 
 /// Everything the watcher remembers for one coordinator.
@@ -214,6 +218,7 @@ pub(crate) fn step(
                     offset: file_length(observation.transcript.as_deref()),
                     missing: 0,
                     exited_unix_ms: None,
+                    quiet: observed == WorkerState::Idle,
                 },
             );
             continue;
@@ -240,13 +245,14 @@ pub(crate) fn step(
         };
         let returned = record.exited_unix_ms.take().is_some();
         if observed != record.state || returned {
+            let quiet = std::mem::take(&mut record.quiet);
             record.state = observed;
             record.since_unix_ms = now;
             record.reminders = 0;
             record.idle_samples = u32::from(observed == WorkerState::Idle);
             match observed {
                 WorkerState::Working => {
-                    if record.announced.take().is_some() {
+                    if record.announced.take().is_some() && !quiet {
                         decide(&observation.agent, NoticeKind::Working);
                     }
                 }
@@ -952,6 +958,34 @@ mod tests {
     }
 
     #[test]
+    fn the_end_of_a_never_posted_idle_period_posts_nothing() {
+        let _serial = shared();
+        let mut state = WatchState::default();
+        step_listed(&mut state, &[seen("a", WorkerState::Idle, true)], 0, POLICY);
+        let resumed = step_listed(
+            &mut state,
+            &[seen("a", WorkerState::Working, true)],
+            10,
+            POLICY,
+        );
+        assert!(resumed.is_empty(), "{resumed:?}");
+        let idle = step_listed(
+            &mut state,
+            &[seen("a", WorkerState::Idle, true)],
+            20,
+            POLICY,
+        );
+        assert_eq!(kinds(&idle), [("a", NoticeKind::Idle)]);
+        let back = step_listed(
+            &mut state,
+            &[seen("a", WorkerState::Working, true)],
+            30,
+            POLICY,
+        );
+        assert_eq!(kinds(&back), [("a", NoticeKind::Working)]);
+    }
+
+    #[test]
     fn a_claude_idle_edge_is_announced_at_once_and_a_resume_withdraws_it() {
         let _serial = shared();
         let mut state = WatchState::default();
@@ -1511,11 +1545,16 @@ mod tests {
             stale_after: DEFAULT_STALE_SECONDS,
         };
         inbox.post(&filler, 1).unwrap();
+        // cycle() reads the real clock, so reminders are off to keep the test independent of load.
+        let policy = Policy {
+            remind_after_ms: 0,
+            ..POLICY
+        };
         list("working");
-        cycle(&inbox, &sources, &[], POLICY, 2).unwrap();
+        cycle(&inbox, &sources, &[], policy, 2).unwrap();
         list("idle");
-        cycle(&inbox, &sources, &[], POLICY, 2).unwrap();
-        let error = cycle(&inbox, &sources, &[], POLICY, 2).unwrap_err();
+        cycle(&inbox, &sources, &[], policy, 2).unwrap();
+        let error = cycle(&inbox, &sources, &[], policy, 2).unwrap_err();
         assert_eq!(error.exit_code(), EXIT_BUSY, "wb's idle does not fit");
         let posted = |inbox: &Inbox| {
             inbox
@@ -1546,7 +1585,7 @@ mod tests {
                 |_| Ok(()),
             )
             .unwrap();
-        let report = cycle(&inbox, &sources, &[], POLICY, 2).unwrap();
+        let report = cycle(&inbox, &sources, &[], policy, 2).unwrap();
         assert_eq!(report["posted"][0]["agent"], "wb", "{report}");
         assert_eq!(posted(&inbox), [("wb".to_owned(), NoticeKind::Idle)]);
     }

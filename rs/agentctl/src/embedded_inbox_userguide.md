@@ -182,7 +182,9 @@ rows.
 State lives in `watch.json` under the inbox directory. A worker's new state is saved only after
 its notice was posted: if a post fails (for example, the queue is full), that worker and every
 worker not yet posted keep their previous state, so the next sample decides the same notices
-again rather than losing them. One
+again rather than losing them. Delivery of a notice is at-least-once: if the watcher stops after
+a post but before saving, the next sample posts the same notice again, which the inbox merges
+into the worker's live notice unless a delivery ran in between. One
 watcher runs per coordinator (`.watch.lock`; a second exits 75). `--once` takes one sample,
 posts, saves, and exits, for use from a cron job or a harness loop; otherwise it samples every
 `--interval` seconds (30 by default). Each sample prints one JSON object: its time, the number of
