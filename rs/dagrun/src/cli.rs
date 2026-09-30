@@ -5707,7 +5707,6 @@ fn cmd_summary_stats(args: &[String]) -> i32 {
     0
 }
 
-/// Parse the `--dag FILE` argument for the read-only subcommands.
 /// Parsed `ascii` / `dot` arguments. `list`, `json`, and `yaml` fill only `dag`.
 #[derive(Debug, Default, PartialEq)]
 struct ViewArgs {
@@ -5736,10 +5735,11 @@ fn parse_view_args(rest: &[String]) -> Result<ViewArgs, String> {
             Some(v) => v,
             None => {
                 i += 1;
-                // `--labels --dag F` must not read `--dag` as a label (the `--dag` value itself
-                // keeps the long-standing take-next-argument behaviour of `parse_simple_dag`).
+                // `--labels --dag F` must not read `--dag` as a label, and, as argparse does in
+                // the Python edition, no option value may begin with `-`. The `--dag` value
+                // keeps the long-standing take-next-argument behaviour of `parse_simple_dag`.
                 rest.get(i)
-                    .filter(|v| flag == "--dag" || !v.starts_with("--"))
+                    .filter(|v| flag == "--dag" || !v.starts_with('-'))
                     .cloned()
                     .ok_or_else(|| format!("the argument {flag} requires a value"))?
             }
@@ -5768,6 +5768,7 @@ fn parse_view_args(rest: &[String]) -> Result<ViewArgs, String> {
     Ok(a)
 }
 
+/// Parse the `--dag FILE` argument for the read-only subcommands.
 fn parse_simple_dag(rest: &[String]) -> Result<Option<String>, String> {
     let mut dag: Option<String> = None;
     let mut i = 0;

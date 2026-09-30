@@ -193,6 +193,10 @@ fn bad_view_flags_are_refused_with_exit_2() {
             "dagrun dot: error: the argument --labels requires a value\n",
         ),
         (
+            &["dot", "--labels", "-x", "--group-by", "group"],
+            "dagrun dot: error: the argument --labels requires a value\n",
+        ),
+        (
             &["list", "--group-by", "group"],
             "dagrun list: error: unrecognized argument: --group-by\n",
         ),

@@ -209,6 +209,7 @@ def test_bad_view_flags_exit_2() -> None:
         "dagrun ascii: error: --labels requires at least one label\n",
     )
     assert _view(["dot", "--group-by", "job"])[0] == 2
+    assert _view(["dot", "--labels", "-x", "--group-by", "group"])[0] == 2
     assert _view(["list", "--group-by", "group"])[0] == 2
 
 
