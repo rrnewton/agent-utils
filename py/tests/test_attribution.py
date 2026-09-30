@@ -13,11 +13,18 @@ from dagrun.attribution import (
     ProcessObservation,
     RunEvidence,
     StepStream,
+    _process_signature,
     bind_process_tests,
     log_max_bytes,
     recognize,
     require_step_end_ok,
 )
+
+
+def test_runnable_cpu_consumer_stays_cpu_burning_under_host_contention() -> None:
+    assert _process_signature("R", 1.81, 0.83) == "cpu-burning"
+    assert _process_signature("S", 1.81, 0.83) == "mixed-or-too-young"
+    assert _process_signature("S", 1.81, 0.01) == "wall-stalled"
 
 
 def test_recognizes_shared_harness_boundaries() -> None:

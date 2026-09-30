@@ -437,6 +437,17 @@ def _exact_libtest_from_argv(argv: list[str]) -> str | None:
     )
 
 
+def _process_signature(state: str, wall_elapsed_s: float, cpu_elapsed_s: float) -> str:
+    ratio = cpu_elapsed_s / wall_elapsed_s if wall_elapsed_s > 0 else 0.0
+    # A runnable process is direct evidence of current CPU demand. Preserve that evidence under
+    # host contention, where an actual busy loop can receive less than half of elapsed wall time.
+    if cpu_elapsed_s >= 0.25 and (ratio >= 0.50 or state == "R"):
+        return "cpu-burning"
+    if wall_elapsed_s >= 0.50 and ratio <= 0.05:
+        return "wall-stalled"
+    return "mixed-or-too-young"
+
+
 def process_snapshot(root: int, nonce: str | None) -> tuple[ProcessObservation, ...]:
     """Snapshot root descendants plus exact-nonce escapees without guessing by process name."""
     if root <= 1:
@@ -490,13 +501,7 @@ def process_snapshot(root: int, nonce: str | None) -> tuple[ProcessObservation, 
             continue
         wall = max(0.0, boot_s - start / ticks)
         cpu = (utime + stime) / ticks
-        ratio = cpu / wall if wall > 0 else 0.0
-        if cpu >= 0.25 and ratio >= 0.50:
-            signature = "cpu-burning"
-        elif wall >= 0.50 and ratio <= 0.05:
-            signature = "wall-stalled"
-        else:
-            signature = "mixed-or-too-young"
+        signature = _process_signature(state, wall, cpu)
         test = _exact_libtest_from_argv(argv)
         command = " ".join(argv) if argv else f"[pid {pid}]"
         if len(command) > 512:

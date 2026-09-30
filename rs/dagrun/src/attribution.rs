@@ -734,6 +734,23 @@ fn exact_libtest_from_argv(argv: &[String]) -> Option<String> {
     None
 }
 
+fn process_signature(state: char, wall_elapsed_s: f64, cpu_elapsed_s: f64) -> &'static str {
+    let cpu_ratio = if wall_elapsed_s > 0.0 {
+        cpu_elapsed_s / wall_elapsed_s
+    } else {
+        0.0
+    };
+    // A runnable process is direct evidence of current CPU demand. Preserve that evidence under
+    // host contention, where an actual busy loop can receive less than half of elapsed wall time.
+    if cpu_elapsed_s >= 0.25 && (cpu_ratio >= 0.50 || state == 'R') {
+        "cpu-burning"
+    } else if wall_elapsed_s >= 0.50 && cpu_ratio <= 0.05 {
+        "wall-stalled"
+    } else {
+        "mixed-or-too-young"
+    }
+}
+
 /// Snapshot every process observably owned by a step, before sending it SIGTERM.
 ///
 /// Ownership is root-descendant reachability plus the runner-minted exact environment nonce. The
@@ -782,18 +799,7 @@ pub fn process_snapshot(root: u32, nonce: Option<&str>) -> Vec<ProcessObservatio
         .map(|row| {
             let wall_elapsed_s = (boot_s - row.start_ticks as f64 / ticks).max(0.0);
             let cpu_elapsed_s = (row.utime_ticks + row.stime_ticks) as f64 / ticks;
-            let cpu_ratio = if wall_elapsed_s > 0.0 {
-                cpu_elapsed_s / wall_elapsed_s
-            } else {
-                0.0
-            };
-            let signature = if cpu_elapsed_s >= 0.25 && cpu_ratio >= 0.50 {
-                "cpu-burning"
-            } else if wall_elapsed_s >= 0.50 && cpu_ratio <= 0.05 {
-                "wall-stalled"
-            } else {
-                "mixed-or-too-young"
-            };
+            let signature = process_signature(row.state, wall_elapsed_s, cpu_elapsed_s);
             let test = exact_libtest_from_argv(&row.argv);
             let mut command = if row.argv.is_empty() {
                 format!("[pid {}]", row.pid)
@@ -1241,6 +1247,13 @@ mod tests {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[test]
+    fn a_runnable_cpu_consumer_stays_cpu_burning_under_host_contention() {
+        assert_eq!(process_signature('R', 1.81, 0.83), "cpu-burning");
+        assert_eq!(process_signature('S', 1.81, 0.83), "mixed-or-too-young");
+        assert_eq!(process_signature('S', 1.81, 0.01), "wall-stalled");
+    }
 
     fn temp_evidence(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
