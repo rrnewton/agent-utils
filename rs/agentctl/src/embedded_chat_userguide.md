@@ -405,11 +405,12 @@ captured. That covers a block that is empty, holds terminal control characters,
 or exceeds 30,000 UTF-8 bytes once the agent label is added, a block beyond the
 request's reply limits, and a block that matches a stored reply only column by
 column. `chat run` logs such a block as
-`agentctl: chat reply capture: reply block ID (text HASH) was not sent: REASON`,
-where HASH is the first 12 hex digits of the SHA-256 of the block's text without
-whitespace or box-drawing characters. A process writes each distinct line once
-while it remembers it; it remembers the latest 4,096 distinct lines, and writes
-a forgotten one again. One capture pass logs at most 128 such lines, so on a
+`TIME agentctl: chat reply capture: reply block ID (text HASH) was not sent: REASON`,
+where TIME is the UTC time that begins every `chat run` log line and HASH is the
+first 12 hex digits of the SHA-256 of the block's text without whitespace or
+box-drawing characters. A process writes each distinct line once while it
+remembers it; it remembers the latest 4,096 distinct lines, and writes a
+forgotten one again. One capture pass logs at most 128 such lines, so on a
 screen with more refused blocks than that, the rest are not logged while they
 stay visible. The agent is not told. Nothing the agent prints stops the bridge:
 a snapshot larger than 2 MiB is read from its newest complete lines, with one
@@ -516,6 +517,30 @@ Size task and memory limits for the selected provider implementation; those
 costs are outside the provider-neutral host and can differ substantially between
 plugins. Disable swap for a latency-sensitive bridge only after giving the
 provider enough physical-memory headroom.
+
+`chat run` logs to standard error, and every line it writes begins with the UTC
+time, to the second, at which it was written, so a service manager that appends
+standard error to a plain file still records when each event happened. That
+includes its final error line and every line of `graceful-stop-main`. Two kinds
+of output have no time: an error in the command-line arguments, which is printed
+before the command is known, and a panic message. Other commands, `chat tick`
+among them, print their lines without a time. Each log line is written in one
+piece, and a line that cannot be written, for example because the disk is full,
+is dropped; the service keeps running. The provider worker logs one line each
+time a provider subscription opens, such as
+`2026-09-30T01:00:36Z agentctl: chat provider: subscribed from the saved cursor`,
+and one line each time a subscription ends or fails, naming the reason and the
+wait before the next attempt, such as
+`agentctl: chat provider: stream ended; reconnecting in 1s` after the time. An
+attempt runs from the start of connecting until its subscription ends or fails.
+The provider reconnect wait starts at 1 second and doubles after each attempt
+that lasted less than 60 seconds, up to 60 seconds. An attempt that lasted at
+least 60 seconds counts as healthy, so the wait after it starts again at 1
+second. A failed Herdr output subscription is logged the same way, with
+`retrying in` and its wait. If the provider worker itself ends or panics while
+the service is not stopping, `chat run` exits with an error, such as `chat
+provider worker stopped unexpectedly`, so the service manager restarts it
+instead of the bridge running on without chat events.
 
 Derive the hard stop interval from the selected plugin manifest rather than
 copying a universal number. Before Hello completes, the host may need

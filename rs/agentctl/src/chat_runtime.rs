@@ -8590,6 +8590,11 @@ fn history_program(executable: io::Result<PathBuf>) -> String {
     named.unwrap_or_else(|| "agentctl".to_owned())
 }
 
+/// The current UTC time as `YYYY-MM-DDTHH:MM:SSZ`, the prefix of every service log line.
+pub(crate) fn log_timestamp() -> String {
+    utc_timestamp(unix_millis())
+}
+
 /// `YYYY-MM-DDTHH:MM:SSZ` for a Unix time in milliseconds.
 fn utc_timestamp(millis: u64) -> String {
     let seconds = millis / 1_000;

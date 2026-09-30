@@ -71,8 +71,10 @@ existing thread prints this command, with absolute paths.
 Each reply block the agent writes for an open request is posted once for each
 distinct text, compared as the userguide describes, whichever of that request's
 reply IDs it uses. A block that cannot be posted, such as an empty or oversized
-one, is skipped with one log line that begins `agentctl: chat reply capture:`;
-nothing the agent prints stops `run`. `agentctl chat userguide` documents
+one, is skipped with one log line that begins with the UTC time and then
+`agentctl: chat reply capture:`; nothing the agent prints stops `run`. Every
+`run` log line begins with the time, and the provider logs each subscription it
+opens and each reconnect it waits for. `agentctl chat userguide` documents
 plugin safety, the outbound NDJSON contract, exact local commit receipts, reply
 capture, explicit route closure and bounded retirement, fail-closed provider
 gaps, recovery, and service-manager limits. A status with `healthy: false` and

@@ -742,6 +742,7 @@ pub(crate) fn main_with_environment<I: IntoIterator<Item = OsString>>(
                 return code;
             }
         };
+    let service_log = args.writes_service_log();
     match run(args, environment) {
         Ok(code) => code,
         Err(Failure::Agent(error)) => {
@@ -749,30 +750,52 @@ pub(crate) fn main_with_environment<I: IntoIterator<Item = OsString>>(
                 if let Err(output) = write_json(
                     &json!({"outcome": error.outcome().map(QueueOutcome::as_str), "message_id": message.message_id, "artifact": message.artifact, "error": error.to_string(), "safe_to_retry": error.safe_to_retry()}),
                 ) {
-                    eprintln!("agentctl: {output}");
+                    print_failure(service_log, format_args!("{output}"));
                     return 1;
                 }
             } else {
-                eprintln!("agentctl: {error}");
+                print_failure(service_log, format_args!("{error}"));
             }
             error.exit_code()
         }
         Err(Failure::Usage(error)) => {
-            eprintln!("agentctl: {error}");
+            print_failure(service_log, format_args!("{error}"));
             2
         }
         Err(Failure::Output(error)) => {
-            eprintln!("agentctl: cannot write output: {error}");
+            print_failure(service_log, format_args!("cannot write output: {error}"));
             1
         }
         Err(Failure::Chat(error)) => {
-            eprintln!("agentctl: {error}");
+            print_failure(service_log, format_args!("{error}"));
             1
         }
         Err(Failure::Inbox(error)) => {
-            eprintln!("agentctl: {error}");
+            print_failure(service_log, format_args!("{error}"));
             error.exit_code()
         }
+    }
+}
+
+impl Cli {
+    /// Whether standard error is the chat bridge service log: `chat run` and its stop helper.
+    fn writes_service_log(&self) -> bool {
+        matches!(
+            &self.command,
+            Some(Commands::Chat(Chat {
+                command: ChatCommand::Run(_) | ChatCommand::GracefulStopMain(_),
+            }))
+        )
+    }
+}
+
+/// Print the final error line. In the service log it starts with the UTC time, like every other
+/// service log line, so the log shows when the service stopped as well as why.
+fn print_failure(service_log: bool, message: std::fmt::Arguments<'_>) {
+    if service_log {
+        crate::chat_service::service_log(format_args!("agentctl: {message}"));
+    } else {
+        eprintln!("agentctl: {message}");
     }
 }
 
@@ -1653,6 +1676,43 @@ mod tests {
                 })
             }))
         ));
+    }
+
+    #[test]
+    fn only_the_chat_service_and_its_stop_helper_timestamp_their_final_error() {
+        let writes_service_log = |arguments: &[&str]| {
+            Cli::try_parse_from(std::iter::once("agentctl").chain(arguments.iter().copied()))
+                .expect("parse")
+                .writes_service_log()
+        };
+        assert!(writes_service_log(&[
+            "chat",
+            "run",
+            "--bridge-state",
+            "/tmp/s"
+        ]));
+        assert!(writes_service_log(&[
+            "chat",
+            "graceful-stop-main",
+            "--main-pid",
+            "123",
+            "--main-pidfd-id",
+            "456",
+        ]));
+        assert!(!writes_service_log(&[
+            "chat",
+            "tick",
+            "--bridge-state",
+            "/tmp/s"
+        ]));
+        assert!(!writes_service_log(&[
+            "chat",
+            "status",
+            "--bridge-state",
+            "/tmp/s"
+        ]));
+        assert!(!writes_service_log(&["list"]));
+        assert!(!writes_service_log(&[]));
     }
 
     #[test]

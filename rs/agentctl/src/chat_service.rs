@@ -41,13 +41,16 @@ const MAX_LOGGED_NOTES: usize = 4_096;
 const MAX_KEYS_PER_PASS: usize = 4;
 const MAX_SENDS_PER_PASS: usize = 64;
 const PROVIDER_NOTICE_CAPACITY: usize = 64;
-const MAX_PROVIDER_NOTICES_PER_PASS: usize = 64;
+// One more than the notice channel holds, so a pass always reaches a closed channel.
+const MAX_PROVIDER_NOTICES_PER_PASS: usize = PROVIDER_NOTICE_CAPACITY + 1;
 const MAX_DIRECT_REQUEST_KEYS: usize = 2_048;
 const ACK_QUEUE_CAPACITY: usize = 64;
 const ACK_RETRY_DELAY: Duration = Duration::from_secs(60);
 const MAX_IMMEDIATE_BACKLOG_CHUNKS: usize = 64;
 const EVENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTPUT_RETRY_MAX: Duration = Duration::from_secs(60);
+const PROVIDER_RETRY_MIN: Duration = Duration::from_secs(1);
+const PROVIDER_RETRY_MAX: Duration = Duration::from_secs(60);
 // Already reported reply IDs one recovery-scan log line names before it counts the rest.
 const ALREADY_REPORTED_LOG_IDS: usize = 8;
 // Two seconds are reserved by the process supervisor for forced pidfd reap; the remaining five
@@ -395,10 +398,10 @@ pub fn graceful_stop_main(main_pid: u32, main_pidfd_id: u64) -> Result<(), ChatS
         }
         if !deadline_reported && Instant::now() >= diagnostic_deadline {
             deadline_reported = true;
-            eprintln!(
+            service_log(format_args!(
                 "agentctl: graceful MAINPID {main_pid} did not exit within {}s; waiting for systemd's same-window control-group kill",
                 SYSTEMD_GRACEFUL_STOP_DIAGNOSTIC_DEADLINE.as_secs()
-            );
+            ));
         }
     }
 }
@@ -526,6 +529,7 @@ pub fn run_with_ignored_text_prefixes<A: ManagedApi + ?Sized>(
             transport,
             Arc::clone(&stop),
             Arc::clone(&output_wake),
+            |line| service_log(line),
         ) {
             Ok(worker) => Some(worker),
             Err(error) => {
@@ -612,7 +616,15 @@ pub fn run_with_ignored_text_prefixes<A: ManagedApi + ?Sized>(
             stop.record_cleanup_error(error.to_string());
         }
     }
-    let cleanup_errors = stop.take_cleanup_errors();
+    service_outcome(result, stop.take_cleanup_errors())
+}
+
+/// What `chat run` returns once shut down: the owner loop's result, with any cleanup errors the
+/// shutdown recorded appended to it.
+fn service_outcome(
+    result: Result<(), ChatServiceError>,
+    cleanup_errors: Vec<String>,
+) -> Result<Value, ChatServiceError> {
     match (result, cleanup_errors.is_empty()) {
         (Ok(()), true) => Ok(json!({"stopped": true})),
         (Err(error), true) => Err(error),
@@ -769,12 +781,15 @@ impl AckQueue {
     }
 }
 
+/// Start the ACK worker thread. It writes each failed acknowledgement as one line through `log`;
+/// production passes `service_log`.
 fn spawn_ack_worker(
     state: BridgeState,
     queue: Arc<AckQueue>,
     mut transport: impl chat_runtime::ReactionTransport + Send + 'static,
     stop: Arc<StopState>,
     output_wake: SharedWake,
+    log: impl Fn(fmt::Arguments<'_>) + Send + 'static,
 ) -> io::Result<ServiceWorker> {
     let (done_sender, done) = mpsc::sync_channel(1);
     let handle = thread::Builder::new()
@@ -788,7 +803,7 @@ fn spawn_ack_worker(
                             queue.finished(&key, result.is_err());
                             let mut report = CycleReport::default();
                             record_acknowledgement(&mut report, &key, result);
-                            log_report(&report);
+                            log_report(&report, &log);
                             wake_output(&output_wake);
                         }
                         AckWork::Reconcile => match state.pending_ack_keys() {
@@ -1047,10 +1062,10 @@ fn process_keys_with_delivery(
                 delivery_result
             }
             Some(Err(spawn_error)) => {
-                eprintln!(
+                control.log(format_args!(
                     "agentctl: chat acknowledgement worker could not start for {key}; \
                      running synchronously: {spawn_error}"
-                );
+                ));
                 let delivery_result =
                     chat_runtime::deliver_request_with(state, coordinator, key, delivery);
                 let transport = control
@@ -1150,7 +1165,7 @@ fn capture_recovery_snapshot<A: ManagedApi + ?Sized>(
     // Visible markers the coordinator already received are not reported twice. Log them, since
     // a marker that stays on screen is otherwise silent after its one report.
     if let Some(line) = already_reported_log_line(&capture.suppressed_ids) {
-        eprintln!("{line}");
+        control.log(line);
     }
     if !capture.unknown_ids.is_empty() {
         match deliver_feedback(state, manager, &capture.unknown_ids, delivery, control.stop) {
@@ -1290,6 +1305,23 @@ struct PassControl<'a> {
 impl PassControl<'_> {
     fn stopped(&self) -> bool {
         self.stop.is_some_and(StopState::is_stopped)
+    }
+
+    /// Write one diagnostic line to standard error. Only `chat run` passes its stop state, and
+    /// its standard error is the service log, so there the line starts with the time; `chat tick`
+    /// prints it without one.
+    fn log(&self, line: impl fmt::Display) {
+        self.log_to(&mut io::stderr().lock(), line);
+    }
+
+    /// Write one diagnostic line to `out`, as `log` describes.
+    fn log_to(&self, out: &mut impl io::Write, line: impl fmt::Display) {
+        if self.stop.is_some() {
+            write_service_log(out, line);
+        } else if let Err(error) = writeln!(out, "{line}") {
+            // `chat tick` keeps what the `eprintln!` it always used here does on a failed write.
+            panic!("failed printing to stderr: {error}");
+        }
     }
 }
 
@@ -1440,12 +1472,38 @@ fn matched_identifier(line: &str) -> Option<&str> {
         .or_else(|| body.strip_prefix("GCHAT_REPLY_"))
 }
 
+/// What the provider worker tells the owner loop. The worker logs its own connects, failures, and
+/// reconnect waits as they happen, so those lines keep their order and their times even while
+/// the owner loop is busy or this bounded channel is full.
 #[derive(Debug)]
 enum ProviderNotice {
     Batch(Vec<String>),
-    Error(String),
     Fatal(String),
-    End,
+}
+
+/// The wait before each provider reconnect. It doubles after each generation that ended sooner
+/// than `PROVIDER_RETRY_MAX`, up to that bound. A generation that lasted at least that long was
+/// healthy, so its end is a new incident and the wait starts again from `PROVIDER_RETRY_MIN`.
+struct ProviderBackoff {
+    next: Duration,
+}
+
+impl ProviderBackoff {
+    fn new() -> Self {
+        Self {
+            next: PROVIDER_RETRY_MIN,
+        }
+    }
+
+    /// The wait before reconnecting after a generation that lasted `lasted`.
+    fn wait_after(&mut self, lasted: Duration) -> Duration {
+        if lasted >= PROVIDER_RETRY_MAX {
+            self.next = PROVIDER_RETRY_MIN;
+        }
+        let wait = self.next;
+        self.next = (self.next * 2).min(PROVIDER_RETRY_MAX);
+        wait
+    }
 }
 
 #[derive(Debug)]
@@ -1891,68 +1949,142 @@ fn spawn_provider(
     notices: mpsc::SyncSender<ProviderNotice>,
     selected_process_timeouts: ProcessPhaseTimeouts,
 ) -> Result<ServiceWorker, ChatServiceError> {
+    spawn_provider_worker(
+        stop,
+        notices,
+        output_wake,
+        move |stop, notices, output_wake| {
+            let log = |line: fmt::Arguments<'_>| service_log(line);
+            run_provider_worker(
+                || {
+                    provider_generation(
+                        &state,
+                        stop,
+                        &cancellation,
+                        notices,
+                        output_wake,
+                        &overflowed,
+                        selected_process_timeouts,
+                        &log,
+                    )
+                },
+                Instant::now,
+                &log,
+                |delay| stop.wait(delay),
+                stop,
+                notices,
+                output_wake,
+            );
+        },
+    )
+    .map_err(ChatServiceError::Io)
+}
+
+/// Start the provider worker thread. It runs `body` and then ends as `end_provider_worker`
+/// describes, whether `body` returned or panicked.
+fn spawn_provider_worker(
+    stop: Arc<StopState>,
+    notices: mpsc::SyncSender<ProviderNotice>,
+    output_wake: SharedWake,
+    body: impl FnOnce(&StopState, &mpsc::SyncSender<ProviderNotice>, &SharedWake) + Send + 'static,
+) -> io::Result<ServiceWorker> {
     let (done_sender, done) = mpsc::sync_channel(1);
     let handle = thread::Builder::new()
         .name("agentctl-chat-provider".to_owned())
         .spawn(move || {
-            let mut delay = Duration::from_secs(1);
-            while !stop.is_stopped() {
-                match provider_generation(
-                    &state,
-                    &stop,
-                    &cancellation,
-                    &notices,
-                    &output_wake,
-                    &overflowed,
-                    selected_process_timeouts,
-                ) {
-                    Ok(()) if stop.is_stopped() => break,
-                    Ok(()) => {
-                        send_notice(&notices, ProviderNotice::End, &output_wake, &overflowed);
-                    }
-                    Err(ProviderGenerationError::Cancelled) if stop.is_stopped() => break,
-                    Err(ProviderGenerationError::Cancelled) => {
-                        stop.record_cleanup_error(
-                            "provider reported cancellation without an owner stop",
-                        );
-                        break;
-                    }
-                    Err(ProviderGenerationError::Cleanup(error)) => {
-                        stop.record_cleanup_error(format!(
-                            "provider shutdown cleanup failed: {error}"
-                        ));
-                        break;
-                    }
-                    Err(error) if stop.is_stopped() => {
-                        stop.record_cleanup_error(format!(
-                            "provider failed before cancellation was observed: {error:?}"
-                        ));
-                        break;
-                    }
-                    Err(ProviderGenerationError::Retryable(error)) => send_notice(
-                        &notices,
-                        ProviderNotice::Error(error),
-                        &output_wake,
-                        &overflowed,
-                    ),
-                    Err(ProviderGenerationError::Fatal(error)) => {
-                        let _ = notices.send(ProviderNotice::Fatal(error));
-                        wake_output(&output_wake);
-                        break;
-                    }
-                }
-                if stop.is_stopped() {
-                    break;
-                }
-                stop.wait(delay);
-                delay = (delay * 2).min(Duration::from_secs(60));
-            }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                body(&stop, &notices, &output_wake);
+            }));
+            end_provider_worker(result, notices, &stop, &output_wake);
             let _ = done_sender.send(());
-        })
-        .map_err(ChatServiceError::Io)?;
+        })?;
     Ok(ServiceWorker { handle, done })
 }
 
+/// Run provider generations until the service stops or a generation ends the worker. After a
+/// generation that may be retried, log why it ended and how long the worker waits, then wait.
+/// `generation` runs one generation, `now` reads the clock, `log` writes one service log line,
+/// and `wait` sleeps for the given time or until the service stops; production passes
+/// `provider_generation`, `Instant::now`, `service_log` and `StopState::wait`, and a test can
+/// script each of them.
+fn run_provider_worker(
+    mut generation: impl FnMut() -> Result<(), ProviderGenerationError>,
+    now: impl Fn() -> Instant,
+    log: &dyn Fn(fmt::Arguments<'_>),
+    wait: impl Fn(Duration),
+    stop: &StopState,
+    notices: &mpsc::SyncSender<ProviderNotice>,
+    output_wake: &SharedWake,
+) {
+    let mut backoff = ProviderBackoff::new();
+    while !stop.is_stopped() {
+        let started = now();
+        let ended = match generation() {
+            Ok(()) if stop.is_stopped() => break,
+            Ok(()) => "stream ended".to_owned(),
+            Err(ProviderGenerationError::Cancelled) if stop.is_stopped() => break,
+            Err(ProviderGenerationError::Cancelled) => {
+                stop.record_cleanup_error("provider reported cancellation without an owner stop");
+                break;
+            }
+            Err(ProviderGenerationError::Cleanup(error)) => {
+                stop.record_cleanup_error(format!("provider shutdown cleanup failed: {error}"));
+                break;
+            }
+            Err(error) if stop.is_stopped() => {
+                stop.record_cleanup_error(format!(
+                    "provider failed before cancellation was observed: {error:?}"
+                ));
+                break;
+            }
+            Err(ProviderGenerationError::Retryable(error)) => error,
+            Err(ProviderGenerationError::Fatal(error)) => {
+                let _ = notices.send(ProviderNotice::Fatal(error));
+                wake_output(output_wake);
+                break;
+            }
+        };
+        if stop.is_stopped() {
+            break;
+        }
+        let delay = backoff.wait_after(now().saturating_duration_since(started));
+        log(format_args!(
+            "agentctl: chat provider: {ended}; reconnecting in {}s",
+            delay.as_secs()
+        ));
+        wait(delay);
+    }
+}
+
+/// Close the provider worker's notice channel and wake the owner loop, which reads the closed
+/// channel as the end of the worker: unless the service is stopping, it stops with an error
+/// instead of running on without chat events. A panic also stops the service, as the ACK
+/// worker's does, and then unwinds on so that joining the worker reports it.
+fn end_provider_worker(
+    result: thread::Result<()>,
+    notices: mpsc::SyncSender<ProviderNotice>,
+    stop: &StopState,
+    output_wake: &SharedWake,
+) {
+    let panic = result.err();
+    if panic.is_some() {
+        // Record the panic and stop before closing the channel, so an owner loop that finds the
+        // channel closed also finds the service stopping, and `chat run` does not also report
+        // that the worker stopped unexpectedly. Its error can still start with that of a Herdr
+        // call the stop cancelled, when the owner loop was woken just before making one
+        // (https://github.com/rrnewton/agent-utils/issues/186).
+        stop.record_cleanup_error("chat provider worker panicked; no chat events arrive after it");
+        stop.stop();
+    }
+    // Close the channel before waking the owner loop, so the loop finds it closed.
+    drop(notices);
+    wake_output(output_wake);
+    if let Some(panic) = panic {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn provider_generation(
     state: &BridgeState,
     stop: &StopState,
@@ -1961,6 +2093,7 @@ fn provider_generation(
     output_wake: &SharedWake,
     overflowed: &AtomicBool,
     selected_process_timeouts: ProcessPhaseTimeouts,
+    log: &dyn Fn(fmt::Arguments<'_>),
 ) -> Result<(), ProviderGenerationError> {
     let inventory = crate::plugins::discover();
     let command = chat_runtime::select_plugin(&inventory, state.config())
@@ -1980,6 +2113,7 @@ fn provider_generation(
                 .connect(timeouts)
                 .map_err(|error| ProviderGenerationError::Retryable(error.to_string()))
         },
+        log,
     )
 }
 
@@ -1993,6 +2127,7 @@ fn run_provider_generation<B, C>(
     overflowed: &AtomicBool,
     timeouts: ProcessPhaseTimeouts,
     connect: impl FnOnce() -> Result<(B, C), ProviderGenerationError>,
+    log: &dyn Fn(fmt::Arguments<'_>),
 ) -> Result<(), ProviderGenerationError>
 where
     B: ChatSubscriptionBackend,
@@ -2059,6 +2194,14 @@ where
     let mut subscription = ChatSubscription::open(&mut backend, &request).map_err(|error| {
         classify_provider_start_failure(stop, cancellation, registration.identity(), error)
     })?;
+    log(format_args!(
+        "agentctl: chat provider: subscribed {}",
+        if request.resume_from().is_some() {
+            "from the saved cursor"
+        } else {
+            "without a saved cursor"
+        }
+    ));
     loop {
         if stop.is_stopped() {
             cancel_provider(cancellation)
@@ -2335,25 +2478,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     let mut output_retry_delay = Duration::from_secs(1);
     let mut next_reconciliation = Instant::now() + options.reconciliation_interval;
     while !stop.is_stopped() {
-        for _ in 0..MAX_PROVIDER_NOTICES_PER_PASS {
-            let Ok(notice) = notices.try_recv() else {
-                break;
-            };
-            match notice {
-                ProviderNotice::Batch(keys) => {
-                    enqueue_direct_keys(&mut direct_keys, keys, overflowed)
-                }
-                ProviderNotice::Error(error) => eprintln!("agentctl: chat provider: {error}"),
-                ProviderNotice::Fatal(error) => {
-                    return Err(ChatServiceError::Generation(format!(
-                        "chat provider stopped on an unrecoverable stream gap: {error}"
-                    )));
-                }
-                ProviderNotice::End => {
-                    eprintln!("agentctl: chat provider stream ended; reconnecting")
-                }
-            }
-        }
+        take_provider_notices(notices, stop, &mut direct_keys, overflowed)?;
         if direct_keys.is_empty() && overflowed.swap(false, Ordering::SeqCst) {
             let report = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
             enqueue_report_backlog(&mut direct_keys, &report, overflowed);
@@ -2432,7 +2557,10 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                     output_retry_delay = Duration::from_secs(1);
                 }
                 Err(error) => {
-                    eprintln!("agentctl: chat output subscription: {error}");
+                    service_log(format_args!(
+                        "agentctl: chat output subscription: {error}; retrying in {}s",
+                        output_retry_delay.as_secs()
+                    ));
                     output_retry_at = Instant::now() + output_retry_delay;
                     output_retry_delay = (output_retry_delay * 2).min(OUTPUT_RETRY_MAX);
                 }
@@ -2542,7 +2670,10 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                     }
                 }
                 Err(error) => {
-                    eprintln!("agentctl: chat output subscription: {error}");
+                    service_log(format_args!(
+                        "agentctl: chat output subscription: {error}; retrying in {}s",
+                        output_retry_delay.as_secs()
+                    ));
                     stream = None;
                     *output_wake
                         .lock()
@@ -2566,15 +2697,11 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                     ProviderNotice::Batch(keys) => {
                         enqueue_direct_keys(&mut direct_keys, keys, overflowed)
                     }
-                    ProviderNotice::Error(error) => {
-                        eprintln!("agentctl: chat provider: {error}")
-                    }
                     ProviderNotice::Fatal(error) => {
                         return Err(ChatServiceError::Generation(format!(
                             "chat provider stopped on an unrecoverable stream gap: {error}"
                         )));
                     }
-                    ProviderNotice::End => {}
                 },
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) if stop.is_stopped() => break,
@@ -2617,6 +2744,41 @@ impl DirectKeyQueue {
         }
         result
     }
+}
+
+/// Move up to `MAX_PROVIDER_NOTICES_PER_PASS` waiting provider notices into `direct_keys`. A closed
+/// channel means the provider worker has ended. Unless the service is stopping, that is an error:
+/// no chat event would arrive again, while the bridge still looked healthy. The channel holds at
+/// most `PROVIDER_NOTICE_CAPACITY` notices, one fewer than a pass reads, so a pass that starts
+/// after the worker has closed it always finds it closed, even when the worker's last wake-up
+/// came before the pass and no other one follows.
+fn take_provider_notices(
+    notices: &mpsc::Receiver<ProviderNotice>,
+    stop: &StopState,
+    direct_keys: &mut DirectKeyQueue,
+    overflowed: &AtomicBool,
+) -> Result<(), ChatServiceError> {
+    for _ in 0..MAX_PROVIDER_NOTICES_PER_PASS {
+        let notice = match notices.try_recv() {
+            Ok(notice) => notice,
+            Err(mpsc::TryRecvError::Empty) => break,
+            Err(mpsc::TryRecvError::Disconnected) if stop.is_stopped() => break,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(ChatServiceError::Worker(
+                    "chat provider worker stopped unexpectedly".to_owned(),
+                ));
+            }
+        };
+        match notice {
+            ProviderNotice::Batch(keys) => enqueue_direct_keys(direct_keys, keys, overflowed),
+            ProviderNotice::Fatal(error) => {
+                return Err(ChatServiceError::Generation(format!(
+                    "chat provider stopped on an unrecoverable stream gap: {error}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn enqueue_direct_keys(queued: &mut DirectKeyQueue, keys: Vec<String>, overflowed: &AtomicBool) {
@@ -2723,10 +2885,29 @@ fn connect_output<A: ManagedApi + ?Sized>(
     .map_err(|error| ChatServiceError::Generation(error.to_string()))
 }
 
-fn log_report(report: &CycleReport) {
+/// Write one service log line to standard error, prefixed with the UTC time it is written. A
+/// service manager often appends standard error to a file that records no times of its own.
+pub(crate) fn service_log(line: impl fmt::Display) {
+    write_service_log(&mut io::stderr().lock(), line);
+}
+
+/// Write one service log line to `out`, which the caller has locked, so the time is read after
+/// the lock is taken and lines from several threads carry times in the order they are written.
+/// The line goes out in one write call, so lines from two processes appending to one file do not
+/// interleave unless a write is cut short, as on a full disk; on a pipe, only a line of at most
+/// 4,096 bytes is kept whole. A failed write is ignored: `eprintln!` panics instead, and a panic
+/// in any thread that writes these lines stops `chat run`, so a full disk or a closed log would
+/// stop chat along with its log.
+fn write_service_log(out: &mut impl io::Write, line: impl fmt::Display) {
+    let line = format!("{} {line}\n", chat_runtime::log_timestamp());
+    let _ = out.write_all(line.as_bytes());
+}
+
+/// Write each of a report's errors as one line through `log`.
+fn log_report(report: &CycleReport, log: &dyn Fn(fmt::Arguments<'_>)) {
     if report.has_errors() {
         for error in &report.errors {
-            eprintln!("agentctl: chat operation: {error}");
+            log(format_args!("agentctl: chat operation: {error}"));
         }
     }
 }
@@ -2742,10 +2923,10 @@ struct NoteLog {
 impl NoteLog {
     /// Log a report's errors, and each of its notes that this process has not logged yet.
     fn log(&mut self, report: &CycleReport) {
-        log_report(report);
+        log_report(report, &|line| service_log(line));
         for note in &report.notes {
             if self.first_time(note) {
-                eprintln!("agentctl: chat reply capture: {note}");
+                service_log(format_args!("agentctl: chat reply capture: {note}"));
             }
         }
     }
@@ -2792,6 +2973,7 @@ fn already_reported_log_line(suppressed_ids: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::collections::BTreeMap;
     use std::fs;
     use std::io::{BufRead, BufReader, Write as _};
@@ -3284,6 +3466,7 @@ mod tests {
             },
             Arc::clone(&stop),
             Arc::new(Mutex::new(None)),
+            captured_service_log,
         )
         .expect("spawn ACK worker");
         queue.enqueue([key.clone()]);
@@ -3374,6 +3557,7 @@ mod tests {
             },
             Arc::clone(&stop),
             Arc::new(Mutex::new(None)),
+            captured_service_log,
         )
         .expect("spawn ACK worker");
         queue.enqueue([key.clone()]);
@@ -3424,6 +3608,7 @@ mod tests {
             },
             Arc::clone(&stop),
             Arc::new(Mutex::new(None)),
+            captured_service_log,
         )
         .expect("restart ACK worker");
         let retry = starts
@@ -3465,6 +3650,7 @@ mod tests {
             },
             Arc::clone(&stop),
             Arc::new(Mutex::new(None)),
+            captured_service_log,
         )
         .expect("spawn ACK worker");
         let mut observed = BTreeSet::new();
@@ -3645,7 +3831,7 @@ mod tests {
             *output_wake.lock().expect("output wake lock") = None;
             send_notice(
                 &notice_sender,
-                ProviderNotice::Error(phase.to_owned()),
+                ProviderNotice::Batch(vec![phase.to_owned()]),
                 &output_wake,
                 &overflowed,
             );
@@ -3670,7 +3856,7 @@ mod tests {
                 started.elapsed()
             );
             match notice_receiver.try_recv().expect("queued provider notice") {
-                ProviderNotice::Error(observed) => assert_eq!(observed, phase),
+                ProviderNotice::Batch(observed) => assert_eq!(observed, [phase]),
                 other => panic!("unexpected notice after {phase}: {other:?}"),
             }
             assert!(!overflowed.load(Ordering::SeqCst));
@@ -4378,6 +4564,524 @@ stale_2, stale_3, stale_4, stale_5, stale_6, stale_7, stale_8 and 2 more"
     }
 
     #[test]
+    fn provider_backoff_doubles_to_sixty_seconds_and_restarts_after_a_healthy_generation() {
+        let short = Duration::from_millis(10);
+        let mut backoff = ProviderBackoff::new();
+        let waits = (0..8)
+            .map(|_| backoff.wait_after(short))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            waits,
+            [1, 2, 4, 8, 16, 32, 60, 60].map(Duration::from_secs),
+            "generations that fail quickly back off to the longest wait and stay there"
+        );
+        assert_eq!(
+            backoff.wait_after(PROVIDER_RETRY_MAX),
+            PROVIDER_RETRY_MIN,
+            "a generation that lasted the longest wait ends a new incident"
+        );
+        assert_eq!(backoff.wait_after(short), Duration::from_secs(2));
+
+        let mut backoff = ProviderBackoff::new();
+        assert_eq!(backoff.wait_after(short), Duration::from_secs(1));
+        assert_eq!(
+            backoff.wait_after(PROVIDER_RETRY_MAX - Duration::from_millis(1)),
+            Duration::from_secs(2),
+            "a generation just shorter than the longest wait keeps backing off"
+        );
+        assert_eq!(
+            backoff.wait_after(Duration::from_secs(3_600)),
+            PROVIDER_RETRY_MIN
+        );
+    }
+
+    /// Records each write call separately, so a test can tell one write from several.
+    #[derive(Default)]
+    struct WriteCalls(Vec<Vec<u8>>);
+
+    impl io::Write for WriteCalls {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.push(bytes.to_vec());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Standard error on a full disk (ENOSPC) or a pipe whose reader has exited (EPIPE).
+    struct FailingWrites(i32);
+
+    impl io::Write for FailingWrites {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from_raw_os_error(self.0))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::from_raw_os_error(self.0))
+        }
+    }
+
+    /// A service log for tests. Libtest captures `eprintln!`, also from the threads a test starts,
+    /// so a line is shown only when its test fails.
+    fn captured_service_log(line: fmt::Arguments<'_>) {
+        eprintln!("{line}");
+    }
+
+    #[test]
+    fn service_log_writes_the_utc_second_and_the_line_in_one_write() {
+        let before = chat_runtime::log_timestamp();
+        let mut out = WriteCalls::default();
+        write_service_log(
+            &mut out,
+            format_args!(
+                "agentctl: chat provider: {}; reconnecting in {}s",
+                "stream ended", 1
+            ),
+        );
+        let after = chat_runtime::log_timestamp();
+        assert_eq!(out.0.len(), 1, "one line is one write: {:?}", out.0);
+        let line = String::from_utf8(out.0.remove(0)).expect("UTF-8 log line");
+        let (stamp, text) = line
+            .split_once(' ')
+            .expect("the time, a space, then the line");
+        assert_eq!(
+            text,
+            "agentctl: chat provider: stream ended; reconnecting in 1s\n"
+        );
+        let shape = "0000-00-00T00:00:00Z";
+        assert_eq!(stamp.len(), shape.len(), "{stamp}");
+        assert!(
+            stamp
+                .chars()
+                .zip(shape.chars())
+                .all(|(actual, form)| if form == '0' {
+                    actual.is_ascii_digit()
+                } else {
+                    actual == form
+                }),
+            "{stamp}"
+        );
+        assert!(
+            before.as_str() <= stamp && stamp <= after.as_str(),
+            "{before} <= {stamp} <= {after}"
+        );
+    }
+
+    #[test]
+    fn a_service_log_line_that_cannot_be_written_is_dropped_without_a_panic() {
+        for error in [libc::ENOSPC, libc::EPIPE] {
+            write_service_log(
+                &mut FailingWrites(error),
+                "agentctl: chat provider: subscribed from the saved cursor",
+            );
+        }
+    }
+
+    #[test]
+    fn a_chat_tick_pass_writes_its_diagnostic_line_without_a_time() {
+        let mut transport = None;
+        let control = PassControl {
+            transport: &mut transport,
+            stop: None,
+        };
+        let mut out = WriteCalls::default();
+        control.log_to(
+            &mut out,
+            "agentctl: chat reply fence feedback: already reported, so not repeated: stale_1",
+        );
+        assert_eq!(
+            String::from_utf8(out.0.concat()).expect("UTF-8 line"),
+            "agentctl: chat reply fence feedback: already reported, so not repeated: stale_1\n"
+        );
+    }
+
+    #[test]
+    fn a_chat_run_pass_writes_its_diagnostic_line_after_the_utc_second() {
+        let stop = StopState::default();
+        let mut transport = None;
+        let control = PassControl {
+            transport: &mut transport,
+            stop: Some(&stop),
+        };
+        let mut out = WriteCalls::default();
+        control.log_to(
+            &mut out,
+            "agentctl: chat reply fence feedback: already reported, so not repeated: stale_1",
+        );
+        assert_eq!(out.0.len(), 1, "one line is one write: {:?}", out.0);
+        let line = String::from_utf8(out.0.remove(0)).expect("UTF-8 log line");
+        let (stamp, text) = line
+            .split_once(' ')
+            .expect("the time, a space, then the line");
+        assert_eq!(
+            text,
+            "agentctl: chat reply fence feedback: already reported, so not repeated: stale_1\n"
+        );
+        let shape = "0000-00-00T00:00:00Z";
+        assert_eq!(stamp.len(), shape.len(), "{stamp}");
+        assert!(
+            stamp
+                .chars()
+                .zip(shape.chars())
+                .all(|(actual, form)| if form == '0' {
+                    actual.is_ascii_digit()
+                } else {
+                    actual == form
+                }),
+            "{stamp}"
+        );
+    }
+
+    #[test]
+    fn taking_notices_fails_once_the_provider_worker_ends_unless_the_service_is_stopping() {
+        let output_wake: SharedWake = Arc::new(Mutex::new(None));
+        let overflowed = AtomicBool::new(false);
+        let mut direct_keys = DirectKeyQueue::default();
+        let stop = StopState::default();
+        let (sender, receiver) = mpsc::sync_channel(PROVIDER_NOTICE_CAPACITY);
+        send_notice(
+            &sender,
+            ProviderNotice::Batch(vec!["key-1".to_owned()]),
+            &output_wake,
+            &overflowed,
+        );
+        take_provider_notices(&receiver, &stop, &mut direct_keys, &overflowed)
+            .expect("a running worker's notice");
+        assert_eq!(direct_keys.take(8), ["key-1"]);
+        take_provider_notices(&receiver, &stop, &mut direct_keys, &overflowed)
+            .expect("a running worker with nothing to say");
+
+        // A worker that ends without a stop, as after a provider cleanup failure, delivers what it
+        // sent first, and then the closed channel is an error, which the owner loop returns.
+        send_notice(
+            &sender,
+            ProviderNotice::Batch(vec!["key-2".to_owned()]),
+            &output_wake,
+            &overflowed,
+        );
+        end_provider_worker(Ok(()), sender, &stop, &output_wake);
+        assert!(!stop.is_stopped());
+        let error = take_provider_notices(&receiver, &stop, &mut direct_keys, &overflowed)
+            .expect_err("an ended provider worker");
+        assert_eq!(
+            error.to_string(),
+            "chat provider worker stopped unexpectedly"
+        );
+        assert_eq!(direct_keys.take(8), ["key-2"]);
+        assert!(!overflowed.load(Ordering::SeqCst));
+
+        // During a stop, the worker's end is the expected one.
+        let stop = StopState::default();
+        let (sender, receiver) = mpsc::sync_channel(PROVIDER_NOTICE_CAPACITY);
+        stop.stop();
+        end_provider_worker(Ok(()), sender, &stop, &output_wake);
+        take_provider_notices(&receiver, &stop, &mut direct_keys, &overflowed)
+            .expect("a stopping service");
+        assert!(direct_keys.is_empty());
+        assert!(stop.take_cleanup_errors().is_empty());
+    }
+
+    #[test]
+    fn one_pass_finds_an_ended_provider_worker_behind_a_full_notice_channel() {
+        // The worker's last wake-up can come before a pass that starts with the channel full, and
+        // then no other wake-up follows, so that one pass has to reach the closed channel. Before,
+        // a pass stopped after as many notices as the channel holds, and the owner loop slept
+        // until its next recovery scan before `chat run` ended.
+        let output_wake: SharedWake = Arc::new(Mutex::new(None));
+        let overflowed = AtomicBool::new(false);
+        let mut direct_keys = DirectKeyQueue::default();
+        let stop = StopState::default();
+        let (sender, receiver) = mpsc::sync_channel(PROVIDER_NOTICE_CAPACITY);
+        for _ in 0..PROVIDER_NOTICE_CAPACITY {
+            send_notice(
+                &sender,
+                ProviderNotice::Batch(Vec::new()),
+                &output_wake,
+                &overflowed,
+            );
+        }
+        assert!(
+            !overflowed.load(Ordering::SeqCst),
+            "the channel took every notice"
+        );
+        end_provider_worker(Ok(()), sender, &stop, &output_wake);
+        let error = take_provider_notices(&receiver, &stop, &mut direct_keys, &overflowed)
+            .expect_err("an ended provider worker behind a full channel");
+        assert_eq!(
+            error.to_string(),
+            "chat provider worker stopped unexpectedly"
+        );
+        assert!(direct_keys.is_empty());
+        assert!(!overflowed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_fatal_provider_notice_is_an_error_after_the_batches_sent_before_it() {
+        let output_wake: SharedWake = Arc::new(Mutex::new(None));
+        let overflowed = AtomicBool::new(false);
+        let mut direct_keys = DirectKeyQueue::default();
+        let stop = StopState::default();
+        let (sender, receiver) = mpsc::sync_channel(PROVIDER_NOTICE_CAPACITY);
+        send_notice(
+            &sender,
+            ProviderNotice::Batch(vec!["key-1".to_owned()]),
+            &output_wake,
+            &overflowed,
+        );
+        send_notice(
+            &sender,
+            ProviderNotice::Fatal("cursor 7 is older than the retained events".to_owned()),
+            &output_wake,
+            &overflowed,
+        );
+        let error = take_provider_notices(&receiver, &stop, &mut direct_keys, &overflowed)
+            .expect_err("a fatal notice");
+        assert_eq!(
+            error.to_string(),
+            "chat provider stopped on an unrecoverable stream gap: cursor 7 is older than the \
+retained events"
+        );
+        assert_eq!(direct_keys.take(8), ["key-1"]);
+        assert!(!stop.is_stopped());
+    }
+
+    #[test]
+    fn an_ended_provider_worker_wakes_a_wait_on_the_output_stream() {
+        let output_wake: SharedWake = Arc::new(Mutex::new(None));
+        let (connected, release, server, root) = connected_event_stream("^startup$");
+        let mut stream = None;
+        install_output_stream(&mut stream, &output_wake, connected).expect("install stream");
+        let active = stream.as_mut().expect("installed stream");
+        assert!(active
+            .wait(Duration::from_secs(30))
+            .expect("the install's own wake")
+            .is_empty());
+
+        let (sender, receiver) = mpsc::sync_channel::<ProviderNotice>(PROVIDER_NOTICE_CAPACITY);
+        let stop = StopState::default();
+        end_provider_worker(Ok(()), sender, &stop, &output_wake);
+        let started = Instant::now();
+        assert!(active
+            .wait(Duration::from_secs(30))
+            .expect("woken output wait")
+            .is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the output wait slept through the provider worker's end: {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+
+        drop(stream.take());
+        *output_wake.lock().expect("output wake lock") = None;
+        release.send(()).expect("release event fixture");
+        server.join().expect("join event fixture");
+        fs::remove_dir_all(root).expect("remove event fixture");
+    }
+
+    #[test]
+    fn a_provider_worker_panic_stops_the_service_and_still_unwinds() {
+        let output_wake: SharedWake = Arc::new(Mutex::new(None));
+        let stop = StopState::default();
+        let (sender, receiver) = mpsc::sync_channel::<ProviderNotice>(PROVIDER_NOTICE_CAPACITY);
+        let panicked = std::panic::catch_unwind(|| panic!("provider worker fixture panic"));
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            end_provider_worker(panicked, sender, &stop, &output_wake)
+        }));
+        assert!(
+            unwound.is_err(),
+            "joining the worker still reports the panic"
+        );
+        assert!(
+            stop.is_stopped(),
+            "the service stops rather than running without chat events"
+        );
+        assert_eq!(
+            stop.take_cleanup_errors(),
+            ["chat provider worker panicked; no chat events arrive after it"]
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn the_provider_worker_logs_each_reconnect_wait_and_backs_off_until_the_service_stops() {
+        let output_wake: SharedWake = Arc::new(Mutex::new(None));
+        let stop = Arc::new(StopState::default());
+        let (sender, receiver) = mpsc::sync_channel::<ProviderNotice>(PROVIDER_NOTICE_CAPACITY);
+        let (record, recorded) = mpsc::channel::<String>();
+        let failed = || -> Result<(), ProviderGenerationError> {
+            Err(ProviderGenerationError::Retryable("x".to_owned()))
+        };
+        let quick = Duration::from_millis(10);
+        // How long each generation lasts on the scripted clock, and how it ends.
+        let mut script = vec![(Duration::ZERO, failed()), (Duration::ZERO, Ok(()))];
+        script.extend((0..6).map(|_| (quick, failed())));
+        script.push((PROVIDER_RETRY_MAX, Ok(())));
+        script.push((quick, failed()));
+        let generations = script.len();
+        let worker = spawn_provider_worker(
+            Arc::clone(&stop),
+            sender,
+            Arc::clone(&output_wake),
+            move |stop, notices, output_wake| {
+                let clock = Cell::new(Instant::now());
+                let waited = Cell::new(0);
+                let mut script = VecDeque::from(script);
+                run_provider_worker(
+                    || {
+                        let (lasted, ended) = script.pop_front().expect("a scripted generation");
+                        clock.set(clock.get() + lasted);
+                        ended
+                    },
+                    || clock.get(),
+                    &|line| record.send(line.to_string()).expect("record a log line"),
+                    |delay| {
+                        record
+                            .send(format!("wait {delay:?}"))
+                            .expect("record a wait");
+                        waited.set(waited.get() + 1);
+                        if waited.get() == generations {
+                            // The owner stops the service during the last reconnect wait.
+                            stop.stop();
+                        }
+                    },
+                    stop,
+                    notices,
+                    output_wake,
+                );
+            },
+        )
+        .expect("spawn provider worker");
+        join_worker_until(
+            worker,
+            "chat provider",
+            Instant::now() + Duration::from_secs(30),
+        )
+        .expect("the worker ends once the service stops");
+        let expected = [
+            ("x", 1),
+            ("stream ended", 2),
+            ("x", 4),
+            ("x", 8),
+            ("x", 16),
+            ("x", 32),
+            ("x", 60),
+            ("x", 60),
+            // The generation that lasted the longest wait was healthy, so the wait starts again.
+            ("stream ended", 1),
+            ("x", 2),
+        ]
+        .into_iter()
+        .flat_map(|(ended, seconds)| {
+            [
+                format!("agentctl: chat provider: {ended}; reconnecting in {seconds}s"),
+                format!("wait {seconds}s"),
+            ]
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(recorded.try_iter().collect::<Vec<_>>(), expected);
+        assert!(stop.take_cleanup_errors().is_empty());
+        assert!(
+            matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Disconnected)),
+            "the ended worker closed its channel"
+        );
+    }
+
+    #[test]
+    fn a_panicking_provider_generation_stops_the_service_before_the_worker_channel_closes() {
+        let output_wake: SharedWake = Arc::new(Mutex::new(None));
+        let queue = Arc::new(AckQueue::default());
+        let stop = Arc::new(StopState {
+            ack_queue: Some(Arc::clone(&queue)),
+            ..StopState::default()
+        });
+        let (sender, receiver) = mpsc::sync_channel::<ProviderNotice>(PROVIDER_NOTICE_CAPACITY);
+        // `StopState::stop` takes the ACK queue's lock first, so holding that lock holds the worker
+        // inside its stop, after it recorded the panic. The test then sees what the owner loop
+        // would see at that moment.
+        let held = queue.state.lock().expect("ACK queue lock");
+        let worker = spawn_provider_worker(
+            Arc::clone(&stop),
+            sender,
+            Arc::clone(&output_wake),
+            |stop, notices, output_wake| {
+                run_provider_worker(
+                    || panic!("provider generation fixture panic"),
+                    Instant::now,
+                    &|line| panic!("a panicking generation logged: {line}"),
+                    |delay| panic!("a panicking generation waited {delay:?}"),
+                    stop,
+                    notices,
+                    output_wake,
+                )
+            },
+        )
+        .expect("spawn provider worker");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while stop
+            .cleanup_errors
+            .lock()
+            .expect("cleanup errors")
+            .is_empty()
+            && !worker.handle.is_finished()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the worker neither recorded its panic nor ended"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            *stop.cleanup_errors.lock().expect("cleanup errors"),
+            ["chat provider worker panicked; no chat events arrive after it"]
+        );
+        assert!(!stop.is_stopped(), "the worker is held inside its stop");
+        assert!(
+            matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "the worker closed its channel before it stopped the service"
+        );
+        drop(held);
+        let error = join_worker_until(
+            worker,
+            "chat provider",
+            Instant::now() + Duration::from_secs(30),
+        )
+        .expect_err("joining the worker reports the panic");
+        assert!(
+            stop.is_stopped(),
+            "the service stops rather than running without chat events"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        // The owner loop's check of the channel then finds the service stopping, so the closed
+        // channel is not a second error, and the joined panic is the last cleanup error.
+        let owner = take_provider_notices(
+            &receiver,
+            &stop,
+            &mut DirectKeyQueue::default(),
+            &AtomicBool::new(false),
+        );
+        stop.record_cleanup_error(error.to_string());
+        assert_eq!(
+            service_outcome(owner, stop.take_cleanup_errors())
+                .expect_err("a panicked worker fails the service")
+                .to_string(),
+            "chat shutdown cleanup is uncertain: chat provider worker panicked; no chat events \
+arrive after it; chat provider worker panicked"
+        );
+    }
+
+    #[test]
     fn closed_nonce_index_keeps_repeated_old_markers_stale() {
         let (state, _, root) = state_with_request();
         let key = "a".repeat(64);
@@ -4825,6 +5529,7 @@ stale_2, stale_3, stale_4, stale_5, stale_6, stale_7, stale_8 and 2 more"
                         process_cancellation,
                     ))
                 },
+                &|line| panic!("a generation whose Start was cancelled logged: {line}"),
             )
         });
 
@@ -4848,6 +5553,115 @@ stale_2, stale_3, stale_4, stale_5, stale_6, stale_7, stale_8 and 2 more"
         assert!(matches!(
             worker.join().expect("join provider generation"),
             Err(ProviderGenerationError::Cancelled)
+        ));
+        assert!(stop.take_cleanup_errors().is_empty());
+        assert!(!overflowed.load(Ordering::SeqCst));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// A provider backend whose stream opens and then ends at once.
+    struct EndingBackend;
+
+    /// The stream an `EndingBackend` opens.
+    struct EndingDriver;
+
+    fn unused_cancellation() -> GateCancellation {
+        GateCancellation {
+            gate: Arc::new((Mutex::new(false), Condvar::new())),
+        }
+    }
+
+    impl ChatSubscriptionDriver for EndingDriver {
+        fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+            Arc::new(unused_cancellation())
+        }
+
+        fn next_item(&mut self) -> std::result::Result<Option<SubscriptionItem>, BackendFailure> {
+            Ok(None)
+        }
+
+        fn acknowledge(
+            &mut self,
+            _delivery_id: &DeliveryId,
+        ) -> std::result::Result<(), BackendFailure> {
+            Ok(())
+        }
+    }
+
+    impl ChatSubscriptionBackend for EndingBackend {
+        fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+            Arc::new(unused_cancellation())
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities::new(
+                "ending-fixture",
+                ReplaySupport::Cursor,
+                true,
+                NonZeroU16::new(1).expect("one"),
+                vec![
+                    EventKind::MessageCreated,
+                    EventKind::Checkpoint,
+                    EventKind::Gap,
+                    EventKind::Heartbeat,
+                ],
+            )
+            .expect("capabilities")
+        }
+
+        fn subscribe(
+            &mut self,
+            _request: &SubscribeRequest,
+        ) -> std::result::Result<Box<dyn ChatSubscriptionDriver>, BackendFailure> {
+            Ok(Box::new(EndingDriver))
+        }
+    }
+
+    #[test]
+    fn provider_generation_logs_its_subscription_through_the_given_sink() {
+        let (state, _, root) = state_with_request();
+        assert!(
+            state
+                .subscribe_request()
+                .expect("subscription request")
+                .resume_from()
+                .is_some(),
+            "the fixture state has a saved cursor"
+        );
+        let timeouts = ProcessPhaseTimeouts::new(
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+        )
+        .expect("valid process fixture timeouts");
+        let stop = StopState::default();
+        let cancellation: SharedCancellation =
+            Arc::new(Mutex::new(ProviderCancellationRegistry::default()));
+        let output_wake: SharedWake = Arc::new(Mutex::new(None));
+        let overflowed = AtomicBool::new(false);
+        let (notices, receiver) = mpsc::sync_channel(PROVIDER_NOTICE_CAPACITY);
+        let lines = Mutex::new(Vec::new());
+        let ended = run_provider_generation(
+            &state,
+            &stop,
+            &cancellation,
+            &notices,
+            &output_wake,
+            &overflowed,
+            timeouts,
+            || Ok((EndingBackend, unused_cancellation())),
+            &|line| lines.lock().expect("log lines").push(line.to_string()),
+        );
+        assert!(matches!(ended, Ok(())), "{ended:?}");
+        assert_eq!(
+            *lines.lock().expect("log lines"),
+            ["agentctl: chat provider: subscribed from the saved cursor"]
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
         ));
         assert!(stop.take_cleanup_errors().is_empty());
         assert!(!overflowed.load(Ordering::SeqCst));

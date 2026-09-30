@@ -701,6 +701,58 @@ PINS: tuple[Pin, ...] = (
             ),
         ),
     ),
+    Pin(
+        "chat-provider-retry-min-seconds",
+        "the first wait before `chat run` reconnects its provider, in seconds",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_service.rs",
+                r"(?m)^const PROVIDER_RETRY_MIN: Duration = Duration::from_secs\((?P<value>[\d_]+)\);$",
+                "the Rust shortest wait",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"provider\s+reconnect\s+wait\s+starts\s+at\s+(?P<value>[A-Za-z\d,]+)\s+seconds?\b",
+                "the first wait the chat guide states",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"the\s+wait\s+after\s+it\s+starts\s+again\s+at\s+(?P<value>[A-Za-z\d,]+)\s+seconds?\b",
+                "the wait the chat guide states after a healthy attempt",
+            ),
+        ),
+    ),
+    Pin(
+        "chat-provider-retry-max-seconds",
+        "the longest wait before `chat run` reconnects its provider, and the attempt length that "
+        "counts as healthy, in seconds",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_service.rs",
+                r"(?m)^const PROVIDER_RETRY_MAX: Duration = Duration::from_secs\((?P<value>[\d_]+)\);$",
+                "the Rust longest wait",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"attempt\s+that\s+lasted\s+less\s+than\s+(?P<value>[A-Za-z\d,]+)\s+seconds",
+                "the attempt length below which the chat guide says the wait doubles",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"less\s+than\s+[A-Za-z\d,]+\s+seconds,\s+up\s+to\s+(?P<value>[A-Za-z\d,]+)\s+seconds",
+                "the longest wait the chat guide states",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"lasted\s+at\s+least\s+(?P<value>[A-Za-z\d,]+)\s+seconds\s+counts\s+as\s+healthy",
+                "the healthy attempt length the chat guide states",
+            ),
+        ),
+    ),
 )
 
 
