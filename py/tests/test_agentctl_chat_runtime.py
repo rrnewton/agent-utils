@@ -24,6 +24,7 @@ from agentctl.chat import Bridge, Config, _read, _write, submit_reply
 from agentctl.chat_input import InputStreamError
 from agentctl.chat_output import PaneAgentStatus, PaneOutputSnapshot, PaneOutputStream
 from agentctl.chat_runtime import _Completion, _Notice, _Runtime
+from agentctl.chat_storage import ArtifactClass, read_json
 from agentctl.client import AgentPaneInfo
 from agentctl.errors import AgentDeliveryError
 from agentctl.jsonx import as_mapping, as_sequence, get_str
@@ -2181,6 +2182,36 @@ def test_received_reply_follows_an_artifact_that_moves_during_lookup(
     submit_reply(rig.state, _key(), "Completed")
     assert rig.record() == record
     assert processed.exists()
+    assert _read(rig.state / "submissions" / f"{_key()}.json")["text"] == "Completed"
+
+
+def test_received_reply_retries_an_atomic_change_then_follows_a_phase_move(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig.bridge._ingest_result({"messages": [_message()]})
+    record = rig.record()
+    queue_id = str(record["queue_id"])
+    enqueue(str(rig.state / "queue"), rig.bridge._prompt(record), message_id=queue_id)
+    artifact = rig.state / "queue" / "inbox" / f"{queue_id}.json"
+    processed = rig.state / "queue" / "processed" / f"{queue_id}.json"
+    original = read_json
+    races = 0
+
+    def read(
+        path: Path, selected: ArtifactClass | None = None,
+    ) -> tuple[dict[str, object], int]:
+        nonlocal races
+        if path == artifact and races < 2:
+            races += 1
+            if races == 2:
+                artifact.rename(processed)
+            raise AgentDeliveryError(f"saved queue artifact changed while it was read: {path}")
+        return original(path, selected)
+
+    monkeypatch.setattr(chat_module, "read_json", read)
+    submit_reply(rig.state, _key(), "Completed")
+    assert races == 2 and processed.exists()
+    assert rig.record() == record
     assert _read(rig.state / "submissions" / f"{_key()}.json")["text"] == "Completed"
 
 

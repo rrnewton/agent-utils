@@ -236,7 +236,9 @@ def _read_chat_json(path: Path, artifact: ArtifactClass | None = None) -> tuple[
     try:
         return read_json(path, artifact)
     except AgentDeliveryError as exc:
-        if "must not be hard-linked:" not in str(exc):
+        detail = str(exc)
+        if ("must not be hard-linked:" not in detail
+                and "changed while it was read:" not in detail):
             raise
         state = _chat_write_state(path)
         parts = path.absolute().relative_to(state).parts
@@ -247,9 +249,10 @@ def _read_chat_json(path: Path, artifact: ArtifactClass | None = None) -> tuple[
                 or (len(parts) == 3 and parts[0] == "queue"
                     and parts[1] in ("inbox", "inflight", "processed", "failed"))):
             raise
-        # A live writer may be between final-link creation and slot unlink.
-        # Wait for its lock, recover only its fixed slot if it crashed, then
-        # repeat the strict bounded read while no writer can create a new link.
+        # A live writer may be between final-link creation and slot unlink, or
+        # may finish that cleanup while this descriptor is being read. Wait for
+        # its lock, recover only its fixed slot if it crashed, then repeat the
+        # strict bounded read while no writer can alter the destination.
         # An unrelated hardlink still fails; the ordinary read path is unchanged.
         with atomic_write_recovery(_chat_atomic_policy(state)):
             return read_json(path, artifact)
@@ -4446,7 +4449,8 @@ def _request_is_enqueued(state: Path, key: str, record: dict[str, object]) -> bo
         try:
             queued = _read(root / phase / f"{queue_id}.json")
         except AgentDeliveryError as exc:
-            if isinstance(exc.__cause__, FileNotFoundError):
+            if (isinstance(exc.__cause__, FileNotFoundError)
+                    or "changed while it was read:" in str(exc)):
                 continue
             raise
         if queued.get("id") != queue_id or not get_str(queued, "text", "queued request"):
