@@ -65,6 +65,15 @@ def _demo_path(tmp: str) -> str:
     return str(path)
 
 
+def _skip_if_parent_validation_is_unboxed(
+    inherited_runner_authority_env: Mapping[str, str],
+) -> None:
+    if inherited_runner_authority_env.get("DAGRUN_DELEGATED_UNBOXED") == "1":
+        pytest.skip(
+            "parent validation is explicitly unboxed; no kernel subtree exists to verify"
+        )
+
+
 def test_no_args_prints_help() -> None:
     rc, out, _ = _capture([])
     assert rc == 0
@@ -477,10 +486,7 @@ def test_delegated_nested_run_keeps_descendants_in_outer_owned_subtree(
     import os
     import time
 
-    if inherited_runner_authority_env.get("DAGRUN_DELEGATED_UNBOXED") == "1":
-        pytest.skip(
-            "parent validation is explicitly unboxed; no kernel subtree exists to verify"
-        )
+    _skip_if_parent_validation_is_unboxed(inherited_runner_authority_env)
 
     pid_marker = tmp_path / "descendant.pid"
     cgroup_marker = tmp_path / "descendant.cgroup"
@@ -620,6 +626,8 @@ def test_delegated_process_can_run_twice_in_process_after_aggregate_migration(
     tmp_path: Path,
     inherited_runner_authority_env: Mapping[str, str],
 ) -> None:
+    _skip_if_parent_validation_is_unboxed(inherited_runner_authority_env)
+
     coordinator_cgroups = tmp_path / "coordinator-cgroups"
     returned_cgroups = tmp_path / "returned-cgroups"
     inner = tmp_path / "inner.json"
@@ -2474,6 +2482,8 @@ def test_boxed_run_enforces_cpu_timeout(
     # genuinely cannot be established the default run exits 3 and we skip LOUDLY, never silently.
     import os
 
+    _skip_if_parent_validation_is_unboxed(inherited_runner_authority_env)
+
     dag = (
         '{"steps": [{"group": "cpu", "job": "burn", "desc": "burn CPU past budget",'
         ' "cmd": "while :; do :; done", "cpu_timeout": 1, "timeout": 30}]}'
@@ -2511,6 +2521,8 @@ def test_default_small_cpu_cap_is_enforced_and_allows_compliant_work(
     # reads its own cpu.max, so a pass/failure cannot be attributed to merely configuring the
     # model without applying the one-core quota in the kernel.
     import os
+
+    _skip_if_parent_validation_is_unboxed(inherited_runner_authority_env)
 
     command = (
         "python3 -c 'import pathlib,time; "
