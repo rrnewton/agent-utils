@@ -653,7 +653,10 @@ def test_stop_busy_runner_terminates_owned_harness_group(fake_runner_state: Path
         "import json, os, subprocess, sys, time\nfrom pathlib import Path\n"
         "if 'exec' in sys.argv: sys.stdin.read()\n"
         "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
-        "Path(sys.argv[0]+'.ready').write_text(json.dumps([os.getpid(),child.pid]))\n"
+        "ready=Path(sys.argv[0]+'.ready')\n"
+        "temporary=Path(sys.argv[0]+'.ready.tmp')\n"
+        "temporary.write_text(json.dumps([os.getpid(),child.pid]))\n"
+        "os.replace(temporary,ready)\n"
         "time.sleep(60)\n")
     executable.chmod(0o755)
     lib.enqueue_message(rec.name, "bounded owned-process test", model=None)
