@@ -531,7 +531,11 @@ the same user skips them. As with `remove`, descriptors of other users' processe
 neither check without privilege, and every process's mount table is read. The JSON report counts the
 scans after the fence in `fenced_process_scans`, their total time in `fenced_process_scan_seconds`,
 and the checks that `lsof` decided in `fenced_lsof_fallbacks`, with each reason in
-`fenced_lsof_fallback_reasons` and their total time in `fenced_lsof_fallback_seconds`.
+`fenced_lsof_fallback_reasons` and their total time in `fenced_lsof_fallback_seconds`. Like the
+checks `remove` makes after the fence, the scan and `lsof` read the fenced slot as it is when they
+run, so the fenced slot need not keep the device and inode it had before the fence. An image-backed
+slot does not keep them: its fence mounts the image again at the fenced path, and the new mount can
+have another device number (see "Disk-image slots" below).
 
 Each slot's work before its first deletion is limited to 60 seconds, counted from when the slot
 takes the registry lock, so that other clients waiting for the lock are not kept waiting past their

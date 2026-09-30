@@ -27257,7 +27257,8 @@ class _AgentRemoveBatchContext:
     decide.
 
     ``identities`` holds each target directory's device and inode from before
-    the shared scan.  ``censused`` names the targets whose identity was
+    the shared scan; only the checks before the fence compare them, since the
+    fence of an image-backed slot can change them.  ``censused`` names the targets whose identity was
     unchanged across the scan that produced ``census`` and about which lsof
     reported nothing; ``unobservable`` holds the lsof diagnostic for each
     target it did report on.  ``nested_git_evidence`` is filled by each
@@ -27374,6 +27375,14 @@ class _AgentRemoveBatchContext:
         mappings with the fenced tree by path and by device and inode, which
         is what lsof compares; see _agent_batch_fenced_use.  When that scan
         cannot decide, the ordinary lsof check of the fenced path decides.
+
+        Both read the fenced slot as it is when they run and use nothing
+        gathered before the fence, so the fenced directory is not required to
+        keep the device and inode ``identities`` recorded for it, and the
+        ordinary check after the fence does not require it either.  An
+        image-backed slot does not keep them: its fence unmounts the disk
+        image and mounts it again at the fenced path, and the new mount can
+        have another device number, for example another loop device.
         """
 
         if check_path == canonical_path:
@@ -27381,16 +27390,12 @@ class _AgentRemoveBatchContext:
                 f"an agent removal batch check after the path fence must name the "
                 f"fenced path, not the canonical slot path {canonical_path}"
             )
-        expected = self.identities.get(canonical_path)
-        if expected is None:
+        if canonical_path not in self.identities:
             raise StateError(
                 f"slot {canonical_path} is not a target of this agent removal batch"
             )
-        if _directory_identity(check_path) != expected:
-            raise Refusal(
-                f"fenced slot {check_path} is not the directory this batch set out "
-                f"to remove from {canonical_path}"
-            )
+        if _directory_identity(check_path) is None:
+            raise Refusal(f"fenced slot {check_path} is missing or is not a directory")
         started = time.monotonic()
         self.fenced_scan_count += 1
         try:

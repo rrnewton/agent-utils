@@ -40739,14 +40739,29 @@ def test_agent_batch_context_routes_checks_after_the_fence_to_the_fenced_scan(
         context.observe_fenced(
             fenced, None, canonical_path=tmp_path / "other", capture_generation=False
         )
+    # The fenced directory need not keep the identity recorded before the
+    # fence (an image-backed slot's fence mounts its image again, possibly on
+    # another device): the scan reads the fenced tree as it is.
     replaced = tmp_path / "worktrees" / ".slot02.fenced.1.replaced"
     fenced.rename(replaced)
     fenced.mkdir()
-    with pytest.raises(wrkslots.Refusal, match="is not the directory this batch set out to remove"):
+    assert wrkslots._directory_identity(fenced) != identity
+    verdicts[0] = None
+    context.observe_fenced(fenced, None, canonical_path=canonical, capture_generation=False)
+    assert scans == [(fenced, canonical)] * 3
+    assert context.fenced_lsof_fallbacks == ["test: cannot decide"]
+    # A fenced path that is missing, or is not a directory, is refused unscanned.
+    fenced.rmdir()
+    with pytest.raises(wrkslots.Refusal, match="is missing or is not a directory"):
         context.observe_fenced(
             fenced, None, canonical_path=canonical, capture_generation=False
         )
-    assert scans == [(fenced, canonical), (fenced, canonical)]
+    fenced.symlink_to(replaced)
+    with pytest.raises(wrkslots.Refusal, match="is missing or is not a directory"):
+        context.observe_fenced(
+            fenced, None, canonical_path=canonical, capture_generation=False
+        )
+    assert scans == [(fenced, canonical)] * 3
     assert ordinary == [fenced]
 
 
@@ -41012,6 +41027,52 @@ def test_agent_batch_fenced_scan_is_undecided_for_a_tree_that_spans_devices(
     assert spanning == wrkslots._UndecidedFencedUse(
         f"{fenced / 'cache'} is on another device than {fenced}"
     )
+
+
+def test_remove_agent_batch_removes_a_slot_whose_fence_changed_its_device_and_inode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The check after the fence does not require the identity from before it.
+
+    The fence of an image-backed slot unmounts the disk image and mounts it
+    again at the fenced path, and the new mount can have another device
+    number.  This test changes the fenced slot's identity the same way for a
+    plain slot, by replacing the fenced directory with a copy of itself right
+    after the fence, and expects the batch to remove it after scanning it, as
+    single-slot remove would.
+    """
+
+    project, _repository, slots = dead_agent_batch_project(tmp_path, count=2)
+    before: dict[str, tuple[int, int] | None] = {}
+    after: dict[str, tuple[int, int] | None] = {}
+    original = wrkslots._rename_slot_path
+
+    def rename_then_copy(config: wrkslots.Config, source: Path, destination: Path) -> None:
+        if source.name == "slot01" and ".slot01.fenced." in destination.name:
+            before["slot01"] = wrkslots._directory_identity(source)
+            original(config, source, destination)
+            copy = destination.with_name(destination.name + ".copy")
+            shutil.copytree(destination, copy, symlinks=True)
+            shutil.rmtree(destination)
+            copy.rename(destination)
+            after["slot01"] = wrkslots._directory_identity(destination)
+            return
+        original(config, source, destination)
+
+    monkeypatch.setattr(wrkslots, "_rename_slot_path", rename_then_copy)
+    returncode, payload, stderr = in_process_agent_batch(project, slots)
+
+    assert before["slot01"] is not None and after["slot01"] is not None
+    assert before["slot01"] != after["slot01"]
+    assert returncode == 0, (stderr, payload)
+    assert batch_slots(payload, "removed") == ["slot01", "slot02"]
+    assert batch_slots(payload, "refused") == []
+    assert payload["fenced_process_scans"] == 2
+    assert payload["recovery_required"] is False
+    assert active_slot_names(project) == []
+    assert fenced_slot_path(project, "slot01") is None
+    assert not checkout(project, "slot01").parent.exists()
+    assert registry_journals(project) == []
 
 
 def test_remove_agent_batch_falls_back_to_lsof_when_the_fenced_scan_cannot_decide(
