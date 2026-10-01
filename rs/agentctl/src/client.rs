@@ -26,7 +26,7 @@ const CONTROL_STDOUT_BYTES: usize = 8 * 1024 * 1024;
 const CONTROL_STDERR_BYTES: usize = 64 * 1024;
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CAPTURE_READ_BURST: usize = 256 * 1024;
-const PROC_STAT_BYTES: usize = 8 * 1024;
+pub(crate) const PROC_STAT_BYTES: usize = 8 * 1024;
 const BOOT_ID_BYTES: usize = 128;
 const SUPPORTED_PANE_SHELLS: [&str; 6] = ["bash", "zsh", "sh", "dash", "fish", "ksh"];
 const MAX_SHELL_TASKS: usize = 4096;
@@ -289,6 +289,17 @@ fn process_stat(pid: u64) -> Result<(u64, u64)> {
             AdapterError::unavailable(format!("process start time is invalid for pid {pid}"))
         })?;
     Ok((process_group_id, starttime_ticks))
+}
+
+/// The start time of the live process whose `/proc/<pid>/stat` holds `stat`, in clock ticks after
+/// boot: field 22 of that file, which with the pid names one process for as long as the system
+/// runs. `None` when `stat` is not a record of that pid, or the process has exited and is a zombie
+/// or a dead task.
+pub(crate) fn process_start_ticks(stat: &[u8], pid: u64) -> Option<u64> {
+    parse_process_stat(stat, pid)
+        .ok()
+        .filter(|stat| !matches!(stat.state, b'Z' | b'X' | b'x') && stat.starttime_ticks > 0)
+        .map(|stat| stat.starttime_ticks)
 }
 
 #[cfg(target_os = "linux")]
@@ -2830,6 +2841,22 @@ mod tests {
             value[closing + 2] = *state;
             assert!(parse_process_stat(&value, 4242).is_err());
         }
+    }
+
+    #[test]
+    fn process_start_ticks_names_only_a_live_process_with_that_pid() {
+        let live = b"4242 (a) (b) S 7 9 11 0 -1 4194304 1 2 3 4 13 14 15 16 20 0 1 0 22 0 0\n";
+        assert_eq!(process_start_ticks(live, 4242), Some(22));
+        assert_eq!(process_start_ticks(live, 4241), None);
+        assert_eq!(process_start_ticks(b"", 4242), None);
+        for state in b"ZXx" {
+            let mut exited = live.to_vec();
+            let closing = exited.iter().rposition(|byte| *byte == b')').unwrap();
+            exited[closing + 2] = *state;
+            assert_eq!(process_start_ticks(&exited, 4242), None);
+        }
+        let unstarted = b"4242 (a) S 7 9 11 0 -1 4194304 1 2 3 4 13 14 15 16 20 0 1 0 0 0 0";
+        assert_eq!(process_start_ticks(unstarted, 4242), None);
     }
 
     #[test]

@@ -7,6 +7,7 @@ pub mod agent;
 pub(crate) mod chat_events;
 pub mod chat_runtime;
 pub mod chat_service;
+pub(crate) mod claude_session;
 pub mod cli;
 pub mod client;
 pub mod codex_goal;

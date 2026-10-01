@@ -718,9 +718,12 @@ fn poll_timeout(deadline: Option<Instant>) -> io::Result<i32> {
             if now >= deadline {
                 return Ok(0);
             }
+            // Rounded up, so a poll that runs out has reached the deadline: a wait for events that
+            // sees none lasts its whole timeout, not up to a millisecond less.
             Ok(deadline
                 .saturating_duration_since(now)
-                .as_millis()
+                .as_nanos()
+                .div_ceil(1_000_000)
                 .clamp(1, i32::MAX as u128) as i32)
         }
     }
@@ -957,6 +960,52 @@ mod tests {
             .expect("join event waiter")
             .expect("wake event wait")
             .is_empty());
+        release.send(()).expect("release fixture connection");
+        server.join().expect("join event fixture");
+        fs::remove_dir_all(directory).expect("remove event fixture");
+    }
+
+    #[test]
+    fn a_wait_that_sees_no_event_lasts_its_whole_timeout() {
+        // A caller that waits until its next deadline finds the deadline reached when the wait
+        // returns with no event. poll(2) takes whole milliseconds, and 2.5 ms rounded down would
+        // end each of these waits half a millisecond early.
+        let (socket, directory) = temporary_socket();
+        let listener = UnixListener::bind(&socket).expect("bind event fixture");
+        let (release, released) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut connection, _) = listener.accept().expect("accept event client");
+            let mut request = String::new();
+            BufReader::new(connection.try_clone().expect("clone fixture socket"))
+                .read_line(&mut request)
+                .expect("read subscription request");
+            let request: Value = serde_json::from_str(&request).expect("decode request");
+            connection
+                .write_all(&wire(json!({
+                    "id": request["id"],
+                    "result": {"type": "subscription_started"},
+                })))
+                .expect("write acknowledgement");
+            released.recv().expect("release fixture connection");
+        });
+        let mut stream =
+            PaneEventStream::connect(&socket, "w1:p2", Vec::new(), 4_000, Duration::from_secs(2))
+                .expect("connect event stream");
+
+        let timeout = Duration::from_micros(2_500);
+        for _ in 0..20 {
+            let started = Instant::now();
+            assert!(stream
+                .wait(timeout)
+                .expect("wait out the timeout")
+                .is_empty());
+            let waited = started.elapsed();
+            assert!(
+                waited >= timeout,
+                "a wait that saw no event ended after {waited:?}, before its {timeout:?} timeout"
+            );
+        }
+
         release.send(()).expect("release fixture connection");
         server.join().expect("join event fixture");
         fs::remove_dir_all(directory).expect("remove event fixture");
