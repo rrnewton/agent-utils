@@ -160,6 +160,20 @@ Transitions become notices:
 | missing from Herdr's list for `--exit-samples` samples in a row (3 by default) | `exited` |
 | back in the list after `exited` | `working`, `idle` or `blocked`, by its state |
 
+An `exited` notice says when the worker was last listed and how many minutes before the notice
+that was, because the absence rule makes it arrive `--exit-samples` intervals late.
+
+**Parked workers.** `agentctl inbox park --to COORDINATOR --worker NAME` marks a worker parked:
+for example, one whose goal is paused on purpose. `--off` unparks it, and without `--worker` the
+command only prints the parked set. The set lives in `parked.json` in the inbox directory, and the
+watcher rereads it on every sample. For a parked worker:
+- idle periods are not announced and earn no still-idle reminders;
+- `blocked`, `exited` and `working` are still posted;
+- an idle notice still replaces a standing blocked or exited notice.
+
+An idle period that began while the worker was parked stays unannounced after it is unparked,
+until the worker works and goes idle again. An unreadable `parked.json` parks nobody.
+
 An unconfirmed one-sample idle leaves a standing notice in place, so a blocked notice is still
 withdrawn when the worker resumes. A sample in which Herdr lists no pane at all is treated as
 unknown, not as every worker leaving; this is judged on Herdr's whole list, so the last worker

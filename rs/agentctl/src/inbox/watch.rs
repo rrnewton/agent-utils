@@ -129,6 +129,28 @@ pub(crate) struct WorkerRecord {
     /// posted: its end needs no `working` notice.
     #[serde(default)]
     quiet: bool,
+    /// When the worker was last listed by Herdr (0 in records written before this was kept).
+    #[serde(default)]
+    last_seen_unix_ms: u64,
+}
+
+impl WorkerRecord {
+    /// Record a confirmed idle edge and say whether to post it. A parked worker's idle is not
+    /// posted, and its idle period is then treated like a quiet one, unless a blocked or exited
+    /// notice still stands for it: that notice must be replaced, not left standing.
+    fn idle_edge(&mut self, parked: bool) -> bool {
+        let standing = matches!(
+            self.announced,
+            Some(NoticeKind::Blocked | NoticeKind::Exited)
+        );
+        self.announced = Some(NoticeKind::Idle);
+        if parked && !standing {
+            self.quiet = true;
+            self.reminders = MAX_REMINDERS;
+            return false;
+        }
+        true
+    }
 }
 
 /// Everything the watcher remembers for one coordinator.
@@ -136,6 +158,10 @@ pub(crate) struct WorkerRecord {
 pub(crate) struct WatchState {
     schema: u32,
     workers: BTreeMap<String, WorkerRecord>,
+    /// Workers a coordinator marked parked (`agentctl inbox park`), loaded from `parked.json`
+    /// for each sample and not saved with the state.
+    #[serde(skip)]
+    parked: std::collections::BTreeSet<String>,
 }
 
 /// A notice the core decided to post; the caller supplies the text.
@@ -181,6 +207,7 @@ pub(crate) fn step(
         });
     };
     for observation in sample {
+        let parked = state.parked.contains(&observation.agent);
         let required = if observation.authoritative {
             1
         } else {
@@ -219,11 +246,13 @@ pub(crate) fn step(
                     missing: 0,
                     exited_unix_ms: None,
                     quiet: observed == WorkerState::Idle,
+                    last_seen_unix_ms: now,
                 },
             );
             continue;
         };
         record.missing = 0;
+        record.last_seen_unix_ms = now;
         record.pane.clone_from(&observation.pane);
         if let Some(path) = &observation.transcript {
             match &record.transcript {
@@ -263,8 +292,7 @@ pub(crate) fn step(
                 // An unconfirmed idle edge leaves any standing notice in place, so a later
                 // `working` still withdraws a blocked or exited notice.
                 WorkerState::Idle => {
-                    if record.idle_samples >= required {
-                        record.announced = Some(NoticeKind::Idle);
+                    if record.idle_samples >= required && record.idle_edge(parked) {
                         decide(&observation.agent, NoticeKind::Idle);
                     }
                 }
@@ -276,10 +304,12 @@ pub(crate) fn step(
         }
         record.idle_samples = record.idle_samples.saturating_add(1);
         if record.announced != Some(NoticeKind::Idle) {
-            if record.idle_samples >= required {
-                record.announced = Some(NoticeKind::Idle);
+            if record.idle_samples >= required && record.idle_edge(parked) {
                 decide(&observation.agent, NoticeKind::Idle);
             }
+            continue;
+        }
+        if parked {
             continue;
         }
         let wait = policy
@@ -689,6 +719,7 @@ fn notice_text(
     record: &mut WorkerRecord,
     sources: &Sources<'_>,
     exit_samples: u32,
+    now: u64,
 ) -> (String, Option<Cursor>) {
     let header = match decision.kind {
         NoticeKind::Idle => "finished its turn and is waiting for input".to_owned(),
@@ -700,7 +731,17 @@ fn notice_text(
             record.reminders
         ),
         NoticeKind::Exited => {
-            format!("has not been listed by Herdr for {exit_samples} samples in a row")
+            let mut text =
+                format!("has not been listed by Herdr for {exit_samples} samples in a row");
+            if record.last_seen_unix_ms > 0 {
+                text.push_str(&format!(
+                    "; last listed at {} {}, {} min before this notice",
+                    super::utc_date(record.last_seen_unix_ms),
+                    super::utc_clock(record.last_seen_unix_ms),
+                    now.saturating_sub(record.last_seen_unix_ms) / 60_000
+                ));
+            }
+            text
         }
         _ => String::new(),
     };
@@ -764,6 +805,7 @@ fn cycle(
     disambiguate(&mut observations, &previous);
     let mut next = previous.clone();
     next.schema = 1;
+    next.parked = read_parked(inbox);
     let decisions = step(&mut next, &observations, listed_anything, now, policy);
     // Start from the new state with every worker that has a pending notice rolled back.
     let mut committed = next.clone();
@@ -783,7 +825,7 @@ fn cycle(
     for decision in &decisions {
         let (text, cursor) = match (decision.kind, next.workers.get_mut(&decision.agent)) {
             (NoticeKind::Working, _) | (_, None) => (String::new(), None),
-            (_, Some(record)) => notice_text(decision, record, sources, policy.exit_samples),
+            (_, Some(record)) => notice_text(decision, record, sources, policy.exit_samples, now),
         };
         let result = inbox.post(
             &PostRequest {
@@ -827,6 +869,58 @@ fn cycle(
         "workers": observations.len(),
         "posted": posted,
     }))
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct Parked {
+    #[serde(default)]
+    schema: u32,
+    workers: std::collections::BTreeSet<String>,
+}
+
+/// Parked workers. An unreadable file reads as none parked: that only makes the watcher noisier.
+fn read_parked(inbox: &Inbox) -> std::collections::BTreeSet<String> {
+    fs::read(inbox.root.join("parked.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Parked>(&bytes).ok())
+        .map(|parked| parked.workers)
+        .unwrap_or_default()
+}
+
+/// `agentctl inbox park` arguments.
+#[derive(Args)]
+pub(crate) struct ParkArgs {
+    #[command(flatten)]
+    target: Target,
+    /// Worker to park or unpark; repeatable. Without any, only prints the parked set
+    #[arg(long = "worker", value_name = "NAME")]
+    workers: Vec<String>,
+    /// Unpark the named workers instead of parking them
+    #[arg(long)]
+    off: bool,
+}
+
+/// Run `agentctl inbox park`: change the parked set and print it as JSON.
+pub(crate) fn run_park(registry: &Path, args: ParkArgs) -> Result<i32> {
+    for worker in &args.workers {
+        check_name("--worker", worker)?;
+    }
+    let inbox = Inbox::open(registry, &args.target.coordinator)?;
+    let _guard = inbox.lock(".lock", true)?;
+    let mut parked = Parked {
+        schema: 1,
+        workers: read_parked(&inbox),
+    };
+    for worker in args.workers {
+        if args.off {
+            parked.workers.remove(&worker);
+        } else {
+            parked.workers.insert(worker);
+        }
+    }
+    inbox.write_json(".", "parked.json", &parked)?;
+    print_json(&parked.workers)?;
+    Ok(0)
 }
 
 /// Run `agentctl inbox watch`.
@@ -1004,6 +1098,162 @@ mod tests {
             POLICY,
         );
         assert_eq!(kinds(&back), [("a", NoticeKind::Working)]);
+    }
+
+    fn parked(state: &mut WatchState, agent: &str) {
+        state.parked.insert(agent.to_owned());
+    }
+
+    #[test]
+    fn a_parked_worker_gets_no_idle_or_reminder_notices() {
+        let _serial = shared();
+        let mut state = WatchState::default();
+        parked(&mut state, "kvm");
+        let mut decided = Vec::new();
+        let states = [
+            WorkerState::Working,
+            WorkerState::Idle,
+            WorkerState::Idle,
+            WorkerState::Working,
+            WorkerState::Idle,
+        ];
+        for (index, observed) in states.into_iter().enumerate() {
+            let now = 10_000 * index as u64;
+            decided.extend(step_listed(
+                &mut state,
+                &[seen("kvm", observed, true)],
+                now,
+                POLICY,
+            ));
+        }
+        for now in (60_000..200_000).step_by(1_000) {
+            decided.extend(step_listed(
+                &mut state,
+                &[seen("kvm", WorkerState::Idle, true)],
+                now,
+                POLICY,
+            ));
+        }
+        assert!(decided.is_empty(), "{decided:?}");
+    }
+
+    #[test]
+    fn a_parked_worker_still_reports_blocked_exited_and_replaces_a_standing_notice() {
+        use WorkerState::{Blocked, Idle, Working};
+        let _serial = shared();
+        let mut state = WatchState::default();
+        parked(&mut state, "kvm");
+        let kinds_seen = run_states(&mut state, "kvm", true, &[Working, Blocked, Idle, Working]);
+        assert_eq!(
+            kinds_seen,
+            [NoticeKind::Blocked, NoticeKind::Idle, NoticeKind::Working],
+            "the idle replaces the standing blocked notice and the resume withdraws it"
+        );
+        let mut decided = Vec::new();
+        for now in [100, 110, 120] {
+            decided.extend(step(&mut state, &[], true, now, POLICY));
+        }
+        assert_eq!(kinds(&decided), [("kvm", NoticeKind::Exited)]);
+    }
+
+    #[test]
+    fn unparking_restores_notices_from_the_next_idle_period() {
+        use WorkerState::{Idle, Working};
+        let _serial = shared();
+        let mut state = WatchState::default();
+        parked(&mut state, "kvm");
+        assert!(run_states(&mut state, "kvm", true, &[Working, Idle]).is_empty());
+        state.parked.clear();
+        let after = run_states(&mut state, "kvm", true, &[Idle, Working, Idle]);
+        assert_eq!(
+            after,
+            [NoticeKind::Idle],
+            "the parked idle period stays quiet; the next one is announced"
+        );
+    }
+
+    #[test]
+    fn an_exit_notice_says_when_the_worker_was_last_listed() {
+        let _serial = exclusive();
+        let directory = scratch();
+        let herdr = directory.join("herdr");
+        executable(&herdr, "exit 1");
+        let sources = Sources {
+            herdr: &herdr,
+            claude: &herdr,
+            projects: &directory,
+            proc_root: &directory,
+            timeout: Duration::from_secs(5),
+        };
+        let mut state = WatchState::default();
+        step_listed(
+            &mut state,
+            &[seen("a", WorkerState::Working, true)],
+            1_790_712_924_000,
+            POLICY,
+        );
+        let mut record = state.workers["a"].clone();
+        let decision = Decision {
+            agent: "a".into(),
+            kind: NoticeKind::Exited,
+        };
+        let (text, _) = notice_text(
+            &decision,
+            &mut record,
+            &sources,
+            3,
+            1_790_712_924_000 + 21 * 60_000,
+        );
+        assert!(
+            text.contains("last listed at 2026-09-29 20:15:24Z, 21 min before this notice"),
+            "{text}"
+        );
+        record.last_seen_unix_ms = 0;
+        let (old, _) = notice_text(&decision, &mut record, &sources, 3, 5);
+        assert!(
+            !old.contains("last listed"),
+            "a record without the time says nothing about it"
+        );
+    }
+
+    #[test]
+    fn the_park_command_edits_the_parked_set_that_cycles_read() {
+        let _serial = shared();
+        let directory = scratch();
+        let registry = directory.join("registry");
+        let park = |workers: &[&str], off: bool| {
+            run_park(
+                &registry,
+                ParkArgs {
+                    target: Target {
+                        coordinator: "coord".into(),
+                    },
+                    workers: workers.iter().map(|worker| (*worker).to_owned()).collect(),
+                    off,
+                },
+            )
+            .unwrap()
+        };
+        park(&["kvm", "lander"], false);
+        park(&["lander"], true);
+        let inbox = Inbox::open(&registry, "coord").unwrap();
+        assert_eq!(read_parked(&inbox).into_iter().collect::<Vec<_>>(), ["kvm"]);
+        fs::write(inbox.root.join("parked.json"), b"{broken").unwrap();
+        assert!(
+            read_parked(&inbox).is_empty(),
+            "an unreadable file parks nobody"
+        );
+        let bad = run_park(
+            &registry,
+            ParkArgs {
+                target: Target {
+                    coordinator: "coord".into(),
+                },
+                workers: vec!["Bad Name".into()],
+                off: false,
+            },
+        );
+        assert_eq!(bad.unwrap_err().exit_code(), 2);
     }
 
     #[test]

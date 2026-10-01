@@ -258,6 +258,11 @@ enum InboxCommand {
         after_help = "Examples:\n  agentctl inbox watch --to coord --once\n  agentctl inbox watch --to coord --interval 30 --exclude chat-bridge\n\nEach sample lists Herdr panes and asks `claude agents --json` for the busy or idle state of\nevery Claude session, joined to its pane through HERDR_PANE_ID in /proc/<pid>/environ. Claude's\nstate is used for Claude panes; other panes use Herdr's state and must look idle for\n--idle-samples samples in a row. Workers seen for the first time are recorded without a notice\nunless blocked. An idle notice carries the last assistant message written to the worker's Claude\ntranscript since its previous notice, with that byte range as its cursor, or else the tail of the\nterminal. State lives in <registry>/.inbox/<coordinator>/watch.json; one watcher runs per\ncoordinator (a second exits 75). Each sample prints one JSON line of what it posted. The watcher\nonly posts: deliver batches with `agentctl inbox deliver`."
     )]
     Watch(watch::WatchArgs),
+    /// Mark workers parked so the watcher posts no idle or still-idle notices for them
+    #[command(
+        after_help = "Examples:\n  agentctl inbox park --to coord --worker kvm\n  agentctl inbox park --to coord --worker kvm --off\n  agentctl inbox park --to coord\n\nA parked worker still gets blocked, exited and working notices, and an idle notice that\nreplaces a standing blocked or exited one. Its other idle periods are not announced and earn\nno reminders, including after it is unparked, until it works and goes idle again. The parked set\nlives in <registry>/.inbox/<coordinator>/parked.json; the command prints it as JSON."
+    )]
+    Park(watch::ParkArgs),
 }
 
 #[derive(Args)]
@@ -480,6 +485,7 @@ pub(crate) fn run(
             Ok(0)
         }
         InboxCommand::Watch(value) => watch::run(registry, herdr, value),
+        InboxCommand::Park(value) => watch::run_park(registry, value),
         InboxCommand::Release(release) => {
             let inbox = Inbox::open(registry, &release.target.coordinator)?;
             let outcome = inbox.release(&release.batch, release.requeue)?;
