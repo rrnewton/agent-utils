@@ -831,9 +831,9 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
 
     assert ordinary.isdisjoint(mapped)
     assert ordinary | mapped == all_tests
-    assert len(all_tests) == 1483
+    assert len(all_tests) == 1547
     assert len(ordinary) == 285
-    assert len(mapped) == 1198
+    assert len(mapped) == 1262
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

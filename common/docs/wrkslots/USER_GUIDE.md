@@ -839,13 +839,83 @@ rule would refuse every new slot for that agent. An unverifiable verdict (exit `
 failure), a live or indeterminate owner generation, a row with no usable owner, or a caller outside
 the initial PID namespace still refuses. The command then performs the same full-host process,
 cgroup, mount, and user-systemd census used for absent validation rows. It does not claim the
-vanished working tree was clean. Every
-recorded checkout commit is pushed individually to a dedicated rescue ref and read back from the
-remote before the exact stale Git worktree registration is removed. Because that push is the only
-preservation, the plan and the apply both refuse unless every checkout's remote is listed in
-`salvage_push_remotes`. The archive is durable before
+vanished working tree was clean. Each recorded checkout commit must be preserved on that checkout's
+own remote before its exact stale Git worktree registration is removed, in one of two ways:
+
+- When the remote's URL is listed in `salvage_push_remotes`, the commit is pushed individually to a
+  dedicated rescue ref and read back from the remote.
+- Otherwise recovery publishes nothing. It accepts the checkout only when a ref already on that
+  remote contains the recorded commit. Branches (`refs/heads/*`), rescue refs (`refs/rescue/*`), and
+  tags (`refs/tags/*`) are searched first; only when none of them contains the commit are the
+  remote's other refs, such as a hosting service's `refs/pull/*` or a user's `refs/archive/*`,
+  fetched and searched, because a hosting service can advertise one or two refs per review. Any
+  ref name Git accepts qualifies, including one of only two components such as `refs/stash` and one
+  whose bytes are not UTF-8: names reach Git as their exact bytes, and output shows unprintable
+  characters escaped. The remote's refs are read fresh and fetched only into a temporary
+  repository, under numbered names in `refs/wrkslots-fetched/`; no ref in the local repository,
+  including `refs/remotes/*`, is read or
+  changed, although fetched objects are stored in its object store. The plan prints the chosen ref
+  as `remote_containment=[...]`, with the object the remote advertised for it (for an annotated tag,
+  the tag object). The apply records it in its journal and checks again, with
+  `git merge-base --is-ancestor` against a freshly fetched copy, immediately before removing each
+  checkout's registration and again before changing ACTIVE. Recovery neither created nor protects
+  that ref, so the archive says that the commit stays preserved only while the ref contains it.
+  Ancestry is read from the commit objects, never from a commit-graph file. A shallow remote is
+  refused: it can advertise a branch without holding that branch's older history, so its refs cannot
+  show that it holds the recorded commit. Each fetch asks for complete history, so the remote is
+  always asked, and reports whether it is shallow, even when every object is already local. Give
+  such a remote complete history, for example with `git fetch --unshallow` there, then rerun.
+  Listing the remote's refs is stopped and refused after 120 seconds, and each fetch after 300
+  seconds. Each fetch names the recorded commit, and every advertised tip already held locally, as
+  history the local repository has, so it does not download the recorded commit's history again. A
+  branch whose history reaches local commits only through commits the local repository lacks can
+  still download objects the local repository already holds.
+
+  Because such a fetch stops at history the local repository already holds, every check that finds
+  the chosen ref containing the commit is confirmed by fetching that ref alone, commits only
+  (`--filter=tree:0` when the remote supports filtering; otherwise its full history), into a
+  temporary repository whose object store starts empty. The commit must then be an ancestor of the
+  ref using only what the remote sent; a remote whose own grafts or replacement refs hide part of
+  the ref's history, or that lacks it, is refused. Push the commit to a branch on that remote, then
+  rerun.
+
+A checkout whose remote is not listed and that no such ref contains is refused by both the plan and
+the apply. A resumed recovery whose recorded ref no longer contains
+the commit is also refused, and it keeps the ACTIVE row, the journal, and the remaining
+registrations. The archive is durable before
 ACTIVE is changed and explicitly records that uncommitted, untracked, ignored, and HANDOFF contents
 could not be inspected because storage was already absent.
+
+Removing a linked worktree's registration deletes what Git keeps only for that worktree, under
+`<common>/worktrees/<id>/`, and both a rescue ref and an existing remote ref preserve only the
+recorded commit's history. On both paths, the plan, the apply, a resume, and the step immediately
+before removal therefore each refuse while that directory holds any of the following:
+
+- An index that stages content, or holds an unmerged conflict, that the recorded commit does not
+  contain. Commit and publish that content, or reset the index to the recorded commit if it is not
+  wanted, then rerun. Staged path names are read as the bytes Git stores, and the refusal shows
+  unprintable bytes escaped.
+- A per-worktree ref (`refs/worktree/*`, `refs/bisect/*`, or `refs/rewritten/*`) naming anything
+  outside the recorded commit's history. Publish its commit and delete the ref, or delete the ref if
+  it is not wanted, then rerun. A ref name that is not UTF-8 is shown escaped.
+- A resolve-undo entry in that index whose content never appeared at the same path in the recorded
+  commit's history. Resolving a conflict keeps the conflicting versions in the index, through later
+  commits, and only that index keeps them. Path names are compared as the bytes Git stores, so a
+  name that is not UTF-8 or that holds a carriage return is checked exactly; each history command
+  is stopped and refused after 300 seconds. Publish that content, or reset the index to the recorded
+  commit if it is not wanted (`GIT_INDEX_FILE=<common>/worktrees/<id>/index git read-tree <commit>`),
+  then rerun.
+- An unfinished merge, cherry-pick, revert, rebase, or bisect (`MERGE_HEAD`, `CHERRY_PICK_HEAD`,
+  `REVERT_HEAD`, `BISECT_LOG`, `rebase-apply`, `rebase-merge`, or `sequencer`). Finish or abandon it,
+  then rerun.
+
+Reflogs, `ORIG_HEAD`, and `FETCH_HEAD` record past positions rather than unfinished work, and they
+are deleted unchecked, as by every `git worktree remove`. Every remote check for a checkout runs
+first. The final checks and the removal then run while recovery holds that worktree's `index.lock`,
+so no Git command can stage or commit there in between. An `index.lock` that already exists belongs
+to a Git command recovery cannot see, running or stopped, and refuses until it is gone. A resumed
+recovery that finds the recorded commit pruned from the local repository fetches it back from the
+remote ref that preserves it before making these checks.
 
 To plan or recover many such rows, name each exact row as `SLOT=GENERATION=SHA256`, with the
 generation and `record_sha256` from the same audit:
