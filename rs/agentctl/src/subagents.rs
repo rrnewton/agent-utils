@@ -4209,6 +4209,20 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         agent::message_state(&self.queue(agent_name)?, message_id)
     }
 
+    /// Remove one prompt from the agent's inbox before any drain types it: see
+    /// [`agent::withdraw`]. `false` means no prompt under this identifier waits there.
+    pub(crate) fn withdraw_with_runtime(
+        &self,
+        agent_name: &str,
+        message_id: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> Result<bool> {
+        let _lock = self.lock_with_runtime(agent_name, runtime)?;
+        let record = self.load(agent_name)?;
+        record.supported()?;
+        agent::withdraw(&self.queue(agent_name)?, message_id, runtime)
+    }
+
     fn send_record(
         &self,
         record: &AgentRecord,
@@ -6018,6 +6032,9 @@ pub(crate) mod tests {
                     screens: Mutex::new(std::collections::VecDeque::new()),
                     screen: Mutex::new(None),
                     unwrapped_empty: AtomicBool::new(false),
+                    pane_status: Mutex::new("idle".to_owned()),
+                    on_run: Mutex::new(None),
+                    on_read: Mutex::new(None),
                 },
                 root,
             }
@@ -6112,13 +6129,18 @@ pub(crate) mod tests {
             let _ = fs::remove_dir_all(&self.root);
         }
     }
+    /// A test's hook on each text the fake writes to a pane.
+    type RunHook = Box<dyn FnMut(&str) + Send>;
+    /// A test's hook on the source of each read of a pane.
+    type ReadHook = Box<dyn FnMut(&str) + Send>;
     pub(crate) struct Fake {
         root: PathBuf,
         panes: Mutex<Vec<Pane>>,
         named_pane: Mutex<String>,
         moves: Mutex<Vec<(String, String, String)>>,
         panes_calls: AtomicU64,
-        pane_info_calls: AtomicU64,
+        /// How many times the fake was asked for one pane's details.
+        pub(crate) pane_info_calls: AtomicU64,
         /// Every text written to a pane with `run`, such as a prompt, in order, and a line for
         /// each agent state reported to herdr.
         pub(crate) runs: Mutex<Vec<String>>,
@@ -6126,7 +6148,8 @@ pub(crate) mod tests {
         environments: Mutex<Vec<Vec<String>>>,
         closed: Mutex<Vec<String>>,
         focused: Mutex<Vec<String>>,
-        fail_panes: AtomicBool,
+        /// Whether every query of the panes, or of one pane's details, fails.
+        pub(crate) fail_panes: AtomicBool,
         add_sibling_on_read: AtomicBool,
         require_start_lock: AtomicBool,
         started: AtomicBool,
@@ -6171,6 +6194,13 @@ pub(crate) mod tests {
         /// Whether a `recent-unwrapped` read returns no text, as herdr's does for a pane it
         /// cannot serve that source for.
         pub(crate) unwrapped_empty: AtomicBool,
+        /// The status herdr reports for every pane: `idle` unless a test sets another.
+        pub(crate) pane_status: Mutex<String>,
+        /// Called with each text written to a pane with `run`, once it is in `runs`.
+        pub(crate) on_run: Mutex<Option<RunHook>>,
+        /// Called with the source of each read, once it is in `read_sources`, before the read
+        /// returns.
+        pub(crate) on_read: Mutex<Option<ReadHook>>,
     }
     impl Fake {
         fn pane(id: &str) -> Pane {
@@ -6280,7 +6310,7 @@ pub(crate) mod tests {
                     .started
                     .load(Ordering::Relaxed)
                     .then(|| kind.to_owned()),
-                status: "idle".to_owned(),
+                status: self.pane_status.lock().unwrap().clone(),
                 session_agent: report_session.then(|| kind.to_owned()),
                 session_value: report_session.then(|| {
                     if changed_after_save {
@@ -6307,6 +6337,9 @@ pub(crate) mod tests {
         }
         fn run(&self, _: &str, text: &str) -> AdapterResult<()> {
             self.runs.lock().unwrap().push(text.to_owned());
+            if let Some(hook) = self.on_run.lock().unwrap().as_mut() {
+                hook(text);
+            }
             Ok(())
         }
         fn wait_agent_status(&self, _: &str, _: &str, _: u64) -> AdapterResult<()> {
@@ -6317,6 +6350,9 @@ pub(crate) mod tests {
         }
         fn read(&self, _: &str, source: &str, _: Option<usize>) -> AdapterResult<String> {
             self.read_sources.lock().unwrap().push(source.to_owned());
+            if let Some(hook) = self.on_read.lock().unwrap().as_mut() {
+                hook(source);
+            }
             if self.fail_read.load(Ordering::Relaxed) {
                 return Err(AdapterError::unavailable("capture failed"));
             }

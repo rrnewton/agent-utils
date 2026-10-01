@@ -660,7 +660,9 @@ stay visible. The agent is not told. Nothing the agent prints stops the bridge:
 a snapshot larger than 2 MiB is read from its newest complete lines, with one
 log line, and a snapshot with more than 4,096 reply blocks is read from its
 newest 4,096, with one log line from a recovery scan. Only state, file system,
-and provider faults are errors.
+and provider faults are errors. A reply reminder check, described below, is the
+exception: it logs a fault of its own, such as an unreadable reminder record,
+and goes on without reminding.
 
 A reply marker in the pane whose ID is not available, such as a typo or a stale
 block left in scrollback by another bridge state, produces one routing-error
@@ -839,6 +841,85 @@ ledger is explicitly reset. A valid receipt starts its 60-second retention
 window; retrying an expired completed reservation must pass the current budget
 again. A full ledger holds new sends until completed entries expire. This can
 conservatively hold replies after a failed attempt.
+
+A Claude Code agent sometimes writes its reply only in its thinking. The bridge
+reads only the agent's ordinary text output, so it never sees such a reply, and
+nobody is told that the reply was lost. `chat run` therefore reminds a Claude
+Code agent, once, of each request it has not answered. Reminders need
+`outbound_enabled`, since an inbound-only agent is told not to write reply
+blocks, and they read Claude Code's own record of whether a session is busy: the
+file `sessions/<pid>.json` in `$CLAUDE_CONFIG_DIR`, or in `$HOME/.claude` when
+that variable is unset or empty. The bridge uses four fields of that file,
+`pid`, `procStart`, `status`, and `statusUpdatedAt`, ignores the others and
+never logs them, and opens no other file in that directory. It uses a record
+only while a live process in the agent's pane has the same process id and start
+time, the earliest-started such process if there are several. At startup the
+service logs the directory it reads, or that reminders are off because the
+variable that applies does not name an absolute directory. An agent that is not
+a Claude Code session, such as a Codex agent, is never reminded.
+
+Every 15 seconds, starting when the service starts, the service looks for a
+request to remind the agent of. Such a request's prompt was confirmed delivered
+to the agent after reminders started and no more than 24 hours ago, and the
+request is not closed, has no stored reply, even one the post-rate breaker holds
+back, and was never reminded. A request whose delivery is pending or uncertain
+is never reminded, since the agent may never have seen its prompt. When there is
+such a request, or a reminder waits in the queue, the service asks herdr whether
+the pane is idle or done and reads the agent's session record. The agent is due
+a reminder once that record has said `idle` for 60 seconds and the request's
+prompt was delivered before that idle period began. The 60 seconds are set by
+reasoning, not measured: the queue types a reminder only when the agent is
+ready for input, and one the agent is not ready for in time is taken back out,
+as described below, so a settle time that is too short costs at most one early
+reminder, never an interrupted turn. The service then reads the pane and
+captures the read as a recovery scan does, so a reply on screen that no capture
+has stored yet counts. That read can type a routing-error prompt or a request's
+prompt into the pane, and Claude Code marks its session record busy only some
+time after text is typed, so no reminder follows a read that may have typed
+anything or left anything waiting in the queue. Otherwise the service sends the
+reminder only if the session has stayed idle since the same moment.
+
+Claude Code 2.1.285 writes `idle` only while the session waits at its prompt
+with nothing it started still running: it writes `busy` while it works on a turn
+or while a subagent it started runs, `shell` while a command it started in the
+background runs, and `waiting` while it waits for its user to answer a question
+or grant a permission. The bridge counts only `idle` as idle, and any other
+value, those three included, as busy. So an agent that leaves a background
+command or a subagent running is not reminded until that ends.
+
+The reminder is one prompt, sent through the same queue as request prompts. It
+names the reply ID of each request it reminds, newest first with how long ago
+each prompt was delivered, up to 32 of them, and counts the rest. It says that
+the bridge has received no reply, that a reply written only in thinking is not
+delivered, and how to write a reply block as ordinary text, and that the agent
+can ignore it if a request needs no reply, was answered another way, or is still
+being worked on. The requests are recorded as reminded in `reply-reminders.json`
+in the bridge state directory before the reminder is typed, so a crash or a
+restart never reminds them again, and a reminder that may have been typed is
+never typed again. A recorded reminder that the queue no longer knows, as when
+the agent's queue was replaced, may have been typed, so it is never typed again
+either. The service waits for the agent to be ready for the reminder no longer
+than `--ready-timeout` or 10 seconds, whichever is shorter. A reminder not typed
+by then is taken back out of the queue, so that it is never typed later, after
+the agent may have answered, and its requests can be reminded again; the agent
+is then due no reminder until its session record next says it went idle, or the
+service restarts. If the queue cannot give the reminder back, it stays recorded
+and nothing else is composed; a delivery to the agent can still type it, and
+otherwise a later check takes it out before composing another. The log names
+each reminded request and its reply ID, with whether the reminder reached the
+agent, was taken back out of the queue, waits in the queue, or may have reached
+it. A check that cannot read the bridge state, the reminder record, the pane, or
+the session record, or cannot hand a reminder to the queue or take one back,
+logs why once, and logs again once that step works.
+
+When the service starts with reminders on and `reply-reminders.json` does not
+exist, it creates the file and records the time. No request whose prompt was
+delivered before that time is ever reminded, so the requests already unanswered
+when reminders are first deployed get none. A release without reminders leaves
+the file alone, so it survives a rollback. Deleting it is safe: the next check
+creates a new one, and only requests delivered after that can be reminded. If it
+cannot be read or is outside its bounds, no reminder is sent until it is
+repaired or deleted, and the log names the file.
 
 ## Service management
 

@@ -76,6 +76,26 @@ const MAX_FEEDBACK_ID_BYTES: usize = 256;
 const MAX_REPORTED_REPLY_MARKERS: usize = MAX_VISIBLE_MARKERS;
 const MAX_FENCE_FEEDBACK_PROMPT_BYTES: usize = 64 * 1_024;
 const MAX_FENCE_FEEDBACK_BYTES: usize = 2 * 1_024 * 1_024;
+// A reply reminder goes to the coordinator once it has stayed idle this long with a request still
+// unanswered whose prompt reached it before it went idle:
+// https://github.com/rrnewton/agent-utils/issues/196. The value is set by reasoning, not
+// measured: the one idle period observed so far lasted 17.8 s and ended busy (2026-10-01, 03:55Z
+// run). The queue types a reminder only into a pane that is ready for input, and one the pane is
+// not ready for in time is taken back out of the queue, so a settle time that is too short costs
+// at most one early reminder, never a turn typed over.
+pub(crate) const REPLY_REMINDER_SETTLE_MILLIS: u64 = 60_000;
+// A request whose prompt reached the coordinator longer ago than this is never reminded: a day
+// later the owner has most likely asked again, and a coordinator back from an outage does not get
+// a reminder for every request it missed.
+const MAX_REPLY_REMINDER_AGE_MILLIS: u64 = 24 * 60 * 60 * 1_000;
+// A reminder names at most this many requests, most recently delivered first, and counts the
+// rest, which it reminds with them.
+const MAX_REMINDER_LISTED_IDS: usize = 32;
+const MAX_REPLY_REMINDER_PROMPT_BYTES: usize = 16 * 1_024;
+// A record at every bound, with reply IDs of the longest length its check admits, encodes to
+// under 999 KiB (1,022,192 bytes, measured on 2026-10-01), so every record the bridge writes can
+// be read back.
+const MAX_REPLY_REMINDER_BYTES: usize = 1_024 * 1_024;
 // A reply alias is the short reply ID, `001` onward, that a request prompt shows in place of
 // `<nonce>_<ordinal>`: at least this many digits, zero padded, and at most as many as a u64 has.
 const MIN_REPLY_ALIAS_DIGITS: usize = 3;
@@ -1239,6 +1259,126 @@ operator deletes fence-feedback.json from the bridge state directory, which forg
         }
         Ok(())
     }
+}
+
+/// The requests the bridge has reminded the coordinator to answer, kept in
+/// `reply-reminders.json`: see [`deliver_reply_reminders`]. A release that does not read this
+/// file leaves it alone, so it survives a rollback.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplyReminderRecord {
+    version: u32,
+    /// When the record was created. Only a request whose prompt reached the coordinator later is
+    /// ever reminded, so none that a first deployment finds unanswered is.
+    since_millis: u64,
+    /// Keys of the requests already reminded, in ascending order. No request is reminded twice.
+    reminded: Vec<String>,
+    /// The reminder the coordinator queue may still hold. Its requests are already in `reminded`.
+    pending: Option<PendingReplyReminder>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingReplyReminder {
+    message_id: String,
+    requests: Vec<RemindedRequest>,
+    prompt: String,
+}
+
+/// One request a reply reminder names, with the reply ID its prompt gave.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RemindedRequest {
+    pub(crate) key: String,
+    pub(crate) reply_id: String,
+}
+
+impl ReplyReminderRecord {
+    fn validate(&self) -> Result<()> {
+        let request_cap = usize::try_from(MAX_REQUESTS).unwrap_or(usize::MAX);
+        let pending_valid = self.pending.as_ref().is_none_or(|pending| {
+            pending
+                .message_id
+                .strip_prefix("chat-reminder-")
+                .is_some_and(valid_key)
+                && !pending.requests.is_empty()
+                && pending.requests.len() <= request_cap
+                && pending.requests.iter().all(|request| {
+                    self.reminded.binary_search(&request.key).is_ok()
+                        && !request.reply_id.is_empty()
+                        && request.reply_id.len() <= MAX_FEEDBACK_ID_BYTES
+                        && request
+                            .reply_id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                })
+                && !pending.prompt.is_empty()
+                && pending.prompt.len() <= MAX_REPLY_REMINDER_PROMPT_BYTES
+        });
+        if self.version != STATE_VERSION
+            || self.reminded.len() > request_cap
+            || !self.reminded.iter().all(|key| valid_key(key))
+            || !self.reminded.windows(2).all(|pair| pair[0] < pair[1])
+            || !pending_valid
+        {
+            return Err(ChatRuntimeError::invalid(
+                "reply reminder record is inconsistent or outside protocol bounds",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The work a reply reminder check finds: see [`BridgeState::reply_reminder_work`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ReplyReminderWork {
+    /// A reminder may still wait in the coordinator queue.
+    pub(crate) pending: bool,
+    /// When the prompt of the earliest-delivered request that could still be reminded reached
+    /// the coordinator.
+    pub(crate) earliest_delivery_millis: Option<u64>,
+}
+
+impl ReplyReminderWork {
+    /// Whether no request could be reminded and no reminder waits in the queue.
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.pending && self.earliest_delivery_millis.is_none()
+    }
+
+    /// Whether a coordinator idle since `idle_since_millis` is due a reminder at `now`: it has
+    /// stayed idle for the settle time, and a reminder waits in the queue or a request that could
+    /// be reminded reached it before it went idle.
+    pub(crate) fn due(&self, idle_since_millis: u64, now: u64) -> bool {
+        now.saturating_sub(idle_since_millis) >= REPLY_REMINDER_SETTLE_MILLIS
+            && (self.pending
+                || self
+                    .earliest_delivery_millis
+                    .is_some_and(|delivered| delivered <= idle_since_millis))
+    }
+}
+
+/// When the prompt of a request that could be reminded reached the coordinator. Such a request
+/// was delivered after reminders started and no longer than the age bound before `now`, has no
+/// stored reply, is not closed, and was never reminded. A stored reply counts even while the
+/// bridge holds it back, as it holds one for a tripped thread breaker. A request whose delivery
+/// is pending or uncertain is never reminded: the coordinator may never have seen its prompt.
+fn reminder_candidate(
+    request: &RequestRecord,
+    record: &ReplyReminderRecord,
+    now: u64,
+) -> Option<u64> {
+    let delivered = request
+        .delivered_at_millis
+        .filter(|_| request.phase == RequestPhase::Delivered)?;
+    if request.reply_closed
+        || request.reply_count > 0
+        || delivered <= record.since_millis
+        || now.saturating_sub(delivered) > MAX_REPLY_REMINDER_AGE_MILLIS
+        || record.reminded.binary_search(&request.key).is_ok()
+    {
+        return None;
+    }
+    Some(delivered)
 }
 
 /// The reply aliases assigned so far, kept in `reply-aliases.json`. A request gets the next
@@ -3274,6 +3414,11 @@ pub(crate) trait CoordinatorDelivery {
         options: DrainOptions,
     ) -> std::result::Result<(), String>;
     fn drain(&self, agent_name: &str, options: DrainOptions) -> std::result::Result<(), String>;
+    /// Remove a prompt that waits in the coordinator's inbox, so that no drain types it.
+    /// `Ok(false)` means no prompt under this identifier waits there; one the queue has claimed
+    /// or typed is left as it is. Only a reminder is ever withdrawn: see
+    /// [`deliver_reply_reminders`].
+    fn withdraw(&self, agent_name: &str, message_id: &str) -> std::result::Result<bool, String>;
     /// Read the coordinator's pane as a capture reads it, without persisting a snapshot. A
     /// request's prompt is written only after this read, and a reply ID it assigns is never a
     /// number the read shows, so no block already in the pane can be taken as a reply to that
@@ -3360,6 +3505,16 @@ impl<A: ManagedApi + ?Sized> CoordinatorDelivery for ManagedAgents<'_, A> {
         ManagedAgents::drain(self, agent_name, options)
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    fn withdraw(&self, agent_name: &str, message_id: &str) -> std::result::Result<bool, String> {
+        ManagedAgents::withdraw_with_runtime(
+            self,
+            agent_name,
+            message_id,
+            &agent::SystemRuntime::default(),
+        )
+        .map_err(|error| error.to_string())
     }
 
     fn screen(&self, agent_name: &str) -> std::result::Result<String, String> {
@@ -5538,6 +5693,203 @@ stay held until an operator repairs or deletes it, and deleting it forgets which
         Ok(record)
     }
 
+    fn reply_reminder_path(&self) -> PathBuf {
+        self.root.join("reply-reminders.json")
+    }
+
+    /// Start reply reminders at `now` unless their record exists or outbound chat is off: only a
+    /// request whose prompt reaches the coordinator after the record is created is ever reminded,
+    /// so none whose prompt asked for no reply block is. The chat service calls this when it
+    /// starts and before each check, so a record an operator deletes starts again from that check.
+    pub(crate) fn start_reply_reminders(&self, now: u64) -> Result<()> {
+        let path = self.reply_reminder_path();
+        if !self.config.outbound_enabled || fs::symlink_metadata(&path).is_ok() {
+            return Ok(());
+        }
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        if self.read_reply_reminders()?.is_some() {
+            return Ok(());
+        }
+        let record = ReplyReminderRecord {
+            version: STATE_VERSION,
+            since_millis: now,
+            reminded: Vec::new(),
+            pending: None,
+        };
+        record.validate()?;
+        write_document(&path, &record)
+    }
+
+    fn read_reply_reminders(&self) -> Result<Option<ReplyReminderRecord>> {
+        let path = self.reply_reminder_path();
+        let unusable = |error: ChatRuntimeError| {
+            ChatRuntimeError::invalid(format!(
+                "reply reminder record {} is unusable: {error}; reply reminders stay off until an \
+operator repairs or deletes it, and deleting it is safe: no request whose prompt reached the \
+coordinator before the next record is created is ever reminded",
+                path.display()
+            ))
+        };
+        let record: ReplyReminderRecord = match read_document(&path, MAX_REPLY_REMINDER_BYTES) {
+            Ok(record) => record,
+            Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(unusable(error)),
+        };
+        record.validate().map_err(unusable)?;
+        Ok(Some(record))
+    }
+
+    /// What a reply reminder check has to do at `now`: see [`ReplyReminderWork`]. Nothing while
+    /// outbound chat is off, since then the coordinator writes no reply blocks, or while the
+    /// record does not exist.
+    pub(crate) fn reply_reminder_work(&self, now: u64) -> Result<ReplyReminderWork> {
+        if !self.config.outbound_enabled {
+            return Ok(ReplyReminderWork::default());
+        }
+        let _snapshot = self.lock_state_snapshot()?;
+        let Some(record) = self.read_reply_reminders()? else {
+            return Ok(ReplyReminderWork::default());
+        };
+        Ok(ReplyReminderWork {
+            pending: record.pending.is_some(),
+            earliest_delivery_millis: self
+                .request_records()?
+                .iter()
+                .filter_map(|(request, _)| reminder_candidate(request, &record, now))
+                .min(),
+        })
+    }
+
+    /// Choose the requests to remind the coordinator of, and record them as reminded with the
+    /// reminder that names them before it is typed, so a crash after this never reminds them
+    /// twice. They are the requests [`reminder_candidate`] admits whose prompts reached the
+    /// coordinator by `idle_since`, most recently delivered first. Nothing is chosen while an
+    /// earlier reminder is recorded: it must be settled or released first.
+    fn compose_reply_reminder(
+        &self,
+        idle_since: u64,
+        now: u64,
+    ) -> Result<Option<PendingReplyReminder>> {
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let Some(mut record) = self.read_reply_reminders()? else {
+            return Ok(None);
+        };
+        if record.pending.is_some() {
+            return Ok(None);
+        }
+        let original = record.clone();
+        let requests = self.request_records()?;
+        // A request gone from the state can never be reminded, so forgetting it keeps the record
+        // within one key for each request the state can hold.
+        let present = requests
+            .iter()
+            .map(|(request, _)| request.key.as_str())
+            .collect::<BTreeSet<_>>();
+        record.reminded.retain(|key| present.contains(key.as_str()));
+        let mut due = requests
+            .iter()
+            .filter_map(|(request, _)| {
+                reminder_candidate(request, &record, now)
+                    .filter(|delivered| *delivered <= idle_since)
+                    .map(|delivered| (delivered, request))
+            })
+            .collect::<Vec<_>>();
+        if due.is_empty() {
+            if record != original {
+                record.validate()?;
+                write_document(&self.reply_reminder_path(), &record)?;
+            }
+            return Ok(None);
+        }
+        due.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| left.1.key.cmp(&right.1.key))
+        });
+        let alias_record = self.read_reply_aliases().ok();
+        let aliases = alias_record
+            .as_ref()
+            .map(ReplyAliasRecord::by_key)
+            .unwrap_or_default();
+        let named = due
+            .iter()
+            .map(|(delivered, request)| {
+                (
+                    *delivered,
+                    RemindedRequest {
+                        key: request.key.clone(),
+                        reply_id: current_reply_id(
+                            request,
+                            aliases.get(request.key.as_str()).copied(),
+                        ),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let identity = serde_json::to_vec(&json!({
+            "remind": due
+                .iter()
+                .map(|(_, request)| [request.key.as_str(), request.reply_nonce.as_str()])
+                .collect::<Vec<_>>(),
+        }))?;
+        let pending = PendingReplyReminder {
+            message_id: format!("chat-reminder-{:x}", Sha256::digest(identity)),
+            prompt: reply_reminder_prompt(&named, now),
+            requests: named.into_iter().map(|(_, request)| request).collect(),
+        };
+        record
+            .reminded
+            .extend(pending.requests.iter().map(|request| request.key.clone()));
+        record.reminded.sort();
+        record.reminded.dedup();
+        record.pending = Some(pending.clone());
+        record.validate()?;
+        write_document(&self.reply_reminder_path(), &record)?;
+        Ok(Some(pending))
+    }
+
+    /// Forget the recorded reminder under `message_id` once the queue has settled it, delivered or
+    /// possibly delivered. Its requests stay reminded.
+    fn settle_reply_reminder(&self, message_id: &str) -> Result<()> {
+        self.forget_reply_reminder(message_id, false)
+    }
+
+    /// Forget the recorded reminder under `message_id`, which was never typed and which the queue
+    /// no longer holds, and its requests' reminded marks with it, so that a later check can remind
+    /// them again, with new text, if they still qualify.
+    fn release_reply_reminder(&self, message_id: &str) -> Result<()> {
+        self.forget_reply_reminder(message_id, true)
+    }
+
+    fn forget_reply_reminder(&self, message_id: &str, release: bool) -> Result<()> {
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let Some(mut record) = self.read_reply_reminders()? else {
+            return Ok(());
+        };
+        let Some(pending) = record
+            .pending
+            .take_if(|pending| pending.message_id == message_id)
+        else {
+            return Ok(());
+        };
+        if release {
+            record
+                .reminded
+                .retain(|key| !pending.requests.iter().any(|request| request.key == *key));
+        }
+        record.validate()?;
+        write_document(&self.reply_reminder_path(), &record)
+    }
+
     fn reply_alias_path(&self) -> PathBuf {
         self.root.join("reply-aliases.json")
     }
@@ -6982,6 +7334,31 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         self.root.join("requests").join(format!("{key}.json"))
     }
 
+    /// Move every time recorded for request `key` back by `millis`, as if the bridge had admitted
+    /// it, delivered its prompt and acknowledged it that much earlier.
+    #[cfg(test)]
+    pub(crate) fn backdate_request(&self, key: &str, millis: u64) -> Result<()> {
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let mut record = self.read_request(key)?;
+        record.admitted_at_millis -= millis;
+        for time in [
+            &mut record.delivery_started_at_millis,
+            &mut record.delivered_at_millis,
+            &mut record.ack_started_at_millis,
+            &mut record.ack_completed_at_millis,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *time -= millis;
+        }
+        let mut checkpoint = self.read_checkpoint()?;
+        self.write_request_accounted(&record, &mut checkpoint)?;
+        self.persist_checkpoint(&mut checkpoint)
+    }
+
     fn reply_artifact_keys(&self) -> Result<BTreeSet<String>> {
         let mut keys = BTreeSet::new();
         let mut count = 0_u64;
@@ -8020,44 +8397,343 @@ fn drive_fence_feedback(
 ) -> Result<CoordinatorDeliveryResult> {
     let identity = serde_json::to_vec(&serde_json::json!({ "unavailable": unavailable }))?;
     let message_id = format!("chat-feedback-{:x}", Sha256::digest(identity));
+    drive_queued_prompt(
+        state,
+        delivery,
+        &message_id,
+        prompt,
+        "fence feedback",
+        options,
+    )
+}
+
+/// Submit or settle one notice from the bridge under its queue identity `message_id`. `what`
+/// names the notice in the details of the result.
+fn drive_queued_prompt(
+    state: &BridgeState,
+    delivery: &dyn CoordinatorDelivery,
+    message_id: &str,
+    prompt: &str,
+    what: &str,
+    options: DrainOptions,
+) -> Result<CoordinatorDeliveryResult> {
     let agent_name = &state.config.agent_name;
     let initial = delivery
-        .message_state(agent_name, &message_id)
+        .message_state(agent_name, message_id)
         .map_err(ChatRuntimeError::invalid)?;
     let operation = match initial {
         Some(QueueMessageState::Processed) => {
             return Ok(CoordinatorDeliveryResult::AlreadyDelivered)
         }
         Some(QueueMessageState::Inflight | QueueMessageState::Failed) => {
-            return Ok(CoordinatorDeliveryResult::Uncertain(
-                "fence feedback may already have reached the coordinator".to_owned(),
-            ));
+            return Ok(CoordinatorDeliveryResult::Uncertain(format!(
+                "{what} may already have reached the coordinator"
+            )));
         }
         // Either one types every prompt in the queue's inbox.
         Some(QueueMessageState::Pending) => {
             guard_typing(state, delivery, None).and_then(|()| delivery.drain(agent_name, options))
         }
         None => guard_typing(state, delivery, None)
-            .and_then(|()| delivery.submit(agent_name, prompt, &message_id, options)),
+            .and_then(|()| delivery.submit(agent_name, prompt, message_id, options)),
     };
     if operation.is_ok() && initial.is_none() {
         return Ok(CoordinatorDeliveryResult::Delivered);
     }
     let detail = operation.err().map(|error| error.to_string());
     match delivery
-        .message_state(agent_name, &message_id)
+        .message_state(agent_name, message_id)
         .map_err(ChatRuntimeError::invalid)?
     {
         Some(QueueMessageState::Processed) => Ok(CoordinatorDeliveryResult::Delivered),
         Some(QueueMessageState::Inflight | QueueMessageState::Failed) => {
             Ok(CoordinatorDeliveryResult::Uncertain(detail.unwrap_or_else(
-                || "fence feedback may already have reached the coordinator".to_owned(),
+                || format!("{what} may already have reached the coordinator"),
             )))
         }
         Some(QueueMessageState::Pending) | None => Ok(CoordinatorDeliveryResult::Pending(
-            detail.unwrap_or_else(|| "fence feedback remains pending".to_owned()),
+            detail.unwrap_or_else(|| format!("{what} remains pending")),
         )),
     }
+}
+
+/// What one reply reminder did: the requests it names and how its delivery went.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReplyReminderOutcome {
+    pub(crate) requests: Vec<RemindedRequest>,
+    pub(crate) result: ReplyReminderResult,
+}
+
+/// How one reply reminder's delivery went.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ReplyReminderResult {
+    /// Typed into the coordinator's pane just now.
+    Delivered,
+    /// The queue had typed it before this check.
+    AlreadyDelivered,
+    /// It may have been typed. It is never typed again.
+    Uncertain(String),
+    /// It was never typed and the queue no longer holds it, so a later check can remind its
+    /// requests again, with new text, once the coordinator next goes idle.
+    Withdrawn(String),
+    /// It waits in the queue, which could not give it back. A later check takes it out unless a
+    /// drain types it first.
+    Waiting(String),
+}
+
+/// Remind a coordinator that has been idle since `idle_since` of the requests it has not
+/// answered: https://github.com/rrnewton/agent-utils/issues/196. A coordinator that writes its
+/// reply only in its thinking, where the bridge cannot read it, otherwise loses the reply without
+/// knowing. Nothing is sent before the coordinator has stayed idle for the settle time. Each
+/// request is reminded at most once, and is recorded as reminded before its reminder is typed:
+/// see [`BridgeState::compose_reply_reminder`]. The caller reads the pane first, so a reply on
+/// screen that no capture has stored yet counts as a reply. What each reminder did is added to
+/// `outcomes` before anything that can fail afterwards, so a caller logs it even then.
+///
+/// A reminder is never left in the coordinator's queue, where a later drain would type it after
+/// its request was answered or with an age that is no longer true. One the coordinator is not
+/// ready for within `options.ready_timeout` is taken back out of the queue, and its requests can
+/// be reminded again; only a reminder the queue cannot give back is left there, for a later check
+/// to take out. A recorded reminder that the queue does not know at a later check may have been
+/// typed into a queue replaced since, so it counts as possibly typed and is never typed again.
+/// That also loses a reminder the bridge stopped between recording and queueing, or between
+/// taking it out of the queue and recording that: the failure is one reminder too few, never one
+/// too many. An error after a reminder is found or composed names each request it reminds.
+pub(crate) fn deliver_reply_reminders(
+    state: &BridgeState,
+    delivery: &dyn CoordinatorDelivery,
+    idle_since: u64,
+    now: u64,
+    options: DrainOptions,
+    outcomes: &mut Vec<ReplyReminderOutcome>,
+) -> Result<()> {
+    if !state.config.outbound_enabled
+        || now.saturating_sub(idle_since) < REPLY_REMINDER_SETTLE_MILLIS
+    {
+        return Ok(());
+    }
+    if let Some(pending) = state
+        .read_reply_reminders()?
+        .and_then(|record| record.pending)
+    {
+        let requests = pending.requests.clone();
+        if !settle_recorded_reply_reminder(state, delivery, pending, outcomes)
+            .map_err(|error| reply_reminder_error(&requests, error))?
+        {
+            return Ok(());
+        }
+    }
+    let Some(pending) = state.compose_reply_reminder(idle_since, now)? else {
+        return Ok(());
+    };
+    let requests = pending.requests.clone();
+    send_reply_reminder(state, delivery, pending, options, outcomes)
+        .map_err(|error| reply_reminder_error(&requests, error))
+}
+
+/// Settle the reminder an earlier check left recorded: one the queue could not give back, or one
+/// queued as the bridge stopped. Returns whether that leaves the coordinator free for another.
+fn settle_recorded_reply_reminder(
+    state: &BridgeState,
+    delivery: &dyn CoordinatorDelivery,
+    pending: PendingReplyReminder,
+    outcomes: &mut Vec<ReplyReminderOutcome>,
+) -> Result<bool> {
+    let result = match delivery
+        .message_state(&state.config.agent_name, &pending.message_id)
+        .map_err(ChatRuntimeError::invalid)?
+    {
+        Some(QueueMessageState::Pending) => withdraw_reply_reminder(
+            state,
+            delivery,
+            &pending,
+            "an earlier check left it in the coordinator queue".to_owned(),
+            true,
+        )?,
+        Some(QueueMessageState::Processed) => ReplyReminderResult::AlreadyDelivered,
+        Some(QueueMessageState::Inflight | QueueMessageState::Failed) => {
+            ReplyReminderResult::Uncertain(
+                "reply reminder may already have reached the coordinator".to_owned(),
+            )
+        }
+        // A queue never forgets a prompt it has typed, so this one either never reached
+        // the queue, as when the bridge stopped between recording and queueing it, or
+        // reached a queue that has been replaced since, which may have typed it.
+        None => ReplyReminderResult::Uncertain(
+            "the coordinator queue does not know it, so it may have been typed into a queue \
+                 replaced since"
+                .to_owned(),
+        ),
+    };
+    // Only a reminder typed before this check, or taken back out of the queue, leaves the
+    // coordinator free for another: one typed just now, or possibly typed, has made it busy.
+    let free = matches!(
+        result,
+        ReplyReminderResult::AlreadyDelivered | ReplyReminderResult::Withdrawn(_)
+    );
+    record_reply_reminder(state, pending, result, outcomes)?;
+    Ok(free)
+}
+
+/// Queue the reminder a check has just composed and recorded, and record what became of it.
+fn send_reply_reminder(
+    state: &BridgeState,
+    delivery: &dyn CoordinatorDelivery,
+    pending: PendingReplyReminder,
+    options: DrainOptions,
+    outcomes: &mut Vec<ReplyReminderOutcome>,
+) -> Result<()> {
+    let result = match drive_queued_prompt(
+        state,
+        delivery,
+        &pending.message_id,
+        &pending.prompt,
+        "reply reminder",
+        options,
+    )? {
+        CoordinatorDeliveryResult::Delivered => ReplyReminderResult::Delivered,
+        CoordinatorDeliveryResult::AlreadyDelivered => ReplyReminderResult::AlreadyDelivered,
+        CoordinatorDeliveryResult::Uncertain(detail) => ReplyReminderResult::Uncertain(detail),
+        CoordinatorDeliveryResult::Pending(detail) => {
+            withdraw_reply_reminder(state, delivery, &pending, detail, false)?
+        }
+    };
+    record_reply_reminder(state, pending, result, outcomes)
+}
+
+/// `error` from a check after it found or composed the reminder of `requests`, naming each of
+/// them with its reply ID, as the log line of what a reminder did names them.
+fn reply_reminder_error(requests: &[RemindedRequest], error: ChatRuntimeError) -> ChatRuntimeError {
+    let mut named = requests
+        .iter()
+        .take(MAX_REMINDER_LISTED_IDS)
+        .map(|request| format!("request {} (reply ID {})", request.key, request.reply_id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Some(more) = requests
+        .len()
+        .checked_sub(MAX_REMINDER_LISTED_IDS)
+        .filter(|more| *more > 0)
+    {
+        named.push_str(&format!(" and {more} more"));
+    }
+    ChatRuntimeError::invalid(format!(
+        "the reply reminder for {named} failed in this check; the next check reads its record \
+         again: {error}"
+    ))
+}
+
+/// Take a reminder the coordinator was not ready for back out of the queue before any drain types
+/// it. `queued` says the queue was seen holding it. Otherwise the queue is asked first: one it
+/// does not know never reached it, as when the queue refused it, so nothing needs taking out.
+fn withdraw_reply_reminder(
+    state: &BridgeState,
+    delivery: &dyn CoordinatorDelivery,
+    pending: &PendingReplyReminder,
+    detail: String,
+    queued: bool,
+) -> Result<ReplyReminderResult> {
+    let agent_name = &state.config.agent_name;
+    let queue_state = |delivery: &dyn CoordinatorDelivery| {
+        delivery
+            .message_state(agent_name, &pending.message_id)
+            .map_err(ChatRuntimeError::invalid)
+    };
+    if !queued && queue_state(delivery)?.is_none() {
+        return Ok(ReplyReminderResult::Withdrawn(detail));
+    }
+    match delivery.withdraw(agent_name, &pending.message_id) {
+        Ok(true) => return Ok(ReplyReminderResult::Withdrawn(detail)),
+        Ok(false) => {}
+        Err(error) => {
+            return Ok(ReplyReminderResult::Waiting(format!(
+                "{detail}; taking it back out of the coordinator queue failed: {error}"
+            )))
+        }
+    }
+    // A drain took it out of the inbox first.
+    Ok(match queue_state(delivery)? {
+        Some(QueueMessageState::Processed) => ReplyReminderResult::Delivered,
+        Some(QueueMessageState::Inflight | QueueMessageState::Failed) => {
+            ReplyReminderResult::Uncertain(format!(
+                "{detail}; a drain took it out of the coordinator queue first"
+            ))
+        }
+        Some(QueueMessageState::Pending) => {
+            ReplyReminderResult::Waiting(format!("{detail}; the coordinator queue holds it again"))
+        }
+        None => ReplyReminderResult::Uncertain(format!(
+            "{detail}; it left the coordinator queue for no phase, so it may have been typed into \
+             a queue replaced since"
+        )),
+    })
+}
+
+/// Add what one reminder did to `outcomes`, then record it: a reminder that was or may have been
+/// typed is settled, and one taken back out of the queue is released. One still waiting in the
+/// queue stays recorded.
+fn record_reply_reminder(
+    state: &BridgeState,
+    pending: PendingReplyReminder,
+    result: ReplyReminderResult,
+    outcomes: &mut Vec<ReplyReminderOutcome>,
+) -> Result<()> {
+    outcomes.push(ReplyReminderOutcome {
+        requests: pending.requests,
+        result: result.clone(),
+    });
+    match result {
+        ReplyReminderResult::Delivered
+        | ReplyReminderResult::AlreadyDelivered
+        | ReplyReminderResult::Uncertain(_) => state.settle_reply_reminder(&pending.message_id),
+        ReplyReminderResult::Withdrawn(_) => state.release_reply_reminder(&pending.message_id),
+        ReplyReminderResult::Waiting(_) => Ok(()),
+    }
+}
+
+/// Compose the reminder that tells the coordinator the bridge has received no reply to requests
+/// whose prompts reached it, most recently delivered first, each with how long ago it arrived. It
+/// says that a reply written only in thinking is not delivered and how to write a reply block. No
+/// reply ID in it follows `CHAT_REPLY_`, so its text never takes a number from the reply IDs.
+fn reply_reminder_prompt(requests: &[(u64, RemindedRequest)], now: u64) -> String {
+    let listed = requests
+        .iter()
+        .take(MAX_REMINDER_LISTED_IDS)
+        .map(|(delivered, request)| {
+            format!(
+                "`{}` (sent to you {})",
+                request.reply_id,
+                format_age(now, *delivered)
+            )
+        })
+        .collect::<Vec<_>>();
+    let subject = match (listed.as_slice(), requests.len() - listed.len()) {
+        ([one], 0) => format!("the chat request with reply ID {one}"),
+        (_, 0) => format!(
+            "{} chat requests, with reply IDs {}",
+            requests.len(),
+            listed.join(", ")
+        ),
+        (_, 1) => format!(
+            "{} chat requests, with reply IDs {} and 1 older one",
+            requests.len(),
+            listed.join(", ")
+        ),
+        (_, more) => format!(
+            "{} chat requests, with reply IDs {} and {more} older ones",
+            requests.len(),
+            listed.join(", ")
+        ),
+    };
+    format!(
+        "Chat reply reminder: the chat bridge has received no reply from you to {subject}. \
+A reply written only in your thinking is not delivered: the bridge reads only your ordinary text output. \
+If you meant to reply, write the reply as ordinary text. \
+Compose an opening line from the literal prefix `<CHAT_REPLY_`, the reply ID, and `>`; \
+compose its closing line from `</CHAT_REPLY_`, the same ID, and `>`. Keep both lines standalone and outside code fences. \
+If a request needs no reply, you answered it another way, or you are still working on it, ignore this notice; \
+the bridge sends this reminder only once for each request."
+    )
 }
 
 /// An open request as a routing notice names it: the ID its next reply uses, whether it has a
@@ -10238,7 +10914,7 @@ fn validate_outbound_body(agent_label: &str, body: &str) -> Result<()> {
     Ok(())
 }
 
-fn unix_millis() -> u64 {
+pub(crate) fn unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -10487,6 +11163,19 @@ mod tests {
             Ok(())
         }
 
+        fn withdraw(
+            &self,
+            _agent_name: &str,
+            _message_id: &str,
+        ) -> std::result::Result<bool, String> {
+            let mut state = self.queue_state.lock().expect("queue state lock");
+            let waiting = *state == Some(QueueMessageState::Pending);
+            if waiting {
+                *state = None;
+            }
+            Ok(waiting)
+        }
+
         fn screen(&self, _agent_name: &str) -> std::result::Result<String, String> {
             *self.screen_reads.lock().expect("screen read lock") += 1;
             if let Some(error) = self.screen_error.lock().expect("screen error lock").take() {
@@ -10516,6 +11205,12 @@ mod tests {
         /// Drain the queue at the next read of the pane, before the read returns, as a drain
         /// that another delivery starts can between the bridge's reads of the queue and the pane.
         drain_at_next_read: Mutex<bool>,
+        /// The message IDs taken back out of the queue before they were typed.
+        withdrawn: Mutex<Vec<String>>,
+        /// The error the next withdrawal returns instead, when set.
+        withdraw_error: Mutex<Option<String>>,
+        /// The prompts the queue has typed into the pane, in the order it typed them.
+        typed: Mutex<Vec<String>>,
     }
 
     impl QueueDelivery {
@@ -10528,15 +11223,29 @@ mod tests {
                 .collect()
         }
 
+        fn typed_prompts(&self) -> Vec<String> {
+            self.typed.lock().expect("typed lock").clone()
+        }
+
         fn drain_queue(&self) -> std::result::Result<(), String> {
             let mut busy = self.busy_drains.lock().expect("busy lock");
             if *busy > 0 {
                 *busy -= 1;
                 return Err("coordinator is busy; the prompt stays queued".to_owned());
             }
-            for state in self.states.lock().expect("queue lock").values_mut() {
+            let submitted = self.submitted.lock().expect("submission lock");
+            let mut typed = self.typed.lock().expect("typed lock");
+            for (message_id, state) in self.states.lock().expect("queue lock").iter_mut() {
                 if *state == QueueMessageState::Pending {
                     *state = QueueMessageState::Processed;
+                    // The text last queued under this identity is the text typed.
+                    if let Some((_, prompt)) = submitted
+                        .iter()
+                        .rev()
+                        .find(|(queued, _)| queued == message_id)
+                    {
+                        typed.push(prompt.clone());
+                    }
                 }
             }
             Ok(())
@@ -10596,6 +11305,31 @@ mod tests {
             _options: DrainOptions,
         ) -> std::result::Result<(), String> {
             self.drain_queue()
+        }
+
+        fn withdraw(
+            &self,
+            _agent_name: &str,
+            message_id: &str,
+        ) -> std::result::Result<bool, String> {
+            if let Some(error) = self
+                .withdraw_error
+                .lock()
+                .expect("withdraw error lock")
+                .take()
+            {
+                return Err(error);
+            }
+            let mut states = self.states.lock().expect("queue lock");
+            if states.get(message_id) != Some(&QueueMessageState::Pending) {
+                return Ok(false);
+            }
+            states.remove(message_id);
+            self.withdrawn
+                .lock()
+                .expect("withdrawal lock")
+                .push(message_id.to_owned());
+            Ok(true)
         }
 
         fn screen(&self, _agent_name: &str) -> std::result::Result<String, String> {
@@ -18294,6 +19028,9 @@ k │\n\
             fn drain(&self, _: &str, _: DrainOptions) -> std::result::Result<(), String> {
                 panic!("overfull pending feedback must not drain");
             }
+            fn withdraw(&self, _: &str, _: &str) -> std::result::Result<bool, String> {
+                panic!("a routing notice is never withdrawn");
+            }
             fn screen(&self, _: &str) -> std::result::Result<String, String> {
                 panic!("a routing notice never reads the pane");
             }
@@ -18402,6 +19139,13 @@ k │\n\
                 options: DrainOptions,
             ) -> std::result::Result<(), String> {
                 self.queue.drain(agent_name, options)
+            }
+            fn withdraw(
+                &self,
+                agent_name: &str,
+                message_id: &str,
+            ) -> std::result::Result<bool, String> {
+                self.queue.withdraw(agent_name, message_id)
             }
             fn screen(&self, agent_name: &str) -> std::result::Result<String, String> {
                 self.queue.screen(agent_name)
@@ -18530,6 +19274,13 @@ k │\n\
             ) -> std::result::Result<(), String> {
                 self.0.drain(agent_name, options)
             }
+            fn withdraw(
+                &self,
+                agent_name: &str,
+                message_id: &str,
+            ) -> std::result::Result<bool, String> {
+                self.0.withdraw(agent_name, message_id)
+            }
             fn screen(&self, agent_name: &str) -> std::result::Result<String, String> {
                 self.0.screen(agent_name)
             }
@@ -18559,6 +19310,1056 @@ k │\n\
             CoordinatorDeliveryResult::AlreadyDelivered
         );
         assert_eq!(queue.prompts().len(), 1);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// A bridge whose reply reminders started before `count` requests were admitted and their
+    /// prompts typed, each request's prompt `spacing` milliseconds before the next one's: each
+    /// request's key with the time its prompt reached the coordinator, in order of admission.
+    fn reminder_bridge(
+        name: &str,
+        count: u64,
+        spacing: u64,
+    ) -> (BridgeState, Vec<(String, u64)>, PathBuf) {
+        let root = temporary(name);
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        state
+            .start_reply_reminders(unix_millis() - count * spacing - 1)
+            .expect("start reply reminders");
+        let keys = admitted(&state, count);
+        let requests = keys
+            .iter()
+            .zip((0..count).rev())
+            .map(|(key, later)| {
+                prompted(&state, key);
+                state
+                    .backdate_request(key, later * spacing)
+                    .expect("backdate request");
+                (key.clone(), delivered_at(&state, key))
+            })
+            .collect();
+        (state, requests, root)
+    }
+
+    fn delivered_at(state: &BridgeState, key: &str) -> u64 {
+        state
+            .read_request(key)
+            .expect("request")
+            .delivered_at_millis
+            .expect("delivered request")
+    }
+
+    fn remind(
+        state: &BridgeState,
+        delivery: &dyn CoordinatorDelivery,
+        idle_since: u64,
+        now: u64,
+    ) -> Vec<ReplyReminderOutcome> {
+        let mut outcomes = Vec::new();
+        deliver_reply_reminders(
+            state,
+            delivery,
+            idle_since,
+            now,
+            DrainOptions::default(),
+            &mut outcomes,
+        )
+        .expect("reply reminders");
+        outcomes
+    }
+
+    fn reminded(key: &str, reply_id: &str) -> RemindedRequest {
+        RemindedRequest {
+            key: key.to_owned(),
+            reply_id: reply_id.to_owned(),
+        }
+    }
+
+    fn reminder_record(state: &BridgeState) -> ReplyReminderRecord {
+        state
+            .read_reply_reminders()
+            .expect("reminder record")
+            .expect("reminders started")
+    }
+
+    #[test]
+    fn reminder_work_is_due_once_settled_with_a_request_from_before_the_idle_period() {
+        let settle = REPLY_REMINDER_SETTLE_MILLIS;
+        let idle = 1_000_000;
+        let delivered = |at| ReplyReminderWork {
+            pending: false,
+            earliest_delivery_millis: Some(at),
+        };
+        assert!(ReplyReminderWork::default().is_empty());
+        assert!(!ReplyReminderWork::default().due(idle, idle + 10 * settle));
+        assert!(!delivered(idle).is_empty());
+        assert!(!delivered(idle).due(idle, idle + settle - 1));
+        assert!(delivered(idle).due(idle, idle + settle));
+        // A prompt that reached the coordinator after it went idle has not been read yet.
+        assert!(!delivered(idle + 1).due(idle, idle + 10 * settle));
+        let waiting = ReplyReminderWork {
+            pending: true,
+            earliest_delivery_millis: None,
+        };
+        assert!(!waiting.is_empty());
+        assert!(!waiting.due(idle, idle + settle - 1));
+        assert!(waiting.due(idle, idle + settle));
+    }
+
+    #[test]
+    fn an_unanswered_request_is_reminded_once_after_the_settle_time() {
+        // https://github.com/rrnewton/agent-utils/issues/196: a coordinator that writes its reply
+        // only in its thinking loses the reply without knowing, so a request still unanswered once
+        // the coordinator has stayed idle for the settle time gets one reminder. It never gets
+        // another: not in the same idle period, not in a later one, and not after a restart.
+        let (state, requests, root) = reminder_bridge("reminder-once", 1, 0);
+        let (key, delivered) = requests[0].clone();
+        let queue = QueueDelivery::default();
+        let idle_since = delivered + 5_000;
+        let settled = idle_since + REPLY_REMINDER_SETTLE_MILLIS;
+        assert_eq!(
+            state.reply_reminder_work(settled).expect("reminder work"),
+            ReplyReminderWork {
+                pending: false,
+                earliest_delivery_millis: Some(delivered),
+            }
+        );
+        assert!(remind(&state, &queue, idle_since, settled - 1).is_empty());
+        assert!(queue.prompts().is_empty());
+        assert_eq!(
+            remind(&state, &queue, idle_since, settled),
+            [ReplyReminderOutcome {
+                requests: vec![reminded(&key, "001")],
+                result: ReplyReminderResult::Delivered,
+            }]
+        );
+        assert_eq!(
+            queue.prompts(),
+            ["Chat reply reminder: the chat bridge has received no reply from you to the chat request \
+with reply ID `001` (sent to you 1m ago). A reply written only in your thinking is not delivered: \
+the bridge reads only your ordinary text output. If you meant to reply, write the reply as \
+ordinary text. Compose an opening line from the literal prefix `<CHAT_REPLY_`, the reply ID, and \
+`>`; compose its closing line from `</CHAT_REPLY_`, the same ID, and `>`. Keep both lines \
+standalone and outside code fences. If a request needs no reply, you answered it another way, or \
+you are still working on it, ignore this notice; the bridge sends this reminder only once for \
+each request."]
+        );
+        let record = reminder_record(&state);
+        assert_eq!(record.reminded, std::slice::from_ref(&key));
+        assert!(record.pending.is_none());
+        assert!(state
+            .reply_reminder_work(settled)
+            .expect("reminder work")
+            .is_empty());
+
+        assert!(remind(&state, &queue, idle_since, settled + 60_000).is_empty());
+        let later = settled + 120_000;
+        assert!(remind(&state, &queue, later, later + REPLY_REMINDER_SETTLE_MILLIS).is_empty());
+        drop(state);
+        let state = BridgeState::open(&root).expect("reopen state");
+        state
+            .start_reply_reminders(unix_millis())
+            .expect("start reply reminders again");
+        assert_eq!(reminder_record(&state).reminded, [key]);
+        assert!(remind(&state, &queue, later, later + REPLY_REMINDER_SETTLE_MILLIS).is_empty());
+        assert_eq!(queue.prompts().len(), 1);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_request_with_a_stored_reply_is_never_reminded() {
+        // 001 has a reply and 002 has none, so a reminder names 002 alone, and 001 is not
+        // reminded later either.
+        let (state, requests, root) = reminder_bridge("reminder-answered", 2, 0);
+        let queue = QueueDelivery::default();
+        let capture = state
+            .capture_snapshot(&reply_block("001", "an answer"))
+            .expect("capture the reply");
+        assert_eq!(capture.replies.len(), 1, "{:?}", capture.replies);
+        let idle_since = requests[1].1;
+        assert_eq!(
+            remind(
+                &state,
+                &queue,
+                idle_since,
+                idle_since + REPLY_REMINDER_SETTLE_MILLIS
+            ),
+            [ReplyReminderOutcome {
+                requests: vec![reminded(&requests[1].0, "002")],
+                result: ReplyReminderResult::Delivered,
+            }]
+        );
+        let later = idle_since + 10 * REPLY_REMINDER_SETTLE_MILLIS;
+        assert!(remind(&state, &queue, later, later + REPLY_REMINDER_SETTLE_MILLIS).is_empty());
+        let prompts = queue.prompts();
+        assert_eq!(prompts.len(), 1, "{prompts:#?}");
+        assert!(
+            prompts[0].contains("`002`") && !prompts[0].contains("`001`"),
+            "{}",
+            prompts[0]
+        );
+        assert_eq!(reminder_record(&state).reminded, [requests[1].0.clone()]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_request_whose_prompt_arrived_after_the_coordinator_went_idle_is_not_reminded_yet() {
+        // The coordinator has taken no turn since that prompt reached it, so it may not have
+        // read it.
+        let (state, requests, root) = reminder_bridge("reminder-after-idle", 1, 0);
+        let (key, delivered) = requests[0].clone();
+        let queue = QueueDelivery::default();
+        let now = delivered + 10 * REPLY_REMINDER_SETTLE_MILLIS;
+        assert!(remind(&state, &queue, delivered - 1, now).is_empty());
+        assert!(queue.prompts().is_empty());
+        assert_eq!(
+            remind(&state, &queue, delivered, now)[0].requests,
+            [reminded(&key, "001")]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_request_whose_prompt_arrived_more_than_a_day_ago_is_never_reminded() {
+        // 001's prompt reached the coordinator a second before 002's. At exactly a day after
+        // 002's, 002 is reminded and 001 never is.
+        let (state, requests, root) = reminder_bridge("reminder-age", 2, 1_000);
+        let queue = QueueDelivery::default();
+        let now = requests[1].1 + MAX_REPLY_REMINDER_AGE_MILLIS;
+        assert_eq!(
+            remind(&state, &queue, requests[1].1, now)[0].requests,
+            [reminded(&requests[1].0, "002")]
+        );
+        assert!(remind(&state, &queue, now - REPLY_REMINDER_SETTLE_MILLIS, now).is_empty());
+        let prompts = queue.prompts();
+        assert_eq!(prompts.len(), 1, "{prompts:#?}");
+        assert!(
+            prompts[0].contains("`002` (sent to you 1d ago)"),
+            "{}",
+            prompts[0]
+        );
+        assert_eq!(reminder_record(&state).reminded, [requests[1].0.clone()]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn only_an_open_request_delivered_after_reminders_started_is_reminded() {
+        // 001's prompt reached the coordinator before reminders started, as every request open
+        // when a release with reminders is first deployed did. 002's replies are closed, and
+        // 003's prompt was never typed. Only 004 is reminded.
+        let root = temporary("reminder-eligible");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let keys = admitted(&state, 4);
+        prompted(&state, &keys[0]);
+        state
+            .start_reply_reminders(unix_millis())
+            .expect("start reply reminders");
+        prompted(&state, &keys[1]);
+        state.close_replies(&keys[1]).expect("close replies");
+        prompted(&state, &keys[3]);
+        let delivered = delivered_at(&state, &keys[3]);
+        let queue = QueueDelivery::default();
+        let now = delivered + REPLY_REMINDER_SETTLE_MILLIS;
+        assert_eq!(
+            remind(&state, &queue, delivered, now),
+            [ReplyReminderOutcome {
+                requests: vec![reminded(&keys[3], "003")],
+                result: ReplyReminderResult::Delivered,
+            }]
+        );
+        let later = now + 10 * REPLY_REMINDER_SETTLE_MILLIS;
+        assert!(remind(&state, &queue, later, later + REPLY_REMINDER_SETTLE_MILLIS).is_empty());
+        assert_eq!(queue.prompts().len(), 1);
+        assert_eq!(reminder_record(&state).reminded, [keys[3].clone()]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_reminder_is_recorded_before_it_is_typed_so_a_restart_never_types_it_twice() {
+        struct RecordCheckedAtTyping<'a> {
+            state: &'a BridgeState,
+            queue: &'a QueueDelivery,
+        }
+        impl CoordinatorDelivery for RecordCheckedAtTyping<'_> {
+            fn message_state(
+                &self,
+                agent_name: &str,
+                message_id: &str,
+            ) -> std::result::Result<Option<QueueMessageState>, String> {
+                self.queue.message_state(agent_name, message_id)
+            }
+            fn submit(
+                &self,
+                agent_name: &str,
+                prompt: &str,
+                message_id: &str,
+                options: DrainOptions,
+            ) -> std::result::Result<(), String> {
+                let record = reminder_record(self.state);
+                let pending = record
+                    .pending
+                    .as_ref()
+                    .expect("the reminder is recorded before it is typed");
+                assert_eq!(pending.message_id, message_id);
+                assert_eq!(pending.prompt, prompt);
+                assert!(pending
+                    .requests
+                    .iter()
+                    .all(|request| record.reminded.binary_search(&request.key).is_ok()));
+                self.queue.submit(agent_name, prompt, message_id, options)
+            }
+            fn drain(
+                &self,
+                agent_name: &str,
+                options: DrainOptions,
+            ) -> std::result::Result<(), String> {
+                self.queue.drain(agent_name, options)
+            }
+            fn withdraw(
+                &self,
+                agent_name: &str,
+                message_id: &str,
+            ) -> std::result::Result<bool, String> {
+                self.queue.withdraw(agent_name, message_id)
+            }
+            fn screen(&self, agent_name: &str) -> std::result::Result<String, String> {
+                self.queue.screen(agent_name)
+            }
+        }
+        let (state, requests, root) = reminder_bridge("reminder-before-typing", 2, 0);
+        let queue = QueueDelivery::default();
+        let idle_since = requests[1].1;
+        let settled = idle_since + REPLY_REMINDER_SETTLE_MILLIS;
+        let checked = RecordCheckedAtTyping {
+            state: &state,
+            queue: &queue,
+        };
+        assert_eq!(
+            remind(&state, &checked, idle_since, settled),
+            [ReplyReminderOutcome {
+                requests: vec![
+                    reminded(&requests[1].0, "002"),
+                    reminded(&requests[0].0, "001")
+                ],
+                result: ReplyReminderResult::Delivered,
+            }]
+        );
+        assert_eq!(queue.prompts().len(), 1);
+        fs::remove_dir_all(root).expect("cleanup");
+
+        // A bridge that stops after a reminder is typed and before it is settled finds at its next
+        // check that the queue processed it: it is settled, not typed again, and its request is
+        // not reminded again.
+        let (state, requests, root) = reminder_bridge("reminder-stop-after-typing", 1, 0);
+        let (key, delivered) = requests[0].clone();
+        let settled = delivered + REPLY_REMINDER_SETTLE_MILLIS;
+        let queue = QueueDelivery::default();
+        let pending = state
+            .compose_reply_reminder(delivered, settled)
+            .expect("compose a reminder")
+            .expect("a reminder");
+        queue
+            .submit(
+                &state.config().agent_name,
+                &pending.prompt,
+                &pending.message_id,
+                DrainOptions::default(),
+            )
+            .expect("type the reminder");
+        drop(state);
+        let state = BridgeState::open(&root).expect("reopen state");
+        assert_eq!(
+            remind(&state, &queue, delivered, settled),
+            [ReplyReminderOutcome {
+                requests: vec![reminded(&key, "001")],
+                result: ReplyReminderResult::AlreadyDelivered,
+            }]
+        );
+        assert!(reminder_record(&state).pending.is_none());
+        assert!(remind(&state, &queue, delivered, settled).is_empty());
+        assert_eq!(queue.prompts().len(), 1);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_reminder_the_coordinator_is_not_ready_for_is_taken_back_out_of_the_queue() {
+        // https://github.com/rrnewton/agent-utils/issues/196: a reminder left waiting in the
+        // coordinator queue would be typed by the next drain, perhaps after one of its requests was
+        // answered. So a reminder that the coordinator's pane is not ready for is taken back out of
+        // the queue, and its requests count as not reminded.
+        let (state, requests, root) = reminder_bridge("reminder-not-ready", 2, 0);
+        let agent = state.config().agent_name.clone();
+        let queue = QueueDelivery::default();
+        *queue.busy_drains.lock().expect("busy lock") = 1;
+        let idle_since = requests[1].1;
+        let settled = idle_since + REPLY_REMINDER_SETTLE_MILLIS;
+        let outcomes = remind(&state, &queue, idle_since, settled);
+        assert!(
+            matches!(
+                &outcomes[..],
+                [ReplyReminderOutcome {
+                    result: ReplyReminderResult::Withdrawn(_),
+                    ..
+                }]
+            ),
+            "{outcomes:?}"
+        );
+        assert_eq!(
+            outcomes[0].requests,
+            [
+                reminded(&requests[1].0, "002"),
+                reminded(&requests[0].0, "001")
+            ]
+        );
+        let stale = queue.withdrawn.lock().expect("withdrawal lock").clone();
+        assert_eq!(stale.len(), 1, "{stale:?}");
+        assert_eq!(queue.message_state(&agent, &stale[0]), Ok(None));
+        let record = reminder_record(&state);
+        assert!(record.reminded.is_empty(), "{:?}", record.reminded);
+        assert!(record.pending.is_none());
+        assert_eq!(
+            state.reply_reminder_work(settled).expect("reminder work"),
+            ReplyReminderWork {
+                pending: false,
+                earliest_delivery_millis: Some(requests[0].1),
+            }
+        );
+
+        // 001 is answered before the next check, which reminds 002 alone. The reminder that named
+        // 001 is never typed, by that check or by a later drain.
+        state
+            .capture_snapshot(&reply_block("001", "an answer"))
+            .expect("capture the reply");
+        assert_eq!(
+            remind(&state, &queue, idle_since, settled + 15_000),
+            [ReplyReminderOutcome {
+                requests: vec![reminded(&requests[1].0, "002")],
+                result: ReplyReminderResult::Delivered,
+            }]
+        );
+        queue
+            .drain(&agent, DrainOptions::default())
+            .expect("drain the queue");
+        let typed = queue.typed_prompts();
+        assert_eq!(typed.len(), 1, "{typed:#?}");
+        assert!(
+            typed[0].contains("`002`") && !typed[0].contains("`001`"),
+            "{}",
+            typed[0]
+        );
+        assert_eq!(queue.message_state(&agent, &stale[0]), Ok(None));
+        let record = reminder_record(&state);
+        assert_eq!(record.reminded, [requests[1].0.clone()]);
+        assert!(record.pending.is_none());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_reminder_the_queue_refused_is_composed_again_without_a_request_answered_meanwhile() {
+        // A refused reminder was never typed, so its requests are not counted as reminded: the
+        // next check composes it again from the requests that still qualify.
+        let (state, requests, root) = reminder_bridge("reminder-refused", 2, 0);
+        let queue = QueueDelivery::default();
+        *queue.refused_submits.lock().expect("refusal lock") = 1;
+        let idle_since = requests[1].1;
+        let settled = idle_since + REPLY_REMINDER_SETTLE_MILLIS;
+        let outcomes = remind(&state, &queue, idle_since, settled);
+        assert!(
+            matches!(
+                &outcomes[..],
+                [ReplyReminderOutcome {
+                    result: ReplyReminderResult::Withdrawn(_),
+                    ..
+                }]
+            ),
+            "{outcomes:?}"
+        );
+        assert_eq!(outcomes[0].requests.len(), 2);
+        assert!(queue.prompts().is_empty());
+        // The queue never held it, so nothing was taken back out.
+        assert!(queue.withdrawn.lock().expect("withdrawal lock").is_empty());
+        let record = reminder_record(&state);
+        assert!(
+            record.reminded.is_empty() && record.pending.is_none(),
+            "{record:?}"
+        );
+        state
+            .capture_snapshot(&reply_block("001", "an answer"))
+            .expect("capture the reply");
+        assert_eq!(
+            remind(&state, &queue, idle_since, settled + 15_000),
+            [ReplyReminderOutcome {
+                requests: vec![reminded(&requests[1].0, "002")],
+                result: ReplyReminderResult::Delivered,
+            }]
+        );
+        let prompts = queue.prompts();
+        assert_eq!(prompts.len(), 1, "{prompts:#?}");
+        assert!(
+            prompts[0].contains("`002`") && !prompts[0].contains("`001`"),
+            "{}",
+            prompts[0]
+        );
+        let record = reminder_record(&state);
+        assert_eq!(record.reminded, [requests[1].0.clone()]);
+        assert!(record.pending.is_none());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_reminder_that_may_have_been_typed_is_never_typed_again() {
+        struct TypedThenFailed<'a>(&'a QueueDelivery);
+        impl CoordinatorDelivery for TypedThenFailed<'_> {
+            fn message_state(
+                &self,
+                agent_name: &str,
+                message_id: &str,
+            ) -> std::result::Result<Option<QueueMessageState>, String> {
+                self.0.message_state(agent_name, message_id)
+            }
+            fn submit(
+                &self,
+                agent_name: &str,
+                prompt: &str,
+                message_id: &str,
+                options: DrainOptions,
+            ) -> std::result::Result<(), String> {
+                self.0.submit(agent_name, prompt, message_id, options)?;
+                self.0
+                    .states
+                    .lock()
+                    .expect("queue lock")
+                    .insert(message_id.to_owned(), QueueMessageState::Inflight);
+                Err("the pane closed while the reminder was being typed".to_owned())
+            }
+            fn drain(
+                &self,
+                agent_name: &str,
+                options: DrainOptions,
+            ) -> std::result::Result<(), String> {
+                self.0.drain(agent_name, options)
+            }
+            fn withdraw(
+                &self,
+                agent_name: &str,
+                message_id: &str,
+            ) -> std::result::Result<bool, String> {
+                self.0.withdraw(agent_name, message_id)
+            }
+            fn screen(&self, agent_name: &str) -> std::result::Result<String, String> {
+                self.0.screen(agent_name)
+            }
+        }
+        let (state, requests, root) = reminder_bridge("reminder-uncertain", 1, 0);
+        let (key, delivered) = requests[0].clone();
+        let queue = QueueDelivery::default();
+        let settled = delivered + REPLY_REMINDER_SETTLE_MILLIS;
+        let outcomes = remind(&state, &TypedThenFailed(&queue), delivered, settled);
+        assert!(
+            matches!(
+                &outcomes[..],
+                [ReplyReminderOutcome {
+                    result: ReplyReminderResult::Uncertain(_),
+                    ..
+                }]
+            ),
+            "{outcomes:?}"
+        );
+        let record = reminder_record(&state);
+        assert_eq!(record.reminded, [key]);
+        assert!(record.pending.is_none());
+        let later = settled + 10 * REPLY_REMINDER_SETTLE_MILLIS;
+        assert!(remind(&state, &queue, later, later + REPLY_REMINDER_SETTLE_MILLIS).is_empty());
+        assert_eq!(queue.prompts().len(), 1);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_recorded_reminder_the_queue_does_not_know_is_never_typed_again() {
+        // A reminder is recorded before it is queued, so a bridge that stopped in between leaves a
+        // recorded reminder that the queue does not know. So does a reminder typed into a
+        // coordinator queue that was replaced afterwards. The bridge cannot tell the two apart, so
+        // it counts the reminder as possibly typed, and its request is never reminded again.
+        let (state, requests, root) = reminder_bridge("reminder-unknown", 1, 0);
+        let (key, delivered) = requests[0].clone();
+        let settled = delivered + REPLY_REMINDER_SETTLE_MILLIS;
+        let stale = state
+            .compose_reply_reminder(delivered, settled)
+            .expect("compose a reminder")
+            .expect("a reminder");
+        drop(state);
+        let state = BridgeState::open(&root).expect("reopen state");
+        let queue = QueueDelivery::default();
+        let outcomes = remind(&state, &queue, delivered, settled);
+        assert!(
+            matches!(
+                &outcomes[..],
+                [ReplyReminderOutcome {
+                    result: ReplyReminderResult::Uncertain(detail),
+                    ..
+                }] if detail.contains("may have been typed")
+            ),
+            "{outcomes:?}"
+        );
+        assert_eq!(outcomes[0].requests, stale.requests);
+        let record = reminder_record(&state);
+        assert_eq!(record.reminded, [key]);
+        assert!(record.pending.is_none());
+        let later = settled + 10 * REPLY_REMINDER_SETTLE_MILLIS;
+        assert!(remind(&state, &queue, later, later + REPLY_REMINDER_SETTLE_MILLIS).is_empty());
+        assert!(queue.prompts().is_empty());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_reminder_an_earlier_check_left_in_the_queue_is_taken_out_before_another_is_composed() {
+        // A bridge that stopped while its reminder waited in the coordinator queue finds it there at
+        // its next check. Typing it then could name a request answered since, so the check takes it
+        // back out of the queue and composes a reminder of the requests that still qualify.
+        let (state, requests, root) = reminder_bridge("reminder-left-queued", 2, 0);
+        let agent = state.config().agent_name.clone();
+        let idle_since = requests[1].1;
+        let settled = idle_since + REPLY_REMINDER_SETTLE_MILLIS;
+        let stale = state
+            .compose_reply_reminder(idle_since, settled)
+            .expect("compose a reminder")
+            .expect("a reminder");
+        let queue = QueueDelivery::default();
+        *queue.busy_drains.lock().expect("busy lock") = 1;
+        assert!(queue
+            .submit(
+                &agent,
+                &stale.prompt,
+                &stale.message_id,
+                DrainOptions::default()
+            )
+            .is_err());
+        state
+            .capture_snapshot(&reply_block("001", "an answer"))
+            .expect("capture the reply");
+        drop(state);
+        let state = BridgeState::open(&root).expect("reopen state");
+        let outcomes = remind(&state, &queue, idle_since, settled);
+        assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+        assert!(
+            matches!(
+                &outcomes[0].result,
+                ReplyReminderResult::Withdrawn(detail) if detail.contains("an earlier check left it")
+            ),
+            "{outcomes:?}"
+        );
+        assert_eq!(outcomes[0].requests, stale.requests);
+        assert_eq!(
+            outcomes[1],
+            ReplyReminderOutcome {
+                requests: vec![reminded(&requests[1].0, "002")],
+                result: ReplyReminderResult::Delivered,
+            }
+        );
+        assert_eq!(
+            *queue.withdrawn.lock().expect("withdrawal lock"),
+            std::slice::from_ref(&stale.message_id)
+        );
+        let typed = queue.typed_prompts();
+        assert_eq!(typed.len(), 1, "{typed:#?}");
+        assert!(
+            typed[0].contains("`002`") && !typed[0].contains("`001`"),
+            "{}",
+            typed[0]
+        );
+        let record = reminder_record(&state);
+        assert_eq!(record.reminded, [requests[1].0.clone()]);
+        assert!(record.pending.is_none());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_reminder_the_queue_cannot_give_back_stays_recorded_and_nothing_else_is_composed() {
+        // A reminder that may still wait in the queue stays recorded, so no other is composed while
+        // a drain could still type it, and each later check tries again to take it out.
+        let (state, requests, root) = reminder_bridge("reminder-withdraw-fails", 1, 0);
+        let (first, delivered) = requests[0].clone();
+        let agent = state.config().agent_name.clone();
+        let queue = QueueDelivery::default();
+        *queue.busy_drains.lock().expect("busy lock") = 1;
+        let refuse_withdrawal = || {
+            *queue.withdraw_error.lock().expect("withdraw error lock") =
+                Some("the queue lock is held".to_owned());
+        };
+        let waiting = |outcomes: &[ReplyReminderOutcome]| {
+            matches!(
+                outcomes,
+                [ReplyReminderOutcome {
+                    result: ReplyReminderResult::Waiting(detail),
+                    ..
+                }] if detail.contains("the queue lock is held")
+            )
+        };
+        refuse_withdrawal();
+        let outcomes = remind(
+            &state,
+            &queue,
+            delivered,
+            delivered + REPLY_REMINDER_SETTLE_MILLIS,
+        );
+        assert!(waiting(&outcomes), "{outcomes:?}");
+        let stale = reminder_record(&state)
+            .pending
+            .expect("the reminder stays recorded");
+        assert_eq!(
+            queue.message_state(&agent, &stale.message_id),
+            Ok(Some(QueueMessageState::Pending))
+        );
+
+        let second = state
+            .admit_batch(&indexed_delivery(2, 2))
+            .expect("admit request")
+            .new_request_keys[0]
+            .clone();
+        prompted(&state, &second);
+        let idle_since = delivered_at(&state, &second);
+        let settled = idle_since + REPLY_REMINDER_SETTLE_MILLIS;
+        refuse_withdrawal();
+        let outcomes = remind(&state, &queue, idle_since, settled);
+        assert!(waiting(&outcomes), "{outcomes:?}");
+        assert_eq!(queue.prompts().len(), 1);
+        assert_eq!(reminder_record(&state).pending, Some(stale.clone()));
+
+        // Once the queue gives it back, the same check reminds both requests.
+        let outcomes = remind(&state, &queue, idle_since, settled + 1);
+        assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+        assert!(
+            matches!(&outcomes[0].result, ReplyReminderResult::Withdrawn(_)),
+            "{outcomes:?}"
+        );
+        assert_eq!(
+            outcomes[1],
+            ReplyReminderOutcome {
+                requests: vec![reminded(&second, "002"), reminded(&first, "001")],
+                result: ReplyReminderResult::Delivered,
+            }
+        );
+        assert_eq!(
+            *queue.withdrawn.lock().expect("withdrawal lock"),
+            std::slice::from_ref(&stale.message_id)
+        );
+        let typed = queue.typed_prompts();
+        assert_eq!(typed.len(), 1, "{typed:#?}");
+        assert!(
+            typed[0].contains("`001`") && typed[0].contains("`002`"),
+            "{}",
+            typed[0]
+        );
+        let record = reminder_record(&state);
+        assert_eq!(record.reminded.len(), 2, "{:?}", record.reminded);
+        assert!(record.pending.is_none());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_recorded_reminder_a_drain_claimed_is_settled_and_nothing_else_is_composed() {
+        // A drain that claimed the reminder and did not finish may have typed it, so its request
+        // stays reminded. The check composes nothing else: typing it may have made the coordinator
+        // busy, and the next check sees whether it is idle again.
+        let (state, requests, root) = reminder_bridge("reminder-claimed", 1, 0);
+        let (first, delivered) = requests[0].clone();
+        let stale = state
+            .compose_reply_reminder(delivered, delivered + REPLY_REMINDER_SETTLE_MILLIS)
+            .expect("compose a reminder")
+            .expect("a reminder");
+        let queue = QueueDelivery::default();
+        queue
+            .states
+            .lock()
+            .expect("queue lock")
+            .insert(stale.message_id.clone(), QueueMessageState::Inflight);
+        let second = state
+            .admit_batch(&indexed_delivery(2, 2))
+            .expect("admit request")
+            .new_request_keys[0]
+            .clone();
+        prompted(&state, &second);
+        let idle_since = delivered_at(&state, &second);
+        let settled = idle_since + REPLY_REMINDER_SETTLE_MILLIS;
+        let outcomes = remind(&state, &queue, idle_since, settled);
+        assert!(
+            matches!(
+                &outcomes[..],
+                [ReplyReminderOutcome {
+                    result: ReplyReminderResult::Uncertain(_),
+                    ..
+                }]
+            ),
+            "{outcomes:?}"
+        );
+        assert_eq!(outcomes[0].requests, [reminded(&first, "001")]);
+        assert!(queue.prompts().is_empty());
+        let record = reminder_record(&state);
+        assert_eq!(record.reminded, std::slice::from_ref(&first));
+        assert!(record.pending.is_none());
+        assert_eq!(
+            remind(&state, &queue, idle_since + 1, settled + 1),
+            [ReplyReminderOutcome {
+                requests: vec![reminded(&second, "002")],
+                result: ReplyReminderResult::Delivered,
+            }]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn what_a_reminder_did_is_reported_even_when_a_later_step_fails() {
+        // The bridge logs what each reminder did. A check that takes one reminder back out of the
+        // queue and then fails to read the queue for the next still reports the first. Its error
+        // names the request of the next, whose reminder stays recorded for a later check.
+        struct UnreadableOnceWithdrawn<'a>(&'a QueueDelivery);
+        impl CoordinatorDelivery for UnreadableOnceWithdrawn<'_> {
+            fn message_state(
+                &self,
+                agent_name: &str,
+                message_id: &str,
+            ) -> std::result::Result<Option<QueueMessageState>, String> {
+                self.0.message_state(agent_name, message_id)
+            }
+            fn submit(
+                &self,
+                agent_name: &str,
+                prompt: &str,
+                message_id: &str,
+                options: DrainOptions,
+            ) -> std::result::Result<(), String> {
+                self.0.submit(agent_name, prompt, message_id, options)
+            }
+            fn drain(
+                &self,
+                agent_name: &str,
+                options: DrainOptions,
+            ) -> std::result::Result<(), String> {
+                self.0.drain(agent_name, options)
+            }
+            fn withdraw(
+                &self,
+                agent_name: &str,
+                message_id: &str,
+            ) -> std::result::Result<bool, String> {
+                let withdrawn = self.0.withdraw(agent_name, message_id)?;
+                self.0
+                    .unreadable
+                    .lock()
+                    .expect("unreadable lock")
+                    .insert(message_id.to_owned());
+                Ok(withdrawn)
+            }
+            fn screen(&self, agent_name: &str) -> std::result::Result<String, String> {
+                self.0.screen(agent_name)
+            }
+        }
+        let (state, requests, root) = reminder_bridge("reminder-later-failure", 1, 0);
+        let delivered = requests[0].1;
+        let settled = delivered + REPLY_REMINDER_SETTLE_MILLIS;
+        let agent = state.config().agent_name.clone();
+        let stale = state
+            .compose_reply_reminder(delivered, settled)
+            .expect("compose a reminder")
+            .expect("a reminder");
+        let queue = QueueDelivery::default();
+        *queue.busy_drains.lock().expect("busy lock") = 1;
+        assert!(queue
+            .submit(
+                &agent,
+                &stale.prompt,
+                &stale.message_id,
+                DrainOptions::default()
+            )
+            .is_err());
+        let mut outcomes = Vec::new();
+        let error = deliver_reply_reminders(
+            &state,
+            &UnreadableOnceWithdrawn(&queue),
+            delivered,
+            settled,
+            DrainOptions::default(),
+            &mut outcomes,
+        )
+        .expect_err("the queue cannot be read for the next reminder");
+        assert!(error.to_string().contains("cannot be read"), "{error}");
+        assert!(
+            error.to_string().contains(&format!(
+                "the reply reminder for request {} (reply ID 001) failed in this check",
+                requests[0].0
+            )),
+            "{error}"
+        );
+        let recorded = reminder_record(&state)
+            .pending
+            .expect("the next reminder stays recorded");
+        assert_eq!(recorded.message_id, stale.message_id);
+        assert_eq!(recorded.requests, stale.requests);
+        assert!(
+            matches!(
+                &outcomes[..],
+                [ReplyReminderOutcome {
+                    result: ReplyReminderResult::Withdrawn(_),
+                    ..
+                }]
+            ),
+            "{outcomes:?}"
+        );
+        assert_eq!(outcomes[0].requests, stale.requests);
+        assert!(queue.typed_prompts().is_empty());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_reminder_names_the_most_recent_requests_and_counts_the_rest() {
+        // Every request is reminded, most recently delivered first, and the reminder lists the
+        // reply IDs of the most recent ones.
+        let count = MAX_REMINDER_LISTED_IDS as u64 + 1;
+        let (state, requests, root) = reminder_bridge("reminder-many", count, 1_000);
+        let queue = QueueDelivery::default();
+        let idle_since = requests.last().expect("a request").1;
+        let outcomes = remind(
+            &state,
+            &queue,
+            idle_since,
+            idle_since + REPLY_REMINDER_SETTLE_MILLIS,
+        );
+        assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+        assert_eq!(
+            outcomes[0].requests,
+            requests
+                .iter()
+                .enumerate()
+                .rev()
+                .map(|(index, (key, _))| reminded(
+                    key,
+                    &format_reply_alias(u64::try_from(index).expect("index") + 1)
+                ))
+                .collect::<Vec<_>>()
+        );
+        let listed = (2..=count)
+            .rev()
+            .map(|alias| format!("`{}` (sent to you 1m ago)", format_reply_alias(alias)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let prompts = queue.prompts();
+        assert_eq!(prompts.len(), 1, "{prompts:#?}");
+        assert!(
+            prompts[0].starts_with(&format!(
+                "Chat reply reminder: the chat bridge has received no reply from you to {count} chat \
+requests, with reply IDs {listed} and 1 older one. "
+            )),
+            "{}",
+            prompts[0]
+        );
+        assert!(prompts[0].len() <= MAX_REPLY_REMINDER_PROMPT_BYTES);
+        assert_eq!(
+            reminder_record(&state).reminded.len(),
+            usize::try_from(count).expect("count")
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_reply_reminder_record_at_every_bound_fits_within_its_read_limit() {
+        let keys = (0..MAX_REQUESTS)
+            .map(|index| format!("{index:064x}"))
+            .collect::<Vec<_>>();
+        let record = ReplyReminderRecord {
+            version: STATE_VERSION,
+            since_millis: u64::MAX,
+            reminded: keys.clone(),
+            pending: Some(PendingReplyReminder {
+                message_id: format!("chat-reminder-{}", "f".repeat(64)),
+                requests: keys
+                    .iter()
+                    .map(|key| reminded(key, &"_".repeat(MAX_FEEDBACK_ID_BYTES)))
+                    .collect(),
+                // A control character is the costliest to encode.
+                prompt: "\u{1}".repeat(MAX_REPLY_REMINDER_PROMPT_BYTES),
+            }),
+        };
+        record.validate().expect("a record at every bound is valid");
+        let encoded = encoded_document_bytes(&record).expect("encode the record");
+        assert!(encoded < 999 * 1_024, "{encoded} bytes");
+        assert!(encoded <= MAX_REPLY_REMINDER_BYTES, "{encoded} bytes");
+        // A reply ID can hold only the characters a reply ID is made of, which never need
+        // escaping, so no valid record encodes to more.
+        let mut escaped = record;
+        if let Some(pending) = escaped.pending.as_mut() {
+            pending.requests[0].reply_id = "\"".to_owned();
+        }
+        assert!(escaped.validate().is_err());
+    }
+
+    #[test]
+    fn an_unusable_reminder_record_stops_reminders_until_it_is_deleted() {
+        let (state, requests, root) = reminder_bridge("reminder-unusable", 1, 0);
+        let delivered = requests[0].1;
+        let settled = delivered + REPLY_REMINDER_SETTLE_MILLIS;
+        let path = root.join("reply-reminders.json");
+        let queue = QueueDelivery::default();
+        fs::write(&path, b"{").expect("spoil the reminder record");
+        let error = state
+            .reply_reminder_work(settled)
+            .expect_err("an unusable record")
+            .to_string();
+        assert!(
+            error.contains("reply-reminders.json is unusable")
+                && error.contains("deleting it is safe"),
+            "{error}"
+        );
+        assert!(deliver_reply_reminders(
+            &state,
+            &queue,
+            delivered,
+            settled,
+            DrainOptions::default(),
+            &mut Vec::new()
+        )
+        .is_err());
+        state
+            .start_reply_reminders(unix_millis())
+            .expect("start leaves the record alone");
+        assert_eq!(fs::read(&path).expect("read the record"), b"{");
+        // Once it is deleted, reminders start again from the next check, and a request whose
+        // prompt reached the coordinator before then is never reminded.
+        fs::remove_file(&path).expect("delete the record");
+        state
+            .start_reply_reminders(unix_millis())
+            .expect("start reply reminders again");
+        assert!(state
+            .reply_reminder_work(settled)
+            .expect("reminder work")
+            .is_empty());
+        assert!(remind(&state, &queue, delivered, settled).is_empty());
+        assert!(queue.prompts().is_empty());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn reply_reminders_are_off_while_outbound_chat_is_off() {
+        // Without outbound chat the coordinator is never asked to write reply blocks.
+        let root = temporary("reminder-outbound-off");
+        let mut configuration = config();
+        configuration.outbound_enabled = false;
+        configuration.ack_reaction = None;
+        let state = BridgeState::initialize(&root, configuration).expect("initialize state");
+        state
+            .start_reply_reminders(0)
+            .expect("start reply reminders");
+        assert!(!root.join("reply-reminders.json").exists());
+        let key = admitted(&state, 1).remove(0);
+        prompted(&state, &key);
+        let delivered = delivered_at(&state, &key);
+        let settled = delivered + REPLY_REMINDER_SETTLE_MILLIS;
+        assert!(state
+            .reply_reminder_work(settled)
+            .expect("reminder work")
+            .is_empty());
+        let queue = QueueDelivery::default();
+        assert!(remind(&state, &queue, delivered, settled).is_empty());
+        assert!(queue.prompts().is_empty());
         fs::remove_dir_all(root).expect("cleanup");
     }
 

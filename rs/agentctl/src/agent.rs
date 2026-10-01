@@ -1184,6 +1184,46 @@ pub fn message_state(root: &Path, message_id: &str) -> AgentResult<Option<QueueM
     Ok(observed)
 }
 
+/// Remove the prompt under `message_id` from the inbox, so that no drain types it. Every drain
+/// claims a prompt by moving it out of the inbox while it holds the queue delivery lock, and this
+/// removes one under the same lock, so a prompt is either withdrawn or claimed, never both.
+///
+/// `true` means the prompt was waiting and is now gone: no queue phase holds its identifier, so
+/// it can be enqueued again. `false` means no prompt under this identifier waits in the inbox; a
+/// prompt in any other phase is left as it is. Like [`message_state`], the answer is exact only
+/// while the caller holds the surrounding agent lifecycle lock.
+pub(crate) fn withdraw(
+    root: &Path,
+    message_id: &str,
+    runtime: &dyn AgentRuntime,
+) -> AgentResult<bool> {
+    validate_message_id(message_id)?;
+    if fs::symlink_metadata(root).is_err() {
+        return Ok(false);
+    }
+    validate_existing_queue(root)?;
+    let lock_path = root.join(".delivery.lock");
+    let lock = open_private_lock(&lock_path, "queue delivery lock")?;
+    lock_exclusive_with_runtime(&lock, &lock_path, "queue delivery", runtime)?;
+    let inbox = QueueDirectories::new(root).inbox;
+    let path = inbox.join(format!("{message_id}.json"));
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(io_error("inspect queued message", &path, error)),
+    }
+    let document = load_message(&path)?;
+    if document.get("id").and_then(Value::as_str) != Some(message_id) {
+        return Err(AgentError::delivery(format!(
+            "queue artifact {} contains a different message id",
+            path.display()
+        )));
+    }
+    fs::remove_file(&path).map_err(|error| io_error("withdraw queued message", &path, error))?;
+    sync_directory(&inbox)?;
+    Ok(true)
+}
+
 /// Read recent terminal output from a validated interactive-agent target.
 pub fn read<A: AgentApi + ?Sized>(
     client: &A,
@@ -3429,6 +3469,65 @@ mod tests {
         assert_eq!(
             message_state(directory.path(), "chat-request-1").unwrap(),
             Some(QueueMessageState::Processed)
+        );
+    }
+
+    #[test]
+    fn a_withdrawn_prompt_is_never_typed_and_its_identifier_can_be_queued_again() {
+        let directory = TestDirectory::new("withdraw");
+        let runtime = SystemRuntime::default();
+        let absent = directory.path().join("absent-queue");
+        assert!(!withdraw(&absent, "chat-reminder-1", &runtime).unwrap());
+        assert!(!absent.exists());
+
+        enqueue(directory.path(), "remind", Some("chat-reminder-1")).unwrap();
+        enqueue(directory.path(), "task", Some("chat-request-1")).unwrap();
+        // A drain holds this lock from claiming a prompt until it has typed it, so a withdrawal
+        // waits for the drain rather than removing a prompt the drain is typing.
+        let lock =
+            open_private_lock(&directory.path().join(".delivery.lock"), "test lock").unwrap();
+        FileExt::lock_exclusive(&lock).unwrap();
+        let error = withdraw(
+            directory.path(),
+            "chat-reminder-1",
+            &CancelOnSleep::default(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cancelled while waiting to lock queue delivery"),
+            "{error}"
+        );
+        assert_eq!(
+            message_state(directory.path(), "chat-reminder-1").unwrap(),
+            Some(QueueMessageState::Pending)
+        );
+        FileExt::unlock(&lock).unwrap();
+
+        assert!(withdraw(directory.path(), "chat-reminder-1", &runtime).unwrap());
+        assert_eq!(
+            message_state(directory.path(), "chat-reminder-1").unwrap(),
+            None
+        );
+        assert!(!withdraw(directory.path(), "chat-reminder-1", &runtime).unwrap());
+        assert!(!withdraw(directory.path(), "absent", &runtime).unwrap());
+
+        let fake = FakeAgent::new(&["idle"]);
+        let result = drain(&fake, &target(), directory.path(), DrainOptions::default()).unwrap();
+        assert_eq!(result.delivered, ["chat-request-1"]);
+        assert_eq!(fake.runs(), ["task"]);
+        // A prompt the queue has already typed is left where it is.
+        assert!(!withdraw(directory.path(), "chat-request-1", &runtime).unwrap());
+        assert_eq!(
+            message_state(directory.path(), "chat-request-1").unwrap(),
+            Some(QueueMessageState::Processed)
+        );
+
+        enqueue(directory.path(), "remind again", Some("chat-reminder-1")).unwrap();
+        assert_eq!(
+            message_state(directory.path(), "chat-reminder-1").unwrap(),
+            Some(QueueMessageState::Pending)
         );
     }
 
