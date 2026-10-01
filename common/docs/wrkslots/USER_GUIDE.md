@@ -280,7 +280,9 @@ command consult validation-run evidence without guessing from a path. Its exit s
 - `2`: the mechanism cannot determine the answer;
 - anything else: the check failed.
 
-Only `0` satisfies that reclaim condition. The exact recorded process generation must independently
+Only `0` satisfies that reclaim condition. (`recover-absent-agent-row`, which acts only on a row
+whose storage is already gone, has one narrow exception for `1`, described under "Recover absent
+agent rows and ownerless agent worktrees".) The exact recorded process generation must independently
 be dead, and the full process-use scan must find no cwd, executable, root, descriptor, mapping,
 cgroup, or mount use. If the liveness source is degraded or stale, return `2`; unknown ownership is
 not a free slot.
@@ -826,9 +828,18 @@ wrkslots recover-absent-agent-row SLOT --expected-generation N \
   --coordinator-pid "$COORDINATOR_PID"
 ```
 
-The command requires the registered liveness authority to report dead, requires any recorded exact
-owner generation to be dead, and performs the same full-host process, cgroup, mount, and user-systemd
-census used for absent validation rows. It does not claim the vanished working tree was clean. Every
+The command requires any recorded exact owner generation to be dead and requires the registered
+liveness authority to report dead, with one exception: an authority verdict of alive (exit `1`) is
+overridden, with a `NOTE:` on standard error, when the row records a usable owner and that exact
+generation (PID, start ticks, and boot) is proven dead from the initial PID namespace. The authority
+answers about an agent name, and another live process carrying that name -- a restarted session or a
+leaked helper -- cannot use a row whose storage is gone and whose every owner operation binds the dead
+generation. Without the exception such a row could never be recovered, and the one-slot-per-agent
+rule would refuse every new slot for that agent. An unverifiable verdict (exit `2` or any other
+failure), a live or indeterminate owner generation, a row with no usable owner, or a caller outside
+the initial PID namespace still refuses. The command then performs the same full-host process,
+cgroup, mount, and user-systemd census used for absent validation rows. It does not claim the
+vanished working tree was clean. Every
 recorded checkout commit is pushed individually to a dedicated rescue ref and read back from the
 remote before the exact stale Git worktree registration is removed. Because that push is the only
 preservation, the plan and the apply both refuse unless every checkout's remote is listed in

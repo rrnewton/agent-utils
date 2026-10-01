@@ -41,7 +41,7 @@ import urllib.parse
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Set as AbstractSet
 from pathlib import Path
-from typing import TypedDict, TypeVar
+from typing import NoReturn, TypedDict, TypeVar
 
 from wrkslots import __version__, imagecmd, sandbox, slotimage, yamlconfig
 
@@ -11819,6 +11819,10 @@ def _assert_registered_liveness(config: Config, record: ActiveRecord) -> None:
     state, detail = _registered_liveness_state(config, record)
     if state == "dead":
         return
+    _refuse_registered_liveness(state, detail)
+
+
+def _refuse_registered_liveness(state: str, detail: str) -> NoReturn:
     if state == "alive":
         raise Refusal(
             f"registered liveness authority reports owner alive: {detail}. state: "
@@ -34531,11 +34535,74 @@ def _assert_absent_agent_storage(
     return paths
 
 
+# The kernel's fixed inode number for the initial PID namespace
+# (PROC_PID_INIT_INO). Only a caller in that namespace sees every process on the
+# machine, so only there does a missing /proc/<pid> prove that a process
+# generation exited rather than that it runs outside the caller's view.
+_INITIAL_PID_NAMESPACE_LINK = "pid:[4026531836]"
+
+
+def _in_initial_pid_namespace() -> bool:
+    try:
+        return os.readlink("/proc/self/ns/pid") == _INITIAL_PID_NAMESPACE_LINK
+    except OSError:
+        return False
+
+
+def _assert_absent_agent_registered_liveness(config: Config, record: ActiveRecord) -> None:
+    """Refuse unless the liveness authority or the exact owner generation settles it.
+
+    The registered liveness authority answers about an agent NAME. It may
+    report "alive" because some other live process carries that name: a
+    restarted session of the same agent, or a leaked helper process that
+    inherited the name from a session that has since exited.
+
+    ⚠️ FOR A ROW WHOSE STORAGE IS ALREADY ABSENT, THAT ANSWER IS NOT ABOUT THE
+    ROW. There is no checkout left to protect; every owner operation on the row
+    binds the exact recorded generation, so a later process with the same name
+    cannot act through it; and this command pushes every recorded HEAD to a
+    rescue ref and reads it back before changing anything. Requiring "dead"
+    from the authority anyway made the row unrecoverable for as long as
+    anything carried the name, while the one-slot-per-agent rule refused every
+    new slot for that agent because of the very same row -- a deadlock.
+    Measured: a row whose owner generation had exited 283,000 seconds earlier
+    (a 3,600-second time-to-live) was held by two leaked helper processes that
+    still carried the agent's name.
+
+    Absent validation rows already decline to treat agent-name liveness as an
+    ownership authority. This keeps the authority in force and overrides only
+    its "alive" verdict, and only when the exact recorded owner generation (PID,
+    start ticks and boot) is proven dead from the initial PID namespace. An
+    "unverifiable" verdict, a live or indeterminate generation, a row with no
+    usable owner, or a restricted process view still refuses. The process,
+    cgroup, mount and user-service census that follows is unchanged.
+    """
+
+    state, detail = _registered_liveness_state(config, record)
+    if state == "dead":
+        return
+    owner = record.owner
+    if state == "alive" and owner is not None and not _owner_record_is_absent(record):
+        owner_state, owner_detail = _process_state(owner)
+        if owner_state == "dead" and _in_initial_pid_namespace():
+            print(
+                f"NOTE: registered liveness authority reports agent {record.agent} alive "
+                f"({detail}), but the exact recorded owner generation of agent row "
+                f"{record.slot} (PID {owner.pid}, start ticks {owner.start_ticks}, boot "
+                f"{owner.boot_id}) is dead ({owner_detail}) and its storage is absent, so "
+                "a live process carrying the same agent name cannot be using this row; "
+                "continuing with the process, cgroup, mount and user-service census",
+                file=sys.stderr,
+            )
+            return
+    _refuse_registered_liveness(state, detail)
+
+
 def _assert_absent_agent_liveness(
     config: Config, record: ActiveRecord, paths: Sequence[Path]
 ) -> None:
     _assert_absent_validate_row_is_local(record)
-    _assert_registered_liveness(config, record)
+    _assert_absent_agent_registered_liveness(config, record)
     if record.owner is not None:
         owner_state, detail = _process_state(record.owner)
         if owner_state != "dead":
@@ -42176,7 +42243,12 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "back, removes only exact stale Git worktree registrations, archives the absent "
             "storage and its limitations, and only then removes the ACTIVE row. Both the "
             "plan and --apply refuse a checkout whose remote is not listed in "
-            "salvage_push_remotes."
+            "salvage_push_remotes. A registered liveness verdict of alive is overridden, "
+            "with a NOTE on standard error, only when the exact recorded owner "
+            "generation (PID, start ticks, boot) is proven dead from the initial PID "
+            "namespace: the verdict names the agent, and another live process carrying "
+            "that name cannot use a row whose storage is gone. An unverifiable verdict "
+            "always refuses."
         ),
         formatter_class=_HelpFormatter,
     )
