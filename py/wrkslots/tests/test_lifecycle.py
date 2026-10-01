@@ -32790,6 +32790,9 @@ def test_recover_absent_agent_row_refuses_live_or_changed_evidence(
     record = prepare_absent_agent_row(project, repository)
     allow_test_host_for_absent_validate_recovery(project, monkeypatch)
 
+    # The recorded owner generation is dead, but from outside the initial PID
+    # namespace a missing PID proves nothing, so the "alive" verdict stands.
+    monkeypatch.setattr(wrkslots, "_in_initial_pid_namespace", lambda: False)
     set_liveness(project, "alive")
     assert run_absent_agent_recovery(project, record, apply=False) == 3
     assert "reports owner alive" in capsys.readouterr().err
@@ -32798,6 +32801,171 @@ def test_recover_absent_agent_row_refuses_live_or_changed_evidence(
     changed = replace(record, generation=record.generation + 1)
     assert run_absent_agent_recovery(project, changed, apply=False) == 3
     assert "generation changed" in capsys.readouterr().err
+
+
+def test_in_initial_pid_namespace_requires_the_kernel_initial_namespace_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def readlink_as(target: str | None) -> Callable[[str], str]:
+        def fake(path: str) -> str:
+            assert path == "/proc/self/ns/pid", path
+            if target is None:
+                raise PermissionError("denied")
+            return target
+
+        return fake
+
+    monkeypatch.setattr(os, "readlink", readlink_as("pid:[4026531836]"))
+    assert wrkslots._in_initial_pid_namespace()
+    monkeypatch.setattr(os, "readlink", readlink_as("pid:[4026532999]"))
+    assert not wrkslots._in_initial_pid_namespace()
+    monkeypatch.setattr(os, "readlink", readlink_as(None))
+    assert not wrkslots._in_initial_pid_namespace()
+
+
+def test_recover_absent_agent_row_admits_alive_agent_name_when_owner_generation_is_dead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The registered authority answers about the agent NAME. A leaked process
+    # that still carries the name must not hold a row whose storage is gone and
+    # whose exact owner generation is dead -- otherwise the agent can never get
+    # a new slot either, because it "already owns" this one.
+    project, repository, remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    monkeypatch.setattr(wrkslots, "_in_initial_pid_namespace", lambda: True)
+    set_liveness(project, "alive")
+
+    held = create(project, slot="next-slot", agent=record.agent, branch="agent/next-slot")
+    assert held.returncode == 3
+    assert f"agent {record.agent!r} already owns slot {record.slot!r}" in held.stderr
+
+    assert run_absent_agent_recovery(project, record, apply=False) == 0
+    planned = capsys.readouterr().err
+    assert (
+        f"NOTE: registered liveness authority reports agent {record.agent} alive (alive)"
+        in planned
+    )
+    assert record.owner is not None
+    assert f"(PID {record.owner.pid}, start ticks {record.owner.start_ticks}" in planned
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+
+    assert run_absent_agent_recovery(project, record, apply=True) == 0
+    assert "NOTE: registered liveness authority reports agent" in capsys.readouterr().err
+    assert not wrkslots._load_active(config).slots
+    assert wrkslots._load_archive(config).records[-1]["slot"] == record.slot
+    rescue_ref = wrkslots._absent_agent_rescue_ref(record, record.checkouts[0])
+    assert git(remote, "rev-parse", rescue_ref).stdout.strip() == record.checkouts[0].head
+
+    freed = create(project, slot="next-slot", agent=record.agent, branch="agent/next-slot")
+    assert freed.returncode == 0, freed.stderr
+
+
+def test_recover_absent_agent_row_refuses_alive_agent_name_unless_owner_generation_is_dead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    monkeypatch.setattr(wrkslots, "_in_initial_pid_namespace", lambda: True)
+    config = wrkslots._load_config(str(project), "testhost")
+
+    def absent_row(slot: str, *, bind_owner: bool) -> wrkslots.ActiveRecord:
+        made = create(
+            project,
+            slot=slot,
+            agent=f"agent-{slot}",
+            branch=f"agent/{slot}",
+            bind_owner=bind_owner,
+        )
+        assert made.returncode == 0, made.stderr
+        shutil.rmtree(wrkslots._slot_directory(config, slot, "agent"))
+        return wrkslots._find_record(wrkslots._load_active(config), slot)
+
+    def assert_refused_alive(record: wrkslots.ActiveRecord) -> None:
+        set_liveness(project, "alive")
+        assert run_absent_agent_recovery(project, record, apply=True) == 3
+        err = capsys.readouterr().err
+        assert "registered liveness authority reports owner alive" in err
+        assert "NOTE:" not in err
+        current = wrkslots._find_record(wrkslots._load_active(config), record.slot)
+        assert current == record
+
+    # The owner generation is this live test process: the verdict stands.
+    live = absent_row("live-owner", bind_owner=True)
+    assert live.owner is not None and live.owner.pid == os.getpid()
+    assert wrkslots._process_state(live.owner)[0] == "live"
+    assert_refused_alive(live)
+
+    # No owner generation is recorded, so there is nothing to prove dead.
+    unbound = absent_row("no-owner", bind_owner=False)
+    assert unbound.owner is None
+    assert_refused_alive(unbound)
+
+    # A degenerate machine-level owner is an absent owner; its PID being
+    # "reused" proves nothing about who held the row.
+    degenerate_source = absent_row("machine-owner", bind_owner=True)
+    assert degenerate_source.owner is not None
+    degenerate = replace(
+        degenerate_source,
+        owner=replace(
+            degenerate_source.owner,
+            pid=1,
+            cgroup_path="/init.scope",
+            start_ticks=degenerate_source.owner.start_ticks + 1,
+        ),
+    )
+    wrkslots._write_active_state(
+        config,
+        wrkslots._replace_record(wrkslots._load_active(config), degenerate),
+        action="test-degenerate-owner",
+        slot=degenerate.slot,
+    )
+    assert wrkslots._owner_record_is_absent(degenerate)
+    assert_refused_alive(degenerate)
+
+    # An owner generation whose state cannot be read is not proven dead.
+    gone = absent_row("unreadable-owner", bind_owner=True)
+    dead = mark_recorded_owner_dead(project, gone.slot)
+    real_process_state = wrkslots._process_state
+
+    def unreadable(identity: wrkslots.ProcessIdentity | None) -> tuple[str, str]:
+        if identity == dead.owner:
+            return "indeterminate", "process identity is unreadable"
+        return real_process_state(identity)
+
+    monkeypatch.setattr(wrkslots, "_process_state", unreadable)
+    assert_refused_alive(dead)
+
+
+@pytest.mark.parametrize(
+    ("fixture_state", "expected"),
+    (
+        ("unverifiable", "registered liveness authority is unverifiable: unverifiable"),
+        ("broken", "registered liveness command returned unexpected rc 3"),
+    ),
+)
+def test_recover_absent_agent_row_refuses_unverifiable_liveness_even_with_dead_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    fixture_state: str,
+    expected: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    monkeypatch.setattr(wrkslots, "_in_initial_pid_namespace", lambda: True)
+    assert record.owner is not None
+    assert wrkslots._process_state(record.owner)[0] == "dead"
+
+    set_liveness(project, fixture_state)
+    assert run_absent_agent_recovery(project, record, apply=True) == 3
+    err = capsys.readouterr().err
+    assert expected in err
+    assert "NOTE:" not in err
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
 
 
 def test_recover_absent_agent_row_accepts_no_owner_only_with_full_dead_evidence(
