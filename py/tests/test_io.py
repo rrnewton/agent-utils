@@ -257,7 +257,7 @@ def test_structured_result_manifest_roundtrips_with_legacy_cell_selector() -> No
     [
         ({"kind": "future", "schema": 3, "path_env": "DAGRUN_TEST_COUNTS_PATH", "owner": "test.counts"}, "unknown result-manifest kind"),
         ({"kind": "structured-test-results", "schema": "3", "path_env": "DAGRUN_TEST_COUNTS_PATH", "owner": "test.counts"}, "schema: must be an integer"),
-        ({"kind": "structured-test-results", "schema": 4, "path_env": "DAGRUN_TEST_COUNTS_PATH", "owner": "test.counts"}, "got 4"),
+        ({"kind": "structured-test-results", "schema": 5, "path_env": "DAGRUN_TEST_COUNTS_PATH", "owner": "test.counts"}, "got 5"),
         ({"kind": "structured-test-results", "schema": 2, "path_env": "OTHER", "owner": "test.counts"}, "path_env: structured test results require"),
         ({"kind": "structured-test-results", "schema": 2, "path_env": "DAGRUN_TEST_COUNTS_PATH", "owner": ""}, "owner: must be non-empty"),
         ({"kind": "structured-test-results", "schema": 2, "path_env": "DAGRUN_TEST_COUNTS_PATH", "owner": "test.counts", "future": 1}, "unknown field(s) 'future'"),

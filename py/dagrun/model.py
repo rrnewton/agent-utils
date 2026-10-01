@@ -231,6 +231,7 @@ STRUCTURED_TEST_RESULTS_KIND = "structured-test-results"
 STRUCTURED_TEST_RESULTS_CURRENT_SCHEMA = 2
 STRUCTURED_TEST_RESULTS_RETAINED_SCHEMA = 2
 STRUCTURED_TEST_RESULTS_CLASSIFIED_SCHEMA = 3
+STRUCTURED_TEST_RESULTS_DIAGNOSTIC_SCHEMA = 4
 STRUCTURED_TEST_RESULTS_PATH_ENV = "DAGRUN_TEST_COUNTS_PATH"
 
 
@@ -245,6 +246,11 @@ class StructuredTestResultsManifest:
     def classified(cls, owner: str) -> "StructuredTestResultsManifest":
         """Explicitly require complete classified attempts (schema 3)."""
         return cls(schema=STRUCTURED_TEST_RESULTS_CLASSIFIED_SCHEMA, owner=owner)
+
+    @classmethod
+    def diagnostic(cls, owner: str) -> "StructuredTestResultsManifest":
+        """Require classified attempts that may carry non-blocking diagnostic failures (schema 4)."""
+        return cls(schema=STRUCTURED_TEST_RESULTS_DIAGNOSTIC_SCHEMA, owner=owner)
 
     @classmethod
     def current(cls, owner: str) -> "StructuredTestResultsManifest":
@@ -398,6 +404,7 @@ class Step:
             STRUCTURED_TEST_RESULTS_RETAINED_SCHEMA,
             STRUCTURED_TEST_RESULTS_CURRENT_SCHEMA,
             STRUCTURED_TEST_RESULTS_CLASSIFIED_SCHEMA,
+            STRUCTURED_TEST_RESULTS_DIAGNOSTIC_SCHEMA,
         }:
             raise ValueError(
                 f"step {self.tag}: structured test-result schema {structured[0].schema} is unsupported"

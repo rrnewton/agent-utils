@@ -366,6 +366,15 @@ impl StructuredTestResultsManifest {
         }
     }
 
+    /// Require classified per-attempt results that may carry non-blocking diagnostic failures
+    /// (schema 4).
+    pub fn diagnostic(owner: impl Into<String>) -> Self {
+        Self {
+            schema: crate::test_results::DIAGNOSTIC_RESULTS_SCHEMA,
+            owner: owner.into(),
+        }
+    }
+
     /// Declare current structured test results owned by one exact step tag.
     pub fn current(owner: impl Into<String>) -> Self {
         Self {
@@ -545,10 +554,11 @@ impl Step {
             if manifest.schema != crate::test_results::RETAINED_RESULTS_SCHEMA
                 && manifest.schema != crate::test_results::CURRENT_SCHEMA
                 && manifest.schema != crate::test_results::CLASSIFIED_RESULTS_SCHEMA
+                && manifest.schema != crate::test_results::DIAGNOSTIC_RESULTS_SCHEMA
             {
                 return Err(format!(
-                    "step {}: structured test-result schema {} is unsupported; expected default schema {} or classified schema {}",
-                    self.tag(), manifest.schema, crate::test_results::CURRENT_SCHEMA, crate::test_results::CLASSIFIED_RESULTS_SCHEMA
+                    "step {}: structured test-result schema {} is unsupported; expected default schema {}, classified schema {} or diagnostic schema {}",
+                    self.tag(), manifest.schema, crate::test_results::CURRENT_SCHEMA, crate::test_results::CLASSIFIED_RESULTS_SCHEMA, crate::test_results::DIAGNOSTIC_RESULTS_SCHEMA
                 ));
             }
             if manifest.owner != self.tag() {

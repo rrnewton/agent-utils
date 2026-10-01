@@ -2868,11 +2868,67 @@ fn read_structured_test_counts(
     }))
 }
 
+/// Whether the structured rows contain a failure that fails the step.
+///
+/// A schema-4 `diagnostic_fail` row does not: its producer declared in advance why it cannot
+/// decide the step. It is reported by [`diagnostic_failure_lines`] instead, never dropped.
 fn test_results_report_failure(counts: &CapturedTestResults) -> bool {
     counts
         .results
         .as_ref()
-        .is_some_and(|results| results.iter().any(|result| !result.passed))
+        .is_some_and(|results| results.iter().any(TestResult::is_blocking_failure))
+}
+
+/// How many diagnostic failures a step's terminal output names one by one.
+const DIAGNOSTIC_FAILURE_LINES: usize = 10;
+
+/// Human-readable lines for a step's non-blocking diagnostic failures, empty when there are none.
+///
+/// The count line always appears; the per-test lines are bounded so one bucket with many
+/// diagnostic rows cannot flood the transcript, and the count says how many were not named.
+fn diagnostic_failure_lines(tag: &str, results: Option<&[TestResult]>) -> Vec<String> {
+    let failures: Vec<&TestResult> = results
+        .unwrap_or_default()
+        .iter()
+        .filter(|result| result.is_diagnostic_failure())
+        .collect();
+    if failures.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "[{tag}] \u{26a0} DIAGNOSTIC {} test failure(s), non-blocking by the producer's declared policy:",
+        failures.len()
+    )];
+    for result in failures.iter().take(DIAGNOSTIC_FAILURE_LINES) {
+        let cause = result
+            .attempt_results
+            .as_ref()
+            .and_then(|attempts| attempts.last())
+            .map(|attempt| {
+                format!(
+                    "attempt {} {}: {}",
+                    attempt.attempt,
+                    attempt.outcome.value(),
+                    attempt
+                        .detail
+                        .as_deref()
+                        .unwrap_or("typed cause unavailable")
+                )
+            })
+            .unwrap_or_else(|| "typed cause unavailable".into());
+        lines.push(format!(
+            "[{tag}]   {} ({cause}; non-blocking because: {})",
+            result.id,
+            result.diagnostic.as_deref().unwrap_or_default()
+        ));
+    }
+    if failures.len() > DIAGNOSTIC_FAILURE_LINES {
+        lines.push(format!(
+            "[{tag}]   ... and {} more diagnostic failure(s) not named here",
+            failures.len() - DIAGNOSTIC_FAILURE_LINES
+        ));
+    }
+    lines
 }
 
 fn structured_test_failure_reason(
@@ -2891,7 +2947,7 @@ fn structured_test_failure_reason(
         .results
         .as_ref()?
         .iter()
-        .find(|result| !result.passed)?;
+        .find(|result| result.is_blocking_failure())?;
     let Some(attempt) = result
         .attempt_results
         .as_ref()
@@ -4233,6 +4289,7 @@ fn run_step(ctx: StepCtx) {
         }
     }
 
+    let diagnostic_lines = diagnostic_failure_lines(&tag, test_counts.results.as_deref());
     let (abort_cause, reason) = {
         let mut sh = lock_shared(&shared);
         retire(&mut sh, &step);
@@ -4409,6 +4466,9 @@ fn run_step(ctx: StepCtx) {
     }
 
     emit_distinct_test_results_error(&tag, &reason, structured_test_results_error.as_deref());
+    for line in &diagnostic_lines {
+        emit(line);
+    }
 
     // Terminal record. Written for EVERY step, pass or fail, so the journal alone answers "what
     // was this run doing" without needing the end-of-run profile rows that a hard kill destroys.
@@ -5956,6 +6016,105 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
             steps: vec![producer],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn diagnostic_failure_is_reported_but_does_not_fail_the_step() {
+        let diagnostic = r#"{"schema":4,"executed_tests":2,"filtered_tests":0,"results":[{"id":"suite$pass","result":"pass","attempts":1,"attempt_results":[{"attempt":1,"outcome":"passed","detail":null}],"diagnostic_reason":null},{"id":"suite$probe","result":"diagnostic_fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"wall_timeout","detail":"exceeded 20 s"}],"diagnostic_reason":"bounded host probe"}]}"#;
+        let blocking = diagnostic
+            .replace(r#""result":"diagnostic_fail""#, r#""result":"fail""#)
+            .replace(
+                r#""diagnostic_reason":"bounded host probe""#,
+                r#""diagnostic_reason":null"#,
+            );
+        for (payload, declared_schema, expect_ok, reason_fragment) in [
+            (diagnostic.to_string(), 4, true, None),
+            (
+                blocking,
+                4,
+                false,
+                Some("STRUCTURED TEST FAILURE: suite$probe attempt 1 wall_timeout"),
+            ),
+            // A schema-3 declaration cannot be satisfied by a schema-4 report.
+            (
+                diagnostic.to_string(),
+                3,
+                false,
+                Some("STRUCTURED TEST RESULTS REFUSED"),
+            ),
+        ] {
+            let marker = std::env::temp_dir().join(format!(
+                "dagrun-diagnostic-{}-{}",
+                std::process::id(),
+                TEST_COUNTS_SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            let command = r#"printf '%s\n' "$DAGRUN_TEST_COUNTS_PATH" > "$TEST_MARKER_PATH"; printf '%s' "$TEST_RESULT_PAYLOAD" > "$DAGRUN_TEST_COUNTS_PATH""#;
+            let mut cfg = classified_structured_producer(command, &marker);
+            cfg.steps[0]
+                .env
+                .insert("TEST_RESULT_PAYLOAD".into(), payload.clone());
+            cfg.steps[0].result_manifests =
+                Some(vec![crate::model::ResultManifest::StructuredTestResults(
+                    crate::model::StructuredTestResultsManifest {
+                        schema: declared_schema,
+                        owner: "test.counts".into(),
+                    },
+                )]);
+            let result = classified_run_without_evidence(&cfg);
+            let outcome = &result.outcomes[0];
+            classified_assert_scheduler_owned_path_was_removed(&marker);
+            assert_eq!(result.ok, expect_ok, "{payload}: {outcome:#?}");
+            assert_eq!(outcome.ok, expect_ok, "{payload}: {outcome:#?}");
+            match reason_fragment {
+                None => {
+                    assert_eq!(outcome.reason, "");
+                    let rows = outcome.test_results.as_ref().unwrap();
+                    assert!(rows[1].is_diagnostic_failure() && !rows[1].passed);
+                    let lines = diagnostic_failure_lines("test.counts", Some(rows));
+                    assert_eq!(lines.len(), 2, "{lines:?}");
+                    assert!(
+                        lines[0].contains("DIAGNOSTIC 1 test failure(s)"),
+                        "{lines:?}"
+                    );
+                    assert!(
+                        lines[1].contains("suite$probe (attempt 1 wall_timeout: exceeded 20 s; non-blocking because: bounded host probe)"),
+                        "{lines:?}"
+                    );
+                }
+                Some(fragment) => {
+                    assert!(outcome.reason.contains(fragment), "{}", outcome.reason);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostic_failure_lines_are_bounded_and_say_how_many_were_not_named() {
+        use crate::test_results::{TestAttemptOutcome, TestAttemptResult};
+        let rows: Vec<TestResult> = (0..13)
+            .map(|index| {
+                TestResult::diagnostic_failure(
+                    format!("suite$probe{index}"),
+                    vec![TestAttemptResult::new(
+                        1,
+                        TestAttemptOutcome::Failed,
+                        Some("exit 1".into()),
+                    )
+                    .unwrap()],
+                    "bounded".into(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let lines = diagnostic_failure_lines("t.x", Some(&rows));
+        assert_eq!(lines.len(), 1 + DIAGNOSTIC_FAILURE_LINES + 1);
+        assert!(lines[0].contains("DIAGNOSTIC 13 test failure(s)"));
+        assert!(lines
+            .last()
+            .unwrap()
+            .contains("and 3 more diagnostic failure(s)"));
+        assert!(diagnostic_failure_lines("t.x", Some(&[])).is_empty());
+        assert!(diagnostic_failure_lines("t.x", None).is_empty());
     }
 
     fn classified_assert_scheduler_owned_path_was_removed(marker: &std::path::Path) {

@@ -4962,6 +4962,9 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     if !result.not_launched.is_empty() {
         eprintln!("{PROG}: not launched: {}", result.not_launched.join(", "));
     }
+    if let Some(line) = diagnostic_failure_summary(&result.outcomes) {
+        eprintln!("{PROG}: {line}");
+    }
 
     if let Some(d) = perf_dir.as_deref() {
         if let Some(w) = &window {
@@ -5791,8 +5794,81 @@ fn parse_simple_dag(rest: &[String]) -> Result<Option<String>, String> {
     Ok(dag)
 }
 
+/// One end-of-run line naming every step that reported non-blocking diagnostic test failures.
+///
+/// A diagnostic failure does not fail its step, so without this line a passing run would show no
+/// trace of it at the bottom of the transcript. `None` when no step reported one.
+fn diagnostic_failure_summary(outcomes: &[StepOutcome]) -> Option<String> {
+    let per_step: Vec<(String, usize)> = outcomes
+        .iter()
+        .filter_map(|outcome| {
+            let count = outcome
+                .test_results
+                .as_ref()?
+                .iter()
+                .filter(|result| result.is_diagnostic_failure())
+                .count();
+            (count > 0).then(|| (outcome.tag.clone(), count))
+        })
+        .collect();
+    if per_step.is_empty() {
+        return None;
+    }
+    let total: usize = per_step.iter().map(|(_, count)| count).sum();
+    Some(format!(
+        "{total} non-blocking diagnostic test failure(s) in {}",
+        per_step
+            .iter()
+            .map(|(tag, count)| format!("{tag} ({count})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnostic_failure_summary_names_each_step_and_the_total() {
+        use crate::test_results::{TestAttemptOutcome, TestAttemptResult, TestResult};
+        let failed = || {
+            vec![
+                TestAttemptResult::new(1, TestAttemptOutcome::Failed, Some("exit 1".into()))
+                    .unwrap(),
+            ]
+        };
+        let mut a = StepOutcome::passed(
+            "e2e.a".into(),
+            1.0,
+            String::new(),
+            Some(0),
+            Some(2),
+            Some(0),
+        );
+        a.test_results = Some(vec![
+            TestResult::diagnostic_failure("x".into(), failed(), "bounded".into()).unwrap(),
+            TestResult::diagnostic_failure("y".into(), failed(), "bounded".into()).unwrap(),
+        ]);
+        let mut b = StepOutcome::passed(
+            "e2e.b".into(),
+            1.0,
+            String::new(),
+            Some(0),
+            Some(1),
+            Some(0),
+        );
+        b.test_results = Some(vec![TestResult::with_attempt_results(
+            "z".into(),
+            false,
+            failed(),
+        )
+        .unwrap()]);
+        assert_eq!(diagnostic_failure_summary(&[b.clone()]), None);
+        assert_eq!(
+            diagnostic_failure_summary(&[a, b]).as_deref(),
+            Some("2 non-blocking diagnostic test failure(s) in e2e.a (2)")
+        );
+    }
+
     use super::*;
 
     fn tiny() -> DagConfig {

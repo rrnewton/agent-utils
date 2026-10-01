@@ -129,6 +129,13 @@ pub const CURRENT_SCHEMA: u64 = 2;
 pub const CLASSIFIED_RESULTS_SCHEMA: u64 = 3;
 /// Schema 2 remains readable while result producers migrate atomically.
 pub const RETAINED_RESULTS_SCHEMA: u64 = 2;
+/// Explicit opt-in schema: schema 3 plus non-blocking diagnostic failures.
+///
+/// A row may be a `diagnostic_fail`: the test failed, the producer declared in advance why its
+/// failure does not decide the step, and the reason travels with the row. The scheduler reports
+/// and counts such a row separately and does not fail the step on it. Every other non-pass is
+/// still a blocking `fail`.
+pub const DIAGNOSTIC_RESULTS_SCHEMA: u64 = 4;
 
 /// Why the scheduler could not import a required structured result.
 ///
@@ -313,6 +320,12 @@ pub struct TestResult {
     pub attempts: u64,
     /// Per-attempt classified causes. `None` is retained schema 2.
     pub attempt_results: Option<Vec<TestAttemptResult>>,
+    /// Why this FAILED test does not fail its step (schema 4 only).
+    ///
+    /// `Some` only on a non-passing row with classified attempts; the scheduler reports and
+    /// counts it as a diagnostic failure instead of failing the step. `None` on every pass and on
+    /// every blocking failure.
+    pub diagnostic: Option<String>,
 }
 
 impl TestResult {
@@ -331,6 +344,7 @@ impl TestResult {
             passed,
             attempts,
             attempt_results: None,
+            diagnostic: None,
         })
     }
 
@@ -347,18 +361,70 @@ impl TestResult {
             passed,
             attempts: attempt_count,
             attempt_results: Some(attempts),
+            diagnostic: None,
         };
         validate_result(&result, true)?;
         Ok(result)
+    }
+
+    /// A failed test whose failure the producer declared non-blocking, for opt-in schema 4.
+    ///
+    /// `reason` is the producer's standing explanation of why this test cannot decide the step
+    /// (not the cause of this failure, which the final attempt's detail carries). The terminal
+    /// attempt must be a non-pass: a passing test is an ordinary `pass` row whatever its policy.
+    pub fn diagnostic_failure(
+        id: String,
+        attempts: Vec<TestAttemptResult>,
+        reason: String,
+    ) -> Result<Self, String> {
+        let attempt_count = u64::try_from(attempts.len())
+            .map_err(|_| "structured-test-results attempt count does not fit u64".to_string())?;
+        let result = Self {
+            id,
+            passed: false,
+            attempts: attempt_count,
+            attempt_results: Some(attempts),
+            diagnostic: Some(reason),
+        };
+        validate_result(&result, true)?;
+        Ok(result)
+    }
+
+    /// A failure that fails the step: every non-pass that is not a declared diagnostic.
+    pub fn is_blocking_failure(&self) -> bool {
+        !self.passed && self.diagnostic.is_none()
+    }
+
+    /// A failure the producer declared non-blocking; reported and counted, never ignored.
+    pub fn is_diagnostic_failure(&self) -> bool {
+        !self.passed && self.diagnostic.is_some()
+    }
+
+    fn wire_result(&self) -> &'static str {
+        match (self.passed, self.diagnostic.is_some()) {
+            (true, _) => "pass",
+            (false, false) => "fail",
+            (false, true) => "diagnostic_fail",
+        }
     }
 }
 
 fn parse_result_row(
     row: &Map<String, Value>,
     index: usize,
-    classified: bool,
+    schema: u64,
 ) -> Result<TestResult, String> {
-    let expected = if classified {
+    let classified = schema >= CLASSIFIED_RESULTS_SCHEMA;
+    let diagnostic_schema = schema == DIAGNOSTIC_RESULTS_SCHEMA;
+    let expected = if diagnostic_schema {
+        &[
+            "id",
+            "result",
+            "attempts",
+            "attempt_results",
+            "diagnostic_reason",
+        ][..]
+    } else if classified {
         &["id", "result", "attempts", "attempt_results"][..]
     } else {
         &["id", "result", "attempts"][..]
@@ -369,9 +435,11 @@ fn parse_result_row(
         .and_then(Value::as_str)
         .ok_or_else(|| format!("structured-test-results-results[{index}].id must be a string"))?
         .to_string();
-    let passed = match row.get("result").and_then(Value::as_str) {
-        Some("pass") => true,
-        Some("fail") => false,
+    let (passed, diagnostic_result) = match row.get("result").and_then(Value::as_str) {
+        Some("pass") => (true, false),
+        Some("fail") => (false, false),
+        // Only the schema that carries a reason may say a failure is non-blocking.
+        Some("diagnostic_fail") if diagnostic_schema => (false, true),
         Some(value) => {
             return Err(format!(
                 "structured-test-results-results[{index}].result has unknown value {value:?}"
@@ -441,11 +509,30 @@ fn parse_result_row(
             })?,
         );
     }
+    let diagnostic = if diagnostic_schema {
+        match (row.get("diagnostic_reason"), diagnostic_result) {
+            (Some(Value::Null), false) => None,
+            (Some(Value::String(reason)), true) => Some(reason.clone()),
+            (_, true) => {
+                return Err(format!(
+                    "structured-test-results-results[{index}].diagnostic_reason must be a string on a diagnostic_fail row"
+                ));
+            }
+            (_, false) => {
+                return Err(format!(
+                    "structured-test-results-results[{index}].diagnostic_reason must be null unless result is diagnostic_fail"
+                ));
+            }
+        }
+    } else {
+        None
+    };
     let result = TestResult {
         id,
         passed,
         attempts,
         attempt_results: Some(attempt_results),
+        diagnostic,
     };
     validate_result(&result, false)?;
     Ok(result)
@@ -492,6 +579,7 @@ impl TestResults {
         validate_results(executed_tests, &results)?;
         for result in &results {
             validate_result(result, true)?;
+            require_blocking_result(result)?;
         }
         Ok(Self {
             executed_tests,
@@ -500,7 +588,24 @@ impl TestResults {
         })
     }
 
-    /// Read count-only schema 1, default schema 2, or classified schema 3.
+    /// Construct opt-in schema-4 results: classified attempts plus diagnostic failures.
+    pub fn diagnostic(
+        executed_tests: u64,
+        filtered_tests: u64,
+        results: Vec<TestResult>,
+    ) -> Result<Self, String> {
+        validate_results(executed_tests, &results)?;
+        for result in &results {
+            validate_result(result, true)?;
+        }
+        Ok(Self {
+            executed_tests,
+            filtered_tests,
+            results: Some(results),
+        })
+    }
+
+    /// Read count-only schema 1, default schema 2, classified schema 3, or diagnostic schema 4.
     pub fn from_json_slice(bytes: &[u8]) -> Result<Self, String> {
         let value = parse_unique_json_value(bytes)?;
         let object = value
@@ -518,7 +623,7 @@ impl TestResults {
                     results: None,
                 })
             }
-            CURRENT_SCHEMA | CLASSIFIED_RESULTS_SCHEMA => {
+            CURRENT_SCHEMA | CLASSIFIED_RESULTS_SCHEMA | DIAGNOSTIC_RESULTS_SCHEMA => {
                 exact_fields(
                     object,
                     &["schema", "executed_tests", "filtered_tests", "results"],
@@ -534,11 +639,9 @@ impl TestResults {
                     let row = row.as_object().ok_or_else(|| {
                         format!("structured-test-results-results[{index}] must be an object")
                     })?;
-                    results.push(
-                        parse_result_row(row, index, schema == CLASSIFIED_RESULTS_SCHEMA).map_err(
-                            |error| format!("structured-test-results-results[{index}]: {error}"),
-                        )?,
-                    );
+                    results.push(parse_result_row(row, index, schema).map_err(|error| {
+                        format!("structured-test-results-results[{index}]: {error}")
+                    })?);
                 }
                 validate_results(executed_tests, &results)?;
                 Ok(Self {
@@ -558,9 +661,12 @@ impl TestResults {
         bytes: &[u8],
         declared_schema: u64,
     ) -> Result<Self, String> {
-        if declared_schema != CURRENT_SCHEMA && declared_schema != CLASSIFIED_RESULTS_SCHEMA {
+        if declared_schema != CURRENT_SCHEMA
+            && declared_schema != CLASSIFIED_RESULTS_SCHEMA
+            && declared_schema != DIAGNOSTIC_RESULTS_SCHEMA
+        {
             return Err(format!(
-                "structured-test-results declaration has unsupported schema {declared_schema}; expected default schema {CURRENT_SCHEMA} or classified schema {CLASSIFIED_RESULTS_SCHEMA}"
+                "structured-test-results declaration has unsupported schema {declared_schema}; expected default schema {CURRENT_SCHEMA}, classified schema {CLASSIFIED_RESULTS_SCHEMA} or diagnostic schema {DIAGNOSTIC_RESULTS_SCHEMA}"
             ));
         }
         let value = parse_unique_json_value(bytes)?;
@@ -616,6 +722,7 @@ impl TestResults {
             .iter()
             .map(|result| -> Result<Value, String> {
                 validate_result(result, true)?;
+                require_blocking_result(result)?;
                 let attempts = result.attempt_results.as_ref();
                 Ok(serde_json::json!({
                     "id": result.id,
@@ -631,6 +738,40 @@ impl TestResults {
             .collect::<Result<Vec<_>, _>>()?;
         serde_json::to_vec(&serde_json::json!({
             "schema": CLASSIFIED_RESULTS_SCHEMA,
+            "executed_tests": self.executed_tests,
+            "filtered_tests": self.filtered_tests,
+            "results": rows,
+        }))
+        .map_err(|error| format!("structured-test-results-json: {error}"))
+    }
+
+    /// Serialize complete opt-in schema-4 evidence, diagnostic reasons included.
+    pub fn to_diagnostic_json(&self) -> Result<Vec<u8>, String> {
+        let results = self.results.as_ref().ok_or_else(|| {
+            "structured-test-results-schema: retained schema 1 has no current write path"
+                .to_string()
+        })?;
+        validate_results(self.executed_tests, results)?;
+        let rows = results
+            .iter()
+            .map(|result| -> Result<Value, String> {
+                validate_result(result, true)?;
+                let attempts = result.attempt_results.as_ref();
+                Ok(serde_json::json!({
+                    "id": result.id,
+                    "result": result.wire_result(),
+                    "attempts": result.attempts,
+                    "attempt_results": attempts.map(|attempts| attempts.iter().map(|attempt| serde_json::json!({
+                        "attempt": attempt.attempt,
+                        "outcome": attempt.outcome.value(),
+                        "detail": attempt.detail,
+                    })).collect::<Vec<_>>()),
+                    "diagnostic_reason": result.diagnostic,
+                }))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        serde_json::to_vec(&serde_json::json!({
+            "schema": DIAGNOSTIC_RESULTS_SCHEMA,
             "executed_tests": self.executed_tests,
             "filtered_tests": self.filtered_tests,
             "results": rows,
@@ -662,6 +803,14 @@ impl TestResults {
     pub fn write_classified_typed(&self, path: &Path) -> Result<(), TestResultsWriteError> {
         let bytes = self
             .to_classified_json()
+            .map_err(TestResultsWriteError::Invalid)?;
+        self.write_bytes(path, bytes)
+    }
+
+    /// Atomically publish schema 4, retaining validation versus filesystem failure.
+    pub fn write_diagnostic_typed(&self, path: &Path) -> Result<(), TestResultsWriteError> {
+        let bytes = self
+            .to_diagnostic_json()
             .map_err(TestResultsWriteError::Invalid)?;
         self.write_bytes(path, bytes)
     }
@@ -737,11 +886,43 @@ fn require_legacy_result(result: &TestResult) -> Result<(), String> {
             "structured-test-results schema-2 writer refuses to discard classified attempts".into(),
         );
     }
+    require_blocking_result(result)
+}
+
+/// Schemas 2 and 3 cannot say a failure is non-blocking. Writing a diagnostic failure as a plain
+/// `fail` would silently change its meaning, so those writers refuse instead.
+fn require_blocking_result(result: &TestResult) -> Result<(), String> {
+    if result.diagnostic.is_some() {
+        return Err(format!(
+            "structured-test-results schema {RETAINED_RESULTS_SCHEMA}/{CLASSIFIED_RESULTS_SCHEMA} writer refuses to discard the diagnostic designation of {:?}; write schema {DIAGNOSTIC_RESULTS_SCHEMA}",
+            result.id
+        ));
+    }
     Ok(())
 }
 
 fn validate_result(result: &TestResult, require_attempt_results: bool) -> Result<(), String> {
     TestResult::new(result.id.clone(), result.passed, result.attempts)?;
+    if let Some(reason) = result.diagnostic.as_deref() {
+        if result.passed {
+            return Err(format!(
+                "structured-test-results diagnostic designation on passing test {:?}; a pass is an ordinary pass row",
+                result.id
+            ));
+        }
+        if reason.is_empty() || reason.trim() != reason {
+            return Err(format!(
+                "structured-test-results diagnostic failure {:?} requires a nonempty trimmed reason",
+                result.id
+            ));
+        }
+        if result.attempt_results.is_none() {
+            return Err(format!(
+                "structured-test-results diagnostic failure {:?} lacks classified attempt_results",
+                result.id
+            ));
+        }
+    }
     let Some(attempts) = result.attempt_results.as_ref() else {
         if require_attempt_results {
             return Err("structured-test-results classified row lacks attempt_results".into());
@@ -1337,5 +1518,129 @@ mod additive_tests {
         ] {
             assert!(TestResults::from_json_slice(bytes).unwrap_err().contains("duplicate key"));
         }
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    fn failed_attempt() -> Vec<TestAttemptResult> {
+        vec![TestAttemptResult::new(1, TestAttemptOutcome::Failed, Some("exit 1".into())).unwrap()]
+    }
+
+    fn report() -> TestResults {
+        TestResults::diagnostic(
+            3,
+            2,
+            vec![
+                TestResult::with_attempt_results(
+                    "suite$pass".into(),
+                    true,
+                    vec![TestAttemptResult::new(1, TestAttemptOutcome::Passed, None).unwrap()],
+                )
+                .unwrap(),
+                TestResult::with_attempt_results("suite$fail".into(), false, failed_attempt())
+                    .unwrap(),
+                TestResult::diagnostic_failure(
+                    "suite$diag".into(),
+                    failed_attempt(),
+                    "bounded probe; a slow host is not a product loss".into(),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn diagnostic_schema_round_trips_and_classifies_each_row() {
+        let report = report();
+        let bytes = report.to_diagnostic_json().unwrap();
+        let parsed = TestResults::from_declared_schema_json_slice(&bytes, 4).unwrap();
+        assert_eq!(parsed, report);
+        let rows = parsed.results.unwrap();
+        let blocking = rows.iter().filter(|r| r.is_blocking_failure()).count();
+        let diagnostic = rows.iter().filter(|r| r.is_diagnostic_failure()).count();
+        assert_eq!((blocking, diagnostic), (1, 1));
+        assert!(!rows[2].passed, "a diagnostic failure is still a failure");
+        let wire: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(wire["results"][2]["result"], "diagnostic_fail");
+        assert_eq!(
+            wire["results"][2]["diagnostic_reason"],
+            "bounded probe; a slow host is not a product loss"
+        );
+        assert_eq!(wire["results"][1]["result"], "fail");
+        assert_eq!(wire["results"][1]["diagnostic_reason"], Value::Null);
+    }
+
+    #[test]
+    fn older_schemas_refuse_to_write_or_read_a_diagnostic_failure() {
+        let report = report();
+        for error in [
+            report.to_classified_json().unwrap_err(),
+            TestResults::classified(3, 2, report.results.clone().unwrap()).unwrap_err(),
+        ] {
+            assert!(
+                error.contains("refuses to discard the diagnostic designation"),
+                "{error}"
+            );
+        }
+        let legacy = TestResult {
+            attempt_results: None,
+            ..report.results.as_ref().unwrap()[2].clone()
+        };
+        assert!(TestResults::current(1, 0, vec![legacy]).is_err());
+        // A schema-3 document cannot spell diagnostic_fail at all.
+        let bytes = br#"{"schema":3,"executed_tests":1,"filtered_tests":0,"results":[{"id":"a","result":"diagnostic_fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"failed","detail":"exit 1"}]}]}"#;
+        assert!(TestResults::from_json_slice(bytes)
+            .unwrap_err()
+            .contains("unknown value \"diagnostic_fail\""));
+        let declared_three = report.to_diagnostic_json().unwrap();
+        assert!(TestResults::from_declared_schema_json_slice(&declared_three, 3).is_err());
+    }
+
+    #[test]
+    fn inconsistent_diagnostic_rows_are_refused() {
+        let base = || -> Value {
+            serde_json::from_slice(&report().to_diagnostic_json().unwrap()).unwrap()
+        };
+        let refuse = |change: &dyn Fn(&mut Value)| {
+            let mut wire = base();
+            change(&mut wire);
+            assert!(
+                TestResults::from_json_slice(&serde_json::to_vec(&wire).unwrap()).is_err(),
+                "{wire}"
+            );
+        };
+        // diagnostic_fail without a reason, with an empty or untrimmed reason, or with a number.
+        refuse(&|w| w["results"][2]["diagnostic_reason"] = Value::Null);
+        refuse(&|w| w["results"][2]["diagnostic_reason"] = "".into());
+        refuse(&|w| w["results"][2]["diagnostic_reason"] = " why".into());
+        refuse(&|w| w["results"][2]["diagnostic_reason"] = 7.into());
+        // A reason on a blocking fail or on a pass.
+        refuse(&|w| w["results"][1]["diagnostic_reason"] = "excuse".into());
+        refuse(&|w| w["results"][0]["diagnostic_reason"] = "excuse".into());
+        // A diagnostic_fail whose terminal attempt passed.
+        refuse(&|w| {
+            w["results"][2]["attempt_results"][0]["outcome"] = "passed".into();
+            w["results"][2]["attempt_results"][0]["detail"] = Value::Null;
+        });
+        // The reason field is required in schema 4, even when null.
+        refuse(&|w| {
+            w["results"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("diagnostic_reason");
+        });
+        // And refused in schema 3.
+        refuse(&|w| w["schema"] = 3.into());
+        assert!(TestResult::diagnostic_failure(
+            "a".into(),
+            vec![TestAttemptResult::new(1, TestAttemptOutcome::Passed, None).unwrap()],
+            "why".into()
+        )
+        .is_err());
+        assert!(TestResult::diagnostic_failure("a".into(), failed_attempt(), "".into()).is_err());
     }
 }
