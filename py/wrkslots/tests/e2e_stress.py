@@ -201,6 +201,8 @@ def _make_project(base: Path, trace: Trace, ttl_seconds: int = 2) -> TestProject
             str(ttl_seconds),
             "--liveness-command",
             "liveness.py",
+            "--salvage-push-remote",
+            str(remote),
         ],
         cwd=root,
         env=environment,

@@ -1058,6 +1058,7 @@ def initialize(
     post_provision_hooks: tuple[str, ...] = (),
     disk_thresholds_gib: tuple[int, int, int] | None = None,
     liveness_batch: bool = False,
+    salvage_push_remotes: tuple[str, ...] = (),
 ) -> None:
     liveness = project / "liveness.py"
     if not liveness.exists():
@@ -1116,6 +1117,8 @@ def initialize(
         argv.extend(("--repo-cache-glob", f"{name}={cache_glob}"))
     for hook in post_provision_hooks:
         argv.extend(("--post-provision-hook", hook))
+    for salvage_remote in salvage_push_remotes:
+        argv.extend(("--salvage-push-remote", salvage_remote))
     if disk_thresholds_gib is not None:
         advisory, provisioning_floor, emergency = disk_thresholds_gib
         argv.extend(
@@ -1149,7 +1152,9 @@ def make_project(
     post_provision_hooks: tuple[str, ...] = (),
     disk_thresholds_gib: tuple[int, int, int] | None = None,
     liveness_batch: bool = False,
+    allow_salvage_push: bool = True,
 ) -> tuple[Path, Path, Path]:
+    """Create a project; salvage may push to the fixture remote unless disallowed."""
     remote = tmp_path / "remote.git"
     project = tmp_path / "project"
     repository = project / "repo"
@@ -1187,6 +1192,7 @@ def make_project(
         post_provision_hooks=post_provision_hooks,
         disk_thresholds_gib=disk_thresholds_gib,
         liveness_batch=liveness_batch,
+        salvage_push_remotes=(str(remote),) if allow_salvage_push else (),
     )
     return project, repository, remote
 
@@ -1525,6 +1531,15 @@ def update_configuration(project: Path, **updates: object) -> None:
     config.update(updates)
     path.write_text(
         json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def allow_salvage_push(project: Path, *remotes: Path) -> None:
+    """Add remotes to the configured salvage push allow list."""
+    allowed = configuration(project).get("salvage_push_remotes", [])
+    assert isinstance(allowed, list)
+    update_configuration(
+        project, salvage_push_remotes=[*allowed, *(str(remote) for remote in remotes)]
     )
 
 
@@ -14240,6 +14255,233 @@ def test_agent_reclaim_does_not_salvage_ignored_only_payload(
     assert receipt["disposition"] == "already-published"
 
 
+def prepare_flat_salvage_with_handoff(
+    tmp_path: Path, *, allow_push: bool, other_allowed: tuple[str, ...] = ()
+) -> tuple[Path, Path, Path]:
+    """A dead-owner flat slot holding a read legacy handoff and authored work.
+
+    ``other_allowed`` adds salvage push remotes that are not the fixture remote.
+    """
+    project, _repository, remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+        allow_salvage_push=allow_push,
+    )
+    if other_allowed:
+        allowed = configuration(project).get("salvage_push_remotes", [])
+        assert isinstance(allowed, list)
+        update_configuration(project, salvage_push_remotes=[*allowed, *other_allowed])
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project)
+    (tree / "HANDOFF.md").write_text("private next steps\n", encoding="utf-8")
+    (tree / "work.txt").write_text("authored work\n", encoding="utf-8")
+    read = raw_command(
+        project, "read-handoff", "slot01", "--coordinator-pid", str(os.getpid())
+    )
+    assert read.returncode == 0, read.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    return project, tree, remote
+
+
+def remote_refs(remote: Path) -> str:
+    return git(remote, "for-each-ref", "--format=%(objectname) %(refname)").stdout
+
+
+def test_flat_salvage_push_omits_handoff_and_task_text(tmp_path: Path) -> None:
+    project, tree, remote = prepare_flat_salvage_with_handoff(tmp_path, allow_push=True)
+
+    removed = raw_command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+
+    assert removed.returncode == 0, removed.stderr
+    assert not tree.exists()
+    control = control_directory(project)
+    archive = json.loads((control / "ARCHIVED.testhost.json").read_text(encoding="utf-8"))
+    receipt = archive["records"][0]["salvage"][0]
+    assert receipt["disposition"] == "salvaged"
+    remote_ref = receipt["remote_ref"]
+    salvage_commit = receipt["salvage_commit"]
+    assert receipt["destination"] == f"origin:{remote_ref}"
+    assert git(remote, "rev-parse", remote_ref).stdout.strip() == salvage_commit
+    names = set(
+        git(remote, "ls-tree", "-r", "--name-only", salvage_commit).stdout.splitlines()
+    )
+    assert "work.txt" in names
+    assert "HANDOFF.md" not in names
+    message = git(remote, "log", "-1", "--format=%B", salvage_commit).stdout
+    assert not any(line.startswith("task:") for line in message.splitlines())
+    assert "task-slot01" not in message
+    events = wrkslots._load_events(wrkslots._load_config(str(project), "testhost"))
+    # The handoff stays local: read-handoff recorded its exact contents.
+    reads = [event for event in events if event["kind"] == "handoff-read"]
+    assert reads
+    assert all(
+        isinstance(event["payload"], dict)
+        and event["payload"]["contents_utf8"] == "private next steps\n"
+        for event in reads
+    )
+    evidence = [
+        event["payload"]
+        for event in events
+        if event["kind"] == "active-state-recorded"
+        and isinstance(event["payload"], dict)
+        and event["payload"]["action"] == "reclaim-evidence-recorded"
+    ]
+    assert len(evidence) == 1
+    recorded = evidence[0]["evidence"]
+    assert isinstance(recorded, dict)
+    assert recorded["salvage"][0]["destination"] == f"origin:{remote_ref}"
+
+
+@pytest.mark.parametrize("allow_list", ["empty", "other-remotes-only"])
+def test_salvage_to_unlisted_remote_keeps_verified_local_bundle(
+    tmp_path: Path, allow_list: str
+) -> None:
+    # A non-empty list that omits the checkout's remote must not allow it.
+    other_allowed = (
+        ()
+        if allow_list == "empty"
+        else (
+            str(tmp_path / "other.git"),
+            "https://github.com/example-owner/example-repo.git",
+        )
+    )
+    project, tree, remote = prepare_flat_salvage_with_handoff(
+        tmp_path, allow_push=False, other_allowed=other_allowed
+    )
+    assert configuration(project).get("salvage_push_remotes", []) == list(other_allowed)
+    before = remote_refs(remote)
+
+    removed = raw_command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+
+    assert removed.returncode == 0, removed.stderr
+    assert "not in salvage_push_remotes" in removed.stderr
+    assert not tree.exists()
+    assert remote_refs(remote) == before
+    control = control_directory(project)
+    archive = json.loads((control / "ARCHIVED.testhost.json").read_text(encoding="utf-8"))
+    receipt = archive["records"][0]["salvage"][0]
+    assert receipt["disposition"] == "archived-local"
+    assert receipt["archive_reason"] == "remote-not-allowed"
+    assert receipt["remote_failure"] is None
+    assert receipt["remote_ref"] is None
+    bundle = Path(receipt["archive_bundle"])
+    assert receipt["destination"] == str(bundle)
+    assert bundle.is_relative_to(control / "wrkslots-salvage")
+    assert hashlib.sha256(bundle.read_bytes()).hexdigest() == receipt["archive_bundle_sha256"]
+    restored = tmp_path / "restored.git"
+    git(tmp_path, "clone", "--bare", str(bundle), str(restored))
+    salvage_commit = receipt["salvage_commit"]
+    assert git(restored, "rev-parse", receipt["archive_ref"]).stdout.strip() == salvage_commit
+    assert git(restored, "show", f"{salvage_commit}:work.txt").stdout == "authored work\n"
+    names = git(restored, "ls-tree", "-r", "--name-only", salvage_commit).stdout.splitlines()
+    assert "HANDOFF.md" not in names
+
+
+@pytest.mark.parametrize("glob_name", ["*.md", "*"])
+def test_salvage_stages_glob_named_untracked_files_literally(
+    tmp_path: Path, glob_name: str
+) -> None:
+    # A shell leaves a file with a literal glob name when the glob matched
+    # nothing (for example `touch *.md`). Salvage must stage that one file, not
+    # every path its name matches as a pathspec, so it cannot pull the
+    # excluded HANDOFF.md back in.
+    project, tree, remote = prepare_flat_salvage_with_handoff(tmp_path, allow_push=True)
+    (tree / glob_name).write_text("literal glob name\n", encoding="utf-8")
+
+    removed = raw_command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+
+    assert removed.returncode == 0, removed.stderr
+    control = control_directory(project)
+    archive = json.loads((control / "ARCHIVED.testhost.json").read_text(encoding="utf-8"))
+    receipt = archive["records"][0]["salvage"][0]
+    assert receipt["disposition"] == "salvaged"
+    salvage_commit = receipt["salvage_commit"]
+    names = set(
+        git(remote, "ls-tree", "-r", "--name-only", salvage_commit).stdout.splitlines()
+    )
+    assert names == {"seed.txt", "work.txt", glob_name}
+    assert git(remote, "show", f"{salvage_commit}:{glob_name}").stdout == "literal glob name\n"
+
+
+def test_salvage_refuses_removal_when_default_bundle_cannot_be_written(
+    tmp_path: Path,
+) -> None:
+    project, tree, remote = prepare_flat_salvage_with_handoff(tmp_path, allow_push=False)
+    blocker = control_directory(project) / "wrkslots-salvage"
+    blocker.write_text("not a directory\n", encoding="utf-8")
+    before = remote_refs(remote)
+
+    refused = raw_command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+
+    assert refused.returncode == 3
+    assert "local salvage archive" in refused.stderr
+    assert (tree / "work.txt").read_text(encoding="utf-8") == "authored work\n"
+    assert (tree / "HANDOFF.md").read_text(encoding="utf-8") == "private next steps\n"
+    assert len(active_slots(project)) == 1
+    assert remote_refs(remote) == before
+    assert blocker.read_text(encoding="utf-8") == "not a directory\n"
+
+
+def test_salvage_push_remotes_refuse_blank_entries(tmp_path: Path) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    update_configuration(project, salvage_push_remotes=[" padded "])
+
+    refused = raw_command(project, "status")
+
+    assert refused.returncode != 0
+    assert "salvage push remotes must be non-empty remote URLs" in refused.stderr
+
+
+def test_create_refuses_a_slot_named_after_control_storage(tmp_path: Path) -> None:
+    # In the nested layout slots sit in the control directory beside its
+    # storage directories, which include the default local salvage bundles.
+    project, _repository, _remote = make_project(tmp_path)
+    control = control_directory(project)
+    assert slots_directory(project) == control
+
+    refused = create(project, slot="wrkslots-salvage")
+
+    assert refused.returncode == 3
+    assert "reserved for wrkslots storage" in refused.stderr
+    assert not (control / "wrkslots-salvage").exists()
+    assert active_slots(project) == []
+
+
 def test_agent_reclaim_salvages_uncommitted_submodule_files_before_removal(
     tmp_path: Path,
 ) -> None:
@@ -14281,6 +14523,7 @@ def test_agent_reclaim_salvages_uncommitted_submodule_files_before_removal(
             "git -c protocol.file.allow=always submodule update --init --recursive"
         ],
     )
+    allow_salvage_push(project, submodule_remote)
 
     made = create(project)
     assert made.returncode == 0, made.stderr
@@ -18830,6 +19073,9 @@ def test_remove_guards_uncommitted_handoffs_for_every_slot_type(
         assert removed.returncode == 3
         assert handoff.name in removed.stderr
         assert "slot and every checkout were retained" in removed.stderr
+        # The remedy must not steer the operator to publish a handoff.
+        assert "publish it" not in removed.stderr
+        assert "salvage never publishes handoffs" in removed.stderr
         assert handoff.is_file()
         assert tree.is_dir()
         assert (
@@ -21456,6 +21702,7 @@ def test_finish_still_refuses_a_legacy_flat_handoff(tmp_path: Path) -> None:
 
     assert refused.returncode == 3
     assert "dirty or has untracked/ignored files" in refused.stderr
+    assert "keep a handoff out of commits (use write-handoff)" in refused.stderr
     assert legacy.read_text(encoding="utf-8") == "legacy untracked work\n"
 
 
@@ -31458,6 +31705,32 @@ def test_recover_absent_agent_row_preserves_commit_before_registry_repair(
     assert run_absent_agent_recovery(project, record, apply=True) == 0
 
 
+def test_recover_absent_agent_row_refuses_rescue_push_to_unlisted_remote(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Absent or empty salvage_push_remotes allows no remote, so the recorded
+    # HEAD must not be published as a rescue ref.
+    project, repository, remote = make_project(tmp_path, allow_salvage_push=False)
+    record = prepare_absent_agent_row(project, repository)
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    before = remote_refs(remote)
+
+    assert run_absent_agent_recovery(project, record, apply=False) == 3
+    assert "not in salvage_push_remotes" in capsys.readouterr().err
+    assert run_absent_agent_recovery(project, record, apply=True) == 3
+    assert "not in salvage_push_remotes" in capsys.readouterr().err
+
+    assert remote_refs(remote) == before
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+    assert not (config.control / "ACTIVE.testhost.journal").exists()
+    path = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
+    assert wrkslots._GitVcs().worktree_registration(repository, path) is not None
+
+
 def test_recover_absent_agent_row_accepts_unchanged_unregistered_branch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -32753,6 +33026,7 @@ def test_recover_ownerless_agent_worktree_salvages_dirty_tree_without_owner(
     assert receipt["disposition"] == "salvaged"
     rescue_ref = wrkslots._as_str(receipt["remote_ref"], "ownerless rescue ref")
     assert rescue_ref.startswith("refs/salvage/testhost/")
+    assert receipt["destination"] == f"origin:{rescue_ref}"
     salvage_commit = git(remote, "rev-parse", rescue_ref).stdout.strip()
     assert salvage_commit == receipt["salvage_commit"]
     assert git(remote, "show", f"{salvage_commit}:uncommitted.txt").stdout == "preserve me\n"
@@ -32943,12 +33217,112 @@ def test_recover_ownerless_agent_worktree_requires_read_handoff_and_preserves_it
         wrkslots._as_list(payload["salvage"], "ownerless salvage")[0],
         "ownerless salvage receipt",
     )
-    salvage_commit = git(
-        remote,
-        "rev-parse",
-        wrkslots._as_str(receipt["remote_ref"], "ownerless rescue ref"),
-    ).stdout.strip()
-    assert git(remote, "show", f"{salvage_commit}:HANDOFF.md").stdout == "unread\n"
+    # The read handoff is kept beside the registry and is never salvaged: with
+    # no other change the published HEAD already preserves the worktree.
+    assert receipt["disposition"] == "already-published"
+    assert git(
+        remote, "for-each-ref", "--format=%(refname)", *SALVAGE_REF_NAMESPACES
+    ).stdout == ""
+    preserved = Path(
+        wrkslots._as_str(payload["handoff_preserved"], "preserved ownerless handoff")
+    )
+    assert preserved.parent == config.control
+    assert preserved.read_text(encoding="utf-8") == "unread\n"
+
+
+def test_recover_ownerless_agent_worktree_keeps_unlisted_remote_work_local(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, remote = make_project(tmp_path, allow_salvage_push=False)
+    target, head, remote_digest = prepare_ownerless_agent_worktree(project, repository)
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+    (target / "HANDOFF.md").write_text("ownerless notes\n", encoding="utf-8")
+    (target / "work.txt").write_text("ownerless work\n", encoding="utf-8")
+    # A literal glob name must not pull the handoff back into the salvage.
+    (target / "*.md").write_text("literal glob name\n", encoding="utf-8")
+    before = remote_refs(remote)
+
+    assert run_ownerless_agent_recovery(
+        project,
+        target,
+        head,
+        remote_digest,
+        apply=True,
+        handoff_sha256=hashlib.sha256(b"ownerless notes\n").hexdigest(),
+    ) == 0
+
+    assert not target.exists()
+    assert remote_refs(remote) == before
+    config = wrkslots._load_config(str(project), "testhost")
+    event = next(
+        value
+        for value in reversed(wrkslots._load_events(config))
+        if value["kind"] == "ownerless-agent-worktree-removed"
+    )
+    payload = wrkslots._as_mapping(event["payload"], "ownerless event payload")
+    receipt = wrkslots._as_mapping(
+        wrkslots._as_list(payload["salvage"], "ownerless salvage")[0],
+        "ownerless salvage receipt",
+    )
+    assert receipt["disposition"] == "archived-local"
+    assert receipt["archive_reason"] == "remote-not-allowed"
+    bundle = Path(wrkslots._as_str(receipt["archive_bundle"], "ownerless bundle"))
+    assert receipt["destination"] == str(bundle)
+    assert bundle.is_relative_to(config.control / "wrkslots-salvage")
+    restored = tmp_path / "restored.git"
+    git(tmp_path, "clone", "--bare", str(bundle), str(restored))
+    salvage_commit = wrkslots._as_str(receipt["salvage_commit"], "ownerless commit")
+    archive_ref = wrkslots._as_str(receipt["archive_ref"], "ownerless archive ref")
+    assert git(restored, "rev-parse", archive_ref).stdout.strip() == salvage_commit
+    assert git(restored, "show", f"{salvage_commit}:work.txt").stdout == "ownerless work\n"
+    names = git(restored, "ls-tree", "-r", "--name-only", salvage_commit).stdout.splitlines()
+    assert "HANDOFF.md" not in names
+    assert "*.md" in names
+    preserved = Path(
+        wrkslots._as_str(payload["handoff_preserved"], "preserved ownerless handoff")
+    )
+    assert preserved.read_text(encoding="utf-8") == "ownerless notes\n"
+
+
+def test_recover_ownerless_agent_worktree_refuses_when_default_bundle_cannot_be_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, remote = make_project(tmp_path, allow_salvage_push=False)
+    target, head, remote_digest = prepare_ownerless_agent_worktree(project, repository)
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+    (target / "work.txt").write_text("ownerless work\n", encoding="utf-8")
+    config = wrkslots._load_config(str(project), "testhost")
+    blocker = config.control / "wrkslots-salvage"
+    blocker.write_text("not a directory\n", encoding="utf-8")
+    before = remote_refs(remote)
+
+    assert run_ownerless_agent_recovery(
+        project, target, head, remote_digest, apply=True
+    ) == 3
+
+    assert "local salvage archive" in capsys.readouterr().err
+    assert (target / "work.txt").read_text(encoding="utf-8") == "ownerless work\n"
+    assert remote_refs(remote) == before
+    assert blocker.read_text(encoding="utf-8") == "not a directory\n"
+
+
+def test_recover_ownerless_agent_worktree_refuses_other_uncommitted_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, remote = make_project(tmp_path)
+    target, head, remote_digest = prepare_ownerless_agent_worktree(project, repository)
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+    (target / "notes").mkdir()
+    (target / "notes" / "HANDOFF-earlier.md").write_text("older notes\n", encoding="utf-8")
+    before = remote_refs(remote)
+
+    assert run_ownerless_agent_recovery(
+        project, target, head, remote_digest, apply=True
+    ) == 3
+
+    assert "uncommitted handoff" in capsys.readouterr().err
+    assert (target / "notes" / "HANDOFF-earlier.md").is_file()
+    assert remote_refs(remote) == before
 
 
 def test_recover_ownerless_agent_worktree_refuses_handoff_change(
@@ -33075,6 +33449,7 @@ def test_recover_ownerless_agent_worktree_salvages_initialized_nested_repositori
 ) -> None:
     project, repository, _remote = make_project(tmp_path)
     add_recursive_submodules(tmp_path, project, repository)
+    allow_salvage_push(project, tmp_path / "component.git", tmp_path / "leaf.git")
     target, head, remote_digest = prepare_ownerless_agent_worktree(project, repository)
     git(
         target,
@@ -39304,8 +39679,8 @@ def test_an_older_client_keeps_working_beside_an_owner_release(tmp_path: Path) -
     """Old and new clients share one registry; a release must not break the old one.
 
     The older client predates the YAML configuration reader and the sandbox
-    setting, both unrelated to release, so it is given the same configuration
-    as JSON without that key.
+    and salvage_push_remotes settings, all unrelated to release, so it is given
+    the same configuration as JSON without those keys.
     """
 
     older = _older_client(tmp_path)
@@ -39319,6 +39694,7 @@ def test_an_older_client_keeps_working_beside_an_owner_release(tmp_path: Path) -
     settings_path = project / ".wrkslots.yml"
     settings = json.loads(settings_path.read_text(encoding="utf-8"))
     settings.pop("sandbox", None)
+    settings.pop("salvage_push_remotes", None)
     settings_path.write_text(json.dumps(settings, indent=2, sort_keys=True) + "\n")
     _write_slot_handoff(project, tmp_path, slot="slot01", agent="codex-1", text="done\n")
     released = _release(project)

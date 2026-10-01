@@ -627,18 +627,28 @@ worktrees directory.
 
 For a dirty or unpushed agent checkout, reclaim constructs a commit without changing the checkout's
 ordinary index or branch. It includes tracked and ordinary untracked files except configured cache
-paths, pushes the commit to `refs/salvage/<machine>/<slot>/...`, reads that exact ref back, and
-records the result. Salvage refs, like the absent-agent rescue refs under `refs/rescue/wrkslots/`,
+paths and handoff files (any basename starting `HANDOFF`, which removal preserves separately). The
+commit message names the slot, checkout, and source head, not the registry task. When the remote's
+URL is listed in the `salvage_push_remotes` configuration key, reclaim pushes the commit to
+`refs/salvage/<machine>/<slot>/...`, reads that exact ref back, and records the result. Absent or
+empty, that key allows no remote: the work is kept in a verified local bundle as described below,
+beneath the explicit `--salvage-archive-root` or, by default, beneath the control directory's
+`wrkslots-salvage/`. If the bundle cannot be written and verified, removal refuses. Wrkslots never
+deletes these bundles; each holds the complete history reachable from its salvage commit, so remove
+a bundle and its receipt yourself once the work is recovered. Older wrkslots clients refuse a
+configuration that contains `salvage_push_remotes`, so upgrade every client that shares the
+configuration before setting it. Salvage refs, like the absent-agent rescue refs under `refs/rescue/wrkslots/`,
 are deliberately outside `refs/heads/`: they are addressable by exact name but are not branches, so
 publishing them does not add branches to a repository that keeps only `main`. Receipts written
 before this change name `refs/heads/salvage/...` or `refs/heads/rescue/wrkslots/...` and still
 verify against the exact ref they recorded. If the checkout was already clean and published, the existing remote containment
 is recorded instead. A failed or unverifiable push preserves the checkout.
 
-When the recorded remote cannot accept a salvage ref, an operator may explicitly choose durable
-local custody by adding `--salvage-archive-root ABSOLUTE_PATH` to `remove`. There is no default: the
+When an allowed remote cannot accept a salvage ref, an operator may explicitly choose durable
+local custody by adding `--salvage-archive-root ABSOLUTE_PATH` to `remove`. The
 directory must already exist, must be owned by the current user, must not be group/world writable,
-must have no symlink component, and must be separate from the managed project tree. Wrkslots still
+must have no symlink component, and must be separate from the managed project tree (the control
+directory, which is the default root, is the one exception). Wrkslots still
 tries the recorded remote first. Only after that push attempt refuses does it
 write one self-contained Git bundle per affected repository under the supplied root. Each bundle has
 a schema-1 JSON receipt binding the machine, slot generation, checkout and repository identities,
@@ -651,9 +661,10 @@ An interrupted removal can be resumed with ordinary `wrkslots recover`; its fini
 the verified local receipt. If interruption occurred just before the finish journal was created,
 repeat the original `remove` command with the same archive root. The deterministic archive path is
 reused only when its receipt and bundle still exactly verify. A missing, changed, partial, or
-wrongly-bound archive refuses and leaves the checkout intact. Local archive custody is intentionally
-not available through `retire-pending`, because selecting that durability boundary must be an
-explicit per-slot operator action.
+wrongly-bound archive refuses and leaves the checkout intact. Local archive custody after a refused
+push is intentionally not available through `retire-pending`, because selecting that durability
+boundary must be an explicit per-slot operator action; a remote outside `salvage_push_remotes` always
+uses the default root there.
 
 ```sh
 mkdir -p "$HOME/temp/agent_checkouts"
@@ -819,7 +830,9 @@ The command requires the registered liveness authority to report dead, requires 
 owner generation to be dead, and performs the same full-host process, cgroup, mount, and user-systemd
 census used for absent validation rows. It does not claim the vanished working tree was clean. Every
 recorded checkout commit is pushed individually to a dedicated rescue ref and read back from the
-remote before the exact stale Git worktree registration is removed. The archive is durable before
+remote before the exact stale Git worktree registration is removed. Because that push is the only
+preservation, the plan and the apply both refuse unless every checkout's remote is listed in
+`salvage_push_remotes`. The archive is durable before
 ACTIVE is changed and explicitly records that uncommitted, untracked, ignored, and HANDOFF contents
 could not be inspected because storage was already absent.
 

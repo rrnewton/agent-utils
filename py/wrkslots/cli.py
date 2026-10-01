@@ -68,6 +68,9 @@ _NETWORK_CONFIG_SHA256_ENV = "WRKSLOTS_NETWORK_CONFIG_SHA256"
 _NETWORK_CONFIG_BYTES_LIMIT = 1024 * 1024
 _LOCAL_SALVAGE_RECEIPT_SCHEMA = 1
 _LOCAL_SALVAGE_RECEIPT_BYTES_LIMIT = 256 * 1024
+#: Directory under a salvage archive root (by default the control directory)
+#: that holds local salvage bundles and their receipts.
+_LOCAL_SALVAGE_DIRECTORY = "wrkslots-salvage"
 # Remote salvage and rescue refs are published outside refs/heads/. A branch
 # namespace would make every reclaim create a visible branch on the recorded
 # remote, which a main-only repository must not accumulate. Custom refs are
@@ -356,6 +359,7 @@ OPTIONAL_CONFIG_KEYS = frozenset(
         "cache_globs",
         "repo_cache_globs",
         "post_provision_hooks",
+        "salvage_push_remotes",
         "disk_advisory_bytes",
         "disk_provisioning_floor_bytes",
         "disk_emergency_bytes",
@@ -415,6 +419,10 @@ CONFIG_KEY_DOCS: dict[str, str] = {
     "cache_globs": "Slot-relative globs of regenerable caches that `clean-caches` may delete.",
     "repo_cache_globs": "Per-repository cache globs: repository name to a list of globs.",
     "post_provision_hooks": "Shell commands run, in order, in every new checkout.",
+    "salvage_push_remotes": (
+        "Remote URLs that removal may push salvage commits to. Absent or empty allows none: "
+        "uncommitted work on any other remote is kept in a verified local bundle instead."
+    ),
     "disk_advisory_bytes": (
         "Free-space level (bytes) below which create warns. The three disk_* keys are set "
         "together and must satisfy emergency < provisioning floor < advisory."
@@ -670,6 +678,8 @@ class Config:
     cache_globs: tuple[str, ...] = ()
     repo_cache_globs: tuple[tuple[str, tuple[str, ...]], ...] = ()
     post_provision_hooks: tuple[str, ...] = ()
+    #: Remote URLs salvage may push to; every other remote gets a local bundle.
+    salvage_push_remotes: tuple[str, ...] = ()
     disk_advisory_bytes: int | None = None
     disk_provisioning_floor_bytes: int | None = None
     disk_emergency_bytes: int | None = None
@@ -1362,6 +1372,12 @@ def _cache_glob_contains_path(pattern: str, path: str) -> bool:
 def _validate_hook(value: str) -> str:
     if not value.strip() or "\x00" in value:
         raise Refusal("post-provision hooks must be non-empty shell commands")
+    return value
+
+
+def _validate_salvage_push_remote(value: str) -> str:
+    if not value or value != value.strip() or "\x00" in value:
+        raise Refusal("salvage push remotes must be non-empty remote URLs")
     return value
 
 
@@ -2961,6 +2977,7 @@ def _config_payload(
     slot_representation: str = "worktree",
     image: Mapping[str, object] | None = None,
     sandbox_section: Mapping[str, object] | None = None,
+    salvage_push_remotes: Sequence[str] = (),
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "schema": SCHEMA,
@@ -2988,6 +3005,8 @@ def _config_payload(
         }
     if post_provision_hooks:
         payload["post_provision_hooks"] = list(post_provision_hooks)
+    if salvage_push_remotes:
+        payload["salvage_push_remotes"] = list(salvage_push_remotes)
     if disk_advisory_bytes is not None:
         payload["disk_advisory_bytes"] = disk_advisory_bytes
         payload["disk_provisioning_floor_bytes"] = disk_provisioning_floor_bytes
@@ -3011,6 +3030,8 @@ def _canonical_config_payload(value: Mapping[str, object]) -> dict[str, object]:
         canonical.pop("repo_cache_globs")
     if canonical.get("post_provision_hooks") == []:
         canonical.pop("post_provision_hooks")
+    if canonical.get("salvage_push_remotes") == []:
+        canonical.pop("salvage_push_remotes")
     if canonical.get("slot_representation") == "worktree":
         canonical.pop("slot_representation")
     return canonical
@@ -3232,6 +3253,15 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
             unique=False,
         )
     )
+    salvage_push_remotes = (
+        ()
+        if "salvage_push_remotes" not in raw
+        else _string_tuple(
+            raw["salvage_push_remotes"],
+            "configuration.salvage_push_remotes",
+            _validate_salvage_push_remote,
+        )
+    )
     disk_keys = (
         "disk_advisory_bytes",
         "disk_provisioning_floor_bytes",
@@ -3282,6 +3312,7 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
         cache_globs=cache_globs,
         repo_cache_globs=repo_cache_globs,
         post_provision_hooks=post_provision_hooks,
+        salvage_push_remotes=salvage_push_remotes,
         disk_advisory_bytes=disk_values[0],
         disk_provisioning_floor_bytes=disk_values[1],
         disk_emergency_bytes=disk_values[2],
@@ -3389,9 +3420,14 @@ def _owned_mount_line(line: str) -> bool:
 
 
 #: Control-directory entries that hold slot storage rather than being slots:
-#: the disk images and the box's per-slot private state. In the nested layout
-#: they sit beside the slot directories.
-_REPRESENTATION_DIRECTORIES = (slotimage.IMAGES_DIRECTORY, "slot-state", "box-state")
+#: the disk images, the box's per-slot private state, and the default local
+#: salvage bundles. In the nested layout they sit beside the slot directories.
+_REPRESENTATION_DIRECTORIES = (
+    slotimage.IMAGES_DIRECTORY,
+    "slot-state",
+    "box-state",
+    _LOCAL_SALVAGE_DIRECTORY,
+)
 
 
 def _is_representation_directory(config: Config, entry: Path) -> bool:
@@ -3542,6 +3578,35 @@ def _init_sandbox_section(config_path: Path) -> dict[str, object] | None:
     if isinstance(section, dict):
         return {str(key): value for key, value in section.items()}
     return None
+
+
+def _init_salvage_push_remotes(
+    args: argparse.Namespace, config_path: Path
+) -> tuple[str, ...]:
+    """The salvage push allow list init writes.
+
+    Explicit --salvage-push-remote flags replace the list. Without them an
+    existing configuration keeps what it has, so rerunning init never drops an
+    allowance; a new project allows no remote.
+    """
+
+    if args.salvage_push_remote:
+        remotes = tuple(
+            _validate_salvage_push_remote(value) for value in args.salvage_push_remote
+        )
+        if len(remotes) != len(set(remotes)):
+            raise Refusal("salvage push remotes must not contain duplicates")
+        return remotes
+    if not config_path.exists() or config_path.is_symlink():
+        return ()
+    try:
+        loaded = _read_config(config_path)
+    except StateError:
+        return ()
+    existing = loaded.get("salvage_push_remotes")
+    if isinstance(existing, list) and all(isinstance(item, str) for item in existing):
+        return tuple(str(item) for item in existing)
+    return ()
 
 
 def _requested_representation(config: Config, args: argparse.Namespace) -> str:
@@ -12932,7 +12997,8 @@ def _assert_checkout_safe(
         first = status.splitlines()[0]
         raise Refusal(
             f"checkout {checkout.name} is dirty or has untracked/ignored files ({first}); "
-            "commit intended work and publish it before finishing"
+            "commit intended work and publish it before finishing; keep a handoff "
+            "out of commits (use write-handoff)"
         )
     remote_authority = vcs.remote_authority(path, checkout.remote)
     if remote_authority.sha256 != checkout.remote_url_sha256:
@@ -12961,7 +13027,10 @@ def _assert_checkout_safe(
 
 
 def _salvage_pathspecs(config: Config, checkout_name: str) -> list[str]:
-    pathspecs = ["."]
+    # A handoff is a private note to the next agent, not work: salvage never
+    # stages one. Removal preserves handoffs before salvage runs (read-handoff
+    # sidecar, or the retained copy beside the registry).
+    pathspecs = [".", ":(exclude,glob)HANDOFF*", ":(exclude,glob)**/HANDOFF*"]
     for pattern in _cache_globs_for(config, checkout_name):
         pathspecs.append(f":(exclude,glob){pattern}")
         pathspecs.append(f":(exclude,glob){pattern}/**")
@@ -12969,7 +13038,11 @@ def _salvage_pathspecs(config: Config, checkout_name: str) -> list[str]:
 
 
 def _local_salvage_archive_root(config: Config, raw: str | None) -> Path | None:
-    """Validate the explicit operator-owned root for local salvage bundles."""
+    """Validate the operator-owned root for local salvage bundles.
+
+    The root is either the explicit --salvage-archive-root or the default, the
+    wrkslots control directory (bundles go under its wrkslots-salvage/).
+    """
     if raw is None:
         return None
     root = Path(raw)
@@ -12996,11 +13069,34 @@ def _local_salvage_archive_root(config: Config, raw: str | None) -> Path | None:
         raise Refusal(
             "--salvage-archive-root must be owned by the current user and not group/world writable"
         )
-    if _path_is_within(root, config.root) or _path_is_within(config.root, root):
+    if root != config.control and (
+        _path_is_within(root, config.root) or _path_is_within(config.root, root)
+    ):
         raise Refusal(
             "--salvage-archive-root must be separate from the managed project tree"
         )
     return root
+
+
+def _default_salvage_archive_root(config: Config) -> Path:
+    """The control directory: local salvage bundles stay beside the registry."""
+    try:
+        root = _local_salvage_archive_root(config, str(config.control))
+    except Refusal as exc:
+        raise Refusal(
+            f"cannot use the default local salvage archive root {config.control}: {exc}; "
+            "pass --salvage-archive-root DIR, or list the remote in salvage_push_remotes"
+        ) from exc
+    assert root is not None
+    return root
+
+
+def _salvage_push_allowed(config: Config, authority: _RemoteAuthority) -> bool:
+    """Whether salvage may push to this remote (configuration.salvage_push_remotes)."""
+    return any(
+        _same_repository_remote(allowed, authority.url)
+        for allowed in config.salvage_push_remotes
+    )
 
 
 def _sha256_regular_file(path: Path, label: str) -> tuple[str, int]:
@@ -13044,23 +13140,27 @@ def _sha256_regular_file(path: Path, label: str) -> tuple[str, int]:
 
 def _local_salvage_paths(
     archive_root: Path,
-    record: ActiveRecord,
+    machine: str,
+    slot: str,
+    generation: int | None,
     checkout: Checkout,
     commit: str,
 ) -> tuple[Path, Path, str]:
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", checkout.name).strip("-.") or "checkout"
     name_digest = hashlib.sha256(checkout.name.encode("utf-8")).hexdigest()[:12]
+    # An ownerless worktree has no registry generation.
+    epoch = "ownerless" if generation is None else str(generation)
     directory = (
         archive_root
-        / "wrkslots-salvage"
-        / record.machine
-        / record.slot
-        / str(record.generation)
+        / _LOCAL_SALVAGE_DIRECTORY
+        / machine
+        / slot
+        / epoch
         / f"{safe_name}-{name_digest}-{commit[:12]}"
     )
     ref = (
-        f"refs/heads/wrkslots-salvage/{record.machine}/{record.slot}/"
-        f"{record.generation}/{safe_name}-{name_digest}"
+        f"refs/heads/{_LOCAL_SALVAGE_DIRECTORY}/{machine}/{slot}/"
+        f"{epoch}/{safe_name}-{name_digest}"
     )
     _validate_full_ref(ref, "local salvage archive ref")
     return directory / "repository.bundle", directory / "receipt.json", ref
@@ -13120,7 +13220,9 @@ def _local_salvage_receipt_payload(
     archive_root: Path,
     bundle: Path,
     archive_ref: str,
-    record: ActiveRecord,
+    machine: str,
+    slot: str,
+    generation: int | None,
     checkout: Checkout,
     facts: _SalvageCandidate,
     bundle_sha256: str,
@@ -13129,9 +13231,9 @@ def _local_salvage_receipt_payload(
     return {
         "schema": _LOCAL_SALVAGE_RECEIPT_SCHEMA,
         "kind": "wrkslots-local-salvage-archive",
-        "machine": record.machine,
-        "slot": record.slot,
-        "generation": record.generation,
+        "machine": machine,
+        "slot": slot,
+        "generation": generation,
         "checkout": checkout.name,
         "repository": checkout.repository,
         "remote": checkout.remote,
@@ -13155,19 +13257,25 @@ def _local_salvage_receipt_payload(
 
 def _archive_salvage_locally(
     config: Config,
-    record: ActiveRecord,
+    machine: str,
+    slot: str,
+    generation: int | None,
     checkout: Checkout,
     path: Path,
     facts: _SalvageCandidate,
     archive_root: Path,
-    remote_failure: Refusal,
+    remote_failure: Refusal | None,
     vcs: _GitVcs,
 ) -> dict[str, object]:
-    """Create and read back a self-contained bundle after remote salvage refused."""
+    """Create and read back a self-contained bundle instead of a remote push.
+
+    ``remote_failure`` is None when the remote is not in salvage_push_remotes,
+    so nothing was pushed; otherwise it is the refused push.
+    """
     checked_root = _local_salvage_archive_root(config, str(archive_root))
     assert checked_root is not None
     bundle, receipt_path, archive_ref = _local_salvage_paths(
-        checked_root, record, checkout, facts.commit
+        checked_root, machine, slot, generation, checkout, facts.commit
     )
     _prepare_local_salvage_directory(checked_root, bundle.parent)
     _ensure_no_symlink_components(checked_root, bundle.parent, "local salvage archive")
@@ -13223,7 +13331,9 @@ def _archive_salvage_locally(
         checked_root,
         bundle,
         archive_ref,
-        record,
+        machine,
+        slot,
+        generation,
         checkout,
         facts,
         bundle_digest,
@@ -13254,8 +13364,13 @@ def _archive_salvage_locally(
             raise Refusal(f"local salvage archive receipt readback failed: {receipt_path}")
     receipt_sha256 = hashlib.sha256(contents).hexdigest()
     _interrupt_for_test("after-local-salvage-archive")
+    reason = (
+        f"remote {checkout.remote} is not in salvage_push_remotes"
+        if remote_failure is None
+        else "remote salvage refused"
+    )
     print(
-        f"WARNING: remote salvage refused for checkout {checkout.name}; "
+        f"WARNING: {reason} for checkout {checkout.name}; "
         f"using verified local archive {bundle}",
         file=sys.stderr,
     )
@@ -13275,13 +13390,19 @@ def _archive_salvage_locally(
         "archive_bundle_bytes": bundle_size,
         "archive_ref": archive_ref,
         "complete_history": True,
-        "remote_failure": str(remote_failure),
+        "remote_failure": None if remote_failure is None else str(remote_failure),
+        "archive_reason": (
+            "remote-not-allowed" if remote_failure is None else "remote-refused"
+        ),
+        "destination": str(bundle),
     }
 
 
 def _assert_local_salvage_receipt(
     config: Config,
-    record: ActiveRecord,
+    machine: str,
+    slot: str,
+    generation: int | None,
     checkout: Checkout,
     facts: _SalvageCandidate,
     salvage: Mapping[str, object],
@@ -13293,7 +13414,7 @@ def _assert_local_salvage_receipt(
     )
     assert root is not None
     bundle, receipt_path, archive_ref = _local_salvage_paths(
-        root, record, checkout, facts.commit
+        root, machine, slot, generation, checkout, facts.commit
     )
     if _as_str(
         salvage.get("archive_receipt"), "salvage receipt.archive_receipt"
@@ -13328,7 +13449,9 @@ def _assert_local_salvage_receipt(
         root,
         bundle,
         archive_ref,
-        record,
+        machine,
+        slot,
+        generation,
         checkout,
         facts,
         bundle_digest,
@@ -13456,15 +13579,28 @@ def _salvage_candidate(
             env_overrides=env,
         ).stdout
         if untracked:
+            # Each listed name is one exact path. Read as a glob pathspec, an
+            # untracked file named `*.md` would also stage the excluded
+            # HANDOFF.md and cache paths, so the names are matched literally.
             vcs._run(
                 path,
                 ["add", "--pathspec-from-file=-", "--pathspec-file-nul"],
                 input_text=untracked,
-                env_overrides=env,
+                env_overrides={**env, "GIT_LITERAL_PATHSPECS": "1"},
             )
         tree = vcs._run(path, ["write-tree"], env_overrides=env).stdout.strip()
         if not SHA_RE.fullmatch(tree):
             raise Refusal(f"salvage tree for checkout {checkout.name} is not a full Git object")
+        head_tree = vcs._run(path, ["rev-parse", f"{head}^{{tree}}"]).stdout.strip()
+        if tree == head_tree:
+            # Only excluded paths (handoffs) differ from HEAD: nothing to salvage.
+            return _SalvageCandidate(
+                head=head,
+                status_digest=status_digest,
+                commit=head,
+                dirty=False,
+                remote_authority=remote_authority,
+            )
         if record is None:
             if ownerless_slot is None or ownerless_recorded_at is None:
                 raise StateError("ownerless salvage lacks its slot and recorded time")
@@ -13474,9 +13610,10 @@ def _salvage_candidate(
             )
             recorded_at = ownerless_recorded_at
         else:
+            # The registry task text stays in the local record: a salvage
+            # commit may be published, so it carries no task description.
             message = (
                 f"Salvage {record.slot}/{checkout.name} after recorded owner exit\n\n"
-                f"task: {record.task}\n"
                 f"source-head: {head}\n"
             )
             recorded_at = record.heartbeat_at
@@ -13625,6 +13762,19 @@ def _salvage_one_checkout(
             "remote_ref": None,
             "containing_remote_refs": list(containing),
         }
+    if not _salvage_push_allowed(config, facts.remote_authority):
+        return _archive_salvage_locally(
+            config,
+            record.machine,
+            record.slot,
+            record.generation,
+            checkout,
+            path,
+            facts,
+            archive_root or _default_salvage_archive_root(config),
+            None,
+            vcs,
+        )
     salvage_name = checkout.name.replace("/", "-")
     salvage_ref = (
         f"{SALVAGE_REF_ROOT}/{record.machine}/{record.slot}/"
@@ -13644,7 +13794,16 @@ def _salvage_one_checkout(
             raise
         vcs.assert_remote_authority(path, checkout.remote, facts.remote_authority)
         return _archive_salvage_locally(
-            config, record, checkout, path, facts, archive_root, exc, vcs
+            config,
+            record.machine,
+            record.slot,
+            record.generation,
+            checkout,
+            path,
+            facts,
+            archive_root,
+            exc,
+            vcs,
         )
     return {
         "checkout": checkout.name,
@@ -13654,6 +13813,7 @@ def _salvage_one_checkout(
         "disposition": "salvaged",
         "remote_ref": salvage_ref,
         "containing_remote_refs": [],
+        "destination": f"{checkout.remote}:{salvage_ref}",
     }
 
 
@@ -13751,6 +13911,19 @@ def _salvage_ownerless_checkout(
             "remote_ref": None,
             "containing_remote_refs": list(containing),
         }
+    if not _salvage_push_allowed(config, facts.remote_authority):
+        return _archive_salvage_locally(
+            config,
+            config.machine,
+            slot,
+            None,
+            checkout,
+            path,
+            facts,
+            _default_salvage_archive_root(config),
+            None,
+            vcs,
+        )
     salvage_name = checkout.name.replace("/", "-")
     ref = (
         f"{SALVAGE_REF_ROOT}/{config.machine}/{slot}/"
@@ -13768,6 +13941,7 @@ def _salvage_ownerless_checkout(
         "disposition": "salvaged",
         "remote_ref": ref,
         "containing_remote_refs": [],
+        "destination": f"{checkout.remote}:{ref}",
     }
 
 
@@ -13925,7 +14099,14 @@ def _assert_salvage_still_matches(
                 )
         elif disposition == "archived-local":
             _assert_local_salvage_receipt(
-                config, record, checkout, facts, receipt, vcs
+                config,
+                record.machine,
+                record.slot,
+                record.generation,
+                checkout,
+                facts,
+                receipt,
+                vcs,
             )
         else:
             raise StateError(f"unknown salvage disposition {disposition!r}")
@@ -14035,8 +14216,9 @@ def _assert_no_uncommitted_handoffs(
         raise Refusal(
             f"slot {record.slot} contains uncommitted handoff path(s): {shown}. "
             "state: REFUSED -- the slot and every checkout were retained. remedy: "
-            "preserve each handoff, then commit and publish it or move its contents "
-            "into the generation-bound handoff before retrying removal"
+            "preserve each handoff outside the checkout or move its contents into the "
+            "generation-bound handoff before retrying removal; salvage never publishes "
+            "handoffs"
         )
 
 
@@ -15021,6 +15203,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
     config_path = root / CONFIG_NAME
     representation, image_section = _init_representation(args, config_path)
     sandbox_section = _init_sandbox_section(config_path)
+    salvage_push_remotes = _init_salvage_push_remotes(args, config_path)
     payload = _config_payload(
         worktrees_relative,
         machine,
@@ -15040,6 +15223,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
         representation,
         image_section,
         sandbox_section,
+        salvage_push_remotes=salvage_push_remotes,
     )
     with _locked_config(config_path, args.wait_lock):
         _recover_config_write(config_path, payload)
@@ -15331,6 +15515,10 @@ def _assert_agent_and_slot_free(
     *,
     enforce_cap: bool = True,
 ) -> None:
+    if _is_representation_directory(config, _slot_directory(config, slot, slot_type)):
+        raise Refusal(
+            f"slot name {slot!r} is reserved for wrkslots storage in the control directory"
+        )
     states = _load_all_active(config)
     for state in states:
         for record in state.slots:
@@ -33652,9 +33840,75 @@ def _ownerless_agent_facts(
     vcs.assert_ordinary_index(path)
     if vcs.remote_url_sha256(path, authorization.remote) != authorization.remote_url_sha256:
         raise Refusal("ownerless agent worktree remote changed")
+    checkout = _ownerless_agent_checkout(config, authorization, path, repository)
+    # Salvage never stages a handoff, and only the bound root HANDOFF.md is
+    # preserved beside the registry, so every other one must be moved first.
+    unprotected: list[str] = []
+    repositories = [(checkout.name, path)]
+    repositories.extend(
+        (f"{checkout.name}/{submodule}", path / submodule)
+        for submodule in vcs.initialized_submodules(path)
+    )
+    for checkout_name, nested in repositories:
+        for relative in vcs.uncommitted_handoff_paths(
+            nested, _cache_globs_for(config, checkout_name)
+        ):
+            candidate = (nested / relative).absolute()
+            if candidate != handoff.absolute() and (
+                candidate.exists() or candidate.is_symlink()
+            ):
+                unprotected.append(candidate.relative_to(path.absolute()).as_posix())
+    if unprotected:
+        raise Refusal(
+            "ownerless agent worktree contains uncommitted handoff path(s): "
+            f"{', '.join(sorted(unprotected))}; salvage never publishes handoffs, so "
+            "preserve each one outside the worktree before retrying"
+        )
     _assert_slot_unused(path)
     _assert_unregistered_path_systemd_unrelated(path)
-    return _ownerless_agent_checkout(config, authorization, path, repository)
+    return checkout
+
+
+def _ownerless_handoff_copy_path(
+    config: Config, authorization: OwnerlessAgentAuthorization
+) -> Path | None:
+    if authorization.handoff_sha256 is None:
+        return None
+    key = hashlib.sha256(
+        f"{config.machine}\0{authorization.path}\0{authorization.recorded_at}".encode(
+            "utf-8"
+        )
+    ).hexdigest()[:16]
+    return config.control / (
+        f"HANDOFF-OWNERLESS-RETIRED.{key}.{authorization.handoff_sha256}.md"
+    )
+
+
+def _preserve_ownerless_handoff(
+    config: Config, authorization: OwnerlessAgentAuthorization, active: Path
+) -> Path | None:
+    """Keep the read HANDOFF.md beside the registry; salvage never stages it."""
+
+    copy = _ownerless_handoff_copy_path(config, authorization)
+    if copy is None:
+        return None
+    if not copy.exists() and not copy.is_symlink():
+        contents = _read_bounded_regular_file(
+            active / "HANDOFF.md", "ownerless agent HANDOFF.md", HANDOFF_BYTES_LIMIT
+        )
+        if hashlib.sha256(contents).hexdigest() != authorization.handoff_sha256:
+            raise Refusal(
+                "ownerless agent HANDOFF.md changed after it was read; preserve the worktree"
+            )
+        _atomic_write_bytes(copy, contents)
+    preserved = _read_bounded_regular_file(
+        copy, "preserved ownerless HANDOFF.md", HANDOFF_BYTES_LIMIT
+    )
+    if hashlib.sha256(preserved).hexdigest() != authorization.handoff_sha256:
+        raise StateError(
+            f"preserved ownerless HANDOFF.md changed; preserve it for recovery: {copy}"
+        )
+    return copy
 
 
 def _ownerless_agent_journal_inputs(
@@ -33799,6 +34053,10 @@ def _assert_ownerless_salvage_still_matches(
                 candidate_path, candidate.remote, facts.head
             ):
                 raise Refusal(f"ownerless checkout {candidate.name} is no longer published")
+        elif receipt.get("disposition") == "archived-local":
+            _assert_local_salvage_receipt(
+                config, config.machine, slot, None, candidate, facts, receipt, vcs
+            )
         else:
             raise StateError("ownerless salvage receipt has unknown disposition")
 
@@ -33826,6 +34084,7 @@ def _recover_ownerless_agent(
         checkout = _ownerless_agent_facts(
             config, authorization, active, repository, expected_identity=True
         )
+        _preserve_ownerless_handoff(config, authorization, active)
         if not salvage:
             salvage = _salvage_ownerless_worktree(
                 config, authorization, checkout, vcs, path_override=active
@@ -33862,6 +34121,7 @@ def _recover_ownerless_agent(
         _assert_ownerless_salvage_still_matches(
             config, authorization, checkout, salvage, vcs, active
         )
+        _preserve_ownerless_handoff(config, authorization, active)
         vcs.remove_worktree(repository, active, force=True)
         journal["phase"] = "removed"
         _write_journal(config, journal)
@@ -33870,6 +34130,7 @@ def _recover_ownerless_agent(
         raise Refusal("ownerless agent worktree still exists after removal")
     if target.absolute() in vcs.listed_worktrees(repository) or fenced.absolute() in vcs.listed_worktrees(repository):
         raise Refusal("Git still registers the removed ownerless agent worktree")
+    preserved_handoff = _ownerless_handoff_copy_path(config, authorization)
     _write_event_file(
         config,
         config.machine,
@@ -33878,6 +34139,9 @@ def _recover_ownerless_agent(
             "slot": raw["slot"],
             "authorization": _ownerless_agent_authorization_to_obj(authorization),
             "salvage": [dict(value) for value in salvage],
+            "handoff_preserved": (
+                None if preserved_handoff is None else str(preserved_handoff)
+            ),
             "recovery_actor": _identity_to_obj(coordinator),
         },
     )
@@ -34448,6 +34712,14 @@ def _absent_agent_checkout_receipts(
         vcs.assert_remote_distinct_from_repositories(
             repository, authority, repositories
         )
+        if not _salvage_push_allowed(config, authority):
+            raise Refusal(
+                f"absent checkout {checkout.name} remote {checkout.remote} is not in "
+                "salvage_push_remotes, and recovery preserves the recorded HEAD only by "
+                "pushing a rescue ref to it. state: REFUSED -- the ACTIVE row and Git "
+                "registrations were retained. remedy: list the remote in "
+                "salvage_push_remotes only if salvage may publish to it"
+            )
         if checkout.name not in preserved and (
             vcs.verify_ref(repository, checkout.head, "recorded checkout HEAD")
             != checkout.head
@@ -34888,6 +35160,8 @@ def _recover_absent_agent_row(
         authorities[len(preserved) :],
     ):
         _stored, repository = _stored_repository_path(config, checkout.repository)
+        # _assert_absent_agent_safe above refused unless salvage_push_remotes
+        # lists every checkout's remote.
         vcs.push_salvage(
             repository,
             checkout.remote,
@@ -40537,16 +40811,18 @@ wrkslots manages durable agent and validation worktree slots.
 6. After the registered running command and exact process identity prove the owner dead, and the
    recorded time-to-live expires without renewal, any later coordinator may remove the slot. A
    slot its owner released needs only the handoff read from step 5.
-   Agent slots publish dirty and unpushed work first; validate slots skip salvage. If remote
-   publication refuses and an operator explicitly approves durable local custody, pass an existing
-   absolute directory outside the project. Remote publication is still attempted first, and
-   removal begins only after the self-contained Git bundle and receipt pass readback checks.
+   Agent slots preserve dirty and unpushed work first; validate slots skip salvage. Salvage never
+   stages a HANDOFF* file, and it pushes only to remotes listed in salvage_push_remotes. Work on
+   any other remote is kept in a self-contained Git bundle under <control>/wrkslots-salvage/ (or
+   under --salvage-archive-root), and removal begins only after the bundle and receipt pass
+   readback checks. If a push to an allowed remote refuses and an operator explicitly approves
+   durable local custody, pass an existing absolute directory outside the project.
 
      wrkslots remove slot01 \\
        --coordinator-pid "$CURRENT_COORDINATOR_PID" --expected-generation 1
 
    Add `--salvage-archive-root "$HOME/temp/agent_checkouts"` to that remove command to enable
-   this fallback. There is no default archive directory.
+   this fallback for a refused push.
 
 If a create or removal is interrupted, preserve all paths and run:
 
@@ -40800,6 +41076,16 @@ usage or audit gate unknown, 3 fail-closed refusal.
         action="append",
         metavar="SHELL-COMMAND",
         help="ordered shell command run in every new checkout (repeatable)",
+    )
+    init.add_argument(
+        "--salvage-push-remote",
+        action="append",
+        metavar="REMOTE-URL",
+        help=(
+            "remote URL that removal may push salvage commits to (repeatable); work on "
+            "any other remote is kept in a verified local bundle. Rerunning init without "
+            "this flag keeps the existing list (default for a new project: none)"
+        ),
     )
     init.add_argument(
         "--config-format",
@@ -41594,9 +41880,12 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "Physical removal that any later participant may complete from durable state. Requires "
             "the heartbeat TTL to be expired, the registered running command to return dead, the "
             "exact owner process generation to be absent, and independent process, mount, Git, "
-            "and path checks to agree. Agent slots are salvaged to their recorded remote first; "
-            "an explicit --salvage-archive-root permits a verified local bundle only when remote "
-            "preservation refuses. Validate slots skip salvage. Ambiguity refuses. One narrow "
+            "and path checks to agree. Agent slots are salvaged first: to their recorded remote "
+            "when it is listed in salvage_push_remotes, otherwise to a verified local bundle under "
+            "the control directory (or --salvage-archive-root). For an allowed remote, an "
+            "explicit --salvage-archive-root permits a verified local bundle only when remote "
+            "preservation refuses. Salvage never stages a HANDOFF* file. Validate slots skip "
+            "salvage. Ambiguity refuses. One narrow "
             "exception covers an agent slot whose recorded owner is still alive: removal proceeds "
             "only when it is --coordinator-authorized, the heartbeat TTL has expired, the current "
             "slot generation carries a completed write-handoff whose recorded writer is exactly "
@@ -41651,7 +41940,9 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "operator-approved existing directory outside the managed project, owned by the "
             "current user and not group/world writable; after the remote salvage push refuses, "
             "preserve each commit as a self-contained, read-back-verified Git bundle beneath "
-            "this root before removal (default: disabled)"
+            "this root before removal (default: disabled). A remote not listed in "
+            "salvage_push_remotes is never pushed to: its bundle goes beneath this root, or "
+            "beneath the control directory when this is absent"
         ),
     )
     remove.add_argument(
@@ -41819,7 +42110,10 @@ usage or audit gate unknown, 3 fail-closed refusal.
     remove_agent_batch.add_argument(
         "--salvage-archive-root",
         metavar="ABSOLUTE_PATH",
-        help="as for remove: verified local bundle fallback when the remote salvage push refuses",
+        help=(
+            "as for remove: verified local bundle root when the remote salvage push refuses "
+            "or the remote is not listed in salvage_push_remotes"
+        ),
     )
     remove_agent_batch.add_argument(
         "--format", choices=("human", "json"), default="human"
@@ -41880,7 +42174,9 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "is a read-only plan. --apply proves registered and operating-system liveness, "
             "pushes every recorded checkout HEAD to an individual rescue ref and reads it "
             "back, removes only exact stale Git worktree registrations, archives the absent "
-            "storage and its limitations, and only then removes the ACTIVE row."
+            "storage and its limitations, and only then removes the ACTIVE row. Both the "
+            "plan and --apply refuse a checkout whose remote is not listed in "
+            "salvage_push_remotes."
         ),
         formatter_class=_HelpFormatter,
     )

@@ -112,9 +112,13 @@ deliberate migration, place the global `--allow-existing-unregistered-worktrees`
 command. The command retains those directories and acts only on registered slots; use `wrkslots
 audit --format json` to inventory what still needs evidence-based import.
 
-Remote salvage remains the default and preferred preservation path. If a recorded remote refuses
-an agent slot's salvage ref, an operator may rerun that one removal with an existing, absolute
-archive directory outside the project:
+Salvage pushes only to remotes whose URLs are listed in the `salvage_push_remotes` configuration
+key (`init --salvage-push-remote URL`, repeatable); absent or empty allows none. Work on any other
+remote is kept in a verified local bundle beneath the control directory's `wrkslots-salvage/`, and
+removal refuses if that bundle cannot be written and verified. Salvage never stages a file whose
+basename starts `HANDOFF`, and its commit message carries no registry task text. If an allowed remote
+refuses an agent slot's salvage ref, an operator may rerun that one removal with an existing,
+absolute archive directory outside the project:
 
 ```sh
 wrkslots remove slot01 --coordinator-authorized \
@@ -150,12 +154,14 @@ as an inconsistency and still returns the readable active roster; it does not au
 make an inconsistent row healthy.
 
 Agent drift has separate bounded recovery commands. `recover-absent-agent-row` accepts one exact
-ACTIVE identity, publishes and reads back every recorded commit, removes only matching stale Git
-registrations, and archives before removing the row. `recover-ownerless-agent-worktree` accepts one
+ACTIVE identity, publishes and reads back every recorded commit (it refuses a remote not listed in
+`salvage_push_remotes`), removes only matching stale Git registrations, and archives before removing
+the row. `recover-ownerless-agent-worktree` accepts one
 exact unregistered worktree and its complete Git identity, salvages authored and nested-repository
 work without assigning an owner, task, or handoff, then fences and removes it. A present HANDOFF.md
-requires its exact SHA-256 after the coordinator reads it; that content is rechecked and preserved
-with the worktree. `recover-ownerless-agent-cache` relocates only its one explicitly supported cache
+requires its exact SHA-256 after the coordinator reads it; that content is rechecked and copied
+beside the registry as `HANDOFF-OWNERLESS-RETIRED.*.md`, never into the salvage commit. Any other
+uncommitted handoff file refuses. `recover-ownerless-agent-cache` relocates only its one explicitly supported cache
 tree outside the managed slot root; it is not an exemption for arbitrary directories.
 
 Agent handoffs can live outside their checkouts. `write-handoff` copies bounded UTF-8 from an exact
