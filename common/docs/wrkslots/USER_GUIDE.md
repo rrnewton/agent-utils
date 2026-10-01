@@ -756,8 +756,12 @@ wrkslots recover --coordinator-authorized --coordinator-pid "$COORDINATOR_PID" \
 ```
 
 The Cargo-home form may instead use
-`--completed-record ignored/validate/runs/validate-example.json` to bind cleanup to an exact
-terminal run record. A recordless path requires a non-empty explanation, but prose is not
+`--completed-record validate_tmp/runs/validate-example.json` to bind cleanup to an exact
+terminal run record. The older `ignored/validate/...` spelling of a completed record, a removal
+proof, or a Cargo home is also accepted: while `ignored/validate` is a real directory it is used
+as written, and once it is the compatibility symlink to `../validate_tmp` wrkslots maps it to the
+`validate_tmp/...` path it names, so no checked path crosses the symlink. Any other symlink at
+`ignored/validate` is refused. A recordless path requires a non-empty explanation, but prose is not
 authority: wrkslots records the exact path and filesystem identity and independently verifies that
 no retained record names it and no process uses it. Cargo homes must have the exact configured
 parent and `validate-cargo-*` name and cannot be Git worktree roots. The cleanup retains positive
