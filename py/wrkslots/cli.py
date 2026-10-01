@@ -1848,8 +1848,277 @@ def _relative_inside_reference(
     return lexical.as_posix(), root / lexical
 
 
+# The originating validator keeps its local validation state in
+# ``validate_tmp/``.  Before 2026-10 the same state lived in
+# ``ignored/validate/``; the one-time migration
+# moves the directory and leaves ``ignored/validate`` as a compatibility symlink
+# whose literal target is ``../validate_tmp``.  Records written before the move,
+# and older ci-hub versions, still name files by the legacy spelling.  Every path
+# this module walks is refused when it crosses a symlink, so a legacy spelling is
+# translated to the physical one lexically, and only while the compatibility
+# symlink is exactly in place.  A root that still holds a real
+# ``ignored/validate`` directory keeps the legacy spelling unchanged.
+_VALIDATION_STATE_DIRECTORY = "validate_tmp"
+_LEGACY_VALIDATION_STATE_DIRECTORY = "ignored/validate"
+_LEGACY_VALIDATION_STATE_SYMLINK_TARGET = "../validate_tmp"
+
+
+def _validation_state_children(child: str) -> frozenset[Path]:
+    """Both project-relative spellings of one validation-state subdirectory."""
+
+    return frozenset(
+        Path(directory) / child
+        for directory in (
+            _VALIDATION_STATE_DIRECTORY,
+            _LEGACY_VALIDATION_STATE_DIRECTORY,
+        )
+    )
+
+
+def _legacy_validation_state_is_compatibility_symlink(root: Path) -> bool:
+    """Whether ``root/ignored/validate`` is exactly the migration's symlink."""
+
+    legacy = root / _LEGACY_VALIDATION_STATE_DIRECTORY
+    try:
+        if not stat.S_ISDIR(os.lstat(legacy.parent).st_mode):
+            return False
+        return os.readlink(legacy) == _LEGACY_VALIDATION_STATE_SYMLINK_TARGET
+    except OSError:
+        return False
+
+
+def _validation_state_is_migrated(root: Path) -> bool:
+    """Whether ``root`` keeps its validation state in ``validate_tmp``.
+
+    The same rule the originating validator's front door and its driver use
+    to decide that a root is migrated: ``validate_tmp`` is a real directory,
+    ``ignored`` is a real directory or absent, and ``ignored/validate`` is
+    absent or exactly the compatibility symlink.  A migrated root whose
+    symlink is missing still keeps every file in ``validate_tmp``, so a
+    record that names the legacy spelling must be read there too; otherwise
+    a census would miss it and declare the target unrelated.
+    """
+
+    try:
+        if not stat.S_ISDIR(os.lstat(root / _VALIDATION_STATE_DIRECTORY).st_mode):
+            return False
+    except OSError:
+        return False
+    legacy = root / _LEGACY_VALIDATION_STATE_DIRECTORY
+    try:
+        if not stat.S_ISDIR(os.lstat(legacy.parent).st_mode):
+            return False
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    try:
+        os.lstat(legacy)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return _legacy_validation_state_is_compatibility_symlink(root)
+
+
+def _physical_validation_state_spelling(root: Path, lexical: str) -> str:
+    """Map a clean ``ignored/validate/...`` spelling to ``validate_tmp/...``.
+
+    Any other spelling, a spelling with empty or dot components, and every
+    spelling on a root that has not been migrated are returned unchanged.
+    """
+
+    parts = lexical.split("/")
+    legacy = _LEGACY_VALIDATION_STATE_DIRECTORY.split("/")
+    if (
+        len(parts) > len(legacy)
+        and parts[: len(legacy)] == legacy
+        and all(part not in {"", ".", ".."} for part in parts)
+        and _validation_state_is_migrated(root)
+    ):
+        return "/".join((_VALIDATION_STATE_DIRECTORY, *parts[len(legacy) :]))
+    return lexical
+
+
+def _physical_validation_state_absolute(root: Path, recorded: str) -> str:
+    """The same translation for an absolute path recorded below ``root``."""
+
+    prefix = f"{root}/{_LEGACY_VALIDATION_STATE_DIRECTORY}/"
+    if not recorded.startswith(prefix):
+        return recorded
+    translated = _physical_validation_state_spelling(
+        root, recorded[len(f"{root}/") :]
+    )
+    return f"{root}/{translated}"
+
+
+def _validation_run_directories(root: Path) -> tuple[Path, ...]:
+    """Every real directory that may hold validation run handles.
+
+    ``validate_tmp/runs`` always, plus ``ignored/validate/runs`` while the
+    legacy directory is still a real directory.  The compatibility symlink is
+    not walked a second time; any other symlink at the legacy spelling is
+    refused because the handles behind it cannot be bounded.
+    """
+
+    current = root / _VALIDATION_STATE_DIRECTORY
+    legacy = root / _LEGACY_VALIDATION_STATE_DIRECTORY
+    # Callers check only the final ``runs`` component, so every ancestor below
+    # the root must be a real directory (or absent): a symlinked
+    # ``validate_tmp`` or ``ignored`` would make a census read some other
+    # directory, or an empty one, as this root's population.
+    for ancestor in (current, legacy.parent):
+        try:
+            ancestor_mode = os.lstat(ancestor).st_mode
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise Refusal(
+                f"cannot inspect validation state directory {ancestor}: {exc}"
+            ) from exc
+        if not stat.S_ISDIR(ancestor_mode):
+            raise Refusal(
+                f"validation state directory {ancestor} must be a real directory, "
+                "not a symlink or file"
+            )
+    directories = [current / "runs"]
+    try:
+        legacy_mode = os.lstat(legacy).st_mode
+    except FileNotFoundError:
+        return tuple(directories)
+    except OSError as exc:
+        raise Refusal(f"cannot inspect validation state directory {legacy}: {exc}") from exc
+    if stat.S_ISDIR(legacy_mode):
+        directories.append(legacy / "runs")
+    elif not _legacy_validation_state_is_compatibility_symlink(root):
+        raise Refusal(
+            f"validation state directory {legacy} is neither a directory nor the "
+            f"compatibility symlink to {_LEGACY_VALIDATION_STATE_SYMLINK_TARGET}"
+        )
+    return tuple(directories)
+
+
+def _require_validation_state_layout(root: Path) -> None:
+    """Refuse a root whose validation-state layout the validator refuses.
+
+    ``ignored`` must be absent or a real directory, so that its child is not
+    read through a symlink.  A real ``ignored/validate`` directory is
+    accepted only while ``validate_tmp`` does not exist: both together split
+    the validator's state, whatever ``validate_tmp`` is.  Otherwise the
+    creation rule applies (``validate_tmp`` absent or a real directory, and
+    ``ignored/validate`` absent or exactly the compatibility symlink).
+    """
+
+    current = root / _VALIDATION_STATE_DIRECTORY
+    legacy = root / _LEGACY_VALIDATION_STATE_DIRECTORY
+    try:
+        mode = os.lstat(legacy.parent).st_mode
+    except FileNotFoundError:
+        mode = None
+    except OSError as exc:
+        raise Refusal(f"cannot inspect directory {legacy.parent}: {exc}") from exc
+    if mode is not None and not stat.S_ISDIR(mode):
+        raise Refusal(f"directory {legacy.parent} must be a real directory, not a symlink or file")
+    try:
+        legacy_is_directory = stat.S_ISDIR(os.lstat(legacy).st_mode)
+    except FileNotFoundError:
+        legacy_is_directory = False
+    except OSError as exc:
+        raise Refusal(f"cannot inspect validation state directory {legacy}: {exc}") from exc
+    if legacy_is_directory:
+        if os.path.lexists(current):
+            raise Refusal(
+                f"validation state directory {legacy} is a real directory beside "
+                f"{current}; the validation state is split between them"
+            )
+        return
+    _require_validation_state_creatable(root)
+
+
+def _validation_state_directory(root: Path) -> Path:
+    """The physical validation-state directory: legacy until migration.
+
+    The layout is checked first, so every caller (planning, applying and
+    resuming a cache relocation) refuses a root the validator refuses
+    before anything is journaled or moved.
+    """
+
+    _require_validation_state_layout(root)
+    legacy = root / _LEGACY_VALIDATION_STATE_DIRECTORY
+    try:
+        if stat.S_ISDIR(os.lstat(legacy).st_mode):
+            return legacy
+    except OSError:
+        pass
+    return root / _VALIDATION_STATE_DIRECTORY
+
+
+def _require_validation_state_creatable(root: Path) -> None:
+    """Refuse a root where ``validate_tmp`` must not be created.
+
+    ``validate_tmp`` must be absent or a real directory, ``ignored`` absent
+    or a real directory, and ``ignored/validate`` absent or exactly the
+    compatibility symlink: the originating validator's own layout rule.  A
+    real ``ignored/validate`` directory is not accepted here either, because
+    creating ``validate_tmp`` beside it would split the validator's state.
+    """
+
+    current = root / _VALIDATION_STATE_DIRECTORY
+    legacy = root / _LEGACY_VALIDATION_STATE_DIRECTORY
+    for path, label in ((current, "validation state directory"), (legacy.parent, "directory")):
+        try:
+            mode = os.lstat(path).st_mode
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise Refusal(f"cannot inspect {label} {path}: {exc}") from exc
+        if not stat.S_ISDIR(mode):
+            raise Refusal(f"{label} {path} must be a real directory, not a symlink or file")
+    if os.path.lexists(legacy) and not _legacy_validation_state_is_compatibility_symlink(root):
+        raise Refusal(
+            f"{legacy} is not the compatibility symlink to "
+            f"{_LEGACY_VALIDATION_STATE_SYMLINK_TARGET}; refusing to create "
+            f"{current} beside it"
+        )
+
+
+def _create_validation_state_directory(root: Path) -> None:
+    """Create ``validate_tmp`` the way the originating validator does.
+
+    The compatibility symlink ``ignored/validate -> ../validate_tmp`` is
+    created first, then ``validate_tmp``.  A writer that still derives the
+    legacy spelling then reaches the same directory instead of creating a
+    real ``ignored/validate`` beside it, which would split the validator's
+    state and make its next run refuse the root.  The layout is checked
+    before anything is created and again after the symlink, so a real
+    ``ignored/validate`` created meanwhile is refused before
+    ``validate_tmp`` exists.
+    """
+
+    _require_validation_state_creatable(root)
+    current = root / _VALIDATION_STATE_DIRECTORY
+    if os.path.lexists(current):
+        return
+    legacy = root / _LEGACY_VALIDATION_STATE_DIRECTORY
+    try:
+        legacy.parent.mkdir()
+    except FileExistsError:
+        pass
+    try:
+        os.symlink(_LEGACY_VALIDATION_STATE_SYMLINK_TARGET, legacy)
+    except FileExistsError:
+        pass
+    _require_validation_state_creatable(root)
+    _fsync_directory(legacy.parent)
+    current.mkdir(exist_ok=True)
+    _fsync_directory(root)
+
+
 def _relative_inside(root: Path, raw: str, label: str) -> tuple[str, Path]:
     lexical, absolute = _relative_inside_reference(root, raw, label)
+    physical = _physical_validation_state_spelling(root, lexical)
+    if physical != lexical:
+        lexical, absolute = physical, root / physical
     _ensure_no_symlink_components(root, absolute, label)
     return lexical, absolute
 
@@ -1888,7 +2157,7 @@ def _canonical_managed_file_path(
         _ensure_no_symlink_components(config.root.parent, candidate, label)
         return raw, candidate
     relative, path = _relative_inside(config.root, raw, label)
-    if relative != raw:
+    if relative != _physical_validation_state_spelling(config.root, raw):
         raise Refusal(
             f"{label} must use its canonical project-relative spelling: {relative!r}"
         )
@@ -2088,16 +2357,14 @@ def _validation_proof_manifest_path(config: Config, raw: str) -> tuple[str, Path
     relative, path = _canonical_managed_file_path(
         config, raw, "validation removal proof manifest"
     )
-    proof_root = Path("ignored/validate/removal-proofs")
     relative_path = Path(relative)
-    if (
-        relative_path.suffix != ".json"
-        or not _path_is_within(relative_path, proof_root)
-        or relative_path == proof_root
+    if relative_path.suffix != ".json" or not any(
+        _path_is_within(relative_path, proof_root) and relative_path != proof_root
+        for proof_root in _validation_state_children("removal-proofs")
     ):
         raise Refusal(
             "validation removal proof manifest must be a JSON file under "
-            "ignored/validate/removal-proofs"
+            "validate_tmp/removal-proofs (or the legacy ignored/validate/removal-proofs)"
         )
     return relative, path
 
@@ -2107,13 +2374,14 @@ def _validation_run_record_argument(config: Config, raw: str) -> tuple[str, Path
         config, raw, "completed validation run-record"
     )
     if (
-        Path(relative).parent != Path("ignored/validate/runs")
+        Path(relative).parent not in _validation_state_children("runs")
         or path.suffix != ".json"
         or path.name.endswith(_VALIDATION_SERVICE_RESULT_SUFFIX)
     ):
         raise Refusal(
             "completed validation run-record must be one canonical "
-            "ignored/validate/runs/*.json handle, not a service-result sidecar"
+            "validate_tmp/runs/*.json (or legacy ignored/validate/runs/*.json) "
+            "handle, not a service-result sidecar"
         )
     return relative, path
 
@@ -2187,13 +2455,14 @@ def _validation_removal_record_path(
         config, artifact.path, "validation removal run-record"
     )
     if (
-        Path(relative).parent != Path("ignored/validate/runs")
+        Path(relative).parent not in _validation_state_children("runs")
         or path.suffix != ".json"
         or path.name.endswith(_VALIDATION_SERVICE_RESULT_SUFFIX)
     ):
         raise Refusal(
             "validation removal run-record must be one canonical "
-            "ignored/validate/runs/*.json handle, not a service-result sidecar"
+            "validate_tmp/runs/*.json (or legacy ignored/validate/runs/*.json) "
+            "handle, not a service-result sidecar"
         )
     return relative, path
 
@@ -2273,17 +2542,21 @@ def _validation_removal_record_fields(
         raise Refusal(
             "validation removal run-record has no completed scorecard writeback"
         )
-    scorecard_directory = (
-        config.root
-        / "ignored"
-        / "validate"
-        / "scorecard-writebacks"
-        / unit_name
-    )
-    if record.get("scorecard_handoff") != str(scorecard_directory):
+    recorded_handoff = record.get("scorecard_handoff")
+    canonical_handoffs = {
+        str(config.root / directory / "scorecard-writebacks" / unit_name)
+        for directory in (
+            _VALIDATION_STATE_DIRECTORY,
+            _LEGACY_VALIDATION_STATE_DIRECTORY,
+        )
+    }
+    if not isinstance(recorded_handoff, str) or recorded_handoff not in canonical_handoffs:
         raise Refusal(
             "validation removal run-record does not name its canonical scorecard handoff"
         )
+    scorecard_directory = Path(
+        _physical_validation_state_absolute(config.root, recorded_handoff)
+    )
     return unit_name, schema, {
         "run-record": record_path,
         "service-result": record_path.with_name(
@@ -2844,7 +3117,9 @@ def _recheck_validation_removal_proof(
     manifest_relative, manifest_path = _validation_proof_manifest_path(
         config, proof.manifest_path
     )
-    if manifest_relative != proof.manifest_path:
+    if manifest_relative != _physical_validation_state_spelling(
+        config.root, proof.manifest_path
+    ):
         raise StateError("journaled validation removal proof path is not canonical")
     contents, observed_manifest = _read_regular_file_identity(
         manifest_path,
@@ -31186,13 +31461,14 @@ def _legacy_validate_recovery_inputs(
         "completed validation record",
     )
     if (
-        Path(record_relative).parent != Path("ignored/validate/runs")
+        Path(record_relative).parent not in _validation_state_children("runs")
         or record_path.suffix != ".json"
     ):
         raise Refusal(
             "completed validation evidence must be an exact JSON record under "
-            "ignored/validate/runs. state: REFUSED -- no checkout was removed. "
-            "remedy: pass the durable run-record path used by validate-run"
+            "validate_tmp/runs (or legacy ignored/validate/runs). state: REFUSED "
+            "-- no checkout was removed. remedy: pass the durable run-record path "
+            "used by validate-run"
         )
     expected_digest = _as_str(
         raw["completed_record_sha256"],
@@ -31408,7 +31684,7 @@ def _validation_recovery_target(
     elif target_kind == "cargo-home":
         allowed = target.name.startswith("validate-cargo-") and target.parent in {
             validate_root,
-            config.root / "ignored" / "validate" / "cargo-homes",
+            *(config.root / child for child in _validation_state_children("cargo-homes")),
         }
     else:
         raise StateError(f"unknown validation recovery target kind {target_kind!r}")
@@ -31974,8 +32250,14 @@ def _terminal_validation_record(
     frozen_removal_proof_supplied: bool | None = None,
 ) -> tuple[str, str, str | None]:
     relative, path = _relative_inside(config.root, raw, "terminal validation record")
-    if Path(relative).parent != Path("ignored/validate/runs") or path.suffix != ".json":
-        raise Refusal("terminal validation record must be an ignored/validate/runs/*.json file")
+    if (
+        Path(relative).parent not in _validation_state_children("runs")
+        or path.suffix != ".json"
+    ):
+        raise Refusal(
+            "terminal validation record must be a validate_tmp/runs/*.json "
+            "(or legacy ignored/validate/runs/*.json) file"
+        )
     try:
         contents = _read_bounded_regular_file(
             path, "terminal validation record", 16 * 1024 * 1024
@@ -31994,7 +32276,11 @@ def _terminal_validation_record(
     )
     if target_kind != "frozen-checkout":
         recorded = record.get(field)
-        if not isinstance(recorded, str) or recorded != str(target):
+        # A handle written before the validation-state move names a Cargo home
+        # by its legacy spelling; the target is already the physical path.
+        if not isinstance(recorded, str) or _physical_validation_state_absolute(
+            config.root, recorded
+        ) != str(target):
             raise Refusal(f"terminal validation record does not name this exact {field}")
         if target_kind == "checkout" and record.get("temporary_checkout") is False:
             raise Refusal("terminal validation record says the checkout is not temporary")
@@ -32837,21 +33123,33 @@ def _recordless_validation_evidence(
         if target_kind in {"checkout", "frozen-checkout"}
         else "cargo_home"
     )
-    records = config.root / "ignored" / "validate" / "runs"
-    if records.is_symlink() or (records.exists() and not records.is_dir()):
-        raise Refusal(f"retained validation record directory is unsafe: {records}")
-    for path in sorted(records.glob("*.json")) if records.is_dir() else ():
-        try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise Refusal(f"cannot prove retained record is unrelated: {path}: {exc}") from exc
-        if not isinstance(value, dict):
-            raise Refusal(f"cannot prove retained record is unrelated: {path} is not an object")
-        recorded = value.get(field)
-        if isinstance(recorded, str) and Path(recorded).resolve() == target:
-            raise Refusal(
-                f"retained validation record {path} names this {field}; use --completed-record"
-            )
+    for records in _validation_run_directories(config.root):
+        if records.is_symlink() or (records.exists() and not records.is_dir()):
+            raise Refusal(f"retained validation record directory is unsafe: {records}")
+        for path in sorted(records.glob("*.json")) if records.is_dir() else ():
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise Refusal(
+                    f"cannot prove retained record is unrelated: {path}: {exc}"
+                ) from exc
+            if not isinstance(value, dict):
+                raise Refusal(
+                    f"cannot prove retained record is unrelated: {path} is not an object"
+                )
+            recorded = value.get(field)
+            if isinstance(recorded, str) and target in {
+                Path(recorded).resolve(),
+                # A record written before the move names the legacy spelling,
+                # which resolves to the target only through the symlink.
+                Path(
+                    _physical_validation_state_absolute(config.root, recorded)
+                ).resolve(),
+            }:
+                raise Refusal(
+                    f"retained validation record {path} names this {field}; "
+                    "use --completed-record"
+                )
     return {"kind": "coordinator-determination", "note": note.strip(), "no_retained_record": True}
 
 
@@ -33587,8 +33885,14 @@ def _ownerless_validation_inputs(
                 for artifact in removal_proof.artifacts
                 if artifact.role == "run-record"
             )
-            if proof_run_record.path != _as_str(
-                evidence["path"], "terminal evidence.path"
+            # A proof sealed before the validation-state move keeps its
+            # legacy ``ignored/validate/runs/...`` bytes, while the terminal
+            # evidence names the physical path; both name one file exactly
+            # when their physical spellings agree.
+            if _physical_validation_state_spelling(
+                config.root, proof_run_record.path
+            ) != _physical_validation_state_spelling(
+                config.root, _as_str(evidence["path"], "terminal evidence.path")
             ):
                 raise StateError(
                     "validation removal proof run-record differs from terminal evidence"
@@ -35609,8 +35913,43 @@ def _cmd_recover_ownerless_agent_worktree(args: argparse.Namespace) -> int:
 
 def _ownerless_agent_cache_paths(config: Config) -> tuple[Path, Path]:
     source = _slot_roots(config)["agent"] / "ignored"
-    destination = config.root / "ignored" / "validate" / "cache" / "wrkslots-agent-ignored"
+    destination = (
+        _validation_state_directory(config.root) / "cache" / "wrkslots-agent-ignored"
+    )
     return source, destination
+
+
+def _ownerless_agent_cache_resume_destination(
+    root: Path, recorded: Path, expected: Path, phase: str
+) -> Path:
+    """The destination an interrupted cache relocation resumes into.
+
+    Normally the recorded destination, which must be the one this root's
+    layout selects now.  One journal shape predates the ``validate_tmp``
+    spelling: the previous version always recorded
+    ``ignored/validate/cache/...``, and on a root that has no validation
+    state yet this version selects ``validate_tmp/cache/...`` instead.
+    While that relocation has not placed the cache (phase ``prepared`` or
+    ``fenced``) and the root still has neither state directory, nothing can
+    be at either destination, so it resumes into the one selected now.  The
+    host, source, fence and inode identity checks are unchanged, and the
+    destination must still be absent when the cache is moved.
+    """
+
+    if recorded == expected:
+        return expected
+    legacy_state = root / _LEGACY_VALIDATION_STATE_DIRECTORY
+    current_state = root / _VALIDATION_STATE_DIRECTORY
+    suffix = ("cache", "wrkslots-agent-ignored")
+    if (
+        phase in {"prepared", "fenced"}
+        and recorded == legacy_state.joinpath(*suffix)
+        and expected == current_state.joinpath(*suffix)
+        and not os.path.lexists(legacy_state)
+        and not os.path.lexists(current_state)
+    ):
+        return expected
+    raise StateError("ownerless agent cache journal names a non-canonical path")
 
 
 def _assert_ownerless_agent_cache_tree(path: Path) -> tuple[int, int, int]:
@@ -35685,8 +36024,14 @@ def _ownerless_agent_cache_journal_inputs(
     _relative, fenced = _relative_inside(
         config.root, _as_str(raw["fenced"], "ownerless agent cache fence"), "cache fence"
     )
-    if source != expected_source or destination != expected_destination:
+    phase = _as_str(raw["phase"], "ownerless agent cache phase")
+    if phase not in {"prepared", "fenced", "relocated"}:
+        raise StateError(f"unknown ownerless agent cache phase {phase!r}")
+    if source != expected_source:
         raise StateError("ownerless agent cache journal names a non-canonical path")
+    destination = _ownerless_agent_cache_resume_destination(
+        config.root, destination, expected_destination, phase
+    )
     prefix = ".ignored.ownerless-agent-cache."
     if fenced.parent != source.parent or not re.fullmatch(
         rf"{re.escape(prefix)}[0-9a-f]{{32}}", fenced.name
@@ -35700,9 +36045,6 @@ def _ownerless_agent_cache_journal_inputs(
         raise StateError("ownerless agent cache identity must have three fields")
     if _identity_from_obj(raw["actor"], "ownerless agent cache actor") is None:
         raise StateError("ownerless agent cache journal has no actor")
-    phase = _as_str(raw["phase"], "ownerless agent cache phase")
-    if phase not in {"prepared", "fenced", "relocated"}:
-        raise StateError(f"unknown ownerless agent cache phase {phase!r}")
     present = [
         candidate
         for candidate in (source, fenced, destination)
@@ -35752,6 +36094,8 @@ def _recover_ownerless_agent_cache(
             journal["phase"] = "fenced"
             _write_journal(config, journal)
             _interrupt_for_test("after-ownerless-agent-cache-fence")
+        if destination.is_relative_to(config.root / _VALIDATION_STATE_DIRECTORY):
+            _create_validation_state_directory(config.root)
         destination.parent.mkdir(parents=True, exist_ok=True)
         _ensure_no_symlink_components(
             config.root, destination.parent, "ownerless agent cache destination"
@@ -35820,6 +36164,8 @@ def _cmd_recover_ownerless_agent_cache(args: argparse.Namespace) -> int:
         _assert_ownerless_agent_no_registry_collision(config, source, states, archives)
         if destination.exists() or destination.is_symlink():
             raise Refusal(f"ownerless agent cache destination already exists: {destination}")
+        if destination.is_relative_to(config.root / _VALIDATION_STATE_DIRECTORY):
+            _require_validation_state_creatable(config.root)
         identity = _assert_ownerless_agent_cache_tree(source)
         if not args.apply:
             print(f"CACHE slot=ignored outcome=planned destination={destination}")
@@ -37588,9 +37934,12 @@ def _retained_handle_path(config: Config, value: str, label: str) -> Path:
 def _retained_handles_for_absent_rows(
     config: Config, rows: Sequence[tuple[ActiveRecord, tuple[Path, ...]]]
 ) -> Mapping[str, tuple[_RetainedValidationHandle, ...]]:
-    handles = config.root / "ignored" / "validate" / "runs"
-    if handles.is_symlink() or (handles.exists() and not handles.is_dir()):
-        raise Refusal(f"retained validation handle directory is unsafe: {handles}")
+    handle_directories = _validation_run_directories(config.root)
+    for handles in handle_directories:
+        if handles.is_symlink() or (handles.exists() and not handles.is_dir()):
+            raise Refusal(
+                f"retained validation handle directory is unsafe: {handles}"
+            )
     targets: dict[Path, set[str]] = {}
     for record, paths in rows:
         for target in paths:
@@ -37601,40 +37950,41 @@ def _retained_handles_for_absent_rows(
     handle_paths: list[Path] = []
     total_bytes = 0
     deadline = time.monotonic() + _RETAINED_HANDLE_CENSUS_SECONDS
-    if handles.is_dir():
-        try:
-            with os.scandir(handles) as entries:
-                for directory_entry in entries:
-                    if time.monotonic() >= deadline:
-                        raise Refusal(
-                            "retained validation handle enumeration exceeded its time bound"
-                        )
-                    if not directory_entry.name.endswith(".json"):
-                        continue
-                    if len(handle_paths) >= _RETAINED_HANDLE_COUNT_LIMIT:
-                        raise Refusal(
-                            "retained validation handles exceed the file-count census bound"
-                        )
-                    metadata = directory_entry.stat(follow_symlinks=False)
-                    path = handles / directory_entry.name
-                    if not stat.S_ISREG(metadata.st_mode):
-                        raise Refusal(f"retained validation handle is unsafe: {path}")
-                    if metadata.st_size > 1024 * 1024:
-                        raise Refusal(
-                            f"retained validation handle exceeds the 1 MiB safety bound: {path}"
-                        )
-                    total_bytes += metadata.st_size
-                    if total_bytes > _RETAINED_HANDLE_BYTES_LIMIT:
-                        raise Refusal(
-                            "retained validation handles exceed the 64 MiB census bound"
-                        )
-                    handle_paths.append(path)
-        except Refusal:
-            raise
-        except OSError as exc:
-            raise Refusal(
-                f"cannot enumerate retained validation handles: {exc}"
-            ) from exc
+    for handles in handle_directories:
+        if handles.is_dir():
+            try:
+                with os.scandir(handles) as entries:
+                    for directory_entry in entries:
+                        if time.monotonic() >= deadline:
+                            raise Refusal(
+                                "retained validation handle enumeration exceeded its time bound"
+                            )
+                        if not directory_entry.name.endswith(".json"):
+                            continue
+                        if len(handle_paths) >= _RETAINED_HANDLE_COUNT_LIMIT:
+                            raise Refusal(
+                                "retained validation handles exceed the file-count census bound"
+                            )
+                        metadata = directory_entry.stat(follow_symlinks=False)
+                        path = handles / directory_entry.name
+                        if not stat.S_ISREG(metadata.st_mode):
+                            raise Refusal(f"retained validation handle is unsafe: {path}")
+                        if metadata.st_size > 1024 * 1024:
+                            raise Refusal(
+                                f"retained validation handle exceeds the 1 MiB safety bound: {path}"
+                            )
+                        total_bytes += metadata.st_size
+                        if total_bytes > _RETAINED_HANDLE_BYTES_LIMIT:
+                            raise Refusal(
+                                "retained validation handles exceed the 64 MiB census bound"
+                            )
+                        handle_paths.append(path)
+            except Refusal:
+                raise
+            except OSError as exc:
+                raise Refusal(
+                    f"cannot enumerate retained validation handles: {exc}"
+                ) from exc
     if time.monotonic() >= deadline:
         raise Refusal("retained validation handle enumeration exceeded its time bound")
     handle_paths.sort()
@@ -43818,7 +44168,8 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--validation-proof-manifest",
         metavar="PATH",
         help=(
-            "canonical ignored/validate/removal-proofs/*.json manifest binding the "
+            "canonical validate_tmp/removal-proofs/*.json manifest (the legacy "
+            "ignored/validate/... spelling is also accepted) binding the "
             "external run record, service-result sidecar, producer schema, and exact "
             "scorecard handoff; this routes validation removal through a private seal"
         ),
@@ -43827,7 +44178,8 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--completed-record",
         metavar="PATH",
         help=(
-            "exact canonical ignored/validate/runs/*.json completed record named by "
+            "exact canonical validate_tmp/runs/*.json completed record (or its "
+            "legacy ignored/validate/runs/*.json spelling) named by "
             "the validation removal proof"
         ),
     )
@@ -43887,7 +44239,8 @@ usage or audit gate unknown, 3 fail-closed refusal.
         action="append",
         metavar="PATH",
         help=(
-            "completed ignored/validate/runs/*.json record aligned positionally "
+            "completed validate_tmp/runs/*.json record (or its legacy "
+            "ignored/validate/runs/*.json spelling) aligned positionally "
             "with --slot and --validation-proof-manifest"
         ),
     )
@@ -44372,7 +44725,8 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--completed-record",
         metavar="PATH",
         help=(
-            "project-relative ignored/validate/runs/*.json record proving the historical "
+            "project-relative validate_tmp/runs/*.json record (or its legacy "
+            "ignored/validate/runs/*.json spelling) proving the historical "
             "validation completed"
         ),
     )
@@ -44385,7 +44739,8 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--validation-proof-manifest",
         metavar="PATH",
         help=(
-            "canonical ignored/validate/removal-proofs/*.json manifest for this "
+            "canonical validate_tmp/removal-proofs/*.json manifest (or its legacy "
+            "ignored/validate/removal-proofs/*.json spelling) for this "
             "ownerless or frozen validation checkout"
         ),
     )

@@ -5434,6 +5434,77 @@ def test_frozen_validate_batch_accepts_exact_validation_removal_proof(
     assert not checkout.exists()
 
 
+@pytest.mark.parametrize("record_spelling", ["validate_tmp", "ignored/validate"])
+def test_frozen_validate_batch_accepts_a_proof_sealed_before_the_state_move(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    record_spelling: str,
+) -> None:
+    # The proof keeps its ignored/validate/... artifact paths after the move,
+    # while the recovery journal names the physical validate_tmp/... record.
+    # Both name one file, so recovery must compare physical spellings rather
+    # than refuse the same record as a different one.
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository, schema_version=3)
+    checkout, record, _target_sha = prepare_frozen_validation_checkout(
+        project,
+        repository,
+        monkeypatch=monkeypatch,
+        name="moved-proof",
+    )
+    manifest, _artifacts = prepare_validation_removal_proof(
+        project,
+        checkout.name,
+        checkout_path=checkout,
+        run_record=record,
+    )
+    proof_bytes = manifest.read_bytes()
+    assert b'"ignored/validate/runs/' in proof_bytes
+    legacy = project / "ignored" / "validate"
+    os.rename(legacy, project / "validate_tmp")
+    os.symlink("../validate_tmp", legacy)
+    stub_validate_batch_censuses(monkeypatch)
+    monkeypatch.setattr(
+        wrkslots,
+        "_root_owned_executable",
+        lambda path, _label: wrkslots._TrustedExecutablePath(
+            path.resolve(strict=True), ()
+        ),
+    )
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover-ownerless-validate-batch",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--frozen-validate-checkout",
+            str(checkout),
+            "--completed-record",
+            f"{record_spelling}/runs/{record.name}",
+            "--repository",
+            repository.relative_to(project).as_posix(),
+            "--validation-proof-manifest",
+            f"{record_spelling}/removal-proofs/{manifest.name}",
+            "--format",
+            "json",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    report = json.loads(captured.out)
+    assert report["retained"] == [], report
+    assert report["removed"] == [{"checkout": str(checkout)}]
+    assert not checkout.exists()
+    assert (project / "validate_tmp" / "removal-proofs" / manifest.name).read_bytes() == (
+        proof_bytes
+    )
+
+
 @pytest.mark.ordinary_environment
 @pytest.mark.parametrize(
     ("mutation", "message"),
@@ -9468,6 +9539,355 @@ def test_ownerless_cargo_cleanup_ignores_an_unrelated_missing_slot(
     assert len(rows) == 1
     row = wrkslots._as_mapping(rows[0], "remaining active slot")
     assert row["slot"] == "unrelated"
+
+
+def migrate_validation_state(project: Path) -> Path:
+    """Apply the one-time move: a real validate_tmp/ plus the exact symlink."""
+
+    current = project / "validate_tmp"
+    current.mkdir(parents=True, exist_ok=True)
+    legacy = project / "ignored" / "validate"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink("../validate_tmp", legacy)
+    return current
+
+
+def write_cargo_home_run_record(record: Path, cargo_home: str) -> None:
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "unit": f"{record.stem}.service",
+                "cargo_home": cargo_home,
+                "state": "completed",
+                "exit_code": 0,
+                "final_validate_status": "PASSED",
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize(
+    ("layout", "target_spelling", "record_spelling", "recorded_spelling"),
+    [
+        # Before the move every spelling is the legacy one and is used as written.
+        ("legacy-directory", "ignored/validate", "ignored/validate", "ignored/validate"),
+        # After the move, a current ci-hub names everything by validate_tmp.
+        ("migrated", "validate_tmp", "validate_tmp", "validate_tmp"),
+        # An older caller, or a record written before the move, still uses the
+        # legacy spelling; it is mapped through the exact compatibility symlink.
+        ("migrated", "ignored/validate", "ignored/validate", "ignored/validate"),
+        ("migrated", "validate_tmp", "ignored/validate", "ignored/validate"),
+        ("migrated", "ignored/validate", "validate_tmp", "validate_tmp"),
+    ],
+)
+def test_ownerless_cargo_home_recovery_accepts_both_validation_state_spellings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    layout: str,
+    target_spelling: str,
+    record_spelling: str,
+    recorded_spelling: str,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    physical = (
+        migrate_validation_state(project)
+        if layout == "migrated"
+        else project / "ignored" / "validate"
+    )
+    target = physical / "cargo-homes" / "validate-cargo-old"
+    target.mkdir(parents=True)
+    (target / "cache-entry").write_text("regenerable\n", encoding="utf-8")
+    record = physical / "runs" / "validate-ownerless.json"
+    write_cargo_home_run_record(
+        record,
+        str(project / recorded_spelling / "cargo-homes" / "validate-cargo-old"),
+    )
+
+    recovered = in_process_validation_exclusion_command(
+        project,
+        monkeypatch,
+        request,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        f"{target_spelling}/cargo-homes/validate-cargo-old",
+        "--completed-record",
+        f"{record_spelling}/runs/validate-ownerless.json",
+        add_coordinator_authorization=True,
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert not target.exists()
+    assert record.is_file()
+    assert active_slots(project) == []
+    if layout == "migrated":
+        assert os.readlink(project / "ignored" / "validate") == "../validate_tmp"
+        assert stat.S_ISDIR(os.lstat(project / "validate_tmp").st_mode)
+    else:
+        assert not (project / "validate_tmp").exists()
+
+
+@pytest.mark.parametrize(
+    ("layout", "target_spelling", "recorded_spelling", "message"),
+    [
+        # A legacy spelling is only mapped through the exact relative symlink the
+        # migration creates; any other link is still a crossed symlink.
+        ("foreign-symlink", "ignored/validate", "ignored/validate", "crosses a symlink"),
+        # Before the move nothing is translated, so a record naming the new
+        # spelling does not name the legacy Cargo home.
+        (
+            "legacy-directory",
+            "ignored/validate",
+            "validate_tmp",
+            "does not name this exact cargo_home",
+        ),
+        # After the move, a record must still name the same Cargo home.
+        (
+            "migrated",
+            "validate_tmp",
+            "ignored/validate/cargo-homes/validate-cargo-other",
+            "does not name this exact cargo_home",
+        ),
+    ],
+)
+def test_ownerless_cargo_home_recovery_refuses_mismatched_validation_state_spellings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    layout: str,
+    target_spelling: str,
+    recorded_spelling: str,
+    message: str,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    if layout == "legacy-directory":
+        physical = project / "ignored" / "validate"
+    else:
+        physical = migrate_validation_state(project)
+        if layout == "foreign-symlink":
+            legacy = project / "ignored" / "validate"
+            legacy.unlink()
+            os.symlink(str(physical), legacy)
+    target = physical / "cargo-homes" / "validate-cargo-old"
+    target.mkdir(parents=True)
+    record = physical / "runs" / "validate-ownerless.json"
+    recorded = (
+        recorded_spelling
+        if recorded_spelling.endswith("validate-cargo-other")
+        else f"{recorded_spelling}/cargo-homes/validate-cargo-old"
+    )
+    write_cargo_home_run_record(record, str(project / recorded))
+    record_spelling = "validate_tmp" if layout != "legacy-directory" else "ignored/validate"
+
+    refused = in_process_validation_exclusion_command(
+        project,
+        monkeypatch,
+        request,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        f"{target_spelling}/cargo-homes/validate-cargo-old",
+        "--completed-record",
+        f"{record_spelling}/runs/validate-ownerless.json",
+        add_coordinator_authorization=True,
+    )
+
+    assert refused.returncode != 0
+    assert message in refused.stderr, refused.stderr
+    assert target.is_dir()
+    assert record.is_file()
+
+
+@pytest.mark.parametrize(
+    "layout", ["legacy-directory", "migrated", "migrated-without-alias", "split"]
+)
+def test_recordless_cargo_home_recovery_finds_a_retained_record_in_either_location(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    layout: str,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    if layout in {"migrated", "migrated-without-alias"}:
+        physical = migrate_validation_state(project)
+        if layout == "migrated-without-alias":
+            # The layout readers accept without the symlink: the legacy
+            # spelling no longer resolves on disk, so only the translation
+            # connects the old record to the moved Cargo home.
+            (project / "ignored" / "validate").unlink()
+        records = physical / "runs"
+        # A record written before the move names the legacy spelling.
+        recorded_root = project / "ignored" / "validate"
+    else:
+        physical = project / "ignored" / "validate"
+        # "split" keeps the legacy directory but holds a record under
+        # validate_tmp; the census must still see it rather than miss it.
+        records = (
+            project / "validate_tmp" / "runs"
+            if layout == "split"
+            else physical / "runs"
+        )
+        recorded_root = physical
+    target = physical / "cargo-homes" / "validate-cargo-old"
+    target.mkdir(parents=True)
+    write_cargo_home_run_record(
+        records / "validate-retained.json",
+        str(recorded_root / "cargo-homes" / "validate-cargo-old"),
+    )
+
+    refused = in_process_validation_exclusion_command(
+        project,
+        monkeypatch,
+        request,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--recovery-note",
+        "no retained record should name this Cargo home",
+        add_coordinator_authorization=True,
+    )
+
+    assert refused.returncode != 0
+    assert "names this cargo_home; use --completed-record" in refused.stderr, (
+        refused.stderr
+    )
+    assert target.is_dir()
+
+
+def test_validation_state_spelling_is_translated_only_through_the_exact_symlink(
+    tmp_path: Path,
+) -> None:
+    legacy_spelling = "ignored/validate/runs/validate-a.json"
+    assert (
+        wrkslots._physical_validation_state_spelling(tmp_path, legacy_spelling)
+        == legacy_spelling
+    )
+    (tmp_path / "ignored" / "validate" / "runs").mkdir(parents=True)
+    assert (
+        wrkslots._physical_validation_state_spelling(tmp_path, legacy_spelling)
+        == legacy_spelling
+    )
+    assert wrkslots._validation_run_directories(tmp_path) == (
+        tmp_path / "validate_tmp" / "runs",
+        tmp_path / "ignored" / "validate" / "runs",
+    )
+    assert wrkslots._validation_state_directory(tmp_path) == (
+        tmp_path / "ignored" / "validate"
+    )
+
+    shutil.rmtree(tmp_path / "ignored")
+    migrate_validation_state(tmp_path)
+    assert (
+        wrkslots._physical_validation_state_spelling(tmp_path, legacy_spelling)
+        == "validate_tmp/runs/validate-a.json"
+    )
+    for unchanged in (
+        "ignored/validate",
+        "ignored/validate/../validate_tmp/runs/validate-a.json",
+        "ignored/validate//runs/validate-a.json",
+        "ignored/validated/runs/validate-a.json",
+        "validate_tmp/runs/validate-a.json",
+    ):
+        assert (
+            wrkslots._physical_validation_state_spelling(tmp_path, unchanged)
+            == unchanged
+        )
+    assert wrkslots._physical_validation_state_absolute(
+        tmp_path, f"{tmp_path}/ignored/validate/cargo-homes/validate-cargo-a"
+    ) == f"{tmp_path}/validate_tmp/cargo-homes/validate-cargo-a"
+    assert wrkslots._validation_run_directories(tmp_path) == (
+        tmp_path / "validate_tmp" / "runs",
+    )
+    assert wrkslots._validation_state_directory(tmp_path) == tmp_path / "validate_tmp"
+
+    legacy = tmp_path / "ignored" / "validate"
+    legacy.unlink()
+    os.symlink(str(tmp_path / "validate_tmp"), legacy)
+    assert (
+        wrkslots._physical_validation_state_spelling(tmp_path, legacy_spelling)
+        == legacy_spelling
+    )
+    with pytest.raises(wrkslots.Refusal, match="neither a directory nor the compatibility"):
+        wrkslots._validation_run_directories(tmp_path)
+
+    # A migrated root without the symlink, with or without ignored/, still
+    # keeps everything in validate_tmp, so the legacy spelling is translated.
+    legacy.unlink()
+    translated = "validate_tmp/runs/validate-a.json"
+    assert (
+        wrkslots._physical_validation_state_spelling(tmp_path, legacy_spelling)
+        == translated
+    )
+    (tmp_path / "ignored").rmdir()
+    assert (
+        wrkslots._physical_validation_state_spelling(tmp_path, legacy_spelling)
+        == translated
+    )
+    assert wrkslots._validation_run_directories(tmp_path) == (
+        tmp_path / "validate_tmp" / "runs",
+    )
+
+
+@pytest.mark.parametrize(
+    ("symlinked", "linked_target"),
+    [
+        ("validate_tmp", "elsewhere"),
+        ("validate_tmp", "missing"),
+        ("ignored", "elsewhere"),
+        ("ignored", "missing"),
+    ],
+)
+def test_validation_state_census_refuses_symlinked_state_ancestors(
+    tmp_path: Path, symlinked: str, linked_target: str
+) -> None:
+    # A census checks only the final runs component, so a symlinked or
+    # dangling ancestor would make it read another population, or an empty
+    # one, as this root's.
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "runs").mkdir(parents=True)
+    (elsewhere / "validate" / "runs").mkdir(parents=True)
+    if symlinked == "ignored":
+        (tmp_path / "validate_tmp" / "runs").mkdir(parents=True)
+    os.symlink(linked_target, tmp_path / symlinked)
+    with pytest.raises(wrkslots.Refusal, match="must be a real directory"):
+        wrkslots._validation_run_directories(tmp_path)
+    assert (
+        wrkslots._physical_validation_state_spelling(
+            tmp_path, "ignored/validate/runs/validate-a.json"
+        )
+        == "ignored/validate/runs/validate-a.json"
+    )
+
+
+def test_validation_state_census_refuses_a_file_in_place_of_validate_tmp(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "validate_tmp").write_text("not a directory\n", encoding="utf-8")
+    with pytest.raises(wrkslots.Refusal, match="must be a real directory"):
+        wrkslots._validation_run_directories(tmp_path)
 
 
 def test_ownerless_cargo_home_allows_nested_git_cache_and_records_determination(
@@ -36361,18 +36781,49 @@ def run_ownerless_agent_cache_recovery(project: Path, *, apply: bool) -> int:
     return wrkslots.main(args)
 
 
+@pytest.mark.parametrize(
+    ("layout", "state_directory"),
+    (
+        # A root that still keeps its state in a real ignored/validate keeps
+        # the cache there too: creating validate_tmp beside it would split the
+        # validator's state and block its one-time move.
+        ("unmigrated", "ignored/validate"),
+        # After the move the cache goes to the physical directory and never
+        # crosses the compatibility symlink.
+        ("migrated", "validate_tmp"),
+        # A root with no validation state yet gets the post-move layout, the
+        # same choice the validator's own first run makes, including the
+        # compatibility symlink, created before validate_tmp.
+        ("fresh", "validate_tmp"),
+        # Only the compatibility symlink exists (dangling): validate_tmp is
+        # created behind it, completing the migrated layout.
+        ("dangling-alias", "validate_tmp"),
+    ),
+)
 def test_recover_ownerless_agent_cache_relocates_exact_tree(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, layout: str, state_directory: str
 ) -> None:
     project, _repository, _remote = make_project(tmp_path)
+    if layout == "unmigrated":
+        (project / "ignored" / "validate" / "runs").mkdir(parents=True)
+    elif layout == "migrated":
+        migrate_validation_state(project)
+    elif layout == "dangling-alias":
+        (project / "ignored").mkdir(exist_ok=True)
+        os.symlink("../validate_tmp", project / "ignored" / "validate")
     source = prepare_ownerless_agent_cache(project)
     allow_test_host_for_ownerless_agent_recovery(monkeypatch)
 
     assert run_ownerless_agent_cache_recovery(project, apply=False) == 0
     assert run_ownerless_agent_cache_recovery(project, apply=True) == 0
-    destination = project / "ignored" / "validate" / "cache" / "wrkslots-agent-ignored"
+    destination = project / state_directory / "cache" / "wrkslots-agent-ignored"
     assert not source.exists()
     assert (destination / "validate/cache/rust-script/projects/one/Cargo.toml").is_file()
+    if layout == "unmigrated":
+        assert not os.path.lexists(project / "validate_tmp")
+    else:
+        assert stat.S_ISDIR(os.lstat(project / "validate_tmp").st_mode)
+        assert os.readlink(project / "ignored" / "validate") == "../validate_tmp"
 
 
 def test_recover_ownerless_agent_cache_refuses_arbitrary_contents(
@@ -36427,8 +36878,292 @@ def test_recover_ownerless_agent_cache_resumes_each_durable_boundary(
         )
         == 0
     )
-    destination = project / "ignored" / "validate" / "cache" / "wrkslots-agent-ignored"
+    # A root with no validation state yet takes the post-move layout.
+    destination = project / "validate_tmp" / "cache" / "wrkslots-agent-ignored"
     assert not source.exists() and destination.is_dir()
+    assert os.readlink(project / "ignored" / "validate") == "../validate_tmp"
+
+
+LEGACY_AGENT_CACHE_DESTINATION = "ignored/validate/cache/wrkslots-agent-ignored"
+
+
+def interrupt_previous_version_agent_cache_recovery(
+    project: Path, monkeypatch: pytest.MonkeyPatch, point: str
+) -> dict[str, object]:
+    """Interrupt a cache relocation exactly as the previous version did.
+
+    That version differs from this one only in ``_ownerless_agent_cache_paths``:
+    it always chose ``ignored/validate/cache/...``, even on a root with no
+    validation state.  Its journal and event records are reproduced by running
+    this version with that one function restored.
+    """
+
+    current_paths = wrkslots._ownerless_agent_cache_paths
+
+    def previous_version_paths(config: wrkslots.Config) -> tuple[Path, Path]:
+        source, _destination = current_paths(config)
+        return source, config.root / LEGACY_AGENT_CACHE_DESTINATION
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(observed: str) -> None:
+        if observed == point:
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_ownerless_agent_cache_paths", previous_version_paths)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_ownerless_agent_cache_recovery(project, apply=True)
+    monkeypatch.setattr(wrkslots, "_ownerless_agent_cache_paths", current_paths)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    config = wrkslots._load_config(str(project), "testhost")
+    journal = json.loads(wrkslots._journal_path(config).read_text(encoding="utf-8"))
+    assert journal["destination"] == LEGACY_AGENT_CACHE_DESTINATION
+    return dict(journal)
+
+
+def run_coordinator_recover(project: Path) -> int:
+    return wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "point",
+    ("after-ownerless-agent-cache-journal", "after-ownerless-agent-cache-fence"),
+)
+@pytest.mark.parametrize(
+    ("layout", "state_directory"),
+    (
+        # Still no validation state: the cache goes where this version puts
+        # it on such a root, because nothing was placed at either spelling.
+        ("fresh", "validate_tmp"),
+        # A real legacy directory appeared meanwhile: the recorded destination
+        # is this root's destination, as before.
+        ("unmigrated", "ignored/validate"),
+        # The root was migrated meanwhile: the recorded spelling maps to
+        # validate_tmp without crossing the compatibility symlink.
+        ("migrated", "validate_tmp"),
+    ),
+)
+def test_recover_ownerless_agent_cache_resumes_previous_version_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    point: str,
+    layout: str,
+    state_directory: str,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    source = prepare_ownerless_agent_cache(project)
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+    interrupt_previous_version_agent_cache_recovery(project, monkeypatch, point)
+    assert not os.path.lexists(project / "ignored" / "validate")
+    assert not os.path.lexists(project / "validate_tmp")
+    if layout == "unmigrated":
+        (project / "ignored" / "validate" / "runs").mkdir(parents=True)
+    elif layout == "migrated":
+        migrate_validation_state(project)
+
+    assert run_coordinator_recover(project) == 0
+    destination = project / state_directory / "cache" / "wrkslots-agent-ignored"
+    assert not source.exists()
+    assert (destination / "validate/cache/rust-script/projects/one/Cargo.toml").is_file()
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._journal_path(config).exists()
+    if layout == "fresh":
+        assert os.readlink(project / "ignored" / "validate") == "../validate_tmp"
+    if layout == "unmigrated":
+        assert not os.path.lexists(project / "validate_tmp")
+
+
+def test_recover_ownerless_agent_cache_previous_version_journal_keeps_collision_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    source = prepare_ownerless_agent_cache(project)
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+    interrupt_previous_version_agent_cache_recovery(
+        project, monkeypatch, "after-ownerless-agent-cache-journal"
+    )
+    planted = project / "validate_tmp" / "cache" / "wrkslots-agent-ignored"
+    planted.mkdir(parents=True)
+    (planted / "foreign.txt").write_text("not ours\n", encoding="utf-8")
+    capsys.readouterr()
+
+    assert run_coordinator_recover(project) == 3
+    assert "more than one ownerless agent cache path exists" in capsys.readouterr().err
+    assert (source / "validate/cache/rust-script/projects/one/Cargo.toml").is_file()
+    assert (planted / "foreign.txt").read_text(encoding="utf-8") == "not ours\n"
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._journal_path(config).exists()
+
+
+def test_recover_ownerless_agent_cache_refuses_unplaced_relocated_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A previous-version journal that says the cache was placed is never
+    # retargeted: on a root where the cache is no longer at the recorded
+    # destination, recovery refuses and leaves the journal for inspection.
+    project, _repository, _remote = make_project(tmp_path)
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+    prepare_ownerless_agent_cache(project)
+    interrupt_previous_version_agent_cache_recovery(
+        project, monkeypatch, "after-ownerless-agent-cache-relocate"
+    )
+    placed = project / LEGACY_AGENT_CACHE_DESTINATION
+    assert placed.is_dir()
+    moved_away = tmp_path / "moved-away"
+    shutil.move(str(project / "ignored" / "validate"), moved_away)
+    capsys.readouterr()
+
+    assert run_coordinator_recover(project) == 3
+    assert "non-canonical path" in capsys.readouterr().err
+    assert not os.path.lexists(project / "validate_tmp")
+    assert (moved_away / "cache" / "wrkslots-agent-ignored").is_dir()
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._journal_path(config).exists()
+
+
+@pytest.mark.parametrize(
+    "point",
+    ("after-ownerless-agent-cache-journal", "after-ownerless-agent-cache-fence"),
+)
+@pytest.mark.parametrize(
+    "layout", ("validate-tmp-symlink", "dangling-alias", "legacy-file")
+)
+def test_recover_ownerless_agent_cache_refuses_previous_version_journal_in_irregular_layout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    point: str,
+    layout: str,
+) -> None:
+    # A previous-version journal is retargeted to validate_tmp only while the
+    # root has neither state directory. A symlinked validate_tmp would move
+    # the cache into another directory; a dangling compatibility symlink
+    # means the root is half-migrated; a file at ignored/validate is no
+    # layout the validator accepts. Each refuses, leaving the cache, the
+    # journal and the layout as they were. The symlinked validate_tmp and the
+    # file are refused by the layout check that runs before the journal's
+    # paths are compared; the dangling symlink is a layout that check
+    # accepts, and the path walk refuses it.
+    project, _repository, _remote = make_project(tmp_path)
+    source = prepare_ownerless_agent_cache(project)
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+    journal = interrupt_previous_version_agent_cache_recovery(project, monkeypatch, point)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    if layout == "validate-tmp-symlink":
+        os.symlink(elsewhere, project / "validate_tmp")
+    elif layout == "dangling-alias":
+        (project / "ignored").mkdir(exist_ok=True)
+        os.symlink("../validate_tmp", project / "ignored" / "validate")
+    else:
+        (project / "ignored").mkdir(exist_ok=True)
+        (project / "ignored" / "validate").write_text("not state\n", encoding="utf-8")
+    fence = project / str(journal["fenced"])
+    cache = fence if point == "after-ownerless-agent-cache-fence" else source
+    capsys.readouterr()
+
+    assert run_coordinator_recover(project) == 3
+    error = capsys.readouterr().err
+    if layout == "validate-tmp-symlink":
+        assert "must be a real directory, not a symlink or file" in error
+        assert os.readlink(project / "validate_tmp") == str(elsewhere)
+        assert not os.path.lexists(project / "ignored" / "validate")
+    elif layout == "dangling-alias":
+        assert "crosses a symlink" in error
+        assert os.readlink(project / "ignored" / "validate") == "../validate_tmp"
+        assert not os.path.lexists(project / "validate_tmp")
+    else:
+        assert "is not the compatibility symlink" in error
+        assert (project / "ignored" / "validate").read_text(encoding="utf-8") == "not state\n"
+        assert not os.path.lexists(project / "validate_tmp")
+    assert list(elsewhere.iterdir()) == []
+    assert (cache / "validate/cache/rust-script/projects/one/Cargo.toml").is_file()
+    assert not os.path.lexists(fence if cache == source else source)
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._journal_path(config).exists()
+
+
+@pytest.mark.parametrize(
+    "foreign",
+    (
+        "other-symlink",
+        "file",
+        "symlinked-ignored",
+        "symlinked-ignored-with-validate",
+        "legacy-beside-symlinked-validate-tmp",
+        "legacy-beside-real-validate-tmp",
+    ),
+)
+def test_recover_ownerless_agent_cache_never_creates_state_beside_a_foreign_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    foreign: str,
+) -> None:
+    # Without a real ignored/validate the cache goes to validate_tmp, which
+    # wrkslots creates behind the compatibility symlink. Anything else at
+    # ignored/validate, a symlinked ignored (even one whose destination holds
+    # a real validate/), or a real ignored/validate beside any validate_tmp is
+    # not a layout the validator accepts, so recovery refuses before
+    # journaling and changes nothing.
+    project, _repository, _remote = make_project(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    if foreign in {"symlinked-ignored", "symlinked-ignored-with-validate"}:
+        if foreign == "symlinked-ignored-with-validate":
+            (elsewhere / "validate").mkdir()
+        os.symlink(elsewhere, project / "ignored")
+    else:
+        (project / "ignored").mkdir(exist_ok=True)
+        if foreign == "other-symlink":
+            os.symlink(str(elsewhere), project / "ignored" / "validate")
+        elif foreign == "file":
+            (project / "ignored" / "validate").write_text("not state\n", encoding="utf-8")
+        else:
+            (project / "ignored" / "validate").mkdir()
+            if foreign == "legacy-beside-symlinked-validate-tmp":
+                os.symlink(elsewhere, project / "validate_tmp")
+            else:
+                (project / "validate_tmp").mkdir()
+    source = prepare_ownerless_agent_cache(project)
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+    elsewhere_before = sorted(path.name for path in elsewhere.iterdir())
+    capsys.readouterr()
+
+    if foreign.startswith("symlinked-ignored"):
+        expected = "must be a real directory"
+    elif foreign.startswith("legacy-beside"):
+        expected = "split between them"
+    else:
+        expected = "is not the compatibility symlink"
+    for apply in (False, True):
+        assert run_ownerless_agent_cache_recovery(project, apply=apply) == 3
+        assert expected in capsys.readouterr().err
+    if foreign == "legacy-beside-symlinked-validate-tmp":
+        assert os.readlink(project / "validate_tmp") == str(elsewhere)
+    elif foreign == "legacy-beside-real-validate-tmp":
+        assert list((project / "validate_tmp").iterdir()) == []
+    else:
+        assert not os.path.lexists(project / "validate_tmp")
+    if foreign.startswith("legacy-beside"):
+        assert list((project / "ignored" / "validate").iterdir()) == []
+    assert sorted(path.name for path in elsewhere.iterdir()) == elsewhere_before
+    if foreign == "symlinked-ignored-with-validate":
+        assert list((elsewhere / "validate").iterdir()) == []
+    assert (source / "validate/cache/rust-script/projects/one/Cargo.toml").is_file()
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._journal_path(config).exists()
 
 
 def test_recover_absent_validate_rows_handles_terminal_and_recordless_rows(
