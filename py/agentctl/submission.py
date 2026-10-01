@@ -72,6 +72,10 @@ _QUEUE_MARKERS = (
 )
 _WORKING_MARKER = "esc to interrupt"
 _CODEX_QUEUE_HINT = "tab to queue message"
+#: Glyphs Codex draws in column 0 of its composer's first row. Earlier releases
+#: draw ``›``; v0.159.1 draws ``»``, and keeps ``›`` for selection lists such as
+#: its folder-trust prompt.
+_CODEX_COMPOSER_MARKERS = ("›", "»")
 
 
 class PromptNotStaged(HerdrUnavailable):
@@ -234,7 +238,7 @@ def _codex_view(rows: list[tuple[str, str]]) -> ComposerView | None:
     start = None
     for index in range(footer - 1, -1, -1):
         plain = rows[index][0]
-        if plain.startswith("›"):
+        if plain.startswith(_CODEX_COMPOSER_MARKERS):
             start = index
             break
         if plain.strip() and not plain.startswith("  "):
