@@ -4684,7 +4684,7 @@ mod tests {
         chat_runtime::deliver_request_with(&state, &delivery, &key, DrainOptions::default())
             .expect("deliver request");
         assert!(delivery.prompts.lock().expect("prompts")[0]
-            .contains("Your reply ID for this message is `001`."));
+            .contains("Include the line <CHAT_REPLY_001> at the beginning"));
         let route = state
             .next_reply_route(&key)
             .expect("route")
@@ -7064,7 +7064,7 @@ esac
         let (_, state) = worker_bridge_state(&fixture, true);
         let (key, prompt) = delivered_worker_request(&state);
         assert!(
-            prompt.contains("Your reply ID for this message is `001`."),
+            prompt.contains("Include the line <CHAT_REPLY_001> at the beginning"),
             "{prompt}"
         );
         let answers = ["first answer", "second answer", "third answer"];
@@ -7293,7 +7293,7 @@ esac
             prompts[0]
         );
         assert!(
-            prompts[1].contains("Your reply ID for this message is `002`."),
+            prompts[1].contains("Include the line <CHAT_REPLY_002> at the beginning"),
             "{}",
             prompts[1]
         );
@@ -7351,7 +7351,7 @@ esac
         assert!(
             prompts
                 .iter()
-                .any(|prompt| prompt.contains("Your reply ID for this message is `002`.")),
+                .any(|prompt| prompt.contains("Include the line <CHAT_REPLY_002> at the beginning")),
             "{prompts:#?}"
         );
         // A read that saves one, such as a capture's, shows that the check above can see it.
@@ -7396,7 +7396,7 @@ esac
         assert!(state
             .prompt(&key, "")
             .expect("prompt")
-            .contains("Your reply ID for this message is `001`."));
+            .contains("Include the line <CHAT_REPLY_001> at the beginning"));
         let block = "<CHAT_REPLY_001>\nan answer meant for another request\n</CHAT_REPLY_001>\n";
         let mut routes = RouteCache::new(vec![state
             .next_reply_route(&key)
@@ -7474,7 +7474,7 @@ request. No open chat request has been sent to you."]
         assert!(state
             .prompt(&key, "")
             .expect("prompt")
-            .contains("Your reply ID for this message is `001`."));
+            .contains("Include the line <CHAT_REPLY_001> at the beginning"));
         let mut routes = RouteCache::new(vec![state
             .next_reply_route(&key)
             .expect("route")

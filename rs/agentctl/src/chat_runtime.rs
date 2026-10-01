@@ -4831,19 +4831,22 @@ Complete this request using your normal instructions and tools. Outbound chat is
         // a request that cannot be given an alias: while the alias record cannot be read or is
         // inconsistent, which the service logs, or when locking or writing the record fails,
         // which nothing logs.
-        let (reply_id_intro, reply_id, numbering) = match self.reveal_reply_alias(key, screen) {
+        // The marker lines are written out whole. The copy of this prompt on the agent's screen
+        // is a prompt echo, whose marker lines do not count while its first row is read as a
+        // prompt row (`the_echoed_request_prompt_posts_nothing`). That row is not read so once it
+        // is out of view, or when it is a `❯` row first in a capture, which is skipped as Claude
+        // Code's pinned copy. If the closing marker line also stands alone on a row, the text
+        // before it can then be reported or, by a joined read, posted; the chat userguide states
+        // the limit.
+        let (reply_id, numbering) = match self.reveal_reply_alias(key, screen) {
             Ok(alias) => (
-                "Your reply ID for this message is",
                 format_reply_alias(alias),
-                "Use this same ID for every reply to this message; do not increment it. \
-Each complete block is sent as a separate chat message, and a block whose text was already sent \
-for this message is not sent again.",
+                "Use the same two lines for every reply, with no tool call between them.",
             ),
             Err(_) => (
-                "Your next reply ID is",
                 format!("{}_{}", record.reply_nonce, record.next_reply_ordinal),
-                "Increment the numeric suffix for every later reply. Each consecutive complete \
-block is sent as a separate chat message.",
+                "For every later reply, add one to the last number in both lines, and make no tool \
+call between them.",
             ),
         };
         Ok(format!(
@@ -4851,15 +4854,9 @@ block is sent as a separate chat message.",
 {context}\n\
 {}\n\n\
 Complete this request using your normal instructions and tools. You may send one or multiple replies, including progress updates. \
-{reply_id_intro} `{reply_id}`. Compose an opening line from the literal prefix `<CHAT_REPLY_`, that ID, and `>`; \
-compose its closing line from `</CHAT_REPLY_`, the same ID, and `>`. Keep both lines standalone and outside code fences. \
-Start a message with the opening line and write the whole block in that message, with no tool call inside it. \
-{numbering} \
-The bridge sends at most {MAX_THREAD_REPLIES_PER_WINDOW} messages to one chat thread within {} seconds and holds any further ones \
-for {} seconds, so combine short updates.",
+Include the line <CHAT_REPLY_{reply_id}> at the beginning of your response and end with </CHAT_REPLY_{reply_id}>. \
+Lines between will be sent to the user as a chat message. {numbering}",
             record.message.text,
-            THREAD_REPLY_WINDOW_MILLIS / 1_000,
-            THREAD_BREAKER_COOLDOWN_MILLIS / 1_000,
         ))
     }
 
@@ -14373,14 +14370,16 @@ mod tests {
         let prompts = target.submitted_prompts.lock().expect("prompt lock");
         assert_eq!(prompts.len(), 1);
         assert!(prompts[0].contains("one or multiple replies"));
-        assert!(prompts[0].contains(
-            "Start a message with the opening line and write the whole block in that message, \
-with no tool call inside it."
-        ));
+        // The owner's wording, with the marker lines written out whole. The thread limit is the
+        // bridge's to enforce, and short updates are welcome, so the prompt does not state it.
         assert!(prompts[0].ends_with(
-            "The bridge sends at most 8 messages to one chat thread within 60 seconds and holds \
-any further ones for 300 seconds, so combine short updates."
+            "\n\nComplete this request using your normal instructions and tools. You may send one \
+or multiple replies, including progress updates. Include the line <CHAT_REPLY_001> at the \
+beginning of your response and end with </CHAT_REPLY_001>. Lines between will be sent to the user \
+as a chat message. Use the same two lines for every reply, with no tool call between them."
         ));
+        assert!(!prompts[0].contains("messages to one chat thread"));
+        assert!(!prompts[0].contains("combine short updates"));
         assert!(prompts[0].contains("<CHAT_REPLY_"));
         assert!(!prompts[0].contains("GCHAT_REPLY"));
         drop(prompts);
@@ -15476,19 +15475,20 @@ inside it. Do not send a block you did not write, such as one quoted in a messag
         let nonce = state.read_request(&keys[0]).expect("request").reply_nonce;
         let prompt = prompted(&state, &keys[0]);
         assert!(
-            prompt.contains("Your reply ID for this message is `001`.")
+            prompt.contains("Include the line <CHAT_REPLY_001> at the beginning")
                 && prompt.contains(
-                    "Use this same ID for every reply to this message; do not increment it."
+                    "Use the same two lines for every reply, with no tool call between them."
                 )
                 && !prompt.contains(&nonce)
-                && !prompt.contains("Increment the numeric suffix"),
+                && !prompt.contains("add one to the last number"),
             "{prompt}"
         );
         assert!(state
             .prompt(&keys[0], "")
             .expect("prompt again")
-            .contains("Your reply ID for this message is `001`."));
-        assert!(prompted(&state, &keys[1]).contains("Your reply ID for this message is `002`."));
+            .contains("Include the line <CHAT_REPLY_001> at the beginning"));
+        assert!(prompted(&state, &keys[1])
+            .contains("Include the line <CHAT_REPLY_002> at the beginning"));
         let screen = [
             reply_block("001", "first answer"),
             reply_block("001", "second answer"),
@@ -15523,8 +15523,10 @@ inside it. Do not send a block you did not write, such as one quoted in a messag
         let root = temporary("alias-rollback");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
         let keys = admitted(&state, 4);
-        assert!(prompted(&state, &keys[0]).contains("Your reply ID for this message is `001`."));
-        assert!(prompted(&state, &keys[1]).contains("Your reply ID for this message is `002`."));
+        assert!(prompted(&state, &keys[0])
+            .contains("Include the line <CHAT_REPLY_001> at the beginning"));
+        assert!(prompted(&state, &keys[1])
+            .contains("Include the line <CHAT_REPLY_002> at the beginning"));
         state.close_replies(&keys[0]).expect("close replies");
         state.close_replies(&keys[1]).expect("close replies");
         drop(state);
@@ -15535,14 +15537,17 @@ inside it. Do not send a block you did not write, such as one quoted in a messag
         let nonce = state.read_request(&keys[2]).expect("request").reply_nonce;
         let prompt = prompted(&state, &keys[2]);
         assert!(
-            prompt.contains(&format!("Your next reply ID is `{nonce}_1`.")),
+            prompt.contains(&format!(
+                "Include the line <CHAT_REPLY_{nonce}_1> at the beginning"
+            )),
             "{prompt}"
         );
         assert_eq!(fs::read(&path).expect("alias record"), b"{");
         drop(state);
         fs::write(&path, &saved).expect("restore alias record");
         let state = BridgeState::open(&root).expect("reopen state");
-        assert!(prompted(&state, &keys[3]).contains("Your reply ID for this message is `003`."));
+        assert!(prompted(&state, &keys[3])
+            .contains("Include the line <CHAT_REPLY_003> at the beginning"));
         // The request first prompted with a long ID keeps it.
         let mut ids = state.available_reply_ids().expect("reply IDs");
         ids.sort();
@@ -15578,8 +15583,10 @@ inside it. Do not send a block you did not write, such as one quoted in a messag
         let root = temporary("alias-skip");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
         let keys = admitted(&state, 5);
-        assert!(prompted(&state, &keys[0]).contains("Your reply ID for this message is `001`."));
-        assert!(prompted(&state, &keys[1]).contains("Your reply ID for this message is `002`."));
+        assert!(prompted(&state, &keys[0])
+            .contains("Include the line <CHAT_REPLY_001> at the beginning"));
+        assert!(prompted(&state, &keys[1])
+            .contains("Include the line <CHAT_REPLY_002> at the beginning"));
         let answer = reply_block("001", "answer");
         assert_eq!(
             state.capture_snapshot(&answer).expect("capture").replies,
@@ -15626,7 +15633,9 @@ you received."
         for (key, alias) in keys[2..].iter().zip(["003", "004", "006"]) {
             let prompt = prompted(&state, key);
             assert!(
-                prompt.contains(&format!("Your reply ID for this message is `{alias}`.")),
+                prompt.contains(&format!(
+                    "Include the line <CHAT_REPLY_{alias}> at the beginning"
+                )),
                 "{prompt}"
             );
         }
@@ -15642,7 +15651,8 @@ you received."
         let root = temporary("alias-skip-one-key");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
         let keys = admitted(&state, 3);
-        assert!(prompted(&state, &keys[0]).contains("Your reply ID for this message is `001`."));
+        assert!(prompted(&state, &keys[0])
+            .contains("Include the line <CHAT_REPLY_001> at the beginning"));
         let capture = state
             .capture_replies(
                 &keys[0],
@@ -15654,7 +15664,9 @@ you received."
         for (key, alias) in keys[1..].iter().zip(["003", "004"]) {
             let prompt = prompted(&state, key);
             assert!(
-                prompt.contains(&format!("Your reply ID for this message is `{alias}`.")),
+                prompt.contains(&format!(
+                    "Include the line <CHAT_REPLY_{alias}> at the beginning"
+                )),
                 "{prompt}"
             );
         }
@@ -15684,11 +15696,12 @@ you received."
         let prompts = delivery.submitted_prompts.lock().expect("prompts").clone();
         assert_eq!(prompts.len(), 1, "{prompts:#?}");
         assert!(
-            prompts[0].contains("Your reply ID for this message is `002`."),
+            prompts[0].contains("Include the line <CHAT_REPLY_002> at the beginning"),
             "{}",
             prompts[0]
         );
-        assert!(prompted(&state, &keys[1]).contains("Your reply ID for this message is `004`."));
+        assert!(prompted(&state, &keys[1])
+            .contains("Include the line <CHAT_REPLY_004> at the beginning"));
         let capture = state
             .capture_snapshot(&[old_block.as_str(), &reply_block("002", "answer")].concat())
             .expect("capture");
@@ -15726,7 +15739,7 @@ you received."
         let prompts = delivery.submitted_prompts.lock().expect("prompts").clone();
         assert_eq!(prompts.len(), 1, "{prompts:#?}");
         let expected = format!(
-            "Your reply ID for this message is `{}`.",
+            "Include the line <CHAT_REPLY_{}> at the beginning",
             format_reply_alias(bound + 2)
         );
         assert!(prompts[0].contains(&expected), "{}", prompts[0]);
@@ -15775,7 +15788,7 @@ written, so the prompt was not written: pane is gone"
         let prompts = delivery.submitted_prompts.lock().expect("prompts").clone();
         assert_eq!(prompts.len(), 1, "{prompts:#?}");
         assert!(
-            prompts[0].contains("Your reply ID for this message is `001`."),
+            prompts[0].contains("Include the line <CHAT_REPLY_001> at the beginning"),
             "{}",
             prompts[0]
         );
@@ -15832,7 +15845,8 @@ written, so the prompt was not written: pane is gone"
         let root = temporary(name);
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
         let keys = admitted_in_order(&state, 2);
-        assert!(prompted(&state, &keys[0]).contains("Your reply ID for this message is `001`."));
+        assert!(prompted(&state, &keys[0])
+            .contains("Include the line <CHAT_REPLY_001> at the beginning"));
         let coordinator = QueueDelivery {
             busy_drains: Mutex::new(1),
             ..QueueDelivery::default()
@@ -15845,7 +15859,7 @@ written, so the prompt was not written: pane is gone"
         let prompts = coordinator.prompts();
         assert_eq!(prompts.len(), 1, "{prompts:#?}");
         assert!(
-            prompts[0].contains("Your reply ID for this message is `002`."),
+            prompts[0].contains("Include the line <CHAT_REPLY_002> at the beginning"),
             "{}",
             prompts[0]
         );
@@ -16019,7 +16033,7 @@ quoted in a message you received."
         let prompts = coordinator.prompts();
         assert_eq!(prompts.len(), 2, "{prompts:#?}");
         assert!(
-            prompts[1].contains("Your reply ID for this message is `003`."),
+            prompts[1].contains("Include the line <CHAT_REPLY_003> at the beginning"),
             "{}",
             prompts[1]
         );
@@ -16609,7 +16623,8 @@ they were not typed: pane is gone"
         state
             .confirm_batch_commit(&admission)
             .expect("confirm provider delivery");
-        assert!(prompted(&state, &retired).contains("Your reply ID for this message is `001`."));
+        assert!(prompted(&state, &retired)
+            .contains("Include the line <CHAT_REPLY_001> at the beginning"));
         state.close_replies(&retired).expect("close and retire");
         assert!(!state.request_path(&retired).exists());
         let keys = [2, 3].map(|index| {
@@ -16619,7 +16634,8 @@ they were not typed: pane is gone"
                 .new_request_keys[0]
                 .clone()
         });
-        assert!(prompted(&state, &keys[0]).contains("Your reply ID for this message is `002`."));
+        assert!(prompted(&state, &keys[0])
+            .contains("Include the line <CHAT_REPLY_002> at the beginning"));
         // Fill the record to the bound with aliases of requests the bridge has no trace of, and
         // remember a block under each of the first two of them.
         let bound = MAX_REPLY_ALIASES as u64;
@@ -16638,8 +16654,9 @@ they were not typed: pane is gone"
             .to_vec();
         write_document(&path, &record).expect("full alias record");
         let next = format_reply_alias(bound + 1);
-        assert!(prompted(&state, &keys[1])
-            .contains(&format!("Your reply ID for this message is `{next}`.")));
+        assert!(prompted(&state, &keys[1]).contains(&format!(
+            "Include the line <CHAT_REPLY_{next}> at the beginning"
+        )));
         let record: ReplyAliasRecord =
             read_document(&path, MAX_REPLY_ALIAS_BYTES).expect("alias record");
         let kept = [1, 2].into_iter().chain(4..=bound + 1).collect::<Vec<_>>();
@@ -16715,7 +16732,8 @@ they were not typed: pane is gone"
         let root = temporary("alias-unusable");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
         let keys = admitted(&state, 2);
-        assert!(prompted(&state, &keys[0]).contains("Your reply ID for this message is `001`."));
+        assert!(prompted(&state, &keys[0])
+            .contains("Include the line <CHAT_REPLY_001> at the beginning"));
         assert_eq!(state.reply_alias_problem(), None);
         assert_eq!(
             state.status().expect("status")["reply_alias_problem"],
@@ -16742,8 +16760,10 @@ they were not typed: pane is gone"
         let nonce = state.read_request(&keys[1]).expect("request").reply_nonce;
         let prompt = prompted(&state, &keys[1]);
         assert!(
-            prompt.contains(&format!("Your next reply ID is `{nonce}_1`."))
-                && prompt.contains("Increment the numeric suffix for every later reply."),
+            prompt.contains(&format!(
+                "Include the line <CHAT_REPLY_{nonce}_1> at the beginning"
+            )) && prompt
+                .contains("For every later reply, add one to the last number in both lines"),
             "{prompt}"
         );
         let capture = state
@@ -21481,7 +21501,9 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
         let root = temporary("alias-prompt-echo");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
         let key = admitted(&state, 1).remove(0);
-        assert!(prompted(&state, &key).contains("Your reply ID for this message is `001`."));
+        assert!(
+            prompted(&state, &key).contains("Include the line <CHAT_REPLY_001> at the beginning")
+        );
         let quoted = "<CHAT_REPLY_001>\n  quoted answer\n  </CHAT_REPLY_001>";
         let queued = "<CHAT_REPLY_001>\n    quoted answer\n    </CHAT_REPLY_001>";
         let quotes = [
@@ -21561,6 +21583,158 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                 .collect::<Vec<_>>(),
             (0..quotes.len())
                 .map(|index| format!("[codex coordinator] real answer {index}"))
+                .collect::<Vec<_>>()
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn the_echoed_request_prompt_posts_nothing() {
+        // The request prompt writes the reply marker lines out whole, and the bridge types that
+        // prompt into the agent's pane, where it shows as a user turn: the prompt character and
+        // the first row, then every later row indented under it. At some pane widths a marker
+        // line of the instruction stands alone on a row. No such echo posts anything, at any
+        // width, at the top of a capture or under a row of the agent's, and the agent's own block
+        // under the same ID is still posted. Under a row of the agent's, nothing in the echo is
+        // reported either. The known gap: at the top of a capture, Claude Code's `❯` row is read
+        // as the pinned copy of a prompt and the rows under it as ordinary rows
+        // (a_prompt_row_at_the_top_of_a_capture_starts_nothing), so where the closing marker line
+        // stands alone, the instruction's text before it is reported as a held-back block. That
+        // takes a pane 19 columns wide for a short ID. It is still not posted.
+        let root = temporary("echoed-request-prompt");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let key = admitted(&state, 1).remove(0);
+        let prompt = prompted(&state, &key);
+        assert!(prompt.contains(
+            "Include the line <CHAT_REPLY_001> at the beginning of your response and end with \
+</CHAT_REPLY_001>."
+        ));
+        // Each line of `text` filled word by word into rows `width` columns wide, a word wider
+        // than a row broken at the row's end.
+        let wrap = |text: &str, width: usize| -> Vec<String> {
+            let mut rows = Vec::new();
+            let mut row = String::new();
+            for word in text.split(' ') {
+                let mut word = word.chars().collect::<Vec<_>>();
+                loop {
+                    let used = row.chars().count();
+                    let gap = usize::from(used > 0);
+                    if used + gap + word.len() <= width {
+                        if gap == 1 {
+                            row.push(' ');
+                        }
+                        row.extend(word.iter());
+                        break;
+                    }
+                    if used > 0 {
+                        rows.push(std::mem::take(&mut row));
+                        continue;
+                    }
+                    row.extend(word.drain(..width));
+                    rows.push(std::mem::take(&mut row));
+                }
+            }
+            rows.push(row);
+            rows
+        };
+        // The prompt as a pane `width` columns wide shows it after the prompt character `mark`.
+        let echo = |mark: &str, width: usize| -> String {
+            let rows = prompt
+                .split('\n')
+                .flat_map(|line| wrap(line, width - 2))
+                .enumerate()
+                .map(|(index, row)| {
+                    if index == 0 {
+                        format!("{mark} {row}")
+                    } else if row.is_empty() {
+                        row
+                    } else {
+                        format!("  {row}")
+                    }
+                })
+                .collect::<Vec<_>>();
+            rows.join("\n") + "\n"
+        };
+        let stands_alone = |screen: &str, marker: &str| {
+            screen
+                .lines()
+                .any(|row| row.trim_start_matches(['❯', '›', '»']).trim() == marker)
+        };
+        let mut opening_alone = Vec::new();
+        let mut closing_alone = Vec::new();
+        let mut answers = Vec::new();
+        // Claude Code, Codex, and Codex's input box holding a message not yet sent.
+        for (mark, bullet) in [("❯", "⏺"), ("›", "•"), ("»", "•")] {
+            for width in 18..=160 {
+                let top = echo(mark, width);
+                if stands_alone(&top, "<CHAT_REPLY_001>") {
+                    opening_alone.push((mark, width));
+                }
+                if stands_alone(&top, "</CHAT_REPLY_001>") {
+                    closing_alone.push((mark, width));
+                }
+                let below = format!("{bullet} Working on it.\n{top}");
+                for screen in [&top, &below] {
+                    let capture = state.capture_snapshot(screen).expect("capture the echo");
+                    assert!(
+                        capture.replies.is_empty(),
+                        "{screen}posted {:?}",
+                        capture.replies
+                    );
+                    let reported: &[String] =
+                        if mark == "❯" && screen == &top && stands_alone(&top, "</CHAT_REPLY_001>")
+                        {
+                            &[held_back(
+                                "001",
+                                "unopened",
+                                "atthebeginningofyourresponseandendwith",
+                            )]
+                        } else {
+                            &[]
+                        };
+                    assert_eq!(capture.unknown_ids, reported, "{screen}");
+                    assert!(
+                        capture.suppressed_ids.is_empty()
+                            && capture.refused.is_empty()
+                            && !capture.overflowed,
+                        "{screen}{capture:?}"
+                    );
+                }
+                // The agent's own block under the same ID, below the echo, is posted.
+                if [19, 80].contains(&width) {
+                    let answer = format!("real answer {}", answers.len());
+                    let screen = format!(
+                        "{below}{bullet} <CHAT_REPLY_001>\n  {answer}\n  </CHAT_REPLY_001>\n"
+                    );
+                    answers.push(answer);
+                    let ordinal = u32::try_from(answers.len()).expect("few answers");
+                    let capture = state.capture_snapshot(&screen).expect("capture the answer");
+                    assert_eq!(capture.replies, [(key.clone(), vec![ordinal])], "{screen}");
+                }
+            }
+        }
+        // The widths at which a marker line stands alone on a row of the echo are covered.
+        for mark in ["❯", "›", "»"] {
+            assert!(
+                opening_alone.contains(&(mark, 19)) && closing_alone.contains(&(mark, 19)),
+                "{opening_alone:?} {closing_alone:?}"
+            );
+        }
+        let mut transport = FakeReplyTransport::default();
+        while state
+            .publish_one(&key, &mut transport)
+            .expect("publish captured reply")
+            .is_some()
+        {}
+        assert_eq!(
+            transport
+                .submissions
+                .iter()
+                .map(|submission| submission.2.clone())
+                .collect::<Vec<_>>(),
+            answers
+                .iter()
+                .map(|answer| format!("[codex coordinator] {answer}"))
                 .collect::<Vec<_>>()
         );
         fs::remove_dir_all(root).expect("cleanup");

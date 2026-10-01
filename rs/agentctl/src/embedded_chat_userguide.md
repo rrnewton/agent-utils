@@ -368,8 +368,17 @@ Code's compact view draws a tool call as a row at the margin of the message,
 with no bullet, and its output after `⎿` at the same column. The block then ends
 unfinished and is handled as a partial block, as described below, unless the new
 item is a bullet row that holds the block's closing marker. Each request prompt
-therefore asks the agent to start a message with the opening line and write the
-whole block in that message, with no tool call inside it.
+therefore asks the agent to put the opening line at the beginning of its
+response and to make no tool call between the two marker lines. The prompt
+writes both marker lines out whole. Its copy on the agent's screen is a prompt
+echo, and its marker lines do not count while the echo's first row is read as a
+prompt row. That row is not read so once it is out of view, or when it is a `❯`
+row at the top of a capture, which is skipped as Claude Code's pinned copy, as
+described below. The closing marker line stands alone on a row only in a pane
+exactly as wide as that line plus the echo's indent: 19 columns for a
+three-digit ID. There, if the echo's first row is not read as a prompt row, the
+instruction's text before that line can be reported as an unopened block or a
+remnant, and a joined read can post it.
 
 These rules read how a row starts, not who wrote it, so they can fail both ways.
 A row of the agent's own text outside a block that starts like a prompt hides
@@ -469,8 +478,8 @@ neither posted nor reported.
 
 Each request's prompt gives one reply ID, a short number, for every reply to
 that request: `001`, `002`, and so on, counting across all requests and past
-`999` with more digits. The prompt asks the agent to use that same ID for each
-reply and not to increment it. The bridge assigns a number when it first writes
+`999` with more digits. The prompt asks the agent to use the same two marker
+lines, and so the same ID, for every reply. The bridge assigns a number when it first writes
 a prompt that shows it, and never assigns it again: the next number is kept in
 `reply-aliases.json` in the state directory and saved before the prompt is
 written, so a restart, a crash, or a rollback to an earlier release and back
@@ -792,7 +801,8 @@ it and diagnostics stay held until it is repaired or deleted.
 A per-thread post-rate breaker bounds any remaining reply loop. One provider
 thread may reserve 8 distinct reply operations within 60 seconds. That leaves
 room for several requests in one thread, each with progress updates and a
-multi-message answer, and each request prompt states this budget to the agent.
+multi-message answer. Request prompts do not state this budget, because short
+progress updates are welcome.
 The next reply to that thread trips the breaker. Replies to that thread then
 stay captured but unsent for 300 seconds; replies to other threads are
 unaffected. Held replies go out in order, under their original operation IDs, at
