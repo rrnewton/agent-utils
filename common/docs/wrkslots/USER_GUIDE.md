@@ -756,8 +756,12 @@ wrkslots recover --coordinator-authorized --coordinator-pid "$COORDINATOR_PID" \
 ```
 
 The Cargo-home form may instead use
-`--completed-record ignored/validate/runs/validate-example.json` to bind cleanup to an exact
-terminal run record. A recordless path requires a non-empty explanation, but prose is not
+`--completed-record validate_tmp/runs/validate-example.json` to bind cleanup to an exact
+terminal run record. The older `ignored/validate/...` spelling of a completed record, a removal
+proof, or a Cargo home is also accepted: while `ignored/validate` is a real directory it is used
+as written, and once it is the compatibility symlink to `../validate_tmp` wrkslots maps it to the
+`validate_tmp/...` path it names, so no checked path crosses the symlink. Any other symlink at
+`ignored/validate` is refused. A recordless path requires a non-empty explanation, but prose is not
 authority: wrkslots records the exact path and filesystem identity and independently verifies that
 no retained record names it and no process uses it. Cargo homes must have the exact configured
 parent and `validate-cargo-*` name and cannot be Git worktree roots. The cleanup retains positive
@@ -994,6 +998,16 @@ wrkslots recover-ownerless-agent-cache --apply --coordinator-authorized \
 
 This command accepts no arbitrary path, refuses symlinks, mounts, `.git`, `HANDOFF.md`, unexpected
 top-level content, live use, or an occupied destination, and journals the same-inode relocation.
+
+The destination is `ignored/validate/cache/wrkslots-agent-ignored` while `ignored/validate` is a
+real directory, and `validate_tmp/cache/wrkslots-agent-ignored` otherwise. When `validate_tmp` does
+not exist yet, wrkslots creates the compatibility symlink `ignored/validate -> ../validate_tmp`
+first and `validate_tmp` second, the order the validator itself uses, so a writer that still
+derives the `ignored/validate` spelling reaches the same directory. A root where `ignored` or `validate_tmp` is
+not a real directory, or where `ignored/validate` is anything other than a real directory or that
+exact symlink, is refused before anything is journaled. So is a root where `ignored/validate` is a
+real directory and `validate_tmp` also exists, because the validator's state would then be split
+between the two. Resuming an interrupted relocation checks the same rule first.
 
 ## Disk-image slots
 
