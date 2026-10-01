@@ -839,11 +839,32 @@ rule would refuse every new slot for that agent. An unverifiable verdict (exit `
 failure), a live or indeterminate owner generation, a row with no usable owner, or a caller outside
 the initial PID namespace still refuses. The command then performs the same full-host process,
 cgroup, mount, and user-systemd census used for absent validation rows. It does not claim the
-vanished working tree was clean. Every
-recorded checkout commit is pushed individually to a dedicated rescue ref and read back from the
-remote before the exact stale Git worktree registration is removed. Because that push is the only
-preservation, the plan and the apply both refuse unless every checkout's remote is listed in
-`salvage_push_remotes`. The archive is durable before
+vanished working tree was clean. Each recorded checkout commit must be preserved on that checkout's
+own remote before its exact stale Git worktree registration is removed, in one of two ways:
+
+- When the remote's URL is listed in `salvage_push_remotes`, the commit is pushed individually to a
+  dedicated rescue ref and read back from the remote.
+- Otherwise recovery publishes nothing. It accepts the checkout only when a branch (`refs/heads/*`)
+  or rescue ref (`refs/rescue/*`) already on that remote contains the recorded commit. The remote's
+  refs are read fresh and fetched only into a temporary repository; no ref in the local repository,
+  including `refs/remotes/*`, is read or changed. The plan prints the chosen ref as
+  `remote_containment=[...]`. The apply records it in its journal and checks again, with
+  `git merge-base --is-ancestor` against a freshly fetched copy, immediately before removing each
+  checkout's registration and again before changing ACTIVE. Recovery neither created nor protects
+  that ref, so the archive says that the commit stays preserved only while the ref contains it.
+  Ancestry is read from the commit objects, never from a commit-graph file. Each fetch is seeded
+  with the recorded commit, so it downloads only history the local repository lacks, and is stopped
+  and refused after 300 seconds.
+- Git keeps a deleted linked worktree's index under `<common>/worktrees/<id>/index`, and removing the
+  registration deletes it. On this path the plan, the apply, a resume, and the step immediately
+  before removal each refuse while that index stages content, or holds an unmerged conflict, that
+  the recorded commit does not contain. Commit and publish that content, or reset the index to the
+  recorded commit if it is not wanted, then rerun.
+
+A checkout whose remote is not listed and that no such ref contains is refused by both the plan and
+the apply. Tags and other refs do not count. A resumed recovery whose recorded ref no longer contains
+the commit is also refused, and it keeps the ACTIVE row, the journal, and the remaining
+registrations. The archive is durable before
 ACTIVE is changed and explicitly records that uncommitted, untracked, ignored, and HANDOFF contents
 could not be inspected because storage was already absent.
 
