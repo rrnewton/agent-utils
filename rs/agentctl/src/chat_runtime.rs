@@ -130,8 +130,9 @@ pub const REQUEST_INSPECTION_SCHEMA: &str = "agentctl-chat-request-inspection/v1
 const GOOGLE_CHAT_MESSAGE_SCHEMA: &str = "google.chat.message.v1";
 // A quote within both whole-quote bounds appears whole in the prompt. A longer one keeps whole
 // lines from its start and its end, within the head and tail bounds, and one line
-// "...N chars elided..." stands for the rest (see `elide_middle`). The line bounds stop a quote of
-// many short lines from filling the pane.
+// "...N chars elided..." stands for the rest, as `elide_middle` describes: it reads
+// "...1 char elided..." when N is 1, and when N would be 0 the quote appears whole. The line
+// bounds stop a quote of many short lines from filling the pane.
 const QUOTED_PARENT_WHOLE_CHARS: usize = 720;
 const QUOTED_PARENT_WHOLE_LINES: usize = 18;
 const QUOTED_PARENT_HEAD_CHARS: usize = 480;
@@ -4866,10 +4867,11 @@ Lines between will be sent to the user as a chat message. {numbering}",
     /// quoted message, and for a reply in an existing thread the command that prints its earlier
     /// messages.
     ///
-    /// Identifiers are kept on one line, quoted text is sanitized and prefixed with `> `, and
-    /// reply syntax in either is neutralized, so nothing here can end the front matter early,
-    /// form a standalone reply marker or open a code fence however the terminal wraps it, or put
-    /// a character in the pane that makes a later capture fail.
+    /// Identifiers are kept on one line, quoted text is sanitized, shortened if long, and every
+    /// line of it prefixed with `> `, or an empty line with `>`, and reply syntax in either is
+    /// neutralized, so nothing here can end the front matter early, form a standalone reply marker
+    /// or open a code fence however the terminal wraps it, or put a character in the pane that
+    /// makes a later capture fail.
     fn prompt_context(&self, message: &SavedMessage) -> String {
         let mut context = format!(
             "Source: {}\nSender: {}\nThread: {} ({})\n",
@@ -4914,7 +4916,8 @@ Lines between will be sent to the user as a chat message. {numbering}",
     /// Only admitted requests that have not been retired, and the replies captured for them, are
     /// retained, so this is a local view rather than the provider's complete thread. It reads
     /// under the shared state lock and never contacts a provider, helper, or Herdr. Message text
-    /// is sanitized and every line prefixed with `> `.
+    /// is sanitized, the line breaks at its end are dropped, and every line is prefixed with `> `,
+    /// or an empty line with `>`.
     pub fn thread_history(&self, thread_id: &str, last: u32) -> Result<String> {
         chat_subscription::ThreadId::new(thread_id)
             .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
@@ -9992,9 +9995,9 @@ fn terminal_safe_text(text: &str) -> String {
         .collect()
 }
 
-/// Prefix every line with `> `, or an empty line with `>`, and neutralize the reply syntax in
-/// each line, so no row of the quoted text can be a standalone reply marker or open a code
-/// fence, however the terminal wraps it.
+/// Drop the `\n` characters at the end of `text`, then prefix every line with `> `, or an empty
+/// line with `>`, and neutralize the reply syntax in each line, so no row of the quoted text can
+/// be a standalone reply marker or open a code fence, however the terminal wraps it.
 fn quote_lines(text: &str) -> String {
     let mut quoted = String::with_capacity(text.len() + 16);
     for line in text.trim_end_matches('\n').split('\n') {
@@ -10009,7 +10012,8 @@ fn quote_lines(text: &str) -> String {
 }
 
 /// A long quote's head and tail with one line `...N chars elided...` between them, or `None` when
-/// the text fits the whole-quote bounds and should appear unchanged.
+/// the text fits the whole-quote bounds and should appear unchanged. The line reads
+/// `...1 char elided...` when one character is left out.
 ///
 /// The head is the longest run of whole lines from the start within the head's line and
 /// character bounds, counting the line breaks between its lines; the tail is the same from the
@@ -10022,8 +10026,9 @@ fn quote_lines(text: &str) -> String {
 /// line breaks around the marker line; a side cut inside a line has none, and the marker line's
 /// break there is added. So N counts the removed lines, the line breaks between them and the rest
 /// of any line cut inside, and the head, the removed text and the tail, with the kept line breaks,
-/// are exactly `text`. When the bounds would leave out nothing, or only one empty line, the quote
-/// appears whole instead, because the marker line would replace nothing shorter.
+/// are exactly `text`. When the head and the tail meet at one line break, or only one empty line
+/// lies between them, no character would be left out, and the quote appears whole instead: a
+/// marker line there would hide nothing and only make the quote longer.
 fn elide_middle(text: &str) -> Option<String> {
     if text.chars().count() <= QUOTED_PARENT_WHOLE_CHARS
         && text.matches('\n').count() < QUOTED_PARENT_WHOLE_LINES
@@ -10131,7 +10136,7 @@ fn quoted_parent_name(message: &SavedMessage) -> Option<String> {
 }
 
 /// The prompt's quoted-message block: its provider ID, then its text with every line prefixed
-/// by `> `, keeping only the head and tail of a long quote.
+/// by `> `, or an empty line by `>`, keeping only the head and tail of a long quote.
 fn quoted_parent(message: &SavedMessage) -> Option<String> {
     let metadata = quoted_parent_metadata(message)?;
     let mut block = String::from("Quoted message:");
@@ -20132,7 +20137,8 @@ To read earlier messages in this thread, run: "
 l14\nl15\nl16\nl17\nl18\nl19"
             )
         );
-        // Just under both bounds at once: 18 lines and 720 characters.
+        // Exactly at both whole-quote bounds at once: 18 lines (17 line breaks) and 720
+        // characters.
         let mut full = vec!["w".repeat(39); QUOTED_PARENT_WHOLE_LINES];
         full[0].push('w');
         let full = full.join("\n");
