@@ -260,7 +260,7 @@ enum InboxCommand {
     Watch(watch::WatchArgs),
     /// Mark workers parked so the watcher posts no idle or still-idle notices for them
     #[command(
-        after_help = "Examples:\n  agentctl inbox park --to coord --worker kvm\n  agentctl inbox park --to coord --worker kvm --off\n  agentctl inbox park --to coord\n\nA parked worker still gets blocked, exited and working notices, and an idle notice that\nreplaces a standing blocked or exited one. Its other idle periods are not announced and earn\nno reminders, including after it is unparked, until it works and goes idle again. The parked set\nlives in <registry>/.inbox/<coordinator>/parked.json; the command prints it as JSON."
+        after_help = "Examples:\n  agentctl inbox park --to coord --worker kvm\n  agentctl inbox park --to coord --worker kvm --off\n  agentctl inbox park --to coord\n\nA parked worker still gets blocked, exited and working notices, and an idle notice that\nreplaces a standing blocked or exited one. Its other idle periods are not announced and earn\nno reminders, including after it is unparked, until it works and goes idle again. The parked set\nlives in <registry>/.inbox/<coordinator>/parked.json; the command prints it as JSON, and without\n--worker only prints it. An unreadable parked.json, or one with an unknown schema, is refused with\nexit 1 and left untouched."
     )]
     Park(watch::ParkArgs),
 }

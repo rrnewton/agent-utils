@@ -734,11 +734,16 @@ fn notice_text(
             let mut text =
                 format!("has not been listed by Herdr for {exit_samples} samples in a row");
             if record.last_seen_unix_ms > 0 {
+                let lag = now.saturating_sub(record.last_seen_unix_ms) / 1000;
+                let lag = if lag < 120 {
+                    format!("{lag} s")
+                } else {
+                    format!("{} min", (lag + 30) / 60)
+                };
                 text.push_str(&format!(
-                    "; last listed at {} {}, {} min before this notice",
+                    "; last listed at {} {}, {lag} before this notice",
                     super::utc_date(record.last_seen_unix_ms),
                     super::utc_clock(record.last_seen_unix_ms),
-                    now.saturating_sub(record.last_seen_unix_ms) / 60_000
                 ));
             }
             text
@@ -878,13 +883,44 @@ struct Parked {
     workers: std::collections::BTreeSet<String>,
 }
 
-/// Parked workers. An unreadable file reads as none parked: that only makes the watcher noisier.
+/// Parked workers as recorded: none when the file is missing, an error when it cannot be read or
+/// is not schema 1. Writers must not overwrite what they cannot read.
+fn read_parked_strict(inbox: &Inbox) -> Result<std::collections::BTreeSet<String>> {
+    let path = inbox.root.join("parked.json");
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(error) => {
+            return Err(InboxError::io(
+                &format!("cannot read {}", path.display()),
+                &error,
+            ));
+        }
+    };
+    match serde_json::from_slice::<Parked>(&bytes) {
+        Ok(parked) if parked.schema == 1 => Ok(parked.workers),
+        Ok(parked) => Err(InboxError {
+            code: 1,
+            message: format!(
+                "{} has schema {}; this agentctl understands schema 1 and will not rewrite it",
+                path.display(),
+                parked.schema
+            ),
+        }),
+        Err(error) => Err(InboxError {
+            code: 1,
+            message: format!(
+                "{} is unreadable ({error}); fix or remove it before parking",
+                path.display()
+            ),
+        }),
+    }
+}
+
+/// Parked workers for the watcher. An unreadable file reads as none parked: that only makes the
+/// watcher noisier, never quieter.
 fn read_parked(inbox: &Inbox) -> std::collections::BTreeSet<String> {
-    fs::read(inbox.root.join("parked.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Parked>(&bytes).ok())
-        .map(|parked| parked.workers)
-        .unwrap_or_default()
+    read_parked_strict(inbox).unwrap_or_default()
 }
 
 /// `agentctl inbox park` arguments.
@@ -909,8 +945,12 @@ pub(crate) fn run_park(registry: &Path, args: ParkArgs) -> Result<i32> {
     let _guard = inbox.lock(".lock", true)?;
     let mut parked = Parked {
         schema: 1,
-        workers: read_parked(&inbox),
+        workers: read_parked_strict(&inbox)?,
     };
+    if args.workers.is_empty() {
+        print_json(&parked.workers)?;
+        return Ok(0);
+    }
     for worker in args.workers {
         if args.off {
             parked.workers.remove(&worker);
@@ -1164,10 +1204,18 @@ mod tests {
         parked(&mut state, "kvm");
         assert!(run_states(&mut state, "kvm", true, &[Working, Idle]).is_empty());
         state.parked.clear();
-        let after = run_states(&mut state, "kvm", true, &[Idle, Working, Idle]);
+        let mut after = Vec::new();
+        for (now, observed) in [(20, Idle), (30, Working), (40, Idle)] {
+            after.extend(step_listed(
+                &mut state,
+                &[seen("kvm", observed, true)],
+                now,
+                POLICY,
+            ));
+        }
         assert_eq!(
-            after,
-            [NoticeKind::Idle],
+            kinds(&after),
+            [("kvm", NoticeKind::Idle)],
             "the parked idle period stays quiet; the next one is announced"
         );
     }
@@ -1208,12 +1256,126 @@ mod tests {
             text.contains("last listed at 2026-09-29 20:15:24Z, 21 min before this notice"),
             "{text}"
         );
+        let (short, _) = notice_text(
+            &decision,
+            &mut record,
+            &sources,
+            3,
+            1_790_712_924_000 + 90_000,
+        );
+        assert!(
+            short.contains("20:15:24Z, 90 s before this notice"),
+            "{short}"
+        );
         record.last_seen_unix_ms = 0;
         let (old, _) = notice_text(&decision, &mut record, &sources, 3, 5);
         assert!(
             !old.contains("last listed"),
             "a record without the time says nothing about it"
         );
+    }
+
+    #[test]
+    fn the_exit_notice_reports_the_last_sample_that_listed_the_worker() {
+        let _serial = shared();
+        let mut state = WatchState::default();
+        let t1 = 1_790_712_924_000;
+        let t2 = t1 + 600_000;
+        step_listed(
+            &mut state,
+            &[seen("a", WorkerState::Working, true)],
+            t1,
+            POLICY,
+        );
+        step_listed(
+            &mut state,
+            &[seen("a", WorkerState::Working, true)],
+            t2,
+            POLICY,
+        );
+        for now in [t2 + 30_000, t2 + 60_000, t2 + 90_000] {
+            step(&mut state, &[], true, now, POLICY);
+        }
+        assert_eq!(
+            state.workers["a"].last_seen_unix_ms, t2,
+            "the later listing, not the first sighting"
+        );
+    }
+
+    #[test]
+    fn a_parked_screen_rule_pane_gets_no_idle_after_the_required_samples() {
+        use WorkerState::{Idle, Working};
+        let _serial = shared();
+        let mut state = WatchState::default();
+        parked(&mut state, "codex");
+        let kinds_seen = run_states(
+            &mut state,
+            "codex",
+            false,
+            &[Working, Idle, Idle, Idle, Working],
+        );
+        assert!(kinds_seen.is_empty(), "{kinds_seen:?}");
+    }
+
+    #[test]
+    fn parking_after_an_idle_was_posted_stops_its_reminders() {
+        let _serial = shared();
+        let mut state = WatchState::default();
+        step_listed(
+            &mut state,
+            &[seen("a", WorkerState::Working, true)],
+            0,
+            POLICY,
+        );
+        let posted = step_listed(
+            &mut state,
+            &[seen("a", WorkerState::Idle, true)],
+            10,
+            POLICY,
+        );
+        assert_eq!(kinds(&posted), [("a", NoticeKind::Idle)]);
+        parked(&mut state, "a");
+        let mut later = Vec::new();
+        for now in (1_000..20_000).step_by(500) {
+            later.extend(step_listed(
+                &mut state,
+                &[seen("a", WorkerState::Idle, true)],
+                now,
+                POLICY,
+            ));
+        }
+        assert!(later.is_empty(), "no reminders while parked: {later:?}");
+    }
+
+    #[test]
+    fn a_suppressed_idle_period_earns_no_reminders_after_unparking() {
+        let _serial = shared();
+        let mut state = WatchState::default();
+        parked(&mut state, "a");
+        step_listed(
+            &mut state,
+            &[seen("a", WorkerState::Working, true)],
+            0,
+            POLICY,
+        );
+        assert!(step_listed(
+            &mut state,
+            &[seen("a", WorkerState::Idle, true)],
+            10,
+            POLICY
+        )
+        .is_empty());
+        state.parked.clear();
+        let mut later = Vec::new();
+        for now in (1_000..20_000).step_by(500) {
+            later.extend(step_listed(
+                &mut state,
+                &[seen("a", WorkerState::Idle, true)],
+                now,
+                POLICY,
+            ));
+        }
+        assert!(later.is_empty(), "{later:?}");
     }
 
     #[test]
@@ -1238,10 +1400,57 @@ mod tests {
         park(&["lander"], true);
         let inbox = Inbox::open(&registry, "coord").unwrap();
         assert_eq!(read_parked(&inbox).into_iter().collect::<Vec<_>>(), ["kvm"]);
-        fs::write(inbox.root.join("parked.json"), b"{broken").unwrap();
+        let path = inbox.root.join("parked.json");
+        let before = fs::read(&path).unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        park(&[], false);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            modified,
+            "printing the parked set must not write it"
+        );
+        let corrupt = br#"{"schema":1,"workers":["kvm","lander"],}"#;
+        fs::write(&path, corrupt).unwrap();
         assert!(
             read_parked(&inbox).is_empty(),
-            "an unreadable file parks nobody"
+            "for the watcher an unreadable file parks nobody"
+        );
+        let attempt = |workers: &[&str], off: bool| {
+            run_park(
+                &registry,
+                ParkArgs {
+                    target: Target {
+                        coordinator: "coord".into(),
+                    },
+                    workers: workers.iter().map(|worker| (*worker).to_owned()).collect(),
+                    off,
+                },
+            )
+        };
+        for (workers, off) in [
+            (&[][..], false),
+            (&["newone"][..], false),
+            (&["kvm"][..], true),
+        ] {
+            assert_eq!(
+                attempt(workers, off).unwrap_err().exit_code(),
+                1,
+                "{workers:?} {off}"
+            );
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                corrupt,
+                "an unreadable set is left untouched"
+            );
+        }
+        let newer = br#"{"schema":2,"workers":["kvm"],"extra":1}"#;
+        fs::write(&path, newer).unwrap();
+        assert_eq!(attempt(&["x"], false).unwrap_err().exit_code(), 1);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            newer,
+            "a newer schema is not rewritten"
         );
         let bad = run_park(
             &registry,
