@@ -513,10 +513,11 @@ the number is posted then. Up to 256 remembered blocks are kept, the newest.
 Each delivery, of a request's prompt or of a routing-error prompt, can type
 every prompt waiting in the queue, so before it types any, if a request whose
 prompt has not been typed has a number, the bridge reads the pane and remembers
-in the same way the blocks the read shows under such numbers. It reads the pane
-too while `reply-aliases.json` cannot be read, but then remembers nothing, as
-described below. If the pane cannot be read then, or a block it shows cannot be
-written to `reply-aliases.json`, the bridge types nothing and tries again later.
+in the same way the blocks the read shows under such numbers. While
+`reply-aliases.json` cannot be read, it reads the pane too if any request's
+prompt has not been typed, but then remembers nothing, as described below. If
+the pane cannot be read then, or a block it shows cannot be written to
+`reply-aliases.json`, the bridge types nothing and tries again later.
 When a recovery scan reads a block that is not posted for this reason, the agent
 gets a routing-error prompt that says the block was not sent, why, and that no
 block with its text will be sent to that request, and lists the open requests.
@@ -579,11 +580,11 @@ reads takes the lock that prompt delivery takes, looks the pane up in herdr, and
 reads it, up to 1,000 lines of a Codex pane, but saves no snapshot. A capture of
 the read follows for each open request whose closing line it shows, as for an
 output event, and reads that request's queue entry too when the bridge has not
-seen its prompt typed and the request has a number or `reply-aliases.json`
-cannot be read. A closing line inside a prompt or tool output the agent received
-keeps them going too, although it is never posted. A read that fails is logged
-once and retried every 2 seconds, and its first success after that is logged as
-well.
+seen its prompt typed and either the request has a number or
+`reply-aliases.json` cannot be read. A closing line inside a prompt or tool
+output the agent received keeps them going too, although it is never posted. A
+read that fails is logged once and retried every 2 seconds, and its first
+success after that is logged as well.
 
 Replies are recognized by their text, not by the number in their reply ID. When
 a block appears under any reply ID of an open request, the bridge compares its
