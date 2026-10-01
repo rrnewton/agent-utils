@@ -128,14 +128,16 @@ pub const REQUEST_INSPECTION_SCHEMA: &str = "agentctl-chat-request-inspection/v1
 // The one provider payload schema whose quoted-message metadata the prompt shows. Every other
 // schema stays opaque, so its prompt simply has no quote.
 const GOOGLE_CHAT_MESSAGE_SCHEMA: &str = "google.chat.message.v1";
-// A quote within both whole-quote bounds appears whole in the prompt. A longer one keeps its head
-// and tail around " ... ". The line bounds stop a quote of many short lines from filling the pane.
-const QUOTED_PARENT_WHOLE_CHARS: usize = 480;
-const QUOTED_PARENT_WHOLE_LINES: usize = 12;
-const QUOTED_PARENT_HEAD_CHARS: usize = 320;
-const QUOTED_PARENT_HEAD_LINES: usize = 8;
-const QUOTED_PARENT_TAIL_CHARS: usize = 160;
-const QUOTED_PARENT_TAIL_LINES: usize = 4;
+// A quote within both whole-quote bounds appears whole in the prompt. A longer one keeps whole
+// lines from its start and its end, within the head and tail bounds, and one line
+// "...N chars elided..." stands for the rest (see `elide_middle`). The line bounds stop a quote of
+// many short lines from filling the pane.
+const QUOTED_PARENT_WHOLE_CHARS: usize = 720;
+const QUOTED_PARENT_WHOLE_LINES: usize = 18;
+const QUOTED_PARENT_HEAD_CHARS: usize = 480;
+const QUOTED_PARENT_HEAD_LINES: usize = 12;
+const QUOTED_PARENT_TAIL_CHARS: usize = 240;
+const QUOTED_PARENT_TAIL_LINES: usize = 6;
 const MAX_QUOTED_PARENT_NAME_CHARS: usize = 256;
 /// Messages `agentctl chat thread` prints without `--last`; request prompts name this count.
 pub const DEFAULT_THREAD_HISTORY_MESSAGES: u32 = 10;
@@ -10006,51 +10008,91 @@ fn quote_lines(text: &str) -> String {
     quoted
 }
 
-/// A long quote's head and tail joined by ` ... `, or `None` when the text fits the whole-quote
-/// bounds and should appear unchanged.
+/// A long quote's head and tail with one line `...N chars elided...` between them, or `None` when
+/// the text fits the whole-quote bounds and should appear unchanged.
+///
+/// The head is the longest run of whole lines from the start within the head's line and
+/// character bounds, counting the line breaks between its lines; the tail is the same from the
+/// end, within the tail's bounds. A line longer than its side's character bound can never be shown
+/// whole, and it is the one line cut inside: when a side stops at such a line, it also takes as
+/// many of that line's characters, nearest the kept lines, as its character bound still allows.
+///
+/// N is the number of characters left out: every character between the head and the tail, except
+/// the line break that ends the head and the one that starts the tail. Those two stay, as the
+/// line breaks around the marker line; a side cut inside a line has none, and the marker line's
+/// break there is added. So N counts the removed lines, the line breaks between them and the rest
+/// of any line cut inside, and the head, the removed text and the tail, with the kept line breaks,
+/// are exactly `text`. When the bounds would leave out nothing, or only one empty line, the quote
+/// appears whole instead, because the marker line would replace nothing shorter.
 fn elide_middle(text: &str) -> Option<String> {
     if text.chars().count() <= QUOTED_PARENT_WHOLE_CHARS
         && text.matches('\n').count() < QUOTED_PARENT_WHOLE_LINES
     {
         return None;
     }
-    let mut head_end = text.len();
-    let mut breaks = 0;
-    for (count, (offset, character)) in text.char_indices().enumerate() {
-        if count == QUOTED_PARENT_HEAD_CHARS {
-            head_end = offset;
-            break;
-        }
-        if character == '\n' {
-            breaks += 1;
-            if breaks == QUOTED_PARENT_HEAD_LINES {
-                head_end = offset;
-                break;
-            }
-        }
+    let head_end = quote_excerpt_len(
+        text,
+        QUOTED_PARENT_HEAD_CHARS,
+        QUOTED_PARENT_HEAD_LINES,
+        false,
+    );
+    let tail_start = text.len()
+        - quote_excerpt_len(
+            text,
+            QUOTED_PARENT_TAIL_CHARS,
+            QUOTED_PARENT_TAIL_LINES,
+            true,
+        );
+    let removed_start = head_end + usize::from(text[head_end..].starts_with('\n'));
+    let removed_end = tail_start - usize::from(text[..tail_start].ends_with('\n'));
+    if removed_start >= removed_end {
+        return None;
     }
-    let mut tail_start = 0;
-    let mut breaks = 0;
-    for (count, (offset, character)) in text.char_indices().rev().enumerate() {
-        if count == QUOTED_PARENT_TAIL_CHARS {
-            tail_start = offset + character.len_utf8();
-            break;
-        }
-        if character == '\n' {
-            breaks += 1;
-            if breaks == QUOTED_PARENT_TAIL_LINES {
-                tail_start = offset + 1;
-                break;
-            }
-        }
+    let removed = text[removed_start..removed_end].chars().count();
+    let unit = if removed == 1 { "char" } else { "chars" };
+    Some(format!(
+        "{}\n...{removed} {unit} elided...\n{}",
+        &text[..head_end],
+        &text[tail_start..]
+    ))
+}
+
+/// The length in bytes of a long quote's head, or of its tail when `from_end`: whole lines within
+/// `max_lines` lines and `max_chars` characters, counting the line breaks between them. When it
+/// stops at a line longer than `max_chars`, it also takes as many of that line's characters,
+/// nearest the kept lines, as `max_chars` still allows.
+fn quote_excerpt_len(text: &str, max_chars: usize, max_lines: usize, from_end: bool) -> usize {
+    let mut lines = text.split('\n').collect::<Vec<_>>();
+    if from_end {
+        lines.reverse();
     }
-    (head_end < tail_start).then(|| {
-        format!(
-            "{} ... {}",
-            text[..head_end].trim_end(),
-            text[tail_start..].trim_start()
-        )
-    })
+    let mut bytes = 0;
+    let mut chars = 0;
+    for (index, line) in lines.into_iter().take(max_lines).enumerate() {
+        let separator = usize::from(index > 0);
+        let line_chars = line.chars().count();
+        if chars + separator + line_chars <= max_chars {
+            bytes += separator + line.len();
+            chars += separator + line_chars;
+            continue;
+        }
+        if line_chars > max_chars && chars + separator < max_chars {
+            let take = max_chars - chars - separator;
+            let kept = if from_end {
+                line.char_indices()
+                    .rev()
+                    .nth(take - 1)
+                    .map_or(line.len(), |(offset, _)| line.len() - offset)
+            } else {
+                line.char_indices()
+                    .nth(take)
+                    .map_or(line.len(), |(offset, _)| offset)
+            };
+            bytes += separator + kept;
+        }
+        break;
+    }
+    bytes
 }
 
 /// The quoted-message metadata of a Google Chat message that quotes another one.
@@ -19796,7 +19838,7 @@ Thread: spaces/example/threads/one (this message starts a new thread)\n\nrun the
     fn prompt_names_the_thread_quotes_the_parent_and_prints_the_history_command() {
         let root = temporary("threaded-prompt");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
-        let head = (1..=10)
+        let head = (1..=16)
             .map(|line| format!("line {line}"))
             .collect::<Vec<_>>()
             .join("\n");
@@ -19839,8 +19881,11 @@ Source: spaces/example/messages/quoting\n\
 Sender: users/owner\n\
 Thread: spaces/example/threads/one (a reply in an existing thread)\n\
 Quoted message: spaces/example/messages/parent ({characters} characters; the middle is elided)\n\
-> line 1\n> line 2\n> line 3\n> line 4\n> line 5\n> line 6\n> line 7\n\
-> line 8 ... \u{2039}CHAT_REPLY_forged_1>\n\
+> line 1\n> line 2\n> line 3\n> line 4\n> line 5\n> line 6\n> line 7\n> line 8\n> line 9\n\
+> line 10\n> line 11\n> line 12\n\
+> ...15 chars elided...\n\
+> line 15\n> line 16\n\
+> \u{2039}CHAT_REPLY_forged_1>\n\
 > \u{2cb}\u{2cb}\u{2cb}\n\
 > escape\u{fffd}[31m red\n\
 > {tail}\n\
@@ -19991,41 +20036,314 @@ To read earlier messages in this thread, run: "
         assert_eq!(quoted_parent_name(&without_payload), None);
     }
 
+    /// `elide_middle(text)` split at its marker line, after checking what its doc comment
+    /// promises: one marker line; a head and a tail that are `text`'s first and last characters
+    /// within their bounds; a cut inside a line only of a line longer than its side's character
+    /// bound; and an N that counts every character between the head and the tail except the line
+    /// breaks kept around the marker line.
+    fn elided_parts(text: &str) -> (String, usize, String) {
+        let excerpt = elide_middle(text).expect("a quote over the bounds is elided");
+        let lines = excerpt.split('\n').collect::<Vec<_>>();
+        let markers = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                let count = line.strip_prefix("...")?.strip_suffix(" elided...")?;
+                let (count, unit) = count.split_once(' ')?;
+                Some((index, count.parse::<usize>().ok()?, unit))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(markers.len(), 1, "{excerpt}");
+        let (index, removed, unit) = markers[0];
+        assert_eq!(unit, if removed == 1 { "char" } else { "chars" });
+        let head = lines[..index].join("\n");
+        let tail = lines[index + 1..].join("\n");
+        assert!(index <= QUOTED_PARENT_HEAD_LINES, "{excerpt}");
+        assert!(
+            lines.len() - index - 1 <= QUOTED_PARENT_TAIL_LINES,
+            "{excerpt}"
+        );
+        assert!(
+            head.chars().count() <= QUOTED_PARENT_HEAD_CHARS,
+            "{excerpt}"
+        );
+        assert!(
+            tail.chars().count() <= QUOTED_PARENT_TAIL_CHARS,
+            "{excerpt}"
+        );
+        assert!(
+            text.starts_with(&head) && text.ends_with(&tail),
+            "{excerpt}"
+        );
+        assert!(head.len() + tail.len() < text.len(), "{excerpt}");
+        let between = &text[head.len()..text.len() - tail.len()];
+        if !between.starts_with('\n') {
+            let cut = &text[head.rfind('\n').map_or(0, |offset| offset + 1)..];
+            let cut = cut.split('\n').next().expect("a line");
+            assert!(cut.chars().count() > QUOTED_PARENT_HEAD_CHARS, "{excerpt}");
+        }
+        if !between.ends_with('\n') {
+            let end = text.len() - tail.len() + tail.find('\n').unwrap_or(tail.len());
+            let cut = text[..end].rsplit('\n').next().expect("a line");
+            assert!(cut.chars().count() > QUOTED_PARENT_TAIL_CHARS, "{excerpt}");
+        }
+        let kept = usize::from(between.starts_with('\n')) + usize::from(between.ends_with('\n'));
+        assert!(removed >= 1, "{excerpt}");
+        assert_eq!(removed + kept, between.chars().count(), "{excerpt}");
+        (head, removed, tail)
+    }
+
+    fn numbered_lines(count: usize, prefix: &str) -> Vec<String> {
+        (1..=count).map(|line| format!("{prefix}{line}")).collect()
+    }
+
     #[test]
     fn elide_middle_keeps_whole_quotes_and_bounds_long_ones_by_characters_and_lines() {
         let whole = "a".repeat(QUOTED_PARENT_WHOLE_CHARS);
         assert_eq!(elide_middle(&whole), None);
+        let over = "a".repeat(QUOTED_PARENT_WHOLE_CHARS + 1);
         assert_eq!(
-            elide_middle(&"a".repeat(QUOTED_PARENT_WHOLE_CHARS + 1)),
+            elide_middle(&over),
             Some(format!(
-                "{} ... {}",
+                "{}\n...1 char elided...\n{}",
                 "a".repeat(QUOTED_PARENT_HEAD_CHARS),
                 "a".repeat(QUOTED_PARENT_TAIL_CHARS)
             ))
         );
+        elided_parts(&over);
         // Characters, not bytes: two-byte characters must not split or count double.
         assert_eq!(elide_middle(&"é".repeat(QUOTED_PARENT_WHOLE_CHARS)), None);
+        let over = "é".repeat(QUOTED_PARENT_WHOLE_CHARS + 1);
         assert_eq!(
-            elide_middle(&"é".repeat(QUOTED_PARENT_WHOLE_CHARS + 1)),
+            elide_middle(&over),
             Some(format!(
-                "{} ... {}",
+                "{}\n...1 char elided...\n{}",
                 "é".repeat(QUOTED_PARENT_HEAD_CHARS),
                 "é".repeat(QUOTED_PARENT_TAIL_CHARS)
             ))
         );
-        let lines = |count: usize| {
-            (1..=count)
-                .map(|line| format!("l{line}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
+        elided_parts(&over);
+        let lines = |count: usize| numbered_lines(count, "l").join("\n");
         assert_eq!(elide_middle(&lines(QUOTED_PARENT_WHOLE_LINES)), None);
         assert_eq!(
             elide_middle(&lines(QUOTED_PARENT_WHOLE_LINES + 1)).as_deref(),
-            Some("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8 ... l10\nl11\nl12\nl13")
+            Some(
+                "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12\n...3 chars elided...\n\
+l14\nl15\nl16\nl17\nl18\nl19"
+            )
         );
+        // Just under both bounds at once: 18 lines and 720 characters.
+        let mut full = vec!["w".repeat(39); QUOTED_PARENT_WHOLE_LINES];
+        full[0].push('w');
+        let full = full.join("\n");
+        assert_eq!(full.chars().count(), QUOTED_PARENT_WHOLE_CHARS);
+        assert_eq!(elide_middle(&full), None);
         assert_eq!(quote_lines("a\n\nb\n\n"), "> a\n>\n> b\n");
         assert_eq!(quote_lines(""), ">\n");
+        assert_eq!(
+            quote_lines("a\n...3 chars elided...\nb"),
+            "> a\n> ...3 chars elided...\n> b\n"
+        );
+    }
+
+    #[test]
+    fn elide_middle_keeps_whole_lines_and_counts_exactly_what_it_leaves_out() {
+        // Many short lines: the line bounds stop the head and the tail.
+        let text = (1..=20)
+            .map(|line| format!("line {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let expected = format!(
+            "{}\n...15 chars elided...\n{}",
+            (1..=12)
+                .map(|line| format!("line {line:02}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            (15..=20)
+                .map(|line| format!("line {line:02}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert_eq!(elide_middle(&text), Some(expected));
+        assert_eq!(elided_parts(&text).1, "line 13\nline 14".len());
+        // The shape of a 1,148-character reply of twelve lines: the character bounds stop the
+        // head after four lines and the tail after one, and no line is cut.
+        let lengths = [81, 105, 103, 153, 56, 110, 18, 87, 39, 141, 155, 89];
+        let lines = lengths
+            .iter()
+            .zip('a'..)
+            .map(|(length, letter)| letter.to_string().repeat(*length))
+            .collect::<Vec<_>>();
+        let text = lines.join("\n");
+        assert_eq!(text.chars().count(), 1_148);
+        assert_eq!(
+            elide_middle(&text),
+            Some(format!(
+                "{}\n...612 chars elided...\n{}",
+                lines[..4].join("\n"),
+                lines[11]
+            ))
+        );
+        assert_eq!(
+            elided_parts(&text).1,
+            lines[4..11].join("\n").chars().count()
+        );
+        // A line that fits its side's bound alone but not after the kept lines is left out
+        // whole, never cut.
+        let text = format!(
+            "{}\n{}\n{}",
+            "a".repeat(300),
+            "b".repeat(300),
+            "c".repeat(300)
+        );
+        assert_eq!(
+            elide_middle(&text),
+            Some(format!(
+                "{}\n...361 chars elided...\n{}",
+                "a".repeat(300),
+                "c".repeat(QUOTED_PARENT_TAIL_CHARS)
+            ))
+        );
+        elided_parts(&text);
+        // A line exactly at its side's bound is kept whole.
+        let text = format!(
+            "{}\n{}\n{}",
+            "h".repeat(QUOTED_PARENT_HEAD_CHARS),
+            "m".repeat(100),
+            "t".repeat(QUOTED_PARENT_TAIL_CHARS)
+        );
+        assert_eq!(
+            elide_middle(&text),
+            Some(format!(
+                "{}\n...100 chars elided...\n{}",
+                "h".repeat(QUOTED_PARENT_HEAD_CHARS),
+                "t".repeat(QUOTED_PARENT_TAIL_CHARS)
+            ))
+        );
+        elided_parts(&text);
+    }
+
+    #[test]
+    fn elide_middle_cuts_inside_a_line_only_when_the_line_is_longer_than_its_bound() {
+        for character in ["a", "é"] {
+            let text = character.repeat(1_000);
+            assert_eq!(
+                elide_middle(&text),
+                Some(format!(
+                    "{}\n...280 chars elided...\n{}",
+                    character.repeat(QUOTED_PARENT_HEAD_CHARS),
+                    character.repeat(QUOTED_PARENT_TAIL_CHARS)
+                ))
+            );
+            elided_parts(&text);
+        }
+        // A long line after a short one fills what the head's bound leaves, and its end fills
+        // what the tail's bound leaves; the marker line goes between the two parts.
+        let text = format!("Hi,\n{}\nBye", "x".repeat(2_000));
+        assert_eq!(
+            elide_middle(&text),
+            Some(format!(
+                "Hi,\n{}\n...1288 chars elided...\n{}\nBye",
+                "x".repeat(QUOTED_PARENT_HEAD_CHARS - 4),
+                "x".repeat(QUOTED_PARENT_TAIL_CHARS - 4)
+            ))
+        );
+        elided_parts(&text);
+        // One character over each side's bound: both lines are cut, and N counts the line
+        // break between their removed ends.
+        let text = format!(
+            "{}\n{}",
+            "h".repeat(QUOTED_PARENT_HEAD_CHARS + 1),
+            "t".repeat(QUOTED_PARENT_TAIL_CHARS + 1)
+        );
+        assert_eq!(
+            elide_middle(&text),
+            Some(format!(
+                "{}\n...3 chars elided...\n{}",
+                "h".repeat(QUOTED_PARENT_HEAD_CHARS),
+                "t".repeat(QUOTED_PARENT_TAIL_CHARS)
+            ))
+        );
+        elided_parts(&text);
+    }
+
+    #[test]
+    fn elide_middle_shows_a_quote_whole_when_it_would_leave_out_nothing_or_one_empty_line() {
+        // 721 characters, but the head and the tail meet at one line break.
+        let text = format!(
+            "{}\n{}",
+            "h".repeat(QUOTED_PARENT_HEAD_CHARS),
+            "t".repeat(QUOTED_PARENT_TAIL_CHARS)
+        );
+        assert_eq!(text.chars().count(), QUOTED_PARENT_WHOLE_CHARS + 1);
+        assert_eq!(elide_middle(&text), None);
+        // Nineteen lines, and the one line between the head and the tail is empty.
+        let mut lines = numbered_lines(QUOTED_PARENT_WHOLE_LINES + 1, "l");
+        lines[QUOTED_PARENT_HEAD_LINES] = String::new();
+        assert_eq!(elide_middle(&lines.join("\n")), None);
+        // Two empty lines there leave out the one line break between them.
+        let mut lines = numbered_lines(QUOTED_PARENT_WHOLE_LINES + 2, "l");
+        lines[QUOTED_PARENT_HEAD_LINES] = String::new();
+        lines[QUOTED_PARENT_HEAD_LINES + 1] = String::new();
+        let text = lines.join("\n");
+        assert_eq!(
+            elide_middle(&text),
+            Some(format!(
+                "{}\n...1 char elided...\n{}",
+                lines[..QUOTED_PARENT_HEAD_LINES].join("\n"),
+                lines[QUOTED_PARENT_HEAD_LINES + 2..].join("\n")
+            ))
+        );
+        elided_parts(&text);
+    }
+
+    #[test]
+    fn elide_middle_keeps_its_promises_over_many_shapes() {
+        const LENGTHS: [usize; 14] = [
+            0, 1, 5, 39, 100, 239, 240, 241, 300, 479, 480, 481, 700, 1_000,
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut elided = 0;
+        for case in 0..3_000_usize {
+            let count = 1 + usize::try_from(next() % 30).expect("small");
+            let text = (0..count)
+                .map(|line| {
+                    let length = LENGTHS[usize::try_from(next() % 14).expect("small")];
+                    let character = if (case + line) % 3 == 0 { "é" } else { "a" };
+                    character.repeat(length)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let chars = text.chars().count();
+            let within = chars <= QUOTED_PARENT_WHOLE_CHARS && count <= QUOTED_PARENT_WHOLE_LINES;
+            match elide_middle(&text) {
+                Some(_) => {
+                    assert!(!within, "{text:?}");
+                    elided_parts(&text);
+                    elided += 1;
+                }
+                None if within => {}
+                None => {
+                    // Whole although over the bounds: the head and the tail leave out at most
+                    // one empty line, so the text is no longer than they are with two breaks.
+                    assert!(
+                        count <= QUOTED_PARENT_HEAD_LINES + QUOTED_PARENT_TAIL_LINES + 1,
+                        "{text:?}"
+                    );
+                    assert!(
+                        chars <= QUOTED_PARENT_HEAD_CHARS + QUOTED_PARENT_TAIL_CHARS + 2,
+                        "{text:?}"
+                    );
+                }
+            }
+        }
+        assert!(elided > 1_000, "{elided}");
     }
 
     #[test]

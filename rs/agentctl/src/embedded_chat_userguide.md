@@ -252,11 +252,13 @@ request prompt gives the message's `Source:` ID, its `Sender:`, and its
 `Thread:` ID, and says whether the message starts a new thread or replies in an
 existing one. When a provider payload with schema `google.chat.message.v1`
 quotes an earlier message, a `Quoted message:` line names that message and its
-text follows with every line prefixed by `> `. A long quote keeps its beginning
-and end joined by ` ... `, and the line then states how many characters the
-provider's quoted text has. Identifiers stay on one line and control characters
-are replaced, so this text cannot break a later terminal capture. In
-identifiers and quoted text, the `<` of a reply-marker token such as
+text follows with every line prefixed by `> `. A long quote keeps whole lines
+from its beginning and its end, with one line `...N chars elided...` between
+them, where N is the number of characters left out; only a line too long to
+show whole is cut inside. The `Quoted message:` line then states how many
+characters the provider's quoted text has. Identifiers stay on one line and
+control characters are replaced, so this text cannot break a later terminal
+capture. In identifiers and quoted text, the `<` of a reply-marker token such as
 `<CHAT_REPLY_` is printed as `‹`, and each character of a run of three or more
 backticks or tildes as `ˋ` or `˜`, so no row can form a reply marker or open a
 code fence however the terminal wraps a long line. These tokens are found as if
