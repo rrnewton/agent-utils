@@ -31705,30 +31705,345 @@ def test_recover_absent_agent_row_preserves_commit_before_registry_repair(
     assert run_absent_agent_recovery(project, record, apply=True) == 0
 
 
-def test_recover_absent_agent_row_refuses_rescue_push_to_unlisted_remote(
+def record_unpublished_absent_agent_head(
+    project: Path, repository: Path, record: wrkslots.ActiveRecord
+) -> wrkslots.ActiveRecord:
+    """Move the absent checkout's recorded HEAD to a commit only the local
+    repository has, as an agent that committed but never pushed leaves it."""
+
+    checkout = record.checkouts[0]
+    head = git(
+        repository,
+        "commit-tree",
+        f"{checkout.head}^{{tree}}",
+        "-p",
+        checkout.head,
+        "-m",
+        "unpublished agent commit",
+    ).stdout.strip()
+    git(repository, "update-ref", f"refs/heads/{checkout.branch}", head, checkout.head)
+    config = wrkslots._load_config(str(project), "testhost")
+    updated = replace(record, checkouts=(replace(checkout, head=head),))
+    state = wrkslots._load_active(config)
+    wrkslots._write_active_state(
+        config,
+        wrkslots._replace_record(state, updated),
+        action="test-unpublished-recorded-head",
+        slot=record.slot,
+    )
+    return updated
+
+
+def child_commit(repository: Path, parent: str, message: str) -> str:
+    return git(
+        repository, "commit-tree", f"{parent}^{{tree}}", "-p", parent, "-m", message
+    ).stdout.strip()
+
+
+def all_refs(repository: Path) -> str:
+    return git(repository, "for-each-ref", "--format=%(objectname) %(refname)").stdout
+
+
+def test_recover_absent_agent_row_accepts_existing_remote_ref_containing_head(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    # Absent or empty salvage_push_remotes allows no remote, so the recorded
-    # HEAD must not be published as a rescue ref.
+    # salvage_push_remotes is empty, so recovery may publish nothing. The
+    # recorded HEAD is already inside a branch someone else pushed, which
+    # preserves it without a rescue ref.
     project, repository, remote = make_project(tmp_path, allow_salvage_push=False)
-    record = prepare_absent_agent_row(project, repository)
+    record = record_unpublished_absent_agent_head(
+        project, repository, prepare_absent_agent_row(project, repository)
+    )
+    head = record.checkouts[0].head
+    descendant = child_commit(repository, head, "published on top of the agent commit")
+    # A push by URL updates no remote-tracking ref, so no local ref proves
+    # the remote holds the commit; only the remote itself can.
+    git(repository, "push", str(remote), f"{descendant}:refs/heads/feature/kept")
+    assert (
+        git(repository, "for-each-ref", "--contains", head, "refs/remotes/").stdout == ""
+    )
     set_liveness(project, "dead")
     allow_test_host_for_absent_validate_recovery(project, monkeypatch)
-    before = remote_refs(remote)
+    remote_before = remote_refs(remote)
+    local_before = all_refs(repository)
+    expected_containment = json.dumps(
+        [{"checkout": "product", "remote_ref": "refs/heads/feature/kept", "tip": descendant}],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
-    assert run_absent_agent_recovery(project, record, apply=False) == 3
-    assert "not in salvage_push_remotes" in capsys.readouterr().err
-    assert run_absent_agent_recovery(project, record, apply=True) == 3
-    assert "not in salvage_push_remotes" in capsys.readouterr().err
+    assert run_absent_agent_recovery(project, record, apply=False) == 0
+    assert f" remote_containment={expected_containment}" in capsys.readouterr().out
+    assert run_absent_agent_recovery(project, record, apply=True) == 0
 
-    assert remote_refs(remote) == before
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._load_active(config).slots
+    assert not (config.control / "ACTIVE.testhost.journal").exists()
+    archived = wrkslots._load_archive(config).records[-1]
+    assert archived["slot"] == record.slot
+    receipt = cast(list[dict[str, object]], archived["salvage"])[0]
+    assert receipt["disposition"] == "already-on-remote"
+    assert receipt["source_head"] == head
+    assert receipt["salvage_commit"] == head
+    assert receipt["remote_ref"] == "refs/heads/feature/kept"
+    assert receipt["remote_ref_tip"] == descendant
+    assert receipt["containing_remote_refs"] == ["refs/heads/feature/kept"]
+    assert (
+        f"checkout product: recorded slot HEAD {head} was already contained in "
+        f"existing remote ref refs/heads/feature/kept at tip {descendant}; recovery "
+        "pushed nothing and re-verified the containment with git merge-base "
+        "--is-ancestor against a freshly fetched copy of that ref"
+    ) in cast(list[str], archived["validation"])
+    assert (
+        "a recorded HEAD found in an existing remote ref stays preserved only while "
+        "that ref, which recovery neither created nor protects, still contains it"
+    ) in cast(list[str], archived["limitations"])
+    # Nothing was published, and no local ref, including refs/remotes/*, moved.
+    assert remote_refs(remote) == remote_before
+    assert all_refs(repository) == local_before
+    path = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
+    assert wrkslots._GitVcs().worktree_registration(repository, path) is None
+
+
+def test_recover_absent_agent_row_prefers_rescue_ref_over_other_branches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, remote = make_project(tmp_path, allow_salvage_push=False)
+    record = record_unpublished_absent_agent_head(
+        project, repository, prepare_absent_agent_row(project, repository)
+    )
+    head = record.checkouts[0].head
+    git(repository, "push", str(remote), f"{head}:refs/heads/aaa-first-by-name")
+    git(repository, "push", str(remote), f"{head}:refs/rescue/elsewhere/kept")
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=False) == 0
+    assert '"remote_ref":"refs/rescue/elsewhere/kept"' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("remote_state", ("no-refs", "tag-only"))
+def test_recover_absent_agent_row_refuses_when_no_remote_ref_contains_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    remote_state: str,
+) -> None:
+    # salvage_push_remotes is empty and no branch or rescue ref on the remote
+    # contains the recorded HEAD, so nothing preserves it: refuse, publish
+    # nothing, and keep the row and registration. In "no-refs" the remote
+    # still stores the commit object, but no ref keeps it.
+    project, repository, remote = make_project(tmp_path, allow_salvage_push=False)
+    record = prepare_absent_agent_row(project, repository)
+    head = record.checkouts[0].head
+    git(remote, "update-ref", "-d", "refs/heads/main")
+    if remote_state == "tag-only":
+        git(repository, "push", str(remote), f"{head}:refs/tags/kept")
+    assert git(remote, "cat-file", "-t", head).stdout.strip() == "commit"
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    remote_before = remote_refs(remote)
+    local_before = all_refs(repository)
+
+    for apply in (False, True):
+        assert run_absent_agent_recovery(project, record, apply=apply) == 3
+        err = capsys.readouterr().err
+        assert "not in salvage_push_remotes" in err
+        assert (
+            f"no branch or rescue ref on that remote contains the recorded HEAD {head}"
+            in err
+        )
+
+    assert remote_refs(remote) == remote_before
+    assert all_refs(repository) == local_before
     config = wrkslots._load_config(str(project), "testhost")
     assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
     assert not (config.control / "ACTIVE.testhost.journal").exists()
     path = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
     assert wrkslots._GitVcs().worktree_registration(repository, path) is not None
+
+
+@pytest.mark.parametrize("remote_branch", ("unpushed-tail", "diverged"))
+def test_recover_absent_agent_row_refuses_existing_ref_without_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    remote_branch: str,
+) -> None:
+    # The remote has the checkout's own branch, but not the recorded HEAD:
+    # either the agent's last commit was never pushed, or the remote branch
+    # moved to a sibling. Neither ref preserves the recorded HEAD.
+    project, repository, remote = make_project(tmp_path, allow_salvage_push=False)
+    seed = git(repository, "rev-parse", "HEAD").stdout.strip()
+    record = record_unpublished_absent_agent_head(
+        project, repository, prepare_absent_agent_row(project, repository)
+    )
+    head = record.checkouts[0].head
+    branch = f"refs/heads/{record.checkouts[0].branch}"
+    published = (
+        seed if remote_branch == "unpushed-tail" else child_commit(repository, seed, "sibling")
+    )
+    git(repository, "push", str(remote), f"{published}:{branch}")
+    assert git(remote, "rev-parse", branch).stdout.strip() == published
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    remote_before = remote_refs(remote)
+    local_before = all_refs(repository)
+
+    for apply in (False, True):
+        assert run_absent_agent_recovery(project, record, apply=apply) == 3
+        err = capsys.readouterr().err
+        assert "not in salvage_push_remotes" in err
+        assert (
+            f"no branch or rescue ref on that remote contains the recorded HEAD {head}"
+            in err
+        )
+
+    assert remote_refs(remote) == remote_before
+    assert all_refs(repository) == local_before
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+    assert not (config.control / "ACTIVE.testhost.journal").exists()
+    path = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
+    assert wrkslots._GitVcs().worktree_registration(repository, path) is not None
+
+
+def test_recover_absent_agent_row_resume_reverifies_existing_remote_ref(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The journal records which existing ref preserved the recorded HEAD.
+    # Resuming must re-check that ref, and refuse while it no longer
+    # contains the commit, rather than trust the plan.
+    project, repository, remote = make_project(tmp_path, allow_salvage_push=False)
+    record = record_unpublished_absent_agent_head(
+        project, repository, prepare_absent_agent_row(project, repository)
+    )
+    head = record.checkouts[0].head
+    git(repository, "push", str(remote), f"{head}:refs/heads/feature/kept")
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(observed: str) -> None:
+        if observed == "after-absent-agent-journal":
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_absent_agent_recovery(project, record, apply=True)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    config = wrkslots._load_config(str(project), "testhost")
+    journal_path = config.control / "ACTIVE.testhost.journal"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert journal["remote_containment"] == [
+        {"checkout": "product", "remote_ref": "refs/heads/feature/kept", "tip": head}
+    ]
+    recover = [
+        "--project-root",
+        str(project),
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ]
+    capsys.readouterr()
+
+    path = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
+    seed = git(repository, "rev-parse", f"{head}^").stdout.strip()
+    sibling = child_commit(repository, seed, "sibling replaced the agent commit")
+    # First the ref still exists but was moved off the commit, then it is gone.
+    for refspec in (f"+{sibling}:refs/heads/feature/kept", ":refs/heads/feature/kept"):
+        git(repository, "push", str(remote), refspec)
+        assert wrkslots.main(recover) == 3
+        assert (
+            f"existing remote ref refs/heads/feature/kept no longer contains the "
+            f"recorded HEAD {head} of absent checkout product"
+        ) in capsys.readouterr().err
+        assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+        assert journal_path.is_file()
+        assert wrkslots._GitVcs().worktree_registration(repository, path) is not None
+
+    # A descendant restores the containment; the recorded tip is the plan's,
+    # and only containment, not the exact tip, is required on resume.
+    git(
+        repository,
+        "push",
+        str(remote),
+        f"{child_commit(repository, head, 'later work')}:refs/heads/feature/kept",
+    )
+    assert wrkslots.main(recover) == 0
+    assert not wrkslots._load_active(config).slots
+    assert not journal_path.exists()
+    assert wrkslots._GitVcs().worktree_registration(repository, path) is None
+    receipt = cast(
+        list[dict[str, object]], wrkslots._load_archive(config).records[-1]["salvage"]
+    )[0]
+    assert receipt["disposition"] == "already-on-remote"
+    assert receipt["remote_ref_tip"] == head
+
+
+def test_recover_absent_agent_row_refuses_when_found_ref_fails_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The search and the confirming merge-base read the remote separately. A
+    # ref the search reported must still contain the recorded HEAD when it is
+    # confirmed; here remote main never did, so confirmation must refuse.
+    project, repository, remote = make_project(tmp_path, allow_salvage_push=False)
+    record = record_unpublished_absent_agent_head(
+        project, repository, prepare_absent_agent_row(project, repository)
+    )
+    seed = git(remote, "rev-parse", "refs/heads/main").stdout.strip()
+    monkeypatch.setattr(
+        wrkslots._GitVcs,
+        "remote_refs_containing_commit",
+        lambda *_args, **_kwargs: {"refs/heads/main": seed},
+    )
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    remote_before = remote_refs(remote)
+
+    assert run_absent_agent_recovery(project, record, apply=True) == 3
+    assert (
+        f"remote ref refs/heads/main stopped containing the recorded HEAD "
+        f"{record.checkouts[0].head} of absent checkout product while recovery was "
+        "planning"
+    ) in capsys.readouterr().err
+    assert remote_refs(remote) == remote_before
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+    assert not (config.control / "ACTIVE.testhost.journal").exists()
+
+
+def test_recover_absent_agent_row_listed_remote_still_pushes_rescue_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # With the remote in salvage_push_remotes, recovery keeps pushing its own
+    # rescue ref even though remote main already contains the recorded HEAD.
+    project, repository, remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    head = record.checkouts[0].head
+    assert git(remote, "rev-parse", "refs/heads/main").stdout.strip() == head
+    set_liveness(project, "dead")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=True) == 0
+    config = wrkslots._load_config(str(project), "testhost")
+    receipt = cast(
+        list[dict[str, object]], wrkslots._load_archive(config).records[-1]["salvage"]
+    )[0]
+    assert receipt["disposition"] == "salvaged"
+    rescue_ref = wrkslots._absent_agent_rescue_ref(record, record.checkouts[0])
+    assert git(remote, "rev-parse", rescue_ref).stdout.strip() == head
 
 
 def test_recover_absent_agent_row_accepts_unchanged_unregistered_branch(
@@ -32678,6 +32993,90 @@ def test_recover_absent_agent_row_leaves_same_branch_peer_worktree_untouched(
         f"refs/heads/{checkout_record.branch}",
     )
     assert git(peer, "rev-parse", "HEAD").stdout.strip() == checkout_record.head
+
+
+def test_absent_agent_journal_remote_containment_is_validated_and_replayed(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path, allow_salvage_push=False)
+    record = prepare_absent_agent_row(project, repository)
+    config = wrkslots._load_config(str(project), "testhost")
+    checkout = record.checkouts[0]
+    item = wrkslots.AbsentAgentRow(
+        machine=record.machine,
+        slot=record.slot,
+        generation=record.generation,
+        record_sha256=wrkslots._record_sha256(record),
+    )
+    witness = wrkslots._AbsentAgentBranchWitness(
+        checkout=checkout.name,
+        branch_ref=f"refs/heads/{checkout.branch}",
+        state="present",
+        head=checkout.head,
+    )
+    containment = {checkout.name: ("refs/heads/main", checkout.head)}
+    receipts = wrkslots._absent_agent_planned_receipts(
+        record, (witness,), containment=containment
+    )
+    archive_entry = wrkslots._absent_agent_archive_entry(
+        record, item, wrkslots._utc_now(), receipts
+    )
+    entry = {"checkout": checkout.name, "remote_ref": "refs/heads/main", "tip": checkout.head}
+    journal: dict[str, object] = {
+        "schema": wrkslots.SCHEMA,
+        "kind": "recover-absent-agent-row",
+        "machine": record.machine,
+        "host_id": wrkslots._host_id(),
+        "slot": record.slot,
+        "phase": "prepared",
+        "actor": wrkslots._identity_to_obj(wrkslots._read_process_identity(os.getpid())),
+        "input": {
+            "machine": item.machine,
+            "slot": item.slot,
+            "generation": item.generation,
+            "record_sha256": item.record_sha256,
+        },
+        "record": wrkslots._record_to_obj(record),
+        "branch_witnesses": [wrkslots._absent_agent_branch_witness_to_obj(witness)],
+        "remote_containment": [entry],
+        "preserved": [],
+        "removed": [],
+        "archive_entry": archive_entry,
+    }
+
+    _item, _record, _branches, planned, parsed_archive = (
+        wrkslots._absent_agent_journal_inputs(config, journal)
+    )
+    assert planned == receipts
+    assert planned[0]["disposition"] == "already-on-remote"
+    assert planned[0]["remote_ref"] == "refs/heads/main"
+    assert parsed_archive == archive_entry
+
+    # Without the recorded containment the same receipts would describe a
+    # rescue-ref push, so the archive entry no longer matches its inputs.
+    without = {key: value for key, value in journal.items() if key != "remote_containment"}
+    with pytest.raises(wrkslots.StateError, match="archive entry differs"):
+        wrkslots._absent_agent_journal_inputs(config, without)
+    legacy = {key: value for key, value in journal.items() if key != "branch_witnesses"}
+    with pytest.raises(wrkslots.StateError, match="requires branch witnesses"):
+        wrkslots._absent_agent_journal_inputs(config, legacy)
+    for replacement, message in (
+        ([], "remote_containment is empty"),
+        ([{**entry, "remote_ref": "refs/tags/kept"}], "must name a branch or rescue ref"),
+        ([{**entry, "remote_ref": "main"}], r"remote_ref is invalid"),
+        ([{**entry, "tip": "not-a-sha"}], "must be one full object SHA"),
+        ([{**entry, "checkout": "other"}], "one distinct recorded checkout"),
+        ([entry, entry], "one distinct recorded checkout"),
+        ([{**entry, "extra": True}], "extra"),
+    ):
+        with pytest.raises(wrkslots.StateError, match=message):
+            wrkslots._absent_agent_journal_inputs(
+                config, {**journal, "remote_containment": replacement}
+            )
+    with pytest.raises(wrkslots.StateError, match="requires branch witnesses"):
+        wrkslots._absent_agent_planned_receipts(
+            record, (witness,), include_branch_witness=False, containment=containment
+        )
 
 
 def test_absent_agent_legacy_journal_retains_recorded_head_branch_semantics(
