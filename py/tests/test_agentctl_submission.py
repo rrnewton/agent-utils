@@ -50,6 +50,8 @@ class FakeAgent:
         self.dialog = False
         # Label Claude draws into the composer's top border, such as a mode name.
         self.top_border_label: str | None = None
+        # Glyph Codex draws before its composer: › before v0.159.1, » from it.
+        self.codex_marker = "›"
         self._pending_reads = 0
         self._paste_counter = 0
         self._placeholder: str | None = None
@@ -144,10 +146,10 @@ class FakeAgent:
         else:
             if composer:
                 first, *rest = composer.split("\n")
-                lines.append(f"› {first}")
+                lines.append(f"{self.codex_marker} {first}")
                 lines += [f"  {line}" for line in rest]
             else:
-                lines.append("› " + _dim("Ask Codex to do anything"))
+                lines.append(f"{self.codex_marker} " + _dim("Ask Codex to do anything"))
             lines.append("")
             if self.busy and composer:
                 lines.append("  tab to queue message                 99% context")
@@ -357,6 +359,208 @@ def test_long_paste_placeholder_counts_as_staged() -> None:
     assert agent.keys == ["Enter", "Enter"]
     assert agent.submitted == [text]
 
+
+
+# Rows Codex v0.159.1 drew at the bottom of its pane, read with
+# `herdr pane read --source visible --format ansi`. Escape sequences, attributes and row
+# layout are as captured; runs of padding are shortened, and the model name, working
+# directory, links and prompt text were replaced with neutral words.
+_V159_PROMPT = "Reply with exactly READY and nothing else."
+_V159_SHADED_BLANK = "\x1b[0m\x1b[48;2;30;30;30m                    \x1b[0m"
+_V159_EMPTY_COMPOSER = (
+    "\x1b[0m\x1b[1m\x1b[38;2;190;142;250m\x1b[48;2;30;30;30m»\x1b[0m"
+    "\x1b[48;2;30;30;30m \x1b[0m\x1b[2m\x1b[48;2;30;30;30mAsk Codex to do anything"
+    "\x1b[0m\x1b[48;2;30;30;30m          \x1b[0m"
+)
+_V159_STAGED_COMPOSER = (
+    "\x1b[0m\x1b[1m\x1b[38;2;190;142;250m\x1b[48;2;30;30;30m»\x1b[0m"
+    "\x1b[48;2;30;30;30m Reply with exactly READY and nothing else.          \x1b[0m"
+)
+_V159_FOOTER = (
+    "  \x1b[0m\x1b[38;2;246;226;183mmodel high\x1b[0m"
+    "\x1b[38;2;132;132;132m · \x1b[0m\x1b[38;2;171;223;167m~/project\x1b[0m"
+    "          \x1b[0m\x1b[38;2;132;132;132m⚠ \x1b[0m"
+    "\x1b[38;2;196;167;103m1 warning\x1b[0m\x1b[38;2;132;132;132m · \x1b[0m"
+    "\x1b[1m\x1b[38;2;220;220;220mf2\x1b[0m\x1b[38;2;132;132;132m to view\x1b[0m"
+)
+_V159_SESSION_FOOTER = (
+    "  \x1b[0m\x1b[38;5;6msession\x1b[0m\x1b[2m · \x1b[0m"
+    "\x1b[38;2;246;226;183mmodel high\x1b[0m\x1b[38;2;132;132;132m · \x1b[0m"
+    "\x1b[38;2;171;223;167m~/project\x1b[0m\x1b[38;2;132;132;132m · \x1b[0m"
+    "\x1b[38;2;242;205;205mReply READY\x1b[0m          \x1b[0m"
+)
+_V159_NOTICE = "\x1b[0m\x1b[2m• \x1b[0mTip: /status shows the session."
+# The submitted prompt as the transcript shows it: Codex still draws › there.
+_V159_SUBMITTED_PROMPT = (
+    "\x1b[0m\x1b[1m\x1b[2m\x1b[48;2;40;40;40m› \x1b[0m"
+    "\x1b[48;2;40;40;40mReply with exactly READY and nothing else.          \x1b[0m"
+)
+_V159_HOOK = "\x1b[0m\x1b[2m↳ Hook · \x1b[0mDiscovered 3 skills"
+_V159_WORKING = (
+    "\x1b[0m\x1b[1m\x1b[38;2;151;151;151m•\x1b[0m \x1b[0m"
+    "\x1b[38;2;167;167;167mW\x1b[0m\x1b[38;2;118;118;118mo\x1b[0m"
+    "\x1b[38;2;110;110;110mrking\x1b[0m \x1b[0m\x1b[2m(0s • \x1b[0m"
+    "\x1b[1m\x1b[38;2;220;220;220mesc\x1b[0m\x1b[2m to interrupt)\x1b[0m"
+)
+_V159_REPLY = "\x1b[0m\x1b[2m• \x1b[0mREADY"
+_V159_WORKED = "\x1b[0m\x1b[2m  Worked for 52s • 12:56 PM\x1b[0m"
+_V159_COMPOSER_ROWS = [_V159_SHADED_BLANK, _V159_EMPTY_COMPOSER, _V159_SHADED_BLANK]
+
+
+def _screen(*rows: str) -> str:
+    return "\n".join(rows) + "\n"
+
+
+# A freshly started session, before any prompt.
+_V159_FRESH_IDLE = _screen(_V159_NOTICE, "", " ", *_V159_COMPOSER_ROWS, _V159_FOOTER)
+# The same session with the prompt pasted and not yet submitted.
+_V159_STAGED = _screen(
+    _V159_NOTICE, "", " ", _V159_SHADED_BLANK, _V159_STAGED_COMPOSER, _V159_SHADED_BLANK,
+    _V159_FOOTER,
+)
+# The first redraw after Enter: the prompt moved into the transcript.
+_V159_SUBMITTED = _screen(
+    _V159_NOTICE, "", _V159_SUBMITTED_PROMPT, "", " ", *_V159_COMPOSER_ROWS, _V159_FOOTER,
+)
+# The turn is running; the composer stays drawn below the progress row.
+_V159_WORKING_SCREEN = _screen(
+    _V159_SUBMITTED_PROMPT, "", "", _V159_HOOK, " ", _V159_WORKING, " ",
+    *_V159_COMPOSER_ROWS, _V159_FOOTER,
+)
+# The working screen with its composer rows removed.
+_V159_WORKING_WITHOUT_COMPOSER = _screen(
+    _V159_SUBMITTED_PROMPT, "", "", _V159_HOOK, " ", _V159_WORKING, " ", _V159_FOOTER,
+)
+# Idle again after a finished turn, with the session footer.
+_V159_SESSION_IDLE = _screen(
+    _V159_SUBMITTED_PROMPT, "", _V159_REPLY, "", _V159_WORKED, "", " ",
+    *_V159_COMPOSER_ROWS, _V159_SESSION_FOOTER,
+)
+# The folder-trust question Codex asks before its first composer in a new directory.
+_V159_TRUST_PROMPT = _screen(
+    _V159_SHADED_BLANK,
+    "\x1b[0m\x1b[1m\x1b[48;2;30;30;30m  Folder access\x1b[0m\x1b[48;2;30;30;30m          \x1b[0m",
+    "\x1b[0m\x1b[48;2;30;30;30m  \x1b[0m\x1b[2m\x1b[48;2;30;30;30m/tmp/project          "
+    "\x1b[0m\x1b[48;2;30;30;30m  \x1b[0m",
+    _V159_SHADED_BLANK,
+    "\x1b[0m\x1b[48;2;30;30;30m  Trust this folder? Codex can read, edit, and run files here.   \x1b[0m",
+    "\x1b[0m\x1b[48;2;30;30;30m  Continue only if you trust these files.          \x1b[0m",
+    _V159_SHADED_BLANK,
+    "\x1b[0m\x1b[1m\x1b[38;2;0;0;46m\x1b[48;2;99;168;248m› 1. Trust and continue          \x1b[0m",
+    "\x1b[0m\x1b[48;2;30;30;30m  2. Quit          \x1b[0m",
+    _V159_SHADED_BLANK,
+    "\x1b[0m\x1b[48;2;30;30;30m  \x1b[0m\x1b[1m\x1b[38;2;220;220;220m"
+    "\x1b[48;2;30;30;30menter\x1b[0m\x1b[2m\x1b[48;2;30;30;30m continue · \x1b[0m"
+    "\x1b[1m\x1b[38;2;220;220;220m\x1b[48;2;30;30;30mesc\x1b[0m\x1b[2m"
+    "\x1b[48;2;30;30;30m quit\x1b[0m\x1b[48;2;30;30;30m          \x1b[0m",
+)
+
+
+class Replay:
+    """Plays captured screens back: before the paste, while staged, and after Enter."""
+
+    def __init__(self, before: str, staged: str, after: str) -> None:
+        self.frames = (before, staged, after)
+        self.phase = 0
+        self.pastes: list[str] = []
+        self.keys: list[str] = []
+
+    def read_screen(self, pane_id: str) -> str:
+        del pane_id
+        return self.frames[self.phase]
+
+    def send_text(self, pane_id: str, text: str) -> None:
+        del pane_id
+        self.pastes.append(text)
+        self.phase = 1
+
+    def send_keys(self, pane_id: str, keys: str) -> None:
+        del pane_id
+        self.keys.append(keys)
+        if keys == "Enter":
+            self.phase = 2
+
+
+def _replay_submit(replay: Replay, text: str) -> object:
+    clock = Clock()
+    return submit_verified(
+        replay, "w1:p1", "codex", text, sleep=clock.sleep, monotonic=clock.monotonic,
+    )
+
+
+@pytest.mark.parametrize(
+    "screen", [_V159_FRESH_IDLE, _V159_SESSION_IDLE], ids=["fresh-start", "after-a-turn"],
+)
+def test_codex_0_159_1_idle_composer_is_recognised(screen: str) -> None:
+    view = composer_view("codex", screen)
+    assert view is not None, screen
+    assert view.composer_solid.strip() == ""
+    assert "Ask Codex to do anything" in view.composer
+    assert "~/project" in view.footer
+    assert "Ask Codex" not in view.transcript
+
+
+def test_codex_0_159_1_prompt_is_staged_submitted_and_verified() -> None:
+    replay = Replay(_V159_FRESH_IDLE, _V159_STAGED, _V159_SUBMITTED)
+    receipt = _replay_submit(replay, _V159_PROMPT)
+    assert getattr(receipt, "key") == "Enter"
+    assert getattr(receipt, "key_presses") == 1
+    assert getattr(receipt, "evidence") == "prompt text appeared above the composer"
+    assert replay.pastes == [f"{_PASTE_START}{_V159_PROMPT}{_PASTE_END}"]
+    assert replay.keys == ["Enter"]
+
+
+def test_codex_0_159_1_working_screen_keeps_its_progress_row_out_of_the_draft() -> None:
+    view = composer_view("codex", _V159_WORKING_SCREEN)
+    assert view is not None
+    assert view.composer_solid.strip() == ""
+    assert "esc to interrupt" in view.transcript
+    assert "tab to queue message" not in view.footer
+
+
+@pytest.mark.parametrize(
+    "screen", [_V159_WORKING_WITHOUT_COMPOSER, _V159_TRUST_PROMPT],
+    ids=["working-without-composer", "folder-trust-prompt"],
+)
+def test_codex_0_159_1_screens_without_a_composer_are_refused_before_typing(screen: str) -> None:
+    replay = Replay(screen, screen, screen)
+    with pytest.raises(PromptNotStaged, match="nothing was typed"):
+        _replay_submit(replay, "hello")
+    assert replay.pastes == [] and replay.keys == []
+
+
+def test_codex_0_159_1_working_screen_without_composer_has_no_view() -> None:
+    assert composer_view("codex", _V159_WORKING_WITHOUT_COMPOSER) is None
+
+
+@pytest.mark.parametrize("marker", ["›", "»"], ids=["before-0.159.1", "0.159.1"])
+def test_codex_flows_hold_under_both_composer_markers(marker: str) -> None:
+    idle = FakeAgent("codex")
+    idle.codex_marker = marker
+    view = composer_view("codex", idle._render())
+    assert view is not None and view.composer_solid.strip() == ""
+    assert getattr(_submit(idle, "start now"), "key") == "Enter"
+    assert idle.submitted == ["start now"]
+
+    busy = FakeAgent("codex", busy=True)
+    busy.codex_marker = marker
+    busy.drop_keys = 1
+    assert getattr(_submit(busy, "follow up later"), "key") == "Tab"
+    assert busy.queued == ["follow up later"] and busy.steered == []
+
+    drafted = FakeAgent("codex")
+    drafted.codex_marker = marker
+    drafted.composer = "someone else's words"
+    with pytest.raises(PromptNotStaged, match="refusing to append"):
+        _submit(drafted, "mine")
+    assert drafted.pastes == []
+
+    dialog = FakeAgent("codex")
+    dialog.codex_marker = marker
+    dialog.dialog = True
+    with pytest.raises(PromptNotStaged, match="recognisable codex composer"):
+        _submit(dialog, "hello")
+    assert dialog.pastes == []
 
 def _completed(
     command: Sequence[str], returncode: int = 0, stdout: str = "", stderr: str = "",

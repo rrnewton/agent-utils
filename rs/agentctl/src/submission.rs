@@ -45,6 +45,10 @@ const QUEUE_MARKERS: [&str; 3] = [
 ];
 const WORKING_MARKER: &str = "esc to interrupt";
 const CODEX_QUEUE_HINT: &str = "tab to queue message";
+/// Glyphs Codex draws in column 0 of its composer's first row. Earlier releases
+/// draw `›`; v0.159.1 draws `»`, and keeps `›` for selection lists such as its
+/// folder-trust prompt.
+const CODEX_COMPOSER_MARKERS: [char; 2] = ['›', '»'];
 
 /// Positive evidence that a staged prompt left the composer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -350,7 +354,7 @@ fn codex_view(rows: &[(Vec<char>, Vec<char>)]) -> Option<ComposerView> {
     let mut start = None;
     for index in (0..footer).rev() {
         let plain = text_of(&rows[index].0);
-        if plain.starts_with('›') {
+        if plain.starts_with(&CODEX_COMPOSER_MARKERS[..]) {
             start = Some(index);
             break;
         }
@@ -637,6 +641,8 @@ pub(crate) mod fake {
         pub dialog: bool,
         /// Label Claude draws into the composer's top border, such as a mode name.
         pub top_border_label: Option<String>,
+        /// Glyph Codex draws before its composer: `›` before v0.159.1, `»` from it.
+        pub codex_marker: &'static str,
         stale_screen: Option<String>,
         pending_reads: u32,
         paste_counter: u32,
@@ -653,6 +659,7 @@ pub(crate) mod fake {
                 harness,
                 busy,
                 transcript: vec!["• earlier output".to_owned()],
+                codex_marker: "›",
                 ..State::default()
             }))
         }
@@ -710,9 +717,13 @@ pub(crate) mod fake {
             lines.push(footer);
         } else {
             if composer.is_empty() {
-                lines.push(format!("› {}", dim("Ask Codex to do anything")));
+                lines.push(format!(
+                    "{} {}",
+                    state.codex_marker,
+                    dim("Ask Codex to do anything")
+                ));
             } else {
-                composer_lines("›", &mut lines);
+                composer_lines(state.codex_marker, &mut lines);
             }
             lines.push(String::new());
             lines.push(if state.busy && !composer.is_empty() {
@@ -1133,5 +1144,316 @@ mod tests {
         let receipt = receipt(submit(&screen, text));
         assert_eq!(receipt.key_presses, 1);
         assert_eq!(screen.state().submitted, [text]);
+    }
+
+    /// Rows Codex v0.159.1 drew at the bottom of its pane, read with
+    /// `herdr pane read --source visible --format ansi`. Escape sequences, attributes and row
+    /// layout are as captured; runs of padding are shortened, and the model name, working
+    /// directory, links and prompt text were replaced with neutral words.
+    mod codex_v0_159_1 {
+        pub(super) const PROMPT: &str = "Reply with exactly READY and nothing else.";
+        const SHADED_BLANK: &str = "\u{1b}[0m\u{1b}[48;2;30;30;30m                    \u{1b}[0m";
+        const EMPTY_COMPOSER: &str = concat!(
+            "\u{1b}[0m\u{1b}[1m\u{1b}[38;2;190;142;250m\u{1b}[48;2;30;30;30m»\u{1b}[0m",
+            "\u{1b}[48;2;30;30;30m \u{1b}[0m\u{1b}[2m\u{1b}[48;2;30;30;30mAsk Codex to do anything",
+            "\u{1b}[0m\u{1b}[48;2;30;30;30m          \u{1b}[0m",
+        );
+        const STAGED_COMPOSER: &str = concat!(
+            "\u{1b}[0m\u{1b}[1m\u{1b}[38;2;190;142;250m\u{1b}[48;2;30;30;30m»\u{1b}[0m",
+            "\u{1b}[48;2;30;30;30m Reply with exactly READY and nothing else.          \u{1b}[0m",
+        );
+        const FOOTER: &str = concat!(
+            "  \u{1b}[0m\u{1b}[38;2;246;226;183mmodel high\u{1b}[0m",
+            "\u{1b}[38;2;132;132;132m · \u{1b}[0m\u{1b}[38;2;171;223;167m~/project\u{1b}[0m",
+            "          \u{1b}[0m\u{1b}[38;2;132;132;132m⚠ \u{1b}[0m",
+            "\u{1b}[38;2;196;167;103m1 warning\u{1b}[0m\u{1b}[38;2;132;132;132m · \u{1b}[0m",
+            "\u{1b}[1m\u{1b}[38;2;220;220;220mf2\u{1b}[0m\u{1b}[38;2;132;132;132m to view\u{1b}[0m",
+        );
+        const SESSION_FOOTER: &str = concat!(
+            "  \u{1b}[0m\u{1b}[38;5;6msession\u{1b}[0m\u{1b}[2m · \u{1b}[0m",
+            "\u{1b}[38;2;246;226;183mmodel high\u{1b}[0m\u{1b}[38;2;132;132;132m · \u{1b}[0m",
+            "\u{1b}[38;2;171;223;167m~/project\u{1b}[0m\u{1b}[38;2;132;132;132m · \u{1b}[0m",
+            "\u{1b}[38;2;242;205;205mReply READY\u{1b}[0m          \u{1b}[0m",
+        );
+        const NOTICE: &str = "\u{1b}[0m\u{1b}[2m• \u{1b}[0mTip: /status shows the session.";
+        /// The submitted prompt as the transcript shows it: Codex still draws `›` there.
+        const SUBMITTED_PROMPT: &str = concat!(
+            "\u{1b}[0m\u{1b}[1m\u{1b}[2m\u{1b}[48;2;40;40;40m› \u{1b}[0m",
+            "\u{1b}[48;2;40;40;40mReply with exactly READY and nothing else.          \u{1b}[0m",
+        );
+        const HOOK: &str = "\u{1b}[0m\u{1b}[2m↳ Hook · \u{1b}[0mDiscovered 3 skills";
+        const WORKING: &str = concat!(
+            "\u{1b}[0m\u{1b}[1m\u{1b}[38;2;151;151;151m•\u{1b}[0m \u{1b}[0m",
+            "\u{1b}[38;2;167;167;167mW\u{1b}[0m\u{1b}[38;2;118;118;118mo\u{1b}[0m",
+            "\u{1b}[38;2;110;110;110mrking\u{1b}[0m \u{1b}[0m\u{1b}[2m(0s • \u{1b}[0m",
+            "\u{1b}[1m\u{1b}[38;2;220;220;220mesc\u{1b}[0m\u{1b}[2m to interrupt)\u{1b}[0m",
+        );
+        const REPLY: &str = "\u{1b}[0m\u{1b}[2m• \u{1b}[0mREADY";
+        const WORKED: &str = "\u{1b}[0m\u{1b}[2m  Worked for 52s • 12:56 PM\u{1b}[0m";
+
+        fn screen(rows: &[&str]) -> String {
+            rows.join("\n") + "\n"
+        }
+
+        /// A freshly started session, before any prompt.
+        pub(super) fn fresh_idle() -> String {
+            screen(&[
+                NOTICE,
+                "",
+                " ",
+                SHADED_BLANK,
+                EMPTY_COMPOSER,
+                SHADED_BLANK,
+                FOOTER,
+            ])
+        }
+
+        /// The same session with [`PROMPT`] pasted into the composer, before the submission key.
+        pub(super) fn staged() -> String {
+            screen(&[
+                NOTICE,
+                "",
+                " ",
+                SHADED_BLANK,
+                STAGED_COMPOSER,
+                SHADED_BLANK,
+                FOOTER,
+            ])
+        }
+
+        /// The first redraw after Enter: the prompt moved into the transcript.
+        pub(super) fn submitted() -> String {
+            screen(&[
+                NOTICE,
+                "",
+                SUBMITTED_PROMPT,
+                "",
+                " ",
+                SHADED_BLANK,
+                EMPTY_COMPOSER,
+                SHADED_BLANK,
+                FOOTER,
+            ])
+        }
+
+        /// The turn is running; the composer stays drawn below the progress row.
+        pub(super) fn working() -> String {
+            screen(&[
+                SUBMITTED_PROMPT,
+                "",
+                "",
+                HOOK,
+                " ",
+                WORKING,
+                " ",
+                SHADED_BLANK,
+                EMPTY_COMPOSER,
+                SHADED_BLANK,
+                FOOTER,
+            ])
+        }
+
+        /// The working screen with its composer rows removed.
+        pub(super) fn working_without_composer() -> String {
+            screen(&[SUBMITTED_PROMPT, "", "", HOOK, " ", WORKING, " ", FOOTER])
+        }
+
+        /// Idle again after a finished turn, with the session footer.
+        pub(super) fn session_idle() -> String {
+            screen(&[
+                SUBMITTED_PROMPT,
+                "",
+                REPLY,
+                "",
+                WORKED,
+                "",
+                " ",
+                SHADED_BLANK,
+                EMPTY_COMPOSER,
+                SHADED_BLANK,
+                SESSION_FOOTER,
+            ])
+        }
+
+        /// The folder-trust question Codex asks before its first composer in a new directory.
+        pub(super) fn trust_prompt() -> String {
+            screen(&[
+                SHADED_BLANK,
+                "\u{1b}[0m\u{1b}[1m\u{1b}[48;2;30;30;30m  Folder access\u{1b}[0m\u{1b}[48;2;30;30;30m          \u{1b}[0m",
+                "\u{1b}[0m\u{1b}[48;2;30;30;30m  \u{1b}[0m\u{1b}[2m\u{1b}[48;2;30;30;30m/tmp/project          \u{1b}[0m\u{1b}[48;2;30;30;30m  \u{1b}[0m",
+                SHADED_BLANK,
+                "\u{1b}[0m\u{1b}[48;2;30;30;30m  Trust this folder? Codex can read, edit, and run files here.   \u{1b}[0m",
+                "\u{1b}[0m\u{1b}[48;2;30;30;30m  Continue only if you trust these files.          \u{1b}[0m",
+                SHADED_BLANK,
+                "\u{1b}[0m\u{1b}[1m\u{1b}[38;2;0;0;46m\u{1b}[48;2;99;168;248m› 1. Trust and continue          \u{1b}[0m",
+                "\u{1b}[0m\u{1b}[48;2;30;30;30m  2. Quit          \u{1b}[0m",
+                SHADED_BLANK,
+                concat!(
+                    "\u{1b}[0m\u{1b}[48;2;30;30;30m  \u{1b}[0m\u{1b}[1m\u{1b}[38;2;220;220;220m",
+                    "\u{1b}[48;2;30;30;30menter\u{1b}[0m\u{1b}[2m\u{1b}[48;2;30;30;30m continue · \u{1b}[0m",
+                    "\u{1b}[1m\u{1b}[38;2;220;220;220m\u{1b}[48;2;30;30;30mesc\u{1b}[0m\u{1b}[2m",
+                    "\u{1b}[48;2;30;30;30m quit\u{1b}[0m\u{1b}[48;2;30;30;30m          \u{1b}[0m",
+                ),
+            ])
+        }
+    }
+
+    /// Plays captured screens back: one before the paste, one while the paste is staged,
+    /// and one after the submission key. Every key press is recorded.
+    struct Replay {
+        frames: [String; 3],
+        phase: std::sync::Mutex<usize>,
+        pastes: std::sync::Mutex<Vec<String>>,
+        keys: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Replay {
+        fn new(before: String, staged: String, after: String) -> Self {
+            Self {
+                frames: [before, staged, after],
+                phase: std::sync::Mutex::new(0),
+                pastes: std::sync::Mutex::default(),
+                keys: std::sync::Mutex::default(),
+            }
+        }
+    }
+
+    impl PromptTerminal for Replay {
+        fn read_screen(&self, _pane_id: &str) -> Result<String> {
+            Ok(self.frames[*self.phase.lock().unwrap()].clone())
+        }
+
+        fn send_text(&self, _pane_id: &str, text: &str) -> Result<()> {
+            self.pastes.lock().unwrap().push(text.to_owned());
+            *self.phase.lock().unwrap() = 1;
+            Ok(())
+        }
+
+        fn send_keys(&self, _pane_id: &str, keys: &str) -> Result<()> {
+            self.keys.lock().unwrap().push(keys.to_owned());
+            if keys == "Enter" {
+                *self.phase.lock().unwrap() = 2;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn codex_0_159_1_idle_composer_is_recognised() {
+        for screen in [codex_v0_159_1::fresh_idle(), codex_v0_159_1::session_idle()] {
+            let view = composer_view("codex", &screen)
+                .unwrap_or_else(|| panic!("no composer in {screen:?}"));
+            assert_eq!(view.composer_solid.trim(), "", "{view:?}");
+            assert!(
+                view.composer.contains("Ask Codex to do anything"),
+                "{view:?}"
+            );
+            assert!(view.footer.contains("~/project"), "{view:?}");
+            assert!(!view.transcript.contains("Ask Codex"), "{view:?}");
+        }
+        let view = composer_view("codex", &codex_v0_159_1::session_idle()).unwrap();
+        assert!(view.transcript.contains("Worked for 52s"), "{view:?}");
+    }
+
+    #[test]
+    fn codex_0_159_1_prompt_is_staged_submitted_and_verified() {
+        let replay = Replay::new(
+            codex_v0_159_1::fresh_idle(),
+            codex_v0_159_1::staged(),
+            codex_v0_159_1::submitted(),
+        );
+        let clock = Clock::default();
+        let outcome = submit_verified(
+            &replay,
+            "w1:p1",
+            "codex",
+            codex_v0_159_1::PROMPT,
+            SubmitTimeouts::default(),
+            &clock,
+        );
+        let receipt = receipt(outcome);
+        assert_eq!(receipt.key, "Enter");
+        assert_eq!(receipt.key_presses, 1);
+        assert_eq!(receipt.evidence, "prompt text appeared above the composer");
+        assert_eq!(
+            *replay.pastes.lock().unwrap(),
+            [format!(
+                "{BRACKETED_PASTE_START}{}{BRACKETED_PASTE_END}",
+                codex_v0_159_1::PROMPT
+            )]
+        );
+        assert_eq!(*replay.keys.lock().unwrap(), ["Enter"]);
+    }
+
+    #[test]
+    fn codex_0_159_1_working_screen_keeps_its_progress_row_out_of_the_draft() {
+        let view = composer_view("codex", &codex_v0_159_1::working()).unwrap();
+        assert_eq!(view.composer_solid.trim(), "", "{view:?}");
+        assert!(view.transcript.contains(WORKING_MARKER), "{view:?}");
+        assert!(!view.footer.contains(CODEX_QUEUE_HINT), "{view:?}");
+    }
+
+    #[test]
+    fn codex_0_159_1_screens_without_a_composer_are_refused_before_typing() {
+        assert!(composer_view("codex", &codex_v0_159_1::working_without_composer()).is_none());
+        for screen in [
+            codex_v0_159_1::working_without_composer(),
+            codex_v0_159_1::trust_prompt(),
+        ] {
+            let replay = Replay::new(screen.clone(), screen.clone(), screen);
+            let clock = Clock::default();
+            let outcome = submit_verified(
+                &replay,
+                "w1:p1",
+                "codex",
+                "hello",
+                SubmitTimeouts::default(),
+                &clock,
+            );
+            let reason = refusal(outcome);
+            assert!(reason.contains("nothing was typed"), "{reason}");
+            assert!(replay.pastes.lock().unwrap().is_empty());
+            assert!(replay.keys.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn codex_flows_hold_under_both_composer_markers() {
+        for marker in ["›", "»"] {
+            let idle = FakeScreen::new("codex", false);
+            idle.state().codex_marker = marker;
+            let view = composer_view("codex", &idle.render()).expect(marker);
+            assert_eq!(view.composer_solid.trim(), "", "{marker}");
+            assert_eq!(receipt(submit(&idle, "start now")).key, "Enter", "{marker}");
+            assert_eq!(idle.state().submitted, ["start now"], "{marker}");
+
+            let busy = FakeScreen::new("codex", true);
+            busy.state().codex_marker = marker;
+            busy.state().drop_keys = 1;
+            assert_eq!(
+                receipt(submit(&busy, "follow up later")).key,
+                "Tab",
+                "{marker}"
+            );
+            assert_eq!(busy.state().queued, ["follow up later"], "{marker}");
+            assert!(busy.state().steered.is_empty(), "{marker}");
+
+            let drafted = FakeScreen::new("codex", false);
+            drafted.state().codex_marker = marker;
+            drafted.state().composer = "someone else's words".to_owned();
+            let reason = refusal(submit(&drafted, "mine"));
+            assert!(reason.contains("refusing to append"), "{marker}: {reason}");
+            assert!(drafted.state().pastes.is_empty(), "{marker}");
+
+            let dialog = FakeScreen::new("codex", false);
+            dialog.state().codex_marker = marker;
+            dialog.state().dialog = true;
+            let reason = refusal(submit(&dialog, "hello"));
+            assert!(
+                reason.contains("recognisable codex composer"),
+                "{marker}: {reason}"
+            );
+            assert!(dialog.state().pastes.is_empty(), "{marker}");
+        }
     }
 }
