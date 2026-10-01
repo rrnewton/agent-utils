@@ -2174,6 +2174,12 @@ LOADER_ACCEPTANCES: tuple[tuple[str, str], ...] = (
         '"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}]}]}',
     ),
     (
+        "diagnostic-result-schema-is-explicit",
+        '{"steps":[{"group":"test","job":"counts","cmd":"true",'
+        '"result_manifests":[{"kind":"structured-test-results","schema":4,'
+        '"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.counts"}]}]}',
+    ),
+    (
         "every-declared-step-field",
         '{"steps":[{"group":"a","job":"one","desc":"d","description":"long","cmd":"true",'
         '"manifest":{"lane":"portable","category":"applications"},'

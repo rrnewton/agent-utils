@@ -776,3 +776,15 @@ def test_classified_result_manifest_is_explicit_and_roundtrips() -> None:
     encoded = dag_to_json(cfg)
     assert json.loads(encoded)["steps"][0]["result_manifests"][0]["schema"] == 3
     assert dag_to_json(dag_from_json(encoded)) == encoded
+
+
+def test_diagnostic_result_manifest_is_explicit_and_roundtrips() -> None:
+    doc = {"steps": [{"group": "test", "job": "counts", "cmd": "true", "result_manifests": [
+        {"kind": "structured-test-results", "schema": 4, "path_env": "DAGRUN_TEST_COUNTS_PATH", "owner": "test.counts"}
+    ]}]}
+    cfg = dag_from_json(json.dumps(doc))
+    assert cfg.steps[0].structured_test_results_manifest() == StructuredTestResultsManifest.diagnostic("test.counts")
+    assert StructuredTestResultsManifest.diagnostic("test.counts") != StructuredTestResultsManifest.classified("test.counts")
+    encoded = dag_to_json(cfg)
+    assert json.loads(encoded)["steps"][0]["result_manifests"][0]["schema"] == 4
+    assert dag_to_json(dag_from_json(encoded)) == encoded

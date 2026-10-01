@@ -4290,6 +4290,12 @@ fn run_step(ctx: StepCtx) {
     }
 
     let diagnostic_lines = diagnostic_failure_lines(&tag, test_counts.results.as_deref());
+    let diagnostic_failures = test_counts.results.as_ref().map_or(0, |results| {
+        results
+            .iter()
+            .filter(|result| result.is_diagnostic_failure())
+            .count()
+    });
     let (abort_cause, reason) = {
         let mut sh = lock_shared(&shared);
         retire(&mut sh, &step);
@@ -4505,6 +4511,14 @@ fn run_step(ctx: StepCtx) {
                 ),
             ),
         ];
+        // A passing step can carry excused failures; the journal must say so durably, not only
+        // the transcript. Recorded only when there are some, like the budgets below.
+        if diagnostic_failures > 0 {
+            fields.push((
+                "diagnostic_test_failures",
+                JournalValue::Text(diagnostic_failures.to_string()),
+            ));
+        }
         // The two ceilings this step ran under, each named for the quantity it bounds. Recorded
         // only when they are live, so a disabled budget stays absent instead of reading as 0.
         if cpu_budget > 0 {
@@ -6020,20 +6034,31 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
 
     #[test]
     fn diagnostic_failure_is_reported_but_does_not_fail_the_step() {
-        let diagnostic = r#"{"schema":4,"executed_tests":2,"filtered_tests":0,"results":[{"id":"suite$pass","result":"pass","attempts":1,"attempt_results":[{"attempt":1,"outcome":"passed","detail":null}],"diagnostic_reason":null},{"id":"suite$probe","result":"diagnostic_fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"wall_timeout","detail":"exceeded 20 s"}],"diagnostic_reason":"bounded host probe"}]}"#;
+        // Unique ids: the step tag is shared with concurrently running tests, and the printed
+        // lines are matched in the process-wide emitted record.
+        let diagnostic = r#"{"schema":4,"executed_tests":2,"filtered_tests":0,"results":[{"id":"diagsched$pass","result":"pass","attempts":1,"attempt_results":[{"attempt":1,"outcome":"passed","detail":null}],"diagnostic_reason":null},{"id":"diagsched$probe","result":"diagnostic_fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"wall_timeout","detail":"exceeded 20 s"}],"diagnostic_reason":"bounded host probe"}]}"#;
         let blocking = diagnostic
             .replace(r#""result":"diagnostic_fail""#, r#""result":"fail""#)
             .replace(
                 r#""diagnostic_reason":"bounded host probe""#,
                 r#""diagnostic_reason":null"#,
             );
+        // A diagnostic row first and a blocking row after it: the step fails and names the
+        // blocking row, not the excused one.
+        let mixed = r#"{"schema":4,"executed_tests":2,"filtered_tests":0,"results":[{"id":"diagsched$excused","result":"diagnostic_fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"failed","detail":"exit 4"}],"diagnostic_reason":"bounded host probe"},{"id":"diagsched$blocks","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"failed","detail":"exit 9"}],"diagnostic_reason":null}]}"#.to_string();
         for (payload, declared_schema, expect_ok, reason_fragment) in [
             (diagnostic.to_string(), 4, true, None),
             (
                 blocking,
                 4,
                 false,
-                Some("STRUCTURED TEST FAILURE: suite$probe attempt 1 wall_timeout"),
+                Some("STRUCTURED TEST FAILURE: diagsched$probe attempt 1 wall_timeout"),
+            ),
+            (
+                mixed,
+                4,
+                false,
+                Some("STRUCTURED TEST FAILURE: diagsched$blocks attempt 1 failed: exit 9"),
             ),
             // A schema-3 declaration cannot be satisfied by a schema-4 report.
             (
@@ -6043,11 +6068,12 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
                 Some("STRUCTURED TEST RESULTS REFUSED"),
             ),
         ] {
-            let marker = std::env::temp_dir().join(format!(
+            let dir = std::env::temp_dir().join(format!(
                 "dagrun-diagnostic-{}-{}",
                 std::process::id(),
                 TEST_COUNTS_SEQ.fetch_add(1, Ordering::Relaxed)
             ));
+            let marker = dir.join("marker");
             let command = r#"printf '%s\n' "$DAGRUN_TEST_COUNTS_PATH" > "$TEST_MARKER_PATH"; printf '%s' "$TEST_RESULT_PAYLOAD" > "$DAGRUN_TEST_COUNTS_PATH""#;
             let mut cfg = classified_structured_producer(command, &marker);
             cfg.steps[0]
@@ -6060,31 +6086,50 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
                         owner: "test.counts".into(),
                     },
                 )]);
-            let result = classified_run_without_evidence(&cfg);
+            let mut runner = Runner::new(&cfg, 1, 1, false, 0, None, None, None, None, None, None);
+            runner.evidence = Some(Arc::new(RunEvidence::open(Some(dir.clone())).unwrap()));
+            let (_, wall) = runner.run();
+            let result = runner.result(wall);
             let outcome = &result.outcomes[0];
             classified_assert_scheduler_owned_path_was_removed(&marker);
             assert_eq!(result.ok, expect_ok, "{payload}: {outcome:#?}");
             assert_eq!(outcome.ok, expect_ok, "{payload}: {outcome:#?}");
+            let journal: Vec<serde_json::Value> =
+                std::fs::read_to_string(dir.join("journal.jsonl"))
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+            let end = journal
+                .iter()
+                .find(|record| record["event"] == "step_end")
+                .expect("step_end record");
             match reason_fragment {
                 None => {
                     assert_eq!(outcome.reason, "");
                     let rows = outcome.test_results.as_ref().unwrap();
                     assert!(rows[1].is_diagnostic_failure() && !rows[1].passed);
-                    let lines = diagnostic_failure_lines("test.counts", Some(rows));
-                    assert_eq!(lines.len(), 2, "{lines:?}");
-                    assert!(
-                        lines[0].contains("DIAGNOSTIC 1 test failure(s)"),
-                        "{lines:?}"
+                    // What the run actually PRINTED, not a recomputation of it.
+                    assert_eq!(
+                        emitted_containing(
+                            "diagsched$probe (attempt 1 wall_timeout: exceeded 20 s; non-blocking because: bounded host probe)"
+                        )
+                        .len(),
+                        1
                     );
-                    assert!(
-                        lines[1].contains("suite$probe (attempt 1 wall_timeout: exceeded 20 s; non-blocking because: bounded host probe)"),
-                        "{lines:?}"
-                    );
+                    assert!(!emitted_containing("DIAGNOSTIC 1 test failure(s)").is_empty());
+                    assert_eq!(end["diagnostic_test_failures"], "1", "{end}");
+                    assert_eq!(crate::attribution::require_step_end_ok(end), Ok(true));
                 }
                 Some(fragment) => {
                     assert!(outcome.reason.contains(fragment), "{}", outcome.reason);
+                    if declared_schema == 3 {
+                        assert!(end.get("diagnostic_test_failures").is_none(), "{end}");
+                    }
                 }
             }
+            drop(runner);
+            std::fs::remove_dir_all(dir).unwrap();
         }
     }
 

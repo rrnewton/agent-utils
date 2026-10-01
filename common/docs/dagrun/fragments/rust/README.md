@@ -78,15 +78,20 @@ Executed counts still count named tests, not attempts.
 
 Schema 4 (`StructuredTestResultsManifest::diagnostic`,
 `TestResults::diagnostic().write_diagnostic_typed(...)`) is schema 3 plus one row kind.
-A row whose `result` is `diagnostic_fail` is a failed test whose producer declared, before
-the run, why that test cannot decide the step; the reason is required in
-`diagnostic_reason`, which is null on every other row. Build one with
-`TestResult::diagnostic_failure`. The scheduler does not fail the step on such a row, but it
-prints a `DIAGNOSTIC` count and the first ten failures with their causes and reasons, and the
-row stays in `StepOutcome.test_results` with `passed: false`
-(`TestResult::is_diagnostic_failure`). Every other non-pass, and every row of schema 2 or 3,
-still fails the step. Schema 2 and 3 writers refuse a diagnostic row rather than turn it
-into a plain failure, and a schema 3 reader refuses the `diagnostic_fail` value.
+A row whose `result` is `diagnostic_fail` is a failed test whose producer declares it cannot
+decide the step; the producer's reason is required in `diagnostic_reason`, which is null on
+every other row. Build one with `TestResult::diagnostic_failure`. Only a measured failure can
+be diagnostic: the terminal attempt must be `failed`, `cpu_timeout` or `wall_timeout`, never
+`cancelled`, `infrastructure_error` or `no_result`. The scheduler does not fail the step on
+such a row, but it prints a `DIAGNOSTIC` count and the first ten failures with their causes
+and reasons, records `diagnostic_test_failures` in the step's journal record, and adds one
+end-of-run line naming each step with diagnostic failures and the total. The row stays in
+`StepOutcome.test_results` with `passed: false` (`TestResult::is_diagnostic_failure`).
+Everything else still fails the step: any other non-pass row, any row of schema 2 or 3, and a
+producer that exits non-zero whatever its rows say. The scheduler trusts the producer to
+decide which tests are diagnostic; declaring schema 4 on a step is what grants that trust.
+Schema 2 and 3 writers refuse a diagnostic row rather than turn it into a plain failure, and a
+schema 3 reader refuses the `diagnostic_fail` value.
 
 Readers require the exact declared schema. Terminal-only rows cannot be promoted into
 classified evidence, and schema-2 writers refuse to discard typed causes.
@@ -94,9 +99,10 @@ Duplicate JSON keys, missing causes, and contradictory histories refuse.
 `StepOutcome.test_results_error` retains a required-result refusal separately
 from a simultaneous process, CPU, wall, OOM or cancellation cause. A terminal
 failed test cannot become a pass because its framework process exited zero.
-Schema 4 adds `TestResult.diagnostic` the same way. This additive API adds `TestResult.attempt_results` and
-`StepOutcome.test_results_error`: downstream exhaustive struct patterns need
-`..` or the new field, and struct literals must initialize the optional field.
+This additive API adds `TestResult.attempt_results` and
+`StepOutcome.test_results_error`, and schema 4 adds `TestResult.diagnostic`:
+downstream exhaustive struct patterns need `..` or the new fields, and struct literals must
+initialize the optional fields.
 
 `resource_caps` apply within one runner process by default. To apply the same
 capacities across independent runners, pass `run --resource-caps-path FILE`.

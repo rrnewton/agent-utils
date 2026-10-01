@@ -916,10 +916,26 @@ fn validate_result(result: &TestResult, require_attempt_results: bool) -> Result
                 result.id
             ));
         }
-        if result.attempt_results.is_none() {
+        let Some(attempts) = result.attempt_results.as_ref() else {
             return Err(format!(
                 "structured-test-results diagnostic failure {:?} lacks classified attempt_results",
                 result.id
+            ));
+        };
+        // Only a MEASURED failure may be excused. A run that was cancelled, could not produce
+        // trustworthy evidence, or produced no result has no product verdict to call diagnostic.
+        let terminal = attempts.last().map(|attempt| attempt.outcome);
+        if !matches!(
+            terminal,
+            Some(
+                TestAttemptOutcome::Failed
+                    | TestAttemptOutcome::CpuTimeout
+                    | TestAttemptOutcome::WallTimeout
+            )
+        ) {
+            return Err(format!(
+                "structured-test-results diagnostic failure {:?} must end in a measured failure (failed, cpu_timeout or wall_timeout), not {:?}",
+                result.id, terminal
             ));
         }
     }
@@ -1586,10 +1602,16 @@ mod diagnostic_tests {
                 "{error}"
             );
         }
+        // The schema-2 writer refuses the designation itself, not only the missing attempts.
         let legacy = TestResult {
             attempt_results: None,
             ..report.results.as_ref().unwrap()[2].clone()
         };
+        let error = require_legacy_result(&legacy).unwrap_err();
+        assert!(
+            error.contains("refuses to discard the diagnostic designation"),
+            "{error}"
+        );
         assert!(TestResults::current(1, 0, vec![legacy]).is_err());
         // A schema-3 document cannot spell diagnostic_fail at all.
         let bytes = br#"{"schema":3,"executed_tests":1,"filtered_tests":0,"results":[{"id":"a","result":"diagnostic_fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"failed","detail":"exit 1"}]}]}"#;
@@ -1642,5 +1664,29 @@ mod diagnostic_tests {
         )
         .is_err());
         assert!(TestResult::diagnostic_failure("a".into(), failed_attempt(), "".into()).is_err());
+        // Only a measured failure may be excused: the terminal attempt must be failed,
+        // cpu_timeout or wall_timeout.
+        for (outcome, excusable) in [
+            (TestAttemptOutcome::Failed, true),
+            (TestAttemptOutcome::CpuTimeout, true),
+            (TestAttemptOutcome::WallTimeout, true),
+            (TestAttemptOutcome::Cancelled, false),
+            (TestAttemptOutcome::InfrastructureError, false),
+            (TestAttemptOutcome::NoResult, false),
+        ] {
+            let attempts = vec![TestAttemptResult::new(1, outcome, Some("cause".into())).unwrap()];
+            assert_eq!(
+                TestResult::diagnostic_failure("a".into(), attempts, "why".into()).is_ok(),
+                excusable,
+                "{outcome:?}"
+            );
+            let mut wire = base();
+            wire["results"][2]["attempt_results"][0]["outcome"] = outcome.value().into();
+            assert_eq!(
+                TestResults::from_json_slice(&serde_json::to_vec(&wire).unwrap()).is_ok(),
+                excusable,
+                "reader, {outcome:?}"
+            );
+        }
     }
 }
