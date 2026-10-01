@@ -1133,8 +1133,15 @@ impl HerdrClient {
         let executable = resolve_executable(&self.executable)?;
         let mut command = Command::new(executable);
         command.args(args);
-        let output = bounded_output_with_cancellation(command, timeout, cancelled)
-            .map_err(|error| AdapterError::unavailable(format!("cannot invoke Herdr: {error}")))?;
+        let output =
+            bounded_output_with_cancellation(command, timeout, cancelled).map_err(|error| {
+                let message = format!("cannot invoke Herdr: {error}");
+                if error.kind() == io::ErrorKind::Interrupted && cancelled() {
+                    AdapterError::interrupted(message)
+                } else {
+                    AdapterError::unavailable(message)
+                }
+            })?;
         Ok(CommandOutput {
             status: output.status.code().unwrap_or(1),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -3394,6 +3401,58 @@ mod tests {
             );
             assert!(message.contains("injected shutdown failure"), "{message}");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_herdr_call_its_caller_cancels_fails_as_a_cancellation_and_one_out_of_time_does_not() {
+        // A service that stops cancels the Herdr calls it is making, and tells the failures that
+        // follow apart from any other by the cancellation:
+        // https://github.com/rrnewton/agent-utils/issues/186.
+        let fixture = FakeExecutable::new("{}");
+        let client = fixture.client();
+        let cancelled = client
+            .read_with_cancellation("pane", "visible", None, &|| true)
+            .expect_err("a cancelled read fails");
+        assert!(cancelled.cancelled(), "{cancelled}");
+        assert!(
+            cancelled
+                .to_string()
+                .contains("cannot invoke Herdr: control command was cancelled"),
+            "{cancelled}"
+        );
+        let timed_out = client
+            .invoke_with_timeout_and_cancellation(
+                &strings(&["pane", "read", "pane"]),
+                Duration::ZERO,
+                &|| false,
+            )
+            .expect_err("a call out of time fails");
+        assert!(!timed_out.cancelled(), "{timed_out}");
+        assert!(
+            timed_out.to_string().contains("control command timed out"),
+            "{timed_out}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_herdr_call_that_cannot_start_while_its_caller_cancels_is_not_a_cancellation() {
+        // Only the cancellation itself fails a call as cancelled. A call that fails for another
+        // reason while its caller is cancelling, here because Herdr cannot start, reports that
+        // failure, so a service that is stopping does not take it for the stop:
+        // https://github.com/rrnewton/agent-utils/issues/186.
+        let fixture = FakeExecutable::new("{}");
+        fs::write(fixture.root.join("herdr"), "#!/nonexistent/interpreter\n").unwrap();
+        let failed = fixture
+            .client()
+            .read_with_cancellation("pane", "visible", None, &|| true)
+            .expect_err("a call that cannot start fails");
+        assert!(!failed.cancelled(), "{failed}");
+        assert!(
+            failed.to_string().contains("cannot invoke Herdr"),
+            "{failed}"
+        );
     }
 
     #[cfg(target_os = "linux")]

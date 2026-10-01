@@ -788,7 +788,7 @@ pub trait ManagedApi: AgentApi {
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<()> {
         if runtime.cancelled() {
-            return Err(crate::error::AdapterError::unavailable(
+            return Err(crate::error::AdapterError::interrupted(
                 "Herdr control operation was cancelled",
             ));
         }
@@ -808,7 +808,7 @@ pub trait ManagedApi: AgentApi {
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<()> {
         if runtime.cancelled() {
-            return Err(crate::error::AdapterError::unavailable(
+            return Err(crate::error::AdapterError::interrupted(
                 "Herdr control operation was cancelled",
             ));
         }
@@ -823,7 +823,7 @@ pub trait ManagedApi: AgentApi {
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<String> {
         if runtime.cancelled() {
-            return Err(crate::error::AdapterError::unavailable(
+            return Err(crate::error::AdapterError::interrupted(
                 "Herdr control operation was cancelled",
             ));
         }
@@ -847,7 +847,7 @@ pub trait ManagedApi: AgentApi {
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<()> {
         if runtime.cancelled() {
-            return Err(crate::error::AdapterError::unavailable(
+            return Err(crate::error::AdapterError::interrupted(
                 "Herdr control operation was cancelled",
             ));
         }
@@ -1747,7 +1747,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<()> {
         if runtime.cancelled() {
-            return Err(crate::error::AdapterError::unavailable(
+            return Err(crate::error::AdapterError::interrupted(
                 "Herdr control operation was cancelled",
             ));
         }
@@ -1800,7 +1800,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         let deadline = Instant::now() + Duration::from_secs(2);
         let staged = loop {
             if runtime.cancelled() {
-                return Err(crate::error::AdapterError::unavailable(
+                return Err(crate::error::AdapterError::interrupted(
                     "Herdr control operation was cancelled",
                 ));
             }
@@ -1903,7 +1903,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             let deadline = Instant::now() + Duration::from_millis(timeout_ms);
             loop {
                 if runtime.cancelled() {
-                    return Err(crate::error::AdapterError::unavailable(
+                    return Err(crate::error::AdapterError::interrupted(
                         "Herdr control operation was cancelled",
                     ));
                 }
@@ -6035,6 +6035,8 @@ pub(crate) mod tests {
                     pane_status: Mutex::new("idle".to_owned()),
                     on_run: Mutex::new(None),
                     on_read: Mutex::new(None),
+                    hold_reads: Mutex::new(None),
+                    held_reads: AtomicU64::new(0),
                 },
                 root,
             }
@@ -6124,6 +6126,117 @@ pub(crate) mod tests {
         assert!(error.to_string().contains("cancelled"));
         assert!(started.elapsed() < Duration::from_secs(1));
     }
+
+    #[test]
+    fn a_herdr_control_operation_its_caller_cancelled_reports_the_cancellation() {
+        // A service that stops cancels the Herdr calls it is making, and tells the failures that
+        // follow apart from any other by the cancellation:
+        // https://github.com/rrnewton/agent-utils/issues/186.
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let runtime = CancelLifecycleWait {
+            cancelled: AtomicBool::new(true),
+        };
+        let client = &fixture.client;
+        let record = fixture.manager().load("worker").expect("worker record");
+        let workspace = WorkspaceClient {
+            client,
+            record: &record,
+            goal_objective: Mutex::new(None),
+            custom_submission: Mutex::new(None),
+            queue: None,
+            check_prompt: false,
+            expected_workspace: None,
+        };
+        let mut muse_record = record.clone();
+        muse_record.adapter = "herdr-pane".to_owned();
+        let muse = WorkspaceClient {
+            client,
+            record: &muse_record,
+            goal_objective: Mutex::new(None),
+            custom_submission: Mutex::new(Some(CustomPaneSubmission {
+                staged_screen: String::new(),
+                text: "text".to_owned(),
+                prior_transcript_count: 0,
+            })),
+            queue: None,
+            check_prompt: false,
+            expected_workspace: None,
+        };
+        let failures = [
+            (
+                "agent pane",
+                client.agent_pane_with_runtime("worker", &runtime).err(),
+            ),
+            (
+                "send keys",
+                client
+                    .send_keys_with_runtime("owned", "Enter", &runtime)
+                    .err(),
+            ),
+            (
+                "send text",
+                client
+                    .send_text_with_runtime("owned", "text", &runtime)
+                    .err(),
+            ),
+            (
+                "verify harness",
+                client
+                    .verify_custom_harness_with_runtime("owned", "muse", None, &runtime)
+                    .err(),
+            ),
+            (
+                "run",
+                workspace.run_with_runtime("owned", "text", &runtime).err(),
+            ),
+            (
+                "wait for a Muse prompt to start",
+                muse.wait_agent_status_with_runtime("owned", "working", 1_000, &runtime)
+                    .err(),
+            ),
+        ];
+        for (operation, error) in failures {
+            let error = error
+                .unwrap_or_else(|| panic!("{operation} went ahead after its caller cancelled"));
+            assert!(error.cancelled(), "{operation}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_muse_prompt_its_caller_cancels_once_the_text_is_inserted_reports_the_cancellation() {
+        // A stop can arrive while the prompt waits for its inserted text to show in the
+        // composer, before Enter: https://github.com/rrnewton/agent-utils/issues/186.
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let mut record = fixture.manager().load("worker").expect("worker record");
+        record.adapter = "herdr-pane".to_owned();
+        fixture.client.custom_alive.store(true, Ordering::Relaxed);
+        *fixture.client.screen.lock().unwrap() = Some("Auto-review\n❯\n".to_owned());
+        let runtime = Arc::new(CancelLifecycleWait::default());
+        let cancel = Arc::clone(&runtime);
+        *fixture.client.on_run.lock().unwrap() = Some(Box::new(move |_| {
+            cancel.cancelled.store(true, Ordering::SeqCst);
+        }));
+        let workspace = WorkspaceClient {
+            client: &fixture.client,
+            record: &record,
+            goal_objective: Mutex::new(None),
+            custom_submission: Mutex::new(None),
+            queue: None,
+            check_prompt: false,
+            expected_workspace: None,
+        };
+        let error = workspace
+            .run_with_runtime("owned", "text", &*runtime)
+            .expect_err("the prompt went ahead after its caller cancelled");
+        assert!(error.cancelled(), "{error}");
+        assert_eq!(
+            fixture.client.runs.lock().unwrap().last().cloned(),
+            Some(format!("{BRACKETED_PASTE_START}text{BRACKETED_PASTE_END}")),
+            "the text was inserted before the stop"
+        );
+    }
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
@@ -6141,8 +6254,8 @@ pub(crate) mod tests {
         panes_calls: AtomicU64,
         /// How many times the fake was asked for one pane's details.
         pub(crate) pane_info_calls: AtomicU64,
-        /// Every text written to a pane with `run`, such as a prompt, in order, and a line for
-        /// each agent state reported to herdr.
+        /// Every text written to a pane with `run` or `send_text`, such as a prompt, in order,
+        /// and a line for each agent state reported to herdr.
         pub(crate) runs: Mutex<Vec<String>>,
         slot_commands: Mutex<Vec<(String, String)>>,
         environments: Mutex<Vec<Vec<String>>>,
@@ -6196,11 +6309,18 @@ pub(crate) mod tests {
         pub(crate) unwrapped_empty: AtomicBool,
         /// The status herdr reports for every pane: `idle` unless a test sets another.
         pub(crate) pane_status: Mutex<String>,
-        /// Called with each text written to a pane with `run`, once it is in `runs`.
+        /// Called with each text written to a pane with `run` or `send_text`, once it is in
+        /// `runs`.
         pub(crate) on_run: Mutex<Option<RunHook>>,
         /// Called with the source of each read, once it is in `read_sources`, before the read
         /// returns.
         pub(crate) on_read: Mutex<Option<ReadHook>>,
+        /// When set, a read through a runtime waits until the runtime is cancelled and then
+        /// fails: with `true`, as a call its caller cancelled, the way herdr's client reports
+        /// one, and with `false`, for another reason.
+        pub(crate) hold_reads: Mutex<Option<bool>>,
+        /// Reads that have started to wait under `hold_reads`.
+        pub(crate) held_reads: AtomicU64,
     }
     impl Fake {
         fn pane(id: &str) -> Pane {
@@ -6438,6 +6558,27 @@ pub(crate) mod tests {
                 .unwrap()
                 .clone()
                 .unwrap_or_else(|| "visible output".to_owned()))
+        }
+        fn read_with_runtime(
+            &self,
+            pane: &str,
+            source: &str,
+            lines: Option<usize>,
+            runtime: &dyn agent::AgentRuntime,
+        ) -> AdapterResult<String> {
+            let hold = *self.hold_reads.lock().unwrap();
+            let Some(cancelled) = hold else {
+                return self.read(pane, source, lines);
+            };
+            self.held_reads.fetch_add(1, Ordering::SeqCst);
+            while !runtime.cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(if cancelled {
+                AdapterError::interrupted("cannot invoke Herdr: control command was cancelled")
+            } else {
+                AdapterError::unavailable("capture failed")
+            })
         }
     }
     impl ManagedApi for Fake {
@@ -6699,6 +6840,9 @@ pub(crate) mod tests {
         }
         fn send_keys(&self, _: &str, _: &str) -> AdapterResult<()> {
             Ok(())
+        }
+        fn send_text(&self, pane: &str, text: &str) -> AdapterResult<()> {
+            AgentApi::run(self, pane, text)
         }
         fn close_tab(&self, _: &str) -> AdapterResult<()> {
             panic!("managed lifecycle must close exactly the owned pane")
