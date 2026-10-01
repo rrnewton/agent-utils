@@ -9467,6 +9467,292 @@ def test_ownerless_cargo_cleanup_ignores_an_unrelated_missing_slot(
     assert row["slot"] == "unrelated"
 
 
+def migrate_validation_state(project: Path) -> Path:
+    """Apply the one-time move: a real validate_tmp/ plus the exact symlink."""
+
+    current = project / "validate_tmp"
+    current.mkdir(parents=True, exist_ok=True)
+    legacy = project / "ignored" / "validate"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink("../validate_tmp", legacy)
+    return current
+
+
+def write_cargo_home_run_record(record: Path, cargo_home: str) -> None:
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "unit": f"{record.stem}.service",
+                "cargo_home": cargo_home,
+                "state": "completed",
+                "exit_code": 0,
+                "final_validate_status": "PASSED",
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize(
+    ("layout", "target_spelling", "record_spelling", "recorded_spelling"),
+    [
+        # Before the move every spelling is the legacy one and is used as written.
+        ("legacy-directory", "ignored/validate", "ignored/validate", "ignored/validate"),
+        # After the move, a current ci-hub names everything by validate_tmp.
+        ("migrated", "validate_tmp", "validate_tmp", "validate_tmp"),
+        # An older caller, or a record written before the move, still uses the
+        # legacy spelling; it is mapped through the exact compatibility symlink.
+        ("migrated", "ignored/validate", "ignored/validate", "ignored/validate"),
+        ("migrated", "validate_tmp", "ignored/validate", "ignored/validate"),
+        ("migrated", "ignored/validate", "validate_tmp", "validate_tmp"),
+    ],
+)
+def test_ownerless_cargo_home_recovery_accepts_both_validation_state_spellings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    layout: str,
+    target_spelling: str,
+    record_spelling: str,
+    recorded_spelling: str,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    physical = (
+        migrate_validation_state(project)
+        if layout == "migrated"
+        else project / "ignored" / "validate"
+    )
+    target = physical / "cargo-homes" / "validate-cargo-old"
+    target.mkdir(parents=True)
+    (target / "cache-entry").write_text("regenerable\n", encoding="utf-8")
+    record = physical / "runs" / "validate-ownerless.json"
+    write_cargo_home_run_record(
+        record,
+        str(project / recorded_spelling / "cargo-homes" / "validate-cargo-old"),
+    )
+
+    recovered = in_process_validation_exclusion_command(
+        project,
+        monkeypatch,
+        request,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        f"{target_spelling}/cargo-homes/validate-cargo-old",
+        "--completed-record",
+        f"{record_spelling}/runs/validate-ownerless.json",
+        add_coordinator_authorization=True,
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert not target.exists()
+    assert record.is_file()
+    assert active_slots(project) == []
+    if layout == "migrated":
+        assert os.readlink(project / "ignored" / "validate") == "../validate_tmp"
+        assert stat.S_ISDIR(os.lstat(project / "validate_tmp").st_mode)
+    else:
+        assert not (project / "validate_tmp").exists()
+
+
+@pytest.mark.parametrize(
+    ("layout", "target_spelling", "recorded_spelling", "message"),
+    [
+        # A legacy spelling is only mapped through the exact relative symlink the
+        # migration creates; any other link is still a crossed symlink.
+        ("foreign-symlink", "ignored/validate", "ignored/validate", "crosses a symlink"),
+        # Before the move nothing is translated, so a record naming the new
+        # spelling does not name the legacy Cargo home.
+        (
+            "legacy-directory",
+            "ignored/validate",
+            "validate_tmp",
+            "does not name this exact cargo_home",
+        ),
+        # After the move, a record must still name the same Cargo home.
+        (
+            "migrated",
+            "validate_tmp",
+            "ignored/validate/cargo-homes/validate-cargo-other",
+            "does not name this exact cargo_home",
+        ),
+    ],
+)
+def test_ownerless_cargo_home_recovery_refuses_mismatched_validation_state_spellings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    layout: str,
+    target_spelling: str,
+    recorded_spelling: str,
+    message: str,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    if layout == "legacy-directory":
+        physical = project / "ignored" / "validate"
+    else:
+        physical = migrate_validation_state(project)
+        if layout == "foreign-symlink":
+            legacy = project / "ignored" / "validate"
+            legacy.unlink()
+            os.symlink(str(physical), legacy)
+    target = physical / "cargo-homes" / "validate-cargo-old"
+    target.mkdir(parents=True)
+    record = physical / "runs" / "validate-ownerless.json"
+    recorded = (
+        recorded_spelling
+        if recorded_spelling.endswith("validate-cargo-other")
+        else f"{recorded_spelling}/cargo-homes/validate-cargo-old"
+    )
+    write_cargo_home_run_record(record, str(project / recorded))
+    record_spelling = "validate_tmp" if layout != "legacy-directory" else "ignored/validate"
+
+    refused = in_process_validation_exclusion_command(
+        project,
+        monkeypatch,
+        request,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        f"{target_spelling}/cargo-homes/validate-cargo-old",
+        "--completed-record",
+        f"{record_spelling}/runs/validate-ownerless.json",
+        add_coordinator_authorization=True,
+    )
+
+    assert refused.returncode != 0
+    assert message in refused.stderr, refused.stderr
+    assert target.is_dir()
+    assert record.is_file()
+
+
+@pytest.mark.parametrize("layout", ["legacy-directory", "migrated", "split"])
+def test_recordless_cargo_home_recovery_finds_a_retained_record_in_either_location(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    layout: str,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    if layout == "migrated":
+        physical = migrate_validation_state(project)
+        records = physical / "runs"
+        # A record written before the move names the legacy spelling.
+        recorded_root = project / "ignored" / "validate"
+    else:
+        physical = project / "ignored" / "validate"
+        # "split" keeps the legacy directory but holds a record under
+        # validate_tmp; the census must still see it rather than miss it.
+        records = (
+            project / "validate_tmp" / "runs"
+            if layout == "split"
+            else physical / "runs"
+        )
+        recorded_root = physical
+    target = physical / "cargo-homes" / "validate-cargo-old"
+    target.mkdir(parents=True)
+    write_cargo_home_run_record(
+        records / "validate-retained.json",
+        str(recorded_root / "cargo-homes" / "validate-cargo-old"),
+    )
+
+    refused = in_process_validation_exclusion_command(
+        project,
+        monkeypatch,
+        request,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-cargo-home",
+        target.relative_to(project).as_posix(),
+        "--recovery-note",
+        "no retained record should name this Cargo home",
+        add_coordinator_authorization=True,
+    )
+
+    assert refused.returncode != 0
+    assert "names this cargo_home; use --completed-record" in refused.stderr, (
+        refused.stderr
+    )
+    assert target.is_dir()
+
+
+def test_validation_state_spelling_is_translated_only_through_the_exact_symlink(
+    tmp_path: Path,
+) -> None:
+    legacy_spelling = "ignored/validate/runs/validate-a.json"
+    assert (
+        wrkslots._physical_validation_state_spelling(tmp_path, legacy_spelling)
+        == legacy_spelling
+    )
+    (tmp_path / "ignored" / "validate" / "runs").mkdir(parents=True)
+    assert (
+        wrkslots._physical_validation_state_spelling(tmp_path, legacy_spelling)
+        == legacy_spelling
+    )
+    assert wrkslots._validation_run_directories(tmp_path) == (
+        tmp_path / "validate_tmp" / "runs",
+        tmp_path / "ignored" / "validate" / "runs",
+    )
+    assert wrkslots._validation_state_directory(tmp_path) == (
+        tmp_path / "ignored" / "validate"
+    )
+
+    shutil.rmtree(tmp_path / "ignored")
+    migrate_validation_state(tmp_path)
+    assert (
+        wrkslots._physical_validation_state_spelling(tmp_path, legacy_spelling)
+        == "validate_tmp/runs/validate-a.json"
+    )
+    for unchanged in (
+        "ignored/validate",
+        "ignored/validate/../validate_tmp/runs/validate-a.json",
+        "ignored/validate//runs/validate-a.json",
+        "ignored/validated/runs/validate-a.json",
+        "validate_tmp/runs/validate-a.json",
+    ):
+        assert (
+            wrkslots._physical_validation_state_spelling(tmp_path, unchanged)
+            == unchanged
+        )
+    assert wrkslots._physical_validation_state_absolute(
+        tmp_path, f"{tmp_path}/ignored/validate/cargo-homes/validate-cargo-a"
+    ) == f"{tmp_path}/validate_tmp/cargo-homes/validate-cargo-a"
+    assert wrkslots._validation_run_directories(tmp_path) == (
+        tmp_path / "validate_tmp" / "runs",
+    )
+    assert wrkslots._validation_state_directory(tmp_path) == tmp_path / "validate_tmp"
+
+    legacy = tmp_path / "ignored" / "validate"
+    legacy.unlink()
+    os.symlink(str(tmp_path / "validate_tmp"), legacy)
+    assert (
+        wrkslots._physical_validation_state_spelling(tmp_path, legacy_spelling)
+        == legacy_spelling
+    )
+    with pytest.raises(wrkslots.Refusal, match="neither a directory nor the compatibility"):
+        wrkslots._validation_run_directories(tmp_path)
+
+
 def test_ownerless_cargo_home_allows_nested_git_cache_and_records_determination(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
