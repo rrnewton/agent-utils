@@ -81,11 +81,18 @@ _LOCAL_SALVAGE_DIRECTORY = "wrkslots-salvage"
 SALVAGE_REF_ROOT = "refs/salvage"
 ABSENT_AGENT_RESCUE_REF_ROOT = "refs/rescue/wrkslots"
 LEGACY_ABSENT_AGENT_RESCUE_REF_ROOT = "refs/heads/rescue/wrkslots"
+# Configuration of every isolated repository. Commands run there read the
+# source repository's object store, whose commit-graph file caches each
+# commit's parents and generation number. Git answers ancestry questions from
+# that cache instead of the commit objects, so a stale or altered graph could
+# make a commit look contained in a remote ref that does not contain it;
+# commitGraph = false makes Git read the commit objects themselves.
 _NETWORK_CONFIG = (
     b"[core]\n"
     b"\trepositoryformatversion = 0\n"
     b"\tfilemode = true\n"
     b"\tbare = true\n"
+    b"\tcommitGraph = false\n"
 )
 _VALIDATION_REMOVAL_ARTIFACT_ROLES = frozenset(
     {"run-record", "service-result", "producer-schema", "scorecard-handoff"}
@@ -347,7 +354,49 @@ _ABSENT_AGENT_JOURNAL_REQUIRED = frozenset(
         "archive_entry",
     }
 )
-_ABSENT_AGENT_JOURNAL_OPTIONAL = frozenset({"branch_witnesses"})
+_ABSENT_AGENT_JOURNAL_OPTIONAL = frozenset({"branch_witnesses", "remote_containment"})
+# Remote refs that may prove an absent checkout's recorded HEAD is already
+# preserved: branches, and rescue refs such as ABSENT_AGENT_RESCUE_REF_ROOT.
+_ABSENT_AGENT_CONTAINING_REF_PREFIXES = ("refs/heads/", "refs/rescue/")
+_ABSENT_AGENT_ALREADY_ON_REMOTE = "already-on-remote"
+# Wall-clock bound on one fetch of remote branch and rescue refs while recovery
+# looks for, or re-checks, an existing ref containing an absent checkout's HEAD.
+# Recovery holds the registry lock meanwhile; an expired fetch is stopped and
+# recovery refuses with nothing removed.
+_ABSENT_AGENT_REMOTE_FETCH_SECONDS = 300.0
+# The same bound for listing those refs with ls-remote, which precedes the fetch.
+_ABSENT_AGENT_REMOTE_LIST_SECONDS = 120.0
+# Fetch depth meaning "complete history"; Git itself sends it for --unshallow.
+# Any depth makes a fetch a deepening fetch, which Git never satisfies from
+# objects already present locally, and a shallow remote answers it by naming
+# its history boundaries, which Git records in the fetching repository's
+# shallow file. A plain fetch can instead complete from local objects without
+# asking the remote anything, so a shallow remote would go unnoticed.
+_GIT_COMPLETE_HISTORY_DEPTH = 2147483647
+# Refs Git keeps per linked worktree, in its administrative directory; removing
+# the worktree's registration deletes them.
+_WORKTREE_PRIVATE_REF_PREFIXES = ("refs/worktree/", "refs/bisect/", "refs/rewritten/")
+# State an unfinished merge, cherry-pick, revert, rebase, or bisect leaves in a
+# worktree's Git directory; the same names operation_paths reports.
+_GIT_OPERATION_STATE_NAMES = (
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "BISECT_LOG",
+    "rebase-apply",
+    "rebase-merge",
+    "sequencer",
+)
+# A gitdir file names one path; Git itself writes a few hundred bytes at most.
+_WORKTREE_GITDIR_BYTES_LIMIT = 64 * 1024
+# Environment for every Git command run in an isolated repository. Grafts
+# would rewrite parentage the same way a commit-graph could (see
+# _NETWORK_CONFIG), so no graft file is read; replacement refs are already
+# disabled for every Git command. Configuration is not passed through
+# GIT_CONFIG_* here: the network wrapper requires an environment without it.
+_ISOLATED_HISTORY_ENV: Mapping[str, str] = {
+    "GIT_GRAFT_FILE": "/dev/null",
+}
 CONFIG_NAME = ".wrkslots.yml"
 # Configuration keys that may be absent. Absent is a meaning, not a default to
 # be materialised: no `max_active_slots` key means allocation is uncapped.
@@ -9629,6 +9678,7 @@ def _run_within_item_budget(
     what: str,
     env: Mapping[str, str] | None = None,
     input_text: str | None = None,
+    timeout_refusal: Refusal | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run ``command`` as subprocess.run would, for at most ``seconds``.
 
@@ -9636,7 +9686,8 @@ def _run_within_item_budget(
     process it starts.  When the time runs out it receives SIGTERM first,
     because Git removes its lock files when SIGTERM stops it and leaves them
     when SIGKILL does, then SIGKILL after a grace period, and the item is
-    refused.  An OSError from starting the command propagates.
+    refused, with ``timeout_refusal`` when the bound is not the item budget.
+    An OSError from starting the command propagates.
     """
 
     process = subprocess.Popen(
@@ -9652,6 +9703,8 @@ def _run_within_item_budget(
         stdout, stderr = process.communicate(input_text, timeout=max(0.0, seconds))
     except subprocess.TimeoutExpired:
         _stop_process_group(process)
+        if timeout_refusal is not None:
+            raise timeout_refusal from None
         raise _item_budget_refusal(what) from None
     except BaseException:
         _stop_process_group(process)
@@ -9692,7 +9745,17 @@ class _GitVcs:
         check: bool = True,
         input_text: str | None = None,
         env_overrides: Mapping[str, str] | None = None,
+        timeout_seconds: float | None = None,
+        timeout_refusal: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        """Run Git with a controlled environment.
+
+        ``timeout_seconds`` bounds this one command; when it expires first,
+        the command is stopped and Refusal(``timeout_refusal``) is raised.
+        """
+
+        if (timeout_seconds is None) != (timeout_refusal is None):
+            raise StateError("a Git timeout needs both its bound and its refusal")
         env = {
             key: value
             for key, value in os.environ.items()
@@ -9741,6 +9804,10 @@ class _GitVcs:
             command = _with_proxy(command, env)
         what = f"git {' '.join(args[:3])} in {repository}"
         seconds = _item_seconds_left(what)
+        expired: Refusal | None = None
+        if timeout_seconds is not None and (seconds is None or timeout_seconds < seconds):
+            seconds = timeout_seconds
+            expired = Refusal(str(timeout_refusal))
         try:
             if seconds is None:
                 completed = subprocess.run(
@@ -9753,7 +9820,12 @@ class _GitVcs:
                 )
             else:
                 completed = _run_within_item_budget(
-                    command, seconds=seconds, what=what, env=env, input_text=input_text
+                    command,
+                    seconds=seconds,
+                    what=what,
+                    env=env,
+                    input_text=input_text,
+                    timeout_refusal=expired,
                 )
         except OSError as exc:
             raise Refusal(f"cannot execute Git: {exc}") from exc
@@ -9844,6 +9916,23 @@ class _GitVcs:
         if not SHA_RE.fullmatch(sha):
             raise Refusal(f"checkout HEAD is not a full commit: {checkout}")
         return root, common, sha
+
+    def commit_present(self, repository: Path, commit: str) -> bool:
+        """Return whether the object store of ``repository`` holds commit ``commit``."""
+
+        if not SHA_RE.fullmatch(commit):
+            raise Refusal(f"cannot look up invalid commit {commit!r}")
+        result = self._run(
+            repository,
+            ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+            input_text=f"{commit}\n",
+        )
+        observed = result.stdout.strip()
+        if observed == f"{commit} commit":
+            return True
+        if observed == f"{commit} missing":
+            return False
+        raise Refusal(f"Git reported {commit} as something other than a commit: {observed!r}")
 
     def verify_ref(self, repository: Path, ref: str, label: str) -> str:
         _validate_ref(ref, label)
@@ -10008,6 +10097,229 @@ class _GitVcs:
             raise Refusal(f"Git worktree registration for {target} has no full HEAD")
         branch = record.get("branch")
         return head, branch
+
+    def worktree_administrative_directory(
+        self, repository: Path, checkout: Path
+    ) -> Path | None:
+        """Return the directory where Git administers the linked worktree ``checkout``.
+
+        Git keeps each linked worktree's HEAD and index in
+        <common>/worktrees/<id>/, whose gitdir file names the worktree's .git
+        path; that directory outlives a deleted checkout. None means no gitdir
+        file names ``checkout``.
+        """
+
+        root = self.common_directory(repository) / "worktrees"
+        if not root.exists() and not root.is_symlink():
+            return None
+        if root.is_symlink() or not root.is_dir():
+            raise Refusal(f"Git worktree administration is unsafe: {root}")
+        target = checkout.absolute() / ".git"
+        matches: list[Path] = []
+        for entry in sorted(root.iterdir()):
+            gitdir = entry / "gitdir"
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            if not gitdir.exists() and not gitdir.is_symlink():
+                continue
+            try:
+                named = _read_bounded_regular_file(
+                    gitdir, "Git worktree gitdir file", _WORKTREE_GITDIR_BYTES_LIMIT
+                ).decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise Refusal(f"Git worktree gitdir file is not UTF-8: {gitdir}") from exc
+            path = Path(named.rstrip())
+            if not path.is_absolute():
+                path = entry / path
+            if Path(os.path.normpath(path)) == target:
+                matches.append(entry)
+        if len(matches) > 1:
+            raise Refusal(
+                f"Git administers {checkout} from more than one directory: "
+                + ", ".join(str(match) for match in matches)
+            )
+        return matches[0] if matches else None
+
+    def worktree_staged_paths(
+        self,
+        repository: Path,
+        checkout: Path,
+        head: str,
+        remote: str,
+        authority: _RemoteAuthority,
+    ) -> tuple[Path | None, tuple[str, ...]]:
+        """Return the index Git kept for ``checkout`` and the paths it stages beyond ``head``.
+
+        A path is listed when its staged content differs from ``head`` or it
+        is unmerged. The index is read in a temporary repository whose only
+        configuration is _NETWORK_CONFIG, so no hook or filter of the source
+        repository runs, and nothing is written.
+        """
+
+        if not SHA_RE.fullmatch(head):
+            raise Refusal(f"cannot compare a worktree index with invalid commit {head!r}")
+        administration = self.worktree_administrative_directory(repository, checkout)
+        if administration is None:
+            raise Refusal(
+                f"Git registers {checkout} but no administrative directory names it"
+            )
+        index = administration / "index"
+        if not index.exists() and not index.is_symlink():
+            return None, ()
+        if index.is_symlink() or not index.is_file():
+            raise Refusal(f"Git worktree index is unsafe: {index}")
+        with self._isolated_remote(repository, remote, authority) as (
+            isolated,
+            object_env,
+        ):
+            result = self._run(
+                isolated,
+                [
+                    "diff-index",
+                    "--cached",
+                    "--exit-code",
+                    "--name-only",
+                    "-z",
+                    "--no-renames",
+                    "--ignore-submodules=none",
+                    head,
+                    "--",
+                ],
+                check=False,
+                env_overrides={**object_env, "GIT_INDEX_FILE": str(index)},
+            )
+        paths = tuple(dict.fromkeys(name for name in result.stdout.split("\0") if name))
+        if result.returncode == 0 and not paths:
+            return index, ()
+        if result.returncode == 1 and paths:
+            return index, paths
+        raise Refusal(
+            f"cannot compare the index Git kept for {checkout} with {head}"
+            + _git_failure_detail(result)
+        )
+
+    def worktree_private_roots_beyond(
+        self,
+        repository: Path,
+        checkout: Path,
+        head: str,
+        remote: str,
+        authority: _RemoteAuthority,
+    ) -> tuple[str, ...]:
+        """Describe what Git keeps only for ``checkout`` that ``head``'s history does not hold.
+
+        That is each per-worktree ref (_WORKTREE_PRIVATE_REF_PREFIXES) not
+        naming a commit in ``head``'s history, and each unfinished-operation
+        file (_GIT_OPERATION_STATE_NAMES) in its administrative directory.
+        Ancestry is decided in a temporary repository whose only configuration
+        is _NETWORK_CONFIG. Reflogs, ORIG_HEAD, and FETCH_HEAD are not
+        reported: they record past positions, not unfinished work.
+        """
+
+        if not SHA_RE.fullmatch(head):
+            raise Refusal(f"cannot compare worktree refs with invalid commit {head!r}")
+        administration = self.worktree_administrative_directory(repository, checkout)
+        if administration is None:
+            raise Refusal(
+                f"Git registers {checkout} but no administrative directory names it"
+            )
+        found = [
+            str(administration / name)
+            for name in _GIT_OPERATION_STATE_NAMES
+            if (administration / name).exists() or (administration / name).is_symlink()
+        ]
+        listed = self._run(
+            repository,
+            [
+                "for-each-ref",
+                "--format=%(refname)%00%(objectname)%00%(objecttype)",
+                *_WORKTREE_PRIVATE_REF_PREFIXES,
+            ],
+            env_overrides={"GIT_DIR": str(administration)},
+        )
+        refs: list[tuple[str, str, str]] = []
+        for line in listed.stdout.splitlines():
+            fields = line.split("\0")
+            if (
+                len(fields) != 3
+                or not fields[0].startswith(_WORKTREE_PRIVATE_REF_PREFIXES)
+                or not SHA_RE.fullmatch(fields[1])
+            ):
+                raise Refusal(f"Git returned a malformed worktree ref inventory for {checkout}")
+            refs.append((fields[0], fields[1], fields[2]))
+        if refs:
+            with self._isolated_remote(repository, remote, authority) as (
+                isolated,
+                object_env,
+            ):
+                for ref, target, kind in refs:
+                    if kind != "commit":
+                        found.append(f"{ref} -> {target} ({kind})")
+                        continue
+                    result = self._run(
+                        isolated,
+                        ["merge-base", "--is-ancestor", target, head],
+                        check=False,
+                        env_overrides=object_env,
+                    )
+                    if result.returncode == 1:
+                        found.append(f"{ref} -> {target}")
+                    elif result.returncode != 0:
+                        raise Refusal(
+                            f"cannot compare worktree ref {ref} with {head}"
+                            + _git_failure_detail(result)
+                        )
+        return tuple(found)
+
+    @contextlib.contextmanager
+    def worktree_index_locked(self, repository: Path, checkout: Path) -> Iterator[Path]:
+        """Hold Git's own lock on the index of linked worktree ``checkout``.
+
+        Git creates <administrative directory>/index.lock exclusively before it
+        writes that index, so while the lock exists no Git command can stage
+        content or commit there. `git worktree remove` deletes the lock with
+        the administrative directory; otherwise it is released on exit. Yields
+        the administrative directory.
+        """
+
+        administration = self.worktree_administrative_directory(repository, checkout)
+        if administration is None:
+            raise Refusal(
+                f"Git registers {checkout} but no administrative directory names it"
+            )
+        lock = administration / "index.lock"
+        try:
+            descriptor = os.open(
+                lock,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+            )
+        except FileExistsError as exc:
+            raise Refusal(
+                f"Git index lock {lock} already exists: a Git command is using the "
+                f"index of {checkout}, or one stopped without removing its lock. "
+                "remedy: once no Git command uses that worktree, delete the lock and "
+                "rerun"
+            ) from exc
+        except OSError as exc:
+            raise Refusal(f"cannot lock the Git index of {checkout}: {exc}") from exc
+        try:
+            created = os.fstat(descriptor)
+        except OSError as exc:
+            os.close(descriptor)
+            lock.unlink(missing_ok=True)
+            raise Refusal(f"cannot lock the Git index of {checkout}: {exc}") from exc
+        os.close(descriptor)
+        try:
+            yield administration
+        finally:
+            try:
+                observed = os.lstat(lock)
+            except FileNotFoundError:
+                pass
+            else:
+                if (observed.st_dev, observed.st_ino) == (created.st_dev, created.st_ino):
+                    lock.unlink()
 
     def verify_existing_worktree(self, repository: Path, checkout: Path) -> str:
         source_common = self.common_directory(repository)
@@ -10306,7 +10618,13 @@ class _GitVcs:
         refs: Sequence[str] = (),
         heads_only: bool = False,
         env_overrides: Mapping[str, str] | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, str]:
+        """List the remote's refs at ``url``; ``timeout_seconds`` bounds the listing.
+
+        A listing still running at that bound is stopped and refused.
+        """
+
         environment = dict(env_overrides or {})
         # ls-remote needs no repository. /dev/null is an explicit, immutable
         # non-repository GIT_DIR, so a same-UID .git/config appearing below the
@@ -10320,6 +10638,14 @@ class _GitVcs:
             repository,
             arguments,
             env_overrides=environment,
+            timeout_seconds=timeout_seconds,
+            timeout_refusal=(
+                None
+                if timeout_seconds is None
+                else f"Git did not list the remote's refs within {timeout_seconds:g} "
+                "seconds; the listing was stopped and no ref of the source repository "
+                "was read or written. remedy: rerun when the remote answers faster"
+            ),
         )
         return self._parse_remote_ref_inventory(result.stdout, "remote-ref")
 
@@ -10480,6 +10806,7 @@ class _GitVcs:
             yield isolated, {
                 "GIT_OBJECT_DIRECTORY": str(objects),
                 _NETWORK_CONFIG_SHA256_ENV: config_digest,
+                **_ISOLATED_HISTORY_ENV,
             }
 
     def remote_url_sha256(self, checkout: Path, remote: str) -> str:
@@ -10494,15 +10821,7 @@ class _GitVcs:
         return observed.sha256
 
     def operation_paths(self, checkout: Path) -> list[Path]:
-        names = (
-            "MERGE_HEAD",
-            "CHERRY_PICK_HEAD",
-            "REVERT_HEAD",
-            "BISECT_LOG",
-            "rebase-apply",
-            "rebase-merge",
-            "sequencer",
-        )
+        names = _GIT_OPERATION_STATE_NAMES
         arguments: list[str] = ["rev-parse"]
         for name in names:
             arguments.extend(("--git-path", name))
@@ -10648,6 +10967,217 @@ class _GitVcs:
         if set(refs) != {ref}:
             raise Refusal(f"remote returned ambiguous content for salvage ref {ref}")
         return refs[ref]
+
+    def _fetch_refs_into_isolated(
+        self,
+        isolated: Path,
+        url: str,
+        advertised: Mapping[str, str],
+        *,
+        haves: Sequence[str] = (),
+        env_overrides: Mapping[str, str],
+    ) -> None:
+        """Fetch exactly the advertised refs into the temporary repository.
+
+        The refs exist only in that temporary repository and are discarded with
+        it; no ref of the source repository, including refs/remotes/*, is read
+        or written. Objects land in the source repository's object store, as
+        with every isolated fetch. Each advertised tip already present there,
+        and each commit in ``haves``, is first named by a temporary have-ref, so
+        Git negotiates from those commits instead of downloading the whole
+        history of a remote with many refs. The fetch is stopped, and refused,
+        after _ABSENT_AGENT_REMOTE_FETCH_SECONDS.
+
+        The fetch asks for complete history (_GIT_COMPLETE_HISTORY_DEPTH), so
+        the remote is always asked, even when every object is already local,
+        and is refused when the remote reports that it is shallow: a shallow
+        remote can advertise a ref without holding that ref's older history,
+        so its refs cannot show that it holds a commit.
+        """
+
+        if not advertised:
+            return
+        tips = sorted(set(advertised.values()) | set(haves))
+        present = self._run(
+            isolated,
+            ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+            input_text="".join(f"{tip}\n" for tip in tips),
+            env_overrides=env_overrides,
+        )
+        wanted = set(tips)
+        commits: list[str] = []
+        for line in present.stdout.splitlines():
+            fields = line.split()
+            if len(fields) == 2 and fields[1] == "commit" and fields[0] in wanted:
+                commits.append(fields[0])
+        if commits:
+            self._run(
+                isolated,
+                ["update-ref", "--stdin"],
+                input_text="".join(
+                    f"create refs/wrkslots-have/{index} {tip}\n"
+                    for index, tip in enumerate(commits)
+                ),
+                env_overrides=env_overrides,
+            )
+        self._run(
+            isolated,
+            [
+                "fetch",
+                f"--depth={_GIT_COMPLETE_HISTORY_DEPTH}",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--no-auto-maintenance",
+                "--force",
+                "--no-recurse-submodules",
+                "--stdin",
+                "--",
+                url,
+            ],
+            input_text="".join(f"+{ref}:{ref}\n" for ref in sorted(advertised)),
+            env_overrides=env_overrides,
+            timeout_seconds=_ABSENT_AGENT_REMOTE_FETCH_SECONDS,
+            timeout_refusal=(
+                f"Git did not fetch {len(advertised)} remote ref(s) into a temporary "
+                f"repository within {_ABSENT_AGENT_REMOTE_FETCH_SECONDS:g} seconds; "
+                "the fetch was stopped and no ref of the source repository was read "
+                "or written. remedy: rerun when the remote answers faster"
+            ),
+        )
+        shallow = isolated / "shallow"
+        if shallow.exists() or shallow.is_symlink():
+            raise Refusal(
+                "the remote is a shallow repository: it reported history boundaries "
+                f"below the {len(advertised)} ref(s) fetched, so it may lack commits "
+                "those refs descend from and cannot show that it holds one. No ref of "
+                "the source repository was read or written. remedy: give that remote "
+                "complete history, for example with git fetch --unshallow there, then "
+                "rerun"
+            )
+        transferred: dict[str, str] = {}
+        for prefix in sorted({"/".join(ref.split("/")[:2]) + "/" for ref in advertised}):
+            transferred.update(
+                self._direct_ref_inventory(isolated, prefix, env_overrides=env_overrides)
+            )
+        if transferred != dict(advertised):
+            raise Refusal(
+                "Git fetched a different ref inventory than the remote advertised"
+            )
+
+    def remote_refs_containing_commit(
+        self,
+        checkout: Path,
+        remote: str,
+        commit: str,
+        authority: _RemoteAuthority,
+    ) -> dict[str, str]:
+        """Return each remote branch or rescue ref that contains ``commit``.
+
+        The result maps the remote's own ref name (refs/heads/* or refs/rescue/*)
+        to the tip it advertised. Every ref is read fresh from the remote and
+        fetched only into a temporary repository; see _fetch_refs_into_isolated,
+        which also refuses a shallow remote. The listing is stopped, and
+        refused, after _ABSENT_AGENT_REMOTE_LIST_SECONDS.
+        """
+
+        _validate_remote(remote)
+        if not SHA_RE.fullmatch(commit):
+            raise Refusal(f"cannot search the remote for invalid commit {commit!r}")
+        with self._isolated_remote(checkout, remote, authority) as (
+            isolated,
+            object_env,
+        ):
+            candidates = {
+                ref: tip
+                for ref, tip in self._ls_remote_inventory(
+                    isolated,
+                    authority.url,
+                    env_overrides=object_env,
+                    timeout_seconds=_ABSENT_AGENT_REMOTE_LIST_SECONDS,
+                ).items()
+                if ref.startswith(_ABSENT_AGENT_CONTAINING_REF_PREFIXES)
+            }
+            if not candidates:
+                return {}
+            self._fetch_refs_into_isolated(
+                isolated,
+                authority.url,
+                candidates,
+                haves=(commit,),
+                env_overrides=object_env,
+            )
+            result = self._run(
+                isolated,
+                [
+                    "for-each-ref",
+                    "--format=%(refname)%00%(objectname)",
+                    "--contains",
+                    commit,
+                    *_ABSENT_AGENT_CONTAINING_REF_PREFIXES,
+                ],
+                env_overrides=object_env,
+            )
+        containing: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            fields = line.split("\0")
+            if len(fields) != 2 or candidates.get(fields[0]) != fields[1]:
+                raise Refusal("Git returned a containing ref the remote did not advertise")
+            containing[fields[0]] = fields[1]
+        return containing
+
+    def remote_ref_contains_commit(
+        self,
+        checkout: Path,
+        remote: str,
+        ref: str,
+        commit: str,
+        authority: _RemoteAuthority,
+    ) -> str | None:
+        """Return ``ref``'s fresh tip when it exists and contains ``commit``.
+
+        The ref is fetched only into a temporary repository and the answer is
+        `git merge-base --is-ancestor` there. None means the remote no longer
+        has the ref or its tip no longer contains the commit. Listing and
+        fetching are bounded, and a shallow remote is refused, as in
+        remote_refs_containing_commit.
+        """
+
+        _validate_remote(remote)
+        _validate_full_ref(ref, "remote containing ref")
+        if not SHA_RE.fullmatch(commit):
+            raise Refusal(f"cannot compare invalid commit {commit!r} with {ref}")
+        with self._isolated_remote(checkout, remote, authority) as (
+            isolated,
+            object_env,
+        ):
+            tip = self._ls_remote_inventory(
+                isolated,
+                authority.url,
+                refs=(ref,),
+                env_overrides=object_env,
+                timeout_seconds=_ABSENT_AGENT_REMOTE_LIST_SECONDS,
+            ).get(ref)
+            if tip is None:
+                return None
+            self._fetch_refs_into_isolated(
+                isolated,
+                authority.url,
+                {ref: tip},
+                haves=(commit,),
+                env_overrides=object_env,
+            )
+            result = self._run(
+                isolated,
+                ["merge-base", "--is-ancestor", commit, ref],
+                check=False,
+                env_overrides=object_env,
+            )
+        if result.returncode not in (0, 1):
+            raise Refusal(
+                f"cannot compare commit {commit} with remote ref {ref}"
+                + _git_failure_detail(result)
+            )
+        return tip if result.returncode == 0 else None
 
     def push_salvage(
         self,
@@ -34753,6 +35283,133 @@ def _assert_absent_agent_rescue_refs_disjoint(
         )
 
 
+def _absent_agent_containing_ref_rank(checkout: Checkout, ref: str) -> tuple[int, str]:
+    """Order remote refs that contain a recorded HEAD by how durable they are.
+
+    The remote branch behind the checkout's landed ref comes first, then rescue
+    refs, which exist to preserve commits, then the checkout's own branch, then
+    every other branch by name.
+    """
+
+    tracking = f"refs/remotes/{checkout.remote}/"
+    landed = (
+        "refs/heads/" + checkout.landed_ref.removeprefix(tracking)
+        if checkout.landed_ref.startswith(tracking)
+        else None
+    )
+    if ref == landed:
+        return (0, ref)
+    if ref.startswith("refs/rescue/"):
+        return (1, ref)
+    if ref == f"refs/heads/{checkout.branch}":
+        return (2, ref)
+    return (3, ref)
+
+
+def _absent_agent_existing_containing_ref(
+    vcs: _GitVcs,
+    repository: Path,
+    checkout: Checkout,
+    authority: _RemoteAuthority,
+) -> tuple[str, str] | None:
+    """Return one existing remote ref that contains the recorded HEAD, and its tip.
+
+    Both the search and the confirming `git merge-base --is-ancestor` read the
+    remote fresh into temporary repositories, so neither creates nor changes a
+    ref in the source repository, including refs/remotes/<remote>/*.
+    """
+
+    containing = vcs.remote_refs_containing_commit(
+        repository, checkout.remote, checkout.head, authority
+    )
+    if not containing:
+        return None
+    ref = min(
+        containing, key=lambda value: _absent_agent_containing_ref_rank(checkout, value)
+    )
+    tip = vcs.remote_ref_contains_commit(
+        repository, checkout.remote, ref, checkout.head, authority
+    )
+    if tip is None:
+        raise Refusal(
+            f"remote ref {ref} stopped containing the recorded HEAD {checkout.head} of "
+            f"absent checkout {checkout.name} while recovery was planning. state: "
+            "REFUSED -- the ACTIVE row and Git registrations were retained. remedy: "
+            "rerun the plan"
+        )
+    return ref, tip
+
+
+def _assert_absent_agent_index_unstaged(
+    vcs: _GitVcs,
+    repository: Path,
+    path: Path,
+    checkout: Checkout,
+    authority: _RemoteAuthority,
+    retained: str,
+) -> None:
+    """Refuse while the index Git kept for an absent checkout stages unpublished content.
+
+    Removing the registration deletes that index. A rescue push or an existing
+    remote ref preserves only the recorded HEAD, so content staged beyond it
+    exists nowhere else.
+    """
+
+    index, staged = vcs.worktree_staged_paths(
+        repository, path, checkout.head, checkout.remote, authority
+    )
+    if staged:
+        shown = ", ".join(staged[:5]) + (
+            f", and {len(staged) - 5} more" if len(staged) > 5 else ""
+        )
+        raise Refusal(
+            f"absent checkout {checkout.name} still has an index at {index} that "
+            f"stages content its recorded HEAD {checkout.head} does not contain "
+            f"({shown}); removing the Git registration would delete it. state: "
+            f"REFUSED -- {retained} were retained. remedy: commit that staged "
+            "content and publish it, or reset that index to the recorded HEAD if "
+            "it is not wanted, then rerun"
+        )
+
+
+def _assert_absent_agent_worktree_state_preserved(
+    vcs: _GitVcs,
+    repository: Path,
+    path: Path,
+    checkout: Checkout,
+    authority: _RemoteAuthority,
+    retained: str,
+) -> None:
+    """Refuse while Git keeps anything for an absent checkout beyond its recorded HEAD.
+
+    Removing the registration deletes the checkout's administrative
+    directory: its index (see _assert_absent_agent_index_unstaged), its
+    per-worktree refs, and any unfinished merge, cherry-pick, revert, rebase,
+    or bisect. Only the recorded HEAD's history is preserved, so a per-worktree
+    ref naming anything outside it, or an unfinished operation, refuses.
+    Reflogs are discarded, as by every `git worktree remove`.
+    """
+
+    _assert_absent_agent_index_unstaged(
+        vcs, repository, path, checkout, authority, retained
+    )
+    roots = vcs.worktree_private_roots_beyond(
+        repository, path, checkout.head, checkout.remote, authority
+    )
+    if roots:
+        shown = ", ".join(roots[:5]) + (
+            f", and {len(roots) - 5} more" if len(roots) > 5 else ""
+        )
+        raise Refusal(
+            f"absent checkout {checkout.name} still has Git state outside the history "
+            f"of its recorded HEAD {checkout.head} ({shown}); removing the Git "
+            f"registration would delete it. state: REFUSED -- {retained} were "
+            "retained. remedy: publish each such ref's commit and delete the ref, "
+            "or delete it if it is not wanted; finish or abandon the unfinished "
+            "operation; then rerun"
+        )
+
+
 def _absent_agent_checkout_receipts(
     config: Config,
     record: ActiveRecord,
@@ -34761,7 +35418,16 @@ def _absent_agent_checkout_receipts(
     removed: AbstractSet[str] = frozenset(),
     *,
     preserved: AbstractSet[str] = frozenset(),
+    containment: Mapping[str, tuple[str, str]] | None = None,
 ) -> tuple[dict[str, object], ...]:
+    """Check every absent checkout and return its planned preservation receipt.
+
+    ``containment`` is None while planning: a checkout whose remote is not in
+    salvage_push_remotes is then accepted only when an existing remote ref
+    already contains its recorded HEAD. A journal passes the containment it
+    recorded, which is re-verified instead of searched for again.
+    """
+
     if len(branch_witnesses) != len(record.checkouts):
         raise StateError("absent-agent branch witness count differs from checkout count")
     _assert_absent_agent_rescue_refs_disjoint(record, branch_witnesses)
@@ -34769,6 +35435,7 @@ def _absent_agent_checkout_receipts(
         _stored_repository_path(config, checkout.repository)[1]
         for checkout in record.checkouts
     )
+    found: dict[str, tuple[str, str]] = {}
     for checkout, witness in zip(record.checkouts, branch_witnesses, strict=True):
         _stored, repository = _stored_repository_path(config, checkout.repository)
         authority = vcs.remote_authority(repository, checkout.remote)
@@ -34779,19 +35446,51 @@ def _absent_agent_checkout_receipts(
         vcs.assert_remote_distinct_from_repositories(
             repository, authority, repositories
         )
-        if not _salvage_push_allowed(config, authority):
-            raise Refusal(
-                f"absent checkout {checkout.name} remote {checkout.remote} is not in "
-                "salvage_push_remotes, and recovery preserves the recorded HEAD only by "
-                "pushing a rescue ref to it. state: REFUSED -- the ACTIVE row and Git "
-                "registrations were retained. remedy: list the remote in "
-                "salvage_push_remotes only if salvage may publish to it"
-            )
         if checkout.name not in preserved and (
             vcs.verify_ref(repository, checkout.head, "recorded checkout HEAD")
             != checkout.head
         ):
             raise Refusal(f"recorded commit object is unavailable for {checkout.name}")
+        recorded = None if containment is None else containment.get(checkout.name)
+        if recorded is not None:
+            if (
+                vcs.remote_ref_contains_commit(
+                    repository, checkout.remote, recorded[0], checkout.head, authority
+                )
+                is None
+            ):
+                raise Refusal(
+                    f"existing remote ref {recorded[0]} no longer contains the recorded "
+                    f"HEAD {checkout.head} of absent checkout {checkout.name}. state: "
+                    "REFUSED -- the ACTIVE row, the recovery journal, and the remaining "
+                    "Git registrations were retained. remedy: restore a remote ref "
+                    "containing that commit, then rerun recover"
+                )
+        elif not _salvage_push_allowed(config, authority):
+            if containment is not None:
+                raise Refusal(
+                    f"absent checkout {checkout.name} remote {checkout.remote} is not in "
+                    "salvage_push_remotes, and the recovery journal preserves the "
+                    "recorded HEAD by pushing a rescue ref to it. state: REFUSED -- the "
+                    "ACTIVE row, the recovery journal, and the remaining Git "
+                    "registrations were retained. remedy: list the remote in "
+                    "salvage_push_remotes only if salvage may publish to it"
+                )
+            existing = _absent_agent_existing_containing_ref(
+                vcs, repository, checkout, authority
+            )
+            if existing is None:
+                raise Refusal(
+                    f"absent checkout {checkout.name} remote {checkout.remote} is not in "
+                    "salvage_push_remotes, and no branch or rescue ref on that remote "
+                    f"contains the recorded HEAD {checkout.head}; recovery preserves the "
+                    "recorded HEAD only by finding it in such a ref or by pushing a "
+                    "rescue ref. state: REFUSED -- the ACTIVE row and Git "
+                    "registrations were retained. remedy: publish the recorded HEAD to "
+                    "that remote, or list the remote in salvage_push_remotes only if "
+                    "salvage may publish to it"
+                )
+            found[checkout.name] = existing
         if checkout.name not in removed:
             _assert_absent_agent_branch_witness(repository, checkout, witness, vcs)
         path = _stored_path(config, checkout.path, "agent checkout path").absolute()
@@ -34803,7 +35502,32 @@ def _absent_agent_checkout_receipts(
                 )
         elif registration is not None:
             _assert_absent_agent_registration(checkout, witness, registration)
-    return _absent_agent_planned_receipts(record, branch_witnesses)
+            # A rescue ref and an existing remote ref both preserve only the
+            # recorded HEAD, so both dispositions need this. A resumed recovery
+            # can find a preserved HEAD pruned from the local repository, when
+            # nothing can be compared with it here; before removing this
+            # registration, _recover_absent_agent_row fetches it back from the
+            # remote ref that preserves it and makes this check under Git's
+            # index lock.
+            if checkout.name not in preserved or vcs.commit_present(
+                repository, checkout.head
+            ):
+                _assert_absent_agent_worktree_state_preserved(
+                    vcs,
+                    repository,
+                    path,
+                    checkout,
+                    authority,
+                    "the ACTIVE row and Git registrations"
+                    if containment is None
+                    else "the ACTIVE row, the recovery journal, and the remaining "
+                    "Git registrations",
+                )
+    return _absent_agent_planned_receipts(
+        record,
+        branch_witnesses,
+        containment=found if containment is None else containment,
+    )
 
 
 def _absent_agent_planned_receipts(
@@ -34812,23 +35536,44 @@ def _absent_agent_planned_receipts(
     *,
     include_branch_witness: bool = True,
     rescue_root: str | None = None,
+    containment: Mapping[str, tuple[str, str]] | None = None,
 ) -> tuple[dict[str, object], ...]:
     if len(branch_witnesses) != len(record.checkouts):
         raise StateError("absent-agent branch witness count differs from checkout count")
+    if containment and not include_branch_witness:
+        raise StateError("absent-agent remote containment requires branch witnesses")
     receipts: list[dict[str, object]] = []
     for checkout, witness in zip(record.checkouts, branch_witnesses, strict=True):
-        receipt: dict[str, object] = {
-            "checkout": checkout.name,
-            "source_head": checkout.head,
-            "salvage_commit": checkout.head,
-            "status_sha256": None,
-            "disposition": "salvaged",
-            "remote_ref": _absent_agent_rescue_ref(
-                record, checkout, root=rescue_root
-            ),
-            "containing_remote_refs": [],
-            "working_tree_contents": "unknown-storage-absent-before-recovery",
-        }
+        existing = None if containment is None else containment.get(checkout.name)
+        receipt: dict[str, object]
+        if existing is None:
+            receipt = {
+                "checkout": checkout.name,
+                "source_head": checkout.head,
+                "salvage_commit": checkout.head,
+                "status_sha256": None,
+                "disposition": "salvaged",
+                "remote_ref": _absent_agent_rescue_ref(
+                    record, checkout, root=rescue_root
+                ),
+                "containing_remote_refs": [],
+                "working_tree_contents": "unknown-storage-absent-before-recovery",
+            }
+        else:
+            # Recovery pushes nothing for this checkout: remote_ref names the
+            # existing remote ref that already contained the recorded HEAD, and
+            # remote_ref_tip is the tip that ref had when recovery was planned.
+            receipt = {
+                "checkout": checkout.name,
+                "source_head": checkout.head,
+                "salvage_commit": checkout.head,
+                "status_sha256": None,
+                "disposition": _ABSENT_AGENT_ALREADY_ON_REMOTE,
+                "remote_ref": existing[0],
+                "remote_ref_tip": existing[1],
+                "containing_remote_refs": [existing[0]],
+                "working_tree_contents": "unknown-storage-absent-before-recovery",
+            }
         if include_branch_witness:
             receipt["local_branch"] = _absent_agent_branch_witness_to_obj(witness)
             receipt["local_branch_rescue"] = (
@@ -34854,16 +35599,32 @@ def _absent_agent_branch_validation(receipt: Mapping[str, object]) -> str:
         receipt.get("local_branch_rescue"),
         "absent-agent receipt.local_branch_rescue",
     )
+    already_on_remote = receipt.get("disposition") == _ABSENT_AGENT_ALREADY_ON_REMOTE
+    existing_ref = receipt.get("remote_ref")
     if disposition == "not-applicable-absent" and witness.head is None:
-        detail = "had no tip to include in the recorded-HEAD rescue ref"
+        detail = (
+            "had no tip; the recorded HEAD was already contained in existing remote "
+            f"ref {existing_ref}"
+            if already_on_remote
+            else "had no tip to include in the recorded-HEAD rescue ref"
+        )
     elif (
         disposition == "same-commit-as-recorded-head"
         and witness.head == receipt.get("source_head")
     ):
-        detail = "named the same commit as the recorded HEAD rescue ref"
+        detail = (
+            "named the recorded HEAD, which existing remote ref "
+            f"{existing_ref} already contained"
+            if already_on_remote
+            else "named the same commit as the recorded HEAD rescue ref"
+        )
     elif disposition == "no-separate-ref-left-untouched" and witness.head is not None:
         detail = (
-            "received no separate rescue ref; the recorded-HEAD rescue ref targets "
+            "received no rescue ref; only the recorded HEAD "
+            f"{receipt.get('source_head')} was checked against existing remote ref "
+            f"{existing_ref}"
+            if already_on_remote
+            else "received no separate rescue ref; the recorded-HEAD rescue ref targets "
             f"{receipt.get('source_head')}"
         )
     else:
@@ -34891,6 +35652,12 @@ def _absent_agent_archive_entry(
         receipt.get("local_branch_rescue") == "no-separate-ref-left-untouched"
         for receipt in receipts
     )
+    already_on_remote = any(
+        receipt.get("disposition") == _ABSENT_AGENT_ALREADY_ON_REMOTE
+        for receipt in receipts
+    )
+    if already_on_remote and not has_branch_witnesses:
+        raise StateError("absent-agent remote containment requires branch witnesses")
     return {
         "archive_id": f"{record.machine}:{record.slot}:{record.generation}:{finished_at}",
         "slot": record.slot,
@@ -34911,6 +35678,12 @@ def _absent_agent_archive_entry(
             *(
                 (
                     f"checkout {receipt['checkout']}: recorded slot HEAD "
+                    f"{receipt['source_head']} was already contained in existing remote "
+                    f"ref {receipt['remote_ref']} at tip {receipt['remote_ref_tip']}; "
+                    "recovery pushed nothing and re-verified the containment with git "
+                    "merge-base --is-ancestor against a freshly fetched copy of that ref"
+                    if receipt.get("disposition") == _ABSENT_AGENT_ALREADY_ON_REMOTE
+                    else f"checkout {receipt['checkout']}: recorded slot HEAD "
                     f"{receipt['source_head']} preserved at remote rescue ref "
                     f"{receipt['remote_ref']} and read back at {receipt['salvage_commit']}"
                     if has_branch_witnesses
@@ -34946,9 +35719,23 @@ def _absent_agent_archive_entry(
                 if distinct_branch_tip
                 else []
             ),
+            *(
+                [
+                    "a recorded HEAD found in an existing remote ref stays preserved "
+                    "only while that ref, which recovery neither created nor protects, "
+                    "still contains it"
+                ]
+                if already_on_remote
+                else []
+            ),
         ],
         "continuation": (
-            "physical storage was already absent; inspect the verified recorded-HEAD "
+            "physical storage was already absent; inspect each checkout's verified "
+            "remote ref, either a rescue ref this recovery pushed or an existing ref "
+            "that already contained the recorded HEAD, and re-read every local branch "
+            "ref because its historical witness has expired"
+            if already_on_remote
+            else "physical storage was already absent; inspect the verified recorded-HEAD "
             "rescue refs and re-read every local branch ref because its historical "
             "witness has expired"
             if has_branch_witnesses
@@ -34991,6 +35778,68 @@ def _absent_agent_event_evidence(
         "source_record_sha256": item.record_sha256,
         "physical_storage": "externally-absent",
     }
+
+
+def _absent_agent_receipt_containment(
+    receipts: Sequence[Mapping[str, object]],
+) -> dict[str, tuple[str, str]]:
+    """Return checkout name -> (existing remote ref, planned tip) for receipts
+    whose recorded HEAD was already on the remote."""
+
+    return {
+        _as_str(receipt.get("checkout"), "absent-agent receipt.checkout"): (
+            _as_str(receipt.get("remote_ref"), "absent-agent receipt.remote_ref"),
+            _as_str(receipt.get("remote_ref_tip"), "absent-agent receipt.remote_ref_tip"),
+        )
+        for receipt in receipts
+        if receipt.get("disposition") == _ABSENT_AGENT_ALREADY_ON_REMOTE
+    }
+
+
+def _absent_agent_containment_to_obj(
+    containment: Mapping[str, tuple[str, str]],
+) -> list[dict[str, object]]:
+    return [
+        {"checkout": name, "remote_ref": ref, "tip": tip}
+        for name, (ref, tip) in containment.items()
+    ]
+
+
+def _absent_agent_containment_from_journal(
+    raw: Mapping[str, object], record: ActiveRecord, legacy_branches: bool
+) -> dict[str, tuple[str, str]]:
+    if "remote_containment" not in raw:
+        return {}
+    if legacy_branches:
+        raise StateError("absent-agent-row remote containment requires branch witnesses")
+    entries = _as_list(
+        raw["remote_containment"], "absent-agent-row journal.remote_containment"
+    )
+    if not entries:
+        raise StateError("absent-agent-row journal.remote_containment is empty")
+    order = [checkout.name for checkout in record.checkouts]
+    containment: dict[str, tuple[str, str]] = {}
+    for index, value in enumerate(entries):
+        label = f"absent-agent-row journal.remote_containment[{index}]"
+        entry = _as_mapping(value, label)
+        _exact_keys(entry, {"checkout", "remote_ref", "tip"}, set(), label)
+        name = _as_str(entry["checkout"], f"{label}.checkout")
+        ref = _as_str(entry["remote_ref"], f"{label}.remote_ref")
+        tip = _as_str(entry["tip"], f"{label}.tip")
+        try:
+            _validate_full_ref(ref, f"{label}.remote_ref")
+        except Refusal as exc:
+            raise StateError(f"{label}.remote_ref is invalid") from exc
+        if not ref.startswith(_ABSENT_AGENT_CONTAINING_REF_PREFIXES):
+            raise StateError(f"{label}.remote_ref must name a branch or rescue ref")
+        if SHA_RE.fullmatch(tip) is None:
+            raise StateError(f"{label}.tip must be one full object SHA")
+        if name not in order or name in containment:
+            raise StateError(f"{label}.checkout must name one distinct recorded checkout")
+        containment[name] = (ref, tip)
+    if list(containment) != [name for name in order if name in containment]:
+        raise StateError("absent-agent-row remote containment is not in checkout order")
+    return containment
 
 
 def _absent_agent_journal_inputs(
@@ -35062,6 +35911,7 @@ def _absent_agent_journal_inputs(
             raise StateError(
                 f"absent-agent-row branch witness differs from checkout {checkout.name}"
             )
+    containment = _absent_agent_containment_from_journal(raw, record, legacy_branches)
     receipts = tuple(
         _as_mapping(value, f"absent-agent-row journal.preserved[{index}]")
         for index, value in enumerate(_as_list(raw["preserved"], "absent-agent-row journal.preserved"))
@@ -35092,6 +35942,7 @@ def _absent_agent_journal_inputs(
             branch_witnesses,
             include_branch_witness=not legacy_branches,
             rescue_root=rescue_root,
+            containment=containment,
         )
         expected_archive = _absent_agent_archive_entry(
             record, item, finished_at, expected_receipts
@@ -35127,6 +35978,7 @@ def _assert_absent_agent_safe(
     removed: AbstractSet[str] = frozenset(),
     *,
     preserved: AbstractSet[str] = frozenset(),
+    containment: Mapping[str, tuple[str, str]] | None = None,
 ) -> tuple[
     tuple[Path, ...],
     tuple[_AbsentAgentBranchWitness, ...],
@@ -35153,6 +36005,7 @@ def _assert_absent_agent_safe(
         selected_witnesses,
         removed,
         preserved=preserved,
+        containment=containment,
     )
     return paths, selected_witnesses, receipts
 
@@ -35199,12 +36052,14 @@ def _recover_absent_agent_row(
     preserved_names = frozenset(
         checkout.name for checkout in recorded.checkouts[:preserved_count]
     )
+    containment = _absent_agent_receipt_containment(planned)
     _assert_absent_agent_safe(
         config,
         current,
         branch_witnesses,
         frozenset(removed_names),
         preserved=preserved_names,
+        containment=containment,
     )
     journal = dict(raw)
     preserved = [
@@ -35227,15 +36082,19 @@ def _recover_absent_agent_row(
         authorities[len(preserved) :],
     ):
         _stored, repository = _stored_repository_path(config, checkout.repository)
-        # _assert_absent_agent_safe above refused unless salvage_push_remotes
-        # lists every checkout's remote.
-        vcs.push_salvage(
-            repository,
-            checkout.remote,
-            checkout.head,
-            _as_str(receipt["remote_ref"], "agent-row rescue ref"),
-            authority,
-        )
+        # An already-on-remote receipt pushes nothing: _assert_absent_agent_safe
+        # above re-verified that its existing remote ref still contains the
+        # recorded HEAD. Every other receipt pushes a rescue ref, and
+        # _assert_absent_agent_safe refused unless salvage_push_remotes lists
+        # that checkout's remote.
+        if receipt.get("disposition") != _ABSENT_AGENT_ALREADY_ON_REMOTE:
+            vcs.push_salvage(
+                repository,
+                checkout.remote,
+                checkout.head,
+                _as_str(receipt["remote_ref"], "agent-row rescue ref"),
+                authority,
+            )
         preserved.append(dict(receipt))
         journal["preserved"] = preserved
         _write_journal(config, journal)
@@ -35243,7 +36102,18 @@ def _recover_absent_agent_row(
     for checkout, receipt, authority in zip(recorded.checkouts, planned, authorities):
         remote_ref = _as_str(receipt["remote_ref"], "agent-row rescue ref")
         _stored, repository = _stored_repository_path(config, checkout.repository)
-        if (
+        if receipt.get("disposition") == _ABSENT_AGENT_ALREADY_ON_REMOTE:
+            if (
+                vcs.remote_ref_contains_commit(
+                    repository, checkout.remote, remote_ref, checkout.head, authority
+                )
+                is None
+            ):
+                raise Refusal(
+                    f"existing remote ref {remote_ref} for {checkout.name} no longer "
+                    "contains its HEAD"
+                )
+        elif (
             vcs.remote_ref_sha(
                 repository, checkout.remote, remote_ref, authority
             )
@@ -35253,9 +36123,11 @@ def _recover_absent_agent_row(
     journal["phase"] = "preserved"
     _write_journal(config, journal)
     removed = list(removed_names)
-    for checkout, witness in zip(
+    for checkout, witness, receipt, authority in zip(
         recorded.checkouts[len(removed) :],
         branch_witnesses[len(removed) :],
+        planned[len(removed) :],
+        authorities[len(removed) :],
         strict=True,
     ):
         _stored, repository = _stored_repository_path(config, checkout.repository)
@@ -35264,12 +36136,71 @@ def _recover_absent_agent_row(
         registration = vcs.worktree_registration(repository, checkout_path)
         if registration is not None:
             _assert_absent_agent_registration(checkout, witness, registration)
-            # Remote preservation can take long enough for the missing path to
-            # reappear. Refuse before asking Git to remove the registration so
-            # the ordinary `git worktree remove --force` path does not knowingly
-            # delete newly materialized storage.
-            _assert_absent_agent_storage(config, recorded)
-            vcs.remove_worktree(repository, checkout_path, force=True)
+            retained = (
+                "the ACTIVE row, the recovery journal, and this checkout's Git "
+                "registration"
+            )
+            if receipt.get("disposition") == _ABSENT_AGENT_ALREADY_ON_REMOTE:
+                # Nothing recovery pushed preserves this HEAD, so check the
+                # existing ref again before this registration, not just before
+                # the first one, is removed. Every remote operation precedes
+                # the index lock below; every check under it is local.
+                remote_ref = _as_str(receipt["remote_ref"], "agent-row containing ref")
+                if (
+                    vcs.remote_ref_contains_commit(
+                        repository, checkout.remote, remote_ref, checkout.head, authority
+                    )
+                    is None
+                ):
+                    raise Refusal(
+                        f"existing remote ref {remote_ref} stopped containing the "
+                        f"recorded HEAD {checkout.head} of absent checkout "
+                        f"{checkout.name} before its Git registration was removed. "
+                        f"state: REFUSED -- {retained} were retained. remedy: restore "
+                        "a remote ref containing that commit, then rerun recover"
+                    )
+            if not vcs.commit_present(repository, checkout.head):
+                # A resumed recovery can find the preserved HEAD pruned from
+                # the local repository. Fetch it back, as objects only, from
+                # the remote ref that preserves it, so the checks below can
+                # compare this worktree's index and refs with it.
+                remote_ref = _as_str(receipt["remote_ref"], "agent-row preserving ref")
+                if (
+                    vcs.remote_ref_contains_commit(
+                        repository, checkout.remote, remote_ref, checkout.head, authority
+                    )
+                    is None
+                ):
+                    raise Refusal(
+                        f"the local repository no longer holds the recorded HEAD "
+                        f"{checkout.head} of absent checkout {checkout.name}, and remote "
+                        f"ref {remote_ref} no longer contains it, so its Git "
+                        f"registration cannot be checked. state: REFUSED -- {retained} "
+                        "were retained. remedy: restore a remote ref containing that "
+                        "commit, then rerun recover"
+                    )
+            # Holding Git's index lock keeps any Git command from staging or
+            # committing in this worktree from these checks until the removal,
+            # which deletes the lock with the administrative directory.
+            with vcs.worktree_index_locked(repository, checkout_path):
+                registration = vcs.worktree_registration(repository, checkout_path)
+                if registration is None:
+                    raise Refusal(
+                        f"Git registration for absent checkout {checkout.name} "
+                        f"disappeared during recovery. state: REFUSED -- {retained} "
+                        "were retained. remedy: rerun recover"
+                    )
+                _assert_absent_agent_registration(checkout, witness, registration)
+                _assert_absent_agent_branch_witness(repository, checkout, witness, vcs)
+                _assert_absent_agent_worktree_state_preserved(
+                    vcs, repository, checkout_path, checkout, authority, retained
+                )
+                # Remote preservation can take long enough for the missing path
+                # to reappear. Refuse before asking Git to remove the
+                # registration so the ordinary `git worktree remove --force`
+                # path does not knowingly delete newly materialized storage.
+                _assert_absent_agent_storage(config, recorded)
+                vcs.remove_worktree(repository, checkout_path, force=True)
         if vcs.worktree_registration(repository, checkout_path) is not None:
             raise Refusal(f"Git still registers absent checkout {checkout.name}")
         _assert_absent_agent_branch_witness(repository, checkout, witness, vcs)
@@ -35285,6 +36216,7 @@ def _recover_absent_agent_row(
         branch_witnesses,
         frozenset(checkout.name for checkout in recorded.checkouts),
         preserved=frozenset(checkout.name for checkout in recorded.checkouts),
+        containment=containment,
     )
     if archived is None:
         archive = _append_archive_once(
@@ -35398,10 +36330,21 @@ def _recover_absent_agent_row_item(
                 sort_keys=True,
                 separators=(",", ":"),
             )
+            planned_containment = _absent_agent_receipt_containment(receipts)
+            rendered_containment = (
+                " remote_containment="
+                + json.dumps(
+                    _absent_agent_containment_to_obj(planned_containment),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                if planned_containment
+                else ""
+            )
             print(
                 f"ROW machine={item.machine} slot={item.slot} generation={item.generation} "
                 "outcome=planned detail=physical-storage-absent "
-                f"branch_witnesses={rendered_witnesses}"
+                f"branch_witnesses={rendered_witnesses}{rendered_containment}"
             )
             return "would-recover"
         assert coordinator is not None
@@ -35426,6 +36369,11 @@ def _recover_absent_agent_row_item(
                 record, item, finished_at, receipts
             ),
         }
+        receipt_containment = _absent_agent_receipt_containment(receipts)
+        if receipt_containment:
+            journal["remote_containment"] = _absent_agent_containment_to_obj(
+                receipt_containment
+            )
         _write_journal(config, journal)
         _interrupt_for_test("after-absent-agent-journal")
         _recover_absent_agent_row(config, _journal_path(config), journal, coordinator)
@@ -42239,11 +43187,19 @@ usage or audit gate unknown, 3 fail-closed refusal.
         description=(
             "Bind one machine, slot, generation, and ACTIVE-record SHA-256. The default "
             "is a read-only plan. --apply proves registered and operating-system liveness, "
-            "pushes every recorded checkout HEAD to an individual rescue ref and reads it "
-            "back, removes only exact stale Git worktree registrations, archives the absent "
-            "storage and its limitations, and only then removes the ACTIVE row. Both the "
-            "plan and --apply refuse a checkout whose remote is not listed in "
-            "salvage_push_remotes. A registered liveness verdict of alive is overridden, "
+            "preserves every recorded checkout HEAD on that checkout's remote, removes only "
+            "exact stale Git worktree registrations, archives the absent storage and its "
+            "limitations, and only then removes the ACTIVE row. A HEAD whose remote is "
+            "listed in salvage_push_remotes is pushed to an individual rescue ref and read "
+            "back. For any other remote nothing is published: the checkout is accepted only "
+            "when an existing branch or rescue ref on that remote already contains the HEAD, "
+            "checked with git merge-base --is-ancestor against a freshly fetched copy of the "
+            "ref when planning and again before each registration is removed; a shallow "
+            "remote is refused. Either way a registration is removed only while what Git "
+            "kept for the deleted checkout holds nothing beyond that HEAD: no staged or "
+            "unmerged index content, no per-worktree ref outside its history, and no "
+            "unfinished merge, rebase, cherry-pick, revert, or bisect. Otherwise both the "
+            "plan and --apply refuse. A registered liveness verdict of alive is overridden, "
             "with a NOTE on standard error, only when the exact recorded owner "
             "generation (PID, start ticks, boot) is proven dead from the initial PID "
             "namespace: the verdict names the agent, and another live process carrying "
