@@ -789,7 +789,7 @@ pub(crate) fn is_official_discord_api_base(api_base: &str) -> bool {
 }
 
 /// Default Slack Web API base.
-pub const DEFAULT_SLACK_API_BASE: &str = "https://slack.com/api";
+pub const DEFAULT_SLACK_API_BASE: &str = crate::slack::DEFAULT_SLACK_API_BASE;
 
 /// Default ElevenLabs API base.
 pub const DEFAULT_ELEVENLABS_API_BASE: &str = "https://api.elevenlabs.io/v1";

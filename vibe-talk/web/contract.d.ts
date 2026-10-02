@@ -141,8 +141,8 @@ declare namespace VibeTalk {
      * that channel's provider entry here instead, so a channel read through a provider without
      * threads is never offered a thread view because some other provider has one.
      *
-     * Optional on the wire: an older server sends none, and the page then treats the
-     * deployment-wide flags as the one provider's.
+     * Sent only when there are several providers. With one, and from an older server, it is
+     * absent and the deployment-wide flags are that provider's.
      */
     providers?: ProviderDescription[];
     /**

@@ -330,7 +330,10 @@ async fn a_channel_added_by_link_stays_with_its_provider_across_a_restart() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(second.slack.unregistration_calls(), std::slice::from_ref(&added));
+    assert_eq!(
+        second.slack.unregistration_calls(),
+        std::slice::from_ref(&added)
+    );
     assert!(second.state.providers.key_for(&added).is_none());
     assert!(second.discord.unregistration_calls().is_empty());
 }

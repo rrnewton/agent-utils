@@ -608,9 +608,15 @@ pub async fn client_config(
     State(state): State<AppState>,
     ReadScope(scope): ReadScope,
 ) -> Result<Json<ClientConfigResponse>, ApiError> {
-    let providers: Vec<crate::contract::ProviderDescription> = state
-        .providers
-        .entries()
+    // Only a deployment with several providers describes them one by one. With one, the
+    // deployment-wide fields below ARE that provider's, and the answer keeps the shape it had
+    // before multi-provider support.
+    let described = if state.providers.is_multi() {
+        state.providers.entries()
+    } else {
+        &[]
+    };
+    let providers: Vec<crate::contract::ProviderDescription> = described
         .iter()
         .map(|entry| crate::contract::ProviderDescription {
             key: entry.key.clone(),

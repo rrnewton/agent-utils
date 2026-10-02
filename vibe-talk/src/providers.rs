@@ -123,9 +123,18 @@ impl ChatRouter {
                 ProviderKind::Discord(discord) => {
                     Arc::new(crate::discord::http::HttpDiscordClient::new(discord)?)
                 }
-                ProviderKind::Slack(_) => {
-                    return Err(ChatError::Refused("SLACK-MERGE-PENDING".to_owned()));
-                }
+                ProviderKind::Slack(slack) => Arc::new(crate::slack::HttpSlackClient::new(
+                    &crate::slack::SlackConfig {
+                        provider_name: provider.name.clone(),
+                        api_base: slack.api_base.clone(),
+                        token: slack.token.clone(),
+                        owner_user_id: slack.owner_user_id.clone(),
+                        request_timeout_seconds: slack.request_timeout_seconds,
+                        channel_registration: slack.channel_registration,
+                        registered_channels_writable: slack.registered_channels_writable,
+                        channel_discovery: slack.channel_discovery,
+                    },
+                )?),
             };
             entries.push(ProviderEntry {
                 key: provider.key.clone(),

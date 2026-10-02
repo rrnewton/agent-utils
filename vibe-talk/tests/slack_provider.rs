@@ -506,6 +506,7 @@ async fn a_channel_narrowed_to_one_thread_reads_posts_and_pages_inside_that_thre
                 writable: true,
                 alias: None,
                 added: true,
+                provider: Some("slack".to_owned()),
             }],
         )
         .await;

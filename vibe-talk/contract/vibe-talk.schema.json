@@ -118,7 +118,7 @@
           ]
         },
         "providers": {
-          "description": "Each configured chat provider and what it can do, in configuration order.\n\nEvery channel names its provider by key ([`ChannelInfo::provider`]). The deployment-wide\nflags above say whether ANY provider can do something; a page showing one channel uses\nthat channel's provider entry here instead, so a channel read through a provider without\nthreads is never offered a thread view because some other provider has one.\n\nOptional on the wire: an older server sends none, and the page then treats the\ndeployment-wide flags as the one provider's.",
+          "description": "Each configured chat provider and what it can do, in configuration order.\n\nEvery channel names its provider by key ([`ChannelInfo::provider`]). The deployment-wide\nflags above say whether ANY provider can do something; a page showing one channel uses\nthat channel's provider entry here instead, so a channel read through a provider without\nthreads is never offered a thread view because some other provider has one.\n\nSent only when there are several providers. With one, and from an older server, it is\nabsent and the deployment-wide flags are that provider's.",
           "items": {
             "$ref": "#/$defs/ProviderDescription"
           },
