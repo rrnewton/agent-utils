@@ -55,6 +55,7 @@ pub mod probe;
 pub mod providers;
 pub mod replay;
 pub mod retrieval;
+pub mod slack;
 pub mod speakable;
 pub mod speech;
 pub mod speech_tickets;

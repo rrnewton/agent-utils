@@ -629,6 +629,123 @@ return Discord's 429 with a `Retry-After` and can carry the bucket headers on a 
 tests measure the waits on a paused clock. The header names, the body field and the rounding
 behaviour come from Discord's published documentation; none of it has met live Discord.
 
+## Slack
+
+The Slack provider reads and posts in Slack conversations — public and private channels, direct
+messages, group messages — and in single threads, through a small fixed part of the Slack Web
+API. Everything the app does with a Discord channel works with a Slack one: the main timeline,
+the thread list, one thread, the flat view, posting and replying, adding a channel by pasting a
+link, and the channel browser.
+
+### Setting up a Slack app
+
+1. At <https://api.slack.com/apps>, **Create New App → From scratch**, and pick the workspace.
+2. Under **OAuth & Permissions**, add these scopes — as **Bot Token Scopes** for a bot token, or
+   as **User Token Scopes** for a user token:
+
+   ```text
+   channels:history groups:history im:history mpim:history
+   channels:read groups:read im:read mpim:read
+   users:read chat:write
+   ```
+
+   `*:history` reads messages, `*:read` lets the channel browser and registration see
+   conversations, `users:read` turns user ids into names, and `chat:write` posts. Leave out
+   `chat:write` for a read-only deployment.
+3. **Install to Workspace** and copy the token.
+
+**Bot or user token.** A bot token (`xoxb-…`) posts as the app and reads only conversations the
+app has been added to: `/invite @your-app` in each channel, and direct messages only with the
+app itself. A user token (`xoxp-…`) reads what you can read and posts **as you**; set
+`owner_user_id` to your own id, so your own messages are drawn as yours either way. Your id is
+under your profile's **⋮ → Copy member ID**.
+
+### Configuration
+
+```toml
+[[providers]]
+key = "slack"
+kind = "slack"
+name = "Slack"                       # the name the app shows
+api_base = "https://slack.com/api"   # the default; or a compatible bridge, below
+token = "xoxb-…"                     # secret
+owner_user_id = "U0123ABCD"          # your own Slack member id
+request_timeout_seconds = 20
+channel_registration = true          # accept Slack links in "Add channel"
+registered_channels_writable = false # whether channels added that way may be posted to
+channel_discovery = true             # offer the channel browser
+live_poll_seconds = 30               # 0 is off; see "Live push"
+
+[[channels]]
+id = "C0123ABCD"
+label = "team chat"
+writable = true
+provider = "slack"
+
+[[channels]]
+id = "C0123ABCD~1700000000.000100"   # one thread of that conversation
+label = "release thread"
+writable = false
+provider = "slack"
+```
+
+**Channel ids.** A whole conversation is its Slack id: `C…` for a channel, `G…` for a private
+one, `D…` for a direct message. A channel narrowed to **one thread** is
+`{conversation}~{thread ts}`: its main view is that thread, root first, posts go into it, and it
+offers no thread navigation of its own. "Add channel" accepts a conversation id, a link copied
+from Slack (`https://<workspace>.slack.com/archives/C…`, or a message link `…/p1700000000000100`,
+which adds that message's thread), or a web-client link (`https://app.slack.com/client/T…/C…`).
+Adding creates nothing in Slack, so removing a channel from the app changes nothing there either.
+
+**Message ids.** Slack names a message by its `ts`, seconds and microseconds. vibe-talk orders,
+pages and dates messages by Discord-style snowflakes, so a `ts` is encoded as one —
+`((ms − 1420070400000) << 22) | (µs % 1000)` — which orders exactly as the `ts` does, carries its
+millisecond, and decodes back exactly. A message from before 2015 cannot be encoded and is not
+shown. A thread's id is its root's `ts`.
+
+**Replies.** Slack has no reply pointer; its only reply is a thread reply. Replying to a message in
+a whole conversation posts in that message's thread, starting one when it has none. Only user
+mentions (`<@U…>`) in a posted message notify anyone: `<!here>`, `<!channel>` and the like are
+escaped, as `@everyone` is suppressed on Discord.
+
+**What is shown.** Joins, leaves, topic changes and other system events are left out; ordinary,
+bot, file-share, `/me` and thread-broadcast messages are kept. Slack's link, channel and
+group-mention markup is rewritten into the markdown the rest of the app reads.
+
+### Limits
+
+* **No push yet.** There is no Events API or Socket Mode connection: new messages arrive by the
+  provider's `live_poll_seconds` polling, which reads each conversation's own timeline. Replies
+  inside threads are read when a thread, or a channel narrowed to one, is opened.
+* **No upstream read marks.** What you have read is vibe-talk's own record, as on Discord.
+* **Bounded reads.** A page Slack (or a bridge) returns may hold fewer messages than were asked
+  for; reads follow the cursor and stop at a fixed page budget. A walk never skips a message to
+  stay inside that budget: it returns a shorter page, or none, and the next read continues from
+  where it stopped. The thread list scans the newest 10 pages of history and says so when it
+  stopped there; the flat view includes replies for at most 10 threads per page and the newest
+  50 replies of each, and says so when either bound applied.
+* **Rate limits** are waited out within 30 seconds per request, honouring `Retry-After`; beyond
+  that the request fails with a message that names the limit. An author's name never waits: it
+  falls back to the user id.
+
+### A compatible bridge
+
+`api_base` may point at anything that implements exactly these Web API methods, as form-encoded
+`POST {api_base}/{method}` with `Authorization: Bearer <token>`, answering Slack's JSON:
+
+| Method | Parameters used |
+|---|---|
+| `auth.test` | — |
+| `conversations.info` | `channel` |
+| `conversations.history` | `channel`, `limit`, `cursor`, `oldest`, `latest`, `inclusive` |
+| `conversations.replies` | `channel`, `ts`, `limit`, `cursor`, `oldest`, `latest`, `inclusive` |
+| `chat.postMessage` | `channel`, `text`, `thread_ts` |
+| `users.info` | `user` |
+| `users.conversations` | `types`, `limit`, `cursor`, `exclude_archived` |
+
+A bridge may cap any page below the `limit` asked for, as long as `has_more` and
+`response_metadata.next_cursor` say so.
+
 ## Checking a deployment
 
 One command, against a running server, local or public:
