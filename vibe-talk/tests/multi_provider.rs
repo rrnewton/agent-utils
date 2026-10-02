@@ -3,6 +3,7 @@
 //! stays with the provider that registered it across a restart.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -271,6 +272,75 @@ async fn pushed_events_are_refused_for_a_channel_whose_provider_is_polled() {
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slack_hint_wakes_only_the_slack_provider_task() {
+    let Deployment {
+        state,
+        discord,
+        slack,
+        ..
+    } = deployment(None);
+    let discord_client = Arc::clone(&state.providers.entry("discord").expect("discord").client);
+    let slack_client = Arc::clone(&state.providers.entry("slack").expect("slack").client);
+    let interval = Duration::from_secs(3_600);
+    let discord_poller = tokio::spawn(vibe_talk::live::poll_forever(
+        state.clone(),
+        Some("discord".to_owned()),
+        discord_client,
+        50,
+        interval,
+    ));
+    let slack_poller = tokio::spawn(vibe_talk::live::poll_forever(
+        state.clone(),
+        Some("slack".to_owned()),
+        slack_client,
+        50,
+        interval,
+    ));
+    for _ in 0..100 {
+        if discord.fetch_count() >= 2 && slack.fetch_count() >= 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(discord.fetch_count(), 2, "Discord startup did not seed");
+    assert_eq!(slack.fetch_count(), 1, "Slack startup did not seed");
+    tokio::task::yield_now().await;
+
+    let channel = ChannelId(SLACK_CHANNEL.to_owned());
+    let mut subscriber = state.live.subscribe(&channel, None).receiver;
+    slack.seed(&channel, "slack-user", "arrived from Slack");
+    let (status, body) = call(
+        &state,
+        "POST",
+        "/api/v1/live/hints",
+        INGEST_TOKEN,
+        Some(json!({"channel_id": SLACK_CHANNEL})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(vibe_talk::live::HINT_COALESCE_MILLIS)).await;
+    for _ in 0..100 {
+        if slack.fetch_count() >= 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(slack.fetch_count(), 2, "the Slack hint was not consumed");
+    assert_eq!(
+        discord.fetch_count(),
+        2,
+        "a Slack hint crossed its provider partition and woke Discord"
+    );
+    let published = subscriber
+        .try_recv()
+        .expect("Slack message was not published");
+    assert_eq!(published.message.content, "arrived from Slack");
+    discord_poller.abort();
+    slack_poller.abort();
 }
 
 #[tokio::test]

@@ -4,10 +4,12 @@
 //! back. This module is the one place that runs without being asked, so the two decisions behind
 //! it are written down here rather than left to be inferred from the code.
 //!
-//! There are two mutually exclusive producers. The built-in Discord path is bounded polling; an
-//! external provider adapter can instead push normalized create, update, and delete events through
-//! the authenticated `/api/v1/live/events` endpoint. Both publish into the same [`LiveHub`], and
-//! the browser always consumes the same SSE stream.
+//! There are two mutually exclusive MESSAGE producers. The built-in provider path is bounded
+//! polling; an external provider adapter can instead push normalized create, update, and delete
+//! events through the authenticated `/api/v1/live/events` endpoint. Both publish into the same
+//! [`LiveHub`], and the browser always consumes the same SSE stream. A polled provider may also
+//! receive content-free `/api/v1/live/hints`: a hint merely wakes its existing cursor, while the
+//! periodic interval remains the recovery path, so it is not a second producer.
 //!
 //! # The built-in Discord source is bounded POLLING, not a Gateway connection
 //!
@@ -50,8 +52,9 @@
 //! reaches this loop — see [`crate::discord::ratelimit`]. That makes a tick cheaper to get wrong,
 //! not free. So polling is still **off unless configured** (`discord.live_poll_seconds`, default
 //! 0), the interval still has a floor the configuration refuses to go below, and a failing channel
-//! still backs off rather than hammering — see [`backoff`]. Push ingestion is separately opt-in
-//! with `ingest.token`, and configuration refuses to enable both sources at once.
+//! still backs off rather than hammering — see [`backoff`]. Adapter authentication is separately
+//! opt-in with `ingest.token`; full pushed events remain refused for a provider this server polls,
+//! while content-free hints safely wake that poller without bypassing its backoff.
 //!
 //! The two waits nest rather than compete: the client's is the inner, precise one Discord asked
 //! for, and [`backoff`] is the outer one, which never waits LESS than Discord's outstanding
@@ -107,7 +110,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use crate::chat::{ChatClient, ChatError};
 use crate::contract::{LiveDeleteEvent, LiveMessageEvent, LiveResetEvent};
@@ -154,6 +157,15 @@ const INGEST_EVENT_PREFIX: &str = "push:";
 /// does not yet handle, so an operator who types `1` should be refused with a reason rather than
 /// quietly given a request storm.
 pub const MIN_POLL_SECONDS: u64 = 5;
+
+/// How briefly a change-hint wake-up waits for the rest of the same upstream burst.
+///
+/// Provider event streams commonly replay several records together after connecting. A hint is
+/// deliberately content-free, so polling once for the burst is both cheaper and just as current
+/// as polling once per record. The first wake-up waits only one tenth of a second; sustained
+/// hint-driven reads are separately spaced by [`MIN_POLL_SECONDS`] so this fast path cannot bypass
+/// the configured polling safety floor.
+pub const HINT_COALESCE_MILLIS: u64 = 100;
 
 /// What happened to the message carried by a live event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,10 +224,23 @@ struct Feed {
 /// the poll loop only ever visits the configured channels. A hub that carried its own copy of the
 /// allowlist would be a second definition of "which channels exist" — and two of those is how one
 /// of them goes stale.
-#[derive(Default)]
 pub struct LiveHub {
     feeds: Mutex<BTreeMap<ChannelId, Feed>>,
     self_posted: Mutex<(VecDeque<MessageId>, BTreeSet<MessageId>)>,
+    hinted: Mutex<BTreeMap<Option<String>, BTreeSet<ChannelId>>>,
+    hint_generation: watch::Sender<u64>,
+}
+
+impl Default for LiveHub {
+    fn default() -> Self {
+        let (hint_generation, _receiver) = watch::channel(0);
+        Self {
+            feeds: Mutex::new(BTreeMap::new()),
+            self_posted: Mutex::new((VecDeque::new(), BTreeSet::new())),
+            hinted: Mutex::new(BTreeMap::new()),
+            hint_generation,
+        }
+    }
 }
 
 impl LiveHub {
@@ -223,6 +248,36 @@ impl LiveHub {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Queue one content-free request to poll `channel` now.
+    ///
+    /// The provider key is `None` for a single-provider deployment, matching the poll task's own
+    /// key, and `Some` in a multi-provider deployment. Repeated hints coalesce until that task
+    /// takes the channel. The periodic poll remains the recovery path, so a full notification
+    /// buffer, process restart, or event-stream gap can delay a read but cannot make the hint the
+    /// only record that a message existed.
+    #[must_use]
+    pub fn queue_hint(&self, provider_key: Option<&str>, channel: &ChannelId) -> bool {
+        let inserted = lock(&self.hinted)
+            .entry(provider_key.map(str::to_owned))
+            .or_default()
+            .insert(channel.clone());
+        if inserted {
+            let next = (*self.hint_generation.borrow()).wrapping_add(1);
+            self.hint_generation.send_replace(next);
+        }
+        inserted
+    }
+
+    fn subscribe_hints(&self) -> watch::Receiver<u64> {
+        self.hint_generation.subscribe()
+    }
+
+    fn take_hints(&self, provider_key: Option<&str>) -> BTreeSet<ChannelId> {
+        lock(&self.hinted)
+            .remove(&provider_key.map(str::to_owned))
+            .unwrap_or_default()
     }
 
     /// Remember that this server posted `id`, so the poll that reads it back can say so.
@@ -680,10 +735,13 @@ async fn poll_state_loop(
                 .map(|channel| channel.id)
                 .collect()
         },
-        limit,
-        interval,
         cursors,
-        ticks,
+        LoopConfig {
+            limit,
+            interval,
+            ticks,
+            hints: Some((state.live.as_ref(), provider_key)),
+        },
     )
     .await;
 }
@@ -709,36 +767,77 @@ async fn poll_loop(
         chat,
         hub,
         || channels.clone(),
-        limit,
-        interval,
         cursors,
-        ticks,
+        LoopConfig {
+            limit,
+            interval,
+            ticks,
+            hints: None,
+        },
     )
     .await;
+}
+
+struct LoopConfig<'a> {
+    limit: u16,
+    interval: Duration,
+    ticks: Option<u32>,
+    hints: Option<(&'a LiveHub, Option<&'a str>)>,
 }
 
 async fn poll_loop_with_channels(
     chat: &dyn ChatClient,
     hub: &LiveHub,
     mut channels: impl FnMut() -> Vec<ChannelId>,
-    limit: u16,
-    interval: Duration,
     cursors: &mut BTreeMap<ChannelId, Option<u64>>,
-    ticks: Option<u32>,
+    config: LoopConfig<'_>,
 ) {
+    let LoopConfig {
+        limit,
+        interval,
+        ticks,
+        hints,
+    } = config;
+    let (hint_hub, hint_provider_key) =
+        hints.map_or((None, None), |(hub, provider)| (Some(hub), provider));
     let max_backoff = interval.saturating_mul(MAX_BACKOFF_INTERVALS);
     let mut failures: BTreeMap<ChannelId, u32> = BTreeMap::new();
     let mut behind: BTreeMap<ChannelId, bool> = BTreeMap::new();
     let mut remaining = ticks;
+    let mut hinted_only: Option<BTreeSet<ChannelId>> = None;
+    let mut hint_generation = hint_hub.map(LiveHub::subscribe_hints);
+    // Hinted reads must not move this deadline. Otherwise a busy channel can keep resetting an
+    // interval-shaped sleep and starve reconciliation for every quieter channel on its provider.
+    let mut next_reconciliation = hint_hub.map(|_| tokio::time::Instant::now());
+    // The first hint is latency-sensitive and may run immediately. Once it does, subsequent
+    // hint-driven reads respect the same five-second floor as configured polling.
+    let mut next_hint_read = hint_hub.map(|_| tokio::time::Instant::now());
     loop {
-        let channels = channels();
-        let current: BTreeSet<_> = channels.iter().cloned().collect();
+        let all_channels = channels();
+        let current: BTreeSet<_> = all_channels.iter().cloned().collect();
         // Removal is durable state, not a pause. If the same channel is added later it must seed
         // from Discord again instead of resuming an old cursor and publishing the intervening
         // history as if it had just arrived.
         cursors.retain(|channel, _| current.contains(channel));
         failures.retain(|channel, _| current.contains(channel));
         behind.retain(|channel, _| current.contains(channel));
+        let requested = hinted_only.take();
+        let full_reconciliation = requested.is_none();
+        // A full reconciliation already reads every channel for this provider. Discard hints
+        // queued before it began; anything queued after this take remains pending and wakes the
+        // next read, closing the fetch race without paying for every replayed event individually.
+        if requested.is_none() {
+            if let Some(hint_hub) = hint_hub {
+                hint_hub.take_hints(hint_provider_key);
+            }
+        }
+        let channels: Vec<_> = match requested {
+            Some(requested) => all_channels
+                .into_iter()
+                .filter(|channel| requested.contains(channel))
+                .collect(),
+            None => all_channels,
+        };
         let mut wait = interval;
         for channel in &channels {
             let cursor = cursors.entry(channel.clone()).or_default();
@@ -824,7 +923,77 @@ async fn poll_loop_with_channels(
                 return;
             }
         }
-        tokio::time::sleep(wait).await;
+        if full_reconciliation {
+            next_reconciliation = Some(tokio::time::Instant::now() + interval);
+        } else {
+            next_hint_read =
+                Some(tokio::time::Instant::now() + Duration::from_secs(MIN_POLL_SECONDS));
+        }
+        // A failing provider already asked this loop to back off. A hint must not turn that
+        // protection into a hammering path, so wake-ups shorten only the ordinary healthy wait.
+        if wait > interval {
+            tokio::time::sleep(wait).await;
+            continue;
+        }
+        let (Some(hint_hub), Some(hint_generation)) = (hint_hub, hint_generation.as_mut()) else {
+            tokio::time::sleep(wait).await;
+            continue;
+        };
+        let reconciliation_deadline =
+            next_reconciliation.expect("a hint receiver always has a reconciliation deadline");
+        hinted_only = wait_for_hints(
+            hint_hub,
+            hint_provider_key,
+            hint_generation,
+            reconciliation_deadline,
+        )
+        .await;
+        if hinted_only.is_some() {
+            tokio::time::sleep(Duration::from_millis(HINT_COALESCE_MILLIS)).await;
+            let next_wake = next_hint_read
+                .expect("a hint receiver always has a hint-read deadline")
+                .min(reconciliation_deadline);
+            tokio::time::sleep_until(next_wake).await;
+            if tokio::time::Instant::now() >= reconciliation_deadline {
+                // The full pass consumes every pending hint for this provider and reads every
+                // channel, so prefer it once due instead of paying for a hinted read first.
+                hinted_only = None;
+            } else if let Some(hinted) = hinted_only.as_mut() {
+                hinted.extend(hint_hub.take_hints(hint_provider_key));
+            }
+        }
+    }
+}
+
+/// Wait for either the ordinary reconciliation tick or at least one queued change hint.
+///
+/// The synchronous `take_hints` before `changed` closes both startup races: a hint queued before
+/// this receiver existed is still found, and one queued between the take and the await changes
+/// the generation and wakes it immediately. A stale generation with an already-drained set is a
+/// harmless loop, not an extra provider read.
+async fn wait_for_hints(
+    hub: &LiveHub,
+    provider_key: Option<&str>,
+    generation: &mut watch::Receiver<u64>,
+    reconciliation_deadline: tokio::time::Instant,
+) -> Option<BTreeSet<ChannelId>> {
+    let hinted = async {
+        loop {
+            let pending = hub.take_hints(provider_key);
+            if !pending.is_empty() {
+                return pending;
+            }
+            if generation.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    tokio::select! {
+        // When both become ready together, reconciliation wins. Random branch choice here would
+        // put the non-starvation guarantee at the mercy of a hot hint stream.
+        biased;
+        () = tokio::time::sleep_until(reconciliation_deadline) => None,
+        pending = hinted => Some(pending),
     }
 }
 
@@ -842,6 +1011,218 @@ mod tests {
         let fake = Arc::new(FakeDiscord::new());
         fake.register_channel(channel);
         fake
+    }
+
+    #[test]
+    fn change_hints_coalesce_only_within_their_provider_partition() {
+        let hub = LiveHub::new();
+        let channel = ChannelId("1111".to_owned());
+        let other = ChannelId("2222".to_owned());
+
+        assert!(hub.queue_hint(Some("slack"), &channel));
+        assert!(!hub.queue_hint(Some("slack"), &channel));
+        assert!(hub.queue_hint(Some("other"), &channel));
+        assert!(hub.queue_hint(None, &other));
+
+        assert_eq!(
+            hub.take_hints(Some("slack")),
+            BTreeSet::from([channel.clone()])
+        );
+        assert!(hub.take_hints(Some("slack")).is_empty());
+        assert_eq!(hub.take_hints(Some("other")), BTreeSet::from([channel]));
+        assert_eq!(hub.take_hints(None), BTreeSet::from([other]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_reconciliation_deadline_wins_over_a_pending_hint() {
+        let hub = LiveHub::new();
+        let channel = ChannelId("1111".to_owned());
+        let mut generation = hub.subscribe_hints();
+        assert!(hub.queue_hint(None, &channel));
+
+        assert!(
+            wait_for_hints(&hub, None, &mut generation, tokio::time::Instant::now())
+                .await
+                .is_none(),
+            "a ready hint won after the full reconciliation deadline was already due"
+        );
+        assert_eq!(
+            hub.take_hints(None),
+            BTreeSet::from([channel]),
+            "the deadline path should leave the hint for the full pass to consume"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sustained_hints_cannot_bypass_the_polling_rate_floor() {
+        let interval = Duration::from_secs(3_600);
+        let channel = ChannelId("1111".to_owned());
+        let fake = fake_with(&channel);
+        let hub = Arc::new(LiveHub::new());
+        let task_fake = Arc::clone(&fake);
+        let task_hub = Arc::clone(&hub);
+        let task_channel = channel.clone();
+        let poller = tokio::spawn(async move {
+            let mut cursors = BTreeMap::new();
+            poll_loop_with_channels(
+                task_fake.as_ref(),
+                task_hub.as_ref(),
+                || vec![task_channel.clone()],
+                &mut cursors,
+                LoopConfig {
+                    limit: 50,
+                    interval,
+                    ticks: Some(3),
+                    hints: Some((task_hub.as_ref(), None)),
+                },
+            )
+            .await;
+        });
+
+        while fake.fetch_count() < 1 {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        assert!(hub.queue_hint(None, &channel));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(HINT_COALESCE_MILLIS)).await;
+        while fake.fetch_count() < 2 {
+            tokio::task::yield_now().await;
+        }
+        let first_hint_read = tokio::time::Instant::now();
+        tokio::task::yield_now().await;
+
+        assert!(hub.queue_hint(None, &channel));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(HINT_COALESCE_MILLIS)).await;
+        let just_before_floor =
+            first_hint_read + Duration::from_secs(MIN_POLL_SECONDS) - Duration::from_millis(1);
+        tokio::time::advance(
+            just_before_floor.saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            fake.fetch_count(),
+            2,
+            "a sustained hint stream bypassed the configured polling rate floor"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        poller.await.expect("poll task");
+        assert_eq!(fake.fetch_count(), 3, "the deferred hint was never read");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hint_cannot_shorten_failure_backoff() {
+        let interval = Duration::from_secs(10);
+        let channel = ChannelId("1111".to_owned());
+        // An unregistered channel fails every authoritative read.
+        let fake = Arc::new(FakeDiscord::new());
+        let hub = Arc::new(LiveHub::new());
+        let task_fake = Arc::clone(&fake);
+        let task_hub = Arc::clone(&hub);
+        let task_channel = channel.clone();
+        let poller = tokio::spawn(async move {
+            let mut cursors = BTreeMap::new();
+            poll_loop_with_channels(
+                task_fake.as_ref(),
+                task_hub.as_ref(),
+                || vec![task_channel.clone()],
+                &mut cursors,
+                LoopConfig {
+                    limit: 50,
+                    interval,
+                    ticks: Some(2),
+                    hints: Some((task_hub.as_ref(), None)),
+                },
+            )
+            .await;
+        });
+
+        while fake.fetch_count() < 1 {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        assert!(hub.queue_hint(None, &channel));
+        tokio::time::advance(Duration::from_secs(19)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            fake.fetch_count(),
+            1,
+            "a hint retried a failing provider before its doubled backoff elapsed"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        poller.await.expect("poll task");
+        assert_eq!(fake.fetch_count(), 2, "the provider was not retried");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn steady_hints_cannot_starve_periodic_reconciliation() {
+        let interval = Duration::from_secs(10);
+        let noisy = ChannelId("1111".to_owned());
+        let quiet = ChannelId("2222".to_owned());
+        let fake = Arc::new(FakeDiscord::new());
+        fake.register_channel(&noisy);
+        fake.register_channel(&quiet);
+        let hub = Arc::new(LiveHub::new());
+        let task_fake = Arc::clone(&fake);
+        let task_hub = Arc::clone(&hub);
+        let task_noisy = noisy.clone();
+        let task_quiet = quiet.clone();
+        let poller = tokio::spawn(async move {
+            let mut cursors = BTreeMap::new();
+            poll_loop_with_channels(
+                task_fake.as_ref(),
+                task_hub.as_ref(),
+                || vec![task_noisy.clone(), task_quiet.clone()],
+                &mut cursors,
+                LoopConfig {
+                    limit: 50,
+                    interval,
+                    ticks: Some(3),
+                    hints: Some((task_hub.as_ref(), None)),
+                },
+            )
+            .await;
+        });
+
+        while fake.fetch_count() < 2 {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(9)).await;
+        assert!(hub.queue_hint(None, &noisy));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(HINT_COALESCE_MILLIS)).await;
+        while fake.fetch_count() < 3 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fake.fetch_count(),
+            3,
+            "the hint should read only its noisy channel"
+        );
+        tokio::task::yield_now().await;
+
+        // The original reconciliation deadline is still ten seconds after the startup pass,
+        // not ten seconds after the hinted pass at 9.1 seconds. It must read BOTH channels now.
+        tokio::time::advance(Duration::from_millis(900)).await;
+        for _ in 0..100 {
+            if poller.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            poller.is_finished(),
+            "the hint moved the reconciliation deadline and starved the quiet channel"
+        );
+        poller.await.expect("poll task");
+        assert_eq!(
+            fake.fetch_count(),
+            5,
+            "the full pass did not read both channels"
+        );
     }
 
     #[tokio::test]

@@ -281,17 +281,19 @@ fn unknown_speech_ticket() -> ApiError {
 }
 
 fn require_ingest(headers: &HeaderMap, state: &AppState) -> Result<(), ApiError> {
-    let configured = state.config.ingest.token.as_ref().ok_or_else(|| {
-        ApiError::new(
-            StatusCode::NOT_FOUND,
-            "ingest_disabled",
-            "live event ingestion is not configured",
-        )
-    })?;
     let header = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
     let presented = auth::bearer_token(header).ok_or(AuthError::Unauthenticated)?;
+    // When ingestion is disabled there is no credential that can authorize this route. Keep that
+    // indistinguishable from a wrong credential instead of revealing the route/configuration to
+    // an anonymous caller with a special 404.
+    let configured = state
+        .config
+        .ingest
+        .token
+        .as_ref()
+        .ok_or(AuthError::Unauthenticated)?;
     if !configured.matches(presented) {
         return Err(AuthError::Unauthenticated.into());
     }
@@ -347,8 +349,21 @@ pub struct IngestEventResponse {
     pub duplicate: bool,
 }
 
+/// A content-free signal that one allowlisted channel may have changed.
+///
+/// The server deliberately ignores the upstream event body. Its configured provider performs the
+/// authoritative read, through the same cursor the periodic reconciliation poll uses.
+#[derive(Debug, Deserialize)]
+pub struct IngestHintRequest {
+    /// Allowlisted channel to read now.
+    pub channel_id: ChannelId,
+}
+
 /// Maximum decoded JSON request size for one event.
 pub const MAX_INGEST_BODY_BYTES: usize = 64 * 1024;
+
+/// Maximum decoded JSON body for one content-free hint.
+pub const MAX_HINT_BODY_BYTES: usize = 1_024;
 
 /// `POST /api/v1/live/events` — authenticated provider-neutral push ingestion.
 ///
@@ -436,8 +451,9 @@ pub async fn ingest_event(
     };
     // One live source per channel. A channel whose provider this server polls is published by
     // the poller; accepting an adapter's copy too would deliver every change twice.
-    if channel
-        .provider
+    if state
+        .providers
+        .key_for(&channel.id)
         .as_deref()
         .and_then(|key| state.providers.entry(key))
         .is_some_and(|entry| entry.live_poll_seconds > 0)
@@ -471,6 +487,84 @@ pub async fn ingest_event(
     let accepted = state
         .live
         .publish_ingested(event_id, kind, historical, &channel_id, message);
+    let status = if accepted {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    Ok((
+        status,
+        Json(IngestEventResponse {
+            accepted,
+            duplicate: !accepted,
+        }),
+    )
+        .into_response())
+}
+
+/// `POST /api/v1/live/hints` — wake one configured provider's existing poll cursor.
+///
+/// A hint is not a message and carries no chat content. It is safe beside periodic polling because
+/// both paths wake the SAME provider reader and advance the SAME in-memory cursor. Repeated hints
+/// coalesce before that reader runs; a missed hint is recovered by the provider's configured poll
+/// interval. Only channels whose provider actually polls are accepted, because an unconsumed hint
+/// would otherwise be acknowledged and silently do nothing.
+pub async fn ingest_hint(
+    State(state): State<AppState>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    // As for full event ingestion, authenticate before reading or parsing any part of the body.
+    require_ingest(request.headers(), &state)?;
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if !content_type.is_some_and(|value| value.eq_ignore_ascii_case("application/json")) {
+        return Err(ApiError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+            "live hints require Content-Type: application/json",
+        ));
+    }
+    let body = axum::body::to_bytes(request.into_body(), MAX_HINT_BODY_BYTES)
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                format!("a live hint may be at most {MAX_HINT_BODY_BYTES} bytes"),
+            )
+        })?;
+    let request: IngestHintRequest = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::bad_request("the live hint body is not valid JSON for this API"))?;
+    let Some(channel) = state.channel(request.channel_id.as_str()) else {
+        return Err(OpError::UnknownChannel.into());
+    };
+    let Some(provider_key) = state.providers.key_for(&channel.id) else {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "channel_has_no_provider",
+            "that channel is not routed to a configured provider",
+        ));
+    };
+    let Some(provider) = state.providers.entry(&provider_key) else {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "channel_has_no_provider",
+            "that channel is not routed to a configured provider",
+        ));
+    };
+    if provider.live_poll_seconds == 0 {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "channel_is_not_polled",
+            "that channel's provider has no polling cursor for a change hint to wake",
+        ));
+    }
+    let queue_key = state.providers.is_multi().then_some(provider_key.as_str());
+    let accepted = state.live.queue_hint(queue_key, &channel.id);
     let status = if accepted {
         StatusCode::ACCEPTED
     } else {

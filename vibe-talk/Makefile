@@ -10,13 +10,13 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability offline-cache-browser read-aloud-browser post-confirm-browser voice-read-acceptance-self-test android-speech-self-test container-smoke clean
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability offline-cache-browser read-aloud-browser post-confirm-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke clean
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
 # UNBOXED, and deliberately the default: it needs Rust, Node, and the repository's Python typing
 # tools, but no cgroup delegation. `validate-boxed` is the bounded version where cgroups exist.
-validate: fmt check scripts-check contract-check typecheck test dag-check voice-read-acceptance-self-test android-speech-self-test
+validate: fmt check scripts-check contract-check typecheck test dag-check voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test
 
 # The complete portable suite, run through dagrun: per-step wall and CPU timeouts, memory caps,
 # and process-tree teardown inside nested cgroups. Container-runtime and alternate-toolchain
@@ -136,6 +136,12 @@ voice-read-acceptance-self-test:
 # later Android recording.
 android-speech-self-test:
 	python3 scripts/android-device-speech.py --self-test
+
+# A live hint carries no chat content, and its adapter owns a long-running child plus retries.
+# Keep the offline HTTP, framing, privacy, and process-cleanup controls in the ordinary gate so a
+# deployment does not have to discover a broken supervisor against a real provider event stream.
+live-hint-adapter-self-test:
+	python3 scripts/live-hint-adapter.py --self-test
 
 # The LAUNCHER -- run.sh, the script the owner types -- as opposed to the image it starts, which
 # the `container` CI job covers separately. Not part of `validate` because it needs a container

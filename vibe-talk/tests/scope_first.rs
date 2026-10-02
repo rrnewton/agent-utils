@@ -101,6 +101,12 @@ fn inventory() -> Vec<Route> {
             Ingest,
             OwnJson(r#"{"kind":"typing"}"#),
         ),
+        route(
+            "POST",
+            "/api/v1/live/hints",
+            Ingest,
+            OwnJson(r#"{"channel_id":"3333333333333333333"}"#),
+        ),
         route("GET", "/api/v1/diagnostics", Read, Nothing),
         route("GET", "/api/v1/signed-url", Write, Nothing),
         route("GET", "/api/v1/voice-session", Write, Nothing),

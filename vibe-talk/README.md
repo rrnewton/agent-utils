@@ -714,9 +714,26 @@ group-mention markup is rewritten into the markdown the rest of the app reads.
 
 ### Limits
 
-* **No push yet.** There is no Events API or Socket Mode connection: new messages arrive by the
-  provider's `live_poll_seconds` polling, which reads each conversation's own timeline. Replies
-  inside threads are read when a thread, or a channel narrowed to one, is opened.
+* **No native Slack socket.** vibe-talk opens no Events API or Socket Mode connection. By default,
+  new messages arrive through the provider's `live_poll_seconds` authoritative history reads. A
+  deployment with a separate Slack event stream can use it as a content-free change hint, waking
+  that same cursor immediately while the interval remains its recovery path; see [Live
+  push](#live-push). Replies inside threads are read when a thread, or a channel narrowed to one,
+  is opened.
+  For the Meta CLI bridge, make the user-token subscription explicit for the whole conversation.
+  An ambient `slack.message tail` depends on the token's existing inbox subscriptions and may
+  produce no match; the channel-scoped subscription used by the service is:
+
+  ```sh
+  meta slack.conversation tail --channel-id=C0123ABCD --event-types=message.created \
+    --catchup=oldest --include-iris-seq-id --quiet --output=json
+  ```
+
+  Its stream omits posts by other bots, edits, and deletes, so use it only as the hint command,
+  never as the message source. A later hint makes the authoritative forward read collect any
+  missed, newer creates — including bot posts — and periodic reconciliation covers a stretch with
+  no emitted hint. Neither forward path detects an edit or deletion of an already-cursored
+  message; change hints do not imply otherwise.
 * **No upstream read marks.** What you have read is vibe-talk's own record, as on Discord.
 * **Bounded reads.** A page Slack (or a bridge) returns may hold fewer messages than were asked
   for; reads follow the cursor and stop at a fixed page budget. A walk never skips a message to
@@ -941,7 +958,7 @@ code path the startup probe uses, which is itself in the same position — see *
 | Count ceiling | `chat.max_count_scan` | — | how many messages a count may walk, default `500`; also accepted as `discord.max_count_scan` |
 | Provider request timeout | `discord.request_timeout_seconds` | — | seconds for one ordinary provider HTTP request, default `20`, range `1`–`120`; compatible bridges may need longer |
 | Live poll interval | `discord.live_poll_seconds` | `VIBE_TALK_LIVE_POLL_SECONDS` | seconds between inbound reads per channel; **`0` (default) is OFF**, and under `5` is refused |
-| Live push token | `ingest.token` | `VIBE_TALK_INGEST_TOKEN` | **secret**, optional, ≥ 24 chars and distinct from both API tokens; enables adapter push. With one provider it cannot be combined with live polling; with several, pushed events for a polled provider's channels are refused with `409 channel_is_polled` |
+| Live adapter token | `ingest.token` | `VIBE_TALK_INGEST_TOKEN` | **secret**, optional, ≥ 24 chars and distinct from both API tokens; authenticates normalized event push and content-free change hints. Full events for a polled provider are refused with `409 channel_is_polled`; hints may safely coexist because they wake the poller's own cursor |
 | Channel registration | `discord.channel_registration` | — | **off by default**; enable only when `discord.api_base` is a compatible bridge implementing `POST /channels` and `DELETE /channels/{id}` |
 | Upstream read marks | `discord.upstream_read_marks` | — | **off by default**; enable only when `discord.api_base` is a compatible bridge implementing `POST /channels/{id}/read` |
 | Chat service name | `discord.provider_name` | — | `Discord`; set to the source service's name (for example, `Google Chat`) when using a compatible HTTP bridge |
@@ -1049,8 +1066,9 @@ How a deployment with several providers behaves:
   restart.
 * **The channel browser** lists each discovery-capable provider in turn.
 * **Live updates are per provider.** Each provider with `live_poll_seconds` set is polled on its
-  own interval. An adapter may push events for the others through `ingest.token`. Pushed events
-  for a polled provider's channels are refused, so no change is delivered twice.
+  own interval. An adapter may push events for the others through `ingest.token`, or send a
+  content-free hint that wakes a polled provider's existing cursor. Pushed events for a polled
+  provider's channels are refused, so no change is delivered twice.
 * **Diagnostics check each provider's credential** and name the provider in every channel check.
 
 ## Durable state
@@ -1410,8 +1428,8 @@ not exist — a client pointed at the wrong URL is exactly the case this log exi
 
 ## The API
 
-All `/api/` routes require `Authorization: Bearer <token>`. The live-event ingestion route uses
-its own adapter-only token; every other route uses the read/write tokens described above.
+All `/api/` routes require `Authorization: Bearer <token>`. The two live-adapter routes use their
+own adapter-only token; every other route uses the read/write tokens described above.
 `/healthz` and the static web app require neither, and neither reveals configuration.
 
 | Method | Path | Scope | Purpose |
@@ -1423,6 +1441,7 @@ its own adapter-only token; every other route uses the read/write tokens describ
 | DELETE | `/api/v1/channels/{id}` | **write** | remove a channel added in the app; managed mode also unregisters it upstream |
 | GET | `/api/v1/client-config` | read | what the web app needs at startup, including the caller's own `token_scope` |
 | POST | `/api/v1/live/events` | ingest | accept one normalized create/update/delete event from an external provider adapter |
+| POST | `/api/v1/live/hints` | ingest | content-free `{channel_id}` wake-up for that polled provider's existing cursor |
 | GET | `/api/v1/diagnostics` | read | re-run the startup checks now, structured, with a remedy on every failure — see above |
 | GET | `/api/v1/agent-tools` | read | the voice agent's tool manifest and approval policy |
 | GET | `/api/v1/voice-session` | **write** | open a browser-ready session through the configured conversational voice provider |
@@ -1697,17 +1716,79 @@ is the exception, and it exists for two things — the channel view on `/voice` 
 messages arrive rather than when something happens to poll, and a reply that lands mid-conversation
 should be able to reach the voice agent on its own instead of waiting to be asked about.
 
-There are two mutually exclusive ways to feed the same channel-keyed `LiveHub`:
+There are two mutually exclusive ways to PRODUCE messages in the same channel-keyed `LiveHub`:
 
-* `discord.live_poll_seconds` keeps the built-in Discord polling source.
+* a provider's `live_poll_seconds` keeps the built-in authoritative polling source;
 * `ingest.token` enables an external provider adapter to push normalized events to
   `POST /api/v1/live/events`.
+
+A polled provider may additionally receive content-free change hints at `POST /api/v1/live/hints`.
+That is not a third producer: the hint wakes the poller's own provider client and its one cursor.
 
 The browser learns `live_delivery: "off" | "poll" | "push"` from `/api/v1/client-config`, so a
 push-only deployment with a zero poll interval still attaches its SSE stream. In push mode the
 screen distinguishes "configured and connected to this server" from adapter health, which the
-server cannot observe. Configuration refuses to enable both producers at once: duplicate delivery
-must not depend on two unrelated cursors happening to agree.
+server cannot observe. Full pushed events are refused per channel when that channel's provider is
+polled: duplicate delivery must not depend on two unrelated cursors happening to agree. Hints are
+allowed beside polling precisely because they contain no message and create no second cursor.
+
+### Change-hint acceleration
+
+Some event sources are excellent wake-ups but incomplete message-create feeds: they omit bot
+posts, retain only a short replay window, or expose a payload shape the chat provider already
+knows how to normalize better. For those, send only:
+
+```json
+{"channel_id":"C0123ABCD"}
+```
+
+to `POST /api/v1/live/hints` with the ingest bearer token. The channel must be allowlisted and its
+provider must have a nonzero `live_poll_seconds`; otherwise the route answers `404 unknown_channel`
+or `409 channel_is_not_polled`. A newly queued hint answers `202`; another already pending hint
+answers `200` with `{"accepted":false,"duplicate":true}`. Pending hints for one provider and
+channel coalesce, including a short 100 ms burst window. The first hinted read is immediate after
+that window; while hints keep arriving, later reads are spaced at least five seconds apart, the
+same safety floor as configured polling. Each read advances through every create since the shared
+cursor, so event volume does not require one provider request per event.
+
+The resulting provider read uses exactly the same cursor as the periodic tick. It therefore cannot
+publish a new message twice, and a missed hint merely postpones delivery until reconciliation.
+Provider failure backoff still wins over a hint, so a noisy event stream cannot turn an upstream
+outage into a request storm. Catch-up events are safe too: the poller seeds its cursor from current
+history on startup and publishes none of that seed as new.
+
+Once the adapter is running, make `live_poll_seconds` the desired recovery bound rather than the
+ordinary delivery latency (for example, `3600` for hourly reconciliation). Do not set it to zero:
+the hint deliberately has no second provider client or cursor of its own to consume it.
+
+`scripts/live-hint-adapter.py` supervises an external JSON-lines event command and turns each JSON
+object it emits into one such hint. It invokes the command literally, without a shell; caps each
+record; reads the ingest credential from a private file; retries only transport failures, `429`,
+and `5xx`; and exits on a permanent `4xx` or malformed stream so a service manager can restart or
+surface the fault. The event command owns event filtering: do not enable heartbeat output, because
+every valid JSON object is intentionally treated as a change hint.
+
+Run its offline protocol and privacy controls before installing it:
+
+```sh
+python3 scripts/live-hint-adapter.py --self-test
+```
+
+For a systemd user service, copy
+[`systemd/vibe-talk-live-hint.service.example`](systemd/vibe-talk-live-hint.service.example) to
+`~/.config/systemd/user/vibe-talk-live-hint.service`, replace its paths, channel, URL, and event
+command, and put the same value as `ingest.token` in `~/.config/vibe-talk/ingest-token` with mode
+`0600`. The example binds the adapter lifecycle to `vibe-talk.service`, treats even a clean event
+stream EOF as a failure, and restarts it without making the channel writable:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now vibe-talk-live-hint.service
+```
+
+The adapter intentionally fixes one channel on its own command line, so an event cannot choose a
+different allowlisted destination. Install one unit per channel when the upstream source cannot be
+split that way itself.
 
 ### Provider-adapter push
 

@@ -21,15 +21,15 @@
 //! * **Who is asking is settled before what they asked.** Every `/api/` handler takes its
 //!   credential as its first extractor after `State` — [`api::ReadScope`], [`api::WriteScope`],
 //!   or on the two ticket routes [`api::SpeechTicket`] — so `Path`, `Query`, `Json` and `Bytes`
-//!   never answer a caller without one. The ingest route is the one exception in form, not in
-//!   effect: it takes the whole request and authenticates before it reads the body.
+//!   never answer a caller without one. The two live-ingest routes are the exceptions in form,
+//!   not in effect: each takes the whole request and authenticates before it reads the body.
 //!   `tests/scope_first.rs` checks every route registered here against an inventory, both in this
 //!   file's source and by probing the router for methods the inventory does not list.
 //! * **Routing does not answer first either.** [`bearer_layer`] refuses an `/api/` request that
 //!   carries neither browser token with the same 401 a route gives — status, headers and body —
 //!   BEFORE routing, so an unknown path or an unserved method does not tell an anonymous caller
-//!   which routes exist or which methods they serve. The ingest
-//!   route and the two ticket routes, which carry their own credentials, are exempt for their own
+//!   which routes exist or which methods they serve. The two live-ingest
+//!   routes and the two ticket routes, which carry their own credentials, are exempt for their own
 //!   method only.
 //! * Every request — routed or not, authorized or not — leaves exactly ONE line in the access
 //!   log at INFO. See [`crate::access`] for why that is load-bearing rather than nice to have.
@@ -90,6 +90,7 @@ fn routes(state: AppState) -> Router {
         .route("/api/v1/agent-tools", get(api::agent_tools))
         .route("/api/v1/client-config", get(api::client_config))
         .route("/api/v1/live/events", post(api::ingest_event))
+        .route("/api/v1/live/hints", post(api::ingest_hint))
         // READ scope. It reports configuration health and never a credential, it writes nothing
         // durable, and it always answers 200 — the report is the answer, so a failing check is
         // not an HTTP failure. See `api::diagnostics`.

@@ -10,6 +10,7 @@ use tower::ServiceExt as _;
 use vibe_talk::http::router;
 use vibe_talk::live::{LiveHub, LiveKind};
 use vibe_talk::model::ChannelId;
+use vibe_talk::state::AppState;
 use vibe_talk::testing::{READ_CHANNEL, READ_TOKEN, WRITE_TOKEN};
 
 const INGEST_TOKEN: &str = "test-ingest-token-0000000000";
@@ -67,6 +68,56 @@ async fn post(app: &axum::Router, token: Option<&str>, payload: Value) -> (Statu
     (status, payload)
 }
 
+async fn post_hint(
+    app: &axum::Router,
+    token: Option<&str>,
+    channel_id: &str,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/live/hints")
+        .header("content-type", "application/json");
+    if let Some(token) = token {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            request
+                .body(Body::from(json!({"channel_id": channel_id}).to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("router responds");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("finite response")
+        .to_bytes();
+    let payload = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, payload)
+}
+
+fn hints_enabled(
+    poll_seconds: u64,
+) -> (
+    axum::Router,
+    AppState,
+    std::sync::Arc<vibe_talk::discord::fake::FakeDiscord>,
+) {
+    let text = format!(
+        "{}\n[ingest]\ntoken = \"{INGEST_TOKEN}\"\n",
+        vibe_talk::testing::config_toml().replace(
+            "[discord]",
+            &format!("[discord]\nlive_poll_seconds = {poll_seconds}"),
+        )
+    );
+    let (state, chat, _voice) = vibe_talk::testing::state_from_toml(&text);
+    (router(state.clone()), state, chat)
+}
+
 fn create(event_id: &str, id: &str, historical: bool) -> Value {
     json!({
         "event_id": event_id,
@@ -81,8 +132,11 @@ async fn ingestion_is_disabled_by_default_and_has_its_own_credential() {
     let (state, _chat) = vibe_talk::testing::state();
     let disabled = router(state);
     let (status, payload) = post(&disabled, Some(WRITE_TOKEN), create("e1", "10", false)).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(payload["error"], "ingest_disabled");
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(payload["error"], "unauthenticated");
+    let (status, payload) = post_hint(&disabled, None, READ_CHANNEL).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(payload["error"], "unauthenticated");
 
     let response = disabled
         .clone()
@@ -139,6 +193,100 @@ async fn ingestion_is_disabled_by_default_and_has_its_own_credential() {
     )
     .expect("client config json");
     assert_eq!(payload["live_delivery"], "push");
+}
+
+#[tokio::test]
+async fn a_hint_wakes_the_one_authoritative_cursor_and_duplicate_hints_coalesce() {
+    let (app, state, chat) = hints_enabled(3_600);
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    let poller = tokio::spawn(vibe_talk::live::poll_forever(
+        state.clone(),
+        None,
+        state.chat.clone(),
+        50,
+        Duration::from_secs(3_600),
+    ));
+    for _ in 0..100 {
+        if chat.fetch_count() >= 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        chat.fetch_count(),
+        2,
+        "the startup tick did not seed both channels"
+    );
+    let mut subscriber = state.live.subscribe(&channel, None).receiver;
+    chat.seed(&channel, "someone", "arrived between reconciliation ticks");
+
+    let first = post_hint(&app, Some(INGEST_TOKEN), READ_CHANNEL).await;
+    assert_eq!(first.0, StatusCode::ACCEPTED);
+    assert_eq!(first.1, json!({"accepted": true, "duplicate": false}));
+    // It is deliberately immaterial whether the poll task has taken the first hint before this
+    // request lands: either it is folded into the pending set (200) or into the 100 ms burst
+    // window (202). The cursor, asserted below, is what guarantees one message delivery.
+    let duplicate = post_hint(&app, Some(INGEST_TOKEN), READ_CHANNEL).await;
+    assert!(
+        matches!(duplicate.0, StatusCode::OK | StatusCode::ACCEPTED),
+        "{duplicate:?}"
+    );
+
+    let published = tokio::time::timeout(Duration::from_secs(2), subscriber.recv())
+        .await
+        .expect("the hint did not wake the provider before its one-hour interval")
+        .expect("the hub stayed open");
+    assert_eq!(
+        published.message.content,
+        "arrived between reconciliation ticks"
+    );
+    assert!(
+        subscriber.try_recv().is_err(),
+        "two hints published one provider message twice"
+    );
+    poller.abort();
+}
+
+#[tokio::test]
+async fn hints_need_the_ingest_credential_and_an_existing_poll_cursor() {
+    let (polled, _state, _chat) = hints_enabled(30);
+    for token in [
+        None,
+        Some(READ_TOKEN),
+        Some(WRITE_TOKEN),
+        Some("wrong-token"),
+    ] {
+        let (status, payload) = post_hint(&polled, token, READ_CHANNEL).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(payload["error"], "unauthenticated");
+    }
+    // Without a running poll task the pending set is stable, so its acknowledgement contract is
+    // deterministic: the first hint queues and a repeat coalesces.
+    let first = post_hint(&polled, Some(INGEST_TOKEN), READ_CHANNEL).await;
+    assert_eq!(first.0, StatusCode::ACCEPTED);
+    assert_eq!(first.1, json!({"accepted": true, "duplicate": false}));
+    let duplicate = post_hint(&polled, Some(INGEST_TOKEN), READ_CHANNEL).await;
+    assert_eq!(duplicate.0, StatusCode::OK);
+    assert_eq!(duplicate.1, json!({"accepted": false, "duplicate": true}));
+    let unknown = post_hint(&polled, Some(INGEST_TOKEN), "9999999999").await;
+    assert_eq!(unknown.0, StatusCode::NOT_FOUND);
+    assert_eq!(unknown.1["error"], "unknown_channel");
+
+    let (unpolled, _state, _chat) = hints_enabled(0);
+    let absent = post_hint(&unpolled, Some(INGEST_TOKEN), READ_CHANNEL).await;
+    assert_eq!(absent.0, StatusCode::CONFLICT);
+    assert_eq!(absent.1["error"], "channel_is_not_polled");
+
+    // Full pushed events remain a second producer and are still refused beside polling. Hints are
+    // safe precisely because they carry no message and wake the poller's own cursor instead.
+    let pushed = post(
+        &polled,
+        Some(INGEST_TOKEN),
+        create("second-source", "10", false),
+    )
+    .await;
+    assert_eq!(pushed.0, StatusCode::CONFLICT);
+    assert_eq!(pushed.1["error"], "channel_is_polled");
 }
 
 #[tokio::test]

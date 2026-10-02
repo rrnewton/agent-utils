@@ -110,13 +110,14 @@ live_poll_seconds = 0
 read_token = "REPLACE-ME-at-least-24-characters"
 write_token = "REPLACE-ME-different-and-at-least-24-characters"
 
-# Optional provider-neutral PUSH input for an external adapter. Leave this whole section absent
-# to disable POST /api/v1/live/events. The token is deliberately separate from both browser
-# credentials and must be at least 24 characters. The endpoint is bounded to 64 KiB per event and
-# still accepts only channels from the allowlist below.
+# Optional provider-neutral input for an external adapter. Leave this whole section absent to
+# disable both POST /api/v1/live/events and POST /api/v1/live/hints. The token is deliberately
+# separate from both browser credentials and must be at least 24 characters. Both routes still
+# accept only channels from the allowlist below.
 #
-# Do not combine this with discord.live_poll_seconds: configure exactly one live source, so one
-# upstream change cannot reach the page twice. Environment: VIBE_TALK_INGEST_TOKEN
+# Full pushed events remain a second source and are refused for a provider with
+# live_poll_seconds. Content-free hints MAY be combined with polling: they wake its one existing
+# cursor rather than publishing a second copy. Environment: VIBE_TALK_INGEST_TOKEN
 # [ingest]
 # token = "REPLACE-ME-third-distinct-token-at-least-24-characters"
 

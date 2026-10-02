@@ -122,6 +122,19 @@ steps:
       classification: light
       rss_baseline_bytes: 268435456
 
+  - group: check
+    job: live-hint-adapter-self-test
+    desc: offline framing, retry, privacy, and child-cleanup controls for live change hints
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 scripts/live-hint-adapter.py --self-test
+    jobs_flag: ""
+    timeout: 30
+    cpu_timeout: 15
+    hint:
+      est_duration_s: 2
+      classification: light
+      rss_baseline_bytes: 268435456
+
   # Chrome's own installability verdict. Unlike the fake-DOM suite, this exercises manifest
   # parsing, icon loading, secure-origin rules and the selected display mode in the browser engine.
   - group: check

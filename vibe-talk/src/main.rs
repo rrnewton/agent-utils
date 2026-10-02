@@ -453,9 +453,11 @@ async fn main() -> anyhow::Result<()> {
     let live = Arc::new(vibe_talk::live::LiveHub::new());
     if config.ingest.enabled() {
         tracing::info!(
-            route = "/api/v1/live/events",
-            "live ingestion accepts PUSH: an authenticated provider adapter publishes normalized \
-             events, which are fanned out to channel streams"
+            events_route = "/api/v1/live/events",
+            hints_route = "/api/v1/live/hints",
+            "live adapter input is ON: an authenticated provider adapter may publish normalized \
+             events for unpolled channels or wake a polled channel's authoritative cursor with \
+             a content-free change hint"
         );
     }
     for entry in providers.entries() {

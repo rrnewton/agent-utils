@@ -27,7 +27,7 @@ pub const ENV_LIVE_POLL_SECONDS: &str = "VIBE_TALK_LIVE_POLL_SECONDS";
 pub const ENV_READ_TOKEN: &str = "VIBE_TALK_READ_TOKEN";
 /// Environment variable carrying the write-scope API token.
 pub const ENV_WRITE_TOKEN: &str = "VIBE_TALK_WRITE_TOKEN";
-/// Environment variable carrying the dedicated live-event ingestion token.
+/// Environment variable carrying the dedicated live-adapter token.
 pub const ENV_INGEST_TOKEN: &str = "VIBE_TALK_INGEST_TOKEN";
 /// Environment variable selecting read-aloud: `elevenlabs` (default), `browser`, or `conversation`.
 pub const ENV_READ_ALOUD_BACKEND: &str = "VIBE_TALK_READ_ALOUD_BACKEND";
@@ -153,7 +153,7 @@ pub struct Config {
     pub replay: ReplayConfig,
     /// API credentials for callers (the voice agent, and the web app).
     pub auth: AuthConfig,
-    /// Optional authenticated adapter-to-server live-event input.
+    /// Optional authenticated adapter-to-server live-event and change-hint input.
     pub ingest: IngestConfig,
     /// Channels this server will read.
     pub channels: Vec<ChannelInfo>,
@@ -503,15 +503,15 @@ pub struct AuthConfig {
     pub write_token: Secret,
 }
 
-/// Authentication for provider-neutral live-event ingestion.
+/// Authentication for provider-neutral live-event and change-hint ingestion.
 #[derive(Debug, Default)]
 pub struct IngestConfig {
-    /// Dedicated bearer token. `None` means the ingestion route is disabled.
+    /// Dedicated bearer token. `None` means both live-adapter routes are disabled.
     pub token: Option<Secret>,
 }
 
 impl IngestConfig {
-    /// Whether an adapter may deliver events to this server.
+    /// Whether an adapter may deliver events or change hints to this server.
     #[must_use]
     pub fn enabled(&self) -> bool {
         self.token.is_some()
@@ -915,17 +915,10 @@ impl Config {
                 });
             }
         }
-        // One live source per channel. With a single provider that is one source for the whole
-        // deployment, as it always was. With several, a polled provider and a pushing adapter may
-        // coexist, and the ingestion route refuses events for a polled provider's channels.
-        if ingest_token.is_some() && providers.len() == 1 && providers[0].live_poll_seconds != 0 {
-            return Err(ConfigError::Invalid {
-                field: poll_field(&providers[0]),
-                detail: "cannot be combined with ingest.token: choose one live source or every \
-                         provider event may be delivered twice"
-                    .to_owned(),
-            });
-        }
+        // Full pushed EVENTS and polling remain mutually exclusive PER CHANNEL: the event route
+        // refuses a polled provider's channels below. The token may nevertheless coexist with a
+        // polling provider because `/live/hints` carries no message — it wakes that provider's
+        // one authoritative cursor, so there is still exactly one producer.
 
         let channels = match get(ENV_CHANNELS) {
             Some(spec) => parse_channel_spec(spec)?,
@@ -1386,15 +1379,6 @@ pub fn default_provider_key(providers: &[ProviderConfig]) -> Option<&str> {
             .iter()
             .find(|provider| provider.key == LEGACY_DISCORD_PROVIDER_KEY)
             .map(|provider| provider.key.as_str()),
-    }
-}
-
-/// The setting an operator edits to change one provider's poll interval.
-fn poll_field(provider: &ProviderConfig) -> String {
-    if provider.key == LEGACY_DISCORD_PROVIDER_KEY {
-        "discord.live_poll_seconds".to_owned()
-    } else {
-        format!("providers.{}.live_poll_seconds", provider.key)
     }
 }
 
@@ -2092,7 +2076,7 @@ provider = "slack"
     }
 
     #[test]
-    fn push_ingestion_may_sit_beside_a_polled_provider_only_when_there_are_several() {
+    fn an_ingest_token_may_wake_a_polled_provider_without_becoming_a_second_source() {
         let with_ingest = MULTI.replace(
             "[chat]",
             "[ingest]\ntoken = \"ingest-token-that-is-long-enough\"\n\n[chat]",
@@ -2102,10 +2086,10 @@ provider = "slack"
 
         let single = FULL.replace("[discord]", "[discord]\nlive_poll_seconds = 30")
             + "\n[ingest]\ntoken = \"ingest-token-that-is-long-enough\"\n";
-        assert!(matches!(
-            Config::from_toml_and_env(&single, &env(&[])),
-            Err(ConfigError::Invalid { field, .. }) if field == "discord.live_poll_seconds"
-        ));
+        let config = Config::from_toml_and_env(&single, &env(&[]))
+            .expect("the token carries content-free hints beside the one poll cursor");
+        assert!(config.ingest.enabled());
+        assert_eq!(config.providers[0].live_poll_seconds, 30);
     }
 
     #[test]
@@ -2415,7 +2399,7 @@ provider = "slack"
     }
 
     #[test]
-    fn adapter_token_cannot_reuse_a_browser_token_or_run_beside_polling() {
+    fn adapter_token_cannot_reuse_a_browser_token() {
         let weak = format!("{FULL}\n[ingest]\ntoken = \"too-short\"\n");
         let err = Config::from_toml_and_env(&weak, &env(&[])).expect_err("must refuse");
         assert!(
@@ -2427,15 +2411,6 @@ provider = "slack"
         let err = Config::from_toml_and_env(&reused, &env(&[])).expect_err("must refuse");
         assert!(
             matches!(&err, ConfigError::Invalid { field, .. } if field == "ingest.token"),
-            "unexpected error: {err}"
-        );
-
-        let both = FULL.replace("[discord]", "[discord]\nlive_poll_seconds = 30")
-            + "\n[ingest]\ntoken = \"adapter-token-that-is-long-enough\"\n";
-        let err = Config::from_toml_and_env(&both, &env(&[])).expect_err("must refuse");
-        assert!(
-            matches!(&err, ConfigError::Invalid { field, .. }
-                if field == "discord.live_poll_seconds"),
             "unexpected error: {err}"
         );
     }
