@@ -1177,6 +1177,13 @@ fn capture_recovery_snapshot<A: ManagedApi + ?Sized>(
             chat_runtime::MAX_VISIBLE_MARKERS
         ));
     }
+    if capture.inline_overflowed {
+        report.note(format!(
+            "coordinator output held more than {} reply blocks with a tag that shared its line \
+with other text, so the oldest were not read",
+            chat_runtime::MAX_VISIBLE_MARKERS
+        ));
+    }
     for refusal in &capture.refused {
         report.note(refusal);
     }

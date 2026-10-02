@@ -770,15 +770,73 @@ reported when fewer than 64 such characters of it were in view, at the top of
 the capture, once a recovery scan shows the first row of its message or 64 such
 characters of it, as it can when rows move back down the screen.
 
+A recovery scan also reports a reply block of an open request whose opening or
+closing tag shared its row with other text. A marker counts only alone on its
+row, so such a tag neither opens nor closes a block, and the reply it was meant
+to mark is not sent. Two shapes are reported. In the first, while no block is
+open, an opening tag shares its row with other text, such as
+`<CHAT_REPLY_001>Done.`, and a closing tag of the same ID follows it, on that row
+or a later one, alone on its row or not, as in
+`Reply: <CHAT_REPLY_001>Done.</CHAT_REPLY_001>`. In the second, a block that an
+opening marker line began holds a closing tag of its ID in a row with other
+text, such as `Done.</CHAT_REPLY_001>`, and ends with no closing marker line. A
+single tag in a row with other text is not reported, since that is how prose or
+a tool call quotes a tag. An opening tag is read for its closing tag until a
+prompt row, a tool output row, a bullet row that starts left of the text of the
+tag's row, as a new message does, another marker line, or a newer opening tag in
+a row with other text. One with no closing tag in view by then is not reported,
+so a block still being written is reported once its closing tag is in view. A
+closing tag in a block that closes is text of the reply. Nor is a tag reported
+inside a fenced code block, prompt echo, or tool output, above the first row at
+the left edge of the capture, where it can belong to a prompt echo such as the
+request prompt's own instruction, or when the text it is read with is part of a
+reply already stored for that request. Nor is a tag of a closed request, of no
+request, or of a request whose blocks the bridge holds because its prompt may
+not have reached the agent; unlike a marker of such a request alone on its row,
+it is not a routing error. An opening tag of an open request in a row that
+starts at the left edge with a bullet, as the first row of a message does, ends
+a code fence that an earlier message left open, as an opening marker line after
+a bullet does.
+
+The prompt names the ID, says that a tag shared its line with other text so the
+block was not sent, that each opening and closing tag must be alone on its own
+line, and that a tag mentioned in other text should leave out its angle
+brackets, and then asks for the block again, as it does for a partial block. It
+names each ID once, and does not also name it for the unopened block or the
+block with no closing line that such a tag leaves; since this goes by ID, a
+separate block under that ID with no closing line is not named on its own. When
+any reported block had no closing line, the prompt still says that a block
+still being written goes out once it is complete. A block of the first shape is
+identified by its ID and by its opening tag, the first 64 characters after it,
+not counting whitespace or box-drawing characters, and its closing tag when no
+more than 64 such characters are between the two. A block of the second shape is
+identified by its ID, by the last 64 such characters before its closing tag in
+the block, and by that tag. So such a block is reported once while it scrolls or
+wraps at another width, a later reply with different text after its opening tag
+is reported again, and an exact repeat of a reply already reported is not. Some
+mistakes are not caught: an opening tag in a row with other text whose closing
+tag never comes into view, tags with a prompt or a tool call between them, and
+both tags inside a tool call's command. Some text that was not meant as a reply
+is reported: a remark that names both tags of an open request with their angle
+brackets, such as ``<CHAT_REPLY_001> and </CHAT_REPLY_001> each went on their
+own line``, once for each distinct text, and a block still being written that
+quotes its own closing tag in a row with other text, while its closing marker
+line is not yet in view. Up to 4,096 such blocks are read in one capture, apart
+from the 4,096 blocks and partial blocks, so a screen full of them cannot hide a
+block; a capture with more is read from its newest 4,096, with one log line from
+a recovery scan.
+
 Reported entries are kept in `fence-feedback.json` in the bridge state
 directory, so each unavailable ID and each partial block entry is reported at
 most once per state directory, including after a restart. An unavailable ID is
 kept as the ID itself. A partial block is kept as `ID KIND HASH`: KIND is
 `unopened` for an unopened block, `remnant` for fewer than 64 characters of one
-at the top of the capture, and `unclosed` for a block with no closing line, and
-HASH is the first 12 hex digits of the SHA-256 of the characters its digest
-covers. A history written by an earlier release keeps the bare ID of a partial
-block, and that ID still covers every partial block under it. A new state
+at the top of the capture, `unclosed` for a block with no closing line, and
+`inline` for a block whose opening or closing tag shares its row with other
+text, and HASH is the first
+12 hex digits of the SHA-256 of the characters its digest covers. A history
+written by an earlier release keeps the bare ID of a partial block, and that ID
+still covers every partial block under it. A new state
 directory starts with no reported entries. A marker that stays visible after its
 report is left out of later prompts, and a later block that reuses a reported
 unavailable ID is not reported again. A block under an ID that belongs to no
