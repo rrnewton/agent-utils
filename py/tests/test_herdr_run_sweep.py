@@ -421,7 +421,8 @@ def test_a_workspace_herdr_does_not_know_is_reported_as_a_missing_listing(
     assert plan.counts()["STALE"] == 0
     assert plan.counts()["UNKNOWN"] == 1
     assert "no workspace labelled" in plan.declined[0].reason
-    assert "does not list this pane" not in plan.declined[0].reason
+    assert plan.counts()["GONE"] == 0
+    assert "already closed" not in plan.declined[0].reason
 
 
 def test_a_tab_retargeted_out_of_the_schema_is_out_of_scope(tmp_path: object) -> None:
@@ -449,7 +450,7 @@ def test_a_pane_in_another_workspace_is_out_of_scope(tmp_path: object) -> None:
     assert plan.reapable == ()
 
 
-def test_a_pane_herdr_no_longer_lists_is_unknown(tmp_path: object) -> None:
+def test_a_pane_missing_from_herdrs_listing_is_gone(tmp_path: object) -> None:
     root = str(tmp_path)
     _write_spool(root, [_record(pane_id="w1:p1"), _record(pane_id="w1:pGONE")])
     fake = _fake_with_pane("w1:p1", shell_pid=4242)
@@ -457,7 +458,7 @@ def test_a_pane_herdr_no_longer_lists_is_unknown(tmp_path: object) -> None:
 
     plan = sweep(_client(fake), _config(root), proc_root=proc)
     verdicts = {decision.pane_id: decision.verdict for decision in plan.decisions}
-    assert verdicts["w1:pGONE"] == Verdict.UNKNOWN
+    assert verdicts["w1:pGONE"] == Verdict.GONE
     assert verdicts["w1:p1"] == Verdict.SHELL_ALIVE
 
 
@@ -474,15 +475,16 @@ def test_an_unanswering_herdr_reaps_nothing(tmp_path: object) -> None:
     assert fake.calls == ["workspace_id_for_label(agent-cmds)"]
     assert plan.counts()["STALE"] == 0
     assert plan.counts()["UNKNOWN"] == 1
-    # And it must say the SERVER did not answer, not that herdr no longer lists the pane. The
-    # verdict is the same either way, but the second sentence tells an operator the tabs are
-    # already gone -- which is the opposite of what happened. Anchored on the two strings
+    # And it must be UNKNOWN saying the SERVER did not answer, never GONE: GONE tells an operator
+    # the tabs are already closed -- which is the opposite of what happened. Anchored on the two
+    # strings
     # PRODUCTION owns: the sweep's "evidence unavailable" wrapper and the control call's own
     # purpose prefix, which HerdrClient._call puts in front of every failure it raises.
     reason = plan.declined[0].reason
     assert reason.startswith("evidence unavailable: "), reason
     assert "pane list" in reason, reason
-    assert "does not list this pane" not in reason, reason
+    assert plan.counts()["GONE"] == 0
+    assert "already closed" not in reason, reason
 
 
 def test_an_empty_spool_reports_zero_of_everything(tmp_path: object) -> None:
@@ -493,7 +495,7 @@ def test_an_empty_spool_reports_zero_of_everything(tmp_path: object) -> None:
     counts = plan.counts()
     assert counts["considered"] == 0
     # Every verdict is present even at zero, so an inert sweep still prints its own shape.
-    assert set(counts) >= {"STALE", "IN_FLIGHT", "SHELL_ALIVE", "UNKNOWN", "OUT_OF_SCOPE"}
+    assert set(counts) >= {"STALE", "IN_FLIGHT", "SHELL_ALIVE", "GONE", "UNKNOWN", "OUT_OF_SCOPE"}
 
 
 def test_evidence_carries_the_recorded_identity_the_policy_needs(tmp_path: object) -> None:

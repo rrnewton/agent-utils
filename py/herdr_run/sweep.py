@@ -176,7 +176,8 @@ def build_evidence(
             workspace_id = client.workspace_id_for_label(config.workspace)
             if workspace_id is None:
                 # No workspace by that label means no listing was obtained. Saying nothing here
-                # would tell an operator the tabs are already gone -- the opposite of what happened.
+                # would leave every pane GONE, telling an operator the tabs are already closed --
+                # the opposite of what happened.
                 listing_error = f"herdr has no workspace labelled {config.workspace!r}"
             else:
                 live_pane_ids = frozenset(pane.pane_id for pane in client.panes(workspace_id))

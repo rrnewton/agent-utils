@@ -978,7 +978,7 @@ def _reap(harness: Harness, report: Report) -> None:
         and '"considered": 0' in python.stdout
         and all(
             f'"{verdict}": 0' in python.stdout
-            for verdict in ("STALE", "IN_FLIGHT", "SHELL_ALIVE", "UNKNOWN", "OUT_OF_SCOPE")
+            for verdict in ("STALE", "IN_FLIGHT", "SHELL_ALIVE", "GONE", "UNKNOWN", "OUT_OF_SCOPE")
         )
         and '"retention_days": 7' in python.stdout
         and f'"workspace": "{_REAP_WORKSPACE}"' in python.stdout,

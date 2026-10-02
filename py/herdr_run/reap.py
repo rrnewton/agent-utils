@@ -51,9 +51,20 @@ A tab is STALE only when all of these hold, each positive evidence rather than a
   current boot before absence of the old PID can authorize anything.
 
 Anything else -- unreadable ``/proc``, missing ``meta.json``, absent ``pane_id``, a boot-id
-mismatch, a pane herdr does not know about -- is UNKNOWN, and unknown is never reaped. The cost
+mismatch, a workspace herdr could not list -- is UNKNOWN, and unknown is never reaped. The cost
 asymmetry is the whole reason: killing an agent mid-work is far worse than clutter, and a reaper
 that is wrong once in the expensive direction gets switched off permanently.
+
+GONE: A RECORD WHOSE TAB IS ALREADY CLOSED
+-----------------------------------------
+A run record outlives its tab: a tab closed by hand keeps its records until retention prunes them.
+When herdr answered with a listing of the workspace and the recorded pane is not in it, the tab is
+GONE. There is nothing to close, and it holds none of ``max_panes``, because the cap counts herdr's
+live pane list rather than run records. GONE needs a listing that succeeded: a listing that failed
+is UNKNOWN, since "herdr did not answer" must never read as "every pane is gone". Measured
+2026-10-02 on devbig030: 15 of the 32 records ``reap`` reported were such closed tabs, reported as
+UNKNOWN, and read as capacity nobody could reclaim while the cap was in fact held by live panes
+with no surviving record.
 
 SCOPE IS ENFORCED, NOT TRUSTED
 ------------------------------
@@ -93,6 +104,7 @@ class Verdict:
     STALE = "STALE"
     IN_FLIGHT = "IN_FLIGHT"
     SHELL_ALIVE = "SHELL_ALIVE"
+    GONE = "GONE"
     UNKNOWN = "UNKNOWN"
     OUT_OF_SCOPE = "OUT_OF_SCOPE"
 
@@ -153,9 +165,11 @@ class PaneEvidence:
     live_shell: ProcessIdentity | None = None
     #: Current kernel boot id, gathered independently even when the recorded pid is absent.
     current_boot_id: str | None = None
-    #: False when herdr no longer lists the pane, or we could not ask.
+    #: Whether herdr's listing of the workspace includes the pane. Read as GONE only when
+    #: ``evidence_error`` is ``None``, so a failed listing must set ``evidence_error``.
     pane_known_to_herdr: bool = True
-    #: Set when evidence could not be gathered; forces UNKNOWN with this reason.
+    #: Set when evidence could not be gathered, including a failed workspace listing; forces
+    #: UNKNOWN with this reason.
     evidence_error: str | None = None
 
 
@@ -201,6 +215,7 @@ class ReapPlan:
             Verdict.STALE: 0,
             Verdict.IN_FLIGHT: 0,
             Verdict.SHELL_ALIVE: 0,
+            Verdict.GONE: 0,
             Verdict.UNKNOWN: 0,
             Verdict.OUT_OF_SCOPE: 0,
         }
@@ -232,9 +247,13 @@ def _decide(evidence: PaneEvidence) -> ReapDecision:
         return decision(Verdict.UNKNOWN, f"evidence unavailable: {evidence.evidence_error}")
 
     if not evidence.pane_known_to_herdr:
-        # The tab may already be gone, or herdr may just not have answered. Either way there is
-        # nothing to close and no basis to claim staleness.
-        return decision(Verdict.UNKNOWN, "herdr does not list this pane")
+        # The listing succeeded (a failed one set evidence_error above) and does not include the
+        # pane, so its tab is already closed: nothing to close, and no share of max_panes.
+        return decision(
+            Verdict.GONE,
+            "herdr's listing of the workspace does not include this pane: its tab is already "
+            "closed and holds none of max_panes",
+        )
 
     # R1 -- in-flight work beats every other signal. This is the "agent is thinking" case.
     unfinished = sum(1 for recorded in evidence.run_exit_codes_recorded if not recorded)

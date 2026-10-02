@@ -239,8 +239,8 @@ pub fn build_evidence<A: HerdrApi + ?Sized>(
                 Err(error) => listing_error = Some(error.to_string()),
             },
             // No workspace by that label means we never got a listing at all. Saying nothing here
-            // would leave every pane reporting "herdr does not list this pane", which tells an
-            // operator the tabs are already gone — the opposite of what happened.
+            // would leave every pane GONE, which tells an operator the tabs are already closed —
+            // the opposite of what happened.
             Ok(None) => {
                 listing_error = Some(format!(
                     "herdr has no workspace labelled '{}'",
@@ -662,7 +662,8 @@ mod tests {
         assert_eq!(plan.counts()["UNKNOWN"], 1);
         let reason = &plan.declined()[0].reason;
         assert!(reason.contains("no workspace labelled"), "{reason}");
-        assert!(!reason.contains("does not list this pane"), "{reason}");
+        assert_eq!(plan.counts()["GONE"], 0);
+        assert!(!reason.contains("already closed"), "{reason}");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -827,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pane_herdr_no_longer_lists_is_unknown() {
+    fn a_pane_missing_from_herdrs_listing_is_gone() {
         let root = temporary_root("delisted");
         write_spool(
             &root,
@@ -843,7 +844,7 @@ mod tests {
             .iter()
             .map(|decision| (decision.pane_id.as_str(), decision.verdict))
             .collect();
-        assert_eq!(verdicts["w1:pGONE"], Verdict::Unknown);
+        assert_eq!(verdicts["w1:pGONE"], Verdict::Gone);
         assert_eq!(verdicts["w1:p1"], Verdict::ShellAlive);
         fs::remove_dir_all(root).unwrap();
     }
@@ -859,15 +860,16 @@ mod tests {
         assert_eq!(fake.workspace_queries.load(Ordering::Relaxed), 1);
         assert_eq!(plan.counts()["STALE"], 0);
         assert_eq!(plan.counts()["UNKNOWN"], 1);
-        // And it must say the SERVER did not answer, not that herdr no longer lists the pane. The
-        // verdict is the same either way, but the second sentence tells an operator the tabs are
-        // already gone -- which is the opposite of what happened. Anchored on the two strings
+        // And it must be UNKNOWN saying the SERVER did not answer, never GONE: GONE tells an
+        // operator the tabs are already closed -- which is the opposite of what happened. Anchored
+        // on the two strings
         // PRODUCTION owns: the sweep's "evidence unavailable" wrapper and the control call's own
         // purpose prefix, which the client puts in front of every failure it raises.
         let reason = &plan.declined()[0].reason;
         assert!(reason.starts_with("evidence unavailable: "), "{reason}");
         assert!(reason.contains("pane list"), "{reason}");
-        assert!(!reason.contains("does not list this pane"), "{reason}");
+        assert_eq!(plan.counts()["GONE"], 0);
+        assert!(!reason.contains("already closed"), "{reason}");
         fs::remove_dir_all(root).unwrap();
     }
 

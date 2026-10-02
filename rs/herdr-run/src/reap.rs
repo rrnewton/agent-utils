@@ -49,9 +49,20 @@
 //!   anything.
 //!
 //! Anything else -- unreadable `/proc`, missing `meta.json`, absent `pane_id`, a boot-id mismatch,
-//! a pane herdr does not know about -- is UNKNOWN, and unknown is never reaped. The cost asymmetry
+//! a workspace herdr could not list -- is UNKNOWN, and unknown is never reaped. The cost asymmetry
 //! is the whole reason: killing an agent mid-work is far worse than clutter, and a reaper that is
 //! wrong once in the expensive direction gets switched off permanently.
+//!
+//! # GONE: a record whose tab is already closed
+//!
+//! A run record outlives its tab: a tab closed by hand keeps its records until retention prunes
+//! them. When herdr answered with a listing of the workspace and the recorded pane is not in it,
+//! the tab is GONE. There is nothing to close, and it holds none of `max_panes`, because the cap
+//! counts herdr's live pane list rather than run records. GONE needs a listing that succeeded: a
+//! listing that failed is UNKNOWN, since "herdr did not answer" must never read as "every pane is
+//! gone". Measured 2026-10-02 on devbig030: 15 of the 32 records `reap` reported were such closed
+//! tabs, reported as UNKNOWN, and read as capacity nobody could reclaim while the cap was in fact
+//! held by live panes with no surviving record.
 //!
 //! # Scope is enforced, not trusted
 //!
@@ -80,6 +91,8 @@ pub enum Verdict {
     InFlight,
     /// The recorded pane shell is still the original process.
     ShellAlive,
+    /// Herdr's listing of the workspace does not include the pane: the tab is already closed.
+    Gone,
     /// We could not tell. Never reaped.
     Unknown,
     /// Not one of ours.
@@ -94,6 +107,7 @@ impl Verdict {
             Verdict::Stale => "STALE",
             Verdict::InFlight => "IN_FLIGHT",
             Verdict::ShellAlive => "SHELL_ALIVE",
+            Verdict::Gone => "GONE",
             Verdict::Unknown => "UNKNOWN",
             Verdict::OutOfScope => "OUT_OF_SCOPE",
         }
@@ -101,11 +115,12 @@ impl Verdict {
 
     /// Every verdict, so a report can print the zeros as well as the hits.
     #[must_use]
-    pub fn all() -> [Verdict; 5] {
+    pub fn all() -> [Verdict; 6] {
         [
             Verdict::Stale,
             Verdict::InFlight,
             Verdict::ShellAlive,
+            Verdict::Gone,
             Verdict::Unknown,
             Verdict::OutOfScope,
         ]
@@ -172,9 +187,11 @@ pub struct PaneEvidence {
     pub live_shell: Option<ProcessIdentity>,
     /// Current kernel boot id, gathered independently of the recorded pid.
     pub current_boot_id: Option<String>,
-    /// False when herdr no longer lists the pane, or we could not ask.
+    /// Whether herdr's listing of the workspace includes the pane. Read as GONE only when
+    /// `evidence_error` is `None`, so a failed listing must set `evidence_error`.
     pub pane_known_to_herdr: bool,
-    /// Set when evidence could not be gathered; forces UNKNOWN with this reason.
+    /// Set when evidence could not be gathered, including a failed workspace listing; forces
+    /// UNKNOWN with this reason.
     pub evidence_error: Option<String>,
 }
 
@@ -271,9 +288,12 @@ fn decide(evidence: &PaneEvidence) -> ReapDecision {
     }
 
     if !evidence.pane_known_to_herdr {
-        // The tab may already be gone, or herdr may just not have answered. Either way there is
-        // nothing to close and no basis to claim staleness.
-        return build(Verdict::Unknown, "herdr does not list this pane".to_owned());
+        // The listing succeeded (a failed one set evidence_error above) and does not include the
+        // pane, so its tab is already closed: nothing to close, and no share of max_panes.
+        return build(
+            Verdict::Gone,
+            "herdr's listing of the workspace does not include this pane: its tab is already closed and holds none of max_panes".to_owned(),
+        );
     }
 
     // R1 -- in-flight work beats every other signal. This is the "agent is thinking" case.
@@ -512,13 +532,36 @@ mod tests {
     }
 
     #[test]
-    fn pane_unknown_to_herdr_is_not_stale() {
+    fn pane_missing_from_a_successful_listing_is_gone_not_stale() {
         let plan = plan_reap(&[PaneEvidence {
             pane_known_to_herdr: false,
             ..scoped()
         }]);
-        assert_eq!(plan.counts()["UNKNOWN"], 1);
+        assert_eq!(plan.counts()["GONE"], 1);
+        assert_eq!(plan.counts()["UNKNOWN"], 0);
         assert!(plan.reapable().is_empty());
+        assert!(plan.declined()[0].reason.contains("already closed"));
+    }
+
+    #[test]
+    fn pane_missing_because_the_listing_failed_is_unknown_not_gone() {
+        let plan = plan_reap(&[PaneEvidence {
+            pane_known_to_herdr: false,
+            evidence_error: Some("pane list: timed out".to_owned()),
+            ..scoped()
+        }]);
+        assert_eq!(plan.counts()["UNKNOWN"], 1);
+        assert_eq!(plan.counts()["GONE"], 0);
+    }
+
+    #[test]
+    fn out_of_scope_beats_gone() {
+        let plan = plan_reap(&[PaneEvidence {
+            pane_known_to_herdr: false,
+            in_scope: false,
+            ..scoped()
+        }]);
+        assert_eq!(plan.counts()["OUT_OF_SCOPE"], 1);
     }
 
     #[test]
@@ -569,9 +612,15 @@ mod tests {
                 in_scope: false,
                 ..scoped()
             },
+            PaneEvidence {
+                pane_id: "wE:p6".to_owned(),
+                pane_known_to_herdr: false,
+                ..scoped()
+            },
         ]);
         let counts = plan.counts();
-        assert_eq!(counts["considered"], 5);
+        assert_eq!(counts["considered"], 6);
+        assert_eq!(counts["GONE"], 1);
         assert_eq!(counts["STALE"], 1);
         assert_eq!(counts["SHELL_ALIVE"], 1);
         assert_eq!(counts["IN_FLIGHT"], 1);

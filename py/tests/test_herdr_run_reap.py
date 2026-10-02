@@ -119,10 +119,23 @@ def test_unbound_recorded_identity_is_unknown() -> None:
     assert plan.reapable == ()
 
 
-def test_pane_unknown_to_herdr_is_not_stale() -> None:
+def test_pane_missing_from_a_successful_listing_is_gone_not_stale() -> None:
     plan = plan_reap([scoped(pane_known_to_herdr=False)])
-    assert plan.counts()["UNKNOWN"] == 1
+    assert plan.counts()["GONE"] == 1
+    assert plan.counts()["UNKNOWN"] == 0
     assert plan.reapable == ()
+    assert "already closed" in plan.declined[0].reason
+
+
+def test_pane_missing_because_the_listing_failed_is_unknown_not_gone() -> None:
+    plan = plan_reap([scoped(pane_known_to_herdr=False, evidence_error="pane list: timed out")])
+    assert plan.counts()["UNKNOWN"] == 1
+    assert plan.counts()["GONE"] == 0
+
+
+def test_out_of_scope_beats_gone() -> None:
+    plan = plan_reap([scoped(pane_known_to_herdr=False, in_scope=False)])
+    assert plan.counts()["OUT_OF_SCOPE"] == 1
 
 
 def test_evidence_error_is_unknown() -> None:
@@ -152,10 +165,12 @@ def test_mixed_population_reports_counts_on_both_sides() -> None:
             scoped(pane_id="wE:p3", run_exit_codes_recorded=(False,)),  # thinking
             scoped(pane_id="wE:p4", live_shell=ident(4242, ticks=7)),  # recycled
             scoped(pane_id="wE:p5", in_scope=False),  # not ours
+            scoped(pane_id="wE:p6", pane_known_to_herdr=False),  # tab already closed
         ]
     )
     counts = plan.counts()
-    assert counts["considered"] == 5
+    assert counts["considered"] == 6
+    assert counts["GONE"] == 1
     assert counts["STALE"] == 1
     assert counts["SHELL_ALIVE"] == 1
     assert counts["IN_FLIGHT"] == 1
