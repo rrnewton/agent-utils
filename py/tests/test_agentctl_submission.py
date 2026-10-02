@@ -16,7 +16,9 @@ from agentctl.errors import HerdrUnavailable
 from agentctl.submission import (
     PromptNotStaged,
     PromptStagedNotSubmitted,
+    _corroborated,
     _is_labelled_rule,
+    _staged,
     composer_view,
     submit_verified,
 )
@@ -457,16 +459,24 @@ _V159_TRUST_PROMPT = _screen(
 
 
 class Replay:
-    """Plays captured screens back: before the paste, while staged, and after Enter."""
+    """Plays captured screens back: before the paste, while staged, and after Enter.
+
+    ``undrawn_reads`` holds the staged screen back for that many reads after the paste,
+    as when a busy agent draws a paste late.
+    """
 
     def __init__(self, before: str, staged: str, after: str) -> None:
         self.frames = (before, staged, after)
         self.phase = 0
+        self.undrawn_reads = 0
         self.pastes: list[str] = []
         self.keys: list[str] = []
 
     def read_screen(self, pane_id: str) -> str:
         del pane_id
+        if self.phase == 1 and self.undrawn_reads > 0:
+            self.undrawn_reads -= 1
+            return self.frames[0]
         return self.frames[self.phase]
 
     def send_text(self, pane_id: str, text: str) -> None:
@@ -481,10 +491,10 @@ class Replay:
             self.phase = 2
 
 
-def _replay_submit(replay: Replay, text: str) -> object:
+def _replay_submit(replay: Replay, text: str, harness: str = "codex") -> object:
     clock = Clock()
     return submit_verified(
-        replay, "w1:p1", "codex", text, sleep=clock.sleep, monotonic=clock.monotonic,
+        replay, "w1:p1", harness, text, sleep=clock.sleep, monotonic=clock.monotonic,
     )
 
 
@@ -561,6 +571,135 @@ def test_codex_flows_hold_under_both_composer_markers(marker: str) -> None:
     with pytest.raises(PromptNotStaged, match="recognisable codex composer"):
         _submit(dialog, "hello")
     assert dialog.pastes == []
+
+
+# Rows Claude Code drew at the bottom of its pane while a turn was running, read with
+# `herdr pane read --source visible --format ansi`: before a paste, with an 11-line paste
+# collapsed into a placeholder, and after one Enter queued that paste. The composer, rule
+# and footer rows are as captured, escape sequences included, except that runs of padding
+# and rule characters are shortened and the placeholder carries the paste number of the
+# session the bridge failed on. The rows above them are simplified. Among the differences:
+# their words are neutral, a 10-row file preview and a hint row are left out, the later
+# frames reuse the first frame's transcript rows and the staged frame its spinner row, and
+# the queued prompt rows lack their trailing reset.
+_CLAUDE_BUSY_PROMPT = "\n".join(
+    ["Reply with one line for each item below."] + [f"item {n}" for n in range(2, 12)]
+)
+_CLAUDE_BUSY_TURN = (
+    "\x1b[0m\x1b[38;5;114m● \x1b[0m\x1b[1mRead\x1b[0m(notes.md)",
+    "\x1b[0m\x1b[38;5;246m  ⎿ \xa0\x1b[0mRead \x1b[0m\x1b[1m45\x1b[0m lines\x1b[0m",
+    "",
+    "\x1b[0m\x1b[38;5;246m  \x1b[0mRunning the test suite\x1b[0m\x1b[38;5;246m · 3s\x1b[0m",
+    "\x1b[0m\x1b[38;5;246m  ⎿  $ cargo test\x1b[0m",
+)
+_CLAUDE_BUSY_SPINNER = (
+    "\x1b[0m\x1b[38;5;174m·\x1b[0m \x1b[0m\x1b[38;5;180mFermenting…\x1b[0m"
+    "\x1b[38;5;174m \x1b[0m\x1b[38;5;246m(16m 8s · ↓\x1b[0m \x1b[0m"
+    "\x1b[38;5;246m12.3k tokens)\x1b[0m"
+)
+# The spinner just after Enter, while Claude Code runs its prompt hooks.
+_CLAUDE_BUSY_SPINNER_HOOKS = (
+    "\x1b[0m\x1b[38;5;174m✢\x1b[0m \x1b[0m\x1b[38;5;216mFermenting…\x1b[0m"
+    "\x1b[38;5;174m \x1b[0m\x1b[38;5;246m(running UserPromptSubmit hooks… 8/10 · "
+    "16m 9s · ↓ 12.3k tokens)\x1b[0m"
+)
+_CLAUDE_BUSY_PADDING = " " * 20
+_CLAUDE_BUSY_RULE = "\x1b[0m\x1b[38;5;244m" + "─" * 40 + "\x1b[0m"
+_CLAUDE_BUSY_WORKING_FOOTER = (
+    "  \x1b[0m\x1b[38;5;220m⏵⏵ auto mode on\x1b[0m"
+    "\x1b[38;5;246m (shift+tab to cycle) · esc to interrupt · ← 2 agents\x1b[0m"
+)
+# While a placeholder is in the composer, this replaces the running-turn footer.
+_CLAUDE_BUSY_PASTE_FOOTER = "  \x1b[0m\x1b[38;5;246mpaste again to expand\x1b[0m"
+# The running turn with an empty composer, before the paste.
+_CLAUDE_BUSY_BEFORE = _screen(
+    *_CLAUDE_BUSY_TURN, "", _CLAUDE_BUSY_SPINNER, _CLAUDE_BUSY_PADDING, _CLAUDE_BUSY_RULE,
+    "\x1b[0m\x1b[38;5;246m❯\xa0\x1b[0m\x1b[7m \x1b[0m",
+    _CLAUDE_BUSY_RULE, _CLAUDE_BUSY_WORKING_FOOTER,
+)
+# The same turn with the prompt pasted: only its placeholder is drawn.
+_CLAUDE_BUSY_STAGED = _screen(
+    *_CLAUDE_BUSY_TURN, "", _CLAUDE_BUSY_SPINNER, _CLAUDE_BUSY_PADDING, _CLAUDE_BUSY_RULE,
+    "\x1b[0m\x1b[38;5;246m❯\xa0\x1b[0m[Pasted text #923 +10 lines]\x1b[0m\x1b[7m \x1b[0m",
+    _CLAUDE_BUSY_RULE, _CLAUDE_BUSY_PASTE_FOOTER,
+)
+# After one Enter: the prompt is queued above the spinner, in full.
+_CLAUDE_BUSY_QUEUED = _screen(
+    *_CLAUDE_BUSY_TURN, "     ",
+    *(
+        ("\x1b[0m\x1b[38;5;239m\x1b[48;5;237m❯ " if index == 0 else "\x1b[0m\x1b[48;5;237m  ")
+        + f"\x1b[0m\x1b[38;5;246m\x1b[48;5;237m{line}\x1b[0m\x1b[48;5;237m{_CLAUDE_BUSY_PADDING}"
+        for index, line in enumerate(_CLAUDE_BUSY_PROMPT.splitlines())
+    ),
+    "", _CLAUDE_BUSY_SPINNER_HOOKS, _CLAUDE_BUSY_PADDING, _CLAUDE_BUSY_RULE,
+    "\x1b[0m\x1b[38;5;246m❯\xa0\x1b[0m\x1b[7mP\x1b[0m\x1b[2mress up to edit queued messages\x1b[0m",
+    _CLAUDE_BUSY_RULE, _CLAUDE_BUSY_PASTE_FOOTER,
+)
+
+
+def test_busy_claude_screens_show_the_paste_only_as_a_placeholder() -> None:
+    before = composer_view("claude", _CLAUDE_BUSY_BEFORE)
+    assert before is not None
+    assert before.composer_solid.strip() == ""
+    assert "[Pasted" not in before.composer
+    assert "esc to interrupt" in before.footer
+
+    pasted = composer_view("claude", _CLAUDE_BUSY_STAGED)
+    assert pasted is not None
+    assert pasted.composer_solid.strip() == "[Pasted text #923 +10 lines]"
+    assert _staged(pasted, _CLAUDE_BUSY_PROMPT, 0)
+    # The footer stops saying that a turn is running while the placeholder is drawn.
+    assert "esc to interrupt" not in pasted.footer
+    assert "paste again to expand" in pasted.footer
+
+    queued = composer_view("claude", _CLAUDE_BUSY_QUEUED)
+    assert queued is not None
+    assert queued.composer_solid.strip() == ""
+    assert not _staged(queued, _CLAUDE_BUSY_PROMPT, 0)
+    assert _corroborated(before, queued, _CLAUDE_BUSY_PROMPT) == (
+        "prompt text appeared above the composer"
+    )
+
+
+def test_placeholder_left_in_a_busy_claude_composer_holds_the_next_prompt() -> None:
+    replay = Replay(_CLAUDE_BUSY_STAGED, _CLAUDE_BUSY_STAGED, _CLAUDE_BUSY_STAGED)
+    with pytest.raises(PromptNotStaged, match="refusing to append"):
+        _replay_submit(replay, "the next prompt", harness="claude")
+    assert replay.pastes == [] and replay.keys == []
+
+
+# Verified submission once saw no paste in a busy Claude Code composer within 3 s of typing
+# it; the paste was there later, unsubmitted, and held later prompts:
+# https://github.com/rrnewton/agent-utils/issues/215
+def test_busy_claude_paste_drawn_late_is_submitted_with_one_enter() -> None:
+    replay = Replay(_CLAUDE_BUSY_BEFORE, _CLAUDE_BUSY_STAGED, _CLAUDE_BUSY_QUEUED)
+    replay.undrawn_reads = 45
+    receipt = _replay_submit(replay, _CLAUDE_BUSY_PROMPT, harness="claude")
+    assert getattr(receipt, "key") == "Enter"
+    assert getattr(receipt, "key_presses") == 1
+    assert getattr(receipt, "evidence") == "prompt text appeared above the composer"
+    # Reads 0.1 s apart missed the placeholder for 4.5 s; the evidence came one poll after
+    # the Enter.
+    assert getattr(receipt, "elapsed_seconds") == 4.6
+    assert replay.pastes == [f"{_PASTE_START}{_CLAUDE_BUSY_PROMPT}{_PASTE_END}"]
+    assert replay.keys == ["Enter"]
+
+
+def test_busy_claude_paste_never_drawn_gives_up_at_the_stage_timeout_without_a_key() -> None:
+    replay = Replay(_CLAUDE_BUSY_BEFORE, _CLAUDE_BUSY_STAGED, _CLAUDE_BUSY_QUEUED)
+    replay.undrawn_reads = 1_000_000
+    clock = Clock()
+    with pytest.raises(HerdrUnavailable, match="within 60s; no submission key was sent") as caught:
+        submit_verified(
+            replay, "w1:p1", "claude", _CLAUDE_BUSY_PROMPT,
+            sleep=clock.sleep, monotonic=clock.monotonic,
+        )
+    assert not isinstance(caught.value, (PromptNotStaged, PromptStagedNotSubmitted))
+    # The clock adds 0.1 s per poll in floating point, so the read that reaches the deadline
+    # can land one poll after it.
+    assert 60.0 <= clock.now - 1000.0 < 60.2
+    assert len(replay.pastes) == 1 and replay.keys == []
+
 
 def _completed(
     command: Sequence[str], returncode: int = 0, stdout: str = "", stderr: str = "",

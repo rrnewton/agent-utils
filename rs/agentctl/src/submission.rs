@@ -26,7 +26,16 @@ pub const VERIFIED_HARNESSES: [&str; 2] = ["claude", "codex"];
 /// Screen rows requested for every composer read.
 pub const SCREEN_LINES: usize = 200;
 /// Maximum wait for pasted text to appear in the composer before any key is sent.
-pub const STAGE_TIMEOUT: Duration = Duration::from_secs(3);
+///
+/// The wait ends at the first read that shows the paste, about 0.1 s after it in the
+/// usual case. It is long because giving up leaves the paste unsubmitted in the
+/// composer, where the draft check then holds every later prompt, and a paste typed
+/// into a busy agent's pane has gone unseen for 3 s and then been found in its composer.
+/// A paste that shows late or never costs the rest of the wait: the queue drain that
+/// typed it keeps its queue and pane locks meanwhile, so other agentctl senders to the
+/// pane wait too, and any new paste placeholder drawn in that time, even another
+/// sender's, counts as this paste.
+pub const STAGE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Maximum time spent retrying the submission key and waiting for corroboration.
 pub const SUBMIT_TIMEOUT: Duration = Duration::from_secs(60);
 /// First wait before a still-staged prompt receives another submission key.
@@ -1298,11 +1307,149 @@ mod tests {
         }
     }
 
+    /// Rows Claude Code drew at the bottom of its pane while a turn was running, read with
+    /// `herdr pane read --source visible --format ansi`: before a paste, with an 11-line paste
+    /// collapsed into a placeholder, and after one Enter queued that paste. The composer, rule
+    /// and footer rows are as captured, escape sequences included, except that runs of padding
+    /// and rule characters are shortened and the placeholder carries the paste number of the
+    /// session the bridge failed on. The rows above them are simplified. Among the differences:
+    /// their words are neutral, a 10-row file preview and a hint row are left out, the later
+    /// frames reuse the first frame's transcript rows and the staged frame its spinner row, and
+    /// the queued prompt rows lack their trailing reset.
+    mod claude_busy {
+        /// Eleven lines, which Claude Code collapses into `[Pasted text #N +10 lines]`.
+        pub(super) const PROMPT: &str = concat!(
+            "Reply with one line for each item below.\n",
+            "item 2\nitem 3\nitem 4\nitem 5\nitem 6\nitem 7\nitem 8\nitem 9\nitem 10\nitem 11",
+        );
+        const TOOL_CALL: &str =
+            "\u{1b}[0m\u{1b}[38;5;114m● \u{1b}[0m\u{1b}[1mRead\u{1b}[0m(notes.md)";
+        const TOOL_RESULT: &str = concat!(
+            "\u{1b}[0m\u{1b}[38;5;246m  ⎿ \u{a0}\u{1b}[0mRead \u{1b}[0m\u{1b}[1m45\u{1b}[0m",
+            " lines\u{1b}[0m",
+        );
+        const RUNNING: &str = concat!(
+            "\u{1b}[0m\u{1b}[38;5;246m  \u{1b}[0mRunning the test suite\u{1b}[0m",
+            "\u{1b}[38;5;246m · 3s\u{1b}[0m",
+        );
+        const RUNNING_COMMAND: &str = "\u{1b}[0m\u{1b}[38;5;246m  ⎿  $ cargo test\u{1b}[0m";
+        const SPINNER: &str = concat!(
+            "\u{1b}[0m\u{1b}[38;5;174m·\u{1b}[0m \u{1b}[0m\u{1b}[38;5;180mFermenting…\u{1b}[0m",
+            "\u{1b}[38;5;174m \u{1b}[0m\u{1b}[38;5;246m(16m 8s · ↓\u{1b}[0m \u{1b}[0m",
+            "\u{1b}[38;5;246m12.3k tokens)\u{1b}[0m",
+        );
+        /// The spinner just after Enter, while Claude Code runs its prompt hooks.
+        const SPINNER_HOOKS: &str = concat!(
+            "\u{1b}[0m\u{1b}[38;5;174m✢\u{1b}[0m \u{1b}[0m\u{1b}[38;5;216mFermenting…\u{1b}[0m",
+            "\u{1b}[38;5;174m \u{1b}[0m\u{1b}[38;5;246m(running UserPromptSubmit hooks… 8/10 · ",
+            "16m 9s · ↓ 12.3k tokens)\u{1b}[0m",
+        );
+        const PADDING: &str = "                    ";
+        const RULE: &str = concat!(
+            "\u{1b}[0m\u{1b}[38;5;244m",
+            "────────────────────────────────────────",
+            "\u{1b}[0m",
+        );
+        const EMPTY_COMPOSER: &str = "\u{1b}[0m\u{1b}[38;5;246m❯\u{a0}\u{1b}[0m\u{1b}[7m \u{1b}[0m";
+        const PASTED_COMPOSER: &str = concat!(
+            "\u{1b}[0m\u{1b}[38;5;246m❯\u{a0}\u{1b}[0m[Pasted text #923 +10 lines]\u{1b}[0m",
+            "\u{1b}[7m \u{1b}[0m",
+        );
+        const QUEUED_COMPOSER: &str = concat!(
+            "\u{1b}[0m\u{1b}[38;5;246m❯\u{a0}\u{1b}[0m\u{1b}[7mP\u{1b}[0m",
+            "\u{1b}[2mress up to edit queued messages\u{1b}[0m",
+        );
+        const WORKING_FOOTER: &str = concat!(
+            "  \u{1b}[0m\u{1b}[38;5;220m⏵⏵ auto mode on\u{1b}[0m",
+            "\u{1b}[38;5;246m (shift+tab to cycle) · esc to interrupt · ← 2 agents\u{1b}[0m",
+        );
+        /// While a placeholder is in the composer, this replaces the running-turn footer.
+        const PASTE_FOOTER: &str = "  \u{1b}[0m\u{1b}[38;5;246mpaste again to expand\u{1b}[0m";
+
+        fn screen(rows: &[&str]) -> String {
+            rows.join("\n") + "\n"
+        }
+
+        /// The running turn with an empty composer, before the paste.
+        pub(super) fn before() -> String {
+            screen(&[
+                TOOL_CALL,
+                TOOL_RESULT,
+                "",
+                RUNNING,
+                RUNNING_COMMAND,
+                "",
+                SPINNER,
+                PADDING,
+                RULE,
+                EMPTY_COMPOSER,
+                RULE,
+                WORKING_FOOTER,
+            ])
+        }
+
+        /// The same turn with [`PROMPT`] pasted: only its placeholder is drawn.
+        pub(super) fn staged() -> String {
+            screen(&[
+                TOOL_CALL,
+                TOOL_RESULT,
+                "",
+                RUNNING,
+                RUNNING_COMMAND,
+                "",
+                SPINNER,
+                PADDING,
+                RULE,
+                PASTED_COMPOSER,
+                RULE,
+                PASTE_FOOTER,
+            ])
+        }
+
+        /// After one Enter: the prompt is queued above the spinner, in full.
+        pub(super) fn queued() -> String {
+            let mut rows = vec![
+                TOOL_CALL.to_owned(),
+                TOOL_RESULT.to_owned(),
+                String::new(),
+                RUNNING.to_owned(),
+                RUNNING_COMMAND.to_owned(),
+                "     ".to_owned(),
+            ];
+            for (index, line) in PROMPT.lines().enumerate() {
+                let lead = if index == 0 {
+                    "\u{1b}[0m\u{1b}[38;5;239m\u{1b}[48;5;237m❯ "
+                } else {
+                    "\u{1b}[0m\u{1b}[48;5;237m  "
+                };
+                rows.push(format!(
+                    "{lead}\u{1b}[0m\u{1b}[38;5;246m\u{1b}[48;5;237m{line}\u{1b}[0m\u{1b}[48;5;237m{PADDING}"
+                ));
+            }
+            rows.extend(
+                [
+                    "",
+                    SPINNER_HOOKS,
+                    PADDING,
+                    RULE,
+                    QUEUED_COMPOSER,
+                    RULE,
+                    PASTE_FOOTER,
+                ]
+                .map(str::to_owned),
+            );
+            rows.join("\n") + "\n"
+        }
+    }
+
     /// Plays captured screens back: one before the paste, one while the paste is staged,
-    /// and one after the submission key. Every key press is recorded.
+    /// and one after the submission key. The staged screen can be held back for a number of
+    /// reads, as when a busy agent draws a paste late. Every key press is recorded.
     struct Replay {
         frames: [String; 3],
         phase: std::sync::Mutex<usize>,
+        /// Reads after the paste that still return the screen from before it.
+        undrawn_reads: std::sync::Mutex<u32>,
         pastes: std::sync::Mutex<Vec<String>>,
         keys: std::sync::Mutex<Vec<String>>,
     }
@@ -1312,15 +1459,28 @@ mod tests {
             Self {
                 frames: [before, staged, after],
                 phase: std::sync::Mutex::new(0),
+                undrawn_reads: std::sync::Mutex::new(0),
                 pastes: std::sync::Mutex::default(),
                 keys: std::sync::Mutex::default(),
             }
+        }
+
+        /// Draw the paste only on the read after `reads` reads that miss it.
+        fn drawn_after(self, reads: u32) -> Self {
+            *self.undrawn_reads.lock().unwrap() = reads;
+            self
         }
     }
 
     impl PromptTerminal for Replay {
         fn read_screen(&self, _pane_id: &str) -> Result<String> {
-            Ok(self.frames[*self.phase.lock().unwrap()].clone())
+            let phase = *self.phase.lock().unwrap();
+            let mut undrawn = self.undrawn_reads.lock().unwrap();
+            if phase == 1 && *undrawn > 0 {
+                *undrawn -= 1;
+                return Ok(self.frames[0].clone());
+            }
+            Ok(self.frames[phase].clone())
         }
 
         fn send_text(&self, _pane_id: &str, text: &str) -> Result<()> {
@@ -1455,5 +1615,176 @@ mod tests {
             );
             assert!(dialog.state().pastes.is_empty(), "{marker}");
         }
+    }
+
+    #[test]
+    fn busy_claude_screens_show_the_paste_only_as_a_placeholder() {
+        let before = composer_view("claude", &claude_busy::before()).expect("busy composer");
+        assert_eq!(before.composer_solid.trim(), "", "{before:?}");
+        assert_eq!(paste_placeholders(&before.composer), 0, "{before:?}");
+        assert!(before.footer.contains(WORKING_MARKER), "{before:?}");
+
+        let pasted = composer_view("claude", &claude_busy::staged()).expect("pasted composer");
+        assert_eq!(
+            pasted.composer_solid.trim(),
+            "[Pasted text #923 +10 lines]",
+            "{pasted:?}"
+        );
+        assert!(staged(&pasted, claude_busy::PROMPT, 0), "{pasted:?}");
+        // The footer stops saying that a turn is running while the placeholder is drawn.
+        assert!(!pasted.footer.contains(WORKING_MARKER), "{pasted:?}");
+        assert!(
+            pasted.footer.contains("paste again to expand"),
+            "{pasted:?}"
+        );
+
+        let queued = composer_view("claude", &claude_busy::queued()).expect("queued composer");
+        assert_eq!(queued.composer_solid.trim(), "", "{queued:?}");
+        assert!(!staged(&queued, claude_busy::PROMPT, 0), "{queued:?}");
+        assert_eq!(
+            corroborated(&before, &queued, claude_busy::PROMPT).as_deref(),
+            Some("prompt text appeared above the composer")
+        );
+    }
+
+    #[test]
+    fn placeholder_left_in_a_busy_claude_composer_holds_the_next_prompt() {
+        let screen = claude_busy::staged();
+        let replay = Replay::new(screen.clone(), screen.clone(), screen);
+        let reason = refusal(submit_verified(
+            &replay,
+            "w1:p1",
+            "claude",
+            "the next prompt",
+            SubmitTimeouts::default(),
+            &Clock::default(),
+        ));
+        assert!(reason.contains("refusing to append"), "{reason}");
+        assert!(replay.pastes.lock().unwrap().is_empty());
+        assert!(replay.keys.lock().unwrap().is_empty());
+    }
+
+    // Verified submission once saw no paste in a busy Claude Code composer within 3 s of
+    // typing it; the paste was there later, unsubmitted, and held later prompts:
+    // https://github.com/rrnewton/agent-utils/issues/215
+    #[test]
+    fn busy_claude_paste_drawn_late_is_submitted_with_one_enter() {
+        let replay = Replay::new(
+            claude_busy::before(),
+            claude_busy::staged(),
+            claude_busy::queued(),
+        )
+        .drawn_after(45);
+        let clock = Clock::default();
+        let outcome = submit_verified(
+            &replay,
+            "w1:p1",
+            "claude",
+            claude_busy::PROMPT,
+            SubmitTimeouts::default(),
+            &clock,
+        );
+        let receipt = receipt(outcome);
+        assert_eq!(receipt.key, "Enter");
+        assert_eq!(receipt.key_presses, 1);
+        assert_eq!(receipt.evidence, "prompt text appeared above the composer");
+        // Reads 100 ms apart missed the placeholder for 4.5 s; the evidence came one poll after
+        // the Enter.
+        assert_eq!(receipt.elapsed, Duration::from_millis(4_600));
+        assert_eq!(
+            *replay.pastes.lock().unwrap(),
+            [format!(
+                "{BRACKETED_PASTE_START}{}{BRACKETED_PASTE_END}",
+                claude_busy::PROMPT
+            )]
+        );
+        assert_eq!(*replay.keys.lock().unwrap(), ["Enter"]);
+    }
+
+    #[test]
+    fn busy_claude_paste_never_drawn_gives_up_at_the_stage_timeout_without_a_key() {
+        let replay = Replay::new(
+            claude_busy::before(),
+            claude_busy::staged(),
+            claude_busy::queued(),
+        )
+        .drawn_after(u32::MAX);
+        let clock = Clock::default();
+        let message = submit_verified(
+            &replay,
+            "w1:p1",
+            "claude",
+            claude_busy::PROMPT,
+            SubmitTimeouts::default(),
+            &clock,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            message.contains("within 60.0s; no submission key was sent"),
+            "{message}"
+        );
+        assert_eq!(
+            clock.monotonic() - Duration::from_millis(1_000_000),
+            STAGE_TIMEOUT
+        );
+        assert_eq!(replay.pastes.lock().unwrap().len(), 1);
+        assert!(replay.keys.lock().unwrap().is_empty());
+    }
+
+    /// A clock whose stop request arrives once `stop_after` has passed.
+    struct StoppingClock {
+        clock: Clock,
+        stop_after: Duration,
+    }
+
+    impl AgentRuntime for StoppingClock {
+        fn monotonic(&self) -> Duration {
+            self.clock.monotonic()
+        }
+
+        fn sleep(&self, duration: Duration) {
+            self.clock.sleep(duration);
+            if self.monotonic() - Duration::from_millis(1_000_000) >= self.stop_after {
+                self.clock.cancel.store(true, Ordering::SeqCst);
+            }
+        }
+
+        fn cancelled(&self) -> bool {
+            self.clock.cancelled()
+        }
+    }
+
+    #[test]
+    fn stop_ends_the_wait_for_a_late_paste_at_the_next_poll() {
+        let replay = Replay::new(
+            claude_busy::before(),
+            claude_busy::staged(),
+            claude_busy::queued(),
+        )
+        .drawn_after(u32::MAX);
+        let runtime = StoppingClock {
+            clock: Clock::default(),
+            stop_after: Duration::from_secs(1),
+        };
+        let message = submit_verified(
+            &replay,
+            "w1:p1",
+            "claude",
+            claude_busy::PROMPT,
+            SubmitTimeouts::default(),
+            &runtime,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            message.contains("cancelled after the prompt was pasted"),
+            "{message}"
+        );
+        assert_eq!(
+            runtime.monotonic() - Duration::from_millis(1_000_000),
+            Duration::from_secs(1)
+        );
+        assert!(replay.keys.lock().unwrap().is_empty());
     }
 }

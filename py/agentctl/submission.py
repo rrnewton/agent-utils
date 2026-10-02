@@ -49,7 +49,16 @@ _BRACKETED_PASTE_END = "\x1b[201~"
 #: Screen rows requested for every composer read.
 SCREEN_LINES = 200
 #: Maximum wait for pasted text to appear in the composer before any key is sent.
-STAGE_TIMEOUT_SECONDS = 3.0
+#:
+#: The wait ends at the first read that shows the paste, about 0.1 s after it in the
+#: usual case. It is long because giving up leaves the paste unsubmitted in the
+#: composer, where the draft check then holds every later prompt, and a paste typed
+#: into a busy agent's pane has gone unseen for 3 s and then been found in its composer.
+#: A paste that shows late or never costs the rest of the wait: the queue drain that
+#: typed it keeps its queue and pane locks meanwhile, so other agentctl senders to the
+#: pane wait too, and any new paste placeholder drawn in that time, even another
+#: sender's, counts as this paste.
+STAGE_TIMEOUT_SECONDS = 60.0
 #: Maximum time spent retrying the submission key and waiting for corroboration.
 SUBMIT_TIMEOUT_SECONDS = 60.0
 #: First wait before a still-staged prompt receives another submission key.
