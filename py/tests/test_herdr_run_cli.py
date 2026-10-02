@@ -26,6 +26,7 @@ from herdr_run.cli import (
 )
 from herdr_run.config import Config
 from herdr_run.reap import ReapDecision, ReapPlan, Verdict
+from herdr_run.sweep import Occupancy
 from herdr_run.errors import (
     EXIT_CONFIG,
     EXIT_REFUSED,
@@ -505,6 +506,9 @@ def test_reap_subcommand_reports_both_sides_and_closes_nothing(
     )
     monkeypatch.setattr(cli_module, "_client", lambda *_args: object())
     monkeypatch.setattr(cli_module, "sweep", lambda *_args, **_kwargs: ReapPlan(decisions))
+    monkeypatch.setattr(
+        cli_module, "measure_occupancy", lambda *_args: Occupancy(live_panes=5, with_record=2, listing_error=None)
+    )
 
     assert main(["reap"]) == 0
     document = json.loads(capsys.readouterr().out)
@@ -521,6 +525,13 @@ def test_reap_subcommand_reports_both_sides_and_closes_nothing(
     # ones missing from this count. Printing the window keeps "considered: 2" from implying more.
     assert document["candidate_source"]["retention_days"] == 4
     assert "retention_days" in document["candidate_source"]["note"]
+    # And what holds max_panes: the cap counts every pane herdr lists, the verdicts above cover only
+    # the panes a record names, so the panes nobody can judge are counted rather than left implicit.
+    occupancy = document["occupancy"]
+    assert (occupancy["live_panes"], occupancy["with_record"], occupancy["without_record"]) == (5, 2, 3)
+    assert occupancy["max_panes"] == Config().max_panes
+    assert occupancy["listing_error"] is None
+    assert "max_panes" in occupancy["note"]
 
 
 class _CapturedText(io.StringIO):

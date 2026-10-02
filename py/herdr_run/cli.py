@@ -37,7 +37,7 @@ from herdr_run.errors import (
 from herdr_run.readiness import assess, infer_prompt_tail
 from herdr_run.runner import RunResult, execute, read_output_bytes, write_meta
 from herdr_run.session import resolve_target, tab_label_for
-from herdr_run.sweep import sweep
+from herdr_run.sweep import load_run_records, measure_occupancy, sweep
 
 __all__ = ["main", "help_text", "subcommand_help_text", "usage_line"]
 
@@ -874,6 +874,14 @@ def _cmd_target(
     return 0 if readiness.ready else EXIT_BUSY
 
 
+#: How to read ``reap``'s ``occupancy`` block. Compared verbatim by the differential harness.
+OCCUPANCY_NOTE = (
+    "max_panes counts every pane herdr lists in the workspace (live_panes); reap can judge only "
+    "the panes a surviving run record names (with_record), so without_record panes hold their "
+    "share of max_panes until closed by hand"
+)
+
+
 def _cmd_reap(config: Config, environ: dict[str, str]) -> int:
     """Report which command tabs are PROVABLY finished with. Closes nothing.
 
@@ -890,11 +898,26 @@ def _cmd_reap(config: Config, environ: dict[str, str]) -> int:
     ones the pane cap exists to bound, drop out of this report while still counting against
     ``max_panes``. Printing the window is the difference between a report an operator can reason
     about and a count that quietly means something narrower than it says.
+
+    ``occupancy`` measures that gap instead of only naming it: herdr's live pane list, which is what
+    the cap counts, split by whether a surviving run record names each pane. Measured 2026-10-02 on
+    devbig030, the cap was held by live panes with no record while ``reap`` listed only records,
+    so its output could not say what was holding the cap.
     """
     client = _client(config, environ)
-    plan = sweep(client, config)
+    records = load_run_records(config)
+    plan = sweep(client, config, records=records)
+    occupancy = measure_occupancy(client, config, records)
     document = {
         "workspace": config.workspace,
+        "occupancy": {
+            "max_panes": config.max_panes,
+            "live_panes": occupancy.live_panes,
+            "with_record": occupancy.with_record,
+            "without_record": occupancy.without_record,
+            "listing_error": occupancy.listing_error,
+            "note": OCCUPANCY_NOTE,
+        },
         "candidate_source": {
             "spool_dir": config.spool_dir,
             "retention_days": config.retention_days,

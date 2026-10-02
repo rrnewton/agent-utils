@@ -19,9 +19,10 @@ use crate::client::{bounded_output, HerdrClient};
 use crate::config::{load_config, Config, MAX_TIMEOUT_SECONDS};
 use crate::error::{ErrorKind, HerdrRunError, Result, EXIT_BUSY};
 use crate::readiness::{assess, infer_prompt_tail};
+use crate::reap::plan_reap;
 use crate::runner::{execute, result_json, write_meta, RunResult};
 use crate::session::{resolve_target, tab_label_for};
-use crate::sweep::sweep;
+use crate::sweep::{build_evidence, load_run_records, measure_occupancy};
 
 /// One subcommand and the single line describing it in `herdr-run --help`.
 struct Subcommand {
@@ -991,19 +992,21 @@ fn write_meta_best_effort(
 /// the pane cap exists to bound, drop out of this report while still counting against `max_panes`.
 /// Printing the window is the difference between a report an operator can reason about and a count
 /// that quietly means something narrower than it says.
-/// The bound on `reap`'s candidate set, printed with every report.
 ///
-/// A constant rather than an inline literal because the wording is part of the command's stable
-/// output and is compared verbatim by the differential harness.
-const CANDIDATE_SOURCE_NOTE: &str = concat!(
-    "candidates are the panes named by surviving run records; run records are pruned ",
-    "retention_days after the run finished, so a tab whose agent last ran longer ago than that ",
-    "is not considered here and must be closed by hand"
-);
-
+/// `occupancy` measures that gap instead of only naming it: herdr's live pane list, which is what
+/// the cap counts, split by whether a surviving run record names each pane. Measured 2026-10-02 on
+/// devbig030, the cap was held by live panes with no record while `reap` listed only records, so
+/// its output could not say what was holding the cap.
 fn command_reap(config: &Config) -> Result<i32> {
     let client = HerdrClient::new(&config.broker)?;
-    let plan = sweep(&client, config, Path::new("/proc"));
+    let records = load_run_records(config);
+    let occupancy = measure_occupancy(&client, config, &records);
+    let plan = plan_reap(&build_evidence(
+        &client,
+        config,
+        Some(records),
+        Path::new("/proc"),
+    ));
     let entry = |decision: &crate::reap::ReapDecision, with_verdict: bool| {
         let mut object = Map::new();
         object.insert("pane_id".to_owned(), json!(decision.pane_id));
@@ -1016,6 +1019,14 @@ fn command_reap(config: &Config) -> Result<i32> {
         Value::Object(object)
     };
     let document = json!({
+        "occupancy": {
+            "listing_error": occupancy.listing_error,
+            "live_panes": occupancy.live_panes,
+            "max_panes": config.max_panes,
+            "note": OCCUPANCY_NOTE,
+            "with_record": occupancy.with_record,
+            "without_record": occupancy.without_record(),
+        },
         "candidate_source": {
             "note": CANDIDATE_SOURCE_NOTE,
             "retention_days": config.retention_days,
@@ -1029,6 +1040,23 @@ fn command_reap(config: &Config) -> Result<i32> {
     print_json(&document)?;
     Ok(0)
 }
+
+/// The bound on `reap`'s candidate set, printed with every report.
+///
+/// A constant rather than an inline literal because the wording is part of the command's stable
+/// output and is compared verbatim by the differential harness.
+const CANDIDATE_SOURCE_NOTE: &str = concat!(
+    "candidates are the panes named by surviving run records; run records are pruned ",
+    "retention_days after the run finished, so a tab whose agent last ran longer ago than that ",
+    "is not considered here and must be closed by hand"
+);
+
+/// How to read `reap`'s `occupancy` block. Compared verbatim by the differential harness.
+const OCCUPANCY_NOTE: &str = concat!(
+    "max_panes counts every pane herdr lists in the workspace (live_panes); reap can judge only ",
+    "the panes a surviving run record names (with_record), so without_record panes hold their ",
+    "share of max_panes until closed by hand"
+);
 
 /// The scope disclaimer `net-doctor` prints before it does anything.
 ///

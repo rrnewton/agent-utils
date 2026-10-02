@@ -367,6 +367,14 @@ will never appear in this report — while still holding a pane and still counti
 The report prints `candidate_source.retention_days` for exactly this reason: `"considered": 3` means
 three panes were *eligible to look at*, not that the workspace holds three tabs.
 
+The report's `occupancy` block measures that gap instead of only naming it. `live_panes` is what
+herdr lists in the workspace — the number `max_panes` is compared against. `with_record` counts the
+live panes a surviving run record names, which are the only ones `reap` can judge, and
+`without_record` is the rest: tabs holding a share of the cap that no verdict will ever cover. When
+`without_record` is most of `max_panes`, closing those tabs by hand is the remedy, and `reap` cannot
+help. If herdr cannot list the workspace, the counts are `null` and `listing_error` says why;
+a failed listing is never reported as an empty workspace.
+
 A tab is reported STALE only when all three hold, each of them positive evidence:
 
 1. **No in-flight work** — every run naming the pane recorded an `exit_code`. A run without one is

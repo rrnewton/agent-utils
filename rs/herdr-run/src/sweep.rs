@@ -317,6 +317,67 @@ fn live_shell<A: HerdrApi + ?Sized>(
     )
 }
 
+/// What holds `max_panes`: herdr's live pane list, split by whether a run record names the pane.
+///
+/// The cap counts every pane herdr lists in the workspace, while `reap` can judge only the panes a
+/// surviving run record names. `without_record` is the difference: panes holding a share of the
+/// cap that no verdict covers and only a human can close. All three counts are `None` when the
+/// listing failed, because a failed listing is not an empty workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Occupancy {
+    /// Panes herdr lists in the workspace: the number `max_panes` is compared against.
+    pub live_panes: Option<usize>,
+    /// Of those, the panes a surviving run record names, which `reap` can judge.
+    pub with_record: Option<usize>,
+    /// Why the listing failed, when it did.
+    pub listing_error: Option<String>,
+}
+
+impl Occupancy {
+    /// Live panes no run record names: they hold a share of the cap and only a human can close them.
+    #[must_use]
+    pub fn without_record(&self) -> Option<usize> {
+        Some(self.live_panes? - self.with_record?)
+    }
+}
+
+/// List the workspace the way the pane cap does, and count the panes no run record names.
+pub fn measure_occupancy<A: HerdrApi + ?Sized>(
+    client: &A,
+    config: &Config,
+    records: &[Value],
+) -> Occupancy {
+    let failed = |error: String| Occupancy {
+        live_panes: None,
+        with_record: None,
+        listing_error: Some(error),
+    };
+    let panes = match client.workspace_id_for_label(&config.workspace) {
+        Ok(Some(workspace_id)) => match client.panes(Some(&workspace_id)) {
+            Ok(panes) => panes,
+            Err(error) => return failed(error.to_string()),
+        },
+        Ok(None) => {
+            return failed(format!(
+                "herdr has no workspace labelled '{}'",
+                config.workspace
+            ))
+        }
+        Err(error) => return failed(error.to_string()),
+    };
+    let recorded: BTreeSet<String> = pane_ids_in(records).into_iter().collect();
+    Occupancy {
+        live_panes: Some(panes.len()),
+        with_record: Some(
+            panes
+                .iter()
+                .filter(|pane| recorded.contains(&pane.pane_id))
+                .count(),
+        ),
+        listing_error: None,
+    }
+}
+
 /// Gather evidence and run the reaping policy over it. Decides only; closes nothing.
 pub fn sweep<A: HerdrApi + ?Sized>(client: &A, config: &Config, proc_root: &Path) -> ReapPlan {
     plan_reap(&build_evidence(client, config, None, proc_root))
@@ -928,6 +989,60 @@ mod tests {
         assert!(
             identity.is_none(),
             "a recycled pane id must not inherit the first shell's authority"
+        );
+    }
+
+    fn occupancy_fake() -> SweepFake {
+        let mut fake = SweepFake::with_pane("w1:p1", 100);
+        for pane_id in ["w1:p2", "w1:p3"] {
+            fake.panes.push(Pane {
+                pane_id: pane_id.to_owned(),
+                tab_id: "w1:t2".to_owned(),
+                workspace_id: "w1".to_owned(),
+            });
+        }
+        fake
+    }
+
+    #[test]
+    fn occupancy_counts_live_panes_no_record_names() {
+        let root = temporary_root("occupancy");
+        let records = [
+            record("w1:p1", json!(0), "agent-cmds", "kvm"),
+            // A record whose pane herdr no longer lists is not occupancy.
+            record("w1:p9", json!(0), "agent-cmds", "old"),
+        ];
+        let occupancy = measure_occupancy(&occupancy_fake(), &config(&root), &records);
+        assert_eq!(occupancy.live_panes, Some(3));
+        assert_eq!(occupancy.with_record, Some(1));
+        assert_eq!(occupancy.without_record(), Some(2));
+        assert_eq!(occupancy.listing_error, None);
+    }
+
+    #[test]
+    fn occupancy_of_a_failed_listing_is_unknown_not_zero() {
+        let root = temporary_root("occupancy-fail");
+        let mut fake = occupancy_fake();
+        fake.fail_pane_list = true;
+        let occupancy = measure_occupancy(&fake, &config(&root), &[]);
+        assert_eq!(occupancy.live_panes, None);
+        assert_eq!(occupancy.without_record(), None);
+        assert!(occupancy
+            .listing_error
+            .as_deref()
+            .is_some_and(|error| error.contains("not answering")));
+    }
+
+    #[test]
+    fn occupancy_of_a_missing_workspace_names_it() {
+        let root = temporary_root("occupancy-missing");
+        let mut fake = occupancy_fake();
+        fake.workspace_exists = false;
+        let occupancy = measure_occupancy(&fake, &config(&root), &[]);
+        assert_eq!(occupancy.with_record, None);
+        assert_eq!(
+            occupancy.listing_error.as_deref(),
+            Some("herdr has no workspace labelled 'agent-cmds'")
         );
     }
 }

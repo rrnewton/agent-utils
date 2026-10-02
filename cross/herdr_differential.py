@@ -981,8 +981,10 @@ def _reap(harness: Harness, report: Report) -> None:
             for verdict in ("STALE", "IN_FLIGHT", "SHELL_ALIVE", "GONE", "UNKNOWN", "OUT_OF_SCOPE")
         )
         and '"retention_days": 7' in python.stdout
-        and f'"workspace": "{_REAP_WORKSPACE}"' in python.stdout,
-        "an inert sweep must still print its own shape, and the window bounding it: "
+        and f'"workspace": "{_REAP_WORKSPACE}"' in python.stdout
+        and all(f'"{key}"' in python.stdout for key in ("occupancy", "max_panes", "without_record")),
+        "an inert sweep must still print its own shape, the window bounding it, and what holds "
+        "max_panes: "
         f"{_describe(python)}",
     )
 

@@ -45,6 +45,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 
 from herdr_run.client import HerdrClient
 from herdr_run.config import Config
@@ -230,6 +231,43 @@ def _live_shell(
     if probe.gone:
         return None, None
     return ProcessIdentity(pid=info.shell_pid, boot_id=boot, start_ticks=probe.start_ticks), None
+
+
+@dataclass(frozen=True)
+class Occupancy:
+    """What holds ``max_panes``: herdr's live pane list, split by whether a run record names the pane.
+
+    The cap counts every pane herdr lists in the workspace, while ``reap`` can judge only the panes a
+    surviving run record names. ``without_record`` is the difference: panes holding a share of the
+    cap that no verdict covers and only a human can close. All three counts are ``None`` when the
+    listing failed, because a failed listing is not an empty workspace.
+    """
+
+    live_panes: int | None
+    with_record: int | None
+    listing_error: str | None
+
+    @property
+    def without_record(self) -> int | None:
+        """Live panes no run record names: they hold a share of the cap and only a human can close them."""
+        if self.live_panes is None or self.with_record is None:
+            return None
+        return self.live_panes - self.with_record
+
+
+def measure_occupancy(
+    client: HerdrClient, config: Config, records: Sequence[dict[str, object]]
+) -> Occupancy:
+    """List the workspace the way the pane cap does, and count the panes no run record names."""
+    try:
+        workspace_id = client.workspace_id_for_label(config.workspace)
+        if workspace_id is None:
+            return Occupancy(None, None, f"herdr has no workspace labelled {config.workspace!r}")
+        panes = client.panes(workspace_id)
+    except HerdrRunError as exc:
+        return Occupancy(None, None, str(exc))
+    recorded = set(pane_ids_in(records))
+    return Occupancy(len(panes), sum(1 for pane in panes if pane.pane_id in recorded), None)
 
 
 def sweep(

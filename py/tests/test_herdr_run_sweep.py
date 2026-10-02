@@ -17,7 +17,13 @@ from herdr_run.config import Config
 from herdr_run.identity import parse_start_ticks, probe_process
 from herdr_run.reap import Verdict
 from herdr_run.retention import prune_runs
-from herdr_run.sweep import build_evidence, load_run_records, pane_ids_in, sweep
+from herdr_run.sweep import (
+    build_evidence,
+    load_run_records,
+    measure_occupancy,
+    pane_ids_in,
+    sweep,
+)
 from tests.herdr_fake import FakeHerdrClient
 
 BOOT = "3f2b1c8e-0000-4000-8000-000000000001"
@@ -508,3 +514,36 @@ def test_evidence_carries_the_recorded_identity_the_policy_needs(tmp_path: objec
     assert len(evidence) == 1
     recorded = evidence[0].recorded_shell
     assert recorded is not None and recorded.is_bound(), "a bare pid can never authorise anything"
+
+
+def _occupancy_fake() -> FakeHerdrClient:
+    fake = _fake_with_pane("w1:p1", shell_pid=4242)
+    tab = next(iter(next(iter(fake.workspaces.values())).tabs.values()))
+    tab.pane_ids[:] = ["w1:p1", "w1:p2", "w1:p3"]
+    return fake
+
+
+def test_occupancy_counts_live_panes_no_record_names(tmp_path: object) -> None:
+    records = [
+        _record(pane_id="w1:p1"),
+        # A record whose pane herdr no longer lists is not occupancy.
+        _record(pane_id="w1:p9", agent="old"),
+    ]
+    occupancy = measure_occupancy(_client(_occupancy_fake()), _config(str(tmp_path)), records)
+    assert (occupancy.live_panes, occupancy.with_record, occupancy.without_record) == (3, 1, 2)
+    assert occupancy.listing_error is None
+
+
+def test_occupancy_of_a_failed_listing_is_unknown_not_zero(tmp_path: object) -> None:
+    fake = _occupancy_fake()
+    fake.fail_pane_list = True
+    occupancy = measure_occupancy(_client(fake), _config(str(tmp_path)), [])
+    assert occupancy.live_panes is None
+    assert occupancy.without_record is None
+    assert occupancy.listing_error is not None and "pane list" in occupancy.listing_error
+
+
+def test_occupancy_of_a_missing_workspace_names_it(tmp_path: object) -> None:
+    occupancy = measure_occupancy(_client(FakeHerdrClient()), _config(str(tmp_path)), [])
+    assert occupancy.with_record is None
+    assert occupancy.listing_error == "herdr has no workspace labelled 'agent-cmds'"
