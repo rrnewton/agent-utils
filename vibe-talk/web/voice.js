@@ -281,6 +281,7 @@ const session = {
   // of being written concurrently to the socket.
   v1Ready: false,
   capturePaused: false,
+  captureResumeTimer: null,
   audioSegmentActive: false,
   waitingForGreeting: false,
   waitingForAudioEnd: false,
@@ -4653,14 +4654,45 @@ function vibeTalkTurnComplete() {
       setStatus("Connected — type a message.");
     } else {
       session.audioSegmentActive = true;
-      session.capturePaused = false;
       sendVibeTalkFrame({ type: "audio_start" });
+      deferVoiceCaptureAcrossTurn();
       setStatus("Connected — say something.");
     }
     return;
   }
   // A turn the page did not start has ended, so a prompt held behind it may go.
+  deferVoiceCaptureAcrossTurn();
   advanceVibeTalkInput();
+}
+
+// The internal voice bridge sends `turn_complete` as soon as the completed backend handler has
+// produced its last output. Its next handler is not ready in that same event-loop turn: live
+// testing found that PCM sent seven milliseconds later opened a handler which immediately ended,
+// then closed the whole session. Keep the microphone graph and audio segment alive, but withhold
+// its frames across that backend hand-off. 750 ms was the shortest controlled live gap that
+// survived both the hand-off and continued silence afterwards.
+const VOICE_CAPTURE_RESUME_MS = 750;
+
+function deferVoiceCaptureAcrossTurn() {
+  if (session.chat) return;
+  session.capturePaused = true;
+  if (session.captureResumeTimer !== null) {
+    clearTimeout(session.captureResumeTimer);
+  }
+  const socket = session.socket;
+  session.captureResumeTimer = setTimeout(() => {
+    session.captureResumeTimer = null;
+    if (
+      session.socket === socket &&
+      session.connected &&
+      !session.chat &&
+      !session.waitingForGreeting &&
+      !session.waitingForAudioEnd &&
+      !session.typedTurnInFlight
+    ) {
+      session.capturePaused = false;
+    }
+  }, VOICE_CAPTURE_RESUME_MS);
 }
 
 function startCapture(socket) {
@@ -4758,6 +4790,10 @@ function teardown() {
   session.health = null;
   session.muted = false;
   session.v1Ready = false;
+  if (session.captureResumeTimer !== null) {
+    clearTimeout(session.captureResumeTimer);
+    session.captureResumeTimer = null;
+  }
   session.capturePaused = false;
   session.audioSegmentActive = false;
   session.waitingForGreeting = false;

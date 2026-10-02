@@ -2276,6 +2276,9 @@ const TUNING_BANDS = {
   FAILURE_REPORT_MS: [50, 2000,
     "it only bridges an onerror and the onclose a browser fires right behind it; a second or " +
     "more of silence is the swallowed-failure bug returning"],
+  VOICE_CAPTURE_RESUME_MS: [250, 1500,
+    "the backend needs a quiet hand-off after one voice turn, but above a second and a half the " +
+    "start of the reader's next sentence is visibly discarded"],
   DISCORD_PAGE_LIMIT: [10, 100,
     "one step of the walk. Discord's own ceiling is 100, and below about ten a step does not " +
     "fill a screen, so the reader taps once per paragraph"],
@@ -12119,6 +12122,27 @@ test("the neutral WebSocket provider carries typed text, PCM, and deduplicated t
     1,
     "a repeated final transcript was rendered twice"
   );
+});
+
+test("microphone PCM waits across a neutral voice turn boundary and then resumes", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  const audioFrames = () => socket.sent.filter((frame) => typeof frame !== "string");
+
+  speakInto(page);
+  assert.equal(audioFrames().length, 1, "the backend received no initial microphone frame");
+  turnDone(socket, 1);
+  speakInto(page);
+  assert.equal(audioFrames().length, 1, "PCM raced the backend immediately after turn_complete");
+
+  const resumeMs = sourceConstant("VOICE_CAPTURE_RESUME_MS");
+  assert.equal(page.expireTimers(resumeMs), 1, "capture was not scheduled to resume");
+  speakInto(page);
+  assert.equal(audioFrames().length, 2, "capture stayed paused after the backend hand-off");
+
+  turnDone(socket, 2);
+  await page.el("hang-up").click();
+  assert.equal(page.expireTimers(resumeMs), 0, "a dead call's capture timer was left running");
 });
 
 // --- streamed speech: one row per turn (#15 transcript-dedup, #12 live-transcript-latency) -------
