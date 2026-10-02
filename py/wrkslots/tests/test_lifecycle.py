@@ -14942,6 +14942,250 @@ def test_validate_slot_removes_dirty_checkout_without_salvage(tmp_path: Path) ->
     ]
 
 
+# The variable is named literally rather than read from the module so that, against a wrkslots
+# without the delegation, these tests fail on behaviour (the refusal or the removal) and not on
+# a missing attribute.
+HELD_CONFIG_LOCK_FD_ENV = "WRKSLOTS_HELD_CONFIG_LOCK_FD"
+
+
+def _validate_complete_removal_args() -> tuple[str, ...]:
+    # The test process is the coordinator: it holds the lock and is the removal's ancestor.
+    return (
+        "remove",
+        "slot01",
+        "--validate-complete",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+
+
+def _open_directory(path: Path) -> int:
+    return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+
+
+def _active_slot_names(project: Path) -> set[object]:
+    return {row.get("slot") for row in active_slots(project) if isinstance(row, dict)}
+
+
+def _configuration_lock_is_free(project: Path) -> bool:
+    probe = _open_directory(project)
+    try:
+        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    finally:
+        os.close(probe)
+    return True
+
+
+def _hold_configuration_lock_in_another_process(project: Path) -> subprocess.Popen[str]:
+    code = "\n".join(
+        (
+            "import sys, time",
+            "from pathlib import Path",
+            f"sys.path.insert(0, {str(PY_ROOT)!r})",
+            "from wrkslots import cli as wrkslots",
+            f"config = Path({str(project / '.wrkslots.yml')!r})",
+            "with wrkslots._locked_config(config, 0):",
+            "    print('locked', flush=True)",
+            "    time.sleep(60)",
+        )
+    )
+    holder = subprocess.Popen(
+        [sys.executable, "-c", code],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert holder.stdout is not None
+    assert holder.stdout.readline().strip() == "locked"
+    return holder
+
+
+def test_validate_complete_removal_adopts_the_configuration_lock_its_coordinator_holds(
+    tmp_path: Path,
+) -> None:
+    """A cleanup that holds the configuration lock can still remove the checkout it retired.
+
+    A cleanup driver may hold its own population lock -- an exclusive flock on the same project
+    root directory -- while it runs this removal. wrkslots's own descriptor is a second open
+    file description, so every such removal refused itself as "configuration lock is busy".
+    The descriptor is deliberately NOT
+    passed to the child: the real removal runs in a host-context service that inherits nothing
+    from the caller, so the proof has to come from the coordinator's own descriptor table.
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project, slot_type="validate")
+    held = _open_directory(project)
+    try:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        removed = raw_command_with_census_authority_stub(
+            project,
+            *_validate_complete_removal_args(),
+            env={HELD_CONFIG_LOCK_FD_ENV: str(held)},
+        )
+        assert removed.returncode == 0, removed.stderr
+        assert not tree.exists()
+        assert "slot01" not in _active_slot_names(project)
+        # The lock is still the coordinator's: wrkslots neither released nor closed it.
+        assert not _configuration_lock_is_free(project)
+        assert stat.S_ISDIR(os.fstat(held).st_mode)
+    finally:
+        os.close(held)
+    assert _configuration_lock_is_free(project)
+
+
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    [
+        ("other-directory", "not the configuration lock directory"),
+        ("unlocked", "holds no exclusive flock"),
+        ("shared", "holds no exclusive flock (only a shared one)"),
+        ("not-open", "is not open in coordinator PID"),
+        ("not-a-number", "it is not a descriptor number"),
+        ("standard-error", "standard input, output and error are never a lock descriptor"),
+    ],
+)
+def test_validate_complete_removal_refuses_an_unproven_held_lock(
+    tmp_path: Path, case: str, reason: str
+) -> None:
+    """A named descriptor must prove the lock; a forged or stale one never removes anything."""
+
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project, slot_type="validate")
+    other = tmp_path / "other-directory"
+    other.mkdir()
+    descriptor = _open_directory(other if case == "other-directory" else project)
+    try:
+        if case == "other-directory":
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        elif case == "shared":
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        named = {
+            "not-open": "100000",
+            "not-a-number": "three",
+            "standard-error": "2",
+        }.get(case, str(descriptor))
+        refused = raw_command_with_census_authority_stub(
+            project,
+            *_validate_complete_removal_args(),
+            env={HELD_CONFIG_LOCK_FD_ENV: named},
+        )
+    finally:
+        os.close(descriptor)
+
+    assert refused.returncode == 3, refused.stderr
+    assert "does not prove the caller holds the configuration lock" in refused.stderr
+    assert reason in refused.stderr
+    assert tree.is_dir()
+    assert "slot01" in _active_slot_names(project)
+
+
+def test_validate_complete_removal_without_a_held_lock_still_waits_for_its_holder(
+    tmp_path: Path,
+) -> None:
+    """Without the delegation, a lock held by another process still refuses the removal.
+
+    This guards against the delegation weakening the ordinary path: it passes with or without
+    the adoption code, by design.
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project, slot_type="validate")
+    holder = _hold_configuration_lock_in_another_process(project)
+    try:
+        refused = raw_command_with_census_authority_stub(
+            project, *_validate_complete_removal_args()
+        )
+        assert refused.returncode == 3, refused.stderr
+        assert "configuration lock is busy" in refused.stderr
+        assert tree.is_dir()
+    finally:
+        terminate_process(holder)
+    removed = raw_command_with_census_authority_stub(project, *_validate_complete_removal_args())
+    assert removed.returncode == 0, removed.stderr
+    assert not tree.exists()
+
+
+def test_held_lock_variable_cannot_borrow_another_processs_lock(tmp_path: Path) -> None:
+    """A descriptor on the locked directory is not the holder's open file description.
+
+    Naming the right directory is not enough: while another process holds the flock, a
+    descriptor the coordinator opened itself owns no lock, so the removal is refused rather
+    than run beside the real holder.
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project, slot_type="validate")
+    holder = _hold_configuration_lock_in_another_process(project)
+    forged = _open_directory(project)
+    try:
+        refused = raw_command_with_census_authority_stub(
+            project,
+            *_validate_complete_removal_args(),
+            env={HELD_CONFIG_LOCK_FD_ENV: str(forged)},
+        )
+    finally:
+        os.close(forged)
+        terminate_process(holder)
+    assert refused.returncode == 3, refused.stderr
+    assert "does not prove the caller holds the configuration lock" in refused.stderr
+    assert "holds no exclusive flock" in refused.stderr
+    assert tree.is_dir()
+
+
+def test_held_configuration_lock_is_reproved_on_every_entry_and_never_released(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One command may take the configuration lock many times; each entry re-proves it."""
+
+    root = tmp_path / "project"
+    root.mkdir()
+    config_path = root / wrkslots.CONFIG_NAME
+    held = _open_directory(root)
+    try:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        monkeypatch.setenv(HELD_CONFIG_LOCK_FD_ENV, str(held))
+        raw = wrkslots._take_held_config_lock_variable()
+        # Taken once: the variable no longer reaches a process this command starts.
+        assert raw == str(held)
+        assert HELD_CONFIG_LOCK_FD_ENV not in os.environ
+        claim = wrkslots._HeldConfigLockClaim(raw, os.getpid())
+        monkeypatch.setattr(wrkslots, "_held_config_lock_claim", claim)
+        for _entry in range(3):
+            with wrkslots._locked_config(config_path, 0):
+                assert not _configuration_lock_is_free(root)
+            assert not _configuration_lock_is_free(root)
+        assert claim.coordinator == wrkslots._read_process_identity(os.getpid())
+        assert stat.S_ISDIR(os.fstat(held).st_mode)
+        fcntl.flock(held, fcntl.LOCK_UN)
+        with pytest.raises(wrkslots.Refusal, match="holds no exclusive flock"):
+            with wrkslots._locked_config(config_path, 0):
+                pass
+        assert _configuration_lock_is_free(root)
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        monkeypatch.setattr(
+            wrkslots, "_held_config_lock_claim", wrkslots._HeldConfigLockClaim(raw, None)
+        )
+        with pytest.raises(wrkslots.Refusal, match="this command names none"):
+            with wrkslots._locked_config(config_path, 0):
+                pass
+    finally:
+        os.close(held)
+
+
 def test_validate_complete_removes_dead_owner_checkout_despite_shared_cgroup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
