@@ -159,12 +159,49 @@ pub struct RegisteredChannel {
     pub writable: bool,
 }
 
+/// How strongly a provider recognises an operator-supplied channel reference.
+///
+/// A deployment with several providers has to decide which one a pasted link belongs to before
+/// any of them is asked to register it. Only the provider can recognise its own link shapes and id
+/// syntax, so the decision is asked of each provider rather than guessed from the text centrally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceClaim {
+    /// The reference is unmistakably this provider's: a link to its host, or its own id syntax.
+    Certain,
+    /// The provider cannot tell. A bridge that resolves references upstream answers this.
+    Possible,
+    /// The reference cannot be this provider's.
+    Never,
+}
+
 /// Read and post access to configured chat channels.
 #[async_trait]
 pub trait ChatClient: Send + Sync {
     /// Human-readable name of the source chat service, including when accessed through a bridge.
     fn provider_name(&self) -> &str {
         "Chat"
+    }
+
+    /// Whether `source`, an operator-supplied channel link or reference, belongs to this provider.
+    ///
+    /// Consulted only when several providers are configured. `Possible` by default, so a bridge
+    /// that resolves arbitrary references keeps working as the fallback for anything another
+    /// provider does not claim with certainty.
+    fn claims_source(&self, _source: &str) -> SourceClaim {
+        SourceClaim::Possible
+    }
+
+    /// The account this provider posts as, when it is known without asking the provider again.
+    ///
+    /// The page uses it to draw this server's own posts as the owner's. `None` means not known
+    /// yet, which degrades to learning it from the first post rather than guessing.
+    fn self_author_id(&self) -> Option<String> {
+        None
+    }
+
+    /// The owner's own account at this provider, when the deployment has said what it is.
+    fn owner_author_id(&self) -> Option<String> {
+        None
     }
 
     /// Whether this backend supports channel and thread timeline views.

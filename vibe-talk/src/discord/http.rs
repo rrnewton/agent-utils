@@ -520,6 +520,7 @@ pub struct HttpDiscordClient {
     request_timeout: std::time::Duration,
     channel_registration: bool,
     upstream_read_marks: bool,
+    owner_user_id: Option<String>,
     /// Discord's rate limits, obeyed. Shared by every request this client makes, which is what
     /// lets one channel's 429 stop the *next* request on that channel before it is sent, and a
     /// global 429 stop all of them. See [`super::ratelimit`].
@@ -571,6 +572,7 @@ impl HttpDiscordClient {
             request_timeout: std::time::Duration::from_secs(config.request_timeout_seconds),
             channel_registration: config.channel_registration,
             upstream_read_marks: config.upstream_read_marks,
+            owner_user_id: config.owner_user_id.clone(),
             limiter: RateLimiter::new(),
         })
     }
@@ -663,6 +665,26 @@ impl HttpDiscordClient {
 impl ChatClient for HttpDiscordClient {
     fn provider_name(&self) -> &str {
         &self.provider_name
+    }
+
+    fn claims_source(&self, source: &str) -> crate::chat::SourceClaim {
+        // A registration bridge resolves references upstream, so only it can say what it accepts.
+        // Direct Discord accepts nothing but its own decimal snowflakes.
+        if self.channel_registration {
+            crate::chat::SourceClaim::Possible
+        } else if !source.is_empty() && source.bytes().all(|byte| byte.is_ascii_digit()) {
+            crate::chat::SourceClaim::Certain
+        } else {
+            crate::chat::SourceClaim::Never
+        }
+    }
+
+    fn self_author_id(&self) -> Option<String> {
+        super::self_user_id_from_token(self.bot_token.expose())
+    }
+
+    fn owner_author_id(&self) -> Option<String> {
+        self.owner_user_id.clone()
     }
 
     fn supports_threading(&self) -> bool {
