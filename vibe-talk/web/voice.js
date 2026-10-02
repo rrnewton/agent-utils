@@ -5306,6 +5306,7 @@ function saveCacheShell(config) {
     threading_supported: config.threading_supported === true,
     self_author_id: config.self_author_id || null,
     owner_author_id: config.owner_author_id || null,
+    providers: Array.isArray(config.providers) ? config.providers : [],
   };
   const listed = new Set(channels.map((channel) => String(channel.id)));
   for (const key of Object.keys(cache.scopes)) {
@@ -5641,11 +5642,15 @@ function hydrateFromCache() {
   if (!cache || !cache.shell) return false;
   const shell = cache.shell;
   threadingSupported = shell.threading_supported === true;
+  deploymentCapabilities.threading = threadingSupported;
   knownChannels = shell.channels;
+  learnProviders(shell.providers);
   if (shell.self_author_id) noteSelfAuthor(shell.self_author_id);
   ownerAuthorId = shell.owner_author_id || null;
   fillChannelSelect("discord-channel");
   fillChannelSelect("settings-channel");
+  const provider = providerOfChannel(el("discord-channel").value);
+  if (provider) threadingSupported = provider.threading_supported === true;
   renderChannelBox();
   restoreChannelComposer();
   hydrateChannelScope();
@@ -6812,6 +6817,27 @@ let selfAuthorId = null;
  */
 let ownerAuthorId = null;
 
+/**
+ * The accounts this server posts as, and the owner's own accounts, at EVERY configured provider.
+ *
+ * A deployment can read several chat services at once, and each has its own account ids, so "me"
+ * is a set rather than one id. Ids from different services cannot be confused for one another,
+ * which is what makes one set safe for every channel. Filled from client-config's `providers`; an
+ * older server sends none and only the two single ids above apply.
+ */
+let providerSelfIds = new Set();
+let providerOwnerIds = new Set();
+
+/** Whether `id` is an account this server posts as. */
+function isSelfId(id) {
+  return Boolean(id) && ((selfAuthorId && id === selfAuthorId) || providerSelfIds.has(id));
+}
+
+/** Whether `id` is one of the owner's own accounts. */
+function isOwnerId(id) {
+  return Boolean(id) && ((ownerAuthorId && id === ownerAuthorId) || providerOwnerIds.has(id));
+}
+
 function loadIdentities() {
   const read = (key, fallback) => {
     try {
@@ -6910,10 +6936,10 @@ function bucketFor(authorId, isBot, channelId) {
   }
   // 2. It is us. Known by construction, not by name — either account the owner speaks through:
   //    the bridge posting on his behalf, or the one he types into Discord with.
-  if (selfAuthorId && id === selfAuthorId) {
+  if (isSelfId(id)) {
     return "me";
   }
-  if (ownerAuthorId && id === ownerAuthorId) {
+  if (isOwnerId(id)) {
     return "me";
   }
   if (!isBot) {
@@ -6927,7 +6953,7 @@ function bucketFor(authorId, isBot, channelId) {
   //    reader is talking to here, and counting it was how the guess went quiet in a channel that
   //    had exactly one candidate in it.
   const otherBots = Object.entries(seenIn(channelId)).filter(
-    ([seen, who]) => who.bot && seen !== selfAuthorId
+    ([seen, who]) => who.bot && !isSelfId(seen)
   );
   if (otherBots.length === 1 && otherBots[0][0] === id) {
     return "coder";
@@ -6999,7 +7025,7 @@ function renderIdentityRows() {
       tag.textContent = "bot";
       label.append(tag);
     }
-    if (selfAuthorId && id === selfAuthorId) {
+    if (isSelfId(id)) {
       const tag = document.createElement("span");
       tag.className = "identity-tag";
       // Says WHY this one is you, so "me" on a bot account does not read as a mistake.
@@ -11431,6 +11457,67 @@ function chatServiceName() {
   return chatProviderName || "the chat service";
 }
 
+/**
+ * Each configured chat provider, by key, from client-config's `providers`.
+ *
+ * A deployment may read several services, and they differ in what they can do: one has threads,
+ * another does not; one is polled, another pushed. The page shows ONE channel at a time, so the
+ * capability flags it acts on are that channel's provider's, applied whenever the channel changes
+ * by `applyChannelProvider`. An older server sends no providers, and the deployment-wide flags it
+ * does send are then the one provider's, exactly as before.
+ */
+let providerDescriptions = new Map();
+let deploymentCapabilities = {
+  threading: false,
+  upstreamReadMark: false,
+  liveDelivery: "off",
+  livePollSeconds: 0,
+};
+
+/** Remember every provider's description, and the accounts each one speaks as. */
+function learnProviders(providers) {
+  providerDescriptions = new Map();
+  providerSelfIds = new Set();
+  providerOwnerIds = new Set();
+  for (const provider of Array.isArray(providers) ? providers : []) {
+    if (!provider || typeof provider.key !== "string") continue;
+    providerDescriptions.set(provider.key, provider);
+    if (provider.self_author_id) providerSelfIds.add(String(provider.self_author_id));
+    if (provider.owner_author_id) providerOwnerIds.add(String(provider.owner_author_id));
+  }
+}
+
+/** The provider description for the channel `id`, or null when the server did not say. */
+function providerOfChannel(id) {
+  const channel = knownChannels.find((candidate) => String(candidate.id) === String(id));
+  const key = channel && typeof channel.provider === "string" ? channel.provider : null;
+  return (key && providerDescriptions.get(key)) || null;
+}
+
+/**
+ * Act on the selected channel's own provider: its threads, its read cursor, its live delivery.
+ *
+ * Called before anything reads the new channel, because whether to read a timeline or a flat
+ * history is exactly the kind of decision that must not be made with another service's answer.
+ */
+function applyChannelProvider() {
+  const provider = providerOfChannel(el("discord-channel").value);
+  threadingSupported = provider
+    ? provider.threading_supported === true
+    : deploymentCapabilities.threading;
+  upstreamReadMarkSupported = provider
+    ? provider.upstream_read_mark_supported === true
+    : deploymentCapabilities.upstreamReadMark;
+  liveDelivery =
+    provider && ["off", "poll", "push"].includes(provider.live_delivery)
+      ? provider.live_delivery
+      : deploymentCapabilities.liveDelivery;
+  livePollSeconds = provider
+    ? Number(provider.live_poll_seconds) || 0
+    : deploymentCapabilities.livePollSeconds;
+  renderLiveState();
+}
+
 /** `text` with its first letter capitalised, for a name that opens a sentence. */
 function sentenceStart(text) {
   return text.charAt(0).toUpperCase() + text.slice(1);
@@ -12019,6 +12106,8 @@ function applyClientConfig(config) {
   setReadAudioSource(storedReadAudioSource() || (agentReadAloud ? "agent" : "device"), false);
   applyReadSpeed(readSpeed);
   threadingSupported = config.threading_supported === true;
+  deploymentCapabilities.threading = threadingSupported;
+  learnProviders(config.providers);
   // The selected backend owns its display name. An older server leaves it unspecified, so the
   // page stays neutral instead of guessing a platform from channel IDs or deployment details.
   chatProviderName =
@@ -12095,8 +12184,13 @@ function applyClientConfig(config) {
     : livePollSeconds > 0
       ? "poll"
       : "off";
-  renderLiveState();
   upstreamReadMarkSupported = config.upstream_read_mark_supported === true;
+  deploymentCapabilities.upstreamReadMark = upstreamReadMarkSupported;
+  deploymentCapabilities.liveDelivery = liveDelivery;
+  deploymentCapabilities.livePollSeconds = livePollSeconds;
+  // The picker already holds a channel; the flags above are the deployment's, and that channel's
+  // own provider may answer differently.
+  applyChannelProvider();
   tokenScope = ["read", "write"].includes(config.token_scope) ? config.token_scope : null;
   // `#46 conversation-replay`. What the SERVER permits, which is not the same as what the reader
   // has asked for — and the screen has to be able to say which of the two is stopping it.
@@ -12562,6 +12656,7 @@ el("view-switch").addEventListener("click", () => {
 // The walk back resets with it: a cursor from one channel means nothing in another, and carrying
 // one across would ask the server to step back from a message that is not there.
 function changeSelectedChannel() {
+  applyChannelProvider();
   rememberActiveChannel();
   rememberChannelDraft();
   channelView = "main";

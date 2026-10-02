@@ -292,6 +292,13 @@ pub struct ChannelInfo {
     /// is what stops the app offering a button whose whole outcome is a refusal.
     #[serde(default)]
     pub added: bool,
+    /// Key of the configured chat provider this channel is read through.
+    ///
+    /// A deployment may serve several providers at once, and the page needs to know which one a
+    /// channel belongs to in order to describe it and to use only that provider's capabilities.
+    /// Absent only from an older server, which had exactly one provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 impl ChannelInfo {
@@ -380,6 +387,7 @@ mod tests {
             writable: false,
             alias: None,
             added: false,
+            provider: None,
         };
         assert_eq!(
             channel.display_name(),

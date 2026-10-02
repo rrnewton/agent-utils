@@ -1106,10 +1106,11 @@ mod tests {
             axum::serve(listener, app).await.expect("server");
         });
         let mut config = crate::testing::config();
-        config.discord.api_base = format!("http://{address}");
-        config.discord.thread_api = mode;
-        config.discord.provider_name = "Example Chat".to_owned();
-        let client = HttpDiscordClient::new(&config.discord).expect("client");
+        let discord = config.discord_mut().expect("discord provider");
+        discord.api_base = format!("http://{address}");
+        discord.thread_api = mode;
+        discord.provider_name = "Example Chat".to_owned();
+        let client = HttpDiscordClient::new(discord).expect("client");
         Mock {
             client,
             seen,
@@ -1755,6 +1756,7 @@ mod tests {
                     writable: true,
                     alias: None,
                     added: false,
+                    provider: None,
                 }],
             )
             .await;

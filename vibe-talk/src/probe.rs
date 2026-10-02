@@ -671,6 +671,7 @@ mod tests {
             writable,
             alias: None,
             added: false,
+            provider: None,
         }
     }
 

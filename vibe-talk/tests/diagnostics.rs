@@ -425,7 +425,7 @@ async fn a_channel_whose_messages_come_back_blank_warns_about_the_message_conten
     }
 
     let (mut state, _discord) = vibe_talk::testing::state();
-    state.chat = Arc::new(BlankContent);
+    state.replace_chat(Arc::new(BlankContent));
     let body = report(state).await;
     assert_eq!(body["warned"], 2, "{body:#}");
     assert_eq!(
@@ -478,7 +478,7 @@ async fn a_vendor_that_never_answers_is_a_failed_check_and_not_a_hung_request() 
     // test would take three times `CHECK_BUDGET` in wall time or would not be written at all.
     tokio::time::pause();
     let (mut state, _discord) = vibe_talk::testing::state();
-    state.chat = Arc::new(NeverAnswers);
+    state.replace_chat(Arc::new(NeverAnswers));
     let finished = tokio::time::timeout(Duration::from_secs(300), report(state))
         .await
         .expect("the route must answer even when the vendor does not");

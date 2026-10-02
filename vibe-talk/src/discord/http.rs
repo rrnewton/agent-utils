@@ -922,10 +922,6 @@ mod tests {
             owner_user_id: None,
             api_base: api_base.to_owned(),
             request_timeout_seconds: 20,
-            default_fetch_limit: 25,
-            max_fetch_limit: 100,
-            max_count_scan: 500,
-            live_poll_seconds: 0,
             channel_registration,
             upstream_read_marks: false,
         }
@@ -1218,6 +1214,7 @@ mod tests {
             request_timeout: std::time::Duration::from_secs(20),
             channel_registration: false,
             upstream_read_marks: true,
+            owner_user_id: None,
             limiter: RateLimiter::new(),
         };
         client
@@ -1272,6 +1269,7 @@ mod tests {
             request_timeout: std::time::Duration::from_secs(20),
             channel_registration: true,
             upstream_read_marks: false,
+            owner_user_id: None,
             limiter: RateLimiter::new(),
         };
         let registered = client
@@ -1331,6 +1329,7 @@ mod tests {
             request_timeout: std::time::Duration::from_secs(20),
             channel_registration: true,
             upstream_read_marks: false,
+            owner_user_id: None,
             limiter: RateLimiter::new(),
         };
         assert!(matches!(
@@ -1379,6 +1378,7 @@ mod tests {
             request_timeout: std::time::Duration::from_secs(20),
             channel_registration: true,
             upstream_read_marks: false,
+            owner_user_id: None,
             limiter: RateLimiter::new(),
         };
         assert!(matches!(
@@ -1431,6 +1431,7 @@ mod tests {
                 request_timeout: std::time::Duration::from_secs(20),
                 channel_registration: true,
                 upstream_read_marks: false,
+                owner_user_id: None,
                 limiter: RateLimiter::new(),
             };
             let error = client
@@ -1476,6 +1477,7 @@ mod tests {
             request_timeout: std::time::Duration::from_secs(20),
             channel_registration: true,
             upstream_read_marks: false,
+            owner_user_id: None,
             limiter: RateLimiter::new(),
         };
         let error = client
@@ -1547,6 +1549,7 @@ mod tests {
             request_timeout: std::time::Duration::from_secs(20),
             channel_registration: true,
             upstream_read_marks: false,
+            owner_user_id: None,
             limiter: RateLimiter::new(),
         };
         client

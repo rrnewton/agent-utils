@@ -314,6 +314,7 @@ mod tests {
                 writable: true,
                 alias: None,
                 added: false,
+                provider: None,
             },
             ChannelInfo {
                 id: ChannelId("222".to_owned()),
@@ -321,6 +322,7 @@ mod tests {
                 writable: false,
                 alias: None,
                 added: false,
+                provider: None,
             },
         ]
     }
@@ -426,6 +428,7 @@ mod tests {
             writable: false,
             alias: None,
             added: false,
+            provider: None,
         }];
         let manifest = tool_manifest(&read_only);
         let post = manifest

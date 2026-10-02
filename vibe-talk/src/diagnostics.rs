@@ -234,6 +234,8 @@ struct Check {
     id: &'static str,
     title: String,
     subject: Option<String>,
+    /// The chat provider a `discord.` check is about, when the deployment has several.
+    provider: Option<String>,
     diagnosis: Diagnosis,
 }
 
@@ -243,6 +245,7 @@ impl Check {
             id,
             title: title.into(),
             subject: None,
+            provider: None,
             diagnosis,
         }
     }
@@ -252,11 +255,18 @@ impl Check {
         self
     }
 
+    fn for_provider(mut self, provider: &str) -> Self {
+        self.provider = Some(provider.to_owned());
+        self
+    }
+
     fn finish(self, state: &AppState) -> CheckReport {
         // The stable check ids are retained for existing API consumers. Display names and
         // remedies describe the actual backend, including compatible provider adapters.
         let provider = if self.id.starts_with("discord.") {
-            state.chat.provider_name()
+            self.provider
+                .as_deref()
+                .unwrap_or_else(|| state.chat.provider_name())
         } else if self.id.starts_with("elevenlabs.") {
             "ElevenLabs"
         } else {
@@ -289,7 +299,7 @@ pub async fn run(state: &AppState) -> DiagnosticsReport {
     let deadline = Deadline::new(TOTAL_BUDGET);
     let mut checks = Vec::new();
 
-    checks.push(discord_token(state, &deadline).await);
+    checks.extend(discord_token(state, &deadline).await);
     checks.extend(discord_channels(state, &deadline).await);
 
     checks.push(read_aloud_selection(state));
@@ -349,22 +359,33 @@ fn read_aloud_selection(state: &AppState) -> Check {
     .about(provider.backend)
 }
 
-/// Did Discord accept the bot token at all, and whose token is it?
+/// Did each chat provider accept its token at all, and whose token is it?
 ///
 /// Asked WITHOUT naming a channel, which is the entire point: a bad token and an uninvited bot
 /// are the two most common ways this deployment is wrong, and a channel read reports both as a
-/// channel that cannot be read.
-async fn discord_token(state: &AppState, deadline: &Deadline) -> Check {
-    let provider = state.chat.provider_name();
-    let diagnosis = match within(deadline, state.chat.identity()).await {
-        Err(timed_out) => timed_out,
-        Ok(Ok(identity)) => Diagnosis::Confirmed(format!(
-            "{provider} accepted the bot token; it belongs to {} ({})",
-            identity.username, identity.id
-        )),
-        Ok(Err(error)) => probe::classify(&error),
-    };
-    Check::new("discord.token", format!("{provider} bot token"), diagnosis)
+/// channel that cannot be read. One check per configured provider.
+async fn discord_token(state: &AppState, deadline: &Deadline) -> Vec<Check> {
+    let mut checks = Vec::new();
+    let multi = state.providers.is_multi();
+    for entry in state.providers.entries() {
+        let provider = entry.client.provider_name();
+        let diagnosis = match within(deadline, entry.client.identity()).await {
+            Err(timed_out) => timed_out,
+            Ok(Ok(identity)) => Diagnosis::Confirmed(format!(
+                "{provider} accepted the token; it belongs to {} ({})",
+                identity.username, identity.id
+            )),
+            Ok(Err(error)) => probe::classify(&error),
+        };
+        let check = Check::new("discord.token", format!("{provider} token"), diagnosis)
+            .for_provider(provider);
+        checks.push(if multi {
+            check.about(entry.key.as_str())
+        } else {
+            check
+        });
+    }
+    checks
 }
 
 /// Can the bot read each configured channel? The five causes, told apart.
@@ -376,15 +397,21 @@ async fn discord_channels(state: &AppState, deadline: &Deadline) -> Vec<Check> {
         .outcomes
         .into_iter()
         .map(|outcome| {
+            let provider = outcome
+                .channel
+                .provider
+                .as_deref()
+                .and_then(|key| state.providers.entry(key))
+                .map_or_else(
+                    || state.chat.provider_name().to_owned(),
+                    |entry| entry.client.provider_name().to_owned(),
+                );
             Check::new(
                 "discord.channel",
-                format!(
-                    "{} channel: {}",
-                    state.chat.provider_name(),
-                    outcome.channel.label
-                ),
+                format!("{provider} channel: {}", outcome.channel.label),
                 outcome.diagnosis,
             )
+            .for_provider(&provider)
             .about(outcome.channel.id.as_str())
         })
         .collect()
@@ -525,11 +552,14 @@ async fn storage(state: &AppState, deadline: &Deadline) -> Check {
 /// Exposed so a test does not have to rebuild the list and quietly miss the one that leaked.
 #[must_use]
 pub fn secrets_of(state: &AppState) -> Vec<Secret> {
-    let mut secrets = vec![
-        state.config.discord.bot_token.clone(),
-        state.config.auth.read_token.clone(),
-        state.config.auth.write_token.clone(),
-    ];
+    let mut secrets: Vec<Secret> = state
+        .config
+        .providers
+        .iter()
+        .map(|provider| provider.token().clone())
+        .collect();
+    secrets.push(state.config.auth.read_token.clone());
+    secrets.push(state.config.auth.write_token.clone());
     if let Some(token) = &state.config.ingest.token {
         secrets.push(token.clone());
     }
@@ -579,7 +609,7 @@ mod tests {
     #[tokio::test]
     async fn chat_checks_take_their_platform_name_from_the_backend() {
         let (mut state, fake) = testing::state();
-        state.chat = std::sync::Arc::new(NamedChat(std::sync::Arc::clone(&fake)));
+        state.replace_chat(std::sync::Arc::new(NamedChat(std::sync::Arc::clone(&fake))));
         for rejected in [false, true] {
             if rejected {
                 fake.revoke_token();

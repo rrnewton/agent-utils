@@ -67,6 +67,14 @@ declare namespace VibeTalk {
      */
     label: string;
     /**
+     * Key of the configured chat provider this channel is read through.
+     *
+     * A deployment may serve several providers at once, and the page needs to know which one a
+     * channel belongs to in order to describe it and to use only that provider's capabilities.
+     * Absent only from an older server, which had exactly one provider.
+     */
+    provider?: string | null;
+    /**
      * Whether posting into this channel is permitted at all.
      */
     writable: boolean;
@@ -125,6 +133,18 @@ declare namespace VibeTalk {
      * through this bridge.
      */
     owner_author_id: string | null;
+    /**
+     * Each configured chat provider and what it can do, in configuration order.
+     *
+     * Every channel names its provider by key ([`ChannelInfo::provider`]). The deployment-wide
+     * flags above say whether ANY provider can do something; a page showing one channel uses
+     * that channel's provider entry here instead, so a channel read through a provider without
+     * threads is never offered a thread view because some other provider has one.
+     *
+     * Optional on the wire: an older server sends none, and the page then treats the
+     * deployment-wide flags as the one provider's.
+     */
+    providers?: ProviderDescription[];
     /**
      * Selected read-aloud backend and the playback interface the browser should use.
      */
@@ -496,6 +516,52 @@ declare namespace VibeTalk {
    * How the web app plays messages with the selected provider.
    */
   type Playback = "browser" | "audio";
+
+  /**
+   * One configured chat provider, as the page needs to know it.
+   */
+  interface ProviderDescription {
+    /**
+     * Whether this provider can list its channels for browsing.
+     */
+    channel_discovery_supported: boolean;
+    /**
+     * Whether this provider accepts pasted links and references when adding a channel.
+     */
+    channel_registration_supported: boolean;
+    /**
+     * The key channels name this provider by.
+     */
+    key: string;
+    /**
+     * How changes in this provider's channels reach the live stream.
+     */
+    live_delivery: LiveDelivery;
+    /**
+     * Seconds between this provider's live polls, or `0` when it is not polled.
+     */
+    live_poll_seconds: number;
+    /**
+     * Human-readable name of the source chat service.
+     */
+    name: string;
+    /**
+     * The owner's own account at this provider, when configured.
+     */
+    owner_author_id: string | null;
+    /**
+     * The account this server posts as at this provider, when known.
+     */
+    self_author_id: string | null;
+    /**
+     * Whether this provider supports channel, thread-list, and flattened timelines.
+     */
+    threading_supported: boolean;
+    /**
+     * Whether this provider exposes a write-through read cursor.
+     */
+    upstream_read_mark_supported: boolean;
+  }
 
   /**
    * One thread in the thread list, independent of the underlying provider's channel model.

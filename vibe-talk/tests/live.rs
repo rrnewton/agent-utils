@@ -162,6 +162,8 @@ async fn a_channel_added_while_the_poller_is_running_publishes_new_messages() {
     let interval = Duration::from_secs(10);
     let poller = tokio::spawn(vibe_talk::live::poll_forever(
         harness.state.clone(),
+        None,
+        harness.state.chat.clone(),
         50,
         interval,
     ));
@@ -219,7 +221,13 @@ async fn a_channel_restored_at_startup_is_polled_and_publishes_new_messages() {
     discord.seed(&fresh, "codex-eng", "present at startup");
 
     let interval = Duration::from_secs(10);
-    let poller = tokio::spawn(vibe_talk::live::poll_forever(state.clone(), 50, interval));
+    let poller = tokio::spawn(vibe_talk::live::poll_forever(
+        state.clone(),
+        None,
+        state.chat.clone(),
+        50,
+        interval,
+    ));
     wait_for_fetches(discord.as_ref(), 3).await;
     let mut subscription = state.live.subscribe(&fresh, None);
     assert!(

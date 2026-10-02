@@ -105,6 +105,17 @@ pub struct ClientConfigResponse {
     /// the data would tell the operator the feature was off every time the channel was plain prose.
     /// They are flipping this switch to compare two runs; guessing is exactly what they cannot do.
     pub speech_prep_enabled: bool,
+    /// Each configured chat provider and what it can do, in configuration order.
+    ///
+    /// Every channel names its provider by key ([`ChannelInfo::provider`]). The deployment-wide
+    /// flags above say whether ANY provider can do something; a page showing one channel uses
+    /// that channel's provider entry here instead, so a channel read through a provider without
+    /// threads is never offered a thread view because some other provider has one.
+    ///
+    /// Optional on the wire: an older server sends none, and the page then treats the
+    /// deployment-wide flags as the one provider's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<ProviderDescription>,
     /// The scope of the token that asked.
     ///
     /// The caller's own scope, so it discloses nothing it did not already hold. The page needs it
@@ -193,6 +204,31 @@ impl From<crate::auth::Scope> for TokenScope {
             crate::auth::Scope::Write => Self::Write,
         }
     }
+}
+
+/// One configured chat provider, as the page needs to know it.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ProviderDescription {
+    /// The key channels name this provider by.
+    pub key: String,
+    /// Human-readable name of the source chat service.
+    pub name: String,
+    /// Whether this provider accepts pasted links and references when adding a channel.
+    pub channel_registration_supported: bool,
+    /// Whether this provider can list its channels for browsing.
+    pub channel_discovery_supported: bool,
+    /// Whether this provider exposes a write-through read cursor.
+    pub upstream_read_mark_supported: bool,
+    /// Whether this provider supports channel, thread-list, and flattened timelines.
+    pub threading_supported: bool,
+    /// How changes in this provider's channels reach the live stream.
+    pub live_delivery: LiveDelivery,
+    /// Seconds between this provider's live polls, or `0` when it is not polled.
+    pub live_poll_seconds: u64,
+    /// The account this server posts as at this provider, when known.
+    pub self_author_id: Option<String>,
+    /// The owner's own account at this provider, when configured.
+    pub owner_author_id: Option<String>,
 }
 
 /// How channel changes reach the live stream.

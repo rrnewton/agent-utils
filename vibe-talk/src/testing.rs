@@ -243,9 +243,17 @@ fn state_pieces_with(
             ))
         }
     };
+    // The fake answers for the deployment's one provider, recorded under that provider's own
+    // namespace exactly as `main` records a real client's.
+    let providers = Arc::new(crate::providers::ChatRouter::single(
+        fake.clone(),
+        &config.providers[0].namespace(),
+        config.providers[0].live_poll_seconds,
+    ));
     let state = AppState {
         config: Arc::new(config),
-        chat: fake.clone(),
+        chat: providers.clone(),
+        providers,
         ranker: Arc::new(LexicalRanker),
         agent: Arc::new(NoAgentBackend),
         elevenlabs: elevenlabs.clone(),

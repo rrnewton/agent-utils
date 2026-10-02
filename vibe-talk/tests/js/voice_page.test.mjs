@@ -1059,6 +1059,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         speech_prep_enabled: page.speechPrepEnabled,
         self_author_id: page.selfAuthorId,
         owner_author_id: page.ownerAuthorId,
+        // Absent unless a test describes providers, as an older single-provider server sends it.
+        providers: page.providers,
         token_scope: page.tokenScope,
       }),
     /**
@@ -17414,6 +17416,44 @@ test("linked conversation sources stay in the channel picker when thread timelin
   assert.match(reads.at(-1), new RegExp(second.id), "the second source was not independently readable");
   assert.deepStrictEqual(optionText(page, "discord-channel"), [first.label, second.label]);
   assert.deepStrictEqual(page.timelineCalls, []);
+});
+
+test("each channel uses its own provider's capabilities in a multi-provider deployment", async () => {
+  // One bridge without threads and one Slack-like provider with them. The deployment-wide flag says
+  // "some provider has threads"; the channel without them must still be read as a flat history,
+  // and the threaded one as a timeline, whichever was selected first.
+  const page = newPage();
+  const space = { id: "1110000000000000201", label: "chat space", writable: false, provider: "gchat" };
+  const team = { id: "C0123ABCDE", label: "slack team", writable: true, provider: "slack" };
+  page.channels = [space, team];
+  page.threadingSupported = true;
+  page.selfAuthorId = null;
+  page.providers = [
+    { key: "gchat", name: "Google Chat", threading_supported: false, live_delivery: "push",
+      live_poll_seconds: 0, channel_registration_supported: true, channel_discovery_supported: false,
+      upstream_read_mark_supported: true, self_author_id: "900000000000000001", owner_author_id: null },
+    { key: "slack", name: "Slack", threading_supported: true, live_delivery: "poll",
+      live_poll_seconds: 15, channel_registration_supported: true, channel_discovery_supported: true,
+      upstream_read_mark_supported: false, self_author_id: "U0SELF0001", owner_author_id: "U0OWNER001" },
+  ];
+  const reads = [];
+  page.channelPage = async (path) => {
+    reads.push(String(path));
+    return json(200, { channel: space, messages: [] });
+  };
+
+  await signIn(page);
+  await showDiscord(page, []);
+  assert.deepStrictEqual(page.timelineCalls, [], "the provider without threads was read as a timeline");
+  assert.match(reads.at(-1) || "", new RegExp(space.id));
+  assert.match(page.el("live-state").textContent, /adapter push/);
+
+  page.el("discord-channel").value = team.id;
+  await page.el("discord-channel").dispatch("change");
+  await page.settle();
+  assert.equal(page.timelineCalls.length, 1, "the threaded provider's channel was not read as a timeline");
+  assert.match(page.timelineCalls[0], new RegExp(team.id));
+  assert.match(page.el("live-state").textContent, /every 15 seconds/);
 });
 
 test("thread views show roots in Main and expose the selector only when threads exist", async () => {

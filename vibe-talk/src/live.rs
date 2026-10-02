@@ -627,33 +627,56 @@ pub fn backoff(interval: Duration, failures: u32, max: Duration) -> Duration {
 /// staleness once it clears.
 pub const MAX_BACKOFF_INTERVALS: u32 = 16;
 
-/// Poll every currently allowed channel forever, publishing into `state.live`.
+/// Poll every currently allowed channel of one provider forever, publishing into `state.live`.
 ///
 /// Never returns and never gives up. A channel that fails backs off and is tried again; it does
 /// not take the loop down with it, and it does not advance its own cursor, so nothing is skipped
 /// once it recovers. The allowlist is read from [`AppState::all_channels`] on every tick so a
 /// channel added in the app starts being polled without restarting the server. Cursor and backoff
-/// state for a removed channel is discarded before the next fetch. Spawned by `main` and
-/// cancelled only by the process exiting.
-pub async fn poll_forever(state: AppState, limit: u16, interval: Duration) {
+/// state for a removed channel is discarded before the next fetch. Spawned by `main`, once per
+/// polled provider, and cancelled only by the process exiting.
+///
+/// `provider_key` limits the loop to that provider's channels and `chat` is that provider's own
+/// client; `None` polls every channel, which is what a single-provider deployment does.
+pub async fn poll_forever(
+    state: AppState,
+    provider_key: Option<String>,
+    chat: std::sync::Arc<dyn ChatClient>,
+    limit: u16,
+    interval: Duration,
+) {
     let mut cursors = BTreeMap::new();
-    poll_state_loop(&state, limit, interval, &mut cursors, None).await;
+    poll_state_loop(
+        &state,
+        provider_key.as_deref(),
+        chat.as_ref(),
+        limit,
+        interval,
+        &mut cursors,
+        None,
+    )
+    .await;
 }
 
 async fn poll_state_loop(
     state: &AppState,
+    provider_key: Option<&str>,
+    chat: &dyn ChatClient,
     limit: u16,
     interval: Duration,
     cursors: &mut BTreeMap<ChannelId, Option<u64>>,
     ticks: Option<u32>,
 ) {
     poll_loop_with_channels(
-        state.chat.as_ref(),
+        chat,
         state.live.as_ref(),
         || {
             state
                 .all_channels()
                 .into_iter()
+                .filter(|channel| {
+                    provider_key.is_none_or(|key| channel.provider.as_deref() == Some(key))
+                })
                 .map(|channel| channel.id)
                 .collect()
         },
@@ -1010,7 +1033,16 @@ mod tests {
                 added_at_ms: 1,
             });
         let mut cursors = BTreeMap::new();
-        poll_state_loop(&state, 50, Duration::ZERO, &mut cursors, Some(1)).await;
+        poll_state_loop(
+            &state,
+            None,
+            state.chat.as_ref(),
+            50,
+            Duration::ZERO,
+            &mut cursors,
+            Some(1),
+        )
+        .await;
         assert!(
             cursors.contains_key(&channel),
             "the channel was never polled"
@@ -1021,7 +1053,16 @@ mod tests {
             .write()
             .expect("added-channel allowlist")
             .clear();
-        poll_state_loop(&state, 50, Duration::ZERO, &mut cursors, Some(1)).await;
+        poll_state_loop(
+            &state,
+            None,
+            state.chat.as_ref(),
+            50,
+            Duration::ZERO,
+            &mut cursors,
+            Some(1),
+        )
+        .await;
         assert!(
             !cursors.contains_key(&channel),
             "a removed channel kept its cursor"
@@ -1039,7 +1080,16 @@ mod tests {
                 registration_provider: None,
                 added_at_ms: 2,
             });
-        poll_state_loop(&state, 50, Duration::ZERO, &mut cursors, Some(1)).await;
+        poll_state_loop(
+            &state,
+            None,
+            state.chat.as_ref(),
+            50,
+            Duration::ZERO,
+            &mut cursors,
+            Some(1),
+        )
+        .await;
         assert!(
             state.live.subscribe(&channel, None).replay.is_empty(),
             "re-adding a channel published messages from while it was removed"

@@ -431,8 +431,22 @@ pub async fn ingest_event(
 
     validate_ingest_id("event_id", &event_id, crate::live::MAX_EVENT_ID_BYTES)?;
     validate_ingest_id("message id", message.id.as_str(), 512)?;
-    if state.channel(channel_id.as_str()).is_none() {
+    let Some(channel) = state.channel(channel_id.as_str()) else {
         return Err(OpError::UnknownChannel.into());
+    };
+    // One live source per channel. A channel whose provider this server polls is published by
+    // the poller; accepting an adapter's copy too would deliver every change twice.
+    if channel
+        .provider
+        .as_deref()
+        .and_then(|key| state.providers.entry(key))
+        .is_some_and(|entry| entry.live_poll_seconds > 0)
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "channel_is_polled",
+            "this server polls that channel's provider itself, so it does not accept pushed events for it",
+        ));
     }
     // The configured zone and the spoken forms are application concerns, not something every
     // adapter should have to reproduce — and an adapter that tried would be choosing how this
@@ -594,6 +608,24 @@ pub async fn client_config(
     State(state): State<AppState>,
     ReadScope(scope): ReadScope,
 ) -> Result<Json<ClientConfigResponse>, ApiError> {
+    let providers: Vec<crate::contract::ProviderDescription> = state
+        .providers
+        .entries()
+        .iter()
+        .map(|entry| crate::contract::ProviderDescription {
+            key: entry.key.clone(),
+            name: entry.client.provider_name().to_owned(),
+            channel_registration_supported: entry.client.supports_channel_registration(),
+            channel_discovery_supported: entry.client.supports_channel_discovery(),
+            upstream_read_mark_supported: entry.client.supports_upstream_read_mark(),
+            threading_supported: entry.client.supports_threading(),
+            live_delivery: live_delivery(&state, entry.live_poll_seconds),
+            live_poll_seconds: entry.live_poll_seconds,
+            self_author_id: entry.client.self_author_id(),
+            owner_author_id: entry.client.owner_author_id(),
+        })
+        .collect();
+    let live_poll_seconds = state.config.live_poll_seconds();
     Ok(Json(ClientConfigResponse {
         chat_provider_name: state.chat.provider_name().to_owned(),
         channels: ops::channels(&state).await,
@@ -601,26 +633,32 @@ pub async fn client_config(
         conversational_voice: state.conversation.describe(),
         read_aloud: state.speech.describe(),
         version: env!("CARGO_PKG_VERSION"),
-        live_poll_seconds: state.config.discord.live_poll_seconds,
-        live_delivery: if state.config.ingest.enabled() {
-            LiveDelivery::Push
-        } else if state.config.discord.live_poll_seconds > 0 {
-            LiveDelivery::Poll
-        } else {
-            LiveDelivery::Off
-        },
+        live_poll_seconds,
+        live_delivery: live_delivery(&state, live_poll_seconds),
         channel_registration_supported: state.chat.supports_channel_registration(),
         channel_discovery_supported: state.chat.supports_channel_discovery(),
         upstream_read_mark_supported: state.chat.supports_upstream_read_mark(),
         threading_supported: state.chat.supports_threading(),
         speech_prep_enabled: state.config.speakable.enabled,
         replay_enabled: state.config.replay.enabled,
-        self_author_id: crate::discord::self_user_id_from_token(
-            state.config.discord.bot_token.expose(),
-        ),
-        owner_author_id: state.config.discord.owner_user_id.clone(),
+        self_author_id: state.chat.self_author_id(),
+        owner_author_id: state.chat.owner_author_id(),
+        providers,
         token_scope: scope.into(),
     }))
+}
+
+/// How changes reach the live stream for a provider polled every `poll_seconds`.
+///
+/// A polled provider is polled whether or not an adapter may push; push applies to the rest.
+fn live_delivery(state: &AppState, poll_seconds: u64) -> LiveDelivery {
+    if poll_seconds > 0 {
+        LiveDelivery::Poll
+    } else if state.config.ingest.enabled() {
+        LiveDelivery::Push
+    } else {
+        LiveDelivery::Off
+    }
 }
 
 /// `GET /api/v1/diagnostics` — re-run every configuration check and say what is wrong.
@@ -3236,8 +3274,6 @@ pub async fn add_channel(
     }
 
     let managed = state.chat.supports_channel_registration();
-    let registration_provider =
-        managed.then(|| state.config.discord.api_base.trim_end_matches('/'));
     // One transaction spans an upstream registration plus the local probe/store update. The two
     // systems cannot commit atomically, so serialize the whole managed lifecycle and make rollback
     // compensation unable to race another add or removal.
@@ -3312,6 +3348,19 @@ pub async fn add_channel(
             .map(str::trim)
             .unwrap_or_default(),
     };
+    // Which provider owns the channel, and the namespace that records it across a restart. A
+    // managed registration was bound to its provider by the router; a direct id belongs to the
+    // deployment's default provider.
+    let provider_key = match registered.as_ref() {
+        Some(channel) => state.providers.key_for(&channel.id),
+        None => state.config.default_provider_key().map(str::to_owned),
+    };
+    let registration_provider = if managed {
+        state.registration_namespace(provider_key.as_deref())
+    } else {
+        None
+    };
+    let registration_provider = registration_provider.as_deref();
     if id.is_empty() || (!managed && !id.chars().all(|c| c.is_ascii_digit())) {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -3371,6 +3420,7 @@ pub async fn add_channel(
         ),
         alias: None,
         added: true,
+        provider: provider_key.clone(),
     };
     let rollback_if_failed = if existing.is_none() {
         registered.as_ref()
@@ -3436,7 +3486,8 @@ pub async fn add_channel(
             added.push(stored);
         }
     }
-    tracing::info!(channel = %candidate.id, writable = candidate.writable, managed, "channel added or reconciled in the app");
+    state.refresh_routes();
+    tracing::info!(channel = %candidate.id, writable = candidate.writable, managed, provider = provider_key.as_deref().unwrap_or_default(), "channel added or reconciled in the app");
     Ok(no_store(Json(AddChannelResponse {
         channel: candidate,
         channels: ops::channels(&state).await,
@@ -3447,12 +3498,14 @@ async fn rollback_registration(
     state: &AppState,
     registered: Option<&crate::chat::RegisteredChannel>,
 ) {
-    let Some(registered) = registered.filter(|registration| registration.created) else {
-        return;
-    };
-    if let Err(error) = state.chat.unregister_channel(&registered.id).await {
-        tracing::warn!(channel = %registered.id, %error, "could not roll back channel registration");
+    if let Some(registered) = registered.filter(|registration| registration.created) {
+        if let Err(error) = state.chat.unregister_channel(&registered.id).await {
+            tracing::warn!(channel = %registered.id, %error, "could not roll back channel registration");
+        }
     }
+    // A registration binds its channel to a provider before the probe can read it. Re-deriving
+    // the routes from the allowlist drops that binding when the channel did not make it in.
+    state.refresh_routes();
 }
 
 /// `DELETE /api/v1/channels/{channel_id}` — take back a channel added in the app.
@@ -3493,8 +3546,7 @@ pub async fn remove_channel(
         ));
     };
     if let Some(provider) = added_channel.registration_provider.as_deref() {
-        let active_provider = state.registration_provider();
-        if Some(provider) != active_provider {
+        if !state.providers.knows_namespace(provider) {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
                 "channel_provider_mismatch",
@@ -3516,6 +3568,7 @@ pub async fn remove_channel(
     if let Ok(mut added) = state.added_channels.write() {
         added.retain(|channel| channel.channel != added_channel.channel);
     }
+    state.refresh_routes();
     tracing::info!(channel = %channel_id, "channel removed in the app");
     Ok(no_store(Json(AddChannelResponse {
         channel: ChannelInfo {
@@ -3524,6 +3577,7 @@ pub async fn remove_channel(
             writable: false,
             alias: None,
             added: true,
+            provider: None,
         },
         channels: ops::channels(&state).await,
     })))

@@ -181,7 +181,7 @@ impl ChatClient for ThreadBackend {
 fn harness() -> (axum::Router, Arc<ThreadBackend>) {
     let (mut state, _) = testing::state();
     let backend = Arc::new(ThreadBackend::default());
-    state.chat = backend.clone();
+    state.replace_chat(backend.clone());
     (vibe_talk::http::router(state), backend)
 }
 

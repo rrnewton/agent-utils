@@ -10,10 +10,10 @@ use vibe_talk::agent_backend::NoAgentBackend;
 use vibe_talk::chat::ChatClient;
 use vibe_talk::config::{Config, ReadAloudBackend, ENV_CONFIG_PATH};
 use vibe_talk::discord::fake::FakeDiscord;
-use vibe_talk::discord::http::HttpDiscordClient;
 use vibe_talk::elevenlabs::http::HttpElevenLabsClient;
 use vibe_talk::elevenlabs::SignedUrlProvider;
 use vibe_talk::probe::{self, ENV_SKIP_STARTUP_PROBE};
+use vibe_talk::providers::ChatRouter;
 use vibe_talk::retrieval::LexicalRanker;
 use vibe_talk::speech::SpeechProvider;
 use vibe_talk::state::AppState;
@@ -229,7 +229,7 @@ async fn main() -> anyhow::Result<()> {
             .context("assembling configuration from the environment alone")?
     };
 
-    let chat: Arc<dyn ChatClient> = if args.fake_discord {
+    let providers: Arc<ChatRouter> = if args.fake_discord {
         tracing::warn!(
             "--fake-discord: serving an IN-MEMORY Discord. Nothing is read from or posted to a \
              real channel."
@@ -251,10 +251,32 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        fake
+        Arc::new(ChatRouter::single(fake, "fake", config.live_poll_seconds()))
     } else {
-        Arc::new(HttpDiscordClient::new(&config.discord).context("building the chat client")?)
+        Arc::new(ChatRouter::from_config(&config).context("building the chat providers")?)
     };
+    let chat: Arc<dyn ChatClient> = providers.clone();
+    // Learn each provider's own account in the background, so the page can draw this server's
+    // posts as the owner's from the first render. A provider that cannot answer yet is reported
+    // by diagnostics and by the startup probe; it does not hold up the server.
+    for entry in providers.entries() {
+        let client = Arc::clone(&entry.client);
+        let key = entry.key.clone();
+        tokio::spawn(async move {
+            match tokio::time::timeout(std::time::Duration::from_secs(30), client.identity()).await
+            {
+                Ok(Ok(identity)) => tracing::info!(
+                    provider = key,
+                    account = identity.id,
+                    "chat provider identified its account"
+                ),
+                Ok(Err(error)) => {
+                    tracing::warn!(provider = key, %error, "chat provider could not identify its account");
+                }
+                Err(_) => tracing::warn!(provider = key, "chat provider identity check timed out"),
+            }
+        });
+    }
 
     // Open the store BEFORE the probe and before the listener: a storage path that cannot be
     // created is a configuration error, and a server that came up and only discovered it on the
@@ -429,30 +451,34 @@ async fn main() -> anyhow::Result<()> {
     // publishes to is indistinguishable from a quiet channel, and the setting that causes it is
     // one line in a file the operator is not looking at.
     let live = Arc::new(vibe_talk::live::LiveHub::new());
-    let poll_seconds = config.discord.live_poll_seconds;
     if config.ingest.enabled() {
         tracing::info!(
             route = "/api/v1/live/events",
-            "live ingestion is ON in PUSH mode: an authenticated provider adapter publishes \
-             normalized events, which are fanned out to channel streams"
+            "live ingestion accepts PUSH: an authenticated provider adapter publishes normalized \
+             events, which are fanned out to channel streams"
         );
-    } else if poll_seconds == 0 {
-        tracing::info!(
-            setting = "discord.live_poll_seconds",
-            provider = chat.provider_name(),
-            "live ingestion is OFF. GET /api/v1/channels/{{id}}/stream accepts subscribers and \
-             nothing publishes to them, so the page falls back to its own timed re-read. Set an \
-             interval to turn it on; every tick is one chat-provider request per channel."
-        );
-    } else {
-        tracing::info!(
-            interval_seconds = poll_seconds,
-            provider = chat.provider_name(),
-            channels = config.channels.len(),
-            "live ingestion is ON: each configured channel is polled on this interval and what is \
-             new is pushed to GET /api/v1/channels/{{id}}/stream. Polling spends one request to \
-             the chat provider per channel per tick."
-        );
+    }
+    for entry in providers.entries() {
+        let provider = entry.client.provider_name();
+        if entry.live_poll_seconds > 0 {
+            tracing::info!(
+                provider,
+                key = entry.key,
+                interval_seconds = entry.live_poll_seconds,
+                "live ingestion is ON for this provider: each of its channels is polled on this \
+                 interval and what is new is pushed to GET /api/v1/channels/{{id}}/stream. Polling \
+                 spends one request to the chat provider per channel per tick."
+            );
+        } else if !config.ingest.enabled() {
+            tracing::info!(
+                provider,
+                key = entry.key,
+                "live ingestion is OFF for this provider. GET /api/v1/channels/{{id}}/stream \
+                 accepts subscribers and nothing publishes to them, so the page falls back to its \
+                 own timed re-read. Set a live poll interval to turn it on; every tick is one \
+                 chat-provider request per channel."
+            );
+        }
     }
 
     let bind = config.bind;
@@ -482,10 +508,11 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&elevenlabs),
         config.elevenlabs.clone(),
     );
-    let live_limit = config.discord.default_fetch_limit;
+    let live_limit = config.chat.default_fetch_limit;
     let state = AppState {
         config: Arc::new(config),
         chat: Arc::clone(&chat),
+        providers: Arc::clone(&providers),
         ranker: Arc::new(LexicalRanker),
         agent: Arc::new(NoAgentBackend),
         elevenlabs,
@@ -518,12 +545,17 @@ async fn main() -> anyhow::Result<()> {
         // unreadable alias does not stop the channel being read.
         Err(error) => tracing::warn!(%error, "could not restore channels added in the app"),
     }
-    if poll_seconds > 0 {
-        tokio::spawn(vibe_talk::live::poll_forever(
-            state.clone(),
-            live_limit,
-            std::time::Duration::from_secs(poll_seconds),
-        ));
+    state.refresh_routes();
+    for entry in providers.entries() {
+        if entry.live_poll_seconds > 0 {
+            tokio::spawn(vibe_talk::live::poll_forever(
+                state.clone(),
+                providers.is_multi().then(|| entry.key.clone()),
+                Arc::clone(&entry.client),
+                live_limit,
+                std::time::Duration::from_secs(entry.live_poll_seconds),
+            ));
+        }
     }
     let app = vibe_talk::http::router(state);
 

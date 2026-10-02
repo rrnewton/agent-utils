@@ -1222,7 +1222,7 @@ async fn restored_channel_harness(
     managed: bool,
 ) -> (Harness, std::sync::Arc<vibe_talk::store::fake::FakeStore>) {
     let (state, discord, store, elevenlabs) = vibe_talk::testing::state_with_store_and_voice();
-    let provider = managed.then(|| state.config.discord.api_base.clone());
+    let provider = managed.then(|| state.config.providers[0].namespace());
     if managed {
         discord.enable_channel_registration(channel, false, writable);
     } else {

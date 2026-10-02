@@ -84,6 +84,23 @@ live_poll_seconds = 0
 # per account, in the browser, with no restart.
 # owner_user_id = "000000000000000000"
 
+# MORE PROVIDERS. One server can read several chat services at once. Each extra one is a
+# [[providers]] entry; channels name it with `provider = "<key>"`. Without a [discord] section, every
+# channel must name its provider. See "Several chat providers in one server" in README.md.
+# Environment: VIBE_TALK_PROVIDER_<KEY>_TOKEN supplies an entry's token (key upper-cased, - as _).
+#
+# [[providers]]
+# key = "slack"
+# kind = "slack"                 # "slack", or "discord" for Discord or a Discord-compatible bridge
+# name = "Slack"
+# api_base = "https://slack.com/api"
+# token = "xoxb-REPLACE-ME"
+# owner_user_id = "U0123ABCDEF"
+# live_poll_seconds = 30
+# channel_registration = true    # accept pasted Slack links in the app
+# registered_channels_writable = false
+# channel_discovery = true
+
 [auth]
 # Credentials THIS server demands of its callers. Not Discord's, not ElevenLabs'.
 # Generate them with:  openssl rand -base64 33
@@ -113,7 +130,8 @@ write_token = "REPLACE-ME-different-and-at-least-24-characters"
 # not the same as adding it to a private CHANNEL, and that omission is what this catches.
 # Set VIBE_TALK_SKIP_STARTUP_PROBE=1 (or pass --skip-startup-probe) to start without the check;
 # the skip is logged loudly.
-# Environment: VIBE_TALK_CHANNELS="123:lead team:rw,456:build noise:ro"
+# Environment: VIBE_TALK_CHANNELS="123:lead team:rw,456:build noise:ro" (a fourth field names
+# the provider: "C0123ABCDEF:team:rw:slack"). In the file, the same is `provider = "slack"`.
 [[channels]]
 id = "000000000000000000"
 label = "lead team"

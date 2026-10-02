@@ -423,6 +423,7 @@ mod tests {
             writable: true,
             alias: None,
             added: false,
+            provider: None,
         }])
     }
 

@@ -9,6 +9,7 @@ use crate::conversation::ConversationalVoiceProvider;
 use crate::elevenlabs::SignedUrlProvider;
 use crate::live::LiveHub;
 use crate::model::{ChannelId, ChannelInfo};
+use crate::providers::ChatRouter;
 use crate::retrieval::Ranker;
 use crate::speech::SpeechProvider;
 use crate::store::{AddedChannel, StateStore};
@@ -19,8 +20,12 @@ use crate::summarize::Summarizer;
 pub struct AppState {
     /// Loaded configuration.
     pub config: Arc<Config>,
-    /// Access to the configured chat provider.
+    /// Access to the configured chat providers, as one client that routes by channel.
     pub chat: Arc<dyn ChatClient>,
+    /// The same providers, for the questions only the router can answer: which provider owns a
+    /// channel, each provider's own capabilities, and the namespace a registration is recorded
+    /// under. [`AppState::chat`] is this router seen through the provider-neutral trait.
+    pub providers: Arc<ChatRouter>,
     /// Strategy for semantic random access.
     pub ranker: Arc<dyn Ranker>,
     /// Mints short-lived signed conversation URLs for the configured ElevenLabs agent.
@@ -101,17 +106,23 @@ pub struct AppState {
     pub voice_health_budget: Arc<crate::voice_health::LogBudget>,
 }
 
-fn added_channel_info(row: &AddedChannel, active_provider: Option<&str>) -> ChannelInfo {
+fn added_channel_info(row: &AddedChannel, providers: &ChatRouter) -> ChannelInfo {
+    // A registration recorded under a namespace no configured provider has belongs to a bridge
+    // this deployment no longer runs. It stays listed and readable, but nothing may be posted
+    // there until that bridge is configured again.
     let provider_matches = row
         .registration_provider
         .as_deref()
-        .is_none_or(|provider| Some(provider) == active_provider);
+        .is_none_or(|namespace| providers.knows_namespace(namespace));
     ChannelInfo {
         id: row.channel.clone(),
         label: row.label.clone(),
         writable: row.writable && provider_matches,
         alias: None,
         added: true,
+        provider: providers
+            .key_for_namespace(row.registration_provider.as_deref())
+            .map(str::to_owned),
     }
 }
 
@@ -124,21 +135,68 @@ impl AppState {
     pub async fn restore_added_channels(&self) -> Result<usize, crate::store::StoreError> {
         let restored = self.store.added_channels().await?;
         let count = restored.len();
-        let mut slot = self.added_channels.write().map_err(|_| {
-            crate::store::StoreError::Backend(
-                "the in-memory added-channel allowlist lock is poisoned".to_owned(),
-            )
-        })?;
-        *slot = restored;
+        {
+            let mut slot = self.added_channels.write().map_err(|_| {
+                crate::store::StoreError::Backend(
+                    "the in-memory added-channel allowlist lock is poisoned".to_owned(),
+                )
+            })?;
+            *slot = restored;
+        }
+        self.refresh_routes();
         Ok(count)
     }
 
-    /// Canonical namespace for provider-managed registrations in the active configuration.
+    /// Serve every channel through `client` alone, as a single-provider deployment would.
+    ///
+    /// For tests and tools that substitute the chat backend: [`AppState::chat`] and
+    /// [`AppState::providers`] must always describe the same providers, so they are replaced
+    /// together, keeping the first configured provider's key, namespace, and poll interval.
+    pub fn replace_chat(&mut self, client: Arc<dyn ChatClient>) {
+        let first = &self.config.providers[0];
+        let router = Arc::new(ChatRouter::single(
+            client,
+            &first.namespace(),
+            first.live_poll_seconds,
+        ));
+        self.replace_providers(router);
+    }
+
+    /// Serve channels through `providers`, routed by the allowlist this state already holds.
+    ///
+    /// For tests and tools that assemble their own provider set; `main` builds the router from
+    /// configuration instead.
+    pub fn replace_providers(&mut self, providers: Arc<ChatRouter>) {
+        self.chat = providers.clone();
+        self.providers = providers;
+        self.refresh_routes();
+    }
+
+    /// Re-derive which provider owns each channel from the current allowlist.
+    ///
+    /// Called whenever the added-channel list changes, so the router reaches exactly the channels
+    /// this server answers for, each through the provider it belongs to.
+    pub fn refresh_routes(&self) {
+        self.providers.replace_routes(&self.all_channels());
+    }
+
+    /// The namespace to record for a channel registered through `provider_key`, when one applies.
+    ///
+    /// A single-provider deployment records one only for a registration-managing bridge, exactly
+    /// as before multi-provider support, so its stored rows keep their meaning. A multi-provider
+    /// deployment records one for every addition, because that is what says which provider owns
+    /// the channel after a restart.
     #[must_use]
-    pub fn registration_provider(&self) -> Option<&str> {
-        self.chat
-            .supports_channel_registration()
-            .then(|| self.config.discord.api_base.trim_end_matches('/'))
+    pub fn registration_namespace(&self, provider_key: Option<&str>) -> Option<String> {
+        if !self.providers.is_multi() {
+            return self
+                .chat
+                .supports_channel_registration()
+                .then(|| self.providers.entries()[0].namespace.clone());
+        }
+        provider_key
+            .and_then(|key| self.providers.namespace_for_key(key))
+            .map(str::to_owned)
     }
 
     /// Look up a configured channel.
@@ -154,13 +212,12 @@ impl AppState {
         if let Some(found) = self.config.channels.iter().find(|c| c.id.as_str() == id) {
             return Some(found.clone());
         }
-        let active_provider = self.registration_provider();
         self.added_channels
             .read()
             .ok()?
             .iter()
             .find(|c| c.channel.as_str() == id)
-            .map(|row| added_channel_info(row, active_provider))
+            .map(|row| added_channel_info(row, &self.providers))
     }
 
     /// Every channel this server will answer for: configured first, then added, in that order.
@@ -168,10 +225,9 @@ impl AppState {
     pub fn all_channels(&self) -> Vec<ChannelInfo> {
         let mut all = self.config.channels.clone();
         if let Ok(added) = self.added_channels.read() {
-            let active_provider = self.registration_provider();
             for channel in added
                 .iter()
-                .map(|row| added_channel_info(row, active_provider))
+                .map(|row| added_channel_info(row, &self.providers))
             {
                 if !all.iter().any(|c| c.id == channel.id) {
                     all.push(channel);
@@ -184,10 +240,10 @@ impl AppState {
     /// Resolve a caller-requested fetch size against the configured default and ceiling.
     #[must_use]
     pub fn effective_limit(&self, requested: Option<u16>) -> u16 {
-        let discord = &self.config.discord;
+        let limits = &self.config.chat;
         requested
-            .unwrap_or(discord.default_fetch_limit)
-            .clamp(1, discord.max_fetch_limit)
+            .unwrap_or(limits.default_fetch_limit)
+            .clamp(1, limits.max_fetch_limit)
     }
 
     /// Resolve a caller-requested count ceiling against the configured one.
@@ -198,7 +254,7 @@ impl AppState {
     /// keeps "how many messages are in there?" from being an expensive question.
     #[must_use]
     pub fn effective_count_cap(&self, requested: Option<u32>) -> u32 {
-        let configured = self.config.discord.max_count_scan;
+        let configured = self.config.chat.max_count_scan;
         requested.map_or(configured, |r| r.clamp(1, configured))
     }
 
@@ -223,8 +279,8 @@ mod tests {
     #[test]
     fn the_fetch_limit_is_defaulted_and_capped() {
         let (state, _fake) = testing::state();
-        let max = state.config.discord.max_fetch_limit;
-        let default = state.config.discord.default_fetch_limit;
+        let max = state.config.chat.max_fetch_limit;
+        let default = state.config.chat.default_fetch_limit;
         assert_eq!(state.effective_limit(None), default);
         assert_eq!(state.effective_limit(Some(1)), 1);
         assert_eq!(state.effective_limit(Some(0)), 1);
@@ -238,7 +294,7 @@ mod tests {
     #[test]
     fn the_count_ceiling_is_a_ceiling_and_not_a_floor() {
         let (state, _fake) = testing::state();
-        let configured = state.config.discord.max_count_scan;
+        let configured = state.config.chat.max_count_scan;
         assert_eq!(state.effective_count_cap(None), configured);
         assert_eq!(state.effective_count_cap(Some(10)), 10);
         assert_eq!(state.effective_count_cap(Some(0)), 1);

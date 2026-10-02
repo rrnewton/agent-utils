@@ -538,7 +538,7 @@ pub async fn page(
     let limit = state
         .effective_limit(request.limit)
         .min(MAX_PAGE)
-        .min(state.config.discord.max_fetch_limit);
+        .min(state.config.chat.max_fetch_limit);
     // The over-fetch. One extra message answers "is there more" outright; the alternative is a
     // second round trip or the guess that a full window means more exists.
     let probe = limit + 1;

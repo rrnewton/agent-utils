@@ -15,6 +15,7 @@
           "alias": null,
           "id": "100",
           "label": "general",
+          "provider": "discord",
           "writable": true
         },
         {
@@ -22,7 +23,16 @@
           "alias": "ops",
           "id": "100",
           "label": "general",
+          "provider": "discord",
           "writable": false
+        },
+        {
+          "added": false,
+          "alias": null,
+          "id": "C0123ABCDE",
+          "label": "team",
+          "provider": "slack",
+          "writable": true
         }
       ],
       "chat_provider_name": "Chat",
@@ -35,6 +45,32 @@
       "live_delivery": "push",
       "live_poll_seconds": 5,
       "owner_author_id": "7",
+      "providers": [
+        {
+          "channel_discovery_supported": false,
+          "channel_registration_supported": false,
+          "key": "discord",
+          "live_delivery": "push",
+          "live_poll_seconds": 5,
+          "name": "Discord",
+          "owner_author_id": "7",
+          "self_author_id": "9",
+          "threading_supported": true,
+          "upstream_read_mark_supported": false
+        },
+        {
+          "channel_discovery_supported": true,
+          "channel_registration_supported": true,
+          "key": "slack",
+          "live_delivery": "poll",
+          "live_poll_seconds": 30,
+          "name": "Slack",
+          "owner_author_id": null,
+          "self_author_id": "U0SELF0001",
+          "threading_supported": true,
+          "upstream_read_mark_supported": false
+        }
+      ],
       "read_aloud": {
         "backend": "browser",
         "label": "This device",
@@ -58,6 +94,7 @@
           "alias": null,
           "id": "100",
           "label": "general",
+          "provider": "discord",
           "writable": true
         },
         {
@@ -65,7 +102,16 @@
           "alias": "ops",
           "id": "100",
           "label": "general",
+          "provider": "discord",
           "writable": false
+        },
+        {
+          "added": false,
+          "alias": null,
+          "id": "C0123ABCDE",
+          "label": "team",
+          "provider": "slack",
+          "writable": true
         }
       ],
       "chat_provider_name": "Chat",
@@ -76,6 +122,32 @@
       "live_delivery": "poll",
       "live_poll_seconds": 5,
       "owner_author_id": null,
+      "providers": [
+        {
+          "channel_discovery_supported": false,
+          "channel_registration_supported": false,
+          "key": "discord",
+          "live_delivery": "poll",
+          "live_poll_seconds": 5,
+          "name": "Discord",
+          "owner_author_id": null,
+          "self_author_id": null,
+          "threading_supported": false,
+          "upstream_read_mark_supported": false
+        },
+        {
+          "channel_discovery_supported": false,
+          "channel_registration_supported": false,
+          "key": "slack",
+          "live_delivery": "poll",
+          "live_poll_seconds": 30,
+          "name": "Slack",
+          "owner_author_id": null,
+          "self_author_id": null,
+          "threading_supported": true,
+          "upstream_read_mark_supported": false
+        }
+      ],
       "read_aloud": {
         "backend": "browser",
         "label": "This device",
@@ -99,6 +171,7 @@
           "alias": null,
           "id": "100",
           "label": "general",
+          "provider": "discord",
           "writable": true
         },
         {
@@ -106,7 +179,16 @@
           "alias": "ops",
           "id": "100",
           "label": "general",
+          "provider": "discord",
           "writable": false
+        },
+        {
+          "added": false,
+          "alias": null,
+          "id": "C0123ABCDE",
+          "label": "team",
+          "provider": "slack",
+          "writable": true
         }
       ],
       "chat_provider_name": "Chat",
@@ -117,6 +199,32 @@
       "live_delivery": "off",
       "live_poll_seconds": 5,
       "owner_author_id": null,
+      "providers": [
+        {
+          "channel_discovery_supported": false,
+          "channel_registration_supported": false,
+          "key": "discord",
+          "live_delivery": "off",
+          "live_poll_seconds": 5,
+          "name": "Discord",
+          "owner_author_id": null,
+          "self_author_id": null,
+          "threading_supported": false,
+          "upstream_read_mark_supported": false
+        },
+        {
+          "channel_discovery_supported": false,
+          "channel_registration_supported": false,
+          "key": "slack",
+          "live_delivery": "poll",
+          "live_poll_seconds": 30,
+          "name": "Slack",
+          "owner_author_id": null,
+          "self_author_id": null,
+          "threading_supported": true,
+          "upstream_read_mark_supported": false
+        }
+      ],
       "read_aloud": {
         "backend": "browser",
         "label": "This device",
@@ -313,6 +421,7 @@
         "alias": null,
         "id": "100",
         "label": "general",
+        "provider": "discord",
         "writable": true
       },
       "dismissed": [
@@ -367,6 +476,7 @@
         "alias": null,
         "id": "100",
         "label": "general",
+        "provider": "discord",
         "writable": true
       },
       "dismissed": [
@@ -417,6 +527,7 @@
         "alias": null,
         "id": "100",
         "label": "general",
+        "provider": "discord",
         "writable": true
       },
       "dismissed": [
@@ -477,6 +588,7 @@
         "alias": null,
         "id": "100",
         "label": "general",
+        "provider": "discord",
         "writable": true
       },
       "dismissed": [

@@ -46,6 +46,13 @@
           "description": "Human label used in speech and in the web app (\"acme lead team\").\n\nThis one comes from the operator's CONFIGURATION file and cannot be changed at runtime.\nWhat a person actually hears is [`ChannelInfo::display_name`], because `#39 channel-alias`\nlets him rename a channel from inside the app without editing a file or redeploying.",
           "type": "string"
         },
+        "provider": {
+          "description": "Key of the configured chat provider this channel is read through.\n\nA deployment may serve several providers at once, and the page needs to know which one a\nchannel belongs to in order to describe it and to use only that provider's capabilities.\nAbsent only from an older server, which had exactly one provider.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "writable": {
           "description": "Whether posting into this channel is permitted at all.",
           "type": "boolean"
@@ -109,6 +116,13 @@
             "string",
             "null"
           ]
+        },
+        "providers": {
+          "description": "Each configured chat provider and what it can do, in configuration order.\n\nEvery channel names its provider by key ([`ChannelInfo::provider`]). The deployment-wide\nflags above say whether ANY provider can do something; a page showing one channel uses\nthat channel's provider entry here instead, so a channel read through a provider without\nthreads is never offered a thread view because some other provider has one.\n\nOptional on the wire: an older server sends none, and the page then treats the\ndeployment-wide flags as the one provider's.",
+          "items": {
+            "$ref": "#/$defs/ProviderDescription"
+          },
+          "type": "array"
         },
         "read_aloud": {
           "$ref": "#/$defs/Description",
@@ -538,6 +552,72 @@
           "type": "string"
         }
       ]
+    },
+    "ProviderDescription": {
+      "description": "One configured chat provider, as the page needs to know it.",
+      "properties": {
+        "channel_discovery_supported": {
+          "description": "Whether this provider can list its channels for browsing.",
+          "type": "boolean"
+        },
+        "channel_registration_supported": {
+          "description": "Whether this provider accepts pasted links and references when adding a channel.",
+          "type": "boolean"
+        },
+        "key": {
+          "description": "The key channels name this provider by.",
+          "type": "string"
+        },
+        "live_delivery": {
+          "$ref": "#/$defs/LiveDelivery",
+          "description": "How changes in this provider's channels reach the live stream."
+        },
+        "live_poll_seconds": {
+          "description": "Seconds between this provider's live polls, or `0` when it is not polled.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "name": {
+          "description": "Human-readable name of the source chat service.",
+          "type": "string"
+        },
+        "owner_author_id": {
+          "description": "The owner's own account at this provider, when configured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "self_author_id": {
+          "description": "The account this server posts as at this provider, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "threading_supported": {
+          "description": "Whether this provider supports channel, thread-list, and flattened timelines.",
+          "type": "boolean"
+        },
+        "upstream_read_mark_supported": {
+          "description": "Whether this provider exposes a write-through read cursor.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "key",
+        "name",
+        "channel_registration_supported",
+        "channel_discovery_supported",
+        "upstream_read_mark_supported",
+        "threading_supported",
+        "live_delivery",
+        "live_poll_seconds",
+        "self_author_id",
+        "owner_author_id"
+      ],
+      "type": "object"
     },
     "ThreadSummary": {
       "description": "One thread in the thread list, independent of the underlying provider's channel model.",

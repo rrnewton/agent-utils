@@ -820,10 +820,11 @@ code path the startup probe uses, which is itself in the same position — see *
 | Bind address | `server.bind` | `VIBE_TALK_BIND` | `0.0.0.0:8080` in a container |
 | Public URL | `server.public_base_url` | `VIBE_TALK_PUBLIC_BASE_URL` | informational |
 | Time zone | `server.timezone` | `VIBE_TALK_TIMEZONE` | IANA name, default `UTC`; an unknown one refuses to start |
-| Count ceiling | `discord.max_count_scan` | — | how many messages a count may walk, default `500` |
+| Fetch size | `chat.default_fetch_limit` / `chat.max_fetch_limit` | — | messages a read returns by default and at most, default `50` / `100`; older files set them under `[discord]`, and setting one in both places is refused |
+| Count ceiling | `chat.max_count_scan` | — | how many messages a count may walk, default `500`; also accepted as `discord.max_count_scan` |
 | Provider request timeout | `discord.request_timeout_seconds` | — | seconds for one ordinary provider HTTP request, default `20`, range `1`–`120`; compatible bridges may need longer |
 | Live poll interval | `discord.live_poll_seconds` | `VIBE_TALK_LIVE_POLL_SECONDS` | seconds between inbound reads per channel; **`0` (default) is OFF**, and under `5` is refused |
-| Live push token | `ingest.token` | `VIBE_TALK_INGEST_TOKEN` | **secret**, optional, ≥ 24 chars and distinct from both API tokens; enables adapter push and cannot be combined with live polling |
+| Live push token | `ingest.token` | `VIBE_TALK_INGEST_TOKEN` | **secret**, optional, ≥ 24 chars and distinct from both API tokens; enables adapter push. With one provider it cannot be combined with live polling; with several, pushed events for a polled provider's channels are refused with `409 channel_is_polled` |
 | Channel registration | `discord.channel_registration` | — | **off by default**; enable only when `discord.api_base` is a compatible bridge implementing `POST /channels` and `DELETE /channels/{id}` |
 | Upstream read marks | `discord.upstream_read_marks` | — | **off by default**; enable only when `discord.api_base` is a compatible bridge implementing `POST /channels/{id}/read` |
 | Chat service name | `discord.provider_name` | — | `Discord`; set to the source service's name (for example, `Google Chat`) when using a compatible HTTP bridge |
@@ -831,7 +832,9 @@ code path the startup probe uses, which is itself in the same position — see *
 | Discord bot token | `discord.bot_token` | `VIBE_TALK_DISCORD_BOT_TOKEN` | **secret** |
 | Read token | `auth.read_token` | `VIBE_TALK_READ_TOKEN` | **secret**, ≥ 24 chars |
 | Write token | `auth.write_token` | `VIBE_TALK_WRITE_TOKEN` | **secret**, ≥ 24 chars, must differ |
-| Channels | `[[channels]]` | `VIBE_TALK_CHANNELS` | `id:label:rw` / `id:label:ro`, comma separated |
+| Channels | `[[channels]]` | `VIBE_TALK_CHANNELS` | `id:label:rw` / `id:label:ro`, comma separated; a fourth field, or `provider` in the file, names the channel's provider |
+| More providers | `[[providers]]` | — | see [Several chat providers in one server](#several-chat-providers-in-one-server) |
+| A provider's token | `providers.<key>.token` | `VIBE_TALK_PROVIDER_<KEY>_TOKEN` | **secret**; the key upper-cased with `-` as `_`, so `google-chat` reads `VIBE_TALK_PROVIDER_GOOGLE_CHAT_TOKEN` |
 | ElevenLabs agent id | `elevenlabs.agent_id` | `VIBE_TALK_ELEVENLABS_AGENT_ID` | public |
 | Read-aloud backend | `read_aloud.backend` | `VIBE_TALK_READ_ALOUD_BACKEND` | `elevenlabs` (default), `browser` for the device speech engine, or `conversation` to use the configured `vibe-talk-v1` agent |
 | Conversation backend | `conversation.backend` | — | `elevenlabs` (default) or `websocket` for a deployment-managed `vibe-talk-v1` endpoint |
@@ -864,6 +867,74 @@ code path the startup probe uses, which is itself in the same position — see *
 Environment wins over file. An empty environment variable is treated as unset, so a runtime that
 renders unset variables as `""` cannot blank out a configured value. An unknown key in the file is
 an error, not a shrug — a typo'd section name should not silently disable a setting.
+
+## Several chat providers in one server
+
+One running server can read Discord, a compatible bridge for another service such as Google
+Chat, and Slack at the same time. You serve one copy of the app, sign in once, and pick any
+channel from any of them in the same channel picker.
+
+Each provider is a `[[providers]]` entry with a short `key`. Each channel names the key of the
+provider it is read through. The legacy `[discord]` section is still accepted: when present, it
+becomes the provider keyed `discord`, and channels that name no provider belong to it.
+
+```toml
+[chat]
+default_fetch_limit = 50
+
+# A Discord-compatible bridge, for example one that serves Google Chat.
+[[providers]]
+key = "gchat"
+kind = "discord"                         # Discord's HTTP API, or a bridge speaking it
+name = "Google Chat"
+api_base = "http://127.0.0.1:18765/api/v10"
+token = "REPLACE-ME"                     # or VIBE_TALK_PROVIDER_GCHAT_TOKEN
+channel_registration = true
+upstream_read_marks = true
+thread_api = "off"
+
+[[providers]]
+key = "slack"
+kind = "slack"
+token = "xoxb-REPLACE-ME"                # or VIBE_TALK_PROVIDER_SLACK_TOKEN
+owner_user_id = "U0123ABCDEF"
+live_poll_seconds = 30
+
+[[channels]]
+id = "C0123ABCDEF"
+label = "team"
+writable = true
+provider = "slack"
+```
+
+Keys common to both kinds: `key` (1–32 lowercase letters, digits, or hyphens), `kind` (`discord`
+or `slack`), `name` (display name; defaults to `Discord` or `Slack`), `api_base`, `token`,
+`owner_user_id`, `request_timeout_seconds` (default `20`, range `1`–`120`), `live_poll_seconds`
+(default `0`, off; at least `5`), and `channel_registration`. Discord-protocol providers also take
+`thread_api` and `upstream_read_marks`, with the same meaning as in `[discord]`. Slack providers
+also take `registered_channels_writable` and `channel_discovery`; see [Slack](#slack). A key that
+does not apply to the provider's kind is refused by name.
+
+How a deployment with several providers behaves:
+
+* **Every channel belongs to exactly one provider.** Reads, posts, threads, read marks, and the
+  startup probe for that channel go to that provider and no other. A channel with no provider,
+  in a deployment that has several and no `[discord]` section, is refused at startup.
+* **The page uses each channel's own provider's capabilities.** `GET /api/v1/client-config`
+  lists every provider (`providers`) and each channel's `provider` key. A channel read through a
+  provider without threads is shown as a flat history even when another provider has threads.
+  The top-level capability flags mean "at least one provider can".
+* **Adding a channel from the app** asks each provider whether it recognises the pasted link. A
+  provider that is certain wins (Slack recognises its own links and conversation ids). Otherwise,
+  the only registration-managing bridge that might accept it is used. Otherwise the app asks you to
+  put the provider's key and a colon in front of the link, for example `gchat:https://…`. The
+  provider that registered a channel is recorded with it, so it stays with that provider across a
+  restart.
+* **The channel browser** lists each discovery-capable provider in turn.
+* **Live updates are per provider.** Each provider with `live_poll_seconds` set is polled on its
+  own interval. An adapter may push events for the others through `ingest.token`. Pushed events
+  for a polled provider's channels are refused, so no change is delivered twice.
+* **Diagnostics check each provider's credential** and name the provider in every channel check.
 
 ## Durable state
 

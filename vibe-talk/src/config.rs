@@ -141,8 +141,14 @@ pub struct Config {
     /// Configured, never hard-coded, and validated at load: a name the bundled database does not
     /// know stops the server rather than quietly becoming UTC. See [`crate::clock`].
     pub timezone: crate::clock::Zone,
-    /// Discord access.
-    pub discord: DiscordConfig,
+    /// Read limits shared by every chat provider.
+    pub chat: ChatLimits,
+    /// Every configured chat provider, in configuration order.
+    ///
+    /// The legacy `[discord]` section, when present, is the first entry under the key
+    /// [`LEGACY_DISCORD_PROVIDER_KEY`]; each `[[providers]]` entry follows it. A deployment always
+    /// has at least one, and every configured channel names exactly one of them.
+    pub providers: Vec<ProviderConfig>,
     /// Whether and how an earlier transcript is replayed into a new call.
     pub replay: ReplayConfig,
     /// API credentials for callers (the voice agent, and the web app).
@@ -359,6 +365,25 @@ pub struct DiscordConfig {
     pub api_base: String,
     /// Deadline for one ordinary provider HTTP request, in seconds.
     pub request_timeout_seconds: u64,
+    /// Whether the configured HTTP bridge manages channel registration.
+    ///
+    /// Off by default because Discord itself does not provide these endpoints. An operator opts in
+    /// only when `api_base` names a compatible bridge.
+    pub channel_registration: bool,
+    /// Whether the configured HTTP bridge implements the optional upstream read endpoint.
+    ///
+    /// Off by default because Discord itself does not provide this operation. An operator must
+    /// opt in only when `api_base` names a compatible bridge.
+    pub upstream_read_marks: bool,
+}
+
+/// Read limits shared by every chat provider.
+///
+/// They bound what one request to THIS server may cost, whichever provider then answers it, so
+/// they are one setting rather than one per provider. They are read from `[chat]`, or from the
+/// legacy `[discord]` section where older configurations put them.
+#[derive(Clone, Copy, Debug)]
+pub struct ChatLimits {
     /// Default number of messages a fetch returns.
     pub default_fetch_limit: u16,
     /// Hard ceiling on a caller-requested fetch size.
@@ -370,6 +395,48 @@ pub struct DiscordConfig {
     /// single spoken "how many messages are in there?" could fire dozens of requests at a busy
     /// channel and stall every other read behind it.
     pub max_count_scan: u32,
+}
+
+/// The first key of a multi-provider deployment, and the only one of a legacy configuration.
+pub const LEGACY_DISCORD_PROVIDER_KEY: &str = "discord";
+
+/// Slack access parameters for one `[[providers]]` entry of kind `slack`.
+///
+/// Mirrors [`crate::slack::SlackConfig`]; the provider router converts one into the other.
+#[derive(Debug)]
+pub struct SlackSettings {
+    /// Slack Web API base, or a compatible bridge implementing the same method subset.
+    pub api_base: String,
+    /// Bearer token: a bot (`xoxb-`) or user (`xoxp-`) token, or a compatible bridge's credential.
+    pub token: Secret,
+    /// The owner's own Slack user id, when the deployment has said what it is.
+    pub owner_user_id: Option<String>,
+    /// Deadline for one ordinary provider HTTP request, in seconds.
+    pub request_timeout_seconds: u64,
+    /// Whether the app may add a Slack conversation or thread by pasting its link.
+    pub channel_registration: bool,
+    /// The write policy given to a conversation added from the app.
+    pub registered_channels_writable: bool,
+    /// Whether the app may list the conversations the token's account belongs to.
+    pub channel_discovery: bool,
+}
+
+/// How one provider is reached.
+#[derive(Debug)]
+pub enum ProviderKind {
+    /// Discord itself, or a bridge speaking Discord's HTTP API (for example, for Google Chat).
+    Discord(DiscordConfig),
+    /// Slack's Web API, or a bridge speaking the same method subset.
+    Slack(SlackSettings),
+}
+
+/// One configured chat provider.
+#[derive(Debug)]
+pub struct ProviderConfig {
+    /// Short, path-safe key that channels use to name this provider.
+    pub key: String,
+    /// Display name of the source service, used in errors, diagnostics, and the app.
+    pub name: String,
     /// How often each configured channel is polled for messages nobody asked for. `0` is OFF.
     ///
     /// **Off by default.** Every tick is one Discord request per channel against a shared rate
@@ -380,16 +447,51 @@ pub struct DiscordConfig {
     /// makes with that in front of them, not a thing that happens because they upgraded. Refused
     /// below [`crate::live::MIN_POLL_SECONDS`].
     pub live_poll_seconds: u64,
-    /// Whether the configured HTTP bridge manages channel registration.
+    /// How this provider is reached.
+    pub kind: ProviderKind,
+}
+
+impl ProviderConfig {
+    /// The namespace recorded beside a channel this provider registered.
     ///
-    /// Off by default because Discord itself does not provide these endpoints. An operator opts in
-    /// only when `api_base` names a compatible bridge.
-    pub channel_registration: bool,
-    /// Whether the configured HTTP bridge implements the optional upstream read endpoint.
-    ///
-    /// Off by default because Discord itself does not provide this operation. An operator must
-    /// opt in only when `api_base` names a compatible bridge.
-    pub upstream_read_marks: bool,
+    /// For a Discord-protocol provider it is the API base, exactly as single-provider deployments
+    /// have always recorded it, so their stored registrations keep resolving after an upgrade.
+    #[must_use]
+    pub fn namespace(&self) -> String {
+        match &self.kind {
+            ProviderKind::Discord(discord) => discord.api_base.trim_end_matches('/').to_owned(),
+            ProviderKind::Slack(slack) => {
+                format!("slack:{}", slack.api_base.trim_end_matches('/'))
+            }
+        }
+    }
+
+    /// Whether this provider manages channel registration for links pasted into the app.
+    #[must_use]
+    pub fn channel_registration(&self) -> bool {
+        match &self.kind {
+            ProviderKind::Discord(discord) => discord.channel_registration,
+            ProviderKind::Slack(slack) => slack.channel_registration,
+        }
+    }
+
+    /// The configured owner account at this provider.
+    #[must_use]
+    pub fn owner_user_id(&self) -> Option<&str> {
+        match &self.kind {
+            ProviderKind::Discord(discord) => discord.owner_user_id.as_deref(),
+            ProviderKind::Slack(slack) => slack.owner_user_id.as_deref(),
+        }
+    }
+
+    /// The provider's credential, for redaction.
+    #[must_use]
+    pub fn token(&self) -> &Secret {
+        match &self.kind {
+            ProviderKind::Discord(discord) => &discord.bot_token,
+            ProviderKind::Slack(slack) => &slack.token,
+        }
+    }
 }
 
 /// API credentials this server requires of its callers.
@@ -529,6 +631,10 @@ struct FileConfig {
     #[serde(default)]
     discord: FileDiscord,
     #[serde(default)]
+    chat: FileChat,
+    #[serde(default)]
+    providers: Vec<FileProvider>,
+    #[serde(default)]
     auth: FileAuth,
     #[serde(default)]
     ingest: FileIngest,
@@ -586,6 +692,34 @@ struct FileDiscord {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct FileChat {
+    default_fetch_limit: Option<u16>,
+    max_fetch_limit: Option<u16>,
+    max_count_scan: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileProvider {
+    key: String,
+    kind: String,
+    name: Option<String>,
+    api_base: Option<String>,
+    token: Option<Secret>,
+    owner_user_id: Option<String>,
+    request_timeout_seconds: Option<u64>,
+    live_poll_seconds: Option<u64>,
+    channel_registration: Option<bool>,
+    // Discord-protocol providers only.
+    thread_api: Option<crate::threads::ThreadApi>,
+    upstream_read_marks: Option<bool>,
+    // Slack providers only.
+    registered_channels_writable: Option<bool>,
+    channel_discovery: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileAuth {
     read_token: Option<Secret>,
     write_token: Option<Secret>,
@@ -604,6 +738,7 @@ struct FileChannel {
     label: String,
     #[serde(default)]
     writable: bool,
+    provider: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -652,6 +787,9 @@ pub(crate) fn is_official_discord_api_base(api_base: &str) -> bool {
         .and_then(|url| url.host_str().map(str::to_owned))
         .is_some_and(|host| matches!(host.as_str(), "discord.com" | "discordapp.com"))
 }
+
+/// Default Slack Web API base.
+pub const DEFAULT_SLACK_API_BASE: &str = "https://slack.com/api";
 
 /// Default ElevenLabs API base.
 pub const DEFAULT_ELEVENLABS_API_BASE: &str = "https://api.elevenlabs.io/v1";
@@ -721,15 +859,31 @@ impl Config {
                 detail,
             })?;
 
-        let bot_token = get(ENV_DISCORD_BOT_TOKEN)
-            .map(Secret::new)
-            .or(file.discord.bot_token)
-            .ok_or_else(|| ConfigError::Missing("discord.bot_token".to_owned()))?;
-        if bot_token.expose().trim().is_empty() {
-            return Err(ConfigError::Invalid {
-                field: "discord.bot_token".to_owned(),
-                detail: "is blank".to_owned(),
-            });
+        let FileConfig {
+            discord: file_discord,
+            chat: file_chat,
+            providers: file_providers,
+            ..
+        } = file;
+        let chat = chat_limits(&file_chat, &file_discord)?;
+        let mut providers = Vec::new();
+        if let Some(legacy) =
+            legacy_discord_provider(file_discord, &get, !file_providers.is_empty())?
+        {
+            providers.push(legacy);
+        }
+        for entry in file_providers {
+            let provider = provider_entry(entry, &get)?;
+            if providers
+                .iter()
+                .any(|p: &ProviderConfig| p.key == provider.key)
+            {
+                return Err(ConfigError::Invalid {
+                    field: "providers.key".to_owned(),
+                    detail: format!("{:?} names two providers", provider.key),
+                });
+            }
+            providers.push(provider);
         }
 
         let read_token = get(ENV_READ_TOKEN)
@@ -761,6 +915,17 @@ impl Config {
                 });
             }
         }
+        // One live source per channel. With a single provider that is one source for the whole
+        // deployment, as it always was. With several, a polled provider and a pushing adapter may
+        // coexist, and the ingestion route refuses events for a polled provider's channels.
+        if ingest_token.is_some() && providers.len() == 1 && providers[0].live_poll_seconds != 0 {
+            return Err(ConfigError::Invalid {
+                field: poll_field(&providers[0]),
+                detail: "cannot be combined with ingest.token: choose one live source or every \
+                         provider event may be delivered twice"
+                    .to_owned(),
+            });
+        }
 
         let channels = match get(ENV_CHANNELS) {
             Some(spec) => parse_channel_spec(spec)?,
@@ -776,117 +941,12 @@ impl Config {
                     alias: None,
                     // From the file, so not removable from the app.
                     added: false,
+                    provider: c.provider,
                 })
                 .collect(),
         };
+        let channels = resolve_channel_providers(channels, &providers)?;
         validate_channels(&channels)?;
-
-        let provider_name = file
-            .discord
-            .provider_name
-            .unwrap_or_else(|| "Discord".to_owned())
-            .trim()
-            .to_owned();
-        if provider_name.is_empty() || provider_name.chars().any(char::is_control) {
-            return Err(ConfigError::Invalid {
-                field: "discord.provider_name".to_owned(),
-                detail: "use a non-empty display name without control characters".to_owned(),
-            });
-        }
-
-        let default_fetch_limit = file
-            .discord
-            .default_fetch_limit
-            .unwrap_or(DEFAULT_FETCH_LIMIT);
-        let max_fetch_limit = file
-            .discord
-            .max_fetch_limit
-            .unwrap_or(DEFAULT_MAX_FETCH_LIMIT);
-        let max_count_scan = file
-            .discord
-            .max_count_scan
-            .unwrap_or(DEFAULT_MAX_COUNT_SCAN);
-        let request_timeout_seconds = file
-            .discord
-            .request_timeout_seconds
-            .unwrap_or(DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECONDS);
-        if default_fetch_limit == 0 || max_fetch_limit == 0 {
-            return Err(ConfigError::Invalid {
-                field: "discord.max_fetch_limit".to_owned(),
-                detail: "fetch limits must be at least 1".to_owned(),
-            });
-        }
-        if max_count_scan == 0 {
-            return Err(ConfigError::Invalid {
-                field: "discord.max_count_scan".to_owned(),
-                detail: "must be at least 1, or counting can never answer anything".to_owned(),
-            });
-        }
-        if !(1..=120).contains(&request_timeout_seconds) {
-            return Err(ConfigError::Invalid {
-                field: "discord.request_timeout_seconds".to_owned(),
-                detail: "must be between 1 and 120 seconds".to_owned(),
-            });
-        }
-        let live_poll_seconds = match get(ENV_LIVE_POLL_SECONDS) {
-            Some(raw) => raw
-                .trim()
-                .parse::<u64>()
-                .map_err(|e| ConfigError::Invalid {
-                    field: "discord.live_poll_seconds".to_owned(),
-                    detail: format!("{raw:?} is not a whole number of seconds ({e})"),
-                })?,
-            None => file.discord.live_poll_seconds.unwrap_or(0),
-        };
-        if live_poll_seconds != 0 && live_poll_seconds < crate::live::MIN_POLL_SECONDS {
-            return Err(ConfigError::Invalid {
-                field: "discord.live_poll_seconds".to_owned(),
-                detail: format!(
-                    "{live_poll_seconds} is below the {} second floor. Every tick is one request to the chat provider \
-                     per channel against a shared rate limit, and obeying Retry-After \
-                     buys time, not quota; use 0 to turn live ingestion off.",
-                    crate::live::MIN_POLL_SECONDS
-                ),
-            });
-        }
-        if live_poll_seconds != 0 && ingest_token.is_some() {
-            return Err(ConfigError::Invalid {
-                field: "discord.live_poll_seconds".to_owned(),
-                detail: "cannot be combined with ingest.token: choose one live source or every \
-                         provider event may be delivered twice"
-                    .to_owned(),
-            });
-        }
-        if default_fetch_limit > max_fetch_limit {
-            return Err(ConfigError::Invalid {
-                field: "discord.default_fetch_limit".to_owned(),
-                detail: format!("{default_fetch_limit} exceeds max_fetch_limit {max_fetch_limit}"),
-            });
-        }
-
-        let channel_registration = file.discord.channel_registration.unwrap_or(false);
-        let discord_api_base = file
-            .discord
-            .api_base
-            .unwrap_or_else(|| DEFAULT_DISCORD_API_BASE.to_owned());
-        let official_discord_host = is_official_discord_api_base(&discord_api_base);
-        if channel_registration && official_discord_host {
-            return Err(ConfigError::Invalid {
-                field: "discord.channel_registration".to_owned(),
-                detail: "cannot be enabled with Discord's official API base: Discord does not implement the managed POST /channels and DELETE /channels/{id} contract; set discord.api_base to a compatible bridge"
-                    .to_owned(),
-            });
-        }
-
-        if file.discord.thread_api == Some(crate::threads::ThreadApi::Bridge)
-            && official_discord_host
-        {
-            return Err(ConfigError::Invalid {
-                field: "discord.thread_api".to_owned(),
-                detail: "bridge threading requires the API base of a compatible bridge".to_owned(),
-            });
-        }
-
         let speakable = SpeakableConfig {
             enabled: match get(ENV_SPEAKABLE) {
                 None => file.speakable.enabled,
@@ -916,24 +976,8 @@ impl Config {
                 .map(str::to_owned)
                 .or(file.server.public_base_url),
             timezone,
-            discord: DiscordConfig {
-                provider_name,
-                thread_api: file.discord.thread_api.unwrap_or_default(),
-                bot_token,
-                owner_user_id: get(ENV_DISCORD_OWNER_USER_ID)
-                    .map(str::to_owned)
-                    .or(file.discord.owner_user_id)
-                    .map(|id| id.trim().to_owned())
-                    .filter(|id| !id.is_empty()),
-                api_base: discord_api_base,
-                request_timeout_seconds,
-                default_fetch_limit,
-                max_fetch_limit,
-                max_count_scan,
-                live_poll_seconds,
-                channel_registration,
-                upstream_read_marks: file.discord.upstream_read_marks.unwrap_or(false),
-            },
+            chat,
+            providers,
             auth: AuthConfig {
                 read_token,
                 write_token,
@@ -1287,6 +1331,470 @@ fn check_token_strength(field: &str, token: &Secret) -> Result<(), ConfigError> 
     Ok(())
 }
 
+impl Config {
+    /// The first Discord-protocol provider, when there is one.
+    #[must_use]
+    pub fn discord(&self) -> Option<&DiscordConfig> {
+        self.providers
+            .iter()
+            .find_map(|provider| match &provider.kind {
+                ProviderKind::Discord(discord) => Some(discord),
+                ProviderKind::Slack(_) => None,
+            })
+    }
+
+    /// Mutable access to the first Discord-protocol provider, for tests and tools.
+    pub fn discord_mut(&mut self) -> Option<&mut DiscordConfig> {
+        self.providers
+            .iter_mut()
+            .find_map(|provider| match &mut provider.kind {
+                ProviderKind::Discord(discord) => Some(discord),
+                ProviderKind::Slack(_) => None,
+            })
+    }
+
+    /// The provider configured under `key`.
+    #[must_use]
+    pub fn provider(&self, key: &str) -> Option<&ProviderConfig> {
+        self.providers.iter().find(|provider| provider.key == key)
+    }
+
+    /// The provider a channel belongs to when nothing says otherwise.
+    #[must_use]
+    pub fn default_provider_key(&self) -> Option<&str> {
+        default_provider_key(&self.providers)
+    }
+
+    /// The shortest live poll interval of any provider, or `0` when none polls.
+    #[must_use]
+    pub fn live_poll_seconds(&self) -> u64 {
+        self.providers
+            .iter()
+            .map(|provider| provider.live_poll_seconds)
+            .filter(|seconds| *seconds > 0)
+            .min()
+            .unwrap_or(0)
+    }
+}
+
+/// The provider a channel belongs to when it does not say: the only one, or the legacy section.
+#[must_use]
+pub fn default_provider_key(providers: &[ProviderConfig]) -> Option<&str> {
+    match providers {
+        [only] => Some(only.key.as_str()),
+        _ => providers
+            .iter()
+            .find(|provider| provider.key == LEGACY_DISCORD_PROVIDER_KEY)
+            .map(|provider| provider.key.as_str()),
+    }
+}
+
+/// The setting an operator edits to change one provider's poll interval.
+fn poll_field(provider: &ProviderConfig) -> String {
+    if provider.key == LEGACY_DISCORD_PROVIDER_KEY {
+        "discord.live_poll_seconds".to_owned()
+    } else {
+        format!("providers.{}.live_poll_seconds", provider.key)
+    }
+}
+
+fn validate_poll_seconds(field: &str, seconds: u64) -> Result<(), ConfigError> {
+    if seconds != 0 && seconds < crate::live::MIN_POLL_SECONDS {
+        return Err(ConfigError::Invalid {
+            field: field.to_owned(),
+            detail: format!(
+                "{seconds} is below the {} second floor. Every tick is one request to the chat provider \
+                 per channel against a shared rate limit, and obeying Retry-After \
+                 buys time, not quota; use 0 to turn live ingestion off.",
+                crate::live::MIN_POLL_SECONDS
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_request_timeout(field: &str, seconds: u64) -> Result<(), ConfigError> {
+    if !(1..=120).contains(&seconds) {
+        return Err(ConfigError::Invalid {
+            field: field.to_owned(),
+            detail: "must be between 1 and 120 seconds".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_display_name(field: &str, name: &str) -> Result<(), ConfigError> {
+    if name.is_empty() || name.chars().any(char::is_control) {
+        return Err(ConfigError::Invalid {
+            field: field.to_owned(),
+            detail: "use a non-empty display name without control characters".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Read the shared limits from `[chat]`, or from `[discord]` where older files keep them.
+fn chat_limits(chat: &FileChat, discord: &FileDiscord) -> Result<ChatLimits, ConfigError> {
+    fn pick<T: Copy>(
+        name: &str,
+        chat: Option<T>,
+        discord: Option<T>,
+    ) -> Result<Option<T>, ConfigError> {
+        match (chat, discord) {
+            (Some(_), Some(_)) => Err(ConfigError::Invalid {
+                field: format!("chat.{name}"),
+                detail: format!("is also set as discord.{name}; keep exactly one"),
+            }),
+            (chat, discord) => Ok(chat.or(discord)),
+        }
+    }
+    let default_fetch_limit = pick(
+        "default_fetch_limit",
+        chat.default_fetch_limit,
+        discord.default_fetch_limit,
+    )?
+    .unwrap_or(DEFAULT_FETCH_LIMIT);
+    let max_fetch_limit = pick(
+        "max_fetch_limit",
+        chat.max_fetch_limit,
+        discord.max_fetch_limit,
+    )?
+    .unwrap_or(DEFAULT_MAX_FETCH_LIMIT);
+    let max_count_scan = pick(
+        "max_count_scan",
+        chat.max_count_scan,
+        discord.max_count_scan,
+    )?
+    .unwrap_or(DEFAULT_MAX_COUNT_SCAN);
+    if default_fetch_limit == 0 || max_fetch_limit == 0 {
+        return Err(ConfigError::Invalid {
+            field: "discord.max_fetch_limit".to_owned(),
+            detail: "fetch limits must be at least 1".to_owned(),
+        });
+    }
+    if max_count_scan == 0 {
+        return Err(ConfigError::Invalid {
+            field: "discord.max_count_scan".to_owned(),
+            detail: "must be at least 1, or counting can never answer anything".to_owned(),
+        });
+    }
+    if default_fetch_limit > max_fetch_limit {
+        return Err(ConfigError::Invalid {
+            field: "discord.default_fetch_limit".to_owned(),
+            detail: format!("{default_fetch_limit} exceeds max_fetch_limit {max_fetch_limit}"),
+        });
+    }
+    Ok(ChatLimits {
+        default_fetch_limit,
+        max_fetch_limit,
+        max_count_scan,
+    })
+}
+
+/// Build the provider the legacy `[discord]` section describes, when it describes one.
+///
+/// Required when there is no `[[providers]]` entry, exactly as before multi-provider support.
+/// Alongside other providers it is optional, but a section that configures a provider without a
+/// credential is refused rather than silently ignored.
+fn legacy_discord_provider<'e>(
+    file: FileDiscord,
+    get: &impl Fn(&str) -> Option<&'e str>,
+    has_other_providers: bool,
+) -> Result<Option<ProviderConfig>, ConfigError> {
+    let Some(bot_token) = get(ENV_DISCORD_BOT_TOKEN)
+        .map(Secret::new)
+        .or(file.bot_token)
+    else {
+        if !has_other_providers {
+            return Err(ConfigError::Missing("discord.bot_token".to_owned()));
+        }
+        let configures_a_provider = file.provider_name.is_some()
+            || file.thread_api.is_some()
+            || file.owner_user_id.is_some()
+            || file.api_base.is_some()
+            || file.request_timeout_seconds.is_some()
+            || file.live_poll_seconds.is_some()
+            || file.channel_registration.is_some()
+            || file.upstream_read_marks.is_some()
+            || get(ENV_DISCORD_OWNER_USER_ID).is_some()
+            || get(ENV_LIVE_POLL_SECONDS).is_some();
+        if configures_a_provider {
+            return Err(ConfigError::Invalid {
+                field: "discord.bot_token".to_owned(),
+                detail: "the [discord] section configures a provider but has no bot token; set \
+                         one, or move those settings to a [[providers]] entry"
+                    .to_owned(),
+            });
+        }
+        return Ok(None);
+    };
+    if bot_token.expose().trim().is_empty() {
+        return Err(ConfigError::Invalid {
+            field: "discord.bot_token".to_owned(),
+            detail: "is blank".to_owned(),
+        });
+    }
+
+    let provider_name = file
+        .provider_name
+        .unwrap_or_else(|| "Discord".to_owned())
+        .trim()
+        .to_owned();
+    validate_display_name("discord.provider_name", &provider_name)?;
+    let request_timeout_seconds = file
+        .request_timeout_seconds
+        .unwrap_or(DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECONDS);
+    validate_request_timeout("discord.request_timeout_seconds", request_timeout_seconds)?;
+    let live_poll_seconds = match get(ENV_LIVE_POLL_SECONDS) {
+        Some(raw) => raw
+            .trim()
+            .parse::<u64>()
+            .map_err(|e| ConfigError::Invalid {
+                field: "discord.live_poll_seconds".to_owned(),
+                detail: format!("{raw:?} is not a whole number of seconds ({e})"),
+            })?,
+        None => file.live_poll_seconds.unwrap_or(0),
+    };
+    validate_poll_seconds("discord.live_poll_seconds", live_poll_seconds)?;
+
+    let discord = discord_protocol(
+        "discord",
+        provider_name.clone(),
+        bot_token,
+        get(ENV_DISCORD_OWNER_USER_ID)
+            .map(str::to_owned)
+            .or(file.owner_user_id),
+        file.api_base,
+        request_timeout_seconds,
+        file.channel_registration,
+        file.thread_api,
+        file.upstream_read_marks,
+    )?;
+    Ok(Some(ProviderConfig {
+        key: LEGACY_DISCORD_PROVIDER_KEY.to_owned(),
+        name: provider_name,
+        live_poll_seconds,
+        kind: ProviderKind::Discord(discord),
+    }))
+}
+
+/// Validate and assemble one Discord-protocol provider; `prefix` names its section in errors.
+#[allow(clippy::too_many_arguments)]
+fn discord_protocol(
+    prefix: &str,
+    provider_name: String,
+    bot_token: Secret,
+    owner_user_id: Option<String>,
+    api_base: Option<String>,
+    request_timeout_seconds: u64,
+    channel_registration: Option<bool>,
+    thread_api: Option<crate::threads::ThreadApi>,
+    upstream_read_marks: Option<bool>,
+) -> Result<DiscordConfig, ConfigError> {
+    let channel_registration = channel_registration.unwrap_or(false);
+    let api_base = api_base.unwrap_or_else(|| DEFAULT_DISCORD_API_BASE.to_owned());
+    let official_discord_host = is_official_discord_api_base(&api_base);
+    if channel_registration && official_discord_host {
+        return Err(ConfigError::Invalid {
+            field: format!("{prefix}.channel_registration"),
+            detail: "cannot be enabled with Discord's official API base: Discord does not implement the managed POST /channels and DELETE /channels/{id} contract; set the api_base to a compatible bridge"
+                .to_owned(),
+        });
+    }
+    if thread_api == Some(crate::threads::ThreadApi::Bridge) && official_discord_host {
+        return Err(ConfigError::Invalid {
+            field: format!("{prefix}.thread_api"),
+            detail: "bridge threading requires the API base of a compatible bridge".to_owned(),
+        });
+    }
+    Ok(DiscordConfig {
+        provider_name,
+        thread_api: thread_api.unwrap_or_default(),
+        bot_token,
+        owner_user_id: owner_user_id
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty()),
+        api_base,
+        request_timeout_seconds,
+        channel_registration,
+        upstream_read_marks: upstream_read_marks.unwrap_or(false),
+    })
+}
+
+/// Whether `key` may name a provider: short, lowercase, and safe in a setting or env var name.
+fn valid_provider_key(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    (1..=32).contains(&bytes.len())
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
+/// The environment variable that supplies one `[[providers]]` entry's token.
+#[must_use]
+pub fn provider_token_env(key: &str) -> String {
+    format!(
+        "VIBE_TALK_PROVIDER_{}_TOKEN",
+        key.to_ascii_uppercase().replace('-', "_")
+    )
+}
+
+/// Validate and assemble one `[[providers]]` entry.
+fn provider_entry<'e>(
+    entry: FileProvider,
+    get: &impl Fn(&str) -> Option<&'e str>,
+) -> Result<ProviderConfig, ConfigError> {
+    let key = entry.key.trim().to_owned();
+    if !valid_provider_key(&key) {
+        return Err(ConfigError::Invalid {
+            field: "providers.key".to_owned(),
+            detail: format!(
+                "{key:?} must be 1 to 32 lowercase letters, digits, or hyphens, starting with a \
+                 letter or digit"
+            ),
+        });
+    }
+    let field = |name: &str| format!("providers.{key}.{name}");
+    let token = get(&provider_token_env(&key))
+        .map(Secret::new)
+        .or(entry.token)
+        .ok_or_else(|| ConfigError::Missing(field("token")))?;
+    if token.expose().trim().is_empty() {
+        return Err(ConfigError::Invalid {
+            field: field("token"),
+            detail: "is blank".to_owned(),
+        });
+    }
+    let request_timeout_seconds = entry
+        .request_timeout_seconds
+        .unwrap_or(DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECONDS);
+    validate_request_timeout(&field("request_timeout_seconds"), request_timeout_seconds)?;
+    let live_poll_seconds = entry.live_poll_seconds.unwrap_or(0);
+    validate_poll_seconds(&field("live_poll_seconds"), live_poll_seconds)?;
+    let refuse = |name: &str, kind: &str| ConfigError::Invalid {
+        field: field(name),
+        detail: format!("does not apply to a provider of kind {kind:?}"),
+    };
+    let kind_name = entry.kind.trim().to_owned();
+    let name = entry
+        .name
+        .unwrap_or_else(|| {
+            if kind_name == "slack" {
+                "Slack".to_owned()
+            } else {
+                "Discord".to_owned()
+            }
+        })
+        .trim()
+        .to_owned();
+    validate_display_name(&field("name"), &name)?;
+    let kind = match kind_name.as_str() {
+        "discord" => {
+            if entry.registered_channels_writable.is_some() {
+                return Err(refuse("registered_channels_writable", "discord"));
+            }
+            if entry.channel_discovery.is_some() {
+                return Err(refuse("channel_discovery", "discord"));
+            }
+            ProviderKind::Discord(discord_protocol(
+                &format!("providers.{key}"),
+                name.clone(),
+                token,
+                entry.owner_user_id,
+                entry.api_base,
+                request_timeout_seconds,
+                entry.channel_registration,
+                entry.thread_api,
+                entry.upstream_read_marks,
+            )?)
+        }
+        "slack" => {
+            if entry.thread_api.is_some() {
+                return Err(refuse("thread_api", "slack"));
+            }
+            if entry.upstream_read_marks.is_some() {
+                return Err(refuse("upstream_read_marks", "slack"));
+            }
+            let api_base = entry
+                .api_base
+                .unwrap_or_else(|| DEFAULT_SLACK_API_BASE.to_owned());
+            if !reqwest::Url::parse(&api_base)
+                .is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+            {
+                return Err(ConfigError::Invalid {
+                    field: field("api_base"),
+                    detail: format!("{api_base:?} is not an http or https URL"),
+                });
+            }
+            ProviderKind::Slack(SlackSettings {
+                api_base,
+                token,
+                owner_user_id: entry
+                    .owner_user_id
+                    .map(|id| id.trim().to_owned())
+                    .filter(|id| !id.is_empty()),
+                request_timeout_seconds,
+                channel_registration: entry.channel_registration.unwrap_or(true),
+                registered_channels_writable: entry.registered_channels_writable.unwrap_or(false),
+                channel_discovery: entry.channel_discovery.unwrap_or(true),
+            })
+        }
+        other => {
+            return Err(ConfigError::Invalid {
+                field: field("kind"),
+                detail: format!("unknown kind {other:?}; choose discord or slack"),
+            })
+        }
+    };
+    Ok(ProviderConfig {
+        key,
+        name,
+        live_poll_seconds,
+        kind,
+    })
+}
+
+/// Give every channel the key of the provider it belongs to, refusing any that cannot be placed.
+fn resolve_channel_providers(
+    channels: Vec<ChannelInfo>,
+    providers: &[ProviderConfig],
+) -> Result<Vec<ChannelInfo>, ConfigError> {
+    let default = default_provider_key(providers);
+    channels
+        .into_iter()
+        .map(|mut channel| {
+            let key = match channel.provider.take() {
+                Some(named) => {
+                    let named = named.trim().to_owned();
+                    if !providers.iter().any(|provider| provider.key == named) {
+                        return Err(ConfigError::Invalid {
+                            field: "channels.provider".to_owned(),
+                            detail: format!(
+                                "channel {} names provider {named:?}, which is not configured",
+                                channel.id
+                            ),
+                        });
+                    }
+                    named
+                }
+                None => default
+                    .ok_or_else(|| ConfigError::Invalid {
+                        field: "channels.provider".to_owned(),
+                        detail: format!(
+                            "channel {} must name its provider: this deployment has several and \
+                             no legacy [discord] section to default to",
+                            channel.id
+                        ),
+                    })?
+                    .to_owned(),
+            };
+            channel.provider = Some(key);
+            Ok(channel)
+        })
+        .collect()
+}
+
 fn validate_channels(channels: &[ChannelInfo]) -> Result<(), ConfigError> {
     if channels.is_empty() {
         return Err(ConfigError::Missing("channels".to_owned()));
@@ -1309,7 +1817,9 @@ fn validate_channels(channels: &[ChannelInfo]) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Parse the `VIBE_TALK_CHANNELS` form: `id:label:rw,id:label` (missing mode means read-only).
+/// Parse the `VIBE_TALK_CHANNELS` form: `id:label[:rw|:ro[:provider]]`, comma-separated.
+///
+/// A missing mode means read-only; a missing provider means the deployment's default provider.
 fn parse_channel_spec(spec: &str) -> Result<Vec<ChannelInfo>, ConfigError> {
     let mut out = Vec::new();
     for entry in spec.split(',').map(str::trim).filter(|e| !e.is_empty()) {
@@ -1317,16 +1827,21 @@ fn parse_channel_spec(spec: &str) -> Result<Vec<ChannelInfo>, ConfigError> {
         let id = parts.next().unwrap_or_default().trim();
         let label = parts.next().unwrap_or_default().trim();
         let mode = parts.next().unwrap_or("ro").trim();
+        let provider = parts
+            .next()
+            .map(str::trim)
+            .filter(|provider| !provider.is_empty())
+            .map(str::to_owned);
         if parts.next().is_some() {
             return Err(ConfigError::Invalid {
                 field: ENV_CHANNELS.to_owned(),
-                detail: format!("{entry:?} has more than three colon-separated fields"),
+                detail: format!("{entry:?} has more than four colon-separated fields"),
             });
         }
         if id.is_empty() || label.is_empty() {
             return Err(ConfigError::Invalid {
                 field: ENV_CHANNELS.to_owned(),
-                detail: format!("{entry:?} must be id:label[:rw|:ro]"),
+                detail: format!("{entry:?} must be id:label[:rw|:ro[:provider]]"),
             });
         }
         let writable = match mode {
@@ -1345,6 +1860,7 @@ fn parse_channel_spec(spec: &str) -> Result<Vec<ChannelInfo>, ConfigError> {
             writable,
             alias: None,
             added: false,
+            provider,
         });
     }
     Ok(out)
@@ -1378,14 +1894,252 @@ label = "lead"
 writable = true
 "#;
 
+    /// Slack alongside a Google Chat bridge, with no legacy `[discord]` section.
+    const MULTI: &str = r#"
+[auth]
+read_token = "read-token-that-is-long-enough"
+write_token = "write-token-that-is-long-enough"
+
+[chat]
+default_fetch_limit = 30
+
+[[providers]]
+key = "gchat"
+kind = "discord"
+name = "Google Chat"
+api_base = "http://127.0.0.1:18765/api/v10"
+token = "bridge-token"
+channel_registration = true
+thread_api = "off"
+
+[[providers]]
+key = "slack"
+kind = "slack"
+token = "xoxb-slack-token"
+owner_user_id = " U0OWNER001 "
+live_poll_seconds = 15
+
+[[channels]]
+id = "900000000000000201"
+label = "homebase"
+provider = "gchat"
+
+[[channels]]
+id = "C0123ABCDE"
+label = "team"
+writable = true
+provider = "slack"
+"#;
+
+    #[test]
+    fn several_providers_load_without_a_legacy_discord_section() {
+        let cfg = Config::from_toml_and_env(MULTI, &env(&[])).expect("valid multi config");
+        let keys: Vec<&str> = cfg.providers.iter().map(|p| p.key.as_str()).collect();
+        assert_eq!(keys, ["gchat", "slack"]);
+        assert_eq!(cfg.default_provider_key(), None);
+        assert_eq!(cfg.chat.default_fetch_limit, 30);
+        assert_eq!(cfg.live_poll_seconds(), 15);
+
+        let gchat = cfg.provider("gchat").expect("gchat");
+        assert_eq!(gchat.name, "Google Chat");
+        assert_eq!(gchat.namespace(), "http://127.0.0.1:18765/api/v10");
+        let ProviderKind::Discord(bridge) = &gchat.kind else {
+            panic!("gchat is a Discord-protocol bridge");
+        };
+        assert!(bridge.channel_registration);
+        assert_eq!(bridge.thread_api, crate::threads::ThreadApi::Off);
+        assert_eq!(bridge.bot_token.expose(), "bridge-token");
+
+        let slack = cfg.provider("slack").expect("slack");
+        assert_eq!(slack.name, "Slack");
+        assert_eq!(slack.namespace(), "slack:https://slack.com/api");
+        assert_eq!(slack.owner_user_id(), Some("U0OWNER001"));
+        let ProviderKind::Slack(settings) = &slack.kind else {
+            panic!("slack is a Slack provider");
+        };
+        assert_eq!(settings.api_base, DEFAULT_SLACK_API_BASE);
+        assert!(
+            settings.channel_registration,
+            "Slack links are accepted by default"
+        );
+        assert!(settings.channel_discovery);
+        assert!(!settings.registered_channels_writable);
+
+        let providers: Vec<Option<&str>> = cfg
+            .channels
+            .iter()
+            .map(|channel| channel.provider.as_deref())
+            .collect();
+        assert_eq!(providers, [Some("gchat"), Some("slack")]);
+    }
+
+    #[test]
+    fn a_provider_token_can_come_from_the_environment() {
+        let text = MULTI.replace("token = \"xoxb-slack-token\"\n", "");
+        assert!(matches!(
+            Config::from_toml_and_env(&text, &env(&[])),
+            Err(ConfigError::Missing(field)) if field == "providers.slack.token"
+        ));
+        let cfg = Config::from_toml_and_env(
+            &text,
+            &env(&[("VIBE_TALK_PROVIDER_SLACK_TOKEN", "xoxp-from-env")]),
+        )
+        .expect("token from the environment");
+        assert_eq!(
+            cfg.provider("slack").expect("slack").token().expose(),
+            "xoxp-from-env"
+        );
+        assert_eq!(
+            provider_token_env("google-chat"),
+            "VIBE_TALK_PROVIDER_GOOGLE_CHAT_TOKEN"
+        );
+    }
+
+    #[test]
+    fn the_legacy_section_is_the_default_provider_beside_new_ones() {
+        let text = format!(
+            "{FULL}\n[[providers]]\nkey = \"slack\"\nkind = \"slack\"\ntoken = \"xoxb-t\"\n\n\
+             [[channels]]\nid = \"C0123ABCDE\"\nlabel = \"team\"\nprovider = \"slack\"\n"
+        );
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("legacy plus slack");
+        assert_eq!(cfg.providers[0].key, LEGACY_DISCORD_PROVIDER_KEY);
+        assert_eq!(
+            cfg.default_provider_key(),
+            Some(LEGACY_DISCORD_PROVIDER_KEY)
+        );
+        assert_eq!(cfg.channels[0].provider.as_deref(), Some("discord"));
+        assert_eq!(cfg.channels[1].provider.as_deref(), Some("slack"));
+        assert!(cfg.discord().is_some());
+    }
+
+    #[test]
+    fn provider_mistakes_are_refused_by_name() {
+        let invalid = |text: String, wanted: &str| match Config::from_toml_and_env(&text, &env(&[]))
+        {
+            Err(ConfigError::Invalid { field, .. }) => assert_eq!(field, wanted, "{text}"),
+            other => panic!("expected {wanted} to be refused, got {other:?}"),
+        };
+        // A channel with no provider, in a deployment with several and no legacy default.
+        invalid(
+            MULTI.replace("provider = \"gchat\"\n", ""),
+            "channels.provider",
+        );
+        // A channel naming a provider that does not exist.
+        invalid(
+            MULTI.replace("provider = \"slack\"\n", "provider = \"teams\"\n"),
+            "channels.provider",
+        );
+        invalid(
+            MULTI.replace("key = \"slack\"", "key = \"Slack\""),
+            "providers.key",
+        );
+        invalid(
+            MULTI.replace("key = \"slack\"", "key = \"gchat\""),
+            "providers.key",
+        );
+        invalid(
+            MULTI.replace("kind = \"slack\"", "kind = \"teams\""),
+            "providers.slack.kind",
+        );
+        invalid(
+            MULTI.replace("live_poll_seconds = 15", "live_poll_seconds = 2"),
+            "providers.slack.live_poll_seconds",
+        );
+        invalid(
+            MULTI.replace(
+                "live_poll_seconds = 15",
+                "live_poll_seconds = 15\nthread_api = \"off\"",
+            ),
+            "providers.slack.thread_api",
+        );
+        invalid(
+            MULTI.replace(
+                "thread_api = \"off\"",
+                "thread_api = \"off\"\nchannel_discovery = true",
+            ),
+            "providers.gchat.channel_discovery",
+        );
+        invalid(
+            MULTI.replace(
+                "live_poll_seconds = 15",
+                "live_poll_seconds = 15\napi_base = \"ftp://x\"",
+            ),
+            "providers.slack.api_base",
+        );
+        // A [discord] section that configures a provider but forgot its credential.
+        invalid(
+            format!("[discord]\nprovider_name = \"Discord\"\n{MULTI}"),
+            "discord.bot_token",
+        );
+        // The shared limits may live in one place, not both.
+        invalid(
+            format!("[discord]\ndefault_fetch_limit = 20\n{MULTI}"),
+            "chat.default_fetch_limit",
+        );
+    }
+
+    #[test]
+    fn a_legacy_discord_section_may_carry_only_the_shared_limits() {
+        let text = format!(
+            "[discord]\nmax_count_scan = 900\n{}",
+            MULTI.replace("[chat]\ndefault_fetch_limit = 30\n", "")
+        );
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("limits only");
+        assert_eq!(cfg.chat.max_count_scan, 900);
+        assert!(cfg
+            .discord()
+            .is_some_and(|discord| discord.provider_name == "Google Chat"));
+    }
+
+    #[test]
+    fn push_ingestion_may_sit_beside_a_polled_provider_only_when_there_are_several() {
+        let with_ingest = MULTI.replace(
+            "[chat]",
+            "[ingest]\ntoken = \"ingest-token-that-is-long-enough\"\n\n[chat]",
+        );
+        Config::from_toml_and_env(&with_ingest, &env(&[]))
+            .expect("the bridge pushes while Slack is polled");
+
+        let single = FULL.replace("[discord]", "[discord]\nlive_poll_seconds = 30")
+            + "\n[ingest]\ntoken = \"ingest-token-that-is-long-enough\"\n";
+        assert!(matches!(
+            Config::from_toml_and_env(&single, &env(&[])),
+            Err(ConfigError::Invalid { field, .. }) if field == "discord.live_poll_seconds"
+        ));
+    }
+
+    #[test]
+    fn the_channel_environment_form_may_name_a_provider() {
+        let cfg = Config::from_toml_and_env(
+            MULTI,
+            &env(&[(
+                ENV_CHANNELS,
+                "900000000000000201:homebase:ro:gchat,C0123ABCDE:team:rw:slack",
+            )]),
+        )
+        .expect("environment channels");
+        assert_eq!(cfg.channels[1].provider.as_deref(), Some("slack"));
+        assert!(cfg.channels[1].writable);
+        assert!(matches!(
+            Config::from_toml_and_env(MULTI, &env(&[(ENV_CHANNELS, "1:a:rw:slack:extra")])),
+            Err(ConfigError::Invalid { .. })
+        ));
+    }
+
     #[test]
     fn file_only_configuration_loads() {
         let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
         assert_eq!(cfg.bind.to_string(), "127.0.0.1:9000");
-        assert_eq!(cfg.discord.bot_token.expose(), "file-discord-token");
+        assert_eq!(
+            cfg.discord().expect("discord provider").bot_token.expose(),
+            "file-discord-token"
+        );
         assert_eq!(cfg.channels.len(), 1);
         assert!(cfg.channels[0].writable);
-        assert_eq!(cfg.discord.api_base, DEFAULT_DISCORD_API_BASE);
+        assert_eq!(
+            cfg.discord().expect("discord provider").api_base,
+            DEFAULT_DISCORD_API_BASE
+        );
     }
 
     #[test]
@@ -1399,7 +2153,10 @@ writable = true
         )
         .expect("valid config");
         assert_eq!(cfg.bind.to_string(), "0.0.0.0:1234");
-        assert_eq!(cfg.discord.bot_token.expose(), "env-discord-token");
+        assert_eq!(
+            cfg.discord().expect("discord provider").bot_token.expose(),
+            "env-discord-token"
+        );
     }
 
     #[test]
@@ -1407,7 +2164,10 @@ writable = true
         // An unset variable rendered as "" by a container runtime must not blank out the file.
         let cfg = Config::from_toml_and_env(FULL, &env(&[(ENV_DISCORD_BOT_TOKEN, "")]))
             .expect("valid config");
-        assert_eq!(cfg.discord.bot_token.expose(), "file-discord-token");
+        assert_eq!(
+            cfg.discord().expect("discord provider").bot_token.expose(),
+            "file-discord-token"
+        );
     }
 
     #[test]
@@ -1513,13 +2273,20 @@ writable = true
     fn provider_request_timeout_is_bounded_and_configurable() {
         let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
         assert_eq!(
-            cfg.discord.request_timeout_seconds,
+            cfg.discord()
+                .expect("discord provider")
+                .request_timeout_seconds,
             DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECONDS
         );
 
         let text = FULL.replace("[discord]", "[discord]\nrequest_timeout_seconds = 75");
         let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
-        assert_eq!(cfg.discord.request_timeout_seconds, 75);
+        assert_eq!(
+            cfg.discord()
+                .expect("discord provider")
+                .request_timeout_seconds,
+            75
+        );
 
         for seconds in [0, 121] {
             let text = FULL.replace(
@@ -1569,11 +2336,11 @@ writable = true
     #[test]
     fn the_count_scan_ceiling_defaults_and_must_be_usable() {
         let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
-        assert_eq!(cfg.discord.max_count_scan, DEFAULT_MAX_COUNT_SCAN);
+        assert_eq!(cfg.chat.max_count_scan, DEFAULT_MAX_COUNT_SCAN);
 
         let text = FULL.replace("[discord]", "[discord]\nmax_count_scan = 1200");
         let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
-        assert_eq!(cfg.discord.max_count_scan, 1200);
+        assert_eq!(cfg.chat.max_count_scan, 1200);
 
         let text = FULL.replace("[discord]", "[discord]\nmax_count_scan = 0");
         let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("must refuse");
@@ -1589,21 +2356,21 @@ writable = true
         // a new, permanent stream of Discord requests on an operator's account without them
         // having typed anything.
         let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
-        assert_eq!(cfg.discord.live_poll_seconds, 0);
+        assert_eq!(cfg.providers[0].live_poll_seconds, 0);
 
         let text = FULL.replace("[discord]", "[discord]\nlive_poll_seconds = 30");
         let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
-        assert_eq!(cfg.discord.live_poll_seconds, 30);
+        assert_eq!(cfg.providers[0].live_poll_seconds, 30);
 
         // The environment wins over the file, like every other setting here.
         let cfg = Config::from_toml_and_env(&text, &env(&[(ENV_LIVE_POLL_SECONDS, "60")]))
             .expect("valid config");
-        assert_eq!(cfg.discord.live_poll_seconds, 60);
+        assert_eq!(cfg.providers[0].live_poll_seconds, 60);
 
         // ...including turning it back OFF, which is the one an operator reaches for in a hurry.
         let cfg = Config::from_toml_and_env(&text, &env(&[(ENV_LIVE_POLL_SECONDS, "0")]))
             .expect("valid config");
-        assert_eq!(cfg.discord.live_poll_seconds, 0);
+        assert_eq!(cfg.providers[0].live_poll_seconds, 0);
 
         // Refused, not clamped. A silently-corrected 1 would look like it was honoured.
         let text = FULL.replace("[discord]", "[discord]\nlive_poll_seconds = 1");
@@ -1727,14 +2494,22 @@ writable = true
     #[test]
     fn channel_registration_is_an_explicit_bridge_opt_in() {
         let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
-        assert!(!cfg.discord.channel_registration);
+        assert!(
+            !cfg.discord()
+                .expect("discord provider")
+                .channel_registration
+        );
 
         let text = FULL.replace(
             "[discord]",
             "[discord]\nchannel_registration = true\napi_base = \"https://bridge.example/v1\"",
         );
         let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid bridge config");
-        assert!(cfg.discord.channel_registration);
+        assert!(
+            cfg.discord()
+                .expect("discord provider")
+                .channel_registration
+        );
     }
 
     #[test]
@@ -1767,11 +2542,11 @@ writable = true
     #[test]
     fn upstream_read_marks_are_an_explicit_bridge_opt_in() {
         let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
-        assert!(!cfg.discord.upstream_read_marks);
+        assert!(!cfg.discord().expect("discord provider").upstream_read_marks);
 
         let text = FULL.replace("[discord]", "[discord]\nupstream_read_marks = true");
         let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
-        assert!(cfg.discord.upstream_read_marks);
+        assert!(cfg.discord().expect("discord provider").upstream_read_marks);
     }
 
     #[test]
@@ -2215,7 +2990,8 @@ writable = true
         assert_eq!(
             Config::from_toml_and_env(FULL, &env(&[]))
                 .expect("default")
-                .discord
+                .discord()
+                .expect("discord provider")
                 .thread_api,
             ThreadApi::Native
         );
@@ -2233,7 +3009,8 @@ writable = true
             assert_eq!(
                 Config::from_toml_and_env(&text, &env(&[]))
                     .expect("explicit mode")
-                    .discord
+                    .discord()
+                    .expect("discord provider")
                     .thread_api,
                 expected
             );

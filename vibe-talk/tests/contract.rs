@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use serde_json::{json, Value};
 use vibe_talk::contract::{
     ApiErrorBody, ClientConfigResponse, CommittedPostResponse, LiveDeleteEvent, LiveDelivery,
-    LiveMessageEvent, LiveResetEvent, PendingPost, PendingPostResponse, TimelineResponse,
-    TokenScope, TranscriptRole, VibeTalkV1ClientFrame, VibeTalkV1ServerFrame,
+    LiveMessageEvent, LiveResetEvent, PendingPost, PendingPostResponse, ProviderDescription,
+    TimelineResponse, TokenScope, TranscriptRole, VibeTalkV1ClientFrame, VibeTalkV1ServerFrame,
 };
 use vibe_talk::conversation::{VoiceDescription, VoiceSession};
 use vibe_talk::model::{ChannelId, ChannelInfo, Message, MessageId, UserId};
@@ -50,6 +50,7 @@ fn channel() -> ChannelInfo {
         writable: true,
         alias: None,
         added: false,
+        provider: Some("discord".into()),
     }
 }
 
@@ -111,6 +112,12 @@ fn client_config(
                 writable: false,
                 ..channel()
             },
+            ChannelInfo {
+                id: ChannelId("C0123ABCDE".into()),
+                label: "team".into(),
+                provider: Some("slack".into()),
+                ..channel()
+            },
         ],
         elevenlabs_agent_id: full.then(|| "agent".into()),
         conversational_voice: VoiceDescription {
@@ -139,6 +146,32 @@ fn client_config(
         upstream_read_mark_supported: full,
         threading_supported: full,
         speech_prep_enabled: full,
+        providers: vec![
+            ProviderDescription {
+                key: "discord".into(),
+                name: "Discord".into(),
+                channel_registration_supported: false,
+                channel_discovery_supported: false,
+                upstream_read_mark_supported: false,
+                threading_supported: full,
+                live_delivery,
+                live_poll_seconds: 5,
+                self_author_id: full.then(|| "9".into()),
+                owner_author_id: full.then(|| "7".into()),
+            },
+            ProviderDescription {
+                key: "slack".into(),
+                name: "Slack".into(),
+                channel_registration_supported: full,
+                channel_discovery_supported: full,
+                upstream_read_mark_supported: false,
+                threading_supported: true,
+                live_delivery: LiveDelivery::Poll,
+                live_poll_seconds: 30,
+                self_author_id: full.then(|| "U0SELF0001".into()),
+                owner_author_id: None,
+            },
+        ],
         token_scope: scope,
     }
 }

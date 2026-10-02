@@ -32,10 +32,11 @@ async fn google_chat_metadata_and_failed_reads_and_sends_use_the_backend_name() 
     // A multibyte response also exercises truncation: slicing at byte 500 used to panic.
     let (base, task) = upstream(StatusCode::BAD_GATEWAY, "故障".repeat(300)).await;
     let mut config = testing::config();
-    config.discord.api_base = base;
-    config.discord.provider_name = "Google Chat".to_owned();
+    let discord = config.discord_mut().expect("discord provider");
+    discord.api_base = base;
+    discord.provider_name = "Google Chat".to_owned();
     let (mut state, _) = testing::state();
-    state.chat = Arc::new(HttpDiscordClient::new(&config.discord).expect("client"));
+    state.replace_chat(Arc::new(HttpDiscordClient::new(discord).expect("client")));
     // Leave state.config at its default Discord value to prove that the trait supplies the name.
     let app = router(state);
     for (method, uri, body) in [
@@ -106,9 +107,10 @@ async fn google_chat_metadata_and_failed_reads_and_sends_use_the_backend_name() 
 async fn malformed_successes_and_refusals_retain_provider_and_classification() {
     let (base, task) = upstream(StatusCode::OK, "{}".to_owned()).await;
     let mut config = testing::config();
-    config.discord.api_base = base;
-    config.discord.provider_name = "Google Chat".to_owned();
-    let client = HttpDiscordClient::new(&config.discord).expect("client");
+    let discord = config.discord_mut().expect("discord provider");
+    discord.api_base = base;
+    discord.provider_name = "Google Chat".to_owned();
+    let client = HttpDiscordClient::new(discord).expect("client");
     let channel = ChannelId(WRITE_CHANNEL.to_owned());
     for error in [
         client.identity().await.expect_err("missing identity"),
@@ -164,11 +166,18 @@ fn provider_configuration_defaults_and_validates_the_display_name() {
             .replace("[discord]", &format!("[discord]\nprovider_name = {name}"));
         vibe_talk::config::Config::from_toml_and_env(&toml, &Default::default())
     };
-    assert_eq!(testing::config().discord.provider_name, "Discord");
+    assert_eq!(
+        testing::config()
+            .discord()
+            .expect("discord provider")
+            .provider_name,
+        "Discord"
+    );
     assert_eq!(
         parse("\" Google Chat \"")
             .expect("valid")
-            .discord
+            .discord()
+            .expect("discord provider")
             .provider_name,
         "Google Chat"
     );
