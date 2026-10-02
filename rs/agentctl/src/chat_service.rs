@@ -1177,6 +1177,13 @@ fn capture_recovery_snapshot<A: ManagedApi + ?Sized>(
             chat_runtime::MAX_VISIBLE_MARKERS
         ));
     }
+    if capture.inline_overflowed {
+        report.note(format!(
+            "coordinator output held more than {} reply blocks with a tag that shared its line \
+with other text, so the oldest were not read",
+            chat_runtime::MAX_VISIBLE_MARKERS
+        ));
+    }
     for refusal in &capture.refused {
         report.note(refusal);
     }
@@ -1186,7 +1193,14 @@ fn capture_recovery_snapshot<A: ManagedApi + ?Sized>(
         control.log(line);
     }
     if !capture.unknown_ids.is_empty() {
-        match deliver_feedback(state, manager, &capture.unknown_ids, delivery, control.stop) {
+        match deliver_feedback(
+            state,
+            manager,
+            &capture.unknown_ids,
+            &capture.covered_ids,
+            delivery,
+            control.stop,
+        ) {
             Ok(CoordinatorDeliveryResult::Pending(_)) => report.more_work = true,
             Ok(CoordinatorDeliveryResult::Uncertain(_)) => {}
             Ok(
@@ -1804,20 +1818,28 @@ fn deliver_feedback<A: ManagedApi + ?Sized>(
     state: &BridgeState,
     manager: &ManagedAgents<'_, A>,
     unknown_ids: &[String],
+    covered_ids: &[String],
     options: DrainOptions,
     stop: Option<&StopState>,
 ) -> Result<CoordinatorDeliveryResult, ChatRuntimeError> {
     match stop {
-        Some(stop) => chat_runtime::deliver_fence_feedback_with(
+        Some(stop) => chat_runtime::deliver_fence_feedback_covering(
             state,
             &CancellableDelivery {
                 manager,
                 runtime: StopRuntime::new(stop),
             },
             unknown_ids,
+            covered_ids,
             options,
         ),
-        None => chat_runtime::deliver_fence_feedback(state, manager, unknown_ids, options),
+        None => chat_runtime::deliver_fence_feedback_covering(
+            state,
+            manager,
+            unknown_ids,
+            covered_ids,
+            options,
+        ),
     }
 }
 
