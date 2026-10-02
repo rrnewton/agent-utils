@@ -770,15 +770,46 @@ reported when fewer than 64 such characters of it were in view, at the top of
 the capture, once a recovery scan shows the first row of its message or 64 such
 characters of it, as it can when rows move back down the screen.
 
+A recovery scan also reports a marker of an open request that shares its row
+with other text: an opening marker that starts a row with text after it, such as
+`<CHAT_REPLY_001>Done.`, or a closing marker that ends a row with text before
+it, such as `Done.</CHAT_REPLY_001>`. A marker counts only alone on its row, so
+such a marker neither opens nor closes a block, and the reply it was meant to
+mark is not sent. The prompt names the ID, says that a tag shared its line with
+other text so the block was not sent, and that each opening and closing tag must
+be alone on its own line, and then asks for the block again, as it does for a
+partial block. It names the ID once, even when both markers of the block were
+misplaced, and does not also name it for the unopened block or the block with no
+closing line that a misplaced marker leaves. A marker elsewhere in a row is not
+reported, since that is where prose or a tool call puts a tag it quotes. Nor is
+a misplaced marker inside a block that closes, where it is text of the reply,
+inside a fenced code block, prompt echo, or tool output, above the first row at
+the left edge of the capture, where it can belong to a prompt echo such as the
+request prompt's own instruction, or whose text is part of a reply already
+stored for that request. Nor is a marker of a closed request, of no request, or
+of a request whose blocks the bridge holds because its prompt may not have
+reached the agent; unlike such a marker alone on its row, it is not a routing
+error. An opening marker is identified by its ID, by itself, and by the first 64
+characters after it, not counting whitespace or box-drawing characters, through
+the row of its closing marker or up to the next row that starts a message, a
+prompt, or tool output or holds another marker. A closing marker is identified
+by its ID, by itself, and by the last 64 such characters before it on its row.
+So a misplaced marker is reported once while it scrolls, a later reply with
+other text after its misplaced opening marker is reported again, and an exact
+repeat of a reply already reported is not. Up to 4,096 misplaced markers are
+read in one capture, apart from the 4,096 blocks and partial blocks, so a screen
+full of them cannot hide a block.
+
 Reported entries are kept in `fence-feedback.json` in the bridge state
 directory, so each unavailable ID and each partial block entry is reported at
 most once per state directory, including after a restart. An unavailable ID is
 kept as the ID itself. A partial block is kept as `ID KIND HASH`: KIND is
 `unopened` for an unopened block, `remnant` for fewer than 64 characters of one
-at the top of the capture, and `unclosed` for a block with no closing line, and
-HASH is the first 12 hex digits of the SHA-256 of the characters its digest
-covers. A history written by an earlier release keeps the bare ID of a partial
-block, and that ID still covers every partial block under it. A new state
+at the top of the capture, `unclosed` for a block with no closing line, and
+`inline` for a marker that shares its row with other text, and HASH is the first
+12 hex digits of the SHA-256 of the characters its digest covers. A history
+written by an earlier release keeps the bare ID of a partial block, and that ID
+still covers every partial block under it. A new state
 directory starts with no reported entries. A marker that stays visible after its
 report is left out of later prompts, and a later block that reuses a reported
 unavailable ID is not reported again. A block under an ID that belongs to no
