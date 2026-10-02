@@ -2433,7 +2433,7 @@ async fn what_is_read_aloud_is_the_speakable_text_and_not_the_raw_markdown() {
         "the vendor was asked to spell out a snowflake: {said}"
     );
     assert!(
-        said.contains("large number"),
+        said.contains("UID ending in 009"),
         "the identifier lost its placeholder entirely: {said}"
     );
     assert!(

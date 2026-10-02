@@ -1341,15 +1341,15 @@ and the rewrite happens once, in `src/ops.rs`, so nothing downstream computes on
 does three things to it, in an order that matters. Markdown comes off, because read aloud
 `**deploy**` is *"asterisk asterisk deploy asterisk asterisk"*. Timestamps become *"three hours
 ago"*, because an ISO string is read out character by character. And long numeric ids and hash
-codes get a **letter** — *"large number A"* — where the same value is the same letter every time it
-appears, so a listener can hear "the same one" without hearing nineteen digits. Times are resolved
-before ids because a Unix epoch and a snowflake are both long runs of digits and only one of them
-is a time.
+codes get short spoken names. A long numeric identifier becomes *"UID ending in 009"*, and a diff
+tag such as `D1234567890` becomes *"Diff ending in 890"*. Hashes still get letters, so the same
+hash is the same letter every time it appears. Times are resolved before ids because a Unix epoch
+and a snowflake are both long runs of digits and only one of them is a time.
 
-The letter table lives on the server for as long as the server does, shared by every reader, and
-is bounded at 4096 names per kind — past that a value is spoken as *"a large number"* with no
-letter, which is audibly different from a named one rather than quietly ambiguous. Sharing one
-table across readers is safe **on this deployment** and not in general: there is one channel
+The hash-letter table lives on the server for as long as the server does, shared by every reader,
+and is bounded at 4096 names — past that a value is spoken as *"a hash code"* with no letter,
+which is audibly different from a named one rather than quietly ambiguous. Sharing one table
+across readers is safe **on this deployment** and not in general: there is one channel
 allowlist and everyone reads through it, so a named value is always one already on the reader's
 screen. A deployment where two readers saw different channels would need two tables.
 

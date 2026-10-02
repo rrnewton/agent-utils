@@ -5964,6 +5964,21 @@ test("device speech keeps Unicode intact across a long unbroken message", async 
   assert.equal(page.dismissCalls.length, 1);
 });
 
+test("device speech reads the server-prepared body, including UID and diff names", async () => {
+  const page = devicePage();
+  await signIn(page);
+  const messages = [message({
+    content: "Review D1234567890 for 1000000000000000789",
+    spoken_content: "Review Diff ending in 890 for UID ending in 789",
+  })];
+  const rows = await inReadingMode(page, messages);
+  await rows[0].dispatch("click", {});
+
+  assert.equal(page.deviceSpeech.utterances[0].text, messages[0].spoken_content);
+  assert.doesNotMatch(page.deviceSpeech.utterances[0].text, /D1234567890|1000000000000000789/);
+  assert.deepEqual(page.prepareCalls, [], "device speech made a network preparation request");
+});
+
 for (const content of ["", "   "]) {
   test(`device speech does not archive a message with ${JSON.stringify(content)} text`, async () => {
     const page = devicePage();
@@ -15101,7 +15116,7 @@ test("WHAT IS RELAYED IS THE PREPARED BODY, not the raw one", async () => {
       message({
         id: "530",
         content: "**deploy** by 1000000000000000009 at 2026-08-24T04:31:00Z",
-        spoken_content: "deploy by large number A three hours ago",
+        spoken_content: "deploy by UID ending in 009 three hours ago",
       })
     )
   );
@@ -15109,7 +15124,7 @@ test("WHAT IS RELAYED IS THE PREPARED BODY, not the raw one", async () => {
 
   const [turn] = relayed(page);
   assert.ok(turn, "nothing was relayed at all");
-  assert.match(turn.text, /large number A/, "the prepared body is not what was quoted");
+  assert.match(turn.text, /UID ending in 009/, "the prepared body is not what was quoted");
   assert.doesNotMatch(
     turn.text,
     /1000000000000000009/,
@@ -15852,11 +15867,12 @@ test("Settings says which way this server says a message, and does not offer a s
   assert.match(settings, /data-help="speech-prep"/, "the group offers no way to reach the detail");
 
   const block = helpEntry("speech-prep");
-  assert.match(block, /large number A/, "the letter scheme has to be shown, not described");
+  assert.match(block, /UID ending in 009/, "the UID scheme has to be shown, not described");
+  assert.match(block, /Diff ending in 890/, "the diff-tag special case is not explained");
   assert.match(
     block,
-    /lost when the server restarts/,
-    "a letter that silently means a different value tomorrow has to be said out loud"
+    /stable across restarts/,
+    "the stability of the spoken UID suffix is not explained"
   );
 });
 
@@ -18418,6 +18434,23 @@ test("channel browser: Add registers the source through the ordinary add route",
     page.el("discord-channel").children.some((option) => option.value === page.registeredChannelId),
     "the added channel is not in the picker"
   );
+});
+
+test("channel browser: removing a browsed channel makes it addable again immediately", async () => {
+  const page = browsingPage();
+  await openBrowser(page);
+  const row = page.el("channel-directory-list").children[1];
+  await row.children.find((kid) => kid.tagName === "button").click();
+  await page.settle();
+
+  const added = String(page.registeredChannelId);
+  page.el("settings-channel").value = added;
+  page.el("settings-channel").dispatch("change");
+  await page.el("remove-channel").click();
+  await page.settle();
+
+  assert.deepEqual(page.removeChannelCalls, [added]);
+  assert.equal(directoryRows(page)[1], "Release Train | Add");
 });
 
 test("channel browser: a duplicate is shown as already added, not as a failure", async () => {

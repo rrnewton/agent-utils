@@ -7746,7 +7746,7 @@ function browserSpeechFailure(error) {
   return "The device voice could not read that message. Check your media volume and installed voices, then tap again.";
 }
 
-/** Speak the cached raw row on the tap's own call stack, without a network request or await. */
+/** Speak the cached prepared row on the tap's own call stack, without a network request or await. */
 function readWithBrowserSpeech(parts, id, ticket) {
   const problem = browserSpeechProblem();
   if (problem) throw new Error(problem);
@@ -7757,7 +7757,10 @@ function readWithBrowserSpeech(parts, id, ticket) {
   const text = parts.map((part) => {
     const message = messages.find((entry) => String(entry.id) === part);
     if (!message) throw new Error("That message is no longer loaded. Refresh the channel and tap it again.");
-    return String(message.content || "");
+    // The server prepares the same body for every speech path. Device-local synthesis used to be
+    // the exception: it read `content` directly, so markdown and long ids were spoken literally
+    // even though Agent audio and Read new both used `spoken_content`.
+    return String(message.spoken_content || message.content || "");
   }).join("\n\n");
   const chunks = browserSpeechChunks(text);
   if (chunks.length === 0) throw new Error("This message has no text to read.");
@@ -11801,6 +11804,16 @@ async function removeChannel() {
   const previousChannel = el("discord-channel").value;
   forgetChannelScopes((channel) => channel === String(id));
   knownChannels = payload.channels || [];
+  // The directory is cached while Settings stays open. Put a removed source back into its real
+  // state immediately; otherwise reopening Browse in the same page still said "Already added"
+  // and offered no way to add it again.
+  for (const entry of channelDirectory.entries) {
+    if (String(entry.channel_id || "") === String(id)) {
+      entry.tracked = false;
+      entry.channel_id = null;
+    }
+  }
+  renderChannelDirectory();
   saveCacheChannels();
   fillChannelSelect("discord-channel");
   fillChannelSelect("settings-channel");

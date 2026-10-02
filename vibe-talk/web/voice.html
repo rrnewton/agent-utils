@@ -1263,17 +1263,14 @@
                 button — this server rewrites it for the ear. Markdown comes off, so
                 <code>**deploy**</code> is not read as <em>asterisk asterisk deploy asterisk
                 asterisk</em>. Timestamps become <em>three hours ago</em> instead of an ISO string
-                read out character by character. And long numeric ids and hash codes are given a
-                letter: <em>large number A</em>. The channel view still shows exactly what was
-                typed; only the spoken form changes.
+                read out character by character. Long numeric ids get a short name such as
+                <em>UID ending in 009</em>, while a tag like <code>D1234567890</code> becomes
+                <em>Diff ending in 890</em>. The channel view still shows exactly what was typed;
+                only the spoken form changes.
               </p>
               <p class="hint">
-                <strong>The letters are consistent, and that is the point.</strong> The same id is
-                the same letter every time it comes up, so you can hear that two messages are about
-                the same account without hearing nineteen digits twice. The letters are assigned in
-                the order values are first seen and are <strong>lost when the server restarts</strong>,
-                so <em>large number A</em> in a conversation yesterday is not the same value as
-                <em>large number A</em> today.
+                UID and diff endings are stable across restarts. Hash codes still get short letter
+                names that remain consistent while this server is running.
               </p>
               <p class="hint">
                 It is <strong>on unless the operator turned it off</strong>, in this server's own

@@ -224,7 +224,7 @@ async fn a_pushed_message_arrives_carrying_the_body_a_voice_should_say() {
         said.spoken_content
     );
     assert!(
-        said.spoken_content.contains("large number A"),
+        said.spoken_content.contains("UID ending in 009"),
         "the id was removed rather than named, so the listener cannot tell it from another: {}",
         said.spoken_content
     );
@@ -241,7 +241,7 @@ async fn a_pushed_message_arrives_carrying_the_body_a_voice_should_say() {
     assert!(
         said.content.contains("**shipped** 1000000000000000009"),
         "the raw body must survive UNTOUCHED beside the prepared one — it is what the screen \
-         shows, and it is what makes the letter recoverable"
+         shows, and it is what makes the UID suffix recoverable"
     );
 
     // And an ordinary sentence carries NOTHING extra. Most chat has no markdown, no timestamp and
@@ -275,11 +275,8 @@ async fn a_pushed_message_arrives_carrying_the_body_a_voice_should_say() {
 }
 
 #[tokio::test]
-async fn one_letter_means_one_account_across_two_pushed_messages() {
-    // The property the whole substitution exists for. Two arrivals, one server, one table: if the
-    // second message's `A` were assigned from a table built for that message alone, "large number
-    // A" in a conversation would mean the same account only by coincidence of ordering, and the
-    // listener would have no way to hear that it had stopped meaning one thing.
+async fn uid_endings_are_stable_across_two_pushed_messages() {
+    // The same compact UID form is used for independent live arrivals.
     let (app, live) = enabled();
     let channel = ChannelId(READ_CHANNEL.to_owned());
     let mut subscription = live.subscribe(&channel, None);
@@ -299,10 +296,10 @@ async fn one_letter_means_one_account_across_two_pushed_messages() {
 
     let one = subscription.receiver.try_recv().expect("first").message;
     let two = subscription.receiver.try_recv().expect("second").message;
-    assert_eq!(one.spoken_content, "large number A opened it");
+    assert_eq!(one.spoken_content, "UID ending in 009 opened it");
     assert_eq!(
-        two.spoken_content, "large number B replied, large number A merged",
-        "the letter from the first message did not survive into the second"
+        two.spoken_content,
+        "UID ending in 017 replied, UID ending in 009 merged"
     );
 }
 

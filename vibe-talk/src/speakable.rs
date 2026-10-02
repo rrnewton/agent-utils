@@ -16,10 +16,9 @@
 //! 1. **Markdown comes off.** Discord's flavour: fences, inline code, bold, italic, underline,
 //!    strikethrough, spoilers, headers, quotes, links, mentions and custom emoji.
 //! 2. **Times become relative.** A listener wants "three hours ago", not "2026-08-24T04:31:00Z".
-//! 3. **Opaque strings become placeholders.** A hash is not information when spoken; it is forty
-//!    seconds of alphabet. It becomes "hash code A", and the SAME hash later in the message is
-//!    "hash code A" again, so the listener can tell "the same one" from "a different one" —
-//!    which is the only thing about a hash that survives being read aloud.
+//! 3. **Opaque strings become useful short names.** A hash is not information when spoken; it is
+//!    forty seconds of alphabet, so it becomes "hash code A". A long numeric identifier becomes
+//!    "UID ending in 009", while `D1234567890` becomes "Diff ending in 890".
 //!
 //! Order matters and is not arbitrary. Times are resolved BEFORE opaque strings, because a Unix
 //! epoch and a snowflake are both long runs of digits and only one of them is a time.
@@ -59,22 +58,22 @@ const CODE_SPOKEN_MAX_LINES: usize = 3;
 /// ABOUT. All of them would be the same wall of text the placeholder exists to remove.
 const TABLE_KEYS_SPOKEN: usize = 4;
 
-/// How many distinct values of ONE kind will be given a letter before the table stops growing.
+/// How many distinct hashes will be given a letter before the table stops growing.
 ///
 /// This is a memory bound on a table that otherwise lives as long as the server, not a claim about
 /// how many letters are useful — that number is far smaller. Past the cap an unseen value is
 /// spoken as its kind with no letter at all, which is audibly different from a named one: the
-/// listener hears "a large number" and knows this one is not being tracked, instead of hearing a
+/// listener hears "a hash code" and knows this one is not being tracked, instead of hearing a
 /// letter that has quietly stopped meaning one value.
 const NAMES_MAX: usize = 4_096;
 
-/// Every letter handed out so far, and the value it stands for.
+/// Every hash letter handed out so far, and the value it stands for.
 ///
 /// Held by the CALLER, because the useful lifetime of a letter is not the lifetime of a call. A
 /// table built inside `for_speech` can only make "the same one" audible within a single message:
-/// hear "user id A" in one message and "user id A" in the next and they are the same account only
-/// by coincidence of ordering. Carried across the messages of one session, the letter becomes a
-/// name the listener can actually use — which is the whole point of naming it.
+/// hear "hash code A" in one message and "hash code A" in the next and they are the same value
+/// only by coincidence of ordering. Carried across the messages of one session, the letter becomes
+/// a name the listener can actually use — which is the whole point of naming it.
 ///
 /// **How wide the table may be shared is a property of the deployment, not of this type.** A letter
 /// is only meaningful beside the transcript that introduced it, and it must never let one reader
@@ -85,7 +84,6 @@ const NAMES_MAX: usize = 4_096;
 #[derive(Debug, Default, Clone)]
 pub struct Names {
     hashes: BTreeMap<String, String>,
-    numbers: BTreeMap<String, String>,
 }
 
 impl Names {
@@ -98,7 +96,7 @@ impl Names {
     /// How many distinct opaque strings have been named.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.hashes.len() + self.numbers.len()
+        self.hashes.len()
     }
 
     /// Whether nothing has been named yet.
@@ -609,7 +607,7 @@ fn ordinal_for(day: i8) -> &'static str {
 /// commit without hearing the commit. How far "every time" reaches is the caller's choice and not
 /// this function's — see [`Names`].
 fn name_opaque_strings(text: &str, names: &mut Names) -> String {
-    let Names { hashes, numbers } = names;
+    let Names { hashes } = names;
     let mut out = String::with_capacity(text.len());
 
     for token in split_keeping_separators(text) {
@@ -618,8 +616,10 @@ fn name_opaque_strings(text: &str, names: &mut Names) -> String {
             out.push_str(&token);
             continue;
         }
-        let replacement = if is_big_number(word) {
-            Some(name_for(word, numbers, "large number"))
+        let replacement = if is_diff_tag(word) {
+            Some(format!("Diff ending in {}", ending(word)))
+        } else if is_big_number(word) {
+            Some(format!("UID ending in {}", ending(word)))
         } else if is_hashlike(word) {
             Some(name_for(word, hashes, "hash code"))
         } else {
@@ -667,6 +667,17 @@ fn letter_for(index: usize) -> String {
 
 fn is_big_number(word: &str) -> bool {
     word.len() >= BIG_NUMBER_MIN_DIGITS && word.chars().all(|c| c.is_ascii_digit())
+}
+
+/// A Phabricator diff tag, including its leading `D`.
+fn is_diff_tag(word: &str) -> bool {
+    word.strip_prefix('D').is_some_and(is_big_number)
+}
+
+/// The short, speakable part of a numeric identifier.
+fn ending(word: &str) -> &str {
+    let digits = word.strip_prefix('D').unwrap_or(word);
+    &digits[digits.len().saturating_sub(3)..]
 }
 
 /// Hex-looking, long, and containing at least one digit.
@@ -787,26 +798,22 @@ mod tests {
     }
 
     #[test]
-    fn a_carried_table_makes_one_letter_mean_one_account_across_messages() {
-        // The reported symptom is an id read out digit by digit. The fix for THAT is the naming,
-        // which already worked. This is the other half: a name nobody can carry between two
-        // messages is not a name, it is a coincidence — the listener hears "user id A" twice and
-        // cannot tell whether the same person wrote both.
+    fn a_carried_table_makes_one_letter_mean_one_hash_across_messages() {
         let mut names = Names::new();
         let zone = eastern();
-        let first = for_speech_with("from 1000000000000000009", NOW, &zone, &mut names);
-        let second = for_speech_with("also from 1000000000000000009", NOW, &zone, &mut names);
-        let other = for_speech_with("but 1000000000000000017 replied", NOW, &zone, &mut names);
+        let first = for_speech_with("from a1b2c3d4e5f6a7", NOW, &zone, &mut names);
+        let second = for_speech_with("also from a1b2c3d4e5f6a7", NOW, &zone, &mut names);
+        let other = for_speech_with("but ffee0011223344 replied", NOW, &zone, &mut names);
 
-        assert_eq!(first, "from large number A");
-        assert_eq!(second, "also from large number A");
-        assert_eq!(other, "but large number B replied");
+        assert_eq!(first, "from hash code A");
+        assert_eq!(second, "also from hash code A");
+        assert_eq!(other, "but hash code B replied");
         assert_eq!(names.len(), 2);
 
-        // And a table that was NOT carried says A for the second account, which is exactly the
+        // And a table that was NOT carried says A for the second hash, which is exactly the
         // confusion the carried one exists to remove.
-        let restarted = for_speech("but 1000000000000000017 replied", NOW, &zone);
-        assert_eq!(restarted, "but large number A replied");
+        let restarted = for_speech("but ffee0011223344 replied", NOW, &zone);
+        assert_eq!(restarted, "but hash code A replied");
     }
 
     #[test]
@@ -825,7 +832,7 @@ mod tests {
     }
 
     #[test]
-    fn hashes_and_numbers_are_counted_apart_so_neither_crowds_the_other() {
+    fn uids_do_not_consume_the_hash_letter_table() {
         let mut names = Names::new();
         assert!(names.is_empty());
         let said = for_speech_with(
@@ -834,33 +841,32 @@ mod tests {
             &eastern(),
             &mut names,
         );
-        // Both are the first of their kind, so both are A, and the KIND is what tells them apart.
-        assert_eq!(said, "large number A touched hash code A");
-        assert_eq!(names.len(), 2);
+        assert_eq!(said, "UID ending in 009 touched hash code A");
+        assert_eq!(names.len(), 1);
     }
 
     #[test]
     fn a_table_that_has_filled_up_stops_naming_rather_than_reusing_a_name() {
         // A table on the server outlives any one conversation, so it needs a bound. The bound has
         // to be a bound on the TABLE and not on the meaning of a letter: a full table that started
-        // handing out `A` again would make "large number A" silently ambiguous, and nothing in the
+        // handing out `A` again would make "hash code A" silently ambiguous, and nothing in the
         // audio would say so. Unnamed is audibly different, which is the property being asserted.
         let mut names = Names::new();
         let zone = eastern();
         for i in 0..NAMES_MAX {
-            let value = format!("9{:018}", i);
+            let value = format!("a{i:012x}");
             let _ = for_speech_with(&value, NOW, &zone, &mut names);
         }
         assert_eq!(names.len(), NAMES_MAX, "the cap is not where it says it is");
 
-        let overflow = for_speech_with("1234567890123456789", NOW, &zone, &mut names);
-        assert_eq!(overflow, "a large number");
+        let overflow = for_speech_with("b123456789abc", NOW, &zone, &mut names);
+        assert_eq!(overflow, "a hash code");
         assert_eq!(names.len(), NAMES_MAX, "a full table grew anyway");
 
         // And a value already in the table is still answered from it: filling up must not cost the
         // letters already handed out, which are the ones a listener has heard.
-        let known = for_speech_with("9000000000000000000", NOW, &zone, &mut names);
-        assert_eq!(known, "large number A");
+        let known = for_speech_with("a000000000000", NOW, &zone, &mut names);
+        assert_eq!(known, "hash code A");
     }
 
     #[test]
@@ -871,18 +877,19 @@ mod tests {
         let shared = SharedNames::new();
         let zone = eastern();
         assert!(shared.is_empty());
-        let first = shared.for_speech("from 1000000000000000009", NOW, &zone);
-        let second = shared.for_speech("still 1000000000000000009", NOW, &zone);
-        let other = shared.for_speech("but 1000000000000000017", NOW, &zone);
-        assert_eq!(first, "from large number A");
-        assert_eq!(second, "still large number A");
-        assert_eq!(other, "but large number B");
+        let first = shared.for_speech("from a1b2c3d4e5f6a7", NOW, &zone);
+        let second = shared.for_speech("still a1b2c3d4e5f6a7", NOW, &zone);
+        let other = shared.for_speech("but ffee0011223344", NOW, &zone);
+        assert_eq!(first, "from hash code A");
+        assert_eq!(second, "still hash code A");
+        assert_eq!(other, "but hash code B");
         assert_eq!(shared.len(), 2);
     }
 
     #[test]
-    fn long_identifiers_are_named_and_ordinary_numbers_are_left_alone() {
-        assert_eq!(say("id 1000000000000000009"), "id large number A");
+    fn long_identifiers_and_diff_tags_have_useful_endings() {
+        assert_eq!(say("id 1000000000000000009"), "id UID ending in 009");
+        assert_eq!(say("review D1234567890"), "review Diff ending in 890");
         // A year, a port and a count are quantities somebody wants to hear.
         assert_eq!(
             say("in 2026 on port 8080, 42 times"),
@@ -931,7 +938,7 @@ mod tests {
     #[test]
     fn a_time_is_resolved_before_a_long_number_can_claim_it() {
         // A Unix epoch and a snowflake are both long runs of digits, and only one is a time. If the
-        // order were reversed this would read "large number A" and the time would be gone.
+        // order were reversed this would read "UID ending in 200" and the time would be gone.
         assert_eq!(say("<t:1787569200:f>"), "1 hour ago");
     }
 
