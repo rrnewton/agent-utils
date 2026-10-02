@@ -3190,10 +3190,17 @@ pub struct SnapshotCapture {
     pub unknown_ids: Vec<String>,
     /// Visible unavailable identifiers left out because the coordinator already received them.
     pub suppressed_ids: Vec<String>,
+    /// Feedback entries the coordinator has not received that are recorded as received when a
+    /// notice about `unknown_ids` is, but are never named in one, so the blocks they describe are
+    /// not reported again in another form: see `deliver_fence_feedback_covering`.
+    pub covered_ids: Vec<String>,
     /// Complete blocks with new text that were not stored, for the service log.
     pub refused: Vec<ReplyRefusal>,
     /// More reply blocks and markers were visible than one capture reads; the oldest were not.
     pub overflowed: bool,
+    /// More blocks with a tag that shared its row with other text were visible than one capture
+    /// reads; the oldest were not.
+    pub inline_overflowed: bool,
     /// Active and closed nonce index derived by this same bounded state scan.
     pub(crate) route_entries: Vec<ReplyRouteEntry>,
 }
@@ -5113,8 +5120,10 @@ and the replies captured for them. The provider's own thread is the complete rec
                 replies: Vec::new(),
                 unknown_ids: Vec::new(),
                 suppressed_ids: Vec::new(),
+                covered_ids: Vec::new(),
                 refused: Vec::new(),
                 overflowed: false,
+                inline_overflowed: false,
                 route_entries: Vec::new(),
             });
         }
@@ -5175,7 +5184,21 @@ and the replies captured for them. The provider's own thread is the complete rec
                 Some((alias.clone(), (*nonce).to_owned()))
             })
             .collect::<BTreeMap<_, _>>();
-        let scan = scan_reply_blocks_for_nonces(rendered, &known_nonces, &aliases, &reported)?;
+        // A block with a tag that shares its row with other text is reported only for a request
+        // that can still take a reply and whose blocks are not held, since only that request's
+        // block would have gone out.
+        let inline_nonces = nonce_to_key
+            .iter()
+            .filter(|(_, key)| gate.hold(key).is_none())
+            .map(|(nonce, _)| nonce.clone())
+            .collect::<BTreeSet<_>>();
+        let scan = scan_reply_blocks_for_nonces(
+            rendered,
+            &known_nonces,
+            &inline_nonces,
+            &aliases,
+            &reported,
+        )?;
         let burned = alias_record
             .as_mut()
             .is_some_and(|record| record.burn(&scan.unknown_aliases));
@@ -5202,6 +5225,7 @@ and the replies captured for them. The provider's own thread is the complete rec
             unknown: scan.unknown_ids,
             suppressed: scan.suppressed_ids,
         };
+        let mut covered = Vec::new();
         for (nonce, found) in scan.by_nonce {
             let Some(key) = nonce_to_key.get(&nonce) else {
                 // Closed retained requests stay recognized so a stale terminal marker is a no-op.
@@ -5230,8 +5254,17 @@ and the replies captured for them. The provider's own thread is the complete rec
             for entry in capture.unknown_ids {
                 unavailable.push(entry);
             }
-            for identifier in self.unmatched_partials_locked(key, &found.partial)? {
+            let entries = self.unmatched_partials_locked(key, &found.partial)?;
+            for identifier in entries.shown {
                 unavailable.push(identifier);
+            }
+            for entry in entries.covered {
+                if covered.len() < MAX_FEEDBACK_UNAVAILABLE_IDS
+                    && !covered.contains(&entry)
+                    && !feedback_reported(&reported, &entry)
+                {
+                    covered.push(entry);
+                }
             }
         }
         let mut route_entries = records
@@ -5267,8 +5300,10 @@ and the replies captured for them. The provider's own thread is the complete rec
             replies,
             unknown_ids: unavailable.unknown,
             suppressed_ids: unavailable.suppressed,
+            covered_ids: covered,
             refused,
             overflowed: scan.overflowed,
+            inline_overflowed: scan.inline_overflowed,
             route_entries,
         })
     }
@@ -5403,7 +5438,13 @@ and the replies captured for them. The provider's own thread is the complete rec
         if nonces.is_empty() {
             return Ok(());
         }
-        let scan = scan_reply_blocks_for_nonces(rendered, &nonces, &aliases, &BTreeSet::new())?;
+        let scan = scan_reply_blocks_for_nonces(
+            rendered,
+            &nonces,
+            &BTreeSet::new(),
+            &aliases,
+            &BTreeSet::new(),
+        )?;
         let mut changed = false;
         for (nonce, found) in &scan.by_nonce {
             if let Some(alias) = alias_by_nonce.get(nonce) {
@@ -6465,6 +6506,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let mut scan = scan_reply_blocks_for_nonces(
             rendered,
             &BTreeSet::from([request.reply_nonce.clone()]),
+            &BTreeSet::new(),
             &alias
                 .map(|alias| (format_reply_alias(alias), request.reply_nonce.clone()))
                 .into_iter()
@@ -6666,53 +6708,86 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
     /// is not part of any reply this request stored, so the coordinator hears that the block did
     /// not go out. The visible end of a stored reply cut by the top of the capture, or the start
     /// of one, is silent, in either the plain or the column view, and so is a partial block with
-    /// no text yet.
+    /// no text yet. A block with a tag that shared its row with other text gets the entry
+    /// `inline_entry` writes, unless the text it was read with is part of a stored reply, such as
+    /// a reply that quotes both tags of its ID and whose opening marker has scrolled away, or the
+    /// partial block read for its rows without that tag is silent, such as the end of a stored
+    /// reply that quotes its own opening tag and whose opening marker has scrolled away. Otherwise
+    /// that partial block's entry is reported with it, silently.
     fn unmatched_partials_locked(
         &self,
         key: &str,
         partial: &[PartialBlock],
-    ) -> Result<Vec<String>> {
+    ) -> Result<PartialEntries> {
         let mut stored: Option<Vec<(String, String)>> = None;
         let mut compared = BTreeSet::new();
-        let mut unmatched = Vec::<String>::new();
+        let mut entries = PartialEntries::default();
         for block in partial {
-            let (unclosed, cut, text) = match block {
-                PartialBlock::Unclosed { text, .. } => (true, false, text),
-                PartialBlock::Unopened { text, cut, .. } => (false, *cut, text),
+            let Some((unclosed, cut, text)) = block.seen_part() else {
+                let PartialBlock::Inline {
+                    identifier,
+                    text,
+                    without_tag,
+                } = block
+                else {
+                    continue;
+                };
+                let view = plain_view(text);
+                let entry = inline_entry(identifier, &view);
+                if entries.shown.contains(&entry) {
+                    continue;
+                }
+                let stored = match stored.as_mut() {
+                    Some(views) => views,
+                    None => stored.insert(self.stored_reply_views_locked(key)?),
+                };
+                if stored.iter().any(|(plain, _)| plain.contains(&view)) {
+                    continue;
+                }
+                let mut covered = None;
+                if let Some((unclosed, cut, text)) =
+                    without_tag.as_deref().and_then(PartialBlock::seen_part)
+                {
+                    let view = plain_view(text);
+                    if !view.is_empty() {
+                        if part_of_stored(stored, unclosed, text, &view) {
+                            continue;
+                        }
+                        covered = Some(held_back_entry(identifier, unclosed, cut, &view));
+                    }
+                }
+                entries.shown.push(entry);
+                entries.covered.extend(covered);
+                continue;
             };
             let view = plain_view(text);
             if view.is_empty() || !compared.insert((unclosed, cut, view.clone())) {
                 continue;
             }
             let entry = held_back_entry(block.identifier(), unclosed, cut, &view);
-            if unmatched.contains(&entry) {
+            if entries.shown.contains(&entry) {
                 continue;
             }
             let stored = match stored.as_mut() {
                 Some(views) => views,
-                None => {
-                    let request = self.read_request(key)?;
-                    let mut views = Vec::new();
-                    for ordinal in (1..request.next_reply_ordinal).rev() {
-                        let body = self.read_reply(key, ordinal)?.body;
-                        views.push((plain_view(&body), ColumnView::of(&body).text));
-                    }
-                    stored.insert(views)
-                }
+                None => stored.insert(self.stored_reply_views_locked(key)?),
             };
-            let columns = ColumnView::of(text).text;
-            let matched = stored.iter().any(|(plain, by_column)| {
-                if unclosed {
-                    plain.starts_with(&view) || by_column.starts_with(&columns)
-                } else {
-                    plain.ends_with(&view) || by_column.ends_with(&columns)
-                }
-            });
-            if !matched {
-                unmatched.push(entry);
+            if !part_of_stored(stored, unclosed, text, &view) {
+                entries.shown.push(entry);
             }
         }
-        Ok(unmatched)
+        Ok(entries)
+    }
+
+    /// The plain and column views of each reply `key` stored, newest first.
+    fn stored_reply_views_locked(&self, key: &str) -> Result<Vec<(String, String)>> {
+        let request = self.read_request(key)?;
+        let mut views = Vec::new();
+        for ordinal in (1..request.next_reply_ordinal).rev() {
+            let body = self.read_reply(key, ordinal)?.body;
+            views.push((plain_view(&body), ColumnView::of(&body).text));
+        }
+        Ok(views)
     }
 
     /// Publish exactly one retained reply in ordinal order.
@@ -7912,12 +7987,31 @@ pub(crate) fn deliver_fence_feedback_with(
     unknown_ids: &[String],
     options: DrainOptions,
 ) -> Result<CoordinatorDeliveryResult> {
+    deliver_fence_feedback_covering(state, delivery, unknown_ids, &[], options)
+}
+
+/// Inject one deduplicated coordinator diagnostic for `unknown_ids`, as
+/// `deliver_fence_feedback_with` does, and record the entries of `covered` that the coordinator
+/// has not received as received along with the entries the notice names, without naming them, as
+/// many as the record holds. A capture covers the entry of the partial block read for the rows
+/// of a block that a notice names for a tag that shared its row with other text, so that block
+/// is not reported again once its opening rows scroll away: see [`PartialBlock::Inline`]. With
+/// no notice to send, nothing in `covered` is recorded.
+pub(crate) fn deliver_fence_feedback_covering(
+    state: &BridgeState,
+    delivery: &dyn CoordinatorDelivery,
+    unknown_ids: &[String],
+    covered: &[String],
+    options: DrainOptions,
+) -> Result<CoordinatorDeliveryResult> {
     if unknown_ids.is_empty() {
         return Ok(CoordinatorDeliveryResult::AlreadyDelivered);
     }
     if unknown_ids.len() > MAX_FEEDBACK_UNAVAILABLE_IDS
+        || covered.len() > MAX_FEEDBACK_UNAVAILABLE_IDS
         || !unknown_ids
             .iter()
+            .chain(covered)
             .all(|identifier| valid_feedback_id(identifier))
     {
         return Err(ChatRuntimeError::invalid(
@@ -7986,6 +8080,15 @@ pub(crate) fn deliver_fence_feedback_with(
         Vec::new()
     };
     let prompt = routing_notice(&unavailable, &open, unix_millis());
+    for entry in covered {
+        if unavailable.len() == MAX_FEEDBACK_UNAVAILABLE_IDS {
+            break;
+        }
+        if !unavailable.contains(entry) && !feedback_reported(&reported, entry) {
+            unavailable.push(entry.clone());
+        }
+    }
+    unavailable.sort();
     // The exact marker set and prompt must survive a crash after submission, before the queue
     // result can be recorded. Otherwise a later superset could report the same marker again.
     state.record_fence_feedback(&unavailable, &prompt, true)?;
@@ -8085,6 +8188,11 @@ enum PromptReach {
     Unknown,
 }
 
+/// What a routing notice about a tag that shared its row with other text asks of the
+/// coordinator. A tag that other text mentions without its angle brackets is not read as one.
+const INLINE_MARKER_RULE: &str = "Each opening and closing tag must be alone on its own line; to \
+mention a tag in other text, leave out its angle brackets.";
+
 /// Compose the notice that tells the coordinator which reply blocks did not go out, and why.
 ///
 /// A block whose ID matches no open request is answered with the open requests the coordinator
@@ -8093,13 +8201,18 @@ enum PromptReach {
 /// the IDs of those already answered.
 /// A block read under the ID of a request whose prompt had not reached the coordinator is
 /// answered the same way, after saying that no block with its text goes to that request.
-/// A block seen only in part is answered with what the screen was missing. IDs are printed as
-/// the coordinator wrote them; none of this text forms a marker line.
+/// A block seen only in part is answered with what the screen was missing, and a block with a
+/// tag that shared its row with other text with `INLINE_MARKER_RULE` instead. When a block had no
+/// closing line or such a tag, the notice says that a block still being written goes out once it
+/// is complete, since a block can quote its own closing tag before its closing line is written.
+/// IDs are printed as the coordinator wrote them; none of this text forms a marker line or holds
+/// a marker.
 fn routing_notice(entries: &[String], open: &[OpenRequest], now: u64) -> String {
     let mut unknown = Vec::new();
     let mut unprompted = Vec::new();
     let mut unopened = Vec::new();
     let mut unclosed = Vec::new();
+    let mut inline = Vec::new();
     for entry in entries {
         match FeedbackEntry::parse(entry) {
             FeedbackEntry::Unknown(identifier) => unknown.push(identifier),
@@ -8112,8 +8225,15 @@ fn routing_notice(entries: &[String], open: &[OpenRequest], now: u64) -> String 
                 identifier,
                 kind: HeldBackKind::Unclosed,
             } => unclosed.push(identifier),
+            FeedbackEntry::HeldBack {
+                identifier,
+                kind: HeldBackKind::Inline,
+            } => inline.push(identifier),
         }
     }
+    // A scan reports a block with a misplaced tag only for that tag, and not also as a block
+    // seen in part, so each line below names blocks of its own.
+    let still_written = !unclosed.is_empty() || !inline.is_empty();
     let mut lines = Vec::new();
     if !unknown.is_empty() || !unprompted.is_empty() {
         lines.push(misrouted_notice(&unknown, &unprompted, open, now));
@@ -8138,7 +8258,20 @@ for, the reply blocks",
             &unclosed,
         ));
     }
-    let blocks = unopened.len() + unclosed.len();
+    if !inline.is_empty() {
+        lines.push(format!(
+            "{} {INLINE_MARKER_RULE}",
+            held_back_notice(
+                [
+                    "an opening or closing tag shared its line with other text in the reply block",
+                    "opening or closing tags shared their lines with other text in the reply \
+blocks",
+                ],
+                &inline,
+            )
+        ));
+    }
+    let blocks = unopened.len() + unclosed.len() + inline.len();
     if blocks > 0 {
         // A block with no closing line may only have been mid-stream when the screen was read.
         // Once its closing line is written, a read that shows the first row of its message and
@@ -8146,11 +8279,11 @@ for, the reply blocks",
         lines.push(format!(
             "{} {} again: start a message with its opening line and write the whole block in \
 that message, with no tool call inside it.",
-            if unclosed.is_empty() {
-                "Send"
-            } else {
+            if still_written {
                 "A block that was still being written goes out once it is complete, if the screen \
 then shows the first row of its message and its closing line. Otherwise, send"
+            } else {
+                "Send"
             },
             if blocks == 1 { "it" } else { "each one" }
         ));
@@ -8811,14 +8944,73 @@ enum PartialBlock {
         text: String,
         cut: bool,
     },
+    /// A block whose opening or closing tag shared its row with other text, so it did not count
+    /// as a marker and the block was never read: an opening tag in a row with other text, such
+    /// as `<CHAT_REPLY_001>Done.`, and after it a closing tag of the same ID, in a row with
+    /// other text or alone on its row, while no block is open; or, in a block that a marker
+    /// opened, a closing tag of its ID in a row with other text, such as `Done.</CHAT_REPLY_001>`.
+    /// `text` holds only identity characters: the opening tag or marker, all the text after it
+    /// up to the closing tag, and that tag. Both kinds keep the same text for the same block, so
+    /// a block whose opening tag a pane moves onto a row of its own, or off it, keeps its entry.
+    /// A block whose tags are in two items is not one, nor is a block whose misplaced tag is in
+    /// a tool call's command, as the call's output row shows: that block is read as
+    /// `without_tag`.
+    ///
+    /// `without_tag` is the partial block that the scan reads for the same rows when it reads no
+    /// tag in a row with other text, if there is one: the unopened block that ends at the
+    /// closing marker line of an opening tag in a row with other text, or the block with no
+    /// closing line that holds a closing tag in a row with other text. Its entry is reported
+    /// with this block's, silently, so once that block's opening rows scroll away it is not
+    /// reported again as an unopened block or a remnant.
+    Inline {
+        identifier: String,
+        text: String,
+        without_tag: Option<Box<PartialBlock>>,
+    },
 }
 
 impl PartialBlock {
     fn identifier(&self) -> &str {
         match self {
-            Self::Unclosed { identifier, .. } | Self::Unopened { identifier, .. } => identifier,
+            Self::Unclosed { identifier, .. }
+            | Self::Unopened { identifier, .. }
+            | Self::Inline { identifier, .. } => identifier,
         }
     }
+
+    /// For a block seen only in part, whether it is the start of a block rather than its end,
+    /// whether that end reaches back to the top of the capture, and its text.
+    fn seen_part(&self) -> Option<(bool, bool, &str)> {
+        match self {
+            Self::Unclosed { text, .. } => Some((true, false, text)),
+            Self::Unopened { text, cut, .. } => Some((false, *cut, text)),
+            Self::Inline { .. } => None,
+        }
+    }
+}
+
+/// Whether `text`, with the plain view `view`, of a block seen only in part is part of a reply
+/// in `stored`, as `stored_reply_views_locked` returns them: the start of one for the start of a
+/// block, if `unclosed`, and otherwise the end of one, in either the plain or the column view.
+fn part_of_stored(stored: &[(String, String)], unclosed: bool, text: &str, view: &str) -> bool {
+    let columns = ColumnView::of(text).text;
+    stored.iter().any(|(plain, by_column)| {
+        if unclosed {
+            plain.starts_with(view) || by_column.starts_with(&columns)
+        } else {
+            plain.ends_with(view) || by_column.ends_with(&columns)
+        }
+    })
+}
+
+/// The feedback entries of one request's partial blocks.
+#[derive(Debug, Default)]
+struct PartialEntries {
+    /// The entries to report.
+    shown: Vec<String>,
+    /// The entries reported only with a notice about other entries, and never named in one: see
+    /// [`PartialBlock::Inline`].
+    covered: Vec<String>,
 }
 
 /// A complete reply block that was read but not stored, and why. The service logs it; nothing
@@ -8881,6 +9073,9 @@ struct MultiReplyScan {
     /// More than `MAX_VISIBLE_MARKERS` blocks and partial blocks were visible, so the oldest
     /// were left out.
     overflowed: bool,
+    /// More than `MAX_VISIBLE_MARKERS` blocks with a tag that shared its row with other text
+    /// were visible, so the oldest were left out.
+    inline_overflowed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -8923,16 +9118,20 @@ enum HeldBackKind {
     Remnant,
     /// The start of the block, with no closing marker after it.
     Unclosed,
+    /// A block whose opening or closing tag shared its row with other text, which therefore did
+    /// not count as a marker: see [`PartialBlock::Inline`].
+    Inline,
 }
 
 impl HeldBackKind {
-    const ALL: [Self; 3] = [Self::Unopened, Self::Remnant, Self::Unclosed];
+    const ALL: [Self; 4] = [Self::Unopened, Self::Remnant, Self::Unclosed, Self::Inline];
 
     fn word(self) -> &'static str {
         match self {
             Self::Unopened => "unopened",
             Self::Remnant => "remnant",
             Self::Unclosed => "unclosed",
+            Self::Inline => "inline",
         }
     }
 }
@@ -9011,6 +9210,22 @@ fn held_back_entry(identifier: &str, unclosed: bool, cut: bool, view: &str) -> S
     format!("{identifier} {} {}", kind.word(), &digest[..12])
 }
 
+/// The fence feedback entry for a block of an open request whose opening or closing tag shared
+/// its row with other text: `<identifier> inline <digest>`, where the digest is the first 12 hex
+/// digits of the SHA-256 of the text [`PartialBlock::Inline`] keeps. That text includes a tag,
+/// so it is never empty, and it holds no whitespace and depends on no row boundary, so it stays
+/// put while its rows scroll or wrap at another width, and the coordinator hears about the block
+/// once. A reply that fails the same way again gets an entry of its own unless that text is the
+/// same too. Like `held_back_entry`, it is never an identifier that matches no request.
+fn inline_entry(identifier: &str, view: &str) -> String {
+    let digest = format!("{:x}", Sha256::digest(view.as_bytes()));
+    format!(
+        "{identifier} {} {}",
+        HeldBackKind::Inline.word(),
+        &digest[..12]
+    )
+}
+
 /// One fence feedback entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FeedbackEntry<'a> {
@@ -9087,32 +9302,230 @@ struct ActiveReply {
     nonce: String,
     opening_margin: String,
     body: Vec<String>,
+    /// The [`PartialBlock::Inline`] text of the first closing tag of the block's ID in a row with
+    /// other text, if the request is one the scan reports such tags for. It is reported only if
+    /// the block ends with no closing marker: in a block that closes, it is text of its reply.
+    inline: Option<String>,
+    /// Whether `inline` was read in the rows of what may be a tool call's command.
+    inline_in_command: bool,
 }
 
 impl ActiveReply {
-    fn unclosed(self) -> (String, ScanEvent) {
+    /// Push the event of a block that ends with no closing marker: the block with a closing tag
+    /// of its ID that shared its row with other text, if it had one, since that tag is where the
+    /// block was meant to end, and otherwise the block itself. Either way the block is one event,
+    /// so it is one entry. A closing tag read in what may be a tool call's command waits with
+    /// that command's events.
+    fn push_unclosed(self, events: &mut ScanEvents, command: &mut Option<PendingCommand>) {
+        let unclosed = PartialBlock::Unclosed {
+            identifier: self.identifier.clone(),
+            text: self.body.join("\n"),
+        };
+        let Some(text) = self.inline else {
+            events.push((self.nonce, ScanEvent::Partial(unclosed)));
+            return;
+        };
+        let event = (
+            self.nonce,
+            ScanEvent::Partial(PartialBlock::Inline {
+                identifier: self.identifier,
+                text,
+                without_tag: Some(Box::new(unclosed)),
+            }),
+        );
+        if self.inline_in_command {
+            emit(events, command, event);
+        } else {
+            events.push(event);
+        }
+    }
+}
+
+/// The rows of what may be a tool call's command, from a row that starts the way a call does,
+/// such as `⏺ Bash(…` or `• Ran …`, while the scan holds the events of the tags in them that
+/// shared their rows with other text. Only the call's output row, `⎿` or `└`, shows that the
+/// rows were a command, which can quote tags; text can start the way a call does, such as
+/// `• Ran the checks: …` or `TODO(owner): …`, and no output row follows it. See
+/// [`PendingCommand::ends`].
+struct PendingCommand {
+    /// The column of the bullet of the row that started the call, or of its text if it has no
+    /// bullet. The command continues on the rows right of it.
+    column: usize,
+    /// The column of the text of the row that started the call, after its bullet if it has one.
+    margin: usize,
+    /// The events held, each with its place in screen order.
+    held: Vec<(usize, String, ScanEvent)>,
+}
+
+impl PendingCommand {
+    /// Whether a nonblank row ends the command, and if so, whether the command was a tool call:
+    /// its output row, at or right of the command's column, ends it as one; a prompt row, a row
+    /// with a bullet, another output row, any other row at or left of that column, and a row
+    /// that starts a call at the column of the text of the command's first row, as Claude Code's
+    /// compact view draws a call with no bullet under a message, end it as text. `prompt`,
+    /// `output` and `call` say the row is read as a prompt row, a tool output row, or a row that
+    /// starts a call.
+    fn ends(
+        &self,
+        indent: usize,
+        decorated: bool,
+        prompt: bool,
+        output: bool,
+        call: bool,
+    ) -> Option<bool> {
+        if output {
+            Some(indent >= self.column)
+        } else if prompt || decorated || indent <= self.column || (call && indent == self.margin) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// End the command. Once its output row shows it was a tool call, the blocks of tags in its
+    /// rows are quoted in a command, so each becomes the partial block read for its rows without
+    /// those tags, if there is one; otherwise its events are pushed as they are. `active` is the
+    /// block open at its end, whose closing tag in a row with other text is dropped the same way.
+    fn end(self, tool_call: bool, events: &mut ScanEvents, active: Option<&mut ActiveReply>) {
+        if let Some(opened) = active {
+            if std::mem::take(&mut opened.inline_in_command) && tool_call {
+                opened.inline = None;
+            }
+        }
+        for (at, nonce, event) in self.held {
+            let event = match event {
+                ScanEvent::Partial(PartialBlock::Inline { without_tag, .. }) if tool_call => {
+                    match without_tag {
+                        Some(block) => ScanEvent::Partial(*block),
+                        None => continue,
+                    }
+                }
+                event => event,
+            };
+            events.push_at(at, (nonce, event));
+        }
+    }
+}
+
+/// Push the event of a block with a tag that shared its row with other text, or hold it with
+/// the events of `command` while the rows read may be a tool call's command.
+fn emit(events: &mut ScanEvents, command: &mut Option<PendingCommand>, event: (String, ScanEvent)) {
+    let at = events.reserve();
+    match command {
+        Some(command) => command.held.push((at, event.0, event.1)),
+        None => events.push_at(at, event),
+    }
+}
+
+/// The scan events of one capture: the newest `MAX_VISIBLE_MARKERS` blocks and partial blocks,
+/// and apart from them the newest `MAX_VISIBLE_MARKERS` blocks with a tag that shared its row
+/// with other text, so rows that mention tags cannot crowd a block out. Older events are most
+/// likely of replies that an earlier capture already stored or reported.
+#[derive(Default)]
+struct ScanEvents {
+    blocks: VecDeque<(usize, String, ScanEvent)>,
+    inline: VecDeque<(usize, String, ScanEvent)>,
+    pushed: usize,
+    overflowed: bool,
+    inline_overflowed: bool,
+}
+
+impl ScanEvents {
+    fn push(&mut self, event: (String, ScanEvent)) {
+        let at = self.reserve();
+        self.push_at(at, event);
+    }
+
+    /// The place in screen order of the next event read.
+    fn reserve(&mut self) -> usize {
+        let at = self.pushed;
+        self.pushed += 1;
+        at
+    }
+
+    /// Push an event at the place in screen order that `reserve` gave it. An event held while
+    /// the scan read what may be a tool call's command is pushed after events read later, so
+    /// each list is kept in screen order and drops its oldest event.
+    fn push_at(&mut self, at: usize, (nonce, event): (String, ScanEvent)) {
+        let (events, overflowed) =
+            if matches!(event, ScanEvent::Partial(PartialBlock::Inline { .. })) {
+                (&mut self.inline, &mut self.inline_overflowed)
+            } else {
+                (&mut self.blocks, &mut self.overflowed)
+            };
+        let place = events.partition_point(|(pushed, _, _)| *pushed < at);
+        events.insert(place, (at, nonce, event));
+        if events.len() > MAX_VISIBLE_MARKERS {
+            events.pop_front();
+            *overflowed = true;
+        }
+    }
+
+    /// The events kept, in the order they were pushed, which is screen order.
+    fn into_screen_order(self) -> Vec<(String, ScanEvent)> {
+        let mut events = self
+            .blocks
+            .into_iter()
+            .chain(self.inline)
+            .collect::<Vec<_>>();
+        events.sort_unstable_by_key(|(pushed, _, _)| *pushed);
+        events
+            .into_iter()
+            .map(|(_, nonce, event)| (nonce, event))
+            .collect()
+    }
+}
+
+/// An opening tag in a row with other text while no block is open, and the identity characters
+/// read after it so far, while the rows after it are read for a closing tag of its ID: see
+/// [`PartialBlock::Inline`].
+struct InlineOpening {
+    nonce: String,
+    identifier: String,
+    /// The margin of the tag's row. A bullet left of it starts a new item.
+    margin: usize,
+    /// The identity characters of the tag and of the text after it so far.
+    text: String,
+}
+
+impl InlineOpening {
+    /// Add the identity characters of `text`, text read after the tag.
+    fn extend(&mut self, text: &str) {
+        self.text.extend(identity_characters(text));
+    }
+
+    /// The event of the block this tag opened and the tag `closing` closed, where `without_tag`
+    /// is the partial block read for the same rows without this tag, if there is one.
+    fn closed_by(
+        mut self,
+        closing: &str,
+        without_tag: Option<Box<PartialBlock>>,
+    ) -> (String, ScanEvent) {
+        self.text.extend(identity_characters(closing));
         (
             self.nonce,
-            ScanEvent::Partial(PartialBlock::Unclosed {
+            ScanEvent::Partial(PartialBlock::Inline {
                 identifier: self.identifier,
-                text: self.body.join("\n"),
+                text: self.text,
+                without_tag,
             }),
         )
     }
 }
 
-/// Keep the newest `MAX_VISIBLE_MARKERS` scan events. Older ones are most likely replies that an
-/// earlier capture already stored.
-fn push_scan_event(
-    events: &mut VecDeque<(String, ScanEvent)>,
-    overflowed: &mut bool,
-    event: (String, ScanEvent),
-) {
-    if events.len() == MAX_VISIBLE_MARKERS {
-        events.pop_front();
-        *overflowed = true;
-    }
-    events.push_back(event);
+/// The [`PartialBlock::Inline`] text of a closing tag of the open block `opened` in a row with
+/// other text, where `before` is that row up to the tag: the identity characters of the block's
+/// opening marker, of the rows of the block above that row, of `before`, and of the tag. They are
+/// those that an opening tag in a row with other text reads for the same block, so the block
+/// keeps its entry when a pane rewraps its rows and puts its opening tag alone on a row, or takes
+/// it off one.
+fn inline_closing(opened: &ActiveReply, before: &str, tag: &str) -> String {
+    let opening = format!("<{}_REPLY_{}>", opened.protocol, opened.identifier);
+    std::iter::once(opening.as_str())
+        .chain(opened.body.iter().map(String::as_str))
+        .chain([before, tag])
+        .flat_map(identity_characters)
+        .collect()
 }
 
 #[cfg(test)]
@@ -9120,6 +9533,7 @@ fn scan_reply_blocks(rendered: &str, expected_nonce: &str) -> Result<ReplyScan> 
     let expected_nonces = BTreeSet::from([expected_nonce.to_owned()]);
     let mut scan = scan_reply_blocks_for_nonces(
         rendered,
+        &expected_nonces,
         &expected_nonces,
         &BTreeMap::new(),
         &BTreeSet::new(),
@@ -9134,21 +9548,29 @@ fn scan_reply_blocks(rendered: &str, expected_nonce: &str) -> Result<ReplyScan> 
 /// request's nonce and an ordinal, or with the request's reply alias, which `aliases` maps to
 /// the nonce. Only an invalid expected nonce is an error: a malformed, nested, oversized, or
 /// unterminated block is returned as a refusal or a partial block, so nothing the coordinator
-/// prints can stop the service.
+/// prints can stop the service. A block of a request `inline_nonces` names whose opening or
+/// closing tag shared its row with other text is returned as [`PartialBlock::Inline`].
 fn scan_reply_blocks_for_nonces(
     rendered: &str,
     expected_nonces: &BTreeSet<String>,
+    inline_nonces: &BTreeSet<String>,
     aliases: &BTreeMap<String, String>,
     reported: &BTreeSet<String>,
 ) -> Result<MultiReplyScan> {
-    if expected_nonces.iter().any(|nonce| !valid_nonce(nonce)) {
+    if expected_nonces
+        .iter()
+        .chain(inline_nonces)
+        .any(|nonce| !valid_nonce(nonce))
+    {
         return Err(ChatRuntimeError::invalid(
             "expected reply nonce is not 22-character base64url",
         ));
     }
     let normalized = rendered.replace("\r\n", "\n");
-    let mut events = VecDeque::new();
-    let mut overflowed = false;
+    let mut events = ScanEvents::default();
+    // The newest opening tag in a row with other text while no block is open, while the rows
+    // after it are read for a closing tag of its ID.
+    let mut inline_opening: Option<InlineOpening> = None;
     let mut unavailable = UnavailableIds {
         reported,
         unknown: Vec::new(),
@@ -9163,6 +9585,16 @@ fn scan_reply_blocks_for_nonces(
     let mut unopened = Vec::<&str>::new();
     let mut unopened_from_top = true;
     let mut fence: Option<(char, usize)> = None;
+    // The code fence that rows are read under for tags that share their row with other text. It
+    // opens and closes as `fence` does, and ends wherever `fence` ends, and also where an opening
+    // tag shares the first row of a new message with other text, as an opening marker ends
+    // `fence` there. It decides only which rows are read for such tags: `fence` alone decides
+    // which rows are reply text, so what such tags read never changes which blocks are stored.
+    let mut tag_fence: Option<(char, usize)> = None;
+    // The rows of what may be a tool call's command, from a row that starts the way a call does,
+    // such as `⏺ Bash(…` or `• Ran …`, while the events of the tags in them that shared their rows
+    // with other text wait for its output row: see [`PendingCommand`].
+    let mut command: Option<PendingCommand> = None;
     // While the rows of a prompt echo are read: the column its wrapped rows continue at.
     let mut echo_column: Option<usize> = None;
     // While the rows of a tool call's output are read: the column of its `⎿` or `└`.
@@ -9203,64 +9635,116 @@ fn scan_reply_blocks_for_nonces(
         if !anchored && indent == 0 && !stripped.is_empty() {
             anchored = true;
             fence = None;
+            tag_fence = None;
         }
+        let (undecorated, margin, decorated) = undecorate(line);
+        let standalone = parse_marker(&undecorated);
         // A prompt row left of an open block's margin starts a new item, so the block ends
         // unclosed. A prompt row inside the margin is part of the block.
-        if prompt_row(stripped)
+        let prompt = prompt_row(stripped)
             && active
                 .as_ref()
-                .is_none_or(|opened| indent < opened.opening_margin.len())
-        {
-            if let Some(opened) = active.take() {
-                push_scan_event(&mut events, &mut overflowed, opened.unclosed());
-                fence = None;
+                .is_none_or(|opened| indent < opened.opening_margin.len());
+        // Tool output is never reply text. Claude Code's compact view draws a tool call as a row
+        // at the margin of the message with no bullet, and its output after `⎿` at the same
+        // column, so a `⎿` row at or left of an open block's margin ends the block unclosed.
+        // Right of the margin, and for `└`, the row is part of the block.
+        let output = tool_output_row(stripped)
+            && active.as_ref().is_none_or(|opened| {
+                stripped.starts_with('⎿') && indent <= opened.opening_margin.len()
+            });
+        if !stripped.is_empty() {
+            let call = !prompt && !output && tool_call_row(&undecorated, decorated);
+            let ends = command
+                .as_ref()
+                .and_then(|pending| pending.ends(indent, decorated, prompt, output, call));
+            if let Some(tool_call) = ends {
+                if let Some(pending) = command.take() {
+                    pending.end(tool_call, &mut events, active.as_mut());
+                }
             }
+            if command.is_none() && call {
+                command = Some(PendingCommand {
+                    column: indent,
+                    margin: margin.len(),
+                    held: Vec::new(),
+                });
+            }
+        }
+        // The tags of open requests in a row with other text. Above the first row at column 0, a
+        // row can belong to a prompt echo, such as the request prompt's own instruction, so no
+        // tag there is read.
+        let tags = if anchored && standalone.is_none() {
+            row_tags(&undecorated, inline_nonces, aliases)
+        } else {
+            Vec::new()
+        };
+        // Where `undecorated` starts in `line`. Text is read from `line`, so a bullet inside a
+        // block counts the same on any row.
+        let offset = line.trim_end_matches([' ', '\t']).len() - undecorated.len();
+        // A prompt row ends a block as above. An opening tag in a row with other text is never
+        // open with a block, so a prompt row always ends it.
+        if prompt {
+            if let Some(opened) = active.take() {
+                opened.push_unclosed(&mut events, &mut command);
+                fence = None;
+                tag_fence = None;
+            }
+            inline_opening = None;
             echo_column = Some(indent + 2);
             unopened.clear();
             unopened_from_top = false;
             continue;
         }
-        // Tool output is never reply text, and a fence line in it neither opens nor closes a
-        // code fence. Claude Code's compact view draws a tool call as a row at the margin of the
-        // message with no bullet, and its output after `⎿` at the same column, so a `⎿` row at
-        // or left of an open block's margin ends the block unclosed. Right of the margin, and
-        // for `└`, the row is part of the block.
-        if tool_output_row(stripped)
-            && active.as_ref().is_none_or(|opened| {
-                stripped.starts_with('⎿') && indent <= opened.opening_margin.len()
-            })
-        {
+        // A fence line in tool output neither opens nor closes a code fence, and an output row
+        // ends a block as above.
+        if output {
             if let Some(opened) = active.take() {
-                push_scan_event(&mut events, &mut overflowed, opened.unclosed());
+                opened.push_unclosed(&mut events, &mut command);
                 fence = None;
+                tag_fence = None;
             }
+            inline_opening = None;
             tool_column = Some(indent);
             unopened.clear();
             unopened_from_top = false;
             continue;
         }
-        let (undecorated, margin, decorated) = undecorate(line);
         // A native bullet left of an open block's margin also starts a new item, unless it
         // carries a closing marker.
         if decorated
             && active
                 .as_ref()
                 .is_some_and(|opened| indent < opened.opening_margin.len())
-            && !parse_marker(&undecorated).is_some_and(|marker| marker.closing)
+            && !standalone.as_ref().is_some_and(|marker| marker.closing)
         {
             if let Some(opened) = active.take() {
-                push_scan_event(&mut events, &mut overflowed, opened.unclosed());
+                opened.push_unclosed(&mut events, &mut command);
             }
             fence = None;
+            tag_fence = None;
+        }
+        // So does one left of the margin of an opening tag in a row with other text, or at the
+        // left edge, where a bullet starts a new message, unless it carries a closing marker of
+        // its ID, as above. A closing tag that shares such a row with other text is most likely
+        // quoted in a new message, such as a remark or a command that searches for it, so it ends
+        // what the opening tag is read with.
+        if decorated
+            && inline_opening.as_ref().is_some_and(|opening| {
+                (indent < opening.margin || indent == 0)
+                    && !standalone.as_ref().is_some_and(|marker| {
+                        marker.closing && marker.identifier == opening.identifier
+                    })
+            })
+        {
+            inline_opening = None;
         }
         if active.is_none() {
             // A native bullet at the left edge starts a new message, so the rows above it belong
             // to an earlier item, even once the prompt or tool output row that started that item
             // is out of view or reads as a pinned prompt. A bullet row that carries a closing
             // marker is the exception, as above: it can close a block begun above it.
-            if decorated
-                && indent == 0
-                && !parse_marker(&undecorated).is_some_and(|marker| marker.closing)
+            if decorated && indent == 0 && !standalone.as_ref().is_some_and(|marker| marker.closing)
             {
                 unopened.clear();
                 unopened_from_top = false;
@@ -9270,7 +9754,7 @@ fn scan_reply_blocks_for_nonces(
 
         if active.is_none()
             && decorated
-            && parse_marker(&undecorated).is_some_and(|marker| {
+            && standalone.as_ref().is_some_and(|marker| {
                 !marker.closing
                     && recognized_reply_marker(&marker.identifier, expected_nonces, aliases)
                         .is_some()
@@ -9279,28 +9763,110 @@ fn scan_reply_blocks_for_nonces(
             // Native assistant bullets delimit items. An unrelated unmatched Markdown fence
             // from an older retained item must not hide the fresh expected reply marker.
             fence = None;
+            tag_fence = None;
         }
-        if let Some((fence_character, fence_length)) = fence {
-            if closing_fence(&undecorated, fence_character, fence_length) {
-                fence = None;
+        if active.is_none() && decorated && indent == 0 && tags.iter().any(|tag| !tag.closing) {
+            // Nor a fresh reply whose opening tag shares its row with other text, from being
+            // reported. Only a bullet at the left edge starts a message for such a tag: an
+            // indented one can be text in a fence.
+            tag_fence = None;
+        }
+        let fenced = read_under_fence(&mut fence, &undecorated);
+        let tag_fenced = read_under_fence(&mut tag_fence, &undecorated);
+
+        // A tag that shares its row with other text is not read as a marker, so a block it was
+        // meant to open or close is never sent. Such a block is reported like a partial block, so
+        // the coordinator hears why, but only when both of its ends are seen: a tag alone in a row
+        // with other text is most likely one that prose or a command quotes. While no block is
+        // open, an opening tag is read with the text after it until a closing tag of its ID, which
+        // reports the block. While the rows read may be a tool call's command, that report waits
+        // for the call's output row: see [`PendingCommand`]. This reads rows under `tag_fence`,
+        // and changes nothing that decides which blocks are stored.
+        let mut closed_opening = None;
+        if tag_fenced {
+            // A fenced row is text after an opening tag, and holds no tag that closes it.
+            if let Some(opening) = inline_opening.as_mut() {
+                opening.extend(line);
             }
+        } else if let Some(marker) = standalone.as_ref() {
+            // A marker row ends the text after an opening tag in a row with other text. A closing
+            // marker of its ID reports the block it opened, and that block is not reported again
+            // as one whose opening line the screen did not show: that partial block, read below,
+            // is the one the block is read as without the tag.
+            if let Some(opening) = inline_opening.take() {
+                if marker.closing && marker.identifier == opening.identifier {
+                    if fenced {
+                        emit(
+                            &mut events,
+                            &mut command,
+                            opening.closed_by(&undecorated, None),
+                        );
+                    } else {
+                        closed_opening = Some(opening);
+                    }
+                }
+            }
+        } else if active.is_none() {
+            // A newer opening tag replaces the one read so far.
+            let mut from = 0;
+            for tag in &tags {
+                let start = offset + tag.start;
+                let end = offset + tag.end;
+                if !tag.closing {
+                    inline_opening = Some(InlineOpening {
+                        nonce: tag.nonce.to_owned(),
+                        identifier: tag.identifier.clone(),
+                        margin: margin.len(),
+                        text: identity_characters(&line[start..end]).collect(),
+                    });
+                    from = end;
+                } else if inline_opening
+                    .as_ref()
+                    .is_some_and(|opening| opening.identifier == tag.identifier)
+                {
+                    if let Some(mut opening) = inline_opening.take() {
+                        opening.extend(&line[from..start]);
+                        emit(
+                            &mut events,
+                            &mut command,
+                            opening.closed_by(&line[start..end], None),
+                        );
+                    }
+                    from = end;
+                }
+            }
+            if let Some(opening) = inline_opening.as_mut() {
+                opening.extend(&line[from..]);
+            }
+        }
+
+        if fenced {
             if let Some(active) = active.as_mut() {
                 active.body.push(line.to_owned());
             }
             continue;
         }
 
-        if let Some(opened) = opening_fence(&undecorated) {
-            fence = Some(opened);
-            if let Some(active) = active.as_mut() {
-                active.body.push(line.to_owned());
-            }
-            continue;
-        }
-
-        let Some(marker) = parse_marker(&undecorated) else {
-            if let Some(active) = active.as_mut() {
-                active.body.push(line.to_owned());
+        let Some(marker) = standalone else {
+            if let Some(opened) = active.as_mut() {
+                // In a block that a marker opened, a closing tag of its ID in a row with other
+                // text shows where the block was meant to end. It is reported only if the block
+                // ends with no closing marker.
+                if opened.inline.is_none() {
+                    if let Some(tag) = tags
+                        .iter()
+                        .find(|tag| tag.closing && tag.identifier == opened.identifier)
+                    {
+                        let at = offset + tag.start;
+                        opened.inline = Some(inline_closing(
+                            opened,
+                            &line[..at],
+                            &line[at..offset + tag.end],
+                        ));
+                        opened.inline_in_command = command.is_some();
+                    }
+                }
+                opened.body.push(line.to_owned());
             }
             continue;
         };
@@ -9317,6 +9883,8 @@ fn scan_reply_blocks_for_nonces(
             nonce: nonce.to_owned(),
             opening_margin: margin,
             body: Vec::new(),
+            inline: None,
+            inline_in_command: false,
         };
 
         match (active.take(), marker.closing) {
@@ -9326,31 +9894,39 @@ fn scan_reply_blocks_for_nonces(
             (None, false) if !anchored => {}
             (None, false) => active = expected.map(|nonce| opening(nonce, margin)),
             (None, true) => {
-                if let Some(nonce) = expected {
+                let unopened = expected.map(|nonce| {
                     // `head` ends with this closing marker line.
                     let text = head[..head.len().saturating_sub(1)].join("\n");
-                    push_scan_event(
+                    (
+                        nonce.to_owned(),
+                        PartialBlock::Unopened {
+                            identifier: marker.identifier.clone(),
+                            text,
+                            cut,
+                        },
+                    )
+                });
+                // A closing marker that closed an opening tag in a row with other text reports
+                // that block, which is read as this partial block without the tag.
+                if let Some(opening) = closed_opening {
+                    let without_tag = unopened.map(|(_, block)| Box::new(block));
+                    emit(
                         &mut events,
-                        &mut overflowed,
-                        (
-                            nonce.to_owned(),
-                            ScanEvent::Partial(PartialBlock::Unopened {
-                                identifier: marker.identifier.clone(),
-                                text,
-                                cut,
-                            }),
-                        ),
+                        &mut command,
+                        opening.closed_by(&undecorated, without_tag),
                     );
+                } else if let Some((nonce, block)) = unopened {
+                    events.push((nonce, ScanEvent::Partial(block)));
                 }
             }
             (Some(opened), false) => {
-                push_scan_event(&mut events, &mut overflowed, opened.unclosed());
+                opened.push_unclosed(&mut events, &mut command);
                 active = expected.map(|nonce| opening(nonce, margin));
             }
             (Some(opened), true)
                 if opened.identifier != marker.identifier || opened.protocol != marker.protocol =>
             {
-                push_scan_event(&mut events, &mut overflowed, opened.unclosed());
+                opened.push_unclosed(&mut events, &mut command);
             }
             (Some(opened), true) => {
                 let event = match reply_body(&opened.body, &opened.opening_margin, &margin) {
@@ -9364,15 +9940,28 @@ fn scan_reply_blocks_for_nonces(
                         error,
                     )),
                 };
-                push_scan_event(&mut events, &mut overflowed, (opened.nonce, event));
+                events.push((opened.nonce, event));
             }
         }
+        // A block that a marker opened ends what an opening tag in a row with other text is read
+        // with, even when that tag's fence hid the marker.
+        if active.is_some() {
+            inline_opening = None;
+        }
+    }
+    // An opening tag in a row with other text and no closing tag of its ID after it is not
+    // reported: a block still being written is reported once its closing tag is in view. Rows
+    // that may be a tool call's command with no output row after them are read as text.
+    if let Some(pending) = command.take() {
+        pending.end(false, &mut events, active.as_mut());
     }
     if let Some(opened) = active {
-        push_scan_event(&mut events, &mut overflowed, opened.unclosed());
+        opened.push_unclosed(&mut events, &mut command);
     }
+    let overflowed = events.overflowed;
+    let inline_overflowed = events.inline_overflowed;
     let mut by_nonce = BTreeMap::<String, NonceScan>::new();
-    for (nonce, event) in events {
+    for (nonce, event) in events.into_screen_order() {
         let found = by_nonce.entry(nonce).or_default();
         match event {
             ScanEvent::Block(block) => found.blocks.push(block),
@@ -9386,6 +9975,7 @@ fn scan_reply_blocks_for_nonces(
         suppressed_ids: unavailable.suppressed,
         unknown_aliases,
         overflowed,
+        inline_overflowed,
     })
 }
 
@@ -9685,6 +10275,59 @@ fn parse_marker(line: &str) -> Option<Marker> {
     })
 }
 
+/// A reply tag inside a row that is not itself a marker, with its request's nonce, as
+/// [`recognized_reply_marker`] reads it.
+#[derive(Clone, Debug)]
+struct RowTag<'a> {
+    closing: bool,
+    identifier: String,
+    nonce: &'a str,
+    /// The byte range of the tag in the row.
+    start: usize,
+    end: usize,
+}
+
+/// The tags of the requests `nonces` names in a row, without its indentation or bullet, from
+/// left to right, such as both tags of `Reply: <CHAT_REPLY_001>Done.</CHAT_REPLY_001>`. A tag of
+/// any other request is left out. One pass reads the row: a tag holds no `<` after its first
+/// character, nor `>` before its last.
+fn row_tags<'a>(
+    row: &str,
+    nonces: &'a BTreeSet<String>,
+    aliases: &BTreeMap<String, String>,
+) -> Vec<RowTag<'a>> {
+    let mut tags = Vec::new();
+    if !row.contains("_REPLY_") {
+        return tags;
+    }
+    let mut from = 0;
+    while let Some(found) = row[from..].find('<') {
+        let start = from + found;
+        let Some(length) = row[start + 1..].find(['<', '>']) else {
+            break;
+        };
+        let stop = start + 1 + length;
+        if row.as_bytes()[stop] == b'<' {
+            from = stop;
+            continue;
+        }
+        from = stop + 1;
+        let Some(marker) = parse_marker(&row[start..from]) else {
+            continue;
+        };
+        if let Some(nonce) = recognized_reply_marker(&marker.identifier, nonces, aliases) {
+            tags.push(RowTag {
+                closing: marker.closing,
+                identifier: marker.identifier,
+                nonce,
+                start,
+                end: from,
+            });
+        }
+    }
+    tags
+}
+
 /// Whether an identifier ends in a well-formed reply ordinal, `_1` through `_999999`.
 pub(crate) fn has_reply_ordinal(identifier: &str) -> bool {
     identifier
@@ -9739,6 +10382,52 @@ fn tool_output_row(stripped: &str) -> bool {
         || stripped
             .strip_prefix('└')
             .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+}
+
+/// Whether a row, without its indentation and bullet, starts a tool call, whose command can quote
+/// reply tags: Claude Code draws a call as a tool name that starts with a capital letter, such as
+/// `Bash` or `Web Search`, or as an MCP tool's name and `(MCP)`, then its arguments in
+/// parentheses; and Codex, after a bullet, as `Ran` or `Running` and a command, or `Called` or
+/// `Calling` and an MCP tool. Claude Code's compact view draws a call with no bullet, so its form
+/// is read on any row. `bulleted` says the row had a bullet.
+fn tool_call_row(row: &str, bulleted: bool) -> bool {
+    let named = |name: &str| {
+        name.starts_with(|character: char| character.is_ascii_uppercase())
+            && !name.ends_with(' ')
+            && name.chars().all(|character| {
+                character.is_ascii_alphanumeric()
+                    || matches!(character, ' ' | '_' | '.' | ':' | '-')
+            })
+    };
+    let mcp = |name: &str| {
+        !name.is_empty()
+            && name.chars().all(|character| {
+                character.is_ascii_alphanumeric()
+                    || matches!(character, ' ' | '_' | '.' | ':' | '-')
+            })
+    };
+    row.split_once('(').is_some_and(|(name, _)| named(name))
+        || row.split_once(" (MCP)(").is_some_and(|(name, _)| mcp(name))
+        || (bulleted
+            && ["Ran ", "Running ", "Called ", "Calling "]
+                .into_iter()
+                .any(|prefix| row.starts_with(prefix)))
+}
+
+/// Read a row under the code fence `fence`, which the row then updates: whether the row is in a
+/// fence, as is a fence line that opens or closes one.
+fn read_under_fence(fence: &mut Option<(char, usize)>, row: &str) -> bool {
+    if let Some((character, length)) = *fence {
+        if closing_fence(row, character, length) {
+            *fence = None;
+        }
+        return true;
+    }
+    if let Some(opened) = opening_fence(row) {
+        *fence = Some(opened);
+        return true;
+    }
+    false
 }
 
 fn undecorate(line: &str) -> (String, String, bool) {
@@ -14625,9 +15314,14 @@ as a chat message. Use the same two lines for every reply, with no tool call bet
 <CHAT_REPLY_{second}_1>\nsecond\n</CHAT_REPLY_{second}_1>\n\
 <CHAT_REPLY_unknown_1>\nunknown\n</CHAT_REPLY_unknown_1>"
         );
-        let scan =
-            scan_reply_blocks_for_nonces(&rendered, &expected, &BTreeMap::new(), &BTreeSet::new())
-                .expect("scan once");
+        let scan = scan_reply_blocks_for_nonces(
+            &rendered,
+            &expected,
+            &expected,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        )
+        .expect("scan once");
         assert_eq!(scan.by_nonce.len(), 2);
         for (nonce, body) in [(first, "first"), (second, "second")] {
             assert_eq!(
@@ -15037,6 +15731,1367 @@ message with its opening line and write the whole block in that message, with no
 it. Do not send a block you did not write, such as one quoted in a message you received."
         );
         assert_eq!(coordinator.prompts(), [notice.clone(), notice]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The text of a routing notice about the reply block marked `id`, a tag of which shared its
+    /// line with other text. It says that a block still being written goes out once it is
+    /// complete, since a block can quote its own closing tag before its closing line.
+    fn inline_notice(id: &str) -> String {
+        format!(
+            "Chat reply not sent: an opening or closing tag shared its line with other text in the \
+reply block marked {id}, so that block was not sent. Each opening and closing tag must be alone on \
+its own line; to mention a tag in other text, leave out its angle brackets.\nA block that was \
+still being written goes out once it is complete, if the screen then shows the first row of its \
+message and its closing line. Otherwise, send it again: start a message with its opening line and \
+write the whole block in that message, with no tool call inside it. Do not send a block you did \
+not write, such as one quoted in a message you received."
+        )
+    }
+
+    /// The identity characters of `text`, worked out here rather than by the code under test:
+    /// those that are not whitespace, as these tests use no box drawing.
+    fn identity_of(text: &str) -> String {
+        text.chars()
+            .filter(|character| !character.is_whitespace())
+            .collect()
+    }
+
+    /// The text the entry of a block with a tag in a row with other text covers: its opening tag,
+    /// the identity characters of all the text between that tag and its closing tag, and the
+    /// closing tag, whether either tag was alone on its row or not.
+    fn pair_covered(opening: &str, between: &str, closing: &str) -> String {
+        format!("{opening}{}{closing}", identity_of(between))
+    }
+
+    /// The opening and closing tags of the reply ID `id`.
+    fn tags_of(id: &str) -> (String, String) {
+        (format!("<CHAT_REPLY_{id}>"), format!("</CHAT_REPLY_{id}>"))
+    }
+
+    #[test]
+    fn a_reply_written_with_its_tags_on_its_text_lines_is_reported_once_and_not_sent() {
+        // A coordinator wrote a reply with its opening tag at the start of the reply's first line
+        // and its closing tag at the end of its last. A marker counts only alone on its row, so
+        // neither row opened or closed a block, and nothing was sent. The block is reported, the
+        // coordinator hears why once, and the block it then writes correctly is sent.
+        let (state, key, nonce, root) = open_request("inline-tags-on-both-lines");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        let coordinator = QueueDelivery::default();
+        let between = "The fix landed and the queue is empty.\n  Nothing else is waiting.";
+        let screen = format!("⏺ Working on it.\n❯ question\n⏺ {opening}{between}{closing}\n");
+        let entries = [held_back(
+            &id,
+            "inline",
+            &pair_covered(&opening, between, &closing),
+        )];
+        let capture = state
+            .capture_snapshot(&format!("{screen}❯\u{a0}\n"))
+            .expect("scan");
+        assert!(capture.replies.is_empty() && capture.refused.is_empty());
+        assert_eq!(capture.unknown_ids, entries);
+        assert!(capture.suppressed_ids.is_empty());
+        deliver_fence_feedback_with(
+            &state,
+            &coordinator,
+            &capture.unknown_ids,
+            DrainOptions::default(),
+        )
+        .expect("fence feedback");
+        assert_eq!(coordinator.prompts(), [inline_notice(&id)]);
+        let capture = state
+            .capture_snapshot(&format!("{screen}❯\u{a0}\n"))
+            .expect("scan again");
+        assert!(capture.replies.is_empty() && capture.unknown_ids.is_empty());
+        assert_eq!(capture.suppressed_ids, entries);
+        // Written with each tag alone on its line, the reply is sent, and a line in it that
+        // starts with a tag is text of the reply, so it is not reported.
+        let body = format!("The fix landed.\n{opening}The fix landed. was the mistake.");
+        let capture = state
+            .capture_snapshot(&format!(
+                "{screen}⏺ {opening}\n  {}\n  {closing}\n❯\u{a0}\n",
+                body.replace('\n', "\n  ")
+            ))
+            .expect("scan of the block written again");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+        assert!(capture.unknown_ids.is_empty() && capture.refused.is_empty());
+        assert_eq!(capture.suppressed_ids, entries);
+        assert_eq!(state.read_reply(&key, 1).expect("reply").body, body);
+        assert_eq!(coordinator.prompts(), [inline_notice(&id)]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn an_opening_tag_on_a_text_line_is_reported_for_the_block_its_closing_line_ends() {
+        // The closing line finds no opening line, but the block is reported once, for the
+        // misplaced tag, which is why it was not sent, and not also for the missing start.
+        let (state, _key, nonce, root) = open_request("inline-opening-tag");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        let coordinator = QueueDelivery::default();
+        let screen = format!(
+            "⏺ Working on it.\n❯ question\n⏺ {opening}Done.\n  Queue empty.\n  {closing}\n❯\u{a0}\n"
+        );
+        let capture = state.capture_snapshot(&screen).expect("scan");
+        assert!(capture.replies.is_empty() && capture.refused.is_empty());
+        assert_eq!(
+            capture.unknown_ids,
+            [held_back(
+                &id,
+                "inline",
+                &pair_covered(&opening, "Done. Queue empty.", &closing)
+            )]
+        );
+        deliver_fence_feedback_with(
+            &state,
+            &coordinator,
+            &capture.unknown_ids,
+            DrainOptions::default(),
+        )
+        .expect("fence feedback");
+        assert_eq!(coordinator.prompts(), [inline_notice(&id)]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_closing_tag_on_a_text_line_is_reported_for_the_block_it_left_unclosed() {
+        // The block has no closing line either, but it is reported once, for the misplaced tag,
+        // and not also as a block still being written. The notice still says a block that was
+        // being written goes out once it is complete, since a block can quote its own closing
+        // tag before its closing line is written. The tag is read with all the text of the block
+        // before it, not only its last HELD_BACK_DIGEST_CHARS characters.
+        let (state, _key, nonce, root) = open_request("inline-closing-tag");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        let coordinator = QueueDelivery::default();
+        let body = format!(
+            "  The fix landed, the build is green, and the queue is empty now.\n  Nothing else is \
+waiting.{closing}"
+        );
+        let screen = format!("⏺ Working on it.\n❯ question\n⏺ {opening}\n{body}\n❯\u{a0}\n");
+        let capture = state.capture_snapshot(&screen).expect("scan");
+        assert!(capture.replies.is_empty() && capture.refused.is_empty());
+        let before = body.strip_suffix(closing.as_str()).expect("closing tag");
+        assert!(identity_of(before).chars().count() > HELD_BACK_DIGEST_CHARS);
+        assert_eq!(
+            capture.unknown_ids,
+            [held_back(
+                &id,
+                "inline",
+                &pair_covered(&opening, before, &closing)
+            )]
+        );
+        deliver_fence_feedback_with(
+            &state,
+            &coordinator,
+            &capture.unknown_ids,
+            DrainOptions::default(),
+        )
+        .expect("fence feedback");
+        assert_eq!(coordinator.prompts(), [inline_notice(&id)]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_tag_on_a_text_line_of_a_fenced_example_is_not_reported() {
+        // A fenced example is never a reply, so a block in it with a tag on a text line is not
+        // reported. The same block after the fence is.
+        let (state, _key, nonce, root) = open_request("inline-tag-in-fence");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        let example = format!(
+            "⏺ Working on it.\n❯ question\n⏺ Write it like this:\n  ```text\n  \
+{opening}Done.{closing}\n  {opening}Done.\n  {closing}\n  ```\n"
+        );
+        for screen in [
+            example.clone(),
+            format!("{example}  ~~~\n  {opening}Done.\n  Queue empty.{closing}\n  ~~~\n"),
+        ] {
+            let capture = state
+                .capture_snapshot(&format!("{screen}❯\u{a0}\n"))
+                .expect("scan of the example");
+            assert!(capture.replies.is_empty(), "{screen}");
+            assert!(capture.unknown_ids.is_empty(), "{screen}{capture:?}");
+            assert!(capture.suppressed_ids.is_empty(), "{screen}{capture:?}");
+        }
+        let capture = state
+            .capture_snapshot(&format!(
+                "{example}  {opening}Done.\n  Queue empty.{closing}\n❯\u{a0}\n"
+            ))
+            .expect("scan of the block after the example");
+        assert!(capture.replies.is_empty());
+        assert_eq!(
+            capture.unknown_ids,
+            [held_back(
+                &id,
+                "inline",
+                &pair_covered(&opening, "Done. Queue empty.", &closing)
+            )]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_reply_with_a_tag_on_a_text_line_after_an_unclosed_fence_is_reported() {
+        // An earlier message left a code fence open. A new message, which starts at a bullet at
+        // the left edge, ends that fence when an opening tag of an open request shares its first
+        // row with other text, as it does for an opening tag alone on its row. A row of the
+        // earlier message inside the fence is still an example, even one that starts with an
+        // indented bullet.
+        let (state, _key, nonce, root) = open_request("inline-tag-after-open-fence");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        let reply = format!("{opening}Done.{closing}");
+        let screen = format!(
+            "⏺ Working on it.\n❯ question\n⏺ Here is the start:\n  ```text\n  \
+{opening}Example.\n❯ go on\n⏺ {reply}\n❯\u{a0}\n"
+        );
+        let capture = state.capture_snapshot(&screen).expect("scan");
+        assert!(capture.replies.is_empty());
+        assert_eq!(capture.unknown_ids, [held_back(&id, "inline", &reply)]);
+        let inside = format!(
+            "⏺ Working on it.\n❯ question\n⏺ Example:\n  ```\n  ⏺ {opening}Done.\n  Queue \
+empty.{closing}\n❯\u{a0}\n"
+        );
+        let capture = state.capture_snapshot(&inside).expect("scan inside");
+        assert!(capture.replies.is_empty());
+        assert!(capture.unknown_ids.is_empty(), "{capture:?}");
+        let capture = state
+            .capture_snapshot(&inside.replace("  ⏺ ", "⏺ "))
+            .expect("scan of a new message");
+        assert!(capture.replies.is_empty());
+        assert_eq!(
+            capture.unknown_ids,
+            [held_back(
+                &id,
+                "inline",
+                &pair_covered(&opening, "Done. Queue empty.", &closing)
+            )]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_message_quoted_in_a_fenced_transcript_does_not_end_the_fence() {
+        // A fenced transcript can quote a message, bullet and all, whose tags share its row with
+        // other text, and then a block written correctly. The quoted bullet is indented, so it
+        // starts no message: the fence holds, and the quoted block is neither sent nor reported,
+        // for either renderer's bullet. The same message after the fence is reported.
+        let (state, _key, nonce, root) = open_request("inline-tag-fenced-transcript");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        for bullet in ['⏺', '•'] {
+            let transcript = format!(
+                "⏺ Working on it.\n❯ question\n⏺ The mistake looked like this:\n  ```text\n  \
+{bullet} {opening}Quoted example text.{closing}\n  {opening}\n  Quoted example text.\n  \
+{closing}\n  ```\n"
+            );
+            let capture = state
+                .capture_snapshot(&format!("{transcript}❯\u{a0}\n"))
+                .expect("scan of the transcript");
+            assert!(capture.replies.is_empty(), "{bullet}{capture:?}");
+            assert!(capture.refused.is_empty(), "{bullet}{capture:?}");
+            assert!(capture.unknown_ids.is_empty(), "{bullet}{capture:?}");
+            assert!(capture.suppressed_ids.is_empty(), "{bullet}{capture:?}");
+            let capture = state
+                .capture_snapshot(&format!(
+                    "{transcript}{bullet} {opening}Done.{closing}\n❯\u{a0}\n"
+                ))
+                .expect("scan of the message after the transcript");
+            assert!(capture.replies.is_empty(), "{bullet}{capture:?}");
+            assert_eq!(
+                capture.unknown_ids,
+                [held_back(
+                    &id,
+                    "inline",
+                    &format!("{opening}Done.{closing}")
+                )],
+                "{bullet}"
+            );
+        }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_tag_on_a_text_line_is_reported_only_for_an_open_request() {
+        // Only a block of a request still open for replies, whose blocks are not held, is
+        // reported. Tags of a closed request, of no request, or of two different IDs on a line
+        // with other text are prose, not a block that failed to go out, and unlike a marker of
+        // such a request alone on its line, they are not a routing error either.
+        let root = temporary("inline-tag-open-request-only");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let keys = admitted(&state, 2);
+        let closed = state.read_request(&keys[0]).expect("request").reply_nonce;
+        let open = state.read_request(&keys[1]).expect("request").reply_nonce;
+        state
+            .close_replies(&keys[0])
+            .expect("close the first request");
+        let others = format!(
+            "⏺ Working on it.\n❯ question\n⏺ <CHAT_REPLY_{closed}_1>Done.</CHAT_REPLY_{closed}_1>\n  \
+<CHAT_REPLY_AAAAAAAAAAAAAAAAAAAAAA_1>Done.</CHAT_REPLY_AAAAAAAAAAAAAAAAAAAAAA_1>\n  \
+<CHAT_REPLY_999>Next.</CHAT_REPLY_999>\n  <CHAT_REPLY_{closed}_2>Then.</CHAT_REPLY_{open}_1>\n  \
+<CHAT_REPLY_{open}_1>Later.</GCHAT_REPLY_{open}_2>\n"
+        );
+        let capture = state
+            .capture_snapshot(&format!("{others}❯\u{a0}\n"))
+            .expect("scan of the other tags");
+        assert!(capture.replies.is_empty());
+        assert!(capture.unknown_ids.is_empty(), "{capture:?}");
+        assert!(capture.suppressed_ids.is_empty(), "{capture:?}");
+        let reply = format!("<CHAT_REPLY_{open}_1>Done.</CHAT_REPLY_{open}_1>");
+        let screen = format!("{others}❯ next\n⏺ {reply}\n❯\u{a0}\n");
+        // While the request's prompt has not reached the coordinator, or may not have, its
+        // blocks are held, and so are not reported either.
+        for gate in [
+            PromptGate {
+                unprompted: BTreeSet::from([keys[1].clone()]),
+                unconfirmed: BTreeSet::new(),
+            },
+            PromptGate {
+                unprompted: BTreeSet::new(),
+                unconfirmed: BTreeSet::from([keys[1].clone()]),
+            },
+        ] {
+            let capture = state
+                .capture_snapshot_with_gate(&screen, &gate)
+                .expect("scan with the request held");
+            assert!(capture.replies.is_empty());
+            assert!(capture.unknown_ids.is_empty(), "{gate:?}{capture:?}");
+        }
+        let capture = state
+            .capture_snapshot(&screen)
+            .expect("scan with a block of the open request");
+        assert!(capture.replies.is_empty());
+        assert_eq!(
+            capture.unknown_ids,
+            [held_back(&format!("{open}_1"), "inline", &reply)]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_single_tag_that_prose_or_a_tool_call_quotes_is_not_reported() {
+        // A tag on a line with other text is reported only with the other tag of its block: an
+        // opening tag and, after it, a closing tag of its ID. A tag on its own is quoted, as in
+        // a remark about a reply, a sentence that wraps just before a tag, or a command that
+        // searches for one. A bullet that starts a new message, tool output, or a marker line
+        // ends what an opening tag is read with, and a row that holds only a tag with a space in
+        // it holds no tag.
+        let (state, key, nonce, root) = open_request("inline-tag-quoted-in-prose");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        let control = format!("{opening}Done.{closing}");
+        let screen = format!(
+            "⏺ Working on it.\n❯ question\n⏺ I will resend with each tag on its own line, starting \
+with\n  {opening} and then the text:\n\n  {opening}\n  The fix landed.\n  {closing}\n\n  The \
+closing tag for that sent block is {closing}\n  I answered in {opening} above; moving on.\n⏺ Next \
+item: the queue.\n  Its last tag was {closing}, as before.\n  Not a tag: </CHAT_REPLY_{id} >\n⏺ \
+Bash(grep -c '{opening}' /tmp/pane.txt)\n  ⎿  2\n• Ran grep -c '{closing}' pane.txt\n  └ 2\n⏺ \
+{control}\n❯\u{a0}\n"
+        );
+        let capture = state.capture_snapshot(&screen).expect("scan");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+        assert_eq!(capture.unknown_ids, [held_back(&id, "inline", &control)]);
+        assert_eq!(
+            state.read_reply(&key, 1).expect("reply").body,
+            "The fix landed."
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn an_acknowledgement_that_names_one_tag_draws_no_second_notice() {
+        // The coordinator hears that its block was not sent, says in a sentence that wraps that
+        // it will write the opening tag alone on its line, writes the block correctly, and then
+        // names the closing tag in a remark. Only the first block is reported, so the
+        // coordinator hears about it once, and the corrected block is sent.
+        let (state, key, nonce, root) = open_request("inline-tag-acknowledged");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        let coordinator = QueueDelivery::default();
+        let failed =
+            format!("⏺ Working on it.\n❯ question\n⏺ {opening}Done.\n  Queue empty.{closing}\n");
+        let entry = held_back(
+            &id,
+            "inline",
+            &pair_covered(&opening, "Done. Queue empty.", &closing),
+        );
+        let capture = state
+            .capture_snapshot(&format!("{failed}❯\u{a0}\n"))
+            .expect("scan of the failed block");
+        assert_eq!(capture.unknown_ids, std::slice::from_ref(&entry));
+        deliver_fence_feedback_with(
+            &state,
+            &coordinator,
+            &capture.unknown_ids,
+            DrainOptions::default(),
+        )
+        .expect("fence feedback");
+        let corrected = format!(
+            "{failed}❯ Chat reply not sent: an opening or closing tag shared its line.\n⏺ \
+Understood: the {opening} tag goes alone on\n  its own line. Resending now.\n⏺ {opening}\n  Done. \
+Queue empty.\n  {closing}\n⏺ Sent; the {closing} line\n  closed it this time.\n❯\u{a0}\n"
+        );
+        let capture = state
+            .capture_snapshot(&corrected)
+            .expect("scan of the corrected block");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+        assert!(capture.unknown_ids.is_empty(), "{capture:?}");
+        assert_eq!(capture.suppressed_ids, [entry]);
+        assert_eq!(
+            state.read_reply(&key, 1).expect("reply").body,
+            "Done. Queue empty."
+        );
+        assert_eq!(coordinator.prompts(), [inline_notice(&id)]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn an_opening_tag_on_a_text_line_that_a_correct_block_follows_is_not_reported() {
+        // The coordinator began a reply with its opening tag on the text line, then wrote the
+        // block again correctly before any closing tag. Nothing is reported and the block is
+        // sent: the marker line ends what the first tag is read with, so a closing tag that a
+        // later remark names is not read as its end. The same start with a closing tag after it
+        // is reported.
+        let (state, key, nonce, root) = open_request("inline-tag-then-correct-block");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        let start = format!("⏺ Working on it.\n❯ question\n⏺ {opening}Done.\n");
+        let capture = state
+            .capture_snapshot(&format!(
+                "{start}⏺ {opening}\n  Done.\n  {closing}\n  The {closing} line is alone this \
+time.\n❯\u{a0}\n"
+            ))
+            .expect("scan of the correct block");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+        assert!(capture.unknown_ids.is_empty(), "{capture:?}");
+        assert_eq!(state.read_reply(&key, 1).expect("reply").body, "Done.");
+        let capture = state
+            .capture_snapshot(&format!("{start}  Queue empty.{closing}\n❯\u{a0}\n"))
+            .expect("scan of the start closed on a text line");
+        assert!(capture.replies.is_empty());
+        assert_eq!(
+            capture.unknown_ids,
+            [held_back(
+                &id,
+                "inline",
+                &pair_covered(&opening, "Done. Queue empty.", &closing)
+            )]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn an_opening_tag_on_a_text_line_is_reported_once_its_closing_tag_is_in_view() {
+        // A block is read while it is still being written. With no closing tag in view, it is
+        // not reported, even once the coordinator stops; with one, it is.
+        let (state, _key, nonce, root) = open_request("inline-tag-streaming");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        let head = format!("⏺ Working on it.\n❯ question\n⏺ {opening}The fix landed.\n  Queue");
+        for screen in [
+            head.clone(),
+            format!("{head} empty.\n"),
+            format!("{head} empty.\n❯\u{a0}\n"),
+        ] {
+            let capture = state.capture_snapshot(&screen).expect("scan");
+            assert!(capture.replies.is_empty());
+            assert!(capture.unknown_ids.is_empty(), "{screen}{capture:?}");
+        }
+        let capture = state
+            .capture_snapshot(&format!("{head} empty.{closing}\n"))
+            .expect("scan of the complete block");
+        assert!(capture.replies.is_empty());
+        assert_eq!(
+            capture.unknown_ids,
+            [held_back(
+                &id,
+                "inline",
+                &pair_covered(&opening, "The fix landed. Queue empty.", &closing)
+            )]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_block_with_a_tag_on_a_text_line_is_reported_once_however_its_rows_wrap() {
+        // A block is identified by its tags and its text with no whitespace, whichever of its
+        // tags shares a row with other text, so a pane that wraps its rows at another width
+        // shows the same block, already reported. The same block with its opening tag alone on
+        // its row is the same block too.
+        let (state, _key, nonce, root) = open_request("inline-tag-rewrapped");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        let coordinator = QueueDelivery::default();
+        let screen = |pair: &str, opened: &str| {
+            format!(
+                "⏺ Working on it.\n❯ question\n⏺ {opening}{pair}{closing}\n❯ next\n⏺ \
+{opening}\n  {opened}{closing}\n❯\u{a0}\n"
+            )
+        };
+        let text = "The fix landed and the queue is empty.";
+        let entries = [held_back(
+            &id,
+            "inline",
+            &pair_covered(&opening, text, &closing),
+        )];
+        let capture = state
+            .capture_snapshot(&screen(text, text))
+            .expect("scan of wide rows");
+        assert_eq!(capture.unknown_ids, entries);
+        deliver_fence_feedback_with(
+            &state,
+            &coordinator,
+            &capture.unknown_ids,
+            DrainOptions::default(),
+        )
+        .expect("fence feedback");
+        assert_eq!(coordinator.prompts(), [inline_notice(&id)]);
+        let capture = state
+            .capture_snapshot(&screen(
+                "The fix landed and the\n  queue is empty.",
+                "The fix landed\n  and the queue is empty.",
+            ))
+            .expect("scan of narrow rows");
+        assert!(capture.unknown_ids.is_empty(), "{capture:?}");
+        assert_eq!(capture.suppressed_ids, entries);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn each_block_of_a_short_reply_id_with_its_tags_on_text_lines_is_reported() {
+        // Short reply IDs and the GCHAT_REPLY form are read as they are on a marker line, and
+        // tags anywhere in a line are read, such as both tags of a reply after a label. Each
+        // block is one entry. A `>` or a `<` between the tags does not hide the closing tag, and
+        // tags of two different IDs make no block.
+        let root = temporary("inline-tag-short-ids");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let keys = admitted(&state, 2);
+        for key in &keys {
+            prompted(&state, key);
+        }
+        let rows = [
+            "<CHAT_REPLY_001>Done.</CHAT_REPLY_001>",
+            "Reply: <CHAT_REPLY_001>Queued.</CHAT_REPLY_001>.",
+            "<GCHAT_REPLY_002>Next. a > b <<x>.</CHAT_REPLY_002>",
+            "<CHAT_REPLY_001>Later.</CHAT_REPLY_002>",
+        ];
+        let screen = format!(
+            "⏺ Working on it.\n❯ question\n⏺ {}\n  {}\n  {}\n  {}\n❯\u{a0}\n",
+            rows[0], rows[1], rows[2], rows[3]
+        );
+        let capture = state.capture_snapshot(&screen).expect("scan");
+        assert!(capture.replies.is_empty());
+        // Entries are in row order for each request; requests are in no particular order.
+        let mut reported = capture.unknown_ids.clone();
+        reported.sort_by_key(|entry| entry.starts_with("002 "));
+        assert_eq!(
+            reported,
+            [
+                held_back("001", "inline", rows[0]),
+                held_back("001", "inline", "<CHAT_REPLY_001>Queued.</CHAT_REPLY_001>"),
+                held_back("002", "inline", &rows[2].replace(' ', "")),
+            ]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn tags_of_a_sent_reply_quoted_again_are_not_reported() {
+        // A sent reply can quote both of its own tags on one line, which in the block is text
+        // of the reply. The same line written again outside the block is text the coordinator
+        // already sent, not a block that failed to go out. Other text between the same tags is.
+        let (state, key, nonce, root) = open_request("inline-tag-of-a-sent-reply");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        let quote = format!("Wrong: {opening}Done.{closing} on one line.");
+        let sent = format!(
+            "⏺ Working on it.\n❯ question\n⏺ {opening}\n  The fix landed.\n  {quote}\n  \
+{closing}\n"
+        );
+        let capture = state
+            .capture_snapshot(&format!("{sent}❯\u{a0}\n"))
+            .expect("scan of the reply");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+        assert!(capture.unknown_ids.is_empty(), "{capture:?}");
+        let other = format!("Also wrong: {opening}Done again.{closing}");
+        let capture = state
+            .capture_snapshot(&format!("{sent}⏺ {quote}\n⏺ {other}\n❯\u{a0}\n"))
+            .expect("scan of the line written again");
+        assert!(capture.replies.is_empty());
+        assert_eq!(
+            capture.unknown_ids,
+            [held_back(
+                &id,
+                "inline",
+                &pair_covered(&opening, "Done again.", &closing)
+            )]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_reply_that_fails_again_with_other_text_after_its_opening_tag_is_reported_again() {
+        // Two replies with the same misplaced tags and the same first and last lines are two
+        // blocks: the entry covers the text after the opening tag, so the second reply is
+        // reported too. An exact repeat of the first is not.
+        let (state, _key, nonce, root) = open_request("inline-tag-fails-again");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        let coordinator = QueueDelivery::default();
+        let reply = |middle: &str| {
+            format!("⏺ {opening}Status update:\n  - {middle}\n  Back soon.{closing}\n")
+        };
+        let entry = |middle: &str| {
+            held_back(
+                &id,
+                "inline",
+                &pair_covered(
+                    &opening,
+                    &format!("Status update: - {middle} Back soon."),
+                    &closing,
+                ),
+            )
+        };
+        let screen = |question: &str, middle: &str| {
+            format!("⏺ Working on it.\n❯ {question}\n{}❯\u{a0}\n", reply(middle))
+        };
+        let capture = state
+            .capture_snapshot(&screen("question", "build is green"))
+            .expect("scan");
+        assert_eq!(capture.unknown_ids, [entry("build is green")]);
+        deliver_fence_feedback_with(
+            &state,
+            &coordinator,
+            &capture.unknown_ids,
+            DrainOptions::default(),
+        )
+        .expect("fence feedback");
+        let capture = state
+            .capture_snapshot(&screen("next question", "landed the fix"))
+            .expect("scan again");
+        assert_eq!(capture.unknown_ids, [entry("landed the fix")]);
+        assert!(capture.suppressed_ids.is_empty());
+        deliver_fence_feedback_with(
+            &state,
+            &coordinator,
+            &capture.unknown_ids,
+            DrainOptions::default(),
+        )
+        .expect("fence feedback again");
+        let capture = state
+            .capture_snapshot(&screen("another question", "build is green"))
+            .expect("scan of the first reply again");
+        assert!(capture.unknown_ids.is_empty());
+        assert_eq!(capture.suppressed_ids, [entry("build is green")]);
+        assert_eq!(
+            coordinator.prompts(),
+            [inline_notice(&id), inline_notice(&id)]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn tags_on_text_lines_cannot_crowd_a_block_out_of_a_capture() {
+        // Blocks with a tag on a text line are kept apart from blocks and partial blocks, each
+        // up to MAX_VISIBLE_MARKERS, so any number of them leaves a block before them readable,
+        // and says so apart from blocks lost. Those of a closed request are not kept at all.
+        let root = temporary("inline-tags-crowd");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let keys = admitted(&state, 2);
+        let closed = state.read_request(&keys[0]).expect("request").reply_nonce;
+        let open = state.read_request(&keys[1]).expect("request").reply_nonce;
+        state
+            .close_replies(&keys[0])
+            .expect("close the first request");
+        // Each block has new text, as a block whose text was already sent is not sent again.
+        let block = |ordinal: u32| {
+            format!(
+                "⏺ Working on it.\n❯ question\n⏺ <CHAT_REPLY_{open}_{ordinal}>\n  Fix {ordinal} \
+landed.\n  </CHAT_REPLY_{open}_{ordinal}>\n"
+            )
+        };
+        let (opening, closing) = tags_of(&format!("{open}_1"));
+        let open_rows = (0..=MAX_VISIBLE_MARKERS)
+            .map(|row| format!("⏺ {opening}Row {row}.{closing}\n"))
+            .collect::<String>();
+        let capture = state
+            .capture_snapshot(&format!("{}{open_rows}❯\u{a0}\n", block(1)))
+            .expect("scan with blocks of the open request");
+        assert_eq!(capture.replies, [(keys[1].clone(), vec![1])]);
+        assert!(capture.inline_overflowed && !capture.overflowed);
+        assert_eq!(capture.unknown_ids.len(), MAX_FEEDBACK_UNAVAILABLE_IDS);
+        assert_eq!(
+            capture.unknown_ids[0],
+            held_back(
+                &format!("{open}_1"),
+                "inline",
+                &format!("{opening}Row1.{closing}")
+            )
+        );
+        let closed_rows = (0..=MAX_VISIBLE_MARKERS)
+            .map(|row| format!("⏺ <CHAT_REPLY_{closed}_1>Row {row}.</CHAT_REPLY_{closed}_1>\n"))
+            .collect::<String>();
+        let capture = state
+            .capture_snapshot(&format!("{}{closed_rows}❯\u{a0}\n", block(2)))
+            .expect("scan with blocks of a closed request");
+        assert_eq!(capture.replies, [(keys[1].clone(), vec![2])]);
+        assert!(capture.unknown_ids.is_empty());
+        assert!(!capture.overflowed && !capture.inline_overflowed);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn routing_notice_names_each_id_with_a_tag_on_a_text_line_once() {
+        // Two blocks under one ID with misplaced tags are two entries, and the notice names the
+        // ID once and speaks of both blocks. A scan reports a block with a misplaced tag only for
+        // that tag, so an entry of another kind under the same ID is another block, and the
+        // notice names it too. The notice always says a block still being written goes out once
+        // it is complete.
+        let entries = [
+            "X_1 inline 0123456789ab".to_owned(),
+            "X_1 inline ba9876543210".to_owned(),
+            "X_2 inline 0123456789ab".to_owned(),
+            "X_2 unclosed 0123456789ab".to_owned(),
+            "X_3 unclosed 0123456789ab".to_owned(),
+            "X_1 unopened 0123456789ab".to_owned(),
+        ];
+        let inline_line = |ids: &str, blocks: usize| {
+            if blocks > 1 {
+                format!(
+                    "Chat reply not sent: opening or closing tags shared their lines with other \
+text in the reply blocks marked {ids}, so those blocks were not sent. {INLINE_MARKER_RULE}"
+                )
+            } else {
+                format!(
+                    "Chat reply not sent: an opening or closing tag shared its line with other \
+text in the reply block marked {ids}, so that block was not sent. {INLINE_MARKER_RULE}"
+                )
+            }
+        };
+        let resend = "A block that was still being written goes out once it is complete, if the \
+screen then shows the first row of its message and its closing line. Otherwise, send each one \
+again: start a message with its opening line and write the whole block in that message, with no \
+tool call inside it. Do not send a block you did not write, such as one quoted in a message you \
+received.";
+        assert_eq!(
+            routing_notice(&entries[..5], &[open_at("X_1", false, 0)], 0),
+            format!(
+                "Chat reply not sent: the screen showed no closing lines for the reply blocks \
+marked X_2, X_3, so those blocks were not sent.\n{}\n{resend}",
+                inline_line("X_1, X_2", 3)
+            )
+        );
+        assert_eq!(
+            routing_notice(&entries[..2], &[], 0),
+            format!("{}\n{resend}", inline_line("X_1", 2))
+        );
+        assert_eq!(routing_notice(&entries[..1], &[], 0), inline_notice("X_1"));
+        assert_eq!(
+            routing_notice(&entries[2..4], &[], 0),
+            format!(
+                "Chat reply not sent: the screen showed no closing line for the reply block marked \
+X_2, so that block was not sent.\n{}\n{resend}",
+                inline_line("X_2", 1)
+            )
+        );
+        assert_eq!(
+            routing_notice(&[entries[0].clone(), entries[5].clone()], &[], 0),
+            format!(
+                "Chat reply not sent: the screen did not show the start of the message holding, \
+or an opening line for, the reply block marked X_1, so that block was not sent.\n{}\n{resend}",
+                inline_line("X_1", 1)
+            )
+        );
+        // A bare reported ID still covers each such entry under it, and an entry covers only its
+        // own text.
+        let bare = BTreeSet::from(["X_1".to_owned()]);
+        assert!(feedback_reported(&bare, "X_1 inline 0123456789ab"));
+        assert!(!feedback_reported(&bare, "X_2 inline 0123456789ab"));
+        let entry = BTreeSet::from(["X_1 inline 0123456789ab".to_owned()]);
+        assert!(feedback_reported(&entry, "X_1 inline 0123456789ab"));
+        assert!(!feedback_reported(&entry, "X_1 inline ba9876543210"));
+        assert!(!feedback_reported(&entry, "X_1 remnant ba9876543210"));
+    }
+
+    #[test]
+    fn a_tag_pair_in_a_tool_call_or_across_messages_is_not_reported() {
+        // A tool call's command, on its header row and on the rows it wraps onto, is what the
+        // coordinator ran, not a reply it wrote, so a pair of tags in it is not reported, for
+        // either renderer. Nor is an opening tag in one message with a closing tag in a later
+        // message or tool call: a block with a misplaced tag is read within one message. The
+        // same pair written in a message is reported.
+        let (state, _key, nonce, root) = open_request("inline-tag-in-tool-call");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        let claude = |rows: &str| format!("⏺ Working on it.\n❯ question\n{rows}❯\u{a0}\n");
+        let codex = |rows: &str| format!("• Working on it.\n› question\n{rows}› \n");
+        let screens = [
+            claude(&format!(
+                "⏺ Bash(printf '%s' '{opening}Example.{closing}')\n  ⎿  Example.\n"
+            )),
+            claude(&format!(
+                "⏺ Bash(printf '%s' '{opening}Example.\n  {closing}')\n  ⎿  Example.\n"
+            )),
+            claude(&format!(
+                "⏺ Bash(cat > /tmp/body.md <<'EOF'\n      {opening}Done.\n      Queue \
+empty.{closing}\n      EOF)\n  ⎿  (No content)\n"
+            )),
+            claude(&format!(
+                "⏺ Checking.\n  Bash(grep -c '{opening}x{closing}' f)\n  ⎿  1\n"
+            )),
+            codex(&format!(
+                "• Ran printf '%s' '{opening}Example.{closing}'\n  └ Example.\n"
+            )),
+            codex(&format!(
+                "• Ran printf '%s' '{opening}Example.\n  {closing}'\n  └ Example.\n"
+            )),
+            codex(&format!(
+                "• Ran(printf '%s' '{opening}Example.{closing}')\n  └ Example.\n"
+            )),
+            codex(&format!(
+                "• Ran rg '{opening}.*{closing}' pane.txt\n  └ 1\n"
+            )),
+            claude(&format!(
+                "⏺ My reply under {opening} did not go out; checking the pane.\n⏺ Bash(grep -c \
+'{closing}' /tmp/pane.txt)\n  ⎿  1\n"
+            )),
+            codex(&format!(
+                "• My reply under {opening} did not go out; checking the pane.\n• Ran grep -c \
+'{closing}' pane.txt\n  └ 1\n"
+            )),
+            claude(&format!(
+                "⏺ I will put {opening} alone on its line.\n⏺ And {closing} alone too, as \
+asked.\n"
+            )),
+        ];
+        for screen in &screens {
+            let capture = state.capture_snapshot(screen).expect("scan");
+            assert!(capture.replies.is_empty(), "{screen}{capture:?}");
+            assert!(capture.unknown_ids.is_empty(), "{screen}{capture:?}");
+            assert!(capture.suppressed_ids.is_empty(), "{screen}{capture:?}");
+        }
+        let entry = held_back(&id, "inline", &format!("{opening}Example.{closing}"));
+        for screen in [
+            claude(&format!("⏺ {opening}Example.{closing}\n")),
+            codex(&format!("• {opening}Example.\n  {closing}\n")),
+            codex(&format!("• Reply: {opening}Example.{closing}\n")),
+        ] {
+            let capture = state.capture_snapshot(&screen).expect("scan of a message");
+            assert!(capture.replies.is_empty(), "{screen}{capture:?}");
+            assert_eq!(
+                capture.unknown_ids,
+                std::slice::from_ref(&entry),
+                "{screen}"
+            );
+        }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_tag_on_a_text_line_never_changes_which_blocks_are_sent() {
+        // Reading tags on text lines only adds notices: each block is sent or not just as it is
+        // when no tag shares a row with other text. After an earlier message left a code fence
+        // open, a block below a row that names a tag is still an example, whether that row is a
+        // tool call, a message at the left edge of the fence quoted from a transcript, or a
+        // remark, for either renderer. The quoted message starts where a new message would, so
+        // its own misplaced tags are reported.
+        let (state, key, nonce, root) = open_request("inline-tag-sends-nothing-new");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        for (bullet, header, end, output) in [
+            (
+                '⏺',
+                "Bash(cat <<'EOF' #",
+                "  EOF)",
+                "  ⎿  Tool command example.",
+            ),
+            (
+                '•',
+                "Ran cat <<'EOF' #",
+                "  EOF",
+                "  └ Tool command example.",
+            ),
+        ] {
+            let tool = format!(
+                "{bullet} Working.\n› question\n{bullet} Example:\n  ```text\n  An unfinished \
+example.\n{bullet} {header} {opening}\n  {opening}\n  Tool command example.\n  {closing}\n{end}\n\
+{output}\n» \n"
+            );
+            let capture = state
+                .capture_snapshot(&tool)
+                .expect("scan of the tool call");
+            assert!(capture.replies.is_empty(), "{tool}{capture:?}");
+            assert!(capture.unknown_ids.is_empty(), "{tool}{capture:?}");
+            let quoted = format!(
+                "{bullet} Working.\n› question\n{bullet} Example transcript:\n  ```text\n{bullet} \
+{opening}Quoted inline example.{closing}\n  {opening}\n  Quoted correct example.\n  {closing}\n  \
+```\n» \n"
+            );
+            let capture = state
+                .capture_snapshot(&quoted)
+                .expect("scan of the transcript");
+            assert!(capture.replies.is_empty(), "{quoted}{capture:?}");
+            assert_eq!(
+                capture.unknown_ids,
+                [held_back(
+                    &id,
+                    "inline",
+                    &pair_covered(&opening, "Quoted inline example.", &closing)
+                )],
+                "{quoted}"
+            );
+        }
+        let (second, closing_second) = tags_of(&format!("{nonce}_2"));
+        for screen in [
+            format!(
+                "⏺ Working on it.\n❯ question\n⏺ Example:\n  ```\n  stale\n⏺ Resending under \
+{opening} as asked:\n  {opening}\n  Body one.\n  {closing}\n❯\u{a0}\n"
+            ),
+            format!(
+                "⏺ Working on it.\n❯ question\n⏺ Example:\n  ```\n⏺ {second}quoted\n  {second}\n  \
+Body two.\n  {closing_second}\n  ```\n❯\u{a0}\n"
+            ),
+        ] {
+            let capture = state
+                .capture_snapshot(&screen)
+                .expect("scan after the fence");
+            assert!(capture.replies.is_empty(), "{screen}{capture:?}");
+        }
+        assert!(state.read_reply(&key, 1).is_err());
+        assert!(state.read_reply(&key, 2).is_err());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_tag_on_a_text_line_ends_no_fence_for_a_held_request() {
+        // A block under a queued request's ID, below a row that names its opening tag after an
+        // earlier message left a code fence open, is an example both while the request is held
+        // and once its prompt is typed: which IDs are open for replies changes what is
+        // reported, never which blocks are read. Once the prompt is typed, a pair of its tags on
+        // one row below is reported.
+        let (state, keys, coordinator, root) =
+            one_delivered_one_queued("inline-tag-held-request-fence");
+        let screen = "⏺ Example:\n  ```\n  stale\n⏺ Next reply goes under <CHAT_REPLY_002> as \
+follows.\n  <CHAT_REPLY_002>\n  an answer meant for the first request\n  </CHAT_REPLY_002>\n"
+            .to_owned();
+        let gate = state.prompt_gate(&coordinator, None).expect("gate");
+        let capture = state
+            .capture_snapshot_with_gate(&screen, &gate)
+            .expect("capture while the request is held");
+        assert!(capture.replies.is_empty(), "{capture:?}");
+        assert!(capture.refused.is_empty(), "{capture:?}");
+        assert!(capture.unknown_ids.is_empty(), "{capture:?}");
+        *coordinator.screen.lock().expect("screen lock") = screen.clone();
+        assert_eq!(
+            deliver_request_with(&state, &coordinator, &keys[1], DrainOptions::default())
+                .expect("deliver request"),
+            CoordinatorDeliveryResult::Delivered
+        );
+        assert!(withheld_aliases(&state).is_empty());
+        assert_eq!(
+            state.prompt_gate(&coordinator, None).expect("gate"),
+            PromptGate::default()
+        );
+        let capture = state
+            .capture_snapshot(&screen)
+            .expect("capture once the prompt is typed");
+        assert!(capture.replies.is_empty(), "{capture:?}");
+        assert!(capture.refused.is_empty(), "{capture:?}");
+        assert!(capture.unknown_ids.is_empty(), "{capture:?}");
+        let pair = "<CHAT_REPLY_002>Done.</CHAT_REPLY_002>";
+        let capture = state
+            .capture_snapshot(&format!("{screen}⏺ {pair}\n"))
+            .expect("capture with a pair on one row");
+        assert!(capture.replies.is_empty(), "{capture:?}");
+        assert_eq!(capture.unknown_ids, [held_back("002", "inline", pair)]);
+        for key in &keys {
+            assert!(state.read_reply(key, 1).is_err());
+        }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_block_with_a_tag_on_a_text_line_is_reported_once_as_it_is_rewrapped() {
+        // The same block, read again with either tag moved onto a row of its own or off it, is
+        // the block already reported, so the coordinator hears about it once. A closing tag
+        // alone on its row that ends a block begun on a text line does not also report a block
+        // whose start was not seen, and a label before the opening tag is not part of the block.
+        let (state, _key, nonce, root) = open_request("inline-tag-rewrapped-across-scans");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        let coordinator = QueueDelivery::default();
+        let entry = held_back(&id, "inline", &pair_covered(&opening, "Done.", &closing));
+        let screen = |rows: &str| format!("⏺ Working on it.\n❯ question\n{rows}❯\u{a0}\n");
+        let capture = state
+            .capture_snapshot(&screen(&format!("⏺ {opening}Done.{closing}\n")))
+            .expect("scan of one row");
+        assert_eq!(capture.unknown_ids, std::slice::from_ref(&entry));
+        deliver_fence_feedback_with(
+            &state,
+            &coordinator,
+            &capture.unknown_ids,
+            DrainOptions::default(),
+        )
+        .expect("fence feedback");
+        for rows in [
+            format!("⏺ {opening}Done.\n  {closing}\n"),
+            format!("⏺ {opening}\n  Done.{closing}\n"),
+            format!("⏺ Resend: {opening}\n  Done.{closing}\n"),
+            format!("⏺ {opening}Done.{closing}\n"),
+        ] {
+            let capture = state.capture_snapshot(&screen(&rows)).expect("scan again");
+            assert!(capture.replies.is_empty(), "{rows}{capture:?}");
+            assert!(capture.unknown_ids.is_empty(), "{rows}{capture:?}");
+            assert_eq!(
+                capture.suppressed_ids,
+                std::slice::from_ref(&entry),
+                "{rows}"
+            );
+            deliver_fence_feedback_with(
+                &state,
+                &coordinator,
+                &capture.unknown_ids,
+                DrainOptions::default(),
+            )
+            .expect("fence feedback again");
+        }
+        assert_eq!(coordinator.prompts(), [inline_notice(&id)]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn prose_that_starts_the_way_a_tool_call_does_is_read_for_misplaced_tags() {
+        // Rows that start the way a tool call does are its command only once the call's output
+        // row follows them. With none they are text, such as a reply after a bullet that starts
+        // `Ran the checks:`, a label in parentheses, a path in Rust syntax, or a sentence that
+        // names a function, so a pair of misplaced tags in them is reported, and so is a closing
+        // tag on such a row in a block that a marker opened. So are they when the output row is
+        // that of a call drawn with no bullet at the column of their text, as Claude Code's
+        // compact view draws one. The same rows followed by their own output row are a command,
+        // so a block with a misplaced tag there is read as it is when no such tag is read.
+        let (state, _key, nonce, root) = open_request("inline-tag-in-prose-like-a-tool-call");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        let claude = |rows: &str| format!("⏺ Working on it.\n❯ question\n{rows}❯\u{a0}\n");
+        let codex = |rows: &str| format!("• Working on it.\n› question\n{rows}› \n");
+        let done = held_back(&id, "inline", &pair_covered(&opening, "Done.", &closing));
+        let fixed = held_back(
+            &id,
+            "inline",
+            &pair_covered(&opening, "Fixed in parse_marker().", &closing),
+        );
+        for (screen, entry) in [
+            (
+                codex(&format!("• Ran the checks: {opening}Done.{closing}\n")),
+                &done,
+            ),
+            (
+                claude(&format!(
+                    "⏺ Status first.\n  TODO(owner): {opening}Done.{closing}\n"
+                )),
+                &done,
+            ),
+            (
+                claude(&format!(
+                    "⏺ HashMap::new() was the cause: {opening}Done.{closing}\n"
+                )),
+                &done,
+            ),
+            (
+                claude(&format!(
+                    "⏺ The cause was in undecorate(): {opening}Done.\n  {closing}\n"
+                )),
+                &done,
+            ),
+            (
+                claude(&format!(
+                    "⏺ TODO(owner): {opening}Done.{closing}\n  Read(src/lib.rs)\n  ⎿  Read 9 \
+lines\n"
+                )),
+                &done,
+            ),
+            (
+                claude(&format!(
+                    "⏺ {opening}\n  Fixed in parse_marker().{closing}\n"
+                )),
+                &fixed,
+            ),
+        ] {
+            let capture = state.capture_snapshot(&screen).expect("scan");
+            assert!(capture.replies.is_empty(), "{screen}{capture:?}");
+            assert_eq!(capture.unknown_ids, std::slice::from_ref(entry), "{screen}");
+        }
+        for screen in [
+            codex(&format!(
+                "• Ran the checks: {opening}Done.{closing}\n  └ Done.\n"
+            )),
+            claude(&format!(
+                "⏺ Status first.\n  TODO(owner): {opening}Done.{closing}\n  ⎿  Done.\n"
+            )),
+        ] {
+            let capture = state
+                .capture_snapshot(&screen)
+                .expect("scan of a tool call");
+            assert!(capture.replies.is_empty(), "{screen}{capture:?}");
+            assert!(capture.unknown_ids.is_empty(), "{screen}{capture:?}");
+            assert!(capture.covered_ids.is_empty(), "{screen}{capture:?}");
+        }
+        // Here the output row ends the block too, which has no closing marker line.
+        let screen = claude(&format!(
+            "⏺ {opening}\n  Fixed in parse_marker().{closing}\n  ⎿  Done.\n"
+        ));
+        let capture = state
+            .capture_snapshot(&screen)
+            .expect("scan of a block cut by a tool call");
+        assert!(capture.replies.is_empty(), "{capture:?}");
+        assert_eq!(
+            capture.unknown_ids,
+            [held_back(
+                &id,
+                "unclosed",
+                &identity_of(&format!("Fixed in parse_marker().{closing}"))
+            )]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_block_with_a_misplaced_opening_tag_is_reported_once_as_it_scrolls_away() {
+        // A block whose opening tag shared its row with other text and whose closing marker line
+        // ends it is reported for that tag. Once that row scrolls away, the rest reads as the end
+        // of a block whose start is above the capture: by its last HELD_BACK_DIGEST_CHARS
+        // identity characters while that many are in view, and as a remnant once fewer are. That
+        // entry is kept as reported with the block's, though the notice does not name it, so
+        // neither draws a second notice.
+        let (state, _key, nonce, root) = open_request("inline-opening-tag-scrolls-away");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        let coordinator = QueueDelivery::default();
+        let lines = [
+            "alpha bravo charlie delta echo",
+            "foxtrot golf hotel india juliet",
+            "kilo lima mike november oscar",
+            "papa quebec romeo sierra tango",
+        ];
+        let screen = format!(
+            "⏺ Working on it.\n❯ question\n⏺ {opening}{}\n  {closing}\n❯\u{a0}\n",
+            lines.join("\n  ")
+        );
+        let scrolled =
+            |from: usize| format!("  {}\n  {closing}\n❯\u{a0}\n", lines[from..].join("\n  "));
+        let view = |from: usize| lines[from..].concat().replace(' ', "");
+        assert_eq!((view(0).len(), view(1).len(), view(2).len()), (104, 78, 51));
+        let inline = held_back(
+            &id,
+            "inline",
+            &pair_covered(&opening, &lines.join(" "), &closing),
+        );
+        let whole = view(0);
+        let unopened = held_back(
+            &id,
+            "unopened",
+            &whole[whole.len() - HELD_BACK_DIGEST_CHARS..],
+        );
+        let capture = state.capture_snapshot(&screen).expect("scan");
+        assert!(capture.replies.is_empty(), "{capture:?}");
+        assert_eq!(capture.unknown_ids, std::slice::from_ref(&inline));
+        assert_eq!(capture.covered_ids, std::slice::from_ref(&unopened));
+        deliver_fence_feedback_covering(
+            &state,
+            &coordinator,
+            &capture.unknown_ids,
+            &capture.covered_ids,
+            DrainOptions::default(),
+        )
+        .expect("fence feedback");
+        let capture = state
+            .capture_snapshot(&scrolled(1))
+            .expect("scan a row later");
+        assert!(capture.unknown_ids.is_empty(), "{capture:?}");
+        assert_eq!(capture.suppressed_ids, [unopened]);
+        for from in [2, 3] {
+            let capture = state
+                .capture_snapshot(&scrolled(from))
+                .expect("scan of the remnant");
+            assert!(capture.unknown_ids.is_empty(), "{capture:?}");
+            assert_eq!(
+                capture.suppressed_ids,
+                [held_back(&id, "remnant", &view(from))]
+            );
+        }
+        assert_eq!(coordinator.prompts(), [inline_notice(&id)]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_closing_marker_line_in_a_tool_call_is_read_as_if_no_tag_were_misplaced() {
+        // An opening tag in a row with other text, then a closing marker line of its ID in a tool
+        // call's command, is not a block with a misplaced tag: the closing marker line ends a
+        // block whose opening line the screen did not show, as it does when no tag in a row with
+        // other text is read. The same closing marker line in the message, with no tool call,
+        // reports the block for its misplaced opening tag.
+        let (state, _key, nonce, root) = open_request("inline-opening-closed-in-tool-call");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        let prose = format!("⏺ My reply under {opening} did not go out; checking.");
+        let command = "  Bash(cat <<'EOF'";
+        let tool = format!(
+            "⏺ Working on it.\n❯ question\n{prose}\n{command}\n      {closing}\n      EOF)\n  ⎿  \
+(No content)\n❯\u{a0}\n"
+        );
+        let head = identity_of(&format!("{prose}{command}"));
+        let tail = head
+            .chars()
+            .skip(head.chars().count() - HELD_BACK_DIGEST_CHARS)
+            .collect::<String>();
+        let capture = state
+            .capture_snapshot(&tool)
+            .expect("scan of the tool call");
+        assert!(capture.replies.is_empty(), "{capture:?}");
+        assert_eq!(capture.unknown_ids, [held_back(&id, "unopened", &tail)]);
+        assert!(capture.covered_ids.is_empty(), "{capture:?}");
+        let message = format!("⏺ Working on it.\n❯ question\n{prose}\n  {closing}\n❯\u{a0}\n");
+        let capture = state
+            .capture_snapshot(&message)
+            .expect("scan of the message");
+        assert!(capture.replies.is_empty(), "{capture:?}");
+        assert_eq!(
+            capture.unknown_ids,
+            [held_back(
+                &id,
+                "inline",
+                &pair_covered(&opening, " did not go out; checking.", &closing)
+            )]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn an_opening_tag_at_the_left_edge_is_not_read_with_the_next_message() {
+        // A bullet at the left edge starts a new message, also after a row with no bullet that
+        // starts there, so a closing tag in that message is not read with an opening tag above
+        // it. A closing tag of its ID on the next row of the same text is.
+        let (state, _key, nonce, root) = open_request("inline-opening-at-the-left-edge");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        let screen = |rows: &str| format!("⏺ Working on it.\n❯ question\n{rows}❯\u{a0}\n");
+        let capture = state
+            .capture_snapshot(&screen(&format!(
+                "I will put {opening} alone on its line.\n⏺ And {closing} alone too, as asked.\n"
+            )))
+            .expect("scan of two messages");
+        assert!(capture.replies.is_empty(), "{capture:?}");
+        assert!(capture.unknown_ids.is_empty(), "{capture:?}");
+        let capture = state
+            .capture_snapshot(&screen(&format!(
+                "I will put {opening} alone on its line.\nAnd {closing} alone too, as asked.\n"
+            )))
+            .expect("scan of one message");
+        assert!(capture.replies.is_empty(), "{capture:?}");
+        assert_eq!(
+            capture.unknown_ids,
+            [held_back(
+                &id,
+                "inline",
+                &pair_covered(&opening, " alone on its line. And ", &closing)
+            )]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn two_blocks_with_misplaced_tags_under_one_id_are_both_counted_in_the_notice() {
+        // Two blocks under one ID, each with a misplaced tag, are two entries. The notice names
+        // the ID once and speaks of both blocks.
+        let (state, _key, nonce, root) = open_request("two-inline-blocks-under-one-id");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        let coordinator = QueueDelivery::default();
+        let screen = format!(
+            "⏺ Working on it.\n❯ question\n⏺ {opening}First try.{closing}\n⏺ {opening}Second \
+try.{closing}\n❯\u{a0}\n"
+        );
+        let capture = state.capture_snapshot(&screen).expect("scan");
+        assert!(capture.replies.is_empty(), "{capture:?}");
+        assert_eq!(
+            capture.unknown_ids,
+            [
+                held_back(
+                    &id,
+                    "inline",
+                    &pair_covered(&opening, "First try.", &closing)
+                ),
+                held_back(
+                    &id,
+                    "inline",
+                    &pair_covered(&opening, "Second try.", &closing)
+                ),
+            ]
+        );
+        deliver_fence_feedback_covering(
+            &state,
+            &coordinator,
+            &capture.unknown_ids,
+            &capture.covered_ids,
+            DrainOptions::default(),
+        )
+        .expect("fence feedback");
+        assert_eq!(
+            coordinator.prompts(),
+            [format!(
+                "Chat reply not sent: opening or closing tags shared their lines with other text \
+in the reply blocks marked {id}, so those blocks were not sent. {INLINE_MARKER_RULE}\nA block \
+that was still being written goes out once it is complete, if the screen then shows the first row \
+of its message and its closing line. Otherwise, send each one again: start a message with its \
+opening line and write the whole block in that message, with no tool call inside it. Do not send a \
+block you did not write, such as one quoted in a message you received."
+            )]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_stored_reply_that_quotes_its_own_opening_tag_is_silent_once_its_marker_scrolls_away() {
+        // A reply can quote its own opening tag in a row with other text. Once its opening marker
+        // line scrolls away, that tag and the closing marker line read as a block with a
+        // misplaced opening tag, but the rows above that line are the end of the reply already
+        // stored, so nothing is reported, as when no such tag is read. Before the reply is
+        // stored, the same rows are reported for that tag.
+        let (state, key, nonce, root) = open_request("stored-reply-quotes-its-opening-tag");
+        let id = format!("{nonce}_1");
+        let (opening, closing) = tags_of(&id);
+        let body = format!("To reply, write {opening} alone on its line.\nThen write the text.");
+        let scrolled = format!("{body}\n{closing}\n");
+        let capture = state
+            .capture_snapshot(&scrolled)
+            .expect("scan before the reply is stored");
+        assert!(capture.replies.is_empty(), "{capture:?}");
+        assert_eq!(
+            capture.unknown_ids,
+            [held_back(
+                &id,
+                "inline",
+                &pair_covered(
+                    &opening,
+                    " alone on its line. Then write the text.",
+                    &closing
+                )
+            )]
+        );
+        let capture = state
+            .capture_snapshot(&format!("{opening}\n{scrolled}"))
+            .expect("scan of the reply");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+        assert_eq!(state.read_reply(&key, 1).expect("reply").body, body);
+        let capture = state
+            .capture_snapshot(&scrolled)
+            .expect("scan once its marker scrolled away");
+        assert!(capture.replies.is_empty(), "{capture:?}");
+        assert!(capture.unknown_ids.is_empty(), "{capture:?}");
+        assert!(capture.suppressed_ids.is_empty(), "{capture:?}");
+        assert!(capture.covered_ids.is_empty(), "{capture:?}");
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -18239,9 +20294,11 @@ k │\n\
         let rendered = (1..=MAX_VISIBLE_MARKERS + 1)
             .map(|ordinal| reply_block(&format!("{nonce}_{ordinal}"), &format!("answer {ordinal}")))
             .collect::<String>();
+        let nonces = BTreeSet::from([nonce.to_owned()]);
         let scan = scan_reply_blocks_for_nonces(
             &rendered,
-            &BTreeSet::from([nonce.to_owned()]),
+            &nonces,
+            &nonces,
             &BTreeMap::new(),
             &BTreeSet::new(),
         )
@@ -19769,8 +21826,10 @@ Thread: spaces/example/threads/one (this message starts a new thread)\n\nrun the
                 replies: Vec::new(),
                 unknown_ids: Vec::new(),
                 suppressed_ids: Vec::new(),
+                covered_ids: Vec::new(),
                 refused: Vec::new(),
                 overflowed: false,
+                inline_overflowed: false,
                 route_entries: Vec::new(),
             }
         );
@@ -20804,6 +22863,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                     }
                     let scan = scan_reply_blocks_for_nonces(
                         &rows,
+                        &nonces,
                         &nonces,
                         &BTreeMap::new(),
                         &BTreeSet::new(),
