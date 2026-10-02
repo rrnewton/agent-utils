@@ -1974,6 +1974,41 @@ repeat of text already held changes nothing — and stores that row once, when t
 The same words in a later turn are a new row. A frame without `turn` cannot be matched and is
 treated as its own turn.
 
+### Repeatable live spoken-read acceptance
+
+`scripts/voice-read-acceptance.py` is the provider-neutral live check for
+`#47 read-aloud-overlong`. It connects directly to a configurable `vibe-talk-v1` WebSocket, opens
+a fresh session per trial, sends the supplied prompt exactly, and requires a non-interrupted
+`turn_complete`. The default acceptance is ten trials, no more than 15 seconds of PCM audio
+between meaningful assistant transcript changes, and no more than 0.09 audio seconds per final
+assistant transcript character. Streaming hypotheses are reconciled with the same cumulative,
+repeat, correction, and fragment rules as the page; repeated text and user recognition do not
+reset the assistant-progress clock. A promised greeting is allowed to finish before the measured
+prompt is sent, and its empty audio segment is closed before the prompt boundary is measured.
+
+The live run may consume provider time and is never part of an automated suite:
+
+```bash
+VIBE_TALK_VOICE_WEBSOCKET_URL='wss://voice.example.test/session' \
+  scripts/voice-read-acceptance.py --prompt-file exact-read-prompt.txt
+```
+
+`results.json` is updated after every trial under
+`debug/voice-read-acceptance/<UTC timestamp>/` by default. It retains each binary-frame and
+transcript-change timestamp, PCM byte and duration counts, the maximum wall-clock span as a
+diagnostic, every threshold verdict, and only lengths for the exact prompt and final transcript.
+It does not retain prompt or transcript words, a prompt fingerprint, or any part of the WebSocket
+URL. `--wav` additionally keeps one 24 kHz, 16-bit mono WAV per trial for ASR replay; those files
+contain the spoken content and must be handled accordingly. `--out`, `--trials`, both thresholds,
+and all three timeouts are explicit CLI overrides. Run
+`scripts/voice-read-acceptance.py --self-test` for the
+offline metric, transcript-merge, interruption, and WAV controls; it opens no socket.
+
+A green report proves only the full-read properties it measured. The operator must separately
+establish that the source message (not merely its instruction wrapper) is about 1,000 characters,
+and `#47 read-aloud-overlong` still requires `#37 read-aloud-cut-truncation`'s 0-of-2 re-answer
+probe. Do not treat this runner alone as the whole issue acceptance.
+
 This protocol is deliberately public and provider-neutral. Authentication, endpoint discovery,
 and the implementation behind a deployment-managed socket belong in deployment configuration and
 private operations documentation.

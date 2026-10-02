@@ -10,13 +10,13 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability offline-cache-browser read-aloud-browser post-confirm-browser android-speech-self-test container-smoke clean
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability offline-cache-browser read-aloud-browser post-confirm-browser voice-read-acceptance-self-test android-speech-self-test container-smoke clean
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
 # UNBOXED, and deliberately the default: it needs Rust, Node, and the repository's Python typing
 # tools, but no cgroup delegation. `validate-boxed` is the bounded version where cgroups exist.
-validate: fmt check scripts-check contract-check typecheck test dag-check android-speech-self-test
+validate: fmt check scripts-check contract-check typecheck test dag-check voice-read-acceptance-self-test android-speech-self-test
 
 # The complete portable suite, run through dagrun: per-step wall and CPU timeouts, memory caps,
 # and process-tree teardown inside nested cgroups. Container-runtime and alternate-toolchain
@@ -124,6 +124,12 @@ read-aloud-browser:
 # WEB_ROOT=dir to run it against another copy of the page.
 post-confirm-browser:
 	python3 tests/post_confirm_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT))
+
+# The live #47 read-aloud-overlong check is opt-in and may consume provider time. Its transcript
+# reconciliation, PCM-duration metric, threshold boundary, interruption rejection, and WAV writer
+# are deterministic offline controls, so keep those in the ordinary gate.
+voice-read-acceptance-self-test:
+	python3 scripts/voice-read-acceptance.py --self-test
 
 # The physical-device run is opt-in, but its signal/language evaluator has offline negative
 # controls. Keep those controls in the ordinary gate so a broken harness cannot silently bless a

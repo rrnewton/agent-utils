@@ -108,6 +108,20 @@ steps:
       classification: light
       rss_baseline_bytes: 268435456
 
+  # The live runner opens fresh provider sessions and may consume paid time. Its metric and output
+  # controls are pure and deterministic, so validate those without dialing any endpoint.
+  - group: check
+    job: voice-read-acceptance-self-test
+    desc: offline controls for the provider-neutral long-read acceptance runner
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 scripts/voice-read-acceptance.py --self-test
+    jobs_flag: ""
+    cpu_timeout: 30
+    hint:
+      est_duration_s: 1
+      classification: light
+      rss_baseline_bytes: 268435456
+
   # Chrome's own installability verdict. Unlike the fake-DOM suite, this exercises manifest
   # parsing, icon loading, secure-origin rules and the selected display mode in the browser engine.
   - group: check
