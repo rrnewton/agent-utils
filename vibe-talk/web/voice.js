@@ -61,7 +61,8 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
  */
 /**
  * @overload
- * @param {"bar-placement" | "discord-channel" | "relay-to-agent" | "settings-channel"} id
+ * @param {"bar-placement" | "discord-channel" | "relay-to-agent" | "settings-audio-source"
+ *   | "settings-channel"} id
  * @returns {HTMLSelectElement}
  */
 /**
@@ -92,6 +93,18 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
 /** @param {string} id */
 function el(id) {
   return document.getElementById(id);
+}
+
+/** The origin receiving the token and API requests, shown before and after sign-in. */
+function deploymentOrigin() {
+  const origin = window.location && typeof window.location.origin === "string"
+    ? window.location.origin.trim()
+    : "";
+  return origin || "this server";
+}
+
+for (const id of ["signin-server-url", "settings-server-url"]) {
+  el(id).textContent = deploymentOrigin();
 }
 
 // ONE status line. It used to be two — a word under the header and a sentence at the foot — which
@@ -3806,7 +3819,11 @@ async function start(options) {
   const validity = minted.valid_for_seconds
     ? `; session valid for about ${Math.round(minted.valid_for_seconds / 60)} minutes`
     : "";
-  showDetail(`${minted.provider || "voice provider"} · ${session.protocol}${validity}`);
+  const voiceTarget = String(minted.websocket_url).split(/[?#]/u, 1)[0]
+    .replace(/^(wss?:\/\/)[^/@]+@/u, "$1");
+  showDetail(
+    `${minted.provider || "voice provider"} · ${session.protocol}${validity} · ${voiceTarget}`
+  );
 
   // CHAT MODE: THE MICROPHONE IS NOT OPENED, AND THAT IS THE WHOLE FEATURE.
   //
@@ -7600,6 +7617,9 @@ function setReadAudioSource(source, announce = true) {
   el("audio-source").title = agent
     ? `${readAloudLabel}. Tap to use device audio.`
     : `Device audio. Tap to use ${agentReadAloud ? agentReadAloud["label"] : "the configured agent"}.`;
+  el("settings-audio-source").value = readAudioSource;
+  el("settings-agent-audio").toggleAttribute("hidden", agentReadAloud === null);
+  el("settings-agent-audio").toggleAttribute("disabled", agentReadAloud === null);
   // The icons are <svg>, and `hidden` reflects only on HTMLElement: assigning `.hidden` here would
   // set an expando and leave the phone icon showing in agent mode.
   el("audio-device-icon").toggleAttribute("hidden", agent);
@@ -12418,6 +12438,9 @@ el("open-settings").addEventListener("click", () => showScreen("settings"));
 el("dismiss-error").addEventListener("click", clearError);
 el("audio-source").addEventListener("click", () =>
   setReadAudioSource(readAudioSource === "device" ? "agent" : "device")
+);
+el("settings-audio-source").addEventListener("change", () =>
+  setReadAudioSource(el("settings-audio-source").value)
 );
 el("close-settings").addEventListener("click", () => showScreen(screenBeforeSettings));
 

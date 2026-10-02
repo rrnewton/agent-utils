@@ -165,33 +165,14 @@
         <!-- ------------------------------------------------------------------ sign-in screen -->
         <section id="screen-signin" class="screen">
           <h1>vibe-talk</h1>
-          <p class="hint">
-            Signing in is between this browser and <strong>this vibe-talk server</strong>. The page
-            asks this server — with the token below — to open a voice session, and then talks to
-            the configured voice provider. Provider credentials and the chat provider's bot token
-            stay on the server and are never pasted into this page. No vendor script, no CDN,
-            nothing bundled.
-          </p>
+          <p class="hint">Server: <code id="signin-server-url"></code></p>
 
-          <label for="api-token">vibe-talk API token</label>
-          <p class="hint">
-            <strong>This deployment's own token</strong> — <code>VIBE_TALK_WRITE_TOKEN</code> from
-            the configuration it was started with. It is not a voice-provider credential or your
-            chat provider's bot token; neither of those is ever entered here. Write scope is what is
-            asked for, because starting a conversation lets the agent post to your channels. The
-            read-scope token will sign in and will read, digest and speak — but it fails on replies
-            and on starting a conversation. Stored per browser <em>and per hostname</em>, so
-            another URL for this same deployment will ask you again.
-          </p>
+          <label for="api-token">Write token</label>
           <input id="api-token" type="password" autocomplete="off" placeholder="paste the token" />
           <div class="row">
             <button id="save-token" type="button">Save token</button>
           </div>
           <p id="token-state" class="hint" aria-live="polite">no token saved in this browser</p>
-          <p class="hint">
-            After signing in you land on the call screen. Tap the microphone, then allow the
-            microphone once. This page asks for a fresh provider session every time a call starts.
-          </p>
         </section>
 
         <!-- --------------------------------------------------------------------- main screen -->
@@ -860,6 +841,18 @@
 
             <section class="settings-group">
               <div class="group-head">
+                <h2>Message audio</h2>
+              </div>
+              <label for="settings-audio-source">Read messages with</label>
+              <select id="settings-audio-source">
+                <option id="settings-agent-audio" value="agent">Agent audio</option>
+                <option value="device">Device voice</option>
+              </select>
+              <p class="hint">Car audio: use Agent audio.</p>
+            </section>
+
+            <section class="settings-group">
+              <div class="group-head">
                 <h2>Stored conversations</h2>
                 <button class="help-link" id="help-link-storage" type="button" data-help="storage" aria-label="About stored conversations" title="Where these are kept">?</button>
               </div>
@@ -873,6 +866,7 @@
               <div class="group-head">
                 <h2>Token</h2>
               </div>
+              <p class="hint">Server: <code id="settings-server-url"></code></p>
               <button id="forget-token" class="secondary" type="button">Forget token and sign out</button>
             </section>
 

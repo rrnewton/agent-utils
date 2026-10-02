@@ -1508,7 +1508,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     document,
     localStorage,
     Date: FixedDate,
-    window: { AudioContext: function () { return new FakeAudioContext(page); } },
+    window: {
+      AudioContext: function () { return new FakeAudioContext(page); },
+      location: { origin: "https://vibe.example" },
+    },
     navigator,
     console,
     // Timers the TEST drives. Nothing is really scheduled, so the page's own 8-second banner timer
@@ -2720,16 +2723,19 @@ test("with no token the page IS the sign-in screen, not the interface behind a n
   );
 });
 
-test("the explanatory text lives on the sign-in screen, not over the transcript", () => {
-  // The header the owner asked to be moved off the main view. Asserting on the MARKUP, because
-  // the point is where it sits in the page, not what a variable says.
+test("the sign-in screen is compact and names the server receiving the token", () => {
   const signin = HTML.slice(
     HTML.indexOf('id="screen-signin"'),
     HTML.indexOf('id="screen-main"')
   );
-  assert.match(signin, /Signing in is between this browser and/);
-  const main = HTML.slice(HTML.indexOf('id="screen-main"'), HTML.indexOf('id="screen-settings"'));
-  assert.doesNotMatch(main, /Signing in is between this browser and/);
+  const hints = [...signin.matchAll(/<p[^>]*class="hint"[^>]*>([\s\S]*?)<\/p>/g)].map((match) =>
+    match[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim()
+  );
+  assert.equal(hints.length, 2, "the sign-in form grew explanatory paragraphs again");
+  assert.ok(hints.every((text) => text.length < 100), `verbose sign-in text: ${hints.join(" | ")}`);
+  const page = newPage();
+  assert.equal(page.el("signin-server-url").textContent, "https://vibe.example");
+  assert.equal(page.el("settings-server-url").textContent, "https://vibe.example");
 });
 
 test("a token the server accepts leads to the main interface", async () => {
@@ -2862,6 +2868,8 @@ test("connection details appear once in a dismissable banner, and stay in settin
   assert.equal(banner.hidden, false, "the connection details never appeared");
   assert.match(page.el("connection-detail").textContent, /Example voice provider/);
   assert.match(page.el("settings-detail").textContent, /Example voice provider/);
+  assert.match(page.el("settings-detail").textContent, /wss:\/\/example\.invalid\/convai/);
+  assert.doesNotMatch(page.el("settings-detail").textContent, /sig=/, "a signed query reached the screen");
 
   await page.el("dismiss-banner").click();
 
@@ -6116,6 +6124,8 @@ test("the channel bar switches between configured agent audio and device audio l
   assert.equal(toggle.getAttribute("aria-checked"), "true");
   assert.equal(toggle.getAttribute("aria-label"), "Read messages with Internal voice preview");
   assert.equal(toggle.title, "Internal voice preview. Tap to use device audio.");
+  assert.equal(page.el("settings-audio-source").value, "agent");
+  assert.equal(page.el("settings-agent-audio").hasAttribute("hidden"), false);
   assert.equal(shown("audio-device-icon"), false, "agent audio still shows the phone icon");
   assert.equal(shown("audio-agent-icon"), true, "agent audio does not show its cloud icon");
   assert.match(HTML_CODE, /id="audio-device-icon"[^>]*data-icon="device"/);
@@ -6128,6 +6138,7 @@ test("the channel bar switches between configured agent audio and device audio l
   assert.equal(toggle.getAttribute("aria-checked"), "false");
   assert.equal(toggle.getAttribute("aria-label"), "Read messages with device audio");
   assert.equal(toggle.title, "Device audio. Tap to use Internal voice preview.");
+  assert.equal(page.el("settings-audio-source").value, "device");
   assert.equal(shown("audio-device-icon"), true, "device speech lost its phone icon");
   assert.equal(shown("audio-agent-icon"), false, "device speech still shows the cloud icon");
   assert.equal(page.prepareCalls.length, requests, "changing the source issued a network request");
@@ -6144,6 +6155,35 @@ test("the channel bar switches between configured agent audio and device audio l
   await page.settle();
   assert.equal(page.deviceSpeech.utterances.length, 1);
   assert.deepEqual(page.speakCalls, []);
+});
+
+test("settings offers the car-compatible agent audio source and stays in sync with the bar", async () => {
+  const page = devicePage();
+  page.readAloud = {
+    backend: "conversation",
+    label: "Internal voice preview",
+    playback: "audio",
+    local_only: false,
+  };
+  await signIn(page);
+  const setting = page.el("settings-audio-source");
+  assert.equal(setting.value, "agent");
+  setting.value = "device";
+  await setting.dispatch("change");
+  assert.equal(page.el("audio-source").getAttribute("aria-checked"), "false");
+  assert.equal(page.storage.get("vibe-talk.voice.read-audio-source"), "device");
+  setting.value = "agent";
+  await setting.dispatch("change");
+  assert.equal(page.el("audio-source").getAttribute("aria-checked"), "true");
+  assert.equal(page.storage.get("vibe-talk.voice.read-audio-source"), "agent");
+});
+
+test("settings does not offer agent audio when this server has none", async () => {
+  const page = devicePage();
+  await signIn(page);
+  assert.equal(page.el("settings-audio-source").value, "device");
+  assert.equal(page.el("settings-agent-audio").hasAttribute("hidden"), true);
+  assert.equal(page.el("settings-agent-audio").hasAttribute("disabled"), true);
 });
 
 test("READ REPLACES TALK IN THE CHANNEL VIEW, and Talk comes back in the transcript", async () => {
