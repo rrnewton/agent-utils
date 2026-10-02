@@ -770,20 +770,122 @@ reported when fewer than 64 such characters of it were in view, at the top of
 the capture, once a recovery scan shows the first row of its message or 64 such
 characters of it, as it can when rows move back down the screen.
 
+A recovery scan also reports a reply block of an open request whose opening or
+closing tag shared its row with other text. A marker counts only alone on its
+row, so such a tag neither opens nor closes a block, and the reply it was meant
+to mark is not sent. Two shapes are reported. In the first, while no block is
+open, an opening tag shares its row with other text, such as
+`<CHAT_REPLY_001>Done.`, and a closing tag of the same ID follows it, on that
+row or a later one, alone on its row or not, as in
+`Reply: <CHAT_REPLY_001>Done.</CHAT_REPLY_001>`. In the second, a block that an
+opening marker line began holds a closing tag of its ID in a row with other
+text, such as `Done.</CHAT_REPLY_001>`, and ends with no closing marker line. A
+single tag in a row with other text is not reported, since that is how prose or
+a tool call quotes a tag. An opening tag is read for its closing tag until a
+prompt row, a tool output row, a bullet row that starts left of the text of the
+tag's row or at the left edge, as a new message does, unless that row is a
+closing marker line of its ID, another marker line, or a newer opening tag in a
+row with other text. One with no closing tag in view by then is not reported, so
+a block still being written is reported once its closing tag is in view. A
+closing tag in a block that closes is text of the reply. Nor is a tag reported
+inside a fenced code block, prompt echo, or tool output, above the first row at
+the left edge of the capture, where it can belong to a prompt echo such as the
+request prompt's own instruction, or when its text is part of a reply already
+stored for that request; the start of a stored reply is not enough, since the
+block's text after the start can differ. Nor is a block reported whose tags are
+in a tool call's command. A row starts what may be a call when its text, after
+any bullet, is a tool name that starts with a capital letter, or an MCP tool's
+name followed by `(MCP)`, and then its arguments in parentheses with nothing
+after the parenthesis that closes them, such as `Bash(...)`, or when, after a
+bullet, it starts with `Ran`, `Running`, `Called` or `Calling` and a space, as
+Codex draws a call. A row whose parentheses close before other text, such as
+`TODO(owner): ...` or `Fixed in parse_marker(): ...`, is text. The command goes
+on in the rows right of that row's bullet, or of its text when it has none,
+until a row ends with the parenthesis that closes its arguments, counting the
+parentheses each row opens and closes; Codex draws each further row of its
+command after `│`, and its command is complete on any row. Text can start the
+same way, such as `• Ran the checks:`, so those rows count as a command only
+once the call's output row, after `⎿` or `└`, follows the complete command at or
+right of that column. A prompt row, a bullet row, an output row left of that
+column or after an incomplete command, any other row at or left of that column,
+any other row after a complete parenthesized command, or a further row of a
+Codex command that does not start with `│` shows they were text, and their tags
+are read like any others. So the output row of a later call never makes the text
+above it a command. A block whose misplaced tag a command holds is read as it is
+when no such tag is read, so a closing marker line in a command, after an
+opening tag in a row with other text above the command, is reported as a block
+whose opening line the screen did not show. Nor is a tag of a closed request, of
+no request, or of a request whose blocks the bridge holds because its prompt may
+not have reached the agent; unlike a marker of such a request alone on its row,
+it is not a routing error. For this reading only, an opening tag of an open
+request in a row that starts at the left edge with a bullet, as the first row of
+a message does, ends a code fence that an earlier message left open, as an
+opening marker line after a bullet ends it for every purpose. Reading these tags
+never changes which blocks are sent.
+
+The prompt names the ID, says that a tag shared its line with other text so the
+block was not sent, that each opening and closing tag must be alone on its own
+line, and that a tag mentioned in other text should leave out its angle
+brackets, and then asks for the block again, as it does for a partial block. It
+names each such ID once, and speaks of blocks when it reports more than one such
+block, even under one ID. A block reported for such a tag is not also reported
+as an unopened block or as a block with no closing line, so when the prompt also
+names its ID for one of those, that is another block under it. The entry such a
+block would have had as one of those is kept as reported once the block is
+reported, though the prompt does not name it, so the block is not reported again
+once its misplaced opening tag scrolls out of view and its closing marker line
+reads as the end of an unopened block, including when the pane has wrapped the
+block at another width since. A block that has not been reported keeps no such
+entry. The prompt always says that a block still being written goes out once it
+is complete, since such a block can quote its own closing tag before its closing
+marker line is written. Such a block is identified by its ID and by its opening
+tag or marker, all the characters after it up to its closing tag, not counting
+whitespace or box-drawing characters, and that tag, whichever of its tags shared
+a row with other text. So such a block is reported once while it scrolls or
+wraps at another width, including when a pane moves one of its tags onto a row
+of its own or off one, a later reply with different text is reported again, and
+an exact repeat of a reply already reported is not. Some mistakes are not
+caught: an opening tag in a row with other text whose closing tag never comes
+into view; tags in two messages, or with a prompt, tool call, or tool output
+between them; a tag split across two rows; both tags inside a tool call's
+command, or inside text that starts the way a call does when a tool output row
+follows it as one follows a call, such as a remark in parentheses after a
+capitalized word that closes at the end of its row; and a block whose marker
+lines are each alone on their rows, but which an earlier message's open code
+fence still covers, as it does when the block does not start its message. Some
+text that was not meant as a reply is reported: a remark that names both tags of
+an open request with their angle brackets, such as
+``<CHAT_REPLY_001> and </CHAT_REPLY_001> each went on their own line``, once for
+each distinct text; a tool call's command that holds both tags of an open
+request while its output row is not yet drawn, such as a command Codex is still
+running, or that is not read as a command: one whose parentheses do not balance,
+one whose first row shows other text after the parenthesis that closes its
+arguments, such as a note Claude Code can draw there, or does not show that
+parenthesis, and one that Codex wraps without `│`, once for each distinct text;
+a block still being written that quotes its own closing tag in a row with other
+text, while its closing marker line is not yet in view; and a quoted message
+whose bullet is at the left edge of a code fence, which reads as a new message.
+A block that is a partial block when its misplaced tag is not read takes that
+partial block's place among the 4,096 blocks and partial blocks a capture reads.
+Up to 4,096 other such blocks are read apart from those, so a screen full of
+them cannot hide a block; a capture with more is read from its newest 4,096,
+with one log line from a recovery scan.
+
 Reported entries are kept in `fence-feedback.json` in the bridge state
 directory, so each unavailable ID and each partial block entry is reported at
 most once per state directory, including after a restart. An unavailable ID is
 kept as the ID itself. A partial block is kept as `ID KIND HASH`: KIND is
 `unopened` for an unopened block, `remnant` for fewer than 64 characters of one
-at the top of the capture, and `unclosed` for a block with no closing line, and
-HASH is the first 12 hex digits of the SHA-256 of the characters its digest
-covers. A history written by an earlier release keeps the bare ID of a partial
-block, and that ID still covers every partial block under it. A new state
-directory starts with no reported entries. A marker that stays visible after its
-report is left out of later prompts, and a later block that reuses a reported
-unavailable ID is not reported again. A block under an ID that belongs to no
-open request is never posted. Once its ID is reported, its only trace is a log
-line, and only recovery scans write that line. Recovery scans run when
+at the top of the capture, `unclosed` for a block with no closing line, and
+`inline` for a block whose opening or closing tag shared its row with other
+text, and HASH is the first 12 hex digits of the SHA-256 of the characters its
+digest covers. A history written by an earlier release keeps the bare ID of a
+partial block, and that ID still covers every partial block under it. A new
+state directory starts with no reported entries. A marker that stays visible
+after its report is left out of later prompts, and a later block that reuses a
+reported unavailable ID is not reported again. A block under an ID that belongs
+to no open request is never posted. Once its ID is reported, its only trace is a
+log line, and only recovery scans write that line. Recovery scans run when
 `chat run` starts, at each `chat tick`, at each reconciliation while the agent
 pane is idle or done, when the pane settles idle or done, and after output names
 a reply ID that belongs to no request the bridge knows. Each recovery scan that
