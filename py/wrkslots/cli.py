@@ -4049,9 +4049,253 @@ def _locked(subject: Path, *, exclusive: bool, wait_seconds: float) -> Iterator[
             os.close(fd)
 
 
+# A caller that already holds the configuration lock -- an exclusive flock on the project root
+# directory -- and runs a wrkslots mutation would otherwise make that mutation refuse itself:
+# wrkslots opens its own descriptor, which is a second open file description, so its flock
+# conflicts with the caller's, and every such mutation refused as "configuration lock is busy".
+# Removal and recovery cannot simply inherit the caller's descriptor either, because a launcher
+# may re-run them in a host-context service that is not the caller's descendant.
+#
+# The caller therefore names, in this variable, the descriptor number it holds the flock on in
+# ITS OWN descriptor table, and must be the process the command names with --coordinator-pid.
+# wrkslots adopts the lock only after proving all of the following, and refuses otherwise; it
+# never falls through to a second acquire:
+#   * the coordinator is authenticated exactly as removal authenticates it (an ancestor of this
+#     process, or the generation the host-context handoff bound);
+#   * a pidfd opened on that PID names that authenticated generation: the generation is read
+#     AFTER the pidfd is opened, and a pidfd cannot be redirected by PID reuse;
+#   * pidfd_getfd(2) duplicates the named descriptor into this process. The duplicate shares the
+#     coordinator's open file description, so every later check reads the one object the lock
+#     belongs to, and nothing the coordinator does to its descriptor table afterwards can make
+#     two checks describe two different files;
+#   * the duplicate is the very directory the lock is taken on (device and inode);
+#   * /proc/self/fdinfo of the duplicate shows an exclusive flock on that inode. fdinfo lists
+#     only the locks owned by that open file description, so this is the kernel saying that the
+#     coordinator's descriptor holds the lock -- not merely that someone does;
+#   * a non-blocking exclusive flock through a new descriptor still fails.
+# Every entry re-proves it. The duplicate is held for the whole locked section and then closed,
+# never unlocked: flock(LOCK_UN) on it would release the coordinator's lock too. While it is
+# held, the open file description -- and with it the lock -- outlives the coordinator closing
+# its own descriptor or exiting, so the section stays excluded to its end.
+#
+# The coordinator, which is authenticated and therefore trusted, must keep one promise: while a
+# command it lent the descriptor to may still run, it releases the lock only by closing its
+# descriptor, never with flock(LOCK_UN). An explicit unlock acts on the shared open file
+# description, so no descriptor this process holds could keep the lock.
+#
+# pidfd_getfd needs ptrace-attach permission over the coordinator: the same user, a dumpable
+# process, and no Yama restriction that forbids attaching to a non-descendant. Without it the
+# duplicate fails and the command refuses.
+HELD_CONFIG_LOCK_FD_ENV = "WRKSLOTS_HELD_CONFIG_LOCK_FD"
+_FDINFO_FLOCK_LINE = re.compile(
+    r"^lock:\s+\d+:\s+FLOCK\s+ADVISORY\s+(?P<mode>READ|WRITE)\s+\S+\s+"
+    r"[0-9a-f]+:[0-9a-f]+:(?P<inode>\d+)\s"
+)
+# pidfd_getfd(2) has no wrapper in the os module. Its number is 438 on both architectures listed
+# here; other architectures number it differently, so they refuse rather than guess.
+_PIDFD_GETFD_SYSCALL = {"x86_64": 438, "aarch64": 438}
+
+
+@dataclasses.dataclass
+class _HeldConfigLockClaim:
+    """The caller's lock delegation for one command, and its coordinator once authenticated."""
+
+    raw: str
+    coordinator_pid: int | None
+    coordinator: ProcessIdentity | None = None
+
+
+_held_config_lock_claim: _HeldConfigLockClaim | None = None
+
+
+def _take_held_config_lock_variable() -> str | None:
+    """Remove the delegation from the environment so no process this command starts sees it."""
+
+    global _held_config_lock_claim
+    _held_config_lock_claim = None
+    return os.environ.pop(HELD_CONFIG_LOCK_FD_ENV, None)
+
+
+def _bind_held_config_lock(raw: str | None, args: argparse.Namespace) -> None:
+    global _held_config_lock_claim
+    if raw is None:
+        _held_config_lock_claim = None
+        return
+    coordinator_pid = getattr(args, "coordinator_pid", None)
+    _held_config_lock_claim = _HeldConfigLockClaim(
+        raw, coordinator_pid if isinstance(coordinator_pid, int) else None
+    )
+
+
+def _directory_identity_for_lock(lock_path: Path) -> os.stat_result:
+    try:
+        fd = os.open(
+            lock_path,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+    except OSError as exc:
+        raise Refusal(f"cannot open configuration lock {lock_path}: {exc}") from exc
+    try:
+        return os.fstat(fd)
+    except OSError as exc:
+        raise Refusal(f"cannot inspect configuration lock {lock_path}: {exc}") from exc
+    finally:
+        os.close(fd)
+
+
+def _pidfd_getfd(pidfd: int, target_fd: int) -> int:
+    """Duplicate ``target_fd`` of the process ``pidfd`` names, as a close-on-exec descriptor.
+
+    The duplicate refers to the same open file description as the original, as dup(2) would.
+    Raises OSError with the kernel's errno.
+    """
+
+    number = _PIDFD_GETFD_SYSCALL.get(os.uname().machine)
+    if number is None:
+        raise OSError(
+            errno.ENOSYS,
+            f"pidfd_getfd has no known system call number on {os.uname().machine}",
+        )
+    syscall = ctypes.CDLL(None, use_errno=True).syscall
+    syscall.restype = ctypes.c_long
+    ctypes.set_errno(0)
+    result = syscall(
+        ctypes.c_long(number), ctypes.c_int(pidfd), ctypes.c_int(target_fd), ctypes.c_uint(0)
+    )
+    if result < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return int(result)
+
+
+def _adopt_held_config_lock(claim: _HeldConfigLockClaim, lock_path: Path) -> int:
+    """Prove the coordinator holds the lock and return a duplicate of its lock descriptor.
+
+    The caller holds the returned descriptor for the locked section, then closes it without
+    unlocking.
+    """
+
+    raw = claim.raw
+
+    def refuse(reason: str) -> NoReturn:
+        raise Refusal(
+            f"{HELD_CONFIG_LOCK_FD_ENV}={raw!r} does not prove the caller holds the "
+            f"configuration lock for {lock_path}: {reason}",
+            remedy=(
+                f"name in {HELD_CONFIG_LOCK_FD_ENV} the descriptor that holds the exclusive "
+                f"flock on {lock_path} in the --coordinator-pid process, or unset it so "
+                "wrkslots takes the lock itself"
+            ),
+        )
+
+    if not (raw.isascii() and raw.isdigit()):
+        refuse("it is not a descriptor number")
+    fd = int(raw)
+    if fd < 3:
+        refuse("standard input, output and error are never a lock descriptor")
+    pid = claim.coordinator_pid
+    if pid is None:
+        refuse("the descriptor is read from the --coordinator-pid process, and this command names none")
+    if claim.coordinator is None:
+        try:
+            claim.coordinator = _capture_remove_processes(pid)[0]
+        except Refusal as exc:
+            refuse(f"coordinator PID {pid} is not authenticated: {exc}")
+    coordinator = claim.coordinator
+    expected = _directory_identity_for_lock(lock_path)
+    try:
+        pidfd = os.pidfd_open(pid)
+    except OSError as exc:
+        refuse(f"coordinator PID {pid} is gone ({exc.strerror})")
+    try:
+        # The pidfd names whichever process held the PID when it was opened. Reading the
+        # generation afterwards proves that was the authenticated one; from here on PID reuse
+        # cannot lend this command another process's descriptor.
+        try:
+            current = _read_process_identity(pid)
+        except Refusal as exc:
+            refuse(f"coordinator PID {pid} is gone: {exc}")
+        if current != coordinator:
+            refuse(f"coordinator PID {pid} is no longer the authenticated process generation")
+        try:
+            held = _pidfd_getfd(pidfd, fd)
+        except OSError as exc:
+            if exc.errno == errno.EBADF:
+                refuse(f"descriptor {fd} is not open in coordinator PID {pid} ({exc.strerror})")
+            if exc.errno == errno.ESRCH:
+                refuse(f"coordinator PID {pid} exited before its descriptor was read")
+            refuse(
+                f"cannot duplicate descriptor {fd} of coordinator PID {pid} ({exc.strerror}); "
+                "this needs ptrace-attach permission over the coordinator"
+            )
+    finally:
+        os.close(pidfd)
+    try:
+        try:
+            observed = os.fstat(held)
+        except OSError as exc:
+            refuse(f"cannot inspect descriptor {fd} of coordinator PID {pid} ({exc.strerror})")
+        if not stat.S_ISDIR(observed.st_mode) or (observed.st_dev, observed.st_ino) != (
+            expected.st_dev,
+            expected.st_ino,
+        ):
+            refuse(
+                f"descriptor {fd} of coordinator PID {pid} is device {observed.st_dev} inode "
+                f"{observed.st_ino}, not the configuration lock directory (device "
+                f"{expected.st_dev} inode {expected.st_ino})"
+            )
+        try:
+            fdinfo = Path(f"/proc/self/fdinfo/{held}").read_text(encoding="ascii")
+        except (OSError, UnicodeDecodeError) as exc:
+            refuse(
+                f"cannot read the lock state of descriptor {fd} of coordinator PID {pid}: {exc}"
+            )
+        # The device is NOT compared here: fdinfo prints the superblock device, which differs
+        # from st_dev on filesystems with per-subvolume anonymous devices such as btrfs
+        # (measured: fdinfo 00:2f against st_dev 0:50 for one /tmp directory). The inode is
+        # matched as a sanity check; fdinfo already restricts itself to this description's locks.
+        modes: set[str] = set()
+        for line in fdinfo.splitlines():
+            match = _FDINFO_FLOCK_LINE.match(line)
+            if match is not None and int(match["inode"]) == expected.st_ino:
+                modes.add(match["mode"])
+        if "WRITE" not in modes:
+            refuse(
+                f"descriptor {fd} of coordinator PID {pid} holds no exclusive flock"
+                + (" (only a shared one)" if "READ" in modes else "")
+            )
+        probe_fd = os.open(
+            lock_path,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        try:
+            try:
+                fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return held
+            fcntl.flock(probe_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(probe_fd)
+        refuse("the lock was free when probed, so the coordinator no longer holds it")
+    except BaseException:
+        # Close only: an unlock would act on the coordinator's open file description.
+        os.close(held)
+        raise
+
+
 @contextlib.contextmanager
-def _locked_config(path: Path, wait_seconds: float) -> Iterator[int]:
+def _locked_config(path: Path, wait_seconds: float) -> Iterator[None]:
     lock_path = path.parent
+    claim = _held_config_lock_claim
+    if claim is not None:
+        held = _adopt_held_config_lock(claim, lock_path)
+        try:
+            yield
+        finally:
+            # Close, never unlock: the duplicate shares the coordinator's open file description,
+            # so flock(LOCK_UN) here would release the coordinator's lock as well.
+            os.close(held)
+        return
     try:
         fd = os.open(
             lock_path,
@@ -4080,7 +4324,7 @@ def _locked_config(path: Path, wait_seconds: float) -> Iterator[int]:
                         "other wrkslots mutation exits"
                     ) from exc
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
-        yield fd
+        yield
     finally:
         try:
             fcntl.flock(fd, fcntl.LOCK_UN)
@@ -44230,12 +44474,14 @@ def _refusal_remedy(args: argparse.Namespace, error: Refusal) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the command-line interface and return its process exit status."""
 
+    held_config_lock = _take_held_config_lock_variable()
     parser = _build_parser()
     values = list(sys.argv[1:] if argv is None else argv)
     if not values:
         parser.print_help()
         return 0
     args = parser.parse_args(values)
+    _bind_held_config_lock(held_config_lock, args)
     # The raw words, for handlers that must know which side of `--` a word was on.
     args.raw_arguments = values
     if args.userguide:
