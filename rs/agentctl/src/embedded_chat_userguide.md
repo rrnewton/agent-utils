@@ -770,14 +770,34 @@ reported when fewer than 64 such characters of it were in view, at the top of
 the capture, once a recovery scan shows the first row of its message or 64 such
 characters of it, as it can when rows move back down the screen.
 
+A recovery scan also reports a row that holds an opening or closing marker of an
+open request together with other text, such as `<CHAT_REPLY_001>Done.` or
+`Done.</CHAT_REPLY_001>`. A marker counts only alone on its row, so such a row
+neither opens nor closes a block, and the reply it was meant to mark is not
+sent. The prompt names the ID, says that a tag shared its line with other text
+so the block was not sent, and that each opening and closing tag must be alone
+on its own line, and then asks for the block again, as it does for a partial
+block. A block whose opening marker is on such a row and whose closing marker is
+alone on its row is also reported as an unopened block, and one whose opening
+marker is alone on its row and whose closing marker is on such a row as a block
+with no closing line. Such a row is not reported inside a block that closes,
+where it is text of the reply, inside a fenced code block, above the first row
+at the left edge of the capture, where it can belong to a prompt echo such as
+the request prompt's own instruction, or when its text is part of a reply
+already stored for that request. Nor is a row whose marker names a closed
+request or no request, which, unlike such a marker alone on its row, is not a
+routing error. A row is identified by its ID and by all of its characters, not
+counting whitespace or box-drawing characters, so it is reported once while it
+scrolls, and again if the pane is resized and the row wraps differently.
+
 Reported entries are kept in `fence-feedback.json` in the bridge state
 directory, so each unavailable ID and each partial block entry is reported at
 most once per state directory, including after a restart. An unavailable ID is
 kept as the ID itself. A partial block is kept as `ID KIND HASH`: KIND is
 `unopened` for an unopened block, `remnant` for fewer than 64 characters of one
-at the top of the capture, and `unclosed` for a block with no closing line, and
-HASH is the first 12 hex digits of the SHA-256 of the characters its digest
-covers. A history written by an earlier release keeps the bare ID of a partial
+at the top of the capture, `unclosed` for a block with no closing line, and
+`inline` for a row that holds a marker with other text, and HASH is the first 12
+hex digits of the SHA-256 of the characters its digest covers. A history written by an earlier release keeps the bare ID of a partial
 block, and that ID still covers every partial block under it. A new state
 directory starts with no reported entries. A marker that stays visible after its
 report is left out of later prompts, and a later block that reuses a reported
