@@ -2092,12 +2092,40 @@ URL. `--wav` additionally keeps one 24 kHz, 16-bit mono WAV per trial for ASR re
 contain the spoken content and must be handled accordingly. `--out`, `--trials`, both thresholds,
 and all three timeouts are explicit CLI overrides. Run
 `scripts/voice-read-acceptance.py --self-test` for the
-offline metric, transcript-merge, interruption, and WAV controls; it opens no socket.
+offline metric, transcript-merge, interruption, re-answer separation, privacy, and WAV controls;
+it opens no socket.
 
-A green report proves only the full-read properties it measured. The operator must separately
-establish that the source message (not merely its instruction wrapper) is about 1,000 characters,
-and `#47 read-aloud-overlong` still requires `#37 read-aloud-cut-truncation`'s 0-of-2 re-answer
-probe. Do not treat this runner alone as the whole issue acceptance.
+The same runner has an explicit two-turn mode for `#37 read-aloud-cut-truncation`'s 0-of-2
+re-answer probe. Keep prompt A, its source A, a different prompt B, and its different source B in
+four UTF-8 files; none is accepted as a command-line value. Supplying all three additional file
+flags selects this mode, while omitting all three preserves the ten-trial full-read mode above:
+
+```bash
+VIBE_TALK_VOICE_WEBSOCKET_URL='wss://voice.example.test/session' \
+  scripts/voice-read-acceptance.py \
+  --prompt-file origin-prompt.txt \
+  --source-file origin-source.txt \
+  --follow-up-prompt-file follow-up-prompt.txt \
+  --follow-up-source-file follow-up-source.txt
+```
+
+Each of the default two trials opens a fresh socket, drains any greeting, sends prompt A, and sends
+exactly one `interrupt` after receiving 2.0 accumulated seconds of PCM. It requires exactly one
+interrupted completion for A, then sends prompt B on that same socket and requires the immediately
+following turn to complete naturally with audible audio. The B assistant transcript stays in
+memory. After the page's word normalization, ordered-word LCS coverage must be at least 0.85 for
+source B, strictly below 0.15 for source A, and have a B-minus-A margin of at least 0.70. B must
+also contain no contiguous eight-word source-A span that does not occur in source B.
+`--interrupt-after-audio-seconds`, the three coverage bounds, the span width, and `--trials`
+override those defaults; every duration override must be positive. A partial set of re-answer file
+flags is rejected, and `--wav` is unavailable in this mode.
+
+The re-answer `results.json` retains only counts, ratios, timings, turn IDs, and pass booleans. It
+does not retain input or transcript text or fragments, file names, stable fingerprints, or any part
+of the WebSocket URL. A green full-read report still proves only the properties it measured: the
+operator must establish separately that the source message (not merely its instruction wrapper) is
+about 1,000 characters. Do not treat either runner mode alone as the whole
+`#47 read-aloud-overlong` acceptance.
 
 This protocol is deliberately public and provider-neutral. Authentication, endpoint discovery,
 and the implementation behind a deployment-managed socket belong in deployment configuration and
