@@ -1,13 +1,14 @@
 ---
 title: 'slack-push: deliver Slack messages without polling'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
 - vibe-talk
 - slack
 created_at: 2026-10-02T18:34:15.007227352+00:00
-updated_at: 2026-10-02T18:34:15.007227352+00:00
+updated_at: 2026-10-02T21:37:45.408829213+00:00
+closed_at: 2026-10-02T21:37:45.408829213+00:00
 ---
 
 # Description

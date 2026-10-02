@@ -10,7 +10,7 @@ labels:
 depends_on:
   agent-utils-1: parent-child
 created_at: 2026-09-25T03:55:15.315366091+00:00
-updated_at: 2026-09-29T23:56:12.369891852+00:00
+updated_at: 2026-10-02T21:37:45.408829213+00:00
 claimed_at: 2026-09-25T04:17:03.192733505+00:00
 claimed_until: 2026-09-27T04:17:03.192544933+00:00
 ---
@@ -58,3 +58,20 @@ control/review worktrees.
 Useful historical work is therefore reconciled without disturbing concurrent work. Final branch
 and worktree removal still awaits an owner decision about the dirty and currently active targets;
 the durable recovery bundle remains retained.
+
+[gpt-5] Rescue and cleanup pass on 2026-10-02:
+
+- The mistakenly allocated AgentCloud workspace was audited and removed. Public `main` was
+  rescued by a plain fast-forward through `5aba7e81`; no rebase, force push, or PR was used.
+- A self-contained `0600` recovery bundle outside the old clone preserves 462 audited refs,
+  including all 71 recovery refs and every tip found unreachable from the observed remotes. Its
+  SHA-256 is `250c81ef10fe58b3ea285c1f197ae0ea4d61a832833a81b820e9dd523feaec3c`.
+  Bundle verification, exact ref-manifest comparison, a full restore, strict fsck, and recovery-
+  only object checks all passed.
+- Twelve clean, inactive worktrees were removed through `git worktree remove` after process,
+  dirtiness, integration, and recovery checks. The Slack deployment worktree was also removed
+  after its exact commit reached GitHub. Their branches and recovery refs were preserved.
+- Four old-clone worktrees remain intentionally: the clean primary checkout is still used by a
+  live shell; one detached negative-control tree has 160 uncommitted insertions; one checkout is
+  the cwd of an adb process; and one chat-bridge checkout has active Claude processes and unique
+  unlanded work. The issue stays open rather than deleting or misclassifying those targets.
