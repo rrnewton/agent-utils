@@ -1790,6 +1790,15 @@ The adapter intentionally fixes one channel on its own command line, so an event
 different allowlisted destination. Install one unit per channel when the upstream source cannot be
 split that way itself.
 
+The checked-in service is specifically a **Meta CLI tail** example, not a statement of the generic
+adapter's minimum resources or sandbox compatibility. On a devserver, Meta's managed runtime
+mounts its packaged client and settles above 512 tasks and 1 GiB; it also aborts when systemd gives
+it `NoNewPrivileges` or `PrivateTmp`. The example therefore leaves those two directives unset and
+allows 2 GiB and 2,048 tasks, matching the same host's established Meta-backed Slack shim. The
+Python adapter itself does not need that footprint. If the command after `--` is not Meta CLI,
+measure that command and restore the strongest sandbox and smallest limits it supports rather than
+copying Meta's exceptions without evidence.
+
 ### Provider-adapter push
 
 The adapter route has its own bearer token, distinct from both browser tokens. It accepts only

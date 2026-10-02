@@ -18,6 +18,45 @@ use vibe_talk::testing::WRITE_TOKEN;
 
 const TEAM: &str = "C0000MAIN1";
 const OTHER: &str = "C0000OTHER";
+const META_TAIL_UNIT: &str = include_str!("../systemd/vibe-talk-live-hint.service.example");
+
+fn active_unit_value<'a>(unit: &'a str, key: &str) -> Vec<&'a str> {
+    unit.lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| line.strip_prefix(key))
+        .filter_map(|value| value.strip_prefix('='))
+        .collect()
+}
+
+#[test]
+fn the_meta_tail_unit_pins_its_proven_runtime_constraints() {
+    let exec_start = active_unit_value(META_TAIL_UNIT, "ExecStart");
+    assert_eq!(
+        exec_start.len(),
+        1,
+        "the unit needs one literal event source"
+    );
+    assert!(
+        exec_start[0].contains(" -- /REPLACE_WITH_META_BIN/meta slack.conversation tail "),
+        "the exceptional runtime envelope belongs to the concrete Meta tail command"
+    );
+    assert_eq!(active_unit_value(META_TAIL_UNIT, "MemoryHigh"), ["1G"]);
+    assert_eq!(active_unit_value(META_TAIL_UNIT, "MemoryMax"), ["2G"]);
+    assert_eq!(active_unit_value(META_TAIL_UNIT, "TasksMax"), ["2048"]);
+    assert!(
+        active_unit_value(META_TAIL_UNIT, "NoNewPrivileges").is_empty(),
+        "Meta's managed runtime aborts under NoNewPrivileges"
+    );
+    assert!(
+        active_unit_value(META_TAIL_UNIT, "PrivateTmp").is_empty(),
+        "Meta's managed runtime aborts under PrivateTmp"
+    );
+    assert!(
+        META_TAIL_UNIT.contains("These are Meta CLI managed-runtime budgets"),
+        "the large Meta-specific budget must not look like a generic adapter requirement"
+    );
+}
 
 fn config_text(api_base: &str) -> String {
     format!(

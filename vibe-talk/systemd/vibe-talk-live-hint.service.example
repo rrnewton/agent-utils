@@ -21,13 +21,16 @@ KillMode=control-group
 TimeoutStopSec=30
 
 UMask=0077
-NoNewPrivileges=true
-PrivateTmp=true
+# These are Meta CLI managed-runtime budgets, not requirements of live-hint-adapter.py itself.
+# On a devserver the tail client mounts its packaged runtime and settles above 512 tasks and 1 GiB.
+# That runtime also aborts inside NoNewPrivileges or PrivateTmp, so this Meta-specific example
+# deliberately omits those otherwise useful sandbox directives. Re-evaluate these choices when
+# replacing the command after `--` with a different event source.
 LimitCORE=0
-MemoryHigh=384M
-MemoryMax=512M
+MemoryHigh=1G
+MemoryMax=2G
 MemorySwapMax=0
-TasksMax=512
+TasksMax=2048
 
 [Install]
 WantedBy=default.target
