@@ -1177,6 +1177,13 @@ fn capture_recovery_snapshot<A: ManagedApi + ?Sized>(
             chat_runtime::MAX_VISIBLE_MARKERS
         ));
     }
+    if capture.inline_overflowed {
+        report.note(format!(
+            "coordinator output held more than {} reply blocks with a tag that shared its line \
+with other text, so the oldest were not read",
+            chat_runtime::MAX_VISIBLE_MARKERS
+        ));
+    }
     for refusal in &capture.refused {
         report.note(refusal);
     }
@@ -1185,8 +1192,15 @@ fn capture_recovery_snapshot<A: ManagedApi + ?Sized>(
     if let Some(line) = already_reported_log_line(&capture.suppressed_ids) {
         control.log(line);
     }
-    if !capture.unknown_ids.is_empty() {
-        match deliver_feedback(state, manager, &capture.unknown_ids, delivery, control.stop) {
+    if !capture.unknown_ids.is_empty() || !capture.covered_ids.is_empty() {
+        match deliver_feedback(
+            state,
+            manager,
+            &capture.unknown_ids,
+            &capture.covered_ids,
+            delivery,
+            control.stop,
+        ) {
             Ok(CoordinatorDeliveryResult::Pending(_)) => report.more_work = true,
             Ok(CoordinatorDeliveryResult::Uncertain(_)) => {}
             Ok(
@@ -1804,20 +1818,28 @@ fn deliver_feedback<A: ManagedApi + ?Sized>(
     state: &BridgeState,
     manager: &ManagedAgents<'_, A>,
     unknown_ids: &[String],
+    covered_ids: &[(String, String)],
     options: DrainOptions,
     stop: Option<&StopState>,
 ) -> Result<CoordinatorDeliveryResult, ChatRuntimeError> {
     match stop {
-        Some(stop) => chat_runtime::deliver_fence_feedback_with(
+        Some(stop) => chat_runtime::deliver_fence_feedback_covering(
             state,
             &CancellableDelivery {
                 manager,
                 runtime: StopRuntime::new(stop),
             },
             unknown_ids,
+            covered_ids,
             options,
         ),
-        None => chat_runtime::deliver_fence_feedback(state, manager, unknown_ids, options),
+        None => chat_runtime::deliver_fence_feedback_covering(
+            state,
+            manager,
+            unknown_ids,
+            covered_ids,
+            options,
+        ),
     }
 }
 
@@ -7380,6 +7402,72 @@ esac
             report.notes[0].contains("reply-aliases.json is unusable"),
             "{}",
             report.notes[0]
+        );
+    }
+
+    #[test]
+    fn a_rewrapped_block_with_misplaced_tags_draws_one_notice_as_it_scrolls_away() {
+        // A block whose tags share their rows with other text is reported once. A capture of a
+        // pane that rewrapped it so its closing tag sits alone on its row has no new block to
+        // report, yet still records, with no notice, the entry of the unopened block those rows
+        // give without the misplaced opening tag, so once that tag's row scrolls away the rest
+        // of the block draws no second notice.
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        let (_root, state) = worker_bridge_state(&fixture, true);
+        let (key, prompt) = delivered_worker_request(&state);
+        let id = prompt
+            .split("<CHAT_REPLY_")
+            .nth(1)
+            .and_then(|rest| rest.split('>').next())
+            .expect("reply ID in the prompt")
+            .to_owned();
+        let (opening, closing) = (format!("<CHAT_REPLY_{id}>"), format!("</CHAT_REPLY_{id}>"));
+        let tail = "remaining reply text. ".repeat(8);
+        let screens = [
+            format!("⏺ Working.\n❯ question\n⏺ {opening}First line.\n  {tail}{closing}\n❯\u{a0}\n"),
+            format!(
+                "⏺ Working.\n❯ question\n⏺ {opening}First line.\n  {tail}\n  {closing}\n❯\u{a0}\n"
+            ),
+            format!("  {tail}\n  {closing}\n❯\u{a0}\n"),
+        ];
+        let mut routes = RouteCache::new(vec![state
+            .next_reply_route(&key)
+            .expect("route")
+            .expect("open route")]);
+        let manager = fixture.manager();
+        let mut transport = None;
+        let mut control = PassControl {
+            transport: &mut transport,
+            stop: None,
+        };
+        fixture.client.runs.lock().expect("runs").clear();
+        for (revision, screen) in (1..).zip(&screens) {
+            let report = capture_recovery_snapshot(
+                &state,
+                &manager,
+                DrainOptions::default(),
+                &mut routes,
+                SnapshotInput {
+                    text: screen,
+                    truncated: false,
+                    revision: Some(revision),
+                },
+                &mut control,
+            )
+            .expect("capture of a whole read");
+            assert!(report.captured.is_empty(), "{:?}", report.captured);
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+        }
+        let runs = fixture.client.runs.lock().expect("runs").clone();
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert!(
+            runs[0].starts_with(&format!(
+                "Chat reply not sent: an opening or closing tag shared its line with other text \
+in the reply block marked {id}, so that block was not sent."
+            )),
+            "{}",
+            runs[0]
         );
     }
 
