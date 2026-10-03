@@ -212,6 +212,22 @@ retained. It never uses that flag as permission to inspect, select, or remove on
 interrupted, or unregistered slots; exits 2 when an expired slot cannot be classified because
 evidence is unavailable; and exits 0 only when neither condition exists. The output names the
 affected slots and the next command. It never converts an unknown result into permission to remove.
+
+A registered row whose slot directory is absent -- `lstat` reports that nothing exists at the path
+-- is reported as `RECOVERABLE` rather than `BLOCKED` when absence is its only remaining reason
+after the same liveness, owner, heartbeat, handoff, and process/path census checks that make a
+present slot `DELETABLE`. Its reason names the exact read-only plan to run on the row's machine:
+`wrkslots recover-absent-agent-rows --row SLOT=GENERATION=SHA256` for an agent row, or
+`wrkslots recover-absent-validate-rows --input FILE` with the complete one-row JSON for a validation
+row. That command re-proves every storage, Git, and process condition before it retires the row;
+audit's classification grants no authority. `RECOVERABLE` rows count as reclaimable for `--gate`.
+An absent row that fails any other check stays `BLOCKED` and still names the recovery command. An
+owner release does not stand in for the owner's exit here: both recovery commands require the
+recorded owner generation to be dead, so an absent row whose releasing owner still runs stays
+`BLOCKED` and says so. A slot path that is occupied by anything other than a real directory -- a
+symlink, even a dangling one, an ordinary file, or a path `lstat` cannot inspect -- is never absent:
+it stays `BLOCKED` or refuses the audit exactly as before.
+
 Audit may update only its regenerable, project-keyed cache-accounting census below
 `XDG_CACHE_HOME` (or a canonical absolute path beneath an existing symlink-free parent outside the
 managed project supplied with `--cache-census-state`); it does not change a

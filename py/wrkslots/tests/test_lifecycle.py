@@ -37432,6 +37432,399 @@ def test_audit_row_round_trips_as_absent_validate_input(
         wrkslots._read_absent_validate_rows_input(config, str(input_path))
 
 
+def _audit_json(
+    project: Path, capsys: pytest.CaptureFixture[str], *extra: str
+) -> tuple[int, str]:
+    code = wrkslots.main(
+        ["--project-root", str(project), "audit", "--format", "json", *extra]
+    )
+    captured = capsys.readouterr()
+    assert captured.out, captured.err
+    return code, captured.out
+
+
+def test_audit_reports_an_absent_agent_directory_as_recoverable_not_unsafe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """ABSENT and UNSAFE used to share one refusal and one verdict: BLOCKED.
+
+    A registry row whose directory is simply gone has a remedy --
+    recover-absent-agent-rows -- but audit reported it exactly like a slot path
+    that is a symlink or an ordinary file, named no command, and its
+    consequential cache-inspection refusal put it in unknown_slots.  Only an
+    lstat ENOENT now selects RECOVERABLE; every occupied-but-wrong path stays
+    BLOCKED with the original refusal text.
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    slots = ("gone", "ordinary-file")
+    for index, slot in enumerate(slots):
+        made = create(project, slot=slot, agent=f"codex-{index}", branch=f"codex/{slot}")
+        assert made.returncode == 0, made.stderr
+        mark_owner_dead(project, slot=slot)
+    set_liveness(project, "dead")
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_process_path_census",
+        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+    )
+    root = slots_directory(project)
+    for slot in slots:
+        shutil.rmtree(root / slot)
+    (root / "ordinary-file").write_text("not a directory\n", encoding="utf-8")
+    registry = control_directory(project) / "ACTIVE.testhost.json"
+    before = registry.read_bytes()
+
+    code, output = _audit_json(project, capsys)
+    payload = json.loads(output)
+
+    assert code == 0
+    rows = {row["slot"]: row for row in payload["slots"]}
+    gone = rows["gone"]
+    assert gone["verdict"] == "RECOVERABLE", gone["reasons"]
+    assert gone["cache_bytes"] == 0
+    assert gone["cache_error"] is None
+    assert gone["cache_status"] == "complete"
+    plan = (
+        f"wrkslots recover-absent-agent-rows --row "
+        f"gone={gone['generation']}={gone['record_sha256']}"
+    )
+    assert gone["reasons"] == [
+        f"slot directory is absent: {root / 'gone'}; nothing occupies the path, so "
+        "this row is retired by recovery, not removal: on machine testhost, run "
+        f"'{plan}' for the read-only plan, then repeat it with '--apply "
+        "--coordinator-authorized --coordinator-pid <coordinator-pid>'"
+    ]
+    occupied = rows["ordinary-file"]
+    assert occupied["verdict"] == "BLOCKED", occupied["reasons"]
+    reasons = " ".join(occupied["reasons"])
+    assert f"slot directory is missing or unsafe: {root / 'ordinary-file'}" in reasons
+    assert "recover-absent" not in reasons
+    assert "slot directory is absent" not in reasons
+
+    code, output = _audit_json(project, capsys, "--gate")
+    gated = json.loads(output)
+    assert code == 1
+    assert gated["state"] == "actionable"
+    assert gated["attention_slots"] == ["gone"]
+    assert "gone" not in gated["unknown_slots"]
+
+    assert wrkslots.main(["--project-root", str(project), "audit", "--gate"]) == 1
+    human = capsys.readouterr().out
+    assert f"RECOVERABLE: gone: slot directory is absent: {root / 'gone'}" in human
+    assert "retire a slot reported RECOVERABLE with the recover-absent command" in human
+    assert registry.read_bytes() == before
+
+    # The named command is real: its read-only plan accepts the exact row.
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    returncode, stdout, stderr = run_absent_agent_rows(
+        project,
+        f"--row=gone={gone['generation']}={gone['record_sha256']}",
+        "--format",
+        "json",
+    )
+    assert returncode == 0, stderr
+    planned, outcomes = absent_rows_payload(stdout)
+    assert planned["mode"] == "plan"
+    assert outcomes == {"gone": "would-recover"}
+    assert registry.read_bytes() == before
+
+
+def test_audit_keeps_an_absent_row_blocked_while_its_releasing_owner_lives(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An honoured release does not make an absent row RECOVERABLE by itself.
+
+    A release lets remove proceed past a live owner, and audit skips the
+    heartbeat, liveness and owner reasons for a released row so that DELETABLE
+    agrees with remove.  The recover-absent commands do not honour a release:
+    they refuse while the exact recorded owner generation lives.  RECOVERABLE
+    would then name a command that refuses, so the row stays BLOCKED and says
+    why.
+    """
+
+    project, _digest = _owner_release_ready(tmp_path)
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_process_path_census",
+        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+    )
+    root = slots_directory(project)
+    shutil.rmtree(root / "slot01")
+    registry = control_directory(project) / "ACTIVE.testhost.json"
+    before = registry.read_bytes()
+
+    code, output = _audit_json(project, capsys)
+    payload = json.loads(output)
+
+    assert code == 0
+    rows = {row["slot"]: row for row in payload["slots"]}
+    row = rows["slot01"]
+    assert row["owner_state"] == "live"
+    assert row["owner_release"]["state"] == "released"
+    assert row["verdict"] == "BLOCKED", row["reasons"]
+    assert len(row["reasons"]) == 2
+    assert row["reasons"][0].startswith(
+        f"recorded owner is live: PID {os.getpid()} generation is live; "
+    )
+    assert row["reasons"][0].endswith(
+        "; the recover-absent commands require the recorded owner generation to "
+        "be dead"
+    )
+    assert row["reasons"][1].startswith(
+        f"slot directory is absent: {root / 'slot01'}; "
+    )
+    assert registry.read_bytes() == before
+
+    # The mismatch is real: the command the absent reason names refuses this
+    # row while its owner lives, even though the release is honoured.
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    returncode, stdout, stderr = run_absent_agent_rows(
+        project,
+        f"--row=slot01={row['generation']}={row['record_sha256']}",
+        "--format",
+        "json",
+    )
+    assert returncode == 1, stderr
+    planned, outcomes = absent_rows_payload(stdout)
+    assert outcomes == {"slot01": "refused"}
+    refused = cast(list[Mapping[str, object]], planned["rows"])[0]
+    assert refused["reason"] == (
+        f"recorded owner for agent row slot01 is live: PID {os.getpid()} "
+        "generation is live"
+    )
+    assert registry.read_bytes() == before
+
+
+@pytest.mark.parametrize("dangling", (True, False))
+def test_audit_still_refuses_a_slot_path_that_is_a_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    dangling: bool,
+) -> None:
+    """A symlink occupies the path, so it is never absence and never RECOVERABLE.
+
+    lstat succeeds on a symlink whether or not its target exists, and the audit
+    refuses as a whole before any row is classified, exactly as before.
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot="linked", agent="codex-linked", branch="codex/linked")
+    assert made.returncode == 0, made.stderr
+    mark_owner_dead(project, slot="linked")
+    set_liveness(project, "dead")
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_process_path_census",
+        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+    )
+    linked = slots_directory(project) / "linked"
+    shutil.rmtree(linked)
+    target = tmp_path / ("never-created" if dangling else "elsewhere")
+    if not dangling:
+        target.mkdir()
+    linked.symlink_to(target, target_is_directory=True)
+    assert wrkslots._path_is_absent(linked) is False
+
+    code = wrkslots.main(
+        ["--project-root", str(project), "audit", "--gate", "--format", "json"]
+    )
+
+    captured = capsys.readouterr()
+    assert code != 0
+    assert captured.out == ""
+    assert f"REFUSED: slot crosses a symlink: {linked}" in captured.err
+    assert "RECOVERABLE" not in captured.err
+    assert "recover-absent" not in captured.err
+
+
+def test_audit_absent_agent_row_with_live_liveness_stays_blocked_but_names_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot="gone", agent="codex-gone", branch="codex/gone")
+    assert made.returncode == 0, made.stderr
+    mark_owner_dead(project, slot="gone")
+    set_liveness(project, "alive")
+    census_calls: list[object] = []
+
+    def census(paths: Sequence[Path]) -> wrkslots._ProcessPathCensus:
+        census_calls.append(tuple(paths))
+        return wrkslots._ProcessPathCensus((), ())
+
+    monkeypatch.setattr(wrkslots, "_capture_process_path_census", census)
+    used: list[Path] = []
+    monkeypatch.setattr(
+        wrkslots,
+        "_assert_slot_unused",
+        lambda slot_path, *_args, **_kwargs: used.append(slot_path),
+    )
+    shutil.rmtree(slots_directory(project) / "gone")
+
+    code, output = _audit_json(project, capsys, "--gate")
+    payload = json.loads(output)
+
+    row = payload["slots"][0]
+    assert row["verdict"] == "BLOCKED", row["reasons"]
+    assert row["reasons"][0].startswith("liveness is alive")
+    assert row["reasons"][-1].startswith(
+        f"slot directory is absent: {slots_directory(project) / 'gone'}"
+    )
+    assert "wrkslots recover-absent-agent-rows --row gone=" in row["reasons"][-1]
+    assert len(row["reasons"]) == 2
+    # A row that is not otherwise reclaimable is not attention, and the use
+    # census is still not consulted for it, exactly as for a present slot.
+    assert payload["attention_slots"] == []
+    assert used == []
+    assert code == 0
+
+
+def test_audit_absent_row_that_a_process_still_uses_is_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot="gone", agent="codex-gone", branch="codex/gone")
+    assert made.returncode == 0, made.stderr
+    mark_owner_dead(project, slot="gone")
+    set_liveness(project, "dead")
+    gone = slots_directory(project) / "gone"
+    shutil.rmtree(gone)
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_process_path_census",
+        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+    )
+    used: list[Path] = []
+
+    def in_use(slot_path: Path, *_args: object, **_kwargs: object) -> None:
+        used.append(slot_path)
+        raise wrkslots.Refusal(f"PID 4242 mounts a path inside {slot_path}")
+
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", in_use)
+
+    code, output = _audit_json(project, capsys)
+    payload = json.loads(output)
+
+    assert code == 0
+    row = payload["slots"][0]
+    # The absent row is still subject to the same use census as a present
+    # one, and evidence of use keeps it out of RECOVERABLE.
+    assert used == [gone]
+    assert row["verdict"] == "BLOCKED"
+    assert row["reasons"][0] == f"PID 4242 mounts a path inside {gone}"
+    assert row["reasons"][1].startswith(f"slot directory is absent: {gone}")
+
+
+def test_audit_absent_row_with_unknown_process_census_stays_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot="gone", agent="codex-gone", branch="codex/gone")
+    assert made.returncode == 0, made.stderr
+    mark_owner_dead(project, slot="gone")
+    set_liveness(project, "dead")
+    shutil.rmtree(slots_directory(project) / "gone")
+
+    def unavailable(_paths: Sequence[Path]) -> wrkslots._ProcessPathCensus:
+        raise wrkslots.Refusal("injected census failure")
+
+    monkeypatch.setattr(wrkslots, "_capture_process_path_census", unavailable)
+
+    code, output = _audit_json(project, capsys, "--gate")
+    payload = json.loads(output)
+
+    row = payload["slots"][0]
+    assert row["verdict"] == "UNKNOWN"
+    assert row["reasons"][0] == "process/path census failed: injected census failure"
+    assert payload["attention_slots"] == []
+    assert payload["unknown_slots"] == ["gone"]
+    assert code == 2
+
+
+def test_audit_reports_an_absent_validation_directory_with_its_recovery_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project, slot="gone", agent="validate-a", branch=None, slot_type="validate")
+    assert made.returncode == 0, made.stderr
+    mark_owner_dead(project, slot="gone")
+    set_liveness(project, "dead")
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_process_path_census",
+        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    slot_path = wrkslots._slot_directory(config, "gone", "validate")
+    make_validate_row_absent(
+        project, repository, wrkslots._find_record(wrkslots._load_active(config), "gone")
+    )
+    assert wrkslots._path_is_absent(slot_path)
+
+    code, output = _audit_json(project, capsys)
+    payload = json.loads(output)
+
+    assert code == 0
+    row = payload["slots"][0]
+    assert row["verdict"] == "RECOVERABLE", row["reasons"]
+    (reason,) = row["reasons"]
+    assert reason.startswith(f"slot directory is absent: {slot_path}; ")
+    assert "on machine testhost, run 'wrkslots recover-absent-validate-rows --input FILE'" in (
+        reason
+    )
+    match = re.search(r"where FILE holds '(\{.*\})' for the read-only plan", reason)
+    assert match is not None, reason
+    input_path = tmp_path / "recover-absent.json"
+    input_path.write_text(match.group(1), encoding="utf-8")
+    _digest, parsed = wrkslots._read_absent_validate_rows_input(config, str(input_path))
+    assert parsed == (
+        wrkslots.AbsentValidateRow(
+            "testhost", "gone", row["generation"], row["record_sha256"]
+        ),
+    )
+    # ...and the named command's read-only plan accepts that exact input.
+    registry = control_directory(project) / "ACTIVE.testhost.json"
+    before = registry.read_bytes()
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    assert (
+        run_absent_validate_recovery(project, input_path, apply=False, output_format="json")
+        == 0
+    )
+    planned = json.loads(capsys.readouterr().out)
+    assert [entry["outcome"] for entry in planned["rows"]] == ["planned"]
+    assert registry.read_bytes() == before
+
+
+def test_slot_directory_absence_is_proved_by_lstat_alone(tmp_path: Path) -> None:
+    missing = tmp_path / "missing"
+    assert wrkslots._path_is_absent(missing) is True
+    assert wrkslots._path_is_absent(tmp_path / "missing-parent" / "child") is True
+    dangling = tmp_path / "dangling"
+    dangling.symlink_to(tmp_path / "nowhere")
+    assert wrkslots._path_is_absent(dangling) is False
+    ordinary = tmp_path / "ordinary"
+    ordinary.write_text("x", encoding="utf-8")
+    # ENOTDIR: a component is an ordinary file, which is not absence.
+    assert wrkslots._path_is_absent(ordinary / "child") is False
+    assert wrkslots._path_is_absent(tmp_path) is False
+    refusal = wrkslots._SlotDirectoryAbsent(missing)
+    assert isinstance(refusal, wrkslots.Refusal)
+    assert str(refusal) == f"slot directory is missing or unsafe: {missing}"
+
+
 def test_bounded_regular_file_refuses_fifo_without_blocking(tmp_path: Path) -> None:
     fifo = tmp_path / "retained-handle.json"
     os.mkfifo(fifo)
@@ -39440,10 +39833,11 @@ def test_mountinfo_census_enforces_file_aggregate_and_deadline_bounds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     observed_limits: list[int] = []
+    tables = {1: b"abc", 2: b"abc", 3: b"defg"}
 
-    def bounded_read(_path: Path, _label: str, limit: int) -> bytes:
+    def bounded_read(path: Path, _label: str, limit: int) -> bytes:
         observed_limits.append(limit)
-        return b"abc"
+        return tables[int(path.parent.name)]
 
     monkeypatch.setattr(wrkslots, "_read_bounded_regular_file", bounded_read)
     monkeypatch.setattr(
@@ -39455,10 +39849,34 @@ def test_mountinfo_census_enforces_file_aggregate_and_deadline_bounds(
         stderr_limit=1,
         input_limit=5,
     )
-    assert wrkslots._mountinfo_path_references(1, budget) == ()
-    with pytest.raises(wrkslots.Refusal, match="input bound"):
-        wrkslots._mountinfo_path_references(2, budget)
-    assert observed_limits == [5, 2]
+    census = wrkslots._MountinfoCensus(limit=5)
+    assert wrkslots._mountinfo_path_references(1, budget, census) == ()
+    # An identical table is read again but charged once.
+    assert wrkslots._mountinfo_path_references(2, budget, census) == ()
+    assert (census.reads, census.read_bytes, census.charged_bytes) == (2, 6, 3)
+    # Distinct content still has an aggregate bound, and the refusal states
+    # the bound, what was already charged, and the file that crossed it.
+    with pytest.raises(wrkslots.Refusal) as refused:
+        wrkslots._mountinfo_path_references(3, budget, census)
+    assert str(refused.value) == (
+        "mountinfo census exceeded its 5-byte bound on distinct mount-table "
+        "content: /proc/3/mountinfo adds 4 new bytes to the 3 bytes already "
+        "charged for 1 distinct table(s) over 2 earlier read(s) of 6 bytes in "
+        "this census; identical tables are charged once"
+    )
+    assert isinstance(refused.value, wrkslots._MountinfoCensusExceeded)
+    assert census.charged_bytes == 3
+    # Exceeding the bound is final for the census: even a table charged before
+    # is refused afterwards, so nothing read after an unparsed table can be
+    # taken as complete evidence.
+    with pytest.raises(wrkslots._MountinfoCensusExceeded) as repeated:
+        wrkslots._mountinfo_path_references(1, budget, census)
+    assert str(repeated.value) == str(refused.value)
+    # Every file is read against the fixed per-file bound, never against what
+    # remains of the aggregate, so a per-file refusal names the per-file bound.
+    assert observed_limits == [wrkslots._MOUNTINFO_FILE_BYTES_LIMIT] * 4
+    # The census account is not the operation's command-input budget.
+    assert budget.input_remaining == 5
 
     expired = wrkslots._ReadOnlyCommandBudget.start(
         timeout_seconds=30,
@@ -39474,9 +39892,11 @@ def test_mountinfo_census_enforces_file_aggregate_and_deadline_bounds(
 def test_mountinfo_census_accepts_observed_fleet_scale_above_one_twenty_eight_mib(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    one_mib = b"x" * (1024 * 1024)
+    one_mib = b"x" * (1024 * 1024 - 8)
     monkeypatch.setattr(
-        wrkslots, "_read_bounded_regular_file", lambda *_args: one_mib
+        wrkslots,
+        "_read_bounded_regular_file",
+        lambda path, *_args: one_mib + int(path.parent.name).to_bytes(8, "big"),
     )
     monkeypatch.setattr(
         wrkslots, "_parse_mountinfo_paths", lambda _text, _label, _cache=None: ()
@@ -39488,14 +39908,202 @@ def test_mountinfo_census_accepts_observed_fleet_scale_above_one_twenty_eight_mi
         input_limit=wrkslots._MOUNTINFO_CENSUS_BYTES_LIMIT,
     )
 
-    # A real fleet census reached 177,236,979 bytes. Exercise 192 MiB so the
-    # regression covers that observation with headroom; the old 128 MiB
-    # aggregate ceiling would refuse this sequence.
+    # A real fleet census reached 177,236,979 bytes. Exercise 192 MiB of
+    # DISTINCT tables so the regression covers that observation with headroom
+    # even if every table differed; the old 128 MiB aggregate ceiling would
+    # refuse this sequence.
+    census = wrkslots._MountinfoCensus()
     for pid in range(192):
-        assert wrkslots._mountinfo_path_references(pid + 1, budget) == ()
-    assert budget.input_remaining == (
-        wrkslots._MOUNTINFO_CENSUS_BYTES_LIMIT - 192 * 1024 * 1024
+        assert wrkslots._mountinfo_path_references(pid + 1, budget, census) == ()
+    assert census.charged_bytes == 192 * 1024 * 1024
+    assert census.distinct_tables == 192
+    assert budget.input_remaining == wrkslots._MOUNTINFO_CENSUS_BYTES_LIMIT
+
+
+def _shared_mount_table(lines: int) -> bytes:
+    return "".join(
+        f"{index + 40} 35 8:1 /export/{index:05d} /mnt/shared/{index:05d} "
+        f"rw,relatime shared:{index} - ext4 /dev/sda1 rw\n"
+        for index in range(lines)
+    ).encode()
+
+
+def test_unreadable_namespace_census_charges_one_shared_table_once_and_reads_every_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """2,000 `pid:N` groups listing one table must not exhaust the bound.
+
+    When a process's /proc/PID/ns/mnt link is unreadable it becomes a group of
+    its own, `pid:N`, so its table is read even if it is the same table as the
+    next process's.  Each read used to be charged in full, so about 1,700
+    unreadable links on one ordinary table exhausted the 256 MiB bound and the
+    census refused for a reason that depended only on how many links happened to
+    be unreadable.  Reading every one of them is what keeps an unreadable
+    namespace conservative, and that still happens; only the CHARGE is per
+    distinct table.
+    """
+
+    shared = _shared_mount_table(1600)
+    target = Path("/absent/validate/gone")
+    holder_pid = 1234
+    holder = shared + (
+        f"9999 35 8:1 /export/gone {target}/root rw,relatime - ext4 /dev/sda1 rw\n"
+    ).encode()
+    processes = tuple(
+        wrkslots._AbsentProcessObservation(pid, 17, "/other", f"pid:{pid}")
+        for pid in range(1000, 3000)
     )
+    assert len(shared) * len(processes) > wrkslots._MOUNTINFO_CENSUS_BYTES_LIMIT
+    reads: list[int] = []
+
+    def bounded_read(path: Path, _label: str, limit: int) -> bytes:
+        assert limit == wrkslots._MOUNTINFO_FILE_BYTES_LIMIT
+        pid = int(path.parent.name)
+        reads.append(pid)
+        return holder if pid == holder_pid else shared
+
+    monkeypatch.setattr(wrkslots, "_read_bounded_regular_file", bounded_read)
+    monkeypatch.setattr(wrkslots, "_process_start_ticks", lambda _path: 17)
+    monkeypatch.setattr(wrkslots, "_process_observation_is_active", lambda _process: True)
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=120,
+        stdout_limit=1,
+        stderr_limit=1,
+        input_limit=wrkslots._MOUNTINFO_CENSUS_BYTES_LIMIT,
+    )
+
+    matches = wrkslots._absent_validate_mount_matches(processes, {target: "gone"}, budget)
+
+    assert sorted(reads) == [process.pid for process in processes]
+    assert matches == ((holder_pid, "gone", "mount", f"{target}/root"),)
+    assert budget.input_remaining == wrkslots._MOUNTINFO_CENSUS_BYTES_LIMIT
+
+
+def test_mountinfo_census_bound_is_per_census_and_independent_of_read_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The verdict depends on the set of distinct tables in ONE census only.
+
+    Mountinfo bytes used to be charged to the operation's command-input budget,
+    which every row of a batch and every census attempt shared, so the same
+    table set could pass for an early row and refuse for a later one.
+    """
+
+    monkeypatch.setattr(wrkslots, "_MOUNTINFO_CENSUS_BYTES_LIMIT", 100)
+    tables = {1: b"a" * 60, 2: b"b" * 60, 3: b"a" * 60}
+    monkeypatch.setattr(
+        wrkslots,
+        "_read_bounded_regular_file",
+        lambda path, _label, _limit: tables[int(path.parent.name)],
+    )
+    monkeypatch.setattr(
+        wrkslots, "_parse_mountinfo_paths", lambda _text, _label, _cache=None: ()
+    )
+    monkeypatch.setattr(wrkslots, "_process_start_ticks", lambda _path: 17)
+    monkeypatch.setattr(wrkslots, "_process_observation_is_active", lambda _process: True)
+    target = {Path("/absent/validate/gone"): "gone"}
+
+    def observation(pid: int) -> wrkslots._AbsentProcessObservation:
+        return wrkslots._AbsentProcessObservation(pid, 17, "/other", f"pid:{pid}")
+
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=30, stdout_limit=1, stderr_limit=1, input_limit=7
+    )
+    # Two censuses under one operation budget: each starts a fresh account.
+    for _attempt in range(3):
+        assert wrkslots._absent_validate_mount_matches((observation(1),), target, budget) == ()
+        assert wrkslots._absent_validate_mount_matches((observation(2),), target, budget) == ()
+    # Repeated identical content within one census is charged once.
+    assert (
+        wrkslots._absent_validate_mount_matches(
+            (observation(1), observation(3), observation(1)), target, budget
+        )
+        == ()
+    )
+    # Distinct content over the bound still refuses, whichever comes first,
+    # and the refusal names the file that crossed the bound.
+    for first, second in ((1, 2), (2, 1)):
+        with pytest.raises(wrkslots.Refusal) as refused:
+            wrkslots._absent_validate_mount_matches(
+                (observation(first), observation(second)), target, budget
+            )
+        assert str(refused.value) == (
+            "mountinfo census exceeded its 100-byte bound on distinct mount-table "
+            f"content: /proc/{second}/mountinfo adds 60 new bytes to the 60 bytes "
+            "already charged for 1 distinct table(s) over 1 earlier read(s) of 60 "
+            "bytes in this census; identical tables are charged once"
+        )
+    assert budget.input_remaining == 7
+
+
+@pytest.mark.parametrize("overflowing_process_active", (True, False))
+def test_mountinfo_census_overflow_is_not_discarded_by_representative_fallback(
+    monkeypatch: pytest.MonkeyPatch, overflowing_process_active: bool
+) -> None:
+    """An unparsed table must refuse the census, not yield to a sibling's table.
+
+    Processes 2 and 3 share mount namespace N2.  Process 2's table references
+    the selected path; process 3's is identical to process 1's, already charged.
+    When process 2's table crosses the bound it is never parsed, and falling
+    back to process 3 -- whose content costs nothing to charge again -- would
+    report no use.  The refusal must survive, whether or not process 2 is
+    still running when its read is refused.
+    """
+
+    target = Path("/absent/validate/gone")
+    clear = b"40 35 8:1 /export/a /mnt/a rw,relatime - ext4 /dev/sda1 rw\n"
+    holder = (
+        f"41 35 8:1 /export/gone {target}/root rw,relatime - ext4 /dev/sda1 rw\n"
+    ).encode()
+    tables = {1: clear, 2: holder, 3: clear}
+    processes = (
+        wrkslots._AbsentProcessObservation(1, 17, "/other", "mnt:[N1]"),
+        wrkslots._AbsentProcessObservation(2, 17, "/other", "mnt:[N2]"),
+        wrkslots._AbsentProcessObservation(3, 17, "/other", "mnt:[N2]"),
+    )
+    reads: list[int] = []
+
+    def bounded_read(path: Path, _label: str, _limit: int) -> bytes:
+        pid = int(path.parent.name)
+        reads.append(pid)
+        return tables[pid]
+
+    monkeypatch.setattr(wrkslots, "_read_bounded_regular_file", bounded_read)
+    monkeypatch.setattr(wrkslots, "_process_start_ticks", lambda _path: 17)
+    monkeypatch.setattr(
+        wrkslots,
+        "_process_observation_is_active",
+        lambda process: process.pid != 2 or overflowing_process_active,
+    )
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=30, stdout_limit=1, stderr_limit=1, input_limit=1
+    )
+
+    # Control: with room for both distinct tables, process 2 is selected for
+    # N2 and its table reports the use, so the table the bound refuses below
+    # is evidence that matters.
+    monkeypatch.setattr(
+        wrkslots, "_MOUNTINFO_CENSUS_BYTES_LIMIT", len(clear) + len(holder)
+    )
+    assert wrkslots._absent_validate_mount_matches(
+        processes, {target: "gone"}, budget
+    ) == ((2, "gone", "mount", f"{target}/root"),)
+    assert reads == [1, 2]
+
+    reads.clear()
+    monkeypatch.setattr(
+        wrkslots, "_MOUNTINFO_CENSUS_BYTES_LIMIT", len(clear) + len(holder) - 1
+    )
+    with pytest.raises(wrkslots._MountinfoCensusExceeded) as refused:
+        wrkslots._absent_validate_mount_matches(processes, {target: "gone"}, budget)
+    assert str(refused.value).startswith(
+        f"mountinfo census exceeded its {len(clear) + len(holder) - 1}-byte bound "
+        f"on distinct mount-table content: /proc/2/mountinfo adds {len(holder)} "
+        "new bytes"
+    )
+    # The census stops at the refused table: process 3 is never read, so its
+    # previously charged content cannot stand in for process 2's.
+    assert reads == [1, 2]
 
 
 @pytest.mark.parametrize(

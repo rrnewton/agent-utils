@@ -578,12 +578,20 @@ _USER_SYSTEMD_UNIT_LIMIT = 4096
 _FILE_HANDLE_BYTES_LIMIT = 128
 _AT_FDCWD = -100
 _AT_SYMLINK_FOLLOW = 0x400
-# This is an operation-wide limit, not a per-file limit.  Hosts where procfs
-# hides mount-namespace identities must conservatively read one mountinfo file
-# per process.  A 2026-09-22 production census had 3,736 readable files totaling
-# 177,236,979 bytes, so the former 128 MiB ceiling made every otherwise healthy
-# ownerless-validation cleanup fail closed.  Keep a finite ceiling with useful
-# headroom while retaining the independent 4 MiB per-file and 60 second bounds.
+# This is a per-census limit on DISTINCT mount-table content, not a per-file
+# limit and not a limit on bytes read.  Hosts where procfs hides
+# mount-namespace identities must conservatively read one mountinfo file per
+# process: a 2026-09-22 production census had 3,736 readable files totaling
+# 177,236,979 bytes, and a 2026-10-03 host could read the namespace link of
+# only about 450 of about 4,300 processes.  Those processes list a handful of
+# distinct tables, so each census charges a table's bytes once, the first time
+# its content is seen.  Every table the census read before is still read and
+# parsed, so the census is exactly as conservative as before; what changed is
+# that thousands of copies of one table no longer exhaust the bound, and one
+# census can no longer be refused because an earlier census, or an earlier row
+# of a batch, read many copies.  Bytes read remain bounded by the 4 MiB
+# per-file bound and the census deadline, and bytes kept by this
+# distinct-content bound.
 _MOUNTINFO_CENSUS_BYTES_LIMIT = 256 * 1024 * 1024
 _ABSENT_PROCESS_CENSUS_SECONDS = 60.0
 _TRUSTED_EXECUTABLE_DIRECTORY = Path("/usr/bin")
@@ -15691,6 +15699,34 @@ def _assert_slot_contents(config: Config, record: ActiveRecord) -> Path:
     )
 
 
+class _SlotDirectoryAbsent(Refusal):
+    """The registered slot path names nothing at all: lstat reports ENOENT.
+
+    This is the same refusal, with the same text, that every caller of
+    `_assert_slot_contents` has always received for a missing slot directory.
+    The subclass only lets audit tell an ABSENT directory, which
+    recover-absent-agent-rows and recover-absent-validate-rows exist to retire,
+    from an UNSAFE one.  A symlink, a non-directory, or any path lstat cannot
+    inspect (EACCES, ENOTDIR, ELOOP, ...) still raises a plain `Refusal`.
+    """
+
+    def __init__(self, slot_path: Path) -> None:
+        super().__init__(f"slot directory is missing or unsafe: {slot_path}")
+        self.slot_path = slot_path
+
+
+def _path_is_absent(path: Path) -> bool:
+    """Return True only when lstat proves nothing occupies ``path``."""
+
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def _assert_slot_contents_values(
     config: Config,
     slot: str,
@@ -15700,6 +15736,8 @@ def _assert_slot_contents_values(
 ) -> Path:
     slot_path = _slot_directory(config, slot, slot_type)
     if not slot_path.is_dir() or slot_path.is_symlink():
+        if _path_is_absent(slot_path):
+            raise _SlotDirectoryAbsent(slot_path)
         raise Refusal(f"slot directory is missing or unsafe: {slot_path}")
     if layout == "flat":
         if len(checkouts) != 1:
@@ -23666,6 +23704,35 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
     return 0
 
 
+def _absent_slot_recovery_reason(
+    record: ActiveRecord, slot_path: Path, record_sha256: str
+) -> str:
+    """Name the exact read-only plan that retires a row whose directory is absent."""
+
+    if record.slot_type == "agent":
+        plan = (
+            "wrkslots recover-absent-agent-rows --row "
+            f"{record.slot}={record.generation}={record_sha256}"
+        )
+    else:
+        row = {
+            "generation": record.generation,
+            "machine": record.machine,
+            "record_sha256": record_sha256,
+            "slot": record.slot,
+        }
+        plan = (
+            "wrkslots recover-absent-validate-rows --input FILE', where FILE holds "
+            f"'{json.dumps({'schema': 1, 'rows': [row]}, sort_keys=True)}"
+        )
+    return (
+        f"slot directory is absent: {slot_path}; nothing occupies the path, so this "
+        f"row is retired by recovery, not removal: on machine {record.machine}, run "
+        f"'{plan}' for the read-only plan, then repeat it with '--apply "
+        "--coordinator-authorized --coordinator-pid <coordinator-pid>'"
+    )
+
+
 def _audit_record(
     config: Config,
     record: ActiveRecord,
@@ -23759,11 +23826,22 @@ def _audit_record(
         elif owner_state != "dead":
             reasons.append(f"recorded owner is {owner_state}: {owner_detail}")
     slot_path = _slot_directory(config, record.slot, record.slot_type)
+    record_sha256 = _event_digest(_record_to_obj(record))
+    # ABSENT is not UNSAFE.  Only `_SlotDirectoryAbsent` -- lstat found nothing
+    # at the exact slot path, after `_assert_record_paths` refused any symlink
+    # on the way to it and proved every checkout is that path or a child of
+    # it -- selects the recovery classification.  Every other directory
+    # refusal still lands in `reasons` below and keeps the row BLOCKED.
+    slot_absent = False
     try:
         _assert_record_paths(config, record)
-        _assert_slot_contents(config, record)
+        try:
+            _assert_slot_contents(config, record)
+        except _SlotDirectoryAbsent:
+            slot_absent = True
+        # Recovery refuses an unread handoff exactly as removal does.
         _assert_handoff_read(config, record, slot_path, events=events)
-        for checkout in record.checkouts:
+        for checkout in () if slot_absent else record.checkouts:
             path = _stored_path(config, checkout.path, "checkout path")
             repository = _stored_repository_path(config, checkout.repository)[1]
             selected_vcs.verify_existing_worktree(repository, path)
@@ -23791,6 +23869,16 @@ def _audit_record(
                 raise Refusal(f"checkout {checkout.name} remote URL changed")
     except Refusal as exc:
         reasons.append(str(exc))
+    if slot_absent and release_honoured and owner_state != "dead":
+        # An honoured release lets REMOVE proceed past a live owner, but the
+        # recover-absent commands bind the exact recorded owner generation and
+        # refuse while it lives.  RECOVERABLE must never name a command that
+        # would refuse on this ground, so a live releasing owner keeps the
+        # absent row BLOCKED until that generation exits.
+        reasons.append(
+            f"recorded owner is {owner_state}: {owner_detail}; the recover-absent "
+            "commands require the recorded owner generation to be dead"
+        )
     if (
         release_honoured
         or (
@@ -23817,6 +23905,14 @@ def _audit_record(
             except Refusal as exc:
                 reasons.append(str(exc))
                 agent_running = True
+    if slot_absent:
+        # The cache census found no checkout to inspect for the same reason:
+        # every checkout path is the absent slot directory or lies inside it,
+        # so there are no cache bytes, and that refusal is not a second blocker.
+        cache_bytes = 0
+        cache_error = None
+        cache_status = "complete"
+        reasons.append(_absent_slot_recovery_reason(record, slot_path, record_sha256))
     if cache_error is not None:
         reasons.append(f"cache inspection failed: {cache_error}")
     elif cache_status == "partial":
@@ -23833,11 +23929,19 @@ def _audit_record(
             "agent": record.agent,
             "slot_type": record.slot_type,
             "generation": record.generation,
-            "record_sha256": _event_digest(_record_to_obj(record)),
+            "record_sha256": record_sha256,
+            # RECOVERABLE is DELETABLE's counterpart for absent storage: every
+            # proof audit makes for removal passed except the directory's
+            # existence, and the only reason is the recovery command.  The
+            # named command re-proves its own preconditions before acting.
             "verdict": (
                 "UNKNOWN"
                 if process_census_unknown
-                else ("DELETABLE" if not reasons else "BLOCKED")
+                else (
+                    ("RECOVERABLE" if len(reasons) == 1 else "BLOCKED")
+                    if slot_absent
+                    else ("DELETABLE" if not reasons else "BLOCKED")
+                )
             ),
             "reasons": reasons,
             "owner_state": owner_state,
@@ -24257,7 +24361,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
     attention = [
         row
         for row in sorted_rows
-        if row["verdict"] == "DELETABLE"
+        if row["verdict"] in ("DELETABLE", "RECOVERABLE")
         or row["owner_state"] == "unregistered"
         or any(
             str(reason).startswith("interrupted ")
@@ -24369,8 +24473,9 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                 print(
                     "ACTION: run 'wrkslots audit --format json' for exact evidence; "
                     "use 'wrkslots recover' for interrupted operations, import live "
-                    "unregistered slots, and run 'wrkslots remove' only for a slot "
-                    "reported DELETABLE"
+                    "unregistered slots, run 'wrkslots remove' only for a slot "
+                    "reported DELETABLE, and retire a slot reported RECOVERABLE "
+                    "with the recover-absent command its reason names"
                 )
             elif unknown_names:
                 print(
@@ -38088,22 +38193,101 @@ def _absent_validate_process_snapshot(
     return tuple(observations)
 
 
+class _MountinfoCensusExceeded(Refusal):
+    """The census's distinct-content byte bound refused a mount table.
+
+    This is a refusal of the WHOLE census, not of one process: the refused
+    table was never parsed, so no later read -- another representative of the
+    same namespace whose table was charged before included -- may stand in for
+    it.  Callers that fall back between representatives must re-raise it.
+    """
+
+
+class _MountinfoCensus(dict[str, tuple[tuple[Path, str], ...]]):
+    """One census's parsed mount tables plus its distinct-content byte account.
+
+    The mapping is the parse memo `_parse_mountinfo_paths` already used, keyed
+    on the table text.  The account charges `_MOUNTINFO_CENSUS_BYTES_LIMIT` once
+    per distinct table content, keyed on a SHA-256 digest of the bytes read, so
+    the bound limits what the census keeps rather than how many processes list
+    the same table.
+
+    ⚠️ CHARGING IS NOT READING.  Every process whose table the census read
+    before still has it read and parsed -- one per readable mount namespace and
+    one for EVERY process whose namespace link is unreadable -- and only the
+    byte charge is shared between identical tables.  A table whose content was
+    already charged still yields that process's references, from the memo.
+
+    The total charged is the sum of the sizes of the distinct tables observed,
+    so whether a census exceeds the bound does not depend on the order in
+    which processes are read, and one census starts with a fresh account
+    rather than inheriting what an earlier census or batch item consumed.
+
+    Exceeding the bound is final for the census: the refusal is a
+    `_MountinfoCensusExceeded`, and every later charge -- of content charged
+    before included -- repeats it, so no read after an unparsed table can be
+    taken as complete evidence.
+    """
+
+    def __init__(self, limit: int | None = None) -> None:
+        super().__init__()
+        self.limit = _MOUNTINFO_CENSUS_BYTES_LIMIT if limit is None else limit
+        self.charged_bytes = 0
+        self.reads = 0
+        self.read_bytes = 0
+        self._charged: set[bytes] = set()
+        self._exceeded: _MountinfoCensusExceeded | None = None
+
+    @property
+    def distinct_tables(self) -> int:
+        return len(self._charged)
+
+    def charge(self, pid: int, contents: bytes) -> None:
+        if self._exceeded is not None:
+            raise _MountinfoCensusExceeded(str(self._exceeded))
+        self.reads += 1
+        self.read_bytes += len(contents)
+        digest = hashlib.sha256(contents).digest()
+        if digest in self._charged:
+            return
+        if self.charged_bytes + len(contents) > self.limit:
+            self._exceeded = _MountinfoCensusExceeded(
+                f"mountinfo census exceeded its {self.limit}-byte bound on distinct "
+                f"mount-table content: /proc/{pid}/mountinfo adds {len(contents)} new "
+                f"bytes to the {self.charged_bytes} bytes already charged for "
+                f"{self.distinct_tables} distinct table(s) over {self.reads - 1} "
+                f"earlier read(s) of {self.read_bytes - len(contents)} bytes in this "
+                "census; identical tables are charged once"
+            )
+            raise self._exceeded
+        self._charged.add(digest)
+        self.charged_bytes += len(contents)
+
+
 def _mountinfo_path_references(
     pid: int,
     budget: _ReadOnlyCommandBudget,
     cache: dict[str, tuple[tuple[Path, str], ...]] | None = None,
 ) -> tuple[tuple[Path, str], ...]:
+    """Return one process's mount references, charged to ``cache``'s census.
+
+    ``budget`` supplies the operation deadline.  The byte bound belongs to the
+    census, so it is charged to ``cache`` when that is a `_MountinfoCensus`;
+    any other caller gets a census of its own for this one table.  Each file is
+    read against the fixed `_MOUNTINFO_FILE_BYTES_LIMIT`, so a per-file refusal
+    names that bound rather than whatever remained of a shared allowance.
+    """
+
+    census = cache if isinstance(cache, _MountinfoCensus) else _MountinfoCensus()
     path = Path("/proc") / str(pid) / "mountinfo"
     try:
         budget.remaining_seconds()
-        if budget.input_remaining <= 0:
-            raise Refusal("mountinfo census exhausted its operation-wide byte bound")
         contents = _read_bounded_regular_file(
             path,
             f"mount evidence for PID {pid}",
-            min(_MOUNTINFO_FILE_BYTES_LIMIT, budget.input_remaining),
+            _MOUNTINFO_FILE_BYTES_LIMIT,
         )
-        budget.reserve_input(len(contents))
+        census.charge(pid, contents)
         budget.remaining_seconds()
         text = contents.decode("utf-8", errors="surrogateescape")
     except (OSError, UnicodeError) as exc:
@@ -38140,7 +38324,9 @@ def _absent_validate_mount_matches(
     # 2026-09-17 -- and they mount the same handful of paths, so the references
     # repeat about 311 times each.
     match_cache: dict[Path, tuple[Path, str] | None] = {}
-    mountinfo_cache: dict[str, tuple[tuple[Path, str], ...]] = {}
+    # One census: a fresh distinct-content byte account for this observation
+    # of every mount table, never one inherited from an earlier census.
+    mountinfo_cache = _MountinfoCensus()
     for representatives in namespaces.values():
         selected: _AbsentProcessObservation | None = None
         references: tuple[tuple[Path, str], ...] = ()
@@ -38150,6 +38336,11 @@ def _absent_validate_mount_matches(
                 candidate_references = _mountinfo_path_references_with_retry(
                     process, selected_budget, mountinfo_cache
                 )
+            except _MountinfoCensusExceeded:
+                # The refused table was never parsed.  Falling back to another
+                # representative would let a table charged earlier stand in for
+                # it, so the bound refuses the whole census.
+                raise
             except Refusal as exc:
                 failures.append((process, exc))
                 continue
@@ -38191,6 +38382,10 @@ def _mountinfo_path_references_with_retry(
     for attempt in range(2):
         try:
             return _mountinfo_path_references(process.pid, budget, cache)
+        except _MountinfoCensusExceeded:
+            # The census bound is not a property of this process, so neither
+            # its exit nor a retry can turn the refusal into evidence.
+            raise
         except Refusal as exc:
             # A process that exits after the snapshot can retain its procfs
             # directory and start ticks until its parent reaps it.  Linux then
