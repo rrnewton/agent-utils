@@ -331,7 +331,10 @@ GEOMETRY_JS = """() => {
     const bare = size();
     pill.hidden = wasHidden;
     if (reserved) pane.setAttribute('data-freshness', '');
-    return {problems, area: measured, bare, tabs: shown(tabs)};
+    // `gchat-thread-selector`: the tabs left the list for the bar's thread picker.
+    const picker = document.getElementById('thread-select');
+    if (shown(tabs)) problems.push('the Main/Threads/All tabs are back over the list');
+    return {problems, area: measured, bare, picker: shown(picker)};
 }"""
 
 # `#36 thread-view-phone-overflow`. `problems` is empty when the page is no wider than the viewport
@@ -487,7 +490,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 check(not problems, f"{label}, {state}: {problems}")
                 check(str(found["area"]) == str(found["bare"]),
                       f"{label}, {state}: #scroll-area is {found['area']}, {found['bare']} without the pill")
-                check(bool(found["tabs"]), f"{label}, {state}: the view tabs were not on screen to measure")
+                check(bool(found["picker"]), f"{label}, {state}: the bar's thread picker was not on screen")
                 return str(found["area"])
 
             # 1. Sign in and read the channel in Main, Threads and All.

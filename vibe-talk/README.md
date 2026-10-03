@@ -105,8 +105,11 @@ bounded snapshot of the channel rows it has already shown, in `localStorage` und
   screen only, and merges it in without duplicating rows. Rows the server no longer returns are
   dropped. It does not refetch every saved channel or walk back through history. After that, the
   live stream and the regular poll keep the view current.
-- **Views are local.** The snapshot keeps one store per channel. Switching among Main, Threads,
-  All and a thread already read is redrawn from that store without a request.
+- **Views are local.** The snapshot keeps one store per channel. Switching among Main, All and a
+  thread already read is redrawn from that store without a request.
+- **Says when it is current.** After a read the pill says `Updated HH:MM`, or `Live · updated
+  HH:MM` while the live stream is attached, with `· refreshing…` while a read is in flight. A live
+  message moves the time forward.
 - **Honest when stale.** If the refresh cannot reach the server, the rows stay and the pill says
   `Offline · showing messages saved …`. A server error says `Refresh failed · …`.
 - **Bounded.** At most 120 messages and 120 thread cards per channel, 12 channels (the least
@@ -240,7 +243,7 @@ Two things are worth knowing before you begin, because they shape everything els
 | Semantic random access (`resolve`) | **works**, lexical ranking behind a `Ranker` trait |
 | Web app: text tab, digest, find-a-message, local speech | **works** |
 | Device speech for the message view's Read control | **prototype.** Uses browser-reported local voices without ElevenLabs credentials. Playback, cancellation, and failures have automated browser coverage; physical-phone audio and background playback remain device checks. |
-| Main, Threads, All, selected-thread history, and bottom composer | **works.** Native thread endpoints have loopback HTTP tests; a compatible Google Chat bridge has been exercised with real read-only traffic. Browser interaction and layout were checked at two phone sizes. Posting tests use local fakes. |
+| Main, All, a selected thread from the bar's picker, and bottom composer | **works.** Native thread endpoints have loopback HTTP tests; a compatible Google Chat bridge has been exercised with real read-only traffic. Browser interaction and layout were checked at two phone sizes. Posting tests use local fakes. |
 | **MCP over Streamable HTTP at `/mcp`** | **works.** Bearer-authenticated, stateless, seven tools, tested end to end. Never yet driven by a real ElevenLabs agent. |
 | ElevenLabs voice agent | **reachable, and currently NOT invoking tools.** A real agent has now been driven headlessly (`scripts/run.sh --smoke-agent`): the signed URL mints, the conversation opens, the agent answers — and it calls no tool, saying its tools "appear to be out of date". In the same conversation ElevenLabs reports our MCP server connected with all five tools visible, so the fault is in the agent's own configuration rather than in this server. |
 | **Signed conversation URLs at `/api/v1/signed-url`** | **works against a fake, unverified against live ElevenLabs.** Mints a short-lived signed URL for an agent that has "Enable Authentication" turned on, and `/voice` is a dependency-free page that uses one. Tested end to end against an in-memory ElevenLabs that refuses a wrong key and an unknown agent, and against a loopback HTTP server that proves the account key travels in a header. |
@@ -2515,6 +2518,22 @@ that borrowed it would put archived rows back on screen when the search was clea
 Rules the page drew itself — the seam between two calls, the date rules — **go away with the rows
 they were explaining**. A seam says the agent below it never heard the words above it, and left
 standing over a filtered list it says that about two rows that are no longer adjacent.
+
+### Choosing a thread sits beside choosing the channel
+
+`gchat-thread-selector`. The second picker on the control bar, immediately right of the channel
+picker and always there on the channel view, chooses what part of that channel to read:
+
+- **Main** — messages posted to the channel itself, with each thread's first message;
+- **All** — every message, threads included, in one history;
+- then **each thread** by name (its first message's first line, or the provider's title), most
+  recently active first, with its reply count.
+
+The threads it lists come from what the page already holds, so opening it costs no request.
+Touching it also reads the channel's thread list in the background, at most once a minute, so the
+next look names every thread. On a channel whose provider has no thread timelines
+(`thread_api = "off"`), the picker stays, offers only Main, and is inert. The Main / Threads / All
+tabs that used to sit over the list are gone.
 
 ### Choosing the channel is a control, not a line of the scrollback
 

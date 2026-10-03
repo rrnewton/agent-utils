@@ -62,7 +62,7 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
 /**
  * @overload
  * @param {"bar-placement" | "discord-channel" | "relay-to-agent" | "settings-audio-source"
- *   | "settings-channel"} id
+ *   | "settings-channel" | "thread-select"} id
  * @returns {HTMLSelectElement}
  */
 /**
@@ -3407,6 +3407,8 @@ function placementChanged() {
 const PACK_VIEWS = {
   "audio-source": ["discord"],
   "discord-channel": ["discord"],
+  // `gchat-thread-selector`. Main, All, or one thread of the channel picked beside it.
+  "thread-select": ["discord"],
   "text-entry": ["voice"],
   // ONE LINE FOR ALL THE CANNED PROMPTS, which is the point of the tray: they used to be derived
   // into this table one entry each, and every prompt added took another slot off a strip already
@@ -5948,8 +5950,11 @@ function threadCount(count, exact) {
 
 function renderChannelNavigation() {
   const inChannel = currentView === "discord";
-  el("channel-navigation").hidden = !inChannel || (!channelHasThreads && channelView !== "thread");
-  el("channel-view-tabs").hidden = !channelHasThreads || channelView === "thread";
+  // `gchat-thread-selector`. Choosing Main, All, or a thread is the bar's thread picker now, so the
+  // tabs that used to sit over the list stay hidden; the heading still names an open thread.
+  el("channel-navigation").hidden = !inChannel || channelView !== "thread";
+  el("channel-view-tabs").hidden = true;
+  renderThreadSelect();
   el("thread-heading").hidden = channelView !== "thread";
   for (const view of ["main", "threads", "flat"]) {
     el(`channel-view-${view}`).setAttribute("aria-pressed", channelView === view ? "true" : "false");
@@ -6086,6 +6091,144 @@ function catchUpHeldView() {
   } else {
     timelineMessages = projected;
     renderCachedTimeline();
+  }
+}
+
+// --- thread selector ----------------------------------------------------------------------------
+//
+// `gchat-thread-selector`. The owner's specification: a thread dropdown immediately right of the
+// channel picker, at the bottom, always shown, with Main and All as extra options. The threads it
+// offers come from the channel's store — summaries read earlier and the thread roots among the
+// messages already loaded — so opening it costs no request. Touching it also asks for the
+// channel's thread list in the background, at most once a minute, so the next look is complete.
+
+/** How long a background read of one channel's thread list is reused by the selector. */
+const THREAD_DIRECTORY_REFRESH_MS = 60000;
+/** Most threads the selector lists, newest activity first; the list is for choosing, not paging. */
+const THREAD_SELECT_LIMIT = 40;
+/** Longest thread name shown in the selector, in characters; a select elides the rest anyway. */
+const THREAD_TITLE_CHARS = 60;
+
+const threadDirectoryReadAt = new Map();
+let threadDirectoryInFlight = null;
+
+/** A thread's name from its first message: the first line that says anything, shortened. */
+function threadNameFrom(text) {
+  const line = String(text || "").split("\n").map((part) => part.trim()).find((part) => part !== "") || "";
+  if (line === "") return "Thread";
+  return line.length > THREAD_TITLE_CHARS ? `${line.slice(0, THREAD_TITLE_CHARS - 1)}…` : line;
+}
+
+/** The threads this channel's store knows, newest activity first. */
+function threadChoices() {
+  if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return [];
+  const byId = new Map();
+  for (const summary of channelCanon.threads) {
+    const id = String(summary.id);
+    if (id === channelCanon.scope) continue;
+    byId.set(id, {
+      id,
+      title: summary.title || threadNameFrom(summary.root && summary.root.content),
+      count: summary.reply_count,
+      exact: summary.reply_count_exact,
+      at: timeOf(summary, "updated_at"),
+    });
+  }
+  for (const message of channelCanon.messages) {
+    const id = threadOf(message);
+    if (!id || id === channelCanon.scope) continue;
+    const at = timeOf(message, "timestamp");
+    const known = byId.get(id);
+    if (known) {
+      known.at = Math.max(known.at, at);
+    } else if (message.thread && message.thread.is_root) {
+      byId.set(id, {
+        id,
+        title: threadNameFrom(message.content),
+        count: message.thread.reply_count,
+        exact: message.thread.reply_count_exact,
+        at,
+      });
+    }
+  }
+  return [...byId.values()].sort((a, b) => b.at - a.at).slice(0, THREAD_SELECT_LIMIT);
+}
+
+/** Main, All, and each known thread, with the view on screen selected. */
+function renderThreadSelect() {
+  const select = el("thread-select");
+  const choices = threadChoices();
+  /** @type {Array<[string, string]>} */
+  const options = [["main", "Main"]];
+  if (threadingSupported) {
+    options.push(["flat", "All"]);
+    for (const choice of choices) {
+      const count = typeof choice.count === "number" ? ` · ${threadCount(choice.count, choice.exact)}` : "";
+      options.push([`thread:${choice.id}`, `${choice.title}${count}`]);
+    }
+    if (channelView === "thread" && selectedThreadId &&
+        !choices.some((choice) => choice.id === String(selectedThreadId))) {
+      options.push([`thread:${selectedThreadId}`, (selectedThread && selectedThread.title) || "Thread"]);
+    }
+  }
+  const current = channelView === "thread" && selectedThreadId
+    ? `thread:${selectedThreadId}`
+    : channelView === "flat" ? "flat" : "main";
+  // Rebuilt only when what it offers changed, so a redraw while it is open does not close it.
+  const signature = JSON.stringify(options);
+  if (select.getAttribute("data-options") !== signature) {
+    select.replaceChildren(...options.map(([value, label]) => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      return option;
+    }));
+    select.setAttribute("data-options", signature);
+  }
+  select.value = current;
+  // A provider without threads has nothing to choose; the picker stays, saying so by being inert.
+  select.disabled = !threadingSupported;
+  select.title = threadingSupported
+    ? "Which part of the channel to read: Main, All, or one thread."
+    : "This channel's chat service does not offer threads here, so Main is the whole channel.";
+}
+
+/** The reader picked Main, All, or a thread. */
+function onThreadSelect() {
+  const value = String(el("thread-select").value);
+  if (value === "main" || value === "flat") {
+    if (channelView === value) return undefined;
+    return changeChannelView(value);
+  }
+  if (!value.startsWith("thread:")) return undefined;
+  const id = value.slice("thread:".length);
+  if (channelView === "thread" && String(selectedThreadId) === id) return undefined;
+  const known = channelCanon.threads.find((summary) => String(summary.id) === id);
+  const choice = threadChoices().find((candidate) => candidate.id === id);
+  return openThread(id, known || (choice ? { id, title: choice.title } : null));
+}
+
+/** Read the channel's thread list in the background, so the selector names every thread. */
+async function refreshThreadDirectory() {
+  const channel = String(el("discord-channel").value);
+  if (!threadingSupported || !channel || channelCanon.scope) return;
+  if (threadDirectoryInFlight === channel) return;
+  if (Date.now() - (threadDirectoryReadAt.get(channel) || 0) < THREAD_DIRECTORY_REFRESH_MS) return;
+  threadDirectoryInFlight = channel;
+  threadDirectoryReadAt.set(channel, Date.now());
+  try {
+    const payload = await apiDecoded(
+      "TimelineResponse",
+      `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=threads&limit=${DISCORD_PAGE_LIMIT}`
+    );
+    if (String(el("discord-channel").value) !== channel) return;
+    foldTimelinePage(payload, false, "threads", null);
+    renderThreadSelect();
+  } catch (_error) {
+    // The selector keeps offering what the store already knew; the next touch may ask again.
+    threadDirectoryReadAt.delete(channel);
+  } finally {
+    if (threadDirectoryInFlight === channel) threadDirectoryInFlight = null;
   }
 }
 
@@ -12707,6 +12850,13 @@ for (const view of ["main", "threads", "flat"]) {
   el(`channel-view-${view}`).addEventListener("click", guardQuietly(() => changeChannelView(view)));
 }
 el("thread-back").addEventListener("click", guardQuietly(closeThread));
+el("thread-select").addEventListener("change", guardQuietly(onThreadSelect));
+// Touching the picker is the cue that the reader wants the full list of threads.
+for (const type of ["focus", "pointerdown"]) {
+  el("thread-select").addEventListener(type, () => {
+    guardQuietly(refreshThreadDirectory)();
+  });
+}
 el("channel-compose-text").addEventListener("input", rememberChannelDraft);
 el("channel-send").addEventListener("click", guardQuietly(sendChannelMessage));
 el("channel-compose-text").addEventListener("keydown", (event) => {

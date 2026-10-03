@@ -2384,6 +2384,16 @@ const TUNING_BANDS = {
     "same author are silently welded together and the second one can be archived by a tap aimed " +
     "at the first, and below about half a second the split halves of one long post — which is the " +
     "case this exists for — arrive too far apart to be caught"],
+  THREAD_DIRECTORY_REFRESH_MS: [10000, 600000,
+    "how long one background read of a channel's thread list is reused by the bar's picker. Under " +
+    "ten seconds every touch of the picker is another history scan; past ten minutes a thread " +
+    "started this morning is missing from the list all afternoon"],
+  THREAD_SELECT_LIMIT: [10, 100,
+    "most threads the picker lists. Fewer than ten and an active space hides the thread being " +
+    "discussed; past a hundred a phone's native picker becomes a scroll nobody finishes"],
+  THREAD_TITLE_CHARS: [20, 120,
+    "longest thread name in the picker. Under twenty a name says nothing; past a line or so it " +
+    "is elided by the select anyway and only costs memory"],
   STREAM_MAX_LEAD_SECONDS: [2, 8,
     "the most audio a streamed read may bank after repeated stalls. Under two seconds a drive " +
     "through patchy coverage is heard as one pause after another; past several seconds a tap on a " +
@@ -17501,6 +17511,9 @@ test("linked conversation sources stay in the channel picker when thread timelin
     "an unrelated child thread displaced the registered source choices"
   );
   assert.equal(page.el("channel-view-tabs").hidden, true, "disabled child timelines became a menu");
+  // The picker stays on the bar, inert, offering only Main: there is nothing else to choose.
+  assert.deepStrictEqual(threadOptions(page), [["main", "Main"]]);
+  assert.equal(page.el("thread-select").disabled, true, "a channel without threads offered thread choices");
   assert.equal(page.el("thread-list").hidden, true, "an unrelated child thread became visible");
   assert.deepStrictEqual(page.timelineCalls, [], "the disabled timeline API was queried");
   assert.match(reads.at(-1), new RegExp(first.id), "the first source was not read as an app channel");
@@ -17551,9 +17564,20 @@ test("each channel uses its own provider's capabilities in a multi-provider depl
   assert.match(page.el("live-state").textContent, /every 15 seconds/);
 });
 
-test("thread views show roots in Main and expose the selector only when threads exist", async () => {
+// `gchat-thread-selector`. What the bar's thread picker offers, as [value, label] pairs.
+const threadOptions = (page) =>
+  page.el("thread-select").children.map((option) => [option.value, option.textContent]);
+
+test("thread views show roots in Main and the bar's selector offers Main, All, and each thread", async () => {
   const page = await threadPage();
-  assert.equal(page.el("channel-view-tabs").hidden, false);
+  assert.equal(page.el("channel-view-tabs").hidden, true, "the tabs over the list came back");
+  const offered = threadOptions(page);
+  assert.deepStrictEqual(offered.slice(0, 2), [["main", "Main"], ["flat", "All"]]);
+  assert.deepStrictEqual(offered.slice(2).map(([value]) => value).sort(),
+    ["thread:spaces/A/threads/another", "thread:spaces/A/threads/one & two"]);
+  assert.ok(offered.some(([, label]) => label === "first thread root · 1 reply"),
+    `a thread was not named by its root: ${JSON.stringify(offered)}`);
+  assert.equal(page.el("thread-select").value, "main");
   assert.deepEqual(page.el("discord-log").children.map((row) => row.getAttribute("data-id")), ["200", "201", "203"]);
   assert.equal(threadButton(page.el("discord-log").children[1]).textContent, "1 reply");
   const rootRow = page.el("discord-log").children[1];
@@ -17567,6 +17591,46 @@ test("thread views show roots in Main and expose the selector only when threads 
   await signIn(empty);
   await showDiscord(empty, [message({ content: "no threads yet" })]);
   assert.equal(empty.el("channel-view-tabs").hidden, true);
+  // Always there, even with no threads yet: Main and All are still choices.
+  assert.deepStrictEqual(threadOptions(empty), [["main", "Main"], ["flat", "All"]]);
+});
+
+test("the bar's thread picker opens a thread, All, and Main, and touching it reads the thread list once", async () => {
+  const page = await threadPage();
+  const picker = page.el("thread-select");
+  const pick = async (value) => {
+    picker.value = value;
+    await picker.dispatch("change");
+    await page.settle();
+  };
+
+  await pick("thread:spaces/A/threads/one & two");
+  assert.deepStrictEqual(shownIds(page), ["201", "202"], "picking a thread did not open it");
+  assert.equal(picker.value, "thread:spaces/A/threads/one & two");
+  assert.equal(page.el("channel-navigation").hidden, false, "an open thread lost its heading");
+
+  await pick("flat");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"], "All did not show every message");
+  assert.equal(picker.value, "flat");
+
+  await pick("main");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "Main did not come back");
+  assert.equal(page.el("channel-navigation").hidden, true);
+
+  // Touching the picker asks for the channel's thread list in the background, and only once a
+  // minute: the view on screen does not change.
+  const threadReads = () => page.timelineCalls.filter((call) => /view=threads/.test(call)).length;
+  const before = threadReads();
+  await picker.dispatch("pointerdown");
+  await page.settle();
+  assert.equal(threadReads(), before + 1, "touching the picker did not read the thread list");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "the background read changed the view");
+  await picker.dispatch("focus");
+  await page.settle();
+  assert.equal(threadReads(), before + 1, "a second touch read the thread list again at once");
+  // The summaries' own names win once they are known.
+  assert.ok(threadOptions(page).some(([, label]) => label === "First discussion · 1 reply"),
+    `the read thread list did not name the threads: ${JSON.stringify(threadOptions(page))}`);
 });
 
 test("Hide read reprojects a cached threaded timeline without fetching", async () => {
@@ -20145,6 +20209,8 @@ test("a channel registered as one conversation draws every message it is served 
     "Main dropped the replies the server served");
   assert.equal(page.el("channel-view-tabs").hidden, true, "a single conversation offered view tabs");
   assert.equal(page.el("channel-navigation").hidden, true, "a single conversation offered navigation");
+  assert.deepStrictEqual(threadOptions(page), [["main", "Main"], ["flat", "All"]],
+    "the conversation offered itself as its own thread");
   assert.equal(threadButton(page.el("discord-log").children[0]), undefined,
     "the conversation offered itself as its own thread");
   assert.equal(savedScopes(page)[scopeKey(CHANNEL.id)].scope, data.scope.id, "the scope was not saved");
@@ -20231,7 +20297,7 @@ test("a channel with child threads keeps a root-only Main, even after visiting a
   const page = await threadPage();
   const data = threadData();
   assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "Main is not the served root-only page");
-  assert.equal(page.el("channel-view-tabs").hidden, false, "a threaded channel lost its tabs");
+  assert.equal(threadOptions(page).length, 4, "a threaded channel's picker lost its threads");
   assert.ok(threadButton(page.el("discord-log").children[1]), "a thread root lost its replies button");
 
   // A thread page names its thread too: that must not make the channel look scoped to it.

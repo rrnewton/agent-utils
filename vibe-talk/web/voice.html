@@ -1392,6 +1392,15 @@
                     title="Which channel this view is reading. Changing it starts that channel at its newest message."></select>
 
             <!--
+              `gchat-thread-selector`. What part of the channel to read, beside the channel it
+              belongs to and always there: Main (messages posted to the channel itself), All
+              (every message, threads included), then each thread by name, most recently active
+              first. A `select` for the same reason the channel picker is one.
+            -->
+            <select id="thread-select" class="bar-select" aria-label="thread"
+                    title="Which part of the channel to read: Main, All, or one thread."></select>
+
+            <!--
               `#59 text-entry-button`. Typing costs ONE small button's worth of the bar, not a
               permanent field: pressing it converts the bar into a text field, and pressing it
               again converts it back. The toggle is the whole interaction model — one control both
