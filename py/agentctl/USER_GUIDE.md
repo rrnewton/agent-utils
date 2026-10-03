@@ -487,6 +487,13 @@ The interactive queue has four durable directories:
 | `failed/` | Quarantined input, with an error record distinguishing invalid input from `possibly_submitted` | Inspect the error and conversation; never automatically replay uncertain work |
 | `processed/` | The target's working transition confirmed submission | Await the agent's result; this is not proof of task completion |
 
+`drain` types the prompts in `inbox/` one at a time, oldest first: by the
+`queued_at` time recorded when each was queued, then by file name for equal
+times. An entry whose `queued_at` is missing or is not a finite number goes
+before every timed entry, by file name. `drain` stops at the first prompt that
+has to wait, for example because the pane is busy, and leaves that prompt and
+every later one in `inbox/`, so a waiting prompt keeps its place.
+
 `send` reports `outcome: pending` with exit 75 for safely queued work and
 `outcome: possibly_submitted` with exit 76 for uncertain delivery, including the
 request ID and artifact path. Preserve that ID and use `drain` for pending

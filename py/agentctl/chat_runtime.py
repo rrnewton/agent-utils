@@ -849,7 +849,11 @@ class _Runtime:
             # harness lane: a slow prompt must never hold up durable intake/ACK.
             def deliver() -> object:
                 queue_root = self.bridge.state / "queue"
-                for identifier, prompt in batch.items():
+                # `drain` types prompts in the order they were queued. A request's
+                # queue ID begins with its message's creation time, so queuing the
+                # batch in ID order types its requests in the order their messages
+                # were created, then its `feedback-` notices.
+                for identifier, prompt in sorted(batch.items()):
                     enqueue(str(queue_root), prompt, message_id=identifier,
                             max_artifact_bytes=_MAX_QUEUE_ARTIFACT_BYTES,
                             atomic_policy=_chat_atomic_policy(self.bridge.state))

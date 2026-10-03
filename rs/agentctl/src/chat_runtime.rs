@@ -5111,14 +5111,20 @@ and the replies captured for them. The provider's own thread is the complete rec
             .collect())
     }
 
-    /// Return the deterministic union of delivery, acknowledgement, and reply work in one scan.
+    /// Return the deterministic union of delivery, acknowledgement, and reply work in one scan,
+    /// oldest admission first, then by key. A recovery pass works in this order: it queues each
+    /// pending prompt and acknowledges its request, then sends replies, and it leaves the newest
+    /// for a later pass when it reaches its key limit. A service that acknowledges on a queue of
+    /// its own hands that queue every key at the start of the pass, in this order, beyond the
+    /// limit too. Keys are hashes, so key order would queue a newer request's prompt ahead of an
+    /// older one's.
     pub fn pending_work_keys(&self) -> Result<Vec<String>> {
         self.pending_work_keys_with_hook(|| {})
     }
 
     fn pending_work_keys_with_hook(&self, after_listing: impl FnOnce()) -> Result<Vec<String>> {
         let _snapshot = self.lock_state_snapshot()?;
-        Ok(self
+        let mut pending: Vec<(u64, String)> = self
             .request_records_with_hook(after_listing)?
             .into_iter()
             .filter_map(|(record, _)| {
@@ -5127,9 +5133,11 @@ and the replies captured for them. The provider's own thread is the complete rec
                     RequestPhase::Pending | RequestPhase::Submitting
                 ) || matches!(record.ack_phase, AckPhase::Pending | AckPhase::Sending)
                     || record.next_send_ordinal < record.next_reply_ordinal)
-                    .then_some(record.key)
+                    .then_some((record.admitted_at_millis, record.key))
             })
-            .collect())
+            .collect();
+        pending.sort();
+        Ok(pending.into_iter().map(|(_, key)| key).collect())
     }
 
     /// Capture complete blocks for every request through one bounded pane-snapshot parse, as if
@@ -8301,7 +8309,8 @@ enum PromptReach {
     /// seen it.
     Sent,
     /// Still waiting in the queue's inbox, so the coordinator has not seen it yet. The queue
-    /// delivers in file-name order, which usually puts it before a routing notice queued later.
+    /// types prompts in the order they were queued, so it comes before a routing notice queued
+    /// later, unless the wall clock stepped back between the two.
     Queued,
     /// In the queue, in a state that could not be read.
     Unknown,
@@ -12138,6 +12147,39 @@ mod tests {
             .new_request_keys
             .is_empty());
         assert_eq!(filtered.pending_work_keys().unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_work_lists_requests_oldest_admission_first_not_by_key() {
+        // Keys are hashes, so key order is not the order of arrival. Here the request with the
+        // largest key is admitted first and the next largest one millisecond later; the two
+        // smallest are admitted together a millisecond after that, so key order decides between
+        // them.
+        let root = temporary("pending-work-admission-order");
+        let state = BridgeState::initialize(&root, config()).unwrap();
+        let mut keys = state
+            .admit_batch(&text_prefix_batch(&["one", "two", "three", "four"]))
+            .unwrap()
+            .new_request_keys;
+        assert_eq!(keys.len(), 4);
+        keys.sort();
+        let base = keys
+            .iter()
+            .map(|key| state.read_request(key).unwrap().admitted_at_millis)
+            .min()
+            .unwrap()
+            - 10;
+        for (key, admitted_at_millis) in keys.iter().zip([base + 2, base + 2, base + 1, base]) {
+            let path = state.request_path(key);
+            let mut record: RequestRecord = read_document(&path, MAX_REQUEST_RECORD_BYTES).unwrap();
+            record.admitted_at_millis = admitted_at_millis;
+            write_document(&path, &record).unwrap();
+        }
+        assert_eq!(
+            state.pending_work_keys().unwrap(),
+            [3, 2, 0, 1].map(|index| keys[index].clone())
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -3837,7 +3837,10 @@ class Bridge:
         queue = self.state / "queue"
         paths = sorted((self.state / "requests").glob("*.json"),
                        key=lambda path: get_str(_read(path), "received_at", "request"))
-        for path in paths:
+        # `drain` types prompts in the order they were queued, and a queue ID begins
+        # with its message's creation time: queue in queue-ID order, so that this
+        # pass's requests reach the agent in the order their messages were created.
+        for path in sorted(paths, key=lambda path: get_str(_read(path), "queue_id", "request")):
             record = _read(path)
             queue_id = get_str(record, "queue_id", "request")
             if record["phase"] == "received":

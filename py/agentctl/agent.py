@@ -1518,6 +1518,36 @@ def _load(path: str, *, max_artifact_bytes: int | None = None) -> dict[str, obje
     return {str(key): value for key, value in raw.items()}
 
 
+def _queue_order(path: str, max_artifact_bytes: int | None) -> tuple[bool, float, str]:
+    """Sort key that makes ``drain`` take the inbox in the order its prompts were queued.
+
+    Entries go by ``queued_at``, then by file name. A chat request's file is named
+    for its key, a hash, so name order alone is not the order of arrival. An entry
+    without a finite numeric ``queued_at`` goes first, by name: one in the subagent
+    message shape that ``agentctl.foreign`` writes, which numbers its file names in
+    sequence and records ``queued_at`` as text, if at all, or one that cannot be
+    read, which the drain loop then quarantines, or refuses when it exceeds
+    ``max_artifact_bytes``, as before.
+    """
+    try:
+        document = _read_queue_json(
+            path, "queued message", require_private=False,
+            max_artifact_bytes=max_artifact_bytes,
+        )
+    except AgentDeliveryError:
+        return (False, 0.0, path)
+    queued_at = document.get("queued_at") if isinstance(document, dict) else None
+    if isinstance(queued_at, bool) or not isinstance(queued_at, (int, float)):
+        return (False, 0.0, path)
+    try:
+        seconds = float(queued_at)
+    except OverflowError:
+        return (False, 0.0, path)
+    if not math.isfinite(seconds):
+        return (False, 0.0, path)
+    return (True, seconds, path)
+
+
 def _delivery_attempts(document: dict[str, object], path: str) -> int:
     """Read the current or legacy attempt count as one strict unsigned 64-bit integer."""
 
@@ -1650,7 +1680,10 @@ def _drain(
             with atomic_write_recovery(policy):
                 pass
         quarantined.extend(_recover_inflight(inflight, failed, max_artifact_bytes=max_artifact_bytes))
-        for path in sorted(os.path.join(inbox, name) for name in os.listdir(inbox) if name.endswith(".json")):
+        for path in sorted(
+            (os.path.join(inbox, name) for name in os.listdir(inbox) if name.endswith(".json")),
+            key=lambda path: _queue_order(path, max_artifact_bytes),
+        ):
             _check_artifact_size(path, max_artifact_bytes)
             try:
                 document = _load(path, max_artifact_bytes=max_artifact_bytes)

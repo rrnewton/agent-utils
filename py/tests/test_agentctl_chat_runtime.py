@@ -1751,6 +1751,26 @@ def test_real_output_event_uses_prompt_index_without_queue_directory_scan(
         "Cached answer"]
 
 
+def test_a_delivery_batch_reaches_the_agent_in_message_creation_order(rig: Rig) -> None:
+    # `drain` types prompts in the order they were queued. While the first delivery
+    # waits on the pane lookup, "later" and then "earlier" arrive and wait together for
+    # the next one. "earlier"'s message was created first, so it must be queued, and
+    # typed, first.
+    lookup = rig.harness.lookup = Gate()
+    rig.accept()
+    assert lookup.entered.wait(5)
+    rig.accept("later", "cursor-later", created_at="2026-01-02T00:00:01Z")
+    rig.accept("earlier", "cursor-earlier")
+    assert list(rig.runtime.delivery_prompts) == [
+        get_str(rig.record(name), "queue_id", "request") for name in ("later", "earlier")]
+    lookup.release.set()
+    rig.until(lambda: all(rig.phase(name) == "awaiting_reply" for name in ("one", "later", "earlier")))
+    assert len(rig.harness.prompts) == 3
+    assert "messages/one" in rig.harness.prompts[0]
+    assert "messages/earlier" in rig.harness.prompts[1]
+    assert "messages/later" in rig.harness.prompts[2]
+
+
 def test_prompt_created_during_drain_cooldown_is_retained_until_worker_accepts_it(
     rig: Rig,
 ) -> None:

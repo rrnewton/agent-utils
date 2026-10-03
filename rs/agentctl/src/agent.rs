@@ -737,7 +737,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
     let mut target_lock: Option<File> = None;
     let mut locked_pane_id: Option<String> = None;
     let mut initial_info: Option<AgentPaneInfo> = None;
-    for path in json_paths(&directories.inbox)? {
+    for path in inbox_in_queue_order(&directories.inbox)? {
         let (mut document, attempts) = match load_message(&path).and_then(|document| {
             let attempts = delivery_attempts(&document, &path)?;
             Ok((document, attempts))
@@ -2247,6 +2247,34 @@ fn json_paths(directory: &Path) -> AgentResult<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// The inbox's prompts in the order they were queued: by `queued_at`, then by file name.
+///
+/// A chat request's file is named for its key, a hash, so name order alone is not the order of
+/// arrival. An entry without a numeric `queued_at` comes first, by name: one in the subagent
+/// message shape, which numbers its file names in sequence and records `queued_at` as text, if
+/// at all, or one that cannot be read, which the drain loop then quarantines.
+fn inbox_in_queue_order(inbox: &Path) -> AgentResult<Vec<PathBuf>> {
+    let mut entries: Vec<(Option<f64>, PathBuf)> = json_paths(inbox)?
+        .into_iter()
+        .map(|path| {
+            let queued_at = read_json(&path)
+                .ok()
+                .and_then(|document| document.get("queued_at").and_then(Value::as_f64))
+                // `total_cmp` puts -0.0 before 0.0; make them one time, as Python does.
+                .map(|seconds| if seconds == 0.0 { 0.0 } else { seconds });
+            (queued_at, path)
+        })
+        .collect();
+    entries.sort_by(|(left_at, left), (right_at, right)| {
+        match (left_at, right_at) {
+            (Some(left_time), Some(right_time)) => left_time.total_cmp(right_time),
+            _ => left_at.is_some().cmp(&right_at.is_some()),
+        }
+        .then_with(|| left.cmp(right))
+    });
+    Ok(entries.into_iter().map(|(_, path)| path).collect())
+}
+
 fn identifiers(directory: &Path) -> AgentResult<Vec<String>> {
     json_paths(directory)?
         .iter()
@@ -3389,6 +3417,128 @@ mod tests {
             .path()
             .join("processed/000000000007.json")
             .is_file());
+    }
+
+    /// Writes one inbox entry as `enqueue` would, with the given `queued_at`.
+    fn queue_at(directory: &TestDirectory, name: &str, queued_at: &str, text: &str) {
+        fs::write(
+            directory.path().join(format!("inbox/{name}.json")),
+            format!(
+                r#"{{"id":"{name}","text":"{text}","queued_at":{queued_at},"delivery_attempts":0}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn drain_types_the_inbox_in_queue_order_not_file_name_order() {
+        // A chat request's file is named for its key, a hash, so names sort in no useful order.
+        // Here they sort opposite to the queue times, and two entries share a time.
+        let directory = TestDirectory::new("queue-order");
+        prepare(directory.path()).unwrap();
+        queue_at(&directory, "chat-d", "100.5", "first");
+        queue_at(&directory, "chat-c", "200", "second");
+        queue_at(&directory, "chat-a", "300", "third");
+        queue_at(&directory, "chat-b", "300.0", "fourth");
+        let fake = FakeAgent::new(&["idle"]);
+        let result = drain(&fake, &target(), directory.path(), DrainOptions::default()).unwrap();
+        assert_eq!(fake.runs(), ["first", "second", "third", "fourth"]);
+        assert_eq!(result.delivered, ["chat-d", "chat-c", "chat-a", "chat-b"]);
+        assert!(result.pending.is_empty());
+    }
+
+    #[test]
+    fn negative_zero_and_zero_are_one_queue_time() {
+        // Python compares -0.0 and 0.0 as equal, so both editions order the two by name.
+        let directory = TestDirectory::new("queue-order-zero");
+        prepare(directory.path()).unwrap();
+        queue_at(&directory, "chat-a", "0.0", "first");
+        queue_at(&directory, "chat-b", "-0.0", "second");
+        let fake = FakeAgent::new(&["idle"]);
+        drain(&fake, &target(), directory.path(), DrainOptions::default()).unwrap();
+        assert_eq!(fake.runs(), ["first", "second"]);
+    }
+
+    #[test]
+    fn a_held_oldest_prompt_holds_newer_prompts_whose_names_sort_first() {
+        let directory = TestDirectory::new("queue-order-held");
+        prepare(directory.path()).unwrap();
+        queue_at(&directory, "chat-zzz", "100", "oldest");
+        queue_at(&directory, "chat-aaa", "200", "middle");
+        queue_at(&directory, "chat-mmm", "300", "newest");
+        let busy = FakeAgent::new(&["working"]);
+        let held = drain(
+            &busy,
+            &target(),
+            directory.path(),
+            DrainOptions {
+                ready_timeout: Duration::ZERO,
+                ..DrainOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(held.outcome, QueueOutcome::Pending);
+        assert!(held.delivered.is_empty());
+        assert!(busy.runs().is_empty());
+        let inbox = directory.path().join("inbox");
+        let oldest = read_json(&inbox.join("chat-zzz.json")).unwrap();
+        assert_eq!(oldest["delivery_state"], "pending");
+        assert!(oldest.get("delivery_error").is_some());
+        for name in ["chat-aaa", "chat-mmm"] {
+            let entry = read_json(&inbox.join(format!("{name}.json"))).unwrap();
+            assert!(entry.get("delivery_state").is_none(), "{name}: {entry}");
+        }
+
+        let idle = FakeAgent::new(&["idle"]);
+        let result = drain(&idle, &target(), directory.path(), DrainOptions::default()).unwrap();
+        assert_eq!(idle.runs(), ["oldest", "middle", "newest"]);
+        assert_eq!(result.delivered, ["chat-zzz", "chat-aaa", "chat-mmm"]);
+    }
+
+    #[test]
+    fn an_entry_without_a_numeric_queue_time_comes_before_every_timed_entry() {
+        // The subagent message shape numbers its file names in sequence and records
+        // `queued_at` as text, if at all, so it cannot be placed by time; nor can a `queued_at`
+        // that is true or null. The timed entry is queued at time 0, so an untimed entry taken
+        // as queued at time 0 would follow it by name.
+        for (label, queued_at) in [
+            ("absent", None),
+            ("text", Some(r#""2026-10-03T10:00:00Z""#)),
+            ("bool", Some("true")),
+            ("null", Some("null")),
+        ] {
+            let directory = TestDirectory::new(&format!("queue-order-{label}"));
+            prepare(directory.path()).unwrap();
+            queue_at(&directory, "chat-a", "0", "timed");
+            let untimed = match queued_at {
+                Some(queued_at) => format!(r#"{{"text":"untimed","queued_at":{queued_at}}}"#),
+                None => r#"{"seq":9,"text":"untimed","tui_delivery_attempts":0}"#.to_owned(),
+            };
+            fs::write(directory.path().join("inbox/chat-z.json"), untimed).unwrap();
+            let fake = FakeAgent::new(&["idle"]);
+            drain(&fake, &target(), directory.path(), DrainOptions::default()).unwrap();
+            assert_eq!(fake.runs(), ["untimed", "timed"], "{label}");
+        }
+    }
+
+    #[test]
+    fn entries_without_a_numeric_queue_time_go_first_by_file_name() {
+        let directory = TestDirectory::new("queue-order-untimed-names");
+        prepare(directory.path()).unwrap();
+        queue_at(&directory, "chat-a", "0", "timed");
+        fs::write(
+            directory.path().join("inbox/chat-y.json"),
+            r#"{"text":"untimed y"}"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("inbox/chat-z.json"),
+            r#"{"text":"untimed z","queued_at":"2026-10-03T10:00:00Z"}"#,
+        )
+        .unwrap();
+        let fake = FakeAgent::new(&["idle"]);
+        drain(&fake, &target(), directory.path(), DrainOptions::default()).unwrap();
+        assert_eq!(fake.runs(), ["untimed y", "untimed z", "timed"]);
     }
 
     #[test]

@@ -912,6 +912,110 @@ def test_drain_accepts_existing_subagent_message_shape(tmp_path: object) -> None
     assert os.path.isfile(tmp_path / "processed" / path.name)  # type: ignore[operator]
 
 
+def _queue_at(inbox: Path, name: str, queued_at: object, text: str) -> None:
+    """Write one inbox entry as ``enqueue`` would, with the given ``queued_at``."""
+    entry = {"id": name, "text": text, "queued_at": queued_at, "delivery_attempts": 0}
+    (inbox / f"{name}.json").write_text(json.dumps(entry) + "\n")
+
+
+def test_drain_types_the_inbox_in_queue_order_not_file_name_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A chat request's file is named for its key, a hash, so names sort in no useful order.
+    # Here they sort opposite to the queue times, two entries share a time, and the directory
+    # lists them in reverse name order, so only the sort key can put them right.
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    _queue_at(inbox, "chat-d", 100.5, "first")
+    _queue_at(inbox, "chat-c", 200, "second")
+    _queue_at(inbox, "chat-a", 300, "third")
+    _queue_at(inbox, "chat-b", 300.0, "fourth")
+    listdir = os.listdir
+    monkeypatch.setattr(os, "listdir", lambda path=".": sorted(listdir(path), reverse=True))
+    fake = FakeAgentHerdr(["idle"])
+    result = drain(client(fake), target(), str(tmp_path))
+    assert fake.runs == ["first", "second", "third", "fourth"]
+    assert result.delivered == ("chat-d", "chat-c", "chat-a", "chat-b")
+    assert result.pending == ()
+
+
+def test_a_held_oldest_prompt_holds_newer_prompts_whose_names_sort_first(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    _queue_at(inbox, "chat-zzz", 100, "oldest")
+    _queue_at(inbox, "chat-aaa", 200, "middle")
+    _queue_at(inbox, "chat-mmm", 300, "newest")
+    busy = FakeAgentHerdr(["working"])
+    held = drain(client(busy), target(), str(tmp_path), ready_timeout=0)
+    assert held.outcome == "pending"
+    assert held.delivered == ()
+    assert busy.runs == []
+    oldest = json.loads((inbox / "chat-zzz.json").read_text())
+    assert oldest["delivery_state"] == "pending"
+    assert oldest["delivery_error"]
+    for name in ("chat-aaa", "chat-mmm"):
+        assert "delivery_state" not in json.loads((inbox / f"{name}.json").read_text()), name
+
+    idle = FakeAgentHerdr(["idle"])
+    result = drain(client(idle), target(), str(tmp_path))
+    assert idle.runs == ["oldest", "middle", "newest"]
+    assert result.delivered == ("chat-zzz", "chat-aaa", "chat-mmm")
+
+
+@pytest.mark.parametrize(
+    "queued_at",
+    [None, '"2026-10-03T10:00:00Z"', "true", "null", "1e400", "1" + "0" * 400],
+    ids=["absent", "text", "bool", "null", "overflowing-float", "overflowing-int"],
+)
+def test_drain_puts_an_entry_without_a_finite_numeric_queue_time_first(
+    tmp_path: Path, queued_at: str | None,
+) -> None:
+    # The subagent message shape numbers its file names in sequence and records `queued_at` as
+    # text, if at all, so it cannot be placed by time; nor can a `queued_at` that is true, null,
+    # or too large for a finite float. The timed entry is queued at time 0, so an untimed entry
+    # taken as queued at time 0 would follow it by name.
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    _queue_at(inbox, "chat-a", 0, "timed")
+    field = "" if queued_at is None else f', "queued_at": {queued_at}'
+    (inbox / "chat-z.json").write_text('{"text": "untimed"' + field + "}\n")
+    fake = FakeAgentHerdr(["idle"])
+    drain(client(fake), target(), str(tmp_path))
+    assert fake.runs == ["untimed", "timed"]
+
+
+def test_drain_takes_entries_without_a_queue_time_by_file_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The directory lists the entries in reverse name order, so only the sort key can put
+    # the two untimed entries ahead of the timed one in name order.
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    _queue_at(inbox, "chat-a", 0, "timed")
+    (inbox / "chat-y.json").write_text('{"text": "untimed y"}\n')
+    (inbox / "chat-z.json").write_text('{"text": "untimed z", "queued_at": "10:00"}\n')
+    listdir = os.listdir
+    monkeypatch.setattr(os, "listdir", lambda path=".": sorted(listdir(path), reverse=True))
+    fake = FakeAgentHerdr(["idle"])
+    drain(client(fake), target(), str(tmp_path))
+    assert fake.runs == ["untimed y", "untimed z", "timed"]
+
+
+def test_bounded_drain_types_nothing_before_an_oversized_entry(tmp_path: Path) -> None:
+    # The drain cannot read an oversized entry's queue time, so it cannot tell which prompts
+    # were queued before it. It refuses the entry, as before, before it types any prompt, even
+    # one queued earlier: chat-z records a later time than chat-a, which is queued at time 0.
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    _queue_at(inbox, "chat-a", 0, "timed")
+    _queue_at(inbox, "chat-z", 2.0, "x" * 1000)
+    fake = FakeAgentHerdr()
+    with pytest.raises(AgentDeliveryError, match="exceeds max_artifact_bytes"):
+        drain(client(fake), target(), str(tmp_path), max_artifact_bytes=1000)
+    assert fake.runs == []
+    assert sorted(path.name for path in inbox.iterdir()) == ["chat-a.json", "chat-z.json"]
+
+
 def test_drain_cli_returns_temporary_failure_when_fifo_remains_blocked(
     tmp_path: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:

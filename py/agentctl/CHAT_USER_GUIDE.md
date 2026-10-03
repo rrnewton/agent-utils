@@ -659,7 +659,10 @@ events and polls; replaying an event does not create a second prompt.
 `input.json` records the stream's durable cursor and connection/recovery state.
 The cursor advances only after its message has been saved or excluded by the
 configured authority. A reconnect passes that saved cursor to the event adapter.
-Source creation timestamps order pending delivery. REST pagination is checkpointed after source
+Each delivery pass queues the requests it delivers in source creation order, and
+the drain types queued prompts in the order they were queued: a request still
+queued from an earlier pass is typed before one a later pass queues, even when
+the later one's message was created first. REST pagination is checkpointed after source
 messages are persisted, with a 60-second overlap for equal timestamps and brief
 indexing delays. Long upstream indexing delays may require an explicit replay with
 a new bridge state directory after checking what was already delivered.
