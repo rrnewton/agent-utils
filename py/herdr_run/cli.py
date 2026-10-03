@@ -34,6 +34,7 @@ from herdr_run.errors import (
     Refused,
     RunTimeout,
 )
+from herdr_run.evict import describe_skipped, survey_workspace
 from herdr_run.readiness import assess, infer_prompt_tail
 from herdr_run.runner import RunResult, execute, read_output_bytes, write_meta
 from herdr_run.session import resolve_target, tab_label_for
@@ -878,7 +879,10 @@ def _cmd_target(
 OCCUPANCY_NOTE = (
     "max_panes counts every pane herdr lists in the workspace (live_panes); reap can judge only "
     "the panes a surviving run record names (with_record), so without_record panes hold their "
-    "share of max_panes until closed by hand or replaced as idle at the cap"
+    "share of max_panes until closed by hand or replaced as idle at the cap; replaceable counts "
+    "the tabs the cap would replace if an agent arrived now (unsplit, shell idle), judged without "
+    "the pane lock and closing nothing, and cap_refusal is what that agent would be told when "
+    "none is"
 )
 
 
@@ -903,11 +907,27 @@ def _cmd_reap(config: Config, environ: dict[str, str]) -> int:
     the cap counts, split by whether a surviving run record names each pane. Measured 2026-10-02 on
     devbig030, the cap was held by live panes with no record while ``reap`` listed only records,
     so its output could not say what was holding the cap.
+
+    ``replaceable`` says whether that matters: the cap replaces an idle unsplit tab before it
+    refuses, so a full workspace with an idle tab still admits the next agent. It is judged as the
+    cap judges except for the pane lock, by :func:`herdr_run.evict.survey`, which closes nothing.
     """
     client = _client(config, environ)
     records = load_run_records(config)
     plan = sweep(client, config, records=records)
     occupancy = measure_occupancy(client, config, records)
+    replaceable: int | None = None
+    cap_refusal: str | None = None
+    survey_error: str | None = None
+    if occupancy.listing_error is None:
+        try:
+            survey = survey_workspace(client, config, records)
+        except HerdrRunError as exc:
+            survey_error = str(exc)
+        else:
+            replaceable = len(survey.replaceable)
+            if not survey.replaceable and survey.kept:
+                cap_refusal = describe_skipped(survey.kept)
     document = {
         "workspace": config.workspace,
         "occupancy": {
@@ -916,6 +936,9 @@ def _cmd_reap(config: Config, environ: dict[str, str]) -> int:
             "with_record": occupancy.with_record,
             "without_record": occupancy.without_record,
             "listing_error": occupancy.listing_error,
+            "replaceable": replaceable,
+            "cap_refusal": cap_refusal,
+            "survey_error": survey_error,
             "note": OCCUPANCY_NOTE,
         },
         "candidate_source": {

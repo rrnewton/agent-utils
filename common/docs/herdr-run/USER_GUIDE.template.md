@@ -397,6 +397,17 @@ live panes a surviving run record names, which are the only ones `reap` can judg
 help. If herdr cannot list the workspace, the counts are `null` and `listing_error` says why;
 a failed listing is never reported as an empty workspace.
 
+A full workspace is not by itself a refusal: at the cap, the next agent's tab replaces the
+least-recently-used unsplit tab whose shell is idle. `replaceable` counts the tabs that would
+qualify if an agent arrived now, judged by every check the cap uses except the pane lock (a tab
+whose lock another herdr-run holds is counted, though the cap would skip it), and `cap_refusal` is the
+refusal that agent would be shown when none does (`null` otherwise). This reading takes no pane
+lock and closes nothing, so it can change before the next agent arrives; the cap judges again,
+under the lock, before it closes anything. `replaceable` is `null` when the listing failed, and
+when the survey itself fails `survey_error` says why. A monitor should warn when `live_panes` is
+at `max_panes` and `replaceable` is short of what the next tab needs, not merely when the
+workspace is nearly full.
+
 A tab is reported STALE only when all three hold, each of them positive evidence:
 
 1. **No in-flight work** — every run naming the pane recorded an `exit_code`. A run without one is

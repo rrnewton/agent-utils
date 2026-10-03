@@ -29,7 +29,7 @@ use serde_json::{Map, Value};
 use crate::audit;
 use crate::client::{HerdrApi, Pane};
 use crate::config::Config;
-use crate::error::Result;
+use crate::error::{HerdrRunError, Result};
 use crate::readiness::{assess_process, ProcessSignal};
 use crate::state::{open_lock_file, pane_lock_path};
 use crate::sweep::load_run_records;
@@ -252,12 +252,7 @@ fn try_evict<A: HerdrApi + ?Sized>(
     candidate: &Candidate,
     proc_root: &Path,
 ) -> std::result::Result<String, String> {
-    if candidate.tab_panes != 1 {
-        return Err(format!(
-            "tab {} holds {} panes; only an unsplit tab is replaced",
-            candidate.tab_id, candidate.tab_panes
-        ));
-    }
+    require_unsplit(candidate)?;
     let lock = pane_lock_path(&candidate.pane_id)
         .and_then(|path| open_lock_file(&path))
         .map_err(|error| format!("cannot open the pane lock: {error}"))?;
@@ -269,6 +264,30 @@ fn try_evict<A: HerdrApi + ?Sized>(
         Err(error) => return Err(format!("cannot lock the pane: {error}")),
     }
     // Judged now, under the lock, and closed at once: never from an earlier survey.
+    let reason = judge_shell(client, config, candidate, proc_root)?;
+    client
+        .close_tab(&candidate.tab_id)
+        .map_err(|error| format!("tab close failed: {error}"))?;
+    drop(lock);
+    Ok(reason)
+}
+
+fn require_unsplit(candidate: &Candidate) -> std::result::Result<(), String> {
+    if candidate.tab_panes != 1 {
+        return Err(format!(
+            "tab {} holds {} panes; only an unsplit tab is replaced",
+            candidate.tab_id, candidate.tab_panes
+        ));
+    }
+    Ok(())
+}
+
+fn judge_shell<A: HerdrApi + ?Sized>(
+    client: &A,
+    config: &Config,
+    candidate: &Candidate,
+    proc_root: &Path,
+) -> std::result::Result<String, String> {
     let info = client
         .process_info(&candidate.pane_id)
         .map_err(|error| format!("process-info failed: {error}"))?;
@@ -276,14 +295,61 @@ fn try_evict<A: HerdrApi + ?Sized>(
         &assess_process(&info, config),
         &scan_session(info.shell_pid, proc_root),
     );
-    if !idle {
-        return Err(reason);
+    if idle {
+        Ok(reason)
+    } else {
+        Err(reason)
     }
-    client
-        .close_tab(&candidate.tab_id)
-        .map_err(|error| format!("tab close failed: {error}"))?;
-    drop(lock);
-    Ok(reason)
+}
+
+/// What the cap path would find if a new agent arrived now.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Survey {
+    /// Panes whose tab the cap path could replace, least-recently-used first.
+    pub replaceable: Vec<String>,
+    /// Every other pane, with the reason its tab would stay open.
+    pub kept: Vec<(String, String)>,
+}
+
+/// Judge every tab as [`evict_one`] would, and close nothing.
+///
+/// The pane lock is not taken: a report must not make a runner wait, and the lock is held only
+/// while a command runs, when the shell does not own the foreground anyway. So this is a reading
+/// of the moment, not a promise; the cap path decides again, under the lock, before any close.
+pub fn survey<A: HerdrApi + ?Sized>(
+    client: &A,
+    config: &Config,
+    panes: &[Pane],
+    records: &[Value],
+    proc_root: &Path,
+) -> Survey {
+    let mut survey = Survey::default();
+    for candidate in lru_candidates(panes, records) {
+        match require_unsplit(&candidate)
+            .and_then(|()| judge_shell(client, config, &candidate, proc_root))
+        {
+            Ok(_) => survey.replaceable.push(candidate.pane_id),
+            Err(reason) => survey.kept.push((candidate.pane_id, reason)),
+        }
+    }
+    survey
+}
+
+/// [`survey`] the workspace `config` names, listed as the cap path lists it.
+pub fn survey_workspace<A: HerdrApi + ?Sized>(
+    client: &A,
+    config: &Config,
+    records: &[Value],
+    proc_root: &Path,
+) -> Result<Survey> {
+    let Some(workspace_id) = client.workspace_id_for_label(&config.workspace)? else {
+        return Err(HerdrRunError::unavailable(format!(
+            "herdr has no workspace labelled '{}'",
+            config.workspace
+        )));
+    };
+    let panes = client.panes(Some(&workspace_id))?;
+    Ok(survey(client, config, &panes, records, proc_root))
 }
 
 fn log_eviction(config: &Config, workspace_id: &str, agent: &str, eviction: &Eviction) {
@@ -838,5 +904,75 @@ mod tests {
             .unwrap()
             .insert(format!("tab-{stuck}"));
         assert_eq!(world.evict().expect("next").candidate.pane_id, next);
+    }
+
+    #[test]
+    fn the_survey_judges_every_tab_as_the_cap_does_and_closes_nothing() {
+        let world = World::new("survey");
+        let busy = world.tab("busy", None);
+        let newer_idle = world.tab("newer-idle", Some(171));
+        let background = world.tab("background", Some(172));
+        write_stat(&world.proc_root, 173, 172);
+        let older_idle = world.tab("older-idle", Some(174));
+        let split = unique_pane("survey-split");
+        world.fake.add(&split, "survey-split-tab", Some(175));
+        world.fake.add(
+            &unique_pane("survey-split-b"),
+            "survey-split-tab",
+            Some(175),
+        );
+        write_record(&world.project, "20261001T080000-a-1", &busy, "a");
+        write_record(&world.project, "20261001T090000-b-2", &older_idle, "b");
+        write_record(&world.project, "20261001T100000-c-3", &newer_idle, "c");
+
+        let panes = world.fake.panes(Some("w1")).unwrap();
+        let records = load_run_records(&world.config);
+        let survey = survey(
+            &world.fake,
+            &world.config,
+            &panes,
+            &records,
+            &world.proc_root,
+        );
+        assert_eq!(survey.replaceable, [older_idle.clone(), newer_idle]);
+        let kept = survey
+            .kept
+            .iter()
+            .map(|(pane, _)| pane.clone())
+            .collect::<Vec<_>>();
+        assert!(kept.contains(&busy) && kept.contains(&background) && kept.contains(&split));
+        assert_eq!(survey.kept.len(), 4, "{:?}", survey.kept);
+        assert!(world.fake.closed().is_empty());
+        assert!(world.audit().is_empty());
+        // The first replaceable tab is the one the cap closes.
+        assert_eq!(world.evict().expect("idle").candidate.pane_id, older_idle);
+    }
+
+    #[test]
+    fn the_survey_neither_waits_for_nor_takes_a_pane_lock() {
+        let world = World::new("survey-locked");
+        let locked = world.tab("locked", Some(181));
+        let lock = open_lock_file(&pane_lock_path(&locked).unwrap()).unwrap();
+        lock.try_lock_exclusive().unwrap();
+        let panes = world.fake.panes(Some("w1")).unwrap();
+        let survey = survey(&world.fake, &world.config, &panes, &[], &world.proc_root);
+        assert_eq!(survey.replaceable, std::slice::from_ref(&locked));
+        assert_eq!(world.fake.probed(), [locked]);
+        drop(lock);
+    }
+
+    #[test]
+    fn surveying_an_all_busy_workspace_yields_the_cap_refusal() {
+        let world = World::new("survey-busy");
+        world.tab("first", None);
+        world.tab("second", None);
+        let survey = survey_workspace(&world.fake, &world.config, &[], &world.proc_root).unwrap();
+        assert!(survey.replaceable.is_empty());
+        let refusal = describe_skipped(&survey.kept);
+        assert!(
+            refusal.starts_with("None of its 2 tab(s) could be replaced: pane "),
+            "{refusal}"
+        );
+        assert!(refusal.contains("running: git"), "{refusal}");
     }
 }

@@ -18,6 +18,7 @@ use crate::audit;
 use crate::client::{bounded_output, HerdrClient};
 use crate::config::{load_config, Config, MAX_TIMEOUT_SECONDS};
 use crate::error::{ErrorKind, HerdrRunError, Result, EXIT_BUSY};
+use crate::evict;
 use crate::readiness::{assess, infer_prompt_tail};
 use crate::reap::plan_reap;
 use crate::runner::{execute, result_json, write_meta, RunResult};
@@ -997,10 +998,28 @@ fn write_meta_best_effort(
 /// the cap counts, split by whether a surviving run record names each pane. Measured 2026-10-02 on
 /// devbig030, the cap was held by live panes with no record while `reap` listed only records, so
 /// its output could not say what was holding the cap.
+///
+/// `replaceable` says whether that matters: the cap replaces an idle unsplit tab before it refuses,
+/// so a full workspace with an idle tab still admits the next agent. It is judged as the cap
+/// judges except for the pane lock, by [`evict::survey`], which closes nothing.
 fn command_reap(config: &Config) -> Result<i32> {
     let client = HerdrClient::new(&config.broker)?;
     let records = load_run_records(config);
     let occupancy = measure_occupancy(&client, config, &records);
+    let survey = occupancy
+        .listing_error
+        .is_none()
+        .then(|| evict::survey_workspace(&client, config, &records, Path::new("/proc")));
+    let (replaceable, cap_refusal, survey_error) = match &survey {
+        Some(Ok(survey)) => (
+            Some(survey.replaceable.len()),
+            (survey.replaceable.is_empty() && !survey.kept.is_empty())
+                .then(|| evict::describe_skipped(&survey.kept)),
+            None,
+        ),
+        Some(Err(error)) => (None, None, Some(error.to_string())),
+        None => (None, None, None),
+    };
     let plan = plan_reap(&build_evidence(
         &client,
         config,
@@ -1023,7 +1042,10 @@ fn command_reap(config: &Config) -> Result<i32> {
             "listing_error": occupancy.listing_error,
             "live_panes": occupancy.live_panes,
             "max_panes": config.max_panes,
+            "cap_refusal": cap_refusal,
             "note": OCCUPANCY_NOTE,
+            "replaceable": replaceable,
+            "survey_error": survey_error,
             "with_record": occupancy.with_record,
             "without_record": occupancy.without_record(),
         },
@@ -1056,7 +1078,10 @@ const CANDIDATE_SOURCE_NOTE: &str = concat!(
 const OCCUPANCY_NOTE: &str = concat!(
     "max_panes counts every pane herdr lists in the workspace (live_panes); reap can judge only ",
     "the panes a surviving run record names (with_record), so without_record panes hold their ",
-    "share of max_panes until closed by hand or replaced as idle at the cap"
+    "share of max_panes until closed by hand or replaced as idle at the cap; replaceable counts ",
+    "the tabs the cap would replace if an agent arrived now (unsplit, shell idle), judged without ",
+    "the pane lock and closing nothing, and cap_refusal is what that agent would be told when ",
+    "none is"
 );
 
 /// The scope disclaimer `net-doctor` prints before it does anything.

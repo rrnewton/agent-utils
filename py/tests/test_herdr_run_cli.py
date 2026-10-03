@@ -25,6 +25,7 @@ from herdr_run.cli import (
     subcommand_help_text,
 )
 from herdr_run.config import Config
+from herdr_run.evict import Survey
 from herdr_run.reap import ReapDecision, ReapPlan, Verdict
 from herdr_run.sweep import Occupancy
 from herdr_run.errors import (
@@ -509,6 +510,9 @@ def test_reap_subcommand_reports_both_sides_and_closes_nothing(
     monkeypatch.setattr(
         cli_module, "measure_occupancy", lambda *_args: Occupancy(live_panes=5, with_record=2, listing_error=None)
     )
+    monkeypatch.setattr(
+        cli_module, "survey_workspace", lambda *_args: Survey(replaceable=["w1:p1"], kept=[("w1:p2", "running: git")])
+    )
 
     assert main(["reap"]) == 0
     document = json.loads(capsys.readouterr().out)
@@ -532,6 +536,66 @@ def test_reap_subcommand_reports_both_sides_and_closes_nothing(
     assert occupancy["max_panes"] == Config().max_panes
     assert occupancy["listing_error"] is None
     assert "max_panes" in occupancy["note"]
+    # Whether the cap would still admit the next agent: one tab is idle and replaceable.
+    assert (occupancy["replaceable"], occupancy["cap_refusal"], occupancy["survey_error"]) == (1, None, None)
+
+
+def _reap_occupancy(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], occupancy: Occupancy, survey: object
+) -> dict[str, object]:
+    def fake_survey(*_args: object) -> Survey:
+        if isinstance(survey, Exception):
+            raise survey
+        assert isinstance(survey, Survey), "the survey must not run after a failed listing"
+        return survey
+
+    monkeypatch.setattr(cli_module, "_client", lambda *_args: object())
+    monkeypatch.setattr(cli_module, "sweep", lambda *_args, **_kwargs: ReapPlan(()))
+    monkeypatch.setattr(cli_module, "measure_occupancy", lambda *_args: occupancy)
+    monkeypatch.setattr(cli_module, "survey_workspace", fake_survey)
+    assert main(["reap"]) == 0
+    return cast(dict[str, object], json.loads(capsys.readouterr().out)["occupancy"])
+
+
+def test_reap_names_the_cap_refusal_when_no_tab_is_replaceable(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(str(tmp_path))
+    kept = [("w1:p1", "running: git"), ("w1:p2", "tab w1:t2 holds 2 panes; only an unsplit tab is replaced")]
+    occupancy = _reap_occupancy(
+        monkeypatch, capsys, Occupancy(live_panes=2, with_record=0, listing_error=None), Survey([], kept)
+    )
+    assert occupancy["replaceable"] == 0
+    assert occupancy["cap_refusal"] == (
+        "None of its 2 tab(s) could be replaced: pane w1:p1: running: git; "
+        "pane w1:p2: tab w1:t2 holds 2 panes; only an unsplit tab is replaced."
+    )
+    assert occupancy["survey_error"] is None
+
+
+def test_reap_reports_a_failed_survey_as_unknown_not_zero(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(str(tmp_path))
+    occupancy = _reap_occupancy(
+        monkeypatch,
+        capsys,
+        Occupancy(live_panes=2, with_record=0, listing_error=None),
+        HerdrUnavailable("pane list: herdr is not answering"),
+    )
+    assert (occupancy["replaceable"], occupancy["cap_refusal"]) == (None, None)
+    assert occupancy["survey_error"] == "pane list: herdr is not answering"
+
+
+def test_reap_does_not_survey_after_a_failed_listing(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(str(tmp_path))
+    occupancy = _reap_occupancy(
+        monkeypatch, capsys, Occupancy(live_panes=None, with_record=None, listing_error="no herdr"), None
+    )
+    assert (occupancy["replaceable"], occupancy["cap_refusal"], occupancy["survey_error"]) == (None, None, None)
+    assert occupancy["listing_error"] == "no herdr"
 
 
 class _CapturedText(io.StringIO):

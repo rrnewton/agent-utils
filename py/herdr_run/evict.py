@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from herdr_run import audit
 from herdr_run.client import HerdrClient, Pane
 from herdr_run.config import Config
-from herdr_run.errors import HerdrRunError
+from herdr_run.errors import HerdrRunError, HerdrUnavailable
 from herdr_run.readiness import ProcessSignal, assess_process
 from herdr_run.state import open_lock_file, pane_lock_path
 from herdr_run.sweep import load_run_records
@@ -222,8 +222,9 @@ def evict_one(
 
 
 def _try_evict(client: HerdrClient, config: Config, candidate: Candidate, proc_root: str) -> Eviction | str:
-    if candidate.tab_panes != 1:
-        return f"tab {candidate.tab_id} holds {candidate.tab_panes} panes; only an unsplit tab is replaced"
+    refusal = _require_unsplit(candidate)
+    if refusal is not None:
+        return refusal
     try:
         lock = open_lock_file(pane_lock_path(candidate.pane_id))
     except HerdrRunError as exc:
@@ -236,11 +237,7 @@ def _try_evict(client: HerdrClient, config: Config, candidate: Candidate, proc_r
         except OSError as exc:
             return f"cannot lock the pane: {exc}"
         # Judged now, under the lock, and closed at once: never from an earlier survey.
-        try:
-            info = client.process_info(candidate.pane_id)
-        except HerdrRunError as exc:
-            return f"process-info failed: {exc}"
-        idle, reason = judge_idle(assess_process(info, config), scan_session(info.shell_pid, proc_root))
+        idle, reason = _judge_shell(client, config, candidate, proc_root)
         if not idle:
             return reason
         try:
@@ -250,6 +247,70 @@ def _try_evict(client: HerdrClient, config: Config, candidate: Candidate, proc_r
         return Eviction(candidate=candidate, reason=reason)
     finally:
         lock.close()
+
+
+def _require_unsplit(candidate: Candidate) -> str | None:
+    if candidate.tab_panes != 1:
+        return f"tab {candidate.tab_id} holds {candidate.tab_panes} panes; only an unsplit tab is replaced"
+    return None
+
+
+def _judge_shell(client: HerdrClient, config: Config, candidate: Candidate, proc_root: str) -> tuple[bool, str]:
+    try:
+        info = client.process_info(candidate.pane_id)
+    except HerdrRunError as exc:
+        return False, f"process-info failed: {exc}"
+    return judge_idle(assess_process(info, config), scan_session(info.shell_pid, proc_root))
+
+
+@dataclass(frozen=True)
+class Survey:
+    """What the cap path would find if a new agent arrived now."""
+
+    #: Panes whose tab the cap path could replace, least-recently-used first.
+    replaceable: list[str]
+    #: Every other pane, with the reason its tab would stay open.
+    kept: list[tuple[str, str]]
+
+
+def survey(
+    client: HerdrClient,
+    config: Config,
+    panes: Sequence[Pane],
+    records: Sequence[Mapping[str, object]],
+    proc_root: str = "/proc",
+) -> Survey:
+    """Judge every tab as :func:`evict_one` would, and close nothing.
+
+    The pane lock is not taken: a report must not make a runner wait, and the lock is held only
+    while a command runs, when the shell does not own the foreground anyway. So this is a reading
+    of the moment, not a promise; the cap path decides again, under the lock, before any close.
+    """
+    replaceable: list[str] = []
+    kept: list[tuple[str, str]] = []
+    for candidate in lru_candidates(panes, records):
+        refusal = _require_unsplit(candidate)
+        if refusal is None:
+            idle, reason = _judge_shell(client, config, candidate, proc_root)
+            refusal = None if idle else reason
+        if refusal is None:
+            replaceable.append(candidate.pane_id)
+        else:
+            kept.append((candidate.pane_id, refusal))
+    return Survey(replaceable=replaceable, kept=kept)
+
+
+def survey_workspace(
+    client: HerdrClient,
+    config: Config,
+    records: Sequence[Mapping[str, object]],
+    proc_root: str = "/proc",
+) -> Survey:
+    """:func:`survey` the workspace ``config`` names, listed as the cap path lists it."""
+    workspace_id = client.workspace_id_for_label(config.workspace)
+    if workspace_id is None:
+        raise HerdrUnavailable(f"herdr has no workspace labelled {config.workspace!r}")
+    return survey(client, config, client.panes(workspace_id), records, proc_root)
 
 
 def _log_eviction(config: Config, workspace_id: str, agent: str, eviction: Eviction) -> None:

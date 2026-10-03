@@ -8,6 +8,7 @@ against the in-memory Herdr fake and a fake ``/proc`` written into the test's te
 
 from __future__ import annotations
 
+import dataclasses
 import fcntl
 import json
 import os
@@ -32,9 +33,12 @@ from herdr_run.evict import (
     parse_session_id,
     run_time,
     scan_session,
+    survey,
+    survey_workspace,
 )
 from herdr_run.readiness import assess_process
 from herdr_run.session import _enforce_pane_cap
+from herdr_run.sweep import load_run_records
 from tests.herdr_fake import FakeHerdrClient, FakeTab, FakeWorkspace
 
 _CASES_PATH = Path(__file__).resolve().parents[2] / "rs" / "herdr-run" / "testdata" / "eviction_cases.json"
@@ -295,6 +299,63 @@ def test_a_failed_close_moves_on_to_the_next_idle_tab(tmp_path: Path) -> None:
     assert isinstance(eviction, Eviction)
     assert eviction.candidate.pane_id == "next"
     assert world.fake.closed_tabs == ["t-next"]
+
+
+def test_the_survey_judges_every_tab_as_the_cap_does_and_closes_nothing(tmp_path: Path) -> None:
+    world = World(tmp_path, ["busy", "newer", "jobs", "older"])
+    world.fake.workspaces["w1"].tabs["t-split"] = FakeTab("t-split", "split", "w1", ["left", "right"])
+    world.idle("newer")
+    jobs = world.idle("jobs", background=1)
+    world.idle("older")
+    world.idle("left")
+    world.idle("right")
+    world.record("busy", "20261001T080000-a-1", "a")
+    world.record("older", "20261001T090000-b-2", "b")
+    world.record("newer", "20261001T100000-c-3", "c")
+    panes = world.fake.panes("w1")
+    records = load_run_records(world.config)
+    found = survey(cast(HerdrClient, world.fake), world.config, panes, records, str(world.proc))
+    assert found.replaceable == ["older", "newer"]
+    assert sorted(found.kept) == [
+        ("busy", "foreground pgid 200 != shell pid 100; running: git"),
+        ("jobs", f"session {jobs} still holds 1 other process(es): {jobs + 1}"),
+        ("left", "tab t-split holds 2 panes; only an unsplit tab is replaced"),
+        ("right", "tab t-split holds 2 panes; only an unsplit tab is replaced"),
+    ]
+    assert world.fake.closed_tabs == []
+    assert world.audit_entries() == []
+    # The first replaceable tab is the one the cap closes.
+    eviction = world.evict()
+    assert isinstance(eviction, Eviction)
+    assert eviction.candidate.pane_id == "older"
+
+
+def test_the_survey_neither_waits_for_nor_takes_a_pane_lock(tmp_path: Path) -> None:
+    world = World(tmp_path, ["held"])
+    world.idle("held")
+    with state.open_lock_file(state.pane_lock_path("held")) as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        found = survey(cast(HerdrClient, world.fake), world.config, world.fake.panes("w1"), [], str(world.proc))
+    assert found.replaceable == ["held"]
+    assert world.fake.probed == ["held"]
+
+
+def test_surveying_an_all_busy_workspace_yields_the_cap_refusal(tmp_path: Path) -> None:
+    world = World(tmp_path, ["a", "b"])
+    config = dataclasses.replace(world.config, workspace="commands")
+    found = survey_workspace(cast(HerdrClient, world.fake), config, [], str(world.proc))
+    assert found.replaceable == []
+    assert describe_skipped(found.kept) == (
+        "None of its 2 tab(s) could be replaced: pane a: foreground pgid 200 != shell pid 100; "
+        "running: git; pane b: foreground pgid 200 != shell pid 100; running: git."
+    )
+
+
+def test_surveying_a_missing_workspace_raises_unavailable(tmp_path: Path) -> None:
+    world = World(tmp_path, ["a"])
+    config = dataclasses.replace(world.config, workspace="nowhere")
+    with pytest.raises(HerdrUnavailable, match="herdr has no workspace labelled 'nowhere'"):
+        survey_workspace(cast(HerdrClient, world.fake), config, [], str(world.proc))
 
 
 class _StickyCloseClient(FakeHerdrClient):
