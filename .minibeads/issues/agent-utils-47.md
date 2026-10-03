@@ -10,7 +10,7 @@ labels:
 depends_on:
   agent-utils-37: discovered-from
 created_at: 2026-09-26T09:35:28.961358042+00:00
-updated_at: 2026-09-29T20:16:01.283304793+00:00
+updated_at: 2026-10-03T00:10:16.183352346+00:00
 claimed_at: 2026-09-26T09:35:28.963597195+00:00
 claimed_until: 2026-09-28T09:35:28.963455011+00:00
 ---
@@ -66,5 +66,21 @@ Validation on the final local successor:
 - lint: no issues;
 - mutation: restoring the old accounting drops the opening word and fails only the new regression.
 
-The private change remains unpublished, has no reviewers, and has not been deployed. The 10-read
-live acceptance and the 0-of-2 re-answer probe therefore remain required before this issue closes.
+That private state has since advanced. The per-event bridge timeout is published as D121901941;
+the guarded TTS retry is published as D121950561; and the exact-read path is published as
+D123105386 on top of it. All three have reviewers, no failed CI signal, and remain in peer review.
+The exact-read stack is deployed from clean commit `69023c604925acfe9ab11bbfb9f740d183f501cf`.
+
+[gpt-5] 2026-10-03 acceptance update: the privacy-contained audio verifier now uses the owned
+transcription-only ASR service, with rewriting disabled, instead of replaying through the
+conversational agent. A non-exact diagnostic WAV produced one authoritative final segment, 134
+recognized words, 0.910 ordered precision, and zero excess 8-grams. Its 0.782 source coverage
+correctly fails the exact-read gate, so this is harness evidence rather than acceptance evidence.
+The private log was empty and the transient PrivateTmp unit left no process or host temporary
+artifact.
+
+The deployed bridge is intentionally unauthenticated because the VM credential is stale. The
+supported refresh requires opening the default VM once in normal hardware-bound Hatch Web; no
+headless or CLI refresh exists. After that refresh, the issue still requires one exact smoke, 10
+fresh default-provider reads with WAV capture and per-WAV ASR coverage and precision of at least
+0.85, and the 0-of-2 re-answer probe before it closes.
