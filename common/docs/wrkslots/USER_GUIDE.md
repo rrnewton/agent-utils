@@ -951,6 +951,63 @@ to a Git command recovery cannot see, running or stopped, and refuses until it i
 recovery that finds the recorded commit pruned from the local repository fetches it back from the
 remote ref that preserves it before making these checks.
 
+Git also keeps a full clone of each submodule of a linked worktree in that directory, at
+`<common>/worktrees/<id>/modules/<name>/` (a nested submodule under
+`.../modules/<name>/modules/<nested>/`), so a submodule commit that was never pushed may exist
+nowhere else. Before writing its journal, recovery examines every such repository. A commit is
+unpublished when HEAD or a ref outside `refs/remotes/` names it and no remote-tracking ref of that
+repository, or of the shared submodule repository `<common>/modules/<name>`, reaches it. The plan
+prints what will happen to each submodule as `submodule_salvage=[...]`. For each submodule with
+unpublished commits:
+
+- When the submodule's remote is listed in `salvage_push_remotes`, each commit is pushed to
+  `refs/rescue/wrkslots/<machine>/<slot>/<checkout>-<generation>-submodules/<submodule>/<commit>` on
+  that remote and read back.
+- Otherwise, or when that push is refused, the commits are written with complete history to a local
+  bundle under `wrkslots-salvage/`, verified like the salvage bundles described above.
+
+If salvage fails, the row is refused and nothing is written. Submodule state that salvaging commits
+cannot keep also refuses: an unfinished operation, staged content or a resolve-undo entry in a
+submodule's index, a shallow clone, a submodule repository with worktrees of its own, a ref naming
+something other than a commit, a missing or unreadable commit, a Git lock file (left by a running or
+stopped Git command), or an unsafe directory entry.
+
+Recovery never deletes these repositories. While it holds the worktree's `index.lock` it renames
+`modules/` to `wrkslots-recovery-modules/` and puts a regular file at `modules`, so a Git command
+already running cannot make a repository there anew, then examines them once more; any unpublished
+commit outside the recorded salvage refuses. Immediately before removing the registration it moves
+them, by one rename and with their reflogs, to
+`<common>/wrkslots-retained-modules/<slot>+<generation>+<digest>+<id>/modules/`, where `<digest>` is
+the first 16 hexadecimal digits of the row's `record_sha256`, so neither a later row that reuses the
+slot name nor a later checkout that reuses Git's `<id>` shares the directory. Recovery first writes
+`wrkslots-retained-owner.json` there, naming the machine, slot, generation, `record_sha256`, and
+`<id>`, and listing each entry of the administrative directory with its kind. A process that already
+held a working directory or directory descriptor inside them follows the renames, so a commit it
+makes after that last examination is neither salvaged nor recorded, but it stays in the retained
+copy.
+
+Removing the registration deletes everything below the administrative directory, and Git walks into
+a mount point there and deletes what the mounted file system holds. A mount point at or below
+`<common>/worktrees/<id>/` therefore refuses the row. Recovery reads `/proc/self/mountinfo` while
+examining the checkout and again just before the removal; a mount made after that last read is not
+seen. Recovery also refuses when retaining the repositories would lose an object they read: a
+symbolic link anywhere in `modules/`, or an `objects/info/alternates` entry, followed as deep as Git
+follows them, that names a different place once the tree is moved (an absolute path into
+`<common>/worktrees/<id>/modules/`, or a relative path that leaves the moved tree into the
+administrative directory) or that names a place in the `worktrees/` directory of the common Git
+directory, which Git deletes with a registration. A relative entry that stays inside the moved
+tree, or one that names the common directory's own objects or a place outside it, still works from
+the retained copy.
+
+A recovery stopped before the removal moves them back to `modules/` when it resumes, before checking
+anything; until then every check of that checkout refuses. It moves nothing back, and refuses, when
+the owner file names another row or directory, when the retained directory holds anything recovery
+did not put there, or when an entry of the administrative directory that the owner file lists is
+gone or has changed kind. That last means `git worktree remove` stopped partway, so Git may no
+longer register the checkout: the repositories stay in the retained directory, and once nothing
+left in the administrative directory is wanted, remove it by hand and rerun. Wrkslots never removes
+a retained directory: inspect it and delete it yourself once nothing in it is wanted.
+
 To plan or recover many such rows, name each exact row as `SLOT=GENERATION=SHA256`, with the
 generation and `record_sha256` from the same audit:
 
