@@ -10,7 +10,7 @@ labels:
 depends_on:
   agent-utils-37: discovered-from
 created_at: 2026-09-26T09:35:28.961358042+00:00
-updated_at: 2026-10-03T00:10:16.183352346+00:00
+updated_at: 2026-10-03T02:00:43.997814574+00:00
 claimed_at: 2026-09-26T09:35:28.963597195+00:00
 claimed_until: 2026-09-28T09:35:28.963455011+00:00
 ---
@@ -66,10 +66,14 @@ Validation on the final local successor:
 - lint: no issues;
 - mutation: restoring the old accounting drops the opening word and fails only the new regression.
 
-That private state has since advanced. The per-event bridge timeout is published as D121901941;
-the guarded TTS retry is published as D121950561; and the exact-read path is published as
-D123105386 on top of it. All three have reviewers, no failed CI signal, and remain in peer review.
-The exact-read stack is deployed from clean commit `69023c604925acfe9ab11bbfb9f740d183f501cf`.
+That private state has since advanced. The per-event bridge timeout is published as D121901941
+version `441024423`; the guarded TTS retry is published as D121950561 version `441010047`;
+and the exact-read path is published as D123105386 version `441014855` on top of it. The current
+versions address the applicable reviewer findings: a hard lifetime beats buffered data after both
+deadlines; TTS closes budget-capped interactions before retry and drops bad prosody context even
+when retry streaming is cancelled; and exact reads fail closed on stale, malformed, or blank input
+behind an independent default-off production kill switch. All three have reviewers, no failed CI
+signal at publication, and remain in peer review.
 
 [gpt-5] 2026-10-03 acceptance update: the privacy-contained audio verifier now uses the owned
 transcription-only ASR service, with rewriting disabled, instead of replaying through the
@@ -84,3 +88,14 @@ supported refresh requires opening the default VM once in normal hardware-bound 
 headless or CLI refresh exists. After that refresh, the issue still requires one exact smoke, 10
 fresh default-provider reads with WAV capture and per-WAV ASR coverage and precision of at least
 0.85, and the 0-of-2 re-answer probe before it closes.
+
+[gpt-5] 2026-10-03 review and deployment update: the latest exact-read Kepler build
+`a52aa3d18f74b5672a603ef9ce1dbf21fcf1a2cd` built successfully and is running from a clean
+review checkout with `KEPLER_ENV=dev` and the dev-only direct-read override enabled. The shim,
+Oxide, and browser bridge remain on the preserved deployment stack
+`8c6927b968eff9245188765edd89ac783f90a9d7`, which carries the devserver-only rate-limit
+warmup bypass and ASR-finality support. All four user units are active with zero restarts and all
+expected listeners are present. The exact-read/config suites report 104 passes, no failures, and
+one pre-existing skip; the full TTS audio suite reports 325 passes; and the corrected Oxide timeout
+suites report 296 passes plus one unrelated H.265 skip. The hardware-bound Hatch refresh remains
+the only prerequisite before the fresh live acceptance matrix can start.
