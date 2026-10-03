@@ -31653,10 +31653,7 @@ def test_scoped_private_finish_upgrades_legacy_identity_in_place(
     assert not finish_path.exists()
     assert not legacy_path.exists()
     assert not seal_path.exists()
-    assert all(
-        not isinstance(row, dict) or row.get("slot") != "target"
-        for row in active_slots(project)
-    )
+    assert active_slots(project) == []
 
 
 def interrupt_scoped_private_finish(
