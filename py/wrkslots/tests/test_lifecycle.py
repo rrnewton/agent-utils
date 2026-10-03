@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
 import fnmatch
 import hashlib
 import datetime as dt
@@ -28,6 +29,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import traceback
 import unicodedata
 from collections.abc import Callable, Iterator, Mapping, Sequence, Set as AbstractSet
 from dataclasses import replace
@@ -33210,6 +33212,3971 @@ def test_recover_absent_agent_row_preserves_commit_before_registry_repair(
     path = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
     assert wrkslots._GitVcs().worktree_registration(repository, path) is None
     assert run_absent_agent_recovery(project, record, apply=True) == 0
+
+
+def prepare_absent_agent_row_with_submodules(
+    tmp_path: Path,
+    *,
+    unpushed: bool,
+) -> tuple[Path, Path, wrkslots.ActiveRecord, Path, dict[str, str]]:
+    """Leave an absent agent row whose worktree administration holds submodule clones.
+
+    Git clones a linked worktree's submodules into
+    <administrative directory>/modules/, which removing the registration
+    deletes. With ``unpushed`` the component clone gets a commit at its
+    detached HEAD and the nested leaf clone gets a commit only on a local
+    branch, as an agent that committed in submodules but never pushed leaves
+    them. Returns the project, the repository, the dead-owner row, the
+    administrative directory, and the unpublished commit for each submodule
+    repository name.
+    """
+
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    made = create(
+        project, slot="gone-agent", agent="agent-gone-agent", branch="agent/gone-agent"
+    )
+    assert made.returncode == 0, made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._find_record(wrkslots._load_active(config), "gone-agent")
+    checkout = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
+    administration = Path(
+        git(checkout, "rev-parse", "--path-format=absolute", "--git-dir").stdout.strip()
+    )
+    assert (administration / "modules" / "component" / "HEAD").is_file()
+    assert (
+        administration / "modules" / "component" / "modules" / "leaf" / "HEAD"
+    ).is_file()
+    identity = ("-c", "user.name=Wrkslots Test", "-c", "user.email=wrkslots@example.invalid")
+    unpublished: dict[str, str] = {}
+    if unpushed:
+        component = checkout / "component"
+        git(component, *identity, "commit", "--allow-empty", "-m", "unpushed component")
+        unpublished["modules/component"] = git(
+            component, "rev-parse", "HEAD"
+        ).stdout.strip()
+        leaf = component / "leaf"
+        detached = git(leaf, "rev-parse", "HEAD").stdout.strip()
+        git(leaf, "checkout", "-q", "-b", "agent-work")
+        git(leaf, *identity, "commit", "--allow-empty", "-m", "unpushed leaf")
+        unpublished["modules/component/modules/leaf"] = git(
+            leaf, "rev-parse", "HEAD"
+        ).stdout.strip()
+        git(leaf, "checkout", "-q", "--detach", detached)
+    record = mark_recorded_owner_dead(project, "gone-agent")
+    shutil.rmtree(wrkslots._slot_directory(config, "gone-agent", "agent"))
+    assert checkout.absolute() in wrkslots._GitVcs().listed_worktrees(repository)
+    return project, repository, record, administration, unpublished
+
+
+def absent_agent_module_receipts(archived: Mapping[str, object]) -> list[Mapping[str, object]]:
+    salvage = archived["salvage"]
+    assert isinstance(salvage, list)
+    return [
+        cast(Mapping[str, object], receipt)
+        for receipt in salvage
+        if isinstance(receipt, Mapping) and "submodule" in receipt
+    ]
+
+
+def test_recover_absent_agent_row_archives_unpushed_submodule_commits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=False) == 0
+    planned = capsys.readouterr().out
+    assert "submodule_salvage=" in planned
+    for name, commit in unpublished.items():
+        assert (
+            json.dumps(
+                {
+                    "checkout": record.checkouts[0].name,
+                    "disposition": "planned-local-archive",
+                    "submodule": name,
+                    "unpublished_commits": [commit],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            in planned
+        )
+    assert (administration / "modules").is_dir()
+
+    assert run_absent_agent_recovery(project, record, apply=True) == 0
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._load_active(config).slots
+    assert not administration.exists()
+    receipts = absent_agent_module_receipts(wrkslots._load_archive(config).records[-1])
+    assert [receipt["submodule"] for receipt in receipts] == sorted(unpublished)
+    for receipt in receipts:
+        commit = unpublished[cast(str, receipt["submodule"])]
+        assert receipt["disposition"] == "archived-local"
+        assert receipt["unpublished_commits"] == [commit]
+        assert receipt["archive_reason"] == "remote-not-allowed"
+        bundle = Path(cast(str, receipt["archive_bundle"]))
+        assert bundle.is_relative_to(config.control)
+        restored = tmp_path / ("restored-" + cast(str, receipt["submodule"]).replace("/", "-"))
+        subprocess.run(
+            ["git", "clone", "--bare", "--quiet", str(bundle), str(restored)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        archive_refs = cast(list[Mapping[str, str]], receipt["archive_refs"])
+        assert [entry["commit"] for entry in archive_refs] == [commit]
+        assert (
+            git(restored, "rev-parse", f"{archive_refs[0]['ref']}^{{commit}}").stdout.strip()
+            == commit
+        )
+        git(restored, "fsck", "--full", "--strict", "--no-dangling")
+    path = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
+    assert wrkslots._GitVcs().worktree_registration(repository, path) is None
+
+
+def test_recover_absent_agent_row_pushes_unpushed_submodule_commits_to_rescue_refs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    remotes = {
+        "modules/component": tmp_path / "component.git",
+        "modules/component/modules/leaf": tmp_path / "leaf.git",
+    }
+    allow_salvage_push(project, *remotes.values())
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=True) == 0
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._load_active(config).slots
+    assert not administration.exists()
+    receipts = absent_agent_module_receipts(wrkslots._load_archive(config).records[-1])
+    assert [receipt["submodule"] for receipt in receipts] == sorted(unpublished)
+    for receipt in receipts:
+        name = cast(str, receipt["submodule"])
+        assert receipt["disposition"] == "salvaged"
+        remote_refs = cast(list[Mapping[str, str]], receipt["remote_refs"])
+        assert [entry["commit"] for entry in remote_refs] == [unpublished[name]]
+        ref = remote_refs[0]["ref"]
+        assert ref.startswith("refs/rescue/wrkslots/testhost/gone-agent/")
+        assert git(remotes[name], "rev-parse", ref).stdout.strip() == unpublished[name]
+    salvage_root = config.control / "wrkslots-salvage"
+    assert not salvage_root.exists() or not list(salvage_root.rglob("repository.bundle"))
+
+
+def test_recover_absent_agent_row_proceeds_when_submodule_commits_are_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=False)
+    )
+    assert unpublished == {}
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=False) == 0
+    assert "submodule_salvage=" not in capsys.readouterr().out
+    assert run_absent_agent_recovery(project, record, apply=True) == 0
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._load_active(config).slots
+    assert not administration.exists()
+    archived = wrkslots._load_archive(config).records[-1]
+    receipts = absent_agent_module_receipts(archived)
+    assert [
+        (receipt["submodule"], receipt["disposition"], receipt["unpublished_commits"])
+        for receipt in receipts
+    ] == [
+        ("modules/component", "already-published", []),
+        ("modules/component/modules/leaf", "already-published", []),
+    ]
+    assert any("submodule" in line for line in cast(list[str], archived["validation"]))
+    assert not (config.control / "wrkslots-salvage").exists()
+
+
+def test_recover_absent_agent_row_refuses_submodule_state_salvage_cannot_keep(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    component = administration / "modules" / "component"
+    (component / "MERGE_HEAD").write_text(
+        unpublished["modules/component"] + "\n", encoding="ascii"
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=False) == 3
+    assert "MERGE_HEAD" in capsys.readouterr().err
+    assert run_absent_agent_recovery(project, record, apply=True) == 3
+    assert "MERGE_HEAD" in capsys.readouterr().err
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+    assert not (config.control / "ACTIVE.testhost.journal").exists()
+    path = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
+    assert wrkslots._GitVcs().worktree_registration(repository, path) is not None
+    assert (
+        git(
+            tmp_path,
+            "--git-dir",
+            str(component),
+            "--work-tree",
+            str(tmp_path),
+            "cat-file",
+            "-t",
+            unpublished["modules/component"],
+        ).stdout.strip()
+        == "commit"
+    )
+
+
+def test_recover_absent_agent_row_resume_refuses_when_submodule_archive_is_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(point: str) -> None:
+        if point == "after-absent-agent-journal":
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_absent_agent_recovery(project, record, apply=True)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    config = wrkslots._load_config(str(project), "testhost")
+    journal = json.loads((config.control / "ACTIVE.testhost.journal").read_text("utf-8"))
+    salvage = journal["submodule_salvage"]
+    assert [entry["submodule"] for entry in salvage] == sorted(unpublished)
+    bundle = Path(salvage[0]["archive_bundle"])
+    bundle.chmod(0o644)
+    bundle.write_bytes(b"not a bundle\n")
+    capsys.readouterr()
+
+    recover = [
+        "--project-root",
+        str(project),
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ]
+    assert wrkslots.main(recover) == 3
+    assert "bundle" in capsys.readouterr().err
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+    path = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
+    assert wrkslots._GitVcs().worktree_registration(repository, path) is not None
+    assert (administration / "modules" / "component").is_dir()
+
+
+def absent_agent_module_git(
+    tmp_path: Path, module: Path, *args: str, check: bool = True
+) -> subprocess.CompletedProcess[str]:
+    """Run Git in a submodule repository whose checkout no longer exists."""
+
+    return git(
+        tmp_path, "--git-dir", str(module), "--work-tree", str(tmp_path), *args, check=check
+    )
+
+
+def test_recover_absent_agent_row_never_runs_a_submodule_lazy_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    component = administration / "modules" / "component"
+    commit = unpublished["modules/component"]
+    absent_agent_module_git(tmp_path, component, "update-ref", "refs/heads/private", commit)
+    # A partial clone fetches a missing object from its promisor remote on
+    # demand. The remote here is a transport helper that leaves a marker, so
+    # any lazy fetch while the census reads the absent agent's refs shows up.
+    marker = tmp_path / "transport-ran"
+    transport = tmp_path / "promisor-transport"
+    transport.write_text(f'#!/bin/sh\necho ran > "{marker}"\nexit 1\n', encoding="ascii")
+    transport.chmod(0o755)
+    for key, value in (
+        ("extensions.partialClone", "origin"),
+        ("remote.origin.promisor", "true"),
+        ("protocol.ext.allow", "always"),
+    ):
+        absent_agent_module_git(tmp_path, component, "config", key, value)
+    absent_agent_module_git(
+        tmp_path, component, "remote", "set-url", "origin", f"ext::{transport}"
+    )
+    loose = component / "objects" / commit[:2] / commit[2:]
+    assert loose.is_file()
+    loose.unlink()
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=False) == 3
+    assert commit in capsys.readouterr().err
+    assert not marker.exists()
+    assert run_absent_agent_recovery(project, record, apply=True) == 3
+    assert not marker.exists()
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+    assert component.is_dir()
+
+
+def test_recover_absent_agent_row_refuses_a_rescue_remote_borrowing_through_a_proc_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    component = administration / "modules" / "component"
+    common = administration.parent.parent
+    remote = common / "rescue-target.git"
+    git(tmp_path, "init", "--quiet", "--bare", str(remote))
+    source = administration / "remote-object-source"
+    shutil.copytree(component / "objects", source)
+    # Git serving the remote enters it before reading its alternates, so for
+    # Git this names objects in the administrative directory; resolved from
+    # where recovery runs, it names some other place.
+    alternate = f"/proc/self/cwd/../worktrees/{administration.name}/remote-object-source"
+    alternates = remote / "objects" / "info" / "alternates"
+    alternates.write_text(f"{alternate}\n", encoding="utf-8")
+    commit = unpublished["modules/component"]
+    assert git(remote, "cat-file", "-t", commit).stdout.strip() == "commit"
+    git(remote, "update-ref", "refs/heads/already-has-work", commit)
+    absent_agent_module_git(tmp_path, component, "remote", "set-url", "origin", str(remote))
+    allow_salvage_push(project, remote)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    before = tree_snapshot(source)
+
+    assert run_absent_agent_recovery(project, record, apply=True) == 3
+    stderr = capsys.readouterr().err
+    assert (
+        f"alternates file {os.path.realpath(alternates)} names {alternate}, which leads "
+        "through /proc into a proc file system"
+    ) in stderr
+    assert_absent_agent_row_and_registration_stand(project, repository, record)
+    assert tree_snapshot(source) == before
+    assert git(remote, "for-each-ref", "--format=%(refname)").stdout.split() == [
+        "refs/heads/already-has-work"
+    ]
+
+
+def borrow_a_commit_through_alternates(
+    tmp_path: Path, component: Path, borrowed: Path, parent: str, message: str
+) -> str:
+    """Write a commit on ``parent`` to the object directory ``borrowed``, which ``component`` reads through its alternates."""
+
+    make_object_directory(borrowed)
+    (component / "objects" / "info" / "alternates").write_text(f"{borrowed}\n", encoding="utf-8")
+    return subprocess.run(
+        ["git", "--git-dir", str(component), "--work-tree", str(tmp_path), *ABSENT_AGENT_TEST_IDENTITY,
+         "commit-tree", f"{parent}^{{tree}}", "-p", parent, "-m", message],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "GIT_OBJECT_DIRECTORY": str(borrowed),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(component / "objects"),
+        },
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+
+
+@pytest.mark.parametrize("named", ["reflog-only", "nothing"])
+def test_recover_absent_agent_row_salvages_or_refuses_unpublished_commits_it_reads_through_alternates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], named: str
+) -> None:
+    project, repository, record, administration, _unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=False)
+    )
+    component = administration / "modules" / "component"
+    published = absent_agent_module_git(tmp_path, component, "rev-parse", "HEAD").stdout.strip()
+    borrowed = tmp_path / "outside-objects"
+    commit = borrow_a_commit_through_alternates(
+        tmp_path, component, borrowed, published, "unpublished, stored where it borrows"
+    )
+    # HEAD named the commit once and names the published one again, so only
+    # the reflog names it; expired, nothing does.
+    absent_agent_module_git(tmp_path, component, "update-ref", "--create-reflog", "HEAD", commit, published)
+    absent_agent_module_git(tmp_path, component, "update-ref", "--create-reflog", "HEAD", published, commit)
+    if named == "nothing":
+        absent_agent_module_git(tmp_path, component, "reflog", "expire", "--expire=now", "--all")
+    assert absent_agent_module_git(tmp_path, component, "cat-file", "-t", commit).stdout.strip() == "commit"
+    assert not (component / "objects" / commit[:2] / commit[2:]).exists()
+    assert not absent_agent_module_git(
+        tmp_path, component, "for-each-ref", "--contains", commit, "refs/remotes/"
+    ).stdout.strip()
+    stored = tree_snapshot(borrowed)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    config = wrkslots._load_config(str(project), "testhost")
+
+    if named == "nothing":
+        # Whether it is this repository's own work cannot be told, so
+        # nothing it reads that way may be left unsalvaged and unpublished.
+        assert run_absent_agent_recovery(project, record, apply=True) == 3
+        stderr = capsys.readouterr().err
+        assert f"1 commits it reads through objects/info/alternates, such as {commit}" in stderr
+        assert_absent_agent_row_and_registration_stand(project, repository, record)
+        assert (component / "HEAD").is_file()
+        assert tree_snapshot(borrowed) == stored
+        return
+    assert run_absent_agent_recovery(project, record, apply=True) == 0
+    assert not administration.exists()
+    receipt = next(
+        value
+        for value in absent_agent_module_receipts(wrkslots._load_archive(config).records[-1])
+        if value["submodule"] == "modules/component"
+    )
+    assert receipt["disposition"] == "archived-local"
+    unpublished_commits = receipt["unpublished_commits"]
+    assert isinstance(unpublished_commits, list) and commit in unpublished_commits
+    bundle = receipt["archive_bundle"]
+    assert isinstance(bundle, str)
+    restored = tmp_path / "restored"
+    git(tmp_path, "clone", "--bare", "--quiet", bundle, str(restored))
+    assert git(restored, "cat-file", "-t", commit).stdout.strip() == "commit"
+    assert tree_snapshot(borrowed) == stored
+
+
+@pytest.mark.parametrize("storage", ["loose", "pack", "kept-pack", "promisor-pack", "cruft-pack"])
+def test_recover_absent_agent_row_salvages_a_commit_no_ref_names_however_it_is_stored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: str
+) -> None:
+    project, repository, record, administration, _unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=False)
+    )
+    component = administration / "modules" / "component"
+    published = absent_agent_module_git(tmp_path, component, "rev-parse", "HEAD").stdout.strip()
+    commit = absent_agent_module_git(
+        tmp_path, component, *ABSENT_AGENT_TEST_IDENTITY,
+        "commit-tree", f"{published}^{{tree}}", "-p", published, "-m", "named by nothing",
+    ).stdout.strip()
+    pack = component / "objects" / "pack"
+    if storage == "cruft-pack":
+        absent_agent_module_git(tmp_path, component, "repack", "-a", "-d", "--cruft")
+        assert list(pack.glob("*.mtimes"))
+    elif storage != "loose":
+        absent_agent_module_git(tmp_path, component, "update-ref", "refs/heads/temporary", commit)
+        absent_agent_module_git(tmp_path, component, "repack", "-a", "-d")
+        absent_agent_module_git(tmp_path, component, "update-ref", "-d", "refs/heads/temporary")
+        marker = {"kept-pack": ".keep", "promisor-pack": ".promisor"}.get(storage)
+        if marker is not None:
+            for packed in pack.glob("*.pack"):
+                packed.with_suffix(marker).touch()
+    assert (component / "objects" / commit[:2] / commit[2:]).exists() == (storage == "loose")
+    assert absent_agent_module_git(tmp_path, component, "cat-file", "-t", commit).stdout.strip() == "commit"
+    assert not absent_agent_module_git(
+        tmp_path, component, "for-each-ref", "--contains", commit
+    ).stdout.strip()
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=True) == 0
+    assert not administration.exists()
+    config = wrkslots._load_config(str(project), "testhost")
+    receipt = next(
+        value
+        for value in absent_agent_module_receipts(wrkslots._load_archive(config).records[-1])
+        if value["submodule"] == "modules/component"
+    )
+    assert receipt["disposition"] == "archived-local"
+    unpublished_commits = receipt["unpublished_commits"]
+    assert isinstance(unpublished_commits, list) and commit in unpublished_commits
+
+
+@pytest.mark.parametrize("damage", ["corrupt-index", "missing-index"])
+def test_recover_absent_agent_row_refuses_a_pack_git_would_leave_out_of_the_census(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], damage: str
+) -> None:
+    project, repository, record, administration, _unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=False)
+    )
+    component = administration / "modules" / "component"
+    published = absent_agent_module_git(tmp_path, component, "rev-parse", "HEAD").stdout.strip()
+    commit = absent_agent_module_git(
+        tmp_path, component, *ABSENT_AGENT_TEST_IDENTITY,
+        "commit-tree", f"{published}^{{tree}}", "-p", published, "-m", "only in a pack",
+    ).stdout.strip()
+    name = subprocess.run(
+        ["git", "--git-dir", str(component), "--work-tree", str(tmp_path), "pack-objects",
+         str(component / "objects" / "pack" / "pack")],
+        cwd=tmp_path, input=f"{commit}\n", text=True, capture_output=True, check=True,
+    ).stdout.strip()
+    (component / "objects" / commit[:2] / commit[2:]).unlink()
+    pack = component / "objects" / "pack" / f"pack-{name}.pack"
+    index = pack.with_suffix(".idx")
+    if damage == "corrupt-index":
+        index.write_bytes(b"bad index")
+        expected = f"has an index {index.name} too small to be one"
+    else:
+        index.unlink()
+        expected = f"has no index {index.name}"
+    # Git lists nothing of the pack, and still exits 0.
+    listed = absent_agent_module_git(
+        tmp_path, component, "cat-file", "--batch-all-objects", "--batch-check"
+    )
+    assert commit not in listed.stdout
+    packed = tree_snapshot(component / "objects" / "pack")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=True) == 3
+    stderr = capsys.readouterr().err
+    assert f"pack {pack} of submodule repository" in stderr
+    assert expected in stderr
+    assert "remedy: run `git index-pack` on it" in stderr
+    assert_absent_agent_row_and_registration_stand(project, repository, record)
+    assert tree_snapshot(component / "objects" / "pack") == packed
+    git(tmp_path, "index-pack", str(pack))
+    assert absent_agent_module_git(tmp_path, component, "cat-file", "-t", commit).stdout.strip() == "commit"
+
+
+def test_recover_absent_agent_row_refuses_a_reflog_naming_a_commit_git_cannot_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, record, administration, _unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=False)
+    )
+    component = administration / "modules" / "component"
+    published = absent_agent_module_git(tmp_path, component, "rev-parse", "HEAD").stdout.strip()
+    commit = absent_agent_module_git(
+        tmp_path, component, *ABSENT_AGENT_TEST_IDENTITY,
+        "commit-tree", f"{published}^{{tree}}", "-p", published, "-m", "gone from the store",
+    ).stdout.strip()
+    absent_agent_module_git(tmp_path, component, "update-ref", "--create-reflog", "HEAD", commit, published)
+    absent_agent_module_git(tmp_path, component, "update-ref", "--create-reflog", "HEAD", published, commit)
+    # Only the reflog names it, and its object is gone: no census can show it
+    # was published, or salvage it.
+    (component / "objects" / commit[:2] / commit[2:]).unlink()
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=True) == 3
+    stderr = capsys.readouterr().err
+    assert "cannot list every commit the reflogs of submodule repository" in stderr
+    assert "references pruned commits" in stderr
+    assert "`git reflog expire --stale-fix --all` drops entries naming commits that are gone" in stderr
+    assert_absent_agent_row_and_registration_stand(project, repository, record)
+    assert (component / "HEAD").is_file()
+
+
+@pytest.mark.parametrize("chained", [False, True], ids=["direct", "relative-chain"])
+def test_recover_absent_agent_row_refuses_a_rescue_remote_borrowing_doomed_objects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    chained: bool,
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    component = administration / "modules" / "component"
+    remote = tmp_path / "rescue-target.git"
+    git(tmp_path, "init", "--quiet", "--bare", str(remote))
+    if chained:
+        # Git resolves a relative alternates entry against the objects
+        # directory and follows alternates transitively.
+        middle = tmp_path / "middle.git"
+        git(tmp_path, "init", "--quiet", "--bare", str(middle))
+        (middle / "objects" / "info" / "alternates").write_text(
+            f"{component / 'objects'}\n", encoding="utf-8"
+        )
+        (remote / "objects" / "info" / "alternates").write_text(
+            "../../middle.git/objects\n", encoding="utf-8"
+        )
+    else:
+        (remote / "objects" / "info" / "alternates").write_text(
+            f"{component / 'objects'}\n", encoding="utf-8"
+        )
+    commit = unpublished["modules/component"]
+    # The remote can read the commit only through the store recovery deletes.
+    assert git(remote, "cat-file", "-t", commit).stdout.strip() == "commit"
+    absent_agent_module_git(tmp_path, component, "remote", "set-url", "origin", str(remote))
+    allow_salvage_push(project, remote)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=False) == 3
+    assert "which recovery deletes" in capsys.readouterr().err
+    assert run_absent_agent_recovery(project, record, apply=True) == 3
+    assert "which recovery deletes" in capsys.readouterr().err
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+    assert not (config.control / "ACTIVE.testhost.journal").exists()
+    assert git(remote, "for-each-ref").stdout == ""
+    assert absent_agent_module_git(tmp_path, component, "cat-file", "-t", commit).stdout.strip() == "commit"
+
+
+ABSENT_AGENT_TEST_IDENTITY = (
+    "-c",
+    "user.name=Wrkslots Test",
+    "-c",
+    "user.email=wrkslots@example.invalid",
+)
+# Git's built-in empty tree, which every repository can name.
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+
+def directory_modes(root: Path) -> dict[str, int]:
+    """Map each directory at or below ``root``, by relative path, to its permission bits."""
+
+    return {
+        os.path.relpath(directory, root): stat.S_IMODE(os.lstat(directory).st_mode)
+        for directory, _directories, _files in os.walk(root)
+    }
+
+
+def tree_snapshot(root: Path) -> dict[str, tuple[str, int, str]]:
+    """Map everything at or below ``root``, by relative path, to its type, mode, and content.
+
+    The content of a regular file is its SHA-256, of a symbolic link its
+    target; a directory has none. Two equal snapshots are the same tree,
+    byte for byte, as far as Git can tell.
+    """
+
+    snapshot: dict[str, tuple[str, int, str]] = {}
+    for directory, directories, names in os.walk(root):
+        for name in (".", *directories, *names):
+            path = Path(directory) if name == "." else Path(directory) / name
+            relative = os.path.relpath(path, root)
+            if relative in snapshot:
+                continue
+            metadata = os.lstat(path)
+            mode = stat.S_IMODE(metadata.st_mode)
+            if stat.S_ISLNK(metadata.st_mode):
+                snapshot[relative] = ("symlink", mode, os.readlink(path))
+            elif stat.S_ISDIR(metadata.st_mode):
+                snapshot[relative] = ("directory", mode, "")
+            elif stat.S_ISREG(metadata.st_mode):
+                snapshot[relative] = (
+                    "file",
+                    mode,
+                    hashlib.sha256(path.read_bytes()).hexdigest(),
+                )
+            else:
+                snapshot[relative] = ("other", mode, "")
+    return snapshot
+
+
+def absent_agent_module_commit_attempts(
+    tmp_path: Path, module: Path
+) -> list[subprocess.CompletedProcess[str]]:
+    """Try each way of committing in a submodule repository by its path.
+
+    An ordinary commit, which needs its index lock; commit-tree followed by
+    update-ref, which needs no index; and a commit through another index
+    named by GIT_INDEX_FILE, which takes that index's lock instead.
+    """
+
+    def run(
+        *args: str, environment: Mapping[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                "git",
+                "--git-dir",
+                str(module),
+                "--work-tree",
+                str(tmp_path),
+                *ABSENT_AGENT_TEST_IDENTITY,
+                *args,
+            ],
+            cwd=tmp_path,
+            env=None if environment is None else {**os.environ, **environment},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    attempts = [
+        run("commit", "--quiet", "--allow-empty", "-m", "ordinary commit after the census")
+    ]
+    plumbing = run("commit-tree", EMPTY_TREE, "-m", "plumbing commit after the census")
+    attempts.append(plumbing)
+    if plumbing.returncode == 0:
+        attempts.append(run("update-ref", "refs/heads/after-census", plumbing.stdout.strip()))
+    attempts.append(
+        run(
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "commit through another index after the census",
+            environment={"GIT_INDEX_FILE": str(tmp_path / "another-index")},
+        )
+    )
+    return attempts
+
+
+def test_recover_absent_agent_row_retains_submodule_repositories_through_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    names = (Path("component"), Path("component") / "modules" / "leaf")
+    aside = administration / "wrkslots-recovery-modules"
+    retained = wrkslots._worktree_modules_retained(administration, record).path
+    # Kept in the common Git directory, as deep below it as modules/ was.
+    assert retained.parent.parent == administration.parent.parent
+    assert len(retained.relative_to(retained.parent.parent).parts) == len(
+        administration.relative_to(administration.parent.parent).parts
+    )
+    before = tree_snapshot(administration / "modules")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    original_retain = wrkslots._retain_worktree_modules
+    attempts: list[subprocess.CompletedProcess[str]] = []
+    kept: list[Path] = []
+
+    def commit_around_retention(
+        directory: Path, destination: wrkslots._RetainedModules
+    ) -> wrkslots._DirectoryIdentity:
+        # The final census has run, so a submodule commit made now would not
+        # be salvaged. No Git command may make one by the path Git keeps the
+        # repository at, with or without its index, and once they are kept
+        # outside the administrative directory none may by the set-aside
+        # path either, where removing the registration would delete it.
+        assert (administration / "index.lock").exists()
+        assert (administration / "modules").is_file()
+        assert aside.is_dir()
+        assert not destination.path.exists()
+        for name in names:
+            attempts.extend(
+                absent_agent_module_commit_attempts(tmp_path, administration / "modules" / name)
+            )
+        identity = original_retain(directory, destination)
+        kept.append(destination.path)
+        assert aside.is_file()
+        assert (administration / "modules").is_file()
+        for name in names:
+            attempts.extend(
+                absent_agent_module_commit_attempts(tmp_path, administration / "modules" / name)
+            )
+            attempts.extend(absent_agent_module_commit_attempts(tmp_path, aside / name))
+        return identity
+
+    monkeypatch.setattr(wrkslots, "_retain_worktree_modules", commit_around_retention)
+    assert run_absent_agent_recovery(project, record, apply=True) == 0
+    assert kept == [retained]
+    # Three attempts each, since commit-tree fails before update-ref runs.
+    assert len(attempts) == 3 * 3 * len(names)
+    for attempt in attempts:
+        assert attempt.returncode != 0, (attempt.args, attempt.stdout, attempt.stderr)
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._load_active(config).slots
+    assert not administration.exists()
+    # Removing the registration deleted none of them, and nothing in them changed.
+    assert tree_snapshot(retained / "modules") == before
+    for name, commit in unpublished.items():
+        module = retained / name
+        assert (
+            absent_agent_module_git(tmp_path, module, "cat-file", "-t", commit).stdout.strip()
+            == "commit"
+        )
+        absent_agent_module_git(tmp_path, module, "fsck", "--full", "--strict")
+    archived = wrkslots._load_archive(config).records[-1]
+    receipts = absent_agent_module_receipts(archived)
+    assert {
+        cast(str, receipt["submodule"]): (receipt["disposition"], receipt["unpublished_commits"])
+        for receipt in receipts
+    } == {name: ("archived-local", [commit]) for name, commit in unpublished.items()}
+    # The archive record says where they are kept, not that they were removed.
+    limitations = cast(list[str], archived["limitations"])
+    digest = wrkslots._record_sha256(record)[:16]
+    kept_at = (
+        f"<common>/wrkslots-retained-modules/{record.slot}+{record.generation}+{digest}"
+        "+<id>/modules"
+    )
+    assert retained.name == f"{record.slot}+{record.generation}+{digest}+{administration.name}"
+    # The file that names whose they are, and what the administrative
+    # directory held when they were moved, is kept beside them.
+    owner = json.loads(
+        (retained / "wrkslots-retained-owner.json").read_text(encoding="ascii")
+    )
+    assert {key: owner[key] for key in owner if key != "administration_entries"} == {
+        "administration": administration.name,
+        "generation": record.generation,
+        "machine": record.machine,
+        "record_sha256": wrkslots._record_sha256(record),
+        "schema": 1,
+        "slot": record.slot,
+    }
+    assert ["HEAD", "file"] in owner["administration_entries"]
+    assert ["modules", "file"] in owner["administration_entries"]
+    assert sorted(path.name for path in retained.iterdir()) == [
+        "modules",
+        "wrkslots-retained-owner.json",
+    ]
+    assert [item for item in limitations if "submodule" in item] == [
+        next(item for item in limitations if kept_at in item and "never deletes" in item)
+    ]
+
+
+def test_recover_absent_agent_row_refuses_a_submodule_commit_made_after_salvage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=False)
+    )
+    component = administration / "modules" / "component"
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    original_lock = wrkslots._GitVcs.worktree_index_locked
+    late: list[str] = []
+    modes: list[dict[str, int]] = []
+
+    @contextlib.contextmanager
+    def commit_then_lock(
+        self: wrkslots._GitVcs, repo: Path, checkout: Path
+    ) -> Iterator[Path]:
+        # Salvage and the journal are done; a commit made now, without any
+        # index, is one salvage never saw.
+        made = absent_agent_module_git(
+            tmp_path,
+            component,
+            *ABSENT_AGENT_TEST_IDENTITY,
+            "commit-tree",
+            EMPTY_TREE,
+            "-m",
+            "made after salvage",
+        ).stdout.strip()
+        absent_agent_module_git(tmp_path, component, "update-ref", "refs/heads/late", made)
+        late.append(made)
+        modes.append(directory_modes(administration / "modules"))
+        with original_lock(self, repo, checkout) as locked:
+            yield locked
+
+    monkeypatch.setattr(wrkslots._GitVcs, "worktree_index_locked", commit_then_lock)
+    assert run_absent_agent_recovery(project, record, apply=True) == 3
+    assert late
+    assert late[0] in capsys.readouterr().err
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+    path = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
+    assert wrkslots._GitVcs().worktree_registration(repository, path) is not None
+    assert component.is_dir()
+    assert not (administration / "wrkslots-recovery-modules").exists()
+    assert not wrkslots._worktree_modules_retained(administration, record).path.exists()
+    # Nothing changed a directory's mode.
+    assert directory_modes(administration / "modules") == modes[0]
+    assert (
+        absent_agent_module_git(tmp_path, component, "cat-file", "-t", late[0]).stdout.strip()
+        == "commit"
+    )
+
+
+def stop_absent_agent_recovery_at(
+    project: Path, record: wrkslots.ActiveRecord, point: str
+) -> int:
+    """Run recovery with --apply in a child process stopped for real at ``point``.
+
+    The child exits at once there, as a killed process would, so nothing it
+    would do on its way out runs. Returns its exit status, 86 when it
+    reached ``point``.
+    """
+
+    child = os.fork()
+    if child == 0:
+        os.environ["WRKSLOTS_TEST_INTERRUPT"] = point
+        try:
+            returncode = run_absent_agent_recovery(project, record, apply=True)
+        except BaseException:
+            os._exit(255)
+        os._exit(returncode)
+    _pid, status = os.waitpid(child, 0)
+    return os.waitstatus_to_exitcode(status)
+
+
+def test_recover_absent_agent_row_moves_back_submodules_a_stopped_recovery_set_aside(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    before = tree_snapshot(administration / "modules")
+    retained = wrkslots._worktree_modules_retained(administration, record).path
+    # Stop the process for real at the boundary, so nothing moves them back.
+    assert (
+        stop_absent_agent_recovery_at(project, record, "after-absent-agent-modules-set-aside")
+        == 86
+    )
+    aside = administration / "wrkslots-recovery-modules"
+    # Moved by a rename only: every file and mode is as it was.
+    assert tree_snapshot(aside) == before
+    assert not retained.exists()
+    # The placeholder that keeps modules/ from being made anew.
+    assert (administration / "modules").is_file()
+    config = wrkslots._load_config(str(project), "testhost")
+    path = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
+    # A census that walked only modules/ would find nothing to protect.
+    with pytest.raises(wrkslots.Refusal, match="moved aside"):
+        wrkslots._GitVcs().worktree_modules(repository, path)
+    capsys.readouterr()
+
+    recover = [
+        "--project-root",
+        str(project),
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ]
+    # The stopped process also left the superproject worktree's index lock,
+    # which no later process can prove stale. Resuming moves the submodule
+    # repositories back first, then refuses on that lock.
+    assert wrkslots.main(recover) == 3
+    assert "index lock" in capsys.readouterr().err.lower()
+    assert not aside.exists()
+    assert tree_snapshot(administration / "modules") == before
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+    (administration / "index.lock").unlink()
+    assert wrkslots.main(recover) == 0, capsys.readouterr().err
+    assert not administration.exists()
+    assert not wrkslots._load_active(config).slots
+    assert tree_snapshot(retained / "modules") == before
+    receipts = absent_agent_module_receipts(wrkslots._load_archive(config).records[-1])
+    assert {
+        cast(str, receipt["submodule"]): receipt["unpublished_commits"] for receipt in receipts
+    } == {name: [commit] for name, commit in unpublished.items()}
+    for receipt in receipts:
+        assert receipt["disposition"] == "archived-local"
+        assert Path(cast(str, receipt["archive_bundle"])).is_file()
+
+
+@pytest.mark.parametrize("salvage", ["archived-local", "salvaged"])
+@pytest.mark.parametrize(
+    "point",
+    [
+        "after-absent-agent-modules-retained-directory",
+        "after-absent-agent-modules-retained-owner",
+        "after-absent-agent-modules-retained",
+        "after-absent-agent-modules-aside-placeholder",
+    ],
+)
+def test_recover_absent_agent_row_moves_back_submodules_a_stopped_recovery_retained(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    point: str,
+    salvage: str,
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    remotes = {
+        "modules/component": tmp_path / "component.git",
+        "modules/component/modules/leaf": tmp_path / "leaf.git",
+    }
+    if salvage == "salvaged":
+        allow_salvage_push(project, *remotes.values())
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    before = tree_snapshot(administration / "modules")
+    retained = wrkslots._worktree_modules_retained(administration, record).path
+    aside = administration / "wrkslots-recovery-modules"
+    # Stop the process for real while it keeps the examined repositories
+    # outside the administrative directory, before the registration is removed.
+    assert stop_absent_agent_recovery_at(project, record, point) == 86
+    assert retained.is_dir()
+    assert (administration / "modules").is_file()
+    if point == "after-absent-agent-modules-retained-directory":
+        assert list(retained.iterdir()) == []
+        assert tree_snapshot(aside) == before
+    elif point == "after-absent-agent-modules-retained-owner":
+        assert [path.name for path in retained.iterdir()] == ["wrkslots-retained-owner.json"]
+        assert tree_snapshot(aside) == before
+    else:
+        assert tree_snapshot(retained / "modules") == before
+        if point == "after-absent-agent-modules-retained":
+            assert not aside.exists() and not aside.is_symlink()
+        else:
+            assert aside.is_file()
+    config = wrkslots._load_config(str(project), "testhost")
+    path = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
+    # A census of modules/ alone would find nothing to protect.
+    with pytest.raises(wrkslots.Refusal, match="wrkslots recover"):
+        wrkslots._GitVcs().worktree_modules(repository, path)
+    capsys.readouterr()
+
+    recover = [
+        "--project-root",
+        str(project),
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ]
+    # Resuming moves them back to modules/ before it checks anything,
+    # including that each submodule's salvage still holds, then refuses on
+    # the index lock the stopped process left.
+    assert wrkslots.main(recover) == 3
+    assert "index lock" in capsys.readouterr().err.lower()
+    assert not retained.exists()
+    assert not aside.exists() and not aside.is_symlink()
+    assert tree_snapshot(administration / "modules") == before
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+    (administration / "index.lock").unlink()
+    assert wrkslots.main(recover) == 0, capsys.readouterr().err
+    assert not administration.exists()
+    assert not wrkslots._load_active(config).slots
+    assert tree_snapshot(retained / "modules") == before
+    receipts = absent_agent_module_receipts(wrkslots._load_archive(config).records[-1])
+    assert {
+        cast(str, receipt["submodule"]): (receipt["disposition"], receipt["unpublished_commits"])
+        for receipt in receipts
+    } == {name: (salvage, [commit]) for name, commit in unpublished.items()}
+    for receipt in receipts:
+        name = cast(str, receipt["submodule"])
+        if salvage == "salvaged":
+            remote_refs = cast(list[Mapping[str, str]], receipt["remote_refs"])
+            assert [entry["commit"] for entry in remote_refs] == [unpublished[name]]
+            assert (
+                git(remotes[name], "rev-parse", remote_refs[0]["ref"]).stdout.strip()
+                == unpublished[name]
+            )
+        else:
+            assert Path(cast(str, receipt["archive_bundle"])).is_file()
+
+
+def start_ref_writer(tmp_path: Path, repository: Path, commit: str) -> subprocess.Popen[str]:
+    """Start `git update-ref --stdin` on ``repository``, named by its absolute path.
+
+    It runs from a working directory outside the repository. Pointing a ref
+    at ``commit`` and deleting that ref again leaves the commit parsed in
+    the process's memory and named by no ref, so a census rightly skips it.
+    """
+
+    writer = subprocess.Popen(
+        [
+            "git",
+            "--git-dir",
+            str(repository),
+            "--work-tree",
+            str(tmp_path),
+            "update-ref",
+            "--stdin",
+        ],
+        cwd=tmp_path,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert writer.stdin is not None and writer.stdout is not None
+    for transaction in (f"update refs/heads/cached {commit}", "delete refs/heads/cached"):
+        writer.stdin.write(f"start\n{transaction}\nprepare\ncommit\n")
+        writer.stdin.flush()
+        assert [writer.stdout.readline() for _ in range(3)] == [
+            "start: ok\n",
+            "prepare: ok\n",
+            "commit: ok\n",
+        ]
+    return writer
+
+
+def test_recover_absent_agent_row_keeps_a_running_writer_from_remaking_submodule_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=False)
+    )
+    component = administration / "modules" / "component"
+    aside = administration / "wrkslots-recovery-modules"
+    retained = wrkslots._worktree_modules_retained(administration, record).path
+    commit = absent_agent_module_git(
+        tmp_path,
+        component,
+        *ABSENT_AGENT_TEST_IDENTITY,
+        "commit-tree",
+        EMPTY_TREE,
+        "-m",
+        "held by a running writer",
+    ).stdout.strip()
+    # A Git process started before recovery names the repository by the path
+    # Git keeps it at.
+    writer = start_ref_writer(tmp_path, component, commit)
+    writers = [writer]
+    late: dict[str, tuple[int, str, str]] = {}
+    try:
+        allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+        original_retain = wrkslots._retain_worktree_modules
+
+        def write_around_retention(
+            directory: Path, destination: wrkslots._RetainedModules
+        ) -> wrkslots._DirectoryIdentity:
+            # The final census has run. Git makes missing leading directories
+            # when it locks a ref, so the running writer would make
+            # modules/component/refs/heads/ anew and name the commit there,
+            # where removal deletes it unexamined. The placeholder file at
+            # modules/ stops that for any process, root included.
+            out, err = writer.communicate(
+                f"start\nupdate refs/heads/late {commit}\nprepare\ncommit\n", timeout=60
+            )
+            late["modules"] = (writer.returncode, out, err)
+            # A writer that found the set-aside path is stopped the same way
+            # once the repositories are kept outside the administrative
+            # directory, by the placeholder file put at that path.
+            aside_writer = start_ref_writer(tmp_path, aside / "component", commit)
+            writers.append(aside_writer)
+            identity = original_retain(directory, destination)
+            out, err = aside_writer.communicate(
+                f"start\nupdate refs/heads/late {commit}\nprepare\ncommit\n", timeout=60
+            )
+            late["aside"] = (aside_writer.returncode, out, err)
+            return identity
+
+        monkeypatch.setattr(wrkslots, "_retain_worktree_modules", write_around_retention)
+        assert run_absent_agent_recovery(project, record, apply=True) == 0
+    finally:
+        for started in writers:
+            if started.poll() is None:
+                started.kill()
+                started.wait()
+    assert sorted(late) == ["aside", "modules"]
+    for returncode, out, err in late.values():
+        assert returncode != 0, (out, err)
+        assert "commit: ok" not in out
+    assert not administration.exists()
+    # The commit is kept, named by no ref, as it was before recovery.
+    kept = retained / "modules" / "component"
+    assert absent_agent_module_git(tmp_path, kept, "cat-file", "-t", commit).stdout.strip() == (
+        "commit"
+    )
+    assert absent_agent_module_git(
+        tmp_path, kept, "for-each-ref", "--format=%(refname)", "refs/heads/late"
+    ).stdout == ""
+
+
+# A process that holds a handle inside a Git repository and, on request,
+# runs a fresh `git update-ref` through that handle. The handle is a
+# directory descriptor or the working directory, of the process, of one of
+# its threads only (unshare(CLONE_FILES) or unshare(CLONE_FS) in that thread),
+# or of a child forked on request, after which the parent closes its own;
+# AbsentAgentModuleHolder may also start it in a PID namespace of its own.
+# Requests and replies are one JSON line each.
+ABSENT_AGENT_MODULE_HOLDER = textwrap.dedent(
+    '''\
+    import json
+    import os
+    import subprocess
+    import sys
+    import threading
+
+    kind, repository, work = sys.argv[1:4]
+
+
+    def read_line():
+        # One byte at a time, so nothing is buffered ahead of a fork.
+        data = bytearray()
+        while True:
+            byte = os.read(0, 1)
+            if not byte or byte == b"\\n":
+                return data.decode()
+            data += byte
+
+
+    def reply(value):
+        os.write(1, (json.dumps(value) + "\\n").encode())
+
+
+    def serve(alias, descriptors):
+        reply("ready")
+        while True:
+            line = read_line()
+            if not line:
+                return
+            if line == "fork":
+                child = os.fork()
+                if child:
+                    for descriptor in descriptors:
+                        os.close(descriptor)
+                    _pid, status = os.waitpid(child, 0)
+                    os._exit(os.waitstatus_to_exitcode(status))
+                reply("forked")
+                continue
+            if line.startswith("store "):
+                # Write the commit object in a file into the repository.
+                arguments = ["hash-object", "-w", "-t", "commit", line[len("store "):]]
+            else:
+                arguments = ["update-ref"] + json.loads(line)
+            done = subprocess.run(
+                ["git", "--git-dir", alias, "--work-tree", work] + arguments,
+                pass_fds=descriptors,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            reply([done.returncode, done.stderr])
+
+
+    def hold():
+        if kind.endswith("-cwd"):
+            if kind.startswith("thread-"):
+                os.unshare(os.CLONE_FS)
+            os.chdir(repository)
+            serve(".", ())
+            return
+        if kind.startswith("thread-"):
+            os.unshare(os.CLONE_FILES)
+        descriptor = os.open(repository, os.O_RDONLY | os.O_DIRECTORY)
+        serve(f"/proc/self/fd/{descriptor}", (descriptor,))
+
+
+    if kind.startswith("thread-"):
+        worker = threading.Thread(target=hold)
+        worker.start()
+        worker.join()
+    else:
+        hold()
+    '''
+)
+
+
+class AbsentAgentModuleHolder:
+    """Run ABSENT_AGENT_MODULE_HOLDER on a repository."""
+
+    def __init__(self, tmp_path: Path, kind: str, repository: Path) -> None:
+        script = tmp_path / "module-holder.py"
+        script.write_text(ABSENT_AGENT_MODULE_HOLDER, encoding="utf-8")
+        command = [sys.executable, str(script), kind, str(repository), str(tmp_path)]
+        if kind.startswith("pidns-"):
+            # In a user and PID namespace of its own, where no process census
+            # outside could see it.
+            unshare = shutil.which("unshare")
+            assert unshare is not None
+            command = [unshare, "--user", "--map-root-user", "--pid", "--fork", *command]
+        self.process = subprocess.Popen(
+            command,
+            cwd=tmp_path,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        assert self.receive() == "ready"
+
+    def receive(self) -> object:
+        assert self.process.stdout is not None
+        line = self.process.stdout.readline()
+        assert line, "the holder exited"
+        answer: object = json.loads(line)
+        return answer
+
+    def send(self, line: str) -> object:
+        assert self.process.stdin is not None
+        self.process.stdin.write(line + "\n")
+        self.process.stdin.flush()
+        return self.receive()
+
+    def update_ref(self, *args: str) -> tuple[int, str]:
+        return self._git(json.dumps(list(args)))
+
+    def store(self, commit: Path) -> tuple[int, str]:
+        """Have the holder write the commit object in ``commit`` through its handle."""
+
+        return self._git(f"store {commit}")
+
+    def _git(self, line: str) -> tuple[int, str]:
+        answer = self.send(line)
+        assert isinstance(answer, list) and len(answer) == 2, answer
+        returncode, stderr = answer
+        assert isinstance(returncode, int) and isinstance(stderr, str), answer
+        return returncode, stderr
+
+    def close(self) -> None:
+        assert self.process.stdin is not None and self.process.stdout is not None
+        self.process.stdin.close()
+        try:
+            self.process.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait()
+        self.process.stdout.close()
+
+
+@pytest.mark.parametrize(
+    "kind", ["process-fd", "process-cwd", "thread-fd", "thread-cwd", "fork-fd", "pidns-fd"]
+)
+def test_recover_absent_agent_row_retains_what_a_writer_holding_a_submodule_directory_makes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=False)
+    )
+    component = administration / "modules" / "component"
+    retained = wrkslots._worktree_modules_retained(administration, record).path
+    # Git names the empty tree without storing it; store it, so a full fsck
+    # of the kept repository can check the commit below as well.
+    assert absent_agent_module_git(
+        tmp_path, component, "hash-object", "-w", "-t", "tree", "/dev/null"
+    ).stdout.strip() == EMPTY_TREE
+    # A commit no repository stores yet: the holder writes it only once the
+    # census is over, so salvage cannot see it. (A commit the repository
+    # stored before the census is salvaged, even one no ref names.)
+    body = (
+        f"tree {EMPTY_TREE}\n"
+        "author Wrkslots Test <wrkslots@example.invalid> 1700000000 +0000\n"
+        "committer Wrkslots Test <wrkslots@example.invalid> 1700000000 +0000\n"
+        "\n"
+        "stored after the census\n"
+    ).encode()
+    late_commit = tmp_path / "late-commit"
+    late_commit.write_bytes(body)
+    commit = hashlib.sha1(b"commit %d\0" % len(body) + body).hexdigest()
+    published = absent_agent_module_git(tmp_path, component, "rev-parse", "HEAD").stdout.strip()
+    # A process started before recovery holds a handle inside the repository.
+    # Renaming the repository does not stop it: the handle follows the
+    # directory, and no process census can be relied on to find it (a
+    # thread's own descriptor table or working directory, a child forked
+    # after any census, a process in another PID namespace). What it writes
+    # after the census is not salvaged, so recovery must not delete it:
+    # every write lands in the repository recovery keeps.
+    holder = AbsentAgentModuleHolder(tmp_path, kind, component)
+    written: dict[str, tuple[int, str]] = {}
+    try:
+        # The handle works: through it the holder can name a commit.
+        assert holder.update_ref("refs/heads/probe", published) == (0, "")
+        assert holder.update_ref("-d", "refs/heads/probe") == (0, "")
+        if kind.startswith("thread-"):
+            # Only the holding thread has it; the process does not show it.
+            proc = Path("/proc") / str(holder.process.pid)
+            assert all(
+                os.readlink(entry) != str(component) for entry in (proc / "fd").iterdir()
+            )
+            assert os.readlink(proc / "cwd") != str(component)
+        allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+        original_storage = wrkslots._assert_absent_agent_storage
+        original_retain = wrkslots._retain_worktree_modules
+
+        def write_then_check(
+            config: wrkslots.Config, recorded: wrkslots.ActiveRecord
+        ) -> tuple[Path, ...]:
+            if (administration / "modules").is_file() and "late" not in written:
+                # Examined where they were set aside, and about to be kept.
+                if kind == "fork-fd":
+                    assert holder.send("fork") == "forked"
+                written["stored"] = holder.store(late_commit)
+                written["late"] = holder.update_ref("refs/heads/late", commit)
+            return original_storage(config, recorded)
+
+        def retain_then_write(
+            directory: Path, destination: wrkslots._RetainedModules
+        ) -> wrkslots._DirectoryIdentity:
+            identity = original_retain(directory, destination)
+            written["later"] = holder.update_ref("refs/heads/later", commit)
+            return identity
+
+        monkeypatch.setattr(wrkslots, "_assert_absent_agent_storage", write_then_check)
+        monkeypatch.setattr(wrkslots, "_retain_worktree_modules", retain_then_write)
+        assert run_absent_agent_recovery(project, record, apply=True) == 0
+        # The registration is removed, and the handle still reaches the repository.
+        assert not administration.exists()
+        written["latest"] = holder.update_ref("refs/heads/latest", commit)
+    finally:
+        holder.close()
+    assert written == {
+        "stored": (0, ""), "late": (0, ""), "later": (0, ""), "latest": (0, "")
+    }
+    kept = retained / "modules" / "component"
+    for name in ("late", "later", "latest"):
+        assert (
+            absent_agent_module_git(tmp_path, kept, "rev-parse", f"refs/heads/{name}").stdout.strip()
+            == commit
+        )
+    absent_agent_module_git(tmp_path, kept, "fsck", "--full", "--strict")
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._load_active(config).slots
+    # Made after the census, so salvage never saw it.
+    assert commit not in json.dumps(wrkslots._load_archive(config).records[-1])
+
+
+@pytest.mark.parametrize("when", ["before-recovery", "after-salvage"])
+def test_recover_absent_agent_row_refuses_a_prepared_submodule_ref_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], when: str
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=False)
+    )
+    component = administration / "modules" / "component"
+    commit = absent_agent_module_git(
+        tmp_path,
+        component,
+        *ABSENT_AGENT_TEST_IDENTITY,
+        "commit-tree",
+        EMPTY_TREE,
+        "-m",
+        "named by a prepared transaction",
+    ).stdout.strip()
+    # A Git process started before recovery prepares a ref transaction
+    # through a directory descriptor: Git checks the commit and holds
+    # refs/heads/late.lock, and committing only renames that into place. No
+    # ref names the commit until then, so only the lock shows it.
+    descriptor = os.open(component, os.O_RDONLY | os.O_DIRECTORY)
+    writer = subprocess.Popen(
+        [
+            "git",
+            "--git-dir",
+            f"/proc/self/fd/{descriptor}",
+            "--work-tree",
+            str(tmp_path),
+            "update-ref",
+            "--stdin",
+        ],
+        pass_fds=(descriptor,),
+        cwd=tmp_path,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    os.close(descriptor)
+    prepared: list[Path] = []
+
+    def prepare() -> None:
+        assert writer.stdin is not None and writer.stdout is not None
+        writer.stdin.write(f"start\nupdate refs/heads/late {commit}\nprepare\n")
+        writer.stdin.flush()
+        assert [writer.stdout.readline() for _ in range(2)] == ["start: ok\n", "prepare: ok\n"]
+        prepared.append(component / "refs" / "heads" / "late.lock")
+        assert prepared[0].is_file()
+
+    try:
+        allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+        modes = directory_modes(administration / "modules")
+        if when == "before-recovery":
+            prepare()
+            assert run_absent_agent_recovery(project, record, apply=False) == 3
+            assert str(prepared[0]) in capsys.readouterr().err
+            # Apply refuses at its first census, before anything is moved.
+            assert run_absent_agent_recovery(project, record, apply=True) == 3
+            assert str(prepared[0]) in capsys.readouterr().err
+        else:
+            original_lock = wrkslots._GitVcs.worktree_index_locked
+
+            @contextlib.contextmanager
+            def prepare_then_lock(
+                self: wrkslots._GitVcs, repo: Path, checkout: Path
+            ) -> Iterator[Path]:
+                # Salvage and the journal are done, and the census that found
+                # nothing to refuse is over.
+                prepare()
+                with original_lock(self, repo, checkout) as locked:
+                    yield locked
+
+            monkeypatch.setattr(wrkslots._GitVcs, "worktree_index_locked", prepare_then_lock)
+            assert run_absent_agent_recovery(project, record, apply=True) == 3
+            # The final census, of the repositories where they were moved,
+            # finds the lock.
+            assert "wrkslots-recovery-modules/component/refs/heads/late.lock" in (
+                capsys.readouterr().err
+            )
+        assert prepared
+        config = wrkslots._load_config(str(project), "testhost")
+        assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+        assert not (administration / "wrkslots-recovery-modules").exists()
+        assert directory_modes(administration / "modules") == modes
+        # Nothing was removed, so the transaction commits and the commit is kept.
+        out, err = writer.communicate("commit\n", timeout=60)
+        assert (writer.returncode, out) == (0, "commit: ok\n"), err
+    finally:
+        if writer.poll() is None:
+            writer.kill()
+            writer.wait()
+    assert (
+        absent_agent_module_git(tmp_path, component, "rev-parse", "refs/heads/late").stdout.strip()
+        == commit
+    )
+
+
+def test_recover_absent_agent_row_takes_a_branch_named_like_an_operation_for_a_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=False)
+    )
+    component = administration / "modules" / "component"
+    # rev-parse resolves the name CHERRY_PICK_HEAD to this branch, though no
+    # cherry-pick is under way.
+    absent_agent_module_git(tmp_path, component, "branch", "CHERRY_PICK_HEAD", "HEAD")
+    assert not (component / "CHERRY_PICK_HEAD").exists()
+    assert (
+        absent_agent_module_git(
+            tmp_path, component, "rev-parse", "--symbolic-full-name", "CHERRY_PICK_HEAD"
+        ).stdout.strip()
+        == "refs/heads/CHERRY_PICK_HEAD"
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=False) == 0, (
+        capsys.readouterr().err
+    )
+    assert run_absent_agent_recovery(project, record, apply=True) == 0, (
+        capsys.readouterr().err
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not administration.exists()
+    receipts = absent_agent_module_receipts(wrkslots._load_archive(config).records[-1])
+    assert [(receipt["submodule"], receipt["disposition"]) for receipt in receipts] == [
+        ("modules/component", "already-published"),
+        ("modules/component/modules/leaf", "already-published"),
+    ]
+
+
+def absent_agent_bare_module(tmp_path: Path, backend: str) -> tuple[Path, Path, Path, str]:
+    """Make a submodule repository with one published commit, using Git's ``backend`` for refs.
+
+    Returns the administrative directory it is under, the repository, the
+    superproject's common directory, and the commit.
+    """
+
+    administration = tmp_path / "administration"
+    module = administration / "modules" / "component"
+    common = tmp_path / "common"
+    module.parent.mkdir(parents=True)
+    common.mkdir()
+    git(tmp_path, "init", "--quiet", "--bare", f"--ref-format={backend}", str(module))
+    tree = subprocess.run(
+        ["git", "--git-dir", str(module), "mktree"],
+        input="",
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+    commit = git_dir(
+        module, *ABSENT_AGENT_TEST_IDENTITY, "commit-tree", tree, "-m", "published"
+    ).stdout.strip()
+    git_dir(module, "update-ref", "refs/heads/main", commit)
+    git_dir(module, "update-ref", "refs/remotes/origin/main", commit)
+    git_dir(module, "symbolic-ref", "HEAD", "refs/heads/main")
+    return administration, module, common, commit
+
+
+@pytest.mark.parametrize("backend", ["files", "reftable"])
+@pytest.mark.parametrize("operation", ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"])
+def test_worktree_module_census_asks_for_operation_refs_by_exact_name(
+    tmp_path: Path, backend: str, operation: str
+) -> None:
+    administration, module, common, commit = absent_agent_bare_module(tmp_path, backend)
+    vcs = wrkslots._GitVcs()
+    # A branch with the operation's name is an ordinary, published branch.
+    git_dir(module, "branch", operation, commit)
+    census = vcs._worktree_module(common, administration, "modules/component", module)
+    assert (census.head, census.tips, census.blocking) == (commit, (), ())
+    # The operation itself, under way, blocks. Git keeps MERGE_HEAD in a file
+    # with either backend, and the others in the ref backend.
+    if operation == "MERGE_HEAD":
+        (module / operation).write_text(f"{commit}\n", encoding="ascii")
+    else:
+        git_dir(module, "update-ref", operation, commit)
+    census = vcs._worktree_module(common, administration, "modules/component", module)
+    assert any(operation in entry for entry in census.blocking), census.blocking
+
+
+def test_recover_absent_agent_row_removes_a_placeholder_a_stopped_recovery_left(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    config = wrkslots._load_config(str(project), "testhost")
+    path = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
+    administration = wrkslots._GitVcs().worktree_administrative_directory(repository, path)
+    assert administration is not None
+    assert not (administration / "modules").exists()
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    child = os.fork()
+    if child == 0:
+        os.environ["WRKSLOTS_TEST_INTERRUPT"] = "after-absent-agent-modules-set-aside"
+        try:
+            returncode = run_absent_agent_recovery(project, record, apply=True)
+        except BaseException:
+            os._exit(255)
+        os._exit(returncode)
+    _pid, status = os.waitpid(child, 0)
+    assert os.waitstatus_to_exitcode(status) == 86
+    # With no submodule repositories to move, the placeholder alone is left.
+    assert (administration / "modules").is_file()
+    assert not (administration / "wrkslots-recovery-modules").exists()
+    with pytest.raises(wrkslots.Refusal, match="stopped before it finished"):
+        wrkslots._GitVcs().worktree_modules(repository, path)
+    capsys.readouterr()
+
+    recover = [
+        "--project-root",
+        str(project),
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ]
+    assert wrkslots.main(recover) == 3
+    assert "index lock" in capsys.readouterr().err.lower()
+    assert not (administration / "modules").exists()
+    (administration / "index.lock").unlink()
+    assert wrkslots.main(recover) == 0, capsys.readouterr().err
+    assert not administration.exists()
+    assert not wrkslots._load_active(config).slots
+
+
+def retention_test_record(
+    slot: str = "gone-agent", generation: int = 7, created_at: str = "2026-10-03T00:00:00+00:00"
+) -> wrkslots.ActiveRecord:
+    """An ACTIVE row for the unit tests of where recovery keeps submodule repositories."""
+
+    lease = wrkslots.ProcessIdentity(
+        pid=124,
+        start_ticks=457,
+        boot_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        host_id="host-a",
+        cgroup_path="/",
+    )
+    return wrkslots.ActiveRecord(
+        slot=slot,
+        agent=f"agent-{slot}",
+        task="task",
+        purpose="retention",
+        slot_type="agent",
+        machine="testhost",
+        generation=generation,
+        created_at=created_at,
+        heartbeat_at=created_at,
+        heartbeat_ttl_seconds=600,
+        owner=None,
+        coordinator_lease=lease,
+        coordinator_recovery_note=None,
+        handoff=None,
+        checkouts=(),
+    )
+
+
+def retained_modules_layout(
+    tmp_path: Path,
+) -> tuple[Path, wrkslots._RetainedModules]:
+    """Make an administrative directory <common>/worktrees/checkout as Git leaves one; return it and where recovery keeps its repositories."""
+
+    administration = tmp_path / "common" / "worktrees" / "checkout"
+    (administration / "logs").mkdir(parents=True)
+    (administration / "HEAD").write_text("ref: refs/heads/topic\n", encoding="utf-8")
+    (administration / "gitdir").write_text("/absent/checkout/.git\n", encoding="utf-8")
+    (administration / "commondir").write_text("../..\n", encoding="utf-8")
+    (administration / "logs" / "HEAD").write_text("reflog\n", encoding="utf-8")
+    retained = wrkslots._worktree_modules_retained(administration, retention_test_record())
+    return administration, retained
+
+
+def make_module_stub(directory: Path, content: str) -> None:
+    directory.mkdir(parents=True)
+    (directory / "HEAD").write_text(content, encoding="utf-8")
+
+
+def keep_module_stubs(administration: Path, retained: wrkslots._RetainedModules) -> None:
+    """Leave what recovery leaves once it has moved repositories out of ``administration``."""
+
+    (administration / "modules").write_bytes(wrkslots._WORKTREE_MODULES_PLACEHOLDER)
+    wrkslots._make_retained_modules_directory(administration, retained)
+    make_module_stub(retained.path / "modules" / "component", "kept\n")
+
+
+def test_worktree_modules_retained_names_each_row_and_directory_apart(
+    tmp_path: Path,
+) -> None:
+    administration, retained = retained_modules_layout(tmp_path)
+    record = retention_test_record()
+    digest = wrkslots._record_sha256(record)
+    assert retained.path == (
+        tmp_path / "common" / "wrkslots-retained-modules" / f"gone-agent+7+{digest[:16]}+checkout"
+    )
+    # As deep below the common Git directory as modules/ is.
+    assert len(retained.path.relative_to(tmp_path / "common").parts) == len(
+        administration.relative_to(tmp_path / "common").parts
+    )
+    assert retained.owner() == {
+        "administration": "checkout",
+        "generation": 7,
+        "machine": "testhost",
+        "record_sha256": digest,
+        "schema": 1,
+        "slot": "gone-agent",
+    }
+    worktrees = tmp_path / "common" / "worktrees"
+    # Slot a with checkout 1-x and slot a-1 with checkout x once shared a name.
+    first = wrkslots._worktree_modules_retained(worktrees / "1-x", retention_test_record("a", 1))
+    second = wrkslots._worktree_modules_retained(worktrees / "x", retention_test_record("a-1", 1))
+    assert first.path != second.path
+    # So does a slot's name reused by a later row, and another generation.
+    later = retention_test_record(created_at="2026-10-04T00:00:00+00:00")
+    assert wrkslots._worktree_modules_retained(administration, later).path != retained.path
+    assert (
+        wrkslots._worktree_modules_retained(administration, retention_test_record(generation=8)).path
+        != retained.path
+    )
+    # Anywhere but the worktrees/ directory of a common Git directory, the
+    # depth that keeps a relative alternates path pointing at the same
+    # place is unknown.
+    elsewhere = tmp_path / "common" / "other" / "checkout"
+    elsewhere.mkdir(parents=True)
+    with pytest.raises(wrkslots.Refusal, match="not in the worktrees/ directory"):
+        wrkslots._worktree_modules_retained(elsewhere, record)
+    with pytest.raises(wrkslots.Refusal, match="longer than a file name"):
+        wrkslots._worktree_modules_retained(worktrees / ("x" * 240), record)
+
+
+def test_restore_worktree_modules_leaves_what_is_kept_once_the_registration_is_removed(
+    tmp_path: Path,
+) -> None:
+    administration, retained = retained_modules_layout(tmp_path)
+    keep_module_stubs(administration, retained)
+    shutil.rmtree(administration)
+    before = tree_snapshot(retained.path)
+    assert wrkslots._restore_worktree_modules_set_aside(administration, retained) is False
+    assert tree_snapshot(retained.path) == before
+
+
+@pytest.mark.parametrize("aside_placeholder", [False, True], ids=["moved", "placeholder"])
+def test_restore_worktree_modules_moves_kept_repositories_back_to_modules(
+    tmp_path: Path, aside_placeholder: bool
+) -> None:
+    administration, retained = retained_modules_layout(tmp_path)
+    aside = administration / "wrkslots-recovery-modules"
+    keep_module_stubs(administration, retained)
+    make_module_stub(retained.path / "modules" / "component" / "modules" / "leaf", "leaf\n")
+    before = tree_snapshot(retained.path / "modules")
+    if aside_placeholder:
+        aside.write_bytes(wrkslots._WORKTREE_MODULES_ASIDE_PLACEHOLDER)
+    # Git writes a file the owner file does not list; that is no removal.
+    (administration / "ORIG_HEAD").write_text("written since\n", encoding="utf-8")
+    assert wrkslots._restore_worktree_modules_set_aside(administration, retained) is True
+    assert tree_snapshot(administration / "modules") == before
+    assert not aside.exists()
+    assert not retained.path.exists()
+    assert retained.path.parent.is_dir()
+    assert wrkslots._restore_worktree_modules_set_aside(administration, retained) is False
+    assert tree_snapshot(administration / "modules") == before
+
+
+@pytest.mark.parametrize("left", ["empty", "owner", "malformed-owner"])
+def test_restore_worktree_modules_removes_the_directory_made_to_keep_them_before_the_move(
+    tmp_path: Path, left: str
+) -> None:
+    administration, retained = retained_modules_layout(tmp_path)
+    aside = administration / "wrkslots-recovery-modules"
+    make_module_stub(aside / "component", "set aside\n")
+    before = tree_snapshot(aside)
+    (administration / "modules").write_bytes(wrkslots._WORKTREE_MODULES_PLACEHOLDER)
+    if left == "owner":
+        wrkslots._make_retained_modules_directory(administration, retained)
+    else:
+        retained.path.mkdir(parents=True)
+        if left == "malformed-owner":
+            # Stopped while writing it: nothing can have been moved beside it.
+            (retained.path / "wrkslots-retained-owner.json").write_bytes(b'{"slot": "gone-ag')
+    assert wrkslots._restore_worktree_modules_set_aside(administration, retained) is True
+    assert not retained.path.exists()
+    assert not aside.exists()
+    assert tree_snapshot(administration / "modules") == before
+
+
+@pytest.mark.parametrize(
+    "where", ["modules", "modules-replaced", "set-aside", "set-aside-file", "kept-file"]
+)
+def test_restore_worktree_modules_refuses_to_merge_kept_repositories_with_others(
+    tmp_path: Path, where: str
+) -> None:
+    administration, retained = retained_modules_layout(tmp_path)
+    aside = administration / "wrkslots-recovery-modules"
+    if where == "modules":
+        # modules/ is a directory of other repositories, not the placeholder,
+        # in the administrative directory the owner file lists.
+        make_module_stub(administration / "modules" / "other", "made since\n")
+        wrkslots._make_retained_modules_directory(administration, retained)
+        make_module_stub(retained.path / "modules" / "component", "kept\n")
+    else:
+        keep_module_stubs(administration, retained)
+    if where == "modules-replaced":
+        # The placeholder gave way to repositories made since.
+        (administration / "modules").unlink()
+        make_module_stub(administration / "modules" / "other", "made since\n")
+    elif where == "kept-file":
+        # Something recovery did not put there sits beside what it kept.
+        (retained.path / "stray").write_text("stray\n", encoding="utf-8")
+        shutil.rmtree(retained.path / "modules")
+    elif where == "set-aside":
+        make_module_stub(aside / "other", "made since\n")
+    elif where == "set-aside-file":
+        aside.write_bytes(b"not the placeholder\n")
+    before = (tree_snapshot(administration), tree_snapshot(retained.path))
+    with pytest.raises(wrkslots.Refusal) as refused:
+        wrkslots._restore_worktree_modules_set_aside(administration, retained)
+    if where == "kept-file":
+        assert "which recovery does not put there" in str(refused.value)
+    elif where == "modules-replaced":
+        assert "is gone or changed" in str(refused.value)
+    else:
+        assert str(refused.value).startswith("both ")
+    assert "nothing was moved" in str(refused.value)
+    assert (tree_snapshot(administration), tree_snapshot(retained.path)) == before
+
+
+@pytest.mark.parametrize("modules", [True, False], ids=["with-modules", "owner-only"])
+@pytest.mark.parametrize(
+    "field", ["slot", "generation", "machine", "record_sha256", "administration"]
+)
+def test_restore_worktree_modules_refuses_what_another_row_or_directory_keeps(
+    tmp_path: Path, field: str, modules: bool
+) -> None:
+    administration, retained = retained_modules_layout(tmp_path)
+    keep_module_stubs(administration, retained)
+    if not modules:
+        shutil.rmtree(retained.path / "modules")
+    # Another row's or directory's, found where this one's would be.
+    asking = {
+        "slot": lambda: replace(retained, slot="gone-agent-1"),
+        "generation": lambda: replace(retained, generation=8),
+        "machine": lambda: replace(retained, machine="otherhost"),
+        "record_sha256": lambda: replace(retained, record_sha256="0" * 64),
+        "administration": lambda: replace(retained, administration="other"),
+    }[field]()
+    before = (tree_snapshot(administration), tree_snapshot(retained.path))
+    with pytest.raises(wrkslots.Refusal, match="keeps the submodule repositories of another row"):
+        wrkslots._restore_worktree_modules_set_aside(administration, asking)
+    assert (tree_snapshot(administration), tree_snapshot(retained.path)) == before
+
+
+@pytest.mark.parametrize("owner", ["missing", "malformed", "not-an-object"])
+def test_restore_worktree_modules_refuses_kept_repositories_no_owner_file_names(
+    tmp_path: Path, owner: str
+) -> None:
+    administration, retained = retained_modules_layout(tmp_path)
+    keep_module_stubs(administration, retained)
+    owner_file = retained.path / "wrkslots-retained-owner.json"
+    owner_file.unlink()
+    if owner == "malformed":
+        owner_file.write_bytes(b"{not json\n")
+    elif owner == "not-an-object":
+        owner_file.write_bytes(b"[]\n")
+    before = (tree_snapshot(administration), tree_snapshot(retained.path))
+    with pytest.raises(wrkslots.Refusal, match="does not name the row"):
+        wrkslots._restore_worktree_modules_set_aside(administration, retained)
+    assert (tree_snapshot(administration), tree_snapshot(retained.path)) == before
+
+
+@pytest.mark.parametrize(
+    "removal", ["HEAD", "gitdir", "logs/HEAD", "logs", "commondir-is-a-directory"]
+)
+def test_restore_worktree_modules_keeps_them_once_git_began_removing_the_registration(
+    tmp_path: Path, removal: str
+) -> None:
+    administration, retained = retained_modules_layout(tmp_path)
+    keep_module_stubs(administration, retained)
+    # Git deletes an administrative directory entry by entry, and stops at
+    # the first it cannot delete: what it deleted before may be what makes
+    # it list the registration, and a later `git worktree prune` would then
+    # delete the rest. Moved back there, the repositories would go with it.
+    if removal == "commondir-is-a-directory":
+        (administration / "commondir").unlink()
+        (administration / "commondir").mkdir()
+    elif removal == "logs":
+        shutil.rmtree(administration / "logs")
+    else:
+        (administration / removal).unlink()
+    before = (tree_snapshot(administration), tree_snapshot(retained.path))
+    with pytest.raises(wrkslots.Refusal, match="stopped partway") as refused:
+        wrkslots._restore_worktree_modules_set_aside(administration, retained)
+    assert "nothing was moved" in str(refused.value)
+    assert (tree_snapshot(administration), tree_snapshot(retained.path)) == before
+
+
+def test_mount_points_reads_only_what_the_kernel_writes() -> None:
+    table = (
+        b"22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n"
+        b"23 22 0:5 / /with\\040space rw - tmpfs tmpfs rw\n"
+        # The kernel escapes only space, tab, newline, and backslash; any
+        # other byte, a vertical tab or U+2028 among them, is written as is.
+        b"24 22 0:6 / /tab\\011and\\012newline\\134slash\x0bvt\xe2\x80\xa8ls rw - tmpfs t rw\n"
+        b"25 22 0:7 /sub /no-optional rw master:3 propagate_from:2 - xfs /dev/x rw\n"
+        # A mount's source may be empty, as `mount -t tmpfs "" /m` leaves it.
+        b"26 22 0:8 / /empty-source rw - tmpfs  rw\n"
+    )
+    assert wrkslots._mount_points(table, "table") == (
+        Path("/"),
+        Path("/with space"),
+        Path("/tab\tand\nnewline\\slash\x0bvt\u2028ls"),
+        Path("/no-optional"),
+        Path("/empty-source"),
+    )
+    for malformed in (
+        b"",
+        b"22 1 8:1 / / rw - ext4 /dev/sda1 rw",
+        b"22 1 8:1 / / rw ext4 /dev/sda1 rw\n",
+        b"22 1 8:1 / / rw - ext4 /dev/sda1\n",
+        b"22 1 8:1 / relative rw - ext4 /dev/sda1 rw\n",
+        b"22 1 8:1 / /bad\\9escape rw - ext4 /dev/sda1 rw\n",
+        b"22 1 8:1 / /bad\\400 rw - ext4 /dev/sda1 rw\n",
+        b"22 1 8:1 / /a  rw - ext4 /dev/sda1 rw\n",
+        b"22 1 8:1 / /a rw  - ext4 /dev/sda1 rw\n",
+    ):
+        with pytest.raises(wrkslots.Refusal):
+            wrkslots._mount_points(malformed, "table")
+
+
+def test_mount_entries_read_identifiers_root_type_and_options() -> None:
+    table = (
+        b"22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n"
+        b"30 22 0:40 /sub\\040dir /mnt/o rw - overlay overlay "
+        b"rw,lowerdir=/l1:/l2,upperdir=/u,workdir=/w\n"
+        b"31 30 0:41 net:[4026531840] /run/n rw - nsfs nsfs rw\n"
+    )
+    assert [
+        (entry.mount_id, entry.parent_id, entry.point, entry.root, entry.fstype, entry.options)
+        for entry in wrkslots._mount_entries(table, "table")
+    ] == [
+        (22, 1, Path("/"), b"/", "ext4", b"rw"),
+        (
+            30,
+            22,
+            Path("/mnt/o"),
+            b"/sub\\040dir",
+            "overlay",
+            b"rw,lowerdir=/l1:/l2,upperdir=/u,workdir=/w",
+        ),
+        (31, 30, Path("/run/n"), b"net:[4026531840]", "nsfs", b"rw"),
+    ]
+    for malformed in (
+        b"x2 1 8:1 / / rw - ext4 /dev/sda1 rw\n",
+        b"22 -1 8:1 / / rw - ext4 /dev/sda1 rw\n",
+    ):
+        with pytest.raises(wrkslots.Refusal, match="malformed mount identifier"):
+            wrkslots._mount_entries(malformed, "table")
+
+
+def test_visible_mount_follows_mounts_by_parent() -> None:
+    def visible(table: bytes, path: str) -> int | None:
+        found = wrkslots._visible_mount(wrkslots._mount_entries(table, "table"), Path(path))
+        return None if found is None else found.mount_id
+
+    nested = (
+        b"20 1 0:1 / / rw - ext4 a rw\n"
+        b"21 20 0:2 / /data rw - ext4 b rw\n"
+        b"22 21 0:3 / /data/x/y rw - tmpfs c rw\n"
+    )
+    assert visible(nested, "/data/x/y/z") == 22
+    assert visible(nested, "/data/x/y") == 22
+    assert visible(nested, "/data/x") == 21
+    assert visible(nested, "/elsewhere") == 20
+    # A mount made later over a directory above the deeper mount hides it,
+    # though the deeper mount point is the longer match.
+    assert visible(nested + b"24 21 0:5 / /data/x rw - tmpfs d rw\n", "/data/x/y/z") == 24
+    # So does one stacked on the mount it was mounted under.
+    assert visible(nested + b"23 21 0:4 / /data rw - tmpfs e rw\n", "/data/x/y/z") == 23
+    # A mount whose parent is not its own does not count: listed after it,
+    # on another mount at the same point, it is not reached from here.
+    assert visible(nested + b"25 20 0:6 / /data/x/y rw - tmpfs f rw\n", "/data/x/y/z") == 22
+    # Mounts stacked at "/".
+    assert visible(b"20 1 0:1 / / rw - ext4 a rw\n26 20 0:7 / / rw - tmpfs g rw\n", "/x") == 26
+    # A process whose root is not a mount point sees no mount at "/".
+    chrooted = (
+        b"30 29 0:6 / /sub rw - tmpfs t rw\n"
+        b"31 30 0:7 / /sub/deeper rw - tmpfs t rw\n"
+    )
+    assert visible(chrooted, "/sub/deeper/x") == 31
+    assert visible(chrooted, "/sub/x") == 30
+    assert visible(chrooted, "/x") is None
+
+
+def test_process_dependent_prefix_finds_each_way_into_proc(tmp_path: Path) -> None:
+    procfs = (Path("/proc"),)
+    base = Path(os.path.realpath(tmp_path))
+    descriptor = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
+    climb = "/..".join([""] * (len(base.parts) + 1))
+    (base / "fd-link").symlink_to("/proc/self/fd", target_is_directory=True)
+    (base / "hop").symlink_to(base / "fd-link", target_is_directory=True)
+    (base / "relative").symlink_to(
+        "../" * (len(base.parts) - 1) + "proc/self", target_is_directory=True
+    )
+    (base / "loop-a").symlink_to("loop-b")
+    (base / "loop-b").symlink_to("loop-a")
+    (base / "plain-link").symlink_to(base / "objects", target_is_directory=True)
+    (base / "objects").mkdir()
+    try:
+        for path, prefix in (
+            (f"/proc/self/fd/{descriptor}", "/proc"),
+            (f"/proc/self/fd/{descriptor}/objects", "/proc"),
+            # It resolves, for this process, to a directory outside proc.
+            (f"{base}{climb}/proc/self/fd/{descriptor}", f"{base}{climb}/proc"),
+            (f"{base}/fd-link/{descriptor}", f"{base}/fd-link"),
+            (f"{base}/hop/{descriptor}/objects", f"{base}/hop"),
+            (f"{base}/relative/fd/{descriptor}", f"{base}/relative"),
+            (f"{base}/loop-a/objects", f"{base}/loop-a"),
+        ):
+            assert wrkslots._process_dependent_prefix(path, procfs) == prefix, path
+        for path in (str(base / "objects"), f"{base}/plain-link/pack", f"{base}/absent/x"):
+            assert wrkslots._process_dependent_prefix(path, procfs) is None, path
+    finally:
+        os.close(descriptor)
+
+
+def test_refuse_aliases_below_refuses_a_place_in_proc() -> None:
+    def refuse(found: str) -> NoReturn:
+        raise wrkslots.Refusal(found)
+
+    with pytest.raises(wrkslots.Refusal, match="lies in the proc file system mounted at /proc"):
+        wrkslots._refuse_aliases_below(Path("/proc/self/fd"), lambda: {}, refuse, links=True)
+
+
+def test_refuse_mounts_below_administration_reads_resolved_mount_points(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = Path(os.path.realpath(tmp_path))
+    administration = base / "common" / "worktrees" / "the checkout"
+    administration.mkdir(parents=True)
+    alias = base / "alias"
+    alias.symlink_to(base / "common")
+    table = base / "mountinfo"
+    monkeypatch.setattr(wrkslots, "_SELF_MOUNTINFO", table)
+
+    def mounted(*points: str) -> None:
+        table.write_bytes(
+            b"".join(
+                b"%d 1 0:9 / %s rw - tmpfs tmpfs rw\n"
+                % (index, os.fsencode(point).replace(b" ", b"\\040"))
+                for index, point in enumerate(("/", *points), start=20)
+            )
+        )
+
+    mounted(str(base), str(administration) + "-sibling", str(base / "common" / "x"))
+    wrkslots._refuse_mounts_below_administration(alias / "worktrees" / "the checkout")
+    mounted(str(administration / "objects-alias"))
+    with pytest.raises(wrkslots.Refusal, match="lies below the Git administrative directory"):
+        # Named through a symbolic link, as the mount table never names it.
+        wrkslots._refuse_mounts_below_administration(alias / "worktrees" / "the checkout")
+    mounted(str(administration))
+    with pytest.raises(wrkslots.Refusal, match="is a mount point"):
+        wrkslots._refuse_mounts_below_administration(administration)
+
+
+def bind_directory(source: Path, destination: Path) -> None:
+    """Bind-mount ``source`` at ``destination``, a directory made here, in this process's mount namespace."""
+
+    destination.mkdir()
+    bind_mount(source, destination)
+
+
+def bind_file(source: Path, destination: Path) -> None:
+    """Bind-mount the file ``source`` at ``destination``, an empty file made here, in this process's mount namespace."""
+
+    destination.write_bytes(b"")
+    bind_mount(source, destination)
+
+
+def bind_mount(source: Path, destination: Path) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    ms_bind = 4096
+    if libc.mount(os.fsencode(source), os.fsencode(destination), None, ms_bind, None) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(destination))
+
+
+def run_in_private_mount_namespace(
+    tmp_path: Path, action: Callable[[], int]
+) -> tuple[int, str]:
+    """Run ``action`` in a child process with a user and mount namespace of its own.
+
+    There a bind mount needs no privilege, and every mount the child makes
+    goes when it exits, so nothing stays mounted below ``tmp_path``.
+    Returns the child's exit status, the result of ``action``, and what it
+    wrote to standard error.
+    """
+
+    uid, gid = os.geteuid(), os.getegid()
+    errors = tmp_path / "private-mount-namespace.stderr"
+    child = os.fork()
+    if child == 0:
+        returncode = 255
+        try:
+            sink = errors.open("w", encoding="utf-8")
+            os.dup2(sink.fileno(), 2)
+            sys.stderr = sink
+            libc = ctypes.CDLL(None, use_errno=True)
+            clone_newns, clone_newuser = 0x00020000, 0x10000000
+            if libc.unshare(clone_newuser | clone_newns) != 0:
+                error = ctypes.get_errno()
+                raise OSError(error, os.strerror(error), "unshare")
+            Path("/proc/self/setgroups").write_text("deny", encoding="ascii")
+            Path("/proc/self/uid_map").write_text(f"{uid} {uid} 1", encoding="ascii")
+            Path("/proc/self/gid_map").write_text(f"{gid} {gid} 1", encoding="ascii")
+            returncode = action()
+        except BaseException:
+            traceback.print_exc()
+        finally:
+            sys.stderr.flush()
+            os._exit(returncode)
+    _pid, status = os.waitpid(child, 0)
+    return os.waitstatus_to_exitcode(status), errors.read_text(encoding="utf-8")
+
+
+def absent_agent_administration(
+    project: Path, repository: Path, record: wrkslots.ActiveRecord
+) -> Path:
+    config = wrkslots._load_config(str(project), "testhost")
+    checkout = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
+    administration = wrkslots._GitVcs().worktree_administrative_directory(repository, checkout)
+    assert administration is not None
+    return administration
+
+
+def assert_absent_agent_row_and_registration_stand(
+    project: Path, repository: Path, record: wrkslots.ActiveRecord
+) -> None:
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+    checkout = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
+    assert wrkslots._GitVcs().worktree_registration(repository, checkout) is not None
+
+
+@pytest.mark.parametrize("layout", ["modules", "no-modules", "objects-alias"])
+def test_recover_absent_agent_row_refuses_a_mount_below_the_administrative_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, layout: str
+) -> None:
+    if layout == "no-modules":
+        project, repository, _remote = make_project(tmp_path)
+        record = prepare_absent_agent_row(project, repository)
+        administration = absent_agent_administration(project, repository, record)
+    else:
+        project, repository, record, administration, _unpublished = (
+            prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+        )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    modules = administration / "modules"
+    retained = wrkslots._worktree_modules_retained(administration, record).path
+    if layout == "objects-alias":
+        # The objects of a repository recovery retains, reachable a second
+        # time through the administrative directory, where Git would delete
+        # them on its way to removing the registration.
+        source = modules / "component" / "objects"
+    else:
+        # Data held nowhere else, which Git would delete through the mount.
+        source = tmp_path / "external-data"
+        source.mkdir()
+        (source / "only-copy").write_text("held nowhere else\n", encoding="utf-8")
+    outside = tree_snapshot(source)
+    before = tree_snapshot(modules) if layout != "no-modules" else None
+    mounted = administration / "mounted"
+
+    def recover() -> int:
+        bind_directory(source, mounted)
+        return run_absent_agent_recovery(project, record, apply=True)
+
+    returncode, stderr = run_in_private_mount_namespace(tmp_path, recover)
+    assert returncode == 3, stderr
+    assert (
+        f"mount point {os.path.realpath(mounted)} lies below the Git administrative directory"
+        in stderr
+    )
+    assert tree_snapshot(source) == outside
+    assert_absent_agent_row_and_registration_stand(project, repository, record)
+    assert not (administration / "wrkslots-recovery-modules").exists()
+    assert not retained.exists()
+    if before is not None:
+        assert tree_snapshot(modules) == before
+    # Unmounted, as the remedy says, recovery completes.
+    assert run_absent_agent_recovery(project, record, apply=True) == 0
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._load_active(config).slots
+    assert not administration.exists()
+    if layout != "objects-alias":
+        assert tree_snapshot(source) == outside
+    if before is not None:
+        assert tree_snapshot(retained / "modules") == before
+
+
+def test_recover_absent_agent_row_refuses_a_mount_made_after_the_census(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, record, administration, _unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    modules = administration / "modules"
+    retained = wrkslots._worktree_modules_retained(administration, record).path
+    source = tmp_path / "external-data"
+    source.mkdir()
+    (source / "only-copy").write_text("held nowhere else\n", encoding="utf-8")
+    outside = tree_snapshot(source)
+    before = tree_snapshot(modules)
+    mounted = administration / "mounted"
+    original_storage = wrkslots._assert_absent_agent_storage
+
+    def mount_then_check(
+        config: wrkslots.Config, recorded: wrkslots.ActiveRecord
+    ) -> tuple[Path, ...]:
+        if modules.is_file() and not mounted.exists():
+            # Every census has passed, and the repositories are set aside to
+            # be moved out before the registration is removed.
+            bind_directory(source, mounted)
+        return original_storage(config, recorded)
+
+    def recover() -> int:
+        # Patched only in the child, whose mount namespace the mount is in.
+        monkeypatch.setattr(wrkslots, "_assert_absent_agent_storage", mount_then_check)
+        return run_absent_agent_recovery(project, record, apply=True)
+
+    returncode, stderr = run_in_private_mount_namespace(tmp_path, recover)
+    assert returncode == 3, stderr
+    assert mounted.is_dir()
+    assert (
+        f"mount point {os.path.realpath(mounted)} lies below the Git administrative directory"
+        in stderr
+    )
+    assert tree_snapshot(source) == outside
+    assert tree_snapshot(modules) == before
+    assert not (administration / "wrkslots-recovery-modules").exists()
+    assert not retained.exists()
+    assert_absent_agent_row_and_registration_stand(project, repository, record)
+    assert run_absent_agent_recovery(project, record, apply=True) == 0
+    assert not administration.exists()
+    assert tree_snapshot(source) == outside
+    assert tree_snapshot(retained / "modules") == before
+
+
+def test_recover_absent_agent_row_refuses_a_mount_made_once_the_repositories_are_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, record, administration, _unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    modules = administration / "modules"
+    retained = wrkslots._worktree_modules_retained(administration, record).path
+    source = tmp_path / "external-data"
+    source.mkdir()
+    (source / "only-copy").write_text("held nowhere else\n", encoding="utf-8")
+    outside = tree_snapshot(source)
+    before = tree_snapshot(modules)
+    mounted = administration / "mounted"
+    original_retain = wrkslots._retain_worktree_modules
+
+    def retain_then_mount(
+        kept_from: Path, kept_at: wrkslots._RetainedModules
+    ) -> wrkslots._DirectoryIdentity:
+        identity = original_retain(kept_from, kept_at)
+        # Every check before the repositories moved has passed.
+        bind_directory(source, mounted)
+        return identity
+
+    def recover() -> int:
+        # Patched only in the child, whose mount namespace the mount is in.
+        monkeypatch.setattr(wrkslots, "_retain_worktree_modules", retain_then_mount)
+        return run_absent_agent_recovery(project, record, apply=True)
+
+    returncode, stderr = run_in_private_mount_namespace(tmp_path, recover)
+    assert returncode == 3, stderr
+    assert (
+        f"mount point {os.path.realpath(mounted)} lies below the Git administrative directory"
+        in stderr
+    )
+    assert f"stay at {retained / 'modules'}" in stderr
+    assert tree_snapshot(source) == outside
+    assert tree_snapshot(retained / "modules") == before
+    assert not modules.is_dir()
+    assert_absent_agent_row_and_registration_stand(project, repository, record)
+    # Unmounted, as the remedy says, a rerun moves them back, examines them
+    # again, and completes.
+    assert run_absent_agent_recovery(project, record, apply=True) == 0
+    assert not administration.exists()
+    assert tree_snapshot(source) == outside
+    assert tree_snapshot(retained / "modules") == before
+
+
+def make_object_directory(path: Path) -> Path:
+    (path / "info").mkdir(parents=True)
+    (path / "pack").mkdir()
+    return path
+
+
+@pytest.mark.parametrize(
+    "storage",
+    [
+        "administration-absolute",
+        "administration-relative",
+        "tree-absolute",
+        "other-administration",
+        "symlink",
+        "link-parent-absolute",
+        "link-parent-relative",
+    ],
+)
+def test_recover_absent_agent_row_refuses_storage_retention_cannot_keep(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    storage: str,
+) -> None:
+    project, repository, record, administration, _unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    modules = administration / "modules"
+    component = modules / "component"
+    alternates = component / "objects" / "info" / "alternates"
+    common = administration.parent.parent
+    if storage == "administration-absolute":
+        # Beside modules/, so deleted with the administrative directory.
+        extra = make_object_directory(administration / "extra-objects")
+        alternates.write_text(f"{extra}\n", encoding="utf-8")
+        expected = "where Git deletes each administrative directory with its registration"
+    elif storage == "administration-relative":
+        extra = make_object_directory(administration / "extra-objects")
+        alternates.write_text(
+            os.path.relpath(extra, component / "objects") + "\n", encoding="utf-8"
+        )
+        expected = "once it is retained"
+    elif storage == "tree-absolute":
+        # In the tree that is moved, named where it was.
+        alternates.write_text(f"{component / 'modules' / 'leaf' / 'objects'}\n", encoding="utf-8")
+        expected = "not where that is moved, once it is retained"
+    elif storage == "other-administration":
+        # Another checkout's administrative directory, named through the
+        # common Git directory so the entry means the same once retained.
+        make_object_directory(common / "worktrees" / "other" / "objects")
+        alternates.write_text(
+            os.path.join(
+                os.path.relpath(common, component / "objects"), "worktrees", "other", "objects"
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        expected = "where Git deletes each administrative directory with its registration"
+    elif storage in ("link-parent-absolute", "link-parent-relative"):
+        # Git follows outside/link before the ".." after it, so the entry
+        # reads <administration>/extra-objects; normalized without reading
+        # the file system it would name outside/extra-objects, a harmless
+        # store beside the link.
+        extra = make_object_directory(administration / "extra-objects")
+        (administration / "child").mkdir()
+        outside = tmp_path / "outside"
+        make_object_directory(outside / "extra-objects")
+        (outside / "link").symlink_to(administration / "child", target_is_directory=True)
+        base = outside if storage == "link-parent-absolute" else Path(
+            os.path.relpath(outside, component / "objects")
+        )
+        alternates.write_text(f"{base}/link/../extra-objects\n", encoding="utf-8")
+        expected = (
+            f"borrows objects from {os.path.realpath(extra)}, in "
+            f"{os.path.realpath(common / 'worktrees')}, where Git deletes each "
+            "administrative directory with its registration"
+        )
+    else:
+        (component / "description-link").symlink_to("description")
+        expected = "is a symbolic link in the submodule repositories recovery would retain"
+    before = tree_snapshot(modules)
+    assert run_absent_agent_recovery(project, record, apply=True) == 3
+    assert expected in capsys.readouterr().err
+    assert tree_snapshot(modules) == before
+    assert not (administration / "wrkslots-recovery-modules").exists()
+    assert not wrkslots._worktree_modules_retained(administration, record).path.exists()
+    assert_absent_agent_row_and_registration_stand(project, repository, record)
+
+
+@pytest.mark.parametrize("storage", ["common-relative", "external-absolute", "tree-relative"])
+def test_recover_absent_agent_row_retains_repositories_with_the_objects_they_borrow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: str
+) -> None:
+    project, repository, record, administration, _unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=False)
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    component = administration / "modules" / "component"
+    common = administration.parent.parent
+    if storage == "common-relative":
+        objects = make_object_directory(common / "shared-objects")
+    elif storage == "external-absolute":
+        objects = make_object_directory(tmp_path / "external-objects")
+    else:
+        objects = component / "modules" / "leaf" / "objects"
+    entry = str(objects) if storage == "external-absolute" else (
+        os.path.relpath(objects, component / "objects")
+    )
+    (component / "objects" / "info" / "alternates").write_text(entry + "\n", encoding="utf-8")
+
+    def borrowing(*args: str, stdin: str | None = None) -> str:
+        # Writes objects only where the repository borrows them from.
+        return subprocess.run(
+            ["git", "--git-dir", str(component), "--work-tree", str(tmp_path), *ABSENT_AGENT_TEST_IDENTITY, *args],
+            cwd=tmp_path,
+            env={**os.environ, "GIT_OBJECT_DIRECTORY": str(objects)},
+            input=stdin,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+
+    tree = borrowing("hash-object", "-w", "-t", "tree", "--stdin", stdin="")
+    commit = borrowing("commit-tree", tree, "-m", "stored only where it is borrowed from")
+    absent_agent_module_git(tmp_path, component, "update-ref", "refs/tags/borrowed", commit)
+    assert not (component / "objects" / commit[:2] / commit[2:]).exists()
+    assert run_absent_agent_recovery(project, record, apply=True) == 0
+    assert not administration.exists()
+    kept = wrkslots._worktree_modules_retained(administration, record).path / "modules" / "component"
+    assert absent_agent_module_git(tmp_path, kept, "cat-file", "-t", commit).stdout.strip() == "commit"
+    absent_agent_module_git(tmp_path, kept, "fsck", "--full", "--strict")
+
+
+@pytest.mark.parametrize(
+    "alias", ["directory-bind", "subdirectory-bind", "file-bind", "link", "administration-bind"]
+)
+def test_recover_absent_agent_row_refuses_borrowed_storage_reaching_the_administration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, alias: str
+) -> None:
+    project, repository, record, administration, _unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    modules = administration / "modules"
+    component = modules / "component"
+    # Objects Git deletes with the registration, which the repository reads
+    # only through a store outside every directory Git deletes.
+    source = make_object_directory(administration / "extra-objects")
+    loose = "c" * 38
+    (source / "ab").mkdir()
+    (source / "ab" / loose).write_bytes(b"held only in the administrative directory\n")
+    store = tmp_path / "external-objects"
+    real_store, real_source = os.path.realpath(store), os.path.realpath(source)
+    borrowed = store
+    if alias == "administration-bind":
+        # The nested repository's objects, in the tree recovery moves, named
+        # through a bind of the administrative directory: once the tree is
+        # moved that name holds nothing.
+        store = tmp_path / "external-administration"
+        borrowed = store / "modules" / "component" / "modules" / "leaf" / "objects"
+        leaf = os.path.realpath(component / "modules" / "leaf" / "objects")
+        expected = f"where {os.path.realpath(borrowed)} is {leaf} under another name"
+    elif alias == "directory-bind":
+        expected = f"where {real_store} is {real_source} under another name"
+    elif alias == "subdirectory-bind":
+        expected = f"where {real_store}/ab is {real_source}/ab under another name"
+    elif alias == "file-bind":
+        expected = f"where mount point {real_store}/ab/{loose} lies below it"
+    else:
+        expected = f"where {real_store}/ab is a symbolic link"
+    (component / "objects" / "info" / "alternates").write_text(f"{borrowed}\n", encoding="utf-8")
+    before = tree_snapshot(modules)
+    held = tree_snapshot(source)
+
+    def recover() -> int:
+        if alias == "administration-bind":
+            bind_directory(administration, store)
+        elif alias == "directory-bind":
+            bind_directory(source, store)
+        else:
+            make_object_directory(store)
+            if alias == "subdirectory-bind":
+                bind_directory(source / "ab", store / "ab")
+            elif alias == "file-bind":
+                (store / "ab").mkdir()
+                bind_file(source / "ab" / loose, store / "ab" / loose)
+            else:
+                (store / "ab").symlink_to(source / "ab", target_is_directory=True)
+        return run_absent_agent_recovery(project, record, apply=True)
+
+    returncode, stderr = run_in_private_mount_namespace(tmp_path, recover)
+    assert returncode == 3, stderr
+    assert expected in stderr
+    assert tree_snapshot(modules) == before
+    assert tree_snapshot(source) == held
+    assert not (administration / "wrkslots-recovery-modules").exists()
+    assert not wrkslots._worktree_modules_retained(administration, record).path.exists()
+    assert_absent_agent_row_and_registration_stand(project, repository, record)
+
+
+def test_recover_absent_agent_row_retains_repositories_borrowing_through_an_outside_bind_mount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, record, administration, _unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=False)
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    component = administration / "modules" / "component"
+    # A mount is refused only when what it shows is deleted with the
+    # registration; this one shows a directory outside every one Git deletes.
+    objects = make_object_directory(tmp_path / "outside-objects")
+    store = tmp_path / "bound-objects"
+    (component / "objects" / "info" / "alternates").write_text(f"{store}\n", encoding="utf-8")
+
+    def borrowing(*args: str, stdin: str | None = None) -> str:
+        return subprocess.run(
+            ["git", "--git-dir", str(component), "--work-tree", str(tmp_path), *ABSENT_AGENT_TEST_IDENTITY, *args],
+            cwd=tmp_path,
+            env={**os.environ, "GIT_OBJECT_DIRECTORY": str(objects)},
+            input=stdin,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+
+    tree = borrowing("hash-object", "-w", "-t", "tree", "--stdin", stdin="")
+    commit = borrowing("commit-tree", tree, "-m", "stored only where it is borrowed from")
+    stored = tree_snapshot(objects)
+    kept = wrkslots._worktree_modules_retained(administration, record).path / "modules" / "component"
+
+    def recover() -> int:
+        bind_directory(objects, store)
+        absent_agent_module_git(tmp_path, component, "update-ref", "refs/tags/borrowed", commit)
+        returncode = run_absent_agent_recovery(project, record, apply=True)
+        # Read where the mount is, before the namespace holding it goes.
+        assert absent_agent_module_git(tmp_path, kept, "cat-file", "-t", commit).stdout.strip() == "commit"
+        absent_agent_module_git(tmp_path, kept, "fsck", "--full", "--strict")
+        return returncode
+
+    returncode, stderr = run_in_private_mount_namespace(tmp_path, recover)
+    assert returncode == 0, stderr
+    assert not administration.exists()
+    assert tree_snapshot(objects) == stored
+
+
+@pytest.mark.parametrize(
+    "entry", ["proc-self-fd", "dev-fd", "symbolic-link", "link-to-a-link", "relative-climb"]
+)
+def test_recover_absent_agent_row_refuses_alternates_leading_into_proc(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    entry: str,
+) -> None:
+    project, repository, record, administration, _unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    modules = administration / "modules"
+    objects = modules / "component" / "objects"
+    # Each names, for a process holding descriptor 900 on a directory, that
+    # directory: for a Git command already running in the repository, it
+    # can be one Git deletes with the registration, whatever it is for
+    # recovery, which holds no descriptor 900.
+    base = Path(os.path.realpath(tmp_path))
+    (base / "fd").symlink_to("/proc/self/fd", target_is_directory=True)
+    (base / "stdin").symlink_to(base / "fd" / "0")
+    written, through = {
+        "proc-self-fd": ("/proc/self/fd/900", "/proc"),
+        "dev-fd": ("/dev/fd/900", "/dev/fd"),
+        "symbolic-link": (f"{base}/fd/900", f"{base}/fd"),
+        "link-to-a-link": (f"{base}/stdin", f"{base}/stdin"),
+        "relative-climb": (
+            "../" * len(Path(os.path.realpath(objects)).parts) + "proc/self/fd/900",
+            None,
+        ),
+    }[entry]
+    if entry == "dev-fd":
+        assert os.readlink("/dev/fd") == "/proc/self/fd"
+    (objects / "info" / "alternates").write_text(f"{written}\n", encoding="utf-8")
+    before = tree_snapshot(modules)
+    capsys.readouterr()
+    assert run_absent_agent_recovery(project, record, apply=True) == 3
+    stderr = capsys.readouterr().err
+    assert "into a proc file system, where a path names a different place" in stderr
+    if through is not None:
+        assert f"which leads through {through} into a proc file system" in stderr
+    assert tree_snapshot(modules) == before
+    assert not wrkslots._worktree_modules_retained(administration, record).path.exists()
+    assert_absent_agent_row_and_registration_stand(project, repository, record)
+
+
+def mount_overlay(target: Path, lower: Path, upper: Path, work: Path) -> None:
+    """Mount an overlay of ``upper`` on ``lower`` at ``target``, in this process's mount namespace."""
+
+    options = f"lowerdir={lower},upperdir={upper},workdir={work},userxattr"
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.mount(b"overlay", os.fsencode(target), b"overlay", 0, options.encode()) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(target))
+
+
+@pytest.mark.parametrize(
+    "layers", ["administration-lower", "administration-upper", "outside", "rebound-upper"]
+)
+def test_recover_absent_agent_row_refuses_borrowed_storage_on_any_overlay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, layers: str
+) -> None:
+    project, repository, record, administration, _unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    modules = administration / "modules"
+    component = modules / "component"
+    # The repository borrows from an overlay mounted outside every directory
+    # Git deletes. The mount table names its layers only by the paths they
+    # had when it was mounted: a layer in the administrative directory, or
+    # one renamed into it after the mount with its old path made anew
+    # ("rebound-upper"), is deleted with the registration, and nothing
+    # shows which directories the layers are now. Every overlay refuses.
+    store = tmp_path / "overlay"
+    work = tmp_path / "overlay-work"
+    lower = make_object_directory(
+        (administration if layers == "administration-lower" else tmp_path) / "overlay-lower"
+    )
+    upper = (administration if layers == "administration-upper" else tmp_path) / "overlay-upper"
+    for directory in (store, work, upper):
+        directory.mkdir()
+    (component / "objects" / "info" / "alternates").write_text(f"{store}\n", encoding="utf-8")
+    before = tree_snapshot(modules)
+
+    def recover() -> int:
+        mount_overlay(store, lower, upper, work)
+        if layers == "rebound-upper":
+            os.rename(upper, administration / "overlay-upper-moved")
+            upper.mkdir()
+        return run_absent_agent_recovery(project, record, apply=True)
+
+    returncode, stderr = run_in_private_mount_namespace(tmp_path, recover)
+    assert returncode == 3, stderr
+    assert f"it is on the overlay mount at {os.path.realpath(store)}" in stderr
+    assert "so which directories they are now cannot be shown" in stderr
+    assert tree_snapshot(modules) == before
+    assert not wrkslots._worktree_modules_retained(administration, record).path.exists()
+    assert_absent_agent_row_and_registration_stand(project, repository, record)
+
+
+@pytest.mark.parametrize("upper_place", ["outside", "rebound-into-administration"])
+def test_recover_absent_agent_row_refuses_salvage_archives_on_any_overlay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, upper_place: str
+) -> None:
+    project, repository, record, administration, _unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    config = wrkslots._load_config(str(project), "testhost")
+    archives = config.control / "wrkslots-salvage"
+    archives.mkdir(mode=0o700)
+    # Archives written to the overlay are stored in its upper layer: here
+    # outside, or renamed into the administrative directory once mounted,
+    # its old path made anew, so the path the mount table shows names a
+    # directory that outlives the registration while the one the overlay
+    # writes to does not.
+    upper = tmp_path / "archive-upper"
+    lower = tmp_path / "archive-lower"
+    work = tmp_path / "archive-work"
+    for directory in (upper, lower, work):
+        directory.mkdir(mode=0o700)
+    modules = administration / "modules"
+    before = tree_snapshot(modules)
+
+    def recover() -> int:
+        mount_overlay(archives, lower, upper, work)
+        if upper_place == "rebound-into-administration":
+            os.rename(upper, administration / "archive-upper-moved")
+            upper.mkdir(mode=0o700)
+        return run_absent_agent_recovery(project, record, apply=True)
+
+    returncode, stderr = run_in_private_mount_namespace(tmp_path, recover)
+    assert returncode == 3, stderr
+    assert "cannot be shown to outlive the removal of a registration" in stderr
+    assert f"it is on the overlay mount at {os.path.realpath(archives)}" in stderr
+    assert tree_snapshot(modules) == before
+    assert not wrkslots._worktree_modules_retained(administration, record).path.exists()
+    assert_absent_agent_row_and_registration_stand(project, repository, record)
+
+
+def held_directory_git(tmp_path: Path, descriptor: int, *args: str) -> str:
+    """Run Git in the repository this process holds open as ``descriptor``, wherever it is now."""
+
+    held = f"/proc/{os.getpid()}/fd/{descriptor}"
+    return git(
+        tmp_path, "--git-dir", held, "--work-tree", str(tmp_path), *ABSENT_AGENT_TEST_IDENTITY, *args
+    ).stdout.strip()
+
+
+def test_recover_absent_agent_row_refuses_a_tree_put_where_it_moved_the_examined_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, record, administration, _unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=False)
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    keep = wrkslots._worktree_modules_retained(administration, record).path
+    component = administration / "modules" / "component"
+    published = absent_agent_module_git(tmp_path, component, "rev-parse", "HEAD").stdout.strip()
+    doomed = administration / "moved-repositories"
+    original_fsync = wrkslots._fsync_directory
+    late: list[str] = []
+    descriptor = os.open(component, os.O_RDONLY | os.O_DIRECTORY)
+
+    def swap_once_moved(path: Path) -> None:
+        original_fsync(path)
+        if path == keep and (keep / "modules").is_dir() and not late:
+            # The examined tree was just moved here. Before anything else
+            # reads it, a copy takes its place and it goes into the
+            # administrative directory, where a process holding a
+            # repository in it open commits.
+            copy = tmp_path / "copied-modules"
+            shutil.copytree(keep / "modules", copy, symlinks=True)
+            os.rename(keep / "modules", doomed)
+            os.rename(copy, keep / "modules")
+            commit = held_directory_git(
+                tmp_path, descriptor, "commit-tree", f"{published}^{{tree}}", "-p", published, "-m", "late"
+            )
+            held_directory_git(tmp_path, descriptor, "update-ref", "refs/heads/late", commit)
+            late.append(commit)
+
+    monkeypatch.setattr(wrkslots, "_fsync_directory", swap_once_moved)
+    try:
+        returncode = run_absent_agent_recovery(project, record, apply=True)
+        stderr = capsys.readouterr().err
+    finally:
+        os.close(descriptor)
+    assert late, "the examined tree was never moved"
+    assert returncode == 3, stderr
+    assert f"{keep / 'modules'} is no longer the directory they were moved to" in stderr
+    assert_absent_agent_row_and_registration_stand(project, repository, record)
+    assert absent_agent_module_git(
+        tmp_path, doomed / "component", "cat-file", "-t", late[0]
+    ).stdout.strip() == "commit"
+
+
+@pytest.mark.parametrize("replaced", [False, True], ids=["missing", "replaced"])
+@pytest.mark.parametrize("destination", ["administration", "outside"])
+def test_recover_absent_agent_row_refuses_once_an_examined_repository_moves(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    replaced: bool,
+    destination: str,
+) -> None:
+    project, repository, record, administration, _unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=False)
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    keep = wrkslots._worktree_modules_retained(administration, record).path
+    component = administration / "modules" / "component"
+    published = absent_agent_module_git(tmp_path, component, "rev-parse", "HEAD").stdout.strip()
+    relocated = (administration if destination == "administration" else tmp_path) / "moved-component"
+    original_retain = wrkslots._retain_worktree_modules
+    late: list[str] = []
+    descriptor = os.open(component, os.O_RDONLY | os.O_DIRECTORY)
+
+    def retain_then_move(
+        administration: Path, retained: wrkslots._RetainedModules
+    ) -> wrkslots._DirectoryIdentity:
+        identity = original_retain(administration, retained)
+        # The tree recovery moved stays where it moved it; one repository
+        # in it, examined and held open by a process that commits there
+        # once it is moved, goes elsewhere, a copy in its place or nothing.
+        kept = keep / "modules" / "component"
+        copy = tmp_path / "copied-component"
+        if replaced:
+            shutil.copytree(kept, copy, symlinks=True)
+        os.rename(kept, relocated)
+        if replaced:
+            os.rename(copy, kept)
+        commit = held_directory_git(
+            tmp_path, descriptor, "commit-tree", f"{published}^{{tree}}", "-p", published, "-m", "late"
+        )
+        held_directory_git(tmp_path, descriptor, "update-ref", "refs/heads/late", commit)
+        late.append(commit)
+        return identity
+
+    monkeypatch.setattr(wrkslots, "_retain_worktree_modules", retain_then_move)
+    try:
+        returncode = run_absent_agent_recovery(project, record, apply=True)
+        stderr = capsys.readouterr().err
+    finally:
+        os.close(descriptor)
+    assert late, "the repository was never moved"
+    assert returncode == 3, stderr
+    kept = keep / "modules" / "component"
+    if replaced:
+        assert f"{kept} is not the directory examined at" in stderr
+        assert "it was moved or replaced since" in stderr
+    else:
+        assert f"{kept}, examined at" in stderr and "is gone" in stderr
+    assert_absent_agent_row_and_registration_stand(project, repository, record)
+    assert absent_agent_module_git(
+        tmp_path, relocated, "cat-file", "-t", late[0]
+    ).stdout.strip() == "commit"
+
+
+@pytest.mark.parametrize("relocate", [False, True], ids=["unmoved", "moved-into-administration"])
+def test_recover_absent_agent_row_checks_salvage_archives_again_before_removal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    relocate: bool,
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    config = wrkslots._load_config(str(project), "testhost")
+    archives = config.control / "wrkslots-salvage"
+    original_retain = wrkslots._retain_worktree_modules
+
+    def retain_then_move_archives(
+        administration: Path, retained: wrkslots._RetainedModules
+    ) -> wrkslots._DirectoryIdentity:
+        identity = original_retain(administration, retained)
+        # Every salvage was verified before this; the archives then go into
+        # the administrative directory, a symbolic link left in their place.
+        assert list(archives.rglob("repository.bundle"))
+        if relocate:
+            moved = administration / "moved-archives"
+            os.rename(archives, moved)
+            archives.symlink_to(moved, target_is_directory=True)
+        return identity
+
+    monkeypatch.setattr(wrkslots, "_retain_worktree_modules", retain_then_move_archives)
+    returncode = run_absent_agent_recovery(project, record, apply=True)
+    stderr = capsys.readouterr().err
+    if relocate:
+        assert returncode == 3, stderr
+        assert "local salvage archive" in stderr
+        assert_absent_agent_row_and_registration_stand(project, repository, record)
+        return
+    assert returncode == 0, stderr
+    receipts = absent_agent_module_receipts(wrkslots._load_archive(config).records[-1])
+    assert len(receipts) == len(unpublished)
+    for receipt in receipts:
+        assert Path(str(receipt["archive_bundle"])).is_file()
+        assert Path(str(receipt["archive_receipt"])).is_file()
+
+
+@pytest.mark.parametrize("relocate", [False, True], ids=["unmoved", "moved-into-administration"])
+def test_recover_absent_agent_row_checks_rescue_remote_storage_again_before_removal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    relocate: bool,
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    component = administration / "modules" / "component"
+    remote = tmp_path / "outside-rescue.git"
+    git(tmp_path, "init", "--bare", "--quiet", str(remote))
+    absent_agent_module_git(tmp_path, component, "remote", "set-url", "origin", str(remote))
+    allow_salvage_push(project, remote)
+    original_retain = wrkslots._retain_worktree_modules
+
+    def retain_then_move_remote_objects(
+        administration: Path, retained: wrkslots._RetainedModules
+    ) -> wrkslots._DirectoryIdentity:
+        identity = original_retain(administration, retained)
+        # The commits were pushed and read back before this; the remote's
+        # objects then go into the administrative directory, a symbolic
+        # link left in their place.
+        assert git(remote, "cat-file", "-t", unpublished["modules/component"]).stdout.strip() == "commit"
+        if relocate:
+            moved = administration / "moved-rescue-objects"
+            os.rename(remote / "objects", moved)
+            (remote / "objects").symlink_to(moved, target_is_directory=True)
+        return identity
+
+    monkeypatch.setattr(wrkslots, "_retain_worktree_modules", retain_then_move_remote_objects)
+    returncode = run_absent_agent_recovery(project, record, apply=True)
+    stderr = capsys.readouterr().err
+    if relocate:
+        assert returncode == 3, stderr
+        assert "the local remote of submodule modules/component" in stderr
+        assert_absent_agent_row_and_registration_stand(project, repository, record)
+        return
+    assert returncode == 0, stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    receipts = absent_agent_module_receipts(wrkslots._load_archive(config).records[-1])
+    assert [
+        receipt["disposition"] for receipt in receipts if receipt["submodule"] == "modules/component"
+    ] == ["salvaged"]
+    assert git(remote, "cat-file", "-t", unpublished["modules/component"]).stdout.strip() == "commit"
+    git(remote, "fsck", "--full", "--strict", "--no-dangling")
+
+
+@pytest.mark.parametrize("storage", ["administration", "outside"])
+def test_recover_absent_agent_row_keeps_salvage_archives_only_where_they_outlive_the_registration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: str
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    config = wrkslots._load_config(str(project), "testhost")
+    # Where recovery writes the local salvage archives is a bind of a
+    # directory: one Git deletes with the registration, or one outside.
+    source = (administration if storage == "administration" else tmp_path) / "archive-storage"
+    source.mkdir(mode=0o700)
+    archives = config.control / "wrkslots-salvage"
+    assert not archives.exists()
+    modules = administration / "modules"
+    before = tree_snapshot(modules)
+
+    def recover() -> int:
+        bind_directory(source, archives)
+        return run_absent_agent_recovery(project, record, apply=True)
+
+    returncode, stderr = run_in_private_mount_namespace(tmp_path, recover)
+    if storage == "administration":
+        assert returncode == 3, stderr
+        assert "cannot be shown to outlive the removal of a registration" in stderr
+        assert f"is {os.path.realpath(source)}" in stderr
+        assert tree_snapshot(modules) == before
+        assert_absent_agent_row_and_registration_stand(project, repository, record)
+        return
+    assert returncode == 0, stderr
+    assert not administration.exists()
+    receipts = absent_agent_module_receipts(wrkslots._load_archive(config).records[-1])
+    assert {receipt["submodule"] for receipt in receipts} == set(unpublished)
+    for index, receipt in enumerate(receipts):
+        assert receipt["disposition"] == "archived-local"
+        bundle = receipt["archive_bundle"]
+        assert isinstance(bundle, str) and isinstance(receipt["archive_receipt"], str)
+        # Kept in the directory the bind showed, which outlives recovery.
+        assert wrkslots._path_is_within(Path(bundle), archives)
+        relative = os.path.relpath(bundle, archives)
+        assert (source / relative).is_file()
+        assert (source / os.path.relpath(receipt["archive_receipt"], archives)).is_file()
+        restored = tmp_path / f"restored-{index}"
+        git(tmp_path, "clone", "--bare", "--quiet", str(source / relative), str(restored))
+        refs = receipt["archive_refs"]
+        assert isinstance(refs, list) and refs
+        for ref in refs:
+            assert isinstance(ref, Mapping)
+            assert git(restored, "rev-parse", f"{ref['ref']}^{{commit}}").stdout.strip() == ref["commit"]
+        git(restored, "fsck", "--full", "--strict", "--no-dangling")
+
+
+@pytest.mark.parametrize("reachability", ["reflog-only", "dangling"])
+def test_recover_absent_agent_row_salvages_a_stored_commit_no_ref_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    reachability: str,
+) -> None:
+    project, repository, record, administration, _unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=False)
+    )
+    component = administration / "modules" / "component"
+    published = absent_agent_module_git(tmp_path, component, "rev-parse", "HEAD").stdout.strip()
+    # Work committed and then reset away: only the reflog names it, or,
+    # once that has expired, nothing does; the repository still stores it.
+    commit = absent_agent_module_git(
+        tmp_path,
+        component,
+        *ABSENT_AGENT_TEST_IDENTITY,
+        "commit-tree",
+        f"{published}^{{tree}}",
+        "-p",
+        published,
+        "-m",
+        f"unpushed work reset away ({reachability})",
+    ).stdout.strip()
+    absent_agent_module_git(
+        tmp_path, component, "update-ref", "--create-reflog", "HEAD", commit, published
+    )
+    absent_agent_module_git(
+        tmp_path, component, "update-ref", "--create-reflog", "HEAD", published, commit
+    )
+    if reachability == "dangling":
+        absent_agent_module_git(tmp_path, component, "reflog", "expire", "--expire=now", "--all")
+    assert commit not in absent_agent_module_git(
+        tmp_path, component, "rev-list", "--all"
+    ).stdout.splitlines()
+    logged = absent_agent_module_git(
+        tmp_path, component, "reflog", "--all", "--format=%H"
+    ).stdout.splitlines()
+    assert (commit in logged) == (reachability == "reflog-only")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    capsys.readouterr()
+    assert run_absent_agent_recovery(project, record, apply=True) == 0
+    assert "preserved 1 unpublished commit(s) in verified local archive" in capsys.readouterr().err
+    config = wrkslots._load_config(str(project), "testhost")
+    receipts = absent_agent_module_receipts(wrkslots._load_archive(config).records[-1])
+    receipt = next(value for value in receipts if value["submodule"] == "modules/component")
+    assert receipt["disposition"] == "archived-local"
+    assert receipt["unpublished_commits"] == [commit]
+    refs = receipt["archive_refs"]
+    assert isinstance(refs, list) and [ref["commit"] for ref in refs] == [commit]
+    bundle = receipt["archive_bundle"]
+    assert isinstance(bundle, str)
+    restored = tmp_path / "restored"
+    git(tmp_path, "clone", "--bare", "--quiet", bundle, str(restored))
+    assert git(restored, "cat-file", "-t", commit).stdout.strip() == "commit"
+    git(restored, "fsck", "--full", "--strict", "--no-dangling")
+
+
+def test_recover_absent_agent_row_refuses_a_stored_commit_whose_history_is_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, record, administration, _unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=False)
+    )
+    modules = administration / "modules"
+    component = modules / "component"
+    assert absent_agent_module_git(
+        tmp_path, component, "hash-object", "-w", "-t", "tree", "/dev/null"
+    ).stdout.strip() == EMPTY_TREE
+    # A commit no ref names whose parent the repository does not store, as
+    # a shallow fetch or a damaged repository leaves one: a bundle of it
+    # could not be verified, so it cannot be salvaged.
+    body = tmp_path / "orphan-commit"
+    body.write_text(
+        f"tree {EMPTY_TREE}\n"
+        f"parent {'1' * 40}\n"
+        "author Wrkslots Test <wrkslots@example.invalid> 1700000000 +0000\n"
+        "committer Wrkslots Test <wrkslots@example.invalid> 1700000000 +0000\n"
+        "\n"
+        "its parent is not stored\n",
+        encoding="ascii",
+    )
+    commit = absent_agent_module_git(
+        tmp_path, component, "hash-object", "-w", "-t", "commit", str(body)
+    ).stdout.strip()
+    assert absent_agent_module_git(tmp_path, component, "cat-file", "-t", commit).stdout.strip() == "commit"
+    before = tree_snapshot(modules)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    capsys.readouterr()
+    assert run_absent_agent_recovery(project, record, apply=True) == 3
+    stderr = capsys.readouterr().err
+    assert "a commit it stores whose history is incomplete cannot be salvaged" in stderr
+    assert tree_snapshot(modules) == before
+    assert_absent_agent_row_and_registration_stand(project, repository, record)
+
+
+@pytest.mark.parametrize("alias", ["symbolic-link", "bind"])
+def test_recover_absent_agent_row_refuses_keeping_repositories_where_the_administration_shows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, alias: str
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    retained = wrkslots._worktree_modules_retained(administration, record)
+    # The directory holding every checkout's kept repositories names a
+    # directory Git deletes with the registration: what recovery keeps
+    # there would go with it.
+    container = retained.path.parent
+    assert not container.exists()
+    storage = administration / "retained-storage"
+    storage.mkdir()
+
+    def recover() -> int:
+        if alias == "bind":
+            bind_directory(storage, container)
+        else:
+            container.symlink_to(storage, target_is_directory=True)
+        return run_absent_agent_recovery(project, record, apply=True)
+
+    returncode, stderr = run_in_private_mount_namespace(tmp_path, recover)
+    assert returncode == 3, stderr
+    assert "nothing was removed" in stderr
+    assert_absent_agent_row_and_registration_stand(project, repository, record)
+    if alias == "bind":
+        # Moving the repositories there crosses a mount, which rename(2)
+        # refuses.
+        assert "Invalid cross-device link" in stderr
+    else:
+        assert f"submodule repository store {container} is not a directory" in stderr
+    # Never moved: still in the administrative directory, which Git has not
+    # deleted, and nothing was kept in the one the alias shows.
+    assert not any(storage.iterdir())
+    for name, commit in unpublished.items():
+        assert absent_agent_module_git(
+            tmp_path, administration / name, "cat-file", "-t", commit
+        ).stdout.strip() == "commit"
+
+@pytest.mark.parametrize("late", ["external-bind", "retained-bind", "retained-link"])
+def test_recover_absent_agent_row_checks_borrowed_storage_again_once_the_repositories_are_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, late: str
+) -> None:
+    project, repository, record, administration, _unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    modules = administration / "modules"
+    retained = wrkslots._worktree_modules_retained(administration, record).path
+    # Objects Git deletes with the registration.
+    source = make_object_directory(administration / "extra-objects")
+    loose = "c" * 38
+    (source / "ab").mkdir()
+    (source / "ab" / loose).write_bytes(b"held only in the administrative directory\n")
+    # A genuinely outside store, which every census accepts.
+    store = make_object_directory(tmp_path / "external-objects")
+    (modules / "component" / "objects" / "info" / "alternates").write_text(
+        f"{store}\n", encoding="utf-8"
+    )
+    before = tree_snapshot(modules)
+    held = tree_snapshot(source)
+    kept_pack = retained / "modules" / "component" / "objects" / "pack"
+    # A loose-object fanout directory the repository does not have yet.
+    fanout = next(
+        name
+        for name in (f"{index:02x}" for index in range(256))
+        if not (modules / "component" / "objects" / name).exists()
+    )
+    kept_link = retained / "modules" / "component" / "objects" / fanout
+    if late == "external-bind":
+        expected = (
+            f"where {os.path.realpath(store)} is {os.path.realpath(source)} under "
+            "another name"
+        )
+    elif late == "retained-bind":
+        expected = f"mount point {os.path.realpath(kept_pack)} lies at or below"
+    else:
+        expected = f"{kept_link} is a symbolic link in the submodule repositories"
+    original_retain = wrkslots._retain_worktree_modules
+
+    def retain_then_alias(
+        kept_from: Path, kept_at: wrkslots._RetainedModules
+    ) -> wrkslots._DirectoryIdentity:
+        identity = original_retain(kept_from, kept_at)
+        # Every check before the repositories moved has passed; what is
+        # made now gives a process still holding a handle in them a way to
+        # write objects that Git deletes with the registration.
+        if late == "external-bind":
+            bind_mount(source, store)
+        elif late == "retained-bind":
+            bind_mount(source, kept_pack)
+        else:
+            kept_link.symlink_to(source / "ab", target_is_directory=True)
+        return identity
+
+    def recover() -> int:
+        # Patched only in the child, whose mount namespace the mount is in.
+        monkeypatch.setattr(wrkslots, "_retain_worktree_modules", retain_then_alias)
+        return run_absent_agent_recovery(project, record, apply=True)
+
+    returncode, stderr = run_in_private_mount_namespace(tmp_path, recover)
+    assert returncode == 3, stderr
+    assert expected in stderr
+    assert f"stay at {retained / 'modules'}" in stderr
+    assert tree_snapshot(source) == held
+    assert not modules.is_dir()
+    assert_absent_agent_row_and_registration_stand(project, repository, record)
+    if late == "retained-link":
+        # A link stays when the namespace goes; removed, as the remedy says.
+        kept_link.unlink()
+    assert tree_snapshot(retained / "modules") == before
+    # A rerun moves them back, examines them again, and completes.
+    assert run_absent_agent_recovery(project, record, apply=True) == 0
+    assert not administration.exists()
+    assert tree_snapshot(retained / "modules") == before
+
+
+@pytest.mark.parametrize(
+    "alias", ["link-into-administration", "link-outside", "bind-from-administration"]
+)
+def test_recover_absent_agent_row_refuses_a_retained_store_moved_once_the_repositories_are_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, alias: str
+) -> None:
+    project, repository, record, administration, _unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=False)
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    retained = wrkslots._worktree_modules_retained(administration, record).path
+    store = retained.parent
+    component = administration / "modules" / "component"
+    published = absent_agent_module_git(tmp_path, component, "rev-parse", "HEAD").stdout.strip()
+    destination = (tmp_path if alias == "link-outside" else administration) / "retained-storage"
+    kept_place = os.path.join(os.path.realpath(store), retained.name, "modules")
+    # A process that opened the repository before recovery keeps a handle in
+    # it wherever it is moved.
+    descriptor = os.open(component, os.O_RDONLY | os.O_DIRECTORY)
+    late = tmp_path / "late-commit"
+    original_retain = wrkslots._retain_worktree_modules
+
+    def held(*args: str) -> str:
+        return git(
+            tmp_path,
+            "--git-dir",
+            f"/proc/{os.getpid()}/fd/{descriptor}",
+            "--work-tree",
+            str(tmp_path),
+            *ABSENT_AGENT_TEST_IDENTITY,
+            *args,
+        ).stdout.strip()
+
+    def retain_then_move(
+        kept_from: Path, kept_at: wrkslots._RetainedModules
+    ) -> wrkslots._DirectoryIdentity:
+        identity = original_retain(kept_from, kept_at)
+        # The final census is over. The holder writes a commit no census saw,
+        # and the store holding the kept repositories gets another name,
+        # its old one left showing it.
+        commit = held("commit-tree", f"{published}^{{tree}}", "-p", published, "-m", "late")
+        held("update-ref", "refs/heads/late", commit)
+        # Recovery runs in a child process; this is how the test learns it.
+        late.write_text(commit, encoding="ascii")
+        os.rename(store, destination)
+        if alias == "bind-from-administration":
+            store.mkdir()
+            bind_mount(destination, store)
+        else:
+            store.symlink_to(destination, target_is_directory=True)
+        return identity
+
+    def recover() -> int:
+        # Patched only in the child, whose mount namespace the mount is in.
+        monkeypatch.setattr(wrkslots, "_retain_worktree_modules", retain_then_move)
+        return run_absent_agent_recovery(project, record, apply=True)
+
+    try:
+        returncode, stderr = run_in_private_mount_namespace(tmp_path, recover)
+        assert returncode == 3, stderr
+        if alias == "bind-from-administration":
+            expected = (
+                f"is {os.path.realpath(destination)}/{retained.name} under another "
+                "name, as a bind mount makes it"
+            )
+        else:
+            expected = f"the submodule repository store {store} became a symbolic link"
+        assert expected in stderr
+        assert f"remedy: put them back at {kept_place}," in stderr
+        assert administration.is_dir()
+        assert_absent_agent_row_and_registration_stand(project, repository, record)
+        # The late commit is still where the store was moved, and still
+        # readable through the handle.
+        moved = destination / retained.name / "modules" / "component"
+        commit = late.read_text(encoding="ascii")
+        assert absent_agent_module_git(tmp_path, moved, "cat-file", "-t", commit).stdout.strip() == "commit"
+        assert held("cat-file", "-t", commit) == "commit"
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.parametrize("removal", ["unregistered", "entry-gone", "nothing"])
+def test_recover_absent_agent_row_keeps_repositories_retained_once_git_stops_removing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    removal: str,
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    config = wrkslots._load_config(str(project), "testhost")
+    checkout = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
+    retained = wrkslots._worktree_modules_retained(administration, record).path
+    component = administration / "modules" / "component"
+    # Git names the empty tree without storing it; store it, so a full fsck
+    # of the kept repository checks the commit below as well.
+    absent_agent_module_git(tmp_path, component, "hash-object", "-w", "-t", "tree", "/dev/null")
+    late = absent_agent_module_git(
+        tmp_path,
+        component,
+        *ABSENT_AGENT_TEST_IDENTITY,
+        "commit-tree",
+        EMPTY_TREE,
+        "-p",
+        unpublished["modules/component"],
+        "-m",
+        "named only once every census has passed",
+    ).stdout.strip()
+    before = tree_snapshot(administration / "modules")
+    # A handle on the repository follows it wherever recovery moves it.
+    holder = os.open(component, os.O_RDONLY | os.O_DIRECTORY)
+    held = f"/proc/{os.getpid()}/fd/{holder}"
+    original_remove = wrkslots._GitVcs.remove_worktree
+
+    def stop_partway(
+        self: wrkslots._GitVcs, repo: Path, path: Path, *, force: bool = False
+    ) -> None:
+        assert not component.exists()
+        if removal == "nothing":
+            raise wrkslots.Refusal("git worktree remove stopped before it removed anything")
+        # The repositories are retained now, and what is written in them is
+        # never salvaged.
+        git(tmp_path, "--git-dir", held, "--work-tree", str(tmp_path), "update-ref", "refs/heads/late", late)
+        if removal == "unregistered":
+            # Git deleted the entries that make it list the registration, and
+            # then stopped; it no longer knows the checkout.
+            (administration / "HEAD").unlink()
+            (administration / "gitdir").unlink()
+            original_remove(self, repo, path, force=force)
+            raise AssertionError("Git removed a registration it does not list")
+        (administration / "index").unlink()
+        raise wrkslots.Refusal("git worktree remove stopped partway")
+
+    monkeypatch.setattr(wrkslots._GitVcs, "remove_worktree", stop_partway)
+    try:
+        assert run_absent_agent_recovery(project, record, apply=True) == 3
+        first = capsys.readouterr().err
+        assert f"stay at {retained / 'modules'}" in first
+        kept = retained / "modules" / "component"
+        assert not component.exists()
+        if removal == "nothing":
+            assert tree_snapshot(retained / "modules") == before
+        else:
+            assert (
+                git(
+                    tmp_path, "--git-dir", held, "--work-tree", str(tmp_path), "rev-parse", "refs/heads/late"
+                ).stdout.strip()
+                == late
+            )
+            assert os.path.realpath(held) == str(kept)
+        monkeypatch.setattr(wrkslots._GitVcs, "remove_worktree", original_remove)
+        if removal == "entry-gone":
+            # Git still lists the registration, but began deleting it.
+            assert wrkslots._GitVcs().worktree_registration(repository, checkout) is not None
+            assert run_absent_agent_recovery(project, record, apply=True) == 3
+            assert "stopped partway" in capsys.readouterr().err
+            assert not component.exists()
+            # As the remedy says, once nothing left there is wanted.
+            shutil.rmtree(administration)
+        elif removal == "unregistered":
+            assert wrkslots._GitVcs().worktree_registration(repository, checkout) is None
+        assert run_absent_agent_recovery(project, record, apply=True) == 0
+    finally:
+        os.close(holder)
+    assert not wrkslots._load_active(config).slots
+    assert wrkslots._GitVcs().worktree_registration(repository, checkout) is None
+    # Pruning deletes an administrative directory Git no longer lists, and
+    # nothing kept is in it.
+    git(repository, "worktree", "prune", "--expire=now")
+    assert not administration.exists()
+    for name, commit in unpublished.items():
+        module = retained / name
+        assert (
+            absent_agent_module_git(tmp_path, module, "cat-file", "-t", commit).stdout.strip()
+            == "commit"
+        )
+    if removal == "nothing":
+        assert tree_snapshot(retained / "modules") == before
+    else:
+        assert (
+            absent_agent_module_git(tmp_path, kept, "rev-parse", "refs/heads/late").stdout.strip()
+            == late
+        )
+    absent_agent_module_git(tmp_path, kept, "fsck", "--full", "--strict")
+
+
+def test_recover_absent_agent_row_keeps_another_rows_retained_repositories_apart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    vcs = wrkslots._GitVcs()
+
+    def absent_row(slot: str, checkout_name: str) -> tuple[wrkslots.ActiveRecord, Path]:
+        made = create(
+            project,
+            slot=slot,
+            agent=f"agent-{slot}",
+            checkout_name=checkout_name,
+            branch=f"agent/{slot}",
+        )
+        assert made.returncode == 0, made.stderr
+        config = wrkslots._load_config(str(project), "testhost")
+        row = wrkslots._find_record(wrkslots._load_active(config), slot)
+        checkout = wrkslots._stored_path(config, row.checkouts[0].path, "test checkout")
+        administration = vcs.worktree_administrative_directory(repository, checkout)
+        assert administration is not None and administration.name == checkout_name
+        return row, administration
+
+    # Slot a with checkout 1-x, and slot a-1 with checkout x: joined by "-",
+    # both would be a-1-1-x.
+    first, first_administration = absent_row("a", "1-x")
+    first = mark_recorded_owner_dead(project, "a")
+    config = wrkslots._load_config(str(project), "testhost")
+    shutil.rmtree(wrkslots._slot_directory(config, "a", "agent"))
+    assert run_absent_agent_recovery(project, first, apply=True) == 0
+    first_retained = wrkslots._worktree_modules_retained(first_administration, first).path
+    kept = tree_snapshot(first_retained)
+    assert (first_retained / "modules" / "component" / "HEAD").is_file()
+    # The second has no submodule repositories of its own.
+    update_configuration(project, post_provision_hooks=[])
+    second, second_administration = absent_row("a-1", "x")
+    assert not (second_administration / "modules").exists()
+    second = mark_recorded_owner_dead(project, "a-1")
+    assert (first.generation, second.generation) == (1, 1)
+    shutil.rmtree(wrkslots._slot_directory(config, "a-1", "agent"))
+    second_retained = wrkslots._worktree_modules_retained(second_administration, second).path
+    assert second_retained != first_retained
+    assert run_absent_agent_recovery(project, second, apply=True) == 0
+    assert not wrkslots._load_active(config).slots
+    assert not second_administration.exists()
+    assert not second_retained.exists()
+    assert tree_snapshot(first_retained) == kept
+
+
+def test_recover_absent_agent_row_refuses_alternates_split_differently_from_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    component = administration / "modules" / "component"
+    remote = tmp_path / "rescue-target.git"
+    git(tmp_path, "init", "--quiet", "--bare", str(remote))
+    # Git separates alternates entries at LF only, so this one entry runs
+    # through a real directory whose name ends in CR and on into the doomed
+    # submodule's objects. str.splitlines() would split it at the CR.
+    (remote / "objects" / "marker\r").mkdir()
+    relative = os.path.relpath(component / "objects", remote / "objects")
+    (remote / "objects" / "info" / "alternates").write_bytes(
+        os.fsencode(f"marker\r/../{relative}\n")
+    )
+    commit = unpublished["modules/component"]
+    assert git(remote, "cat-file", "-t", commit).stdout.strip() == "commit"
+    absent_agent_module_git(tmp_path, component, "remote", "set-url", "origin", str(remote))
+    allow_salvage_push(project, remote)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=False) == 3
+    assert "control character" in capsys.readouterr().err
+    assert run_absent_agent_recovery(project, record, apply=True) == 3
+    assert "control character" in capsys.readouterr().err
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+    assert not (config.control / "ACTIVE.testhost.journal").exists()
+    assert git(remote, "for-each-ref").stdout == ""
+    assert (
+        absent_agent_module_git(tmp_path, component, "cat-file", "-t", commit).stdout.strip()
+        == "commit"
+    )
+
+
+@pytest.mark.parametrize("pointer", ["gitfile", "commondir"])
+def test_recover_absent_agent_row_follows_a_crlf_repository_pointer_as_git_does(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    pointer: str,
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    component = administration / "modules" / "component"
+    doomed = administration / "rescue-target.git"
+    git(tmp_path, "init", "--quiet", "--bare", str(doomed))
+    remote = tmp_path / "rescue-target"
+    remote.mkdir()
+    # An alias outside the administrative directory names a repository
+    # inside it. Git strips the CR LF ending a gitfile or a commondir file,
+    # so it uses that repository for the remote.
+    (remote / "alias").symlink_to(doomed)
+    if pointer == "gitfile":
+        (remote / ".git").write_bytes(b"gitdir: alias\r\n")
+    else:
+        (remote / "HEAD").write_bytes(b"ref: refs/heads/main\n")
+        (remote / "commondir").write_bytes(b"alias\r\n")
+    common = git(remote, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    assert Path(common.stdout.strip()).resolve() == doomed.resolve()
+    absent_agent_module_git(tmp_path, component, "remote", "set-url", "origin", str(remote))
+    allow_salvage_push(project, remote)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=False) == 3
+    assert "which recovery deletes" in capsys.readouterr().err
+    assert run_absent_agent_recovery(project, record, apply=True) == 3
+    assert "which recovery deletes" in capsys.readouterr().err
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+    assert not (config.control / "ACTIVE.testhost.journal").exists()
+    assert git(doomed, "for-each-ref").stdout == ""
+    commit = unpublished["modules/component"]
+    assert (
+        absent_agent_module_git(tmp_path, component, "cat-file", "-t", commit).stdout.strip()
+        == "commit"
+    )
+
+
+def test_recover_absent_agent_row_refuses_a_rescue_url_holding_a_tab(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    component = administration / "modules" / "component"
+    # Git keeps a tab in a file:// URL; urllib.parse.urlsplit removes it. To
+    # Git each "\t.." below is a directory, so its path ends inside the
+    # administrative directory; without the tabs the path climbs four levels
+    # above it, to a shadow repository a check reading it would inspect.
+    (administration / "\t.." / "\t..").mkdir(parents=True)
+    doomed = administration / "rescue-target.git"
+    git(tmp_path, "init", "--quiet", "--bare", str(doomed))
+    shadow = administration.parents[3] / "rescue-target.git"
+    assert not shadow.exists()
+    git(tmp_path, "init", "--quiet", "--bare", str(shadow))
+    url = f"file://{administration}/\t../\t../../../rescue-target.git"
+    absent_agent_module_git(tmp_path, component, "remote", "set-url", "origin", url)
+    allowed = configuration(project).get("salvage_push_remotes", [])
+    assert isinstance(allowed, list)
+    update_configuration(project, salvage_push_remotes=[*allowed, url])
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=False) == 3
+    assert "control character" in capsys.readouterr().err
+    assert run_absent_agent_recovery(project, record, apply=True) == 3
+    assert "control character" in capsys.readouterr().err
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+    assert not (config.control / "ACTIVE.testhost.journal").exists()
+    assert git(doomed, "for-each-ref").stdout == ""
+    assert git(shadow, "for-each-ref").stdout == ""
+    commit = unpublished["modules/component"]
+    assert (
+        absent_agent_module_git(tmp_path, component, "cat-file", "-t", commit).stdout.strip()
+        == "commit"
+    )
+
+
+def _require_git_reftable_migration() -> None:
+    version = git(Path.cwd(), "version").stdout
+    matched = re.match(r"git version (\d+)\.(\d+)", version)
+    assert matched is not None, version
+    if (int(matched.group(1)), int(matched.group(2))) < (2, 46):
+        pytest.skip(f"`git refs migrate` needs Git 2.46 or later; found {version.strip()}")
+
+
+@pytest.mark.parametrize("representation", ["crlf-detached", "reftable"])
+def test_recover_absent_agent_row_reads_a_published_submodule_head_as_git_does(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    representation: str,
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=False)
+    )
+    component = administration / "modules" / "component"
+    head = absent_agent_module_git(
+        tmp_path, component, "rev-parse", "--verify", "HEAD"
+    ).stdout.strip()
+    if representation == "crlf-detached":
+        # The files backend strips the carriage return ending a HEAD file.
+        (component / "HEAD").write_bytes(f"{head}\r\n".encode("ascii"))
+    else:
+        # A reftable repository keeps HEAD in its ref database; its HEAD file
+        # only names a placeholder.
+        _require_git_reftable_migration()
+        absent_agent_module_git(tmp_path, component, "refs", "migrate", "--ref-format=reftable")
+        assert (component / "HEAD").read_bytes() == b"ref: refs/heads/.invalid\n"
+    assert (
+        absent_agent_module_git(tmp_path, component, "rev-parse", "--verify", "HEAD").stdout.strip()
+        == head
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=True) == 0, capsys.readouterr().err
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._load_active(config).slots
+    assert not administration.exists()
+    receipts = absent_agent_module_receipts(wrkslots._load_archive(config).records[-1])
+    receipt = next(r for r in receipts if r["submodule"] == "modules/component")
+    assert receipt["disposition"] == "already-published"
+
+
+def test_recover_absent_agent_row_salvages_a_detached_reftable_submodule_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _require_git_reftable_migration()
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    component = administration / "modules" / "component"
+    commit = unpublished["modules/component"]
+    absent_agent_module_git(tmp_path, component, "refs", "migrate", "--ref-format=reftable")
+    # Without an index nothing else compares HEAD: HEAD, kept only in the
+    # ref database, alone names the unpublished commit.
+    (component / "index").unlink()
+    assert (component / "HEAD").read_bytes() == b"ref: refs/heads/.invalid\n"
+    assert (
+        absent_agent_module_git(tmp_path, component, "rev-parse", "--verify", "HEAD").stdout.strip()
+        == commit
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=True) == 0, capsys.readouterr().err
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not administration.exists()
+    receipts = absent_agent_module_receipts(wrkslots._load_archive(config).records[-1])
+    receipt = next(r for r in receipts if r["submodule"] == "modules/component")
+    assert receipt["disposition"] == "archived-local"
+    assert receipt["unpublished_commits"] == [commit]
+    restored = tmp_path / "restored-component"
+    git(tmp_path, "clone", "--bare", "--quiet", cast(str, receipt["archive_bundle"]), str(restored))
+    assert git(restored, "cat-file", "-t", commit).stdout.strip() == "commit"
+
+
+@pytest.mark.parametrize("spelling", ["native", "file-url"])
+def test_recover_absent_agent_row_salvages_to_a_remote_whose_path_holds_percent_00(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    spelling: str,
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    component = administration / "modules" / "component"
+    # Git decodes no %00 in a file:// URL: this one names the directory
+    # rescue%00.git, which Python's percent decoding would turn into a NUL.
+    remote = tmp_path / "rescue%00.git"
+    git(tmp_path, "init", "--quiet", "--bare", str(remote))
+    url = str(remote) if spelling == "native" else f"file://{remote}"
+    assert git(tmp_path, "ls-remote", "--", url).returncode == 0
+    absent_agent_module_git(tmp_path, component, "remote", "set-url", "origin", url)
+    allowed = configuration(project).get("salvage_push_remotes", [])
+    assert isinstance(allowed, list)
+    update_configuration(project, salvage_push_remotes=[*allowed, url])
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=False) == 0, capsys.readouterr().err
+    assert run_absent_agent_recovery(project, record, apply=True) == 0, capsys.readouterr().err
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._load_active(config).slots
+    assert not administration.exists()
+    receipts = absent_agent_module_receipts(wrkslots._load_archive(config).records[-1])
+    receipt = next(r for r in receipts if r["submodule"] == "modules/component")
+    assert receipt["disposition"] == "salvaged"
+    remote_refs = cast(list[Mapping[str, str]], receipt["remote_refs"])
+    assert (
+        git(remote, "rev-parse", remote_refs[0]["ref"]).stdout.strip()
+        == unpublished["modules/component"]
+    )
+
+
+def test_recover_absent_agent_row_submodule_index_lock_refuses_a_running_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=False)
+    )
+    lock = administration / "modules" / "component" / "index.lock"
+    lock.write_bytes(b"")
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=True) == 3
+    assert "index lock" in capsys.readouterr().err.lower()
+    assert lock.exists()
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+    path = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
+    assert wrkslots._GitVcs().worktree_registration(repository, path) is not None
+
+
+@pytest.mark.parametrize(
+    "linked", ["pack-directory", "pack-file", "loose-directory", "refs-directory"]
+)
+def test_recover_absent_agent_row_refuses_a_rescue_remote_with_linked_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    linked: str,
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    component = administration / "modules" / "component"
+    commit = unpublished["modules/component"]
+    remote = tmp_path / "rescue-target.git"
+    git(tmp_path, "init", "--quiet", "--bare", str(remote))
+    # Storage inside the administrative directory recovery deletes. Git
+    # follows each link below, so whatever a push wrote there would go with it.
+    doomed = administration / "linked-storage"
+    doomed.mkdir()
+    if linked == "pack-directory":
+        (remote / "objects" / "pack").rmdir()
+        (remote / "objects" / "pack").symlink_to(doomed, target_is_directory=True)
+    elif linked == "pack-file":
+        pack = f"pack-{'0' * 40}.pack"
+        (doomed / pack).write_bytes(b"")
+        (remote / "objects" / "pack" / pack).symlink_to(doomed / pack)
+    elif linked == "loose-directory":
+        (remote / "objects" / commit[:2]).symlink_to(doomed, target_is_directory=True)
+    else:
+        (remote / "refs" / "rescue").symlink_to(doomed, target_is_directory=True)
+    absent_agent_module_git(tmp_path, component, "remote", "set-url", "origin", str(remote))
+    allow_salvage_push(project, remote)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=False) == 3
+    assert "symbolic link" in capsys.readouterr().err
+    assert run_absent_agent_recovery(project, record, apply=True) == 3
+    assert "symbolic link" in capsys.readouterr().err
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+    assert not (config.control / "ACTIVE.testhost.journal").exists()
+    assert git(remote, "for-each-ref").stdout == ""
+    assert list(doomed.iterdir()) == ([doomed / pack] if linked == "pack-file" else [])
+    assert (
+        absent_agent_module_git(tmp_path, component, "cat-file", "-t", commit).stdout.strip()
+        == "commit"
+    )
+
+
+@pytest.mark.parametrize("bound", ["repository", "objects"])
+def test_recover_absent_agent_row_refuses_a_rescue_remote_bound_from_the_administration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bound: str
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    component = administration / "modules" / "component"
+    commit = unpublished["modules/component"]
+    # A repository, or its objects, in the administrative directory recovery
+    # deletes, reached through a path outside it.
+    doomed = administration / "rescue-storage.git"
+    git(tmp_path, "init", "--quiet", "--bare", str(doomed))
+    remote = tmp_path / "rescue-target.git"
+    if bound == "repository":
+        where = (os.path.realpath(remote), os.path.realpath(doomed))
+    else:
+        git(tmp_path, "init", "--quiet", "--bare", str(remote))
+        where = (
+            os.path.realpath(remote / "objects"),
+            os.path.realpath(doomed / "objects"),
+        )
+    absent_agent_module_git(tmp_path, component, "remote", "set-url", "origin", str(remote))
+    allow_salvage_push(project, remote)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    def recover() -> int:
+        if bound == "repository":
+            bind_directory(doomed, remote)
+        else:
+            shutil.rmtree(remote / "objects")
+            bind_directory(doomed / "objects", remote / "objects")
+        return run_absent_agent_recovery(project, record, apply=True)
+
+    returncode, stderr = run_in_private_mount_namespace(tmp_path, recover)
+    assert returncode == 3, stderr
+    assert f"where {where[0]} is {where[1]} under another name" in stderr
+    assert "a rescue ref there would preserve nothing" in stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+    assert not (config.control / "ACTIVE.testhost.journal").exists()
+    assert git(doomed, "for-each-ref").stdout == ""
+    assert (
+        absent_agent_module_git(tmp_path, component, "cat-file", "-t", commit).stdout.strip()
+        == "commit"
+    )
+
+
+def test_recover_absent_agent_row_archives_for_an_allowed_relative_remote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    component = administration / "modules" / "component"
+    relative = "../component.git"
+    absent_agent_module_git(tmp_path, component, "remote", "set-url", "origin", relative)
+    allow_salvage_push(project, Path(relative))
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    # Git would resolve a relative remote from wherever the push runs, so
+    # salvage keeps those commits in a local archive instead of refusing.
+    assert run_absent_agent_recovery(project, record, apply=False) == 0, (
+        capsys.readouterr().err
+    )
+    assert run_absent_agent_recovery(project, record, apply=True) == 0, (
+        capsys.readouterr().err
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._load_active(config).slots
+    assert not administration.exists()
+    receipts = absent_agent_module_receipts(wrkslots._load_archive(config).records[-1])
+    assert {
+        cast(str, receipt["submodule"]): (
+            receipt["disposition"],
+            receipt["unpublished_commits"],
+        )
+        for receipt in receipts
+    } == {name: ("archived-local", [commit]) for name, commit in unpublished.items()}
+
+
+def test_recover_absent_agent_row_resume_refuses_a_relative_rescue_remote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    remotes = {
+        "modules/component": tmp_path / "component.git",
+        "modules/component/modules/leaf": tmp_path / "leaf.git",
+    }
+    allow_salvage_push(project, *remotes.values())
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(point: str) -> None:
+        if point == "after-absent-agent-journal":
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_absent_agent_recovery(project, record, apply=True)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    config = wrkslots._load_config(str(project), "testhost")
+    journal_path = config.control / "ACTIVE.testhost.journal"
+    journal = json.loads(journal_path.read_bytes())
+    component = administration / "modules" / "component"
+    # Name the same remote relatively. From the submodule repository it is
+    # still the remote that holds the rescue ref, but Git resolves a relative
+    # URL from wherever the command runs.
+    relative = os.path.relpath(remotes["modules/component"], component)
+    absent_agent_module_git(tmp_path, component, "remote", "set-url", "origin", relative)
+    with tempfile.TemporaryDirectory(dir=tmp_path) as temporary:
+        work = Path(temporary)
+        authority = wrkslots._GitVcs().remote_authority(
+            work,
+            config.default_remote,
+            env_overrides=wrkslots._absent_agent_module_env(component, work),
+        )
+    # Record the new URL consistently, so only a check of its form can refuse.
+    edited = 0
+    for receipt in journal["submodule_salvage"]:
+        if receipt["submodule"] == "modules/component":
+            assert receipt["disposition"] == "salvaged"
+            receipt["remote_url_sha256"] = authority.sha256
+            edited += 1
+    assert edited == 1
+    branch_receipts = [
+        receipt
+        for receipt in journal["archive_entry"]["salvage"]
+        if "submodule" not in receipt
+    ]
+    item = wrkslots._absent_agent_row_identity(journal["input"], "test input")
+    journal["archive_entry"] = wrkslots._absent_agent_archive_entry(
+        record,
+        item,
+        journal["archive_entry"]["finished_at"],
+        branch_receipts,
+        journal["submodule_salvage"],
+    )
+    wrkslots._write_journal(config, journal)
+    wrkslots._absent_agent_journal_inputs(config, json.loads(journal_path.read_bytes()))
+    capsys.readouterr()
+
+    recover = [
+        "--project-root",
+        str(project),
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ]
+    assert wrkslots.main(recover) == 3
+    assert "relative local path" in capsys.readouterr().err
+    assert component.is_dir()
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+
+
+def test_recover_absent_agent_row_refuses_a_non_commit_ref_the_shared_repository_borrows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=False)
+    )
+    component = administration / "modules" / "component"
+    shared = wrkslots._GitVcs().common_directory(repository) / "modules" / "component"
+    assert (shared / "HEAD").is_file()
+    content = tmp_path / "note.txt"
+    content.write_text("kept only in the doomed submodule repository\n", encoding="utf-8")
+    blob = absent_agent_module_git(
+        tmp_path, component, "hash-object", "-w", str(content)
+    ).stdout.strip()
+    absent_agent_module_git(tmp_path, component, "update-ref", "refs/tags/note", blob)
+    # The shared repository holds the same ref, but reads its blob from the
+    # repository recovery deletes.
+    (shared / "objects" / "info" / "alternates").write_text(
+        f"{component / 'objects'}\n", encoding="utf-8"
+    )
+    git_dir(shared, "update-ref", "refs/tags/note", blob)
+    assert git_dir(shared, "cat-file", "-t", "refs/tags/note").stdout.strip() == "blob"
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=False) == 3
+    assert f"refs/tags/note names blob {blob}" in capsys.readouterr().err
+    assert run_absent_agent_recovery(project, record, apply=True) == 3
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
+    assert git_dir(shared, "cat-file", "-t", "refs/tags/note").stdout.strip() == "blob"
+
+
+@pytest.mark.parametrize("relocation", ["edited-journal", "symlinked-directory"])
+def test_recover_absent_agent_row_resume_refuses_a_relocated_submodule_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    relocation: str,
+) -> None:
+    project, repository, record, administration, unpublished = (
+        prepare_absent_agent_row_with_submodules(tmp_path, unpushed=True)
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(point: str) -> None:
+        if point == "after-absent-agent-journal":
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_absent_agent_recovery(project, record, apply=True)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    config = wrkslots._load_config(str(project), "testhost")
+    journal_path = config.control / "ACTIVE.testhost.journal"
+    original = journal_path.read_bytes()
+    journal = json.loads(original)
+    # Move every archive into the administrative directory recovery deletes,
+    # keeping the bytes intact, so only the archive's location is wrong.
+    moved: list[Path] = []
+    for receipt in journal["submodule_salvage"]:
+        bundle = Path(receipt["archive_bundle"])
+        receipt_path = Path(receipt["archive_receipt"])
+        destination = Path(receipt["submodule_repository"]) / "archive-storage"
+        if relocation == "edited-journal":
+            destination.mkdir()
+            shutil.move(bundle, destination / bundle.name)
+            shutil.move(receipt_path, destination / receipt_path.name)
+            receipt["archive_root"] = receipt["submodule_repository"]
+            receipt["archive_bundle"] = str(destination / bundle.name)
+            receipt["archive_receipt"] = str(destination / receipt_path.name)
+            moved.append(destination / bundle.name)
+        else:
+            shutil.move(bundle.parent, destination)
+            bundle.parent.symlink_to(destination, target_is_directory=True)
+            moved.append(destination / bundle.name)
+    if relocation == "edited-journal":
+        branch_receipts = [
+            receipt
+            for receipt in journal["archive_entry"]["salvage"]
+            if "submodule" not in receipt
+        ]
+        item = wrkslots._absent_agent_row_identity(journal["input"], "test input")
+        journal["archive_entry"] = wrkslots._absent_agent_archive_entry(
+            record,
+            item,
+            journal["archive_entry"]["finished_at"],
+            branch_receipts,
+            journal["submodule_salvage"],
+        )
+        wrkslots._write_journal(config, journal)
+    else:
+        assert journal_path.read_bytes() == original
+    # The journal still agrees with its own archive entry, so only a check of
+    # where the archives live can catch this.
+    wrkslots._absent_agent_journal_inputs(config, json.loads(journal_path.read_bytes()))
+    capsys.readouterr()
+
+    recover = [
+        "--project-root",
+        str(project),
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ]
+    assert wrkslots.main(recover) == 3
+    assert "archive" in capsys.readouterr().err
+    assert administration.exists()
+    assert all(path.is_file() for path in moved)
+    assert wrkslots._find_record(wrkslots._load_active(config), record.slot) == record
 
 
 def record_unpublished_absent_agent_head(
