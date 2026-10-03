@@ -14140,6 +14140,408 @@ def test_recover_resumes_verified_local_archive_from_finish_journal(
     assert archived["records"][0]["salvage"][0]["disposition"] == "archived-local"
 
 
+# Measured on a host whose forward proxy denies the destination.
+CONNECT_DENIED = (
+    "fatal: unable to access 'https://github.com/example/product/': "
+    "CONNECT tunnel failed, response 403"
+)
+
+
+def deny_network_transport(
+    tmp_path: Path,
+    output: str,
+    *,
+    before: str = "",
+    stdout: str = "",
+    without_redirects: str | None = None,
+    answer_without_redirects: bool = False,
+) -> dict[str, str]:
+    """Return an environment whose Git network commands fail with ``output``.
+
+    wrkslots runs every fetch, push, and ls-remote through ``with-proxy`` when
+    one is on PATH, so this fails exactly the network boundary and nothing else.
+    Like the host's wrapper, the stand-in requires an environment without
+    GIT_CONFIG_*: a command that arrives with GIT_CONFIG_COUNT set at all exits
+    99 with no output, so the test cannot pass. ``before`` is a shell command
+    the stand-in runs first, outside the Git environment wrkslots gives the
+    network command; it can read the command's redirect setting as
+    ``$redirects``. If it fails, the stand-in exits 99 with no output so the
+    test cannot pass without it. ``stdout`` is printed on standard output beside
+    ``output`` on standard error.
+
+    A command whose ``-c http.followRedirects=false`` option turns off HTTP
+    redirects fails with ``without_redirects`` instead when that is given, or
+    runs for real when ``answer_without_redirects`` is set. Every call is logged
+    to ``denying-proxy/calls`` as the redirect setting, ``default`` when the
+    command sets none, followed by the command.
+    """
+
+    directory = tmp_path / "denying-proxy"
+    directory.mkdir()
+    wrapper = directory / "with-proxy"
+    calls = directory / "calls"
+    prelude = (
+        f"(unset GIT_DIR GIT_OBJECT_DIRECTORY; {before}) >/dev/null 2>&1 || exit 99\n"
+        if before
+        else ""
+    )
+    printed_stdout = f"printf '%s\\n' {shlex.quote(stdout)}\n" if stdout else ""
+    if answer_without_redirects:
+        redirect_free = 'exec "$@"\n'
+    elif without_redirects is not None:
+        redirect_free = f"printf '%s\\n' {shlex.quote(without_redirects)} >&2\nexit 128\n"
+    else:
+        redirect_free = ""
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        '[ -z "${GIT_CONFIG_COUNT+set}" ] || exit 99\n'
+        # Git takes a setting for one command as "-c key=value"; the last wins.
+        "redirects=default; previous=\n"
+        'for argument in "$@"; do\n'
+        '  if [ "$previous" = -c ]; then\n'
+        '    case "$argument" in http.followRedirects=*) redirects="${argument#*=}" ;; esac\n'
+        "  fi\n"
+        '  previous="$argument"\n'
+        "done\n"
+        f'printf \'%s %s\\n\' "$redirects" "$*" >> {shlex.quote(str(calls))}\n'
+        f"{prelude}"
+        'if [ "$redirects" = false ]; then\n'
+        f"{redirect_free}:\nfi\n"
+        f"{printed_stdout}"
+        f"printf '%s\\n' {shlex.quote(output)} >&2\nexit 128\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    return {"PATH": f"{directory}{os.pathsep}{os.environ['PATH']}"}
+
+
+def network_calls(tmp_path: Path) -> list[str]:
+    return (tmp_path / "denying-proxy" / "calls").read_text(encoding="utf-8").splitlines()
+
+
+def test_agent_reclaim_archives_locally_when_remote_transport_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    project, _repository, remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    commit_local(tree, "local.txt", "must survive\n", "local")
+    (tree / "untracked.txt").write_text("untracked work\n", encoding="utf-8")
+    source_head = git(tree, "rev-parse", "HEAD").stdout.strip()
+    archive_root = tmp_path / "approved-archive"
+    archive_root.mkdir()
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = local_archive_remove(
+        project, archive_root, env=deny_network_transport(tmp_path, CONNECT_DENIED)
+    )
+
+    assert removed.returncode == 0, removed.stderr
+    assert "using verified local archive" in removed.stderr
+    assert not tree.exists()
+    archived = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
+    )
+    receipt = archived["records"][0]["salvage"][0]
+    assert receipt["source_head"] == source_head
+    assert receipt["disposition"] == "archived-local"
+    assert receipt["remote_ref"] is None
+    # The initial fetch is what failed; no push was attempted.
+    assert "git ls-remote" in receipt["remote_failure"]
+    calls = network_calls(tmp_path)
+    assert [call.split()[0] for call in calls] == ["default", "false"]
+    assert all(" ls-remote " in call for call in calls)
+    assert "CONNECT tunnel failed, response 403" in receipt["remote_failure"]
+    assert git(remote, "for-each-ref", "refs/heads/salvage/").stdout == ""
+    bundle = Path(receipt["archive_bundle"])
+    assert hashlib.sha256(bundle.read_bytes()).hexdigest() == receipt["archive_bundle_sha256"]
+    restored = tmp_path / "restored.git"
+    git(tmp_path, "clone", "--bare", str(bundle), str(restored))
+    salvage_commit = receipt["salvage_commit"]
+    assert git(restored, "show", f"{salvage_commit}:local.txt").stdout == "must survive\n"
+    assert git(restored, "show", f"{salvage_commit}:untracked.txt").stdout == "untracked work\n"
+
+
+def test_unavailable_transport_without_archive_root_retains_the_slot(
+    tmp_path: Path,
+) -> None:
+    project, tree, _remote, archive_root = prepare_refused_salvage(tmp_path)
+
+    refused = raw_command_with_census_authority_stub(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env=deny_network_transport(tmp_path, CONNECT_DENIED),
+    )
+
+    assert refused.returncode == 3
+    assert "CONNECT tunnel failed, response 403" in refused.stderr
+    assert tree.is_dir()
+    assert len(active_slots(project)) == 1
+    assert list(archive_root.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        pytest.param(
+            "fatal: Authentication failed for 'https://github.com/example/product/'",
+            id="authentication",
+        ),
+        pytest.param(
+            "remote: Permission to example/product.git denied to bot.\n"
+            "fatal: unable to access 'https://github.com/example/product/': "
+            "The requested URL returned error: 403",
+            id="server-refused",
+        ),
+        pytest.param(
+            f"{CONNECT_DENIED}\n"
+            "fatal: Authentication failed for 'https://github.com/example/product/'",
+            id="outage-and-authentication",
+        ),
+        pytest.param(
+            "Host key verification failed.\nfatal: Could not read from remote repository.",
+            id="host-identity",
+        ),
+        pytest.param(
+            "fatal: unable to access 'https://github.com/example/product/': "
+            "SSL certificate problem: self-signed certificate in certificate chain",
+            id="certificate",
+        ),
+        pytest.param("fatal: the remote end hung up unexpectedly", id="unclassified"),
+        # Measured: a server's error packet whose text names a connection failure.
+        pytest.param("fatal: remote error: Connection refused", id="server-error-packet"),
+        pytest.param(
+            "remote: Connection timed out talking to backend\nfatal: early EOF",
+            id="server-message",
+        ),
+        # Measured: a proxy that wants credentials refuses the tunnel with 407.
+        pytest.param(
+            "fatal: unable to access 'https://github.com/example/product/': "
+            "Received HTTP code 407 from proxy after CONNECT",
+            id="proxy-authentication",
+        ),
+        pytest.param(
+            "fatal: unable to access 'https://github.com/example/product/': "
+            "CONNECT tunnel failed, response 407",
+            id="proxy-authentication-tunnel",
+        ),
+    ],
+)
+def test_archive_root_does_not_absorb_remote_failures_other_than_an_outage(
+    tmp_path: Path, output: str
+) -> None:
+    project, tree, _remote, archive_root = prepare_refused_salvage(tmp_path)
+
+    # The redirect-free retry would report an outage, so only the first
+    # classification can refuse; it must refuse before that retry runs.
+    refused = local_archive_remove(
+        project,
+        archive_root,
+        env=deny_network_transport(tmp_path, output, without_redirects=CONNECT_DENIED),
+    )
+
+    assert refused.returncode == 3
+    assert output.splitlines()[-1] in refused.stderr
+    assert "using verified local archive" not in refused.stderr
+    assert [call.split()[0] for call in network_calls(tmp_path)] == ["default"]
+    assert tree.is_dir()
+    assert len(active_slots(project)) == 1
+    assert list(archive_root.iterdir()) == []
+
+
+def test_outage_text_from_a_local_git_command_is_not_an_outage(tmp_path: Path) -> None:
+    """Only fetch, push, and ls-remote output is read as a transport failure."""
+
+    repository = tmp_path / "repository"
+    git(tmp_path, "init", str(repository))
+
+    with pytest.raises(wrkslots.Refusal) as refused:
+        wrkslots._GitVcs._run(repository, ["rev-parse", "Could not resolve host"])
+
+    assert "Could not resolve host" in str(refused.value)
+    assert not isinstance(refused.value, wrkslots._RemoteTransportUnavailable)
+
+
+def test_remote_identity_answer_on_standard_output_still_refuses(
+    tmp_path: Path,
+) -> None:
+    """Outage text on standard error does not outweigh an answer on standard output."""
+
+    project, tree, _remote, archive_root = prepare_refused_salvage(tmp_path)
+
+    refused = local_archive_remove(
+        project,
+        archive_root,
+        env=deny_network_transport(
+            tmp_path,
+            CONNECT_DENIED,
+            stdout="remote: Repository not found.",
+            without_redirects=CONNECT_DENIED,
+        ),
+    )
+
+    assert refused.returncode == 3
+    assert "CONNECT tunnel failed, response 403" in refused.stderr
+    assert "Repository not found" in refused.stderr
+    assert "using verified local archive" not in refused.stderr
+    assert tree.is_dir()
+    assert len(active_slots(project)) == 1
+    assert list(archive_root.iterdir()) == []
+
+
+def test_redirected_connection_failure_does_not_archive(tmp_path: Path) -> None:
+    """A remote that redirects to an unreachable host reports that host's failure.
+
+    Both outputs were measured with Git 2.53 against an HTTP server answering
+    301 to 127.0.0.1 port 1, following redirects and then not.
+    """
+
+    project, tree, _remote, archive_root = prepare_refused_salvage(tmp_path)
+
+    refused = local_archive_remove(
+        project,
+        archive_root,
+        env=deny_network_transport(
+            tmp_path,
+            "fatal: unable to access 'https://github.com/example/product/': "
+            "Failed to connect to 127.0.0.1 port 1: Connection refused",
+            without_redirects="fatal: unable to access "
+            "'https://github.com/example/product/': The requested URL returned error: 301",
+        ),
+    )
+
+    assert refused.returncode == 3
+    assert "The requested URL returned error: 301" in refused.stderr
+    assert "using verified local archive" not in refused.stderr
+    assert tree.is_dir()
+    assert len(active_slots(project)) == 1
+    assert list(archive_root.iterdir()) == []
+
+
+def test_remote_that_answers_when_asked_again_does_not_archive(tmp_path: Path) -> None:
+    project, tree, _remote, archive_root = prepare_refused_salvage(tmp_path)
+
+    refused = local_archive_remove(
+        project,
+        archive_root,
+        env=deny_network_transport(tmp_path, CONNECT_DENIED, answer_without_redirects=True),
+    )
+
+    assert refused.returncode == 3
+    assert "answered when asked again without redirects" in refused.stderr
+    assert "using verified local archive" not in refused.stderr
+    assert tree.is_dir()
+    assert len(active_slots(project)) == 1
+    assert list(archive_root.iterdir()) == []
+
+
+def test_unavailable_transport_does_not_archive_under_a_changed_remote(
+    tmp_path: Path,
+) -> None:
+    project, tree, _remote, archive_root = prepare_refused_salvage(tmp_path)
+    elsewhere = tmp_path / "elsewhere.git"
+    git(tmp_path, "init", "--bare", str(elsewhere))
+    git(tree, "remote", "set-url", "origin", str(elsewhere))
+
+    refused = local_archive_remove(
+        project, archive_root, env=deny_network_transport(tmp_path, CONNECT_DENIED)
+    )
+
+    assert refused.returncode == 3
+    assert "URL changed" in refused.stderr
+    assert tree.is_dir()
+    assert len(active_slots(project)) == 1
+    assert list(archive_root.iterdir()) == []
+
+
+@pytest.mark.parametrize("moved_during", ["fetch", "redirect-free-recheck"])
+def test_unavailable_transport_rechecks_the_remote_before_archiving(
+    tmp_path: Path, moved_during: str
+) -> None:
+    """The remote changes while a network command is failing, after earlier checks."""
+
+    project, tree, _remote, archive_root = prepare_refused_salvage(tmp_path)
+    elsewhere = tmp_path / "elsewhere.git"
+    git(tmp_path, "init", "--bare", str(elsewhere))
+    retarget = shlex.join(
+        ["git", "-C", str(tree), "remote", "set-url", "origin", str(elsewhere)]
+    )
+    if moved_during == "redirect-free-recheck":
+        retarget = f'[ "$redirects" != false ] || {retarget}'
+
+    refused = local_archive_remove(
+        project,
+        archive_root,
+        env=deny_network_transport(tmp_path, CONNECT_DENIED, before=retarget),
+    )
+
+    assert refused.returncode == 3
+    assert "changed after authority was captured" in refused.stderr
+    assert tree.is_dir()
+    assert len(active_slots(project)) == 1
+    assert list(archive_root.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("output", "outage"),
+    [
+        (CONNECT_DENIED, True),
+        ("curl: (56) Received HTTP code 403 from proxy after CONNECT", True),
+        ("fatal: unable to access 'https://x/': Could not resolve host: github.com", True),
+        ("ssh: Could not resolve hostname github.com: Name or service not known", True),
+        ("fatal: unable to access 'https://x/': Failed to connect to github.com port 443", True),
+        ("ssh: connect to host github.com port 22: Connection refused", True),
+        ("ssh: connect to host github.com port 22: Connection timed out", True),
+        ("ssh: connect to host github.com port 22: Network is unreachable", True),
+        ("", False),
+        ("fatal: the remote end hung up unexpectedly", False),
+        ("fatal: Could not read from remote repository.", False),
+    ],
+)
+def test_remote_transport_classification_requires_an_outage(
+    output: str, outage: bool
+) -> None:
+    assert wrkslots._remote_transport_unavailable(output) is outage
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "fatal: Authentication failed for 'https://github.com/example/product/'",
+        "fatal: could not read Password for 'https://bot@github.com': No such device",
+        "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+        "remote: Invalid username or password.",
+        "git@github.com: Permission denied (publickey).",
+        "Host key verification failed.",
+        "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!",
+        "fatal: unable to access 'https://x/': SSL certificate problem: unable to get local issuer",
+        "fatal: unable to access 'https://x/': The requested URL returned error: 401",
+        "remote: Repository not found.",
+        # Over SSH, Git passes the server's stderr through without a prefix.
+        "ERROR: Repository not found.",
+        "Invalid username or password.",
+        "fatal: '/srv/product.git' does not appear to be a git repository",
+        "fatal: remote error: Connection refused",
+        "remote: Connection timed out talking to backend",
+        "fatal: unable to access 'https://x/': Received HTTP code 407 from proxy after CONNECT",
+        "fatal: unable to access 'https://x/': CONNECT tunnel failed, response 407",
+        "HTTP/1.1 407 Proxy Authentication Required",
+    ],
+)
+def test_remote_identity_answer_is_never_an_outage(answer: str) -> None:
+    """Every identity answer overrides outage text printed beside it, in either order."""
+
+    assert wrkslots._remote_transport_unavailable(answer) is False
+    assert wrkslots._remote_transport_unavailable(f"{CONNECT_DENIED}\n{answer}") is False
+    assert wrkslots._remote_transport_unavailable(f"{answer}\n{CONNECT_DENIED}") is False
+
+
 @pytest.mark.parametrize("archive_root_kind", ("relative", "missing", "symlink", "inside"))
 def test_agent_reclaim_refuses_unapproved_archive_root_before_mutation(
     tmp_path: Path, archive_root_kind: str

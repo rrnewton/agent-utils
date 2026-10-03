@@ -654,8 +654,23 @@ local custody by adding `--salvage-archive-root ABSOLUTE_PATH` to `remove`. The
 directory must already exist, must be owned by the current user, must not be group/world writable,
 must have no symlink component, and must be separate from the managed project tree (the control
 directory, which is the default root, is the one exception). Wrkslots still
-tries the recorded remote first. Only after that push attempt refuses does it
-write one self-contained Git bundle per affected repository under the supplied root. Each bundle has
+tries the recorded remote first. Only after a salvage push refuses, for any reason, or after the
+initial fetch fails in the transport, does it write one self-contained Git bundle per affected
+repository under the supplied root. A fetch failure counts as a transport failure only when Git's
+combined output reports a proxy `CONNECT` refusal, an unresolved host, or a refused, timed-out, or
+unreachable connection, and reports none of the refusals listed next. Any line Git
+relays from the server (`remote:`), a `remote error:` packet, an HTTP error answer, a proxy `407`
+authentication demand, failed authentication, a host key or certificate problem, or a missing
+repository still refuses, even when outage text appears beside it. Because a redirect can make Git
+report the redirect target's connection failure, wrkslots then asks the recorded remote once more
+with HTTP redirects disabled; the checkout is archived only if that attempt fails in the transport
+too. Over SSH, Git passes the server's own error text through without a `remote:` prefix and
+redirects do not apply, so a server message that reports a connection failure and names none of the
+refusals above can still be read as a transport failure; wrkslots then keeps the work in verified
+local custody rather than publishing it anywhere. Finally it checks again that the checkout's
+remote URL still matches the recorded one. A
+transport failure can also happen after an earlier network step succeeded, so an archive records
+that the remote could not be used at that moment, not that it was never reached. Each bundle has
 a schema-1 JSON receipt binding the machine, slot generation, checkout and repository identities,
 remote URL digest, source and salvage commits, status digest, archive ref, byte count, and SHA-256.
 Wrkslots clones the bundle into a fresh empty bare repository, resolves the exact archive ref, and

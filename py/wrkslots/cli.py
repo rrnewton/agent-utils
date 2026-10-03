@@ -717,6 +717,10 @@ class _LockBusy(Refusal):
     """A bounded lock wait elapsed without acquiring the requested lock."""
 
 
+class _RemoteTransportUnavailable(Refusal):
+    """A Git network command never reached the remote, and nothing named its identity."""
+
+
 class _RetirementDeferred(Refusal):
     """A queue candidate changed before its exact guarded attempt began."""
 
@@ -9807,6 +9811,51 @@ def _with_proxy(command: Sequence[str], env: Mapping[str, str]) -> list[str]:
     return [str(Path(wrapper).absolute()), *command] if wrapper is not None else list(command)
 
 
+# Git and its transports print these when no connection to the remote was made.
+_REMOTE_TRANSPORT_UNAVAILABLE = re.compile(
+    r"CONNECT tunnel failed, response \d{3}"
+    r"|Received HTTP code \d{3} from proxy after CONNECT"
+    r"|Could not resolve (?:host|proxy|hostname)\b"
+    r"|Failed to connect to \S+ port \d+"
+    r"|Connection refused"
+    r"|Connection timed out"
+    r"|Network is unreachable",
+    re.IGNORECASE,
+)
+# Any of these means the remote, or something claiming to be it, answered, or
+# the caller or the remote was refused on identity. A command that prints one is
+# not an outage. Git relays server messages over HTTP and during a pack transfer
+# with a ``remote:`` prefix, so such text that merely mentions a connection
+# failure also vetoes. Over SSH the server's stderr arrives unprefixed, so the
+# forms a server prints there are listed on their own.
+_REMOTE_AUTHORITY_FAILURE = re.compile(
+    r"^remote:"
+    r"|remote error:"
+    r"|Authentication failed"
+    r"|Proxy Authentication Required"
+    r"|(?:response|HTTP code) 407\b"
+    r"|could not read (?:Username|Password)"
+    r"|Invalid username or password"
+    r"|Permission denied \("
+    r"|Host key verification failed"
+    r"|REMOTE HOST IDENTIFICATION HAS CHANGED"
+    r"|certificate"
+    r"|The requested URL returned error"
+    r"|Repository not found"
+    r"|does not appear to be a git repository",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _remote_transport_unavailable(output: str) -> bool:
+    """Return whether failed Git network output shows only an absent connection."""
+
+    return bool(
+        _REMOTE_TRANSPORT_UNAVAILABLE.search(output)
+        and not _REMOTE_AUTHORITY_FAILURE.search(output)
+    )
+
+
 def _local_remote_url_path(repository: Path, url: str) -> Path | None:
     """Return a conservative local path for a Git remote URL, if it has one."""
 
@@ -10139,14 +10188,19 @@ class _GitVcs:
         env_overrides: Mapping[str, str] | None = None,
         timeout_seconds: float | None = None,
         timeout_refusal: str | None = None,
+        config: Sequence[tuple[str, str]] = (),
     ) -> subprocess.CompletedProcess[str]:
         """Run Git with a controlled environment.
 
         ``timeout_seconds`` bounds this one command; when it expires first,
         the command is stopped and Refusal(``timeout_refusal``) is raised.
+        ``config`` holds Git settings, as (key, value) pairs, for this one
+        command; they are passed on Git's command line.
         """
 
-        command, env, what = _GitVcs._invocation(repository, args, env_overrides)
+        command, env, what = _GitVcs._invocation(
+            repository, args, env_overrides, config=config
+        )
         seconds, expired = _GitVcs._bound(what, timeout_seconds, timeout_refusal)
         try:
             if seconds is None:
@@ -10170,21 +10224,54 @@ class _GitVcs:
         except OSError as exc:
             raise Refusal(f"cannot execute Git: {exc}") from exc
         if check and completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout).strip()
-            raise Refusal(
-                f"Git refused in {repository}: git {' '.join(args)}"
-                + (f": {detail}" if detail else "")
+            network_operation = _GitVcs._network_operation(args)
+            detail = (
+                "\n".join(
+                    text.strip()
+                    for text in (completed.stderr, completed.stdout)
+                    if text.strip()
+                )
+                if network_operation
+                else (completed.stderr or completed.stdout).strip()
             )
+            message = f"Git refused in {repository}: git {' '.join(args)}" + (
+                f": {detail}" if detail else ""
+            )
+            if network_operation and _remote_transport_unavailable(
+                completed.stderr + "\n" + completed.stdout
+            ):
+                raise _RemoteTransportUnavailable(message)
+            raise Refusal(message)
         return completed
+
+    @staticmethod
+    def _network_operation(args: Sequence[str]) -> bool:
+        """Return whether ``args`` is a Git command that talks to a remote."""
+
+        return bool(args and args[0] in {"fetch", "push", "ls-remote"})
 
     @staticmethod
     def _invocation(
         repository: Path,
         args: Sequence[str],
         env_overrides: Mapping[str, str] | None,
+        *,
+        config: Sequence[tuple[str, str]] = (),
     ) -> tuple[list[str], dict[str, str], str]:
-        """Return the command line, environment, and description of one Git command."""
+        """Return the command line, environment, and description of one Git command.
 
+        Each ``config`` pair becomes a ``-c key=value`` option before the
+        subcommand, so a setting reaches Git without a GIT_CONFIG_* variable.
+        """
+
+        settings: list[str] = []
+        for key, value in config:
+            # Git splits the option at its first "=".
+            if not key or "=" in key or any(
+                character in key + value for character in "\n\0"
+            ):
+                raise StateError(f"malformed Git setting for one command: {key!r}")
+            settings.extend(("-c", f"{key}={value}"))
         env = {
             key: value
             for key, value in os.environ.items()
@@ -10203,9 +10290,7 @@ class _GitVcs:
         if env_overrides:
             env.update(env_overrides)
         env.pop(_NETWORK_CONFIG_SHA256_ENV, None)
-        network_operation = bool(
-            args and args[0] in {"fetch", "push", "ls-remote"}
-        )
+        network_operation = _GitVcs._network_operation(args)
         if expected_network_config is not None:
             observed_network_config = hashlib.sha256(
                 _read_bounded_regular_file(
@@ -10224,6 +10309,7 @@ class _GitVcs:
             "--no-replace-objects",
             "-c",
             "core.useReplaceRefs=false",
+            *settings,
             *(_github_credential_helper_args(env) if network_operation else ()),
             "-C",
             str(repository),
@@ -11236,10 +11322,12 @@ class _GitVcs:
         heads_only: bool = False,
         env_overrides: Mapping[str, str] | None = None,
         timeout_seconds: float | None = None,
+        config: Sequence[tuple[str, str]] = (),
     ) -> dict[str, str]:
         """List the remote's refs at ``url``; ``timeout_seconds`` bounds the listing.
 
         A listing still running at that bound is stopped and refused.
+        ``config`` holds Git settings for the listing, as _run takes them.
         """
 
         environment = dict(env_overrides or {})
@@ -11251,11 +11339,16 @@ class _GitVcs:
         if heads_only:
             arguments.append("--heads")
         arguments.extend(("--", url, *refs))
+        # Settings reach _run only when there are some, so a listing without
+        # them calls _run exactly as before ``config`` existed.
+        run = self._run
+        if config:
+            run = functools.partial(self._run, config=config)
         # An unbounded listing calls _run exactly as before the bound existed.
         if timeout_seconds is None:
-            result = self._run(repository, arguments, env_overrides=environment)
+            result = run(repository, arguments, env_overrides=environment)
         else:
-            result = self._run(
+            result = run(
                 repository,
                 arguments,
                 env_overrides=environment,
@@ -11495,6 +11588,37 @@ class _GitVcs:
                 _NETWORK_CONFIG_SHA256_ENV: config_digest,
                 **_ISOLATED_HISTORY_ENV,
             }
+
+    def confirm_remote_unreachable(
+        self, checkout: Path, remote: str, authority: _RemoteAuthority
+    ) -> _RemoteTransportUnavailable:
+        """Ask the recorded URL again, without redirects, and return the outage.
+
+        An HTTP remote that redirects elsewhere reports the other host's
+        connection failure as its own. Asked without following redirects, the
+        same remote answers with its redirect instead, which refuses.
+        """
+
+        with self._isolated_remote(checkout, remote, authority) as (
+            isolated,
+            object_env,
+        ):
+            try:
+                # On Git's command line: the network wrapper requires an
+                # environment without GIT_CONFIG_* (see _ISOLATED_HISTORY_ENV).
+                self._ls_remote_inventory(
+                    isolated,
+                    authority.url,
+                    heads_only=True,
+                    env_overrides=object_env,
+                    config=(("http.followRedirects", "false"),),
+                )
+            except _RemoteTransportUnavailable as exc:
+                return exc
+        raise Refusal(
+            f"remote {remote!r} answered when asked again without redirects after its "
+            "fetch failed; preserve the checkout and rerun remove"
+        )
 
     def remote_url_sha256(self, checkout: Path, remote: str) -> str:
         return self.remote_authority(checkout, remote).sha256
@@ -14690,7 +14814,8 @@ def _archive_salvage_locally(
     """Create and read back a self-contained bundle instead of a remote push.
 
     ``remote_failure`` is None when the remote is not in salvage_push_remotes,
-    so nothing was pushed; otherwise it is the refused push.
+    so nothing was pushed; otherwise it is the refused push, or the initial
+    fetch's transport failure, so remote salvage did not complete.
     """
     checked_root = _local_salvage_archive_root(config, str(archive_root))
     assert checked_root is not None
@@ -14787,7 +14912,7 @@ def _archive_salvage_locally(
     reason = (
         f"remote {checkout.remote} is not in salvage_push_remotes"
         if remote_failure is None
-        else "remote salvage refused"
+        else "remote salvage did not complete"
     )
     print(
         f"WARNING: {reason} for checkout {checkout.name}; "
@@ -15167,9 +15292,33 @@ def _salvage_one_checkout(
         if prepared is None
         else prepared
     )
-    vcs.fetch_remote(
-        path, checkout.remote, checkout.landed_ref, facts.remote_authority
-    )
+    try:
+        vcs.fetch_remote(
+            path, checkout.remote, checkout.landed_ref, facts.remote_authority
+        )
+    except _RemoteTransportUnavailable as exc:
+        if archive_root is None:
+            raise
+        # With no connection there is no remote answer to publish to or to
+        # trust, so archive locally. The outage must repeat when the recorded
+        # URL is asked again without redirects, which also rechecks the
+        # recorded remote binding. Every other fetch refusal, including
+        # authentication, host identity, and inventory disagreement, still
+        # refuses, and so does a remote that answers the second time.
+        vcs.confirm_remote_unreachable(path, checkout.remote, facts.remote_authority)
+        vcs.assert_remote_authority(path, checkout.remote, facts.remote_authority)
+        return _archive_salvage_locally(
+            config,
+            record.machine,
+            record.slot,
+            record.generation,
+            checkout,
+            path,
+            facts,
+            archive_root,
+            exc,
+            vcs,
+        )
     vcs.assert_remote_authority(path, checkout.remote, facts.remote_authority)
     containing = vcs.remote_refs_containing(path, checkout.remote, facts.head)
     if not facts.dirty and containing:
