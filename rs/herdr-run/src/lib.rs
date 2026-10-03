@@ -15,6 +15,7 @@ pub mod cli;
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod evict;
 pub mod identity;
 pub mod init;
 pub mod readiness;

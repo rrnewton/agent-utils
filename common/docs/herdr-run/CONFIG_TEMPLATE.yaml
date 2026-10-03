@@ -128,9 +128,10 @@ spool_dir: .herdr-run
 # and incomplete runs are kept regardless of age. The audit log is never pruned.
 retention_days: 4
 
-# Refuse to open a NEW tab once the workspace already holds this many panes; 0 disables the cap.
-# Existing tabs are never affected, so a cap can never break work already in progress. Nothing
-# closes a tab automatically — `herdr-run reap` reports which ones are provably finished with.
+# At most this many panes in the workspace; 0 disables the cap. When a NEW tab is needed at the cap,
+# the least-recently-used tab whose shell is provably idle is closed to make room; only when every
+# tab is busy is the new tab refused. Existing tabs are never refused, and a tab running a command
+# is never closed. `herdr-run reap` reports which tabs are provably finished with.
 max_panes: 32
 
 # The remote `herdr-run net-doctor` probes with `git ls-remote`.

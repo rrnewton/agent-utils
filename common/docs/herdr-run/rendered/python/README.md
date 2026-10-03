@@ -49,8 +49,10 @@ dependency, and provides the `herdr-run` command.
   callers from different projects cannot inject into the same pane concurrently.
 - **Bounded tab growth.** Every agent that runs a command leaves a tab behind and nothing closes
   it, so the workspace grows until the Herdr server is the bottleneck (measured: 260 panes, >1000%
-  CPU, every control call timing out). `max_panes` refuses to open a NEW tab past a ceiling -- never
-  an existing one -- and `herdr-run reap` reports which tabs are provably finished with.
+  CPU, every control call timing out). At the `max_panes` ceiling a NEW tab replaces the
+  least-recently-used tab whose shell is provably idle, and is refused only when every tab is busy;
+  an existing tab is never refused, a running command never closed, and `herdr-run reap` reports
+  which tabs are provably finished with.
 - **Visible, best-effort audit.** Refusals, admissions, failures, and completions are appended to a
   private JSONL log. Storage failures warn but never replace a completed command's exit status.
 

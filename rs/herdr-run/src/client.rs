@@ -261,6 +261,14 @@ pub trait HerdrApi {
     fn create_tab(&self, workspace_id: &str, label: &str, cwd: &str) -> Result<String>;
     /// Rename a tab.
     fn rename_tab(&self, tab_id: &str, label: &str) -> Result<()>;
+    /// Close a tab and every pane in it.
+    ///
+    /// Defaults to a refusal so a client that never closes tabs need not implement it.
+    fn close_tab(&self, tab_id: &str) -> Result<()> {
+        Err(HerdrRunError::unavailable(format!(
+            "this Herdr client cannot close tab {tab_id}"
+        )))
+    }
     /// List panes, optionally restricted to a workspace.
     fn panes(&self, workspace_id: Option<&str>) -> Result<Vec<Pane>>;
     /// Report whether a pane ID is currently live.
@@ -977,6 +985,10 @@ impl HerdrApi for HerdrClient {
 
     fn rename_tab(&self, tab_id: &str, label: &str) -> Result<()> {
         HerdrClient::rename_tab(self, tab_id, label)
+    }
+
+    fn close_tab(&self, tab_id: &str) -> Result<()> {
+        HerdrClient::close_tab(self, tab_id)
     }
 
     fn panes(&self, workspace_id: Option<&str>) -> Result<Vec<Pane>> {

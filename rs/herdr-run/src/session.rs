@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::client::HerdrApi;
 use crate::config::{render_tab_name, Config};
 use crate::error::{HerdrRunError, Result};
+use crate::evict;
 use crate::state::{open_lock_file, session_lock_path};
 
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -137,7 +138,7 @@ fn resolve_target_locked<A: HerdrApi + ?Sized>(
             let tab_id = match client.tab_id_for_label(&workspace_id, &tab_label)? {
                 Some(tab_id) => tab_id,
                 None => {
-                    enforce_pane_cap(client, config, &workspace_id)?;
+                    enforce_pane_cap(client, config, &workspace_id, agent, Path::new("/proc"))?;
                     let tab_id = client.create_tab(&workspace_id, &tab_label, cwd)?;
                     created.push("tab".to_owned());
                     tab_id
@@ -172,12 +173,14 @@ fn resolve_target_locked<A: HerdrApi + ?Sized>(
     Ok(target)
 }
 
-/// Refuse to open ANOTHER tab once the workspace is already at `max_panes`.
+/// Make room for ANOTHER tab once the workspace is already at `max_panes`, or refuse.
 ///
-/// Agents are coined continuously and every one that runs a command leaves a tab behind; nothing
-/// closes them, so the command workspace grows without bound until the Herdr server itself becomes
-/// the bottleneck (measured: 260 panes, >1000% CPU, every control call timing out). A ceiling turns
-/// that slow collapse into one legible refusal naming the tool that fixes it.
+/// Agents are coined continuously and every one that runs a command leaves a tab behind, so the
+/// command workspace grows without bound until the Herdr server itself becomes the bottleneck
+/// (measured: 260 panes, >1000% CPU, every control call timing out). At the ceiling the
+/// least-recently-used tab whose shell is provably idle is closed and the new tab takes its place
+/// (see [`crate::evict`]); a tab running a command is never closed. Only when no tab is idle does
+/// this refuse, with one legible message naming the remedy.
 ///
 /// Checked ONLY on the create path. An agent whose tab already exists must never be locked out of
 /// it -- a cap that can break work in progress is a cap that gets switched off -- and a cap that
@@ -187,11 +190,26 @@ fn enforce_pane_cap<A: HerdrApi + ?Sized>(
     client: &A,
     config: &Config,
     workspace_id: &str,
+    agent: &str,
+    proc_root: &Path,
 ) -> Result<()> {
     if config.max_panes == 0 {
         return Ok(());
     }
-    let existing = client.panes(Some(workspace_id))?.len() as u64;
+    let mut existing = client.panes(Some(workspace_id))?.len() as u64;
+    // Bounded: a close that the listing never reflects must not turn into closing every tab.
+    let mut budget = existing.saturating_sub(config.max_panes) + 1;
+    let mut skipped = Vec::new();
+    while existing >= config.max_panes && budget > 0 {
+        budget -= 1;
+        match evict::evict_one(client, config, workspace_id, agent, proc_root)? {
+            Ok(_) => existing = client.panes(Some(workspace_id))?.len() as u64,
+            Err(reasons) => {
+                skipped = reasons;
+                break;
+            }
+        }
+    }
     if existing < config.max_panes {
         return Ok(());
     }
@@ -199,10 +217,15 @@ fn enforce_pane_cap<A: HerdrApi + ?Sized>(
         .source_path
         .as_deref()
         .unwrap_or("your .herdr-run.yaml");
-    Err(HerdrRunError::unavailable(format!(
+    let mut message = format!(
         "workspace '{}' already holds {existing} pane(s) and max_panes is {}; refusing to open a tab for this agent. Run 'herdr-run reap' to see which tabs are provably finished and can be closed, or raise max_panes in {source} (0 disables the cap).",
         config.workspace, config.max_panes
-    )))
+    );
+    if !skipped.is_empty() {
+        message.push(' ');
+        message.push_str(&evict::describe_skipped(&skipped));
+    }
+    Err(HerdrRunError::unavailable(message))
 }
 
 fn resolved_cwd(config: &Config) -> Result<PathBuf> {
@@ -617,22 +640,41 @@ mod tests {
     struct CapFake {
         panes: Mutex<Vec<Pane>>,
         created: AtomicUsize,
+        idle: Mutex<BTreeMap<String, i64>>,
+        closed: Mutex<Vec<String>>,
+        pane_prefix: String,
+        /// When set, `tab close` reports success but the listing never changes.
+        sticky_close: bool,
     }
 
     impl CapFake {
         fn holding(count: usize) -> Self {
+            Self::holding_panes("p", count)
+        }
+
+        /// Pane IDs carry `pane_prefix`, so a test that takes real pane locks can use IDs that no
+        /// concurrently running test shares.
+        fn holding_panes(pane_prefix: &str, count: usize) -> Self {
             Self {
                 panes: Mutex::new(
                     (0..count)
                         .map(|index| Pane {
-                            pane_id: format!("p{index}"),
+                            pane_id: format!("{pane_prefix}{index}"),
                             tab_id: format!("t{index}"),
                             workspace_id: "w1".to_owned(),
                         })
                         .collect(),
                 ),
                 created: AtomicUsize::new(0),
+                idle: Mutex::new(BTreeMap::new()),
+                closed: Mutex::new(Vec::new()),
+                pane_prefix: pane_prefix.to_owned(),
+                sticky_close: false,
             }
+        }
+
+        fn closed(&self) -> Vec<String> {
+            self.closed.lock().expect("closed").clone()
         }
 
         fn creates(&self) -> usize {
@@ -672,10 +714,10 @@ mod tests {
 
         fn create_tab(&self, workspace_id: &str, _label: &str, _cwd: &str) -> Result<String> {
             let mut panes = self.panes.lock().expect("panes");
-            let index = panes.len();
+            let index = panes.len() + self.closed.lock().expect("closed").len();
             self.created.fetch_add(1, AtomicOrdering::SeqCst);
             panes.push(Pane {
-                pane_id: format!("p{index}"),
+                pane_id: format!("{}{index}", self.pane_prefix),
                 tab_id: format!("t{index}"),
                 workspace_id: workspace_id.to_owned(),
             });
@@ -698,8 +740,38 @@ mod tests {
                 .any(|pane| pane.pane_id == pane_id)
         }
 
-        fn process_info(&self, _pane_id: &str) -> Result<ProcessInfo> {
-            unreachable!()
+        fn close_tab(&self, tab_id: &str) -> Result<()> {
+            let mut closed = self.closed.lock().expect("closed");
+            closed.push(tab_id.to_owned());
+            if self.sticky_close {
+                assert!(closed.len() <= 10, "runaway eviction: {closed:?}");
+                return Ok(());
+            }
+            drop(closed);
+            self.panes
+                .lock()
+                .expect("panes")
+                .retain(|pane| pane.tab_id != tab_id);
+            Ok(())
+        }
+
+        /// Every pane runs `git push` except those given an idle shell.
+        fn process_info(&self, pane_id: &str) -> Result<ProcessInfo> {
+            let idle = self.idle.lock().expect("idle").get(pane_id).copied();
+            Ok(match idle {
+                Some(pid) => ProcessInfo {
+                    pane_id: pane_id.to_owned(),
+                    shell_pid: pid,
+                    foreground_pgid: pid,
+                    foreground: vec![(pid, "bash".to_owned(), "/bin/bash".to_owned())],
+                },
+                None => ProcessInfo {
+                    pane_id: pane_id.to_owned(),
+                    shell_pid: 1,
+                    foreground_pgid: 2,
+                    foreground: vec![(2, "git".to_owned(), "git push".to_owned())],
+                },
+            })
         }
 
         fn read(&self, _pane_id: &str, _source: &str, _lines: Option<usize>) -> Result<String> {
@@ -726,9 +798,85 @@ mod tests {
         let error = resolve_target(&fake, &config, "one-too-many", false)
             .expect_err("the cap must refuse a fourth tab");
         assert!(error.to_string().contains("max_panes is 3"), "{error}");
+        // Every tab is running a command, so none may be replaced; the refusal says why.
+        assert!(
+            error
+                .to_string()
+                .contains("None of its 3 tab(s) could be replaced"),
+            "{error}"
+        );
         // Refused BEFORE creating anything: the workspace must not grow past the cap even by one.
         assert_eq!(fake.creates(), 0);
+        assert!(fake.closed().is_empty());
         assert_eq!(fake.panes(None).unwrap().len(), 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A real session-leading process, so the replacement path reads the live `/proc`.
+    fn idle_session_leader() -> std::process::Child {
+        std::process::Command::new("setsid")
+            .args(["sleep", "60"])
+            .spawn()
+            .expect("spawn a session leader")
+    }
+
+    #[test]
+    fn pane_cap_replaces_the_least_recently_used_idle_tab() {
+        let root = temporary_root("cap-replace");
+        let mut config = config(&root);
+        config.max_panes = 3;
+        let prefix = format!("cap-replace-{}-p", std::process::id());
+        let fake = CapFake::holding_panes(&prefix, 3);
+        let mut leader = idle_session_leader();
+        let pid = i64::from(leader.id());
+        // `setsid` execs `sleep` in place; wait until the child really leads its own session.
+        for _ in 0..200 {
+            if evict::scan_session(pid, Path::new("/proc")).shell_sid == Some(pid) {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        fake.idle
+            .lock()
+            .expect("idle")
+            .insert(format!("{prefix}1"), pid);
+        let target = resolve_target(&fake, &config, "newcomer", false).expect("replaced");
+        let _ = leader.kill();
+        let _ = leader.wait();
+        assert_eq!(target.created, ["tab"]);
+        assert_eq!(fake.closed(), ["t1"]);
+        assert_eq!(fake.creates(), 1);
+        assert_eq!(fake.panes(None).unwrap().len(), 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pane_cap_stops_closing_when_the_listing_never_shrinks() {
+        let root = temporary_root("cap-sticky");
+        let mut config = config(&root);
+        config.max_panes = 3;
+        let prefix = format!("cap-sticky-{}-p", std::process::id());
+        let mut fake = CapFake::holding_panes(&prefix, 4);
+        fake.sticky_close = true;
+        let mut leader = idle_session_leader();
+        let pid = i64::from(leader.id());
+        for _ in 0..200 {
+            if evict::scan_session(pid, Path::new("/proc")).shell_sid == Some(pid) {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        fake.idle
+            .lock()
+            .expect("idle")
+            .insert(format!("{prefix}0"), pid);
+        let error = enforce_pane_cap(&fake, &config, "w1", "newcomer", Path::new("/proc"))
+            .expect_err("a listing that never shrinks must end in a refusal");
+        let _ = leader.kill();
+        let _ = leader.wait();
+        // One close per pane over the cap, plus the one that makes room: never an endless loop.
+        assert_eq!(fake.closed(), ["t0", "t0"]);
+        assert!(error.to_string().contains("max_panes is 3"), "{error}");
         fs::remove_dir_all(root).unwrap();
     }
 

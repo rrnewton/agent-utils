@@ -159,6 +159,7 @@
         "py/tests/test_herdr_run_cli.py",
         "py/tests/test_herdr_run_client.py",
         "py/tests/test_herdr_run_config.py",
+        "py/tests/test_herdr_run_evict.py",
         "py/tests/test_herdr_run_init.py",
         "py/tests/test_herdr_run_readiness.py",
         "py/tests/test_herdr_run_reap.py",

@@ -51,6 +51,8 @@ class FakeHerdrClient:
         self.pane_text = pane_text
         self._next_workspace = 1
         self._next_pane = 1
+        #: Tabs ever created per workspace, so an id is never reused after ``close_tab``.
+        self._tabs_created: dict[str, int] = {}
         #: Panes reported as running a job rather than sitting at a prompt.
         self.busy_panes: set[str] = set()
         #: Per-pane shell pid, so a sweep can plant a shell that /proc does or does not know.
@@ -62,6 +64,12 @@ class FakeHerdrClient:
         #: call that did not answer says nothing about whether the pane's shell is alive, so the
         #: sweep must reach UNKNOWN and not "the shell is gone".
         self.fail_process_info = False
+        #: Tabs for which ``close_tab`` fails the way a refused control call does.
+        self.failing_close: set[str] = set()
+        #: Panes asked for ``process_info``, in order.
+        self.probed: list[str] = []
+        #: Tabs closed through ``close_tab``, in order.
+        self.closed_tabs: list[str] = []
         #: Every call made, in order — lets a test assert on idempotency rather than infer it.
         self.calls: list[str] = []
         self.commands: list[tuple[str, str]] = []
@@ -116,7 +124,9 @@ class FakeHerdrClient:
         """Create a labelled tab with one pane."""
         self.calls.append(f"create_tab({workspace_id},{label})")
         workspace = self.workspaces[workspace_id]
-        tab_id = f"{workspace_id}:t{len(workspace.tabs) + 1}"
+        created = self._tabs_created.get(workspace_id, len(workspace.tabs)) + 1
+        self._tabs_created[workspace_id] = created
+        tab_id = f"{workspace_id}:t{created}"
         pane_id = f"{workspace_id}:p{self._next_pane}"
         self._next_pane += 1
         workspace.tabs[tab_id] = FakeTab(tab_id, label, workspace_id, [pane_id])
@@ -128,6 +138,18 @@ class FakeHerdrClient:
         for workspace in self.workspaces.values():
             if tab_id in workspace.tabs:
                 workspace.tabs[tab_id].label = label
+                return
+        raise HerdrUnavailable(f"no such tab {tab_id}")
+
+    def close_tab(self, tab_id: str) -> None:
+        """Close a tab and every pane in it."""
+        self.calls.append(f"close_tab({tab_id})")
+        if tab_id in self.failing_close:
+            raise HerdrUnavailable(f"tab close {tab_id}: herdr refused")
+        for workspace in self.workspaces.values():
+            if tab_id in workspace.tabs:
+                del workspace.tabs[tab_id]
+                self.closed_tabs.append(tab_id)
                 return
         raise HerdrUnavailable(f"no such tab {tab_id}")
 
@@ -150,6 +172,7 @@ class FakeHerdrClient:
 
     def process_info(self, pane_id: str) -> ProcessInfo:
         """Report the pane as idle, or as running a job when listed in ``busy_panes``."""
+        self.probed.append(pane_id)
         if self.fail_process_info:
             raise HerdrUnavailable("pane process-info: herdr is not answering")
         shell_pid = self.shell_pids.get(pane_id, 100)

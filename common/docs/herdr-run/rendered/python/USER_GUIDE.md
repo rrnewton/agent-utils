@@ -139,7 +139,7 @@ Wrapped-command statuses are passed through unchanged. Wrapper failures use thes
 | --- | --- |
 | `77` | **REFUSED** by the allowlist. Nothing was executed. |
 | `75` | **PANE BUSY** — the pane was not observably idle. Nothing was executed; retrying is meaningful. |
-| `69` | Herdr server / workspace / tab / pane could not be established. **Not a retry signal**: it covers both a transient bring-up failure and the `max_panes` refusal, and the second only clears when somebody closes tabs. `75` is the only code that promises retrying is meaningful. |
+| `69` | Herdr server / workspace / tab / pane could not be established. **Not a retry signal**: it covers both a transient bring-up failure and the `max_panes` refusal, which is reached only when every tab in the workspace is busy and clears only when one of them finishes or is closed. `75` is the only code that promises retrying is meaningful. |
 | `76` | The command was launched but did not finish before the timeout. It is **still running**. |
 | `78` | The project config is malformed. |
 
@@ -336,17 +336,44 @@ misleading.
 
 ### The pane cap and `reap`
 
-Every agent that ever runs a command leaves a tab behind, and **nothing closes it**. Agents are
+Every agent that ever runs a command leaves a tab behind, and **no run closes it**. Agents are
 coined and destroyed continuously, so the command workspace grows for as long as agents are coined
 — until the Herdr server itself becomes the bottleneck. That end state is measured, not feared: on
 a 316-core host a session with 260 panes drove the server to over 1000% CPU, with roughly 98% of
 cycles in the allocator's futex spinlock and every control call timing out.
 
-`max_panes` (32 by default) turns that slow collapse into one legible refusal. When the workspace
-already holds that many panes and this agent has **no tab yet**, bring-up fails with exit 69 and a
-message naming the remedy. The check is deliberately only on the create path: an agent whose tab
+`max_panes` (32 by default) bounds the workspace. When it already holds that many panes and this
+agent has **no tab yet**, herdr-run makes room by closing the **least-recently-used idle tab** and
+then opens the new one. The check is deliberately only on the create path: an agent whose tab
 already exists is never locked out of it, because a cap that can break work in progress is a cap
 that gets switched off. Set `max_panes: 0` to disable it.
+
+Least recently used means the tab whose most recent run record (the timestamp-prefixed spool
+directory) is oldest; a tab with **no** surviving record — never driven by herdr-run, or older than
+`retention_days` — counts as the oldest of all. Only tabs in the configured `workspace` are
+considered. A tab is closed only when, checked under its pane lock immediately before the close:
+
+1. no other herdr-run holds the pane's lock (a command is being typed or awaited there);
+2. the shell alone owns the terminal's foreground process group — the same test a run uses to
+   decide the pane is at a prompt;
+3. the shell leads its own session and **no other process is in that session**, so a background
+   job (`cmd &`) or a stopped job keeps the tab open; and
+4. the tab holds exactly one pane, because closing a tab closes every pane in it.
+
+If `/proc` cannot be read, the tab counts as busy. Nothing beyond `herdr tab close` is done: the
+run spool and the audit log are untouched. Each replacement is reported on stderr and appended to
+the audit log as an `EVICTED` entry carrying the newcomer as `agent`, plus `pane_id`, `tab_id`,
+`workspace_id`, `evicted_agent`, `last_run` and `last_run_at`:
+
+```text
+herdr-run: replaced idle tab 7 (pane 7-1, agent builder-3, last run 2026-10-01T09:00:00Z) to make room for 'tester-9'
+```
+
+Only when **no** tab qualifies does bring-up fail with exit 69. The message names the remedy and
+says, for the first three tabs it considered, why each stayed open (`pane 4-1: foreground pgid 812
+!= shell pid 790; running: cargo`). One window remains: an agent whose tab is replaced after it resolved
+the tab but before it took the pane lock finds its pane gone and fails its readiness check before
+anything is typed; retrying brings up a fresh tab.
 
 The cap is **per workspace**, while the measurement behind the number is **per server**. Nine
 projects each with their own `workspace:` and each sitting at 31 panes reproduce the measured
@@ -363,7 +390,8 @@ recorded agent. Retarget either and the old tabs immediately fall out of scope.
 and herdr-run deletes a run record `retention_days` (four by default) after the run finished. A tab
 whose owning agent last ran a week ago therefore has no surviving record, is not a candidate, and
 will never appear in this report — while still holding a pane and still counting against
-`max_panes`. The oldest leaks are the ones `reap` cannot see, and they have to be closed by hand.
+`max_panes`. The oldest leaks are the ones `reap` cannot see: at the cap they are the first to be
+replaced if their shell is idle, and otherwise they have to be closed by hand.
 The report prints `candidate_source.retention_days` for exactly this reason: `"considered": 3` means
 three panes were *eligible to look at*, not that the workspace holds three tabs.
 

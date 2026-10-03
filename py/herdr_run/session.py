@@ -150,8 +150,10 @@ def _pane_of_tab(client: HerdrClient, workspace_id: str, tab_id: str) -> str:
     return panes[0].pane_id
 
 
-def _enforce_pane_cap(client: HerdrClient, config: Config, workspace_id: str) -> None:
-    """Refuse to open ANOTHER tab once the workspace is already at ``max_panes``.
+def _enforce_pane_cap(
+    client: HerdrClient, config: Config, workspace_id: str, agent: str, proc_root: str = "/proc"
+) -> None:
+    """Make room for ONE more tab once the workspace is already at ``max_panes``, or refuse.
 
     Agents are coined continuously and every one that runs a command leaves a tab behind; nothing
     closes them, so the command workspace grows without bound until the Herdr server itself becomes
@@ -162,19 +164,38 @@ def _enforce_pane_cap(client: HerdrClient, config: Config, workspace_id: str) ->
     it -- a cap that can break work in progress is a cap that gets switched off -- and a cap that
     refused an existing tab would also make the failure arrive at a random later moment rather than
     when a new tab is actually being added.
+
+    At the cap, the least-recently-used tab whose shell is provably idle is closed first (see
+    :mod:`herdr_run.evict`); the refusal is reserved for a workspace in which every tab is busy.
     """
+    # Imported here, not at module level: evict reaches session through sweep.
+    from herdr_run.evict import describe_skipped, evict_one
+
     if config.max_panes <= 0:
         return
     existing = len(client.panes(workspace_id))
+    # Bounded: a close that the listing never reflects must not turn into closing every tab.
+    budget = max(existing - config.max_panes, 0) + 1
+    skipped: list[tuple[str, str]] = []
+    while existing >= config.max_panes and budget > 0:
+        budget -= 1
+        outcome = evict_one(client, config, workspace_id, agent, proc_root)
+        if isinstance(outcome, list):
+            skipped = outcome
+            break
+        existing = len(client.panes(workspace_id))
     if existing < config.max_panes:
         return
     source = config.source_path or "your .herdr-run.yaml"
-    raise HerdrUnavailable(
+    message = (
         f"workspace {config.workspace!r} already holds {existing} pane(s) and max_panes is "
         f"{config.max_panes}; refusing to open a tab for this agent. Run 'herdr-run reap' to see "
         f"which tabs are provably finished and can be closed, or raise max_panes in {source} "
         "(0 disables the cap)."
     )
+    if skipped:
+        message += " " + describe_skipped(skipped)
+    raise HerdrUnavailable(message)
 
 
 def _cache_still_valid(
@@ -274,7 +295,7 @@ def _resolve_target_locked(
     else:
         tab_id = client.tab_id_for_label(workspace_id, tab_label)
         if tab_id is None:
-            _enforce_pane_cap(client, config, workspace_id)
+            _enforce_pane_cap(client, config, workspace_id, agent)
             tab_id = client.create_tab(
                 workspace_id=workspace_id, label=tab_label, cwd=cwd
             )

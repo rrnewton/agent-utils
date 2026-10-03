@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import threading
+import time
 from typing import cast
 
 import pytest
@@ -18,6 +20,7 @@ import herdr_run.state as state
 from herdr_run.client import HerdrClient
 from herdr_run.config import Config
 from herdr_run.errors import ConfigError, HerdrUnavailable
+from herdr_run.evict import scan_session
 from herdr_run.session import cache_path, resolve_target, tab_label_for
 from tests.herdr_fake import FakeHerdrClient
 
@@ -287,12 +290,20 @@ def test_unknown_placeholder_is_a_clear_error() -> None:
 # that already has its tab is never locked out" and "one below the cap still gets a tab".
 
 
-def _fill_workspace(fake: FakeHerdrClient, config: Config, agents: int) -> str:
-    """Bring up ``agents`` tabs (one pane each) and return the workspace id."""
+def _fill_workspace(
+    fake: FakeHerdrClient, config: Config, agents: int, *, busy: bool = False
+) -> str:
+    """Bring up ``agents`` tabs (one pane each) and return the workspace id.
+
+    With ``busy``, every filler pane reports a running command, so none can be replaced and the
+    cap has to refuse.
+    """
     workspace_id = ""
     for index in range(agents):
         target = resolve_target(_client(fake), config, f"filler-{index}", use_cache=False)
         workspace_id = target.workspace_id
+        if busy:
+            fake.busy_panes.add(target.pane_id)
     return workspace_id
 
 
@@ -300,15 +311,18 @@ def test_pane_cap_refuses_a_new_tab_once_the_workspace_is_full(tmp_path: object)
     root = str(tmp_path)
     fake = FakeHerdrClient()
     config = _config(root, max_panes=3)
-    _fill_workspace(fake, config, 3)
+    _fill_workspace(fake, config, 3, busy=True)
 
     creates_before = [call for call in fake.calls if call.startswith("create_")]
-    with pytest.raises(HerdrUnavailable, match="max_panes is 3"):
+    with pytest.raises(HerdrUnavailable, match="max_panes is 3") as caught:
         resolve_target(_client(fake), config, "one-agent-too-many", use_cache=False)
     # Refused BEFORE creating anything: the workspace must not grow past the cap even by one, and
     # the refusal must not leave a half-built tab behind for the next sweep to puzzle over.
     assert len(fake.panes()) == 3
     assert [call for call in fake.calls if call.startswith("create_")] == creates_before
+    # Every tab is running a command, so none was closed, and the refusal says why for each.
+    assert fake.closed_tabs == []
+    assert "None of its 3 tab(s) could be replaced" in str(caught.value)
 
 
 def test_pane_cap_leaves_room_up_to_the_limit(tmp_path: object) -> None:
@@ -351,10 +365,43 @@ def test_pane_cap_names_the_remedy_rather_than_only_refusing(tmp_path: object) -
     root = str(tmp_path)
     fake = FakeHerdrClient()
     config = _config(root, max_panes=1)
-    _fill_workspace(fake, config, 1)
+    _fill_workspace(fake, config, 1, busy=True)
 
     with pytest.raises(HerdrUnavailable) as caught:
         resolve_target(_client(fake), config, "another", use_cache=False)
     message = str(caught.value)
     assert "herdr-run reap" in message
     assert "max_panes" in message
+
+
+def _idle_session_leader() -> subprocess.Popen[bytes]:
+    """Start a real process that leads its own session and has nothing else in it: an idle shell."""
+    child = subprocess.Popen(["setsid", "sleep", "60"])
+    deadline = time.monotonic() + 10
+    while scan_session(child.pid).shell_sid != child.pid:
+        assert time.monotonic() < deadline, "setsid child never became a session leader"
+        time.sleep(0.01)
+    return child
+
+
+def test_pane_cap_replaces_the_least_recently_used_idle_tab(tmp_path: object) -> None:
+    """At the cap, an idle tab gives way to the newcomer instead of the newcomer being refused."""
+    root = str(tmp_path)
+    fake = FakeHerdrClient()
+    config = _config(root, max_panes=3)
+    _fill_workspace(fake, config, 3, busy=True)
+    panes = fake.panes()
+    victim = panes[1]
+    fake.busy_panes.discard(victim.pane_id)
+    child = _idle_session_leader()
+    try:
+        fake.shell_pids[victim.pane_id] = child.pid
+        target = resolve_target(_client(fake), config, "newcomer", use_cache=False)
+    finally:
+        child.kill()
+        child.wait()
+
+    assert target.created == ("tab",)
+    assert fake.closed_tabs == [victim.tab_id]
+    assert len(fake.panes()) == 3
+    assert victim.pane_id not in {pane.pane_id for pane in fake.panes()}

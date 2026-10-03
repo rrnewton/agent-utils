@@ -1048,14 +1048,15 @@ fn command_reap(config: &Config) -> Result<i32> {
 const CANDIDATE_SOURCE_NOTE: &str = concat!(
     "candidates are the panes named by surviving run records; run records are pruned ",
     "retention_days after the run finished, so a tab whose agent last ran longer ago than that ",
-    "is not considered here and must be closed by hand"
+    "is not considered here; at the cap it is replaced first if its shell is idle, otherwise it ",
+    "must be closed by hand"
 );
 
 /// How to read `reap`'s `occupancy` block. Compared verbatim by the differential harness.
 const OCCUPANCY_NOTE: &str = concat!(
     "max_panes counts every pane herdr lists in the workspace (live_panes); reap can judge only ",
     "the panes a surviving run record names (with_record), so without_record panes hold their ",
-    "share of max_panes until closed by hand"
+    "share of max_panes until closed by hand or replaced as idle at the cap"
 );
 
 /// The scope disclaimer `net-doctor` prints before it does anything.

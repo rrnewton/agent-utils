@@ -25,9 +25,10 @@ pub const CONFIG_FILENAMES: [&str; 2] = [".herdr-run.yaml", ".herdr-run.yml"];
 /// `PATH`, wrapper prefixes must still be declared, and every `deny_*` rule still bites.
 pub const ALLOW_ANY_PROGRAM: &str = "*";
 
-/// Default ceiling on panes in the command workspace before a NEW tab is refused.
+/// Default ceiling on panes in the command workspace before a NEW tab replaces the least-recently-
+/// used idle tab, or is refused when every tab is busy.
 ///
-/// Every agent that ever runs a command leaves a tab behind and nothing closes it, so without a
+/// Every agent that ever runs a command leaves a tab behind and nothing else closes it, so without a
 /// ceiling the workspace grows for as long as agents are coined. The number is not arbitrary:
 /// measured on devbig014 2026-08-10, a session with 260 panes drove the Herdr server to >1000% CPU
 /// with every control call timing out. 32 keeps an eightfold margin below that while being far

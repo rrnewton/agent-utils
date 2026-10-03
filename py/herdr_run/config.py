@@ -50,9 +50,10 @@ CONFIG_FILENAMES: tuple[str, ...] = (".herdr-run.yaml", ".herdr-run.yml")
 #: wrapper prefixes must still be declared, and every ``deny_*`` rule still bites.
 ALLOW_ANY_PROGRAM = "*"
 
-#: Default ceiling on how many panes the command workspace may hold before herdr-run refuses to
-#: open ANOTHER tab. Every agent that ever runs a command leaves a tab behind and nothing closes it,
-#: so without a ceiling the workspace grows for as long as agents are coined. The number is not
+#: Default ceiling on how many panes the command workspace may hold before herdr-run replaces the
+#: least-recently-used idle tab (or, when every tab is busy, refuses to open ANOTHER one). Every
+#: agent that ever runs a command leaves a tab behind and nothing else closes it, so without a
+#: ceiling the workspace grows for as long as agents are coined. The number is not
 #: arbitrary: measured on devbig014 2026-08-10, a session with 260 panes drove the Herdr server to
 #: >1000% CPU with every control call timing out (see ``client.SERVER_WORKER_THREADS``, which is the
 #: in-tree mitigation for that same convoy). 32 keeps an eightfold margin below that and is far more
