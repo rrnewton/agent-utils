@@ -10023,6 +10023,7 @@ def _run_within_item_budget(
     env: Mapping[str, str] | None = None,
     input_text: str | None = None,
     timeout_refusal: Refusal | None = None,
+    errors: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run ``command`` as subprocess.run would, for at most ``seconds``.
 
@@ -10031,6 +10032,7 @@ def _run_within_item_budget(
     because Git removes its lock files when SIGTERM stops it and leaves them
     when SIGKILL does, then SIGKILL after a grace period, and the item is
     refused, with ``timeout_refusal`` when the bound is not the item budget.
+    ``errors`` is the text decoding error handler, as for subprocess.run.
     An OSError from starting the command propagates.
     """
 
@@ -10040,6 +10042,7 @@ def _run_within_item_budget(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        errors=errors,
         env=None if env is None else dict(env),
         start_new_session=True,
     )
@@ -13140,6 +13143,42 @@ def _registered_liveness_states(
     return result
 
 
+def _bound_alive_verdict(stdout: str, stderr: str, agent: str) -> str | None:
+    """Return the one output line that binds exit status 1 to this agent.
+
+    Exit status 1 is also what an uncaught Python exception produces, so the
+    status alone cannot mean alive. The command's whole output must be one
+    non-empty line whose only ``agent=`` token names the requested agent and
+    whose only ``rc=`` token is ``rc=1``. Anything else is not an answer.
+    """
+
+    lines = [line for line in (stdout + "\n" + stderr).splitlines() if line.strip()]
+    if len(lines) != 1:
+        return None
+    tokens = lines[0].split()
+    if [token for token in tokens if token.startswith("agent=")] != [f"agent={agent}"]:
+        return None
+    if [token for token in tokens if token.startswith("rc=")] != ["rc=1"]:
+        return None
+    return _liveness_batch_diagnostic(lines[0])
+
+
+def _liveness_output_diagnostic(stdout: str, stderr: str) -> str:
+    """Keep each stream's first and last lines; a traceback's cause is its last."""
+
+    parts = []
+    for name, text in (("stderr", stderr), ("stdout", stdout)):
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if len(lines) == 1:
+            parts.append(f"{name}: {lines[0][:1536]}")
+        elif lines:
+            # Bound each end separately so a long first line cannot hide the last.
+            parts.append(
+                f"{name} ({len(lines)} lines): {lines[0][:512]} ... {lines[-1][-1024:]}"
+            )
+    return _liveness_batch_diagnostic("; ".join(parts)) if parts else "no output"
+
+
 def _registered_liveness_state(config: Config, record: ActiveRecord) -> tuple[str, str]:
     """Ask the registered liveness command about ``record``'s owner.
 
@@ -13161,13 +13200,14 @@ def _registered_liveness_state(config: Config, record: ActiveRecord) -> tuple[st
             completed = subprocess.run(
                 command,
                 text=True,
+                errors="replace",
                 capture_output=True,
                 check=False,
                 env=env,
             )
         else:
             completed = _run_within_item_budget(
-                command, seconds=seconds, what=what, env=env
+                command, seconds=seconds, what=what, env=env, errors="replace"
             )
     except OSError as exc:
         return "unverifiable", f"registered liveness command could not run: {exc}"
@@ -13176,7 +13216,14 @@ def _registered_liveness_state(config: Config, record: ActiveRecord) -> tuple[st
     if completed.returncode == 0:
         return "dead", first
     if completed.returncode == 1:
-        return "alive", first
+        verdict = _bound_alive_verdict(completed.stdout, completed.stderr, record.agent)
+        if verdict is not None:
+            return "alive", verdict
+        return "unverifiable", (
+            "registered liveness command exited 1 without a single output line "
+            f"binding agent={record.agent} to rc=1: "
+            + _liveness_output_diagnostic(completed.stdout, completed.stderr)
+        )
     if completed.returncode == 2:
         return "unverifiable", first
     return "unverifiable", (

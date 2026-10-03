@@ -151,7 +151,7 @@ except (KeyError, OSError, UnicodeError, ValueError, json.JSONDecodeError) as ex
     print(f"unverifiable: {exc}")
     raise SystemExit(2)
 if actual == expected:
-    print(f"pid {pid} generation is alive")
+    print(f"pid {pid} generation is alive agent={agent} rc=1")
     raise SystemExit(1)
 print(f"pid {pid} generation ended")
 raise SystemExit(0)
