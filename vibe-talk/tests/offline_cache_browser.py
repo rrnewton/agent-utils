@@ -37,6 +37,7 @@ import argparse
 import json
 import mimetypes
 import os
+import re
 import tempfile
 import threading
 import time
@@ -441,6 +442,10 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                     "() => { const p = document.getElementById('channel-freshness');"
                     " return p.hidden ? '' : p.textContent; }"))
 
+            def current(text: str) -> bool:
+                # A current list says so with the time of its last read; blank means unknown.
+                return re.fullmatch(r"(Live · u|U)pdated \d{2}:\d{2}", text) is not None
+
             def view(name: str) -> None:
                 page.evaluate(f"() => document.getElementById('channel-view-{name}').click()")
 
@@ -453,9 +458,9 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
 
             def wait_pill(prefix: str, why: str) -> None:
                 deadline = time.monotonic() + 10
-                while time.monotonic() < deadline and not (pill().startswith(prefix) if prefix else pill() == ""):
+                while time.monotonic() < deadline and not (pill().startswith(prefix) if prefix else current(pill())):
                     page.wait_for_timeout(50)
-                check(pill().startswith(prefix) if prefix else pill() == "", f"{label}, {why}: pill {pill()!r}")
+                check(pill().startswith(prefix) if prefix else current(pill()), f"{label}, {why}: pill {pill()!r}")
 
             def poll_channel(fail: bool) -> None:
                 """The channel's own re-read, brought forward on the page clock rather than awaited."""
@@ -525,11 +530,11 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             check("view=main" in reads[0] and "before=" not in reads[0],
                   f"the cold-start read was not the newest page of Main: {reads[0]}")
             deadline = time.monotonic() + 5
-            while time.monotonic() < deadline and pill():
+            while time.monotonic() < deadline and not current(pill()):
                 page.wait_for_timeout(50)
-            check(pill() == "", f"a refreshed view still says {pill()!r}")
+            check(current(pill()), f"a refreshed view still says {pill()!r}")
             check(str(page.evaluate(GEOMETRY_JS)["area"]) == baseline,
-                  f"{label}: #scroll-area changed size when the pill cleared")
+                  f"{label}: #scroll-area changed size when the pill turned current")
             shot("3-merged")
 
             # 4. Switching among views already covered is local.

@@ -253,6 +253,7 @@ const session = {
   node: null, // ScriptProcessorNode capturing the microphone
   source: null,
   playAt: 0, // next start time on the audio clock
+  playLead: 0.25, // seconds banked before an answer starts; grows after a mid-answer stall
   playing: [], // scheduled AudioBufferSourceNodes, so an interruption can cancel them
   protocol: "unknown",
   providerName: "voice provider",
@@ -3164,6 +3165,17 @@ function outputRateFrom(format) {
   return Number(match[1]);
 }
 
+/**
+ * How far ahead of the speaker a voice answer is scheduled, at most.
+ *
+ * Answers arrive at speaking pace, so the audio banked before the first sample plays is the only
+ * cushion against a network stall: with 0.05 s, every hiccup on a highway was heard as a pause.
+ * It starts small, because a conversation is latency-sensitive, and doubles after each stall.
+ */
+const CALL_MAX_LEAD_SECONDS = 2;
+/** A queue that ran dry less than this long ago ran dry mid-answer. */
+const CALL_STALL_WINDOW_SECONDS = 1;
+
 function playPcm(b64) {
   playPcmBytes(base64ToBytes(b64));
 }
@@ -3179,7 +3191,13 @@ function playPcmBytes(bytes) {
   node.buffer = buffer;
   node.connect(session.audio.destination);
   const now = session.audio.currentTime;
-  session.playAt = Math.max(session.playAt, now + 0.05);
+  if (session.playAt < now + 0.005) {
+    // Nothing queued. A gap of under a second inside an answer is a network stall, not a new
+    // answer: bank more before resuming, so the next stall of the same size is not heard.
+    const stalled = session.playAt > 0 && now - session.playAt < CALL_STALL_WINDOW_SECONDS;
+    if (stalled) session.playLead = Math.min(CALL_MAX_LEAD_SECONDS, session.playLead * 2);
+    session.playAt = now + session.playLead;
+  }
   node.start(session.playAt);
   // Scheduled, not heard yet: the first sound starts when the audio clock reaches `playAt`.
   markStartup("greeting_audible", Date.now() + (session.playAt - now) * 1000);
@@ -3741,7 +3759,62 @@ let visibleAt = 0;
 // longer than about forty characters is simply not readable on a phone.
 const SUSPENDED_STATUS = "Paused — the app was in the background.";
 
+/**
+ * KEEP THE SCREEN ON WHILE SOMETHING IS BEING SAID.
+ *
+ * An Android phone locks its screen after its idle timeout, and locking it stops a page's audio:
+ * a read cut off mid-message, a call that goes silent on the highway. A web page cannot reliably
+ * keep playing with the screen off, but Chrome lets it ask for the screen to stay on, so it asks
+ * while a call is connected or read-aloud is on, and lets go as soon as neither is.
+ *
+ * The browser releases the lock whenever the page is hidden, so it is asked for again when the
+ * page comes back. A browser without the API, or one that refuses (battery saver), simply keeps
+ * its usual timeout; nothing else depends on the lock.
+ */
+let screenWakeLock = null;
+let screenWakeLockPending = false;
+
+function wantsScreenAwake() {
+  try {
+    return session.socket !== null || readingMode || nowPlaying !== null || pendingRead !== null;
+  } catch (_error) {
+    // Asked before the page's state finished initialising: nothing is playing yet.
+    return false;
+  }
+}
+
+async function syncScreenWakeLock() {
+  const api = typeof navigator === "undefined" ? undefined : navigator.wakeLock;
+  if (!api || typeof api.request !== "function") return;
+  const want = wantsScreenAwake() && document.visibilityState === "visible";
+  if (want && screenWakeLock === null && !screenWakeLockPending) {
+    screenWakeLockPending = true;
+    try {
+      const lock = await api.request("screen");
+      screenWakeLock = lock;
+      lock.addEventListener("release", () => {
+        if (screenWakeLock === lock) screenWakeLock = null;
+      });
+      // Wanted when asked, perhaps not by the time the browser answered.
+      if (!wantsScreenAwake()) syncScreenWakeLock();
+    } catch (_error) {
+      // Refused (battery saver, no user activation yet): the phone keeps its usual timeout.
+    } finally {
+      screenWakeLockPending = false;
+    }
+  } else if (!want && screenWakeLock !== null) {
+    const lock = screenWakeLock;
+    screenWakeLock = null;
+    try {
+      await lock.release();
+    } catch (_error) {
+      // Already released by the browser.
+    }
+  }
+}
+
 function onVisibility() {
+  syncScreenWakeLock();
   if (document.visibilityState === "hidden") {
     // Only a call can be suspended. Hiding an idle page is not an event.
     if (session.socket) {
@@ -4854,6 +4927,7 @@ let hasEnded = false;
 let hasSuspended = false;
 
 function renderControls() {
+  syncScreenWakeLock();
   const talk = el("talk");
   const label = el("talk-label");
   const note = el("talk-note");
@@ -5764,13 +5838,20 @@ function setChannelFreshness(state) {
 function renderChannelFreshness() {
   const pill = el("channel-freshness");
   const at = stamp(channelFreshAt);
+  const refreshing = !el("channel-loading").hidden;
+  // CURRENT IS SAID TOO, not left blank: a blank pill reads the same as a page that never managed
+  // to refresh, which is what a reader opening the app in the car could not tell apart.
+  const current = channelFreshAt
+    ? `${liveAttached && liveDelivery !== "off" ? "Live · updated" : "Updated"} ${at}` +
+      (refreshing ? " · refreshing…" : "")
+    : "";
   const text = channelFreshness === "saved"
-    ? (el("channel-loading").hidden ? `Showing messages saved ${at}` : `Saved ${at} · refreshing…`)
+    ? (refreshing ? `Saved ${at} · refreshing…` : `Showing messages saved ${at}`)
     : channelFreshness === "offline"
       ? `Offline · showing messages saved ${at}`
       : channelFreshness === "failed"
         ? `Refresh failed · showing messages from ${at}`
-        : "";
+        : current;
   pill.textContent = text;
   pill.setAttribute("data-state", channelFreshness);
   pill.hidden = text === "" || currentView !== "discord" || !el("pull-refresh").hidden;
@@ -8161,9 +8242,12 @@ function reportSpeechPlayback(url, timing) {
  * stopping and archiving applies to it unchanged. Pausing ABORTS the fetch, because closing the
  * response is still what tells the server to interrupt the agent.
  */
-const STREAM_START_LEAD_SECONDS = 0.1;
+// A read arrives at speaking pace, so the audio banked before the first sample is the whole
+// cushion against a network stall. A tenth of a second made every hiccup on a highway audible; half
+// a second costs that much more before the first word and survives the common short dropout.
+const STREAM_START_LEAD_SECONDS = 0.5;
 /** An underrun doubles the lead, up to this, so a jittery network costs one gap rather than many. */
-const STREAM_MAX_LEAD_SECONDS = 0.8;
+const STREAM_MAX_LEAD_SECONDS = 4;
 /** A WAV header larger than this is not one this page will wait for. */
 const STREAM_HEADER_LIMIT_BYTES = 64 * 1024;
 
@@ -10894,6 +10978,8 @@ function chooseReadNew(mode) {
  * that is not changing. The third is the working one.
  */
 function renderLiveState() {
+  // "Live · updated" in the channel pill depends on the stream being attached.
+  renderChannelFreshness();
   const state = el("live-state");
   if (!state) {
     return;
@@ -11171,6 +11257,12 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
   if (String(message.channel_id) !== String(el("discord-channel").value)) {
     renderOutgoingMessages();
     return;
+  }
+  // A live message for this channel is proof the list is current as of now. Only a list already
+  // current moves its stamp: saved or failed rows stay labelled until a read replaces them.
+  if (!replayed && channelFreshness === "fresh" && channelFreshAt) {
+    channelFreshAt = Date.now();
+    renderChannelFreshness();
   }
   if (!threadingSupported && discordFetchInFlight) {
     // This event is newer evidence than a read already on the wire. Invalidate that snapshot

@@ -2088,6 +2088,35 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       return audio;
     };
   };
+  /**
+   * Chrome's Screen Wake Lock, recorded. Every request is kept, with whether the page has released
+   * it, and `releaseAll` is what a browser does to every lock when the page is hidden.
+   */
+  page.wakeLocks = [];
+  page.enableWakeLock = () => {
+    navigator.wakeLock = {
+      request: async (type) => {
+        const listeners = [];
+        const lock = {
+          type,
+          released: false,
+          addEventListener: (name, fn) => {
+            if (name === "release") listeners.push(fn);
+          },
+          release: async () => {
+            if (lock.released) return;
+            lock.released = true;
+            for (const fn of listeners) fn();
+          },
+        };
+        page.wakeLocks.push(lock);
+        return lock;
+      },
+    };
+    page.releaseAllWakeLocks = async () => {
+      for (const lock of page.wakeLocks) await lock.release();
+    };
+  };
   // The page makes its first requests while the script is still running, so a test that needs to
   // hold or fail THOSE — a reload that must draw before the network answers — arranges the fixture
   // here, before a line of the page has run.
@@ -2355,6 +2384,16 @@ const TUNING_BANDS = {
     "same author are silently welded together and the second one can be archived by a tap aimed " +
     "at the first, and below about half a second the split halves of one long post — which is the " +
     "case this exists for — arrive too far apart to be caught"],
+  STREAM_MAX_LEAD_SECONDS: [2, 8,
+    "the most audio a streamed read may bank after repeated stalls. Under two seconds a drive " +
+    "through patchy coverage is heard as one pause after another; past several seconds a tap on a " +
+    "new row waits that long behind audio the reader no longer wants"],
+  CALL_MAX_LEAD_SECONDS: [1, 4,
+    "the most a voice answer may bank after repeated stalls. A conversation is latency-sensitive, " +
+    "so this is lower than read-aloud's, but under a second a highway dropout is still audible"],
+  CALL_STALL_WINDOW_SECONDS: [1, 3,
+    "how recently an answer's queue must have run dry to count as a stall rather than a new answer. " +
+    "Too long and the pause between two answers grows the cushion; too short and a real stall does not"],
   // `#18 offline-message-cache`. The saved snapshot is a convenience that shares its storage with
   // the token, the drafts and the unsent messages, so every bound here is about how much of the
   // quota it may take and how much history a cold start has to be worth drawing.
@@ -16863,24 +16902,26 @@ test("a prepared read PLAYS AS IT ARRIVES, rather than after the ~225 KB an <aud
   await page.settle();
   assert.equal(audio.sources.length, 1, "the first samples were held back");
   assert.deepEqual([...audio.sources[0].buffer.getChannelData(0)], [0.5]);
-  assert.equal(audio.sources[0].startedAt, 0.1, "the first piece was not given its short lead");
+  // Half a second banked: a read arrives at speaking pace, so this lead is its whole cushion
+  // against a network stall.
+  assert.equal(audio.sources[0].startedAt, 0.5, "the first piece was not given its lead");
 
   // `playing` is when that lead has run out, not when the piece was queued.
-  page.setClock(tappedAt + 140);
-  assert.equal(page.expireTimers(100), 1, "nothing waited for the first sample to reach the speaker");
+  page.setClock(tappedAt + 540);
+  assert.equal(page.expireTimers(500), 1, "nothing waited for the first sample to reach the speaker");
   await page.settle();
   assert.deepEqual(page.speechTimingCalls.map((call) => call.timing), [{
     tap_to_play_ms: 0,
     request_to_loaded_ms: 40,
-    loaded_to_playing_ms: 100,
-    tap_to_audible_ms: 140,
+    loaded_to_playing_ms: 500,
+    tap_to_audible_ms: 540,
   }]);
 
   stream.controller.bytes(samples.subarray(3));
   await page.settle();
   assert.equal(audio.sources.length, 2);
   assert.deepEqual([...audio.sources[1].buffer.getChannelData(0)], [-1, 0.25], "a split sample was garbled");
-  assert.equal(audio.sources[1].startedAt, 0.1 + 1 / 24000, "the next piece did not follow on without a gap");
+  assert.equal(audio.sources[1].startedAt, 0.5 + 1 / 24000, "the next piece did not follow on without a gap");
 
   stream.controller.drop();
   await page.settle();
@@ -16891,6 +16932,36 @@ test("a prepared read PLAYS AS IT ARRIVES, rather than after the ~225 KB an <aud
   await page.settle();
   assert.deepEqual(page.dismissCalls, [{ messages: ["1000000000000000001"] }]);
   assert.equal(audio.state, "suspended", "the audio output was held open after the read ended");
+});
+
+test("read-aloud keeps the screen on while it is on, and asks again after the page comes back", async () => {
+  // A phone that locks its screen mid-read cuts the audio off, so the page asks Chrome to keep the
+  // screen on for as long as read-aloud is on — and only that long.
+  const page = newPage();
+  page.enableStreamedAudio();
+  page.enableWakeLock();
+  await signIn(page);
+  assert.equal(page.wakeLocks.length, 0, "an idle page held the screen on");
+
+  await inReadingMode(page, [message({ id: "1000000000000000001" })]);
+  await page.settle();
+  const active = () => page.wakeLocks.filter((lock) => !lock.released);
+  assert.equal(active().length, 1, "read-aloud did not keep the screen on");
+  assert.equal(active()[0].type, "screen");
+
+  // Hidden: the browser drops every lock. Back: the page has to ask again.
+  await page.releaseAllWakeLocks();
+  await page.setVisibility("hidden");
+  await page.settle();
+  assert.equal(active().length, 0, "the page asked for a lock while hidden");
+  await page.setVisibility("visible");
+  await page.settle();
+  assert.equal(active().length, 1, "coming back did not ask for the screen to stay on again");
+
+  // Read-aloud off: the page lets the screen sleep again.
+  await readButton(page).click();
+  await page.settle();
+  assert.equal(active().length, 0, "the screen was held on after read-aloud stopped");
 });
 
 test("a SWITCH aborts the first read's response and silences what it had queued, on one context", async () => {
@@ -18565,6 +18636,13 @@ const savedScopes = (page) => (savedCache(page) || { scopes: {} }).scopes;
 /** The device keeps ONE entry per channel: its store in timeline mode, its page in legacy mode. */
 const scopeKey = (channel) => String(channel);
 const freshness = (page) => page.el("channel-freshness");
+// A current list says so, with the time of its last read, rather than leaving the pill blank: a
+// blank pill looked the same as a page that never managed to refresh.
+const assertCurrent = (page, why) => {
+  assert.equal(freshness(page).hidden, false, why);
+  assert.equal(freshness(page).getAttribute("data-state"), "fresh", why);
+  assert.match(freshness(page).textContent, /^(Live · u|U)pdated \d{2}:\d{2}$/, why);
+};
 
 /** Wrap a fixture route so it answers only when the test opens it. */
 function gate(respond) {
@@ -18633,7 +18711,7 @@ test("a reload draws the saved timeline before any request answers, then merges 
   assert.deepStrictEqual(shownIds(page), ["501", "502", "503", "504"], "the refresh duplicated or lost rows");
   assert.match(page.el("discord-log").children[1].text(), /the corrected text/);
   assert.doesNotMatch(page.el("discord-log").text(), /typo/, "a corrected row kept its stale text");
-  assert.equal(freshness(page).hidden, true, "a successful refresh still says the rows are saved");
+  assertCurrent(page, "a successful refresh still says the rows are saved");
   const entry = savedScopes(page)[scopeKey(CHANNEL.id)];
   assert.deepStrictEqual(entry.messages.map((m) => m.id), ["501", "502", "503", "504"]);
   assert.equal(entry.messages[1].content, "the corrected text", "the correction was not saved");
@@ -18661,7 +18739,7 @@ test("a legacy page-mode channel is saved, drawn first on reload, and merged the
   // copy of 602 gives way to the edit, and nothing appears twice.
   assert.deepStrictEqual(shownIds(page), ["602", "603"]);
   assert.match(page.el("discord-log").children[0].text(), /two, edited/);
-  assert.equal(freshness(page).hidden, true);
+  assertCurrent(page, "a legacy-mode refresh still says the rows are saved");
 });
 
 test("offline, the saved rows stay up and say how old they are, and the next poll recovers", async () => {
@@ -18695,7 +18773,7 @@ test("offline, the saved rows stay up and say how old they are, and the next pol
   await page.settle();
   await page.settle();
   assert.deepStrictEqual(shownIds(page), ["701", "702"]);
-  assert.equal(freshness(page).hidden, true, "a recovered read still says it is offline");
+  assertCurrent(page, "a recovered read still says it is offline");
   assert.equal(page.streamOpens.length, 1, "the late /client-config never attached the live stream");
 });
 
@@ -18724,7 +18802,10 @@ test("the channel pane reserves the freshness pill's room for as long as it has 
   await showDiscord(page, [message({ id: "721", content: "on screen" })]);
   const reserved = () => page.el("pane-discord").hasAttribute("data-freshness");
   const failing = errorResponse(502, "discord_error", "the provider is down");
-  assert.equal(reserved(), false, "a fresh channel reserved room for a pill it is not showing");
+  // The pill has something to say from the first read on, so its room is held from then: the
+  // list never shifts as the pill changes between current, failed, and current again.
+  assertCurrent(page, "a freshly read channel did not say it is current");
+  assert.equal(reserved(), true, "the current-state pill sits over the list's header");
   page.channelPage = failing;
   await reReadChannel(page);
   assert.equal(freshness(page).hidden, false);
@@ -18732,8 +18813,8 @@ test("the channel pane reserves the freshness pill's room for as long as it has 
   page.channelPage = async () =>
     json(200, { channel: CHANNEL, messages: [message({ id: "721", content: "on screen" })], has_more: false });
   await reReadChannel(page);
-  assert.equal(freshness(page).hidden, true);
-  assert.equal(reserved(), false, "a recovered channel kept the room for a pill that has gone");
+  assertCurrent(page, "a recovered channel did not say it is current again");
+  assert.equal(reserved(), true, "a recovered channel moved the list by dropping the pill's room");
   page.channelPage = failing;
   await reReadChannel(page);
   assert.equal(reserved(), true);
@@ -19030,7 +19111,7 @@ test("one store per channel: every view it covered is drawn after a reload with 
   await page.settle();
   assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
   assert.equal(channelReads(page).length, 1);
-  assert.equal(freshness(page).hidden, true, `the refreshed view still says: ${freshness(page).textContent}`);
+  assertCurrent(page, `the refreshed view still says: ${freshness(page).textContent}`);
 
   // All was not refreshed: it says when it was saved, and does not claim to be refreshing.
   await page.el("channel-view-flat").click();
@@ -19042,7 +19123,7 @@ test("one store per channel: every view it covered is drawn after a reload with 
   await page.settle();
   assert.equal(channelReads(page).length, 2);
   assert.match(channelReads(page)[1], /view=flat/);
-  assert.equal(freshness(page).hidden, true);
+  assertCurrent(page, "the polled All view still says it is saved");
 });
 
 test("a refresh that lands after the reader switched away still makes its view current", async () => {
@@ -19075,7 +19156,7 @@ test("a refresh that lands after the reader switched away still makes its view c
   page.el("channel-view-main").click();
   await page.settle();
   assert.deepStrictEqual(shownIds(page), ["200", "201", "203", "206"], "Main dropped the page read for it");
-  assert.equal(freshness(page).hidden, true, `Main still says: ${freshness(page).textContent}`);
+  assertCurrent(page, `Main still says: ${freshness(page).textContent}`);
   assert.equal(channelReads(page).length, 1, "returning to Main went to the network");
   assert.ok(savedScopes(page)[scopeKey(CHANNEL.id)].messages.some((m) => m.id === "206"),
     "the late page was not saved");
