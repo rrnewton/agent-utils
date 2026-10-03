@@ -128,9 +128,11 @@ remains on screen, so such a block is usually captured at the next recovery
 scan rather than at once. Exact IDs route through the in-memory durable-state
 index; all 2,048 active requests fit within the subscription budget of 128
 predicates, 32 KiB per predicate and 96 KiB total. Provider notices and
-SIGINT/SIGTERM interrupt that wait through a local wake descriptor. A
-disk-backed terminal and delivery reconciliation occurs every 300 seconds by
-default and can be changed with `--reconcile-interval`.
+SIGINT/SIGTERM interrupt that wait through a local wake descriptor. While the
+agent works and a request is open, `run` also reads the pane itself every 2
+seconds, as described below. A disk-backed terminal and delivery reconciliation
+occurs every 300 seconds by default and can be changed with
+`--reconcile-interval`.
 
 A provider `Gap` is a terminal continuity warning in protocol v1. Its reason does not
 contain a recoverable range or completeness proof, so the host journals the
@@ -475,7 +477,13 @@ next read, the block is neither posted nor reported. A joined read could have
 recovered it. Before herdr 0.8.0 added those reads, a read of such a pane
 returned only its screen, so the bridge lost such a block then too. The bridge
 accepts that loss rather than scan rows joined from different times, which can
-post a block the agent did not write. A block that the screen cannot show whole
+post a block the agent did not write. While the bridge counts the agent as
+working, as described below, it also reads the pane every 2 seconds, so then a
+block is lost this way only if it appears and leaves the screen between two of
+those reads, while those reads fail, or while the bridge restarts. Two of those
+reads can be further apart than 2 seconds, because none is made while the
+bridge types a prompt, which can take up to about 2 minutes for each prompt
+whose paste is slow to show. A block that the screen cannot show whole
 together with the first row of its message, as described above, can be lost even
 when no event is missed: only recovery scans report a partial block, and during
 a busy turn a recovery scan normally comes only when the pane settles, so if the
@@ -599,6 +607,61 @@ cannot be read. A closing line inside a prompt or tool output the agent received
 keeps them going too, although it is never posted. A read that fails is logged
 once and retried every 2 seconds, and its first success after that is logged as
 well.
+
+A turn can also write a reply block and then push it off the screen with more
+output before it ends. If another line keeps the pattern matched without
+starting the reads above, such as a closing line under a long reply ID inside a
+prompt the agent received, the block's closing line raises no event, and the
+read when the pane settles comes too late. So while outbound replies are on and
+some request is open, the service also reads the pane in the same way every 2
+seconds for as long as it counts the agent as working. A request stays open
+until `chat close`, so in practice these reads run whenever the agent works, and
+each costs what the reads above cost. The service counts the agent as working
+while any of these holds:
+
+- herdr reports its status as `working`;
+- the last of the service's own reads of the pane that could tell showed a
+  running turn, or the rows of an output event since that read showed one;
+- the service has asked for a request prompt or a routing-error prompt to be
+  typed, even if the typing failed, and none of its own reads that could tell
+  has shown since that no turn runs.
+
+The service's own reads are the ones this guide describes, other than those it
+makes to type a prompt. The rows of an output event can show a running turn but
+cannot end one, because herdr may have read them before a prompt that the
+service typed while the event waited to be handled. Herdr's status alone is not
+enough, because herdr's status rules can report a Claude Code pane that is
+running a turn as idle. The service looks herdr's status up at each
+reconciliation and after each wait for an output event. Such a wait ends when
+herdr reports a matched line or a change of the agent's status to `working`,
+`idle`, or `done`, when a read or a reconciliation is due, or when a provider
+notice or a signal arrives. While no output subscription works, only
+reconciliation looks the status up. No event depends on a lookup after a wait
+that ended with no event, so if that lookup fails, the service logs it once,
+tries again after the next wait, and logs the first success after that; a
+failed lookup after an event, or at a reconciliation, stops `run`.
+
+A screen shows a running turn when one of its bottom 16 rows, counted up from
+the last row with text, holds `esc to interrupt`, as Claude Code's status row
+and Codex's progress row do during a turn, or one of the hints both show while
+a message waits in their queue. Only the text is matched, so a message of the
+agent's that quotes one of them in those rows counts too, and keeps the reads
+going until later output moves it out of those rows. For a while after a paste,
+Claude Code shows `paste again to expand` in place of that status row, whether
+or not a turn runs, so a screen whose last row with text holds that hint, and
+whose bottom rows hold neither marker, cannot tell. Any other screen shows no
+running turn, even if a turn has just started and its status row is not drawn
+yet; the reads then go on only if herdr reports the agent as working.
+
+Two more reads are made at once in the same way, whether or not a request is
+open, unless a failed read is waiting for its retry. One comes before each pass
+that handles queued requests, whether new ones from the chat or ones an earlier
+pass left for later, and before the rescan the service makes when new requests
+arrive faster than it can queue them: typing their prompts, and the turn that
+starts, can push a block of the turn before off the screen before herdr reports
+that turn's end. The other comes when herdr reports that the pane settled idle
+or done but the pane has already left that status, as when a prompt typed
+meanwhile has started another turn.
 
 Replies are recognized by their text, not by the number in their reply ID. When
 a block appears under any reply ID of an open request, the bridge compares its

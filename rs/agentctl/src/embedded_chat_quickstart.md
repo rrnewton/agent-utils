@@ -78,7 +78,11 @@ agent's queue is not posted to that request, then or later, apart from gaps the
 userguide lists, and the agent gets a routing-error prompt about it when a
 recovery scan reads it. While the closing line of a reply under a short ID is in
 view, `run` reads the pane every 2 seconds, because herdr raises no event for
-the next reply under the same ID. Each reply block the agent writes for an open
+the next reply under the same ID. It also reads the pane every 2 seconds while
+the agent works and some request is open, so that a reply block the agent's
+later output pushes off the screen is normally read before it goes; the
+userguide says what these reads cost, how `run` tells that the agent works, and
+when such a block is still lost. Each reply block the agent writes for an open
 request is posted once for each distinct text, compared as the userguide
 describes, whichever of that request's reply IDs it uses. Rows that start like a
 prompt the agent received, or like a tool call's output, are skipped with the

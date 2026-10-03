@@ -53,6 +53,11 @@ const QUEUE_MARKERS: [&str; 3] = [
     "Queued follow-up inputs",
 ];
 const WORKING_MARKER: &str = "esc to interrupt";
+/// Rows, ending at the last row with text, that `running_turn` searches for a marker.
+const RUNNING_TURN_ROWS: usize = 16;
+/// The hint Claude Code draws in place of the status row under its input box for a while after
+/// a paste, so that row's `esc to interrupt` is missing even while a turn runs.
+const PASTE_HINT: &str = "paste again to expand";
 const CODEX_QUEUE_HINT: &str = "tab to queue message";
 /// Glyphs Codex draws in column 0 of its composer's first row. Earlier releases
 /// draw `›`; v0.159.1 draws `»`, and keeps `›` for selection lists such as its
@@ -389,6 +394,39 @@ pub fn composer_view(harness: &str, screen: &str) -> Option<ComposerView> {
         "codex" => codex_view(&rows),
         _ => None,
     }
+}
+
+/// Whether the bottom of `screen` shows that the agent is running a turn: `Some(true)` if it
+/// does, `Some(false)` if it shows none, and `None` if it cannot tell.
+///
+/// Claude Code ends the status row under its input box with `esc to interrupt` while a turn
+/// runs, and Codex prints the same words in the progress row above its composer. Both show a
+/// queued-message hint only while a turn runs. Only the `RUNNING_TURN_ROWS` rows that end at
+/// the last row with text are searched, so the same words higher up in the conversation do not
+/// count. A status rule that looks for the input box cannot tell this: Claude Code keeps that
+/// box on screen while it works, so such a rule can report a working pane as idle.
+///
+/// For a while after a paste, Claude Code draws `PASTE_HINT` in place of its status row, whether
+/// or not a turn runs. A screen whose last row with text is that hint, and which shows no marker,
+/// gives `None`.
+pub(crate) fn running_turn(screen: &str) -> Option<bool> {
+    let rows = render_screen(screen);
+    let Some(last) = rows
+        .iter()
+        .rposition(|(plain, _)| plain.iter().any(|character| !character.is_whitespace()))
+    else {
+        return Some(false);
+    };
+    let marked = rows[(last + 1).saturating_sub(RUNNING_TURN_ROWS)..=last]
+        .iter()
+        .any(|(plain, _)| {
+            let row = text_of(plain);
+            row.contains(WORKING_MARKER) || QUEUE_MARKERS.iter().any(|marker| row.contains(marker))
+        });
+    if !marked && text_of(&rows[last].0).contains(PASTE_HINT) {
+        return None;
+    }
+    Some(marked)
 }
 
 fn compact(text: &str) -> String {
@@ -1786,5 +1824,106 @@ mod tests {
             Duration::from_secs(1)
         );
         assert!(replay.keys.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_running_turn_is_read_from_the_bottom_rows_of_the_screen() {
+        // Claude Code ends its status row with the marker while it works, and shows the queued
+        // hint as the placeholder of its empty input box.
+        let claude = FakeScreen::new("claude", true);
+        assert_eq!(
+            running_turn(&claude.render()),
+            Some(true),
+            "{}",
+            claude.render()
+        );
+        claude.state().busy = false;
+        assert_eq!(
+            running_turn(&claude.render()),
+            Some(false),
+            "{}",
+            claude.render()
+        );
+        claude.state().queued.push("next".to_owned());
+        assert_eq!(
+            running_turn(&claude.render()),
+            Some(true),
+            "{}",
+            claude.render()
+        );
+
+        // Codex prints the marker in its progress row, above the composer.
+        assert_eq!(running_turn(&codex_v0_159_1::working()), Some(true));
+        for idle in [
+            codex_v0_159_1::fresh_idle(),
+            codex_v0_159_1::submitted(),
+            codex_v0_159_1::session_idle(),
+        ] {
+            assert_eq!(running_turn(&idle), Some(false), "{idle:?}");
+        }
+        let queued = concat!(
+            "• Queued follow-up inputs\n",
+            "  ↳ check the logs\n",
+            "\n",
+            "› Ask Codex to do anything\n",
+            "\n",
+            "  GPT default · /tmp/project\n",
+        );
+        assert_eq!(running_turn(queued), Some(true));
+
+        assert_eq!(running_turn(""), Some(false));
+        assert_eq!(running_turn(" \n\n \n"), Some(false));
+    }
+
+    #[test]
+    fn running_turn_words_above_the_bottom_rows_do_not_count() {
+        // The marker sits `above` rows over the last row with text; blank rows below that row
+        // are not counted.
+        let screen = |above: usize| {
+            let mut rows = vec!["• Claude prints esc to interrupt while it works".to_owned()];
+            rows.extend((1..above).map(|row| format!("• line {row}")));
+            rows.push("  ⏵⏵ auto mode on".to_owned());
+            rows.extend([String::new(), String::new()]);
+            rows.join("\n")
+        };
+        assert_eq!(running_turn(&screen(RUNNING_TURN_ROWS - 1)), Some(true));
+        assert_eq!(running_turn(&screen(RUNNING_TURN_ROWS)), Some(false));
+    }
+
+    #[test]
+    fn a_screen_whose_last_row_is_the_paste_hint_cannot_tell_whether_a_turn_runs() {
+        // A busy Claude Code as captured: the marker ends the status row before the paste, the
+        // hint takes that row's place while the paste is staged, and the queued-message hint
+        // shows once Enter has queued the paste.
+        assert_eq!(running_turn(&claude_busy::before()), Some(true));
+        assert_eq!(running_turn(&claude_busy::staged()), None);
+        assert_eq!(running_turn(&claude_busy::queued()), Some(true));
+
+        // The hint follows a paste into an idle pane too, so it says nothing either way.
+        let rows = |above: &str, status: &str| {
+            [
+                "● Done.",
+                above,
+                "────────────────────────────────────────",
+                "❯ [Pasted text #923 +10 lines]",
+                "────────────────────────────────────────",
+                status,
+                "",
+            ]
+            .join("\n")
+        };
+        assert_eq!(running_turn(&rows("", "  paste again to expand")), None);
+        // A marker still counts beside the hint, as in a spinner row that ends with it.
+        let spinner = "✻ Fermenting… (16m 8s · ↓ 12.3k tokens · esc to interrupt)";
+        assert_eq!(
+            running_turn(&rows(spinner, "  paste again to expand")),
+            Some(true)
+        );
+        // Only the last row with text is the status row: the hint's words above it do not count.
+        let quoted = "  Claude Code prints paste again to expand after a paste";
+        assert_eq!(
+            running_turn(&rows(quoted, "  ⏵⏵ auto mode on")),
+            Some(false)
+        );
     }
 }

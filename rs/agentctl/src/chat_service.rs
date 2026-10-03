@@ -1,5 +1,6 @@
 //! Launchable orchestration for the durable chat runtime.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::io;
@@ -52,7 +53,8 @@ const MAX_IMMEDIATE_BACKLOG_CHUNKS: usize = 64;
 const EVENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTPUT_RETRY_MAX: Duration = Duration::from_secs(60);
 // How often the service reads the pane itself while a reply alias keeps an output pattern
-// matched; see `RouteCache::saturated_by`.
+// matched, as `RouteCache::saturated_by` describes, and while the agent works by Herdr's report
+// or by its screen, as `TurnEvidence` describes.
 const SATURATED_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const PROVIDER_RETRY_MIN: Duration = Duration::from_secs(1);
 const PROVIDER_RETRY_MAX: Duration = Duration::from_secs(60);
@@ -160,6 +162,10 @@ pub struct CycleReport {
     recovery_requested: bool,
     #[serde(skip)]
     processed_keys: Vec<String>,
+    // The pass asked for a request prompt or a notice to be typed into the pane, so one may have
+    // reached it: see `TypingWatch`.
+    #[serde(skip)]
+    prompt_typed: bool,
 }
 
 impl CycleReport {
@@ -186,6 +192,7 @@ impl CycleReport {
         self.deferred_keys.append(&mut other.deferred_keys);
         self.recovery_requested |= other.recovery_requested;
         self.processed_keys.append(&mut other.processed_keys);
+        self.prompt_typed |= other.prompt_typed;
     }
 
     fn error(&mut self, operation: &str, key: &str, error: impl fmt::Display) {
@@ -1032,6 +1039,11 @@ fn process_keys_with_delivery(
     if keys.is_empty() {
         return Ok(CycleReport::default());
     }
+    let typed = Cell::new(false);
+    let coordinator = &TypingWatch {
+        delivery: coordinator,
+        typed: &typed,
+    };
     let async_ack = control.stop.and_then(|stop| stop.ack_queue.as_ref());
     if let Some(queue) = async_ack {
         queue.enqueue(keys.iter().cloned());
@@ -1109,6 +1121,7 @@ fn process_keys_with_delivery(
             Err(error) => report.error("deliver", key, error),
         }
     }
+    report.prompt_typed = typed.get();
     if let Some(transport) = control.transport.as_mut() {
         let mut sends = 0_usize;
         for key in keys.iter().take(MAX_KEYS_PER_PASS) {
@@ -1193,14 +1206,18 @@ with other text, so the oldest were not read",
         control.log(line);
     }
     if !capture.unknown_ids.is_empty() || !capture.covered_ids.is_empty() {
-        match deliver_feedback(
+        let typed = Cell::new(false);
+        let result = deliver_feedback(
             state,
             manager,
             &capture.unknown_ids,
             &capture.covered_ids,
             delivery,
             control.stop,
-        ) {
+            &typed,
+        );
+        report.prompt_typed = typed.get();
+        match result {
             Ok(CoordinatorDeliveryResult::Pending(_)) => report.more_work = true,
             Ok(CoordinatorDeliveryResult::Uncertain(_)) => {}
             Ok(
@@ -1526,6 +1543,11 @@ impl RouteCache {
             .is_some_and(|(_, current)| current.is_some())
     }
 
+    /// Whether some open request has a current reply ID, so that a reply could be stored.
+    fn has_current(&self) -> bool {
+        !self.by_identifier.is_empty()
+    }
+
     /// The current reply IDs of open requests whose closing line `text` shows, each once, in
     /// the order of the lines.
     fn visible_current_identifiers(&self, text: &str) -> Vec<String> {
@@ -1814,6 +1836,47 @@ impl<A: ManagedApi + ?Sized> chat_runtime::CoordinatorDelivery for CancellableDe
     }
 }
 
+/// A delivery that sets `typed` once it is asked to type into the pane: `submit` types a prompt
+/// and `drain` types the queued ones. Either may have typed even when it fails, so `typed` says
+/// that a prompt may have reached the pane, not that one did.
+struct TypingWatch<'a> {
+    delivery: &'a dyn chat_runtime::CoordinatorDelivery,
+    typed: &'a Cell<bool>,
+}
+
+impl chat_runtime::CoordinatorDelivery for TypingWatch<'_> {
+    fn message_state(
+        &self,
+        agent_name: &str,
+        message_id: &str,
+    ) -> std::result::Result<Option<QueueMessageState>, String> {
+        self.delivery.message_state(agent_name, message_id)
+    }
+
+    fn submit(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        message_id: &str,
+        options: DrainOptions,
+    ) -> std::result::Result<(), String> {
+        self.typed.set(true);
+        self.delivery
+            .submit(agent_name, prompt, message_id, options)
+    }
+
+    fn drain(&self, agent_name: &str, options: DrainOptions) -> std::result::Result<(), String> {
+        self.typed.set(true);
+        self.delivery.drain(agent_name, options)
+    }
+
+    fn screen(&self, agent_name: &str) -> std::result::Result<String, String> {
+        self.delivery.screen(agent_name)
+    }
+}
+
+/// `chat_runtime::deliver_fence_feedback_covering` through the service's delivery, which sets
+/// `typed` as `TypingWatch` does.
 fn deliver_feedback<A: ManagedApi + ?Sized>(
     state: &BridgeState,
     manager: &ManagedAgents<'_, A>,
@@ -1821,13 +1884,17 @@ fn deliver_feedback<A: ManagedApi + ?Sized>(
     covered_ids: &[(String, String)],
     options: DrainOptions,
     stop: Option<&StopState>,
+    typed: &Cell<bool>,
 ) -> Result<CoordinatorDeliveryResult, ChatRuntimeError> {
     match stop {
         Some(stop) => chat_runtime::deliver_fence_feedback_covering(
             state,
-            &CancellableDelivery {
-                manager,
-                runtime: StopRuntime::new(stop),
+            &TypingWatch {
+                delivery: &CancellableDelivery {
+                    manager,
+                    runtime: StopRuntime::new(stop),
+                },
+                typed,
             },
             unknown_ids,
             covered_ids,
@@ -1835,7 +1902,10 @@ fn deliver_feedback<A: ManagedApi + ?Sized>(
         ),
         None => chat_runtime::deliver_fence_feedback_covering(
             state,
-            manager,
+            &TypingWatch {
+                delivery: manager,
+                typed,
+            },
             unknown_ids,
             covered_ids,
             options,
@@ -2545,7 +2615,8 @@ fn install_output_stream(
     *published = Some(wake);
     // The notice/signal producer may have observed the empty slot immediately before this
     // publication. Pre-arm the new stream while publication remains serialized: the socket byte
-    // is sticky, so the first wait returns and the owner loop rechecks every queued source.
+    // is sticky, so the first wait returns and the owner loop rechecks every queued source. The
+    // loop also learns Herdr's status from the lookup after that wait.
     published
         .as_ref()
         .expect("the output wake was just installed")
@@ -2587,6 +2658,55 @@ fn spawn_signal_worker(
             done,
         },
     ))
+}
+
+/// What the owner loop last learned about whether the agent is running a turn.
+///
+/// Herdr's status is one source, but a status rule can report a working Claude Code pane as idle,
+/// so each screen the loop reads itself, or receives with an output event, is checked too, with
+/// `submission::running_turn`; the reads a delivery makes to type a prompt are not. A read that
+/// cannot tell, because Claude Code's paste hint has taken the place of its status row, leaves
+/// the screen's evidence as it was. A pass that asks for a prompt or a notice to be typed, as
+/// `CycleReport::prompt_typed` records, counts as the start of a turn until a later read of the
+/// loop's own says otherwise. An output event's screen can show a running turn but not end one:
+/// the loop handles the events that queued while it typed a prompt after the typing, and Herdr
+/// may have read their screens before it. While either source says the agent works and some
+/// request has a current reply ID, the loop reads the pane every `SATURATED_POLL_INTERVAL`.
+#[derive(Debug, Default)]
+struct TurnEvidence {
+    // Herdr last reported the pane as `working`.
+    herdr: bool,
+    // The last read of the loop's own that could tell showed a running turn, or a later pass
+    // asked for a prompt or a notice to be typed, or a later output event's screen showed a
+    // running turn.
+    screen: bool,
+}
+
+impl TurnEvidence {
+    fn status(&mut self, status: &str) {
+        self.herdr = status == "working";
+    }
+
+    /// A screen the loop read itself, after every prompt it had asked to be typed.
+    fn read(&mut self, screen: &str) {
+        if let Some(running) = crate::submission::running_turn(screen) {
+            self.screen = running;
+        }
+    }
+
+    /// The screen an output event carries, which Herdr may have read before a prompt the loop
+    /// has since asked to be typed.
+    fn event(&mut self, screen: &str) {
+        self.screen |= crate::submission::running_turn(screen) == Some(true);
+    }
+
+    fn report(&mut self, report: &CycleReport) {
+        self.screen |= report.prompt_typed;
+    }
+
+    fn working(&self) -> bool {
+        self.herdr || self.screen
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2633,12 +2753,23 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     )?;
     enqueue_report_backlog(&mut direct_keys, &initial_report, overflowed);
     notes.log(&initial_report);
+    // The loop looks Herdr's status up after each wait for a pane event, and the first wait on a
+    // new subscription returns at once, as `install_output_stream` arms it, so the loop learns the
+    // status as soon as its first pass subscribes. While no subscription works, the status comes
+    // from each reconciliation.
+    let mut turn = TurnEvidence::default();
+    turn.read(&initial);
+    turn.report(&initial_report);
     let recovery = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
     enqueue_report_backlog(&mut direct_keys, &recovery, overflowed);
     notes.log(&recovery);
+    turn.report(&recovery);
     let mut poll_at = next_saturated_poll(&routes, &initial);
     // Consecutive failed reads of the saturated poll, which logs the first and the recovery.
     let mut poll_failures = 0_u64;
+    // Consecutive failed lookups of Herdr's status after a wait that ended with no event, which
+    // logs the first and the recovery.
+    let mut lookup_failures = 0_u64;
 
     let mut stream: Option<PaneEventStream> = None;
     let mut subscribed_patterns = Vec::new();
@@ -2647,10 +2778,69 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     let mut next_reconciliation = Instant::now() + options.reconciliation_interval;
     while !stop.is_stopped() {
         take_provider_notices(notices, stop, &mut direct_keys, overflowed)?;
-        if direct_keys.is_empty() && overflowed.swap(false, Ordering::SeqCst) {
+        let recover = direct_keys.is_empty() && overflowed.swap(false, Ordering::SeqCst);
+        if (recover || !direct_keys.is_empty()) && poll_failures == 0 {
+            // A rescan may type a prompt, and so may a pass that handles queued request keys,
+            // whether the chat provider reported them or a capture deferred them. The prompt's
+            // echo and the turn it starts can push a reply block of the turn before off the
+            // screen before the pane is read again, and Herdr may not yet have reported that the
+            // turn ended, so each such pass reads the pane first, unless a failed read is waiting
+            // for its retry.
+            poll_at = Some(Instant::now());
+        }
+        if poll_at.is_some_and(|at| Instant::now() >= at) {
+            // This read runs every `SATURATED_POLL_INTERVAL` for as long as the pane shows the
+            // closing line, or the agent works while some request has a current reply ID, and at
+            // once before each rescan and each pass that handles queued request keys and after a
+            // settle the pane has already left, so it saves no snapshot, which would cost a file
+            // write and two fsyncs each time, and a failed read is tried again at the next
+            // interval. Every other read of the pane still stops the service when it fails.
+            match manager.peek_capture_with_runtime(
+                &state.config().agent_name,
+                SNAPSHOT_LINES,
+                &owner_runtime,
+            ) {
+                Ok(snapshot) => {
+                    if poll_failures > 0 {
+                        service_log(format_args!(
+                            "agentctl: the {}s read of the coordinator's pane works again after {poll_failures} failed reads",
+                            SATURATED_POLL_INTERVAL.as_secs()
+                        ));
+                        poll_failures = 0;
+                    }
+                    turn.read(&snapshot);
+                    let report = capture_visible_current(
+                        state,
+                        manager,
+                        options.delivery,
+                        &mut routes,
+                        &snapshot,
+                        &mut control,
+                    )?;
+                    enqueue_report_backlog(&mut direct_keys, &report, overflowed);
+                    notes.log(&report);
+                    turn.report(&report);
+                    poll_at = next_saturated_poll(&routes, &snapshot);
+                }
+                Err(error) if stop.is_stopped() => return Err(error.into()),
+                Err(error) => {
+                    if poll_failures == 0 {
+                        service_log(format_args!(
+                            "agentctl: the {0}s read of the coordinator's pane failed; retrying every {0}s: {error}",
+                            SATURATED_POLL_INTERVAL.as_secs()
+                        ));
+                    }
+                    poll_failures = poll_failures.saturating_add(1);
+                    poll_at = Some(Instant::now() + SATURATED_POLL_INTERVAL);
+                }
+            }
+        }
+
+        if recover {
             let report = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
             enqueue_report_backlog(&mut direct_keys, &report, overflowed);
             notes.log(&report);
+            turn.report(&report);
         }
         if !direct_keys.is_empty() {
             let report = drain_immediate_backlog(
@@ -2662,6 +2852,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                 overflowed,
             )?;
             notes.log(&report);
+            turn.report(&report);
             for key in &report.processed_keys {
                 routes.replace(key, state.next_reply_route(key)?);
             }
@@ -2678,12 +2869,14 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
             }
             let info =
                 manager.pane_info_with_runtime(&state.config().agent_name, &owner_runtime)?;
+            turn.status(&info.status);
             if matches!(info.status.as_str(), "idle" | "done") {
                 let snapshot = manager.read_capture_with_runtime(
                     &state.config().agent_name,
                     SNAPSHOT_LINES,
                     &owner_runtime,
                 )?;
+                turn.read(&snapshot);
                 let report = capture_recovery_snapshot(
                     state,
                     manager,
@@ -2698,56 +2891,14 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                 )?;
                 enqueue_report_backlog(&mut direct_keys, &report, overflowed);
                 notes.log(&report);
+                turn.report(&report);
                 poll_at = next_saturated_poll(&routes, &snapshot);
             }
             let report = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
             enqueue_report_backlog(&mut direct_keys, &report, overflowed);
             notes.log(&report);
+            turn.report(&report);
             next_reconciliation = Instant::now() + options.reconciliation_interval;
-        }
-
-        if poll_at.is_some_and(|at| Instant::now() >= at) {
-            // This read runs every `SATURATED_POLL_INTERVAL` for as long as the pane shows the
-            // closing line, so it saves no snapshot, which would cost a file write and two fsyncs
-            // each time, and a failed read is tried again at the next interval. Every other read
-            // of the pane still stops the service when it fails.
-            match manager.peek_capture_with_runtime(
-                &state.config().agent_name,
-                SNAPSHOT_LINES,
-                &owner_runtime,
-            ) {
-                Ok(snapshot) => {
-                    if poll_failures > 0 {
-                        service_log(format_args!(
-                            "agentctl: the {}s read of the coordinator's pane works again after {poll_failures} failed reads",
-                            SATURATED_POLL_INTERVAL.as_secs()
-                        ));
-                        poll_failures = 0;
-                    }
-                    let report = capture_visible_current(
-                        state,
-                        manager,
-                        options.delivery,
-                        &mut routes,
-                        &snapshot,
-                        &mut control,
-                    )?;
-                    enqueue_report_backlog(&mut direct_keys, &report, overflowed);
-                    notes.log(&report);
-                    poll_at = next_saturated_poll(&routes, &snapshot);
-                }
-                Err(error) if stop.is_stopped() => return Err(error.into()),
-                Err(error) => {
-                    if poll_failures == 0 {
-                        service_log(format_args!(
-                            "agentctl: the {0}s read of the coordinator's pane failed; retrying every {0}s: {error}",
-                            SATURATED_POLL_INTERVAL.as_secs()
-                        ));
-                    }
-                    poll_failures = poll_failures.saturating_add(1);
-                    poll_at = Some(Instant::now() + SATURATED_POLL_INTERVAL);
-                }
-            }
         }
 
         let desired_patterns = if state.config().outbound_enabled {
@@ -2788,6 +2939,16 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
             }
         }
 
+        // A turn can print a reply block and then push it off the screen with more output before
+        // the turn ends, and the block's closing line raises no output event while an older
+        // closing line keeps its pattern matched. So while the agent works, by Herdr's report or
+        // by its screen, and some request has a current reply ID, the pane is read every
+        // interval. A request stays open until `chat close`, so with outbound replies on, that is
+        // in practice whenever the agent works.
+        if turn.working() && poll_at.is_none() && routes.has_current() {
+            poll_at = Some(Instant::now() + SATURATED_POLL_INTERVAL);
+        }
+
         if let Some(active) = stream.as_mut() {
             let subscribed_pane = active.pane_id().to_owned();
             let timeout = if direct_keys.is_empty() {
@@ -2799,14 +2960,43 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
             };
             match active.wait(timeout) {
                 Ok(events) => {
-                    let info = manager
-                        .pane_info_with_runtime(&state.config().agent_name, &owner_runtime)?;
+                    let info = match manager
+                        .pane_info_with_runtime(&state.config().agent_name, &owner_runtime)
+                    {
+                        Ok(info) => {
+                            if lookup_failures > 0 {
+                                service_log(format_args!(
+                                    "agentctl: the status lookup of the coordinator's pane works again after {lookup_failures} failed lookups"
+                                ));
+                                lookup_failures = 0;
+                            }
+                            info
+                        }
+                        // A wait that returned no event ended at a timer, as for the read due
+                        // every `SATURATED_POLL_INTERVAL` while the agent works, or at a wake, as
+                        // for a notice from the chat provider. No event depends on this lookup,
+                        // so a failed one is logged and tried again after the next wait, as a
+                        // failed read of the saturated poll is tried again at the next interval.
+                        // A failed lookup after an event, or at a reconciliation, still stops the
+                        // service.
+                        Err(error) if events.is_empty() && !stop.is_stopped() => {
+                            if lookup_failures == 0 {
+                                service_log(format_args!(
+                                    "agentctl: the status lookup of the coordinator's pane failed; trying again after the next wait: {error}"
+                                ));
+                            }
+                            lookup_failures = lookup_failures.saturating_add(1);
+                            continue;
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
                     if info.pane_id != subscribed_pane {
                         return Err(ChatServiceError::Generation(format!(
                             "coordinator moved from subscribed pane {subscribed_pane:?} to {:?}",
                             info.pane_id
                         )));
                     }
+                    turn.status(&info.status);
                     let mut unknown_route_seen = false;
                     for event in events {
                         match event {
@@ -2817,6 +3007,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                                 revision,
                             } => {
                                 let identifier = matched_identifier(&matched_line).unwrap_or("");
+                                turn.event(&text);
                                 let report = capture_direct(
                                     state,
                                     manager,
@@ -2833,6 +3024,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                                 unknown_route_seen |= report.recovery_requested;
                                 enqueue_report_backlog(&mut direct_keys, &report, overflowed);
                                 notes.log(&report);
+                                turn.report(&report);
                                 // This capture covers only the event's own reply ID, so an event
                                 // never puts off a poll that is already due for the others.
                                 poll_at = poll_at.or_else(|| next_saturated_poll(&routes, &text));
@@ -2846,6 +3038,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                                     SNAPSHOT_LINES,
                                     &owner_runtime,
                                 )?;
+                                turn.read(&snapshot);
                                 let report = capture_recovery_snapshot(
                                     state,
                                     manager,
@@ -2860,6 +3053,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                                 )?;
                                 enqueue_report_backlog(&mut direct_keys, &report, overflowed);
                                 notes.log(&report);
+                                turn.report(&report);
                                 poll_at = next_saturated_poll(&routes, &snapshot);
                                 let recovery = recover_pass(
                                     state,
@@ -2870,8 +3064,22 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                                 )?;
                                 enqueue_report_backlog(&mut direct_keys, &recovery, overflowed);
                                 notes.log(&recovery);
+                                turn.report(&recovery);
                             }
-                            PaneEvent::Settled { .. } => {}
+                            // The agent is no longer in the status Herdr reported, as when a
+                            // prompt typed before this event was read has started another turn.
+                            // The turn that ended may have left a reply block on the screen,
+                            // which the new turn's output can push off, so the pane is read at
+                            // once rather than at the next interval, unless a failed read is
+                            // waiting for its retry.
+                            PaneEvent::Settled { .. } => {
+                                if poll_failures == 0 {
+                                    poll_at = Some(Instant::now());
+                                }
+                            }
+                            // `turn` took Herdr's status above, from a lookup made after this
+                            // event arrived, so the event adds nothing to it.
+                            PaneEvent::Working => {}
                         }
                     }
                     if unknown_route_seen {
@@ -2880,6 +3088,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                             SNAPSHOT_LINES,
                             &owner_runtime,
                         )?;
+                        turn.read(&snapshot);
                         let report = capture_recovery_snapshot(
                             state,
                             manager,
@@ -2894,6 +3103,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                         )?;
                         enqueue_report_backlog(&mut direct_keys, &report, overflowed);
                         notes.log(&report);
+                        turn.report(&report);
                         poll_at = next_saturated_poll(&routes, &snapshot);
                     }
                 }
@@ -4409,7 +4619,7 @@ mod tests {
                     PaneEvent::Output { matched_line, .. } => {
                         matched_identifier(matched_line).map(str::to_owned)
                     }
-                    PaneEvent::Settled { .. } => None,
+                    PaneEvent::Settled { .. } | PaneEvent::Working => None,
                 })
                 .collect::<Vec<_>>()
         };
@@ -4722,7 +4932,7 @@ mod tests {
                     PaneEvent::Output { matched_line, .. } => {
                         matched_identifier(matched_line).map(str::to_owned)
                     }
-                    PaneEvent::Settled { .. } => None,
+                    PaneEvent::Settled { .. } | PaneEvent::Working => None,
                 })
                 .collect::<Vec<_>>()
         };
@@ -6773,11 +6983,13 @@ esac
     /// A stand-in for the Herdr binary and server the owner loop talks to. Its
     /// `status server --json` names a socket on which a thread acknowledges each output
     /// subscription, sends it the events `events` builds for the subscribed pane, and keeps the
-    /// connection open until `release` is sent or dropped.
+    /// connection open until `release` is sent or dropped. `subscriptions` counts the
+    /// subscriptions it has acknowledged.
     struct OwnerLoopHerdr {
         client: HerdrClient,
         release: mpsc::Sender<()>,
         server: thread::JoinHandle<()>,
+        subscriptions: Arc<AtomicU64>,
     }
 
     fn owner_loop_herdr(root: &Path, name: &str, events: fn(&str) -> Vec<Value>) -> OwnerLoopHerdr {
@@ -6792,23 +7004,14 @@ esac
         events: fn(&str) -> Vec<Value>,
         every: Option<Duration>,
     ) -> OwnerLoopHerdr {
-        let socket = root.join(format!("{name}.sock"));
-        let executable = root.join(format!("{name}-herdr"));
-        fs::write(
-            &executable,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' '{}'\n",
-                json!({"running": true, "compatible": true, "socket": socket})
-            ),
-        )
-        .expect("write herdr stand-in");
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
-            .expect("herdr stand-in mode");
+        let (socket, client) = herdr_stand_in(root, name);
         let listener = UnixListener::bind(&socket).expect("bind herdr events");
         listener
             .set_nonblocking(true)
             .expect("poll for herdr event clients");
         let (release, released) = mpsc::channel();
+        let subscriptions = Arc::new(AtomicU64::new(0));
+        let acknowledged = Arc::clone(&subscriptions);
         let server = thread::spawn(move || {
             let mut connections = Vec::<(UnixStream, String)>::new();
             let mut sent_at = Instant::now();
@@ -6853,6 +7056,7 @@ esac
                     json!({"id": request["id"], "result": {"type": "subscription_started"}})
                 )
                 .expect("acknowledge herdr event subscription");
+                acknowledged.fetch_add(1, AtomicOrdering::SeqCst);
                 for event in events(&pane) {
                     writeln!(connection, "{event}").expect("write herdr event");
                 }
@@ -6860,10 +7064,45 @@ esac
             }
         });
         OwnerLoopHerdr {
-            client: HerdrClient::with_executable("direct", &executable).expect("herdr client"),
+            client,
             release,
             server,
+            subscriptions,
         }
+    }
+
+    /// `owner_loop_herdr` for a Herdr whose socket no server listens on, so every output
+    /// subscription the owner loop tries fails to connect.
+    fn unreachable_owner_loop_herdr(root: &Path, name: &str) -> OwnerLoopHerdr {
+        let (_, client) = herdr_stand_in(root, name);
+        let (release, released) = mpsc::channel::<()>();
+        OwnerLoopHerdr {
+            client,
+            release,
+            server: thread::spawn(move || {
+                let _ = released.recv();
+            }),
+            subscriptions: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// A client for a stand-in Herdr binary named `name` under `root`, whose
+    /// `status server --json` names the socket returned with it.
+    fn herdr_stand_in(root: &Path, name: &str) -> (std::path::PathBuf, HerdrClient) {
+        let socket = root.join(format!("{name}.sock"));
+        let executable = root.join(format!("{name}-herdr"));
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{}'\n",
+                json!({"running": true, "compatible": true, "socket": socket})
+            ),
+        )
+        .expect("write herdr stand-in");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+            .expect("herdr stand-in mode");
+        let client = HerdrClient::with_executable("direct", &executable).expect("herdr client");
+        (socket, client)
     }
 
     /// Admit one request from the owner to `state` and deliver its prompt. Returns the request's
@@ -6880,20 +7119,31 @@ esac
 
     /// Admit one request from the owner to `state`, and return its key.
     fn admitted_worker_request(state: &BridgeState) -> String {
+        admitted_worker_message(state, 1, "one")
+    }
+
+    /// Admit the owner's message `name`, in a thread of its own, as provider event `sequence`,
+    /// and return the key of its request. `name` and `sequence` must be new to `state`.
+    fn admitted_worker_message(state: &BridgeState, sequence: u64, name: &str) -> String {
         let message = InboundMessage::new(
             ChannelId::new("spaces/example").expect("channel"),
-            MessageId::new("spaces/example/messages/one").expect("message"),
-            ThreadId::new("spaces/example/threads/one").expect("thread"),
+            MessageId::new(format!("spaces/example/messages/{name}")).expect("message"),
+            ThreadId::new(format!("spaces/example/threads/{name}")).expect("thread"),
             SenderId::new("users/owner").expect("sender"),
             "request",
             "2026-09-30T12:00:00Z",
             false,
         )
         .expect("inbound message");
+        let (cursor, delivery) = if sequence == 1 {
+            ("cursor".to_owned(), "delivery".to_owned())
+        } else {
+            (format!("cursor-{sequence}"), format!("delivery-{sequence}"))
+        };
         let batch = DeliveryBatch::new(
-            EventSequence::new(1).expect("sequence"),
-            ProviderCursor::new("cursor").expect("cursor"),
-            DeliveryId::new("delivery").expect("delivery"),
+            EventSequence::new(sequence).expect("sequence"),
+            ProviderCursor::new(cursor).expect("cursor"),
+            DeliveryId::new(delivery).expect("delivery"),
             vec![CommittableEvent::message_created(message)],
         )
         .expect("delivery batch");
@@ -6938,17 +7188,43 @@ esac
         limit: Duration,
         mut done: impl FnMut() -> bool + Send,
     ) {
+        run_owner_loop_notified(
+            fixture,
+            state,
+            herdr,
+            reconciliation_interval,
+            limit,
+            move |_, _| done(),
+        );
+    }
+
+    /// `run_owner_loop_until`, which also gives `done` a function that sends the loop a provider
+    /// notice as the provider thread of `chat run` does, and one that tells the loop that notices
+    /// were lost, as that thread does when the notice channel is full.
+    fn run_owner_loop_notified(
+        fixture: &crate::subagents::tests::Fixture,
+        state: &BridgeState,
+        herdr: &OwnerLoopHerdr,
+        reconciliation_interval: Duration,
+        limit: Duration,
+        mut done: impl FnMut(&dyn Fn(ProviderNotice), &dyn Fn()) -> bool + Send,
+    ) {
         let manager = fixture.manager();
         let stop = StopState::default();
         let cancellation: SharedCancellation = Arc::default();
         let output_wake: SharedWake = Arc::default();
         let overflowed = AtomicBool::new(false);
-        let (_notices, notice_receiver) = mpsc::sync_channel(PROVIDER_NOTICE_CAPACITY);
+        let (notices, notice_receiver) = mpsc::sync_channel(PROVIDER_NOTICE_CAPACITY);
         let mut transport = None;
         thread::scope(|scope| {
             scope.spawn(|| {
+                let notify = |notice| send_notice(&notices, notice, &output_wake, &overflowed);
+                let overflow = || {
+                    overflowed.store(true, AtomicOrdering::SeqCst);
+                    wake_output(&output_wake);
+                };
                 let deadline = Instant::now() + limit;
-                while !done() && Instant::now() < deadline {
+                while !done(&notify, &overflow) && Instant::now() < deadline {
                     thread::sleep(Duration::from_millis(5));
                 }
                 thread::sleep(Duration::from_millis(300));
@@ -7231,6 +7507,962 @@ esac
         );
         assert!(failed, "the reads never failed");
         assert_eq!(stored(), 2);
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+    }
+
+    /// The rows of a Claude Code pane's 52-row screen, and the rows of it below the
+    /// conversation: a blank row, the input box, and the status row under it.
+    const CLAUDE_SCREEN_ROWS: usize = 52;
+    const CLAUDE_FOOTER: [&str; 5] = [
+        "",
+        "────────────────────────────────────────",
+        "❯\u{a0}",
+        "────────────────────────────────────────",
+        "  ⏵⏵ bypass permissions on · 1 shell",
+    ];
+    /// The rows of that screen that show the conversation.
+    const CLAUDE_CONVERSATION_ROWS: usize = CLAUDE_SCREEN_ROWS - CLAUDE_FOOTER.len();
+
+    /// The screen of a Claude Code pane in a turn that answers the request with reply ID 001,
+    /// once the turn has printed `below` rows of tool calls, each a blank row, a call row, and an
+    /// output row, as Claude Code draws them. With `block`, the turn printed a four-row message
+    /// holding a reply block before the tool calls, so the whole message is on the screen while
+    /// `below` is at most 43 and none of it once `below` is 47. Earlier rows fill the top of the
+    /// screen.
+    fn claude_turn_screen(block: bool, below: usize) -> String {
+        let mut rows = vec!["● Earlier work.".to_owned()];
+        rows.extend((1..=60).map(|line| format!("  earlier line {line}")));
+        rows.push(String::new());
+        rows.push("❯ The user's request arrived through the configured chat bridge.".to_owned());
+        rows.extend((1..=5).map(|line| format!("  Line {line} of the request.")));
+        rows.push(String::new());
+        if block {
+            rows.extend(
+                [
+                    "● Here is the answer.",
+                    "  <CHAT_REPLY_001>",
+                    "  first answer",
+                    "  </CHAT_REPLY_001>",
+                ]
+                .map(str::to_owned),
+            );
+        }
+        rows.extend(
+            (1..)
+                .flat_map(|call| {
+                    [
+                        String::new(),
+                        format!("● Bash(echo step {call})"),
+                        format!("  ⎿  step {call}"),
+                    ]
+                })
+                .take(below),
+        );
+        rows.extend(CLAUDE_FOOTER.map(str::to_owned));
+        let mut screen = rows[rows.len() - CLAUDE_SCREEN_ROWS..].join("\n");
+        screen.push('\n');
+        screen
+    }
+
+    /// `claude_turn_screen` as Claude Code draws it while the turn runs, with `esc to interrupt`
+    /// at the end of the status row.
+    fn claude_running_screen(block: bool, below: usize) -> String {
+        let status = CLAUDE_FOOTER[CLAUDE_FOOTER.len() - 1];
+        claude_turn_screen(block, below).replace(status, &format!("{status} · esc to interrupt"))
+    }
+
+    /// `claude_turn_screen` as Claude Code draws it for a while after a paste, with a hint in
+    /// place of the status row, whether or not the turn runs.
+    fn claude_pasted_screen(block: bool, below: usize) -> String {
+        let status = CLAUDE_FOOTER[CLAUDE_FOOTER.len() - 1];
+        claude_turn_screen(block, below).replace(status, "  paste again to expand")
+    }
+
+    #[test]
+    fn the_poll_stores_a_reply_block_once_wherever_later_tool_calls_have_pushed_it() {
+        // https://github.com/rrnewton/agent-utils/issues/201: an agent wrote a complete reply
+        // block and then, in the same turn, made tool calls, whose rows appear below the block
+        // and push it up the screen. The read the service makes while the agent works stores the
+        // block the first time it sees the whole message, at any height, and never again as
+        // later reads see it higher up, then without the first row of its message, and then not
+        // at all.
+        let message_rows = |below: usize| {
+            let screen = claude_turn_screen(true, below);
+            ["● Here is the answer.", "  <CHAT_REPLY_001>"].map(|row| screen.contains(row))
+        };
+        assert_eq!(message_rows(43), [true, true]);
+        assert_eq!(message_rows(44), [false, true]);
+        assert!(!claude_turn_screen(true, CLAUDE_CONVERSATION_ROWS).contains("CHAT_REPLY_001"));
+        for first_below in 0..=43 {
+            let (state, key, root) = state_with_request();
+            let delivery = RecordingDelivery::default();
+            chat_runtime::deliver_request_with(&state, &delivery, &key, DrainOptions::default())
+                .expect("deliver request");
+            let route = state
+                .next_reply_route(&key)
+                .expect("route")
+                .expect("active route");
+            assert_eq!(route.identifier, "001");
+            let mut routes = RouteCache::new(vec![route]);
+            let client = HerdrClient::with_executable("direct", Path::new("/missing/herdr"))
+                .expect("construct client");
+            let manager = ManagedAgents::new(&client, &root.join("registry")).expect("manager");
+            let mut transport = None;
+            let mut control = PassControl {
+                transport: &mut transport,
+                stop: None,
+            };
+            for below in first_below..=CLAUDE_CONVERSATION_ROWS {
+                let report = capture_visible_current(
+                    &state,
+                    &manager,
+                    DrainOptions::default(),
+                    &mut routes,
+                    &claude_turn_screen(true, below),
+                    &mut control,
+                )
+                .expect("poll");
+                let expected = if below == first_below {
+                    vec![(key.clone(), vec![1])]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(
+                    report.captured, expected,
+                    "first read with {first_below} rows below the block, this one with {below}"
+                );
+            }
+            assert_eq!(
+                state.inspect_request(&key).expect("inspect request")["replies"]
+                    .as_array()
+                    .expect("replies")
+                    .len(),
+                1
+            );
+            fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    /// How many replies are stored for the request `key` of `state`.
+    fn stored_replies(state: &BridgeState, key: &str) -> usize {
+        state.inspect_request(key).expect("inspect request")["replies"]
+            .as_array()
+            .expect("replies")
+            .len()
+    }
+
+    #[test]
+    fn while_the_agent_works_the_owner_loop_reads_a_reply_block_before_tool_calls_push_it_off() {
+        // https://github.com/rrnewton/agent-utils/issues/201 and
+        // https://github.com/rrnewton/agent-utils/issues/202: a turn printed a complete reply
+        // block and went on to make tool calls, whose rows pushed the block up and off the
+        // screen before the turn ended, and no output event reported the block, as when an older
+        // closing line keeps its pattern matched. While the agent works with a request open, the
+        // loop reads the pane every `SATURATED_POLL_INTERVAL`. Here the agent works throughout,
+        // Herdr sends no event, and no reconciliation is due within the hour, so only that read
+        // can see the block. The startup read shows the turn before the block; the next shows
+        // the block with 20 rows of tool calls below it, the next without the first row of its
+        // message, and every later read without the block.
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        *fixture.client.scroll.lock().expect("scroll") = Some(SCREEN_ONLY);
+        *fixture.client.status.lock().expect("status") = Some("working".to_owned());
+        let (_, state) = worker_bridge_state(&fixture, true);
+        let (key, prompt) = delivered_worker_request(&state);
+        assert!(
+            prompt.contains("Include the line <CHAT_REPLY_001> at the beginning"),
+            "{prompt}"
+        );
+        fixture.client.screens.lock().expect("screens").extend([
+            claude_turn_screen(false, 4),
+            claude_turn_screen(true, 20),
+            claude_turn_screen(true, 44),
+        ]);
+        *fixture.client.screen.lock().expect("screen") =
+            Some(claude_turn_screen(true, CLAUDE_CONVERSATION_ROWS));
+        let read_sources = &fixture.client.read_sources;
+        read_sources.lock().expect("read sources").clear();
+        let herdr = owner_loop_herdr(&fixture.root, "herdr", |_| Vec::new());
+        run_owner_loop_until(
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_secs(3_600),
+            Duration::from_secs(15),
+            || {
+                stored_replies(&state, &key) == 1
+                    && read_sources.lock().expect("read sources").len() >= 4
+            },
+        );
+        assert_eq!(stored_replies(&state, &key), 1);
+        let reads = read_sources.lock().expect("read sources").len();
+        assert!(reads >= 4, "{reads} reads");
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+    }
+
+    #[test]
+    fn once_herdr_reports_that_the_agent_works_the_owner_loop_reads_the_pane_while_it_does() {
+        // A turn can start without a prompt from the service, as when someone types into the
+        // pane, and its screen need not show the running-turn marker, so Herdr's report that the
+        // agent works may be the only sign of it. The loop subscribes to that report, so it reads
+        // the pane every `SATURATED_POLL_INTERVAL` during such a turn too. Here the agent is idle
+        // until the loop has subscribed and works from then on, and Herdr reports that it works
+        // every 200 ms; no reconciliation is due within the hour. No read shows the marker; the
+        // startup read shows no block, and every later read shows one.
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        *fixture.client.scroll.lock().expect("scroll") = Some(SCREEN_ONLY);
+        let (_, state) = worker_bridge_state(&fixture, true);
+        let (key, _) = delivered_worker_request(&state);
+        fixture
+            .client
+            .screens
+            .lock()
+            .expect("screens")
+            .push_back(claude_turn_screen(false, 4));
+        *fixture.client.screen.lock().expect("screen") = Some(claude_turn_screen(true, 4));
+        let herdr = owner_loop_herdr_every(
+            &fixture.root,
+            "herdr",
+            |pane| {
+                vec![json!({
+                    "event": "pane.agent_status_changed",
+                    "data": {"pane_id": pane, "agent_status": "working"},
+                })]
+            },
+            Some(Duration::from_millis(200)),
+        );
+        let subscriptions = &herdr.subscriptions;
+        run_owner_loop_until(
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_secs(3_600),
+            Duration::from_secs(15),
+            || {
+                if subscriptions.load(AtomicOrdering::SeqCst) > 0 {
+                    *fixture.client.status.lock().expect("status") = Some("working".to_owned());
+                }
+                stored_replies(&state, &key) == 1
+            },
+        );
+        assert_eq!(stored_replies(&state, &key), 1);
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+    }
+
+    #[test]
+    fn a_settle_the_agent_has_already_left_makes_the_owner_loop_read_the_pane_at_once() {
+        // Herdr reports that the agent settled, but by the time the loop asks, Herdr reports
+        // another status, as when a prompt typed before the event was read has started another
+        // turn. The turn that ended may have left a reply block on the screen, which the new
+        // turn's output can push off, so the loop reads the pane at once. Here Herdr reports the
+        // agent idle every 200 ms but `done` when asked, so the agent never counts as working,
+        // and no reconciliation is due within the hour: only the read for such an event can see
+        // the block. The startup read shows no block, and every later read shows one.
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        *fixture.client.scroll.lock().expect("scroll") = Some(SCREEN_ONLY);
+        *fixture.client.status.lock().expect("status") = Some("done".to_owned());
+        let (_, state) = worker_bridge_state(&fixture, true);
+        let (key, _) = delivered_worker_request(&state);
+        fixture
+            .client
+            .screens
+            .lock()
+            .expect("screens")
+            .push_back(claude_turn_screen(false, 4));
+        *fixture.client.screen.lock().expect("screen") = Some(claude_turn_screen(true, 4));
+        let herdr = owner_loop_herdr_every(
+            &fixture.root,
+            "herdr",
+            |pane| {
+                vec![json!({
+                    "event": "pane.agent_status_changed",
+                    "data": {"pane_id": pane, "agent_status": "idle"},
+                })]
+            },
+            Some(Duration::from_millis(200)),
+        );
+        run_owner_loop_until(
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_secs(3_600),
+            Duration::from_secs(15),
+            || stored_replies(&state, &key) == 1,
+        );
+        assert_eq!(stored_replies(&state, &key), 1);
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+    }
+
+    #[test]
+    fn the_owner_loop_reads_the_pane_before_it_types_the_prompt_of_a_new_request() {
+        // A typed prompt, and the turn it starts, push the rows above them up, and can push a
+        // reply block of the turn before off the screen before the loop reads the pane again,
+        // while Herdr has not yet reported that that turn ended
+        // (https://github.com/rrnewton/agent-utils/issues/202). So before the loop types the
+        // prompt of a request the chat provider reports, it reads the pane.
+        reads_the_pane_before_it_types_the_prompt_of_a_new_request(true);
+    }
+
+    #[test]
+    fn the_owner_loop_reads_the_pane_before_a_rescan_types_the_prompt_of_a_new_request() {
+        // When the chat provider finds the notice channel full, it tells the loop that notices
+        // were lost, and the loop rescans the requests, which types the prompt of a new one as a
+        // notice would. So the loop reads the pane before the rescan too.
+        reads_the_pane_before_it_types_the_prompt_of_a_new_request(false);
+    }
+
+    /// The owner loop stores a reply block that typing the prompt of a second request pushes off
+    /// the screen, as the loop reads the pane before it types that prompt. The second request
+    /// arrives once the loop has subscribed, after its startup, and the chat provider sends the
+    /// loop its key when `notified` is set, and otherwise only tells the loop that notices were
+    /// lost. The agent is idle, Herdr sends no event, and no reconciliation is due within the
+    /// hour. The startup read shows the first request's turn before its block, and later reads
+    /// show the block until the second request's prompt is typed, which pushes it off the screen.
+    fn reads_the_pane_before_it_types_the_prompt_of_a_new_request(notified: bool) {
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        *fixture.client.scroll.lock().expect("scroll") = Some(SCREEN_ONLY);
+        let (_, state) = worker_bridge_state(&fixture, true);
+        let (first, _) = delivered_worker_request(&state);
+        fixture
+            .client
+            .screens
+            .lock()
+            .expect("screens")
+            .push_back(claude_turn_screen(false, 4));
+        *fixture.client.screen.lock().expect("screen") = Some(claude_turn_screen(true, 4));
+        *fixture
+            .client
+            .screen_after_run
+            .lock()
+            .expect("screen after run") = Some(claude_turn_screen(true, CLAUDE_CONVERSATION_ROWS));
+        fixture.client.runs.lock().expect("runs").clear();
+        let herdr = owner_loop_herdr(&fixture.root, "herdr", |_| Vec::new());
+        let subscriptions = &herdr.subscriptions;
+        let mut second = None;
+        run_owner_loop_notified(
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_secs(3_600),
+            Duration::from_secs(15),
+            |notify, overflow| {
+                if second.is_none() && subscriptions.load(AtomicOrdering::SeqCst) > 0 {
+                    let key = admitted_worker_message(&state, 2, "two");
+                    if notified {
+                        notify(ProviderNotice::Batch(vec![key.clone()]));
+                    } else {
+                        overflow();
+                    }
+                    second = Some(key);
+                }
+                !fixture.client.runs.lock().expect("runs").is_empty()
+            },
+        );
+        let second = second.expect("the loop never subscribed");
+        let prompts = fixture.client.runs.lock().expect("runs").clone();
+        assert_eq!(prompts.len(), 1, "{prompts:#?}");
+        assert!(
+            prompts[0].contains("Include the line <CHAT_REPLY_002> at the beginning"),
+            "{}",
+            prompts[0]
+        );
+        assert_eq!(stored_replies(&state, &first), 1);
+        assert_eq!(stored_replies(&state, &second), 0);
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+    }
+
+    #[test]
+    fn the_owner_loop_reads_the_pane_while_its_screen_shows_a_running_turn() {
+        // Herdr can report a working Claude Code pane as idle
+        // (https://github.com/rrnewton/agent-utils/issues/179), so the loop also takes a running
+        // turn from the screens it reads. Here Herdr reports the agent idle throughout and sends
+        // no event, no reconciliation is due within the hour, and every read shows the
+        // running-turn marker. The startup read shows the turn before the block; the next shows
+        // the block with 20 rows of tool calls below it, the next without the first row of its
+        // message, and every later read without the block.
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        *fixture.client.scroll.lock().expect("scroll") = Some(SCREEN_ONLY);
+        let (_, state) = worker_bridge_state(&fixture, true);
+        let (key, _) = delivered_worker_request(&state);
+        fixture.client.screens.lock().expect("screens").extend([
+            claude_running_screen(false, 4),
+            claude_running_screen(true, 20),
+            claude_running_screen(true, 44),
+        ]);
+        *fixture.client.screen.lock().expect("screen") =
+            Some(claude_running_screen(true, CLAUDE_CONVERSATION_ROWS));
+        let read_sources = &fixture.client.read_sources;
+        read_sources.lock().expect("read sources").clear();
+        let herdr = owner_loop_herdr(&fixture.root, "herdr", |_| Vec::new());
+        run_owner_loop_until(
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_secs(3_600),
+            Duration::from_secs(15),
+            || {
+                stored_replies(&state, &key) == 1
+                    && read_sources.lock().expect("read sources").len() >= 4
+            },
+        );
+        assert_eq!(stored_replies(&state, &key), 1);
+        let reads = read_sources.lock().expect("read sources").len();
+        assert!(reads >= 4, "{reads} reads");
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+    }
+
+    #[test]
+    fn after_typing_a_prompt_the_owner_loop_reads_the_pane_though_herdr_reports_idle() {
+        // A typed prompt starts a turn that Herdr can report as idle
+        // (https://github.com/rrnewton/agent-utils/issues/179), and the screen need not show the
+        // running-turn marker yet. So once the loop has typed a prompt, it reads the pane every
+        // `SATURATED_POLL_INTERVAL` until a read shows no running turn. Here Herdr reports the
+        // agent idle throughout and sends no event, no reconciliation is due within the hour, and
+        // no read shows the marker. The loop types the prompt of the admitted request at startup;
+        // reads before that show no block, and every read after it shows one.
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        *fixture.client.scroll.lock().expect("scroll") = Some(SCREEN_ONLY);
+        let (_, state) = worker_bridge_state(&fixture, true);
+        let key = admitted_worker_request(&state);
+        *fixture.client.screen.lock().expect("screen") = Some(claude_turn_screen(false, 4));
+        *fixture
+            .client
+            .screen_after_run
+            .lock()
+            .expect("screen after run") = Some(claude_turn_screen(true, 4));
+        fixture.client.runs.lock().expect("runs").clear();
+        let herdr = owner_loop_herdr(&fixture.root, "herdr", |_| Vec::new());
+        run_owner_loop_until(
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_secs(3_600),
+            Duration::from_secs(15),
+            || stored_replies(&state, &key) == 1,
+        );
+        let prompts = fixture.client.runs.lock().expect("runs").clone();
+        assert_eq!(prompts.len(), 1, "{prompts:#?}");
+        assert!(
+            prompts[0].contains("Include the line <CHAT_REPLY_001> at the beginning"),
+            "{}",
+            prompts[0]
+        );
+        assert_eq!(stored_replies(&state, &key), 1);
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+    }
+
+    #[test]
+    fn the_owner_loop_keeps_reading_the_pane_while_the_paste_hint_hides_the_running_turn() {
+        // For a while after a paste, Claude Code draws a hint in place of the status row that
+        // shows a running turn, so a read of that screen cannot tell whether the agent works and
+        // leaves what the loop knew. Here Herdr reports the agent idle throughout and sends no
+        // event, and no reconciliation is due within the hour. The loop types the prompt of the
+        // admitted request at startup. Reads before that show no block and no marker; reads after
+        // it show the hint, without a block until one of them has been made, and with a block
+        // that answers the request from then on.
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        *fixture.client.scroll.lock().expect("scroll") = Some(SCREEN_ONLY);
+        let (_, state) = worker_bridge_state(&fixture, true);
+        let key = admitted_worker_request(&state);
+        *fixture.client.screen.lock().expect("screen") = Some(claude_turn_screen(false, 4));
+        *fixture
+            .client
+            .screen_after_run
+            .lock()
+            .expect("screen after run") = Some(claude_pasted_screen(false, 4));
+        fixture.client.runs.lock().expect("runs").clear();
+        let read_sources = &fixture.client.read_sources;
+        let herdr = owner_loop_herdr(&fixture.root, "herdr", |_| Vec::new());
+        // The number of reads when the prompt was first seen typed, and whether a later read has
+        // been made since.
+        let mut typed_at = None;
+        let mut hint_read = false;
+        run_owner_loop_until(
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_secs(3_600),
+            Duration::from_secs(15),
+            || {
+                let reads = read_sources.lock().expect("read sources").len();
+                if typed_at.is_none() && !fixture.client.runs.lock().expect("runs").is_empty() {
+                    typed_at = Some(reads);
+                }
+                if !hint_read && typed_at.is_some_and(|typed| reads > typed) {
+                    hint_read = true;
+                    *fixture.client.screen.lock().expect("screen") =
+                        Some(claude_pasted_screen(true, 4));
+                }
+                stored_replies(&state, &key) == 1
+            },
+        );
+        assert!(hint_read, "no read after the prompt was typed");
+        assert_eq!(fixture.client.runs.lock().expect("runs").len(), 1);
+        assert_eq!(stored_replies(&state, &key), 1);
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+    }
+
+    #[test]
+    fn a_pass_says_it_asked_for_a_prompt_to_be_typed_only_when_it_did() {
+        // The owner loop counts a pass that asked for a prompt to be typed as the start of a
+        // turn, so `CycleReport::prompt_typed` must not be set by a pass that typed nothing.
+        let pass = |state: &BridgeState, delivery: &RecordingDelivery, key: &str| {
+            let mut transport = None;
+            process_keys_with_delivery(
+                state,
+                delivery,
+                DrainOptions::default(),
+                &[key.to_owned()],
+                &mut PassControl {
+                    transport: &mut transport,
+                    stop: None,
+                },
+            )
+            .expect("pass")
+        };
+        let (state, key, root) = state_with_request();
+        let delivery = RecordingDelivery::default();
+        let first = pass(&state, &delivery, &key);
+        assert_eq!(first.delivered, std::slice::from_ref(&key));
+        assert!(first.prompt_typed);
+        // The request is delivered, so the next pass types nothing.
+        let second = pass(&state, &delivery, &key);
+        assert_eq!(second.delivered, std::slice::from_ref(&key));
+        assert!(!second.prompt_typed);
+        assert_eq!(delivery.prompts.lock().expect("prompts").len(), 1);
+        fs::remove_dir_all(root).expect("cleanup");
+
+        // The queue reports the request's prompt as possibly typed already, so the pass leaves
+        // the request uncertain and types nothing.
+        let (state, key, root) = state_with_request();
+        let message_id = state.inspect_request(&key).expect("inspect request")["delivery"]
+            ["message_id"]
+            .as_str()
+            .expect("queue message ID")
+            .to_owned();
+        let delivery = RecordingDelivery::default();
+        delivery
+            .states
+            .lock()
+            .expect("states")
+            .insert(message_id, QueueMessageState::Inflight);
+        let report = pass(&state, &delivery, &key);
+        assert_eq!(report.delivery_uncertain, std::slice::from_ref(&key));
+        assert!(!report.prompt_typed);
+        assert!(delivery.prompts.lock().expect("prompts").is_empty());
+        fs::remove_dir_all(root).expect("cleanup");
+
+        // The request's prompt waits in the queue's inbox, so the pass drains the queue, which
+        // types every prompt there, instead of submitting the prompt itself.
+        let (state, key, root) = state_with_request();
+        let message_id = state.inspect_request(&key).expect("inspect request")["delivery"]
+            ["message_id"]
+            .as_str()
+            .expect("queue message ID")
+            .to_owned();
+        let delivery = RecordingDelivery::default();
+        delivery
+            .states
+            .lock()
+            .expect("states")
+            .insert(message_id, QueueMessageState::Pending);
+        let report = pass(&state, &delivery, &key);
+        assert!(report.prompt_typed);
+        assert!(delivery.prompts.lock().expect("prompts").is_empty());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// How many times the owner loop reads the pane in the two `SATURATED_POLL_INTERVAL`s after
+    /// it subscribes to Herdr, for an agent that Herdr reports as `status` and whose every read
+    /// shows `screen`. Outbound replies are on when `outbound` is set, and one delivered request
+    /// is open when `request` is set. Herdr sends no event, and no reconciliation is due within
+    /// the hour.
+    fn owner_loop_polls(status: &str, screen: String, outbound: bool, request: bool) -> usize {
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        *fixture.client.scroll.lock().expect("scroll") = Some(SCREEN_ONLY);
+        *fixture.client.status.lock().expect("status") = Some(status.to_owned());
+        *fixture.client.screen.lock().expect("screen") = Some(screen);
+        let (_, state) = worker_bridge_state(&fixture, outbound);
+        if request {
+            delivered_worker_request(&state);
+        }
+        let read_sources = &fixture.client.read_sources;
+        let herdr = owner_loop_herdr(&fixture.root, "herdr", |_| Vec::new());
+        let subscriptions = &herdr.subscriptions;
+        let mut subscribed = None;
+        run_owner_loop_until(
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_secs(3_600),
+            Duration::from_secs(15),
+            || {
+                let reads = read_sources.lock().expect("read sources").len();
+                if subscribed.is_none() && subscriptions.load(AtomicOrdering::SeqCst) > 0 {
+                    subscribed = Some((Instant::now(), reads));
+                }
+                subscribed.is_some_and(|(at, _): (Instant, usize)| {
+                    at.elapsed() > SATURATED_POLL_INTERVAL * 2
+                })
+            },
+        );
+        let (_, at_subscription) = subscribed.expect("the loop never subscribed");
+        let reads = read_sources.lock().expect("read sources").len();
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+        reads - at_subscription
+    }
+
+    #[test]
+    fn the_owner_loop_does_not_poll_a_pane_that_neither_herdr_nor_the_screen_reports_working() {
+        // No read shows the running-turn marker. Only the last case, where Herdr reports the
+        // agent working, is read every `SATURATED_POLL_INTERVAL`.
+        let polls = thread::scope(|scope| {
+            ["idle", "done", "blocked", "unknown", "working"]
+                .map(|status| {
+                    scope.spawn(move || {
+                        owner_loop_polls(status, claude_turn_screen(false, 4), true, true)
+                    })
+                })
+                .map(|case| case.join().expect("case"))
+        });
+        assert_eq!(polls[..4], [0; 4], "{polls:?}");
+        assert!(polls[4] >= 1, "{polls:?}");
+    }
+
+    #[test]
+    fn the_owner_loop_does_not_poll_a_working_agent_while_no_request_has_a_current_reply_id() {
+        // Herdr and every read report a running turn. With outbound replies off, or no request
+        // open, no request has a current reply ID, so no reply can arrive for the poll to read;
+        // only the last case has one.
+        let polls = thread::scope(|scope| {
+            [(true, false), (false, true), (true, true)]
+                .map(|(outbound, request)| {
+                    scope.spawn(move || {
+                        owner_loop_polls(
+                            "working",
+                            claude_running_screen(false, 4),
+                            outbound,
+                            request,
+                        )
+                    })
+                })
+                .map(|case| case.join().expect("case"))
+        });
+        assert_eq!(polls[..2], [0; 2], "{polls:?}");
+        assert!(polls[2] >= 1, "{polls:?}");
+    }
+
+    /// How many times the owner loop reads the pane in the two `SATURATED_POLL_INTERVAL`s after
+    /// its first `first` reads, with outbound replies on and one delivered request open, for an
+    /// agent that Herdr reports as `status`. The startup read shows `startup`, when set, and every
+    /// other read shows `screen`. `herdr` makes the Herdr stand-in under the fixture's root, and
+    /// reconciliation is due every `reconciliation_interval`.
+    fn owner_loop_reads_after(
+        status: &str,
+        startup: Option<String>,
+        screen: String,
+        herdr: fn(&Path) -> OwnerLoopHerdr,
+        reconciliation_interval: Duration,
+        first: usize,
+    ) -> usize {
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        *fixture.client.scroll.lock().expect("scroll") = Some(SCREEN_ONLY);
+        *fixture.client.status.lock().expect("status") = Some(status.to_owned());
+        *fixture.client.screen.lock().expect("screen") = Some(screen);
+        let (_, state) = worker_bridge_state(&fixture, true);
+        delivered_worker_request(&state);
+        if let Some(startup) = startup {
+            fixture
+                .client
+                .screens
+                .lock()
+                .expect("screens")
+                .push_back(startup);
+        }
+        let read_sources = &fixture.client.read_sources;
+        read_sources.lock().expect("read sources").clear();
+        let herdr = herdr(&fixture.root);
+        let mut started = None;
+        run_owner_loop_until(
+            &fixture,
+            &state,
+            &herdr,
+            reconciliation_interval,
+            Duration::from_secs(15),
+            || {
+                let reads = read_sources.lock().expect("read sources").len();
+                if started.is_none() && reads >= first {
+                    started = Some((Instant::now(), reads));
+                }
+                started.is_some_and(|(at, _): (Instant, usize)| {
+                    at.elapsed() > SATURATED_POLL_INTERVAL * 2
+                })
+            },
+        );
+        let (_, at_start) = started.expect("the loop never made its first reads");
+        let reads = read_sources.lock().expect("read sources").len();
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+        reads - at_start
+    }
+
+    #[test]
+    fn while_no_subscription_works_the_owner_loop_takes_herdrs_status_from_reconciliation() {
+        // While the loop cannot subscribe to the pane's events, it makes no wait for them and so
+        // no status lookup after one, and each reconciliation, which looks the status up too, is
+        // its only source of Herdr's report that the agent works. Here no subscription connects,
+        // reconciliation is due every 200 ms, and no read shows the running-turn marker. Herdr
+        // reports a status that does not settle the agent, so no reconciliation reads the pane,
+        // and only the last case, where Herdr reports the agent working, is read every
+        // `SATURATED_POLL_INTERVAL` after the startup read.
+        let polls = thread::scope(|scope| {
+            ["blocked", "unknown", "working"]
+                .map(|status| {
+                    scope.spawn(move || {
+                        owner_loop_reads_after(
+                            status,
+                            None,
+                            claude_turn_screen(false, 4),
+                            |root| unreachable_owner_loop_herdr(root, "herdr"),
+                            Duration::from_millis(200),
+                            1,
+                        )
+                    })
+                })
+                .map(|case| case.join().expect("case"))
+        });
+        assert_eq!(polls[..2], [0; 2], "{polls:?}");
+        assert!(polls[2] >= 1, "{polls:?}");
+    }
+
+    /// An output event on `pane` for a closing line under a reply ID that no request has, whose
+    /// read of the pane's recent rows shows that line above `screen`.
+    fn unknown_reply_event(pane: &str, screen: String) -> Vec<Value> {
+        let line = "</CHAT_REPLY_unknownnonce00_1>";
+        vec![json!({
+            "event": "pane.output_matched",
+            "data": {
+                "pane_id": pane,
+                "matched_line": line,
+                "read": {
+                    "pane_id": pane,
+                    "workspace_id": "workspace",
+                    "tab_id": "tab",
+                    "source": "recent_unwrapped",
+                    "format": "text",
+                    "text": format!("{line}\n{screen}"),
+                    "revision": 1,
+                    "truncated": false,
+                },
+            },
+        })]
+    }
+
+    #[test]
+    fn the_owner_loop_takes_a_running_turn_from_the_rows_an_output_event_carries() {
+        // An output event carries the pane's recent rows as Herdr read them when the pattern
+        // matched, and the loop takes a running turn from them as from the screens it reads
+        // itself, but not the end of one: Herdr may have read them before a prompt the loop has
+        // since typed. Here Herdr reports the agent idle throughout
+        // (https://github.com/rrnewton/agent-utils/issues/179), no reconciliation is due within
+        // the hour, and Herdr sends one event, for a reply ID no request has, so the loop reads
+        // the pane after it. By then a paste, as from another sender, has put Claude Code's paste
+        // hint in place of the status row, so that read cannot tell whether the agent works. In
+        // the first two cases the startup read cannot tell either, and the event's rows show the
+        // running-turn marker in the first and not in the second; in the third, the startup read
+        // shows the marker and the event's rows do not. The first and third are read every
+        // `SATURATED_POLL_INTERVAL` after the read for the event, and the second is not.
+        let polls = thread::scope(|scope| {
+            let running = scope.spawn(|| {
+                owner_loop_reads_after(
+                    "idle",
+                    None,
+                    claude_pasted_screen(false, 4),
+                    |root| {
+                        owner_loop_herdr(root, "herdr", |pane| {
+                            unknown_reply_event(pane, claude_running_screen(false, 4))
+                        })
+                    },
+                    Duration::from_secs(3_600),
+                    2,
+                )
+            });
+            let finished = scope.spawn(|| {
+                owner_loop_reads_after(
+                    "idle",
+                    None,
+                    claude_pasted_screen(false, 4),
+                    |root| {
+                        owner_loop_herdr(root, "herdr", |pane| {
+                            unknown_reply_event(pane, claude_turn_screen(false, 4))
+                        })
+                    },
+                    Duration::from_secs(3_600),
+                    2,
+                )
+            });
+            let running_before = scope.spawn(|| {
+                owner_loop_reads_after(
+                    "idle",
+                    Some(claude_running_screen(false, 4)),
+                    claude_pasted_screen(false, 4),
+                    |root| {
+                        owner_loop_herdr(root, "herdr", |pane| {
+                            unknown_reply_event(pane, claude_turn_screen(false, 4))
+                        })
+                    },
+                    Duration::from_secs(3_600),
+                    2,
+                )
+            });
+            [running, finished, running_before].map(|case| case.join().expect("case"))
+        });
+        assert!(polls[0] >= 1, "{polls:?}");
+        assert_eq!(polls[1], 0, "{polls:?}");
+        assert!(polls[2] >= 1, "{polls:?}");
+    }
+
+    #[test]
+    fn while_a_failed_read_waits_for_its_retry_settles_and_request_keys_do_not_read_the_pane() {
+        // The loop reads the pane at once after a settle the agent has already left and before
+        // each pass that handles queued request keys, but not while a failed read waits for the
+        // retry the saturated poll makes after `SATURATED_POLL_INTERVAL`, so a pane whose reads
+        // fail is not tried again at every event. Here Herdr reports the agent working when
+        // asked, so the loop polls, and sends a settle to idle every 200 ms, and no
+        // reconciliation is due within the hour. Once the loop has read the pane twice, every
+        // read fails, and the chat provider reports the key of the open request every 100 ms,
+        // which the loop finds already delivered without touching the pane. The fake records each
+        // read before it fails, and in the next five seconds the loop tries the pane at most
+        // three times.
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        *fixture.client.scroll.lock().expect("scroll") = Some(SCREEN_ONLY);
+        *fixture.client.status.lock().expect("status") = Some("working".to_owned());
+        *fixture.client.screen.lock().expect("screen") = Some(claude_turn_screen(false, 4));
+        let (_, state) = worker_bridge_state(&fixture, true);
+        let (key, _) = delivered_worker_request(&state);
+        let read_sources = &fixture.client.read_sources;
+        read_sources.lock().expect("read sources").clear();
+        let herdr = owner_loop_herdr_every(
+            &fixture.root,
+            "herdr",
+            |pane| {
+                vec![json!({
+                    "event": "pane.agent_status_changed",
+                    "data": {"pane_id": pane, "agent_status": "idle"},
+                })]
+            },
+            Some(Duration::from_millis(200)),
+        );
+        let reads = || read_sources.lock().expect("read sources").len();
+        let mut failing: Option<(Instant, usize)> = None;
+        let mut notified_at = Instant::now();
+        let mut tried = None;
+        run_owner_loop_notified(
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_secs(3_600),
+            Duration::from_secs(30),
+            |notify, _| {
+                let Some((at, before)) = failing else {
+                    if reads() >= 2 {
+                        fixture.client.fail_read.store(true, AtomicOrdering::SeqCst);
+                        failing = Some((Instant::now(), reads()));
+                    }
+                    return false;
+                };
+                if at.elapsed() > Duration::from_secs(5) {
+                    tried = Some(reads() - before);
+                    return true;
+                }
+                if notified_at.elapsed() >= Duration::from_millis(100) {
+                    notify(ProviderNotice::Batch(vec![key.clone()]));
+                    notified_at = Instant::now();
+                }
+                false
+            },
+        );
+        let tried = tried.expect("the loop never read the pane twice");
+        assert!((1..=3).contains(&tried), "{tried} tries in five seconds");
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+    }
+
+    #[test]
+    fn a_failed_status_lookup_after_a_wait_that_returned_no_event_leaves_the_owner_loop_running() {
+        // While the agent works, the loop's wait for pane events ends every
+        // `SATURATED_POLL_INTERVAL` for its next read, and the loop looks Herdr's status up after
+        // each such wait, so a Herdr call that fails there must not stop the service. Here Herdr
+        // reports the agent working and sends no event, and no reconciliation is due within the
+        // hour. Once the loop has read the pane twice, every Herdr query, and so every lookup and
+        // read, fails for five seconds, which spans at least two such waits. The loop keeps
+        // querying Herdr, and once Herdr answers again it reads the pane again; the harness fails
+        // the test if the loop stops with an error before it is told to stop.
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        *fixture.client.scroll.lock().expect("scroll") = Some(SCREEN_ONLY);
+        *fixture.client.status.lock().expect("status") = Some("working".to_owned());
+        *fixture.client.screen.lock().expect("screen") = Some(claude_turn_screen(false, 4));
+        let (_, state) = worker_bridge_state(&fixture, true);
+        delivered_worker_request(&state);
+        let read_sources = &fixture.client.read_sources;
+        read_sources.lock().expect("read sources").clear();
+        let herdr = owner_loop_herdr(&fixture.root, "herdr", |_| Vec::new());
+        let reads = || read_sources.lock().expect("read sources").len();
+        let queries = || {
+            fixture.client.panes_calls.load(AtomicOrdering::SeqCst)
+                + fixture.client.pane_info_calls.load(AtomicOrdering::SeqCst)
+        };
+        let mut failing: Option<(Instant, u64)> = None;
+        let mut answering: Option<(u64, usize)> = None;
+        run_owner_loop_until(
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_secs(3_600),
+            Duration::from_secs(30),
+            || {
+                if failing.is_none() && reads() >= 2 {
+                    fixture
+                        .client
+                        .fail_panes
+                        .store(true, AtomicOrdering::SeqCst);
+                    failing = Some((Instant::now(), queries()));
+                }
+                match (failing, answering) {
+                    (Some((at, queried)), None) if at.elapsed() > Duration::from_secs(5) => {
+                        answering = Some((queries() - queried, reads()));
+                        fixture
+                            .client
+                            .fail_panes
+                            .store(false, AtomicOrdering::SeqCst);
+                    }
+                    _ => {}
+                }
+                answering.is_some_and(|(_, before)| reads() > before)
+            },
+        );
+        let (failed_queries, before) = answering.expect("the loop never read the pane twice");
+        assert!(failed_queries >= 2, "{failed_queries} failed Herdr queries");
+        assert!(reads() > before, "no read after Herdr answered again");
         drop(herdr.release);
         herdr.server.join().expect("herdr stand-in");
     }

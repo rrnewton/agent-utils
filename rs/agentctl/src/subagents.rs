@@ -6018,6 +6018,8 @@ pub(crate) mod tests {
                     screens: Mutex::new(std::collections::VecDeque::new()),
                     screen: Mutex::new(None),
                     unwrapped_empty: AtomicBool::new(false),
+                    status: Mutex::new(None),
+                    screen_after_run: Mutex::new(None),
                 },
                 root,
             }
@@ -6117,8 +6119,10 @@ pub(crate) mod tests {
         panes: Mutex<Vec<Pane>>,
         named_pane: Mutex<String>,
         moves: Mutex<Vec<(String, String, String)>>,
-        panes_calls: AtomicU64,
-        pane_info_calls: AtomicU64,
+        /// How many times `panes` was called.
+        pub(crate) panes_calls: AtomicU64,
+        /// How many times `pane_info` was called.
+        pub(crate) pane_info_calls: AtomicU64,
         /// Every text written to a pane with `run`, such as a prompt, in order, and a line for
         /// each agent state reported to herdr.
         pub(crate) runs: Mutex<Vec<String>>,
@@ -6126,7 +6130,8 @@ pub(crate) mod tests {
         environments: Mutex<Vec<Vec<String>>>,
         closed: Mutex<Vec<String>>,
         focused: Mutex<Vec<String>>,
-        fail_panes: AtomicBool,
+        /// Whether every `panes` and `pane_info` call fails.
+        pub(crate) fail_panes: AtomicBool,
         add_sibling_on_read: AtomicBool,
         require_start_lock: AtomicBool,
         started: AtomicBool,
@@ -6171,6 +6176,11 @@ pub(crate) mod tests {
         /// Whether a `recent-unwrapped` read returns no text, as herdr's does for a pane it
         /// cannot serve that source for.
         pub(crate) unwrapped_empty: AtomicBool,
+        /// The agent status `pane_info` reports, when set; `idle` otherwise.
+        pub(crate) status: Mutex<Option<String>>,
+        /// The text `screen` becomes once the next text is written with `run`, when set, as a
+        /// typed prompt and the turn it starts push the rows above them up.
+        pub(crate) screen_after_run: Mutex<Option<String>>,
     }
     impl Fake {
         fn pane(id: &str) -> Pane {
@@ -6280,7 +6290,12 @@ pub(crate) mod tests {
                     .started
                     .load(Ordering::Relaxed)
                     .then(|| kind.to_owned()),
-                status: "idle".to_owned(),
+                status: self
+                    .status
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "idle".to_owned()),
                 session_agent: report_session.then(|| kind.to_owned()),
                 session_value: report_session.then(|| {
                     if changed_after_save {
@@ -6307,6 +6322,9 @@ pub(crate) mod tests {
         }
         fn run(&self, _: &str, text: &str) -> AdapterResult<()> {
             self.runs.lock().unwrap().push(text.to_owned());
+            if let Some(screen) = self.screen_after_run.lock().unwrap().take() {
+                *self.screen.lock().unwrap() = Some(screen);
+            }
             Ok(())
         }
         fn wait_agent_status(&self, _: &str, _: &str, _: u64) -> AdapterResult<()> {

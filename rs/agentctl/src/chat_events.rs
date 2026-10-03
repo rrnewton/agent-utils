@@ -60,6 +60,9 @@ pub(crate) enum PaneEvent {
     Settled {
         status: String,
     },
+    /// Herdr reported that the agent started work, as at the start of a turn the service did not
+    /// prompt.
+    Working,
 }
 
 /// A cloneable, descriptor-backed interrupt for one blocking pane-event wait.
@@ -173,7 +176,7 @@ impl PaneEventStream {
                 })
             })
             .collect::<Vec<_>>();
-        subscriptions.extend(["idle", "done"].into_iter().map(|status| {
+        subscriptions.extend(["idle", "done", "working"].into_iter().map(|status| {
             json!({
                 "type": "pane.agent_status_changed",
                 "pane_id": pane_id,
@@ -406,16 +409,16 @@ impl PaneEventStream {
                         "status event belongs to a different pane",
                     ));
                 }
-                let status = string_value(data, "agent_status", "status event")?;
-                if !matches!(status, "idle" | "done") {
-                    return Err(ChatEventError::new(
+                match string_value(data, "agent_status", "status event")? {
+                    status @ ("idle" | "done") => Ok(Some(PaneEvent::Settled {
+                        status: status.to_owned(),
+                    })),
+                    "working" => Ok(Some(PaneEvent::Working)),
+                    _ => Err(ChatEventError::new(
                         "invalid_frame",
-                        "status event is not idle or done",
-                    ));
+                        "status event is not idle, done, or working",
+                    )),
                 }
-                Ok(Some(PaneEvent::Settled {
-                    status: status.to_owned(),
-                }))
             }
             Some("pane.output_matched") if !self.patterns.is_empty() => {
                 let data = object_value(
@@ -854,10 +857,11 @@ mod tests {
             let subscriptions = request["params"]["subscriptions"]
                 .as_array()
                 .expect("subscription array");
-            assert_eq!(subscriptions.len(), 4);
+            assert_eq!(subscriptions.len(), 5);
             assert_eq!(subscriptions[0]["type"], "pane.output_matched");
             assert_eq!(subscriptions[2]["agent_status"], "idle");
             assert_eq!(subscriptions[3]["agent_status"], "done");
+            assert_eq!(subscriptions[4]["agent_status"], "working");
             let mut frames = wire(json!({
                 "id": request["id"],
                 "result": {"type": "subscription_started"},
@@ -866,6 +870,10 @@ mod tests {
             frames.extend(wire(json!({
                 "event": "pane.agent_status_changed",
                 "data": {"pane_id": "w1:p2", "agent_status": "idle"},
+            })));
+            frames.extend(wire(json!({
+                "event": "pane.agent_status_changed",
+                "data": {"pane_id": "w1:p2", "agent_status": "working"},
             })));
             frames
         });
@@ -890,6 +898,7 @@ mod tests {
                 PaneEvent::Settled {
                     status: "idle".to_owned(),
                 },
+                PaneEvent::Working,
             ]
         );
         server.join().expect("join event fixture");
@@ -924,6 +933,45 @@ mod tests {
         assert_eq!(error.code, "invalid_frame");
         server.join().expect("join event fixture");
         fs::remove_dir_all(directory).expect("remove event fixture");
+    }
+
+    #[test]
+    fn refuses_a_status_event_for_a_status_it_did_not_subscribe_to() {
+        // The stream subscribes to `idle`, `done`, and `working` only, so a status event for
+        // another status, such as Herdr's `blocked` or `unknown`, is a malformed frame.
+        for status in ["blocked", "unknown"] {
+            let (socket, directory) = temporary_socket();
+            let listener = UnixListener::bind(&socket).expect("bind event fixture");
+            let server = serve(listener, move |request| {
+                let mut frames = wire(json!({
+                    "id": request["id"],
+                    "result": {"type": "subscription_started"},
+                }));
+                frames.extend(wire(json!({
+                    "event": "pane.agent_status_changed",
+                    "data": {"pane_id": "w1:p2", "agent_status": status},
+                })));
+                frames
+            });
+            let mut stream = PaneEventStream::connect(
+                &socket,
+                "w1:p2",
+                Vec::new(),
+                4_000,
+                Duration::from_secs(2),
+            )
+            .expect("connect event stream");
+            let error = stream
+                .wait(Duration::from_secs(1))
+                .expect_err("a status it did not subscribe to must fail");
+            assert_eq!(error.code, "invalid_frame", "{status}");
+            assert_eq!(
+                error.detail, "status event is not idle, done, or working",
+                "{status}"
+            );
+            server.join().expect("join event fixture");
+            fs::remove_dir_all(directory).expect("remove event fixture");
+        }
     }
 
     #[test]
