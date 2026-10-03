@@ -5979,6 +5979,7 @@ pub(crate) mod tests {
                     closed: Mutex::new(Vec::new()),
                     focused: Mutex::new(Vec::new()),
                     fail_panes: AtomicBool::new(false),
+                    fail_pane_info_once: Arc::new(AtomicBool::new(false)),
                     add_sibling_on_read: AtomicBool::new(false),
                     require_start_lock: AtomicBool::new(false),
                     started: AtomicBool::new(false),
@@ -6132,6 +6133,9 @@ pub(crate) mod tests {
         focused: Mutex<Vec<String>>,
         /// Whether every `panes` and `pane_info` call fails.
         pub(crate) fail_panes: AtomicBool,
+        /// Whether the next `pane_info` call fails, which clears it. An `Arc`, so a stand-in for
+        /// Herdr's server can set it from its own thread.
+        pub(crate) fail_pane_info_once: Arc<AtomicBool>,
         add_sibling_on_read: AtomicBool,
         require_start_lock: AtomicBool,
         started: AtomicBool,
@@ -6225,7 +6229,8 @@ pub(crate) mod tests {
         }
         fn pane_info(&self, pane: &str) -> AdapterResult<AgentPaneInfo> {
             self.pane_info_calls.fetch_add(1, Ordering::Relaxed);
-            if self.fail_panes.load(Ordering::Relaxed) {
+            let fail_once = self.fail_pane_info_once.swap(false, Ordering::SeqCst);
+            if self.fail_panes.load(Ordering::Relaxed) || fail_once {
                 return Err(AdapterError::unavailable(
                     "pane query failed after allocation",
                 ));

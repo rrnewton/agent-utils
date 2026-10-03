@@ -2616,7 +2616,10 @@ fn install_output_stream(
     // The notice/signal producer may have observed the empty slot immediately before this
     // publication. Pre-arm the new stream while publication remains serialized: the socket byte
     // is sticky, so the first wait returns and the owner loop rechecks every queued source. The
-    // loop also learns Herdr's status from the lookup after that wait.
+    // loop also looks Herdr's status up after that wait. If that lookup fails, the loop tries it
+    // again after a wait that ends within `SATURATED_POLL_INTERVAL`, or, if this subscription is
+    // dropped before then, because that wait fails or the reply patterns change, after the first
+    // wait on the next one.
     published
         .as_ref()
         .expect("the output wake was just installed")
@@ -2755,8 +2758,10 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     notes.log(&initial_report);
     // The loop looks Herdr's status up after each wait for a pane event, and the first wait on a
     // new subscription returns at once, as `install_output_stream` arms it, so the loop learns the
-    // status as soon as its first pass subscribes. While no subscription works, the status comes
-    // from each reconciliation.
+    // status as soon as its first pass subscribes, or, if that lookup fails, from the first of
+    // its retries that succeeds, each made within `SATURATED_POLL_INTERVAL` of a failure for as
+    // long as the subscription lasts. While no subscription works, the status comes from each
+    // reconciliation.
     let mut turn = TurnEvidence::default();
     turn.read(&initial);
     turn.report(&initial_report);
@@ -2770,6 +2775,8 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     // Consecutive failed lookups of Herdr's status after a wait that ended with no event, which
     // logs the first and the recovery.
     let mut lookup_failures = 0_u64;
+    // When the next wait ends to try a failed lookup again, while one has failed.
+    let mut lookup_retry_at: Option<Instant> = None;
 
     let mut stream: Option<PaneEventStream> = None;
     let mut subscribed_patterns = Vec::new();
@@ -2781,11 +2788,11 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
         let recover = direct_keys.is_empty() && overflowed.swap(false, Ordering::SeqCst);
         if (recover || !direct_keys.is_empty()) && poll_failures == 0 {
             // A rescan may type a prompt, and so may a pass that handles queued request keys,
-            // whether the chat provider reported them or a capture deferred them. The prompt's
-            // echo and the turn it starts can push a reply block of the turn before off the
-            // screen before the pane is read again, and Herdr may not yet have reported that the
-            // turn ended, so each such pass reads the pane first, unless a failed read is waiting
-            // for its retry.
+            // whether the chat provider reported them or an earlier pass left them for later. The
+            // prompt's echo and the turn it starts can push a reply block of the turn before off
+            // the screen before the pane is read again, and Herdr may not yet have reported that
+            // the turn ended, so each such pass reads the pane first, unless a failed read is
+            // waiting for its retry.
             poll_at = Some(Instant::now());
         }
         if poll_at.is_some_and(|at| Instant::now() >= at) {
@@ -2952,8 +2959,10 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
         if let Some(active) = stream.as_mut() {
             let subscribed_pane = active.pane_id().to_owned();
             let timeout = if direct_keys.is_empty() {
-                poll_at
-                    .map_or(next_reconciliation, |at| at.min(next_reconciliation))
+                [poll_at, lookup_retry_at]
+                    .into_iter()
+                    .flatten()
+                    .fold(next_reconciliation, Instant::min)
                     .saturating_duration_since(Instant::now())
             } else {
                 Duration::ZERO
@@ -2964,6 +2973,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                         .pane_info_with_runtime(&state.config().agent_name, &owner_runtime)
                     {
                         Ok(info) => {
+                            lookup_retry_at = None;
                             if lookup_failures > 0 {
                                 service_log(format_args!(
                                     "agentctl: the status lookup of the coordinator's pane works again after {lookup_failures} failed lookups"
@@ -2974,18 +2984,29 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                         }
                         // A wait that returned no event ended at a timer, as for the read due
                         // every `SATURATED_POLL_INTERVAL` while the agent works, or at a wake, as
-                        // for a notice from the chat provider. No event depends on this lookup,
-                        // so a failed one is logged and tried again after the next wait, as a
-                        // failed read of the saturated poll is tried again at the next interval.
-                        // A failed lookup after an event, or at a reconciliation, still stops the
-                        // service.
+                        // for a notice from the chat provider or the first wait on a new
+                        // subscription. No event depends on this lookup, so a failed one does
+                        // not stop the service. The loop sets a retry time that ends its next
+                        // wait within `SATURATED_POLL_INTERVAL`, as a failed read of the saturated
+                        // poll is tried again after that interval, and the lookup after that wait
+                        // is the retry; if the subscription is dropped before then, because that
+                        // wait fails or the reply patterns change, the lookup after the first wait
+                        // on the next one is. Until a lookup after a wait succeeds, the loop goes
+                        // by the status it last learned; it logs the first failure and that
+                        // success. The retry matters most after the first wait on a subscription:
+                        // Herdr raises no event for a status that has not changed, so that wait's
+                        // lookup is the only one sure to follow the subscription promptly and show
+                        // an agent already working when the loop subscribed. A failed lookup after
+                        // an event, or at a reconciliation, still stops the service.
                         Err(error) if events.is_empty() && !stop.is_stopped() => {
                             if lookup_failures == 0 {
                                 service_log(format_args!(
-                                    "agentctl: the status lookup of the coordinator's pane failed; trying again after the next wait: {error}"
+                                    "agentctl: the status lookup of the coordinator's pane failed; trying again within {}s: {error}",
+                                    SATURATED_POLL_INTERVAL.as_secs()
                                 ));
                             }
                             lookup_failures = lookup_failures.saturating_add(1);
+                            lookup_retry_at = Some(Instant::now() + SATURATED_POLL_INTERVAL);
                             continue;
                         }
                         Err(error) => return Err(error.into()),
@@ -7004,6 +7025,19 @@ esac
         events: fn(&str) -> Vec<Value>,
         every: Option<Duration>,
     ) -> OwnerLoopHerdr {
+        owner_loop_herdr_arming(root, name, events, every, None)
+    }
+
+    /// `owner_loop_herdr_every`, which also sets `arm`, when given, just before it acknowledges
+    /// each subscription. Given the test double's `fail_pane_info_once`, it makes the owner loop's
+    /// next `pane_info` call after it subscribes fail.
+    fn owner_loop_herdr_arming(
+        root: &Path,
+        name: &str,
+        events: fn(&str) -> Vec<Value>,
+        every: Option<Duration>,
+        arm: Option<Arc<AtomicBool>>,
+    ) -> OwnerLoopHerdr {
         let (socket, client) = herdr_stand_in(root, name);
         let listener = UnixListener::bind(&socket).expect("bind herdr events");
         listener
@@ -7050,6 +7084,9 @@ esac
                     .as_str()
                     .expect("subscribed pane")
                     .to_owned();
+                if let Some(arm) = &arm {
+                    arm.store(true, AtomicOrdering::SeqCst);
+                }
                 writeln!(
                     connection,
                     "{}",
@@ -8415,7 +8452,11 @@ esac
         // hour. Once the loop has read the pane twice, every Herdr query, and so every lookup and
         // read, fails for five seconds, which spans at least two such waits. The loop keeps
         // querying Herdr, and once Herdr answers again it reads the pane again; the harness fails
-        // the test if the loop stops with an error before it is told to stop.
+        // the test if the loop stops with an error before it is told to stop. Each failure moves
+        // the retry time of its kind, the lookup's or the read's, `SATURATED_POLL_INTERVAL` ahead.
+        // So the waits end only a few times in those five seconds, the loop looks the status up
+        // after each, and it queries Herdr fewer than 20 times; a retry time that a later failure
+        // did not move would make every wait after it end at once.
         let fixture = crate::subagents::tests::Fixture::new();
         fixture.start(None);
         *fixture.client.scroll.lock().expect("scroll") = Some(SCREEN_ONLY);
@@ -8462,7 +8503,93 @@ esac
         );
         let (failed_queries, before) = answering.expect("the loop never read the pane twice");
         assert!(failed_queries >= 2, "{failed_queries} failed Herdr queries");
+        assert!(failed_queries < 20, "{failed_queries} failed Herdr queries");
         assert!(reads() > before, "no read after Herdr answered again");
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+    }
+
+    #[test]
+    fn a_failed_status_lookup_right_after_subscribing_is_tried_again_within_the_poll_interval() {
+        // Herdr raises a `working` event only when the status changes, so the lookup after the
+        // first wait on a new subscription is the only lookup sure to follow the subscription
+        // promptly and tell the loop that an agent already working then is working. Here Herdr
+        // reports the agent working and sends no event, and the next `pane_info` call after it
+        // acknowledges the subscription, which that lookup makes, fails. No screen shows a
+        // running turn, the loop types no prompt, and no reconciliation is due within the hour,
+        // so only a retry of the lookup can start the reads. The loop tries the lookup again
+        // `SATURATED_POLL_INTERVAL` later and reads the pane one interval after that: not before
+        // three seconds from the subscription, which a lookup that did not fail would allow, and
+        // within ten. A loop that kept the retry time after a lookup succeeded would wait no time
+        // at all and query Herdr without pause, so Herdr is also queried fewer than 20 times in
+        // the three seconds after that read.
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        *fixture.client.scroll.lock().expect("scroll") = Some(SCREEN_ONLY);
+        *fixture.client.status.lock().expect("status") = Some("working".to_owned());
+        *fixture.client.screen.lock().expect("screen") = Some(claude_turn_screen(false, 4));
+        let (_, state) = worker_bridge_state(&fixture, true);
+        delivered_worker_request(&state);
+        let read_sources = &fixture.client.read_sources;
+        let herdr = owner_loop_herdr_arming(
+            &fixture.root,
+            "herdr",
+            |_| Vec::new(),
+            None,
+            Some(Arc::clone(&fixture.client.fail_pane_info_once)),
+        );
+        let reads = || read_sources.lock().expect("read sources").len();
+        let queries = || {
+            fixture.client.panes_calls.load(AtomicOrdering::SeqCst)
+                + fixture.client.pane_info_calls.load(AtomicOrdering::SeqCst)
+        };
+        let mut subscribed: Option<(Instant, usize)> = None;
+        let mut first_read: Option<(Duration, Instant, u64)> = None;
+        let mut queried = None;
+        run_owner_loop_until(
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_secs(3_600),
+            Duration::from_secs(30),
+            || {
+                if subscribed.is_none() && herdr.subscriptions.load(AtomicOrdering::SeqCst) > 0 {
+                    subscribed = Some((Instant::now(), reads()));
+                }
+                let Some((at, before)) = subscribed else {
+                    return false;
+                };
+                if first_read.is_none() && reads() > before {
+                    first_read = Some((at.elapsed(), Instant::now(), queries()));
+                }
+                match first_read {
+                    Some((_, read_at, before)) if read_at.elapsed() >= Duration::from_secs(3) => {
+                        queried = Some(queries() - before);
+                        true
+                    }
+                    _ => false,
+                }
+            },
+        );
+        assert_eq!(herdr.subscriptions.load(AtomicOrdering::SeqCst), 1);
+        assert!(
+            !fixture
+                .client
+                .fail_pane_info_once
+                .load(AtomicOrdering::SeqCst),
+            "the failure armed at the subscription was never used"
+        );
+        let (after, _, _) = first_read.expect("the loop never read the pane after subscribing");
+        assert!(
+            after >= Duration::from_secs(3),
+            "read {after:?} after subscribing"
+        );
+        assert!(
+            after <= Duration::from_secs(10),
+            "read {after:?} after subscribing"
+        );
+        let queried = queried.expect("the loop stopped within three seconds of its read");
+        assert!(queried < 20, "{queried} Herdr queries in three seconds");
         drop(herdr.release);
         herdr.server.join().expect("herdr stand-in");
     }

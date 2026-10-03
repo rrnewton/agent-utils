@@ -788,6 +788,11 @@ PINS: tuple[Pin, ...] = (
                 "the retry interval of a failed poll the chat guide states",
             ),
             Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"ends\s+its\s+next\s+wait\s+within\s+(?P<value>[A-Za-z\d,]+)\s+seconds?\b",
+                "the retry interval of a failed status lookup the chat guide states",
+            ),
+            Site(
                 "rs/agentctl/src/embedded_chat_quickstart.md",
                 r"`run`\s+reads\s+the\s+pane\s+every\s+(?P<value>[A-Za-z\d,]+)\s+seconds?\b",
                 "the poll interval the chat quickstart states",

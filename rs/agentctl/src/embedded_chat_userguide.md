@@ -634,12 +634,23 @@ enough, because herdr's status rules can report a Claude Code pane that is
 running a turn as idle. The service looks herdr's status up at each
 reconciliation and after each wait for an output event. Such a wait ends when
 herdr reports a matched line or a change of the agent's status to `working`,
-`idle`, or `done`, when a read or a reconciliation is due, or when a provider
-notice or a signal arrives. While no output subscription works, only
-reconciliation looks the status up. No event depends on a lookup after a wait
-that ended with no event, so if that lookup fails, the service logs it once,
-tries again after the next wait, and logs the first success after that; a
-failed lookup after an event, or at a reconciliation, stops `run`.
+`idle`, or `done`, when a read, a reconciliation, or the retry of a failed
+lookup is due, or when a provider notice or a signal arrives. While no output
+subscription works, the herdr status by which the service counts the agent as
+working comes only from the lookup at each reconciliation; the lookups that it
+makes to subscribe, to read the pane, or to type a prompt do not change that
+status. No event depends on a lookup after a wait that ended with no event, so
+if that lookup fails, the service ends its next wait within 2 seconds to try
+the lookup again, and does the same after each further failure, until a lookup
+after a wait succeeds. If the subscription ends first, because that wait fails
+or the reply routes change, the lookup after the first wait on the next
+subscription is the retry. Until a lookup after a wait succeeds, the service
+counts the agent as working by herdr's status only if the last lookup that
+succeeded, at a reconciliation or after a wait, reported `working`. The service
+logs the first failure and that success. A failed lookup after an event, or at
+a reconciliation, stops `run`. The first wait on a new output subscription ends
+at once, so that its lookup shows an agent that was already working when the
+service subscribed, which herdr raises no event for.
 
 A screen shows a running turn when one of its bottom 16 rows, counted up from
 the last row with text, holds `esc to interrupt`, as Claude Code's status row
