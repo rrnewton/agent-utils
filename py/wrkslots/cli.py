@@ -25527,6 +25527,8 @@ def _upgrade_legacy_finish_seal_identity(
     config: Config,
     raw: Mapping[str, object],
     record: ActiveRecord,
+    *,
+    journal_path: Path,
 ) -> Mapping[str, object]:
     """Upgrade a paired finish/seal identity before destructive recovery resumes."""
 
@@ -25604,7 +25606,7 @@ def _upgrade_legacy_finish_seal_identity(
 
     updated_finish = dict(raw)
     updated_finish["private_census_identity"] = list(stable)
-    _write_journal(config, updated_finish)
+    _write_journal(config, updated_finish, journal_path=journal_path)
     return updated_finish
 
 
@@ -42393,7 +42395,9 @@ def _cmd_recover(
                     "validation-batch seal evidence coexists with a non-finish journal"
                 )
             record = _record_from_obj(raw.get("record"), "finish journal.record")
-            raw = _upgrade_legacy_finish_seal_identity(config, raw, record)
+            raw = _upgrade_legacy_finish_seal_identity(
+                config, raw, record, journal_path=path
+            )
             private_identity = _finish_private_census_identity(raw)
             if private_identity is None:
                 raise StateError(
