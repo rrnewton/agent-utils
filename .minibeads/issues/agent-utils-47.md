@@ -10,7 +10,7 @@ labels:
 depends_on:
   agent-utils-37: discovered-from
 created_at: 2026-09-26T09:35:28.961358042+00:00
-updated_at: 2026-10-03T02:00:43.997814574+00:00
+updated_at: 2026-10-03T09:44:47.799223895+00:00
 claimed_at: 2026-09-26T09:35:28.963597195+00:00
 claimed_until: 2026-09-28T09:35:28.963455011+00:00
 ---
@@ -99,3 +99,14 @@ expected listeners are present. The exact-read/config suites report 104 passes, 
 one pre-existing skip; the full TTS audio suite reports 325 passes; and the corrected Oxide timeout
 suites report 296 passes plus one unrelated H.265 skip. The hardware-bound Hatch refresh remains
 the only prerequisite before the fresh live acceptance matrix can start.
+
+[opus 5.5] 2026-10-03 consolidation and review-finding update. This supersedes the deployment and review state in the two notes above.
+
+- Deployment: all four voice units now run from one retained review checkout at `e1ad0a10593150552701bcc107543cfedbe83de5` (the deployment-only skip-warmup copy of D123155424 on top of the D123105386 stack). All are active with zero restarts and expected listeners present. Redundant checkouts were removed; local bookmarks preserve `e1ad0a105931` and a local Slack shim note at `09b4e96f4a01`.
+- Review: reviewer requests were withdrawn from D123105386 and the rest of the stack. Nothing is in active review, nothing new was published, and no human has accepted any of it. Nothing upstream changes until the owner inspects the evidence.
+- The three remaining D123105386 review findings were reproduced before any fix (4 of 4 evidence tests, no warnings):
+  1. The denied direct response was announced but never got a terminal: `response.created`, then the replacement, with no `response.completed`. The legacy safety route has the same gap, so this is not a D123105386 regression.
+  2. The legacy detached safety response's teardown, which D123105386 extended, cleared a newer generator, forced IDLE, and ended the group when a newer response had been installed without cancelling it. The ordinary barge path was unaffected.
+  3. The exact-read safety preconditions were asserts. Compiled at `-O` both vanish and safety receives `text=None`. Not reachable today: the invariant holds by construction and the deployed process runs without `-O`.
+- Local fix commit `2167ebafa3d6b84a383d3a460ec5b61475049a46` on top of `e1ad0a105931`, not uploaded: a cancelled terminal (with no unsafe text) before the replacement and exactly one terminal on a failed install; an ownership-guarded legacy teardown; an explicit fail-closed check that holds at both optimize levels. Validation: focused session tests 22/22, safety handler 6/6, verbatim response tests 18/18, response lifecycle 49/49, all without warnings; type check clean on four targets; lint shows only pre-existing complexity advice. The running services were not restarted, so the deployed code does not yet include these fixes.
+- Acceptance is unchanged and still pending the stale Hatch token: one exact smoke, 10 fresh WAV/ASR reads, and the 0-of-2 re-answer probe. This issue stays open for them.
