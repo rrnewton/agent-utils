@@ -951,6 +951,39 @@ to a Git command recovery cannot see, running or stopped, and refuses until it i
 recovery that finds the recorded commit pruned from the local repository fetches it back from the
 remote ref that preserves it before making these checks.
 
+Git also keeps a full clone of each submodule of a linked worktree in that directory, at
+`<common>/worktrees/<id>/modules/<name>/` (a nested submodule under
+`.../modules/<name>/modules/<nested>/`), so a submodule commit that was never pushed may exist
+nowhere else. Before writing its journal, recovery examines every such repository. A commit is
+unpublished when HEAD or a ref outside `refs/remotes/` names it and no remote-tracking ref of that
+repository, or of the shared submodule repository `<common>/modules/<name>`, reaches it. The plan
+prints what will happen to each submodule as `submodule_salvage=[...]`. For each submodule with
+unpublished commits:
+
+- When the submodule's remote is listed in `salvage_push_remotes`, each commit is pushed to
+  `refs/rescue/wrkslots/<machine>/<slot>/<checkout>-<generation>-submodules/<submodule>/<commit>` on
+  that remote and read back.
+- Otherwise, or when that push is refused, the commits are written with complete history to a local
+  bundle under `wrkslots-salvage/`, verified like the salvage bundles described above.
+
+If salvage fails, the row is refused and nothing is written. Submodule state that salvaging commits
+cannot keep also refuses: an unfinished operation, staged content or a resolve-undo entry in a
+submodule's index, a shallow clone, a submodule repository with worktrees of its own, a ref naming
+something other than a commit, a missing or unreadable commit, a Git lock file (left by a running or
+stopped Git command), or an unsafe directory entry.
+
+Recovery never deletes these repositories. While it holds the worktree's `index.lock` it renames
+`modules/` to `wrkslots-recovery-modules/` and puts a regular file at `modules`, so a Git command
+already running cannot make a repository there anew, then examines them once more; any unpublished
+commit outside the recorded salvage refuses. Immediately before removing the registration it moves
+them, by one rename and with their reflogs, to
+`<common>/wrkslots-retained-modules/<slot>-<generation>-<id>/modules/`. A process that already held
+a working directory or directory descriptor inside them follows the renames, so a commit it makes
+after that last examination is neither salvaged nor recorded, but it stays in the retained copy. A
+recovery stopped before the removal moves them back to `modules/` when it resumes, before checking
+anything; until then every check of that checkout refuses. Wrkslots never removes a retained
+directory: inspect it and delete it yourself once nothing in it is wanted.
+
 To plan or recover many such rows, name each exact row as `SLOT=GENERATION=SHA256`, with the
 generation and `record_sha256` from the same audit:
 
