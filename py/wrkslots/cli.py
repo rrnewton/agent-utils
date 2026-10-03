@@ -354,7 +354,9 @@ _ABSENT_AGENT_JOURNAL_REQUIRED = frozenset(
         "archive_entry",
     }
 )
-_ABSENT_AGENT_JOURNAL_OPTIONAL = frozenset({"branch_witnesses", "remote_containment"})
+_ABSENT_AGENT_JOURNAL_OPTIONAL = frozenset(
+    {"branch_witnesses", "remote_containment", "submodule_salvage"}
+)
 # Any ref a remote advertises may prove that an absent checkout's recorded HEAD
 # is already preserved there. Branches, rescue refs such as
 # ABSENT_AGENT_RESCUE_REF_ROOT, and tags are searched first; every other
@@ -406,6 +408,18 @@ _GIT_OPERATION_STATE_NAMES = (
 )
 # A gitdir file names one path; Git itself writes a few hundred bytes at most.
 _WORKTREE_GITDIR_BYTES_LIMIT = 64 * 1024
+# Bounds on the walk of <administrative directory>/modules/ before an absent
+# checkout's registration is removed: directories examined, and levels of
+# submodule names and nested submodules. Exceeding either refuses.
+_WORKTREE_MODULE_ENTRY_LIMIT = 4096
+_WORKTREE_MODULE_DEPTH_LIMIT = 32
+# A HEAD file is one ref name or object name; Git writes well under this.
+_WORKTREE_MODULE_HEAD_BYTES_LIMIT = 4096
+# Dispositions of a submodule repository that an absent checkout's
+# administrative directory held (see _absent_agent_module_receipts).
+_ABSENT_MODULE_PUBLISHED = "already-published"
+_ABSENT_MODULE_PUSHED = "salvaged"
+_ABSENT_MODULE_ARCHIVED = "archived-local"
 # Environment for every Git command run in an isolated repository. Grafts
 # would rewrite parentage the same way a commit-graph could (see
 # _NETWORK_CONFIG), so no graft file is read; replacement refs are already
@@ -10183,6 +10197,134 @@ def _agent_batch_item_deadline(
         agent_batch.last_seconds_before_deletion = deadline.seconds_before_deletion
 
 
+@dataclasses.dataclass(frozen=True)
+class _WorktreeModule:
+    """A submodule repository Git keeps in a linked worktree's administrative directory.
+
+    ``name`` is its path relative to ``administration``, such as
+    ``modules/lib`` or ``modules/lib/modules/nested``. ``shared`` is the
+    repository at the same relative path in the superproject's common
+    directory, which outlives the worktree, or None. ``tips`` are the commits
+    named by HEAD or by a ref outside refs/remotes/ that no remote-tracking ref
+    of this repository or of ``shared`` reaches, in name order: removing the
+    registration deletes this repository, and with it the only local copy of
+    those commits. ``blocking`` describes state the repository holds that
+    salvaging commits cannot preserve.
+    """
+
+    name: str
+    path: Path
+    administration: Path
+    shared: Path | None
+    head: str | None
+    tips: tuple[str, ...]
+    blocking: tuple[str, ...]
+
+
+def _worktree_module_directories(administration: Path) -> tuple[tuple[str, Path], ...]:
+    """List the submodule repositories under ``administration``/modules, by relative name.
+
+    Git clones each submodule of a linked worktree into
+    <administrative directory>/modules/<submodule name>/, and a nested
+    submodule into .../modules/<name>/modules/<nested name>/. A submodule name
+    may hold slashes, so a directory without a HEAD file is one level of a
+    name and is walked. A symlink, a file, or an incomplete repository found
+    there refuses: removing the registration would delete it unexamined.
+    """
+
+    root = administration / "modules"
+    if not root.exists() and not root.is_symlink():
+        return ()
+    found: list[tuple[str, Path]] = []
+    examined = 0
+    pending: list[tuple[Path, int]] = [(root, 1)]
+    while pending:
+        directory, depth = pending.pop()
+        if depth > _WORKTREE_MODULE_DEPTH_LIMIT:
+            raise Refusal(
+                f"submodule repositories under {root} nest deeper than "
+                f"{_WORKTREE_MODULE_DEPTH_LIMIT} levels; they cannot all be examined"
+            )
+        if directory.is_symlink() or not directory.is_dir():
+            raise Refusal(f"submodule directory Git kept for a worktree is unsafe: {directory}")
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError as exc:
+            raise Refusal(f"cannot list submodule directory {directory}: {exc}") from exc
+        for entry in entries:
+            examined += 1
+            if examined > _WORKTREE_MODULE_ENTRY_LIMIT:
+                raise Refusal(
+                    f"{root} holds more than {_WORKTREE_MODULE_ENTRY_LIMIT} submodule "
+                    "directories; they cannot all be examined"
+                )
+            if entry.is_symlink() or not entry.is_dir():
+                raise Refusal(
+                    f"submodule directory {directory} holds {entry}, which is not a "
+                    "directory; removing the registration would delete it unexamined"
+                )
+            head = entry / "HEAD"
+            if not head.exists() and not head.is_symlink():
+                pending.append((entry, depth + 1))
+                continue
+            if head.is_symlink() or not head.is_file() or any(
+                (entry / part).is_symlink() or not (entry / part).is_dir()
+                for part in ("objects", "refs")
+            ):
+                raise Refusal(
+                    f"submodule repository {entry} has no regular HEAD file, objects "
+                    "directory, and refs directory; it cannot be examined"
+                )
+            name = entry.relative_to(administration).as_posix()
+            try:
+                os.fsencode(name).decode("utf-8")
+            except UnicodeDecodeError:
+                raise Refusal(f"submodule repository name is not UTF-8: {entry}") from None
+            found.append((name, entry))
+            nested = entry / "modules"
+            if nested.exists() or nested.is_symlink():
+                pending.append((nested, depth + 1))
+    return tuple(sorted(found))
+
+
+@contextlib.contextmanager
+def _exclusive_git_index_lock(git_directory: Path, label: str) -> Iterator[None]:
+    """Create <git_directory>/index.lock the way Git does, and remove it on exit if unchanged."""
+
+    lock = git_directory / "index.lock"
+    try:
+        descriptor = os.open(
+            lock,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+        )
+    except FileExistsError as exc:
+        raise Refusal(
+            f"Git index lock {lock} already exists: a Git command is using {label}, "
+            "or one stopped without removing its lock. remedy: once no Git command "
+            "uses it, delete the lock and rerun"
+        ) from exc
+    except OSError as exc:
+        raise Refusal(f"cannot lock the Git index of {label}: {exc}") from exc
+    try:
+        created = os.fstat(descriptor)
+    except OSError as exc:
+        os.close(descriptor)
+        lock.unlink(missing_ok=True)
+        raise Refusal(f"cannot lock the Git index of {label}: {exc}") from exc
+    os.close(descriptor)
+    try:
+        yield
+    finally:
+        try:
+            observed = os.lstat(lock)
+        except FileNotFoundError:
+            pass
+        else:
+            if (observed.st_dev, observed.st_ino) == (created.st_dev, created.st_ino):
+                lock.unlink()
+
+
 class _GitVcs:
     """The small Git boundary used by slot operations."""
 
@@ -10982,6 +11124,371 @@ class _GitVcs:
             if obj not in seen.get(path, set())
         ]
 
+    def worktree_modules(
+        self, repository: Path, checkout: Path
+    ) -> tuple[_WorktreeModule, ...]:
+        """Examine each submodule repository Git keeps in ``checkout``'s administrative directory.
+
+        Removing the registration deletes <administrative directory>/modules/,
+        where Git cloned every submodule of the checkout. A commit there that
+        no remote-tracking ref reaches, in that repository or in the
+        superproject's shared repository of the same name, exists nowhere
+        else (see _WorktreeModule).
+        """
+
+        administration = self.worktree_administrative_directory(repository, checkout)
+        if administration is None:
+            raise Refusal(
+                f"Git registers {checkout} but no administrative directory names it"
+            )
+        directories = _worktree_module_directories(administration)
+        if not directories:
+            return ()
+        common = self.common_directory(repository)
+        return tuple(
+            self._worktree_module(common, administration, name, path)
+            for name, path in directories
+        )
+
+    def _repository_refs(
+        self, work: Path, git_directory: Path, label: str
+    ) -> tuple[tuple[str, str], ...]:
+        """Return (ref, object name) for each ref of a repository, reading no object.
+
+        ``work`` is an empty directory given to Git as the work tree, because
+        a submodule repository's core.worktree names a checkout that may be
+        absent. Git reads this repository's own configuration here, so no
+        object is read: asking for an object's type could make Git fetch a
+        missing object through the transport a promisor remote configures.
+        GIT_NO_LAZY_FETCH forbids that fetch as well. Object types are read
+        later, in an isolated repository (see _worktree_module).
+        """
+
+        listed = self._run_bytes(
+            work,
+            ["for-each-ref", "--format=%(refname)%00%(objectname)"],
+            env_overrides={
+                "GIT_DIR": str(git_directory),
+                "GIT_WORK_TREE": str(work),
+                "GIT_NO_LAZY_FETCH": "1",
+            },
+            timeout_seconds=_ABSENT_AGENT_HISTORY_SECONDS,
+            timeout_refusal=(
+                f"Git did not list the refs of {label} within "
+                f"{_ABSENT_AGENT_HISTORY_SECONDS:g} seconds; the command was stopped and "
+                "nothing was removed. remedy: rerun when the host is less loaded"
+            ),
+        )
+        if listed.returncode != 0:
+            raise Refusal(
+                f"cannot list the refs of {label}" + _git_bytes_failure_detail(listed)
+            )
+        refs: list[tuple[str, str]] = []
+        for line in listed.stdout.split(b"\n"):
+            if not line:
+                continue
+            fields = [_display_git_path(field) for field in line.split(b"\0")]
+            if (
+                len(fields) != 2
+                or not fields[0].startswith("refs/")
+                or not SHA_RE.fullmatch(fields[1])
+            ):
+                raise Refusal(f"Git returned a malformed ref inventory for {label}")
+            refs.append((fields[0], fields[1]))
+        return tuple(refs)
+
+    def _isolated_object_kinds(
+        self,
+        isolated: Path,
+        object_env: Mapping[str, str],
+        objects: Iterable[str],
+        label: str,
+        timeout_refusal: str,
+    ) -> dict[str, tuple[str, str | None, str | None]]:
+        """Map each object to (type, peeled object, peeled type), read in ``isolated``.
+
+        The isolated repository has no promisor remote and no configuration
+        of the repository examined, so a missing object reads as "missing"
+        and nothing is fetched. The peeled fields name what a tag finally
+        points to, and are None for any other object.
+        """
+
+        queried = sorted(set(objects))
+        if not queried:
+            return {}
+
+        def census(lines: Sequence[str]) -> list[tuple[str, str]]:
+            checked = self._run_bytes(
+                isolated,
+                ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+                input_bytes="".join(f"{line}\n" for line in lines).encode("ascii"),
+                env_overrides={**object_env, "GIT_NO_LAZY_FETCH": "1"},
+                timeout_seconds=_ABSENT_AGENT_HISTORY_SECONDS,
+                timeout_refusal=timeout_refusal,
+            )
+            if checked.returncode != 0:
+                raise Refusal(
+                    f"cannot read the objects of {label}" + _git_bytes_failure_detail(checked)
+                )
+            output = checked.stdout.decode("ascii", "replace").splitlines()
+            if len(output) != len(lines):
+                raise Refusal(f"Git returned a malformed object census for {label}")
+            result: list[tuple[str, str]] = []
+            for line in output:
+                fields = line.split(" ")
+                if len(fields) != 2 or not fields[1]:
+                    raise Refusal(f"Git returned a malformed object census for {label}")
+                result.append((fields[0], fields[1]))
+            return result
+
+        kinds: dict[str, tuple[str, str | None, str | None]] = {}
+        for value, (name, kind) in zip(queried, census(queried), strict=True):
+            if name != value:
+                raise Refusal(f"Git returned a malformed object census for {label}")
+            kinds[value] = (kind, None, None)
+        tags = [value for value in queried if kinds[value][0] == "tag"]
+        for value, (name, kind) in zip(
+            tags, census([f"{value}^{{}}" for value in tags]), strict=True
+        ):
+            if kind == "missing":
+                kinds[value] = ("tag", None, "missing")
+            elif not SHA_RE.fullmatch(name):
+                raise Refusal(f"Git returned a malformed object census for {label}")
+            else:
+                kinds[value] = ("tag", name, kind)
+        return kinds
+
+    def _worktree_module(
+        self, common: Path, administration: Path, name: str, path: Path
+    ) -> _WorktreeModule:
+        label = f"submodule repository {path}"
+        blocking = [
+            f"unfinished operation {path / state}"
+            for state in _GIT_OPERATION_STATE_NAMES
+            if (path / state).exists() or (path / state).is_symlink()
+        ]
+        if (path / "commondir").exists() or (path / "commondir").is_symlink():
+            blocking.append(f"{path / 'commondir'} names objects kept elsewhere")
+        if (path / "shallow").exists() or (path / "shallow").is_symlink():
+            # A shallow clone lacks the history below its boundary, so no
+            # bundle of it is complete and no ancestry walk of it is sound.
+            return _WorktreeModule(
+                name=name,
+                path=path,
+                administration=administration,
+                shared=None,
+                head=None,
+                tips=(),
+                blocking=(
+                    *blocking,
+                    f"{path / 'shallow'} marks a shallow clone, whose history cannot "
+                    "be checked or bundled completely",
+                ),
+            )
+        linked = path / "worktrees"
+        if linked.exists() or linked.is_symlink():
+            if linked.is_symlink() or not linked.is_dir() or any(linked.iterdir()):
+                blocking.append(f"other worktrees use this repository ({linked})")
+        candidate = common / name
+        shared: Path | None = (
+            None
+            if (
+                candidate == path
+                or candidate.is_symlink()
+                or not (candidate / "HEAD").is_file()
+                or (candidate / "HEAD").is_symlink()
+                or (candidate / "objects").is_symlink()
+                or not (candidate / "objects").is_dir()
+            )
+            else candidate
+        )
+        try:
+            head_text = _read_bounded_regular_file(
+                path / "HEAD", "submodule HEAD", _WORKTREE_MODULE_HEAD_BYTES_LIMIT
+            ).decode("utf-8")
+        except UnicodeDecodeError:
+            head_text = ""
+        with tempfile.TemporaryDirectory(prefix="wrkslots-module-") as temporary:
+            work = Path(temporary)
+            refs = self._repository_refs(work, path, label)
+            shared_refs = (
+                ()
+                if shared is None
+                else self._repository_refs(work, shared, f"shared repository {shared}")
+            )
+
+        timeout_refusal = (
+            f"Git did not compare the commits of {label} with its remote-tracking refs "
+            f"within {_ABSENT_AGENT_HISTORY_SECONDS:g} seconds; the command was stopped "
+            "and nothing was removed. remedy: rerun when the host is less loaded"
+        )
+        tips: list[str] = []
+        with self._isolated_repository(
+            path / "objects",
+            alternates=() if shared is None else (shared / "objects",),
+        ) as (isolated, object_env):
+            kinds = self._isolated_object_kinds(
+                isolated,
+                object_env,
+                (target for _ref, target in (*refs, *shared_refs)),
+                label,
+                timeout_refusal,
+            )
+
+            def commit_of(entry: tuple[str, str]) -> str | None:
+                kind, peeled, peeled_kind = kinds[entry[1]]
+                if kind == "commit":
+                    return entry[1]
+                if kind == "tag" and peeled_kind == "commit":
+                    return peeled
+                return None
+
+            published = {
+                commit
+                for entry in (*refs, *shared_refs)
+                if entry[0].startswith("refs/remotes/")
+                and (commit := commit_of(entry)) is not None
+            }
+            shared_values = dict(shared_refs)
+            candidates: dict[str, None] = {}
+            for entry in refs:
+                if entry[0].startswith("refs/remotes/"):
+                    continue
+                commit = commit_of(entry)
+                if commit is not None:
+                    candidates[commit] = None
+                elif shared_values.get(entry[0]) != entry[1]:
+                    # A ref naming a tree, a blob, or a missing object preserves
+                    # no commit; it is kept only when the shared repository
+                    # holds the same ref.
+                    blocking.append(
+                        f"ref {entry[0]} names {kinds[entry[1]][0]} {entry[1]}"
+                    )
+            head: str | None = None
+            stripped = head_text.rstrip("\n")
+            if stripped.startswith("ref: ") and "\n" not in stripped:
+                target = stripped.removeprefix("ref: ")
+                head = next(
+                    (commit_of(entry) for entry in refs if entry[0] == target), None
+                )
+            elif SHA_RE.fullmatch(stripped):
+                head = stripped
+                candidates[head] = None
+            else:
+                blocking.append(f"HEAD {path / 'HEAD'} names neither a ref nor a commit")
+            queried = sorted({*candidates, *published})
+            types: dict[str, str] = {}
+            if queried:
+                checked = self._run_bytes(
+                    isolated,
+                    ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+                    input_bytes="".join(f"{value}\n" for value in queried).encode("ascii"),
+                    env_overrides=object_env,
+                    timeout_seconds=_ABSENT_AGENT_HISTORY_SECONDS,
+                    timeout_refusal=timeout_refusal,
+                )
+                if checked.returncode != 0:
+                    raise Refusal(
+                        f"cannot read the objects of {label}"
+                        + _git_bytes_failure_detail(checked)
+                    )
+                lines = checked.stdout.decode("ascii", "replace").splitlines()
+                if len(lines) != len(queried):
+                    raise Refusal(f"Git returned a malformed object census for {label}")
+                for value, line in zip(queried, lines, strict=True):
+                    fields = line.split(" ")
+                    if len(fields) != 2 or fields[0] != value:
+                        raise Refusal(f"Git returned a malformed object census for {label}")
+                    types[value] = fields[1]
+            for commit in candidates:
+                if types.get(commit) != "commit":
+                    blocking.append(
+                        f"commit {commit} named by HEAD or a ref is unreadable "
+                        f"({types.get(commit, 'missing')})"
+                    )
+            readable = [commit for commit in candidates if types.get(commit) == "commit"]
+            if readable:
+                walked = self._run_bytes(
+                    isolated,
+                    ["rev-list", "--stdin"],
+                    input_bytes="".join(
+                        [
+                            *(f"{commit}\n" for commit in readable),
+                            *(
+                                f"^{commit}\n"
+                                for commit in sorted(published)
+                                if types.get(commit) == "commit"
+                            ),
+                        ]
+                    ).encode("ascii"),
+                    env_overrides=object_env,
+                    timeout_seconds=_ABSENT_AGENT_HISTORY_SECONDS,
+                    timeout_refusal=timeout_refusal,
+                )
+                if walked.returncode != 0:
+                    raise Refusal(
+                        f"cannot compare the commits of {label} with its remote-tracking "
+                        "refs" + _git_bytes_failure_detail(walked)
+                    )
+                unpublished = set(walked.stdout.decode("ascii", "replace").split())
+                tips = sorted(commit for commit in readable if commit in unpublished)
+            index = path / "index"
+            if index.exists() or index.is_symlink():
+                if index.is_symlink() or not index.is_file():
+                    blocking.append(f"index {index} is not a regular file")
+                elif head is None or types.get(head) != "commit":
+                    blocking.append(f"index {index} has no readable HEAD commit to compare")
+                else:
+                    staged = self._run_bytes(
+                        isolated,
+                        [
+                            "diff-index",
+                            "--cached",
+                            "--exit-code",
+                            "--name-only",
+                            "-z",
+                            "--no-renames",
+                            "--ignore-submodules=none",
+                            head,
+                            "--",
+                        ],
+                        env_overrides={**object_env, "GIT_INDEX_FILE": str(index)},
+                        timeout_seconds=_ABSENT_AGENT_HISTORY_SECONDS,
+                        timeout_refusal=timeout_refusal,
+                    )
+                    paths = [
+                        _display_git_path(value)
+                        for value in staged.stdout.split(b"\0")
+                        if value
+                    ]
+                    if staged.returncode == 1 and paths:
+                        shown = ", ".join(paths[:5]) + (
+                            f", and {len(paths) - 5} more" if len(paths) > 5 else ""
+                        )
+                        blocking.append(
+                            f"index {index} stages content HEAD {head} does not "
+                            f"contain ({shown})"
+                        )
+                    elif staged.returncode != 0 or paths:
+                        raise Refusal(
+                            f"cannot compare the index of {label} with {head}"
+                            + _git_bytes_failure_detail(staged)
+                        )
+                    blocking.extend(
+                        self._resolve_undo_beyond(
+                            isolated, object_env, index, head, path
+                        )
+                    )
+        return _WorktreeModule(
+            name=name,
+            path=path,
+            administration=administration,
+            shared=shared,
+            head=head,
+            tips=tuple(tips),
+            blocking=tuple(blocking),
+        )
+
     @contextlib.contextmanager
     def worktree_index_locked(self, repository: Path, checkout: Path) -> Iterator[Path]:
         """Hold Git's own lock on the index of linked worktree ``checkout``.
@@ -11031,6 +11538,29 @@ class _GitVcs:
             else:
                 if (observed.st_dev, observed.st_ino) == (created.st_dev, created.st_ino):
                     lock.unlink()
+
+    @contextlib.contextmanager
+    def worktree_module_indexes_locked(
+        self, administration: Path
+    ) -> Iterator[tuple[Path, ...]]:
+        """Hold Git's lock on the index of every submodule repository under ``administration``.
+
+        Each submodule repository Git keeps for a linked worktree has its own
+        index, so the worktree's index lock does not stop a commit there.
+        While these locks exist no Git command can stage or commit in any of
+        them. `git worktree remove` deletes them with the administrative
+        directory; otherwise each is released on exit. Yields the locked
+        repositories, in name order.
+        """
+
+        with contextlib.ExitStack() as stack:
+            locked: list[Path] = []
+            for _name, path in _worktree_module_directories(administration):
+                stack.enter_context(
+                    _exclusive_git_index_lock(path, f"submodule repository {path}")
+                )
+                locked.append(path)
+            yield tuple(locked)
 
     def verify_existing_worktree(self, repository: Path, checkout: Path) -> str:
         source_common = self.common_directory(repository)
@@ -11426,12 +11956,19 @@ class _GitVcs:
             listed[ref] = head_text
         return listed
 
-    def _assert_no_push_urls(self, checkout: Path, remote: str) -> None:
+    def _assert_no_push_urls(
+        self,
+        checkout: Path,
+        remote: str,
+        *,
+        env_overrides: Mapping[str, str] | None = None,
+    ) -> None:
         _validate_remote(remote)
         result = self._run(
             checkout,
             ["config", "--null", "--get-all", f"remote.{remote}.pushurl"],
             check=False,
+            env_overrides=env_overrides,
         )
         if result.returncode not in (0, 1):
             raise Refusal(
@@ -11447,17 +11984,27 @@ class _GitVcs:
                 f"remote.{remote}.pushurl before remote operations"
             )
 
-    def _remote_url_with_push_authority(self, checkout: Path, remote: str) -> str:
+    def _remote_url_with_push_authority(
+        self,
+        checkout: Path,
+        remote: str,
+        *,
+        env_overrides: Mapping[str, str] | None = None,
+    ) -> str:
         _validate_remote(remote)
-        self._assert_no_push_urls(checkout, remote)
-        result = self._run(checkout, ["remote", "get-url", "--all", remote])
+        self._assert_no_push_urls(checkout, remote, env_overrides=env_overrides)
+        result = self._run(
+            checkout, ["remote", "get-url", "--all", remote], env_overrides=env_overrides
+        )
         urls = result.stdout.splitlines()
         if len(urls) != 1 or not urls[0]:
             raise Refusal(
                 f"remote {remote!r} must have exactly one non-empty fetch URL"
             )
         push_result = self._run(
-            checkout, ["remote", "get-url", "--push", "--all", remote]
+            checkout,
+            ["remote", "get-url", "--push", "--all", remote],
+            env_overrides=env_overrides,
         )
         push_urls = push_result.stdout.splitlines()
         if push_urls != urls:
@@ -11467,8 +12014,18 @@ class _GitVcs:
             )
         return urls[0]
 
-    def remote_authority(self, checkout: Path, remote: str) -> _RemoteAuthority:
-        url = self._remote_url_with_push_authority(checkout, remote)
+    def remote_authority(
+        self,
+        checkout: Path,
+        remote: str,
+        *,
+        env_overrides: Mapping[str, str] | None = None,
+    ) -> _RemoteAuthority:
+        """Return ``remote``'s single URL; ``env_overrides`` can name another GIT_DIR."""
+
+        url = self._remote_url_with_push_authority(
+            checkout, remote, env_overrides=env_overrides
+        )
         if url.startswith("-"):
             raise Refusal(
                 f"remote {remote!r} URL cannot begin with '-' for isolated transport"
@@ -11576,8 +12133,33 @@ class _GitVcs:
 
         self.assert_remote_authority(checkout, remote, authority)
         objects = self.common_directory(checkout) / "objects"
+        with self._isolated_repository(objects, own_objects=own_objects) as repository:
+            yield repository
+
+    @contextlib.contextmanager
+    def _isolated_repository(
+        self,
+        objects: Path,
+        *,
+        own_objects: bool = False,
+        alternates: Sequence[Path] = (),
+    ) -> Iterator[tuple[Path, Mapping[str, str]]]:
+        """Yield a temporary bare repository whose only configuration is _NETWORK_CONFIG.
+
+        Its objects are ``objects``, or, with ``own_objects``, a store of its
+        own that starts empty and has no alternates. Each of ``alternates``
+        is added as an alternate object directory, read-only.
+        """
+
         if objects.is_symlink() or not objects.is_dir():
             raise Refusal(f"Git object directory is absent or unsafe: {objects}")
+        if own_objects and alternates:
+            raise StateError("an isolated repository with its own objects has no alternates")
+        for alternate in alternates:
+            if alternate.is_symlink() or not alternate.is_dir():
+                raise Refusal(f"Git object directory is absent or unsafe: {alternate}")
+            if os.pathsep in str(alternate):
+                raise Refusal(f"Git object directory cannot be an alternate: {alternate}")
         with tempfile.TemporaryDirectory(prefix="wrkslots-remote-") as temporary:
             root = Path(temporary)
             isolated = root / "network.git"
@@ -11595,6 +12177,15 @@ class _GitVcs:
                 "GIT_OBJECT_DIRECTORY": str(isolated / "objects" if own_objects else objects),
                 _NETWORK_CONFIG_SHA256_ENV: config_digest,
                 **_ISOLATED_HISTORY_ENV,
+                **(
+                    {
+                        "GIT_ALTERNATE_OBJECT_DIRECTORIES": os.pathsep.join(
+                            str(alternate) for alternate in alternates
+                        )
+                    }
+                    if alternates
+                    else {}
+                ),
             }
 
     def confirm_remote_unreachable(
@@ -12167,36 +12758,53 @@ class _GitVcs:
             isolated,
             object_env,
         ):
-            existing = self._remote_ref_sha_at_url(
-                isolated, authority.url, ref, env_overrides=object_env
-            )
-            if existing is not None:
-                if existing != commit:
-                    raise Refusal(
-                        f"remote salvage ref {ref} already names {existing}, not {commit}; "
-                        "preserve the checkout and choose a different recorded destination"
-                    )
-                return
-            self._run(
-                isolated,
-                [
-                    "push",
-                    "--porcelain",
-                    f"--force-with-lease={ref}:",
-                    "--",
-                    authority.url,
-                    f"{commit}:{ref}",
-                ],
-                env_overrides=object_env,
-            )
-            observed = self._remote_ref_sha_at_url(
-                isolated, authority.url, ref, env_overrides=object_env
-            )
-            if observed != commit:
+            self._push_salvage_ref(isolated, object_env, authority.url, commit, ref)
+
+    def _push_salvage_ref(
+        self,
+        isolated: Path,
+        object_env: Mapping[str, str],
+        url: str,
+        commit: str,
+        ref: str,
+    ) -> None:
+        """Create ``ref`` at ``commit`` on ``url`` from an isolated repository and read it back.
+
+        An existing ``ref`` naming ``commit`` is accepted as already pushed;
+        one naming anything else refuses.
+        """
+
+        _validate_full_ref(ref, "remote salvage ref")
+        existing = self._remote_ref_sha_at_url(
+            isolated, url, ref, env_overrides=object_env
+        )
+        if existing is not None:
+            if existing != commit:
                 raise Refusal(
-                    f"salvage push did not leave {ref} at {commit}; remote reports "
-                    f"{observed or 'no ref'}. Preserve the checkout and retry"
+                    f"remote salvage ref {ref} already names {existing}, not {commit}; "
+                    "preserve the checkout and choose a different recorded destination"
                 )
+            return
+        self._run(
+            isolated,
+            [
+                "push",
+                "--porcelain",
+                f"--force-with-lease={ref}:",
+                "--",
+                url,
+                f"{commit}:{ref}",
+            ],
+            env_overrides=object_env,
+        )
+        observed = self._remote_ref_sha_at_url(
+            isolated, url, ref, env_overrides=object_env
+        )
+        if observed != commit:
+            raise Refusal(
+                f"salvage push did not leave {ref} at {commit}; remote reports "
+                f"{observed or 'no ref'}. Preserve the checkout and retry"
+            )
 
     def delete_branch_at(self, repository: Path, branch: str, expected_head: str) -> None:
         if not self.branch_exists(repository, branch):
@@ -36491,6 +37099,961 @@ def _absent_agent_existing_containing_ref(
     return ref, tip
 
 
+def _absent_agent_module_env(module: Path, work: Path) -> dict[str, str]:
+    """Environment for a Git command in a submodule repository whose checkout is absent.
+
+    Its core.worktree names a directory that no longer exists, so Git is
+    given ``work``, an existing empty directory, as the work tree.
+    GIT_NO_LAZY_FETCH keeps a promisor remote that repository configures
+    from fetching anything.
+    """
+
+    return {"GIT_DIR": str(module), "GIT_WORK_TREE": str(work), "GIT_NO_LAZY_FETCH": "1"}
+
+
+def _assert_absent_agent_modules_preserved(
+    vcs: _GitVcs,
+    repository: Path,
+    path: Path,
+    checkout: Checkout,
+    retained: str,
+    salvaged: Mapping[str, AbstractSet[str]] | None,
+) -> tuple[_WorktreeModule, ...]:
+    """Refuse while a submodule repository Git kept for an absent checkout holds unsaved work.
+
+    Removing the registration deletes every submodule repository under the
+    administrative directory (see _GitVcs.worktree_modules). Content staged
+    there, a resolve-undo entry, an unfinished operation, or anything else
+    _WorktreeModule.blocking names refuses, because recovery salvages only
+    commits. ``salvaged`` is None before salvage; afterwards it maps each
+    submodule name to the commits salvage preserved, and a commit outside
+    every remote-tracking ref that salvage did not preserve refuses.
+    """
+
+    modules = vcs.worktree_modules(repository, path)
+    blocked = [
+        f"{module.path}: {reason}" for module in modules for reason in module.blocking
+    ]
+    if blocked:
+        shown = "; ".join(blocked[:5]) + (
+            f"; and {len(blocked) - 5} more" if len(blocked) > 5 else ""
+        )
+        raise Refusal(
+            f"absent checkout {checkout.name} still has submodule repository state "
+            f"that recovery cannot salvage ({shown}); removing the Git registration "
+            f"would delete it. state: REFUSED -- {retained} were retained. remedy: "
+            "commit and publish that content, or discard it if it is not wanted, "
+            "then rerun"
+        )
+    if salvaged is not None:
+        missing = [
+            f"{module.path} commit {tip}"
+            for module in modules
+            for tip in module.tips
+            if tip not in salvaged.get(module.name, frozenset())
+        ]
+        if missing:
+            shown = ", ".join(missing[:5]) + (
+                f", and {len(missing) - 5} more" if len(missing) > 5 else ""
+            )
+            raise Refusal(
+                f"absent checkout {checkout.name} has submodule commits that no "
+                f"remote-tracking ref holds and that recovery did not salvage ({shown}); "
+                f"removing the Git registration would delete them. state: REFUSED -- "
+                f"{retained} were retained. remedy: publish those commits, then rerun; "
+                "a recovery journal written before they appeared cannot preserve them"
+            )
+    return modules
+
+
+def _absent_agent_module_safe_name(name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.") or "submodule"
+    return f"{safe}-{hashlib.sha256(name.encode('utf-8')).hexdigest()[:12]}"
+
+
+def _absent_agent_module_rescue_ref(
+    record: ActiveRecord, checkout: Checkout, module: str, commit: str
+) -> str:
+    ref = (
+        f"{ABSENT_AGENT_RESCUE_REF_ROOT}/{record.machine}/{record.slot}/"
+        f"{checkout.name.replace('/', '-')}-{record.generation}-submodules/"
+        f"{_absent_agent_module_safe_name(module)}/{commit}"
+    )
+    _validate_full_ref(ref, "submodule rescue ref")
+    return ref
+
+
+def _absent_agent_module_archive_paths(
+    archive_root: Path,
+    record: ActiveRecord,
+    checkout: Checkout,
+    module: str,
+    tips: Sequence[str],
+) -> tuple[Path, Path, tuple[tuple[str, str], ...]]:
+    """Return the bundle, its receipt, and (commit, ref) for each commit it archives."""
+
+    checkout_name = re.sub(r"[^A-Za-z0-9._-]+", "-", checkout.name).strip("-.") or (
+        "checkout"
+    )
+    checkout_digest = hashlib.sha256(checkout.name.encode("utf-8")).hexdigest()[:12]
+    tips_digest = hashlib.sha256("".join(tips).encode("ascii")).hexdigest()[:12]
+    module_name = _absent_agent_module_safe_name(module)
+    directory = (
+        archive_root
+        / _LOCAL_SALVAGE_DIRECTORY
+        / record.machine
+        / record.slot
+        / str(record.generation)
+        / f"{checkout_name}-{checkout_digest}-submodules"
+        / f"{module_name}-{tips_digest}"
+    )
+    refs = tuple(
+        (
+            tip,
+            _validate_full_ref(
+                f"refs/heads/{_LOCAL_SALVAGE_DIRECTORY}/{record.machine}/{record.slot}/"
+                f"{record.generation}/{checkout_name}-{checkout_digest}/{module_name}/{tip}",
+                "local submodule salvage archive ref",
+            ),
+        )
+        for tip in tips
+    )
+    return directory / "repository.bundle", directory / "receipt.json", refs
+
+
+def _verify_absent_agent_module_bundle(
+    bundle: Path,
+    expected_sha256: str,
+    expected_size: int,
+    refs: Sequence[tuple[str, str]],
+    vcs: _GitVcs,
+) -> None:
+    """Prove the bundle unchanged, self-contained, and naming each commit at its ref."""
+
+    observed = _sha256_regular_file(bundle, "local submodule salvage bundle")
+    if observed != (expected_sha256, expected_size):
+        raise Refusal(f"local submodule salvage bundle changed after publication: {bundle}")
+    with tempfile.TemporaryDirectory(prefix="wrkslots-archive-verify-") as temporary:
+        root = Path(temporary)
+        restored = root / "restored.git"
+        vcs._run(root, ["clone", "--bare", "--", str(bundle), str(restored)])
+        for commit, ref in refs:
+            restored_commit = vcs._run(
+                restored, ["rev-parse", "--verify", f"{ref}^{{commit}}"]
+            ).stdout.strip()
+            if restored_commit != commit:
+                raise Refusal(
+                    f"local submodule salvage bundle ref {ref} names {restored_commit}, "
+                    f"not {commit}"
+                )
+        vcs._run(restored, ["fsck", "--full", "--strict", "--no-dangling"])
+
+
+def _absent_agent_module_receipt_payload(
+    archive_root: Path,
+    bundle: Path,
+    record: ActiveRecord,
+    checkout: Checkout,
+    submodule: str,
+    submodule_repository: str,
+    refs: Sequence[tuple[str, str]],
+    bundle_sha256: str,
+    bundle_size: int,
+) -> dict[str, object]:
+    return {
+        "schema": _LOCAL_SALVAGE_RECEIPT_SCHEMA,
+        "kind": "wrkslots-local-submodule-salvage-archive",
+        "machine": record.machine,
+        "slot": record.slot,
+        "generation": record.generation,
+        "checkout": checkout.name,
+        "submodule": submodule,
+        "submodule_repository": submodule_repository,
+        "archive_root": str(archive_root),
+        "bundle": str(bundle.relative_to(archive_root)),
+        "bundle_sha256": bundle_sha256,
+        "bundle_bytes": bundle_size,
+        "archive_refs": [{"commit": commit, "ref": ref} for commit, ref in refs],
+        "verification": {
+            "fresh_bare_clone": True,
+            "exact_refs": True,
+            "full_fsck": True,
+            "complete_history": True,
+        },
+    }
+
+
+def _archive_absent_agent_module_locally(
+    config: Config,
+    record: ActiveRecord,
+    checkout: Checkout,
+    module: _WorktreeModule,
+    archive_root: Path,
+    remote_failure: Refusal | None,
+    vcs: _GitVcs,
+) -> dict[str, object]:
+    """Bundle the complete history of each unpublished commit of ``module`` and read it back.
+
+    ``remote_failure`` is None when the submodule's remote is not in
+    salvage_push_remotes; otherwise it is the refused push.
+    """
+
+    checked_root = _local_salvage_archive_root(config, str(archive_root))
+    assert checked_root is not None
+    bundle, receipt_path, refs = _absent_agent_module_archive_paths(
+        checked_root, record, checkout, module.name, module.tips
+    )
+    _prepare_local_salvage_directory(checked_root, bundle.parent)
+    _ensure_no_symlink_components(checked_root, bundle.parent, "local salvage archive")
+    if not bundle.exists() and not bundle.is_symlink():
+        with tempfile.TemporaryDirectory(prefix="wrkslots-bundle-stage-") as temporary:
+            stage_root = Path(temporary)
+            stage = stage_root / "stage.git"
+            temp_bundle = (
+                bundle.parent / f".{bundle.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+            )
+            vcs._run(stage_root, ["init", "--bare", "--", str(stage)])
+            object_env = {
+                "GIT_OBJECT_DIRECTORY": str(module.path / "objects"),
+                **_ISOLATED_HISTORY_ENV,
+                **(
+                    {"GIT_ALTERNATE_OBJECT_DIRECTORIES": str(module.shared / "objects")}
+                    if module.shared is not None
+                    else {}
+                ),
+            }
+            for commit, ref in refs:
+                vcs._run(stage, ["update-ref", ref, commit], env_overrides=object_env)
+            try:
+                vcs._run(
+                    stage,
+                    ["bundle", "create", str(temp_bundle), *(ref for _commit, ref in refs)],
+                    env_overrides=object_env,
+                )
+                descriptor = os.open(temp_bundle, os.O_RDONLY | os.O_CLOEXEC)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                os.chmod(temp_bundle, 0o444)
+                temp_digest, temp_size = _sha256_regular_file(
+                    temp_bundle, "temporary local submodule salvage bundle"
+                )
+                _verify_absent_agent_module_bundle(
+                    temp_bundle, temp_digest, temp_size, refs, vcs
+                )
+                try:
+                    os.link(temp_bundle, bundle, follow_symlinks=False)
+                    _fsync_directory(bundle.parent)
+                except FileExistsError:
+                    pass
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    temp_bundle.unlink()
+    bundle_digest, bundle_size = _sha256_regular_file(
+        bundle, "local submodule salvage bundle"
+    )
+    _verify_absent_agent_module_bundle(bundle, bundle_digest, bundle_size, refs, vcs)
+    expected_receipt = _absent_agent_module_receipt_payload(
+        checked_root,
+        bundle,
+        record,
+        checkout,
+        module.name,
+        str(module.path),
+        refs,
+        bundle_digest,
+        bundle_size,
+    )
+    if receipt_path.exists() or receipt_path.is_symlink():
+        contents = _read_bounded_regular_file(
+            receipt_path,
+            "local submodule salvage archive receipt",
+            _LOCAL_SALVAGE_RECEIPT_BYTES_LIMIT,
+        )
+        observed = _strict_json_object(contents, "local submodule salvage archive receipt")
+        if not _json_equal(observed, expected_receipt):
+            raise Refusal(
+                "local submodule salvage archive receipt disagrees with the submodule "
+                f"repository: {receipt_path}"
+            )
+    else:
+        _atomic_write_json(receipt_path, expected_receipt)
+        contents = _read_bounded_regular_file(
+            receipt_path,
+            "local submodule salvage archive receipt",
+            _LOCAL_SALVAGE_RECEIPT_BYTES_LIMIT,
+        )
+        if not _json_equal(
+            _strict_json_object(contents, "local submodule salvage archive receipt"),
+            expected_receipt,
+        ):
+            raise Refusal(
+                f"local submodule salvage archive receipt readback failed: {receipt_path}"
+            )
+    print(
+        f"WARNING: submodule {module.name} of absent checkout {checkout.name}: "
+        + (
+            "its remote is not in salvage_push_remotes"
+            if remote_failure is None
+            else "remote salvage did not complete"
+        )
+        + f"; preserved {len(module.tips)} unpublished commit(s) in verified local "
+        f"archive {bundle}",
+        file=sys.stderr,
+    )
+    return {
+        **_absent_agent_module_receipt_base(checkout, module),
+        "disposition": _ABSENT_MODULE_ARCHIVED,
+        "archive_root": str(checked_root),
+        "archive_receipt": str(receipt_path),
+        "archive_receipt_sha256": hashlib.sha256(contents).hexdigest(),
+        "archive_bundle": str(bundle),
+        "archive_bundle_sha256": bundle_digest,
+        "archive_bundle_bytes": bundle_size,
+        "archive_refs": [{"commit": commit, "ref": ref} for commit, ref in refs],
+        "complete_history": True,
+        "archive_reason": "remote-not-allowed" if remote_failure is None else "remote-refused",
+        "remote_failure": None if remote_failure is None else str(remote_failure),
+    }
+
+
+def _absent_agent_module_receipt_base(
+    checkout: Checkout, module: _WorktreeModule
+) -> dict[str, object]:
+    return {
+        "checkout": checkout.name,
+        "submodule": module.name,
+        "submodule_repository": str(module.path),
+        "shared_repository": None if module.shared is None else str(module.shared),
+        "unpublished_commits": list(module.tips),
+    }
+
+
+def _absent_agent_module_authority(
+    config: Config,
+    vcs: _GitVcs,
+    repository: Path,
+    module: _WorktreeModule,
+    repositories: Sequence[Path],
+    doomed: Sequence[Path],
+) -> _RemoteAuthority | None:
+    """Return the submodule remote salvage may push to, or None to archive locally.
+
+    That is the submodule repository's configuration.default_remote, when it
+    has exactly one URL, no push URL, is listed in salvage_push_remotes, and
+    is neither a source repository of the row nor a repository Git keeps for
+    the checkout. A local remote named by a relative path is archived
+    locally instead: Git would resolve it from wherever the push runs. A
+    local remote that is, or reads objects from, an administrative directory
+    in ``doomed`` refuses (_assert_local_remote_outlives).
+    """
+
+    with tempfile.TemporaryDirectory(prefix="wrkslots-module-") as temporary:
+        work = Path(temporary)
+        try:
+            authority = vcs.remote_authority(
+                work,
+                config.default_remote,
+                env_overrides=_absent_agent_module_env(module.path, work),
+            )
+        except Refusal:
+            return None
+    if not _salvage_push_allowed(config, authority):
+        return None
+    vcs.assert_remote_distinct_from_repositories(repository, authority, repositories)
+    local = _local_remote_url_path(repository, authority.url)
+    if local is not None:
+        if not _local_remote_url_is_absolute(authority.url):
+            return None
+        resolved = _assert_local_remote_outlives(
+            local, (module.administration, *doomed), f"submodule repository {module.path}"
+        )
+        if module.shared is not None and (
+            resolved == module.shared.resolve()
+            or _path_is_within(resolved, module.shared.resolve())
+        ):
+            raise Refusal(
+                f"the remote of submodule repository {module.path} is {module.shared}, "
+                "which is not a separate repository to salvage into"
+            )
+    return authority
+
+
+def _local_remote_url_is_absolute(url: str) -> bool:
+    """Whether a local remote URL (see _local_remote_url_path) names an absolute path."""
+
+    parsed = urllib.parse.urlsplit(url)
+    raw = urllib.parse.unquote(parsed.path) if parsed.scheme == "file" else url
+    return Path(raw).is_absolute()
+
+
+def _local_repository_object_directories(path: Path, label: str) -> tuple[Path, ...]:
+    """Return, resolved, every object directory Git may read for the local repository ``path``.
+
+    Git looks for a local remote at ``path``, path/.git, path.git, and
+    path.git/.git, follows a gitfile and a commondir file, and borrows
+    objects through objects/info/alternates, up to five levels deep. Each
+    candidate found is included, so the result can only overstate what Git
+    reads. Anything that cannot be read, or nests deeper, refuses.
+    """
+
+    git_directories: list[Path] = []
+    for candidate in (
+        path / ".git",
+        path,
+        Path(f"{path}.git") / ".git",
+        Path(f"{path}.git"),
+    ):
+        if candidate.is_file():
+            try:
+                text = _read_bounded_regular_file(
+                    candidate, f"{label} gitfile", _WORKTREE_GITDIR_BYTES_LIMIT
+                ).decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise Refusal(f"{label} gitfile {candidate} is not UTF-8") from exc
+            line = text.rstrip("\n")
+            if not line.startswith("gitdir: ") or "\n" in line:
+                raise Refusal(f"{label} gitfile {candidate} is malformed")
+            target = Path(line.removeprefix("gitdir: "))
+            git_directories.append(
+                target if target.is_absolute() else candidate.parent / target
+            )
+        elif candidate.is_dir():
+            git_directories.append(candidate)
+    pending: list[tuple[Path, int]] = []
+    for git_directory in git_directories:
+        pending.append((git_directory / "objects", 0))
+        commondir = git_directory / "commondir"
+        if commondir.exists() or commondir.is_symlink():
+            try:
+                text = _read_bounded_regular_file(
+                    commondir, f"{label} commondir", _WORKTREE_GITDIR_BYTES_LIMIT
+                ).decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise Refusal(f"{label} commondir {commondir} is not UTF-8") from exc
+            common = Path(text.rstrip("\n"))
+            if not str(common) or "\n" in text.rstrip("\n"):
+                raise Refusal(f"{label} commondir {commondir} is malformed")
+            pending.append(
+                ((common if common.is_absolute() else git_directory / common) / "objects", 0)
+            )
+    found: dict[Path, None] = {}
+    while pending:
+        objects, depth = pending.pop()
+        resolved = objects.resolve()
+        if resolved in found:
+            continue
+        found[resolved] = None
+        alternates = resolved / "info" / "alternates"
+        if not alternates.exists() and not alternates.is_symlink():
+            continue
+        if depth >= 5:
+            raise Refusal(f"{label} borrows objects more than five alternates deep")
+        try:
+            lines = _read_bounded_regular_file(
+                alternates, f"{label} alternates", _WORKTREE_GITDIR_BYTES_LIMIT
+            ).decode("utf-8").splitlines()
+        except UnicodeDecodeError as exc:
+            raise Refusal(f"{label} alternates file {alternates} is not UTF-8") from exc
+        for line in lines:
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith('"'):
+                raise Refusal(
+                    f"{label} alternates file {alternates} quotes a path, which is not "
+                    "checked"
+                )
+            alternate = Path(line)
+            pending.append(
+                (alternate if alternate.is_absolute() else resolved / alternate, depth + 1)
+            )
+    return tuple(found)
+
+
+def _assert_local_remote_outlives(
+    local: Path, doomed: Sequence[Path], label: str
+) -> Path:
+    """Refuse a local remote that is, or reads objects from, a directory in ``doomed``.
+
+    A rescue ref on such a remote names a commit whose objects recovery is
+    about to delete with an administrative directory. Returns the remote's
+    resolved path.
+    """
+
+    try:
+        resolved = local.resolve(strict=True)
+    except OSError as exc:
+        raise Refusal(f"cannot resolve the local remote of {label}: {exc}") from exc
+    kept = [directory.resolve() for directory in doomed]
+    for used in (resolved, *_local_repository_object_directories(resolved, label)):
+        for directory in kept:
+            if used == directory or _path_is_within(used, directory):
+                raise Refusal(
+                    f"the local remote of {label} uses {used}, inside {directory}, "
+                    "which recovery deletes; a rescue ref there would preserve nothing. "
+                    "remedy: point the remote at a repository that keeps its own "
+                    "objects, or remove it from salvage_push_remotes so salvage "
+                    "archives locally"
+                )
+    return resolved
+
+
+def _push_absent_agent_module(
+    record: ActiveRecord,
+    checkout: Checkout,
+    module: _WorktreeModule,
+    authority: _RemoteAuthority,
+    vcs: _GitVcs,
+) -> dict[str, object]:
+    refs = [
+        (tip, _absent_agent_module_rescue_ref(record, checkout, module.name, tip))
+        for tip in module.tips
+    ]
+    with vcs._isolated_repository(
+        module.path / "objects",
+        alternates=() if module.shared is None else (module.shared / "objects",),
+    ) as (isolated, object_env):
+        for commit, ref in refs:
+            vcs._push_salvage_ref(isolated, object_env, authority.url, commit, ref)
+    return {
+        **_absent_agent_module_receipt_base(checkout, module),
+        "disposition": _ABSENT_MODULE_PUSHED,
+        "remote_url_sha256": authority.sha256,
+        "remote_refs": [{"commit": commit, "ref": ref} for commit, ref in refs],
+    }
+
+
+def _absent_agent_doomed_administrations(
+    config: Config, record: ActiveRecord, removed: AbstractSet[str], vcs: _GitVcs
+) -> dict[str, Path]:
+    """Map each checkout still registered, outside ``removed``, to the directory removal deletes."""
+
+    doomed: dict[str, Path] = {}
+    for checkout in record.checkouts:
+        if checkout.name in removed:
+            continue
+        _stored, repository = _stored_repository_path(config, checkout.repository)
+        path = _stored_path(config, checkout.path, "agent checkout path").absolute()
+        if vcs.worktree_registration(repository, path) is None:
+            continue
+        administration = vcs.worktree_administrative_directory(repository, path)
+        if administration is None:
+            raise Refusal(
+                f"Git registers {path} but no administrative directory names it"
+            )
+        doomed[checkout.name] = administration
+    return doomed
+
+
+def _assert_private_salvage_directories(root: Path, directory: Path) -> None:
+    """Refuse unless every directory from ``root`` down to ``directory`` is private and real."""
+
+    try:
+        relative = directory.relative_to(root)
+    except ValueError as exc:
+        raise Refusal(f"local salvage archive {directory} is outside {root}") from exc
+    current = root
+    for part in relative.parts:
+        current /= part
+        try:
+            metadata = current.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise Refusal(f"cannot inspect local salvage archive {current}: {exc}") from exc
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_mode & 0o022
+        ):
+            raise Refusal(
+                f"local salvage archive directory is not private current-user storage: "
+                f"{current}"
+            )
+
+
+def _salvage_absent_agent_modules(
+    config: Config, record: ActiveRecord, vcs: _GitVcs, *, apply: bool
+) -> list[dict[str, object]]:
+    """Preserve, or with ``apply`` False only plan, every unpublished submodule commit.
+
+    Each submodule repository Git keeps for a still-registered checkout is
+    examined (_assert_absent_agent_modules_preserved). Its commits outside
+    every remote-tracking ref are pushed to rescue refs on its remote when
+    salvage_push_remotes lists that remote, and otherwise, or when the push
+    is refused, bundled with their complete history into the default local
+    salvage archive and read back. A planned receipt names only the
+    submodule and the commits that need salvage.
+    """
+
+    repositories = tuple(
+        _stored_repository_path(config, checkout.repository)[1]
+        for checkout in record.checkouts
+    )
+    doomed = _absent_agent_doomed_administrations(config, record, frozenset(), vcs)
+    receipts: list[dict[str, object]] = []
+    for checkout in record.checkouts:
+        _stored, repository = _stored_repository_path(config, checkout.repository)
+        path = _stored_path(config, checkout.path, "agent checkout path").absolute()
+        if vcs.worktree_registration(repository, path) is None:
+            continue
+        modules = _assert_absent_agent_modules_preserved(
+            vcs, repository, path, checkout, "the ACTIVE row and Git registrations", None
+        )
+        for module in modules:
+            if not module.tips:
+                receipts.append(
+                    {
+                        **_absent_agent_module_receipt_base(checkout, module),
+                        "disposition": _ABSENT_MODULE_PUBLISHED,
+                    }
+                )
+                continue
+            authority = _absent_agent_module_authority(
+                config, vcs, repository, module, repositories, tuple(doomed.values())
+            )
+            if not apply:
+                if authority is None:
+                    _default_salvage_archive_root(config)
+                receipts.append(
+                    {
+                        **_absent_agent_module_receipt_base(checkout, module),
+                        "disposition": "planned-push"
+                        if authority is not None
+                        else "planned-local-archive",
+                    }
+                )
+                continue
+            failure: Refusal | None = None
+            if authority is not None:
+                try:
+                    receipts.append(
+                        _push_absent_agent_module(record, checkout, module, authority, vcs)
+                    )
+                    continue
+                except Refusal as exc:
+                    failure = exc
+            receipts.append(
+                _archive_absent_agent_module_locally(
+                    config,
+                    record,
+                    checkout,
+                    module,
+                    _default_salvage_archive_root(config),
+                    failure,
+                    vcs,
+                )
+            )
+    return receipts
+
+
+def _absent_agent_module_salvaged(
+    receipts: Sequence[Mapping[str, object]],
+) -> dict[str, dict[str, frozenset[str]]]:
+    """Map checkout -> submodule -> the commits its receipt preserved."""
+
+    salvaged: dict[str, dict[str, frozenset[str]]] = {}
+    for receipt in receipts:
+        commits = (
+            frozenset()
+            if receipt["disposition"] == _ABSENT_MODULE_PUBLISHED
+            else frozenset(
+                _as_str(value, "submodule receipt commit")
+                for value in _as_list(
+                    receipt["unpublished_commits"], "submodule receipt.unpublished_commits"
+                )
+            )
+        )
+        salvaged.setdefault(str(receipt["checkout"]), {})[str(receipt["submodule"])] = commits
+    return salvaged
+
+
+_ABSENT_MODULE_RECEIPT_KEYS: Mapping[str, frozenset[str]] = {
+    _ABSENT_MODULE_PUBLISHED: frozenset(),
+    _ABSENT_MODULE_PUSHED: frozenset({"remote_url_sha256", "remote_refs"}),
+    _ABSENT_MODULE_ARCHIVED: frozenset(
+        {
+            "archive_root",
+            "archive_receipt",
+            "archive_receipt_sha256",
+            "archive_bundle",
+            "archive_bundle_sha256",
+            "archive_bundle_bytes",
+            "archive_refs",
+            "complete_history",
+            "archive_reason",
+            "remote_failure",
+        }
+    ),
+}
+
+
+def _absent_agent_module_commit_refs(
+    receipt: Mapping[str, object], key: str, label: str
+) -> tuple[tuple[str, str], ...]:
+    pairs: list[tuple[str, str]] = []
+    for index, value in enumerate(_as_list(receipt[key], f"{label}.{key}")):
+        entry = _as_mapping(value, f"{label}.{key}[{index}]")
+        _exact_keys(entry, {"commit", "ref"}, set(), f"{label}.{key}[{index}]")
+        commit = _as_str(entry["commit"], f"{label}.{key}[{index}].commit")
+        ref = _as_str(entry["ref"], f"{label}.{key}[{index}].ref")
+        try:
+            _validate_full_ref(ref, f"{label}.{key}[{index}].ref")
+        except Refusal as exc:
+            raise StateError(f"{label}.{key}[{index}].ref is invalid") from exc
+        pairs.append((commit, ref))
+    return tuple(pairs)
+
+
+def _absent_agent_submodule_salvage_from_journal(
+    raw: Mapping[str, object], record: ActiveRecord
+) -> tuple[dict[str, object], ...]:
+    """Validate the submodule receipts a recovery journal recorded before its first push."""
+
+    if "submodule_salvage" not in raw:
+        return ()
+    entries = _as_list(raw["submodule_salvage"], "absent-agent-row journal.submodule_salvage")
+    if not entries:
+        raise StateError("absent-agent-row journal.submodule_salvage is empty")
+    order = [checkout.name for checkout in record.checkouts]
+    receipts: list[dict[str, object]] = []
+    seen: list[tuple[int, str]] = []
+    for index, value in enumerate(entries):
+        label = f"absent-agent-row journal.submodule_salvage[{index}]"
+        entry = dict(_as_mapping(value, label))
+        disposition = _as_str(entry.get("disposition"), f"{label}.disposition")
+        if disposition not in _ABSENT_MODULE_RECEIPT_KEYS:
+            raise StateError(f"{label}.disposition {disposition!r} is unknown")
+        _exact_keys(
+            entry,
+            {
+                "checkout",
+                "submodule",
+                "submodule_repository",
+                "shared_repository",
+                "unpublished_commits",
+                "disposition",
+                *_ABSENT_MODULE_RECEIPT_KEYS[disposition],
+            },
+            set(),
+            label,
+        )
+        checkout = _as_str(entry["checkout"], f"{label}.checkout")
+        submodule = _as_str(entry["submodule"], f"{label}.submodule")
+        _as_str(entry["submodule_repository"], f"{label}.submodule_repository")
+        if entry["shared_repository"] is not None:
+            _as_str(entry["shared_repository"], f"{label}.shared_repository")
+        if checkout not in order or not submodule:
+            raise StateError(f"{label} names no recorded checkout and submodule")
+        commits = [
+            _as_str(commit, f"{label}.unpublished_commits[{position}]")
+            for position, commit in enumerate(
+                _as_list(entry["unpublished_commits"], f"{label}.unpublished_commits")
+            )
+        ]
+        if (
+            any(SHA_RE.fullmatch(commit) is None for commit in commits)
+            or commits != sorted(set(commits))
+            or (disposition == _ABSENT_MODULE_PUBLISHED) != (not commits)
+        ):
+            raise StateError(f"{label}.unpublished_commits is invalid for {disposition}")
+        if disposition == _ABSENT_MODULE_PUSHED:
+            if DIGEST_RE.fullmatch(
+                _as_str(entry["remote_url_sha256"], f"{label}.remote_url_sha256")
+            ) is None or [
+                commit
+                for commit, _ref in _absent_agent_module_commit_refs(
+                    entry, "remote_refs", label
+                )
+            ] != commits:
+                raise StateError(f"{label} remote refs differ from its commits")
+        elif disposition == _ABSENT_MODULE_ARCHIVED:
+            for key in (
+                "archive_root",
+                "archive_receipt",
+                "archive_bundle",
+                "archive_reason",
+            ):
+                _as_str(entry[key], f"{label}.{key}")
+            for key in ("archive_receipt_sha256", "archive_bundle_sha256"):
+                if DIGEST_RE.fullmatch(_as_str(entry[key], f"{label}.{key}")) is None:
+                    raise StateError(f"{label}.{key} must be one SHA-256 digest")
+            _as_int(entry["archive_bundle_bytes"], f"{label}.archive_bundle_bytes", minimum=1)
+            if entry["remote_failure"] is not None:
+                _as_str(entry["remote_failure"], f"{label}.remote_failure")
+            if entry["complete_history"] is not True or [
+                commit
+                for commit, _ref in _absent_agent_module_commit_refs(
+                    entry, "archive_refs", label
+                )
+            ] != commits:
+                raise StateError(f"{label} archive refs differ from its commits")
+        position = (order.index(checkout), submodule)
+        if seen and position <= seen[-1]:
+            raise StateError(
+                "absent-agent-row submodule receipts are not distinct and in checkout order"
+            )
+        seen.append(position)
+        receipts.append(entry)
+    return tuple(receipts)
+
+
+def _assert_absent_agent_module_salvage_intact(
+    config: Config,
+    record: ActiveRecord,
+    receipts: Sequence[Mapping[str, object]],
+    removed: AbstractSet[str],
+    vcs: _GitVcs,
+) -> None:
+    """Re-read every submodule salvage before any registration is removed.
+
+    The journal's paths are not trusted. A submodule repository must be
+    where Git keeps it for a still-registered checkout. A pushed commit must
+    still be at its rescue ref on the URL that repository names, and a local
+    remote must not read objects from an administrative directory recovery
+    deletes. A bundle and its receipt must be at the paths wrkslots derives
+    for them in the default archive root, below private directories that
+    cross no symlink and lie outside every such administrative directory;
+    the receipt must say exactly what the journal records, and the bundle
+    must still hash to it, clone afresh, name each commit, and pass a full
+    fsck.
+    """
+
+    checkouts = {checkout.name: checkout for checkout in record.checkouts}
+    doomed = _absent_agent_doomed_administrations(config, record, removed, vcs)
+    doomed_paths = tuple(doomed.values())
+    for receipt in receipts:
+        checkout = checkouts[str(receipt["checkout"])]
+        submodule = _as_str(receipt["submodule"], "submodule name")
+        recorded_repository = _as_str(receipt["submodule_repository"], "submodule path")
+        label = f"submodule {submodule} of absent checkout {checkout.name}"
+        administration = doomed.get(checkout.name)
+        if administration is not None and Path(recorded_repository) != (
+            administration / submodule
+        ):
+            raise Refusal(
+                f"the recovery journal places {label} at {recorded_repository}, not "
+                f"where Git keeps it ({administration / submodule}); nothing was removed"
+            )
+        if receipt["disposition"] == _ABSENT_MODULE_PUSHED:
+            if administration is None:
+                continue
+            module_path = administration / submodule
+            with tempfile.TemporaryDirectory(prefix="wrkslots-module-") as temporary:
+                work = Path(temporary)
+                authority = vcs.remote_authority(
+                    work,
+                    config.default_remote,
+                    env_overrides=_absent_agent_module_env(module_path, work),
+                )
+                if authority.sha256 != receipt["remote_url_sha256"]:
+                    raise Refusal(f"the remote of {label} changed after salvage")
+                local = _local_remote_url_path(module_path, authority.url)
+                if local is not None:
+                    _assert_local_remote_outlives(local, doomed_paths, label)
+                with vcs._isolated_repository(module_path / "objects") as (
+                    isolated,
+                    object_env,
+                ):
+                    for commit, ref in _absent_agent_module_commit_refs(
+                        receipt, "remote_refs", label
+                    ):
+                        if (
+                            vcs._remote_ref_sha_at_url(
+                                isolated, authority.url, ref, env_overrides=object_env
+                            )
+                            != commit
+                        ):
+                            raise Refusal(
+                                f"remote rescue ref {ref} for {label} no longer names "
+                                f"{commit}"
+                            )
+        elif receipt["disposition"] == _ABSENT_MODULE_ARCHIVED:
+            root = _default_salvage_archive_root(config)
+            commits = [
+                _as_str(value, "submodule receipt commit")
+                for value in _as_list(
+                    receipt["unpublished_commits"], "submodule receipt commits"
+                )
+            ]
+            bundle, receipt_path, refs = _absent_agent_module_archive_paths(
+                root, record, checkout, submodule, commits
+            )
+            if (
+                receipt["archive_root"] != str(root)
+                or receipt["archive_bundle"] != str(bundle)
+                or receipt["archive_receipt"] != str(receipt_path)
+                or _absent_agent_module_commit_refs(receipt, "archive_refs", label)
+                != refs
+            ):
+                raise Refusal(
+                    f"the recovery journal names a local salvage archive for {label} "
+                    f"other than {bundle}, where wrkslots writes it; nothing was removed"
+                )
+            _assert_private_salvage_directories(root, bundle.parent)
+            for kept in (bundle, receipt_path):
+                real = Path(os.path.realpath(kept))
+                for directory in doomed_paths:
+                    resolved = directory.resolve()
+                    if real == resolved or _path_is_within(real, resolved):
+                        raise Refusal(
+                            f"local salvage archive {kept} for {label} lies in {directory}, "
+                            "which recovery deletes; nothing was removed"
+                        )
+            contents = _read_bounded_regular_file(
+                receipt_path,
+                "local submodule salvage archive receipt",
+                _LOCAL_SALVAGE_RECEIPT_BYTES_LIMIT,
+            )
+            if hashlib.sha256(contents).hexdigest() != receipt["archive_receipt_sha256"]:
+                raise Refusal(f"local salvage archive receipt for {label} changed")
+            bundle_sha256 = _as_str(receipt["archive_bundle_sha256"], "submodule bundle digest")
+            bundle_size = _as_int(
+                receipt["archive_bundle_bytes"], "submodule bundle size", minimum=1
+            )
+            if not _json_equal(
+                _strict_json_object(contents, "local submodule salvage archive receipt"),
+                _absent_agent_module_receipt_payload(
+                    root,
+                    bundle,
+                    record,
+                    checkout,
+                    submodule,
+                    recorded_repository,
+                    refs,
+                    bundle_sha256,
+                    bundle_size,
+                ),
+            ):
+                raise Refusal(
+                    f"local salvage archive receipt {receipt_path} for {label} disagrees "
+                    "with the recovery journal; nothing was removed"
+                )
+            _verify_absent_agent_module_bundle(bundle, bundle_sha256, bundle_size, refs, vcs)
+
+
+def _absent_agent_module_validation(receipt: Mapping[str, object]) -> str:
+    commits = _as_list(receipt["unpublished_commits"], "submodule receipt commits")
+    prefix = f"checkout {receipt['checkout']} submodule {receipt['submodule']}: "
+    if receipt["disposition"] == _ABSENT_MODULE_PUBLISHED:
+        return (
+            prefix + "every commit named by HEAD or a ref of the submodule repository "
+            "Git kept for the checkout was reachable from a remote-tracking ref there or "
+            "in the shared submodule repository; nothing was salvaged"
+        )
+    if receipt["disposition"] == _ABSENT_MODULE_PUSHED:
+        return (
+            prefix + f"{len(commits)} commit(s) outside every remote-tracking ref were "
+            "pushed to rescue refs on the submodule's remote and read back before the "
+            "registration was removed"
+        )
+    return (
+        prefix + f"{len(commits)} commit(s) outside every remote-tracking ref were "
+        f"bundled with complete history into {receipt['archive_bundle']} (SHA-256 "
+        f"{receipt['archive_bundle_sha256']}), which was cloned afresh and fsck-checked "
+        "before the registration was removed"
+    )
+
+
 def _assert_absent_agent_index_unstaged(
     vcs: _GitVcs,
     repository: Path,
@@ -36572,6 +38135,7 @@ def _absent_agent_checkout_receipts(
     *,
     preserved: AbstractSet[str] = frozenset(),
     containment: Mapping[str, tuple[str, str]] | None = None,
+    module_salvage: Mapping[str, Mapping[str, AbstractSet[str]]] | None,
 ) -> tuple[dict[str, object], ...]:
     """Check every absent checkout and return its planned preservation receipt.
 
@@ -36579,6 +38143,9 @@ def _absent_agent_checkout_receipts(
     salvage_push_remotes is then accepted only when an existing remote ref
     already contains its recorded HEAD. A journal passes the containment it
     recorded, which is re-verified instead of searched for again.
+    ``module_salvage`` is None before submodule salvage, and afterwards maps
+    checkout -> submodule -> the commits salvage preserved (see
+    _assert_absent_agent_modules_preserved).
     """
 
     if len(branch_witnesses) != len(record.checkouts):
@@ -36676,6 +38243,19 @@ def _absent_agent_checkout_receipts(
                     else "the ACTIVE row, the recovery journal, and the remaining "
                     "Git registrations",
                 )
+            _assert_absent_agent_modules_preserved(
+                vcs,
+                repository,
+                path,
+                checkout,
+                "the ACTIVE row and Git registrations"
+                if containment is None
+                else "the ACTIVE row, the recovery journal, and the remaining "
+                "Git registrations",
+                None
+                if module_salvage is None
+                else module_salvage.get(checkout.name, {}),
+            )
     return _absent_agent_planned_receipts(
         record,
         branch_witnesses,
@@ -36799,6 +38379,7 @@ def _absent_agent_archive_entry(
     item: AbsentAgentRow,
     finished_at: str,
     receipts: Sequence[Mapping[str, object]],
+    submodules: Sequence[Mapping[str, object]] = (),
 ) -> dict[str, object]:
     branch_receipts = ["local_branch" in receipt for receipt in receipts]
     if any(branch_receipts) and not all(branch_receipts):
@@ -36854,6 +38435,7 @@ def _absent_agent_archive_entry(
                 for receipt in receipts
                 if has_branch_witnesses
             ),
+            *(_absent_agent_module_validation(receipt) for receipt in submodules),
         ],
         "limitations": [
             "working-tree contents were absent before recovery; tracked and ordinary "
@@ -36885,6 +38467,17 @@ def _absent_agent_archive_entry(
                 if already_on_remote
                 else []
             ),
+            *(
+                [
+                    "submodule repositories Git kept for the checkouts were removed "
+                    "with their administrative directories; only commits named by "
+                    "their HEADs and refs were checked, and their reflogs were "
+                    "discarded; a commit found in a remote-tracking ref stays "
+                    "preserved only while that remote still holds it"
+                ]
+                if submodules
+                else []
+            ),
         ],
         "continuation": (
             "physical storage was already absent; inspect each checkout's verified "
@@ -36898,7 +38491,10 @@ def _absent_agent_archive_entry(
             if has_branch_witnesses
             else "physical storage was already absent; inspect the verified rescue refs"
         ),
-        "salvage": [dict(receipt) for receipt in receipts],
+        "salvage": [
+            *(dict(receipt) for receipt in receipts),
+            *(dict(receipt) for receipt in submodules),
+        ],
         "checkouts": [_checkout_to_obj(checkout) for checkout in record.checkouts],
         **({"layout": record.layout} if record.layout is not None else {}),
         **(
@@ -37067,6 +38663,7 @@ def _absent_agent_journal_inputs(
                 f"absent-agent-row branch witness differs from checkout {checkout.name}"
             )
     containment = _absent_agent_containment_from_journal(raw, record, legacy_branches)
+    submodules = _absent_agent_submodule_salvage_from_journal(raw, record)
     receipts = tuple(
         _as_mapping(value, f"absent-agent-row journal.preserved[{index}]")
         for index, value in enumerate(_as_list(raw["preserved"], "absent-agent-row journal.preserved"))
@@ -37100,7 +38697,7 @@ def _absent_agent_journal_inputs(
             containment=containment,
         )
         expected_archive = _absent_agent_archive_entry(
-            record, item, finished_at, expected_receipts
+            record, item, finished_at, expected_receipts, submodules
         )
         if _json_equal(archive_entry, expected_archive):
             break
@@ -37134,6 +38731,7 @@ def _assert_absent_agent_safe(
     *,
     preserved: AbstractSet[str] = frozenset(),
     containment: Mapping[str, tuple[str, str]] | None = None,
+    module_salvage: Mapping[str, Mapping[str, AbstractSet[str]]] | None,
 ) -> tuple[
     tuple[Path, ...],
     tuple[_AbsentAgentBranchWitness, ...],
@@ -37161,6 +38759,7 @@ def _assert_absent_agent_safe(
         removed,
         preserved=preserved,
         containment=containment,
+        module_salvage=module_salvage,
     )
     return paths, selected_witnesses, receipts
 
@@ -37208,6 +38807,8 @@ def _recover_absent_agent_row(
         checkout.name for checkout in recorded.checkouts[:preserved_count]
     )
     containment = _absent_agent_receipt_containment(planned)
+    submodules = _absent_agent_submodule_salvage_from_journal(raw, recorded)
+    module_salvage = _absent_agent_module_salvaged(submodules)
     _assert_absent_agent_safe(
         config,
         current,
@@ -37215,6 +38816,7 @@ def _recover_absent_agent_row(
         frozenset(removed_names),
         preserved=preserved_names,
         containment=containment,
+        module_salvage=module_salvage,
     )
     journal = dict(raw)
     preserved = [
@@ -37276,6 +38878,11 @@ def _recover_absent_agent_row(
             != checkout.head
         ):
             raise Refusal(f"remote rescue ref for {checkout.name} no longer preserves its HEAD")
+    # Submodule salvage completed before the journal was written; re-read it
+    # here, with the other remote checks, before any registration is removed.
+    _assert_absent_agent_module_salvage_intact(
+        config, recorded, submodules, frozenset(removed_names), vcs
+    )
     journal["phase"] = "preserved"
     _write_journal(config, journal)
     removed = list(removed_names)
@@ -37338,8 +38945,14 @@ def _recover_absent_agent_row(
                     )
             # Holding Git's index lock keeps any Git command from staging or
             # committing in this worktree from these checks until the removal,
-            # which deletes the lock with the administrative directory.
-            with vcs.worktree_index_locked(repository, checkout_path):
+            # which deletes the lock with the administrative directory. Each
+            # submodule repository kept there has an index of its own, locked
+            # the same way, so no commit lands in one after it is examined.
+            with vcs.worktree_index_locked(
+                repository, checkout_path
+            ) as administration, vcs.worktree_module_indexes_locked(
+                administration
+            ) as locked_modules:
                 registration = vcs.worktree_registration(repository, checkout_path)
                 if registration is None:
                     raise Refusal(
@@ -37352,6 +38965,21 @@ def _recover_absent_agent_row(
                 _assert_absent_agent_worktree_state_preserved(
                     vcs, repository, checkout_path, checkout, authority, retained
                 )
+                examined = _assert_absent_agent_modules_preserved(
+                    vcs,
+                    repository,
+                    checkout_path,
+                    checkout,
+                    retained,
+                    module_salvage.get(checkout.name, {}),
+                )
+                if tuple(module.path for module in examined) != locked_modules:
+                    raise Refusal(
+                        f"the submodule repositories Git keeps for absent checkout "
+                        f"{checkout.name} changed while their indexes were being "
+                        f"locked. state: REFUSED -- {retained} were retained. remedy: "
+                        "rerun recover"
+                    )
                 # Remote preservation can take long enough for the missing path
                 # to reappear. Refuse before asking Git to remove the
                 # registration so the ordinary `git worktree remove --force`
@@ -37374,6 +39002,7 @@ def _recover_absent_agent_row(
         frozenset(checkout.name for checkout in recorded.checkouts),
         preserved=frozenset(checkout.name for checkout in recorded.checkouts),
         containment=containment,
+        module_salvage=module_salvage,
     )
     if archived is None:
         archive = _append_archive_once(
@@ -37476,7 +39105,14 @@ def _recover_absent_agent_row_item(
             )
         _validate_absent_agent_row(record, item)
         _paths, branch_witnesses, receipts = _assert_absent_agent_safe(
-            config, record
+            config, record, module_salvage=None
+        )
+        # Removing a registration deletes the submodule repositories Git
+        # keeps for that checkout, so their unpublished commits are salvaged
+        # before the journal exists: a salvage that refuses leaves no journal
+        # to block other rows, and a rerun salvages again idempotently.
+        submodules = _salvage_absent_agent_modules(
+            config, record, _GitVcs(), apply=apply
         )
         if not apply:
             rendered_witnesses = json.dumps(
@@ -37498,10 +39134,27 @@ def _recover_absent_agent_row_item(
                 if planned_containment
                 else ""
             )
+            planned_submodules = [
+                {
+                    "checkout": receipt["checkout"],
+                    "submodule": receipt["submodule"],
+                    "unpublished_commits": receipt["unpublished_commits"],
+                    "disposition": receipt["disposition"],
+                }
+                for receipt in submodules
+                if receipt["disposition"] != _ABSENT_MODULE_PUBLISHED
+            ]
+            rendered_submodules = (
+                " submodule_salvage="
+                + json.dumps(planned_submodules, sort_keys=True, separators=(",", ":"))
+                if planned_submodules
+                else ""
+            )
             print(
                 f"ROW machine={item.machine} slot={item.slot} generation={item.generation} "
                 "outcome=planned detail=physical-storage-absent "
                 f"branch_witnesses={rendered_witnesses}{rendered_containment}"
+                f"{rendered_submodules}"
             )
             return "would-recover"
         assert coordinator is not None
@@ -37523,7 +39176,7 @@ def _recover_absent_agent_row_item(
             "preserved": [],
             "removed": [],
             "archive_entry": _absent_agent_archive_entry(
-                record, item, finished_at, receipts
+                record, item, finished_at, receipts, submodules
             ),
         }
         receipt_containment = _absent_agent_receipt_containment(receipts)
@@ -37531,6 +39184,8 @@ def _recover_absent_agent_row_item(
             journal["remote_containment"] = _absent_agent_containment_to_obj(
                 receipt_containment
             )
+        if submodules:
+            journal["submodule_salvage"] = submodules
         _write_journal(config, journal)
         _interrupt_for_test("after-absent-agent-journal")
         _recover_absent_agent_row(config, _journal_path(config), journal, coordinator)
