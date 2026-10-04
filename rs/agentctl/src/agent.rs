@@ -1766,14 +1766,46 @@ fn lock_target_with(
     mut wait: impl FnMut(&File, &Path) -> AgentResult<()>,
 ) -> AgentResult<TargetLock> {
     let [account_path, legacy_path] = target_lock_paths(name)?;
-    let account = open_private_lock(&account_path, purpose)?;
-    wait(&account, &account_path)?;
-    let legacy = open_private_lock(&legacy_path, purpose)?;
-    wait(&legacy, &legacy_path)?;
+    let account = lock_current_file(&account_path, purpose, &mut wait)?;
+    let legacy = lock_current_file(&legacy_path, purpose, &mut wait)?;
     Ok(TargetLock {
         _account: account,
         _legacy: legacy,
     })
+}
+
+/// Open and lock the file at `path`, retrying until the locked file is still the one the path
+/// names, then set its modification time to now.
+///
+/// The host's daily cleaner deletes `/tmp` files by modification time, so it can unlink a lock
+/// file while a sender waits on it. A sender that then took the lock would hold a file no
+/// other process can open, while the next sender locked a fresh file at the same path; the
+/// check after locking sends it back to contend on the file that is there. Setting the
+/// modification time on every acquisition keeps a file that is still in use from ever
+/// looking four days old to the cleaner, including while a process that takes only the `/tmp`
+/// file holds it.
+fn lock_current_file(
+    path: &Path,
+    purpose: &str,
+    wait: &mut dyn FnMut(&File, &Path) -> AgentResult<()>,
+) -> AgentResult<File> {
+    loop {
+        let file = open_private_lock(path, purpose)?;
+        wait(&file, path)?;
+        let held = file
+            .metadata()
+            .map_err(|error| io_error(&format!("inspect {purpose}"), path, error))?;
+        match fs::symlink_metadata(path) {
+            Ok(current) if current.dev() == held.dev() && current.ino() == held.ino() => {
+                file.set_modified(SystemTime::now())
+                    .map_err(|error| io_error(&format!("mark {purpose} used"), path, error))?;
+                return Ok(file);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error(&format!("inspect {purpose}"), path, error)),
+        }
+    }
 }
 
 /// Lock one target name, blocking until every holder releases it.
@@ -1793,7 +1825,20 @@ pub(crate) fn lock_target(name: &str, purpose: &str) -> AgentResult<TargetLock> 
 /// could delete it while it was held and a second sender would lock a fresh file at the same
 /// path.
 fn host_target_lock_root() -> AgentResult<PathBuf> {
-    Ok(crate::client::account_home()?.join(".local/state/agentctl/target-locks"))
+    target_lock_root_under(crate::client::account_home()?)
+}
+
+/// The account-state lock root under `home`, which must be absolute: a relative home would
+/// resolve against each caller's working directory, so senders started in different
+/// directories would lock different files.
+fn target_lock_root_under(home: PathBuf) -> AgentResult<PathBuf> {
+    if !home.is_absolute() {
+        return Err(AgentError::delivery(format!(
+            "account home directory is not an absolute path: {}",
+            home.display()
+        )));
+    }
+    Ok(home.join(".local/state/agentctl/target-locks"))
 }
 
 /// The root earlier editions lock in. New editions lock it second, after the account root.
@@ -1803,9 +1848,14 @@ fn legacy_host_target_lock_root() -> PathBuf {
     }))
 }
 
+/// The roots every agentctl process on the host locks in, in acquisition order.
+fn host_target_lock_roots() -> AgentResult<[PathBuf; 2]> {
+    Ok([host_target_lock_root()?, legacy_host_target_lock_root()])
+}
+
 #[cfg(not(test))]
 fn target_lock_roots() -> AgentResult<[PathBuf; 2]> {
-    Ok([host_target_lock_root()?, legacy_host_target_lock_root()])
+    host_target_lock_roots()
 }
 
 /// Unit tests lock roots private to this test process. The fixture panes (`w1:p1`) are
@@ -3097,7 +3147,7 @@ mod tests {
         // The host's daily cleaner deletes files under these directories by modification
         // time, and a lock file is never written, so a held lock there was deleted once it
         // was four days old and a second sender locked a fresh file at the same path.
-        let host = host_target_lock_root().expect("host target lock root");
+        let [host, legacy] = host_target_lock_roots().expect("host target lock roots");
         let home = crate::client::account_home().expect("account home");
         assert_eq!(host, home.join(".local/state/agentctl/target-locks"));
         for cleaned in ["/tmp", "/var/tmp", "/dev/shm"] {
@@ -3105,11 +3155,85 @@ mod tests {
         }
         // Earlier editions keep the legacy name, so new editions must keep locking it too.
         assert_eq!(
-            legacy_host_target_lock_root(),
+            legacy,
             PathBuf::from(format!("/tmp/herdr-agent-target-locks-{}", unsafe {
                 libc::getuid()
             }))
         );
+    }
+
+    #[test]
+    fn a_relative_account_home_is_refused() {
+        // Senders started in different directories would resolve a relative home to
+        // different lock files and stop excluding each other.
+        let error = target_lock_root_under(PathBuf::from("relative-home"))
+            .expect_err("a relative home is refused");
+        assert!(
+            error.to_string().contains("not an absolute path"),
+            "{error}"
+        );
+        assert_eq!(
+            target_lock_root_under(PathBuf::from("/home/someone")).expect("absolute home"),
+            PathBuf::from("/home/someone/.local/state/agentctl/target-locks")
+        );
+    }
+
+    #[test]
+    fn a_lock_file_unlinked_while_waited_on_is_not_held() {
+        // The cleaner unlinks the file while this sender waits on it, and a sender that takes
+        // only the /tmp file then locks a fresh file at the same path. Taking the lock on the
+        // unlinked file would let both senders in; this sender must contend on the new file.
+        let directory = TestDirectory::new("unlinked-target-lock");
+        let path = directory.path().join("target.lock");
+        let mut replacement: Option<File> = None;
+        let mut waits = 0;
+        let held = lock_current_file(&path, "test target lock", &mut |file, path| {
+            waits += 1;
+            if waits == 1 {
+                fs::remove_file(path).expect("unlink waited-on lock");
+                let other = open_private_lock(path, "replacement lock").expect("replacement");
+                other
+                    .lock_exclusive()
+                    .expect("other sender holds the replacement");
+                replacement = Some(other);
+            } else {
+                assert!(
+                    FileExt::try_lock_exclusive(file).is_err(),
+                    "the retry must open the file the other sender holds"
+                );
+                replacement = None;
+            }
+            FileExt::lock_exclusive(file).map_err(|error| io_error("lock", path, error))
+        })
+        .expect("lock the current file");
+        assert_eq!(waits, 2);
+        let current = fs::metadata(&path).expect("current lock file");
+        let metadata = held.metadata().expect("held lock file");
+        assert_eq!(
+            (current.dev(), current.ino()),
+            (metadata.dev(), metadata.ino())
+        );
+    }
+
+    #[test]
+    fn taking_a_target_lock_marks_both_files_used() {
+        // The cleaner deletes by modification time, and only a file it sees as four days old.
+        let name = "marks-files-used";
+        let paths = target_lock_paths(name).expect("target lock paths");
+        let stale = SystemTime::now() - Duration::from_secs(5 * 24 * 60 * 60);
+        for path in &paths {
+            open_private_lock(path, "stale test lock")
+                .expect("create lock file")
+                .set_modified(stale)
+                .expect("age lock file");
+        }
+        let before = SystemTime::now() - Duration::from_secs(1);
+        let lock = lock_target(name, "test target lock").expect("take target lock");
+        for path in &paths {
+            let modified = fs::metadata(path).and_then(|meta| meta.modified()).unwrap();
+            assert!(modified >= before, "{} was not marked used", path.display());
+        }
+        drop(lock);
     }
 
     #[test]

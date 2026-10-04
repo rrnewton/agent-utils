@@ -1236,7 +1236,18 @@ def _host_target_lock_root() -> str:
     time, and a lock file is never written, so once the file was four days old the cleaner could
     delete it while it was held and a second sender would lock a fresh file at the same path.
     """
-    return os.path.join(HerdrClient._account_home(), ".local", "state", "agentctl", "target-locks")
+    return _target_lock_root_under(HerdrClient._account_home())
+
+
+def _target_lock_root_under(home: str) -> str:
+    """Return the account-state lock root under ``home``, which must be absolute.
+
+    A relative home would resolve against each caller's working directory, so senders started
+    in different directories would lock different files.
+    """
+    if not os.path.isabs(home):
+        raise AgentDeliveryError(f"account home directory is not an absolute path: {home}")
+    return os.path.join(home, ".local", "state", "agentctl", "target-locks")
 
 
 def _legacy_host_target_lock_root() -> str:
@@ -1244,12 +1255,17 @@ def _legacy_host_target_lock_root() -> str:
     return os.path.join("/tmp", f"herdr-agent-target-locks-{os.getuid()}")
 
 
+def _host_target_lock_roots() -> tuple[str, str]:
+    """Return the roots every agentctl process on the host locks in, in acquisition order."""
+    return _host_target_lock_root(), _legacy_host_target_lock_root()
+
+
 def _target_lock_paths(name: str) -> tuple[str, str]:
     """Return the lock files for one target name in acquisition order: account state, then legacy."""
     paths = []
-    for lock_root, purpose in (
-        (_host_target_lock_root(), "host-wide target lock directory"),
-        (_legacy_host_target_lock_root(), "legacy host-wide target lock directory"),
+    for lock_root, purpose in zip(
+        _host_target_lock_roots(),
+        ("host-wide target lock directory", "legacy host-wide target lock directory"),
     ):
         os.makedirs(lock_root, mode=0o700, exist_ok=True)
         _validate_private_directory(lock_root, purpose)
@@ -1285,13 +1301,49 @@ def _lock_target(name: str, purpose: str) -> _TargetLock:
     lock = _TargetLock(())
     try:
         for path in _target_lock_paths(name):
-            descriptor = _open_private_lock(path, purpose)
-            lock._descriptors.append(descriptor)
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            lock._descriptors.append(_lock_current_file(path, purpose))
     except BaseException:
         lock.close()
         raise
     return lock
+
+
+def _flock_exclusive(descriptor: int, _path: str) -> None:
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+
+
+def _lock_current_file(
+    path: str, purpose: str, wait: Callable[[int, str], None] = _flock_exclusive
+) -> int:
+    """Lock the file at ``path``, retrying until it is still the file the path names.
+
+    The host's daily cleaner deletes ``/tmp`` files by modification time, so it can unlink a
+    lock file while a sender waits on it. A sender that then took the lock would hold a file no
+    other process can open, while the next sender locked a fresh file at the same path; the
+    check after locking sends it back to contend on the file that is there. Setting the
+    modification time on every acquisition keeps a file that is still in use from ever looking
+    four days old to the cleaner, including while a process that takes only the ``/tmp`` file
+    holds it.
+    """
+    while True:
+        descriptor = _open_private_lock(path, purpose)
+        try:
+            wait(descriptor, path)
+            held = os.fstat(descriptor)
+            try:
+                current = os.stat(path, follow_symlinks=False)
+            except FileNotFoundError:
+                current = None
+            if current is not None and (current.st_dev, current.st_ino) == (
+                held.st_dev,
+                held.st_ino,
+            ):
+                os.utime(descriptor)
+                return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+        os.close(descriptor)
 
 
 def _lock_resolved_target(

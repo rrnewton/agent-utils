@@ -595,13 +595,73 @@ def test_host_target_locks_live_in_account_state_not_a_cleaned_temporary_directo
     # old and a second sender locked a fresh file at the same path.
     import pwd
 
-    host = agent_api._host_target_lock_root()
+    host, legacy = agent_api._host_target_lock_roots()
     home = pwd.getpwuid(os.getuid()).pw_dir
     assert host == os.path.join(home, ".local", "state", "agentctl", "target-locks")
     for cleaned in ("/tmp", "/var/tmp", "/dev/shm"):
         assert not (host == cleaned or host.startswith(cleaned + "/")), host
     # Earlier editions keep the legacy name, so new editions must keep locking it too.
-    assert agent_api._legacy_host_target_lock_root() == f"/tmp/herdr-agent-target-locks-{os.getuid()}"
+    assert legacy == f"/tmp/herdr-agent-target-locks-{os.getuid()}"
+
+
+def test_a_relative_account_home_is_refused() -> None:
+    # Senders started in different directories would resolve a relative home to different
+    # lock files and stop excluding each other.
+    with pytest.raises(AgentDeliveryError, match="not an absolute path"):
+        agent_api._target_lock_root_under("relative-home")
+    assert (
+        agent_api._target_lock_root_under("/home/someone")
+        == "/home/someone/.local/state/agentctl/target-locks"
+    )
+
+
+def test_a_lock_file_unlinked_while_waited_on_is_not_held(tmp_path: Path) -> None:
+    # The cleaner unlinks the file while this sender waits on it, and a sender that takes only
+    # the /tmp file then locks a fresh file at the same path. Taking the lock on the unlinked
+    # file would let both senders in; this sender must contend on the new file.
+    import fcntl
+
+    path = str(tmp_path / "target.lock")
+    replacement: list[int] = []
+    waits = 0
+
+    def wait(descriptor: int, lock_path: str) -> None:
+        nonlocal waits
+        waits += 1
+        if waits == 1:
+            os.unlink(lock_path)
+            other = agent_api._open_private_lock(lock_path, "replacement lock")
+            fcntl.flock(other, fcntl.LOCK_EX)
+            replacement.append(other)
+        else:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.close(replacement.pop())
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+
+    held = agent_api._lock_current_file(path, "test target lock", wait)
+    try:
+        assert waits == 2
+        current, locked = os.stat(path), os.fstat(held)
+        assert (current.st_dev, current.st_ino) == (locked.st_dev, locked.st_ino)
+    finally:
+        os.close(held)
+
+
+def test_taking_a_target_lock_marks_both_files_used() -> None:
+    # The cleaner deletes by modification time, and only a file it sees as four days old.
+    import time
+
+    name = "marks-files-used"
+    paths = agent_api._target_lock_paths(name)
+    stale = time.time() - 5 * 24 * 60 * 60
+    for path in paths:
+        os.close(agent_api._open_private_lock(path, "stale test lock"))
+        os.utime(path, (stale, stale))
+    before = time.time() - 1
+    with agent_api._lock_target(name, "test target lock"):
+        for path in paths:
+            assert os.stat(path).st_mtime >= before, path
 
 
 @pytest.mark.parametrize("held", [0, 1], ids=["account-root", "legacy-root"])
