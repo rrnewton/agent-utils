@@ -89,6 +89,11 @@ impl From<ChatError> for ApiError {
             ChatError::Refused(_) => {
                 Self::new(StatusCode::BAD_REQUEST, "refused", value.to_string())
             }
+            // `#203 incremental-refresh`. 410 rather than 400: nothing about the request was wrong
+            // when it was issued; the position it names is gone, and a newest read issues another.
+            ChatError::CursorExpired(_) => {
+                Self::new(StatusCode::GONE, "cursor_expired", value.to_string())
+            }
             _ => Self::new(StatusCode::BAD_GATEWAY, "chat_error", value.to_string()),
         }
     }
@@ -151,9 +156,10 @@ impl From<OpError> for ApiError {
         let code = value.code();
         let status = match value {
             OpError::UnknownChannel | OpError::UnknownMessage => StatusCode::NOT_FOUND,
-            OpError::EmptyQuery | OpError::InvalidCursor | OpError::InvalidRange => {
-                StatusCode::BAD_REQUEST
-            }
+            OpError::EmptyQuery
+            | OpError::InvalidCursor
+            | OpError::InvalidRange
+            | OpError::CursorMismatch => StatusCode::BAD_REQUEST,
             OpError::ChannelNotWritable => StatusCode::FORBIDDEN,
             // A fallback only: the reply route handles this itself, because an `ApiError` body
             // carries a code and prose and this case has to carry the UNSENT TEXT. Reaching here
@@ -1243,6 +1249,9 @@ pub struct TimelineQuery {
     pub thread_id: Option<String>,
     /// Opaque backward continuation returned by the previous page.
     pub before: Option<String>,
+    /// Opaque forward cursor: the `next_after` of an earlier newest page or delta of this view.
+    /// The answer then carries only what changed since. `#203 incremental-refresh`.
+    pub after: Option<String>,
     /// Entries requested, clamped to the configured limit and 99.
     pub limit: Option<u16>,
 }
@@ -1275,11 +1284,24 @@ pub async fn timeline(
             "before must be a continuation returned by this view",
         ));
     }
+    if query.before.is_some() && query.after.is_some() {
+        return Err(ApiError::bad_request(
+            "before and after cannot both be given",
+        ));
+    }
+    if query.after.as_ref().is_some_and(|cursor| {
+        cursor.is_empty() || cursor.len() > crate::timeline_forward::MAX_ENVELOPE
+    }) {
+        return Err(ApiError::bad_request(
+            "after must be a next_after returned by this view",
+        ));
+    }
     let limit = state.effective_limit(query.limit).min(ops::MAX_PAGE);
     let request = crate::threads::TimelineRequest {
         view: query.view,
         thread_id: query.thread_id,
         before: query.before,
+        after: query.after,
         limit,
     };
     let (channel, page) = ops::timeline(&state, &channel_id, &request).await?;

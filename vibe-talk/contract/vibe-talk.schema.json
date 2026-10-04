@@ -741,12 +741,66 @@
       ],
       "type": "object"
     },
+    "TimelineDelta": {
+      "description": "What a forward read says about the changes it carries. `#203 incremental-refresh`.",
+      "properties": {
+        "complete": {
+          "description": "True when this delta carries EVERY creation, edit, deletion and summary change in the view\nsince the cursor. False when it carries additions only: a read filtered by creation time\ncannot see an edit or a deletion, which then reach the caller through live events or its\nnext full read.",
+          "type": "boolean"
+        },
+        "deleted": {
+          "default": [],
+          "description": "Messages removed since the cursor, channel-wide in every view. Always empty when\n`complete` is false.",
+          "items": {
+            "$ref": "#/$defs/MessageId"
+          },
+          "type": "array"
+        },
+        "more": {
+          "description": "More changes remain past this page: ask again with `next_after` straight away.",
+          "type": "boolean"
+        },
+        "removed_threads": {
+          "default": [],
+          "description": "Threads that left the thread list since the cursor. Threads view only; empty elsewhere.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "more",
+        "complete",
+        "deleted",
+        "removed_threads"
+      ],
+      "type": "object"
+    },
     "TimelineResponse": {
       "description": "A provider-neutral timeline plus this application's channel and read-state metadata.",
       "properties": {
+        "as_of": {
+          "description": "The instant, RFC 3339, up to which the backend knows this page is complete, when it is\nserving data it could not bring up to date just now. Absent means now.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "channel": {
           "$ref": "#/$defs/ChannelInfo",
           "description": "Configured parent channel, including its local alias and write policy."
+        },
+        "delta": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimelineDelta"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Present exactly on an answer to `after`: the page then carries only what is new or changed\nsince that cursor, and rows absent from it are UNCHANGED, never deleted."
         },
         "dismissed": {
           "description": "Messages on this page that the reader has archived locally.",
@@ -776,6 +830,13 @@
             "$ref": "#/$defs/Message"
           },
           "type": "array"
+        },
+        "next_after": {
+          "description": "Forward cursor for this view: what to pass as `after` to learn what changed since this\npage. `#203 incremental-refresh`.\n\nFrom a backend, present only when that backend answers `after` itself. Above the backend\nvibe-talk always fills it on a newest page or a delta — with its own generic cursor when\nthe backend left it empty — and removes it from a `before` page, which says nothing about\nthe newest end. Absent from an older bridge's answer, which therefore still parses.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "next_before": {
           "description": "Opaque continuation, present exactly when another page exists.",

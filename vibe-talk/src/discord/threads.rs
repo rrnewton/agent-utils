@@ -22,7 +22,8 @@ use super::{
 use crate::chat::ChatError;
 use crate::model::{ChannelId, Message, MessageId};
 use crate::threads::{
-    MessageThread, ThreadApi, ThreadSummary, TimelinePage, TimelineRequest, TimelineView,
+    MessageThread, ThreadApi, ThreadSummary, TimelineDelta, TimelinePage, TimelineRequest,
+    TimelineView,
 };
 
 const MAX_THREADS: usize = 256;
@@ -32,6 +33,13 @@ const MAX_SNAPSHOTS: usize = 16;
 const TIMELINE_TIMEOUT: Duration = Duration::from_secs(90);
 const THREAD_CONTAINER_NOTICE: &str =
     "This channel contains threads. Open a thread to post a reply.";
+/// The longest cursor, either direction, a caller may hand back.
+const MAX_CURSOR: usize = 8192;
+/// The longest forward cursor the bridge contract lets a bridge issue. `#203 incremental-refresh`.
+const MAX_BRIDGE_FORWARD_CURSOR: usize = 2048;
+/// The most ids one bridge delta may list as deleted, or as threads removed. The contract caps
+/// deletions at 500 and answers 410 past that; the margin keeps a bridge on the edge readable.
+const MAX_DELTA_REMOVALS: usize = 1000;
 
 #[derive(Debug, Default)]
 pub(super) struct InventoryCache {
@@ -159,6 +167,84 @@ impl NativeCursor {
     }
 }
 
+/// A native forward cursor: the newest snowflake a newest read or delta of this view delivered.
+/// `#203 incremental-refresh`. Snowflakes are unique and ordered, so `after` needs no overlap and
+/// has no ties. A separate shape from [`NativeCursor`], so neither can be handed back as the other.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeForward {
+    channel: String,
+    view: TimelineView,
+    thread_id: Option<String>,
+    after: String,
+    /// Whether the newest read found child threads: a Main delta reads no inventory, so it
+    /// carries this forward rather than guessing.
+    threads: bool,
+}
+
+impl NativeForward {
+    fn encode(&self) -> Result<String, ChatError> {
+        serde_json::to_vec(self)
+            .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+            .map_err(|_| shape("could not encode the forward cursor"))
+    }
+
+    /// The cursor, if this backend issued it for exactly this read.
+    ///
+    /// Anything else is [`ChatError::CursorExpired`], never a refusal. vibe-talk's envelope has
+    /// already checked the channel, view and thread, so a cursor that still does not fit here was
+    /// issued by some other backend for this channel — a bridge, before the deployment moved the
+    /// channel to the native API — and the caller's answer is a newest read, which issues one that
+    /// fits. A 400 would leave the page retrying the same cursor and reporting each refresh as
+    /// failed. `#203 incremental-refresh`.
+    fn decode(
+        raw: &str,
+        channel: &ChannelId,
+        request: &TimelineRequest,
+    ) -> Result<Self, ChatError> {
+        let gone = |detail: &str| ChatError::CursorExpired(detail.to_owned());
+        let cursor: Self = URL_SAFE_NO_PAD
+            .decode(raw)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .ok_or_else(|| gone("this backend did not issue that forward cursor"))?;
+        if cursor.channel != channel.as_str()
+            || cursor.view != request.view
+            || cursor.thread_id != request.thread_id
+        {
+            return Err(gone(
+                "the forward cursor belongs to a different channel or view",
+            ));
+        }
+        native_id(&cursor.after).map_err(|_| gone("the forward cursor names no message"))?;
+        Ok(cursor)
+    }
+}
+
+/// The newest message of a page as a forward cursor, or `floor` when the page is empty: a read
+/// forward from there returns everything posted after it.
+fn forward_from(
+    channel: &ChannelId,
+    request: &TimelineRequest,
+    page: &TimelinePage,
+    floor: &str,
+) -> Result<String, ChatError> {
+    let newest = page
+        .messages
+        .iter()
+        .filter_map(|message| message.id.numeric())
+        .max()
+        .map_or_else(|| floor.to_owned(), |id| id.to_string());
+    NativeForward {
+        channel: channel.0.clone(),
+        view: request.view,
+        thread_id: request.thread_id.clone(),
+        after: newest,
+        threads: page.has_threads,
+    }
+    .encode()
+}
+
 fn shape(detail: &str) -> ChatError {
     ChatError::Shape(detail.to_owned())
 }
@@ -183,11 +269,12 @@ fn native_id(raw: &str) -> Result<u64, ChatError> {
 }
 
 fn validate_request(request: &TimelineRequest) -> Result<(), ChatError> {
+    request.one_direction()?;
     if request.limit == 0
-        || request
-            .before
-            .as_ref()
-            .is_some_and(|cursor| cursor.len() > 8192)
+        || [&request.before, &request.after]
+            .into_iter()
+            .flatten()
+            .any(|cursor| cursor.len() > MAX_CURSOR)
     {
         return Err(refused(
             "timeline page size must be positive and its cursor at most 8192 bytes",
@@ -268,6 +355,9 @@ impl HttpDiscordClient {
                 if let Some(before) = &request.before {
                     query.push(("before", before.clone()));
                 }
+                if let Some(after) = &request.after {
+                    query.push(("after", after.clone()));
+                }
                 let value = self
                     .send_with_timeout(
                         self.thread_request(
@@ -277,7 +367,8 @@ impl HttpDiscordClient {
                         )?,
                         TIMELINE_TIMEOUT,
                     )
-                    .await?;
+                    .await
+                    .map_err(|error| forward_refusal(error, request))?;
                 parse_bridge_page(value, channel, request)
             }
             ThreadApi::Native => {
@@ -509,17 +600,19 @@ impl HttpDiscordClient {
         channel: &ChannelId,
         thread: Option<&NativeThread>,
         before: Option<&str>,
+        after: Option<&str>,
         limit: u16,
     ) -> Result<Vec<Message>, ChatError> {
         let physical = thread.map_or(channel.as_str(), |thread| thread.id.as_str());
         let cursor = before.map(|value| MessageId(value.to_owned()));
+        let forward = after.map(|value| MessageId(value.to_owned()));
         let value = self
             .send(page_request(
                 &self.api_base,
                 &ChannelId(physical.to_owned()),
                 limit,
                 cursor.as_ref(),
-                None,
+                forward.as_ref(),
             )?)
             .await?;
         let raw = value
@@ -623,12 +716,134 @@ impl HttpDiscordClient {
         channel: &ChannelId,
         request: &TimelineRequest,
     ) -> Result<TimelinePage, ChatError> {
+        let limit = usize::from(request.limit.clamp(1, 99));
+        if let Some(raw) = &request.after {
+            let forward = NativeForward::decode(raw, channel, request)?;
+            return self.native_forward(channel, request, &forward, limit).await;
+        }
+        let mut page = self.native_backward(channel, request, limit).await?;
+        // `#203 incremental-refresh`. Only where one request answers a forward read: a thread, and
+        // the Main of a text or announcement channel. The thread list, All, and a forum's Main
+        // need the whole inventory again, so vibe-talk's generic reader catches those up.
+        if request.before.is_none() {
+            // A forum or media container's Main says so in its notice: it has no message
+            // endpoint to read forward.
+            let floor = match request.view {
+                TimelineView::Thread => request.thread_id.clone(),
+                TimelineView::Main if page.notice.is_none() => Some(channel.0.clone()),
+                _ => None,
+            };
+            if let Some(floor) = floor {
+                page.next_after = Some(forward_from(channel, request, &page, &floor)?);
+            }
+        }
+        Ok(page)
+    }
+
+    /// What was posted in a thread, or in a text channel's Main, after the cursor's snowflake,
+    /// oldest first, as a delta. `#203 incremental-refresh`. Filtered by creation, so it carries no
+    /// edit or deletion, and a reply in a thread does not bring its root's new count into Main:
+    /// `complete: false`, and the page keeps its full poll for this channel.
+    async fn native_forward(
+        &self,
+        channel: &ChannelId,
+        request: &TimelineRequest,
+        forward: &NativeForward,
+        limit: usize,
+    ) -> Result<TimelinePage, ChatError> {
+        let ask = u16::try_from(limit + 1).unwrap_or(crate::discord::http::DISCORD_MAX_LIMIT);
+        let (mut messages, thread, has_threads) = match request.view {
+            TimelineView::Thread => {
+                let id = request.thread_id.as_deref().expect("validated thread id");
+                let thread = self.verified_thread(channel, id).await?;
+                let messages = self
+                    .native_messages(channel, Some(&thread), None, Some(&forward.after), ask)
+                    .await?;
+                let parent = self
+                    .read_thread_json(&["channels", channel.as_str()], &[])
+                    .await?;
+                let parent_kind = parent
+                    .get("type")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| shape("channel response has no type"))?;
+                let mut summary = thread.summary()?;
+                summary.root = self.thread_root(channel, &thread, parent_kind).await?;
+                (messages, Some(summary), true)
+            }
+            TimelineView::Main => {
+                native_id(channel.as_str())?;
+                let mut messages = self
+                    .native_messages(channel, None, None, Some(&forward.after), ask)
+                    .await?;
+                // No inventory is read for a delta. One read in the last few minutes still names
+                // which of these messages head threads; without one they are drawn as posted.
+                let inventory = self
+                    .thread_inventory
+                    .snapshots
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .rev()
+                    .find(|item| {
+                        item.channel == channel.as_str() && item.created.elapsed() < SNAPSHOT_TTL
+                    })
+                    .cloned();
+                if let Some(inventory) = &inventory {
+                    for message in &mut messages {
+                        if let Some(thread) = inventory
+                            .threads
+                            .iter()
+                            .find(|thread| thread.id == message.id.as_str())
+                        {
+                            message.thread = Some(thread.membership(true));
+                        }
+                    }
+                }
+                let found = inventory.is_some_and(|inventory| !inventory.threads.is_empty());
+                (messages, None, forward.threads || found)
+            }
+            // Never issued for this view, so the cursor came from another backend: see
+            // `NativeForward::decode`.
+            _ => {
+                return Err(ChatError::CursorExpired(
+                    "this view is not read forward natively".to_owned(),
+                ))
+            }
+        };
+        let after = forward.after.parse::<u64>().unwrap_or(0);
+        messages.retain(|message| message.id.numeric().unwrap_or(0) > after);
+        messages.sort_by_key(|message| message.id.numeric().unwrap_or(0));
+        messages.dedup_by(|later, earlier| later.id == earlier.id);
+        let more = messages.len() > limit;
+        messages.truncate(limit);
+        let mut page = TimelinePage {
+            messages,
+            thread,
+            has_threads,
+            delta: Some(TimelineDelta {
+                more,
+                complete: false,
+                deleted: Vec::new(),
+                removed_threads: Vec::new(),
+            }),
+            ..TimelinePage::default()
+        };
+        page.next_after = Some(forward_from(channel, request, &page, &forward.after)?);
+        Ok(page)
+    }
+
+    /// A newest or older page, through the backward cursor.
+    async fn native_backward(
+        &self,
+        channel: &ChannelId,
+        request: &TimelineRequest,
+        limit: usize,
+    ) -> Result<TimelinePage, ChatError> {
         let cursor = request
             .before
             .as_deref()
             .map(|before| NativeCursor::decode(before, channel, request))
             .transpose()?;
-        let limit = usize::from(request.limit.clamp(1, 99));
         if request.view == TimelineView::Thread {
             let id = request.thread_id.as_deref().expect("validated thread id");
             let thread = self.verified_thread(channel, id).await?;
@@ -637,7 +852,7 @@ impl HttpDiscordClient {
                 native_id(before)?;
             }
             let mut messages = self
-                .native_messages(channel, Some(&thread), before, (limit + 1) as u16)
+                .native_messages(channel, Some(&thread), before, None, (limit + 1) as u16)
                 .await?;
             let parent = self
                 .read_thread_json(&["channels", channel.as_str()], &[])
@@ -755,7 +970,7 @@ impl HttpDiscordClient {
                 if let Some(thread) = &thread {
                     self.verified_thread(channel, &thread.id).await?;
                 }
-                self.native_messages(channel, thread.as_ref(), before, (limit + 1) as u16)
+                self.native_messages(channel, thread.as_ref(), before, None, (limit + 1) as u16)
                     .await
             }))
             .buffer_unordered(4)
@@ -987,6 +1202,80 @@ fn parse_bridge_summary(mut value: Value, channel: &ChannelId) -> Result<ThreadS
     Ok(summary)
 }
 
+/// A bridge's refusal of a forward read, as the cursor problem it is. `#203 incremental-refresh`.
+///
+/// 410 is the contract's own answer for a cursor the bridge can no longer serve. 400, 405 and 501
+/// can only reach a forward read after the bridge was rolled back to a version without `after`,
+/// because vibe-talk sends `after` only to a bridge that issued a cursor: that cursor is just as
+/// unusable, and the newest read the caller makes next learns the capability is gone. Any other
+/// failure, and every failure of a read without `after`, is unchanged.
+fn forward_refusal(error: ChatError, request: &TimelineRequest) -> ChatError {
+    if request.after.is_none() {
+        return error;
+    }
+    match error.cause() {
+        ChatError::Status { status, body } if matches!(status, 400 | 405 | 410 | 501) => {
+            ChatError::CursorExpired(format!(
+                "the bridge answered HTTP {status} to a forward read: {body}"
+            ))
+        }
+        _ => error,
+    }
+}
+
+/// What the forward-read fields of a bridge page may say. `#203 incremental-refresh`.
+///
+/// A delta answers only `after`, always continues with `next_after`, and says nothing about older
+/// history. An answer to `after` WITHOUT a delta is a bridge that ignored the parameter: it is a
+/// newest page and passes as one, because the caller folds by what it received, not what it asked.
+fn validate_bridge_forward(
+    page: &TimelinePage,
+    request: &TimelineRequest,
+) -> Result<(), ChatError> {
+    if let Some(cursor) = &page.next_after {
+        if cursor.is_empty()
+            || cursor.len() > MAX_BRIDGE_FORWARD_CURSOR
+            || !cursor.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(shape(
+                "next_after must be a URL-safe string of at most 2048 characters",
+            ));
+        }
+    }
+    if let Some(at) = &page.as_of {
+        at.parse::<jiff::Timestamp>()
+            .map_err(|_| shape("as_of is not an RFC 3339 instant"))?;
+    }
+    let Some(delta) = &page.delta else {
+        return Ok(());
+    };
+    if request.after.is_none() {
+        return Err(shape(
+            "a timeline delta answered a read that asked for none",
+        ));
+    }
+    if page.next_after.is_none() {
+        return Err(shape("a timeline delta has no next_after to continue from"));
+    }
+    if page.has_more || page.next_before.is_some() {
+        return Err(shape("a timeline delta claimed older history"));
+    }
+    if delta.deleted.len() > MAX_DELTA_REMOVALS || delta.removed_threads.len() > MAX_DELTA_REMOVALS
+    {
+        return Err(shape("a timeline delta listed more than 1000 removals"));
+    }
+    if delta
+        .deleted
+        .iter()
+        .map(|id| id.as_str())
+        .chain(delta.removed_threads.iter().map(String::as_str))
+        .any(|id| id.is_empty() || id.len() > 2048)
+    {
+        return Err(shape("a timeline delta named an empty or oversized id"));
+    }
+    Ok(())
+}
+
 fn parse_bridge_page(
     mut value: Value,
     channel: &ChannelId,
@@ -1028,6 +1317,7 @@ fn parse_bridge_page(
     if page.has_more != page.next_before.is_some() {
         return Err(shape("timeline continuation disagrees with has_more"));
     }
+    validate_bridge_forward(&page, request)?;
     if request.view == TimelineView::Thread
         && thread.as_ref().map(|thread| thread.id.as_str()) != request.thread_id.as_deref()
     {
@@ -1540,6 +1830,217 @@ mod tests {
         }
     }
 
+    fn bridge_page(messages: Value) -> Value {
+        json!({"messages":messages,"threads":[],"thread":null,"has_threads":false,
+            "has_more":false,"next_before":null,"notice":null})
+    }
+
+    fn after(cursor: &str) -> TimelineRequest {
+        TimelineRequest {
+            after: Some(cursor.to_owned()),
+            ..TimelineRequest::default()
+        }
+    }
+
+    /// `#203 incremental-refresh`. A bridge advertises forward reads only by issuing `next_after`;
+    /// the client hands `after` back untouched and keeps what the delta says about itself.
+    #[tokio::test]
+    async fn bridge_forward_reads_pass_the_cursor_through_and_keep_the_delta() {
+        let mut routes = Replies::new();
+        let mut newest = bridge_page(json!([message("parent", "m-1", "old")]));
+        newest["next_after"] = json!("rev-1");
+        ok(
+            &mut routes,
+            "/channels/parent/timeline?view=main&limit=50",
+            newest,
+        );
+        let mut delta = bridge_page(json!([message("parent", "m-2", "new")]));
+        delta["next_after"] = json!("rev-2");
+        delta["delta"] =
+            json!({"more":true,"complete":true,"deleted":["m-0"],"removed_threads":[]});
+        delta["as_of"] = json!("2026-10-04T07:00:00Z");
+        ok(
+            &mut routes,
+            "/channels/parent/timeline?view=main&limit=50&after=rev-1",
+            delta,
+        );
+        // A bridge that ignored the parameter answers with a newest page, and it passes as one.
+        ok(
+            &mut routes,
+            "/channels/parent/timeline?view=main&limit=50&after=rev-2",
+            bridge_page(json!([message("parent", "m-2", "new")])),
+        );
+        let mock = mock(routes, ThreadApi::Bridge).await;
+        let channel = ChannelId("parent".into());
+        let page = mock
+            .client
+            .fetch_timeline(&channel, &TimelineRequest::default())
+            .await
+            .expect("newest page");
+        assert_eq!(page.next_after.as_deref(), Some("rev-1"));
+        assert_eq!(page.delta, None);
+        let page = mock
+            .client
+            .fetch_timeline(&channel, &after("rev-1"))
+            .await
+            .expect("delta");
+        assert_eq!(page.messages[0].id.as_str(), "m-2");
+        assert_eq!(page.next_after.as_deref(), Some("rev-2"));
+        assert_eq!(page.as_of.as_deref(), Some("2026-10-04T07:00:00Z"));
+        let delta = page.delta.expect("a delta");
+        assert!(delta.more && delta.complete);
+        assert_eq!(delta.deleted, [MessageId("m-0".into())]);
+        let page = mock
+            .client
+            .fetch_timeline(&channel, &after("rev-2"))
+            .await
+            .expect("an ignored after");
+        assert_eq!((page.delta, page.next_after), (None, None));
+        let both = TimelineRequest {
+            before: Some("b".into()),
+            ..after("rev-1")
+        };
+        let error = mock
+            .client
+            .fetch_timeline(&channel, &both)
+            .await
+            .expect_err("both cursors");
+        assert!(matches!(error.cause(), ChatError::Refused(_)), "{error}");
+        assert_eq!(
+            mock.seen.lock().expect("seen").len(),
+            3,
+            "a refused read was sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bridge_delta_that_breaks_the_contract_is_refused() {
+        let delta = |fields: Value| {
+            let mut page = bridge_page(json!([]));
+            page["next_after"] = json!("rev-9");
+            page["delta"] = json!({"more":false,"complete":true,"deleted":[],"removed_threads":[]});
+            for (key, value) in fields.as_object().expect("fields") {
+                page[key] = value.clone();
+            }
+            page
+        };
+        let cases = [
+            ("delta on a newest read", None, delta(json!({}))),
+            (
+                "no next_after",
+                Some("c"),
+                delta(json!({"next_after":null})),
+            ),
+            (
+                "older history",
+                Some("c"),
+                delta(json!({"has_more":true,"next_before":"older"})),
+            ),
+            (
+                "too many deletions",
+                Some("c"),
+                delta(json!({"delta":{"more":false,"complete":true,
+                    "deleted":vec!["x"; MAX_DELTA_REMOVALS + 1],"removed_threads":[]}})),
+            ),
+            (
+                "an empty id",
+                Some("c"),
+                delta(
+                    json!({"delta":{"more":false,"complete":true,"deleted":[""],"removed_threads":[]}}),
+                ),
+            ),
+            (
+                "an oversized next_after",
+                None,
+                delta(json!({"delta":null,"next_after":"n".repeat(MAX_BRIDGE_FORWARD_CURSOR + 1)})),
+            ),
+            (
+                "a next_after with a space",
+                None,
+                delta(json!({"delta":null,"next_after":"two words"})),
+            ),
+            (
+                "an unreadable as_of",
+                Some("c"),
+                delta(json!({"as_of":"seven"})),
+            ),
+        ];
+        for (why, cursor, answer) in cases {
+            let mut routes = Replies::new();
+            let path = match cursor {
+                Some(cursor) => {
+                    format!("/channels/parent/timeline?view=main&limit=50&after={cursor}")
+                }
+                None => "/channels/parent/timeline?view=main&limit=50".to_owned(),
+            };
+            ok(&mut routes, &path, answer);
+            let mock = mock(routes, ThreadApi::Bridge).await;
+            let request = cursor.map_or_else(TimelineRequest::default, after);
+            let error = mock
+                .client
+                .fetch_timeline(&ChannelId("parent".into()), &request)
+                .await
+                .expect_err(why);
+            assert!(
+                matches!(error.cause(), ChatError::Shape(_)),
+                "{why}: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bridge_that_cannot_continue_a_forward_read_expires_the_cursor() {
+        for (status, expired) in [
+            (StatusCode::GONE, true),
+            (StatusCode::BAD_REQUEST, true),
+            (StatusCode::METHOD_NOT_ALLOWED, true),
+            (StatusCode::NOT_IMPLEMENTED, true),
+            (StatusCode::NOT_FOUND, false),
+            (StatusCode::BAD_GATEWAY, false),
+        ] {
+            let mut routes = Replies::new();
+            routes.insert(
+                "GET /channels/parent/timeline?view=main&limit=50&after=old".into(),
+                (
+                    status,
+                    json!({"error":"cursor_expired","message":"issued by an earlier process"}),
+                ),
+            );
+            routes.insert(
+                "GET /channels/parent/timeline?view=main&limit=50".into(),
+                (status, json!({"message":"no"})),
+            );
+            let mock = mock(routes, ThreadApi::Bridge).await;
+            let channel = ChannelId("parent".into());
+            let error = mock
+                .client
+                .fetch_timeline(&channel, &after("old"))
+                .await
+                .expect_err("refused forward read");
+            assert_eq!(
+                matches!(error.cause(), ChatError::CursorExpired(_)),
+                expired,
+                "HTTP {status} to a forward read: {error}"
+            );
+            if expired {
+                assert!(
+                    error.to_string().contains("can no longer continue"),
+                    "{error}"
+                );
+                assert!(!error.is_transient());
+            }
+            let error = mock
+                .client
+                .fetch_timeline(&channel, &TimelineRequest::default())
+                .await
+                .expect_err("refused newest read");
+            assert!(
+                matches!(error.cause(), ChatError::Status { .. }),
+                "HTTP {status} to a newest read is not a cursor problem: {error}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn thread_root_lookup_falls_back_to_the_verified_parent_message() {
         let mut routes = inventory_routes();
@@ -1697,6 +2198,233 @@ mod tests {
                 .is_root
         );
         assert!(!page.has_more);
+    }
+
+    /// `#203 incremental-refresh`. A thread, and a text channel's Main, are read forward with one
+    /// `after=` request each from the newest snowflake delivered; the thread list and All need the
+    /// whole inventory again and issue no native cursor, so the generic reader catches them up.
+    #[tokio::test]
+    async fn native_threads_and_text_main_read_forward_from_the_newest_snowflake() {
+        let mut routes = inventory_routes();
+        let root = message("100", "201", "first root");
+        let mut starter = message("201", "201", "");
+        starter["type"] = json!(21);
+        starter["referenced_message"] = root;
+        ok(
+            &mut routes,
+            "/channels/201/messages?limit=3",
+            json!([
+                message("201", "901", "new reply"),
+                message("201", "701", "old reply"),
+                starter
+            ]),
+        );
+        // Discord answers `after` newest first as well; the client puts it oldest first.
+        ok(
+            &mut routes,
+            "/channels/201/messages?limit=3&after=901",
+            json!([
+                message("201", "950", "newest reply"),
+                message("201", "920", "newer reply")
+            ]),
+        );
+        ok(
+            &mut routes,
+            "/channels/201/messages?limit=3&after=950",
+            json!([]),
+        );
+        ok(
+            &mut routes,
+            "/channels/100/messages?limit=3",
+            json!([
+                message("100", "850", "main"),
+                message("100", "301", "second root"),
+                message("100", "201", "first root")
+            ]),
+        );
+        ok(
+            &mut routes,
+            "/channels/100/messages?limit=3&after=850",
+            json!([
+                message("100", "880", "later still"),
+                message("100", "870", "later"),
+                message("100", "860", "soon after")
+            ]),
+        );
+        let mock = mock(routes, ThreadApi::Native).await;
+        let channel = ChannelId("100".into());
+        let thread = TimelineRequest {
+            view: TimelineView::Thread,
+            thread_id: Some("201".into()),
+            limit: 2,
+            ..TimelineRequest::default()
+        };
+        let newest = mock
+            .client
+            .fetch_timeline(&channel, &thread)
+            .await
+            .expect("newest thread page");
+        let cursor = newest
+            .next_after
+            .expect("a thread is read forward natively");
+        let ids = |page: &TimelinePage| {
+            page.messages
+                .iter()
+                .map(|message| message.id.0.clone())
+                .collect::<Vec<_>>()
+        };
+        let delta = mock
+            .client
+            .fetch_timeline(
+                &channel,
+                &TimelineRequest {
+                    after: Some(cursor.clone()),
+                    ..thread.clone()
+                },
+            )
+            .await
+            .expect("thread delta");
+        assert_eq!(ids(&delta), ["920", "950"]);
+        assert_eq!(
+            delta.delta,
+            Some(TimelineDelta {
+                more: false,
+                complete: false,
+                ..TimelineDelta::default()
+            })
+        );
+        assert!(delta
+            .messages
+            .iter()
+            .all(|message| message.thread.as_ref().is_some_and(|t| t.id == "201")));
+        assert_eq!(
+            delta
+                .thread
+                .expect("current summary")
+                .root
+                .expect("root")
+                .content,
+            "first root"
+        );
+        assert!(!delta.has_more && delta.next_before.is_none());
+        let quiet = mock
+            .client
+            .fetch_timeline(
+                &channel,
+                &TimelineRequest {
+                    after: delta.next_after.clone(),
+                    ..thread.clone()
+                },
+            )
+            .await
+            .expect("an empty delta");
+        assert!(quiet.messages.is_empty());
+        assert_eq!(
+            quiet.next_after, delta.next_after,
+            "an empty delta moved its cursor"
+        );
+
+        let main = TimelineRequest {
+            limit: 2,
+            ..TimelineRequest::default()
+        };
+        let newest = mock
+            .client
+            .fetch_timeline(&channel, &main)
+            .await
+            .expect("newest main page");
+        let delta = mock
+            .client
+            .fetch_timeline(
+                &channel,
+                &TimelineRequest {
+                    after: newest.next_after.clone(),
+                    ..main.clone()
+                },
+            )
+            .await
+            .expect("main delta");
+        assert_eq!(
+            ids(&delta),
+            ["860", "870"],
+            "the oldest `limit` after the cursor"
+        );
+        assert!(delta.delta.as_ref().expect("a delta").more);
+        assert!(
+            delta.has_threads,
+            "the newest read's thread navigation was dropped"
+        );
+        // A cursor issued for Main is no cursor for the thread.
+        let crossed = mock
+            .client
+            .fetch_timeline(
+                &channel,
+                &TimelineRequest {
+                    after: newest.next_after.clone(),
+                    ..thread.clone()
+                },
+            )
+            .await
+            .expect_err("a cursor from another view");
+        assert!(
+            matches!(crossed.cause(), ChatError::CursorExpired(_)),
+            "{crossed}"
+        );
+        // A cursor this backend never issued — a bridge's, from before the channel moved to the
+        // native API, or one for a view it does not read forward — is gone, not a bad request:
+        // the page then reads the newest page instead of failing every refresh with it.
+        let thread_list = NativeForward {
+            channel: channel.0.clone(),
+            view: TimelineView::Threads,
+            thread_id: None,
+            after: "850".into(),
+            threads: true,
+        }
+        .encode()
+        .expect("a cursor for the thread list");
+        for (view, cursor) in [
+            (thread.clone(), "rev-1".to_owned()),
+            (main.clone(), "rev-1".to_owned()),
+            (
+                TimelineRequest {
+                    view: TimelineView::Threads,
+                    ..main.clone()
+                },
+                thread_list,
+            ),
+        ] {
+            let error = mock
+                .client
+                .fetch_timeline(
+                    &channel,
+                    &TimelineRequest {
+                        after: Some(cursor),
+                        ..view
+                    },
+                )
+                .await
+                .expect_err("a cursor another backend issued");
+            assert!(
+                matches!(error.cause(), ChatError::CursorExpired(_)),
+                "{error}"
+            );
+        }
+        let threads = mock
+            .client
+            .fetch_timeline(
+                &channel,
+                &TimelineRequest {
+                    view: TimelineView::Threads,
+                    limit: 2,
+                    ..TimelineRequest::default()
+                },
+            )
+            .await
+            .expect("thread list");
+        assert_eq!(
+            threads.next_after, None,
+            "the thread list issued a native forward cursor"
+        );
     }
 
     #[tokio::test]

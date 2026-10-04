@@ -54,15 +54,26 @@ impl TimelineView {
     }
 }
 
-/// One backward page request. Every returned page is ordered oldest first.
+/// One page request. Every returned page is ordered oldest first.
+///
+/// Three kinds of read share it: the NEWEST page (neither cursor), a step BACK (`before`), and a
+/// step FORWARD from an earlier newest read (`after`), which answers only what changed since then.
+/// `#203 incremental-refresh`.
 #[derive(Clone, Debug)]
 pub struct TimelineRequest {
     /// Which channel view to read.
     pub view: TimelineView,
     /// Required only for the thread view; opaque to callers.
     pub thread_id: Option<String>,
-    /// The previous page's opaque continuation, or `None` for the newest page.
+    /// The previous page's opaque backward continuation, or `None` for the newest page.
     pub before: Option<String>,
+    /// The backend's OWN forward cursor, from an earlier [`TimelinePage::next_after`] for this
+    /// channel, view and thread, or `None`.
+    ///
+    /// Never vibe-talk's envelope: [`crate::timeline_forward`] removes that before a backend sees
+    /// the request, and only ever sets this for a backend that issued the cursor. Mutually
+    /// exclusive with `before`; a backend refuses both with [`crate::chat::ChatError::Refused`].
+    pub after: Option<String>,
     /// Maximum entries requested. The backend may clamp this to its page ceiling.
     pub limit: u16,
 }
@@ -73,8 +84,26 @@ impl Default for TimelineRequest {
             view: TimelineView::Main,
             thread_id: None,
             before: None,
+            after: None,
             limit: 50,
         }
+    }
+}
+
+impl TimelineRequest {
+    /// Refuse a request that names both cursors: a step back and a step forward at once means
+    /// nothing, and guessing which was meant would answer a question nobody asked.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::chat::ChatError::Refused`] when both `before` and `after` are present.
+    pub fn one_direction(&self) -> Result<(), crate::chat::ChatError> {
+        if self.before.is_some() && self.after.is_some() {
+            return Err(crate::chat::ChatError::Refused(
+                "before and after cannot both be given".to_owned(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -166,6 +195,42 @@ pub struct TimelinePage {
     pub next_before: Option<String>,
     /// Relevant provider limitation or scope information, if any.
     pub notice: Option<String>,
+    /// Forward cursor for this view: what to pass as `after` to learn what changed since this
+    /// page. `#203 incremental-refresh`.
+    ///
+    /// From a backend, present only when that backend answers `after` itself. Above the backend
+    /// vibe-talk always fills it on a newest page or a delta — with its own generic cursor when
+    /// the backend left it empty — and removes it from a `before` page, which says nothing about
+    /// the newest end. Absent from an older bridge's answer, which therefore still parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_after: Option<String>,
+    /// Present exactly on an answer to `after`: the page then carries only what is new or changed
+    /// since that cursor, and rows absent from it are UNCHANGED, never deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta: Option<TimelineDelta>,
+    /// The instant, RFC 3339, up to which the backend knows this page is complete, when it is
+    /// serving data it could not bring up to date just now. Absent means now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<String>,
+}
+
+/// What a forward read says about the changes it carries. `#203 incremental-refresh`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct TimelineDelta {
+    /// More changes remain past this page: ask again with `next_after` straight away.
+    pub more: bool,
+    /// True when this delta carries EVERY creation, edit, deletion and summary change in the view
+    /// since the cursor. False when it carries additions only: a read filtered by creation time
+    /// cannot see an edit or a deletion, which then reach the caller through live events or its
+    /// next full read.
+    pub complete: bool,
+    /// Messages removed since the cursor, channel-wide in every view. Always empty when
+    /// `complete` is false.
+    #[serde(default)]
+    pub deleted: Vec<MessageId>,
+    /// Threads that left the thread list since the cursor. Threads view only; empty elsewhere.
+    #[serde(default)]
+    pub removed_threads: Vec<String>,
 }
 
 #[cfg(test)]

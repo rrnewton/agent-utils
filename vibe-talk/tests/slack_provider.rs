@@ -57,6 +57,7 @@ fn page_request(view: TimelineView, limit: u16) -> TimelineRequest {
         view,
         thread_id: None,
         before: None,
+        after: None,
         limit,
     }
 }
@@ -1233,4 +1234,206 @@ async fn an_id_from_another_provider_is_refused_before_any_request() {
         .await
         .is_err());
     assert_eq!(fake.calls("conversations.history"), 0);
+}
+
+/// `#203 incremental-refresh`. A server that repeats a thread's root on every replies page must
+/// not make a thread delta stop short. A delta asks for one more reply than it returns to learn
+/// whether more remain; were the root counted in that, three new replies on pages of two would come
+/// back as two and no `more`. The page reader drops anything outside its bounds, the root included,
+/// before a caller counts, and this pins that it stays so.
+#[tokio::test]
+async fn a_thread_delta_with_more_replies_than_a_page_says_so_when_the_root_is_repeated() {
+    let (mut state, [_, r2, _]) = three_threads();
+    state.root_always = true;
+    let fake = Fake::start(state, 4).await;
+    let client = fake.client();
+    let thread = TimelineRequest {
+        thread_id: Some(r2.clone()),
+        ..page_request(TimelineView::Thread, 25)
+    };
+    let newest = client
+        .fetch_timeline(&channel(), &thread)
+        .await
+        .expect("thread");
+    fake.with(|state| {
+        let replies = state
+            .replies
+            .get_mut(&(CH.to_owned(), r2.clone()))
+            .expect("replies");
+        for second in 5000..5003 {
+            replies.push(
+                json!({"type": "message", "ts": ts(second, 0), "thread_ts": r2,
+                "user": "UREPLIER1", "text": format!("reply {second}"),
+                "user_profile": {"display_name": "Replier"}}),
+            );
+        }
+    });
+    let two = TimelineRequest {
+        thread_id: Some(r2.clone()),
+        ..page_request(TimelineView::Thread, 2)
+    };
+    let first = client
+        .fetch_timeline(
+            &channel(),
+            &TimelineRequest {
+                after: newest.next_after.clone(),
+                ..two.clone()
+            },
+        )
+        .await
+        .expect("thread delta");
+    assert_eq!(ts_list(&first.messages), [ts(5000, 0), ts(5001, 0)]);
+    assert!(
+        first.delta.as_ref().expect("a delta").more,
+        "a third new reply waited for the next refresh"
+    );
+    let rest = client
+        .fetch_timeline(
+            &channel(),
+            &TimelineRequest {
+                after: first.next_after.clone(),
+                ..two
+            },
+        )
+        .await
+        .expect("the rest");
+    assert_eq!(ts_list(&rest.messages), [ts(5002, 0)]);
+    assert!(!rest.delta.expect("a delta").more);
+}
+
+/// `#203 incremental-refresh`. A conversation's Main, and one thread, are read forward with
+/// `oldest=`: only what was posted after the newest message delivered, oldest first, and said to
+/// carry additions only. The thread list and Flat issue no native cursor.
+#[tokio::test]
+async fn main_and_a_thread_are_read_forward_from_the_newest_ts_delivered() {
+    let (state, [_, r2, _]) = three_threads();
+    let fake = Fake::start(state, 4).await;
+    let client = fake.client();
+    let main = page_request(TimelineView::Main, 7);
+    let newest = client
+        .fetch_timeline(&channel(), &main)
+        .await
+        .expect("main");
+    let cursor = newest.next_after.expect("Main is read forward natively");
+    fake.with(|state| {
+        let list = state.history.get_mut(CH).expect("history");
+        list.push(profiled(&ts(3000, 0), "UADA00001", "Ada", "after the read"));
+        list.push(profiled(&ts(3001, 0), "UADA00001", "Ada", "and again"));
+    });
+    let first = client
+        .fetch_timeline(
+            &channel(),
+            &TimelineRequest {
+                after: Some(cursor),
+                ..page_request(TimelineView::Main, 1)
+            },
+        )
+        .await
+        .expect("delta");
+    assert_eq!(ts_list(&first.messages), [ts(3000, 0)]);
+    let said = first.delta.as_ref().expect("a delta");
+    assert!(said.more && !said.complete, "{said:?}");
+    assert!(!first.has_more && first.next_before.is_none());
+    assert!(fake
+        .requests("conversations.history")
+        .last()
+        .is_some_and(|params| params.contains_key("oldest")));
+    let second = client
+        .fetch_timeline(
+            &channel(),
+            &TimelineRequest {
+                after: first.next_after.clone(),
+                ..page_request(TimelineView::Main, 1)
+            },
+        )
+        .await
+        .expect("the rest");
+    assert_eq!(ts_list(&second.messages), [ts(3001, 0)]);
+    assert!(!second.delta.expect("a delta").more);
+
+    let thread = TimelineRequest {
+        thread_id: Some(r2.clone()),
+        ..page_request(TimelineView::Thread, 25)
+    };
+    let newest = client
+        .fetch_timeline(&channel(), &thread)
+        .await
+        .expect("thread");
+    let cursor = newest
+        .next_after
+        .expect("a thread is read forward natively");
+    fake.with(|state| {
+        state
+            .replies
+            .get_mut(&(CH.to_owned(), r2.clone()))
+            .expect("replies")
+            .push(
+                json!({"type": "message", "ts": ts(5000, 0), "thread_ts": r2, "user": "UREPLIER1",
+                "text": "a reply after the read", "user_profile": {"display_name": "Replier"}}),
+            );
+    });
+    let delta = client
+        .fetch_timeline(
+            &channel(),
+            &TimelineRequest {
+                after: Some(cursor.clone()),
+                ..thread.clone()
+            },
+        )
+        .await
+        .expect("thread delta");
+    assert_eq!(
+        ts_list(&delta.messages),
+        [ts(5000, 0)],
+        "the root or an old reply came back"
+    );
+    assert_eq!(delta.thread.expect("the current summary").id, r2);
+    // Bound to the view it was issued for.
+    let crossed = client
+        .fetch_timeline(
+            &channel(),
+            &TimelineRequest {
+                after: Some(cursor),
+                ..page_request(TimelineView::Main, 7)
+            },
+        )
+        .await
+        .expect_err("a thread's cursor read as Main's");
+    assert!(
+        matches!(crossed.cause(), ChatError::CursorExpired(_)),
+        "{crossed}"
+    );
+    // A cursor this backend did not issue for this read — a bridge's, from before the channel was
+    // configured here, or one carried over a change to what the view is — is gone, not a bad
+    // request: the page reads the newest page instead of failing every refresh with it.
+    for request in [
+        TimelineRequest {
+            after: Some("rev-1".to_owned()),
+            ..page_request(TimelineView::Main, 7)
+        },
+        TimelineRequest {
+            after: first.next_after.clone(),
+            ..page_request(TimelineView::Threads, 7)
+        },
+    ] {
+        let error = client
+            .fetch_timeline(&channel(), &request)
+            .await
+            .expect_err("a cursor this backend cannot continue");
+        assert!(
+            matches!(error.cause(), ChatError::CursorExpired(_)),
+            "{:?}: {error}",
+            request.view
+        );
+    }
+    for view in [TimelineView::Threads, TimelineView::Flat] {
+        let page = client
+            .fetch_timeline(&channel(), &page_request(view, 7))
+            .await
+            .expect("page");
+        assert_eq!(
+            page.next_after, None,
+            "{view:?} issued a native forward cursor"
+        );
+    }
 }

@@ -3984,6 +3984,8 @@ let failureTimer = null;
 
 let hiddenDuringCall = false;
 let visibleAt = 0;
+// When the page was last hidden, or 0 while it is visible. `#203 incremental-refresh`.
+let hiddenAt = 0;
 
 // Short on purpose: `#status` is one line with `white-space: nowrap` and an ellipsis, so anything
 // longer than about forty characters is simply not readable on a phone.
@@ -4046,6 +4048,7 @@ async function syncScreenWakeLock() {
 function onVisibility() {
   syncScreenWakeLock();
   if (document.visibilityState === "hidden") {
+    if (!hiddenAt) hiddenAt = Date.now();
     // Only a call can be suspended. Hiding an idle page is not an event.
     if (session.socket) {
       hiddenDuringCall = true;
@@ -4053,9 +4056,18 @@ function onVisibility() {
     return;
   }
   visibleAt = Date.now();
+  const away = hiddenAt ? visibleAt - hiddenAt : 0;
+  hiddenAt = 0;
   // `#195 send-resilience`. A phone holds a hidden page's timers; a send whose wait ran out while
   // the reader was away goes now, not a further wait after they are back.
   resumeOutgoingRetries();
+  // `#203 incremental-refresh`. Coming back to the channel after a while is the moment a reader
+  // most wants it current, and a phone held the poll's timer the whole time it was away. Only what
+  // changed is asked for, so this costs one small read rather than the next poll's wait.
+  if (away >= VISIBLE_REFRESH_MS && currentView === "discord" && threadingSupported &&
+      clientConfigApplied && el("discord-channel").value) {
+    refreshQuietly(() => loadDiscord({ keepPosition: true, reason: "visible" }))();
+  }
 }
 
 function wasSuspended() {
@@ -5707,6 +5719,10 @@ function emptyCanon(channel = "") {
   return {
     channel: String(channel), messages: [], threads: [], views: new Map(), dismissed: new Set(), hasThreads: false,
     scope: null, unplaced: new Set(),
+    // `#203 incremental-refresh`. Whether this channel's forward reads carry edits and deletions:
+    // null until one has landed. The backend's property rather than a view's, so it outlives a
+    // view's cover being reset by an explicit refresh.
+    complete: null,
   };
 }
 
@@ -5785,6 +5801,11 @@ function coverView(arriving, older, hasMore, notice, view = channelView, thread 
     at: older && prior ? prior.at : Date.now(),
     live: true,
     cursor: prior ? prior.cursor : null,
+    // `#203 incremental-refresh`. The forward cursor of the last newest read or delta folded for
+    // this view, and when the last newest read landed. In memory only: a cursor saved with the
+    // rows would usually have expired by the time a cold start could use it.
+    newest: prior ? prior.newest || null : null,
+    fullAt: prior ? prior.fullAt || 0 : 0,
   });
 }
 
@@ -5804,11 +5825,86 @@ function foldTimelinePage(payload, older, view = channelView, thread = selectedT
   if (view !== "thread") channelCanon.hasThreads = payload.has_threads === true;
   coverView(view === "threads" ? payload.threads || [] : payload.messages || [], older, hasMore, payload.notice || "",
     view, thread);
+  if (!older) {
+    const cover = channelCanon.views.get(viewKey(view, thread));
+    cover.newest = payload.next_after || null;
+    cover.fullAt = Date.now();
+    const asOf = staleAsOf(payload);
+    if (asOf !== null) cover.at = asOf;
+  }
   // A page is the server's own answer for every message on it, thread record or none.
   for (const message of payload.messages || []) channelCanon.unplaced.delete(String(message.id));
   for (const summary of [...(payload.threads || []), payload.thread]) {
     if (summary && summary.root) channelCanon.unplaced.delete(String(summary.root.id));
   }
+}
+
+/**
+ * When the server says it could not bring this page up to date: the instant it is complete up to,
+ * as a time, if that is old enough to say so — or null, which means now. `#203 incremental-refresh`.
+ * A bridge serving a snapshot it failed to refresh sends `as_of`; a page that took it for a fresh
+ * read would claim to be current when it is not.
+ */
+function staleAsOf(payload) {
+  const asOf = payload && typeof payload.as_of === "string" ? Date.parse(payload.as_of) : NaN;
+  return Number.isFinite(asOf) && Date.now() - asOf > STALE_AS_OF_MS ? asOf : null;
+}
+
+/**
+ * Fold a DELTA — what changed in a view since its forward cursor — into the store. `#203
+ * incremental-refresh`. False, and nothing touched, when the cover no longer holds the cursor the
+ * read was sent with: a newest read or another delta landed in between, and the next read asks
+ * again from where that one left the view.
+ *
+ * NEVER THE NEWEST PAGE'S RULE. A row a delta does not carry is unchanged, not deleted: removal is
+ * said only by `delta.deleted`, channel-wide, and by `delta.removed_threads`. Coverage is not
+ * changed either — a delta continues the view upward from its previous newest position without a
+ * gap, so the floor and whether older history exists stay as they were, and "a projection never
+ * invents coverage" still holds. Its rows are the server's own answer, so a thread record on one
+ * replaces the store's, and the id leaves `unplaced`, as a page row does (`#185`).
+ */
+function foldTimelineDelta(payload, sent, view = channelView, thread = selectedThreadId) {
+  const key = viewKey(view, thread);
+  const cover = channelCanon.views.get(key);
+  if (!cover || !sent || cover.newest !== sent) return false;
+  const delta = payload.delta;
+  const gone = new Set((delta.deleted || []).map(String));
+  if (gone.size) {
+    channelCanon.messages = channelCanon.messages.filter((message) => !gone.has(String(message.id)));
+    for (const id of gone) {
+      channelCanon.dismissed.delete(id);
+      channelCanon.unplaced.delete(id);
+      archivedIds.delete(id);
+    }
+  }
+  const arriving = payload.messages || [];
+  if (arriving.length) {
+    const ids = new Set(arriving.map((message) => String(message.id)));
+    channelCanon.messages = inTimeOrder(
+      [...channelCanon.messages.filter((held) => !ids.has(String(held.id))), ...arriving], "timestamp");
+    for (const id of ids) channelCanon.unplaced.delete(id);
+  }
+  for (const summary of payload.threads || []) upsertThreadSummary(summary);
+  const removed = new Set((delta.removed_threads || []).map(String));
+  if (removed.size) channelCanon.threads = channelCanon.threads.filter((held) => !removed.has(String(held.id)));
+  if (payload.thread) upsertThreadSummary(payload.thread);
+  for (const summary of [...(payload.threads || []), payload.thread]) {
+    if (summary && summary.root) channelCanon.unplaced.delete(String(summary.root.id));
+  }
+  if (view !== "thread") {
+    channelCanon.scope = payload.thread ? String(payload.thread.id) : null;
+    channelCanon.hasThreads = payload.has_threads === true;
+  }
+  const asOf = staleAsOf(payload);
+  channelCanon.views.set(key, {
+    ...cover,
+    notice: payload.notice || "",
+    at: asOf === null ? Date.now() : asOf,
+    live: true,
+    newest: payload.next_after || null,
+  });
+  channelCanon.complete = delta.complete === true;
+  return true;
 }
 
 /**
@@ -6754,7 +6850,7 @@ async function changeChannelView(view, threadId = null, summary = null) {
     return;
   }
   scrollToNewest();
-  await loadDiscord();
+  await loadDiscord({ reason: "enter" });
 }
 
 /**
@@ -6770,7 +6866,10 @@ async function changeChannelView(view, threadId = null, summary = null) {
 function inheritAllCover(threadId, summary) {
   if (threadingSupported && channelCanon.channel === String(el("discord-channel").value) &&
       !channelCanon.views.has(viewKey("thread", threadId)) && allReachesThread(threadId, summary)) {
-    channelCanon.views.set(viewKey("thread", threadId), { ...channelCanon.views.get(viewKey("flat")), cursor: null });
+    // Not All's forward cursor, which is bound to All: the thread's first refresh reads in full.
+    // `#203 incremental-refresh`.
+    channelCanon.views.set(viewKey("thread", threadId),
+      { ...channelCanon.views.get(viewKey("flat")), cursor: null, newest: null, fullAt: 0 });
   }
 }
 
@@ -7087,13 +7186,28 @@ async function refreshThreadDirectory() {
   if (Date.now() - (threadDirectoryReadAt.get(channel) || 0) < THREAD_DIRECTORY_REFRESH_MS) return;
   threadDirectoryInFlight = channel;
   threadDirectoryReadAt.set(channel, Date.now());
+  const base = `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=threads&limit=${DISCORD_PAGE_LIMIT}`;
+  // `#203 incremental-refresh`. With the thread list's forward cursor, only the threads that moved,
+  // under the same rule as the poll's: a list a complete delta keeps current needs no full read.
+  const cover = channelCanon.channel === channel ? channelCanon.views.get(viewKey("threads")) : null;
+  let sent = cover && cover.live && cover.newest && channelCanon.complete !== false &&
+    Date.now() - (cover.fullAt || 0) < TIMELINE_RECONCILE_MS ? cover.newest : null;
   try {
-    const payload = await apiDecoded(
-      "TimelineResponse",
-      `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=threads&limit=${DISCORD_PAGE_LIMIT}`
-    );
+    let payload;
+    try {
+      payload = await apiDecoded("TimelineResponse", sent ? `${base}&after=${encodeURIComponent(sent)}` : base);
+    } catch (error) {
+      if (!sent || !isCursorRefusal(error)) throw error;
+      if (cover.newest === sent) cover.newest = null;
+      sent = null;
+      payload = await apiDecoded("TimelineResponse", base);
+    }
     if (String(el("discord-channel").value) !== channel) return;
-    foldTimelinePage(payload, false, "threads", null);
+    if (sent && payload.delta) {
+      if (!foldTimelineDelta(payload, sent, "threads", null)) return;
+    } else {
+      foldTimelinePage(payload, false, "threads", null);
+    }
     renderThreadSelect();
     renderThreadHeading();
   } catch (_error) {
@@ -7355,21 +7469,29 @@ function addThreadDecoration(meta, message, row) {
   }
 }
 
-function timelinePath(before = null) {
+function timelinePath(before = null, after = null) {
   let path = `/api/v1/channels/${encodeURIComponent(el("discord-channel").value)}/timeline` +
     `?view=${channelView}&limit=${DISCORD_PAGE_LIMIT}`;
   path = withThreadQuery(path, selectedThreadId);
   if (before) path += `&before=${encodeURIComponent(before)}`;
+  if (after) path += `&after=${encodeURIComponent(after)}`;
   return path;
 }
 
-function applyTimelinePage(payload, older = false, saved = false) {
+/**
+ * Draw a page: a newest page, an older one (`older`), saved rows (`saved`), or a delta the caller
+ * has already folded into the store (`delta`, `#203 incremental-refresh`). A delta is drawn exactly
+ * as a refresh that keeps the reader's place is — the store's projection of the view — but it says
+ * nothing about older history, so the walk back keeps its cursor, and it names only the archived
+ * rows among its own.
+ */
+function applyTimelinePage(payload, older = false, saved = false, delta = false) {
   if (!saved) observeOutgoingMessages(payload.messages || []);
   const previousCount = channelView === "threads" ? timelineThreads.length : timelineMessages.length;
   const incoming = channelView === "threads" ? payload.threads || [] : payload.messages || [];
   // Into the channel's store, and this view back out of it: what the reader sees is the store's
   // projection, so a row another view corrected or the stream delivered is here too.
-  if (!saved) foldTimelinePage(payload, older);
+  if (!saved && !delta) foldTimelinePage(payload, older);
   const merged = projectView() || [];
   if (channelView === "threads") timelineThreads = merged;
   else timelineMessages = merged;
@@ -7380,16 +7502,16 @@ function applyTimelinePage(payload, older = false, saved = false) {
     // of a view read in this page has its live cursor.
     discordMoreAbove = payload.has_more === true ? (payload.next_before ? true : undefined) : false;
     discordOlderCursor = payload.next_before || null;
-  } else if (older || merged.length <= incoming.length || previousCount === 0 ||
-      (discordMoreAbove === undefined && !discordOlderCursor)) {
+  } else if (!delta && (older || merged.length <= incoming.length || previousCount === 0 ||
+      (discordMoreAbove === undefined && !discordOlderCursor))) {
     discordMoreAbove = payload.has_more === true;
     discordOlderCursor = payload.next_before || null;
   }
   const cover = channelCanon.views.get(viewKey());
-  if (cover && !saved) cover.cursor = discordOlderCursor;
+  if (cover && !saved && !delta) cover.cursor = discordOlderCursor;
   channelHasThreads = payload.has_threads === true || channelView === "thread";
   if (payload.thread) selectedThread = payload.thread;
-  noteArchived(payload, !older && merged.length <= incoming.length);
+  noteArchived(payload, !delta && !older && merged.length <= incoming.length);
   const shown = timelineMessages.filter((message) => !todoMode || stillToDo(message));
   if (older) {
     // Keep existing elements attached to the same messages: scroll restoration holds one of
@@ -7444,6 +7566,107 @@ function renderCachedTimeline() {
   guardQuietly(prepareSpeech)();
 }
 
+// --- reading only what changed -------------------------------------------------------------------
+//
+// `#203 incremental-refresh`. The owner: "This is the common case inner loop for how we use the
+// application all the time. It is important for this to be efficient. Right now my refreshes feel
+// very slow." Every refresh used to re-read the newest page of the view, and behind a bridge that
+// could mean re-scanning a channel's whole history. Now a newest read hands back `next_after`, and
+// a refresh with that cursor asks only for what changed since: a DELTA, folded into the store
+// without the newest page's deletion-by-absence, which a delta must never apply.
+//
+// WHICH READ. A full read on entering a view, changing channel, a stream reset, an expired or
+// mismatched cursor, a delta that runs past `TIMELINE_DELTA_PAGES`, and every
+// `TIMELINE_RECONCILE_MS`. Otherwise a delta — as far as the channel's deltas reach. A bridge with a
+// change record answers COMPLETE deltas, edits and deletions included, so every refresh there is
+// one. Any other backend answers additions only, so its channel keeps the full poll it always had
+// and its edits and deletions are no slower; deltas there serve a live arrival and a return to the
+// page, where speed is the point.
+
+/**
+ * How old a view's last newest read may be before a refresh reads the newest page again: fifteen
+ * minutes. A bridge with a change record reconciles its own snapshot and conveys what that finds in
+ * its deltas, so this guards only against the page folding a delta wrongly; fifteen minutes is about
+ * one reading session, so a session pays for at most one full read beyond the one it opened with.
+ */
+const TIMELINE_RECONCILE_MS = 900000;
+/** How many delta pages one refresh follows before it reads the newest page instead. */
+const TIMELINE_DELTA_PAGES = 4;
+/** How long the page must have been hidden for coming back to refresh the channel. */
+const VISIBLE_REFRESH_MS = 15000;
+/** How far behind a page's `as_of` must be before the pill says the service is slow. */
+const STALE_AS_OF_MS = 120000;
+/** Why a read may be a delta. Anything else — entering a view, a stream reset — reads in full. */
+const DELTA_REASONS = ["live", "visible", "poll", "pull", "replay", "mutation"];
+
+/** Whether an edit or removal from the replay tail is waiting for a read to answer it. */
+function mutationAwaitsRead() {
+  return [...replaysAwaitingRead.keys()].some(isMutationKey);
+}
+
+const isMutationKey = (key) => key.startsWith("message_update:") || key.startsWith("message_delete:");
+
+/**
+ * The forward cursor this refresh may read from, or null for a full read. Only a view this page
+ * has read live, recently enough, and only where the reason can be served by what this channel's
+ * deltas carry: an edit or deletion needs a complete one. A queued read standing for several
+ * triggers carries all their reasons, and is a delta only if every one of them could be.
+ *
+ * @param {string | (string | undefined)[] | undefined} reason
+ * @returns {string | null}
+ */
+function forwardCursor(reason) {
+  if (Array.isArray(reason)) {
+    const cursors = reason.map(forwardCursor);
+    return cursors.length > 0 && cursors.every((cursor) => cursor !== null) ? cursors[0] : null;
+  }
+  if (reason === undefined || !DELTA_REASONS.includes(reason)) return null;
+  if (channelCanon.channel !== String(el("discord-channel").value)) return null;
+  const cover = channelCanon.views.get(viewKey());
+  if (!cover || !cover.live || !cover.newest) return null;
+  if (Date.now() - (cover.fullAt || 0) >= TIMELINE_RECONCILE_MS) return null;
+  const complete = channelCanon.complete;
+  if (reason === "mutation") return complete === true ? cover.newest : null;
+  if (reason === "replay") return complete === true || !mutationAwaitsRead() ? cover.newest : null;
+  if (complete === false && reason !== "live" && reason !== "visible") return null;
+  return cover.newest;
+}
+
+/** The server can no longer continue from that cursor, or it was not issued for this view. */
+function isCursorRefusal(error) {
+  return Boolean(error) && ((error.status === 410 && error.code === "cursor_expired") ||
+    (error.status === 400 && error.code === "cursor_mismatch"));
+}
+
+/** A read landed: say how fresh the rows are — now, or as of what the server could vouch for. */
+function noteFreshRead(payload) {
+  const asOf = staleAsOf(payload);
+  channelFreshAt = asOf === null ? Date.now() : asOf;
+  setChannelFreshness(asOf === null ? "fresh" : "slow");
+}
+
+/** Several delta pages of one refresh, as the one page that draws them. */
+function joinedDeltas(pages) {
+  const last = pages[pages.length - 1];
+  return {
+    ...last,
+    messages: pages.flatMap((page) => page.messages || []),
+    threads: pages.flatMap((page) => page.threads || []),
+    dismissed: pages.flatMap((page) => page.dismissed || []),
+  };
+}
+
+/** What one refresh's landed pages answer for, for `settleReplays`; null when none landed. */
+function landedAnswer(pages) {
+  if (!pages.length) return null;
+  const full = pages.some((page) => !page.delta);
+  return {
+    messages: pages.flatMap((page) => page.messages || []),
+    threads: pages.flatMap((page) => page.threads || []),
+    delta: full ? null : { complete: pages.every((page) => page.delta && page.delta.complete === true) },
+  };
+}
+
 async function loadTimeline(options) {
   const generation = ++discordLoadGeneration;
   const context = channelContextKey();
@@ -7458,47 +7681,123 @@ async function loadTimeline(options) {
   const read = ++timelineReadsStarted;
   const area = el("scroll-area");
   const position = channelReadPosition(area);
+  const keepPosition = Boolean(options && options.keepPosition);
   renderChannelLoading(true);
-  /** @type {VibeTalk.TimelineResponse | null} */
-  let landed = null;
-  try {
-    const path = timelinePath();
-    const payload = await within(CHANNEL_READ_TIMEOUT_MS,
-      (signal) => apiDecoded("TimelineResponse", path, { signal }));
-    landed = payload;
-    if (generation !== discordLoadGeneration || context !== channelContextKey()) {
-      foldLateTimelinePage(payload, { context, channel, view, thread, canon });
-      return;
-    }
-    // Remove the in-flow indicator before measuring or restoring scroll. In
-    // real browsers scrollTop is clamped when it disappears, but making the
-    // order explicit also keeps the viewport model deterministic.
+  /** @type {VibeTalk.TimelineResponse[]} every page this refresh folded, in order */
+  const landed = [];
+  /** @type {VibeTalk.TimelineResponse[]} the delta pages among them, still to be drawn */
+  const deltas = [];
+  let sent = forwardCursor(options && options.reason);
+  const sameStore = () => canon === channelCanon && canon.channel === channel &&
+    String(el("discord-channel").value) === channel;
+  /** Draw the delta pages folded so far, as the one refresh they are. */
+  const drawDeltas = () => {
     renderChannelLoading(false);
-    // ...unless what is on screen came from the device or a read that failed: those rows are what
-    // the reader has, and the refresh MERGES into them rather than replacing them with one page.
-    if (!(options && options.keepPosition) && channelFreshness === "fresh") {
-      // An explicit refresh starts a fresh provider snapshot. Retaining old pages here would
-      // retain their expiring cursor forever, even though the newest request made a new one.
-      timelineMessages = [];
-      timelineThreads = [];
-      discordOlderCursor = null;
-      discordMoreAbove = false;
-      channelCanon.views.delete(viewKey());
-    }
-    const messages = applyTimelinePage(payload);
-    settleAfterRead(messages, { keepPosition: Boolean(options && options.keepPosition), area, ...position });
-    channelFreshAt = Date.now();
-    setChannelFreshness("fresh");
+    const messages = applyTimelinePage(joinedDeltas(deltas), false, false, true);
+    settleAfterRead(messages, { keepPosition, area, ...position });
+    noteFreshRead(deltas[deltas.length - 1]);
     saveChannelScope();
     renderScrollTools();
     requestVisibleSummaries();
+  };
+  try {
+    for (;;) {
+      const path = timelinePath(null, sent);
+      /** @type {VibeTalk.TimelineResponse} */
+      let payload;
+      try {
+        payload = await within(CHANNEL_READ_TIMEOUT_MS,
+          (signal) => apiDecoded("TimelineResponse", path, { signal }));
+      } catch (error) {
+        // A cursor the server can no longer continue is not a failed refresh. Forget it and read
+        // the newest page now, in the same hold: the pill says "refreshing…" and nothing else.
+        if (sent && isCursorRefusal(error) && sameStore()) {
+          const cover = canon.views.get(viewKey(view, thread));
+          if (cover && cover.newest === sent) cover.newest = null;
+          sent = null;
+          continue;
+        }
+        throw error;
+      }
+      const current = generation === discordLoadGeneration && context === channelContextKey();
+      // Folded by what ARRIVED, never by what was asked: a bridge that ignored `after` answers
+      // with the newest page it is, and that is folded as one.
+      if (sent && payload.delta) {
+        if (!sameStore() || !foldTimelineDelta(payload, sent, view, thread)) {
+          // Overtaken partway through a chain — the thread selector's own read of the list moved
+          // its cursor on meanwhile. What the pages before this one brought is in the store
+          // already, so it is drawn now rather than left off screen until the next read.
+          if (deltas.length && current && sameStore()) drawDeltas();
+          return;
+        }
+        landed.push(payload);
+        if (!current) {
+          // Read for a view the reader has since left, or overtaken by a read queued behind it:
+          // the store has it, so that view is current from its next showing.
+          canon.views.get(viewKey(view, thread)).landedHidden = true;
+          if (context === channelContextKey()) {
+            catchUpHeldView();
+            renderChannelFreshness();
+          }
+          saveChannelScope();
+          return;
+        }
+        deltas.push(payload);
+        if (payload.delta.more) {
+          if (deltas.length < TIMELINE_DELTA_PAGES && payload.next_after) {
+            sent = payload.next_after;
+            continue;
+          }
+          // Still more after that many pages: read the newest page, AFTER dropping the view's
+          // cover, as an explicit refresh does. The store keeps its rows, but the new page starts
+          // coverage afresh instead of claiming continuity across what was not read.
+          timelineMessages = [];
+          timelineThreads = [];
+          discordOlderCursor = null;
+          discordMoreAbove = false;
+          channelCanon.views.delete(viewKey());
+          deltas.length = 0;
+          sent = null;
+          continue;
+        }
+        drawDeltas();
+        return;
+      }
+      landed.push(payload);
+      if (!current) {
+        foldLateTimelinePage(payload, { context, channel, view, thread, canon });
+        return;
+      }
+      // Remove the in-flow indicator before measuring or restoring scroll. In
+      // real browsers scrollTop is clamped when it disappears, but making the
+      // order explicit also keeps the viewport model deterministic.
+      renderChannelLoading(false);
+      // ...unless what is on screen came from the device or a read that failed: those rows are what
+      // the reader has, and the refresh MERGES into them rather than replacing them with one page.
+      if (!keepPosition && channelFreshness === "fresh") {
+        // An explicit refresh starts a fresh provider snapshot. Retaining old pages here would
+        // retain their expiring cursor forever, even though the newest request made a new one.
+        timelineMessages = [];
+        timelineThreads = [];
+        discordOlderCursor = null;
+        discordMoreAbove = false;
+        channelCanon.views.delete(viewKey());
+      }
+      const messages = applyTimelinePage(payload);
+      settleAfterRead(messages, { keepPosition, area, ...position });
+      noteFreshRead(payload);
+      saveChannelScope();
+      renderScrollTools();
+      requestVisibleSummaries();
+      return;
+    }
   } catch (error) {
     if (generation === discordLoadGeneration && context === channelContextKey()) {
       noteChannelReadFailure(error);
       throw error;
     }
   } finally {
-    settleReplays(read, landed);
+    settleReplays(read, landedAnswer(landed));
     await finishDiscordLoad();
   }
 }
@@ -7542,7 +7841,7 @@ async function loadOlderTimeline() {
       olderFetchInFlight = false;
       discordOlderCursor = null;
       discordMoreAbove = false;
-      await loadTimeline({ keepPosition: false });
+      await loadTimeline({ keepPosition: false, reason: "expired" });
       if (context === channelContextKey()) {
         setStatus("This history snapshot expired. Refreshed the newest messages; scroll up to load older history again.");
       }
@@ -11620,8 +11919,8 @@ async function pullEnd() {
   renderPull("busy", { travel: PULL_ARM_PX });
   const before = discordNewestId;
   try {
-    // No options: a user-initiated refresh goes to the newest message. See the note above.
-    await loadDiscord();
+    // No `keepPosition`: a user-initiated refresh goes to the newest message. See the note above.
+    await loadDiscord({ reason: "pull" });
   } finally {
     renderPull(null);
   }
@@ -11767,11 +12066,15 @@ function channelReadPosition(area) {
 }
 
 /**
- * @param {{keepPosition?: boolean}} [options] `keepPosition` marks a RE-read of a channel already
- *   on screen — the background poll, or the Refresh button. It must not drag the reader to the
- *   bottom while they are reading older messages; it follows the newest line only if that is
- *   where they already were. The FIRST load of a channel is the other case and does not pass it:
- *   arriving at the top of a long history means scrolling past everything already read.
+ * @param {{keepPosition?: boolean, reason?: string | (string | undefined)[]}} [options]
+ *   `keepPosition` marks a RE-read of a channel already on screen — the background poll, or the
+ *   Refresh button. It must not drag the reader to the bottom while they are reading older
+ *   messages; it follows the newest line only if that is where they already were. The FIRST load
+ *   of a channel is the other case and does not pass it: arriving at the top of a long history
+ *   means scrolling past everything already read. `reason` says what asked for the read — one of
+ *   `DELTA_REASONS`, or `enter`, `reset`, `expired` — which decides whether a timeline read may ask
+ *   only for what changed; absent reads in full. A queued read carries the reasons of every
+ *   trigger it stands for (`queueDiscordLoad`). `#203 incremental-refresh`.
  */
 async function loadDiscord(options) {
   screenBelongsToToken();
@@ -13080,12 +13383,35 @@ let discordQueuedLoad = null;
 // for it once it lands: one that failed saw nothing. `#43 replay-burst-double-read`.
 let timelineReadsStarted = 0;
 let timelineReadsLanded = 0;
+// The newest of them that could answer an edit or a removal: a newest page or a complete delta.
+// `#203 incremental-refresh`.
+let mutationReadsLanded = 0;
 let liveAttachReads = 0;
 const replaysAwaitingRead = new Map();
 
-/** Remember the newest read requested while another channel read is in flight. */
+/**
+ * Remember the newest read requested while another channel read is in flight.
+ *
+ * `#203 incremental-refresh`. The one queued read stands for every trigger that asked meanwhile,
+ * so it carries EVERY reason among them, and `forwardCursor` makes it a delta only if each could
+ * be one: a stream reset's full read must not be narrowed to a delta because a live message
+ * arrived behind it. Not a ranking: which of two reasons reads more depends on what the channel's
+ * deltas carry, which is learned only when the queued read runs — on a channel whose deltas carry
+ * additions only, a poll reads in full while a replay with no edit waiting reads a delta, and
+ * before any delta has landed it can be the other way round. The newest request's other options
+ * win, as they always have.
+ *
+ * @param {{keepPosition?: boolean, reason?: string | (string | undefined)[]}} [options]
+ */
 function queueDiscordLoad(options) {
-  discordQueuedLoad = { options };
+  if (!discordQueuedLoad) {
+    discordQueuedLoad = { options };
+    return;
+  }
+  /** @param {{reason?: string | (string | undefined)[]} | undefined} opts */
+  const reasons = (opts) => (opts && Array.isArray(opts.reason) ? opts.reason : [opts ? opts.reason : undefined]);
+  const all = [...new Set([...reasons(discordQueuedLoad.options), ...reasons(options)])];
+  discordQueuedLoad = { options: { ...(options || {}), reason: all.length === 1 ? all[0] : all } };
 }
 
 /** Release the fetch lock, then perform the newest read that was requested while it was held. */
@@ -13134,7 +13460,7 @@ function scheduleDiscordPoll() {
       let refused = false;
       try {
         refused = !clientConfigApplied && !(await signIn());
-        if (!refused) await loadDiscord({ keepPosition: true });
+        if (!refused) await loadDiscord({ keepPosition: true, reason: "poll" });
       } finally {
         if (currentView === "discord" && !refused) {
           scheduleDiscordPoll();
@@ -13788,7 +14114,7 @@ function onStreamFrame(frame) {
     // would ask the server to replay what it has already said it cannot.
     liveLastEventId = null;
     setStatus("the live feed fell behind — re-reading the channel.");
-    refreshQuietly(() => loadDiscord({ keepPosition: true }))();
+    refreshQuietly(() => loadDiscord({ keepPosition: true, reason: "reset" }))();
     return;
   }
   if (!frame.data) {
@@ -13851,7 +14177,7 @@ function refreshAfterLiveMutation() {
         while (discordFetchInFlight) {
           await new Promise((resolve) => setTimeout(resolve, 50));
         }
-        await loadDiscord({ keepPosition: true });
+        await loadDiscord({ keepPosition: true, reason: "mutation" });
       }
     } finally {
       liveMutationRefreshRunning = false;
@@ -13904,7 +14230,7 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
     relayToAgent(message, selfPosted, replayed);
     // The server owns thread membership, counts and activity ordering. Re-read the active
     // context instead of dropping a reply from another thread into the visible conversation.
-    if (!replayed) refreshQuietly(() => loadDiscord({ keepPosition: true }))();
+    if (!replayed) refreshQuietly(() => loadDiscord({ keepPosition: true, reason: "live" }))();
     else if (!held) {
       awaitReplayRead(String(message.id), String(message.channel_id),
         fromTail ? liveAttachReads : timelineReadsStarted);
@@ -13977,9 +14303,13 @@ function heldMessage(id) {
  * @param {number} arrivedAfter
  */
 function awaitReplayRead(key, channel, arrivedAfter) {
-  if (timelineReadsLanded > arrivedAfter) return;
+  // `#203 incremental-refresh`. An edit or removal is answered only by a read that carries them:
+  // a newest page, or a complete delta. A delta of additions says nothing about either.
+  if ((isMutationKey(key) ? mutationReadsLanded : timelineReadsLanded) > arrivedAfter) return;
   replaysAwaitingRead.set(key, { channel, arrivedAfter });
-  if (!discordFetchInFlight && currentView === "discord") refreshQuietly(() => loadDiscord({ keepPosition: true }))();
+  if (!discordFetchInFlight && currentView === "discord") {
+    refreshQuietly(() => loadDiscord({ keepPosition: true, reason: "replay" }))();
+  }
 }
 
 /**
@@ -13993,23 +14323,29 @@ function awaitReplayRead(key, channel, arrivedAfter) {
  * failing is not asked again for every frame.
  *
  * @param {number} read
- * @param {VibeTalk.TimelineResponse | null} page
+ * @param {{messages: VibeTalk.Message[], threads: VibeTalk.ThreadSummary[],
+ *          delta: {complete: boolean} | null} | null} page what the read's landed pages carried,
+ *   and — when every one of them was a delta — whether all of those were complete
  */
 function settleReplays(read, page) {
   const channel = String(el("discord-channel").value);
+  // A delta answers for what it carries: creations always, edits and removals only when complete.
+  const answersMutations = Boolean(page) && (!page.delta || page.delta.complete === true);
   if (page) timelineReadsLanded = Math.max(timelineReadsLanded, read);
+  if (answersMutations) mutationReadsLanded = Math.max(mutationReadsLanded, read);
   const onPage = new Set([
     ...((page && page.messages) || []).map((message) => String(message.id)),
     ...((page && page.threads) || []).map((thread) => String(thread.root && thread.root.id)),
   ]);
   for (const [key, waiting] of replaysAwaitingRead) {
     if (waiting.channel !== channel ||
-        (page && (waiting.arrivedAfter < read || onPage.has(key)))) {
+        (page && (answersMutations || !isMutationKey(key)) &&
+          (waiting.arrivedAfter < read || onPage.has(key)))) {
       replaysAwaitingRead.delete(key);
     }
   }
   if (page && replaysAwaitingRead.size && currentView === "discord" && !discordQueuedLoad) {
-    queueDiscordLoad({ keepPosition: true });
+    queueDiscordLoad({ keepPosition: true, reason: "replay" });
   }
 }
 
@@ -15517,7 +15853,8 @@ el("view-switch").addEventListener("click", () => {
 function readEnteredChannel(keepPosition) {
   guardQuietly(async () => {
     try {
-      await loadDiscord(keepPosition ? { keepPosition: true } : undefined);
+      // A return finds the channel's store as it was left, so it asks only for what changed.
+      await loadDiscord(keepPosition ? { keepPosition: true, reason: "visible" } : { reason: "enter" });
     } finally {
       // Armed after a failure too: offline is exactly when the reader needs the page to try again.
       if (currentView === "discord") {
@@ -15576,7 +15913,7 @@ function changeSelectedChannel() {
   // A stream follows ONE channel, and a cursor from the old one means nothing in the new one —
   // the same reason the walk-back cursor is dropped two lines above.
   startChannelStream(el("discord-channel").value);
-  return loadDiscord(saved && currentView === "discord" ? { keepPosition: true } : undefined);
+  return loadDiscord(saved && currentView === "discord" ? { keepPosition: true, reason: "enter" } : { reason: "enter" });
 }
 el("discord-channel").addEventListener("change", guardQuietly(changeSelectedChannel));
 // `#39 channel-alias`. Pointing the editor at another channel shows THAT channel's name; it does

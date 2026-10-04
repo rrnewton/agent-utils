@@ -1167,7 +1167,7 @@ remain compatible with earlier deployments.
 With `thread_api = "bridge"`, a compatible HTTP bridge implements these paths relative to
 `discord.api_base`:
 
-* `GET /channels/{id}/timeline?view=main|threads|flat|thread&thread_id=…&before=…&limit=…`
+* `GET /channels/{id}/timeline?view=main|threads|flat|thread&thread_id=…&before=…&after=…&limit=…`
 * `GET /channels/{id}/threads/{thread_id}/messages/{message_id}`
 * `POST /channels/{id}/threads/{thread_id}/messages`
 
@@ -1190,6 +1190,53 @@ conversation: the page draws every message it is served there, the root and its 
 order, keeps the replies through a walk back and a reload from the device, and offers no replies
 button on the root, which would only open what Main already shows. A channel with child threads
 keeps a Main of roots and unthreaded messages.
+
+**Forward reads** (`#203 incremental-refresh`). A compatible bridge may also answer
+`GET /channels/{id}/timeline?view=…&thread_id=…&limit=…&after=…`. `after` is the opaque
+`next_after` of an earlier response for the same channel, view, and thread; `after` and `before`
+are mutually exclusive (`400`). A bridge that supports forward reads includes `next_after` (a
+URL-safe string of at most 2048 characters) in every newest-page response for which it will accept
+one; vibe-talk learns the capability from that field alone and never probes for it. A bridge that
+omits it is read with full newest pages exactly as before.
+
+A response to `after` carries only the entries new or changed in that view since the cursor,
+oldest first, at most `limit`, and an object
+`"delta": {"more": bool, "complete": bool, "deleted": [message ids], "removed_threads": [thread ids]}`.
+`has_more` is `false` and `next_before` is `null`; `next_after` is required and continues the read.
+`more` asks the caller to continue at once. `complete: true` promises that edits and deletions
+since the cursor are included (`deleted` is channel-wide, at most 500 ids); a bridge that only sees
+creations answers `complete: false` with empty lists. In the main view, the root of a thread whose
+replies changed is included, because its `reply_count` changed. `thread`, `has_threads`, and
+`notice` carry current values. Messages and summaries use the existing wire formats and the same
+membership checks as every other timeline read. A response to `after` without `delta` is treated as
+the newest page it is.
+
+A cursor the bridge can no longer answer for — issued by an earlier process, older than the changes
+it still remembers, or failing verification — gets `410` with
+`{"error":"cursor_expired","message":"…"}`; vibe-talk then reads the newest page again. A malformed
+cursor, or one issued for another channel, view, or thread, gets `400`. A bridge rolled back to a
+version without forward reads may answer an `after` it once issued with `400`, `405`, or `501`;
+vibe-talk treats that as an expired cursor too, and the newest read that follows carries no
+`next_after`.
+
+A bridge may also include `as_of`, an RFC 3339 instant up to which it knows the response is
+complete, when it is serving data it could not bring up to date just now; vibe-talk passes it to
+the page, which then says the service is slow instead of claiming the list is current. Absent
+means "now".
+
+Every backend can be read forward through vibe-talk's own route, bridge or not. For one that issues
+no `next_after` of its own, vibe-talk issues a generic cursor — the newest provider timestamp
+served, a two-minute overlap below it, and the entries already delivered inside that overlap — and
+answers `after` by reading newest pages and keeping what is newer: correct, with `complete: false`,
+and no cheaper than a newest read. The direct backends answer the views one request can serve
+themselves: native Discord a thread and a text channel's Main with `after=<snowflake>`, Slack a
+conversation's Main and one thread with `oldest=<ts>`. Both read by creation, so they too answer
+`complete: false`, and a reply does not bring its root's new count into Main until the next full
+read; their thread lists, All views, and a forum's or a narrowed channel's Main use the generic
+cursor. A cursor a direct backend did not issue for that view — one a bridge issued before the
+channel moved to the native API, say — is answered `410 cursor_expired`, so the page reads the
+newest page rather than failing every refresh with it. The page keeps its full poll on all such channels, so edits and deletions are as prompt as
+before; forward reads there serve live arrivals and a return to the page.
 
 The native backend includes accessible active and archived threads. It bounds discovery at 256
 threads and 100 pages per archived collection, retains pagination inventories for five minutes,
@@ -1515,7 +1562,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/api/v1/channels/{id}/digest?limit=&width=` | read | one speakable line per message |
 | GET | `/api/v1/channels/{id}/messages/{message_id}/summary` | read | one message summarised, from cache when it can be |
 | GET | `/api/v1/channels/{id}/page?limit=&before=&since=&until=` | read | **one step of a walk**, saying that it is one |
-| GET | `/api/v1/channels/{id}/timeline?view=&thread_id=&limit=&before=` | read | main channel, thread list, flattened history, or one thread; opaque backward cursor |
+| GET | `/api/v1/channels/{id}/timeline?view=&thread_id=&limit=&before=&after=` | read | main channel, thread list, flattened history, or one thread; opaque backward cursor, or `after=` for what changed since a newest read: `400 cursor_mismatch` for a cursor from another channel, view or thread, `410 cursor_expired` for one the backend can no longer continue — read the newest page again (`#203 incremental-refresh`) |
 | GET | `/api/v1/channels/{id}/count?since=&cap=` | read | a bounded, honest count |
 | POST | `/api/v1/channels/{id}/resolve` | read | **semantic random access** |
 | POST | `/api/v1/channels/{id}/reply` | **write** | `{text, thread_id?, reply_to?, idempotency_key?}` — post to the channel or selected thread; quoting a message is optional. A split post that fails part-way answers `207` with `{posted, unsent, retryable, resumable}`; `idempotency_key` (1–64 of `A-Z a-z 0-9 - _`) names the post across attempts, and where client-config reports `idempotent_posts_supported` the same key and text are posted at most once (`#195 send-resilience`). `unsent` is the request's own text when nothing posted; `resumable` says whether sending `unsent` again repeats the failed part under the same words and key, which a split code block can prevent |
@@ -2035,6 +2082,23 @@ stream has attached, so it answers for the whole tail. An edit or removal from t
 same way, for a read begun after the attach, because a page's copy of a message says nothing about
 which edit it has seen. The un-threaded channel view still re-reads for a replayed message that
 arrives during a read, as it does for a live one.
+
+**A refresh asks only for what changed** (`#203 incremental-refresh`). Once a view has been read,
+the page holds that read's `next_after`, in memory only, and a refresh sends it back as `after=`;
+the answer carries only what changed and is folded into the channel's store as a delta — rows it
+does not mention are unchanged, never taken as deleted, removals arrive as `deleted` ids, and the
+view's coverage and walk-back cursor stay as they were. Where the channel's deltas are complete (a
+bridge with a change record), the poll, a live message, a live edit or deletion, pull-to-refresh,
+and coming back to a page hidden for fifteen seconds or more are all deltas. Where they carry
+additions only, the forty-five-second poll and pull-to-refresh stay full reads, so edits and
+deletions are no slower than before, and deltas serve live arrivals and the return to the page. A
+full read still happens on entering a view, changing channel, a stream reset, an expired or
+mismatched cursor (`410 cursor_expired` or `400 cursor_mismatch`, answered at once with a full read
+rather than a failure), a delta still saying `more` after four pages, and every fifteen minutes per
+view. A cold start always reads in full: no cursor is saved to the device. An answer carrying `as_of`
+more than two minutes old makes the freshness pill say the service is slow, with that time, instead
+of claiming the list is current. An edit or removal replayed from the tail is answered only by a
+newest page or a complete delta.
 
 **`user_message`, not `contextual_update`, and that is the substance of the feature.** A
 contextual update injects text into the agent's context *without consuming a turn*: the agent

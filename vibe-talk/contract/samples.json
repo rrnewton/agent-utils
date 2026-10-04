@@ -630,6 +630,140 @@
       "threads": [],
       "untrusted_content_notice": "third-party text",
       "view": "flat"
+    },
+    {
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "dismissed": [
+        "150"
+      ],
+      "has_more": false,
+      "has_threads": false,
+      "limit": 50,
+      "messages": [
+        {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": false,
+          "channel_id": "100",
+          "content": "hello",
+          "id": "300",
+          "reply_to": null,
+          "spoken_time": "",
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        }
+      ],
+      "next_after": "forward",
+      "next_before": null,
+      "notice": null,
+      "returned": 1,
+      "thread": null,
+      "threads": [],
+      "untrusted_content_notice": "third-party text",
+      "view": "main"
+    },
+    {
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "delta": {
+        "complete": true,
+        "deleted": [
+          "299"
+        ],
+        "more": false,
+        "removed_threads": []
+      },
+      "dismissed": [
+        "150"
+      ],
+      "has_more": false,
+      "has_threads": true,
+      "limit": 50,
+      "messages": [
+        {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": false,
+          "channel_id": "100",
+          "content": "hello",
+          "id": "301",
+          "noise": true,
+          "reply_to": "200",
+          "spoken_content": "hello, spoken",
+          "spoken_time": "noon",
+          "thread": {
+            "id": "t1",
+            "is_root": false,
+            "reply_count": 3,
+            "reply_count_exact": true,
+            "root_message_id": "200"
+          },
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        }
+      ],
+      "next_after": "forward-2",
+      "next_before": null,
+      "notice": null,
+      "returned": 1,
+      "thread": null,
+      "threads": [],
+      "untrusted_content_notice": "third-party text",
+      "view": "main"
+    },
+    {
+      "as_of": "2026-10-04T07:00:00Z",
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "delta": {
+        "complete": false,
+        "deleted": [],
+        "more": true,
+        "removed_threads": [
+          "gone-thread"
+        ]
+      },
+      "dismissed": [
+        "150"
+      ],
+      "has_more": false,
+      "has_threads": false,
+      "limit": 50,
+      "messages": [],
+      "next_after": "forward-3",
+      "next_before": null,
+      "notice": null,
+      "returned": 1,
+      "thread": null,
+      "threads": [
+        {
+          "id": "t1",
+          "reply_count": null,
+          "reply_count_exact": false,
+          "root": null,
+          "title": "a thread",
+          "updated_at": "2026-09-25T12:00:00+00:00"
+        }
+      ],
+      "untrusted_content_notice": "third-party text",
+      "view": "threads"
     }
   ],
   "VibeTalkV1ClientFrame": [

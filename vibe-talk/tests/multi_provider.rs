@@ -407,3 +407,144 @@ async fn a_channel_added_by_link_stays_with_its_provider_across_a_restart() {
     assert!(second.state.providers.key_for(&added).is_none());
     assert!(second.discord.unregistration_calls().is_empty());
 }
+
+/// `#203 incremental-refresh`. A provider with threads, with or without a forward cursor of its
+/// own — a bridge with a change record, and one that only reads backward.
+struct Forwardable {
+    name: &'static str,
+    native: bool,
+    asked: std::sync::Mutex<Vec<Option<String>>>,
+}
+
+impl Forwardable {
+    fn new(name: &'static str, native: bool) -> Arc<Self> {
+        Arc::new(Self {
+            name,
+            native,
+            asked: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+}
+
+#[async_trait]
+impl ChatClient for Forwardable {
+    fn provider_name(&self) -> &str {
+        self.name
+    }
+    fn supports_threading(&self) -> bool {
+        true
+    }
+    async fn identity(&self) -> Result<ChatIdentity, ChatError> {
+        Ok(ChatIdentity {
+            id: "7".to_owned(),
+            username: self.name.to_owned(),
+        })
+    }
+    async fn fetch_page(
+        &self,
+        _: &ChannelId,
+        _: u16,
+        _: Option<&MessageId>,
+        _: Option<&MessageId>,
+    ) -> Result<Vec<Message>, ChatError> {
+        Ok(Vec::new())
+    }
+    async fn post_message(
+        &self,
+        _: &ChannelId,
+        _: &str,
+        _: Option<&MessageId>,
+    ) -> Result<Message, ChatError> {
+        Err(ChatError::Refused("read only".to_owned()))
+    }
+    async fn fetch_timeline(
+        &self,
+        _: &ChannelId,
+        request: &vibe_talk::threads::TimelineRequest,
+    ) -> Result<vibe_talk::threads::TimelinePage, ChatError> {
+        self.asked.lock().unwrap().push(request.after.clone());
+        Ok(vibe_talk::threads::TimelinePage {
+            has_threads: true,
+            next_after: self.native.then(|| format!("{}-own", self.name)),
+            delta: (self.native && request.after.is_some()).then(|| {
+                vibe_talk::threads::TimelineDelta {
+                    complete: true,
+                    ..Default::default()
+                }
+            }),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn each_channel_gets_the_forward_cursor_its_own_provider_can_answer() {
+    let (mut state, _discord, _store) =
+        vibe_talk::testing::state_with_store_from_toml(&config_text());
+    let bridge = Forwardable::new("bridge", true);
+    let plain = Forwardable::new("plain", false);
+    let entries = vec![
+        ProviderEntry {
+            key: "discord".to_owned(),
+            namespace: state.config.providers[0].namespace(),
+            client: bridge.clone(),
+            live_poll_seconds: 0,
+        },
+        ProviderEntry {
+            key: "slack".to_owned(),
+            namespace: state.config.providers[1].namespace(),
+            client: plain.clone(),
+            live_poll_seconds: 30,
+        },
+    ];
+    let router = ChatRouter::new(entries, state.config.default_provider_key());
+    state.replace_providers(Arc::new(router));
+    for (channel, provider, complete) in [
+        (READ_CHANNEL, &bridge, true),
+        (SLACK_CHANNEL, &plain, false),
+    ] {
+        let timeline = format!("/api/v1/channels/{channel}/timeline?view=main");
+        let (status, newest) = call(&state, "GET", &timeline, WRITE_TOKEN, None).await;
+        assert_eq!(status, StatusCode::OK, "{newest}");
+        let cursor = newest["next_after"]
+            .as_str()
+            .expect("every newest page continues forward");
+        let (status, delta) = call(
+            &state,
+            "GET",
+            &format!("{timeline}&after={cursor}"),
+            WRITE_TOKEN,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{delta}");
+        assert_eq!(delta["delta"]["complete"], complete, "{channel}: {delta}");
+        let asked = provider.asked.lock().unwrap().clone();
+        let expected = if complete {
+            Some("bridge-own".to_owned())
+        } else {
+            None
+        };
+        assert_eq!(
+            asked,
+            [None, expected],
+            "{channel} was handed the wrong cursor"
+        );
+        // A cursor from one provider's channel is no cursor for the other's.
+        let other = if channel == READ_CHANNEL {
+            SLACK_CHANNEL
+        } else {
+            READ_CHANNEL
+        };
+        let (status, refused) = call(
+            &state,
+            "GET",
+            &format!("/api/v1/channels/{other}/timeline?view=main&after={cursor}"),
+            WRITE_TOKEN,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+        assert_eq!(refused["error"], "cursor_mismatch");
+    }
+}

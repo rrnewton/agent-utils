@@ -518,6 +518,9 @@ pub fn classify(error: &ChatError) -> Diagnosis {
         ChatError::Transport(detail) => Diagnosis::Unreachable(detail.clone()),
         ChatError::Shape(detail) => Diagnosis::Unintelligible(detail.clone()),
         ChatError::Refused(detail) => Diagnosis::Refused(detail.clone()),
+        // A probe reads no forward cursor, so this cannot arise from one; were it to, it is the
+        // backend declining that read, which is what a refusal reports.
+        ChatError::CursorExpired(detail) => Diagnosis::Refused(detail.clone()),
         // The client already waited this out and could not clear it, so the probe learned nothing
         // about readability — exactly what a bare 429 used to mean here, and still does.
         ChatError::RateLimited(_) => Diagnosis::RateLimited,

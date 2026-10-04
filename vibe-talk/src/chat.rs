@@ -86,6 +86,13 @@ pub enum ChatError {
     /// The server refused the operation before contacting the provider.
     #[error("refused: {0}")]
     Refused(String),
+    /// A forward cursor the backend can no longer answer for. `#203 incremental-refresh`.
+    ///
+    /// Issued by an earlier process, older than the changes the backend still remembers, failing
+    /// its verification, or more changed than one catch-up reads. Never transient: the same cursor
+    /// fails the same way again. The caller reads the newest page instead, which issues a fresh one.
+    #[error("cannot continue from that position: {0}")]
+    CursorExpired(String),
     /// A failure labeled by the backend that actually handled the request.
     #[error("{}", source.format_for(provider))]
     Provider {
@@ -122,6 +129,9 @@ impl ChatError {
             Self::Status { status, body } => format!("{provider} returned HTTP {status}: {body}"),
             Self::Shape(detail) => format!("{provider} response could not be understood: {detail}"),
             Self::Refused(detail) => format!("{provider} refused: {detail}"),
+            Self::CursorExpired(detail) => {
+                format!("{provider} can no longer continue from that position: {detail}")
+            }
             Self::RateLimited(detail) => detail.format_for(provider),
             Self::Provider { .. } => unreachable!("cause removes provider context"),
         }
@@ -147,7 +157,9 @@ impl ChatError {
         match self.cause() {
             Self::Transport(_) | Self::RateLimited(_) => true,
             Self::Status { status, .. } => *status >= 500 || *status == 408 || *status == 429,
-            Self::Shape(_) | Self::Refused(_) | Self::Provider { .. } => false,
+            Self::Shape(_) | Self::Refused(_) | Self::CursorExpired(_) | Self::Provider { .. } => {
+                false
+            }
         }
     }
 }
@@ -236,6 +248,27 @@ pub trait ChatClient: Send + Sync {
         Err(ChatError::Refused(
             "thread timelines are not supported by this backend".to_owned(),
         ))
+    }
+
+    /// What changed in a view since a generic position, for a backend whose
+    /// [`ChatClient::fetch_timeline`] does not answer `after` itself. `#203 incremental-refresh`.
+    ///
+    /// `request` carries no cursor. The default reads newest pages and keeps what is newer than
+    /// the position: correct for every backend, with `complete: false`, and no cheaper than a
+    /// newest read. The router forwards it to the channel's provider, so a provider may override
+    /// it with something cheaper. Answers the delta page and the position that continues it.
+    ///
+    /// # Errors
+    ///
+    /// [`ChatError::CursorExpired`] when more changed than one catch-up reads; otherwise the
+    /// errors of [`ChatClient::fetch_timeline`].
+    async fn fetch_timeline_since(
+        &self,
+        channel: &ChannelId,
+        request: &crate::threads::TimelineRequest,
+        since: &crate::timeline_forward::GenericPosition,
+    ) -> Result<crate::timeline_forward::GenericDelta, ChatError> {
+        crate::timeline_forward::generic_since(self, channel, request, since).await
     }
 
     /// Post inside a thread after verifying that it belongs to the configured parent channel.

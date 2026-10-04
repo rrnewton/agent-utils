@@ -2522,6 +2522,19 @@ const TUNING_BANDS = {
   DISCORD_POLL_MS: [5000, 600000,
     "the unasked re-read: often enough to be fresh, rare enough that a voice call is not sharing " +
     "its network with it"],
+  TIMELINE_RECONCILE_MS: [300000, 3600000,
+    "how long a view goes on deltas before a full read checks the page's own folding (#203 " +
+    "incremental-refresh): under five minutes most refreshes are full reads again, the slowness " +
+    "this exists to remove; past an hour a folding defect outlasts a reading session"],
+  TIMELINE_DELTA_PAGES: [2, 10,
+    "delta pages one refresh follows before it reads the newest page instead: one turns every burst " +
+    "into a full read; past ten a refresh far behind spends longer catching up than a full read takes"],
+  VISIBLE_REFRESH_MS: [5000, 60000,
+    "how long the page is hidden before coming back refreshes it: under five seconds a glance at " +
+    "another app costs a read; past a minute the reader comes back to rows the held poll left stale"],
+  STALE_AS_OF_MS: [30000, 600000,
+    "how far behind the server's as_of must be before the pill says the service is slow: shorter " +
+    "calls an ordinary snapshot slow, longer calls minutes-old rows current"],
   ACTIVITY_INTERVAL_MS: [1000, 60000,
     "how often composing tells the agent someone is there. The vendor's turn timeout is the thing " +
     "being held off, so above a minute the agent starts asking whether anyone is still there — " +
@@ -24099,4 +24112,574 @@ test("signing out forgets where the reader was, with the messages", async () => 
   assert.equal(again.screen(), "signin");
   await signIn(again);
   assert.equal(again.tab(), "voice", "a signed-out record reopened the channel");
+});
+
+// --- `#203 incremental-refresh`: a refresh asks only for what changed ---------------------------
+//
+// The owner: "This is the common case inner loop for how we use the application all the time. It
+// is important for this to be efficient. Right now my refreshes feel very slow." These are the
+// page's half: once a view has been read, a refresh carries that read's `next_after` and folds the
+// DELTA it gets back, under rules a newest page does not have — above all, that a row a delta does
+// not mention is unchanged rather than deleted.
+
+/**
+ * A timeline server with a change record, as a bridge with a journal is: every message posted,
+ * edited or deleted, and every thread that moves, gets a revision. A newest read hands back
+ * `next_after` naming the view and the revision it saw; a read with `after=` answers what changed
+ * in that view since, oldest first. Built with `complete: false` it is every other backend — the
+ * generic catch-up — which sees creations only and says so.
+ *
+ * Knobs: `deltaLimit` (entries per delta, after which it says `more`), `newestLimit` (rows a newest
+ * page holds, after which it says older history exists), `olderCursor`, `refuse` (the status and
+ * code the next forward read is answered with), `asOf`, and `hold` (a `gate` every read waits on).
+ */
+function forwardTimeline(page, { complete = true, olderCursor = null } = {}) {
+  const server = {
+    revision: 0, created: new Map(), changed: new Map(), deleted: [], threadChanged: new Map(),
+    removedThreads: [], complete, deltaLimit: Infinity, newestLimit: Infinity, olderCursor,
+    refuse: null, asOf: null, hold: null, reads: [],
+  };
+  const bump = () => (server.revision += 1);
+  const note = (m) => {
+    const at = bump();
+    server.created.set(String(m.id), at);
+    server.changed.set(String(m.id), at);
+  };
+  page.messages.forEach(note);
+  for (const thread of page.threads) server.threadChanged.set(String(thread.id), bump());
+  server.post = (m) => {
+    page.messages.push(m);
+    note(m);
+    return m;
+  };
+  server.edit = (id, fields) => {
+    Object.assign(page.messages.find((m) => String(m.id) === id), fields);
+    server.changed.set(id, bump());
+  };
+  server.remove = (id) => {
+    page.messages = page.messages.filter((m) => String(m.id) !== id);
+    server.deleted.push({ at: bump(), id });
+  };
+  server.dropThread = (id) => {
+    page.threads = page.threads.filter((thread) => thread.id !== id);
+    server.removedThreads.push({ at: bump(), id });
+  };
+  const byTime = (a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp);
+  server.answer = async (path) => {
+    const url = new URL(path, "http://fixture.test");
+    const view = url.searchParams.get("view");
+    const threadId = url.searchParams.get("thread_id");
+    const after = url.searchParams.get("after");
+    const before = url.searchParams.get("before");
+    server.reads.push({ view, after, before });
+    const scope = threadId ? `${view}:${threadId}` : view;
+    const inView = (m) => view === "flat" || (view === "thread" && Boolean(m.thread) && m.thread.id === threadId) ||
+      (view === "main" && (!m.thread || m.thread.is_root));
+    const fields = {
+      view, has_threads: page.threads.length > 0,
+      thread: (view === "thread" && page.threads.find((thread) => thread.id === threadId)) || null,
+      ...(server.asOf ? { as_of: server.asOf } : {}),
+    };
+    const dismissed = (rows) => rows.map((m) => String(m.id)).filter((id) => page.dealtWith.has(id));
+    if (after) {
+      if (server.refuse) {
+        const { status, error } = server.refuse;
+        server.refuse = null;
+        return json(status, { error, detail: "that position is gone" });
+      }
+      const [issued, at] = after.split("@");
+      if (issued !== scope) return json(400, { error: "cursor_mismatch", detail: "not issued for this view" });
+      const since = Number(at);
+      const record = server.complete ? server.changed : server.created;
+      // The thread list's entries are summaries, revised when their thread moves; every other
+      // view's are messages.
+      const revisionOf = view === "threads"
+        ? (thread) => server.threadChanged.get(String(thread.id))
+        : (m) => record.get(String(m.id));
+      const changed = (view === "threads" ? page.threads : page.messages.filter(inView))
+        .filter((entry) => revisionOf(entry) > since)
+        .sort((a, b) => revisionOf(a) - revisionOf(b));
+      const more = changed.length > server.deltaLimit;
+      const taken = changed.slice(0, server.deltaLimit);
+      const upto = more ? revisionOf(taken[taken.length - 1]) : server.revision;
+      const between = (list) => list.filter((entry) => entry.at > since && entry.at <= upto).map((entry) => entry.id);
+      return json(200, timelineAnswer({
+        ...fields,
+        messages: view === "threads" ? [] : [...taken].sort(byTime),
+        threads: view === "threads" ? taken : [],
+        next_after: `${scope}@${upto}`,
+        delta: {
+          more, complete: server.complete,
+          deleted: server.complete ? between(server.deleted) : [],
+          removed_threads: server.complete && view === "threads" ? between(server.removedThreads) : [],
+        },
+        dismissed: view === "threads" ? [] : dismissed(taken),
+      }));
+    }
+    if (before) return json(200, timelineAnswer(fields));
+    const rows = view === "threads" ? [] : page.messages.filter(inView);
+    const shown = rows.slice(Math.max(0, rows.length - server.newestLimit));
+    const older = shown.length < rows.length || Boolean(server.olderCursor);
+    return json(200, timelineAnswer({
+      ...fields, messages: shown, threads: view === "threads" ? page.threads : [],
+      has_more: older, next_before: older ? server.olderCursor || "older" : null,
+      next_after: `${scope}@${server.revision}`, dismissed: dismissed(shown),
+    }));
+  };
+  page.timeline = (path) => (server.hold ? server.hold.respond(path) : server.answer(path));
+  return server;
+}
+
+/**
+ * The threaded channel from `threadData`, read once through a forward-capable server — in MAIN.
+ *
+ * These tests were written when a channel opened in Main. `#189 restore-ui-state` opens a threaded
+ * channel in All, so the page is reopened the way a reader who chose Main is: a first session picks
+ * Main, the device gives up that session's snapshot, and the reopen reads Main alone — through the
+ * forward-capable server, whose read log then starts at that one full read.
+ */
+async function forwardPage(options = {}, arrange = null, script = SCRIPT) {
+  const data = threadData();
+  const first = newPage(new Map(), script);
+  first.threadingSupported = true;
+  first.threads = data.threads;
+  first.messages = data.messages;
+  await signIn(first);
+  await showDiscord(first, data.messages);
+  await pickThread(first, "main");
+  first.storage.delete(MESSAGE_CACHE_KEY);
+  let server = null;
+  const page = newPage(first.storage, script, (p) => {
+    p.threadingSupported = true;
+    p.threads = data.threads;
+    p.messages = data.messages;
+    if (arrange) arrange(p);
+    server = forwardTimeline(p, options);
+  });
+  await reopenedChannel(page);
+  await page.settle();
+  return { page, server };
+}
+
+const VISIBLE_REFRESH_MS = sourceConstant("VISIBLE_REFRESH_MS");
+const TIMELINE_RECONCILE_MS = sourceConstant("TIMELINE_RECONCILE_MS");
+
+const pollOnce = async (page) => {
+  page.expireTimers(DISCORD_POLL_MS);
+  await page.settle();
+  await page.settle();
+};
+
+/** Which reads, from the `from`th on, were deltas (true) or full reads (false). */
+const forwardReadKinds = (server, from = 0) => server.reads.slice(from).map((read) => read.after !== null);
+
+test("a poll after a newest read asks only for what changed since, and draws it", async () => {
+  const { page, server } = await forwardPage();
+  assert.deepStrictEqual(forwardReadKinds(server), [false], "the first read of a view is not a full one");
+  const seen = server.revision;
+  server.post(message({ id: "300", content: "posted after the first read" }));
+  await pollOnce(page);
+  assert.equal(server.reads.at(-1).after, `main@${seen}`, "the poll did not continue from the read before it");
+  assert.equal(server.reads.at(-1).before, null);
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203", "300"]);
+  assert.match(freshness(page).textContent, /^(Live · u|U)pdated \d{2}:\d{2}$/);
+  assert.equal(freshness(page).getAttribute("data-state"), "fresh");
+  await pollOnce(page);
+  assert.equal(server.reads.at(-1).after, `main@${server.revision}`, "the delta's own cursor was not kept");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203", "300"], "an empty delta changed the list");
+});
+
+test("a delta replaces what changed, removes what was deleted, and keeps every row it does not mention", async () => {
+  const { page, server } = await forwardPage({ olderCursor: "older:held" }, (p) => p.dealtWith.add("200"));
+  assert.ok(savedScopes(page)[scopeKey(CHANNEL.id)].dismissed.includes("200"));
+  assert.equal(page.el("load-older").hidden, false, "the fixture's older history was not offered");
+  const root = page.messages.find((m) => m.id === "201");
+  server.edit("201", { content: "first thread root, edited", thread: { ...root.thread, reply_count: 7 } });
+  server.remove("200");
+  await pollOnce(page);
+  assert.equal(server.reads.at(-1).after !== null, true);
+  assert.deepStrictEqual(shownIds(page), ["201", "203"],
+    "a deleted row stayed, or a row the delta did not mention was taken as deleted");
+  assert.ok(rowShowing(page, "first thread root, edited"), "the edit did not replace the held row");
+  assert.equal(threadButton(rowShowing(page, "first thread root, edited")).textContent, "7 replies",
+    "the delta's thread record did not replace the held one");
+  const saved = savedScopes(page)[scopeKey(CHANNEL.id)];
+  assert.ok(!saved.messages.some((m) => m.id === "200"), "the deleted message was saved for the next start");
+  assert.ok(!saved.dismissed.includes("200"), "the deleted message kept its archive mark");
+  assert.ok(!("newest" in saved.views.main), "a forward cursor was saved to the device");
+  // A delta says nothing about older history: the walk back continues from where it was.
+  assert.equal(page.el("load-older").hidden, false, "a delta took the walk back away");
+  await page.el("load-older").click();
+  await page.settle();
+  assert.equal(server.reads.at(-1).before, "older:held", "a delta replaced the walk-back cursor");
+});
+
+test("a thread list delta moves the threads that changed and takes away the ones that left", async () => {
+  const { page, server } = await forwardPage();
+  await page.el("channel-view-threads").click();
+  await page.settle();
+  assert.deepStrictEqual(forwardReadKinds(server), [false, false], "the thread list was not read in full first");
+  const [first, second] = page.threads;
+  assert.match(page.el("thread-list").text(), /Second discussion/);
+  server.dropThread(second.id);
+  page.threads[0] = { ...first, title: "First discussion, renamed", updated_at: "2026-08-19T06:00:00.000Z" };
+  server.threadChanged.set(first.id, (server.revision += 1));
+  await pollOnce(page);
+  const read = server.reads.at(-1);
+  assert.equal(read.view, "threads");
+  assert.equal(read.after !== null, true, "the thread list was read in full again");
+  assert.doesNotMatch(page.el("thread-list").text(), /Second discussion/, "a thread the delta removed is still listed");
+  assert.match(page.el("thread-list").text(), /First discussion, renamed/, "the moved thread was not replaced");
+});
+
+for (const [status, error] of [[410, "cursor_expired"], [400, "cursor_mismatch"]]) {
+  test(`a forward read answered ${status} ${error} becomes one full read in the same refresh, never a failure`, async () => {
+    const { page, server } = await forwardPage();
+    server.post(message({ id: "301", content: "posted while the cursor went stale" }));
+    server.refuse = { status, error };
+    const from = server.reads.length;
+    await pollOnce(page);
+    assert.deepStrictEqual(forwardReadKinds(server, from), [true, false], "the refusal was not followed by a full read");
+    assert.equal(freshness(page).getAttribute("data-state"), "fresh", "a refused cursor was reported as a failure");
+    assert.doesNotMatch(freshness(page).textContent, /failed/i);
+    assert.equal(page.el("error").hidden, true, "a refused cursor raised the error banner");
+    assert.ok(shownIds(page).includes("301"));
+    await pollOnce(page);
+    assert.equal(server.reads.at(-1).after, `main@${server.revision}`, "the full read's cursor was not taken up");
+  });
+}
+
+test("a delta still saying more after four pages is replaced by a full read that claims no continuity", async () => {
+  const { page, server } = await forwardPage();
+  server.deltaLimit = 1;
+  server.newestLimit = 2;
+  for (const id of ["310", "311", "312", "313", "314", "315"]) {
+    server.post(message({ id, content: `burst ${id}` }));
+  }
+  const from = server.reads.length;
+  await pollOnce(page);
+  assert.deepStrictEqual(forwardReadKinds(server, from), [true, true, true, true, false]);
+  assert.deepStrictEqual(shownIds(page), ["314", "315"],
+    "the full read claimed coverage across rows it never read");
+  assert.equal(page.el("load-older").hidden, false, "the history it did not read is not offered");
+});
+
+test("a delta overtaken by a newer read of its view is dropped, not folded over it", async () => {
+  const { page, server } = await forwardPage();
+  await page.el("thread-select").dispatch("pointerdown");
+  await page.settle();
+  const stale = {
+    id: "from-a-stale-delta", root: null, title: "a card only the stale delta had", reply_count: 1,
+    reply_count_exact: true, updated_at: "2026-08-19T06:30:00.000Z",
+  };
+  const held = gate(async (path) => (new URL(path, "http://fixture.test").searchParams.get("after")
+    ? json(200, timelineAnswer({ view: "threads", has_threads: true, threads: [stale], next_after: "threads@999",
+      delta: { more: false, complete: true, deleted: [], removed_threads: [] } }))
+    : server.answer(path)));
+  server.hold = held;
+  page.setClock(page.clock() + 120000);
+  await page.el("thread-select").dispatch("pointerdown");
+  await page.settle();
+  // While that delta is on the wire, something changes and the Threads screen reads the newest page
+  // of the same list, which issues a cursor of its own.
+  server.hold = null;
+  server.post(message({ id: "390", content: "moves the change record on" }));
+  await pickThread(page, "older");
+  assert.equal(page.screen(), "threads");
+  const replaced = server.revision;
+  held.open();
+  await page.settle();
+  await page.settle();
+  assert.ok(!threadOptions(page).some(([value]) => value === `thread:${stale.id}`),
+    "a delta older than the page it raced was folded over it");
+  page.setClock(page.clock() + 120000);
+  await page.el("close-threads").click();
+  await page.el("thread-select").dispatch("pointerdown");
+  await page.settle();
+  assert.equal(server.reads.at(-1).after, `threads@${replaced}`, "the dropped delta's cursor was taken up");
+});
+
+test("a live message reads a delta; an edit or deletion does only where deltas carry them", async () => {
+  for (const complete of [true, false]) {
+    const { page, server } = await forwardPage({ complete });
+    const stream = page.stream();
+    const arriving = server.post(message({ id: "320", content: "arrived live" }));
+    await deliver(page, stream, sseMessage(arriving));
+    await page.settle();
+    assert.equal(server.reads.at(-1).after !== null, true, `complete=${complete}: a live arrival read in full`);
+    server.edit("320", { content: "arrived live, edited" });
+    await deliver(page, stream, sseUpdate("e1", { ...arriving, content: "arrived live, edited" }));
+    await page.settle();
+    assert.equal(server.reads.at(-1).after !== null, complete,
+      `complete=${complete}: an edit was read with a delta that cannot carry it, or in full when one can`);
+    assert.ok(rowShowing(page, "arrived live, edited"), `complete=${complete}: the edit never showed`);
+    server.remove("320");
+    await deliver(page, stream, sseDelete("d1", CHANNEL.id, "320"));
+    await page.settle();
+    assert.equal(server.reads.at(-1).after !== null, complete);
+    assert.ok(!shownIds(page).includes("320"), `complete=${complete}: the deletion never showed`);
+  }
+});
+
+test("an edit replayed from the tail is answered by a read that carries edits, and by one read", async () => {
+  for (const complete of [true, false]) {
+    const { page, server } = await forwardPage({ complete });
+    // Learn what this channel's deltas carry, then reattach the stream so its tail is replayed.
+    const arriving = server.post(message({ id: "330", content: "before the reconnect" }));
+    await deliver(page, page.stream(), sseMessage(arriving));
+    page.stream().drop();
+    await page.settle();
+    page.expireTimers(sourceConstant("LIVE_RETRY_MS"));
+    await page.settle();
+    server.edit("330", { content: "edited while the stream was away" });
+    const from = server.reads.length;
+    await deliver(page, page.stream(),
+      sseUpdate("u9", page.messages.find((m) => m.id === "330"), { replayed: true, from_tail: true }));
+    await page.settle();
+    await page.settle();
+    assert.deepStrictEqual(forwardReadKinds(server, from), [complete],
+      `complete=${complete}: the tail edit was not answered by exactly one read that carries edits`);
+    assert.ok(rowShowing(page, "edited while the stream was away"));
+  }
+});
+
+test("a delta of additions does not answer an edit replayed from the tail; the full read after it does", async () => {
+  const { page, server } = await forwardPage({ complete: false });
+  const first = server.post(message({ id: "395", content: "learns what the deltas carry" }));
+  await deliver(page, page.stream(), sseMessage(first));
+  page.stream().drop();
+  await page.settle();
+  page.expireTimers(sourceConstant("LIVE_RETRY_MS"));
+  await page.settle();
+  // A read begun after the reattach is on the wire when the tail's edit is replayed.
+  const held = gate(server.answer);
+  server.hold = held;
+  const live = server.post(message({ id: "396", content: "arrived after the reconnect" }));
+  await deliver(page, page.stream(), sseMessage(live));
+  server.edit("395", { content: "edited while the stream was away" });
+  await deliver(page, page.stream(),
+    sseUpdate("u5", page.messages.find((m) => m.id === "395"), { replayed: true, from_tail: true }));
+  server.hold = null;
+  const from = server.reads.length;
+  held.open();
+  await page.settle();
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(forwardReadKinds(server, from), [true, false],
+    "a delta that cannot carry edits was taken as having seen the replayed one");
+  assert.ok(rowShowing(page, "edited while the stream was away"), "the replayed edit never showed");
+});
+
+test("coming back after fifteen seconds away reads what changed; a glance away reads nothing", async () => {
+  const { page, server } = await forwardPage();
+  const reads = server.reads.length;
+  await page.setVisibility("hidden");
+  page.setClock(page.clock() + 10000);
+  await page.setVisibility("visible");
+  await page.settle();
+  assert.equal(server.reads.length, reads, "a ten-second glance at another app read the channel");
+  server.post(message({ id: "340", content: "posted while the phone was in a pocket" }));
+  await page.setVisibility("hidden");
+  page.setClock(page.clock() + VISIBLE_REFRESH_MS);
+  await page.setVisibility("visible");
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(forwardReadKinds(server, reads), [true], "coming back did not read one delta");
+  assert.ok(shownIds(page).includes("340"));
+});
+
+test("the first refresh fifteen minutes after a view's last full read reads it in full", async () => {
+  const { page, server } = await forwardPage();
+  await pollOnce(page);
+  page.setClock(page.clock() + TIMELINE_RECONCILE_MS - 1000);
+  await pollOnce(page);
+  page.setClock(page.clock() + 1000);
+  await pollOnce(page);
+  await pollOnce(page);
+  assert.deepStrictEqual(forwardReadKinds(server), [false, true, true, false, true],
+    "the reconcile read did not come at fifteen minutes, or did not start the deltas again");
+});
+
+test("a channel whose deltas carry additions only keeps its full poll and its full pull", async () => {
+  const { page, server } = await forwardPage({ complete: false });
+  const arriving = server.post(message({ id: "350", content: "learns what the deltas carry" }));
+  await deliver(page, page.stream(), sseMessage(arriving));
+  await page.settle();
+  const from = server.reads.length;
+  await pollOnce(page);
+  page.el("scroll-area").scrollTop = 0;
+  await pullDown(page, PULL_ARM_PX);
+  await page.settle();
+  assert.deepStrictEqual(forwardReadKinds(server, from), [false, false],
+    "a channel whose edits only full reads see was polled or pulled with a delta");
+});
+
+test("pull-to-refresh on a channel with complete deltas is a delta, and lands on the newest message", async () => {
+  const { page, server } = await forwardPage();
+  await pollOnce(page);
+  server.post(message({ id: "355", content: "pulled in" }));
+  page.el("scroll-area").scrollTop = 0;
+  const from = server.reads.length;
+  await pullDown(page, PULL_ARM_PX);
+  await page.settle();
+  assert.deepStrictEqual(forwardReadKinds(server, from), [true]);
+  assert.equal(shownIds(page).at(-1), "355");
+  assert.match(page.el("status").textContent, /something new had arrived/);
+});
+
+test("the pill says live after a delta, and slow when the server can vouch only for an older moment", async () => {
+  const { page, server } = await forwardPage();
+  await pollOnce(page);
+  assert.match(freshness(page).textContent, /^(Live · u|U)pdated \d{2}:\d{2}$/);
+  const asOf = page.clock() - 10 * 60000;
+  server.asOf = new Date(asOf).toISOString();
+  await pollOnce(page);
+  const when = new Date(asOf);
+  const at = `${String(when.getHours()).padStart(2, "0")}:${String(when.getMinutes()).padStart(2, "0")}`;
+  assert.equal(freshness(page).getAttribute("data-state"), "slow");
+  assert.match(freshness(page).textContent, new RegExp(`is slow to answer · showing messages from ${at}$`));
+  server.asOf = null;
+  await pollOnce(page);
+  assert.equal(freshness(page).getAttribute("data-state"), "fresh", "a current answer still said slow");
+});
+
+test("a cold start reads in full: no forward cursor is kept on the device", async () => {
+  const { page: first } = await forwardPage();
+  await pollOnce(first);
+  const saved = savedScopes(first)[scopeKey(CHANNEL.id)];
+  assert.ok(Object.values(saved.views).every((cover) => !("newest" in cover) && !("fullAt" in cover)));
+  let server = null;
+  const page = reloadPage(first.storage, (p) => {
+    p.threadingSupported = true;
+    p.threads = threadData().threads;
+    p.messages = first.messages;
+    server = forwardTimeline(p);
+  });
+  await page.settle();
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.deepStrictEqual(forwardReadKinds(server), [false], "a cold start sent a cursor it cannot have");
+});
+
+test("each view keeps its own forward cursor, and what one view's delta brings every view shows", async () => {
+  const { page, server } = await forwardPage();
+  await pickThread(page, "flat");
+  assert.deepStrictEqual(server.reads.at(-1), { view: "flat", after: null, before: null },
+    "entering All was not a full read of All");
+  server.post(message({ id: "360", content: "read on All" }));
+  await pollOnce(page);
+  assert.match(server.reads.at(-1).after, /^flat@/, "All was refreshed with another view's cursor");
+  assert.ok(shownIds(page).includes("360"));
+  const reads = server.reads.length;
+  await pickThread(page, "main");
+  assert.equal(server.reads.length, reads, "returning to a held view read it");
+  assert.ok(shownIds(page).includes("360"), "Main did not show the message All's delta brought");
+  await pollOnce(page);
+  assert.match(server.reads.at(-1).after, /^main@/, "Main lost its own cursor while All was read");
+});
+
+test("a delta for a view the reader has left is kept, and the view is current when it comes back", async () => {
+  const { page, server } = await forwardPage();
+  server.post(message({ id: "370", content: "landed while All was open" }));
+  const held = gate(server.answer);
+  server.hold = held;
+  page.expireTimers(DISCORD_POLL_MS);
+  await page.settle();
+  server.hold = null;
+  await pickThread(page, "flat");
+  held.open();
+  await page.settle();
+  await page.settle();
+  const reads = server.reads.length;
+  await pickThread(page, "main");
+  assert.equal(server.reads.length, reads, "coming back to Main read it again");
+  assert.ok(shownIds(page).includes("370"), "the delta Main's poll read while All was open was lost");
+  assert.equal(freshness(page).getAttribute("data-state"), "fresh");
+});
+
+test("a queued read standing for triggers that read differently is a delta only if every one could be", async () => {
+  // Driven through the queue itself: no trigger the page has today puts a replay behind another
+  // read, so a page-level path cannot reach this, and the rule must not depend on that staying so.
+  // On a channel whose deltas carry additions only, a poll reads in full while a replay with no edit
+  // waiting reads a delta; neither outranks the other, so the read standing for both is full.
+  const probe = `${SCRIPT}\n;el("scroll-area").queueProbe = {\n` +
+    "  queue: queueDiscordLoad,\n" +
+    "  cursor: () => forwardCursor(discordQueuedLoad && discordQueuedLoad.options && discordQueuedLoad.options.reason),\n" +
+    "  clear: () => { discordQueuedLoad = null; },\n};\n";
+  const { page, server } = await forwardPage({ complete: false }, null, probe);
+  const arriving = server.post(message({ id: "385", content: "learns what the deltas carry" }));
+  await deliver(page, page.stream(), sseMessage(arriving));
+  await page.settle();
+  const queue = page.el("scroll-area").queueProbe;
+  const queued = (...reasons) => {
+    queue.clear();
+    for (const reason of reasons) queue.queue({ keepPosition: true, reason });
+    const cursor = queue.cursor();
+    queue.clear();
+    return cursor !== null;
+  };
+  assert.equal(queued("replay"), true, "a replay with no edit waiting could not read a delta at all");
+  assert.equal(queued("replay", "poll"), false, "a poll's full read was narrowed to a replay's delta");
+  assert.equal(queued("poll", "replay"), false);
+  assert.equal(queued("pull", "replay", "live"), false);
+  assert.equal(queued("live", "visible"), true, "two triggers that both read deltas were made a full read");
+  assert.equal(queued("live", "reset"), false);
+  assert.equal(queued("live", undefined), false, "a read asked for with no reason was narrowed to a delta");
+});
+
+test("a delta chain overtaken partway still draws the pages it had folded", async () => {
+  const { page, server } = await forwardPage();
+  await page.el("channel-view-threads").click();
+  await page.settle();
+  const [first, second] = page.threads;
+  page.threads[0] = { ...first, title: "First discussion, renamed", updated_at: "2026-08-19T06:00:00.000Z" };
+  const firstMoved = (server.revision += 1);
+  server.threadChanged.set(first.id, firstMoved);
+  page.threads[1] = { ...second, title: "Second discussion, renamed", updated_at: "2026-08-19T06:01:00.000Z" };
+  server.threadChanged.set(second.id, (server.revision += 1));
+  server.deltaLimit = 1;
+  // The poll's second page waits on the wire. Meanwhile the thread selector's own read of the list
+  // continues from the cursor the first page left and moves it on, so the second page, when it
+  // lands, no longer fits and is dropped.
+  const held = gate(server.answer);
+  let holding = true;
+  server.hold = {
+    respond: (path) => {
+      if (holding && new URL(path, "http://fixture.test").searchParams.get("after") === `threads@${firstMoved}`) {
+        holding = false;
+        return held.respond(path);
+      }
+      return server.answer(path);
+    },
+  };
+  page.expireTimers(DISCORD_POLL_MS);
+  await page.settle();
+  assert.equal(holding, false, "the poll did not continue its chain to a second page");
+  page.setClock(page.clock() + 120000);
+  await page.el("thread-select").dispatch("pointerdown");
+  await page.settle();
+  held.open();
+  await page.settle();
+  await page.settle();
+  assert.match(page.el("thread-list").text(), /First discussion, renamed/,
+    "a page the overtaken chain had already folded was never drawn");
+});
+
+test("a stream reset queued behind a read is not narrowed to a delta by a live message behind it", async () => {
+  const { page, server } = await forwardPage();
+  await pollOnce(page);
+  const held = gate(server.answer);
+  server.hold = held;
+  page.expireTimers(DISCORD_POLL_MS);
+  await page.settle();
+  await deliver(page, page.stream(), "event: reset\ndata: {}\n\n");
+  const arriving = server.post(message({ id: "380", content: "behind the reset" }));
+  await deliver(page, page.stream(), sseMessage(arriving));
+  server.hold = null;
+  const from = server.reads.length;
+  held.open();
+  await page.settle();
+  await page.settle();
+  // The poll's delta that was on the wire, then the one queued read standing for both triggers.
+  assert.deepStrictEqual(forwardReadKinds(server, from), [true, false], "the reset's full read was narrowed to a delta");
 });

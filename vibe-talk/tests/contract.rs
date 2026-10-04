@@ -22,7 +22,7 @@ use vibe_talk::contract::{
 use vibe_talk::conversation::{VoiceDescription, VoiceSession};
 use vibe_talk::model::{ChannelId, ChannelInfo, Message, MessageId, UserId};
 use vibe_talk::speech::{Description, Playback};
-use vibe_talk::threads::{MessageThread, ThreadSummary, TimelinePage, TimelineView};
+use vibe_talk::threads::{MessageThread, ThreadSummary, TimelineDelta, TimelinePage, TimelineView};
 
 fn contract_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("contract")
@@ -295,6 +295,38 @@ fn samples() -> Value {
                 ..TimelinePage::default()
             })),
             to(&timeline(TimelineView::Flat, TimelinePage::default())),
+            // `#203 incremental-refresh`: a newest page that can be continued forward, a complete
+            // delta with one upsert and one deletion, and an incomplete one that says there is
+            // more and that the backend could not bring it up to date just now.
+            to(&timeline(TimelineView::Main, TimelinePage {
+                messages: vec![plain.clone()],
+                next_after: Some("forward".into()),
+                ..TimelinePage::default()
+            })),
+            to(&timeline(TimelineView::Main, TimelinePage {
+                messages: vec![threaded.clone()],
+                has_threads: true,
+                next_after: Some("forward-2".into()),
+                delta: Some(TimelineDelta {
+                    more: false,
+                    complete: true,
+                    deleted: vec![MessageId("299".into())],
+                    removed_threads: Vec::new(),
+                }),
+                ..TimelinePage::default()
+            })),
+            to(&timeline(TimelineView::Threads, TimelinePage {
+                threads: vec![thread_summary(None)],
+                next_after: Some("forward-3".into()),
+                delta: Some(TimelineDelta {
+                    more: true,
+                    complete: false,
+                    deleted: Vec::new(),
+                    removed_threads: vec!["gone-thread".into()],
+                }),
+                as_of: Some("2026-10-04T07:00:00Z".into()),
+                ..TimelinePage::default()
+            })),
         ],
         "LiveMessageEvent": [
             to(&LiveMessageEvent {

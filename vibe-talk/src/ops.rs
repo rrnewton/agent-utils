@@ -39,6 +39,13 @@ pub enum OpError {
     /// A cursor argument was not a Discord message id.
     #[error("that cursor is not a message id; use the one the previous page handed back")]
     InvalidCursor,
+    /// A forward cursor that does not decode, or was issued for another channel, view or thread.
+    /// `#203 incremental-refresh`. The caller reads the newest page again, which issues one that
+    /// fits.
+    #[error(
+        "that forward cursor was not issued for this channel and view; read the newest page again"
+    )]
+    CursorMismatch,
     /// The requested span could not be turned into a single walk.
     #[error(
         "that is not a span this server can walk: give either a cursor to step back from, or a \
@@ -91,8 +98,12 @@ impl OpError {
             Self::ChannelNotWritable => "channel_not_writable",
             Self::InvalidCursor => "invalid_cursor",
             Self::InvalidRange => "invalid_range",
+            Self::CursorMismatch => "cursor_mismatch",
             Self::PartiallyPosted { .. } => "partially_posted",
             Self::Chat(error) if matches!(error.cause(), ChatError::Refused(_)) => "refused",
+            Self::Chat(error) if matches!(error.cause(), ChatError::CursorExpired(_)) => {
+                "cursor_expired"
+            }
             Self::Chat(_) => "chat_error",
             Self::Store(inner) => inner.code(),
             Self::Summarizer(inner) => inner.code(),
@@ -411,13 +422,62 @@ pub async fn message_by_id_scoped(
 }
 
 /// Browse a channel or its threads through the provider's own pagination contract.
+///
+/// `request.after` is the PAGE-VISIBLE forward cursor, vibe-talk's envelope around either the
+/// backend's own cursor or a generic position; see [`crate::timeline_forward`]. It is unwrapped
+/// here, so a backend only ever sees a cursor it issued, and every newest page and delta leaves
+/// with a fresh envelope in `next_after`. A `before` page leaves without one: it says nothing about
+/// the newest end. `#203 incremental-refresh`.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`]; [`OpError::CursorMismatch`] for a forward cursor issued for any
+/// other channel, view or thread, checked before anything is read; [`OpError::Chat`], including
+/// [`ChatError::CursorExpired`] for one the backend can no longer answer for.
 pub async fn timeline(
     state: &AppState,
     channel_id: &str,
     request: &crate::threads::TimelineRequest,
 ) -> Result<(ChannelInfo, crate::threads::TimelinePage), OpError> {
+    use crate::timeline_forward::{self as forward, Forward};
     let channel = allowed(state, channel_id).await?;
-    let mut page = state.chat.fetch_timeline(&channel.id, request).await?;
+    request.one_direction()?;
+    let thread = request.thread_id.as_deref();
+    let resumed = request
+        .after
+        .as_deref()
+        .map(|raw| forward::decode(raw, &channel.id, request.view, thread))
+        .transpose()
+        .map_err(|_| OpError::CursorMismatch)?;
+    let mut backend = request.clone();
+    let (mut page, position) = match resumed {
+        Some(Forward::Native(own)) => {
+            backend.after = Some(own);
+            (
+                state.chat.fetch_timeline(&channel.id, &backend).await?,
+                None,
+            )
+        }
+        Some(Forward::Generic(since)) => {
+            backend.after = None;
+            let read = state
+                .chat
+                .fetch_timeline_since(&channel.id, &backend, &since)
+                .await?;
+            (read.page, Some(read.position))
+        }
+        None => (state.chat.fetch_timeline(&channel.id, request).await?, None),
+    };
+    page.next_after = if request.before.is_some() {
+        None
+    } else {
+        let next = match (page.next_after.take(), position) {
+            (Some(own), _) => Forward::Native(own),
+            (None, Some(position)) => Forward::Generic(position),
+            (None, None) => Forward::Generic(forward::position_of(&page, request.view)),
+        };
+        Some(forward::encode(&channel.id, request.view, thread, &next)?)
+    };
     // One filter for the whole page, thread roots included: a root that is itself a placeholder
     // is drawn as one, in the thread list as much as in the conversation.
     let noise = crate::noise::filter_for(state, &channel.id).await;
@@ -2513,6 +2573,12 @@ mod tests {
         assert_eq!(OpError::ChannelNotWritable.code(), "channel_not_writable");
         assert_eq!(OpError::InvalidCursor.code(), "invalid_cursor");
         assert_eq!(OpError::InvalidRange.code(), "invalid_range");
+        assert_eq!(OpError::CursorMismatch.code(), "cursor_mismatch");
+        assert_eq!(
+            OpError::Chat(ChatError::CursorExpired("gone".to_owned()).with_provider("Bridge"))
+                .code(),
+            "cursor_expired"
+        );
         assert_eq!(
             OpError::Chat(ChatError::Refused("too long".to_owned())).code(),
             "refused"

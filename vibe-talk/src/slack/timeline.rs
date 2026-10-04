@@ -29,7 +29,7 @@ use super::ids::{self, ChannelRef};
 use crate::chat::{ChatError, RegisteredChannel};
 use crate::directory::{DirectoryEntry, DirectoryPage, DirectoryRequest, MAX_NAME_CHARS};
 use crate::model::{ChannelId, Message, MessageId};
-use crate::threads::{ThreadSummary, TimelinePage, TimelineRequest, TimelineView};
+use crate::threads::{ThreadSummary, TimelineDelta, TimelinePage, TimelineRequest, TimelineView};
 
 /// The most entries one timeline page returns.
 pub const MAX_TIMELINE_LIMIT: u16 = 100;
@@ -101,8 +101,67 @@ impl Cursor {
     }
 }
 
+/// A forward cursor: the newest `ts` a newest read or delta of this view delivered.
+/// `#203 incremental-refresh`. A separate shape from the backward [`Cursor`], so neither can be
+/// handed back as the other.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Forward {
+    channel: String,
+    view: TimelineView,
+    thread_id: Option<String>,
+    after: String,
+}
+
+impl Forward {
+    fn encode(&self) -> Result<String, ChatError> {
+        serde_json::to_vec(self)
+            .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+            .map_err(|_| shape("could not encode the forward cursor"))
+    }
+
+    /// The cursor's `ts` as an instant, after checking it was issued for this very read.
+    ///
+    /// Anything else is [`ChatError::CursorExpired`], never a refusal: vibe-talk's envelope has
+    /// already checked the channel, view and thread, so a cursor that does not fit here was issued
+    /// before the channel's configuration changed, and the caller's answer is a newest read, which
+    /// issues one that fits. `#203 incremental-refresh`.
+    fn decode(raw: &str, channel: &ChannelId, request: &TimelineRequest) -> Result<i64, ChatError> {
+        let gone = |detail: &str| ChatError::CursorExpired(detail.to_owned());
+        let cursor: Self = URL_SAFE_NO_PAD
+            .decode(raw)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .ok_or_else(|| gone("this backend did not issue that forward cursor"))?;
+        if cursor.channel != channel.as_str()
+            || cursor.view != request.view
+            || cursor.thread_id != request.thread_id
+        {
+            return Err(gone(
+                "the forward cursor belongs to a different channel or view",
+            ));
+        }
+        ids::ts_micros(&cursor.after).ok_or_else(|| gone("the forward cursor names no message"))
+    }
+}
+
+/// Whether this view of this channel is read forward natively: one conversation's own timeline,
+/// with `conversations.history oldest=`, and one thread, with `conversations.replies oldest=`.
+/// `#203 incremental-refresh`. The thread list is not — a reply never moves an old root into
+/// `history oldest=` — nor Flat, nor a channel narrowed to one thread; those are caught up by
+/// vibe-talk's generic reader.
+fn forward_native(target: &ChannelRef, view: TimelineView) -> bool {
+    target.thread_ts.is_none() && matches!(view, TimelineView::Main | TimelineView::Thread)
+}
+
 fn validate_request(request: &TimelineRequest) -> Result<(), ChatError> {
-    if request.limit == 0 || request.before.as_ref().is_some_and(|c| c.len() > 8192) {
+    request.one_direction()?;
+    if request.limit == 0
+        || [&request.before, &request.after]
+            .into_iter()
+            .flatten()
+            .any(|cursor| cursor.len() > 8192)
+    {
         return Err(refused(
             "timeline page size must be positive and its cursor at most 8192 bytes",
         ));
@@ -254,11 +313,117 @@ impl HttpSlackClient {
             .transpose()?;
         let limit = usize::from(request.limit.clamp(1, MAX_TIMELINE_LIMIT));
         let conversation = target.conversation.as_str();
+        if let Some(after) = &request.after {
+            // Only issued where it is answered, so a cursor here for any other view predates a
+            // change to the channel — narrowed to one thread since, say: gone, as in
+            // `Forward::decode`, and the page reads the newest page instead.
+            if !forward_native(&target, request.view) {
+                return Err(ChatError::CursorExpired(
+                    "this view is not read forward by the Slack backend".to_owned(),
+                ));
+            }
+            let after = Forward::decode(after, channel, request)?;
+            return self
+                .forward(channel, conversation, request, after, limit)
+                .await;
+        }
         if let Some(scope) = &target.thread_ts {
             return self
                 .scoped_timeline(channel, conversation, scope, request, cursor, limit)
                 .await;
         }
+        let mut page = self
+            .newest_or_older(channel, conversation, request, cursor, limit)
+            .await?;
+        if request.before.is_none() && forward_native(&target, request.view) {
+            // The newest real message delivered, or the beginning of the conversation when there
+            // is none: a forward read from there returns what came after it.
+            let newest = page
+                .messages
+                .last()
+                .and_then(|message| super::ts_from_message_id(&message.id))
+                .unwrap_or_else(|| ids::micros_ts(0));
+            page.next_after = Some(self.forward_cursor(channel, request, newest)?);
+        }
+        Ok(page)
+    }
+
+    fn forward_cursor(
+        &self,
+        channel: &ChannelId,
+        request: &TimelineRequest,
+        after: String,
+    ) -> Result<String, ChatError> {
+        Forward {
+            channel: channel.0.clone(),
+            view: request.view,
+            thread_id: request.thread_id.clone(),
+            after,
+        }
+        .encode()
+    }
+
+    /// What was posted in Main or one thread after `after`, oldest first, as a delta. `#203
+    /// incremental-refresh`. Filtered by creation, so it carries no edit or deletion and says so
+    /// with `complete: false`; the page then keeps its full poll for this channel.
+    async fn forward(
+        &self,
+        channel: &ChannelId,
+        conversation: &str,
+        request: &TimelineRequest,
+        after: i64,
+        limit: usize,
+    ) -> Result<TimelinePage, ChatError> {
+        let (mut raws, thread) = if request.view == TimelineView::Thread {
+            let thread = thread_ts(request.thread_id.as_deref().unwrap_or_default())?;
+            let root = self.thread_root(conversation, &thread).await?;
+            self.mark_threaded(conversation);
+            let raws = self
+                .replies_oldest_after(conversation, &thread, Some(after), limit + 1)
+                .await?;
+            (raws, Some(self.summary(channel, &root).await))
+        } else {
+            let raws = self
+                .history_oldest_after(conversation, after, limit + 1)
+                .await?;
+            (raws, None)
+        };
+        // A server may repeat a thread's root on every replies page; it is not news.
+        raws.retain(|raw| raw.micros > after);
+        raws.sort_by_key(|raw| raw.micros);
+        raws.dedup_by_key(|raw| raw.micros);
+        let more = raws.len() > limit;
+        raws.truncate(limit);
+        if raws.iter().any(Raw::is_thread_root) {
+            self.mark_threaded(conversation);
+        }
+        let next = raws
+            .last()
+            .map_or_else(|| ids::micros_ts(after), |raw| raw.ts.clone());
+        Ok(TimelinePage {
+            messages: self.messages(channel, &raws).await,
+            has_threads: thread.is_some() || self.is_threaded(conversation),
+            thread,
+            next_after: Some(self.forward_cursor(channel, request, next)?),
+            delta: Some(TimelineDelta {
+                more,
+                complete: false,
+                deleted: Vec::new(),
+                removed_threads: Vec::new(),
+            }),
+            ..TimelinePage::default()
+        })
+    }
+
+    /// A newest or older page of an unscoped conversation's view.
+    async fn newest_or_older(
+        &self,
+        channel: &ChannelId,
+        conversation: &str,
+        request: &TimelineRequest,
+        cursor: Option<Cursor>,
+        limit: usize,
+    ) -> Result<TimelinePage, ChatError> {
         match request.view {
             TimelineView::Main => {
                 let page = self

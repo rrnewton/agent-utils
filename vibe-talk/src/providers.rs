@@ -411,6 +411,22 @@ impl ChatClient for ChatRouter {
             .await
     }
 
+    /// `#203 incremental-refresh`. The channel's own provider decides how to catch up, so one that
+    /// overrides the generic default keeps its override behind the router. There is no
+    /// deployment-wide answer: a bridge channel and a Slack channel in the same server each get
+    /// their own kind of forward cursor.
+    async fn fetch_timeline_since(
+        &self,
+        channel: &ChannelId,
+        request: &crate::threads::TimelineRequest,
+        since: &crate::timeline_forward::GenericPosition,
+    ) -> Result<crate::timeline_forward::GenericDelta, ChatError> {
+        self.route(channel)?
+            .client
+            .fetch_timeline_since(channel, request, since)
+            .await
+    }
+
     async fn post_in_thread(
         &self,
         channel: &ChannelId,

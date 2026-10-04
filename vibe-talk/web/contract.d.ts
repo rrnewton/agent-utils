@@ -674,13 +674,49 @@ declare namespace VibeTalk {
   }
 
   /**
+   * What a forward read says about the changes it carries. `#203 incremental-refresh`.
+   */
+  interface TimelineDelta {
+    /**
+     * True when this delta carries EVERY creation, edit, deletion and summary change in the view
+     * since the cursor. False when it carries additions only: a read filtered by creation time
+     * cannot see an edit or a deletion, which then reach the caller through live events or its
+     * next full read.
+     */
+    complete: boolean;
+    /**
+     * Messages removed since the cursor, channel-wide in every view. Always empty when
+     * `complete` is false.
+     */
+    deleted: MessageId[];
+    /**
+     * More changes remain past this page: ask again with `next_after` straight away.
+     */
+    more: boolean;
+    /**
+     * Threads that left the thread list since the cursor. Threads view only; empty elsewhere.
+     */
+    removed_threads: string[];
+  }
+
+  /**
    * A provider-neutral timeline plus this application's channel and read-state metadata.
    */
   interface TimelineResponse {
     /**
+     * The instant, RFC 3339, up to which the backend knows this page is complete, when it is
+     * serving data it could not bring up to date just now. Absent means now.
+     */
+    as_of?: string | null;
+    /**
      * Configured parent channel, including its local alias and write policy.
      */
     channel: ChannelInfo;
+    /**
+     * Present exactly on an answer to `after`: the page then carries only what is new or changed
+     * since that cursor, and rows absent from it are UNCHANGED, never deleted.
+     */
+    delta?: TimelineDelta | null;
     /**
      * Messages on this page that the reader has archived locally.
      */
@@ -701,6 +737,16 @@ declare namespace VibeTalk {
      * Messages for main, flat, or thread views, ordered oldest first.
      */
     messages: Message[];
+    /**
+     * Forward cursor for this view: what to pass as `after` to learn what changed since this
+     * page. `#203 incremental-refresh`.
+     *
+     * From a backend, present only when that backend answers `after` itself. Above the backend
+     * vibe-talk always fills it on a newest page or a delta — with its own generic cursor when
+     * the backend left it empty — and removes it from a `before` page, which says nothing about
+     * the newest end. Absent from an older bridge's answer, which therefore still parses.
+     */
+    next_after?: string | null;
     /**
      * Opaque continuation, present exactly when another page exists.
      */

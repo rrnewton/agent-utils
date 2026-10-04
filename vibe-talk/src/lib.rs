@@ -66,6 +66,7 @@ pub mod summarize;
 pub mod summary;
 pub mod testing;
 pub mod threads;
+pub mod timeline_forward;
 pub mod untrusted;
 pub mod voice_agent;
 pub mod voice_health;

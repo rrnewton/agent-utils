@@ -11,7 +11,7 @@ use vibe_talk::chat::{ChatClient, ChatError, ChatIdentity};
 use vibe_talk::model::{ChannelId, Message, MessageId, UserId};
 use vibe_talk::testing::{self, READ_CHANNEL, READ_TOKEN, WRITE_CHANNEL, WRITE_TOKEN};
 use vibe_talk::threads::{
-    MessageThread, ThreadSummary, TimelinePage, TimelineRequest, TimelineView,
+    MessageThread, ThreadSummary, TimelineDelta, TimelinePage, TimelineRequest, TimelineView,
 };
 
 const THREAD: &str = "opaque/thread-A";
@@ -143,6 +143,7 @@ impl ChatClient for ThreadBackend {
             has_more: true,
             next_before: Some("opaque cursor/+=".to_owned()),
             notice: None,
+            ..TimelinePage::default()
         })
     }
 
@@ -424,5 +425,450 @@ async fn a_timeline_marks_noise_on_messages_and_on_thread_roots() {
     assert_eq!(
         body["thread"]["root"]["noise"], true,
         "a thread root escaped the rules: {body}"
+    );
+}
+
+// --- `#203 incremental-refresh`: forward reads through the route ------------------------------
+
+/// A backend with a change record, the way a bridge with a journal has one: every message seeded,
+/// edited or deleted gets a revision, a newest page names the newest as `fake:{rev}`, and `after`
+/// answers exactly what changed since, deletions included. Built WITHOUT a change record
+/// (`native: false`) it issues no cursor of its own, which is every backend the generic fallback
+/// is for.
+struct Journal {
+    native: bool,
+    state: Mutex<JournalState>,
+    reads: Mutex<Vec<TimelineRequest>>,
+}
+
+#[derive(Default)]
+struct JournalState {
+    revision: u64,
+    messages: Vec<(u64, Message)>,
+    deleted: Vec<(u64, MessageId)>,
+}
+
+impl Journal {
+    fn new(native: bool) -> Self {
+        Self {
+            native,
+            state: Mutex::new(JournalState::default()),
+            reads: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn seed(&self, id: &str, minute: u32) {
+        let mut state = self.state.lock().unwrap();
+        state.revision += 1;
+        let mut posted = message(id, &format!("message {id}"), false);
+        posted.timestamp = format!("2026-10-04T07:{minute:02}:00Z");
+        let revision = state.revision;
+        state.messages.push((revision, posted));
+    }
+
+    fn edit(&self, id: &str, content: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.revision += 1;
+        let revision = state.revision;
+        let held = state
+            .messages
+            .iter_mut()
+            .find(|(_, m)| m.id.0 == id)
+            .unwrap();
+        held.0 = revision;
+        held.1.content = content.to_owned();
+    }
+
+    fn delete(&self, id: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.revision += 1;
+        let revision = state.revision;
+        state.messages.retain(|(_, m)| m.id.0 != id);
+        state.deleted.push((revision, MessageId(id.to_owned())));
+    }
+
+    fn forwarded(&self) -> Vec<Option<String>> {
+        self.reads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.after.clone())
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl ChatClient for Journal {
+    fn provider_name(&self) -> &str {
+        "Example Bridge"
+    }
+    fn supports_threading(&self) -> bool {
+        true
+    }
+    async fn identity(&self) -> Result<ChatIdentity, ChatError> {
+        Ok(ChatIdentity {
+            id: "7".to_owned(),
+            username: "Reader".to_owned(),
+        })
+    }
+    async fn fetch_page(
+        &self,
+        _channel: &ChannelId,
+        _limit: u16,
+        _before: Option<&MessageId>,
+        _after: Option<&MessageId>,
+    ) -> Result<Vec<Message>, ChatError> {
+        Ok(Vec::new())
+    }
+    async fn post_message(
+        &self,
+        _channel: &ChannelId,
+        content: &str,
+        _reply: Option<&MessageId>,
+    ) -> Result<Message, ChatError> {
+        Ok(message("99", content, false))
+    }
+    async fn fetch_timeline(
+        &self,
+        _channel: &ChannelId,
+        request: &TimelineRequest,
+    ) -> Result<TimelinePage, ChatError> {
+        self.reads.lock().unwrap().push(request.clone());
+        let state = self.state.lock().unwrap();
+        let mut current: Vec<(u64, Message)> = state.messages.clone();
+        current.sort_by(|a, b| a.1.timestamp.cmp(&b.1.timestamp));
+        if let Some(after) = &request.after {
+            assert!(
+                self.native,
+                "a backend without a cursor of its own was handed one"
+            );
+            let since: u64 = match after.strip_prefix("fake:").and_then(|r| r.parse().ok()) {
+                Some(since) => since,
+                None => {
+                    // Labelled, as every real backend labels its failures.
+                    return Err(ChatError::CursorExpired(
+                        "issued by an earlier process".to_owned(),
+                    )
+                    .with_provider("Example Bridge"));
+                }
+            };
+            return Ok(TimelinePage {
+                messages: current
+                    .into_iter()
+                    .filter(|(revision, _)| *revision > since)
+                    .map(|(_, m)| m)
+                    .collect(),
+                has_threads: true,
+                next_after: Some(format!("fake:{}", state.revision)),
+                delta: Some(TimelineDelta {
+                    more: false,
+                    complete: true,
+                    deleted: state
+                        .deleted
+                        .iter()
+                        .filter(|(revision, _)| *revision > since)
+                        .map(|(_, id)| id.clone())
+                        .collect(),
+                    removed_threads: Vec::new(),
+                }),
+                ..TimelinePage::default()
+            });
+        }
+        let all: Vec<Message> = current.into_iter().map(|(_, m)| m).collect();
+        let limit = usize::from(request.limit);
+        let (messages, has_more) = if request.before.as_deref() == Some("older") {
+            (all[..all.len().saturating_sub(limit)].to_vec(), false)
+        } else {
+            (
+                all[all.len().saturating_sub(limit)..].to_vec(),
+                all.len() > limit,
+            )
+        };
+        Ok(TimelinePage {
+            messages,
+            has_threads: true,
+            has_more,
+            next_before: has_more.then(|| "older".to_owned()),
+            next_after: self.native.then(|| format!("fake:{}", state.revision)),
+            ..TimelinePage::default()
+        })
+    }
+}
+
+fn journal(native: bool) -> (axum::Router, Arc<Journal>) {
+    let (mut state, _) = testing::state();
+    let backend = Arc::new(Journal::new(native));
+    state.replace_chat(backend.clone());
+    (vibe_talk::http::router(state), backend)
+}
+
+fn timeline_path(query: &str) -> String {
+    format!("/api/v1/channels/{WRITE_CHANNEL}/timeline?{query}")
+}
+
+fn ids(body: &Value) -> Vec<String> {
+    body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn next_after(body: &Value) -> String {
+    let cursor = body["next_after"]
+        .as_str()
+        .expect("a forward cursor")
+        .to_owned();
+    assert!(
+        !cursor.contains("fake:"),
+        "the page saw the backend's own cursor: {cursor}"
+    );
+    cursor
+}
+
+#[tokio::test]
+async fn a_backend_with_a_change_record_answers_edits_and_deletions_since_the_last_read() {
+    let (app, backend) = journal(true);
+    for (id, minute) in [("1", 0), ("2", 1), ("3", 2)] {
+        backend.seed(id, minute);
+    }
+    let (status, newest) = call(
+        &app,
+        "GET",
+        &timeline_path("view=main"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{newest}");
+    assert_eq!(ids(&newest), ["1", "2", "3"]);
+    assert!(newest["delta"].is_null(), "a newest page is not a delta");
+    let cursor = next_after(&newest);
+
+    backend.seed("4", 3);
+    backend.edit("2", "corrected");
+    backend.delete("3");
+    let (status, delta) = call(
+        &app,
+        "GET",
+        &timeline_path(&format!("view=main&after={cursor}")),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{delta}");
+    assert_eq!(ids(&delta), ["2", "4"], "only what changed, oldest first");
+    assert_eq!(delta["messages"][0]["content"], "corrected");
+    assert!(!delta["messages"][0]["spoken_time"]
+        .as_str()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        delta["delta"],
+        json!({"more": false, "complete": true, "deleted": ["3"], "removed_threads": []})
+    );
+    assert_eq!(delta["has_more"], false);
+    assert!(delta["next_before"].is_null());
+    assert_eq!(delta["returned"], 2);
+    // The backend was handed its OWN cursor, unwrapped, and never the envelope.
+    assert_eq!(backend.forwarded(), [None, Some("fake:3".to_owned())]);
+
+    let (_, quiet) = call(
+        &app,
+        "GET",
+        &timeline_path(&format!("view=main&after={}", next_after(&delta))),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert!(
+        ids(&quiet).is_empty(),
+        "nothing changed, nothing returned: {quiet}"
+    );
+    assert_eq!(quiet["delta"]["complete"], true);
+    assert_eq!(
+        backend.forwarded().last().unwrap().as_deref(),
+        Some("fake:6")
+    );
+}
+
+#[tokio::test]
+async fn a_backend_without_a_cursor_of_its_own_is_caught_up_generically() {
+    let (app, backend) = journal(false);
+    backend.seed("1", 0);
+    backend.seed("2", 1);
+    let (_, newest) = call(
+        &app,
+        "GET",
+        &timeline_path("view=main"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    let cursor = next_after(&newest);
+    backend.seed("3", 2);
+    backend.edit("1", "an edit a creation-time read cannot see");
+    let (status, delta) = call(
+        &app,
+        "GET",
+        &timeline_path(&format!("view=main&after={cursor}")),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{delta}");
+    assert_eq!(ids(&delta), ["3"]);
+    assert_eq!(
+        delta["delta"],
+        json!({"more": false, "complete": false, "deleted": [], "removed_threads": []}),
+        "a generic catch-up promises additions only"
+    );
+    let (_, quiet) = call(
+        &app,
+        "GET",
+        &timeline_path(&format!("view=main&after={}", next_after(&delta))),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert!(ids(&quiet).is_empty(), "{quiet}");
+    assert!(
+        backend.forwarded().iter().all(Option::is_none),
+        "a generic cursor reached the backend"
+    );
+}
+
+#[tokio::test]
+async fn a_forward_cursor_is_refused_anywhere_but_the_read_it_came_from() {
+    let (app, backend) = journal(true);
+    backend.seed("1", 0);
+    let (_, newest) = call(
+        &app,
+        "GET",
+        &timeline_path("view=main"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    let cursor = next_after(&newest);
+    let reads = backend.forwarded().len();
+    for (path, code) in [
+        (
+            timeline_path(&format!("view=flat&after={cursor}")),
+            "cursor_mismatch",
+        ),
+        (
+            timeline_path(&format!("view=thread&thread_id=t&after={cursor}")),
+            "cursor_mismatch",
+        ),
+        (
+            format!("/api/v1/channels/{READ_CHANNEL}/timeline?view=main&after={cursor}"),
+            "cursor_mismatch",
+        ),
+        (
+            timeline_path("view=main&after=not-a-cursor"),
+            "cursor_mismatch",
+        ),
+        (
+            timeline_path(&format!("view=main&before=older&after={cursor}")),
+            "bad_request",
+        ),
+        (timeline_path("view=main&after="), "bad_request"),
+    ] {
+        let (status, body) = call(&app, "GET", &path, Some(READ_TOKEN), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        assert_eq!(body["error"], code, "{path}: {body}");
+    }
+    assert_eq!(
+        backend.forwarded().len(),
+        reads,
+        "a refused cursor reached the backend"
+    );
+}
+
+#[tokio::test]
+async fn a_cursor_the_backend_cannot_continue_answers_410_cursor_expired() {
+    use vibe_talk::timeline_forward::{encode, Forward};
+    let (app, _backend) = journal(true);
+    let expired = encode(
+        &ChannelId(WRITE_CHANNEL.to_owned()),
+        TimelineView::Main,
+        None,
+        &Forward::Native("issued-before-a-restart".to_owned()),
+    )
+    .unwrap();
+    let (status, body) = call(
+        &app,
+        "GET",
+        &timeline_path(&format!("view=main&after={expired}")),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::GONE, "{body}");
+    assert_eq!(body["error"], "cursor_expired");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Example Bridge can no longer continue"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn a_step_back_carries_no_forward_cursor_and_a_delta_reports_only_its_own_dismissals() {
+    let (app, backend) = journal(true);
+    for (id, minute) in [("1", 0), ("2", 1), ("3", 2)] {
+        backend.seed(id, minute);
+    }
+    let (_, newest) = call(
+        &app,
+        "GET",
+        &timeline_path("view=main&limit=2"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(newest["next_before"], "older");
+    let cursor = next_after(&newest);
+    let (_, older) = call(
+        &app,
+        "GET",
+        &timeline_path("view=main&limit=2&before=older"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(ids(&older), ["1"]);
+    assert!(
+        older.get("next_after").is_none(),
+        "a step back says nothing about the newest end: {older}"
+    );
+
+    let (status, _) = call(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/dismiss"),
+        Some(WRITE_TOKEN),
+        Some(json!({"messages": ["1", "4"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    backend.seed("4", 3);
+    let (_, delta) = call(
+        &app,
+        "GET",
+        &timeline_path(&format!("view=main&limit=2&after={cursor}")),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(ids(&delta), ["4"]);
+    assert_eq!(
+        delta["dismissed"],
+        json!(["4"]),
+        "dismissals outside the delta leaked in"
     );
 }
