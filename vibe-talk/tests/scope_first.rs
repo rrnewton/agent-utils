@@ -258,6 +258,8 @@ fn inventory() -> Vec<Route> {
             Query("?limit=5", "?limit=soon"),
         ),
         route("DELETE", "/api/v1/channels/{channel_id}", Write, Nothing),
+        // `#199 removable-config-channels`: putting a configured channel back on the list.
+        route("DELETE", "/api/v1/channels/{channel_id}/hidden", Write, Nothing),
         route("GET", "/api/v1/channels/{channel_id}/todo", Read, limit),
         route(
             "POST",
