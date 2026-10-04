@@ -44907,8 +44907,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         with _event_memo_scope():
             result = handler(args)
     except Refusal as exc:
+        remedy = _refusal_remedy(args, exc)
+        # A caller that asked for JSON parses stdout; with only the stderr
+        # text it sees a malformed result, not a lock someone else holds.
+        if isinstance(exc, _LockBusy) and getattr(args, "format", None) == "json":
+            print(
+                json.dumps(
+                    {
+                        "status": "refused",
+                        "reason": "lock-busy",
+                        "message": str(exc),
+                        "remedy": remedy,
+                    },
+                    sort_keys=True,
+                )
+            )
         print(f"REFUSED: {exc}", file=sys.stderr)
-        print(f"REMEDY: {_refusal_remedy(args, exc)}", file=sys.stderr)
+        print(f"REMEDY: {remedy}", file=sys.stderr)
         return 3
     return int(result)
 
