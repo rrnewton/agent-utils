@@ -19977,7 +19977,13 @@ def _cache_directories_for_path(
                 if not candidate.exists():
                     continue
                 if not candidate.is_dir():
-                    raise Refusal(f"configured cache path is not a directory: {candidate}")
+                    # A match that is not a directory is not a cache, for
+                    # example a test fixture's one-byte regular file named
+                    # `target`. It is ordinary checkout content: it goes with
+                    # the checkout, or with the cache directory that holds
+                    # it. The escape, symlink, mount, and symlink-match
+                    # refusals above still apply to it.
+                    continue
                 candidates.add(absolute)
         except (OSError, ValueError) as exc:
             raise Refusal(

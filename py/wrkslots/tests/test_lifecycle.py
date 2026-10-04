@@ -15968,6 +15968,87 @@ def test_validate_complete_removes_nested_git_metadata_in_configured_cache(
     assert active_slots(project) == []
 
 
+@pytest.mark.parametrize(
+    "file_match",
+    [
+        # A test fixture wrote a one-byte regular file named `target` inside a
+        # real cache directory that the same glob also matches.
+        "ignored/hermetic/split/target/tmp/rename-race/native/target",
+        # A regular file named `target` that no cache directory contains.
+        "ignored/fixture/target",
+    ],
+)
+def test_validate_complete_removes_a_regular_file_that_a_cache_glob_matches(
+    tmp_path: Path, file_match: str
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path, cache_globs=("ignored/**/target",)
+    )
+    made = create(project, slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project, slot_type="validate")
+    regular = tree / file_match
+    regular.parent.mkdir(parents=True)
+    regular.write_bytes(b"x")
+    (regular.parent / "fresh_000").write_bytes(b"x")
+    mark_owner_dead_in_current_cgroup(project)
+    set_liveness(project, "dead")
+
+    removed = raw_command_with_census_authority_stub(
+        project,
+        "remove",
+        "slot01",
+        "--validate-complete",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+
+    assert removed.returncode == 0, removed.stderr
+    assert "not a directory" not in removed.stderr
+    assert not tree.exists()
+    assert active_slots(project) == []
+
+
+def test_validate_complete_still_refuses_a_cache_glob_symlink_out_of_the_checkout(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path, cache_globs=("ignored/**/target",)
+    )
+    made = create(project, slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project, slot_type="validate")
+    outside = tmp_path / "outside-target"
+    outside.mkdir()
+    (outside / "keep").write_bytes(b"x")
+    link = tree / "ignored" / "fixture" / "target"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(outside, target_is_directory=True)
+    mark_owner_dead_in_current_cgroup(project)
+    set_liveness(project, "dead")
+
+    refused = raw_command_with_census_authority_stub(
+        project,
+        "remove",
+        "slot01",
+        "--validate-complete",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+
+    assert refused.returncode == 3, refused.stderr
+    assert "cache path crosses a symlink" in refused.stderr
+    assert (outside / "keep").is_file()
+    assert tree.is_dir()
+    assert active_slots(project)
+
+
 def test_validate_removal_without_complete_refuses_nested_git_metadata(
     tmp_path: Path,
 ) -> None:
