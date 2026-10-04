@@ -50,8 +50,8 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
  * @param {"api-token" | "channel-alias" | "channel-directory-search" | "combine-messages"
  *   | "compose-text" | "mark-own-read" | "mic-auto-gain" | "mic-echo-cancellation"
  *   | "mic-noise-suppression" | "msg-scale" | "new-channel-id" | "new-channel-label"
- *   | "new-channel-writable" | "read-speed-range" | "reading-width" | "resume-toggle"
- *   | "search-field"} id
+ *   | "new-channel-writable" | "read-speed-range" | "reading-width" | "reply-branch"
+ *   | "resume-toggle" | "search-field"} id
  * @returns {HTMLInputElement}
  */
 /**
@@ -5495,7 +5495,10 @@ function validCacheEntry(entry) {
       !Array.isArray(entry.dismissed)) return false;
   if (entry.mode === "timeline") {
     return coverageValid(entry.views) && typeof entry.hasThreads === "boolean" &&
-      (entry.scope === undefined || entry.scope === null || typeof entry.scope === "string");
+      (entry.scope === undefined || entry.scope === null || typeof entry.scope === "string") &&
+      // Absent from an entry saved before `#185 reply-new-thread`, which then has nothing unplaced.
+      (entry.unplaced === undefined ||
+        (Array.isArray(entry.unplaced) && entry.unplaced.every((id) => typeof id === "string")));
   }
   return entry.mode === "page" && Number.isFinite(entry.savedAt) && typeof entry.more === "boolean";
 }
@@ -5571,6 +5574,7 @@ function trimCacheEntry(entry, limit) {
   }
   const kept = new Set(entry.messages.map((message) => String(message.id)));
   entry.dismissed = entry.dismissed.map(String).filter((id) => kept.has(id));
+  if (entry.unplaced) entry.unplaced = entry.unplaced.filter((id) => kept.has(id));
   if (entry.mode === "page") {
     entry.cursor = entry.more && entry.messages.length > 0 ? String(entry.messages[0].id) : null;
   }
@@ -5661,6 +5665,12 @@ function saveCacheChannels() {
 // A PROJECTION NEVER INVENTS COVERAGE. Each view remembers how far back its OWN pages reached, and
 // shows the store only from there up: Main's newest page does not prove anything about the thread
 // replies between its rows, so All is not drawn from it. A view no page has covered is read.
+//
+// NOR DOES A LIVE ARRIVAL INVENT MEMBERSHIP. `#185 reply-new-thread`. A provider's stream may carry
+// a message without saying which thread it is in — the Google Chat bridge pushes every message in
+// that shape — so a copy without a thread record is not evidence that the message is on the main
+// channel. `unplaced` holds the ids that arrived that way and that no page has carried since: a
+// reply to one of them waits for a read rather than guessing the main channel.
 
 /** The selected channel's store. `views` maps a view key to how far back that view is covered. */
 let channelCanon = emptyCanon();
@@ -5668,7 +5678,7 @@ let channelCanon = emptyCanon();
 function emptyCanon(channel = "") {
   return {
     channel: String(channel), messages: [], threads: [], views: new Map(), dismissed: new Set(), hasThreads: false,
-    scope: null,
+    scope: null, unplaced: new Set(),
   };
 }
 
@@ -5766,20 +5776,42 @@ function foldTimelinePage(payload, older, view = channelView, thread = selectedT
   if (view !== "thread") channelCanon.hasThreads = payload.has_threads === true;
   coverView(view === "threads" ? payload.threads || [] : payload.messages || [], older, hasMore, payload.notice || "",
     view, thread);
+  // A page is the server's own answer for every message on it, thread record or none.
+  for (const message of payload.messages || []) channelCanon.unplaced.delete(String(message.id));
+  for (const summary of [...(payload.threads || []), payload.thread]) {
+    if (summary && summary.root) channelCanon.unplaced.delete(String(summary.root.id));
+  }
 }
 
-/** A live arrival or an acknowledged send: every view it belongs to has it from now on. */
-function foldLiveMessage(message) {
+/**
+ * A live arrival or an acknowledged send: every view it belongs to has it from now on. Answers
+ * the copy the store kept, which is the one to draw.
+ *
+ * A COPY WITHOUT A THREAD RECORD NEVER REPLACES ONE WITH. No provider moves a message between
+ * threads, so a held record is still true; what changed is only that this copy came through a
+ * path that does not carry it. The Google Chat bridge's stream is such a path, and its echo of a
+ * reply this page had just posted into a thread used to overwrite the acknowledgement's record —
+ * after which All drew the reply as a main-channel message and a reply to it went there too.
+ *
+ * `live` is a copy from the stream. One without a record, of a message no page has placed, is
+ * `unplaced` until one does; an acknowledged send is the server's own answer and is placed.
+ */
+function foldLiveMessage(message, live = false) {
   const channel = String(el("discord-channel").value);
   if (channelCanon.channel !== channel) loadCanon(channel);
   const id = String(message.id);
+  const held = channelCanon.messages.find((candidate) => String(candidate.id) === id);
+  const kept = !threadOf(message) && threadOf(held) ? { ...message, thread: held.thread } : message;
   channelCanon.messages = inTimeOrder(
-    [...channelCanon.messages.filter((held) => String(held.id) !== id), message], "timestamp");
-  const thread = threadOf(message);
-  const summary = thread && channelCanon.threads.find((held) => String(held.id) === thread);
-  if (summary && timeOf(message, "timestamp") > timeOf(summary, "updated_at")) {
-    upsertThreadSummary({ ...summary, updated_at: message.timestamp });
+    [...channelCanon.messages.filter((candidate) => String(candidate.id) !== id), kept], "timestamp");
+  if (!live || threadOf(kept)) channelCanon.unplaced.delete(id);
+  else if (!held) channelCanon.unplaced.add(id);
+  const thread = threadOf(kept);
+  const summary = thread && channelCanon.threads.find((candidate) => String(candidate.id) === thread);
+  if (summary && timeOf(kept, "timestamp") > timeOf(summary, "updated_at")) {
+    upsertThreadSummary({ ...summary, updated_at: kept.timestamp });
   }
+  return kept;
 }
 
 /** The current view's rows from the store, or null when no page has covered this view. */
@@ -5814,6 +5846,8 @@ function loadCanon(channel) {
   channelCanon.hasThreads = entry.hasThreads;
   channelCanon.scope = entry.scope || null;
   channelCanon.dismissed = new Set(entry.dismissed.map(String));
+  // A reload does not place a message either: what the stream left unplaced stays so until read.
+  channelCanon.unplaced = new Set((entry.unplaced || []).map(String));
   for (const [key, cover] of Object.entries(entry.views)) {
     channelCanon.views.set(key, { ...cover, live: false, cursor: null });
   }
@@ -5894,6 +5928,7 @@ function saveChannelScope() {
       hasThreads: channelCanon.hasThreads,
       scope: channelCanon.scope,
       dismissed: [...channelCanon.dismissed].filter((id) => held.has(id)),
+      unplaced: [...channelCanon.unplaced].filter((id) => held.has(id)),
     };
   } else {
     const messages = [...el("discord-log").children].flatMap(rowMessages);
@@ -6132,15 +6167,75 @@ function threadOf(message) {
     ? message.thread.id : null;
 }
 
+/**
+ * The thread record the page holds for a message: the copy's own, the store's copy of it, or —
+ * for a thread root whose copy arrived without one — the summary of the thread it starts. A row
+ * keeps the objects it was drawn from, and the store may have learnt more about them since.
+ */
+function heldThreadRecord(message) {
+  const id = String(message.id);
+  for (const copy of [message, heldMessage(id)]) {
+    if (threadOf(copy)) return copy.thread;
+  }
+  const summary = channelCanon.threads.find((held) => held.root && String(held.root.id) === id);
+  return summary ? {
+    id: String(summary.id), root_message_id: id, is_root: true,
+    reply_count: summary.reply_count, reply_count_exact: summary.reply_count_exact,
+  } : null;
+}
+
+/**
+ * Where a reply to `message` goes, from the view on screen. `#185 reply-new-thread`.
+ *
+ * WHERE THE MESSAGE IS, not where the reader happens to be looking from. Inside a thread, into
+ * that thread. A thread reply seen anywhere else — All, above all — into ITS thread: on
+ * 2026-10-04 a reply from All went to the main channel because the message's live copy carried no
+ * thread record. A message on the main channel, thread root or not, onto the main channel as a
+ * reply to it, which the provider shows as a quote or a reply link (Slack has neither, and its
+ * server side threads such a reply instead). A channel registered as one conversation keeps every
+ * reply in that conversation, as it always did.
+ *
+ * `branch` is the thread a reply could START instead: only for a main-channel message the provider
+ * has already named an empty thread for, which is what makes "start a new thread here" something
+ * the server can do today (every Google Chat message is the root of such a thread). A root whose
+ * thread already has replies has nothing new to branch. `unknown` is a message whose thread no
+ * read has stated, which the send settles before it posts — see `placeReplyTarget`.
+ */
+function replyRoute(message) {
+  const route = { thread: null, branch: null, unknown: false, note: "" };
+  if (!threadingSupported) return { ...route, thread: threadOf(message) };
+  if (channelView === "thread" && selectedThreadId) {
+    return { ...route, thread: String(selectedThreadId), note: "Posts in this thread." };
+  }
+  const record = heldThreadRecord(message);
+  const scope = channelCanon.scope;
+  if (scope) return { ...route, thread: record && String(record.id) === scope ? scope : null };
+  if (record && record.is_root !== true) {
+    return { ...route, thread: String(record.id), note: "Posts in the thread this message belongs to." };
+  }
+  if (record) return { ...route, branch: record.reply_count === 0 ? String(record.id) : null };
+  if (!channelCanon.unplaced.has(String(message.id))) return route;
+  return {
+    ...route, unknown: true,
+    note: "This message came in live and the channel has not been read since, so whether it is " +
+      "in a thread is not known yet. Send finds out first, then posts your reply where it is.",
+  };
+}
+
 /** How many replies a thread has, from its summary or the message's own thread record. */
 function threadReplyCount(id, message) {
+  return threadReplies(id, message).count;
+}
+
+/** `threadReplyCount`, with whether that count is exact. Null when neither record says. */
+function threadReplies(id, message) {
   const summary = channelCanon.threads.find((held) => String(held.id) === String(id));
-  const count = summary && typeof summary.reply_count === "number"
-    ? summary.reply_count
-    : message && message.thread && typeof message.thread.reply_count === "number"
-      ? message.thread.reply_count
-      : null;
-  return count;
+  if (summary && typeof summary.reply_count === "number") {
+    return { count: summary.reply_count, exact: summary.reply_count_exact };
+  }
+  const own = message && message.thread;
+  if (own && typeof own.reply_count === "number") return { count: own.reply_count, exact: own.reply_count_exact };
+  return { count: null, exact: false };
 }
 
 function threadForMessageId(id) {
@@ -6457,7 +6552,8 @@ function threadName(choice, chars = THREAD_TITLE_CHARS) {
  */
 function threadFacts(choice) {
   const age = briefAge(Number.isFinite(choice.at) ? choice.at : choice.started);
-  return [age, typeof choice.count === "number" ? String(choice.count) : ""]
+  // A count of 0 is never printed: "Thread 0" read as a thread numbered zero, not an empty one.
+  return [age, typeof choice.count === "number" && choice.count > 0 ? String(choice.count) : ""]
     .filter((part) => part !== "").join(" · ");
 }
 
@@ -6482,7 +6578,10 @@ function threadIndex() {
     const root = message.thread.is_root ? message : null;
     const known = byId.get(id);
     if (!known) {
-      if (root) byId.set(id, threadChoice(id, null, root));
+      // A root nobody has answered is not offered as a thread to read, as the server's own thread
+      // list leaves it out: on a provider that names a thread for every message, that would be
+      // every recent message. Opened from its tag on All, it is still offered while it is open.
+      if (root && root.thread.reply_count !== 0) byId.set(id, threadChoice(id, null, root));
       continue;
     }
     if (Number.isFinite(at)) known.at = Number.isFinite(known.at) ? Math.max(known.at, at) : at;
@@ -6845,20 +6944,29 @@ function addThreadDecoration(meta, message, row) {
     badge.setAttribute("type", "button");
     badge.setAttribute("title", "Open this thread");
     badge.style.setProperty("--thread-hue", threadHue(id));
-    // The reply count tells two tags apart at a glance, as their colours do.
+    // The reply count tells two tags apart at a glance, as their colours do. NOT A ZERO: a provider
+    // can name a thread nobody has answered yet — every Google Chat message heads one — and
+    // "Thread 0" on such a row read as a broken count. `#185 reply-new-thread`.
     const replies = threadReplyCount(id, message);
-    badge.textContent = replies === null ? "Thread" : `Thread ${replies}`;
-    if (replies !== null) badge.setAttribute("aria-label", `Open this thread, ${threadCount(replies, true)}`);
+    badge.textContent = replies ? `Thread ${replies}` : "Thread";
+    if (replies) badge.setAttribute("aria-label", `Open this thread, ${threadCount(replies, true)}`);
     badge.addEventListener("click", () => guardQuietly(() => openThread(id))());
     meta.append(badge);
   }
   if (message.thread.is_root) {
+    // The root's own count, as it always was, unless it has none to give: then the summary's. A
+    // thread with no replies gets no chip at all — "0 replies" offered to open nothing.
+    const own = message.thread;
+    const { count, exact } = typeof own.reply_count === "number" && own.reply_count > 0
+      ? { count: own.reply_count, exact: own.reply_count_exact }
+      : threadReplies(id, message);
+    if (count === 0) return;
     const replies = document.createElement("button");
     replies.className = "thread-replies";
     replies.setAttribute("type", "button");
     replies.setAttribute("title", "Open this thread");
     replies.style.setProperty("--thread-hue", threadHue(id));
-    replies.textContent = threadCount(message.thread.reply_count, message.thread.reply_count_exact);
+    replies.textContent = threadCount(count, exact);
     replies.addEventListener("click", () => guardQuietly(() => openThread(id))());
     row.append(replies);
   }
@@ -7097,6 +7205,8 @@ function loadOutgoingMessages() {
       const entry = {
         id: held.id, channel: held.channel,
         threadId: typeof held.threadId === "string" ? held.threadId : null,
+        // A reply whose destination was still to be found out keeps finding it out on Retry.
+        placement: held.placement === "unknown" ? "unknown" : null,
         replyTo: typeof held.replyTo === "string" ? held.replyTo : null,
         originView: ["main", "threads", "thread", "flat"].includes(held.originView) ? held.originView : "main",
         text: held.text,
@@ -7130,7 +7240,11 @@ function outgoingInView(entry) {
 }
 
 function outgoingStatus(entry) {
-  if (entry.state === "sending") return entry.phase === "queued" ? "Waiting to send…" : "Sending…";
+  if (entry.state === "sending") {
+    return entry.phase === "queued" ? "Waiting to send…"
+      : entry.phase === "placing" ? "Finding out which thread the message you answered is in…"
+        : "Sending…";
+  }
   if (entry.state === "sent") return "Sent.";
   const prefix = entry.postedCount > 0
     ? `${entry.postedCount} part${entry.postedCount === 1 ? "" : "s"} confirmed. ` : "";
@@ -7272,6 +7386,44 @@ function renderOutgoingMessages() {
   host.hidden = rows.length === 0;
 }
 
+/**
+ * Settle where a reply to an unplaced message goes, before anything is posted, and answer the
+ * thread it belongs in or null for the main channel. `#185 reply-new-thread`.
+ *
+ * From the store when a read has placed the message since Reply was opened; otherwise from one
+ * read of All, which carries every message with the thread record its live copy lacked. A message
+ * that read does not carry cannot be placed and the reply is not posted at all: guessing the main
+ * channel is exactly what turned the answer of 2026-10-04 into a thread of its own.
+ */
+async function placeReplyTarget(entry) {
+  const id = String(entry.replyTo);
+  const current = () => String(el("discord-channel").value) === entry.channel;
+  const held = current() ? heldMessage(id) : null;
+  if (held && !channelCanon.unplaced.has(id)) return answeredThread(held);
+  const payload = await apiDecoded(
+    "TimelineResponse",
+    `/api/v1/channels/${encodeURIComponent(entry.channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}`
+  );
+  const messages = payload.messages || [];
+  if (current()) {
+    // What the read says about every message the stream left unplaced, not only this one. The
+    // page itself is not folded: the view on screen is the next read's to redraw.
+    for (const message of messages) {
+      if (channelCanon.unplaced.has(String(message.id))) foldLiveMessage(message);
+    }
+    saveChannelScope();
+  }
+  const found = messages.find((message) => String(message.id) === id);
+  if (!found) throw new Error("it is not among the channel's newest messages");
+  return answeredThread(found);
+}
+
+/** The thread a reply to `message` belongs in once it is placed: a reply's thread, else none. */
+function answeredThread(message) {
+  const thread = threadOf(message);
+  return thread && message.thread.is_root !== true ? thread : null;
+}
+
 function queueOutgoingMessage(request) {
   let id;
   do {
@@ -7353,6 +7505,29 @@ async function dispatchOutgoingMessage(entry, job) {
       entry.detail = "This device is offline.";
       holdOutgoingMessage(entry, { at: Date.now(), offline: true, unsent: true });
       return;
+    }
+    if (entry.placement === "unknown") {
+      entry.phase = "placing";
+      persistOutgoingMessages();
+      renderOutgoingMessages();
+      let thread = null;
+      try {
+        thread = await placeReplyTarget(entry);
+      } catch (error) {
+        if (job.stopped) return;
+        // Nothing has been posted, so this is a plain failure the reader can retry, never the
+        // "unconfirmed" of a POST whose answer was lost.
+        entry.state = "failed";
+        entry.detail = redact(
+          "The message you answered came in live, and whether it is in a thread could not be " +
+            `found out, so this was not posted anywhere: ${error.message}. Retry once the channel ` +
+            "can be read."
+        );
+        return;
+      }
+      if (job.stopped) return;
+      entry.threadId = thread;
+      entry.placement = null;
     }
     entry.phase = "posting";
     persistOutgoingMessages();
@@ -10973,9 +11148,12 @@ function todoSummary() {
  * that says two over a list of three — which `clearBacklog` would then clear all three of.
  *
  * Outside the mode this is an ordinary append, because nothing on screen is claiming a count.
+ *
+ * `live` says which of the two it is: only the stream's copy can leave a message's thread unknown.
  */
-function appendChannelRow(message) {
-  if (threadingSupported) foldLiveMessage(message);
+function appendChannelRow(arriving, live = false) {
+  // The store's copy, which may keep a thread record this one arrived without.
+  const message = threadingSupported ? foldLiveMessage(arriving, live) : arriving;
   if ([...el("discord-log").children].some((row) => idsOf(row).includes(String(message.id)))) {
     if (threadingSupported) saveChannelScope();
     return;
@@ -11296,7 +11474,8 @@ function persistDrafts() {
 
 let replyTarget = null;
 let replyChannelId = null;
-let replyThreadId = null;
+/** Where the reply on screen goes, as `replyRoute` decided when it opened. */
+let replyRouting = { thread: null, branch: null, unknown: false, note: "" };
 // Where the reader was in the channel when they opened this. Captured with the SAME mechanism the
 // fold control uses (`#47 scrollback-stability`), not a second one.
 let replyScrollMark = null;
@@ -11336,7 +11515,12 @@ function openReply(messages) {
   const message = messages[0];
   replyTarget = message;
   replyChannelId = el("discord-channel").value;
-  replyThreadId = threadOf(message) || selectedThreadId;
+  replyRouting = replyRoute(message);
+  // `#185 reply-new-thread`. Offered only where a new thread is possible, and never carried over
+  // from the last reply: the default is to answer where the message is.
+  el("reply-branch").checked = false;
+  el("reply-branch-row").hidden = !replyRouting.branch;
+  renderReplyDestination();
   // BEFORE the screen changes: once #screen-main is hidden nothing in it has a rectangle, so the
   // anchor has to be taken while the reader can still see it.
   replyScrollMark = captureScroll();
@@ -11351,6 +11535,20 @@ function openReply(messages) {
   el("reply-text").value = drafts.get(message.id) || "";
   el("reply-state").textContent = "";
   showScreen("reply");
+}
+
+/**
+ * Say where Send will post, in the words of the choice the reader has made. Silent for a plain
+ * main-channel reply, which is what Reply has always done and needs no note.
+ */
+function renderReplyDestination() {
+  const note = el("reply-destination");
+  note.textContent = replyRouting.branch
+    ? el("reply-branch").checked
+      ? "Starts a new thread from this message, with your reply as its first answer."
+      : "Posts in the main channel as a reply to this message."
+    : replyRouting.note;
+  note.hidden = note.textContent === "";
 }
 
 function closeReply() {
@@ -11378,8 +11576,12 @@ async function sendReply() {
     return;
   }
   rememberDraft();
+  const route = replyRouting;
+  const branch = route.branch && el("reply-branch").checked ? route.branch : null;
   const completion = queueOutgoingMessage({
-    channel, threadId: replyThreadId, replyTo: String(target.id), text,
+    channel, threadId: branch || route.thread, replyTo: String(target.id), text,
+    // Not where to post yet: the send reads the channel first. See `placeReplyTarget`.
+    ...(route.unknown ? { placement: "unknown" } : {}),
   });
   drafts.delete(target.id);
   if (outgoingStorageOkay) persistDrafts();
@@ -12208,7 +12410,7 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
     // make every message look already held. A held message is already in the view drawn from the
     // store, or deliberately not when the to-do filter hides it, so it is not appended again.
     const held = replayed ? heldMessage(message.id) : null;
-    if (!held) appendChannelRow(message);
+    if (!held) appendChannelRow(message, true);
     renderOutgoingMessages();
     relayToAgent(message, selfPosted, replayed);
     // The server owns thread membership, counts and activity ordering. Re-read the active
@@ -12233,7 +12435,7 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
   // identical on both paths. A live feed is not a reason to relax element construction.
   const area = el("scroll-area");
   const wasAtNewest = currentView === "discord" && atBottom(area);
-  appendChannelRow(message);
+  appendChannelRow(message, true);
   discordNewestId = id;
   if (wasAtNewest) {
     scrollToNewest();
@@ -13697,6 +13899,7 @@ renderChannelRows();
 el("close-reply").addEventListener("click", closeReply);
 el("reply-cancel").addEventListener("click", closeReply);
 el("reply-send").addEventListener("click", guardQuietly(sendReply));
+el("reply-branch").addEventListener("change", renderReplyDestination);
 // A draft survives leaving the screen without sending, so it is written as it is typed rather than
 // only on the way out — a way out that is not a control (the browser's own back, a reload) would
 // otherwise lose it.

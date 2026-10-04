@@ -461,6 +461,14 @@
           <div id="reply-target"></div>
           <label for="reply-text">Your reply</label>
           <textarea id="reply-text" rows="4" placeholder="write a reply"></textarea>
+          <!-- `#185 reply-new-thread`. Where Send will post, said before it does: a reply goes
+               where the message it answers is, and starting a new thread from a main-channel
+               message is a choice offered only where the chat service can do it. -->
+          <label id="reply-branch-row" class="toggle" hidden>
+            <input id="reply-branch" type="checkbox" />
+            Start a new thread from this message
+          </label>
+          <p id="reply-destination" class="hint" hidden></p>
           <div class="row">
             <button id="reply-cancel" class="secondary" type="button">Cancel</button>
             <button id="reply-send" type="button">Send reply</button>

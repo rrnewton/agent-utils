@@ -734,7 +734,12 @@ body {
  */
 #screen-reply {
   display: grid;
-  grid-template-rows: auto minmax(4rem, 1fr) auto auto auto auto;
+  /* The meta line, then the message, which is the only elastic row. Everything after it — the
+     label, the box, the `#185 reply-new-thread` choice and destination, the buttons, the state
+     line — gets an implicit `auto` row only while it is shown, so the two rows that are hidden
+     when they have nothing to say leave no empty track and no extra gap behind. */
+  grid-template-rows: auto minmax(4rem, 1fr);
+  grid-auto-rows: auto;
   gap: 0.4rem;
   min-height: 0;
   padding: 0.75rem calc(1rem + env(safe-area-inset-right)) 1rem

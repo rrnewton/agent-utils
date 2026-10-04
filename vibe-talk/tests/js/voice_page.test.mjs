@@ -17806,13 +17806,16 @@ async function pickThread(page, value) {
   await page.settle();
 }
 
-/** A thread root posted `ageMs` before the fixture's clock, with a thread of its own. */
+/**
+ * A thread root posted `ageMs` before the fixture's clock, with a thread of its own holding one
+ * reply — a root nobody has answered is not offered as a thread (`#185 reply-new-thread`).
+ */
 function agedRoot(page, n, ageMs, content = `root number ${n}`) {
   return message({
     id: String(5000 + n), content,
     timestamp: new Date(page.clock() - ageMs).toISOString(),
     thread: { id: `spaces/A/threads/r${n}`, root_message_id: String(5000 + n), is_root: true,
-      reply_count: 0, reply_count_exact: true },
+      reply_count: 1, reply_count_exact: true },
   });
 }
 
@@ -17904,7 +17907,7 @@ test("ages read as days and hours, never 42h, on one compact scale", async () =>
     await signIn(page);
     await showDiscord(page, rows.map(([age], i) => agedRoot(page, i, age)));
     const labels = threadOptions(page).slice(2).map(([, label]) => label);
-    assert.deepStrictEqual(labels, rows.map(([, said], i) => `${said} · 0 · root number ${i}`));
+    assert.deepStrictEqual(labels, rows.map(([, said], i) => `${said} · 1 · root number ${i}`));
   }
 });
 
@@ -18696,6 +18699,273 @@ test("retry retains its original channel, thread and reply target after navigati
   assert.deepEqual(again.repliesPosted[0].body, {
     text: "answer only inside this thread", thread_id: page.threads[0].id, reply_to: "202",
   });
+});
+
+// --- a reply goes where the message it answers lives -----------------------------------------------
+//
+// `#185 reply-new-thread`. Answering a thread reply posts into that thread; answering a message on
+// the main channel posts on the main channel, as a reply to it. A provider's live copy of a message
+// may say nothing about which thread it is in, so a reply to one is held until a read has said,
+// rather than guessed onto the main channel.
+
+/** The rendered row whose first message is `id`. */
+const rowOf = (page, id) => page.el("discord-log").children.find((li) => li.getAttribute("data-id") === id);
+
+/** Serve each POST to the reply route as its own new message, so receipts never share an id. */
+function distinctReplies(page) {
+  let sent = 0;
+  page.replyResponse = async (_path, options) => {
+    const body = JSON.parse(options.body);
+    sent += 1;
+    return json(200, {
+      posted: message({ id: `930000000000000000${sent}`, content: body.text, reply_to: body.reply_to || null }),
+    });
+  };
+}
+
+test("a reply from All to a thread reply that arrived live goes into that thread, not the main channel", async () => {
+  // The failure of 2026-10-04: a thread reply arrived on the live stream, whose copy carried no
+  // thread record, and the read that would have placed it timed out. Reply from All then posted
+  // on the main channel, where the answer stood alone as a thread of its own.
+  const page = await threadPage();
+  await page.el("channel-view-flat").click();
+  await page.settle();
+  const first = page.messages[1].thread;
+  const pushed = message({ id: "206", content: "a later answer in the first discussion" });
+  page.messages.push({ ...pushed, thread: { ...first, is_root: false } });
+  const standard = page.timeline;
+  page.timeline = errorResponse(502, "chat_error", "history read timed out");
+  await deliver(page, page.stream(), sseMessage(pushed));
+  await page.settle();
+  // "slow" since `#195 send-resilience`: a read that timed out says so rather than just "failed".
+  assert.ok(["failed", "slow"].includes(freshness(page).getAttribute("data-state")),
+    "the read after the arrival did not fail");
+
+  await replyButton(rowOf(page, "206")).click();
+  page.timeline = standard;
+  await page.el("reply-text").setValue("answering where the question was asked");
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.equal(page.repliesPosted.length, 1);
+  assert.deepEqual(page.repliesPosted[0].body, {
+    text: "answering where the question was asked", reply_to: "206", thread_id: first.id,
+  }, "the reply left its thread for the main channel");
+});
+
+test("a reply whose message cannot be placed is not posted anywhere, and Retry places it once the channel reads", async () => {
+  const page = await threadPage();
+  await page.el("channel-view-flat").click();
+  await page.settle();
+  const first = page.messages[1].thread;
+  const pushed = message({ id: "206", content: "a later answer in the first discussion" });
+  page.messages.push({ ...pushed, thread: { ...first, is_root: false } });
+  const standard = page.timeline;
+  page.timeline = errorResponse(502, "chat_error", "history read timed out");
+  await deliver(page, page.stream(), sseMessage(pushed));
+  await page.settle();
+
+  await replyButton(rowOf(page, "206")).click();
+  await page.el("reply-text").setValue("held until the page knows where");
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.equal(page.repliesPosted.length, 0, "a reply was posted before anyone knew where it belonged");
+  const held = outgoingRows(page)[0];
+  assert.equal(held.getAttribute("data-send-state"), "failed", "nothing was posted, so nothing is unconfirmed");
+  assert.match(held.text(), /thread/i, "the receipt did not say what the page could not find out");
+  assert.match(held.text(), /history read timed out/, "the receipt hid why");
+  assert.equal(savedOutgoing(page)[0].remaining, "held until the page knows where");
+
+  page.timeline = standard;
+  await outgoingRetry(held).click();
+  await page.settle();
+  assert.deepEqual(page.repliesPosted[0].body, {
+    text: "held until the page knows where", reply_to: "206", thread_id: first.id,
+  });
+});
+
+test("the live echo of a reply sent into a thread does not take the thread away from it", async () => {
+  const page = await threadPage();
+  await page.el("channel-view-flat").click();
+  await page.settle();
+  const first = page.messages[1].thread;
+  const mine = message({ id: "9301", content: "my answer in the first discussion", reply_to: "202",
+    thread: { ...first, is_root: false, reply_count: null, reply_count_exact: false } });
+  page.replyResponse = async () => json(200, { posted: mine });
+  // No read succeeds from here on, so only what the page keeps can say where the reply is.
+  page.timeline = errorResponse(502, "chat_error", "history read timed out");
+  await replyButton(rowOf(page, "202")).click();
+  await page.el("reply-text").setValue("my answer in the first discussion");
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.deepEqual(page.repliesPosted[0].body, {
+    text: "my answer in the first discussion", reply_to: "202", thread_id: first.id,
+  });
+  // The stream's copy of the same message, which says nothing about threads.
+  const { thread: _withheld, ...echo } = mine;
+  await deliver(page, page.stream(), sseMessage(echo, { self_posted: true }));
+  await page.settle();
+  // Main and back to All again draws All from what the page holds, with no read.
+  await page.el("channel-view-main").click();
+  await page.settle();
+  assert.equal(rowOf(page, "9301"), undefined, "a thread reply was drawn on Main");
+  await page.el("channel-view-flat").click();
+  await page.settle();
+  assert.ok(threadBadge(rowOf(page, "9301")), "the echo erased the reply's thread");
+
+  page.replyResponse = async () => json(200, { posted: message({ id: "9302", content: "and a follow-up" }) });
+  await replyButton(rowOf(page, "9301")).click();
+  await page.el("reply-text").setValue("and a follow-up");
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.deepEqual(page.repliesPosted[1].body, { text: "and a follow-up", reply_to: "9301", thread_id: first.id });
+});
+
+test("a read that lands after a newer one was asked for still places the message a reply is opened on", async () => {
+  // A read that lands once a newer one has been asked for is folded into the store without
+  // redrawing rows whose ids did not change, so the row on screen keeps the stream's copy.
+  const page = await threadPage();
+  await page.el("channel-view-flat").click();
+  await page.settle();
+  const first = page.messages[1].thread;
+  const pushed = message({ id: "206", content: "a later answer in the first discussion" });
+  page.messages.push({ ...pushed, thread: { ...first, is_root: false } });
+  const held = gate(page.timeline);
+  const failing = errorResponse(502, "chat_error", "history read timed out");
+  let reads = 0;
+  page.timeline = (path) => (++reads === 1 ? held.respond(path) : failing());
+  await deliver(page, page.stream(), sseMessage(pushed));
+  const aside = message({ id: "207", content: "an aside on the main channel" });
+  page.messages.push(aside);
+  await deliver(page, page.stream(), sseMessage(aside));
+  held.open();
+  await page.settle();
+  await page.settle();
+  assert.equal(reads, 2, "the newer read was never made");
+  assert.equal(threadBadge(rowOf(page, "206")), undefined,
+    "the late read redrew the row, so this no longer tests the row's stale copy");
+
+  await replyButton(rowOf(page, "206")).click();
+  await page.el("reply-text").setValue("answering from the stale row");
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.deepEqual(page.repliesPosted[0].body, {
+    text: "answering from the stale row", reply_to: "206", thread_id: first.id,
+  }, "the reply trusted the row's copy over what the store had since read");
+});
+
+test("a message the stream left unplaced is still unplaced after a reload, so its reply still waits", async () => {
+  const page = await threadPage();
+  await page.el("channel-view-flat").click();
+  await page.settle();
+  const first = page.messages[1].thread;
+  const pushed = message({ id: "206", content: "a later answer in the first discussion" });
+  page.messages.push({ ...pushed, thread: { ...first, is_root: false } });
+  page.timeline = errorResponse(502, "chat_error", "history read timed out");
+  await deliver(page, page.stream(), sseMessage(pushed));
+  await page.settle();
+
+  const again = reloadPage(page.storage, (p) => {
+    p.threadingSupported = true;
+    p.threads = page.threads;
+    p.messages = page.messages;
+    p.timeline = offline;
+  });
+  await again.settle();
+  await again.el("view-switch").click();
+  await again.settle();
+  assert.ok(rowOf(again, "206"), "the saved row was not drawn");
+  await replyButton(rowOf(again, "206")).click();
+  assert.equal(again.el("reply-destination").hidden, false);
+  assert.match(again.el("reply-destination").textContent, /not known yet/,
+    "after a reload the page took the saved copy's silence for the main channel");
+  await again.el("reply-text").setValue("still waiting to know where");
+  await again.el("reply-send").click();
+  await again.settle();
+  assert.equal(again.repliesPosted.length, 0, "the reply was guessed onto the main channel");
+});
+
+test("a thread nobody has answered yet is tagged Thread with no number, and grows no replies chip", async () => {
+  // A provider can name a thread for a message nobody has answered — every Google Chat message
+  // heads one — so a zero is an ordinary count, not a broken one.
+  const page = newPage();
+  page.threadingSupported = true;
+  page.threads = [];
+  const lone = { id: "spaces/A/threads/lone", root_message_id: "210", is_root: true,
+    reply_count: 0, reply_count_exact: true };
+  await signIn(page);
+  await showDiscord(page, [message({ id: "210", content: "nobody has answered this", thread: lone })]);
+  assert.equal(threadButton(rowOf(page, "210")), undefined, "Main offered a chip for no replies");
+  assert.deepStrictEqual(threadOptions(page), [["main", "Main"], ["flat", "All"]],
+    "the picker offered a thread with nothing in it to read");
+
+  await page.el("channel-view-flat").click();
+  await page.settle();
+  const badge = threadBadge(rowOf(page, "210"));
+  assert.equal(badge.textContent, "Thread");
+  assert.equal(badge.getAttribute("aria-label"), null, "the tag announced a count of nothing");
+  assert.equal(threadButton(rowOf(page, "210")), undefined, "All offered a chip for no replies");
+  assert.doesNotMatch(page.el("discord-log").text(), /Thread 0|0 replies/);
+
+  // Its tag still opens it, and while it is open the picker names it.
+  await badge.click();
+  await page.settle();
+  assert.equal(page.el("thread-heading").hidden, false);
+  assert.ok(threadOptions(page).some(([value]) => value === `thread:${lone.id}`));
+});
+
+test("Reply offers a new thread only on a main-channel message the chat service can branch one from", async () => {
+  const page = newPage();
+  page.threadingSupported = true;
+  const data = threadData();
+  page.threads = data.threads;
+  const lone = { id: "spaces/A/threads/lone", root_message_id: "210", is_root: true,
+    reply_count: 0, reply_count_exact: true };
+  await signIn(page);
+  await showDiscord(page, [...data.messages, message({ id: "210", content: "nobody has answered this", thread: lone })]);
+  distinctReplies(page);
+  const branchOffered = () => !page.el("reply-branch-row").hidden;
+  const send = async (text) => {
+    await page.el("reply-text").setValue(text);
+    await page.el("reply-send").click();
+    await page.settle();
+    return page.repliesPosted.at(-1).body;
+  };
+
+  // A main-channel message with an empty thread: offered, off, and off means a reply on Main.
+  await replyButton(rowOf(page, "210")).click();
+  assert.ok(branchOffered(), "no new-thread choice where one is possible");
+  assert.equal(page.el("reply-branch").checked, false, "a new thread was the default");
+  assert.match(page.el("reply-destination").textContent, /main channel/);
+  assert.deepEqual(await send("an answer on the main channel"), { text: "an answer on the main channel", reply_to: "210" });
+
+  // Ticked, the reply starts that message's thread — and the tick does not outlive the reply.
+  await replyButton(rowOf(page, "210")).click();
+  assert.equal(page.el("reply-branch").checked, false, "the last reply's choice carried over");
+  page.el("reply-branch").checked = true;
+  await page.el("reply-branch").dispatch("change");
+  assert.match(page.el("reply-destination").textContent, /new thread/);
+  assert.deepEqual(await send("starting a thread on it"),
+    { text: "starting a thread on it", reply_to: "210", thread_id: lone.id });
+
+  // A root whose thread already has replies has nothing new to branch: it is answered on Main.
+  await replyButton(rowOf(page, "201")).click();
+  assert.equal(branchOffered(), false, "a new thread was offered where one already exists");
+  assert.deepEqual(await send("an answer to the root"), { text: "an answer to the root", reply_to: "201" });
+
+  // A message with no thread at all, which this provider says is on the main channel.
+  await replyButton(rowOf(page, "200")).click();
+  assert.equal(branchOffered(), false);
+  assert.equal(page.el("reply-destination").hidden, true, "a plain reply grew a note");
+  assert.deepEqual(await send("an answer to the announcement"), { text: "an answer to the announcement", reply_to: "200" });
+
+  // On All, a thread reply is answered in its thread, with nothing to choose.
+  await page.el("channel-view-flat").click();
+  await page.settle();
+  await replyButton(rowOf(page, "202")).click();
+  assert.equal(branchOffered(), false);
+  assert.match(page.el("reply-destination").textContent, /thread this message belongs to/);
+  assert.deepEqual(await send("an answer in the thread"),
+    { text: "an answer in the thread", reply_to: "202", thread_id: data.threads[0].id });
 });
 
 test("a live message arriving before its send acknowledgement appears only once", async () => {
