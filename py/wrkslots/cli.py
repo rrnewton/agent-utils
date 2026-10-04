@@ -607,6 +607,17 @@ HISTORICAL_PURPOSE_NOT_RECORDED = "no purpose recorded in worktree-state.json"
 _RETAINED_HANDLE_COUNT_LIMIT = 4096
 _RETAINED_HANDLE_BYTES_LIMIT = 64 * 1024 * 1024
 _RETAINED_HANDLE_CENSUS_SECONDS = 30.0
+# The bound on one /proc/<pid>/mountinfo read, sized from measurement. On
+# 2026-10-04, at load average about 150, the largest of 4,118 readable tables
+# on a production host was 143,648 bytes (976 mounts), so 4 MiB is about 29
+# times the largest table seen; the 46 distinct tables totalled 4,401,695
+# bytes. Reaching it takes about 28,000 mounts at that table's 147 bytes per
+# line. The kernel allows up to fs.mount-max mounts per namespace (100,000 by
+# default), so the bound is reachable in principle; a table over it refuses
+# the census, naming the file and the bound, rather than being read in part.
+# Before 263d0e65 each read was also capped by what remained of a shared
+# operation-wide allowance, which is how a 2026-10-03 cleanup was refused at
+# "the 52620-byte safety bound"; that allowance is now `_MountinfoCensus`.
 _MOUNTINFO_FILE_BYTES_LIMIT = 4 * 1024 * 1024
 _UNIX_SOCKET_TABLE_BYTES_LIMIT = 16 * 1024 * 1024
 # The privileged fallback must enumerate every descriptor inode it cannot read
