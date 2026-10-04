@@ -25570,6 +25570,16 @@ def _clear_open_directory(
         raise Refusal(f"cache path crossed onto another filesystem: {path}")
     if _fd_mount_id(directory_fd, str(path)) != mount_id:
         raise Refusal(f"cache path crossed a mount point: {path}")
+    writable = stat.S_IWUSR | stat.S_IXUSR
+    if metadata.st_uid == os.geteuid() and metadata.st_mode & writable != writable:
+        # Build scripts and Go's module cache leave read-only directories
+        # (mode 0555) whose entries cannot be unlinked until the owner restores
+        # write permission. The descriptor is the one already identity-checked
+        # above, so this changes only the directory being emptied.
+        try:
+            os.fchmod(directory_fd, stat.S_IMODE(metadata.st_mode) | writable)
+        except OSError as exc:
+            raise Refusal(f"cannot make cache directory writable: {path}: {exc}") from exc
     total = metadata.st_blocks * 512
     names = _directory_names(directory_fd, path)
     for name in names:
