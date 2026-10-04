@@ -2797,7 +2797,7 @@ SCENES: tuple[Scene, ...] = (
     ),
     Scene(
         name="19-reply-view-long-target",
-        what="a target longer than the frame — it scrolls itself, and the box stays reachable",
+        what="a target longer than the frame — the conversation pane scrolls, and the box stays reachable",
         act=_act_reply_long_target,
         # PHONES ONLY, and this is a scoping decision rather than an oversight. The property is
         # that a message longer than the frame scrolls inside its own box instead of pushing the
@@ -2808,11 +2808,13 @@ SCENES: tuple[Scene, ...] = (
         profiles=PHONE_PROFILES,
         expect=(
             ("the reply screen is up", "window.__visible('screen-reply')"),
-            # The whole content of this picture: the message being answered overflows its own box
-            # rather than the screen, so the thing you type into is still there.
+            # The whole content of this picture: the message being answered overflows the reply
+            # screen's conversation pane rather than the screen, so the thing you type into is still
+            # there. Since `#200 reply-context` the message and the earlier ones above it scroll
+            # TOGETHER in #reply-scroll; the message no longer scrolls inside a box of its own.
             (
-                "the message being answered overflows its OWN box",
-                "(() => { const t = document.getElementById('reply-target'); "
+                "the message being answered overflows the conversation pane, not the screen",
+                "(() => { const t = document.getElementById('reply-scroll'); "
                 "return t.scrollHeight > t.clientHeight + 10; })()",
             ),
             (
