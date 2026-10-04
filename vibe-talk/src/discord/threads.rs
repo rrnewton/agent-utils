@@ -860,11 +860,14 @@ impl HttpDiscordClient {
         id: &str,
         content: &str,
         reply_to: Option<&MessageId>,
+        key: Option<&str>,
     ) -> Result<Message, ChatError> {
         match self.thread_api {
             ThreadApi::Off => Err(refused("thread posting is disabled on this backend")),
             ThreadApi::Bridge => {
-                let nonce = fresh_post_nonce();
+                // `#195 send-resilience`: the caller's idempotency key, when it sent one, is this
+                // post's provider request id on every attempt; see `supports_idempotent_posts`.
+                let nonce = key.map_or_else(fresh_post_nonce, str::to_owned);
                 let mut request = post_request_with_nonce(
                     &self.api_base,
                     channel,

@@ -1617,7 +1617,8 @@ body {
 }
 
 #channel-freshness[data-state="offline"],
-#channel-freshness[data-state="failed"] {
+#channel-freshness[data-state="failed"],
+#channel-freshness[data-state="slow"] {
   color: var(--warn);
   border-color: currentColor;
 }

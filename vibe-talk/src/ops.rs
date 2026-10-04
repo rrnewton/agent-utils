@@ -61,6 +61,8 @@ pub enum OpError {
         unsent: String,
         /// Why the next part failed.
         cause: String,
+        /// Whether that failure was a moment rather than an answer; see [`ChatError::is_transient`].
+        retryable: bool,
     },
 
     /// The configured chat provider failed, or refused the request before it was sent.
@@ -958,16 +960,24 @@ pub async fn reply(
     text: &str,
     reply_to: Option<&str>,
 ) -> Result<(ChannelInfo, Message, Vec<Message>), OpError> {
-    reply_scoped(state, channel_id, text, reply_to, None).await
+    reply_scoped(state, channel_id, text, reply_to, None, None).await
 }
 
 /// Post to the channel or to one of its threads, preserving write policy and partial progress.
+///
+/// `idempotency_key` names this post across attempts — `#195 send-resilience`. A caller that
+/// lost an answer sends the same text again under the same key, and every part goes upstream
+/// under the same per-part key it had the first time ([`part_key`]); a provider for which
+/// [`ChatClient::supports_idempotent_posts`] holds then posts it at most once.
+///
+/// [`ChatClient::supports_idempotent_posts`]: crate::chat::ChatClient::supports_idempotent_posts
 pub async fn reply_scoped(
     state: &AppState,
     channel_id: &str,
     text: &str,
     reply_to: Option<&str>,
     thread_id: Option<&str>,
+    idempotency_key: Option<&str>,
 ) -> Result<(ChannelInfo, Message, Vec<Message>), OpError> {
     let info = allowed(state, channel_id).await?;
     if !info.writable {
@@ -975,6 +985,9 @@ pub async fn reply_scoped(
     }
     if let Some(thread) = thread_id {
         validate_thread_id(thread)?;
+    }
+    if let Some(key) = idempotency_key {
+        validate_idempotency_key(key)?;
     }
     let reply_to = reply_to.map(|id| MessageId(id.to_owned()));
 
@@ -994,14 +1007,21 @@ pub async fn reply_scoped(
         // pointing every part at the same parent would render as several separate answers to the
         // same thing rather than as one answer that ran long.
         let parent = if index == 0 { reply_to.as_ref() } else { None };
+        let earlier_twins = parts[..index].iter().filter(|other| *other == part).count();
+        let key = idempotency_key.map(|key| part_key(key, part, earlier_twins));
         let sent = match thread_id {
             Some(thread) => {
                 state
                     .chat
-                    .post_in_thread(&info.id, thread, part, parent)
+                    .post_in_thread_keyed(&info.id, thread, part, parent, key.as_deref())
                     .await
             }
-            None => state.chat.post_message(&info.id, part, parent).await,
+            None => {
+                state
+                    .chat
+                    .post_message_keyed(&info.id, part, parent, key.as_deref())
+                    .await
+            }
         };
         match sent {
             Ok(mut one) => {
@@ -1022,6 +1042,7 @@ pub async fn reply_scoped(
                 return Err(OpError::PartiallyPosted {
                     posted: posted.len(),
                     unsent,
+                    retryable: cause.is_transient(),
                     cause: cause.to_string(),
                 });
             }
@@ -1029,6 +1050,51 @@ pub async fn reply_scoped(
     }
     let first = posted.first().cloned().expect("at least one part posted");
     Ok((info, first, posted))
+}
+
+/// The longest idempotency key a caller may send. Short enough that a part's key, which adds a
+/// fingerprint and a count, stays inside the 128 characters a bridge nonce may have.
+pub const IDEMPOTENCY_KEY_MAX_CHARS: usize = 64;
+
+fn validate_idempotency_key(key: &str) -> Result<(), OpError> {
+    if key.is_empty()
+        || key.len() > IDEMPOTENCY_KEY_MAX_CHARS
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(ChatError::Refused(format!(
+            "idempotency_key must be 1 to {IDEMPOTENCY_KEY_MAX_CHARS} letters, digits, '-' or '_'"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// The key ONE part of a split post travels upstream with: the caller's key, bound to that part's
+/// own text.
+///
+/// Bound to the TEXT rather than to the part's position, because the position is not stable
+/// across attempts. A 207 hands the caller back the unsent remainder, and its retry sends only
+/// that — so the part that failed ambiguously, the one whose arrival nobody knows, is part 0 of
+/// the retry where it was part 2 of the first attempt. Its text is the same, so its key is too,
+/// and the provider that may already hold it is asked for the same post rather than a new one.
+/// The same binding means a key reused for different words can never be answered with a post of
+/// other words.
+///
+/// `earlier_twins` counts identical parts before this one in the same request, so a post that
+/// repeats a whole part posts it twice, as written, rather than collapsing into one.
+///
+/// FNV-1a rather than a cryptographic hash: this distinguishes a caller's own parts from one
+/// another and needs no secrecy — the key it extends is already the caller's to choose.
+#[must_use]
+pub fn part_key(key: &str, part: &str, earlier_twins: usize) -> String {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let fingerprint = part.bytes().fold(OFFSET, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(PRIME)
+    });
+    format!("{key}.{fingerprint:016x}.{earlier_twins}")
 }
 
 fn validate_thread_id(thread_id: &str) -> Result<(), OpError> {

@@ -110,6 +110,14 @@ declare namespace VibeTalk {
      */
     elevenlabs_agent_id: string | null;
     /**
+     * Whether a post sent again under the same `idempotency_key` is posted at most once.
+     *
+     * `#195 send-resilience`. The page retries a send whose answer it lost — a timeout, a 502 —
+     * on its own only when this is true, because only then can the retry not post the message
+     * twice. Sent only when true: absent, from this server or an older one, means false.
+     */
+    idempotent_posts_supported?: boolean;
+    /**
      * How changes reach the SSE hub.
      */
     live_delivery: LiveDelivery;
@@ -536,6 +544,11 @@ declare namespace VibeTalk {
      * Whether this provider accepts pasted links and references when adding a channel.
      */
     channel_registration_supported: boolean;
+    /**
+     * Whether this provider posts a message sent again under the same key at most once. Sent
+     * only when true.
+     */
+    idempotent_posts_supported?: boolean;
     /**
      * The key channels name this provider by.
      */

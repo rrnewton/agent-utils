@@ -135,6 +135,21 @@ impl ChatError {
             _ => None,
         }
     }
+
+    /// Whether the same request, sent again later, could succeed.
+    ///
+    /// `#195 send-resilience`. A lost connection, a rate limit, a timeout, or a provider's 5xx is a
+    /// moment; a refusal — ours, or the provider's 4xx — is an answer, and sending it again asks
+    /// the same question. An answer this server could not read is not transient either: it came
+    /// from a provider that is up, and repeating the request repeats the answer.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        match self.cause() {
+            Self::Transport(_) | Self::RateLimited(_) => true,
+            Self::Status { status, .. } => *status >= 500 || *status == 408 || *status == 429,
+            Self::Shape(_) | Self::Refused(_) | Self::Provider { .. } => false,
+        }
+    }
 }
 
 /// The account a chat backend posts as, as reported by the provider.
@@ -375,6 +390,54 @@ pub trait ChatClient: Send + Sync {
         content: &str,
         reply_to: Option<&MessageId>,
     ) -> Result<Message, ChatError>;
+
+    /// Whether a post carrying an idempotency key is posted at most once, however often it is sent.
+    ///
+    /// `#195 send-resilience`. A post whose answer is lost — a timeout, a dropped connection, a
+    /// gateway's 502 — may or may not have landed, and sending it again is safe only where
+    /// something upstream recognises the second request as the first. True only where the key
+    /// provably reaches such a thing; the page retries an ambiguous failure on its own only then.
+    ///
+    /// False by default, and for every provider whose post API has no such key: the keyed methods
+    /// below then ignore the key, which is honest exactly because this says so.
+    fn supports_idempotent_posts(&self) -> bool {
+        false
+    }
+
+    /// [`ChatClient::post_message`], carrying the idempotency key for this one part.
+    ///
+    /// The same key, for the same text, must name the same post on every attempt; see
+    /// [`ChatClient::supports_idempotent_posts`]. The default ignores it.
+    ///
+    /// # Errors
+    ///
+    /// As [`ChatClient::post_message`].
+    async fn post_message_keyed(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+        _key: Option<&str>,
+    ) -> Result<Message, ChatError> {
+        self.post_message(channel, content, reply_to).await
+    }
+
+    /// [`ChatClient::post_in_thread`], carrying the idempotency key for this one part.
+    ///
+    /// # Errors
+    ///
+    /// As [`ChatClient::post_in_thread`].
+    async fn post_in_thread_keyed(
+        &self,
+        channel: &ChannelId,
+        thread_id: &str,
+        content: &str,
+        reply_to: Option<&MessageId>,
+        _key: Option<&str>,
+    ) -> Result<Message, ChatError> {
+        self.post_in_thread(channel, thread_id, content, reply_to)
+            .await
+    }
 
     /// Move the provider's read cursor through one message.
     ///

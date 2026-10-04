@@ -424,6 +424,20 @@ impl ChatClient for ChatRouter {
             .await
     }
 
+    async fn post_in_thread_keyed(
+        &self,
+        channel: &ChannelId,
+        thread_id: &str,
+        content: &str,
+        reply_to: Option<&MessageId>,
+        key: Option<&str>,
+    ) -> Result<Message, ChatError> {
+        self.route(channel)?
+            .client
+            .post_in_thread_keyed(channel, thread_id, content, reply_to, key)
+            .await
+    }
+
     async fn fetch_thread_message(
         &self,
         channel: &ChannelId,
@@ -606,6 +620,27 @@ impl ChatClient for ChatRouter {
         self.route(channel)?
             .client
             .post_message(channel, content, reply_to)
+            .await
+    }
+
+    /// Whether ANY provider posts keyed messages at most once, like the other deployment-wide
+    /// flags; the key itself goes to the channel's own provider, which ignores it if it cannot.
+    fn supports_idempotent_posts(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.client.supports_idempotent_posts())
+    }
+
+    async fn post_message_keyed(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+        key: Option<&str>,
+    ) -> Result<Message, ChatError> {
+        self.route(channel)?
+            .client
+            .post_message_keyed(channel, content, reply_to, key)
             .await
     }
 

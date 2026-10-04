@@ -42,6 +42,7 @@
         "settings_url": "https://voice.example/settings"
       },
       "elevenlabs_agent_id": "agent",
+      "idempotent_posts_supported": true,
       "live_delivery": "push",
       "live_poll_seconds": 5,
       "owner_author_id": "7",
@@ -49,6 +50,7 @@
         {
           "channel_discovery_supported": false,
           "channel_registration_supported": false,
+          "idempotent_posts_supported": true,
           "key": "discord",
           "live_delivery": "push",
           "live_poll_seconds": 5,

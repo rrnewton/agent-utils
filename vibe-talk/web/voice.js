@@ -520,10 +520,22 @@ const CHANNEL_DRAFTS_KEY = "vibe-talk.channel-drafts";
 // Local send records never enter the provider message list or its read/archive/reply machinery.
 const OUTGOING_KEY = "vibe-talk.outgoing-messages";
 const OUTGOING_TIMEOUT_MS = 60000;
+// `#195 send-resilience`. A send whose answer was lost goes out again on its own after the first
+// wait, then after each wait this many times the last — 5 s, 15 s, 45 s — and then a person decides.
+// Only where it cannot post twice; see `retriesItself`.
+const OUTGOING_RETRY_FIRST_MS = 5000;
+const OUTGOING_RETRY_FACTOR = 3;
+const OUTGOING_RETRY_ATTEMPTS = 3;
 const outgoingMessages = new Map();
 const outgoingObservations = new Map();
 const outgoingDestinations = new Map();
 const outgoingJobs = new Map();
+/**
+ * Entries waiting to go out again on their own, by id: when (`at`), or when the connection returns
+ * (`offline`); whether nothing has been attempted yet (`unsent`); the credential it was armed
+ * under (`identity`); and its timer. Never saved: see `planOutgoingRetry`.
+ */
+const outgoingRetries = new Map();
 let outgoingSequence = 0;
 let outgoingStorageOkay = true;
 
@@ -2435,12 +2447,17 @@ function setPromptsOpen(open) {
 /**
  * What {@link api} throws: an ordinary Error, plus the facts a caller branches on.
  *
+ * `timedOut` and `shownInPill` are the page's own, from `#195 send-resilience`: the page stopped
+ * waiting for the answer, and the freshness pill already says the read failed.
+ *
  * @typedef {Error & {
  *   network?: boolean,
  *   refused?: boolean,
  *   status?: number,
  *   code?: string,
  *   detail?: string,
+ *   timedOut?: boolean,
+ *   shownInPill?: boolean,
  * }} ApiRequestError
  */
 
@@ -2543,6 +2560,112 @@ async function apiDecoded(type, path, options) {
     error.cause = cause;
     throw error;
   }
+}
+
+/**
+ * A request to vibe-talk that stops waiting after `ms`, failing as a timeout the reader can be
+ * told about rather than as a "refreshing…" nobody ends.
+ *
+ * `#195 send-resilience`. The server bounds its own read of a slow chat service, but at a figure
+ * set for the service — fifty seconds, in the incident this was written for — not for a reader
+ * looking at the screen. Giving up here does not cancel the server's read; it only stops this page
+ * waiting on it, and the next poll asks again.
+ *
+ * @template T
+ * @param {number} ms
+ * @param {(signal: AbortSignal | undefined) => Promise<T>} request
+ * @returns {Promise<T>}
+ */
+async function within(ms, request) {
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let timer = null;
+  /** @type {Promise<never>} */
+  const late = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => {
+      if (controller) controller.abort();
+      const error = /** @type {ApiRequestError} */ (new Error(
+        `${sentenceStart(chatServiceOf(el("discord-channel").value))} did not answer within ` +
+          `${Math.round(ms / 1000)} seconds.`
+      ));
+      error.timedOut = true;
+      reject(error);
+    }, ms);
+  });
+  try {
+    return await Promise.race([request(controller ? controller.signal : undefined), late]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
+// --- what a slow or failing chat service means, in words ------------------------------------------
+//
+// `#195 send-resilience`. The server's sentence for a provider failure is a diagnosis —
+// `HTTP 502 chat_error: Google Chat returned HTTP 502: {"message":"… timed out …"}` — which is
+// right in a log and wrong on a phone, where it was all the reader saw of a refresh that did not
+// land, in a red banner that came back every poll for as long as the service stayed slow. These say
+// what it means instead: the provider's own words without the JSON around them, and a timeout —
+// most of what a slow service does — as "slow to answer". A network failure and a refusal are
+// already sentences, and keep them.
+
+/** Wording that marks a failure as a service that did not answer in time. */
+const SLOW_WORDS = /timed?[ -]?out|timeout|deadline/i;
+
+/** The chat service a channel is read through, as a noun phrase for a sentence. */
+function chatServiceOf(channel) {
+  const provider = providerOfChannel(channel);
+  return (provider && typeof provider.name === "string" && provider.name.trim()) || chatServiceName();
+}
+
+/**
+ * The provider's own words inside a server detail such as `X returned HTTP 502: {"message":"…"}`,
+ * or the detail itself when it is already prose.
+ */
+function providerWords(detail) {
+  const text = String(detail || "").trim();
+  const brace = text.indexOf("{");
+  if (brace < 0) return text;
+  try {
+    const inner = JSON.parse(text.slice(brace));
+    const said = inner && [inner.message, inner.detail, inner.error].find((value) =>
+      typeof value === "string" && value.trim());
+    if (said) return said.trim();
+  } catch (_error) {
+    // A provider body the server cut short is not JSON any more; its message may still be whole.
+    // `\x22` is a double quote, spelled out so the page suite's scan for string literals does
+    // not read one opening here.
+    const quoted = /\x22(?:message|detail)\x22\s*:\s*\x22((?:[^\x22\\]|\\.)+)\x22/.exec(text);
+    if (quoted) return quoted[1].replace(/\\(.)/g, "$1");
+  }
+  return text.slice(0, brace).replace(/[:\s]+$/, "") || text;
+}
+
+/** Whether a failure is a service that did not answer in time, rather than one that said no. */
+function isSlowFailure(error) {
+  if (!error) return false;
+  if (error.timedOut) return true;
+  const status = Number(error.status) || 0;
+  return status === 504 || status === 408 || (status >= 500 && SLOW_WORDS.test(String(error.detail || "")));
+}
+
+/**
+ * A failed request to `service`, in words for the reader. Only a 5xx is reworded: anything else is
+ * this server's own sentence or the page's, and is returned as it was.
+ */
+function readableFailure(error, service) {
+  if (!error) return "";
+  const status = Number(error.status) || 0;
+  if (error.network || error.timedOut || status < 500) return String(error.message || "");
+  const name = sentenceStart(service);
+  if (isSlowFailure(error)) return `${name} is slow to answer right now.`;
+  const said = providerWords(error.detail);
+  return said ? `${name} could not answer: ${said}` : `${name} could not answer (HTTP ${status}).`;
+}
+
+/** {@link readableFailure} for the channel on screen. */
+function readableChannelFailure(error) {
+  return readableFailure(error, chatServiceOf(el("discord-channel").value));
 }
 
 // --- confirming a post the assistant proposed ----------------------------------------------------
@@ -3897,6 +4020,9 @@ function onVisibility() {
     return;
   }
   visibleAt = Date.now();
+  // `#195 send-resilience`. A phone holds a hidden page's timers; a send whose wait ran out while
+  // the reader was away goes now, not a further wait after they are back.
+  resumeOutgoingRetries();
 }
 
 function wasSuspended() {
@@ -5293,7 +5419,8 @@ const MESSAGE_CACHE_CHARS = 600000;
 
 /**
  * How the channel rows on screen relate to the server: "fresh" from a read in this page, "saved"
- * from the device and not yet refreshed, or "offline"/"failed" when the refresh did not succeed.
+ * from the device and not yet refreshed, or "offline"/"failed" when the refresh did not succeed —
+ * "slow" when it failed because the chat service did not answer in time.
  */
 let channelFreshness = "fresh";
 /** When the rows on screen were last known to be current, or 0 when there are none. */
@@ -5892,6 +6019,9 @@ function forgetMessages() {
 
 /** A channel read failed. Say so over the rows it leaves standing — or take them away. */
 function noteChannelReadFailure(error) {
+  // `#195 send-resilience`. Whatever reports this — the banner, for a read the reader asked for —
+  // says what it means rather than the server's diagnosis of it.
+  if (error) error.message = readableChannelFailure(error);
   if (error && error.refused) {
     forgetMessages();
     return;
@@ -5903,7 +6033,12 @@ function noteChannelReadFailure(error) {
     return;
   }
   // With nothing on screen the error itself is the whole report.
-  if (channelFreshAt) setChannelFreshness(error && error.network ? "offline" : "failed");
+  if (channelFreshAt) {
+    setChannelFreshness(error && error.network ? "offline" : isSlowFailure(error) ? "slow" : "failed");
+    // `#195 send-resilience`. Said, over the rows it is about: a refresh nobody asked for needs no
+    // banner on top of it. See `refreshQuietly`.
+    if (error) error.shownInPill = true;
+  }
 }
 
 function setChannelFreshness(state) {
@@ -5932,7 +6067,10 @@ function renderChannelFreshness() {
       ? `Offline · showing messages saved ${at}`
       : channelFreshness === "failed"
         ? `Refresh failed · showing messages from ${at}`
-        : current;
+        : channelFreshness === "slow"
+          ? `${sentenceStart(chatServiceOf(el("discord-channel").value))} is slow to answer · ` +
+            `showing messages from ${at}`
+          : current;
   pill.textContent = text;
   pill.setAttribute("data-state", channelFreshness);
   pill.hidden = text === "" || currentView !== "discord" || !el("pull-refresh").hidden;
@@ -6832,7 +6970,9 @@ async function loadTimeline(options) {
   /** @type {VibeTalk.TimelineResponse | null} */
   let landed = null;
   try {
-    const payload = await apiDecoded("TimelineResponse", timelinePath());
+    const path = timelinePath();
+    const payload = await within(CHANNEL_READ_TIMEOUT_MS,
+      (signal) => apiDecoded("TimelineResponse", path, { signal }));
     landed = payload;
     if (generation !== discordLoadGeneration || context !== channelContextKey()) {
       foldLateTimelinePage(payload, { context, channel, view, thread, canon });
@@ -6963,6 +7103,8 @@ function loadOutgoingMessages() {
           part && typeof part.id === "string" && typeof part.content === "string") : [],
         observedParts: Array.isArray(held.observedParts)
           ? held.observedParts.filter((id) => typeof id === "string") : [],
+        // Absent from an entry saved before keys were sent: its attempts went without one.
+        keyedOnly: held.keyedOnly === true,
         detail: interrupted ? "This page closed before delivery was confirmed." : String(held.detail || ""),
       };
       outgoingMessages.set(entry.id, entry);
@@ -6987,8 +7129,20 @@ function outgoingStatus(entry) {
   if (entry.state === "sent") return "Sent.";
   const prefix = entry.postedCount > 0
     ? `${entry.postedCount} part${entry.postedCount === 1 ? "" : "s"} confirmed. ` : "";
+  // `#195 send-resilience`. Waiting to go again on its own: say so, and when, so a row that is
+  // about to fix itself does not read as a failure the reader has to act on.
+  const waiting = outgoingRetries.get(entry.id);
+  if (waiting && waiting.offline) {
+    return waiting.unsent ? `${prefix}Offline. Will send when online.` : `${prefix}Sending… Will retry when online.`;
+  }
+  if (waiting) {
+    const seconds = Math.max(1, Math.round((waiting.at - Date.now()) / 1000));
+    return `${prefix}Sending… ${entry.detail} Retrying in ${seconds} s.`.replace(/\s+/g, " ");
+  }
   if (entry.state === "unconfirmed") {
-    return `${prefix}Delivery unconfirmed. Check history before retrying to avoid a duplicate. ${entry.detail}`;
+    return retriesItself(entry)
+      ? `${prefix}Delivery unconfirmed. Retrying cannot post it twice. ${entry.detail}`
+      : `${prefix}Delivery unconfirmed. Check history before retrying to avoid a duplicate. ${entry.detail}`;
   }
   return `${prefix}Not sent. ${entry.detail}`;
 }
@@ -7040,7 +7194,8 @@ function renderOutgoingMessages() {
     const row = document.createElement("li");
     row.className = "outgoing-message";
     row.setAttribute("data-outgoing-id", entry.id);
-    row.setAttribute("data-send-state", entry.state);
+    const waiting = outgoingRetries.has(entry.id);
+    row.setAttribute("data-send-state", waiting ? "retrying" : entry.state);
     row.setAttribute("data-who", "me");
     const meta = document.createElement("div");
     meta.className = "meta";
@@ -7081,7 +7236,7 @@ function renderOutgoingMessages() {
       const retry = document.createElement("button");
       retry.className = "outgoing-retry";
       retry.setAttribute("type", "button");
-      retry.textContent = entry.postedCount ? "Retry unsent text" : "Retry";
+      retry.textContent = waiting ? "Retry now" : entry.postedCount ? "Retry unsent text" : "Retry";
       retry.disabled = !entry.remaining || knownChannel(entry.channel)?.writable === false;
       retry.addEventListener("click", guardQuietly(() => retryOutgoingMessage(entry.id)));
       const dismiss = document.createElement("button");
@@ -7090,6 +7245,7 @@ function renderOutgoingMessages() {
       dismiss.textContent = "Dismiss";
       dismiss.setAttribute("title", "Discard this local send record. This does not delete a message from the chat service.");
       dismiss.addEventListener("click", () => {
+        cancelOutgoingRetry(entry.id);
         outgoingMessages.delete(entry.id);
         outgoingObservations.delete(entry.id);
         persistOutgoingMessages();
@@ -7117,15 +7273,22 @@ function queueOutgoingMessage(request) {
   const entry = {
     id, ...request, originView: channelView, createdAt: Date.now(),
     remaining: request.text.trim(), state: "sending", phase: "queued",
-    parts: [], observedParts: [], postedCount: 0, detail: "",
+    parts: [], observedParts: [], postedCount: 0, detail: "", keyedOnly: true,
   };
   outgoingMessages.set(id, entry);
   return scheduleOutgoingMessage(entry);
 }
 
-function retryOutgoingMessage(id) {
+/**
+ * Send a failed or unconfirmed entry again: because the reader tapped Retry, or — `automatic` —
+ * because its wait for an automatic retry ran out.
+ */
+function retryOutgoingMessage(id, automatic = false) {
   const entry = outgoingMessages.get(id);
   if (!entry || entry.state === "sending" || entry.state === "sent" || !entry.remaining) return;
+  cancelOutgoingRetry(id);
+  // A person deciding starts the automatic schedule again, should this attempt fail too.
+  entry.retriesUsed = automatic ? (entry.retriesUsed || 0) + 1 : 0;
   if (knownChannel(entry.channel)?.writable === false) {
     entry.detail = "This channel is read-only.";
     persistOutgoingMessages();
@@ -7161,6 +7324,9 @@ async function dispatchOutgoingMessage(entry, job) {
   if (job.stopped) return;
   let timer = null;
   const controller = typeof AbortController === "function" ? new AbortController() : null;
+  // Whether this attempt failed in a way that could succeed later — a timeout, a lost connection,
+  // the provider's 5xx — rather than with an answer. Only such a failure goes again on its own.
+  let transient = false;
   try {
     if (!job.credential || token() !== job.credential) {
       entry.state = "failed";
@@ -7172,12 +7338,29 @@ async function dispatchOutgoingMessage(entry, job) {
       entry.detail = "This channel is read-only.";
       return;
     }
+    // `#195 send-resilience`. A device that knows it is offline holds the message instead of
+    // failing it. Nothing has left the device, so sending it when the connection returns cannot
+    // post it twice — through any provider, keyed or not.
+    if (navigator.onLine === false) {
+      entry.state = "failed";
+      entry.detail = "This device is offline.";
+      holdOutgoingMessage(entry, { at: Date.now(), offline: true, unsent: true });
+      return;
+    }
     entry.phase = "posting";
     persistOutgoingMessages();
     renderOutgoingMessages();
     const body = { text: entry.remaining };
     if (entry.replyTo) body.reply_to = entry.replyTo;
     if (entry.threadId) body.thread_id = entry.threadId;
+    // The entry's id names this post on every attempt, across reloads, so the server can tell a
+    // retry from a second message. Sent only where it is honoured; one attempt without it and the
+    // entry can never again prove a retry safe.
+    if (channelPostsOnce(entry.channel) && IDEMPOTENCY_KEY.test(entry.id)) {
+      body.idempotency_key = entry.id;
+    } else {
+      entry.keyedOnly = false;
+    }
     const interruption = new Promise((_resolve, reject) => {
       job.cancel = () => {
         if (controller) controller.abort();
@@ -7185,7 +7368,9 @@ async function dispatchOutgoingMessage(entry, job) {
       };
       timer = setTimeout(() => {
         if (controller) controller.abort();
-        reject(new Error("The send timed out before delivery was confirmed."));
+        const late = /** @type {ApiRequestError} */ (new Error("The send timed out before delivery was confirmed."));
+        late.timedOut = true;
+        reject(late);
       }, OUTGOING_TIMEOUT_MS);
     });
     const payload = await Promise.race([
@@ -7202,7 +7387,12 @@ async function dispatchOutgoingMessage(entry, job) {
       entry.remaining = typeof payload.unsent === "string" ? payload.unsent : "";
       entry.state = "unconfirmed";
       outgoingObservations.delete(entry.id);
-      entry.detail = redact(payload.detail || "The remaining delivery could not be confirmed.");
+      entry.detail = redact(payload.detail
+        ? readableCause(payload.detail, chatServiceOf(entry.channel))
+        : "The remaining delivery could not be confirmed.");
+      // Said by the server, which knows whether the provider answered or merely failed to; an
+      // older server does not say, and its 207 is left to the reader.
+      transient = payload.retryable === true && Boolean(entry.remaining);
       return;
     }
     const parts = payload && Array.isArray(payload.parts) && payload.parts.length
@@ -7230,17 +7420,146 @@ async function dispatchOutgoingMessage(entry, job) {
     entry.state = error.status >= 400 && error.status < 500 && error.status !== 408
       ? "failed" : "unconfirmed";
     outgoingObservations.delete(entry.id);
-    entry.detail = redact(error.message);
+    // The page's own network sentence tells the reader to retry when the connection recovers,
+    // which a row that may retry by itself must not say.
+    entry.detail = redact(error.network
+      ? "The connection to vibe-talk failed before delivery was confirmed."
+      : readableFailure(error, chatServiceOf(entry.channel)));
+    // Never a refusal: a 4xx is an answer, and asking again asks the same question.
+    transient = Boolean(error.network || error.timedOut || error.status >= 500 || error.status === 408);
   } finally {
     if (timer !== null) clearTimeout(timer);
     job.cancel = null;
     entry.phase = "";
+    if (transient && !job.stopped) planOutgoingRetry(entry);
     persistOutgoingMessages();
     renderChannelRows();
   }
 }
 
+// --- sending again on its own ---------------------------------------------------------------------
+//
+// `#195 send-resilience`. The incident this answers: a slow chat service timed out two sends, each
+// was left as "Delivery unconfirmed. Check history before retrying", and the same words went
+// through from the service's own app a minute later. A send whose answer was lost may or may not
+// have landed, so sending it again is only safe where the second request is recognised as the
+// first. The server says where that is (`idempotent_posts_supported`): there each entry's id goes
+// with every attempt as its idempotency key, the server binds it to each part's text, and the
+// provider posts it at most once. There, and only there, a transient failure goes again after
+// 5 s, 15 s and 45 s, sooner when the connection returns or the page comes back into view, and
+// then stops and offers Retry. Everywhere else the only automatic send is one that never left the
+// device — held while it knew it was offline.
+//
+// Never after a reload: a reopened page has no record of what its last attempt did, and a send the
+// reader did not watch go out should not go out again on a page they did not ask to send from.
+
+/** What the server accepts as an idempotency key; the outbox's own ids always are one. */
+const IDEMPOTENCY_KEY = /^[A-Za-z0-9_-]{1,64}$/;
+
+/** Whether `channel`'s provider posts a keyed message at most once, by the server's account. */
+function channelPostsOnce(channel) {
+  // With several providers each channel answers for its own; a channel the server described no
+  // provider for is not given another provider's guarantee.
+  if (providerDescriptions.size) {
+    const provider = providerOfChannel(channel);
+    return Boolean(provider && provider.idempotent_posts_supported === true);
+  }
+  return deploymentCapabilities.idempotentPosts;
+}
+
+/**
+ * Whether sending `entry` again cannot post what may already have landed: every attempt so far
+ * carried its key to a provider that honours it.
+ *
+ * Not for a remainder that starts with the reply, though. After a 207 the unsent text goes again
+ * with the reply target, which makes its first part a different request from the part that failed
+ * — and that part is exactly the one whose arrival nobody knows.
+ */
+function retriesItself(entry) {
+  return entry.keyedOnly === true && channelPostsOnce(entry.channel) &&
+    !(entry.postedCount > 0 && entry.replyTo);
+}
+
+/** After a transient failure: arm the next automatic attempt, or leave the row to the reader. */
+function planOutgoingRetry(entry) {
+  const used = entry.retriesUsed || 0;
+  if (!retriesItself(entry) || used >= OUTGOING_RETRY_ATTEMPTS) return;
+  const delay = OUTGOING_RETRY_FIRST_MS * OUTGOING_RETRY_FACTOR ** used;
+  holdOutgoingMessage(entry, { at: Date.now() + delay, offline: navigator.onLine === false, unsent: false });
+}
+
+/** Hold `entry` for an automatic send: at `at`, or when the connection returns. */
+function holdOutgoingMessage(entry, { at, offline, unsent }) {
+  cancelOutgoingRetry(entry.id);
+  const delay = Math.max(0, at - Date.now());
+  const waiting = { at, offline, unsent, identity: tokenFingerprint(token()), timer: null };
+  if (!offline) waiting.timer = setTimeout(() => fireOutgoingRetry(entry.id), delay);
+  outgoingRetries.set(entry.id, waiting);
+}
+
+function cancelOutgoingRetry(id) {
+  const waiting = outgoingRetries.get(id);
+  if (!waiting) return;
+  if (waiting.timer !== null) clearTimeout(waiting.timer);
+  outgoingRetries.delete(id);
+}
+
+/** The wait is over. Still offline: wait for the connection instead. */
+function fireOutgoingRetry(id) {
+  const waiting = outgoingRetries.get(id);
+  const entry = outgoingMessages.get(id);
+  if (!waiting || !entry) return;
+  if (waiting.timer !== null) clearTimeout(waiting.timer);
+  waiting.timer = null;
+  if (navigator.onLine === false) {
+    waiting.offline = true;
+    renderOutgoingMessages();
+    return;
+  }
+  // Signed in as someone else since: this is not a send that person made.
+  if (waiting.identity !== tokenFingerprint(token())) {
+    outgoingRetries.delete(id);
+    entry.detail = "Sign-in changed before this message was sent again.";
+    persistOutgoingMessages();
+    renderOutgoingMessages();
+    return;
+  }
+  // A hold for a connection was never an attempt, so it spends none of the automatic ones.
+  const automatic = !waiting.unsent;
+  guardQuietly(() => retryOutgoingMessage(id, automatic))();
+}
+
+/** The connection is back, or the page is in view again after its timers were held. */
+function resumeOutgoingRetries() {
+  for (const [id, waiting] of [...outgoingRetries]) {
+    const due = waiting.offline ? navigator.onLine !== false : waiting.at <= Date.now();
+    if (due) fireOutgoingRetry(id);
+  }
+}
+
+// The browser's own word that the connection is back. The fixture pages in the suite have no
+// `window.addEventListener`; a browser always does.
+if (typeof window.addEventListener === "function") {
+  window.addEventListener("online", () => resumeOutgoingRetries());
+}
+
+/**
+ * {@link readableFailure} for the cause a 207 carries, which is always the provider's: its answer
+ * (`… returned HTTP 400: …`), or the server's failure to get one (`… request failed: …`).
+ */
+function readableCause(detail, service) {
+  const text = String(detail || "");
+  const status = Number((/returned HTTP (\d{3})/.exec(text) || [])[1]) || 0;
+  if (status && status < 500 && status !== 408) return providerWords(text);
+  if (!status && /request failed/i.test(text) && !SLOW_WORDS.test(text)) {
+    return `${sentenceStart(service)} could not be reached right now.`;
+  }
+  return readableFailure(Object.assign(new Error(text), { status: status || 502, detail: text }), service);
+}
+
 function stopOutgoingSends() {
+  // Nothing goes out on its own for a credential that is going away.
+  for (const id of [...outgoingRetries.keys()]) cancelOutgoingRetry(id);
   for (const [id, job] of outgoingJobs) {
     const entry = outgoingMessages.get(id);
     if (!entry || entry.state !== "sending") continue;
@@ -10371,9 +10690,8 @@ async function loadDiscord(options) {
     if (!keepPosition) {
       setStatus("fetching the channel…");
     }
-    const payload = await api(
-      `/api/v1/channels/${encodeURIComponent(channel)}/page?limit=${DISCORD_PAGE_LIMIT}`
-    );
+    const path = `/api/v1/channels/${encodeURIComponent(channel)}/page?limit=${DISCORD_PAGE_LIMIT}`;
+    const payload = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => api(path, { signal }));
     if (!currentDiscordLoad(generation, channel, false)) {
       return;
     }
@@ -11072,6 +11390,10 @@ async function sendReply() {
 // fallback if that adapter or the browser's stream is interrupted.
 
 const DISCORD_POLL_MS = 45000;
+// `#195 send-resilience`. How long a read of the newest messages may take before the page stops
+// waiting and says the refresh failed. Above what a slow service ordinarily takes — ten to twelve
+// seconds, in the incident this was written for — and well inside the server's own fifty.
+const CHANNEL_READ_TIMEOUT_MS = 20000;
 let discordPollTimer = null;
 let discordFetchInFlight = false;
 // Every requested replacement gets a generation, including one that arrives while another request
@@ -11132,7 +11454,7 @@ function scheduleDiscordPoll() {
   discordPollTimer = setTimeout(() => {
     discordPollTimer = null;
     if (currentView !== "discord") return;
-    guardQuietly(async () => {
+    refreshQuietly(async () => {
       // A failed poll is the case polling exists for — the network comes back — so the next one
       // is armed whatever this one did. A page that opened offline never heard `/client-config`
       // either, and it asks again first.
@@ -11756,7 +12078,7 @@ function onStreamFrame(frame) {
     // would ask the server to replay what it has already said it cannot.
     liveLastEventId = null;
     setStatus("the live feed fell behind — re-reading the channel.");
-    guardQuietly(() => loadDiscord({ keepPosition: true }))();
+    refreshQuietly(() => loadDiscord({ keepPosition: true }))();
     return;
   }
   if (!frame.data) {
@@ -11809,7 +12131,7 @@ function refreshAfterLiveMutation() {
     return;
   }
   liveMutationRefreshRunning = true;
-  guardQuietly(async () => {
+  refreshQuietly(async () => {
     try {
       while (liveMutationRefreshNeeded) {
         liveMutationRefreshNeeded = false;
@@ -11872,7 +12194,7 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
     relayToAgent(message, selfPosted, replayed);
     // The server owns thread membership, counts and activity ordering. Re-read the active
     // context instead of dropping a reply from another thread into the visible conversation.
-    if (!replayed) guardQuietly(() => loadDiscord({ keepPosition: true }))();
+    if (!replayed) refreshQuietly(() => loadDiscord({ keepPosition: true }))();
     else if (!held) {
       awaitReplayRead(String(message.id), String(message.channel_id),
         fromTail ? liveAttachReads : timelineReadsStarted);
@@ -11945,7 +12267,7 @@ function heldMessage(id) {
 function awaitReplayRead(key, channel, arrivedAfter) {
   if (timelineReadsLanded > arrivedAfter) return;
   replaysAwaitingRead.set(key, { channel, arrivedAfter });
-  if (!discordFetchInFlight && currentView === "discord") guardQuietly(() => loadDiscord({ keepPosition: true }))();
+  if (!discordFetchInFlight && currentView === "discord") refreshQuietly(() => loadDiscord({ keepPosition: true }))();
 }
 
 /**
@@ -12188,6 +12510,7 @@ let providerDescriptions = new Map();
 let deploymentCapabilities = {
   threading: false,
   upstreamReadMark: false,
+  idempotentPosts: false,
   liveDelivery: "off",
   livePollSeconds: 0,
 };
@@ -12904,6 +13227,8 @@ function applyClientConfig(config) {
       : "off";
   upstreamReadMarkSupported = config.upstream_read_mark_supported === true;
   deploymentCapabilities.upstreamReadMark = upstreamReadMarkSupported;
+  // `#195 send-resilience`. Read per channel, by `channelPostsOnce`, when a send fails.
+  deploymentCapabilities.idempotentPosts = config.idempotent_posts_supported === true;
   summariesDisabledByServer =
     typeof config.summaries_unavailable === "string" ? config.summaries_unavailable.trim() : "";
   if (summariesDisabledByServer && summaryMode) setSummaryMode(false);
@@ -13551,6 +13876,24 @@ function guardQuietly(fn) {
   return (...args) =>
     Promise.resolve(fn(...args)).catch((error) => {
       showError(error.message);
+    });
+}
+
+/**
+ * Like `guardQuietly`, for a re-read of the channel nobody asked for: the poll, the live feed's
+ * catch-up. `#195 send-resilience`.
+ *
+ * Its failure is already said over the rows it is about, by the freshness pill — "Refresh failed ·
+ * showing messages from 10:17". The banner on top of that was the same news a second time, in the
+ * server's diagnostic words, back on every poll for as long as the service stayed slow, and it
+ * read as though something the reader did had failed. The banner stays for what the reader asked
+ * for, and for a failure with no rows on screen to carry it — reworded, never raw.
+ */
+function refreshQuietly(fn) {
+  return (...args) =>
+    Promise.resolve(fn(...args)).catch((error) => {
+      if (error && error.shownInPill) return;
+      showError(readableChannelFailure(error));
     });
 }
 

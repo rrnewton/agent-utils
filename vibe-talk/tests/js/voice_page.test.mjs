@@ -1055,6 +1055,9 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         channel_discovery_supported: page.channelDiscoverySupported,
         threading_supported: page.threadingSupported,
         upstream_read_mark_supported: page.upstreamReadMarkSupported,
+        // Absent unless a test says the provider posts a keyed message at most once, as the server
+        // omits it when false. `#195 send-resilience`.
+        idempotent_posts_supported: page.idempotentPostsSupported,
         replay_enabled: page.replayEnabled,
         speech_prep_enabled: page.speechPrepEnabled,
         self_author_id: page.selfAuthorId,
@@ -1113,6 +1116,11 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     addChannelConflict: false,
     /** Whether the provider can move its own read cursor. Default false, like production. */
     upstreamReadMarkSupported: false,
+    /**
+     * Whether the server says a keyed send is posted at most once, so the page may retry a lost
+     * answer on its own. `undefined` sends nothing, which is what a server that cannot says.
+     */
+    idempotentPostsSupported: undefined,
     /** The scope the server reports for the saved token; `undefined` plays a malformed answer. */
     tokenScope: "write",
     /** Every explicit provider read-boundary request. Separate from local Done/archive calls. */
@@ -1469,6 +1477,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
 
   const navigator = {
     language: "en-US",
+    // `#195 send-resilience`. What the browser believes about the connection; see `setOnline`.
+    onLine: true,
     mediaDevices: {
       getUserMedia: async (constraints) => {
         // Rebuilt in THIS realm, key for key. The page's object is made inside the vm context, so
@@ -1508,6 +1518,16 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   };
   page.clock = () => clockMs;
 
+  // The window's own listeners — today only `online`, the browser's word that the connection is
+  // back, which `#195 send-resilience` resumes held sends on.
+  const windowListeners = new Map();
+  /** Lose or regain the connection — the property AND the event, as a browser does. */
+  page.setOnline = async (online) => {
+    navigator.onLine = online;
+    for (const fn of windowListeners.get(online ? "online" : "offline") || []) {
+      await fn();
+    }
+  };
   const context = {
     document,
     localStorage,
@@ -1515,6 +1535,9 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     window: {
       AudioContext: function () { return new FakeAudioContext(page); },
       location: { origin: "https://vibe.example" },
+      addEventListener: (type, fn) => {
+        windowListeners.set(type, [...(windowListeners.get(type) || []), fn]);
+      },
     },
     navigator,
     console,
@@ -2282,6 +2305,20 @@ const TUNING_BANDS = {
     "short chunks at half speed may take many seconds; a hung engine must eventually release the row"],
   OUTGOING_TIMEOUT_MS: [15000, 180000,
     "slow mobile sends need time to complete, but a lost response must not spin forever or block queued messages"],
+  OUTGOING_RETRY_FIRST_MS: [2000, 15000,
+    "the wait before a lost send goes again on its own (#195 send-resilience). Under a couple of " +
+    "seconds it lands on the same slow moment that lost it; past fifteen the reader has already " +
+    "decided it failed and is reaching for Retry"],
+  OUTGOING_RETRY_FACTOR: [2, 4,
+    "how much longer each later wait is. Below double, three tries are spent inside one bad " +
+    "minute; above four, the last one comes after the reader has stopped looking"],
+  OUTGOING_RETRY_ATTEMPTS: [1, 4,
+    "automatic tries before a person decides. None is the incident this exists for; past a few, a " +
+    "service that is down is asked again and again by a page nobody is watching"],
+  CHANNEL_READ_TIMEOUT_MS: [15000, 45000,
+    "how long a read of the newest messages is waited for (#195 send-resilience). A slow service " +
+    "ordinarily answers in ten to twelve seconds, so under fifteen every slow read fails; past " +
+    "forty-five the reader watches \"refreshing…\" about as long as the server's own fifty-second bound"],
   STATUS_DISMISS_MS: [2000, 20000,
     "below a couple of seconds the message goes before it can be read; above twenty it is a " +
     "fixture covering a line of the conversation, the thing #63 status-line-placement took away"],
@@ -20737,4 +20774,367 @@ test("a channel with child threads keeps a root-only Main, even after visiting a
   await page.settle();
   assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "a live reply reached a threaded Main");
   assert.equal(savedScopes(page)[scopeKey(CHANNEL.id)].scope, null);
+});
+
+// --- a slow or failing chat service --------------------------------------------------------------
+//
+// `#195 send-resilience`. The incident: a chat service answering reads in ten to twelve seconds
+// and failing some after fifty, and timing out sends. The page raised a red banner carrying the
+// server's raw diagnosis for a background refresh nobody asked for, and left each lost send for a
+// manual Retry although the server could have made a second attempt safe. The provider name and
+// every message text here are invented.
+
+/** A provider failure as the server words it for a send that timed out upstream. */
+const SLOW_SEND =
+  'Example Chat returned HTTP 502: {"message":"upstream message send failed: command timed out after 4.8s"}';
+const RETRY_FIRST_MS = sourceConstant("OUTGOING_RETRY_FIRST_MS");
+const RETRY_FACTOR = sourceConstant("OUTGOING_RETRY_FACTOR");
+const RETRY_ATTEMPTS = sourceConstant("OUTGOING_RETRY_ATTEMPTS");
+const CHANNEL_READ_TIMEOUT_MS = sourceConstant("CHANNEL_READ_TIMEOUT_MS");
+
+/** A signed-in channel view whose server promises that a keyed send is posted at most once. */
+async function keyedChannel() {
+  const page = newPage();
+  page.chatProviderName = "Example Chat";
+  page.idempotentPostsSupported = true;
+  await signIn(page);
+  await showDiscord(page, []);
+  return page;
+}
+
+/** Type and send one channel message, and let its first attempt finish. */
+async function sendChannel(page, text) {
+  await page.el("channel-compose-text").setValue(text);
+  await page.el("channel-send").click();
+  await page.settle();
+}
+
+/** Let an automatic retry's POST go out and its answer land. */
+async function settleSend(page) {
+  await page.settle();
+  await page.settle();
+}
+
+const posted = (page) => page.repliesPosted.map((call) => call.body);
+const sentOk = async (_path, options) =>
+  json(200, { posted: message({ id: "9194000000000000001", content: JSON.parse(options.body).text }) });
+
+test("a background refresh the chat service is too slow for says so in the pill, never in a banner", async () => {
+  const page = newPage();
+  page.chatProviderName = "Example Chat";
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1941", content: "already on screen" })]);
+  page.channelPage = errorResponse(502, "chat_error",
+    'Example Chat returned HTTP 502: {"message":"history read timed out (command timed out after ' +
+      '18.6s); no partial timeline was returned"}');
+  await reReadChannel(page);
+  assert.deepStrictEqual(shownIds(page), ["1941"], "a failed refresh took the rows away");
+  assert.equal(page.el("error").hidden, true,
+    `a refresh nobody asked for raised a banner: ${page.el("error").textContent}`);
+  assert.match(freshness(page).textContent,
+    /^Example Chat is slow to answer · showing messages from \d{2}:\d{2}$/);
+  assert.equal(freshness(page).getAttribute("data-state"), "slow");
+
+  // A failure that is not a timeout is still the pill's to say.
+  page.channelPage = errorResponse(502, "chat_error",
+    'Example Chat returned HTTP 502: {"message":"upstream command exited 1"}');
+  await reReadChannel(page);
+  assert.match(freshness(page).textContent, /^Refresh failed · showing messages from \d{2}:\d{2}$/);
+  assert.equal(page.el("error").hidden, true, "the second failed refresh raised a banner");
+
+  // A refresh the READER asked for keeps its banner: in words, not the server's diagnosis.
+  page.el("scroll-area").scrollTop = 0;
+  await pullDown(page, PULL_ARM_PX);
+  assert.equal(page.el("error").hidden, false, "a pull that failed said nothing");
+  assert.match(page.el("error").textContent, /^Example Chat could not answer: upstream command exited 1$/);
+  assert.doesNotMatch(page.el("error").textContent, /HTTP 502|chat_error|\{/);
+});
+
+test("a failed background refresh with nothing on screen is still reported, in words", async () => {
+  const page = newPage();
+  page.chatProviderName = "Example Chat";
+  await signIn(page);
+  page.channelPage = errorResponse(504, "error", "(no detail)");
+  await showDiscord(page, []);
+  assert.equal(page.el("error").hidden, false, "entering a channel that could not be read said nothing");
+  await page.el("dismiss-error").click();
+  await reReadChannel(page);
+  assert.equal(page.el("error").hidden, false, "with no rows there is no pill to carry the failure");
+  assert.equal(page.el("error").textContent, "Example Chat is slow to answer right now.");
+});
+
+test("a read of the newest messages gives up after a bound, says so, and the next poll asks again", async () => {
+  // The server bounds its own read at fifty seconds; a reader watching "refreshing…" should not.
+  const page = newPage();
+  page.chatProviderName = "Example Chat";
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1942", content: "already on screen" })]);
+  const healthy = page.channelPage;
+  const reads = page.pageReads;
+  page.channelPage = () => new Promise(() => {});
+  await reReadChannel(page);
+  assert.equal(page.pageReads, reads + 1);
+  assert.equal(page.expireTimers(CHANNEL_READ_TIMEOUT_MS), 1, "nothing bounded the read");
+  await page.settle();
+  assert.match(freshness(page).textContent, /^Example Chat is slow to answer · showing messages from/);
+  assert.equal(page.el("error").hidden, true);
+  page.channelPage = healthy;
+  await reReadChannel(page);
+  assert.equal(page.pageReads, reads + 2, "the abandoned read still held the next one back");
+  assertCurrent(page, "a read after the abandoned one did not bring the channel back to current");
+
+  const threaded = newPage();
+  threaded.threadingSupported = true;
+  await signIn(threaded);
+  await showDiscord(threaded, [message({ id: "1943", content: "a threaded channel" })]);
+  threaded.timeline = () => new Promise(() => {});
+  await reReadChannel(threaded);
+  assert.equal(threaded.expireTimers(CHANNEL_READ_TIMEOUT_MS), 1, "a timeline read was not bounded");
+  await threaded.settle();
+  assert.match(freshness(threaded).textContent, /is slow to answer · showing messages from/);
+});
+
+test("a send the chat service was too slow to confirm goes again on its own, under the same key", async () => {
+  const page = await keyedChannel();
+  page.replyResponse = async () => json(207, {
+    error: "partially_posted", posted: 0, unsent: "did this go out", detail: SLOW_SEND, retryable: true,
+  });
+  await sendChannel(page, "did this go out");
+  const row = outgoingRows(page)[0];
+  const id = row.getAttribute("data-outgoing-id");
+  assert.deepEqual(posted(page), [{ text: "did this go out", idempotency_key: id }],
+    "the send carried no key a retry could be recognised by");
+  assert.equal(row.getAttribute("data-send-state"), "retrying");
+  assert.match(row.text(), /Sending… Example Chat is slow to answer right now\. Retrying in 5 s\./);
+  assert.doesNotMatch(row.text(), /HTTP 502|\{/, "the row shows the server's diagnosis");
+  assert.equal(outgoingRetry(row).textContent, "Retry now");
+  assert.equal(outgoingSpinner(row), undefined, "a row that is waiting claims to be sending");
+  assert.equal(savedOutgoing(page)[0].state, "unconfirmed", "the saved state would let a reload resend");
+
+  page.replyResponse = sentOk;
+  assert.equal(page.expireTimers(RETRY_FIRST_MS), 1, "no automatic retry was armed");
+  await settleSend(page);
+  assert.equal(page.repliesPosted.length, 2);
+  assert.deepEqual(posted(page)[1], posted(page)[0], "the retry was not the same request");
+  assert.equal(outgoingRows(page).length, 0, "the confirmed retry left its receipt behind");
+  assert.equal(shownIds(page).filter((shown) => shown === "9194000000000000001").length, 1);
+});
+
+test("automatic retries wait 5, 15 and 45 seconds, then stop and leave Retry to the reader", async () => {
+  const page = await keyedChannel();
+  page.replyResponse = errorResponse(502, "chat_error", SLOW_SEND);
+  await sendChannel(page, "keep trying");
+  for (let attempt = 0; attempt < RETRY_ATTEMPTS; attempt += 1) {
+    const wait = RETRY_FIRST_MS * RETRY_FACTOR ** attempt;
+    assert.match(outgoingRows(page)[0].text(), new RegExp(`Retrying in ${wait / 1000} s\\.`));
+    assert.ok(page.expireTimers(wait) >= 1, `no retry was armed for ${wait} ms`);
+    await settleSend(page);
+    assert.equal(page.repliesPosted.length, attempt + 2, `the retry after ${wait} ms did not go out`);
+  }
+  const row = outgoingRows(page)[0];
+  assert.equal(row.getAttribute("data-send-state"), "unconfirmed", "the retries never stopped");
+  assert.doesNotMatch(row.text(), /Retrying in/);
+  assert.match(row.text(), /Delivery unconfirmed\. Retrying cannot post it twice\./);
+  assert.equal(outgoingRetry(row).textContent, "Retry");
+  page.expireTimers(RETRY_FIRST_MS * RETRY_FACTOR ** RETRY_ATTEMPTS);
+  await settleSend(page);
+  assert.equal(page.repliesPosted.length, RETRY_ATTEMPTS + 1, "a retry went out after the last one");
+  assert.ok(posted(page).every((body) => body.idempotency_key === posted(page)[0].idempotency_key),
+    "an attempt went out under another key");
+
+  // A person tapping Retry starts the schedule again, should that attempt fail too.
+  await outgoingRetry(row).click();
+  await settleSend(page);
+  assert.equal(page.repliesPosted.length, RETRY_ATTEMPTS + 2);
+  assert.match(outgoingRows(page)[0].text(), /Retrying in 5 s\./);
+});
+
+test("a refusal is never sent again on its own, keyed or not", async () => {
+  const page = await keyedChannel();
+  // The provider said no: the server marks the 207 as not worth retrying.
+  page.replyResponse = async () => json(207, {
+    error: "partially_posted", posted: 0, unsent: "refused words", retryable: false,
+    detail: 'Example Chat returned HTTP 400: {"message":"not allowed in this space"}',
+  });
+  await sendChannel(page, "refused words");
+  const row = outgoingRows(page)[0];
+  assert.equal(row.getAttribute("data-send-state"), "unconfirmed");
+  assert.match(row.text(), /not allowed in this space/);
+  assert.doesNotMatch(row.text(), /Retrying in|\{/);
+  // ...and the server itself refusing, with a 4xx.
+  page.replyResponse = errorResponse(400, "refused", "message content is empty");
+  await sendChannel(page, "also refused");
+  assert.equal(outgoingRows(page)[1].getAttribute("data-send-state"), "failed");
+  for (const wait of [RETRY_FIRST_MS, RETRY_FIRST_MS * RETRY_FACTOR, RETRY_FIRST_MS * RETRY_FACTOR ** 2]) {
+    page.expireTimers(wait);
+  }
+  await settleSend(page);
+  assert.equal(page.repliesPosted.length, 2, "a refusal was asked again");
+});
+
+test("where no provider promises one post per key, a lost send waits for the reader and carries no key", async () => {
+  const page = newPage();
+  page.chatProviderName = "Example Chat";
+  await signIn(page);
+  await showDiscord(page, []);
+  page.replyResponse = async () => json(207, {
+    error: "partially_posted", posted: 0, unsent: "maybe delivered", retryable: true,
+    detail: "Example Chat request failed: connection reset by peer",
+  });
+  await sendChannel(page, "maybe delivered");
+  assert.deepEqual(posted(page), [{ text: "maybe delivered" }], "a key went to a server that ignores it");
+  const row = outgoingRows(page)[0];
+  assert.equal(row.getAttribute("data-send-state"), "unconfirmed");
+  assert.match(row.text(), /Check history before retrying/);
+  assert.match(row.text(), /Example Chat could not be reached right now\./);
+  page.expireTimers(RETRY_FIRST_MS);
+  await settleSend(page);
+  assert.equal(page.repliesPosted.length, 1, "an ambiguous send was retried without a guarantee");
+
+  // Several providers: only the channel whose own provider promises it is retried on its own.
+  const multi = newPage();
+  const space = { id: "1110000000000000301", label: "chat space", writable: true, provider: "gchat" };
+  const team = { id: "C0194ABCDE", label: "team", writable: true, provider: "slack" };
+  multi.channels = [team, space];
+  multi.idempotentPostsSupported = true;
+  multi.providers = [
+    { key: "gchat", name: "Example Chat", threading_supported: false, live_delivery: "poll",
+      live_poll_seconds: 30, channel_registration_supported: true, channel_discovery_supported: false,
+      upstream_read_mark_supported: false, idempotent_posts_supported: true,
+      self_author_id: null, owner_author_id: null },
+    { key: "slack", name: "Other Chat", threading_supported: false, live_delivery: "poll",
+      live_poll_seconds: 30, channel_registration_supported: true, channel_discovery_supported: false,
+      upstream_read_mark_supported: false, self_author_id: null, owner_author_id: null },
+  ];
+  multi.channelPage = async (path) =>
+    json(200, { channel: String(path).includes(space.id) ? space : team, messages: [] });
+  multi.replyResponse = errorResponse(502, "chat_error", SLOW_SEND);
+  await signIn(multi);
+  await showDiscord(multi, []);
+  await sendChannel(multi, "to the team");
+  multi.el("discord-channel").value = space.id;
+  await multi.el("discord-channel").dispatch("change");
+  await multi.settle();
+  await sendChannel(multi, "to the space");
+  assert.equal("idempotency_key" in posted(multi)[0], false, "the other provider's guarantee was borrowed");
+  assert.ok(posted(multi)[1].idempotency_key, "the promising provider's channel sent no key");
+  assert.match(outgoingRows(multi)[0].text(), /Retrying in 5 s\./);
+});
+
+test("a message written while the device is offline waits for the connection, then goes", async () => {
+  // Nothing left the device, so this is safe through any provider: no key is needed.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, []);
+  await page.setOnline(false);
+  await sendChannel(page, "written in a tunnel");
+  assert.equal(page.repliesPosted.length, 0, "an offline device tried to send");
+  const row = outgoingRows(page)[0];
+  assert.equal(row.getAttribute("data-send-state"), "retrying");
+  assert.match(row.text(), /Offline\. Will send when online\./);
+  assert.equal(savedOutgoing(page)[0].state, "failed", "a reload would claim it might have been sent");
+  await page.setOnline(true);
+  await settleSend(page);
+  assert.deepEqual(posted(page), [{ text: "written in a tunnel" }]);
+  assert.equal(outgoingRows(page).length, 0);
+});
+
+test("a retry that comes due while offline waits for the connection instead", async () => {
+  const page = await keyedChannel();
+  page.replyResponse = async () => { throw new TypeError("Failed to fetch"); };
+  await sendChannel(page, "sent as the signal dropped");
+  assert.match(outgoingRows(page)[0].text(), /Retrying in 5 s\./);
+  await page.setOnline(false);
+  page.expireTimers(RETRY_FIRST_MS);
+  await settleSend(page);
+  assert.equal(page.repliesPosted.length, 1, "a retry was attempted with no connection");
+  assert.match(outgoingRows(page)[0].text(), /Sending… Will retry when online\./);
+  page.replyResponse = sentOk;
+  await page.setOnline(true);
+  await settleSend(page);
+  assert.equal(page.repliesPosted.length, 2, "the connection came back and nothing was sent");
+  assert.deepEqual(posted(page)[1], posted(page)[0]);
+  assert.equal(outgoingRows(page).length, 0);
+});
+
+test("a retry whose wait ran out while the page was hidden goes as soon as the page is back", async () => {
+  // A phone holds a hidden page's timers, so the wait cannot be trusted to have fired.
+  const page = await keyedChannel();
+  page.replyResponse = errorResponse(502, "chat_error", SLOW_SEND);
+  await sendChannel(page, "sent before the screen went off");
+  await page.setVisibility("hidden");
+  page.setClock(page.clock() + RETRY_FIRST_MS + 1000);
+  page.replyResponse = sentOk;
+  await page.setVisibility("visible");
+  await settleSend(page);
+  assert.equal(page.repliesPosted.length, 2, "coming back did not send what was due");
+  page.expireTimers(RETRY_FIRST_MS);
+  await settleSend(page);
+  assert.equal(page.repliesPosted.length, 2, "the held timer sent it a second time");
+});
+
+test("a reload never resumes an automatic retry, and a tapped Retry still goes under the same key", async () => {
+  const page = await keyedChannel();
+  page.replyResponse = errorResponse(502, "chat_error", SLOW_SEND);
+  await sendChannel(page, "before the app was closed");
+  const key = posted(page)[0].idempotency_key;
+  const again = newPage(new Map(page.storage));
+  again.idempotentPostsSupported = true;
+  await signIn(again);
+  await showDiscord(again, []);
+  for (const wait of [RETRY_FIRST_MS, RETRY_FIRST_MS * RETRY_FACTOR]) again.expireTimers(wait);
+  await settleSend(again);
+  assert.equal(again.repliesPosted.length, 0, "reopening the app sent a message on its own");
+  const row = outgoingRows(again)[0];
+  assert.equal(row.getAttribute("data-send-state"), "unconfirmed");
+  assert.match(row.text(), /Retrying cannot post it twice\./);
+  again.replyResponse = sentOk;
+  await outgoingRetry(row).click();
+  await settleSend(again);
+  assert.deepEqual(posted(again), [{ text: "before the app was closed", idempotency_key: key }]);
+});
+
+test("after part of a message posted, the rest goes again on its own only if it does not start a reply", async () => {
+  const page = await keyedChannel();
+  page.replyResponse = async () => json(207, {
+    error: "partially_posted", posted: 1, unsent: "the second part", detail: SLOW_SEND, retryable: true,
+  });
+  await sendChannel(page, "the first part. the second part");
+  assert.match(outgoingRows(page)[0].text(), /1 part confirmed\. Sending… .*Retrying in 5 s\./);
+  page.replyResponse = sentOk;
+  page.expireTimers(RETRY_FIRST_MS);
+  await settleSend(page);
+  assert.deepEqual(posted(page)[1], { text: "the second part", idempotency_key: posted(page)[0].idempotency_key },
+    "the retry repeated the posted part or changed its key");
+
+  // A reply's remainder goes again WITH the reply target, so its first part would be a different
+  // request from the one that failed: that is left to the reader.
+  const replied = await keyedChannel();
+  replied.messages = [message({ id: "1944", content: "a question" })];
+  await reReadChannel(replied);
+  await openReplyOn(replied, replied.messages);
+  replied.replyResponse = async () => json(207, {
+    error: "partially_posted", posted: 1, unsent: "the rest of the answer", detail: SLOW_SEND, retryable: true,
+  });
+  await replied.el("reply-text").setValue("an answer. the rest of the answer");
+  await replied.el("reply-send").click();
+  await replied.settle();
+  const row = outgoingRows(replied)[0];
+  assert.equal(row.getAttribute("data-send-state"), "unconfirmed");
+  assert.match(row.text(), /Check history before retrying/);
+  replied.expireTimers(RETRY_FIRST_MS);
+  await settleSend(replied);
+  assert.equal(replied.repliesPosted.length, 1, "a reply's remainder was retried on its own");
+});
+
+test("signing out cancels every automatic retry", async () => {
+  const page = await keyedChannel();
+  page.replyResponse = errorResponse(502, "chat_error", SLOW_SEND);
+  await sendChannel(page, "not for the next person");
+  await page.el("forget-token").click();
+  await page.settle();
+  assert.equal(page.screen(), "signin");
+  page.expireTimers(RETRY_FIRST_MS);
+  await settleSend(page);
+  assert.equal(page.repliesPosted.length, 1, "a send went out after signing out");
 });

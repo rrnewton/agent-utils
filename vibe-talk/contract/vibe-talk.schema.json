@@ -100,6 +100,10 @@
             "null"
           ]
         },
+        "idempotent_posts_supported": {
+          "description": "Whether a post sent again under the same `idempotency_key` is posted at most once.\n\n`#195 send-resilience`. The page retries a send whose answer it lost — a timeout, a 502 —\non its own only when this is true, because only then can the retry not post the message\ntwice. Sent only when true: absent, from this server or an older one, means false.",
+          "type": "boolean"
+        },
         "live_delivery": {
           "$ref": "#/$defs/LiveDelivery",
           "description": "How changes reach the SSE hub."
@@ -569,6 +573,10 @@
         },
         "channel_registration_supported": {
           "description": "Whether this provider accepts pasted links and references when adding a channel.",
+          "type": "boolean"
+        },
+        "idempotent_posts_supported": {
+          "description": "Whether this provider posts a message sent again under the same key at most once. Sent\nonly when true.",
           "type": "boolean"
         },
         "key": {

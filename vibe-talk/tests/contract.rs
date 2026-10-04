@@ -147,6 +147,7 @@ fn client_config(
         channel_discovery_supported: full,
         upstream_read_mark_supported: full,
         threading_supported: full,
+        idempotent_posts_supported: full,
         speech_prep_enabled: full,
         providers: vec![
             ProviderDescription {
@@ -156,6 +157,7 @@ fn client_config(
                 channel_discovery_supported: false,
                 upstream_read_mark_supported: false,
                 threading_supported: full,
+                idempotent_posts_supported: full,
                 live_delivery,
                 live_poll_seconds: 5,
                 self_author_id: full.then(|| "9".into()),
@@ -168,6 +170,7 @@ fn client_config(
                 channel_discovery_supported: full,
                 upstream_read_mark_supported: false,
                 threading_supported: true,
+                idempotent_posts_supported: false,
                 live_delivery: LiveDelivery::Poll,
                 live_poll_seconds: 30,
                 self_author_id: full.then(|| "U0SELF0001".into()),

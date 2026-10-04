@@ -719,6 +719,7 @@ pub async fn client_config(
             channel_discovery_supported: entry.client.supports_channel_discovery(),
             upstream_read_mark_supported: entry.client.supports_upstream_read_mark(),
             threading_supported: entry.client.supports_threading(),
+            idempotent_posts_supported: entry.client.supports_idempotent_posts(),
             live_delivery: live_delivery(&state, entry.live_poll_seconds),
             live_poll_seconds: entry.live_poll_seconds,
             self_author_id: entry.client.self_author_id(),
@@ -739,6 +740,7 @@ pub async fn client_config(
         channel_discovery_supported: state.chat.supports_channel_discovery(),
         upstream_read_mark_supported: state.chat.supports_upstream_read_mark(),
         threading_supported: state.chat.supports_threading(),
+        idempotent_posts_supported: state.chat.supports_idempotent_posts(),
         speech_prep_enabled: state.config.speakable.enabled,
         replay_enabled: state.config.replay.enabled,
         self_author_id: state.chat.self_author_id(),
@@ -1380,6 +1382,12 @@ pub struct ReplyRequest {
     pub reply_to: Option<String>,
     /// The destination thread; absent posts directly to the configured channel.
     pub thread_id: Option<String>,
+    /// Names this post across attempts, so sending it again cannot post it twice where the
+    /// provider honours that. `#195 send-resilience`; see [`ops::reply_scoped`].
+    ///
+    /// One key names one text: a caller sending different words mints a new key. The page uses
+    /// its outbox entry's id, which it keeps for the life of the entry and across reloads.
+    pub idempotency_key: Option<String>,
 }
 
 /// The result of posting.
@@ -1409,6 +1417,10 @@ pub struct PartialReplyResponse {
     /// remainder travels in the body rather than being something they must reconstruct by
     /// re-splitting the original the same way this server did.
     pub unsent: String,
+    /// Whether the failure was transient — a timeout, a lost connection, a provider's 5xx — so
+    /// that sending `unsent` again later could succeed. False for a refusal, which would only be
+    /// refused again. `#195 send-resilience`; see [`crate::chat::ChatError::is_transient`].
+    pub retryable: bool,
 }
 
 /// `POST /api/v1/channels/{channel_id}/reply` — the only route that speaks in the owner's name.
@@ -1424,6 +1436,7 @@ pub async fn reply(
         &request.text,
         request.reply_to.as_deref(),
         request.thread_id.as_deref(),
+        request.idempotency_key.as_deref(),
     )
     .await
     {
@@ -1435,6 +1448,7 @@ pub async fn reply(
             posted,
             unsent,
             cause,
+            retryable,
         }) => Ok((
             StatusCode::MULTI_STATUS,
             Json(PartialReplyResponse {
@@ -1442,6 +1456,7 @@ pub async fn reply(
                 detail: cause,
                 posted,
                 unsent,
+                retryable,
             }),
         )
             .into_response()),
@@ -1627,6 +1642,7 @@ pub async fn commit_post(
             posted,
             unsent,
             cause,
+            retryable,
         })) => Ok((
             StatusCode::MULTI_STATUS,
             Json(PartialReplyResponse {
@@ -1634,6 +1650,7 @@ pub async fn commit_post(
                 detail: cause,
                 posted,
                 unsent,
+                retryable,
             }),
         )
             .into_response()),

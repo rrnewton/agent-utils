@@ -708,7 +708,27 @@ impl ChatClient for HttpDiscordClient {
         content: &str,
         reply_to: Option<&MessageId>,
     ) -> Result<Message, ChatError> {
-        self.thread_post(channel, thread_id, content, reply_to)
+        self.post_in_thread_keyed(channel, thread_id, content, reply_to, None)
+            .await
+    }
+
+    /// `#195 send-resilience`. Both post routes carry the nonce the bridge contract makes its
+    /// provider request id — main posts under registration, thread posts on the bridge thread
+    /// API — so a key given as that nonce names one post however often it is sent. A native
+    /// thread post goes to Discord itself, which honours no such field, so it is excluded.
+    fn supports_idempotent_posts(&self) -> bool {
+        self.channel_registration && self.thread_api != crate::threads::ThreadApi::Native
+    }
+
+    async fn post_in_thread_keyed(
+        &self,
+        channel: &ChannelId,
+        thread_id: &str,
+        content: &str,
+        reply_to: Option<&MessageId>,
+        key: Option<&str>,
+    ) -> Result<Message, ChatError> {
+        self.thread_post(channel, thread_id, content, reply_to, key)
             .await
             .map_err(|error| error.with_provider(self.provider_name()))
     }
@@ -865,9 +885,24 @@ impl ChatClient for HttpDiscordClient {
         content: &str,
         reply_to: Option<&MessageId>,
     ) -> Result<Message, ChatError> {
+        self.post_message_keyed(channel, content, reply_to, None)
+            .await
+    }
+
+    async fn post_message_keyed(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+        key: Option<&str>,
+    ) -> Result<Message, ChatError> {
         async {
             self.validate_main_post(channel)?;
-            let nonce = self.channel_registration.then(fresh_post_nonce);
+            // The caller's key when it has one, so the page's next attempt at the same post reuses
+            // it; otherwise one minted here, kept across this call's own retries as before.
+            let nonce = self
+                .channel_registration
+                .then(|| key.map_or_else(fresh_post_nonce, str::to_owned));
             let request = post_request_with_nonce(
                 &self.api_base,
                 channel,

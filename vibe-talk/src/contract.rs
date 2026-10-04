@@ -96,6 +96,13 @@ pub struct ClientConfigResponse {
     pub upstream_read_mark_supported: bool,
     /// Whether the backend supports channel, thread-list, and flattened timelines.
     pub threading_supported: bool,
+    /// Whether a post sent again under the same `idempotency_key` is posted at most once.
+    ///
+    /// `#195 send-resilience`. The page retries a send whose answer it lost — a timeout, a 502 —
+    /// on its own only when this is true, because only then can the retry not post the message
+    /// twice. Sent only when true: absent, from this server or an older one, means false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub idempotent_posts_supported: bool,
     /// Whether this server rewrites message bodies for speech before anything says them.
     ///
     /// Here for the same reason as `replay_enabled`: Settings has to be able to describe what this
@@ -227,6 +234,10 @@ pub struct ProviderDescription {
     pub upstream_read_mark_supported: bool,
     /// Whether this provider supports channel, thread-list, and flattened timelines.
     pub threading_supported: bool,
+    /// Whether this provider posts a message sent again under the same key at most once. Sent
+    /// only when true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub idempotent_posts_supported: bool,
     /// How changes in this provider's channels reach the live stream.
     pub live_delivery: LiveDelivery,
     /// Seconds between this provider's live polls, or `0` when it is not polled.
