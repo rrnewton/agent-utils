@@ -1,10 +1,11 @@
 ---
 title: 'read-through-here: mark read through a message in vibe-talk itself, with one tidy ⋯ menu'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-10-04T14:35:07.015878915+00:00
-updated_at: 2026-10-04T14:35:07.015878915+00:00
+updated_at: 2026-10-04T16:03:06.909408770+00:00
+closed_at: 2026-10-04T16:03:06.909408450+00:00
 ---
 
 # Description

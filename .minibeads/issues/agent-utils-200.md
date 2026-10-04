@@ -1,10 +1,11 @@
 ---
 title: 'reply-context: the reply screen names its thread and shows the thread''s earlier messages'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-10-04T12:35:47.079586581+00:00
-updated_at: 2026-10-04T12:35:47.079586581+00:00
+updated_at: 2026-10-04T16:03:06.917172212+00:00
+closed_at: 2026-10-04T16:03:06.917171882+00:00
 ---
 
 # Description

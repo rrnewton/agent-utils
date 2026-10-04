@@ -1,10 +1,11 @@
 ---
 title: 'removable-config-channels: every channel in the list can be removed, including ones from the config file'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-10-04T13:37:14.300261567+00:00
-updated_at: 2026-10-04T13:37:14.300261567+00:00
+updated_at: 2026-10-04T16:03:06.901987323+00:00
+closed_at: 2026-10-04T16:03:06.901987203+00:00
 ---
 
 # Description

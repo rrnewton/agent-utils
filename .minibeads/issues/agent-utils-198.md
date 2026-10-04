@@ -1,10 +1,11 @@
 ---
 title: 'copy-message-text: Copy text in each message''s ⋯ menu'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-10-04T13:36:59.683640995+00:00
-updated_at: 2026-10-04T13:36:59.683640995+00:00
+updated_at: 2026-10-04T16:03:06.924658397+00:00
+closed_at: 2026-10-04T16:03:06.924658256+00:00
 ---
 
 # Description

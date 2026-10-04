@@ -1,12 +1,13 @@
 ---
 title: 'gchat-thread-read-speed: thread timeline reads take 9-11 s and the phone reports Offline'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-04T10:09:55.444349668+00:00
-updated_at: 2026-10-04T10:09:55.444349668+00:00
+updated_at: 2026-10-04T16:03:06.887051007+00:00
+closed_at: 2026-10-04T16:03:06.887050667+00:00
 ---
 
 # Description

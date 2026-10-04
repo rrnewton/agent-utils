@@ -1,10 +1,11 @@
 ---
 title: 'incremental-refresh: refresh fetches only what is new since the last read'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 created_at: 2026-10-04T12:42:05.442191565+00:00
-updated_at: 2026-10-04T12:42:05.442191565+00:00
+updated_at: 2026-10-04T16:03:06.878580114+00:00
+closed_at: 2026-10-04T16:03:06.878579994+00:00
 ---
 
 # Description
