@@ -1899,8 +1899,11 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           }
           // The boundary is INCLUDED, and messages already dealt with are not reported: the
           // server's own rule, reproduced, because the undo built from this answer depends on it.
+          // Nor is a message the server calls noise (`#196 auto-read-noise`): the list never
+          // showed it, and a dismissal would outlive the rule. tests/noise.rs pins the real one.
           cleared = page.messages
             .slice(0, at + 1)
+            .filter((m) => !m.noise)
             .map((m) => String(m.id))
             .filter((id) => !page.dealtWith.has(id));
         } else {
@@ -21844,6 +21847,30 @@ test("Hide read leaves a placeholder out of the to-do list, and an arriving one 
   // ...while a real arrival does, so the guard is about the verdict and not about arriving.
   await deliver(page, page.stream(), sseMessage(message({ id: "9400000000000000005", content: "One more question." })));
   assert.deepStrictEqual(shownIds(page).slice(-1), ["9400000000000000005"]);
+});
+
+test("Clear the backlog clears exactly the messages it counted, and never records a placeholder", async () => {
+  // The control counts the rows the to-do list shows, which leave the placeholder out; the server
+  // resolves `through` against its whole window, which holds it. When the server swept it up too,
+  // the page asked "clear 2" and reported 3, the undo restored 3, and the placeholder was recorded
+  // as dealt with — a record that outlives the rule and would hide it if it were edited into the
+  // answer.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, placeholderChannel());
+  await turnTodoOn(page);
+  await page.el("clear-backlog").click();
+  await page.settle();
+  assert.match(page.el("status").textContent, /clear 2 /, "the premise is a confirmation of two");
+  await page.el("clear-backlog").click();
+  await page.settle();
+  assert.equal(page.dismissCalls[0].through, "9400000000000000003", "the clear stopped short");
+  assert.match(
+    page.el("status").textContent,
+    /^2 messages marked as dealt with/,
+    `asked to clear 2, the page reported "${page.el("status").textContent}"`
+  );
+  assert.ok(!page.dealtWith.has("9400000000000000002"), "a placeholder was recorded as dealt with");
 });
 
 test("a threaded channel hides placeholders under Hide read and dims them otherwise", async () => {

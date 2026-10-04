@@ -1513,6 +1513,14 @@ pub async fn dismiss(
 /// did not change, and restoring them would resurrect something the reader cleared earlier and
 /// never asked to see again.
 ///
+/// **Nor is a message the owner's noise rules call read** (`#196 auto-read-noise`). The to-do list
+/// this clears never showed one, so sweeping it up would clear a message the reader did not see —
+/// and, worse, RECORD it: a dismissal outlives the rule, so removing the rule would no longer bring
+/// the placeholder back, and an agent that later edits it into the real answer would find the
+/// answer already dealt with. A placeholder stays read by being judged on every read, never by
+/// being written down. A `through` that names a placeholder is still a valid boundary; only the
+/// placeholder itself is left alone.
+///
 /// # Errors
 ///
 /// As [`dismiss`]. `through` must itself be in the window `limit` describes.
@@ -1535,6 +1543,7 @@ pub async fn declare_bankruptcy(
     // beside it is a second thing to get wrong.
     let clearing: Vec<MessageId> = window.messages[..=boundary]
         .iter()
+        .filter(|m| !m.noise)
         .map(|m| m.id.clone())
         .filter(|id| !already.contains(id.as_str()))
         .collect();

@@ -2696,9 +2696,10 @@ from the person it is for, so what it catches has to be predictable by reading i
 
 **Evaluated on every read, never recorded.** Each message the server serves is judged against the
 rules as its text reads now and carries `noise: true` when it matches — the page, the to-do list,
-the count, the digest and the agent's tools all read that one flag. Nothing is dismissed, so a
-placeholder later edited into the answer is unread again, and removing a rule brings back
-everything it caught.
+the count, the digest and the agent's tools all read that one flag. Nothing is dismissed — not
+even by **Clear the backlog**, which sweeps only the messages the to-do list showed and so never a
+placeholder — so a placeholder later edited into the answer is unread again, and removing a rule
+brings back everything it caught.
 
 What "read" means here, concretely: `/todo` leaves noise out and says how many (`noise`); `/count`
 and `/digest` skip it and say how many; the agent's `digest_channel`, `read_page` and

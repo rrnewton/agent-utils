@@ -273,6 +273,57 @@ async fn removing_the_rule_un_hides_everything_it_caught() {
 }
 
 #[tokio::test]
+async fn clearing_the_backlog_dismisses_only_what_the_list_showed() {
+    // The to-do list never shows a placeholder, so "clear everything up to this row" must not
+    // write a dismissal for one. A dismissal is DURABLE: the placeholder would stay hidden after
+    // the rule was removed, and an agent that later edited it into the real answer would find the
+    // answer hidden as well — and the page, which counted the rows it showed, would promise to
+    // clear two and report three.
+    let harness = Harness::new();
+    let question = harness.seed("alice", "Is the nightly build green?");
+    let placeholder = harness.seed(AGENT, PLACEHOLDER);
+    let answer = harness.seed(AGENT, "Green again since the fixture was renewed.");
+    assert_eq!(
+        harness.todo_ids().await,
+        vec![question.clone(), answer.clone()]
+    );
+    let (status, cleared) = harness
+        .call(
+            "POST",
+            &format!("/api/v1/channels/{READ_CHANNEL}/dismiss"),
+            WRITE_TOKEN,
+            Some(json!({ "through": answer.as_str() })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{cleared}");
+    assert_eq!(
+        cleared["messages"],
+        json!([question.as_str(), answer.as_str()]),
+        "the clear swept up a message the list never showed"
+    );
+    assert_eq!(cleared["count"], json!(2), "{cleared}");
+    let stored = harness
+        .store
+        .dismissals(&harness.channel)
+        .await
+        .expect("reads");
+    assert!(
+        !stored.contains(&placeholder),
+        "a placeholder was recorded as dealt with: {stored:?}"
+    );
+    // The consequence that matters: the placeholder edited into the answer is unread again.
+    harness.discord.edit(
+        &placeholder,
+        "Found it: the fixture certificate expired on the first of the month.",
+    );
+    assert_eq!(
+        harness.todo_ids().await,
+        vec![placeholder],
+        "an edited placeholder swept up by a clear stayed hidden"
+    );
+}
+
+#[tokio::test]
 async fn a_prefix_rule_catches_what_starts_that_way_and_nothing_else() {
     let harness = Harness::new();
     let thinking = harness.seed(AGENT, "Thinking about the cache layout…");
