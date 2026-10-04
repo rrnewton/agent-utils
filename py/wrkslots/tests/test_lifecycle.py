@@ -34017,6 +34017,8 @@ def test_recover_absent_agent_row_refuses_a_pack_git_would_leave_out_of_the_cens
     pack = component / "objects" / "pack" / f"pack-{name}.pack"
     index = pack.with_suffix(".idx")
     if damage == "corrupt-index":
+        # pack-objects writes the index read-only (0444).
+        index.chmod(0o644)
         index.write_bytes(b"bad index")
         expected = f"has an index {index.name} too small to be one"
     else:
