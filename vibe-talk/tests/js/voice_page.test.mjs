@@ -18968,6 +18968,184 @@ test("Reply offers a new thread only on a main-channel message the chat service 
     { text: "an answer in the thread", reply_to: "202", thread_id: data.threads[0].id });
 });
 
+// The outbox posts the messages bound for one destination in the order they were sent. A reply
+// still being placed has no destination yet: until it has one it may share any, and once it has
+// one it is behind whatever was already on its way there.
+
+/**
+ * All, holding a message that came in live and that no read has placed since: by default the first
+ * discussion's answer `206`, which the channel's own reads put in that thread. Reads fail from the
+ * arrival on; `standard` is the fixture's timeline route, for a test to put back.
+ */
+async function unplacedArrival(fields = {}) {
+  const page = await threadPage();
+  await page.el("channel-view-flat").click();
+  await page.settle();
+  const first = page.messages[1].thread;
+  const pushed = message({ id: "206", content: "a later answer in the first discussion", ...fields });
+  page.messages.push(fields.id ? pushed : { ...pushed, thread: { ...first, is_root: false } });
+  const standard = page.timeline;
+  page.timeline = errorResponse(502, "chat_error", "history read timed out");
+  await deliver(page, page.stream(), sseMessage(pushed));
+  await page.settle();
+  return { page, first, standard };
+}
+
+/** Hold each POST to the reply route until the test answers it, as its own new message. */
+function heldReplies(page) {
+  const waiting = [];
+  page.replyResponse = (_path, options) => new Promise((resolve) => {
+    const body = JSON.parse(options.body);
+    const sent = waiting.length + 1;
+    waiting.push(() => resolve(json(200, {
+      posted: message({ id: `940000000000000000${sent}`, content: body.text, reply_to: body.reply_to || null }),
+    })));
+  });
+  return waiting;
+}
+
+/** Each POST to the reply route so far, as its text and the thread it named. */
+const postedWhere = (page) => page.repliesPosted.map((call) => [call.body.text, call.body.thread_id || null]);
+
+/** Open Reply on `id` and send `text`, without waiting for the outbox to deliver it. */
+async function replyQuietly(page, id, text) {
+  await replyButton(rowOf(page, id)).click();
+  await page.el("reply-text").setValue(text);
+  page.el("reply-send").click();
+  await page.settle();
+}
+
+test("an answer sent into a thread waits for an earlier reply that is still finding out it belongs there", async () => {
+  const { page, first, standard } = await unplacedArrival();
+  const placing = gate(standard);
+  page.timeline = placing.respond;
+  distinctReplies(page);
+  await replyQuietly(page, "206", "the first answer, to the message that came in live");
+  await replyQuietly(page, "202", "the second answer, to a message the page has placed");
+  assert.equal(page.repliesPosted.length, 0, "the second answer did not wait for the first to be placed");
+
+  placing.open();
+  await page.settle();
+  await page.settle();
+  assert.deepEqual(postedWhere(page), [
+    ["the first answer, to the message that came in live", first.id],
+    ["the second answer, to a message the page has placed", first.id],
+  ], "the thread received its answers in the wrong order");
+});
+
+test("a reply placed in a thread waits behind an answer already on its way there", async () => {
+  const { page, first, standard } = await unplacedArrival();
+  const answers = heldReplies(page);
+  await replyQuietly(page, "202", "an answer already on its way to the thread");
+  assert.equal(page.repliesPosted.length, 1);
+
+  page.timeline = standard;
+  await replyQuietly(page, "206", "an answer that had to find its thread first");
+  await page.settle();
+  assert.equal(page.repliesPosted.length, 1,
+    "the placed reply overtook the answer queued before it for the same thread");
+  assert.match(outgoingRows(page)[1].text(), /Waiting to send/, "the reply was not placed and held");
+
+  answers[0]();
+  await page.settle();
+  await page.settle();
+  assert.deepEqual(postedWhere(page), [
+    ["an answer already on its way to the thread", first.id],
+    ["an answer that had to find its thread first", first.id],
+  ]);
+  answers[1]();
+  await page.settle();
+});
+
+test("a message to the main channel waits for a reply to be placed, not for its delivery into a thread", async () => {
+  const { page, first, standard } = await unplacedArrival();
+  const placing = gate(standard);
+  page.timeline = placing.respond;
+  const answers = heldReplies(page);
+  await replyQuietly(page, "206", "an answer that has to find its thread first");
+  await page.el("channel-compose-text").setValue("a note to the main channel");
+  page.el("channel-send").click();
+  await page.settle();
+  assert.equal(page.repliesPosted.length, 0,
+    "a message that could have shared the reply's destination did not wait to learn it");
+
+  placing.open();
+  await page.settle();
+  await page.settle();
+  assert.deepEqual(postedWhere(page), [
+    ["an answer that has to find its thread first", first.id],
+    ["a note to the main channel", null],
+  ], "the main channel waited for a delivery into a thread");
+  answers[0]();
+  answers[1]();
+  await page.settle();
+});
+
+test("a message to the main channel waits for the delivery of a reply placed on the main channel", async () => {
+  const { page, standard } = await unplacedArrival({ id: "207", content: "an aside on the main channel" });
+  const placing = gate(standard);
+  page.timeline = placing.respond;
+  const answers = heldReplies(page);
+  await replyQuietly(page, "207", "an answer to the aside");
+  await page.el("channel-compose-text").setValue("a note after it");
+  page.el("channel-send").click();
+  await page.settle();
+  placing.open();
+  await page.settle();
+  await page.settle();
+  assert.deepEqual(postedWhere(page), [["an answer to the aside", null]],
+    "a later message to the main channel overtook a reply placed there");
+
+  answers[0]();
+  await page.settle();
+  await page.settle();
+  assert.deepEqual(postedWhere(page), [["an answer to the aside", null], ["a note after it", null]]);
+  answers[1]();
+  await page.settle();
+});
+
+test("two replies to messages that came in live are placed by one read of the channel", async () => {
+  // The read that places a reply folds in every message the stream left unplaced, and on a slow
+  // chat service a second read alongside it is one more to time out.
+  const { page, first, standard } = await unplacedArrival();
+  const aside = message({ id: "207", content: "an aside on the main channel" });
+  page.messages.push(aside);
+  await deliver(page, page.stream(), sseMessage(aside));
+  await page.settle();
+  const placing = gate(standard);
+  page.timeline = placing.respond;
+  distinctReplies(page);
+  const before = page.timelineCalls.length;
+  await replyQuietly(page, "206", "an answer in the first discussion");
+  await replyQuietly(page, "207", "an answer to the aside");
+  placing.open();
+  await page.settle();
+  await page.settle();
+  // Bound for different destinations, so neither waits for the other's delivery.
+  assert.deepEqual(postedWhere(page).sort(), [
+    ["an answer in the first discussion", first.id],
+    ["an answer to the aside", null],
+  ]);
+  assert.equal(page.timelineCalls.length - before, 1, "each reply read the channel to place itself");
+});
+
+test("a reply that cannot be placed holds up nothing sent after it", async () => {
+  const { page } = await unplacedArrival();
+  const placing = gate(errorResponse(502, "chat_error", "history read timed out"));
+  page.timeline = placing.respond;
+  distinctReplies(page);
+  await replyQuietly(page, "206", "an answer that will not find its thread");
+  await page.el("channel-compose-text").setValue("a note to the main channel");
+  page.el("channel-send").click();
+  await page.settle();
+  placing.open();
+  await page.settle();
+  await page.settle();
+  assert.deepEqual(postedWhere(page), [["a note to the main channel", null]],
+    "an unplaceable reply kept the main channel waiting, or was posted anyway");
+  assert.equal(outgoingRows(page)[0].getAttribute("data-send-state"), "failed");
+});
+
 test("a live message arriving before its send acknowledgement appears only once", async () => {
   const page = newPage();
   const stream = await withLiveChannel(page, []);

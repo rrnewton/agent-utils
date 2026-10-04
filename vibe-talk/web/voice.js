@@ -529,6 +529,8 @@ const OUTGOING_RETRY_ATTEMPTS = 3;
 const outgoingMessages = new Map();
 const outgoingObservations = new Map();
 const outgoingDestinations = new Map();
+// Per channel, the replies still finding out which thread they go in. See `scheduleOutgoingMessage`.
+const outgoingPlacing = new Map();
 const outgoingJobs = new Map();
 /**
  * Entries waiting to go out again on their own, by id: when (`at`), or when the connection returns
@@ -7461,25 +7463,75 @@ function retryOutgoingMessage(id, automatic = false) {
   return scheduleOutgoingMessage(entry);
 }
 
-/** Serialize a burst to one destination without making the composer wait for that destination. */
+/** The outbox lane of one destination: a channel, and the thread in it or none. */
+function outgoingDestination(channel, threadId) {
+  return JSON.stringify([channel, threadId || null]);
+}
+
+/**
+ * Serialize a burst to one destination without making the composer wait for that destination.
+ *
+ * A message's destination is fixed when it is queued, except for a reply whose thread is still to
+ * be found out (`placeReplyTarget`). Until it is placed it may be bound for any destination in its
+ * channel, so whatever is queued in that channel after it waits for the placement, and then for its
+ * delivery only if both go to the same place; the reply in turn waits behind whatever was already
+ * on its way to where it is placed. Queued in the main channel's lane instead, as it first was, a
+ * placed reply was overtaken by an answer sent into the same thread while the read was out, and
+ * held up every main-channel message behind a delivery somewhere else. `#185 reply-new-thread`.
+ */
 function scheduleOutgoingMessage(entry) {
-  const destination = JSON.stringify([entry.channel, entry.threadId]);
   let credential = "";
   try { credential = token(); } catch (_error) { /* Dispatch reports the missing credential. */ }
   const job = { credential, stopped: false, cancel: null };
   outgoingJobs.set(entry.id, job);
   persistOutgoingMessages();
   renderOutgoingMessages();
-  const previous = outgoingDestinations.get(destination) || Promise.resolve();
-  const completion = previous.catch(() => {}).then(() => dispatchOutgoingMessage(entry, job));
-  outgoingDestinations.set(destination, completion);
-  return completion.finally(() => {
+  // What this message must not overtake, as things stand now: the last message queued for each
+  // destination, and every reply in its channel that is still being placed.
+  const lanes = new Map(outgoingDestinations);
+  const placing = [...(outgoingPlacing.get(entry.channel) || [])];
+  const ahead = (destination) => Promise.all([
+    lanes.get(destination),
+    ...placing.map((earlier) => earlier.placed.then((where) => (where === destination ? earlier.done : null))),
+  ].map((step) => Promise.resolve(step).catch(() => {})));
+  const release = () => {
     if (outgoingJobs.get(entry.id) === job) outgoingJobs.delete(entry.id);
-    if (outgoingDestinations.get(destination) === completion) outgoingDestinations.delete(destination);
+  };
+  if (entry.placement !== "unknown") {
+    const destination = outgoingDestination(entry.channel, entry.threadId);
+    const completion = ahead(destination).then(() => dispatchOutgoingMessage(entry, job));
+    outgoingDestinations.set(destination, completion);
+    return completion.finally(() => {
+      release();
+      if (outgoingDestinations.get(destination) === completion) outgoingDestinations.delete(destination);
+    });
+  }
+  let settle = (_destination) => {};
+  const record = { placed: new Promise((resolve) => { settle = resolve; }), done: null };
+  record.done = dispatchOutgoingMessage(entry, job, {
+    // One read of All places every message the stream left unplaced, so an earlier reply's read
+    // goes first and this one is then usually placed from the store, without a read of its own.
+    earlier: Promise.all(placing.map((earlier) => earlier.placed)),
+    placed: (destination) => settle(destination),
+    ahead,
+  });
+  outgoingPlacing.set(entry.channel, [...(outgoingPlacing.get(entry.channel) || []), record]);
+  return record.done.finally(() => {
+    // Never placed (refused, unreadable, signed out) means never posted: nothing waits for it.
+    settle(null);
+    release();
+    const left = (outgoingPlacing.get(entry.channel) || []).filter((held) => held !== record);
+    if (left.length) outgoingPlacing.set(entry.channel, left);
+    else outgoingPlacing.delete(entry.channel);
   });
 }
 
-async function dispatchOutgoingMessage(entry, job) {
+/**
+ * Post one outbox entry. `placing` is given only for a reply still to be placed, by
+ * `scheduleOutgoingMessage`: what to let go first, where to say it was placed, and what to wait
+ * behind once it has been.
+ */
+async function dispatchOutgoingMessage(entry, job, placing = null) {
   if (job.stopped) return;
   let timer = null;
   const controller = typeof AbortController === "function" ? new AbortController() : null;
@@ -7506,7 +7558,9 @@ async function dispatchOutgoingMessage(entry, job) {
       holdOutgoingMessage(entry, { at: Date.now(), offline: true, unsent: true });
       return;
     }
-    if (entry.placement === "unknown") {
+    if (placing) {
+      await placing.earlier;
+      if (job.stopped) return;
       entry.phase = "placing";
       persistOutgoingMessages();
       renderOutgoingMessages();
@@ -7528,6 +7582,13 @@ async function dispatchOutgoingMessage(entry, job) {
       if (job.stopped) return;
       entry.threadId = thread;
       entry.placement = null;
+      const destination = outgoingDestination(entry.channel, thread);
+      placing.placed(destination);
+      entry.phase = "queued";
+      persistOutgoingMessages();
+      renderOutgoingMessages();
+      await placing.ahead(destination);
+      if (job.stopped) return;
     }
     entry.phase = "posting";
     persistOutgoingMessages();
