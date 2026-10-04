@@ -890,6 +890,10 @@ class Driver:
             # state that inherited it would photograph a resumed call under a name that does not
             # say so -- or, worse, an ordinary post-call frame carrying the resumed wording.
             "  localStorage.removeItem('vibe-talk.voice.resume');\n"
+            # `#189 restore-ui-state`. Where the reader left the page is stored, and a reload
+            # reopens there; a scene that loads the page must start from the default instead of
+            # the view the previous scene left up.
+            "  localStorage.removeItem('vibe-talk.voice.ui-state');\n"
             "} catch (e) {}\n"
         )
         # `#58 control-bar`. Where the control bar sits is a stored preference, so it is cleared
