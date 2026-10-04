@@ -1468,10 +1468,9 @@ def _glob_matches_path(pattern: str, path: str) -> bool:
 def _cache_glob_contains_path(pattern: str, path: str) -> bool:
     """Whether any prefix of ``path`` is the cache directory named by ``pattern``.
 
-    This decides one path against one cache glob, and every checkout inspection
-    calls it once per path per glob over complete ``git ls-files`` and
-    ``git ls-tree`` listings, so it is the hottest loop in a large registry's
-    audit. Two properties keep it cheap without changing which paths it accepts:
+    This decides one path against one cache glob. ``tracked_cache_paths``
+    calls it only for the globs ``_cache_glob_index`` says can contain a path.
+    Two properties keep it cheap without changing which paths it accepts:
     only a prefix whose component count equals the pattern's own can match
     unless a ``**`` component absorbs a variable number, and a pattern whose
     components are all literal is decided by comparing the components directly
@@ -1490,6 +1489,63 @@ def _cache_glob_contains_path(pattern: str, path: str) -> bool:
     if len(pattern_parts) > len(path_parts):
         return False
     return _glob_parts_match(pattern_parts, path_parts[: len(pattern_parts)])
+
+
+@functools.lru_cache(maxsize=None)
+def _cache_glob_index(
+    cache_globs: tuple[str, ...],
+) -> tuple[Mapping[str, tuple[str, ...]], tuple[str, ...]]:
+    """For each possible first path component, the cache globs that can contain
+    a path beginning with it, in their original order.
+
+    ``_cache_glob_contains_path`` matches a pattern's first component against
+    the path's first component, so a pattern whose first component is literal
+    can contain only paths whose first component is exactly that string; for
+    any other path it returns False at once, without raising. A pattern whose
+    first component is ``**`` or has a wildcard can contain any path:
+    validation refuses that form, but a caller that has not validated its globs
+    still gets those patterns tested. A pattern with no components contains no
+    path and is left out.
+
+    Returns a mapping from each literal first component to its patterns merged
+    with every unanchored pattern, and the unanchored patterns alone for a path
+    whose first component no pattern names. Both keep the order of
+    ``cache_globs``, so a caller that stops at the first accepting pattern
+    makes the calls it would make trying every pattern in turn, minus calls
+    that return False, and any exception a pattern raises surfaces exactly
+    where it did before.
+    """
+
+    by_first: dict[str, list[str]] = {}
+    unanchored: list[str] = []
+    for pattern in cache_globs:
+        parts = _glob_pattern_parts(pattern)
+        if not parts:
+            continue
+        first = parts[0]
+        if first == "**" or any(character in first for character in "*?["):
+            unanchored.append(pattern)
+            for patterns in by_first.values():
+                patterns.append(pattern)
+        else:
+            # A first component seen for the first time inherits every
+            # unanchored pattern that precedes it.
+            by_first.setdefault(first, list(unanchored)).append(pattern)
+    return (
+        {first: tuple(patterns) for first, patterns in by_first.items()},
+        tuple(unanchored),
+    )
+
+
+def _first_path_component(path: str) -> str:
+    """The first component ``_cache_glob_contains_path`` sees in ``path``.
+
+    The matcher skips empty components, so a leading or repeated separator
+    does not change which component comes first; a path with no components
+    yields the empty string, which no glob is indexed under.
+    """
+
+    return next((part for part in path.split("/") if part), "")
 
 
 def _validate_hook(value: str) -> str:
@@ -11135,13 +11191,26 @@ class _GitVcs:
             checkout,
             ["ls-tree", "-r", "--name-only", "-z", "HEAD"],
         )
+        # A listing holds tens of thousands of paths and nearly none are cache,
+        # so testing every path against every glob made this the audit's
+        # largest cost. Each path is tested only against the globs that can
+        # contain it (see _cache_glob_index), in their original order; every
+        # glob skipped would have returned False without raising. The
+        # selection stays inline, as it was, so the matcher runs at the same
+        # stack depth and a glob deep enough to approach the recursion limit
+        # succeeds or fails exactly as before.
+        by_first, unanchored = _cache_glob_index(tuple(cache_globs))
         paths = [
             path
             for output in (indexed.stdout, committed.stdout)
             for path in output.split("\x00")
             if path
             and any(
-                _cache_glob_contains_path(pattern, path) for pattern in cache_globs
+                _cache_glob_contains_path(pattern, path)
+                for pattern in by_first.get(
+                    path.partition("/")[0] or _first_path_component(path),
+                    unanchored,
+                )
             )
         ]
         return tuple(dict.fromkeys(paths))
