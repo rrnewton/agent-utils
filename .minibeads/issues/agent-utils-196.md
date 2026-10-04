@@ -1,10 +1,11 @@
 ---
 title: 'auto-read-noise: treat trivial placeholder messages as read automatically'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-10-04T12:19:56.425434330+00:00
-updated_at: 2026-10-04T12:19:56.425434330+00:00
+updated_at: 2026-10-04T12:59:22.256991072+00:00
+closed_at: 2026-10-04T12:59:22.256990972+00:00
 ---
 
 # Description

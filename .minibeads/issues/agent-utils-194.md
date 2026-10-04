@@ -1,10 +1,11 @@
 ---
 title: 'thread-picker-polish: one thread name everywhere, d/h ages, older threads on their own page'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-10-04T11:21:19.140607645+00:00
-updated_at: 2026-10-04T11:21:19.140607645+00:00
+updated_at: 2026-10-04T12:59:22.252680156+00:00
+closed_at: 2026-10-04T12:59:22.252679996+00:00
 ---
 
 # Description

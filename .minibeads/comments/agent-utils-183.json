@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-183-ce7c8e612b8",
+    "issue_id": "agent-utils-183",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Adapter timeline reuse + send priority deployed on devbig014 at 12:21Z as a devbig014-only release (runtime drop-in; the shared adapter file the other host runs is unchanged). Warm reads measured 0.03-0.07 s (were 10-12 s). Still slow: the first read after a snapshot is more than 5 min old (measured 10.4 s and 12.2 s). That case is the incremental-refresh work (one created-after delta instead of a full history scan), in progress.",
+    "created_at": "2026-10-04T12:59:29.039222319Z",
+    "updated_at": "2026-10-04T12:59:29.039222319Z"
+  }
+]

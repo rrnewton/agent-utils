@@ -1,12 +1,13 @@
 ---
 title: 'pull-refresh-bottom: pulling past the bottom refreshes, with a visible spinner'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-04T10:09:55.509181878+00:00
-updated_at: 2026-10-04T10:09:55.509181878+00:00
+updated_at: 2026-10-04T12:59:22.264104106+00:00
+closed_at: 2026-10-04T12:59:22.264103495+00:00
 ---
 
 # Description

@@ -1,10 +1,11 @@
 ---
 title: 'floating-search: the search glass floats beside the freshness pill instead of costing a header row'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-10-04T11:34:31.447406814+00:00
-updated_at: 2026-10-04T11:34:31.447406814+00:00
+updated_at: 2026-10-04T12:59:22.260506192+00:00
+closed_at: 2026-10-04T12:59:22.260506071+00:00
 ---
 
 # Description
