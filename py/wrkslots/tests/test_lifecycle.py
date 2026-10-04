@@ -29504,6 +29504,41 @@ def test_clean_caches_can_reclaim_an_explicit_unregistered_flat_slot(
     assert (tree / "seed.txt").is_file()
 
 
+def test_clean_caches_removes_read_only_directories_inside_a_cache(
+    tmp_path: Path,
+) -> None:
+    """Build-script out/ trees and Go module caches are mode 0555 (EACCES before)."""
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+        cache_globs=("target",),
+    )
+    tree = checkout(project)
+    tree.parent.mkdir(exist_ok=True)
+    git(repository, "worktree", "add", "-b", "codex/read-only", str(tree), "origin/main")
+    out = tree / "target" / "debug" / "build" / "crate-0123456789abcdef" / "out"
+    nested = out / "pkg"
+    nested.mkdir(parents=True)
+    (out / "generated.rs").write_text("// generated\n", encoding="utf-8")
+    (nested / "module.go").write_text("package pkg\n", encoding="utf-8")
+    kept = tree / "read-only-source"
+    kept.mkdir()
+    (kept / "file").write_text("checkout content\n", encoding="utf-8")
+    for directory in (nested, out, kept):
+        directory.chmod(0o555)
+    try:
+        cleaned = command(project, "clean-caches", "--only", "slot01")
+        assert cleaned.returncode == 0, cleaned.stderr
+        assert not (tree / "target").exists()
+        assert stat.S_IMODE(kept.stat().st_mode) == 0o555
+        assert (kept / "file").read_text(encoding="utf-8") == "checkout content\n"
+    finally:
+        for directory in (nested, out, kept):
+            if directory.exists():
+                directory.chmod(0o755)
+
+
 def test_clean_caches_reports_and_reclaims_across_machine_shards(
     tmp_path: Path,
 ) -> None:
