@@ -3176,6 +3176,22 @@ const CALL_MAX_LEAD_SECONDS = 2;
 /** A queue that ran dry less than this long ago ran dry mid-answer. */
 const CALL_STALL_WINDOW_SECONDS = 1;
 
+/**
+ * The voice socket's address. A deployment may configure a PATH (`/ws?mode=…`), which means this
+ * page's own host: one configuration then serves every host it is deployed on, each page talking to
+ * the voice bridge behind its own front door. An absolute URL is used exactly as given.
+ *
+ * Why it matters: a configuration naming one host's address, shared with a second host, sent the
+ * second host's page to the first host's bridge, where the sign-in its front door had granted did
+ * not apply and the socket never opened.
+ */
+function voiceSocketUrl(configured) {
+  const url = String(configured || "");
+  if (!url.startsWith("/") || url.startsWith("//")) return url;
+  const origin = String(window.location.origin || "");
+  return origin.replace(/^http/, "ws") + url;
+}
+
 function playPcm(b64) {
   playPcmBytes(base64ToBytes(b64));
 }
@@ -3924,7 +3940,7 @@ async function start(options) {
   }
 
   setState("working");
-  const socket = new WebSocket(minted.websocket_url);
+  const socket = new WebSocket(voiceSocketUrl(minted.websocket_url));
   socket.binaryType = "arraybuffer";
   session.socket = socket;
   session.muted = false;

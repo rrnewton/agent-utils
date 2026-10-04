@@ -220,6 +220,8 @@ enabled = true
 # binary frames. Provider endpoints belong in deployment configuration, never in source.
 # backend = "elevenlabs"
 # websocket_url = "wss://voice-provider.example/ws"
+# A path means the page's own host, which suits a bridge behind the same front door as the page:
+# websocket_url = "/ws?mode=voice"
 # label = "WebSocket voice provider"
 
 [storage]

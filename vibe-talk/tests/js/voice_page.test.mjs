@@ -12102,6 +12102,25 @@ async function compose(page, text) {
 const typedFrames = (socket) => socket.sent.filter((s) => s.includes('"user_message"'));
 const activityFrames = (socket) => socket.sent.filter((s) => s.includes('"user_activity"'));
 
+test("a voice socket configured as a PATH opens on this page's own host", async () => {
+  // One configuration shared by two hosts: a path means "the bridge behind this page's front door",
+  // so neither host's page is sent to the other host's bridge.
+  const page = newPage();
+  await signIn(page);
+  page.setFetch(async () =>
+    json(200, {
+      websocket_url: "/ws?mode=metaai_voice&tools=chat",
+      protocol: "vibe-talk-v1",
+      provider: "Internal voice preview",
+      input_sample_rate: 24000,
+      output_sample_rate: 24000,
+    })
+  );
+  await page.el("talk").click();
+  await page.settle();
+  assert.equal(page.sockets[0].url, "wss://vibe.example/ws?mode=metaai_voice&tools=chat");
+});
+
 test("the neutral WebSocket provider carries typed text, PCM, and deduplicated transcripts", async () => {
   const page = newPage();
   await signIn(page);
