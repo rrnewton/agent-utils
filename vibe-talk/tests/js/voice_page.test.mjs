@@ -18968,6 +18968,45 @@ test("Reply offers a new thread only on a main-channel message the chat service 
     { text: "an answer in the thread", reply_to: "202", thread_id: data.threads[0].id });
 });
 
+test("Reply offers no new thread on a root the page has since learnt was answered, whatever its row says", async () => {
+  // A row keeps the copy it was drawn from. Drawn while nobody had answered the root, that copy
+  // still says 0 replies after the store has read otherwise — and ticking "Start a new thread"
+  // would post into the thread that already exists.
+  const page = newPage();
+  page.threadingSupported = true;
+  const data = threadData();
+  page.threads = data.threads;
+  const lone = { id: "spaces/A/threads/lone", root_message_id: "210", is_root: true,
+    reply_count: 0, reply_count_exact: true };
+  const root = message({ id: "210", content: "nobody has answered this yet", thread: lone });
+  await signIn(page);
+  await showDiscord(page, [...data.messages, root]);
+  await page.el("channel-view-flat").click();
+  await page.settle();
+
+  // Somebody answers it, and the read that says so lands after a newer one was asked for.
+  const answered = { ...lone, reply_count: 1 };
+  const answer = message({ id: "211", content: "an answer at last" });
+  page.messages = [...data.messages, { ...root, thread: answered }, { ...answer, thread: { ...answered, is_root: false } }];
+  const held = gate(page.timeline);
+  const failing = errorResponse(502, "chat_error", "history read timed out");
+  let reads = 0;
+  page.timeline = (path) => (++reads === 1 ? held.respond(path) : failing());
+  await deliver(page, page.stream(), sseMessage(answer));
+  const aside = message({ id: "212", content: "an aside on the main channel" });
+  page.messages.push(aside);
+  await deliver(page, page.stream(), sseMessage(aside));
+  held.open();
+  await page.settle();
+  await page.settle();
+  assert.equal(reads, 2, "the newer read was never made");
+  assert.equal(threadButton(rowOf(page, "210")), undefined,
+    "the late read redrew the root, so this no longer tests the row's old copy");
+
+  await replyButton(rowOf(page, "210")).click();
+  assert.equal(page.el("reply-branch-row").hidden, true, "a new thread was offered on a root that has replies");
+});
+
 // The outbox posts the messages bound for one destination in the order they were sent. A reply
 // still being placed has no destination yet: until it has one it may share any, and once it has
 // one it is behind whatever was already on its way there.
@@ -19144,6 +19183,28 @@ test("a reply that cannot be placed holds up nothing sent after it", async () =>
   assert.deepEqual(postedWhere(page), [["a note to the main channel", null]],
     "an unplaceable reply kept the main channel waiting, or was posted anyway");
   assert.equal(outgoingRows(page)[0].getAttribute("data-send-state"), "failed");
+});
+
+test("a page closed while a reply was being placed says nothing was sent, not that delivery is unconfirmed", async () => {
+  // As signing out does: only a POST that had started can have arrived. Neither the reply still
+  // finding out where it goes nor the note waiting behind it had one.
+  const { page, standard } = await unplacedArrival();
+  page.timeline = gate(standard).respond;
+  await replyQuietly(page, "206", "an answer still finding its thread");
+  await page.el("channel-compose-text").setValue("a note waiting its turn");
+  page.el("channel-send").click();
+  await page.settle();
+  assert.equal(page.repliesPosted.length, 0);
+
+  const again = newPage(new Map(page.storage));
+  await signIn(again);
+  await showDiscord(again, []);
+  assert.equal(again.repliesPosted.length, 0, "a reload posted on its own");
+  assert.deepEqual(outgoingRows(again).map((row) => row.getAttribute("data-send-state")), ["failed", "failed"]);
+  for (const row of outgoingRows(again)) {
+    assert.match(row.text(), /closed before this message was sent/);
+    assert.doesNotMatch(row.text(), /unconfirmed/i, "a message posted nowhere was called possibly delivered");
+  }
 });
 
 test("a live message arriving before its send acknowledgement appears only once", async () => {

@@ -56,13 +56,13 @@ A thread nobody has answered yet — Google Chat names one for every message —
 
 **Reply answers a message where it is.** Replying to a thread message posts in that thread, from
 any view, including **All**. Replying to a main-channel message posts in the main channel as a reply
-to it: a quote on Google Chat, a reply link on Discord. (Slack has neither, so its backend posts such
-a reply in the message's thread; see below.) Where the chat service has already named an empty
-thread for the message, as Google Chat does, the reply screen also offers **Start a new thread from
-this message**, unticked each time it opens. A message that arrived on the live stream without
-saying which thread it is in, and that no read has placed since, is placed by one read of **All**
-before the reply is posted; if that read fails, nothing is posted and the reply keeps its text for
-**Retry**.
+to it: a quote on Google Chat, a reply link on Discord. (Slack has neither, so its backend posts
+such a reply in the message's thread; see [Slack](#slack).) Where the chat service has already named
+an empty thread for the message, as Google Chat does, the reply screen also offers **Start a new
+thread from this message**, unticked each time it opens. A message that arrived on the live stream
+without saying which thread it is in, and that no read has placed since, is placed by one read of
+**All** before the reply is posted; if that read fails, nothing is posted and the reply keeps its
+text for **Retry**. Until it is placed, whatever you send next in that channel waits for it.
 
 **A normal text box at the bottom.** Scroll below the newest message to write to the channel or
 selected thread. **Send** posts without requiring a message to reply to. Drafts are kept separately

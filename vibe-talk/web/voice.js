@@ -6170,13 +6170,14 @@ function threadOf(message) {
 }
 
 /**
- * The thread record the page holds for a message: the copy's own, the store's copy of it, or —
- * for a thread root whose copy arrived without one — the summary of the thread it starts. A row
- * keeps the objects it was drawn from, and the store may have learnt more about them since.
+ * The thread record the page holds for a message: the store's copy's, the row's own, or — for a
+ * thread root whose copy arrived without one — the summary of the thread it starts. The store
+ * first: a row keeps the objects it was drawn from, and the store may have learnt more about them
+ * since, a root's reply count above all.
  */
 function heldThreadRecord(message) {
   const id = String(message.id);
-  for (const copy of [message, heldMessage(id)]) {
+  for (const copy of [heldMessage(id), message]) {
     if (threadOf(copy)) return copy.thread;
   }
   const summary = channelCanon.threads.find((held) => held.root && String(held.root.id) === id);
@@ -6215,7 +6216,11 @@ function replyRoute(message) {
   if (record && record.is_root !== true) {
     return { ...route, thread: String(record.id), note: "Posts in the thread this message belongs to." };
   }
-  if (record) return { ...route, branch: record.reply_count === 0 ? String(record.id) : null };
+  // The count the thread tag goes by, a summary's before the record's: ticking the box on a thread
+  // that has replies after all would post into it while saying it starts one.
+  if (record) {
+    return { ...route, branch: threadReplyCount(record.id, { thread: record }) === 0 ? String(record.id) : null };
+  }
   if (!channelCanon.unplaced.has(String(message.id))) return route;
   return {
     ...route, unknown: true,
@@ -7204,6 +7209,9 @@ function loadOutgoingMessages() {
           !held.channel || typeof held.text !== "string" ||
           !["sending", "sent", "failed", "unconfirmed"].includes(held.state)) continue;
       const interrupted = held.state === "sending";
+      // The rule signing out goes by: only a POST that had started can have been delivered. One
+      // still waiting its turn, or still finding out where its reply goes, was posted nowhere.
+      const attempted = interrupted && !["queued", "placing"].includes(held.phase);
       const entry = {
         id: held.id, channel: held.channel,
         threadId: typeof held.threadId === "string" ? held.threadId : null,
@@ -7213,7 +7221,7 @@ function loadOutgoingMessages() {
         originView: ["main", "threads", "thread", "flat"].includes(held.originView) ? held.originView : "main",
         text: held.text,
         remaining: typeof held.remaining === "string" ? held.remaining : held.text.trim(),
-        state: interrupted ? "unconfirmed" : held.state,
+        state: attempted ? "unconfirmed" : interrupted ? "failed" : held.state,
         phase: "", createdAt: Number(held.createdAt) || Date.now(),
         postedCount: Math.max(0, Number(held.postedCount) || 0),
         parts: Array.isArray(held.parts) ? held.parts.filter((part) =>
@@ -7222,7 +7230,8 @@ function loadOutgoingMessages() {
           ? held.observedParts.filter((id) => typeof id === "string") : [],
         // Absent from an entry saved before keys were sent: its attempts went without one.
         keyedOnly: held.keyedOnly === true,
-        detail: interrupted ? "This page closed before delivery was confirmed." : String(held.detail || ""),
+        detail: attempted ? "This page closed before delivery was confirmed."
+          : interrupted ? "This page closed before this message was sent." : String(held.detail || ""),
       };
       outgoingMessages.set(entry.id, entry);
     }
