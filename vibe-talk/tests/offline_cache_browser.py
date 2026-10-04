@@ -20,6 +20,10 @@ it (`#32 freshness-pill-overlap`). As the pill's room and the error panel above 
 go, a scrolled reader's line stays where it is on the screen, and a reader at the newest line stays
 there (`#33 error-banner-scroll-shift`).
 
+On a touchscreen, a real finger parked at the newest line and drawn up past the end of the list
+reads the channel once, says "Updated" at the foot of the list and does not reload the page; a drag
+short of the threshold reads nothing (`#188 pull-refresh-bottom`).
+
 Opening a thread whose title is longer than the screen, with a long unbroken token and inline code
 in its reply, leaves the page no wider than the viewport and no shown part of the main screen past
 its right edge; on a phone the title is ellipsised instead (`#36 thread-view-phone-overflow`). With
@@ -543,7 +547,8 @@ def main() -> int:
                   " clear of the tabs and the header with #scroll-area unmoved, a scrolled reader"
                   " held in place as it and the error panel come and go, the search glass on the pill's"
                   " line with no header strip and a 44px target, the search bar opened by a real tap and"
-                  " folded with #scroll-area unmoved, Settings' title bar, no Cache Storage or"
+                  " folded with #scroll-area unmoved, Settings' title bar,"
+                  f"{' a pull up past the newest line refreshes in place,' if mobile else ''} no Cache Storage or"
                   " service worker, a long thread title ellipsised within the viewport, the thread"
                   " composer clear of every floating chip, sign-out clears,"
                   " a read-scope token reads with no refused request or console error")
@@ -793,6 +798,76 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                             geometry("in place at the top", "4b-top")
                     before = after
             shot("4b-in-place")
+
+            # 4c. `#188 pull-refresh-bottom`, with a real finger: parked at the newest line, a drag UP
+            # past the end of the list reads the channel once and says so at the foot of the list,
+            # in this same page — no reload — and a drag short of the threshold reads nothing. The
+            # touches go through Chromium's own input pipeline, so this is also the check that the
+            # passive listeners still hear the overscroll at the end of a list that cannot scroll.
+            if mobile:
+                cdp = context.new_cdp_session(page)
+
+                def drag_up(travel: float) -> None:
+                    """One finger, landed on a message low in the list and drawn up, then lifted."""
+                    box = page.evaluate("() => { const r = document.getElementById('scroll-area')"
+                                        ".getBoundingClientRect(); return [r.left + r.width / 2,"
+                                        " r.top + r.height * 0.6]; }")
+                    x, y = float(box[0]), float(box[1])
+                    steps = 12
+                    cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [{"x": x, "y": y}]})
+                    for step in range(1, steps + 1):
+                        page.wait_for_timeout(16)
+                        cdp.send("Input.dispatchTouchEvent", {
+                            "type": "touchMove", "touchPoints": [{"x": x, "y": y - travel * step / steps}]})
+                    page.wait_for_timeout(16)
+                    cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+
+                def affordance() -> tuple[str, str, str]:
+                    found = page.evaluate("() => { const p = document.getElementById('pull-refresh');"
+                                          " return [p.hidden ? '' : p.textContent,"
+                                          " p.getAttribute('data-state'), p.getAttribute('data-edge')]; }")
+                    return str(found[0]), str(found[1]), str(found[2])
+
+                resting = place("newest")
+                check(resting["gap"] <= 2, f"{label}: could not park the reader at the newest line: {resting}")
+                page.evaluate("() => { window.pullRefreshPageMark = true; }")
+                # The channel's own poll — or any other timer that re-reads it, such as the live
+                # stream re-attaching — would be indistinguishable from the pull's read, so the page
+                # clock stands still while the finger is down; the fetch itself needs no timer. Then
+                # a moment for anything those timers already put on the wire to land before counting.
+                page.clock.pause_at(int(page.evaluate("() => Date.now()")) + 1000)
+                page.wait_for_timeout(500)
+                with api.lock:
+                    seen = len(api.requests)
+                reads_before = len(api.reads())
+                drag_up(30)
+                page.wait_for_timeout(400)
+                with api.lock:
+                    during = api.requests[seen:]
+                check(len(api.reads()) == reads_before,
+                      f"{label}: a 30px drag at the newest line read the channel; requests since: {during}")
+                check(affordance()[0] == "", f"{label}: a short drag left the affordance up: {affordance()}")
+                drag_up(160)
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and not affordance()[0].startswith("Updated"):
+                    page.wait_for_timeout(50)
+                shown = affordance()
+                shot("4c-pulled-up")
+                fresh = api.reads()[reads_before:]
+                check(len(fresh) == 1 and "before=" not in fresh[0],
+                      f"{label}: a pull up past the newest line made {len(fresh)} reads: {fresh}")
+                check(re.fullmatch(r"Updated \d{2}:\d{2} · nothing new", shown[0]) is not None
+                      and shown[2] == "end", f"{label}: the foot of the list said {shown}")
+                check(bool(page.evaluate("() => window.pullRefreshPageMark === true")),
+                      f"{label}: the pull up reloaded the page instead of re-reading the channel")
+                page.clock.resume()
+                # After the resume: `place` waits on animation frames, which the paused clock holds.
+                check(place("")["gap"] <= 2, f"{label}: the refresh moved the reader off the newest line")
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and affordance()[0]:
+                    page.wait_for_timeout(50)
+                check(affordance()[0] == "", f"{label}: the pull's result never went: {affordance()}")
+                cdp.detach()
 
             # 5. The API unreachable: the rows stay, and the pill says they are old.
             page.route("**/api/**", lambda route: route.abort("internetdisconnected"))

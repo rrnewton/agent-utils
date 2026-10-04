@@ -6103,10 +6103,12 @@ function setChannelFreshness(state) {
 /**
  * Over the top of the list rather than in it: a sentence at the head of the history scrolls away
  * with it, and the reader is usually at the bottom, which is exactly where "these are old" has to
- * be visible. Hidden while the pull-to-refresh pill is in the same place.
+ * be visible. Hidden while the pull-to-refresh pill is in the same place — a pull at the top. A
+ * pull up from the newest line puts that pill at the foot of the list, and this one stays.
  */
 function renderChannelFreshness() {
   const pill = el("channel-freshness");
+  const gesture = el("pull-refresh");
   const at = stamp(channelFreshAt);
   const refreshing = !el("channel-loading").hidden;
   // CURRENT IS SAID TOO, not left blank: a blank pill reads the same as a page that never managed
@@ -6127,10 +6129,12 @@ function renderChannelFreshness() {
           : current;
   pill.textContent = text;
   pill.setAttribute("data-state", channelFreshness);
-  // It gives way to a pull, and — since `#197 floating-search` put the search glass on the same
-  // line — to the open search bar, which grows along that line across the top of the list.
-  pill.hidden =
-    text === "" || currentView !== "discord" || !el("pull-refresh").hidden || searchOpen;
+  // It gives way to a pull at the TOP, which draws in the same place (a pull up at the foot leaves
+  // "Offline" or "Refresh failed" standing, `#188 pull-refresh-bottom`), and — since `#197
+  // floating-search` put the search glass on the same line — to the open search bar, which grows
+  // along that line across the top of the list.
+  pill.hidden = text === "" || currentView !== "discord" ||
+    (!gesture.hidden && gesture.getAttribute("data-edge") !== "end") || searchOpen;
   reserveFreshnessRoom(text !== "");
 }
 
@@ -10773,16 +10777,91 @@ function takeDeferredOlder() {
 // the history asking for what is new, and "keep my place" there means "stay at the oldest thing
 // you have loaded", which is the opposite of the request. The button keeps its place because it
 // is pressed from wherever the reader happens to be reading.
+//
+// ...AND PULLING UP PAST THE NEWEST MESSAGE. `#188 pull-refresh-bottom`. The same gesture at the
+// other end of the list, which is the end the owner actually reads at: "I want pull UP to trigger
+// refresh even IF messages were loaded in the past." The pull above answers only a reader at the
+// TOP. Before anything has loaded, that is everyone — an empty list is at its top — which is why
+// it seemed to work then; once a channel has loaded, the reader is parked at the newest line, a
+// whole history away from it. Bouncing against the bottom did nothing, and showed nothing.
+//
+// ONE GESTURE, TWO EDGES, and the edge is whichever end of the list ran out under the finger. A
+// list too short to scroll is at both ends at once, and there the direction decides: down is the
+// top's pull, up is the bottom's. The axis test, the second-finger refusal, the threshold and the
+// refusal during a step back are shared, because a second gesture beside this one would be a
+// second set of rules about what counts as a pull, and the two would drift. What differs, and why:
+//
+//   * A PULL UP MUST BEGIN WITH THE READER PARKED AT THE NEWEST LINE — `atBottom` at touchstart,
+//     the same test that decides whether a re-read follows them. The top cannot ask this (rule 1:
+//     the step back makes "already at the top" unreachable on a paged channel), but nothing pages
+//     in at the bottom, so the bottom can. It is what keeps a fling from refreshing: a drag that
+//     starts in the history and runs the list out is a scroll however far the finger goes after
+//     it. Only a reader who stopped at the bottom and pulled again is asking.
+//   * ITS TRAVEL IS STILL MEASURED FROM WHERE THE LIST REALLY RAN OUT, which is rule 2 — to within
+//     PULL_EDGE_SLACK_PX, not `atBottom`'s thumb-sized slack. The pixels inside that slack still
+//     scroll, and pixels that scroll are not a pull.
+//   * `keepPosition: true`, like the poll. The reader is AT the newest line, which is the one place
+//     "keep my place" and "show me the newest" are the same instruction — and keeping it means a
+//     refresh does not throw away the history they walked back through to get here.
+//   * A READ ALREADY IN FLIGHT IS THE REFRESH. A poll, the stream's catch-up or the cold start's
+//     re-read is reading what the reader asked for, so the release waits for it and reports it
+//     rather than putting a second read on the wire behind it — whether it was already on the wire
+//     when the finger landed or began while the finger was down. The top's pull is NOT offered
+//     over a read in flight, as before: its release asks `loadDiscord` directly, which can only
+//     queue behind that read and return at once, and it would report a refresh that had not
+//     happened. The foot has to be offered there all the same. On a weak signal a channel read can
+//     hang for as long as the connection stalls, which is just when the owner bounces against the
+//     bottom, and a pull that showed nothing then would be "I don't get a refresh that shows in
+//     the UI" all over again.
+//   * WHAT IT REPORTS IS ABOUT THE VIEW IT WAS ASKED OVER, AND FROM THE RELEASE ON. A reader on a
+//     slow read taps another tab, another thread or another channel; the read they pulled for is
+//     then folded away for later, and the freshness the page restores belongs to the view they
+//     went to. Said at the foot, that would be "Updated" at a time the reader never refreshed,
+//     with "new messages" for rows that arrived with a different view. So the result is dropped
+//     once the view is not the one pulled, and "Updated" needs a read that landed since the
+//     release.
+//   * IT SAYS WHAT IT FOUND, ITSELF. At the top the affordance gives way to the freshness pill,
+//     which then says "Updated 07:15" or "Refresh failed" in the same place. From the bottom that
+//     pill is a screen away, so the affordance says it, for PULL_RESULT_MS, and goes.
+//
+// Chrome's OWN pull-to-refresh is not a concern at either end, and must not become one: it
+// reloads the whole application — the live stream, a call, the reader's place — to re-read a list
+// this page can re-read by itself. `overscroll-behavior: none` on the document and `contain` on
+// #scroll-area already keep every overscroll on this list: `contain` rather than `none`, so the
+// platform's own stretch at the edge still shows, which is the bounce the owner described and a
+// fair cue that the list has run out.
 
-// How far past the top the finger has to travel before a release means anything.
+// How far past either end the finger has to travel before a release means anything. About a
+// centimetre on a phone: beyond the few pixels a resting thumb wanders, and within one stroke of a
+// thumb that is already on the glass. The same at both ends, so the gesture feels like one thing.
 const PULL_ARM_PX = 64;
 
+// How close to the true bottom the list must be for a pull up to start counting. Not zero, because
+// a browser at a fractional device-pixel ratio reports a resting list a fraction of a pixel short
+// of `scrollHeight - clientHeight`; not BOTTOM_SLACK_PX, because the pixels inside that slack can
+// still scroll.
+const PULL_EDGE_SLACK_PX = 2;
+
+// How far the affordance moves however far the finger goes. It follows the finger by less and less
+// — half of this at the threshold — so the pull reads as stretching something, not dragging it.
+const PULL_RISE_PX = 40;
+
+// How long a pull up leaves its result on the screen: long enough to read "Updated 07:15" at a
+// glance, short enough not to sit over the newest line once it has been read.
+const PULL_RESULT_MS = 2000;
+
+// How often a release that found a read already in flight looks again — the same interval
+// `refreshAfterLiveMutation` waits on for the same lock.
+const PULL_WAIT_MS = 50;
+
 // What the affordance says in each state of the gesture. The reader is told it is armed BEFORE
-// they let go, because a gesture that only reports itself afterwards cannot be abandoned.
+// they let go, because a gesture that only reports itself afterwards cannot be abandoned. A
+// successful pull up says when it was updated instead, so its words are written where it lands.
 const PULL_LABELS = {
   pull: "Pull to refresh",
   armed: "Release to refresh",
   busy: "Refreshing…",
+  failed: "Refresh failed",
 };
 
 /**
@@ -10790,26 +10869,77 @@ const PULL_LABELS = {
  *
  * Built on every touchstart in the channel view, wherever the list happens to be scrolled to —
  * because rule 1 above is about a finger being down and not about what that finger turns out to
- * mean. `anchorY` is null until the list runs out under it, and that is what says whether any of
- * this drag counts as a pull yet.
+ * mean. `anchorY` is null until the list runs out under it at the top — and stays null for a touch
+ * that landed without `topOpen` — and `endY` the same at the bottom, set only for a touch that
+ * began `fromNewest`; that is what says whether any of this drag counts as a pull yet. `edge` is
+ * the end the travel is pulling past, or null.
  */
 let pull = null;
 
 /** A step back that `maybeLoadOlder` refused because a finger was down, and owes the reader. */
 let olderDeferred = false;
 
-/** Show the gesture, or take the affordance away. `null` is "no gesture". */
-function renderPull(state) {
+/** The timer that takes a pull up's result away again, or null. */
+let pullResultTimer = null;
+
+/**
+ * Show the gesture, or take the affordance away. `null` is "no gesture".
+ *
+ * `edge` puts it at the end being pulled past, and `travel` is how far the finger has gone past
+ * that end: the affordance moves with it, resisted, and its spinner winds up as the pull nears the
+ * threshold. Every call replaces whatever the affordance was saying, a pull up's result included.
+ *
+ * @param {string|null} state a key of PULL_LABELS, "done", or null
+ * @param {{edge?: string, travel?: number, label?: string}} [how]
+ */
+function renderPull(state, { edge = "top", travel = 0, label = "" } = {}) {
   const element = el("pull-refresh");
+  if (pullResultTimer !== null) {
+    clearTimeout(pullResultTimer);
+    pullResultTimer = null;
+  }
   element.hidden = state === null;
   element.setAttribute("data-state", state === null ? "idle" : state);
-  element.textContent = state === null ? "" : PULL_LABELS[state];
+  element.setAttribute("data-edge", edge);
+  element.textContent = state === null ? "" : label || PULL_LABELS[state];
+  const gone = Math.max(0, travel);
+  const rise = Math.round(PULL_RISE_PX * gone / (gone + PULL_ARM_PX));
+  element.style.setProperty("--pull-rise", `${rise}px`);
+  // Only while the finger is still deciding: the in-flight spin starts from zero, and starting it
+  // from wherever the pull left the arc would jerk it back once a turn.
+  const winding = state === "pull" || state === "armed";
+  const turn = winding ? Math.round(270 * gone / PULL_ARM_PX) : 0;
+  element.style.setProperty("--pull-turn", `${turn}deg`);
   renderChannelFreshness();
+}
+
+/**
+ * Take the affordance away IF it is describing a drag. A refresh in flight, and the result of one,
+ * are reports about the channel rather than about this touch: a tap or a cancelled touch while one
+ * is up must not take it down, and a scroll elsewhere in the list must not either.
+ */
+function clearPullOffer() {
+  const state = el("pull-refresh").getAttribute("data-state");
+  if (state === "pull" || state === "armed") {
+    renderPull(null);
+  }
+}
+
+/**
+ * A touch that lands in a draft long enough to scroll belongs to the draft. The composer sits at
+ * the foot of the channel, exactly where a pull up starts, and dragging through a long message to
+ * reach its end is the same motion; while the draft scrolls, the list stays at its end, so without
+ * this it would read as a pull. A draft that fits is just part of the list and pulls like it.
+ */
+function inScrollingDraft(event) {
+  const target = event && event.target;
+  return Boolean(target) && String(target.tagName).toUpperCase() === "TEXTAREA" &&
+    Number(target.scrollHeight) > Number(target.clientHeight) + 1;
 }
 
 function pullCancel() {
   pull = null;
-  renderPull(null);
+  clearPullOffer();
   // The finger is off the glass however it left, so the suspension is over. A step the reader is
   // owed must not be lost because the browser took the gesture away.
   takeDeferredOlder();
@@ -10827,7 +10957,7 @@ function pullStart(event) {
     if (pull !== null) {
       pull.refused = true;
       pull.armed = false;
-      renderPull(null);
+      clearPullOffer();
     }
     return;
   }
@@ -10836,18 +10966,32 @@ function pullStart(event) {
   // would suspend the automatic step back for as long as the page stayed open.
   const point = touches[0];
   pull = null;
-  if (!point || currentView !== "discord" || olderFetchInFlight || discordFetchInFlight) {
+  if (!point || currentScreen !== "main" || currentView !== "discord" || olderFetchInFlight) {
     return;
   }
+  const area = el("scroll-area");
+  const y = Number(point.clientY) || 0;
+  // Parked at the newest line when the finger landed — the condition for a pull UP at all. See
+  // `#188 pull-refresh-bottom` above: it is what tells a pull from a fling that reached the end.
+  const fromNewest = atBottom(area);
+  // A channel read on the wire closes the TOP to this touch, and only the top: the foot's release
+  // waits for that read and reports it. See "A READ ALREADY IN FLIGHT IS THE REFRESH" above.
+  const topOpen = !discordFetchInFlight;
   pull = {
     startX: Number(point.clientX) || 0,
-    startY: Number(point.clientY) || 0,
+    startY: y,
     // Null means "the list has not run out yet". Set to where the finger was at the moment it
     // did, which is where an overscroll actually begins — see rule 2 above. Landing with the list
     // already at its top is that same moment, arriving early.
-    anchorY: el("scroll-area").scrollTop > 0 ? null : Number(point.clientY) || 0,
+    anchorY: topOpen && area.scrollTop <= 0 ? y : null,
+    topOpen,
+    fromNewest,
+    // The same, at the bottom: landing with the list already at its very end is that moment too.
+    endY: fromNewest && atBottom(area, PULL_EDGE_SLACK_PX) ? y : null,
+    edge: null,
     armed: false,
-    refused: false,
+    // Still a touch, so the step back stays suspended under it; it is just never a pull.
+    refused: inScrollingDraft(event),
   };
 }
 
@@ -10866,43 +11010,56 @@ function pullMove(event) {
   if (Math.abs((Number(point.clientX) || 0) - pull.startX) > Math.abs(y - pull.startY)) {
     pull.refused = true;
     pull.armed = false;
-    renderPull(null);
+    clearPullOffer();
     return;
   }
-  if (el("scroll-area").scrollTop > 0) {
-    // Still content above: the browser has somewhere to scroll, so these pixels are a scroll. Any
-    // anchor from earlier in this drag is void — the reader went back INTO the history, and the
-    // overscroll would have to begin again if they come back out of it.
+  const area = el("scroll-area");
+  // Each end keeps its anchor only while the list is still run out at that end. Content above,
+  // or below: the browser has somewhere to scroll, so these pixels are a scroll, and any anchor
+  // from earlier in this drag is void — the reader went back INTO the history, and the overscroll
+  // would have to begin again if they come back out of it. Arriving at an end anchors it HERE:
+  // the pull is measured from the edge, and the travel spent reaching it belonged to the scroll.
+  if (!pull.topOpen || area.scrollTop > 0) {
     pull.anchorY = null;
-    pull.armed = false;
-    renderPull(null);
-    return;
-  }
-  if (pull.anchorY === null) {
-    // The list has just run out under the finger. THIS is the edge, and the pull is measured from
-    // here — the travel spent reaching it belonged to the scroll.
+  } else if (pull.anchorY === null) {
     pull.anchorY = y;
   }
-  const travelled = y - pull.anchorY;
-  if (travelled <= 0) {
-    // Moving back up while still at the top. Re-anchor rather than refuse: the finger has not
-    // left, the list is still at its edge, and the next downward millimetre is the start of a
-    // pull. This is what lets the reader change their mind without lifting.
-    pull.anchorY = y;
+  if (!pull.fromNewest || !atBottom(area, PULL_EDGE_SLACK_PX)) {
+    pull.endY = null;
+  } else if (pull.endY === null) {
+    pull.endY = y;
+  }
+  const down = pull.anchorY === null ? 0 : y - pull.anchorY;
+  const up = pull.endY === null ? 0 : pull.endY - y;
+  // The end already being pulled keeps the gesture while its travel lasts. Otherwise it goes to
+  // whichever end the finger is past — on a list too short to scroll, the direction of the drag.
+  const keeps = (pull.edge === "top" && down > 0) || (pull.edge === "end" && up > 0);
+  if (!keeps) {
+    pull.edge = down > 0 ? "top" : up > 0 ? "end" : null;
+  }
+  if (pull.edge === null) {
+    // Back past where the pull began, or no end under the finger at all. Re-anchor whichever end
+    // the list is still at rather than refuse: the finger has not left, and the next millimetre
+    // past that end is the start of a pull. This is what lets the reader change their mind
+    // without lifting.
+    if (pull.anchorY !== null) pull.anchorY = y;
+    if (pull.endY !== null) pull.endY = y;
     pull.armed = false;
-    renderPull(null);
+    clearPullOffer();
     return;
   }
+  const travelled = pull.edge === "top" ? down : up;
   pull.armed = travelled >= PULL_ARM_PX;
-  renderPull(pull.armed ? "armed" : "pull");
+  renderPull(pull.armed ? "armed" : "pull", { edge: pull.edge, travel: travelled });
 }
 
 /** The finger lifted. Only an ARMED pull does anything — but the suspension ends either way. */
 async function pullEnd() {
   const armed = pull !== null && pull.armed;
+  const edge = pull !== null ? pull.edge : null;
   pull = null;
   if (!armed) {
-    renderPull(null);
+    clearPullOffer();
     // Whatever this touch was, it was not a pull, so the step back it stood in the way of is the
     // reader's again. THIS is what keeps the walk automatic: a reader who drags up to the top and
     // lifts has asked for what is above, and gets it here rather than having to scroll a second
@@ -10913,7 +11070,12 @@ async function pullEnd() {
   // An ARMED pull drops it instead: the reader has asked for the newest end of the channel, and
   // answering that by prepending more history is answering the opposite question.
   olderDeferred = false;
-  renderPull("busy");
+  if (edge === "end") {
+    await refreshFromNewest();
+    return;
+  }
+  // Held where it armed, rather than snapping back to the edge as the finger lifts.
+  renderPull("busy", { travel: PULL_ARM_PX });
   const before = discordNewestId;
   try {
     // No options: a user-initiated refresh goes to the newest message. See the note above.
@@ -10928,6 +11090,74 @@ async function pullEnd() {
       ? "refreshed — something new had arrived."
       : "refreshed — nothing new since the last read."
   );
+}
+
+/**
+ * An armed pull up, released. Re-read what is on screen — the channel, the thread list, or the one
+ * thread that is open, since `loadDiscord` reads whichever view is up — and then say what it found.
+ *
+ * The error is re-thrown after the affordance has said "Refresh failed", so that the failure is
+ * reported where every other failed read is reported, and the affordance is not the only record.
+ */
+async function refreshFromNewest() {
+  renderPull("busy", { edge: "end", travel: PULL_ARM_PX });
+  // What the result will be about: this view of this channel, from this moment on.
+  const asked = {
+    context: channelContextKey(),
+    at: Date.now(),
+    newest: discordNewestId,
+  };
+  let failure = null;
+  try {
+    if (discordFetchInFlight) {
+      // A poll, the live stream's catch-up or the cold start's re-read — on the wire when the
+      // finger landed, or begun while it was down. It is reading the view on screen now, which is
+      // what the reader asked for; a second read queued behind it would only ask again.
+      while (discordFetchInFlight) {
+        await new Promise((resolve) => setTimeout(resolve, PULL_WAIT_MS));
+      }
+    } else {
+      await loadDiscord({ keepPosition: true });
+    }
+  } catch (error) {
+    failure = error;
+  }
+  showPullResult(failure !== null, asked);
+  if (failure !== null) {
+    throw failure;
+  }
+}
+
+/** Say, at the foot of the list, what the refresh a pull up asked for found — then go. */
+function showPullResult(threw, asked) {
+  // Nothing to say over a view the reader has left — another tab, another thread, another channel.
+  // The read they pulled for was folded away for when they come back, or dropped, and the
+  // freshness on the page now is the one restored for where they went. The freshness pill speaks
+  // for that view; "Updated" here would be a time they never refreshed at.
+  if (currentView !== "discord" || channelContextKey() !== asked.context) {
+    renderPull(null);
+    return;
+  }
+  // The freshness state is the record of how the read went, whichever read it was — this one, or
+  // the one already in flight that it waited on — but CURRENT only for a read that landed since
+  // the release. A read that was superseded and never landed leaves the stamp from an older one.
+  // Current wins over a throw: a read queued behind a failed one can still land for this view.
+  const current = channelFreshness === "fresh" && channelFreshAt >= asked.at;
+  const failed = !current &&
+    (threw || channelFreshness === "offline" || channelFreshness === "failed");
+  if (!failed && !current) {
+    renderPull(null);
+    return;
+  }
+  const arrived = discordNewestId !== null && discordNewestId !== asked.newest;
+  const label = failed
+    ? PULL_LABELS.failed
+    : `Updated ${stamp(channelFreshAt)} · ${arrived ? "new messages" : "nothing new"}`;
+  renderPull(failed ? "failed" : "done", { edge: "end", travel: PULL_ARM_PX, label });
+  pullResultTimer = setTimeout(() => {
+    pullResultTimer = null;
+    renderPull(null);
+  }, PULL_RESULT_MS);
 }
 
 /** The id of the newest message the channel list is currently showing, or null. */
@@ -14421,12 +14651,18 @@ el("scroll-area").addEventListener("scroll", () => {
 // `preventDefault`: the pull only ever begins where the element has nothing left to scroll, so
 // there is no browser behaviour to suppress — `overscroll-behavior: contain` has already stopped
 // the drag becoming the browser's own page-level refresh.
-el("scroll-area").addEventListener("touchstart", pullStart);
-el("scroll-area").addEventListener("touchmove", pullMove);
-el("scroll-area").addEventListener("touchend", guardQuietly(pullEnd));
+//
+// So all four are PASSIVE, and say so. A listener that might cancel makes the browser hold every
+// scroll that starts on this list until the script has answered, and this script is often busy —
+// drawing a page of rows, decoding a stream. The gesture only ever reads the touches; declaring
+// that lets the list scroll first and tell the page afterwards. `#188 pull-refresh-bottom`.
+const PASSIVE = { passive: true };
+el("scroll-area").addEventListener("touchstart", pullStart, PASSIVE);
+el("scroll-area").addEventListener("touchmove", pullMove, PASSIVE);
+el("scroll-area").addEventListener("touchend", guardQuietly(pullEnd), PASSIVE);
 // A cancel is the browser taking the gesture away — a phone call arriving, a system gesture
 // winning. It must not leave the affordance standing on the screen saying "release to refresh".
-el("scroll-area").addEventListener("touchcancel", pullCancel);
+el("scroll-area").addEventListener("touchcancel", pullCancel, PASSIVE);
 
 /**
  * Like `guard`, but for things that are not a call: it reports, and it does NOT tear down a live

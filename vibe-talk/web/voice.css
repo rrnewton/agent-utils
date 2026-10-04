@@ -1628,13 +1628,25 @@ body {
 
    `pointer-events: none`, because it is a report and never a control. The finger that summoned it
    is mid-drag on the list underneath, and a strip that swallowed that drag would cancel the gesture
-   it exists to describe. */
+   it exists to describe.
+
+   `#188 pull-refresh-bottom`. It follows the finger: `--pull-rise` is the resisted travel and
+   `--pull-turn` winds the spinner up toward the threshold, both written by `renderPull`. One line,
+   and as wide as its words, because "Updated 07:15 · nothing new" in a box only half the pane wide
+   — which is what `left: 50%` leaves an auto width — wraps. */
 #pull-refresh {
   position: absolute;
   z-index: 2;
   top: 0.4rem;
   left: 50%;
-  transform: translateX(-50%);
+  transform: translate(-50%, var(--pull-rise, 0px));
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  box-sizing: border-box;
+  width: max-content;
+  max-width: calc(100% - 2rem);
+  white-space: nowrap;
   padding: 0.25rem 0.75rem;
   background: var(--panel);
   color: var(--muted);
@@ -1643,6 +1655,48 @@ body {
   font-size: 0.78rem;
   box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
   pointer-events: none;
+}
+
+/* The same spinner as the channel's loading line, so "this is fetching" looks one way everywhere.
+   Turned by the pull until the release, then spun by the fetch. */
+#pull-refresh::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 0.75rem;
+  height: 0.75rem;
+  border: 2px solid var(--edge);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  transform: rotate(var(--pull-turn, 0deg));
+}
+
+#pull-refresh[data-state="busy"]::before {
+  animation: outgoing-spin 0.8s linear infinite;
+}
+
+/* A result is a sentence, not a fetch: no spinner beside it. */
+#pull-refresh[data-state="done"]::before,
+#pull-refresh[data-state="failed"]::before {
+  display: none;
+}
+
+/* `#188 pull-refresh-bottom`. A pull UP past the newest message reports at the foot of the list,
+   where the reader's thumb and eyes already are, and rises from there. It stands where the status
+   line does and clears the floating chips the same way, by their measured height: the two are the
+   same kind of thing — what was true a moment ago — and neither may cover a control. */
+#pull-refresh[data-edge="end"] {
+  top: auto;
+  bottom: calc(0.5rem + var(--scroll-tools-clearance, 0px));
+  transform: translate(-50%, calc(-1 * var(--pull-rise, 0px)));
+}
+
+#pull-refresh[data-state="failed"] {
+  color: var(--warn);
+  border-color: currentColor;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #pull-refresh[data-state="busy"]::before { animation: none; }
 }
 
 /* `#18 offline-message-cache`. The same pill as #pull-refresh, which it gives way to: rows saved

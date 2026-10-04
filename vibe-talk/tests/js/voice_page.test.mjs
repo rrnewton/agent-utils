@@ -2424,11 +2424,27 @@ const TUNING_BANDS = {
     "step — including one at the bottom — so a single flick walks the whole channel; at zero the " +
     "reader has to hit the top exactly"],
   PULL_ARM_PX: [24, 200,
-    "how far past the top a finger has to travel before releasing refreshes. Below a couple of " +
-    "dozen pixels an ordinary flick at the top of the channel refreshes by accident — and it " +
-    "throws the reader to the newest message, which is the one thing they did not ask for; above " +
-    "a couple of hundred it is further than a thumb travels on a 375x667 phone, so the gesture " +
-    "cannot be completed at all"],
+    "how far past either end a finger has to travel before releasing refreshes. Below a couple " +
+    "of dozen pixels an ordinary flick refreshes by accident — and at the top it throws the " +
+    "reader to the newest message, which is the one thing they did not ask for; above a couple " +
+    "of hundred it is further than a thumb travels on a 375x667 phone, so the gesture cannot be " +
+    "completed at all"],
+  PULL_EDGE_SLACK_PX: [1, 8,
+    "how close to the true bottom a pull up starts counting. At zero a phone at a fractional " +
+    "pixel ratio, resting a fraction of a pixel short of the end, never starts one; past a few " +
+    "pixels the travel through the last of the scroll counts as pull, so it arms early " +
+    "(#188 pull-refresh-bottom)"],
+  PULL_RISE_PX: [8, 120,
+    "how far the affordance follows the finger. Under a few pixels the pull shows no give and " +
+    "reads as a label that merely appeared; past a hundred or so it climbs over the messages it " +
+    "is reporting on"],
+  PULL_RESULT_MS: [1000, 6000,
+    "how long a pull up's result stays. Under a second \"Updated 07:15\" goes before it can be " +
+    "read; past the status line's own few seconds it is a fixture over the newest line"],
+  PULL_WAIT_MS: [10, 500,
+    "how often a release that found a read in flight looks again. Under ten milliseconds it is a " +
+    "busy loop on the thread drawing the rows; past half a second the result visibly trails the " +
+    "rows it is describing"],
   DISCORD_POLL_MS: [5000, 600000,
     "the unasked re-read: often enough to be fresh, rare enough that a voice call is not sharing " +
     "its network with it"],
@@ -10898,6 +10914,582 @@ test("the pull affordance is a sibling of the scroll area, not a passenger insid
   );
   // The gesture depends on the browser NOT taking the overscroll for its own page refresh.
   assert.match(cssBlock("#scroll-area"), /overscroll-behavior:\s*contain/);
+});
+
+// --- pulling UP past the newest message ---------------------------------------------------------
+//
+// `#188 pull-refresh-bottom`. The owner reads at the newest end of the channel, and "I want pull UP
+// to trigger refresh even IF messages were loaded in the past." The top's pull answered only a
+// reader at the top, which on an empty list is everyone — so it seemed to work until the channel
+// had loaded, and then the reader was a whole history away from it. Bouncing against the bottom did
+// nothing and showed nothing.
+//
+// The same gesture at the other end, so the tests below check what differs: it must BEGIN with the
+// reader parked at the newest line, so a fling that merely reaches the end is a scroll; it keeps the
+// reader's place; it waits for a read already in flight instead of adding one; and it says what it
+// found at the foot of the list, where the reader is looking, before it goes.
+
+/** How long a pull up leaves its result on the screen. Derived, never restated. */
+const PULL_RESULT_MS = sourceConstant("PULL_RESULT_MS");
+/** How often a release waiting on a read in flight looks again. Derived, for the same reason. */
+const PULL_WAIT_MS = sourceConstant("PULL_WAIT_MS");
+/** How far the affordance follows the finger, however far the finger goes. */
+const PULL_RISE_PX = sourceConstant("PULL_RISE_PX");
+
+/**
+ * One pull UP on the channel list: land at `from`, drag `travel` pixels toward the top of the
+ * screen, and lift — the drag that, at the newest line, runs past the end of the list.
+ */
+async function pullUp(page, travel, { lift = true, from = 300, target = undefined } = {}) {
+  const area = page.el("scroll-area");
+  await area.dispatch("touchstart", { ...touchAt(from), target });
+  await area.dispatch("touchmove", touchAt(from - travel));
+  if (lift) {
+    await area.dispatch("touchend");
+    await page.settle();
+  }
+}
+
+/**
+ * A channel long enough to scroll, read, and left where the owner reads it: at the newest line.
+ * Returns the channel's whole history too, so a test can make something arrive.
+ */
+async function parkedAtNewest(page) {
+  const all = pagedChannel(page, { steps: 2, size: 12, content: (i) => longMessage(`m${i}`) });
+  await showDiscord(page, []);
+  const area = page.el("scroll-area");
+  assert.ok(area.scrollHeight > area.clientHeight * 2, "the channel does not overflow");
+  area.scrollTop = area.scrollHeight;
+  assert.ok(atBottomOf(area), "the reader is not at the newest line");
+  return { area, all };
+}
+
+/**
+ * Hold the channel's next reads open until the test says, still answering them as the fixture does.
+ * `route` is the fixture's handler to hold: `channelPage` for a flat channel, `timeline` for one
+ * with threads. `release` answers every held read and stops holding; `fail` answers them as a
+ * dropped connection would.
+ */
+function holdChannelReads(page, route = "channelPage") {
+  const serve = page[route];
+  const held = [];
+  page[route] = (path, options) => new Promise((resolve, reject) => {
+    held.push({
+      open: () => resolve(serve(path, options)),
+      drop: () => reject(new TypeError("Failed to fetch")),
+    });
+  });
+  return {
+    held,
+    release: () => {
+      page[route] = serve;
+      for (const read of held.splice(0)) read.open();
+    },
+    fail: () => {
+      page[route] = serve;
+      for (const read of held.splice(0)) read.drop();
+    },
+  };
+}
+
+/** The pixels the affordance has risen by, as `renderPull` wrote them. */
+const riseOf = (page) => Number.parseInt(page.el("pull-refresh").style.getPropertyValue("--pull-rise"), 10);
+
+test("A PULL UP PAST THE NEWEST MESSAGE REFRESHES, WITH THE CHANNEL ALREADY LOADED", async () => {
+  // The case the owner reported, exactly: messages loaded in the past, the reader at the bottom.
+  const page = newPage();
+  await signIn(page);
+  const { area, all } = await parkedAtNewest(page);
+  const readsBefore = page.pageReads;
+  all.push(message({ id: "9995", content: "the arm64 runner came back by itself" }));
+
+  await pullUp(page, PULL_ARM_PX);
+
+  assert.equal(page.pageReads, readsBefore + 1, "a pull up past the newest message fetched nothing");
+  assert.doesNotMatch(
+    page.pagesServed[page.pagesServed.length - 1],
+    /before=/,
+    "the pull up walked BACK instead of fetching what is new"
+  );
+  assert.ok(shownIds(page).includes("9995"), "the message the pull up fetched is not on the screen");
+  // The reader was at the newest line and is at the new newest line: keeping their place, there,
+  // IS following the newest.
+  assert.ok(atBottomOf(area), "the refresh left the reader above the message it fetched");
+
+  // ...and it says so where the reader is looking, then goes.
+  const affordance = page.el("pull-refresh");
+  assert.equal(affordance.hidden, false, "a pull up refreshed and said nothing at the foot of the list");
+  assert.equal(affordance.getAttribute("data-edge"), "end", "the result was reported at the top");
+  assert.equal(affordance.getAttribute("data-state"), "done");
+  assert.match(affordance.textContent, /^Updated \d{2}:\d{2} · new messages$/);
+  assert.equal(page.expireTimers(PULL_RESULT_MS), 1, "nothing was armed to take the result away");
+  assert.equal(affordance.hidden, true, "the result stayed over the newest line");
+  assert.equal(affordance.textContent, "", "the collapsed affordance kept its wording");
+});
+
+test("...and a pull up that finds nothing new says THAT, rather than looking like no refresh", async () => {
+  const page = newPage();
+  await signIn(page);
+  await parkedAtNewest(page);
+  const readsBefore = page.pageReads;
+
+  await pullUp(page, PULL_ARM_PX);
+
+  assert.equal(page.pageReads, readsBefore + 1, "the pull up fetched nothing");
+  assert.match(page.el("pull-refresh").textContent, /^Updated \d{2}:\d{2} · nothing new$/);
+});
+
+test("THE FOOT OF THE LIST SAYS PULL, THEN RELEASE, THEN REFRESHING — AND FOLLOWS THE FINGER", async () => {
+  const page = newPage();
+  await signIn(page);
+  const { area } = await parkedAtNewest(page);
+  const affordance = page.el("pull-refresh");
+  assert.equal(affordance.hidden, true, "the affordance stands on the screen at rest");
+
+  await area.dispatch("touchstart", touchAt(300));
+  await area.dispatch("touchmove", touchAt(300 - (PULL_ARM_PX - 1)));
+  assert.equal(affordance.hidden, false, "a drag past the newest message said nothing at all");
+  assert.equal(affordance.getAttribute("data-edge"), "end", "a pull up was drawn at the top edge");
+  assert.equal(affordance.getAttribute("data-state"), "pull");
+  assert.match(affordance.textContent, /Pull/);
+  // The freshness pill is a screen away from the foot of the list, so — unlike a pull at the top,
+  // which takes its place — this one leaves it up: "Offline · …" is the reason to pull at all.
+  assert.equal(page.el("channel-freshness").hidden, false, "a pull up hid how current the channel is");
+  const short = riseOf(page);
+  assert.ok(short > 0 && short < PULL_ARM_PX - 1, `the affordance rose ${short}px for a ${PULL_ARM_PX - 1}px pull`);
+
+  await area.dispatch("touchmove", touchAt(300 - PULL_ARM_PX));
+  assert.equal(affordance.getAttribute("data-state"), "armed");
+  assert.match(affordance.textContent, /Release/);
+  const armedAt = riseOf(page);
+
+  // RESISTED: twice the travel is not twice the rise, and no pull climbs past PULL_RISE_PX.
+  await area.dispatch("touchmove", touchAt(300 - PULL_ARM_PX * 4));
+  const far = riseOf(page);
+  assert.ok(far > armedAt, "the affordance stopped following the finger");
+  assert.ok(far - armedAt < PULL_ARM_PX * 3, "the affordance moved as far as the finger did");
+  assert.ok(far < PULL_RISE_PX, `the affordance climbed ${far}px, past its ${PULL_RISE_PX}px reach`);
+
+  // Changing your mind takes the offer away: back down past where the pull began.
+  await area.dispatch("touchmove", touchAt(310));
+  assert.equal(affordance.hidden, true, "an abandoned pull up left its offer on the screen");
+  const readsBefore = page.pageReads;
+  await area.dispatch("touchend");
+  await page.settle();
+  assert.equal(page.pageReads, readsBefore, "an abandoned pull up refreshed anyway");
+
+  // Now the real one, held in flight: "it shows the refresh happening" is a claim about the window
+  // between the release and the answer, and a fixture that answers at once has none.
+  await area.dispatch("touchstart", touchAt(300));
+  await area.dispatch("touchmove", touchAt(300 - PULL_ARM_PX));
+  const reads = holdChannelReads(page);
+  const lifted = area.dispatch("touchend");
+  await page.settle();
+  assert.equal(affordance.hidden, false, "nothing at the foot of the list says the refresh is happening");
+  assert.equal(affordance.getAttribute("data-state"), "busy");
+  assert.equal(affordance.getAttribute("data-edge"), "end");
+  assert.match(affordance.textContent, /Refreshing/);
+  // A tap while it is in flight is not a pull, and must not take the report down with it.
+  await area.dispatch("touchstart", touchAt(200));
+  await area.dispatch("touchend");
+  assert.equal(affordance.getAttribute("data-state"), "busy", "a tap took down the refresh in flight");
+
+  reads.release();
+  await lifted;
+  await page.settle();
+  assert.equal(affordance.getAttribute("data-state"), "done", "the refresh never said it had finished");
+  assert.match(affordance.textContent, /^Updated \d{2}:\d{2}/);
+});
+
+test("A PULL UP THAT FAILS SAYS SO AT THE FOOT, AND IN THE ERROR PANEL, AND KEEPS THE ROWS", async () => {
+  // The owner's other half: "especially while the page says it is offline". A pull that fails has
+  // to look different from one that worked, at the place the reader is looking.
+  const page = newPage();
+  await signIn(page);
+  await parkedAtNewest(page);
+  const rows = shownIds(page);
+  const serve = page.channelPage;
+  page.channelPage = errorResponse(502, "discord_error", "the provider is down");
+
+  await pullUp(page, PULL_ARM_PX);
+
+  const affordance = page.el("pull-refresh");
+  assert.equal(affordance.getAttribute("data-edge"), "end");
+  assert.equal(affordance.getAttribute("data-state"), "failed", "a failed pull up reported success");
+  assert.equal(affordance.textContent, "Refresh failed");
+  assert.deepStrictEqual(shownIds(page), rows, "a failed refresh took the rows away");
+  assert.match(page.el("channel-freshness").textContent, /^Refresh failed · showing messages from/);
+  assert.match(page.el("error").textContent, /provider is down/, "the failure is reported nowhere lasting");
+  assert.equal(page.expireTimers(PULL_RESULT_MS), 1);
+  assert.equal(affordance.hidden, true, "the failure stayed over the newest line");
+
+  // OFFLINE is a failure too, and the next pull — with the network back — recovers in place.
+  page.channelPage = async () => {
+    throw new TypeError("Failed to fetch");
+  };
+  await pullUp(page, PULL_ARM_PX);
+  assert.equal(affordance.getAttribute("data-state"), "failed", "an offline pull up reported success");
+  assert.match(page.el("channel-freshness").textContent, /^Offline · showing messages saved/);
+  page.channelPage = serve;
+  await pullUp(page, PULL_ARM_PX);
+  assert.equal(affordance.getAttribute("data-state"), "done", "the pull up did not recover once online");
+  assert.match(page.el("channel-freshness").textContent, /^(Live · u|U)pdated \d{2}:\d{2}$/);
+});
+
+test("A PULL UP THAT DOES NOT REACH THE THRESHOLD REFRESHES NOTHING", async () => {
+  const page = newPage();
+  await signIn(page);
+  const { area } = await parkedAtNewest(page);
+  const parked = area.scrollTop;
+  const readsBefore = page.pageReads;
+
+  await pullUp(page, PULL_ARM_PX - 1);
+
+  assert.equal(page.pageReads, readsBefore, "a short drag at the newest line refreshed the channel");
+  assert.equal(page.el("pull-refresh").hidden, true, "the affordance was left on the screen");
+  assert.equal(area.scrollTop, parked, "a short drag moved the reader");
+});
+
+test("ONLY A READER PARKED AT THE NEWEST LINE PULLS UP — A FLING THAT REACHES IT IS A SCROLL", async () => {
+  const page = newPage();
+  await signIn(page);
+  const { area } = await parkedAtNewest(page);
+  const furthest = area.scrollHeight - area.clientHeight;
+  const readsBefore = page.pageReads;
+
+  // In the middle of the history the drag has somewhere to scroll to, however far it goes.
+  area.scrollTop = Math.round(furthest * 0.5);
+  await pullUp(page, PULL_ARM_PX * 3);
+  assert.equal(page.pageReads, readsBefore, "a drag mid-history refreshed the channel");
+  assert.equal(page.el("pull-refresh").hidden, true, "a drag mid-history offered to refresh");
+
+  // A FLING that runs the list out: the finger landed in the history, the list reached its end on
+  // the way, and the finger kept going. At the top that has to count (rule 2 — paging makes the
+  // top unreachable otherwise), but nothing pages in at the bottom, so here it is a scroll. Only a
+  // reader who stopped at the newest line and pulled again is asking.
+  area.scrollTop = Math.round(furthest * 0.5);
+  await area.dispatch("touchstart", touchAt(500));
+  area.scrollTop = area.scrollHeight; // the drag has run the list out, as a fast one does
+  await area.dispatch("touchmove", touchAt(400));
+  // ...and the finger keeps going, well past the threshold, measured from where the list ran out.
+  await area.dispatch("touchmove", touchAt(400 - PULL_ARM_PX * 2));
+  assert.equal(page.el("pull-refresh").hidden, true, "a fling that reached the newest line offered to refresh");
+  await area.dispatch("touchend");
+  await page.settle();
+  assert.equal(page.pageReads, readsBefore, "a fling that merely reached the newest line refreshed");
+
+  // Parked a little short of the end still counts as parked — `atBottom`'s slack — but only the
+  // travel past the REAL end is pull. The pixels before it scrolled the list.
+  const shortBy = Math.floor(BOTTOM_SLACK_PX / 2);
+  area.scrollTop = furthest - shortBy;
+  assert.ok(atBottomOf(area) && area.scrollTop < furthest, "the fixture is not parked short of the end");
+  await area.dispatch("touchstart", touchAt(500));
+  await area.dispatch("touchmove", touchAt(500 - shortBy)); // scrolling the last few pixels
+  assert.equal(page.el("pull-refresh").hidden, true, "the last of the scroll was taken for a pull");
+  area.scrollTop = furthest;
+  await area.dispatch("touchmove", touchAt(500 - shortBy - 1)); // ...and the list has run out here
+  await area.dispatch("touchmove", touchAt(500 - shortBy - 1 - (PULL_ARM_PX - 1)));
+  assert.equal(
+    page.el("pull-refresh").getAttribute("data-state"),
+    "pull",
+    "the travel spent scrolling to the end was counted toward the pull"
+  );
+  await area.dispatch("touchmove", touchAt(500 - shortBy - 1 - PULL_ARM_PX));
+  assert.equal(page.el("pull-refresh").getAttribute("data-state"), "armed");
+  await area.dispatch("touchend");
+  await page.settle();
+  assert.equal(page.pageReads, readsBefore + 1, "a reader parked a little short of the end could not pull");
+});
+
+test("A READ ALREADY IN FLIGHT IS THE REFRESH — A PULL UP NEVER PUTS A SECOND ONE ON THE WIRE", async () => {
+  const page = newPage();
+  await signIn(page);
+  const { area } = await parkedAtNewest(page);
+
+  const affordance = page.el("pull-refresh");
+  // ONE: the poll is already reading when the finger lands. That read is answering the question,
+  // so no second one goes out — but the pull is still OFFERED, and its release still says it is
+  // refreshing and then what it found. On a stalled connection this is the state the page sits in
+  // for as long as the stall lasts, and a pull that showed nothing in it would be the owner's
+  // "I don't get a refresh that shows in the UI" all over again.
+  let reads = holdChannelReads(page);
+  assert.ok(page.expireTimers(DISCORD_POLL_MS) > 0, "no channel poll was armed");
+  await page.settle();
+  const during = page.pageReads;
+  assert.equal(reads.held.length, 1, "the poll did not start a read, so this proves nothing");
+  // The poll's "Loading messages…" line arrived in flow ABOVE the log. A browser's own scroll
+  // anchoring keeps a reader at the end through that; this fixture does not model it, so it is
+  // done here — otherwise the list would no longer be at its end and this would not be a pull.
+  area.scrollTop = area.scrollHeight;
+  // Time passes, so that a result stamped with the last read's time is told from this one's.
+  page.setClock(page.clock() + 7 * 60 * 1000);
+  await area.dispatch("touchstart", touchAt(300));
+  await area.dispatch("touchmove", touchAt(300 - (PULL_ARM_PX - 1)));
+  assert.equal(affordance.hidden, false, "a pull up over a read in flight showed nothing at all");
+  assert.equal(affordance.getAttribute("data-state"), "pull");
+  assert.equal(affordance.getAttribute("data-edge"), "end");
+  await area.dispatch("touchmove", touchAt(300 - PULL_ARM_PX * 2));
+  assert.equal(affordance.getAttribute("data-state"), "armed", "a pull up over a read never armed");
+  const lifted = area.dispatch("touchend");
+  await page.settle();
+  assert.equal(affordance.getAttribute("data-state"), "busy", "the release said nothing was happening");
+  assert.match(affordance.textContent, /Refreshing/);
+  assert.equal(page.pageReads, during, "a pull up started a second read beside the poll's");
+  reads.release();
+  await page.settle();
+  assert.ok(page.expireTimers(PULL_WAIT_MS) > 0, "the release was not waiting on the read in flight");
+  await lifted;
+  await page.settle();
+  assert.equal(page.el("channel-loading").hidden, true, "the poll's read never finished");
+  assert.equal(page.pageReads, during, "a read went on the wire after the one the release waited for");
+  assert.equal(affordance.getAttribute("data-state"), "done", "the read it waited on was not reported");
+  // ...stamped with when THAT read landed, which is when the freshness pill says too.
+  const stamped = /^Updated (\d{2}:\d{2}) · nothing new$/.exec(affordance.textContent);
+  assert.ok(stamped, `the foot said ${JSON.stringify(affordance.textContent)}`);
+  assert.match(page.el("channel-freshness").textContent, new RegExp(`pdated ${stamped[1]}$`));
+  assert.equal(page.expireTimers(PULL_RESULT_MS), 1);
+
+  // The TOP is still not offered over a read in flight: its release asks for a read directly, which
+  // could only queue behind this one and return at once, reporting a refresh that had not happened.
+  reads = holdChannelReads(page);
+  assert.ok(page.expireTimers(DISCORD_POLL_MS) > 0, "no channel poll was armed");
+  await page.settle();
+  const polling = page.pageReads;
+  assert.equal(reads.held.length, 1, "the poll did not start a read, so this proves nothing");
+  area.scrollTop = 0;
+  await pullDown(page, PULL_ARM_PX * 2, { lift: false });
+  assert.equal(affordance.hidden, true, "a pull at the top armed on top of a read in flight");
+  const topLifted = area.dispatch("touchend");
+  await page.settle();
+  assert.equal(page.pageReads, polling, "a pull at the top started a second read beside the poll's");
+  reads.release();
+  await topLifted;
+  await page.settle();
+  area.scrollTop = area.scrollHeight;
+
+  // TWO: the poll starts AFTER the finger lands. The release waits for that read and reports it.
+  await area.dispatch("touchstart", touchAt(300));
+  reads = holdChannelReads(page);
+  assert.ok(page.expireTimers(DISCORD_POLL_MS) > 0, "no channel poll was armed");
+  await page.settle();
+  const polled = page.pageReads;
+  // The poll's "Loading messages…" line arrives in flow ABOVE the log. A browser's own scroll
+  // anchoring keeps a reader at the end through that; this fixture does not model it, so it is
+  // done here — otherwise the list would no longer be at its end and this would not be a pull.
+  area.scrollTop = area.scrollHeight;
+  await area.dispatch("touchmove", touchAt(300 - PULL_ARM_PX));
+  assert.equal(page.el("pull-refresh").getAttribute("data-state"), "armed");
+  const released = area.dispatch("touchend");
+  await page.settle();
+  assert.equal(page.el("pull-refresh").getAttribute("data-state"), "busy", "the release did not wait");
+  assert.equal(page.pageReads, polled, "the release queued a second read behind the poll's");
+
+  reads.release();
+  await page.settle();
+  assert.ok(page.expireTimers(PULL_WAIT_MS) > 0, "the release was not waiting on the read in flight");
+  await released;
+  await page.settle();
+  assert.equal(page.pageReads, polled, "a read went on the wire after the one the release waited for");
+  assert.equal(page.el("pull-refresh").getAttribute("data-state"), "done", "the waited-on read was not reported");
+  assert.match(page.el("pull-refresh").textContent, /^Updated \d{2}:\d{2}/);
+});
+
+test("IN A THREAD, A PULL UP REFRESHES THAT THREAD — AND A SHORT LIST IS PULLED BY DIRECTION", async () => {
+  // A thread of two messages cannot scroll, so the list is at its top AND its newest line at once.
+  // There the direction decides, and this checks the half `#68` could never reach: UP.
+  const page = await threadPage();
+  const picker = page.el("thread-select");
+  picker.value = `thread:${page.threads[0].id}`;
+  await picker.dispatch("change");
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["201", "202"], "the thread did not open");
+  const area = page.el("scroll-area");
+  assert.ok(area.scrollTop === 0 && atBottomOf(area), "the thread scrolls, so it is not the short case");
+  const reads = page.timelineCalls.length;
+  page.messages.push(message({
+    id: "205",
+    content: "a second answer in the thread",
+    thread: { ...page.messages[2].thread },
+  }));
+
+  const affordance = page.el("pull-refresh");
+  await area.dispatch("touchstart", touchAt(300));
+  await area.dispatch("touchmove", touchAt(300 + PULL_ARM_PX));
+  assert.equal(affordance.getAttribute("data-edge"), "top", "a pull DOWN was taken for a pull up");
+  assert.equal(affordance.getAttribute("data-state"), "armed");
+  assert.equal(page.el("channel-freshness").hidden, true, "two pills stacked at the top");
+  // Straight back up past where the finger landed, without lifting: now it is the foot's pull.
+  await area.dispatch("touchmove", touchAt(300 - PULL_ARM_PX));
+  assert.equal(affordance.getAttribute("data-edge"), "end", "a pull UP was taken for a pull down");
+  assert.equal(affordance.getAttribute("data-state"), "armed");
+  assert.equal(page.el("channel-freshness").hidden, false, "the freshness pill stayed hidden");
+  await area.dispatch("touchend");
+  await page.settle();
+
+  assert.equal(page.timelineCalls.length, reads + 1, "the pull up did not read anything");
+  const read = new URL(page.timelineCalls.at(-1), "http://fixture.test");
+  assert.equal(read.searchParams.get("view"), "thread", "the pull up read something other than the thread");
+  assert.equal(read.searchParams.get("thread_id"), page.threads[0].id, "the pull up read another thread");
+  assert.equal(read.searchParams.get("before"), null, "the pull up walked back instead of refreshing");
+  assert.deepStrictEqual(shownIds(page), ["201", "202", "205"], "the thread's new answer is not on the screen");
+  assert.equal(page.el("thread-heading").hidden, false, "refreshing the thread closed it");
+  assert.equal(affordance.getAttribute("data-state"), "done");
+});
+
+/**
+ * Pull up past the threshold and lift, leaving the refresh in flight. Returns `{ lifted }`, the
+ * release still running — wrapped, because an async function returning it bare would wait for it.
+ */
+async function pullUpAndHold(page) {
+  await pullUp(page, PULL_ARM_PX, { lift: false });
+  const lifted = page.el("scroll-area").dispatch("touchend");
+  await page.settle();
+  assert.equal(page.el("pull-refresh").getAttribute("data-state"), "busy", "the pull up never started");
+  return { lifted };
+}
+
+test("A PULL UP REPORTS ONLY ON THE VIEW IT WAS PULLED OVER, AND ONLY A READ SINCE", async () => {
+  // On a slow read the reader does not wait: they tap the other tab. The read they pulled for is
+  // then folded away for later, and the page restores the freshness of the tab they went to. A
+  // result said at the foot from that would be "Updated" at a time they never refreshed at, with
+  // "new messages" for rows that came with the other tab.
+  const page = await threadPage();
+  await page.el("channel-view-flat").click();
+  await page.settle();
+  await page.el("channel-view-main").click();
+  await page.settle();
+  const area = page.el("scroll-area");
+  const affordance = page.el("pull-refresh");
+  area.scrollTop = area.scrollHeight;
+  // Time passes between reads, so that a stamp from an earlier read is told from a new one.
+  page.setClock(page.clock() + 7 * 60 * 1000);
+
+  // ONE: to a tab the page already holds, so the switch costs no read of its own.
+  let reads = holdChannelReads(page, "timeline");
+  let { lifted } = await pullUpAndHold(page);
+  assert.equal(reads.held.length, 1, "the pull up's read is not the one held, so this proves nothing");
+  await page.el("channel-view-flat").click();
+  await page.settle();
+  reads.release();
+  await lifted;
+  await page.settle();
+  assert.equal(
+    affordance.hidden,
+    true,
+    `All was told ${JSON.stringify(affordance.textContent)} about the refresh pulled on Main`
+  );
+
+  // TWO: away and straight back while the read hangs, and then it fails. The tab on screen IS the
+  // one pulled, but nothing has landed for it since the release: the page restored the stamp of the
+  // read BEFORE, and "Updated" at that time would report a refresh that never happened.
+  await page.el("channel-view-main").click();
+  await page.settle();
+  area.scrollTop = area.scrollHeight;
+  page.setClock(page.clock() + 7 * 60 * 1000);
+  reads = holdChannelReads(page, "timeline");
+  ({ lifted } = await pullUpAndHold(page));
+  assert.equal(reads.held.length, 1, "the pull up's read is not the one held, so this proves nothing");
+  await page.el("channel-view-flat").click();
+  await page.settle();
+  await page.el("channel-view-main").click();
+  await page.settle();
+  reads.fail();
+  await lifted;
+  await page.settle();
+  assert.equal(
+    affordance.hidden,
+    true,
+    `a refresh that never landed was reported as ${JSON.stringify(affordance.textContent)}`
+  );
+
+  // ...while one that lands after the reader comes back is reported as usual.
+  reads = holdChannelReads(page, "timeline");
+  ({ lifted } = await pullUpAndHold(page));
+  reads.release();
+  await lifted;
+  await page.settle();
+  assert.equal(affordance.getAttribute("data-state"), "done", "a refresh that landed was not reported");
+});
+
+test("...and a pull up left for another CHANNEL says nothing about the one now on screen", async () => {
+  const page = newPage();
+  const second = { id: "1110000000000000002", label: "second", writable: true };
+  page.channels = [{ ...CHANNEL }, second];
+  await signIn(page);
+  await parkedAtNewest(page);
+  const affordance = page.el("pull-refresh");
+  page.setClock(page.clock() + 7 * 60 * 1000);
+
+  const reads = holdChannelReads(page);
+  const { lifted } = await pullUpAndHold(page);
+  assert.equal(reads.held.length, 1, "the pull up's read is not the one held, so this proves nothing");
+  page.el("discord-channel").value = second.id;
+  await page.el("discord-channel").dispatch("change");
+  await page.settle();
+  // The new channel's read queues behind the pulled one, and runs inside the wait for it.
+  reads.release();
+  await lifted;
+  await page.settle();
+  assert.match(page.pagesServed.at(-1), new RegExp(second.id), "the second channel was never read");
+  assert.match(page.el("channel-freshness").textContent, /pdated \d{2}:\d{2}$/, "the channel is not current");
+  assert.equal(
+    affordance.hidden,
+    true,
+    `the second channel was told ${JSON.stringify(affordance.textContent)} about the first one's refresh`
+  );
+});
+
+test("A PULL UP IS THE CHANNEL'S ALONE — NOT THE VOICE VIEW'S, AND NOT A DRAFT'S THAT SCROLLS", async () => {
+  const page = newPage();
+  await signIn(page);
+  // The voice view shares #scroll-area, and an empty transcript is at its newest line. Its pull
+  // would re-read a channel that is not on screen.
+  assert.equal(page.tab(), "voice");
+  await pullUp(page, PULL_ARM_PX * 2);
+  assert.equal(page.pageReads, 0, "a pull up on the voice view read the channel");
+  assert.equal(page.el("pull-refresh").hidden, true, "a pull up on the voice view offered to refresh");
+
+  const { area } = await parkedAtNewest(page);
+  const readsBefore = page.pageReads;
+  // The composer sits at the foot of the channel. Dragging through a draft too long for its box is
+  // the reader reaching the end of their own message, and the list stays at its end throughout.
+  const longDraft = { tagName: "TEXTAREA", scrollHeight: 240, clientHeight: 60 };
+  await pullUp(page, PULL_ARM_PX * 2, { target: longDraft });
+  assert.equal(page.pageReads, readsBefore, "scrolling a long draft refreshed the channel");
+  assert.equal(page.el("pull-refresh").hidden, true, "scrolling a long draft offered to refresh");
+  // ...but a draft that fits is just part of the list, and a pull that starts on it is a pull.
+  const shortDraft = { tagName: "TEXTAREA", scrollHeight: 60, clientHeight: 60 };
+  await pullUp(page, PULL_ARM_PX, { target: shortDraft });
+  assert.equal(page.pageReads, readsBefore + 1, "a pull up starting on the composer did nothing");
+  assert.ok(atBottomOf(area));
+});
+
+test("the foot's affordance clears the chips, spins only while fetching, and never blocks a scroll", () => {
+  const end = cssBlock('#pull-refresh[data-edge="end"]');
+  assert.match(end, /top:\s*auto/, "a pull up's affordance is still pinned to the top edge");
+  // Where the status line stands, and above the floating chips by their measured height.
+  assert.match(end, /bottom:\s*calc\([^;]*var\(--scroll-tools-clearance/, "it can cover a chip");
+  assert.match(cssBlock("#pull-refresh"), /white-space:\s*nowrap/, "\"Updated 07:15 · nothing new\" wraps");
+  assert.match(
+    cssBlock('#pull-refresh[data-state="busy"]::before'),
+    /animation:\s*outgoing-spin/,
+    "nothing spins while the refresh is in flight"
+  );
+  // Beside the rule, as this sheet's other spinners keep theirs — so not `mediaBody`, which finds
+  // only the first of the several reduced-motion blocks.
+  assert.match(
+    CSS_CODE,
+    /@media \(prefers-reduced-motion: reduce\)\s*\{\s*#pull-refresh\[data-state="busy"\]::before\s*\{\s*animation:\s*none/,
+    "the spinner ignores a reader who asked for less motion"
+  );
+  // PASSIVE, all four: the gesture only reads touches, and a listener that might cancel makes the
+  // browser hold every scroll that starts on the list until this script has answered.
+  assert.match(SCRIPT_CODE, /const PASSIVE = \{ passive: true \};/);
+  for (const type of ["touchstart", "touchmove", "touchend", "touchcancel"]) {
+    const line = SCRIPT_CODE.split("\n").find((text) => text.includes(`addEventListener("${type}"`));
+    assert.ok(line, `nothing listens for ${type}`);
+    assert.match(line, /, PASSIVE\);\s*$/, `the ${type} listener can hold up a scroll`);
+  }
 });
 
 // --- one channel row at a time --------------------------------------------------------------
