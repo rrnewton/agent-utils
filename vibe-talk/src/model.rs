@@ -214,6 +214,17 @@ pub struct Message {
     /// genuinely rewritten.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub spoken_content: String,
+    /// Whether the owner's noise rules call this message read already. `#196 auto-read-noise`.
+    ///
+    /// DECIDED BY THIS SERVER EVERY TIME the message is served, from its current text, by
+    /// [`crate::noise::NoiseFilter::mark`]; it is never stored and never trusted from whoever
+    /// sent the message. That is what lets an edited placeholder come back as unread, and a
+    /// removed rule un-hide everything it caught, without a single record having to change.
+    ///
+    /// The page reads this flag rather than matching the text itself, so there is one predicate
+    /// and it is the server's. Absent means `false`, which is also what an older server meant.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub noise: bool,
 }
 
 impl Message {
@@ -330,6 +341,7 @@ mod tests {
             reply_to: None,
             content: String::new(),
             spoken_content: String::new(),
+            noise: false,
         }
     }
 

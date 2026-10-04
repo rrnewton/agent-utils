@@ -222,6 +222,19 @@ fn routes(state: AppState) -> Router {
             "/api/v1/channels/{channel_id}/alias",
             axum::routing::put(api::set_alias).delete(api::clear_alias),
         )
+        // `#196 auto-read-noise`. The rules that decide which messages are read automatically,
+        // and the one per-message override. WRITE scope both, because they outlive the process
+        // and every device reads them back — and NO MCP TOOL for either, for the `#39` reason
+        // above made sharper: a model that could add a rule could hide messages from the owner
+        // it reports to. Reading the rules rides on client-config.
+        .route(
+            "/api/v1/noise-rules",
+            axum::routing::put(api::set_noise_rules),
+        )
+        .route(
+            "/api/v1/channels/{channel_id}/not-noise",
+            post(api::not_noise),
+        )
         // One path, three methods: POST carries the whole protocol, and GET/DELETE — which exist
         // in the spec for server-initiated streams and session teardown — are refused plainly
         // because this endpoint is stateless and has nothing to push.

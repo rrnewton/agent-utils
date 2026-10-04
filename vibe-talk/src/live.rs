@@ -449,8 +449,16 @@ pub const EVENT_RESET: &str = "reset";
 /// A subscriber that falls further behind than [`BROADCAST_CAPACITY`] gets one
 /// [`EVENT_RESET`] and the stream ENDS. See its documentation for why that is better than
 /// resuming.
+///
+/// **Every message is judged against the owner's noise rules on its way OUT**, not when it was
+/// published. `#196 auto-read-noise`: a rule is evaluated on the message's current text each time
+/// it is served, and the tail can be minutes old — a rule added or a message rescued since then
+/// has to be reflected in what a page attaching now is told. `app` and `channel` are what that
+/// needs; the replay burst shares one reading of the rules, and each live event takes a fresh one.
 pub fn events(
     subscription: Subscription,
+    app: AppState,
+    channel: ChannelId,
 ) -> impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>
 {
     struct State {
@@ -458,12 +466,21 @@ pub fn events(
         receiver: broadcast::Receiver<LiveMessage>,
         reset_on_attach: bool,
         done: bool,
+        app: AppState,
+        channel: ChannelId,
+        /// The rules as they stood when the replay burst began. Up to [`REPLAY_TAIL`] events go
+        /// out back to back on attach, and two store reads for each would be the attach's whole
+        /// cost for no change in the answer.
+        replay_noise: Option<crate::noise::NoiseFilter>,
     }
     let start = State {
         replay: subscription.replay.into_iter().collect(),
         receiver: subscription.receiver,
         reset_on_attach: subscription.reset_on_attach,
         done: false,
+        app,
+        channel,
+        replay_noise: None,
     };
     futures_util::stream::unfold(start, |mut state| async move {
         if state.reset_on_attach {
@@ -471,14 +488,25 @@ pub fn events(
             state.done = true;
             return Some((Ok(reset_event(0)), state));
         }
-        if let Some(held) = state.replay.pop_front() {
+        if let Some(mut held) = state.replay.pop_front() {
+            if state.replay_noise.is_none() {
+                state.replay_noise =
+                    Some(crate::noise::filter_for(&state.app, &state.channel).await);
+            }
+            if let Some(noise) = &state.replay_noise {
+                judge(noise, &mut held);
+            }
             return Some((Ok(message_event(&held, true)), state));
         }
         if state.done {
             return None;
         }
         match state.receiver.recv().await {
-            Ok(live) => Some((Ok(message_event(&live, false)), state)),
+            Ok(mut live) => {
+                let noise = crate::noise::filter_for(&state.app, &state.channel).await;
+                judge(&noise, &mut live);
+                Some((Ok(message_event(&live, false)), state))
+            }
             Err(broadcast::error::RecvError::Lagged(missed)) => {
                 state.done = true;
                 Some((Ok(reset_event(missed)), state))
@@ -486,6 +514,13 @@ pub fn events(
             Err(broadcast::error::RecvError::Closed) => None,
         }
     })
+}
+
+/// Decide whether one outgoing event's message is noise. A delete carries no text to judge.
+fn judge(noise: &crate::noise::NoiseFilter, live: &mut LiveMessage) {
+    if live.kind != LiveKind::Delete {
+        noise.mark(std::slice::from_mut(&mut live.message));
+    }
 }
 
 fn message_event(live: &LiveMessage, from_tail: bool) -> axum::response::sse::Event {
@@ -1864,6 +1899,7 @@ mod tests {
             reply_to: None,
             content: content.to_owned(),
             spoken_content: String::new(),
+            noise: false,
         }
     }
 }

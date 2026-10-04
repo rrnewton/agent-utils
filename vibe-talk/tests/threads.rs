@@ -28,6 +28,7 @@ fn message(id: &str, content: &str, thread: bool) -> Message {
         reply_to: None,
         content: content.to_owned(),
         spoken_content: String::new(),
+        noise: false,
         thread: thread.then(|| MessageThread {
             id: THREAD.to_owned(),
             root_message_id: Some(MessageId("10".to_owned())),
@@ -386,4 +387,42 @@ async fn older_thread_messages_remain_addressable_for_summaries_and_speech() {
     let (_, config) = call(&app, "GET", "/api/v1/client-config", Some(READ_TOKEN), None).await;
     assert_eq!(config["threading_supported"], true);
     assert_eq!(config["chat_provider_name"], "Google Chat");
+}
+
+#[tokio::test]
+async fn a_timeline_marks_noise_on_messages_and_on_thread_roots() {
+    // `#196 auto-read-noise`. One filter for the whole page, thread roots included, and evaluated
+    // on every read: the rules below are changed between two reads of the same thread.
+    let (app, _backend) = harness();
+    let path = format!(
+        "/api/v1/channels/{WRITE_CHANNEL}/timeline?view=thread&thread_id=opaque%2Fthread-A"
+    );
+    let (status, body) = call(&app, "GET", &path, Some(READ_TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m.get("noise").is_none()),
+        "nothing here matches the default rule: {body}"
+    );
+
+    let (status, saved) = call(
+        &app,
+        "PUT",
+        "/api/v1/noise-rules",
+        Some(WRITE_TOKEN),
+        Some(json!({ "rules": ["older thread text", "ROOT"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    let (status, body) = call(&app, "GET", &path, Some(READ_TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["messages"][1]["content"], "older thread text");
+    assert_eq!(body["messages"][1]["noise"], true, "{body}");
+    assert_eq!(
+        body["thread"]["root"]["noise"], true,
+        "a thread root escaped the rules: {body}"
+    );
 }

@@ -757,6 +757,44 @@
 
             <section class="settings-group">
               <div class="group-head">
+                <h2>Read automatically</h2>
+                <button class="help-link" id="help-link-auto-read" type="button" data-help="auto-read" aria-label="About messages read automatically" title="What these match">?</button>
+              </div>
+              <!--
+                `#196 auto-read-noise`. The SERVER's list, not this browser's: it is kept in the
+                store and shared by every device and by the voice agent, so it is edited here and
+                read back from the answer rather than from what was typed. The sentence saying how
+                a rule matches is the server's too — `#noise-matching` quotes it, the same rule
+                `#alias-note` follows — because the matcher lives on the server and a second
+                description here would be a second thing that can drift from it.
+
+                Hidden as a whole when the server does not report the list, which is an older
+                server or one whose store is failing; `#noise-state` then says so.
+              -->
+              <div id="noise-editor" hidden>
+                <p id="noise-matching" class="hint"></p>
+                <!-- Rows are built by `renderNoiseRules` in web/voice.js: the rule, and Remove. -->
+                <ul id="noise-rule-list" class="noise-rules" aria-label="Messages read automatically"></ul>
+                <p id="noise-count" class="hint" aria-live="polite"></p>
+                <label for="noise-rule-new">Add a message</label>
+                <input
+                  id="noise-rule-new"
+                  type="text"
+                  maxlength="200"
+                  autocomplete="off"
+                  enterkeyhint="done"
+                  placeholder="Working…"
+                  aria-describedby="noise-state"
+                />
+                <div class="channel-actions">
+                  <button id="add-noise-rule" class="secondary" type="button">Add</button>
+                </div>
+              </div>
+              <p id="noise-state" class="hint" aria-live="polite"></p>
+            </section>
+
+            <section class="settings-group">
+              <div class="group-head">
                 <h2>Combining messages</h2>
                 <button class="help-link" id="help-link-combining" type="button" data-help="combining" aria-label="About combining messages" title="What this does">?</button>
               </div>
@@ -1154,6 +1192,36 @@
                 <strong>Hide archived</strong>. It is not an archive: nothing is recorded on the
                 server, there is nothing to undo, and turning it off brings every one of them
                 straight back. Nothing here changes anything in the source chat service.
+              </p>
+            </article>
+
+            <article id="help-auto-read" class="help-entry">
+              <h2>Read automatically</h2>
+              <p class="hint">
+                Some messages are only placeholders — a coding agent posting <em>Working…</em>
+                while it works, with the real answer arriving later as a separate message. A
+                message whose whole text matches one of these rules counts as read the moment it
+                arrives: it is dimmed in the channel, left out of the list behind
+                <strong>Hide read</strong>, never read aloud or passed to the voice agent as news,
+                and not counted when the agent counts or summarizes a channel.
+              </p>
+              <p class="hint">
+                Matching is deliberately simple, so a rule never hides more than you expect. The
+                message's whole text must equal the rule, ignoring case, extra spaces, emphasis
+                such as <em>_italics_</em> or <strong>**bold**</strong> around it, and the
+                difference between three dots and the single ellipsis character. A message that
+                merely starts with the rule is a real message and is not matched. To match how a
+                message starts instead, end the rule with <code>*</code>, as in
+                <code>Thinking*</code>.
+              </p>
+              <p class="hint">
+                Nothing is recorded per message: the rules are checked against each message as it
+                reads now. A placeholder later edited into a real answer shows as unread again, and
+                removing a rule brings back everything it matched. If a rule catches a message you
+                wanted, <strong>Not noise</strong> on that row brings back just that one message.
+                The rules are kept on the server and shared by every device you use; the voice
+                agent cannot change them. Like <strong>Done</strong>, this is this app's own read
+                state and changes nothing in the source chat service.
               </p>
             </article>
 

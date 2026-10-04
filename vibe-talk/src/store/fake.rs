@@ -59,6 +59,12 @@ struct State {
     aliases: BTreeMap<String, (String, i64)>,
     /// Channels added from inside the app: id -> (label, writable, provider, added_at_ms).
     added: BTreeMap<String, (String, bool, Option<String>, i64)>,
+    /// The owner's saved noise rules; `None` until he saves a list. `#196 auto-read-noise`.
+    noise_rules: Option<Vec<String>>,
+    /// `(channel, message)` to `(when it was exempted, insertion order)`: the "not noise" list,
+    /// with enough of the real table's shape to reproduce its count bound and its eviction order.
+    noise_exemptions: BTreeMap<(String, String), (i64, u64)>,
+    next_exemption_seq: u64,
     next_summary_seq: u64,
     fail_next: Option<String>,
     appended: usize,
@@ -569,6 +575,70 @@ impl StateStore for FakeStore {
         Ok(removed)
     }
 
+    async fn noise_rules(&self) -> Result<Option<Vec<String>>, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        Ok(state.noise_rules.clone())
+    }
+
+    async fn set_noise_rules(&self, rules: &[String]) -> Result<Vec<String>, StoreError> {
+        // Validated BEFORE `armed`, as `set_channel_alias` is: a fake that kept a list the real
+        // store refuses would certify a bug.
+        let rules = crate::noise::validate_rules(rules)?;
+        let mut state = self.lock();
+        armed(&mut state)?;
+        state.noise_rules = Some(rules.clone());
+        Ok(rules)
+    }
+
+    async fn noise_exemptions(&self, channel: &ChannelId) -> Result<Vec<MessageId>, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        Ok(state
+            .noise_exemptions
+            .keys()
+            .filter(|(held, _)| held == channel.as_str())
+            .map(|(_, message)| MessageId(message.clone()))
+            .collect())
+    }
+
+    async fn exempt_from_noise(
+        &self,
+        channel: &ChannelId,
+        messages: &[MessageId],
+    ) -> Result<u64, StoreError> {
+        crate::noise::validate_exempt_ids(messages)?;
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let at = now_ms();
+        let mut added = 0;
+        for message in messages {
+            let slot = (channel.as_str().to_owned(), message.as_str().to_owned());
+            if state.noise_exemptions.contains_key(&slot) {
+                continue;
+            }
+            let seq = state.next_exemption_seq;
+            state.next_exemption_seq += 1;
+            state.noise_exemptions.insert(slot, (at, seq));
+            added += 1;
+        }
+        // The same bound the real store applies, oldest first.
+        while state.noise_exemptions.len() > self.retention.max_dismissals as usize {
+            let oldest = state
+                .noise_exemptions
+                .iter()
+                .min_by_key(|(_, order)| **order)
+                .map(|(slot, _)| slot.clone());
+            match oldest {
+                Some(slot) => {
+                    state.noise_exemptions.remove(&slot);
+                }
+                None => break,
+            }
+        }
+        Ok(added)
+    }
+
     async fn cached_summary(&self, key: &SummaryKey) -> Result<Option<String>, StoreError> {
         let mut state = self.lock();
         armed(&mut state)?;
@@ -639,6 +709,8 @@ impl StateStore for FakeStore {
         state.summaries.clear();
         state.dismissals.clear();
         state.aliases.clear();
+        state.noise_rules = None;
+        state.noise_exemptions.clear();
         state.purges += 1;
         Ok(())
     }

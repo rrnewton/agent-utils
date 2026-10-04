@@ -49,6 +49,7 @@ pub mod http;
 pub mod live;
 pub mod mcp;
 pub mod model;
+pub mod noise;
 pub mod ops;
 pub mod post_gate;
 pub mod probe;

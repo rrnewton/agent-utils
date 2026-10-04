@@ -483,6 +483,10 @@ pub struct Retention {
     /// growing, and it is enough here for a reason it is not enough for a summary: a dismissal
     /// holds two snowflakes and a timestamp and NO message text, so unlike a cached summary it is
     /// not a second at-rest copy of anybody's words.
+    ///
+    /// The same count bounds the "not noise" exemptions of `#196 auto-read-noise`, separately:
+    /// they are the same shape of row and an age limit would be wrong for them for the same
+    /// reason — it would re-hide a message the owner rescued.
     pub max_dismissals: u32,
     /// How many days a record survives: a conversation after its last turn, a cached summary
     /// after it was made. `0` means no age limit.
@@ -834,6 +838,68 @@ pub trait StateStore: Send + Sync {
     /// write failure.
     async fn restore(&self, channel: &ChannelId, messages: &[MessageId])
         -> Result<u64, StoreError>;
+
+    /// The owner's noise rules, exactly as he last saved them. `#196 auto-read-noise`.
+    ///
+    /// `Ok(None)` means he never has, and that is NOT the same answer as an empty list: "never
+    /// saved" is where [`crate::noise::DEFAULT_RULES`] stand in, and an empty list is the owner
+    /// having removed every rule on purpose. Collapsing the two would bring the default back the
+    /// moment he turned the feature off.
+    ///
+    /// Nothing ever writes the defaults here on his behalf. They are applied by
+    /// [`crate::noise::current_rules`] at read time, because the read that would otherwise seed
+    /// them is often a read-scope one, and a read-scope credential writes nothing durable.
+    ///
+    /// **Not covered by [`Retention`]**, for the reason [`StateStore::channel_aliases`] is not:
+    /// it is one bounded list the owner curates, and an age limit would silently bring the
+    /// placeholders back months later with nothing on screen saying why.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a read
+    /// failure.
+    async fn noise_rules(&self) -> Result<Option<Vec<String>>, StoreError>;
+
+    /// Replace the owner's noise rules with `rules`, returning the list as stored.
+    ///
+    /// The WHOLE list, not one rule at a time: the Settings editor always holds all of it, and a
+    /// replace cannot leave half an edit behind. Validated by [`crate::noise::validate_rules`]
+    /// before anything is written, so the stored list is trimmed and de-duplicated.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::BadId`] or [`StoreError::TooLarge`] for a list the validator refuses;
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
+    /// write failure.
+    async fn set_noise_rules(&self, rules: &[String]) -> Result<Vec<String>, StoreError>;
+
+    /// The messages in this channel the owner has said are NOT noise, whatever the rules say.
+    ///
+    /// The ids alone, for the same reason [`StateStore::dismissals`] returns ids alone.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a read
+    /// failure.
+    async fn noise_exemptions(&self, channel: &ChannelId) -> Result<Vec<MessageId>, StoreError>;
+
+    /// Record that these messages are not noise, returning how many were not already recorded.
+    ///
+    /// The owner's way to rescue a false positive: a rule caught a message he wanted to see.
+    /// Idempotent, like [`StateStore::dismiss`], and bounded by the same count,
+    /// [`Retention::max_dismissals`] — it is the same kind of row, two ids and an instant with no
+    /// message text, and an age limit on it would quietly re-hide a message he rescued.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::BadId`] for an id [`crate::noise::validate_exempt_ids`] refuses;
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
+    /// write failure.
+    async fn exempt_from_noise(
+        &self,
+        channel: &ChannelId,
+        messages: &[MessageId],
+    ) -> Result<u64, StoreError>;
 
     /// The summary already produced for this exact key, if there is one.
     ///

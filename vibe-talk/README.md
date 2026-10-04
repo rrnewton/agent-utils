@@ -1103,7 +1103,11 @@ question is a fresh Discord fetch, and it stays that way. There is exactly one s
   second at-rest copy of third-party text and is treated as one everywhere below; and
 * **channel aliases** — what THIS app calls a channel, one row per configured channel at most.
   Ours and local in the same sense the read marks are: never sent to Discord, renaming nothing
-  there. See "What to call a channel". `#39 channel-alias`.
+  there. See "What to call a channel". `#39 channel-alias`; and
+* **noise rules and "not noise" marks** — which placeholder messages count as read
+  automatically, one list for the whole deployment, and the messages you rescued from it. Two ids
+  and an instant per mark, bounded by the same count as the "dealt with" marks. See "Messages read
+  automatically". `#196 auto-read-noise`.
 
 The first three are your own record. The last is a derived cache, bounded by the same
 retention as the rest, erased by the same purge, and never filled by a read-scope token.
@@ -1246,7 +1250,7 @@ version, and an orphan is under the live one.
 ### How an operator purges it
 
 Three ways, all of which erase everything — transcripts, read marks, "dealt with" marks,
-cached summaries and channel aliases alike:
+cached summaries, channel aliases, and the noise rules (back to the default) alike:
 
 1. `DELETE /api/v1/storage` with the **write** token, on a running server. This is the only
    complete erase over HTTP: `DELETE /api/v1/conversations` clears transcripts and deliberately
@@ -1497,6 +1501,8 @@ own adapter-only token; every other route uses the read/write tokens described a
 | POST | `/api/v1/channels/{id}/upstream-read` | **write** | `{message_id:"…"}` — ask an explicitly capable provider to move its monotone read cursor through that message; thread behavior is provider-defined |
 | PUT | `/api/v1/channels/{id}/alias` | **write** | `{alias:"…"}` — what THIS app calls the channel; see "What to call a channel" |
 | DELETE | `/api/v1/channels/{id}/alias` | **write** | drop it, putting the configured label back |
+| PUT | `/api/v1/noise-rules` | **write** | `{rules:["…"]}` — replace the whole list of messages read automatically; answers what was stored. Read through client-config's `noise_rules`; see "Messages read automatically" |
+| POST | `/api/v1/channels/{id}/not-noise` | **write** | `{messages:[…]}` — these are real messages; stop reading them automatically, leaving the rules alone |
 | DELETE | `/api/v1/storage` | **write** | erase EVERYTHING durable: transcripts, read marks, "dealt with" marks, cached summaries, channel aliases |
 | POST | `/mcp` | read, or **write** per tool | MCP over Streamable HTTP — see below |
 | GET/DELETE | `/mcp` | none | `405`; this endpoint is stateless and has nothing to push |
@@ -2671,6 +2677,48 @@ still takes it, because "erase everything" has to mean everything.
 
 Out of scope, and stated so nobody reads more into it: the agent changing an alias, renaming
 anything in Discord, and multi-channel addressing itself — which this only prepares for.
+
+### Messages read automatically
+
+`#196 auto-read-noise`. A coding agent posts `_Working…_` as a thread reply while it works, and the
+real answer arrives later as a separate message. In the owner's main space nine of the latest fifty
+messages were exactly that, and each one was an unread row, a to-do item, and a line of every
+digest. So the server keeps a short list of **noise rules**, and a message matching one counts as
+read without anybody tapping Done. The list starts as one rule, `Working…`, and is edited in
+Settings under *Read automatically*.
+
+**The matcher is deliberately trivial.** A rule matches when the message's WHOLE text equals it,
+ignoring case, extra whitespace, `_ * ~` emphasis around it, and `...` versus `…`; a rule ending in
+`*` matches how a message starts instead. A message that merely begins with "Working…" and goes on
+is a real message and is not matched. Not a regular expression, on purpose: a rule hides messages
+from the person it is for, so what it catches has to be predictable by reading it.
+`src/noise.rs` holds the matcher and the one sentence Settings quotes about it.
+
+**Evaluated on every read, never recorded.** Each message the server serves is judged against the
+rules as its text reads now and carries `noise: true` when it matches — the page, the to-do list,
+the count, the digest and the agent's tools all read that one flag. Nothing is dismissed, so a
+placeholder later edited into the answer is unread again, and removing a rule brings back
+everything it caught.
+
+What "read" means here, concretely: `/todo` leaves noise out and says how many (`noise`); `/count`
+and `/digest` skip it and say how many; the agent's `digest_channel`, `read_page` and
+`count_messages` leave it out and say so, and `find_message` never offers one as a match; read-aloud neither prepares it nor relays it into a
+call; and the page dims it, gives it no unread treatment, and hides it under *Hide read*. A tap on a
+placeholder still reads it aloud — an explicit request is not noise. `/inbox` holds only read marks
+and counts no messages, so it has nothing to skip.
+
+**A false positive is rescued per message.** *Not noise* on a dimmed row records that one message
+on the server (`POST /api/v1/channels/{id}/not-noise`); the rule goes on catching the placeholders
+it is right about.
+
+**Only the owner edits the rules.** `PUT /api/v1/noise-rules` takes the write token, and — for the
+`#39 channel-alias` reason — there is no MCP tool for either route: a model that could add a rule
+could hide messages from the person it reports to. With no store configured the default rule still
+applies and an edit is refused; with a store that is failing, nothing is treated as noise, because
+a failure should show more rather than hide more.
+
+This is this app's own read state, like Done. The source chat service's read cursor is not moved,
+and the upstream-read route is not involved.
 
 ### Pulling the channel down, and the other end of the same container
 

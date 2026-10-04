@@ -136,6 +136,28 @@ pub struct ClientConfigResponse {
     /// the conversation routes), and a read-scope page that probed them anyway got a 403 and a
     /// console error on every load. `#38 read-token-conversation-probe`.
     pub token_scope: TokenScope,
+    /// The rules that decide which messages are read automatically. `#196 auto-read-noise`.
+    ///
+    /// Here rather than behind a route of its own because the page needs them at startup, for the
+    /// Settings editor, and every device and the voice agent share one list. Absent from an older
+    /// server — the page then hides the editor — and also when this one cannot read its store, so
+    /// a broken store makes the editor disappear rather than show a list that is not in force.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise_rules: Option<NoiseRules>,
+}
+
+/// The owner's noise rules, as the Settings editor shows them. `#196 auto-read-noise`.
+///
+/// Also the body `PUT /api/v1/noise-rules` answers with, so the editor redraws from what the
+/// server STORED — trimmed and de-duplicated — rather than from what was typed.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct NoiseRules {
+    /// The rules in force, in the owner's order and his own spelling. Until he saves a list this
+    /// is the shipped default.
+    pub rules: Vec<String>,
+    /// One sentence saying how a rule matches, written beside the matcher and quoted by the page
+    /// where the rules are edited, so the description cannot drift from what the server does.
+    pub matching: &'static str,
 }
 
 /// A provider-neutral timeline plus this application's channel and read-state metadata.

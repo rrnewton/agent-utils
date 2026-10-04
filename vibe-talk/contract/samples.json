@@ -45,6 +45,13 @@
       "idempotent_posts_supported": true,
       "live_delivery": "push",
       "live_poll_seconds": 5,
+      "noise_rules": {
+        "matching": "a message counts as read when its whole text is one of these",
+        "rules": [
+          "Working…",
+          "Thinking*"
+        ]
+      },
       "owner_author_id": "7",
       "providers": [
         {
@@ -308,6 +315,7 @@
         "channel_id": "100",
         "content": "hello",
         "id": "301",
+        "noise": true,
         "reply_to": "200",
         "spoken_content": "hello, spoken",
         "spoken_time": "noon",
@@ -350,6 +358,7 @@
       "channel_id": "100",
       "content": "hello",
       "id": "301",
+      "noise": true,
       "reply_to": "200",
       "spoken_content": "hello, spoken",
       "spoken_time": "noon",
@@ -453,6 +462,7 @@
           "channel_id": "100",
           "content": "hello",
           "id": "301",
+          "noise": true,
           "reply_to": "200",
           "spoken_content": "hello, spoken",
           "spoken_time": "noon",
@@ -548,6 +558,7 @@
           "channel_id": "100",
           "content": "hello",
           "id": "301",
+          "noise": true,
           "reply_to": "200",
           "spoken_content": "hello, spoken",
           "spoken_time": "noon",

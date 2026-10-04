@@ -301,6 +301,18 @@ fn inventory() -> Vec<Route> {
             Write,
             Nothing,
         ),
+        route(
+            "PUT",
+            "/api/v1/noise-rules",
+            Write,
+            Json(r#"{"rules":["Working…"]}"#),
+        ),
+        route(
+            "POST",
+            "/api/v1/channels/{channel_id}/not-noise",
+            Write,
+            Json(r#"{"messages":["3333333333"]}"#),
+        ),
     ]
 }
 

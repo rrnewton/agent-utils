@@ -332,6 +332,12 @@ pub async fn messages(
         .min(crate::discord::http::DISCORD_MAX_LIMIT);
     let mut messages = state.chat.fetch_recent(&channel.id, limit).await?;
     stamp(state, &mut messages);
+    // `#196 auto-read-noise`. Decided HERE, on every read, from the text as it now stands — never
+    // recorded — so every caller of this function (the digest, the to-do list, a lookup by id,
+    // bankruptcy) sees the same answer the page does. See `crate::noise`.
+    crate::noise::filter_for(state, &channel.id)
+        .await
+        .mark(&mut messages);
     Ok(Window {
         channel,
         messages,
@@ -381,6 +387,9 @@ pub async fn message_by_id_scoped(
         .fetch_thread_message(&channel.id, thread_id, &MessageId(message_id.to_owned()))
         .await?;
     stamp(state, std::slice::from_mut(&mut message));
+    crate::noise::filter_for(state, &channel.id)
+        .await
+        .mark(std::slice::from_mut(&mut message));
     Ok((channel, message))
 }
 
@@ -392,20 +401,42 @@ pub async fn timeline(
 ) -> Result<(ChannelInfo, crate::threads::TimelinePage), OpError> {
     let channel = allowed(state, channel_id).await?;
     let mut page = state.chat.fetch_timeline(&channel.id, request).await?;
+    // One filter for the whole page, thread roots included: a root that is itself a placeholder
+    // is drawn as one, in the thread list as much as in the conversation.
+    let noise = crate::noise::filter_for(state, &channel.id).await;
     stamp(state, &mut page.messages);
+    noise.mark(&mut page.messages);
     for summary in page.threads.iter_mut().chain(page.thread.iter_mut()) {
         if let Some(root) = &mut summary.root {
             stamp(state, std::slice::from_mut(root));
+            noise.mark(std::slice::from_mut(root));
         }
     }
     Ok((channel, page))
 }
 
+/// One speakable line per recent message, and what was left out of it.
+#[derive(Clone, Debug)]
+pub struct Digest {
+    /// Channel that was read.
+    pub channel: ChannelInfo,
+    /// One line per message, oldest first — noise excluded.
+    pub entries: Vec<DigestEntry>,
+    /// [`Window::is_whole_channel`]: true when the WINDOW was the entire channel, false when it
+    /// was a window onto something larger. A caller that renders a count without consulting it is
+    /// reporting the fetch size as a channel total.
+    pub complete: bool,
+    /// How many messages in the window the owner's noise rules call read, and so have no line.
+    /// `#196 auto-read-noise`. Reported rather than silently dropped, so a caller can say "and
+    /// three placeholders" instead of making the channel sound quieter than it is.
+    pub noise: usize,
+}
+
 /// One speakable line per recent message. Read scope.
 ///
-/// The trailing flag is [`Window::is_whole_channel`]: true when the entries are the entire
-/// channel, false when they are a window onto something larger. A caller that renders a count
-/// without consulting it is reporting the fetch size as a channel total.
+/// A message the owner's noise rules call read gets no line: a digest is what the agent reads to
+/// find out what is there, and nine `Working…` lines out of fifty are exactly the noise the owner
+/// asked to stop hearing. [`Digest::noise`] says how many were left out.
 ///
 /// # Errors
 ///
@@ -415,7 +446,7 @@ pub async fn digest(
     channel_id: &str,
     limit: Option<u16>,
     width: Option<u16>,
-) -> Result<(ChannelInfo, Vec<DigestEntry>, bool), OpError> {
+) -> Result<Digest, OpError> {
     let window = messages(state, channel_id, limit).await?;
     let complete = window.is_whole_channel();
     let width = usize::from(width.unwrap_or(0));
@@ -424,11 +455,14 @@ pub async fn digest(
     } else {
         width
     };
-    Ok((
-        window.channel,
-        summary::digest(&window.messages, width),
+    let (noise, kept): (Vec<Message>, Vec<Message>) =
+        window.messages.into_iter().partition(|m| m.noise);
+    Ok(Digest {
+        channel: window.channel,
+        entries: summary::digest(&kept, width),
         complete,
-    ))
+        noise: noise.len(),
+    })
 }
 
 /// The largest page this server will hand back in one step.
@@ -587,6 +621,12 @@ pub async fn page(
         }
     }
     stamp(state, &mut messages);
+    // Marked, not dropped: this route is also what the page draws the channel from, and the page
+    // shows a placeholder dimmed rather than pretending it is not there. The agent's `read_page`
+    // tool is what leaves them out; see `mcp::protocol::run_page`.
+    crate::noise::filter_for(state, &channel.id)
+        .await
+        .mark(&mut messages);
 
     let (next_before, next_since) = if !has_more {
         (None, None)
@@ -642,9 +682,18 @@ pub struct MessageCount {
     pub oldest_seen: Option<MessageId>,
     /// Newest message the walk started from.
     pub newest_seen: Option<MessageId>,
+    /// Messages the walk passed that the owner's noise rules call read, and so did NOT count.
+    /// `#196 auto-read-noise`.
+    pub noise: usize,
 }
 
 /// Count the messages in a channel, up to a cap, optionally only since an instant. Read scope.
+///
+/// A message the owner's noise rules call read is not counted — "how many messages since this
+/// morning" asked of a channel where a third are `Working…` placeholders should not answer with
+/// the placeholders — and [`MessageCount::noise`] says how many were passed over. The cap bounds
+/// what the walk READS, placeholders included, because it is a ceiling on requests: a channel of
+/// nothing but placeholders must not be walked to its first message.
 ///
 /// # Errors
 ///
@@ -666,6 +715,8 @@ pub async fn count(
     let mut oldest_seen: Option<MessageId> = None;
     let mut newest_seen: Option<MessageId> = None;
     let mut before: Option<MessageId> = None;
+    let mut noise: usize = 0;
+    let filter = crate::noise::filter_for(state, &channel.id).await;
 
     loop {
         let batch = state
@@ -682,14 +733,17 @@ pub async fn count(
         let oldest = batch.first().expect("non-empty").clone();
         let exhausted = batch.len() < usize::from(stride);
 
-        let kept = match since {
-            None => batch.len(),
+        let in_range: Vec<&Message> = match since {
+            None => batch.iter().collect(),
             Some(from) => batch
                 .iter()
                 .filter(|m| message_ms(m).is_none_or(|ms| ms >= from))
-                .count(),
+                .collect(),
         };
-        counted += kept;
+        let kept = in_range.len();
+        let placeholders = in_range.iter().filter(|m| filter.is_noise(m)).count();
+        counted += kept - placeholders;
+        noise += placeholders;
         oldest_seen = Some(oldest.id.clone());
 
         // Stop as soon as the walk has passed the `since` boundary: everything older is outside
@@ -698,7 +752,7 @@ pub async fn count(
         if passed_since || exhausted {
             break;
         }
-        if counted >= usize::try_from(cap).unwrap_or(usize::MAX) {
+        if counted + noise >= usize::try_from(cap).unwrap_or(usize::MAX) {
             at_least = true;
             break;
         }
@@ -712,6 +766,7 @@ pub async fn count(
         cap,
         oldest_seen,
         newest_seen,
+        noise,
     })
 }
 
@@ -740,6 +795,10 @@ pub async fn resolve(
     // without this those lines would be the only ones still speaking raw UTC.
     let mut messages = state.chat.fetch_recent(&info.id, limit).await?;
     stamp(state, &mut messages);
+    // `#196 auto-read-noise`. A placeholder is never the message somebody is describing, and one
+    // that happened to share a word with the description would be a confident wrong answer.
+    let noise = crate::noise::filter_for(state, &info.id).await;
+    messages.retain(|message| !noise.is_noise(message));
     let max_alternatives = usize::from(max_alternatives.unwrap_or(3)).min(10);
     let resolution = retrieval::resolve(state.ranker.as_ref(), &messages, query, max_alternatives);
     let searched = messages.len();
@@ -1300,13 +1359,19 @@ pub struct TodoView {
     pub window: usize,
     /// Whether that window is the whole channel, so a caller can avoid a confident wrong total.
     pub complete: bool,
+    /// How many messages in the window the owner's noise rules call read. `#196 auto-read-noise`.
+    ///
+    /// They are not in `messages` — a placeholder is not something to deal with — and they are
+    /// still in `window`, because they are still in the channel.
+    pub noise: usize,
 }
 
 /// The messages in one channel that have not been dealt with here. Read scope to ask.
 ///
-/// The list is the recent window MINUS the dismissals, and nothing else: there is no server-side
-/// notion of "important" and no inference from dwell time, both of which `#50` excludes
-/// deliberately. A message leaves this list because somebody said so.
+/// The list is the recent window MINUS the dismissals, MINUS what the owner's noise rules call
+/// read: there is no server-side notion of "important" and no inference from dwell time, both of
+/// which `#50` excludes deliberately. A message leaves this list because somebody said so — by
+/// tapping Done on it, or by writing a rule it matches (`#196 auto-read-noise`).
 ///
 /// A store that is not configured is an ERROR here, unlike in [`summarize_message`], and the
 /// difference is not an inconsistency. There, the store is a cache and degrading to "generate
@@ -1329,16 +1394,22 @@ pub async fn todo(
     let dismissed: std::collections::HashSet<&str> =
         dismissed.iter().map(MessageId::as_str).collect();
     let total = window.messages.len();
+    let noise = window
+        .messages
+        .iter()
+        .filter(|message| message.noise)
+        .count();
     let left = window
         .messages
         .into_iter()
-        .filter(|message| !dismissed.contains(message.id.as_str()))
+        .filter(|message| !message.noise && !dismissed.contains(message.id.as_str()))
         .collect();
     Ok(TodoView {
         channel: window.channel,
         messages: left,
         window: total,
         complete,
+        noise,
     })
 }
 
@@ -1483,6 +1554,59 @@ pub async fn restore(
 ) -> Result<InboxChange, OpError> {
     let channel = allowed(state, channel_id).await?;
     state.store.restore(&channel.id, wanted).await?;
+    Ok(InboxChange {
+        channel,
+        messages: wanted.to_vec(),
+    })
+}
+
+// --- messages read automatically -----------------------------------------------------------------
+//
+// `#196 auto-read-noise`. The rules and the one override. Neither is reachable from an MCP tool —
+// the same reasoning as `#39 channel-alias`, and stronger here: a model that could add a rule could
+// hide messages from the person it reports to. See `crate::noise` for the matcher and for why a
+// rule is evaluated on every read rather than written down as dismissals.
+
+/// The noise rules in force. Read scope: they are shown in Settings and they decide what every
+/// read calls noise, so nothing about them is secret from a caller who can read the channels.
+///
+/// # Errors
+///
+/// [`OpError::Store`] when a configured store cannot be read. No store at all is the defaults.
+pub async fn noise_rules(state: &AppState) -> Result<Vec<String>, OpError> {
+    Ok(crate::noise::current_rules(state).await?)
+}
+
+/// Replace the noise rules. Write scope, and the OPERATOR's act alone — there is no MCP tool.
+///
+/// # Errors
+///
+/// [`OpError::Store`] for a list the validator refuses, when no store is configured, or when the
+/// write fails.
+pub async fn set_noise_rules(state: &AppState, rules: &[String]) -> Result<Vec<String>, OpError> {
+    Ok(state.store.set_noise_rules(rules).await?)
+}
+
+/// Say that these messages are not noise, whatever the rules say. Write scope.
+///
+/// The rescue for a false positive. Checked against the allowlist and bounded to one page per
+/// request, exactly as [`dismiss`] is, and for the same reason not checked against a fresh fetch:
+/// the ids came from the page the owner is looking at.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`] outside the allowlist, [`OpError::InvalidRange`] for an oversized
+/// batch, or [`OpError::Store`].
+pub async fn exempt_from_noise(
+    state: &AppState,
+    channel_id: &str,
+    wanted: &[MessageId],
+) -> Result<InboxChange, OpError> {
+    let channel = allowed(state, channel_id).await?;
+    if wanted.len() > usize::from(MAX_PAGE) {
+        return Err(OpError::InvalidRange);
+    }
+    state.store.exempt_from_noise(&channel.id, wanted).await?;
     Ok(InboxChange {
         channel,
         messages: wanted.to_vec(),

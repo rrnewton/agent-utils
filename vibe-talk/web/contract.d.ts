@@ -132,6 +132,15 @@ declare namespace VibeTalk {
      */
     live_poll_seconds: number;
     /**
+     * The rules that decide which messages are read automatically. `#196 auto-read-noise`.
+     *
+     * Here rather than behind a route of its own because the page needs them at startup, for the
+     * Settings editor, and every device and the voice agent share one list. Absent from an older
+     * server — the page then hides the editor — and also when this one cannot read its store, so
+     * a broken store makes the editor disappear rather than show a list that is not in force.
+     */
+    noise_rules?: NoiseRules | null;
+    /**
      * The READER's own Discord account, when the operator has said what it is.
      *
      * Distinct from `self_author_id`, which is the BRIDGE's account and is read out of the bot
@@ -372,6 +381,18 @@ declare namespace VibeTalk {
      */
     id: MessageId;
     /**
+     * Whether the owner's noise rules call this message read already. `#196 auto-read-noise`.
+     *
+     * DECIDED BY THIS SERVER EVERY TIME the message is served, from its current text, by
+     * [`crate::noise::NoiseFilter::mark`]; it is never stored and never trusted from whoever
+     * sent the message. That is what lets an edited placeholder come back as unread, and a
+     * removed rule un-hide everything it caught, without a single record having to change.
+     *
+     * The page reads this flag rather than matching the text itself, so there is one predicate
+     * and it is the server's. Absent means `false`, which is also what an older server meant.
+     */
+    noise?: boolean;
+    /**
      * The message this one is a reply to, when it is one.
      *
      * Discord records a reply on the REPLYING message, as `message_reference.message_id`, and
@@ -476,6 +497,25 @@ declare namespace VibeTalk {
      * The original channel message, if this provider exposes one.
      */
     root_message_id: MessageId | null;
+  }
+
+  /**
+   * The owner's noise rules, as the Settings editor shows them. `#196 auto-read-noise`.
+   *
+   * Also the body `PUT /api/v1/noise-rules` answers with, so the editor redraws from what the
+   * server STORED — trimmed and de-duplicated — rather than from what was typed.
+   */
+  interface NoiseRules {
+    /**
+     * One sentence saying how a rule matches, written beside the matcher and quoted by the page
+     * where the rules are edited, so the description cannot drift from what the server does.
+     */
+    matching: string;
+    /**
+     * The rules in force, in the owner's order and his own spelling. Until he saves a list this
+     * is the shipped default.
+     */
+    rules: string[];
   }
 
   /**

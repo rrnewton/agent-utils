@@ -156,6 +156,33 @@ pub const MIGRATIONS: &[&str] = &[
     "
     CREATE INDEX turns_by_time ON turns (at_ms, conversation_id, seq);
     ",
+    // v8 — messages read automatically. `#196 auto-read-noise`.
+    //
+    // `noise_rules` is ONE row or none, and the difference is the point: no row means the owner
+    // has never saved a list, so `noise::DEFAULT_RULES` stand in; a row holding `[]` means he
+    // removed every rule on purpose. Nothing is inserted here, because seeding the default into
+    // the file would make the two states indistinguishable from the first migration on. The list
+    // is a JSON array of the rules as he typed them, already validated by
+    // `noise::validate_rules`; it is read and written whole, never one rule at a time.
+    //
+    // `noise_exemptions` is the owner's "not noise" on a false positive: two ids and an instant,
+    // no message text, bounded by the same count as `dismissals` for the same reasons. Unlike a
+    // dismissal it does not need to be ordered, so there is no numeric column and an id that is
+    // not a snowflake is fine.
+    "
+    CREATE TABLE noise_rules (
+        id        INTEGER PRIMARY KEY CHECK (id = 1),
+        rules     TEXT    NOT NULL,
+        set_at_ms INTEGER NOT NULL
+    ) STRICT;
+
+    CREATE TABLE noise_exemptions (
+        channel_id TEXT    NOT NULL,
+        message_id TEXT    NOT NULL,
+        at_ms      INTEGER NOT NULL,
+        PRIMARY KEY (channel_id, message_id)
+    ) STRICT;
+    ",
 ];
 
 /// A [`StateStore`] backed by one SQLite file.
@@ -338,6 +365,24 @@ fn prune_dismissals(
         .execute(
             "DELETE FROM dismissals WHERE rowid NOT IN (
                  SELECT rowid FROM dismissals ORDER BY at_ms DESC, rowid DESC LIMIT ?1
+             )",
+            [i64::from(retention.max_dismissals)],
+        )
+        .map_err(backend)?;
+    Ok(())
+}
+
+/// Keep the "not noise" table under its ceiling, inside the caller's transaction.
+///
+/// The dismissal bound, applied to a separate table: see [`Retention::max_dismissals`].
+fn prune_noise_exemptions(
+    transaction: &rusqlite::Transaction<'_>,
+    retention: Retention,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "DELETE FROM noise_exemptions WHERE rowid NOT IN (
+                 SELECT rowid FROM noise_exemptions ORDER BY at_ms DESC, rowid DESC LIMIT ?1
              )",
             [i64::from(retention.max_dismissals)],
         )
@@ -977,6 +1022,101 @@ impl StateStore for SqliteStore {
         .await
     }
 
+    async fn noise_rules(&self) -> Result<Option<Vec<String>>, StoreError> {
+        self.with_connection(|connection| {
+            let stored = connection
+                .query_row("SELECT rules FROM noise_rules WHERE id = 1", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .optional()
+                .map_err(backend)?;
+            stored
+                .map(|text| {
+                    // A row this server cannot read is a refusal, not "no rules": treating it as
+                    // empty would silently turn the feature off, and treating it as the defaults
+                    // would silently undo whatever the owner had saved.
+                    serde_json::from_str::<Vec<String>>(&text).map_err(|error| {
+                        StoreError::Backend(format!(
+                            "the stored noise rules are unreadable: {error}"
+                        ))
+                    })
+                })
+                .transpose()
+        })
+        .await
+    }
+
+    async fn set_noise_rules(&self, rules: &[String]) -> Result<Vec<String>, StoreError> {
+        let rules = crate::noise::validate_rules(rules)?;
+        let encoded = serde_json::to_string(&rules).map_err(|error| {
+            StoreError::Backend(format!("cannot encode the noise rules: {error}"))
+        })?;
+        self.with_connection(move |connection| {
+            connection
+                .execute(
+                    "INSERT INTO noise_rules (id, rules, set_at_ms) VALUES (1, ?1, ?2)
+                     ON CONFLICT(id) DO UPDATE SET
+                        rules     = excluded.rules,
+                        set_at_ms = excluded.set_at_ms",
+                    rusqlite::params![encoded, now_ms()],
+                )
+                .map_err(backend)?;
+            Ok(rules)
+        })
+        .await
+    }
+
+    async fn noise_exemptions(&self, channel: &ChannelId) -> Result<Vec<MessageId>, StoreError> {
+        let channel = channel.clone();
+        self.with_connection(move |connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT message_id FROM noise_exemptions WHERE channel_id = ?1
+                     ORDER BY message_id ASC",
+                )
+                .map_err(backend)?;
+            let rows = statement
+                .query_map([channel.as_str()], |row| row.get::<_, String>(0))
+                .map_err(backend)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(MessageId(row.map_err(backend)?));
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn exempt_from_noise(
+        &self,
+        channel: &ChannelId,
+        messages: &[MessageId],
+    ) -> Result<u64, StoreError> {
+        crate::noise::validate_exempt_ids(messages)?;
+        let channel = channel.clone();
+        let messages: Vec<MessageId> = messages.to_vec();
+        let retention = self.retention;
+        self.with_connection(move |connection| {
+            let transaction = connection.transaction().map_err(backend)?;
+            let at = now_ms();
+            let mut added = 0_u64;
+            for message in &messages {
+                added += transaction
+                    .execute(
+                        "INSERT INTO noise_exemptions (channel_id, message_id, at_ms)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT(channel_id, message_id) DO NOTHING",
+                        rusqlite::params![channel.as_str(), message.as_str(), at],
+                    )
+                    .map_err(backend)? as u64;
+            }
+            prune_noise_exemptions(&transaction, retention)?;
+            transaction.commit().map_err(backend)?;
+            Ok(added)
+        })
+        .await
+    }
+
     async fn cached_summary(&self, key: &SummaryKey) -> Result<Option<String>, StoreError> {
         let key = key.clone();
         self.with_connection(move |connection| {
@@ -1058,6 +1198,14 @@ impl StateStore for SqliteStore {
                 .map_err(backend)?;
             transaction
                 .execute("DELETE FROM channel_aliases", [])
+                .map_err(backend)?;
+            // Back to the shipped default, which is what "erase everything this store holds"
+            // means for a list that has one: no row is the never-saved state.
+            transaction
+                .execute("DELETE FROM noise_rules", [])
+                .map_err(backend)?;
+            transaction
+                .execute("DELETE FROM noise_exemptions", [])
                 .map_err(backend)?;
             transaction.commit().map_err(backend)
         })
@@ -2226,5 +2374,119 @@ mod tests {
             MIGRATIONS.len(),
             "a fresh file must end at the newest schema version"
         );
+    }
+
+    #[tokio::test]
+    async fn noise_rules_start_unsaved_survive_a_restart_and_an_empty_list_stays_empty() {
+        // `#196 auto-read-noise`. Three states, and the file has to keep them apart: never saved
+        // (the default stands in), a saved list, and a saved EMPTY list — the owner turning the
+        // feature off, which must not bring the default back on the next start.
+        let dir = TempDir::new("sqlite-noise");
+        let file = dir.path().join("state").join("vibe-talk.sqlite3");
+        {
+            let store = SqliteStore::open(&file, Retention::default()).expect("open");
+            assert_eq!(
+                store.noise_rules().await.expect("read"),
+                None,
+                "a fresh file must say 'never saved', not seed a list a read could not have written"
+            );
+            let stored = store
+                .set_noise_rules(&[
+                    "  Working…  ".to_owned(),
+                    "working...".to_owned(),
+                    "Thinking…".to_owned(),
+                ])
+                .await
+                .expect("save");
+            assert_eq!(stored, vec!["Working…".to_owned(), "Thinking…".to_owned()]);
+        }
+        let reopened = SqliteStore::open(&file, Retention::default()).expect("reopen");
+        assert_eq!(
+            reopened.noise_rules().await.expect("read back"),
+            Some(vec!["Working…".to_owned(), "Thinking…".to_owned()])
+        );
+        reopened.set_noise_rules(&[]).await.expect("turn it off");
+        drop(reopened);
+        let again = SqliteStore::open(&file, Retention::default()).expect("reopen again");
+        assert_eq!(again.noise_rules().await.expect("read"), Some(Vec::new()));
+
+        // A list the validator refuses changes nothing at all.
+        let error = again
+            .set_noise_rules(&["Working…".to_owned(), "*".to_owned()])
+            .await
+            .expect_err("a bare star would match everything");
+        assert_eq!(error.code(), "bad_id", "{error}");
+        assert_eq!(again.noise_rules().await.expect("read"), Some(Vec::new()));
+
+        // The purge is the operator's "erase everything", and for this list that is the default.
+        again
+            .set_noise_rules(&["Working…".to_owned()])
+            .await
+            .expect("save");
+        again.purge_everything().await.expect("purge");
+        assert_eq!(again.noise_rules().await.expect("read"), None);
+    }
+
+    #[tokio::test]
+    async fn a_not_noise_exemption_survives_a_restart_and_is_bounded_like_a_dismissal() {
+        let dir = TempDir::new("sqlite-noise-exempt");
+        let file = dir.path().join("state").join("vibe-talk.sqlite3");
+        let channel = ChannelId("1111111111".to_owned());
+        let other = ChannelId("2222222222".to_owned());
+        let retention = Retention {
+            max_dismissals: 2,
+            ..Retention::default()
+        };
+        {
+            let store = SqliteStore::open(&file, retention).expect("open");
+            // Not a snowflake, on purpose: nothing orders these, so nothing requires one.
+            let added = store
+                .exempt_from_noise(&channel, &[MessageId("spaces/A/messages/B".to_owned())])
+                .await
+                .expect("exempt");
+            assert_eq!(added, 1);
+            let again = store
+                .exempt_from_noise(&channel, &[MessageId("spaces/A/messages/B".to_owned())])
+                .await
+                .expect("exempt again");
+            assert_eq!(again, 0, "a repeated tap is not a second exemption");
+        }
+        let store = SqliteStore::open(&file, retention).expect("reopen");
+        assert_eq!(
+            store.noise_exemptions(&channel).await.expect("read"),
+            vec![MessageId("spaces/A/messages/B".to_owned())]
+        );
+        assert!(
+            store
+                .noise_exemptions(&other)
+                .await
+                .expect("read")
+                .is_empty(),
+            "one channel's exemption leaked into another"
+        );
+        for id in ["1000000000000000001", "1000000000000000002"] {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            store
+                .exempt_from_noise(&channel, &[MessageId(id.to_owned())])
+                .await
+                .expect("exempt");
+        }
+        let held = store.noise_exemptions(&channel).await.expect("read");
+        assert_eq!(held.len(), 2, "the exemption table is unbounded");
+        assert!(
+            !held.contains(&MessageId("spaces/A/messages/B".to_owned())),
+            "the ceiling evicted the wrong end: the oldest exemption goes first"
+        );
+        let error = store
+            .exempt_from_noise(&channel, &[MessageId(String::new())])
+            .await
+            .expect_err("an empty id is not a message");
+        assert_eq!(error.code(), "bad_id");
+        store.purge_everything().await.expect("purge");
+        assert!(store
+            .noise_exemptions(&channel)
+            .await
+            .expect("read")
+            .is_empty());
     }
 }

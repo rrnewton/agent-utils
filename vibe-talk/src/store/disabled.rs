@@ -130,6 +130,25 @@ impl StateStore for DisabledStore {
         refuse()
     }
 
+    async fn noise_rules(&self) -> Result<Option<Vec<String>>, StoreError> {
+        // A refusal, not `Ok(None)`. The caller that wants the defaults when nothing is stored
+        // (`noise::current_rules`) asks for them by name; answering "never saved" here would let
+        // a settings screen believe it could save.
+        refuse()
+    }
+
+    async fn set_noise_rules(&self, _: &[String]) -> Result<Vec<String>, StoreError> {
+        refuse()
+    }
+
+    async fn noise_exemptions(&self, _: &ChannelId) -> Result<Vec<MessageId>, StoreError> {
+        refuse()
+    }
+
+    async fn exempt_from_noise(&self, _: &ChannelId, _: &[MessageId]) -> Result<u64, StoreError> {
+        refuse()
+    }
+
     async fn cached_summary(&self, _: &SummaryKey) -> Result<Option<String>, StoreError> {
         refuse()
     }
@@ -197,6 +216,19 @@ mod tests {
                 .restore(&channel, std::slice::from_ref(&message))
                 .await
                 .expect_err("restore"),
+            store.noise_rules().await.expect_err("noise rules"),
+            store
+                .set_noise_rules(&["Working…".to_owned()])
+                .await
+                .expect_err("set noise rules"),
+            store
+                .noise_exemptions(&channel)
+                .await
+                .expect_err("noise exemptions"),
+            store
+                .exempt_from_noise(&channel, std::slice::from_ref(&message))
+                .await
+                .expect_err("exempt from noise"),
             store.purge_everything().await.expect_err("purge"),
         ];
         for error in errors {

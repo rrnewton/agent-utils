@@ -50,8 +50,8 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
  * @param {"api-token" | "channel-alias" | "channel-directory-search" | "combine-messages"
  *   | "compose-text" | "mark-own-read" | "mic-auto-gain" | "mic-echo-cancellation"
  *   | "mic-noise-suppression" | "msg-scale" | "new-channel-id" | "new-channel-label"
- *   | "new-channel-writable" | "read-speed-range" | "reading-width" | "reply-branch"
- *   | "resume-toggle" | "search-field"} id
+ *   | "new-channel-writable" | "noise-rule-new" | "read-speed-range" | "reading-width"
+ *   | "reply-branch" | "resume-toggle" | "search-field"} id
  * @returns {HTMLInputElement}
  */
 /**
@@ -67,14 +67,16 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
  */
 /**
  * @overload
- * @param {"add-channel" | "audio-source" | "cancel-add-channel" | "cancel-rename" | "canned-blockers"
- *   | "canned-summary" | "channel-directory-more" | "channel-directory-retry" | "channel-send"
+ * @param {"add-channel" | "add-noise-rule" | "audio-source" | "cancel-add-channel"
+ *   | "cancel-rename" | "canned-blockers" | "canned-summary" | "channel-directory-more"
+ *   | "channel-directory-retry" | "channel-send"
  *   | "channel-view-flat" | "channel-view-main" | "channel-view-threads" | "clear-alias"
  *   | "clear-backlog" | "clear-view" | "close-browse-channels" | "close-help" | "close-reply"
  *   | "close-settings" | "close-threads" | "collapse-all" | "dismiss-banner" | "dismiss-error"
  *   | "dismiss-status" | "expand-all" | "forget-conversations" | "forget-token" | "hang-up"
- *   | "help-link-canned-prompts" | "help-link-channel-alias" | "help-link-combining"
- *   | "help-link-connection" | "help-link-control-bar" | "help-link-identities"
+ *   | "help-link-auto-read" | "help-link-canned-prompts" | "help-link-channel-alias"
+ *   | "help-link-combining" | "help-link-connection" | "help-link-control-bar"
+ *   | "help-link-identities"
  *   | "help-link-live-messages" | "help-link-mark-own" | "help-link-microphone"
  *   | "help-link-reading-width" | "help-link-resuming" | "help-link-speech-prep"
  *   | "help-link-storage" | "jump-marker" | "jump-newest" | "load-older" | "load-older-turns"
@@ -434,6 +436,7 @@ const HELP_TOPICS = [
   "identities",
   "channel-alias",
   "mark-own",
+  "auto-read",
   "combining",
   "reading-width",
   "resuming",
@@ -7014,9 +7017,7 @@ function applyTimelinePage(payload, older = false, saved = false) {
   channelHasThreads = payload.has_threads === true || channelView === "thread";
   if (payload.thread) selectedThread = payload.thread;
   noteArchived(payload, !older && merged.length <= incoming.length);
-  const shown = timelineMessages.filter((message) => !todoMode ||
-    (!archivedIds.has(String(message.id)) && (!markOwnRead ||
-      bucketFor(message.author_id, message.author_is_bot, messageChannel(message)) !== "me")));
+  const shown = timelineMessages.filter((message) => !todoMode || stillToDo(message));
   if (older) {
     // Keep existing elements attached to the same messages: scroll restoration holds one of
     // those elements as its anchor, and recreating it would throw away the reader's position.
@@ -7050,9 +7051,7 @@ function applyTimelinePage(payload, older = false, saved = false) {
 /** Re-project the already fetched timeline after a local preference or archive change. */
 function renderCachedTimeline() {
   if (!threadingSupported || channelView === "threads") return;
-  const shown = timelineMessages.filter((message) => !todoMode ||
-    (!archivedIds.has(String(message.id)) && (!markOwnRead ||
-      bucketFor(message.author_id, message.author_is_bot, messageChannel(message)) !== "me")));
+  const shown = timelineMessages.filter((message) => !todoMode || stillToDo(message));
   const redraw = () => {
     el("discord-log").replaceChildren(...glom(shown).map(discordNode));
     renderChannelRows();
@@ -8429,6 +8428,7 @@ function childByClass(row, className) {
 }
 
 const doneButtonOf = (row) => childByClass(row, "done-button");
+const notNoiseButtonOf = (row) => childByClass(row, "not-noise-button");
 
 /** How a row names its author: the display name, and `(bot)` when it is one. */
 function authorLabel(row) {
@@ -8507,11 +8507,20 @@ function renderChannelRows() {
     // and the whole point of the archive is that it says what is left.
     const isArchived = ids.length > 0 && ids.every((one) => archivedIds.has(one));
     row.setAttribute("data-archived", isArchived ? "true" : "false");
+    // `#196 auto-read-noise`. Read automatically, by the server's verdict on EVERY constituent —
+    // `joinsGroup` keeps a placeholder out of a real message's row, so a mixed row is not one the
+    // reader should be told is noise. Dimmed, never hidden, here: hiding is Hide read's job, and
+    // a row that vanished could not be rescued from a rule that caught it by mistake.
+    const held = rowMessages(row);
+    const isNoiseRow = held.length > 0 && held.every(isNoise);
+    row.setAttribute("data-noise", !isArchived && isNoiseRow ? "true" : "false");
+    const rescue = notNoiseButtonOf(row);
+    if (rescue) rescue.hidden = !isNoiseRow;
     // Separate from the declared archive: this one is implied, carries no undo, and disappears
     // the moment the setting is turned off.
     row.setAttribute(
       "data-own-read",
-      !isArchived && markOwnRead && who === "me" ? "true" : "false"
+      !isArchived && !isNoiseRow && markOwnRead && who === "me" ? "true" : "false"
     );
     const isReading = nowPlaying !== null && nowPlaying.id === id;
     // ASKED FOR, but not yet speaking. Distinct from `data-reading` on purpose: this one the
@@ -8571,6 +8580,8 @@ function renderChannelRows() {
     }
   }
   renderOutgoingMessages();
+  // Settings counts what is loaded, and this is where what is loaded changes.
+  renderNoiseCount();
 }
 
 /**
@@ -8668,7 +8679,10 @@ function advanceMarkerPastRead() {
       el("discord-channel").value
     );
     const ids = idsOf(li);
-    return ids.length > 0 && ids.every((one) => readAlready(one, who));
+    // A placeholder the server reads automatically is as dealt with as an archived message: the
+    // marker means "the oldest thing still waiting", and a placeholder is never waiting.
+    const held = rowMessages(li);
+    return ids.length > 0 && ids.every((one, index) => readAlready(one, who) || isNoise(held[index]));
   };
   let i = at;
   while (i < rows.length && dealtWith(rows[i])) {
@@ -8853,6 +8867,32 @@ function storedMarkOwnRead() {
 /** Is this row one the reader never has to deal with? Declared archive, or own-and-implicitly-read. */
 function readAlready(id, who) {
   return archivedIds.has(String(id)) || (markOwnRead && who === "me");
+}
+
+/**
+ * Does the SERVER say this message is read automatically? `#196 auto-read-noise`.
+ *
+ * The flag and nothing else. The server decides it from the owner's noise rules against the
+ * message's text as it reads NOW, on every read, and this page deliberately has no copy of the
+ * matcher: two predicates would disagree the first time either one changed, and the one that
+ * decides what the agent hears is the server's.
+ *
+ * Like `markOwnRead` and unlike the declared archive, it is implied: nothing is recorded per
+ * message, there is no undo, and an edit or a removed rule brings the message straight back.
+ */
+function isNoise(message) {
+  return Boolean(message) && message.noise === true;
+}
+
+/**
+ * Does this message belong in the list behind Hide read?
+ *
+ * ONE definition, for both places the threaded view filters. Not archived, not read automatically,
+ * and not the reader's own words when they have said those are read.
+ */
+function stillToDo(message) {
+  return !archivedIds.has(String(message.id)) && !isNoise(message) &&
+    (!markOwnRead || bucketFor(message.author_id, message.author_is_bot, messageChannel(message)) !== "me");
 }
 
 /** Is a tap on a message a request to hear it? Session-only, and only in the channel view. */
@@ -9165,11 +9205,14 @@ async function prepareSpeechNow() {
   }
   const ids = [];
   for (const li of el("discord-log").children) {
-    for (const id of idsOf(li)) {
-      if (id && !preparedSpeech.has(id)) {
+    // `#196 auto-read-noise`. A placeholder is not prepared: preparing warms a vendor lookup for a
+    // message nobody is going to ask to hear. A tap on one still reads it, by the slower route.
+    const held = rowMessages(li);
+    idsOf(li).forEach((id, index) => {
+      if (id && !preparedSpeech.has(id) && !isNoise(held[index])) {
         ids.push(id);
       }
-    }
+    });
   }
   if (ids.length === 0) {
     return;
@@ -10101,6 +10144,12 @@ function joinsGroup(previous, message) {
   if (String(previous.author_id || "") !== String(message.author_id || "")) {
     return false;
   }
+  // `#196 auto-read-noise`. A placeholder and the answer that follows it seconds later are two
+  // rows, not one: combined, the row would be neither read nor quiet, and the placeholder's text
+  // would sit at the head of the real message.
+  if (isNoise(previous) !== isNoise(message)) {
+    return false;
+  }
   const before = messageDate(previous);
   const after = messageDate(message);
   if (before === null || after === null) {
@@ -10371,6 +10420,21 @@ function discordNode(messages) {
   // queue is the failure mode a display-layer grouping has to be built against.
   const ids = messages.map((m) => String(m.id));
   done.addEventListener("click", () => guardQuietly(() => toggleArchived(ids))());
+  // `#196 auto-read-noise`. The rescue for a rule that caught a message by mistake: ONE message,
+  // recorded on the server, leaving the rule to go on catching the placeholders it is right about.
+  // On every row and shown only on a noise row by `renderChannelRows`, for the reason Done is on
+  // every row — a control that exists in one rendering and not another is a second code path.
+  const rescue = document.createElement("button");
+  rescue.className = "not-noise-button";
+  rescue.setAttribute("type", "button");
+  rescue.setAttribute(
+    "title",
+    "This is a real message. Stop reading it automatically; the rule stays as it is."
+  );
+  rescue.textContent = "Not noise";
+  rescue.hidden = !messages.every(isNoise);
+  rescue.addEventListener("click", () => guardQuietly(() => markNotNoise(ids))());
+  meta.append(rescue);
   meta.append(done);
   // `#84 reply-aware-dismissal`. THE SWIPE `#50` deferred, and it drives the same act the Done button does
   // rather than a second notion of "dealt with": one dismissal, recorded on the server, reachable
@@ -11172,7 +11236,7 @@ async function loadTodo(options) {
  * read at all, and the head of the list, the backlog count and the bulk control all have to move
  * with it or the view contradicts itself.
  */
-let todoView = { left: 0, window: 0, complete: false, channelId: null };
+let todoView = { left: 0, window: 0, noise: 0, complete: false, channelId: null };
 
 /** Take down what a `/todo` answer said about itself. */
 function noteTodoRead(payload) {
@@ -11180,12 +11244,16 @@ function noteTodoRead(payload) {
   todoView = {
     left,
     window: typeof payload.window === "number" ? payload.window : left,
+    // `#196 auto-read-noise`. How many of the window the server left out as read automatically.
+    // The rows are not here to count, so Settings' count comes from this in to-do mode.
+    noise: typeof payload.noise === "number" ? payload.noise : 0,
     complete: payload.complete === true,
     // The ID, not the name it was wearing at the time. `#39 channel-alias` lets the owner rename
     // a channel from Settings without re-reading it, and a name captured here would leave this
     // line saying what the channel used to be called.
     channelId: payload.channel ? payload.channel.id : null,
   };
+  renderNoiseCount();
 }
 
 /**
@@ -11238,6 +11306,13 @@ function appendChannelRow(arriving, live = false) {
       return;
     }
     if (!timelineMessages.some((held) => String(held.id) === String(message.id))) timelineMessages.push(message);
+  }
+  // `#196 auto-read-noise`. A placeholder arriving while Hide read is on is already read: it is
+  // held with the rest of the channel, and the list — and its count — are not told about it.
+  if (todoMode && isNoise(message)) {
+    saveChannelScope();
+    renderNoiseCount();
+    return;
   }
   const list = el("discord-log");
   // A LIVE ARRIVAL CAN JOIN THE ROW ABOVE IT, and it has to be given the chance: the second half
@@ -11501,6 +11576,177 @@ function setTodoMode(on) {
   } else {
     guardQuietly(() => (on ? loadTodo() : loadDiscord()))();
   }
+}
+
+// --- messages read automatically ------------------------------------------------------------------
+//
+// `#196 auto-read-noise`. The owner asked for "Working…" placeholders to stop counting as unread.
+// The server holds the rules and judges every message it serves against them; what this page does
+// is carry that verdict through — `isNoise` — and give the owner the two acts the verdict needs:
+// editing the rules, in Settings, and rescuing one message a rule caught by mistake, on its row.
+//
+// WHAT THIS PAGE DELIBERATELY DOES NOT HAVE is a copy of the matcher. A row is quiet because the
+// server said so, the count in Settings counts the server's verdicts, and a rule the owner adds is
+// applied by re-reading the channel rather than by matching text here. Two predicates would agree
+// until the day one of them changed.
+
+/** The rules as the server last reported them, or null when it does not say. */
+let noiseRules = null;
+
+/** The server's own sentence about how a rule matches, quoted beside the list. */
+let noiseMatching = "";
+
+/** Take down what the server said the rules are — from client-config, or from a save. */
+function applyNoiseRules(view) {
+  if (view && Array.isArray(view.rules)) {
+    noiseRules = view.rules.map(String);
+    noiseMatching = typeof view.matching === "string" ? view.matching : "";
+  } else {
+    noiseRules = null;
+    noiseMatching = "";
+  }
+  renderNoiseRules();
+}
+
+/** Draw the editor from `noiseRules`: the sentence, one row per rule, and the count. */
+function renderNoiseRules() {
+  el("noise-editor").hidden = noiseRules === null;
+  if (noiseRules === null) {
+    // Said rather than left blank: an older server, or a store that is not answering, and the
+    // owner looking for the list should learn which side of that he is on.
+    el("noise-state").textContent =
+      "This server does not say which messages it reads automatically, so there is nothing to edit here.";
+    return;
+  }
+  el("noise-matching").textContent = noiseMatching;
+  el("noise-rule-list").replaceChildren(...noiseRules.map(noiseRuleRow));
+  renderNoiseCount();
+}
+
+/**
+ * One rule and its Remove.
+ *
+ * The rule is the OWNER's own text, shown as he typed it, through `textContent` like everything
+ * else this page draws. Removing sends the whole list without it, which is how the server takes
+ * every change: one list, replaced, so two devices cannot leave half an edit each.
+ */
+function noiseRuleRow(rule, index) {
+  const li = document.createElement("li");
+  li.className = "noise-rule";
+  const text = document.createElement("span");
+  text.className = "noise-rule-text";
+  text.textContent = rule;
+  const remove = document.createElement("button");
+  remove.className = "secondary noise-rule-remove";
+  remove.setAttribute("type", "button");
+  remove.setAttribute("title", "Stop reading messages like this automatically");
+  remove.textContent = "Remove";
+  remove.addEventListener(
+    "click",
+    guardQuietly(() =>
+      saveNoiseRules(
+        (noiseRules || []).filter((_held, at) => at !== index),
+        `Removed. Messages reading "${rule}" count as unread again.`
+      )
+    )
+  );
+  li.append(text, remove);
+  return li;
+}
+
+/**
+ * How many of the LOADED messages the server calls noise, and out of how many.
+ *
+ * The rows on screen, or the threaded view's messages — except in the plain to-do list, where the
+ * server already left the placeholders out and said how many it left, so that number is the one.
+ */
+function noiseTally() {
+  if (!threadingSupported && todoMode) {
+    return { matched: todoView.noise || 0, total: todoView.window || 0 };
+  }
+  const loaded = threadingSupported
+    ? timelineMessages
+    : [...el("discord-log").children].flatMap(rowMessages);
+  return { matched: loaded.filter(isNoise).length, total: loaded.length };
+}
+
+/**
+ * The live count under the list: "Matches 9 of the 50 loaded messages."
+ *
+ * Recounted wherever the loaded messages change — `renderChannelRows`, a to-do read, an arrival —
+ * so it moves when the owner adds a rule and the channel is re-read under it.
+ */
+function renderNoiseCount() {
+  if (noiseRules === null) {
+    return;
+  }
+  const { matched, total } = noiseTally();
+  el("noise-count").textContent =
+    total === 0
+      ? "No messages are loaded yet, so there is nothing to count."
+      : `Matches ${matched} of the ${total} loaded message${total === 1 ? "" : "s"}.`;
+}
+
+/**
+ * Replace the server's list, take back what it STORED, and re-read the channel under it.
+ *
+ * The re-read is the point of the third step. Every loaded message was judged under the old list,
+ * and the page has no matcher of its own to re-judge them with — so the server is asked again.
+ */
+async function saveNoiseRules(rules, said) {
+  const payload = await api("/api/v1/noise-rules", { method: "PUT", body: { rules } });
+  applyNoiseRules(payload);
+  el("noise-state").textContent = said;
+  setStatus(said);
+  if (el("discord-channel").value) {
+    guardQuietly(() => loadDiscord({ keepPosition: true }))();
+  }
+}
+
+/** Add what is in the field as a rule. The server trims it and drops a duplicate. */
+async function addNoiseRule() {
+  const typed = el("noise-rule-new").value.trim();
+  if (!typed) {
+    el("noise-state").textContent = "Type the message to read automatically, then Add.";
+    return;
+  }
+  await saveNoiseRules(
+    [...(noiseRules || []), typed],
+    `Added. A message reading "${typed}" counts as read from now on.`
+  );
+  el("noise-rule-new").value = "";
+}
+
+/**
+ * Rescue messages a rule caught by mistake: the server records them as not noise, and every copy
+ * of them this page holds is told the same, so the row is ordinary at once rather than after the
+ * next read.
+ *
+ * Not optimistic, unlike Done. Done is undoable and its failure puts back a row the reader can
+ * see; a rescue that failed silently would leave him believing a message is safe from a rule that
+ * is still hiding it.
+ */
+async function markNotNoise(ids) {
+  const channel = el("discord-channel").value;
+  const rescued = new Set(ids.map(String));
+  if (!channel || rescued.size === 0) return;
+  await api(`/api/v1/channels/${encodeURIComponent(channel)}/not-noise`, {
+    method: "POST",
+    body: { messages: [...rescued] },
+  });
+  const copies = [
+    ...timelineMessages,
+    ...channelCanon.messages,
+    ...[...el("discord-log").children].flatMap(rowMessages),
+  ];
+  for (const message of copies) {
+    if (rescued.has(String(message.id))) message.noise = false;
+  }
+  await refreshAfterInboxChange();
+  const count = rescued.size;
+  setStatus(
+    `${count} message${count === 1 ? "" : "s"} no longer read automatically — the rule still applies to the others.`
+  );
 }
 
 // --- replying to a channel message -------------------------------------------------------------
@@ -12509,8 +12755,10 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
   discordNewestId = id;
   if (wasAtNewest) {
     scrollToNewest();
-  } else {
+  } else if (!isNoise(message)) {
     // Somewhere else in the history, or looking at the call. Offer the jump; never take it.
+    // Never for a placeholder the server reads automatically (`#196 auto-read-noise`): an offer to
+    // go and look at "Working…" is the interruption the owner asked to be rid of.
     setJumpNewest(true, "discord");
   }
   renderScrollTools();
@@ -12722,7 +12970,10 @@ function flushRelay() {
  * instead of talking over itself once per message.
  */
 function relayToAgent(message, selfPosted, replayed) {
-  if (replayed || selfPosted || relayMode() === "off" || !canSendText()) {
+  // `#196 auto-read-noise`. NOISE is a fifth guard, and the one the owner asked for by name: a
+  // placeholder announced into a live call is the agent saying "a new message: Working…" while he
+  // drives. The server already decided it is read; the call is not told otherwise.
+  if (replayed || selfPosted || isNoise(message) || relayMode() === "off" || !canSendText()) {
     return false;
   }
   relayPending.push(relayLine(message));
@@ -13535,6 +13786,7 @@ function applyClientConfig(config) {
   resumeAllowed = config.replay_enabled === true;
   renderResumeState();
   renderSpeechPrepState(config.speech_prep_enabled);
+  applyNoiseRules(config.noise_rules);
   // Started here rather than when the Discord view opens: PUSH TWO is the point of it, and an
   // arriving message has to be able to reach a call that is happening on the OTHER tab. Following
   // only the visible view would mean the relay was off precisely while the reader was talking.
@@ -14107,6 +14359,10 @@ el("channel-directory-retry").addEventListener(
 );
 el("remove-channel").addEventListener("click", guardQuietly(removeChannel));
 el("save-alias").addEventListener("click", guardQuietly(saveAlias));
+el("add-noise-rule").addEventListener("click", guardQuietly(addNoiseRule));
+el("noise-rule-new").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") guardQuietly(addNoiseRule)();
+});
 el("clear-alias").addEventListener("click", guardQuietly(clearChannelAlias));
 el("load-older").addEventListener("click", guardQuietly(loadOlder));
 el("load-older-turns").addEventListener("click", guardQuietly(loadOlderTurns));

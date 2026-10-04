@@ -569,12 +569,30 @@ fn page_header(page: &ops::Page) -> String {
     )
 }
 
+/// The sentence that says how many messages the owner's noise rules left out, or nothing.
+///
+/// `#196 auto-read-noise`. Said rather than silently dropped, for the reason `#62
+/// message-count-accuracy` made every count say what it is: a model told "four messages" about a
+/// page of seven will repeat four as though the other three did not exist.
+fn noise_note(noise: usize) -> String {
+    match noise {
+        0 => String::new(),
+        1 => " One placeholder message the owner's noise rules mark as read was left out; do not \
+              mention it."
+            .to_owned(),
+        n => format!(
+            " {n} placeholder messages the owner's noise rules mark as read were left out; do \
+             not mention them."
+        ),
+    }
+}
+
 async fn run_page(state: &AppState, args: &Value) -> Result<String, OpError> {
     let channel_id = arg_id(args, "channel_id").unwrap_or_default();
     let before = arg_id(args, "before");
     let since = arg_str(args, "since");
     let until = arg_str(args, "until");
-    let page = ops::page(
+    let mut page = ops::page(
         state,
         &channel_id,
         ops::PageRequest {
@@ -585,7 +603,27 @@ async fn run_page(state: &AppState, args: &Value) -> Result<String, OpError> {
         },
     )
     .await?;
-    let header = page_header(&page);
+    // Dropped HERE and not in `ops::page`, which is also what the page draws the channel from and
+    // shows a placeholder dimmed. The cursors are untouched: they point into the channel, and a
+    // placeholder is as good a place to step back from as any other message.
+    let noise = page.messages.iter().filter(|m| m.noise).count();
+    page.messages.retain(|m| !m.noise);
+    let header = if page.messages.is_empty() && noise > 0 {
+        // Not "no messages in that part of the channel", which would be false, and not a count
+        // the model would read out as news either.
+        format!(
+            "Page of {} (id {}): nothing to report — every message in this page is a placeholder \
+             the owner's noise rules mark as read.\n",
+            page.channel.display_name(),
+            page.channel.id
+        )
+    } else {
+        let header = page_header(&page);
+        match header.strip_suffix('\n') {
+            Some(line) if noise > 0 => format!("{line}{}\n", noise_note(noise)),
+            _ => header,
+        }
+    };
     Ok(format!(
         "{header}{}",
         untrusted::render_for_model(&page.messages)
@@ -604,6 +642,17 @@ async fn run_count(state: &AppState, args: &Value) -> Result<String, OpError> {
     let scope = match &since {
         Some(from) => format!(" since {from}"),
         None => String::new(),
+    };
+    // `#196 auto-read-noise`. The number is what the owner would call messages; the placeholders
+    // it did not count are named so that "exactly" stays true of what was said.
+    let scope = match tally.noise {
+        0 => scope,
+        1 => format!(
+            "{scope}, not counting one placeholder message the owner's noise rules mark as read"
+        ),
+        n => format!(
+            "{scope}, not counting {n} placeholder messages the owner's noise rules mark as read"
+        ),
     };
     let plural = if tally.counted == 1 {
         "message"
@@ -628,7 +677,12 @@ async fn run_count(state: &AppState, args: &Value) -> Result<String, OpError> {
 
 async fn run_digest(state: &AppState, args: &Value) -> Result<String, OpError> {
     let channel_id = arg_id(args, "channel_id").unwrap_or_default();
-    let (info, entries, complete) = ops::digest(
+    let ops::Digest {
+        channel: info,
+        entries,
+        complete,
+        noise,
+    } = ops::digest(
         state,
         &channel_id,
         arg_u16(args, "limit"),
@@ -647,6 +701,19 @@ async fn run_digest(state: &AppState, args: &Value) -> Result<String, OpError> {
         complete,
         oldest.as_ref(),
     );
+    let header = if entries.is_empty() && noise > 0 {
+        format!(
+            "Digest of {} (id {}): nothing to report — the recent messages are all placeholders \
+             the owner's noise rules mark as read.\n",
+            info.display_name(),
+            info.id
+        )
+    } else {
+        match header.strip_suffix('\n') {
+            Some(line) if noise > 0 => format!("{line}{}\n", noise_note(noise)),
+            _ => header,
+        }
+    };
     let mut body = String::new();
     for entry in &entries {
         // `author_id` is rendered as the mention token itself rather than as a bare number, so

@@ -439,6 +439,7 @@ pub async fn ingest_event(
                 reply_to: None,
                 content: String::new(),
                 spoken_content: String::new(),
+                noise: false,
             };
             (crate::live::LiveKind::Delete, channel_id, tombstone)
         }
@@ -748,7 +749,85 @@ pub async fn client_config(
         providers,
         summaries_unavailable: state.summarizer.unavailable_reason(),
         token_scope: scope.into(),
+        noise_rules: noise_rules_view(&state).await,
     }))
+}
+
+/// The noise rules for client-config, or `None` when a configured store cannot say what they are.
+///
+/// Absent rather than an error: client-config is what signs the page in, and a store fault must
+/// not lock the owner out of a page that can still read every channel. The editor hides itself
+/// instead of showing a list that may not be the one in force.
+async fn noise_rules_view(state: &AppState) -> Option<crate::contract::NoiseRules> {
+    match ops::noise_rules(state).await {
+        Ok(rules) => Some(crate::contract::NoiseRules {
+            rules,
+            matching: crate::noise::MATCHING_RULE,
+        }),
+        Err(error) => {
+            tracing::warn!(%error, "could not read the noise rules for client-config");
+            None
+        }
+    }
+}
+
+/// A replacement list of noise rules. `#196 auto-read-noise`.
+#[derive(Debug, Deserialize)]
+pub struct NoiseRulesRequest {
+    /// Every rule, in order. The whole list: what is not here is removed. Validated by
+    /// [`crate::noise::validate_rules`]; empty is allowed and turns the feature off.
+    pub rules: Vec<String>,
+}
+
+/// `PUT /api/v1/noise-rules` — replace the rules that decide what is read automatically.
+///
+/// WRITE scope, because the list outlives the process and every device reads it back. And, as
+/// with [`set_alias`], **the scope is not what keeps the voice agent out**: a hosted agent is
+/// routinely given the write token for `post_reply`. What keeps a model from hiding messages from
+/// the owner it reports to is that NO TOOL edits this list — [`crate::mcp::tool_manifest`] offers
+/// none and [`crate::mcp::protocol::dispatch`] refuses any name it cannot find there.
+///
+/// Reading the list needs no route of its own: it rides on client-config.
+pub async fn set_noise_rules(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Json(request): Json<NoiseRulesRequest>,
+) -> Result<Response, ApiError> {
+    let rules = ops::set_noise_rules(&state, &request.rules).await?;
+    Ok(no_store(Json(crate::contract::NoiseRules {
+        rules,
+        matching: crate::noise::MATCHING_RULE,
+    })))
+}
+
+/// Messages the owner says are not noise. `#196 auto-read-noise`.
+#[derive(Debug, Deserialize)]
+pub struct NotNoiseRequest {
+    /// The ids, as the page was served them. At most one page's worth.
+    pub messages: Vec<String>,
+}
+
+/// `POST /api/v1/channels/{channel_id}/not-noise` — rescue a message a rule caught by mistake.
+///
+/// WRITE scope, like every durable write. Recorded per message rather than by editing the rules,
+/// because a false positive is ONE message: the rule is still right about the other nine, and the
+/// owner should not have to weaken it to see the tenth. There is no MCP tool for this either.
+pub async fn not_noise(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path(channel_id): Path<String>,
+    Json(request): Json<NotNoiseRequest>,
+) -> Result<Response, ApiError> {
+    if request.messages.is_empty() {
+        return Err(ApiError::bad_request(
+            "send the `messages` that are not noise; an empty request would report success for \
+             having done nothing",
+        ));
+    }
+    let wanted: Vec<MessageId> = request.messages.into_iter().map(MessageId).collect();
+    Ok(answered(
+        ops::exempt_from_noise(&state, &channel_id, &wanted).await?,
+    ))
 }
 
 /// How changes reach the live stream for a provider polled every `poll_seconds`.
@@ -1235,6 +1314,9 @@ pub struct CountResponse {
     pub oldest_seen: Option<String>,
     /// Newest message the walk started from.
     pub newest_seen: Option<String>,
+    /// Messages the walk passed that the owner's noise rules call read, and so did NOT count.
+    /// `#196 auto-read-noise`.
+    pub noise: usize,
 }
 
 /// `GET /api/v1/channels/{channel_id}/count`
@@ -1252,6 +1334,7 @@ pub async fn count(
         cap: tally.cap,
         oldest_seen: tally.oldest_seen.map(|id| id.0),
         newest_seen: tally.newest_seen.map(|id| id.0),
+        noise: tally.noise,
     }))
 }
 
@@ -1301,6 +1384,9 @@ pub struct DigestResponse {
     /// Whether the fetch came back short, so `entries.len()` counts the CHANNEL rather than the
     /// window. See [`MessagesResponse::complete`].
     pub complete: bool,
+    /// Messages in the window the owner's noise rules call read, which have no entry.
+    /// `#196 auto-read-noise`.
+    pub noise: usize,
     /// Standing reminder that the content is third-party text.
     pub untrusted_content_notice: &'static str,
 }
@@ -1312,12 +1398,12 @@ pub async fn digest(
     Path(channel_id): Path<String>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<DigestResponse>, ApiError> {
-    let (channel, entries, complete) =
-        ops::digest(&state, &channel_id, query.limit, query.width).await?;
+    let digest = ops::digest(&state, &channel_id, query.limit, query.width).await?;
     Ok(Json(DigestResponse {
-        channel,
-        entries,
-        complete,
+        channel: digest.channel,
+        entries: digest.entries,
+        complete: digest.complete,
+        noise: digest.noise,
         untrusted_content_notice: untrusted::NOTICE,
     }))
 }
@@ -1744,10 +1830,12 @@ pub async fn stream(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| crate::model::MessageId(value.to_owned()));
-    let (_channel, subscription) = ops::watch(&state, &channel_id, after.as_ref())?;
-    let body = axum::response::sse::Sse::new(crate::live::events(subscription)).keep_alive(
-        axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),
-    );
+    let (channel, subscription) = ops::watch(&state, &channel_id, after.as_ref())?;
+    let body =
+        axum::response::sse::Sse::new(crate::live::events(subscription, state.clone(), channel.id))
+            .keep_alive(
+                axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),
+            );
     Ok((
         [
             (header::CACHE_CONTROL, "no-store"),

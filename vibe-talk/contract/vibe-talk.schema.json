@@ -114,6 +114,17 @@
           "minimum": 0,
           "type": "integer"
         },
+        "noise_rules": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NoiseRules"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The rules that decide which messages are read automatically. `#196 auto-read-noise`.\n\nHere rather than behind a route of its own because the page needs them at startup, for the\nSettings editor, and every device and the voice agent share one list. Absent from an older\nserver — the page then hides the editor — and also when this one cannot read its store, so\na broken store makes the editor disappear rather than show a list that is not in force."
+        },
         "owner_author_id": {
           "description": "The READER's own Discord account, when the operator has said what it is.\n\nDistinct from `self_author_id`, which is the BRIDGE's account and is read out of the bot\ntoken. This one cannot be derived from anything the server holds — a bot's account has no\nrelationship to the human reading the channel — so it is absent unless configured. The page\ndraws both as the owner's own words, because they are: one typed into Discord, one dictated\nthrough this bridge.",
           "type": [
@@ -376,6 +387,10 @@
           "$ref": "#/$defs/MessageId",
           "description": "Snowflake of this message."
         },
+        "noise": {
+          "description": "Whether the owner's noise rules call this message read already. `#196 auto-read-noise`.\n\nDECIDED BY THIS SERVER EVERY TIME the message is served, from its current text, by\n[`crate::noise::NoiseFilter::mark`]; it is never stored and never trusted from whoever\nsent the message. That is what lets an edited placeholder come back as unread, and a\nremoved rule un-hide everything it caught, without a single record having to change.\n\nThe page reads this flag rather than matching the text itself, so there is one predicate\nand it is the server's. Absent means `false`, which is also what an older server meant.",
+          "type": "boolean"
+        },
         "reply_to": {
           "anyOf": [
             {
@@ -472,6 +487,27 @@
         "is_root",
         "reply_count",
         "reply_count_exact"
+      ],
+      "type": "object"
+    },
+    "NoiseRules": {
+      "description": "The owner's noise rules, as the Settings editor shows them. `#196 auto-read-noise`.\n\nAlso the body `PUT /api/v1/noise-rules` answers with, so the editor redraws from what the\nserver STORED — trimmed and de-duplicated — rather than from what was typed.",
+      "properties": {
+        "matching": {
+          "description": "One sentence saying how a rule matches, written beside the matcher and quoted by the page\nwhere the rules are edited, so the description cannot drift from what the server does.",
+          "type": "string"
+        },
+        "rules": {
+          "description": "The rules in force, in the owner's order and his own spelling. Until he saves a list this\nis the shipped default.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "rules",
+        "matching"
       ],
       "type": "object"
     },

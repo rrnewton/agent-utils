@@ -976,12 +976,29 @@ body {
   filter: grayscale(1);
 }
 
+/*
+ * `#196 auto-read-noise`. A placeholder the server reads automatically — `_Working…_` while an
+ * agent works — is QUIETER still than an archived row, and smaller.
+ *
+ * Quieter, because it never carried anything: an archived row is a message the reader dealt with,
+ * this is one that was never worth dealing with. Smaller, because nine of fifty rows in the owner's
+ * main space were exactly this, and nine full-height grey rows are still nine rows of scrolling.
+ * Not hidden: hiding is Hide read's job, and a row that vanished from the channel view could not be
+ * rescued with Not noise when a rule caught a real message.
+ */
+#discord-log li.discord-message[data-noise="true"] {
+  opacity: 0.32;
+  filter: grayscale(1);
+  font-size: 0.85em;
+}
+
 /* Under the pointer or the keyboard an archived row comes all the way back — it still carries a
    Reply and an Unarchive, and a control nobody can read is a control that looks broken. The
    opacity half of this is handled by the shared rules below; the tint has to be restored here
    because `filter` does not inherit that treatment. */
 #discord-log li.discord-message[data-archived="true"]:focus-within,
-#discord-log li.discord-message[data-own-read="true"]:focus-within {
+#discord-log li.discord-message[data-own-read="true"]:focus-within,
+#discord-log li.discord-message[data-noise="true"]:focus-within {
   filter: none;
 }
 
@@ -1485,8 +1502,44 @@ body {
   display: none;
 }
 
+/* The rescue is offered only on a noise row; `renderChannelRows` sets `hidden`, and a class rule
+   for the button's display must not overrule it. */
+.not-noise-button[hidden] {
+  display: none;
+}
+
+/*
+ * `#196 auto-read-noise`. The rules in Settings: one line each, the rule as the owner typed it and
+ * its Remove at the end of the same line, so a list of a handful reads as a list rather than a
+ * stack of forms.
+ */
+.noise-rules {
+  list-style: none;
+  margin: 0.3rem 0;
+  padding: 0;
+}
+
+.noise-rule {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.25rem 0;
+  border-bottom: 1px solid var(--edge);
+}
+
+.noise-rule-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.noise-rule-remove {
+  flex: 0 0 auto;
+}
+
 .row-more-button,
 .done-button,
+.not-noise-button,
 .upstream-read-button {
   flex: 0 0 auto;
   padding: 0.05rem 0.5rem;
@@ -1797,6 +1850,7 @@ body {
 
   #discord-log li.discord-message:hover .reply-button,
   #discord-log li.discord-message:hover .done-button,
+  #discord-log li.discord-message:hover .not-noise-button,
   #discord-log li.discord-message:hover .upstream-read-button {
     color: var(--ink);
     border-color: var(--accent);
@@ -1811,7 +1865,8 @@ body {
 
   /* The archived row's colour, on the same terms and for the same reason. */
   #discord-log li.discord-message[data-archived="true"]:hover,
-  #discord-log li.discord-message[data-own-read="true"]:hover {
+  #discord-log li.discord-message[data-own-read="true"]:hover,
+  #discord-log li.discord-message[data-noise="true"]:hover {
     filter: none;
   }
 }

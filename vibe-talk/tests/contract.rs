@@ -15,8 +15,9 @@ use std::path::PathBuf;
 use serde_json::{json, Value};
 use vibe_talk::contract::{
     ApiErrorBody, ClientConfigResponse, CommittedPostResponse, LiveDeleteEvent, LiveDelivery,
-    LiveMessageEvent, LiveResetEvent, PendingPost, PendingPostResponse, ProviderDescription,
-    TimelineResponse, TokenScope, TranscriptRole, VibeTalkV1ClientFrame, VibeTalkV1ServerFrame,
+    LiveMessageEvent, LiveResetEvent, NoiseRules, PendingPost, PendingPostResponse,
+    ProviderDescription, TimelineResponse, TokenScope, TranscriptRole, VibeTalkV1ClientFrame,
+    VibeTalkV1ServerFrame,
 };
 use vibe_talk::conversation::{VoiceDescription, VoiceSession};
 use vibe_talk::model::{ChannelId, ChannelInfo, Message, MessageId, UserId};
@@ -67,6 +68,7 @@ fn message(id: &str) -> Message {
         reply_to: None,
         content: "hello".into(),
         spoken_content: String::new(),
+        noise: false,
     }
 }
 
@@ -82,6 +84,9 @@ fn threaded_message(id: &str) -> Message {
         spoken_time: "noon".into(),
         reply_to: Some(MessageId("200".into())),
         spoken_content: "hello, spoken".into(),
+        // `#196 auto-read-noise`: present on one sample and absent on the other, so the
+        // generated validators are proven against both.
+        noise: true,
         ..message(id)
     }
 }
@@ -179,6 +184,10 @@ fn client_config(
         ],
         summaries_unavailable: (!full).then(|| "elevenlabs.api_key is not configured".into()),
         token_scope: scope,
+        noise_rules: full.then(|| NoiseRules {
+            rules: vec!["Working…".into(), "Thinking*".into()],
+            matching: "a message counts as read when its whole text is one of these",
+        }),
     }
 }
 
