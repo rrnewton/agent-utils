@@ -20306,6 +20306,11 @@ async function discussionPage(setup = () => {}) {
   setup(page);
   await signIn(page);
   await showDiscord(page, data.messages);
+  // The picker touched, as a thumb does before choosing: that is what reads the channel's thread
+  // list, whose names these tests compare. A channel opened in Main used to read it beside Main;
+  // since `#189 restore-ui-state` it opens in All, which does not.
+  await page.el("thread-select").dispatch("pointerdown");
+  await page.settle();
   return { page, data };
 }
 
@@ -20573,22 +20578,34 @@ test("Load earlier pages the thread back from the server on its cursor, with a G
   ];
   const summary = { id: thread.id, root: all[0], title: "Paged discussion", reply_count: 7,
     reply_count_exact: true, updated_at: all[7].timestamp };
-  const page = newPage();
-  page.threadingSupported = true;
-  page.threads = [summary];
-  // Read-scope: the context only ever reads.
-  page.tokenScope = "read";
-  const standard = page.timeline;
-  // The thread's newest page is its last four answers; the page before it, the root and the rest.
-  page.timeline = async (path) => {
-    const url = new URL(path, "http://fixture.test");
-    if (url.searchParams.get("view") !== "thread") return standard(path);
-    const older = url.searchParams.get("before") === cursor;
-    return json(200, timelineAnswer({ view: "thread", messages: older ? all.slice(0, 4) : all.slice(4),
-      thread: summary, has_threads: true, has_more: !older, next_before: older ? null : cursor }));
+  // A reader who chose Main in an earlier session, on a device that no longer holds that session's
+  // snapshot: the reopen reads Main alone, so the thread is read for itself, on its own cursor. Opened
+  // from All — the default since `#189 restore-ui-state`, and here the whole thread — it would be
+  // drawn from All's rows and never page. The same arrangement as `mainOnlyThreadPage`.
+  const arrange = (p) => {
+    p.threadingSupported = true;
+    p.threads = [summary];
+    // Read-scope: the context only ever reads.
+    p.tokenScope = "read";
+    const standard = p.timeline;
+    // The thread's newest page is its last four answers; the page before it, the root and the rest.
+    p.timeline = async (path) => {
+      const url = new URL(path, "http://fixture.test");
+      if (url.searchParams.get("view") !== "thread") return standard(path);
+      const older = url.searchParams.get("before") === cursor;
+      return json(200, timelineAnswer({ view: "thread", messages: older ? all.slice(0, 4) : all.slice(4),
+        thread: summary, has_threads: true, has_more: !older, next_before: older ? null : cursor }));
+    };
   };
-  await signIn(page);
-  await showDiscord(page, all);
+  const first = newPage();
+  arrange(first);
+  await signIn(first);
+  await showDiscord(first, all);
+  await pickThread(first, "main");
+  first.storage.delete(MESSAGE_CACHE_KEY);
+  const page = reloadWith(first.storage, all, arrange);
+  await reopenedChannel(page);
+  await page.settle();
   await pickThread(page, `thread:${thread.id}`);
   await replyButton(rowOf(page, "607")).click();
   assert.deepEqual(contextIds(page), ["605", "606"], "the newest page's earlier answers are not shown");
