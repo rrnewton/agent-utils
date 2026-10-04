@@ -10956,6 +10956,63 @@ def test_lock_conflict_refuses_without_state_change(tmp_path: Path) -> None:
     assert repaired.returncode == 0, repaired.stderr
 
 
+@pytest.mark.ordinary_environment
+def test_lock_conflict_under_json_format_prints_a_json_refusal(tmp_path: Path) -> None:
+    """The validate-checkout cleanup parses retire-pending's stdout as JSON.
+
+    A busy lock left stdout empty, and the cleanup reported the batch as could-not-determine.
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    code = "\n".join(
+        (
+            "import sys, time",
+            "from pathlib import Path",
+            f"sys.path.insert(0, {str(PY_ROOT)!r})",
+            "from wrkslots import cli as wrkslots",
+            f"subject = Path({str(project / 'worktrees' / 'ACTIVE')!r})",
+            "with wrkslots._locked(subject, exclusive=True, wait_seconds=0):",
+            "    print('locked', flush=True)",
+            "    time.sleep(60)",
+        )
+    )
+    holder = subprocess.Popen(
+        [sys.executable, "-c", code],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "locked"
+        refused = raw_command(
+            project,
+            "--wait-lock",
+            "0.2",
+            "retire-pending",
+            "--limit",
+            "1",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--format",
+            "json",
+        )
+        assert refused.returncode == 3, refused.stderr
+        payload = json.loads(refused.stdout)
+        assert payload["status"] == "refused"
+        assert payload["reason"] == "lock-busy"
+        assert "state lock is busy" in payload["message"]
+        assert "wrkslots retire-pending --help" in payload["remedy"]
+        assert "REFUSED: state lock is busy" in refused.stderr
+
+        human = raw_command(project, "--wait-lock", "0.2", "status")
+        assert human.returncode == 3
+        assert human.stdout == ""
+        assert "REFUSED: state lock is busy" in human.stderr
+    finally:
+        terminate_process(holder)
+
+
 def test_different_machines_use_different_shards(tmp_path: Path) -> None:
     project, _repository, _remote = make_project(tmp_path, machine="machine-a")
     first = create(
