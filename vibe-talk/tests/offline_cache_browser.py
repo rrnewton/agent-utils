@@ -26,6 +26,15 @@ its right edge; on a phone the title is ellipsised instead (`#36 thread-view-pho
 every floating chip showing at once and that thread scrolled to its end, no chip covers the reply
 composer's text box or its Send button (`#194 thread-picker-polish`).
 
+The search glass floats on the pill's line rather than costing a header row (`#197
+floating-search`): on the main screen no header strip stands above the list, on the call view and
+the channel alike; wherever the pill is measured the glass is centred on its line, drawn its height,
+over the list and clear of it, and a 44px square around the disc presses it. A real tap below the
+disc opens the search as a bar across the top of the list — no wider than the list, not hanging
+over what is above it, the pill given way and the head of the list clear of it — the bar filters,
+and the glass folds it back with #scroll-area unmoved. Settings still has its title bar and a way
+back, and in a thread neither floating thing covers the heading's Back button or title.
+
 Last, a fresh page signed in with a read-scope token reads the channel without a single 4xx answer
 or console error: the stored-conversation routes are write-scope, answered 403 here as the server
 answers them, and the page must not ask (`#38 read-token-conversation-probe`).
@@ -292,6 +301,26 @@ GEOMETRY_JS = """() => {
     const pill = document.getElementById('channel-freshness');
     const tabs = document.getElementById('channel-view-tabs');
     const problems = [];
+    const glassProblems = (layout, p, list) => {
+        const glass = document.getElementById('search-toggle');
+        if (!shown(glass)) return [`${layout}: the search glass is not on screen`];
+        const g = box(glass), found = [], mid = (r) => (r.top + r.bottom) / 2;
+        const off = mid(g) - mid(p);
+        if (Math.abs(off) > 1.5) found.push(`${layout}: the glass is centred ${off.toFixed(1)}px off the pill's line`);
+        if (Math.abs(g.height - p.height) > 1) found.push(`${layout}: the glass is ${g.height}px beside a ${p.height}px pill`);
+        if (meets(p, g)) found.push(`${layout}: the glass overlaps the pill "${pill.textContent}"`);
+        if (g.top < list.top || g.left < list.left || g.right > list.right) found.push(`${layout}: the glass is not over the list`);
+        // The 44px target: beside and below the disc, outside it but inside the square, is the glass.
+        const cx = (g.left + g.right) / 2, cy = mid(g);
+        for (const [dx, dy] of [[-20, 0], [20, 0], [0, 20]]) {
+            const hit = document.elementFromPoint(cx + dx, cy + dy);
+            if (!hit || !glass.contains(hit)) {
+                const what = hit ? (hit.id ? `#${hit.id}` : hit.tagName.toLowerCase()) : 'nothing';
+                found.push(`${layout}: a tap at (${dx}, ${dy})px from the glass's centre lands on ${what}`);
+            }
+        }
+        return found;
+    };
     const covering = (layout) => {
         const p = box(pill), list = box(area);
         if (shown(tabs) && meets(p, box(tabs))) problems.push(`${layout}: it covers the Main/Threads/All tabs`);
@@ -304,10 +333,29 @@ GEOMETRY_JS = """() => {
         if (!shown(first)) problems.push(`${layout}: there is no first row to measure against`);
         else if (meets(p, box(first))) problems.push(`${layout}: it covers the first row`);
         if (pill.scrollWidth > pill.clientWidth + 1) problems.push(`${layout}: it is cut short: ${pill.textContent}`);
+        // ...and to the fraction of a pixel, which the check above rounds away: a flex line that
+        // took a quarter of a pixel off the pill ellipsised the whole of its time (`#197
+        // floating-search`) — an ellipsis removes whole glyphs, however small the shortfall. Its
+        // width with nothing constraining it is the width it needs; 1/64px is layout's own unit.
+        const saved = pill.getAttribute('style');
+        pill.style.cssText = 'flex: none; max-width: none; width: max-content';
+        const natural = box(pill).width;
+        if (saved === null) pill.removeAttribute('style'); else pill.setAttribute('style', saved);
+        if (natural > p.width + 1 / 64) {
+            problems.push(`${layout}: it needs ${natural.toFixed(2)}px and has ${p.width.toFixed(2)}: ${pill.textContent}`);
+        }
         if (p.top < list.top || p.left < list.left || p.right > list.right) {
             problems.push(`${layout}: it is not over the list`);
         }
+        // `#197 floating-search`: the glass on the pill's line, the pill's height, clear of it.
+        // Measured in every pill state, because the longest sentences are the ones that reach it.
+        glassProblems(layout, p, list).forEach((problem) => problems.push(problem));
     };
+    // An empty header strip over the list is the defect `#197 floating-search` removed.
+    const header = document.getElementById('topbar');
+    if (shown(header)) {
+        problems.push(`a ${Math.round(box(header).height)}px header strip stands over the main screen`);
+    }
     if (!shown(pill)) {
         problems.push('the freshness pill is not shown');
     } else {
@@ -384,6 +432,91 @@ COMPOSER_JS = """async () => {
     return problems;
 }"""
 
+# `#197 floating-search`. Shared by the checks below: is an element really laid out, its box, and
+# whether two boxes meet.
+FLOAT_HELPERS_JS = """
+    const shown = (e) => Boolean(e) && !e.hidden && e.getClientRects().length > 0;
+    const box = (e) => e.getBoundingClientRect();
+    const meets = (a, b) => a.top < b.bottom && b.top < a.bottom && a.left < b.right && b.left < a.right;
+    const name = (e) => e ? (e.id ? `#${e.id}` : e.tagName.toLowerCase()) : 'nothing';
+"""
+
+# The call view has no pill, so the glass is measured against the line it shares with one: centred
+# on the zero-height anchor (whose top IS the line), over the list's top-right corner, and no header
+# strip standing above it. `problems` is empty when all of that holds.
+GLASS_ALONE_JS = """() => {""" + FLOAT_HELPERS_JS + """
+    const problems = [];
+    const header = document.getElementById('topbar');
+    if (shown(header)) problems.push(`a ${Math.round(box(header).height)}px header strip stands over the call view`);
+    const glass = document.getElementById('search-toggle');
+    if (!shown(glass)) return {problems: [...problems, 'the search glass is not on the call view']};
+    const g = box(glass), list = box(document.getElementById('scroll-area'));
+    const line = box(document.getElementById('channel-freshness-anchor'));
+    const off = (g.top + g.bottom) / 2 - line.top;
+    if (Math.abs(off) > 1) problems.push(`the glass is centred ${off.toFixed(1)}px off the pill's line`);
+    if (g.top < list.top || g.right > list.right) problems.push('the glass is not over the list');
+    // The line is the list's width on a phone and the reading column's on a desk.
+    if (line.right - g.right > 24) problems.push(`the glass is ${Math.round(line.right - g.right)}px from the corner`);
+    return {problems};
+}"""
+
+# The search open over the channel: a bar across the top of the list, no wider than it and not
+# hanging over whatever is above it, with the field focused and wide enough to read, the pill given
+# way, and the first thing the list shows clear of the bar. `query`, when given, has just been typed;
+# `rows` is what is left on screen and `count` what the bar says about it.
+SEARCH_OPEN_JS = """(query) => {""" + FLOAT_HELPERS_JS + """
+    const area = document.getElementById('scroll-area');
+    area.scrollTop = 0;
+    const problems = [];
+    const bar = document.getElementById('search-float'), field = document.getElementById('search-field');
+    const count = document.getElementById('search-count'), glass = document.getElementById('search-toggle');
+    if (glass.getAttribute('aria-pressed') !== 'true') problems.push('the glass does not read as open');
+    if (!shown(field)) return {problems: [...problems, 'the field is not open'], rows: [], count: ''};
+    const list = box(area), b = box(bar), f = box(field), g = box(glass);
+    if (b.top < list.top - 0.5) problems.push(`the bar hangs ${(list.top - b.top).toFixed(1)}px over what is above the list`);
+    if (b.left < list.left - 0.5 || b.right > list.right + 0.5) problems.push('the bar is wider than the list');
+    if (f.width < 150) problems.push(`the field is ${Math.round(f.width)}px wide`);
+    if (f.left < b.left || g.right > b.right + 0.5 || g.top < b.top - 0.5 || g.bottom > b.bottom + 0.5) {
+        problems.push('the glass or the field is outside the bar');
+    }
+    if (query && (!shown(count) || meets(box(count), f) || meets(box(count), g))) problems.push('the count is not on the bar beside the field');
+    if (shown(document.getElementById('channel-freshness'))) problems.push('the pill is drawn under the open bar');
+    if (document.activeElement !== field) problems.push(`the field did not take focus: ${name(document.activeElement)}`);
+    const first = [...document.querySelectorAll('#pane-discord .seam, #discord-log > li')].find(shown);
+    if (!first) problems.push('there is nothing at the head of the list to measure against');
+    else if (box(first).top < b.bottom) problems.push(`the open bar covers ${(b.bottom - box(first).top).toFixed(1)}px of the head of the list`);
+    const rows = [...document.querySelectorAll('#discord-log > li[data-id]')].filter(shown).map((li) => li.getAttribute('data-id'));
+    return {problems, rows, count: count.textContent};
+}"""
+
+# In a thread the heading row is above the list; neither floating thing may cover its Back button
+# or title, nor take the Back button's tap.
+HEADING_JS = """() => {""" + FLOAT_HELPERS_JS + """
+    const problems = [];
+    const glass = document.getElementById('search-toggle'), pill = document.getElementById('channel-freshness');
+    const back = document.getElementById('thread-back');
+    for (const id of ['thread-back', 'thread-title']) {
+        const target = box(document.getElementById(id));
+        if (meets(box(glass), target)) problems.push(`the glass covers #${id}`);
+        if (shown(pill) && meets(box(pill), target)) problems.push(`the pill covers #${id}`);
+    }
+    if (box(glass).top < box(document.getElementById('channel-navigation')).bottom) {
+        problems.push('the glass is drawn over the thread heading row');
+    }
+    const b = box(back), hit = document.elementFromPoint((b.left + b.right) / 2, (b.top + b.bottom) / 2);
+    if (!back.contains(hit)) problems.push(`a tap on Back lands on ${name(hit)}`);
+    return problems;
+}"""
+
+# Settings is a destination: the header comes back as a title bar with a way back.
+TITLE_BAR_JS = """() => {""" + FLOAT_HELPERS_JS + """
+    const header = document.getElementById('topbar');
+    return {shown: shown(header), height: box(header).height,
+            title: shown(document.getElementById('topbar-title')) ? document.getElementById('topbar-title').textContent : '',
+            back: shown(document.getElementById('close-settings')),
+            glass: shown(document.getElementById('search-toggle'))};
+}"""
+
 # A phone, the common narrow Android width, and a desk: the desktop regime is `(min-width: 900px) and
 # (pointer: fine)`, so the last is a fine pointer without touch, not a wide phone. Below 360 the
 # pill's longest line is ellipsised, which the "cut short" check would report.
@@ -408,7 +541,9 @@ def main() -> int:
             print(f"{browser_version} {label} at {width}x{height}: snapshot drawn before the network,"
                   " one newest-page read, local view switches, offline and failed states, the pill"
                   " clear of the tabs and the header with #scroll-area unmoved, a scrolled reader"
-                  " held in place as it and the error panel come and go, no Cache Storage or"
+                  " held in place as it and the error panel come and go, the search glass on the pill's"
+                  " line with no header strip and a 44px target, the search bar opened by a real tap and"
+                  " folded with #scroll-area unmoved, Settings' title bar, no Cache Storage or"
                   " service worker, a long thread title ellipsised within the viewport, the thread"
                   " composer clear of every floating chip, sign-out clears,"
                   " a read-scope token reads with no refused request or console error")
@@ -521,10 +656,15 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 check(bool(found["picker"]), f"{label}, {state}: the bar's thread picker was not on screen")
                 return str(found["area"])
 
-            # 1. Sign in and read the channel in Main, Threads and All.
+            # 1. Sign in and read the channel in Main, Threads and All. The call view comes up first:
+            # its glass floats over the transcript with no header strip above it (`#197`).
             page.goto(url, wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
+            page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
+            alone = page.evaluate(GLASS_ALONE_JS)
+            shot("1-call-view-glass")
+            check(not alone["problems"], f"{label}, the call view: {alone['problems']}")
             page.click("#view-switch")
             wait_rows(["200", "201"], "Main after sign-in")
             view("threads")
@@ -577,6 +717,44 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             wait_rows(["200", "201", "203"], "Main after switching back")
             check(len(api.reads()) == 1, f"switching views read history again: {api.reads()}")
             shot("4-switched-locally")
+
+            # 4a. `#197 floating-search`. Settings is still a title bar with a way back, and leaving
+            # it leaves no strip behind. A real tap BELOW the disc — outside it, inside its 44px
+            # square — opens the search as a bar over the top of the list; the bar filters; the
+            # glass folds it again and the list is the box it was.
+            page.click("#open-settings")
+            title_bar = page.evaluate(TITLE_BAR_JS)
+            shot("4a-settings-title-bar")
+            check(bool(title_bar["shown"]) and float(title_bar["height"]) > 30
+                  and title_bar["title"] == "Settings" and bool(title_bar["back"])
+                  and not title_bar["glass"], f"{label}, Settings lost its title bar: {title_bar}")
+            page.click("#close-settings")
+            check(not page.evaluate(TITLE_BAR_JS)["shown"],
+                  f"{label}: coming back from Settings left a header strip over the channel")
+            centre = page.evaluate("() => { const b = document.getElementById('search-toggle')"
+                                   ".getBoundingClientRect(); return [b.left + b.width / 2, b.bottom + 5]; }")
+            if mobile:
+                page.touchscreen.tap(float(centre[0]), float(centre[1]))
+            else:
+                page.mouse.click(float(centre[0]), float(centre[1]))
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and page.evaluate("() => document.getElementById('search-field').hidden"):
+                page.wait_for_timeout(50)
+            opened = page.evaluate(SEARCH_OPEN_JS, "")
+            shot("4a-search-open")
+            check(not opened["problems"], f"{label}, a tap 5px below the glass's disc: {opened['problems']}")
+            page.fill("#search-field", "thread root")
+            found = page.evaluate(SEARCH_OPEN_JS, "thread root")
+            shot("4a-search-filtered")
+            check(not found["problems"], f"{label}, the search filtered: {found['problems']}")
+            check(found["rows"] == ["201"] and found["count"] == "1 of 3 loaded",
+                  f"{label}: the floating search left {found['rows']} saying {found['count']!r}")
+            page.click("#search-toggle")
+            check(bool(page.evaluate("() => document.getElementById('search-field').hidden")),
+                  f"{label}: the glass did not fold the search bar")
+            wait_rows(["200", "201", "203"], "folding the search did not put every row back")
+            check(geometry("search folded", "4a-search-folded") == baseline,
+                  f"{label}: #scroll-area changed size across opening and folding the search")
 
             # 4b. A failed refresh IN PLACE, over a list long enough to scroll: the pill's room is made
             # at the head of the list and the error panel takes a row above it, and both go again
@@ -655,6 +833,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             shot("6b-long-thread-title")
             check(not found["problems"], f"{label}, a long-titled thread: {found['problems']}")
             check(bool(found["clipped"]) or not mobile, f"{label}: the long title was not ellipsised: {found}")
+            heading = page.evaluate(HEADING_JS)
+            check(not heading, f"{label}, a thread's heading and the floating line: {heading}")
 
             # 6c. Every floating chip up at once, over that thread scrolled to its end: none of them
             # covers the reply composer, which keeps their measured height as room under itself

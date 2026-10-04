@@ -3301,14 +3301,14 @@ test("the header shows two things at a time, and which two depends on the screen
   // `#85 voice-desktop-review` added a THIRD for the same reason: Settings returns to the call, Reply
   // returns to the channel, and Help returns to Settings.
   //
-  // `#129 message-search` added the fourth, and it is not a way back — it is the one control the
-  // header holds in its own right. LAST, because it lives in the corner: the ways back are at the
-  // leading edge where a thumb reaches for them, and the glass is at the trailing edge where a
-  // phone application puts it.
+  // `#129 message-search` added a fourth, the search glass, in the corner; `#197 floating-search`
+  // took it out again, because a glass in this row is what made the header cost a whole row on
+  // every main screen. It floats over the list now — see "THE HEADER COSTS NO ROW ON THE MAIN
+  // SCREEN". The list says so rather than being relaxed: only the ways back are declared here.
   //
   // `#194 thread-picker-polish` added a fourth way back, for the Threads screen, which returns to
   // the channel it lists — at the leading edge with the others.
-  assert.deepStrictEqual(ids, ["close-settings", "close-reply", "close-help", "close-threads", "search-toggle"]);
+  assert.deepStrictEqual(ids, ["close-settings", "close-reply", "close-help", "close-threads"]);
 
   const page = newPage();
   const showing = () =>
@@ -5706,39 +5706,154 @@ test("the header spends one row, because the transcript is what deserves the hei
   assert.match(cssBlock("#control-bar-top"), /flex:\s*1 1 auto/);
 });
 
-test("THE HEADER NEVER STANDS EMPTY, WHICH IS WHAT COSTING A ROW HAS TO BUY", async () => {
-  // AMENDED BY `#129 message-search`, and the amendment is to the wording, not to the rule. This
-  // used to say the header costs NO ROW at the bottom placement, which was true while the header
-  // held nothing: an empty 2.4rem strip across the top of a phone is exactly the real estate
-  // `#58 control-bar` reclaimed, and it is hidden outright — a grid row that collapses — rather
-  // than merely emptied.
+test("THE HEADER COSTS NO ROW ON THE MAIN SCREEN, AND THE GLASS FLOATS OVER THE LIST INSTEAD", async () => {
+  // `#58 control-bar` made this claim first: with the bar in the dock the header holds nothing on
+  // the main screen, and an empty 2.4rem strip across the top of a phone is exactly the real estate
+  // that issue reclaimed — hidden outright, a grid row that collapses, not merely emptied.
   //
-  // The search control lives up there now, so on the main screen the row is bought and paid for.
-  // What has to keep holding is the principle underneath: the strip is never standing there with
-  // nothing in it. Before sign-in there is nothing to search and the header is still gone.
+  // `#129 message-search` then parked its glass in that strip's corner, and the row came back on
+  // every main screen to carry one small icon. The owner, from his phone: "Wasteful search bar. The
+  // little search button in the upper right wastes a full horizontal strip of space. It should just
+  // be a floating icon." `#197 floating-search` is that, and this restores `#58`'s claim with the
+  // glass's new home asserted beside it, so the row cannot come back by the same route.
   const page = newPage();
   assert.equal(page.el("topbar").hidden, true, "an empty header stands on the sign-in screen");
   await signIn(page);
-  assert.equal(page.el("topbar").hidden, false, "the search control has nowhere to be");
-  assert.deepStrictEqual(
-    ["close-settings", "close-reply", "close-help", "close-threads", "topbar-title", "search-toggle"].filter(
-      (id) => !page.el(id).hidden
-    ),
-    ["search-toggle"],
-    "the header holds something other than the one control it is up there for"
-  );
+  assert.equal(page.el("topbar").hidden, true, "the header costs a row on the main screen again");
+  assert.equal(page.el("search-toggle").hidden, false, "the glass went with the header");
 
-  // ...and it is still a title bar where it has something to say. Settings turns it back into one
+  // ...in both views: the glass filters the transcript as well as the channel.
+  await showDiscord(page, [message({ id: "1", content: "hello" })]);
+  assert.equal(page.el("topbar").hidden, true, "the channel view brought the header back");
+  assert.equal(page.el("search-toggle").hidden, false, "the channel view has no glass");
+
+  // It is still a title bar wherever it has something to say, with a way back on every one of the
+  // three screens that is a destination.
+  const [line] = page.el("discord-log").children;
+  await replyButton(line).click();
+  assert.equal(page.el("topbar").hidden, false, "the reply screen lost its title bar");
+  assert.equal(page.el("close-reply").hidden, false, "the reply screen has no way back");
+  assert.equal(page.el("search-toggle").hidden, true, "the glass followed the reader to Reply");
+  await page.el("close-reply").click();
+  assert.equal(page.el("topbar").hidden, true, "leaving Reply left the header standing");
+
   await page.el("open-settings").click();
   assert.equal(page.el("topbar").hidden, false, "the way back out of Settings was hidden");
   assert.equal(page.el("topbar-title").textContent, "Settings");
+  assert.equal(page.el("close-settings").hidden, false, "Settings has no way back");
+  await page.el("help-link-resuming").click();
+  assert.equal(page.el("topbar").hidden, false, "Help lost its title bar");
+  assert.equal(page.el("topbar-title").textContent, "Help");
+  assert.equal(page.el("close-help").hidden, false, "Help has no way back");
+  await page.el("close-help").click();
   await page.el("close-settings").click();
-  assert.equal(page.el("topbar").hidden, false, "coming back from Settings took the glass with it");
+  assert.equal(page.el("topbar").hidden, true, "coming back from Settings brought the row back");
 
-  // ...and never when the reader has asked for the bar to be up there.
+  // ...and the reader who asks for the bar up there gets the header, holding the bar — with the
+  // glass still floating over the list rather than taking a share of that row.
   page.el("bar-placement").value = "top";
   await page.el("bar-placement").dispatch("change");
   assert.equal(page.el("topbar").hidden, false, "the bar moved to a header that is not shown");
+  assert.equal(page.el("search-toggle").hidden, false, "moving the bar up took the glass away");
+});
+
+test("the glass, its field and its count are declared on the floating line, not in the header", () => {
+  // The markup half of `#197 floating-search`. The ids are unchanged — scripts/screenshots.py and
+  // every search test drive them by name — and what moved is their parent: out of the header row
+  // and onto the zero-height line over the top of the list that the freshness pill floats on.
+  const header = HTML.slice(HTML.indexOf('id="topbar"'), HTML.indexOf("</header>"));
+  for (const id of ["search-toggle", "search-field", "search-count"]) {
+    assert.doesNotMatch(header, new RegExp(`id="${id}"`), `#${id} is still declared in the header`);
+    assertMarkupContains("channel-freshness-anchor", id);
+    assertMarkupContains("search-float", id);
+  }
+  assertMarkupContains("channel-freshness-anchor", "channel-freshness");
+  // OUTSIDE the scroller, beside the pill, for the pill's reasons: inside, the header mask would
+  // fade the glass with the content and it would scroll away from the reader who wants it.
+  const main = HTML.slice(HTML.indexOf('id="screen-main"'), HTML.indexOf('id="screen-reply"'));
+  assert.ok(
+    main.indexOf('id="search-toggle"') < main.indexOf('id="scroll-area"'),
+    "the glass is inside the scrolling list, where the mask fades it and a scroll takes it away"
+  );
+
+  // The line: zero height, at the top of the scroller's own cell, centred on the pill's middle.
+  const line = cssBlock("#channel-freshness-anchor");
+  assert.match(line, /height:\s*0/, "the line has height, so its appearing resizes the list");
+  assert.match(line, /grid-row:\s*3/);
+  assert.match(
+    line,
+    /margin-top:\s*var\(--float-line\)/,
+    "the line is not through the pill's middle"
+  );
+  assert.match(line, /align-items:\s*center/, "the pill is not centred on the line");
+  assert.match(
+    cssBlock(":root"),
+    /--float-line:\s*calc\(var\(--freshness-top\) \+ var\(--freshness-box\) \/ 2\)/,
+    "the line is restated rather than derived from the pill's own box"
+  );
+  // ...and the glass is centred on the same line, at its right-hand end, whatever height it is.
+  const float = cssBlock("#search-float");
+  assert.match(float, /position:\s*absolute/);
+  assert.match(float, /top:\s*0/);
+  assert.match(float, /transform:\s*translateY\(-50%\)/, "the glass is not centred on the line");
+  assert.match(float, /right:\s*calc\(var\(--float-edge\) \+ env\(safe-area-inset-right\)\)/);
+});
+
+test("the glass is DRAWN the pill's size and HIT at 44px", () => {
+  // Mobile guidance on both platforms asks for a 44px target; the owner asked for a SMALL floating
+  // icon that matches the pill. Both, by drawing the disc at the pill's height and putting the rest
+  // of the target in an invisible pseudo-element, which a browser hit-tests as part of its button.
+  const root = cssBlock(":root");
+  assert.match(
+    root,
+    /--search-disc:\s*var\(--freshness-box\)/,
+    "the disc is not the pill's height"
+  );
+  const hit = /--search-hit:\s*([\d.]+)rem/.exec(root);
+  assert.ok(hit, "the glass declares no hit size");
+  assert.ok(Number(hit[1]) * 16 >= 44, `the glass is hit at ${Number(hit[1]) * 16}px, under 44px`);
+  const glass = cssBlock("#search-toggle");
+  assert.match(glass, /width:\s*var\(--search-disc\)/);
+  assert.match(glass, /height:\s*var\(--search-disc\)/);
+  assert.match(glass, /position:\s*relative/, "the hit area has nothing to be measured from");
+  const target = cssBlock("#search-toggle::after");
+  assert.match(target, /content:\s*""/, "the hit area is not generated at all");
+  assert.match(target, /position:\s*absolute/);
+  // Every side is measured from the button's padding box, one border inside the disc. Vertically
+  // the square is centred on the disc; sideways it reaches the list's edge on the right and makes
+  // up the rest of --search-hit on the left, because centred it stuck out of the viewport.
+  const sides = /inset:\s*([^;]+);/.exec(target);
+  assert.ok(sides, "the hit area has no inset");
+  assert.deepStrictEqual(
+    sides[1].trim().split(/\s*\n\s*|\s+(?=calc)/),
+    [
+      "calc((var(--search-disc) - var(--search-hit)) / 2 - 1px)",
+      "calc(-1 * var(--float-edge) - 1px)",
+      "calc((var(--search-disc) - var(--search-hit)) / 2 - 1px)",
+      "calc(var(--search-disc) + var(--float-edge) - var(--search-hit) - 1px)",
+    ],
+    "the hit area is not --search-hit square, or it reaches past the list's edge"
+  );
+  // ...and the glass sits exactly --float-edge from that edge, which the right side assumes.
+  assert.match(
+    cssBlock("#search-float"),
+    /right:\s*calc\(var\(--float-edge\) \+ env\(safe-area-inset-right\)\)/
+  );
+});
+
+test("with no header on screen, the body applies the top safe-area inset itself", () => {
+  // NOT VERIFIABLE BY SCREENSHOT, for the reason the horizontal insets are not: no automation makes
+  // Chromium report an inset. The top inset lived only in the header's padding, and the header is
+  // now hidden on the ordinary main screen — so without this the notch sits on the floating glass.
+  assert.match(cssBlock("#topbar"), /env\(safe-area-inset-top\)/, "the header lost its own inset");
+  assert.match(
+    cssBlock("#topbar[hidden] + #frame-body"),
+    /padding-top:\s*env\(safe-area-inset-top\)/,
+    "nothing applies the top inset when the header is not there"
+  );
+  // ...and the selector is honest: the header really is the body's immediate sibling.
+  const between = HTML.slice(HTML.indexOf("</header>"), HTML.indexOf('<main id="frame-body"'));
+  assert.doesNotMatch(between.replace(/<!--[\s\S]*?-->/g, ""), /<[a-z]/i, "something sits between");
 });
 
 /**
@@ -14752,8 +14867,8 @@ test("CLOSING THE GLASS PUTS EVERY ROW BACK, BECAUSE A FILTER NOBODY CAN SEE IS 
 test("NOTHING MATCHED IS SAID WHERE THE MESSAGES WERE, NOT ONLY IN THE CORNER", async () => {
   // The state this closes is a blank screen. Every row is still IN the list — hidden by a class,
   // which is the whole design — so neither pane's own empty state fires, and the only thing
-  // reporting what happened would be "0 of 4 loaded" in 0.75rem grey type in the far corner of
-  // the header. A reader who does not find that concludes the page broke.
+  // reporting what happened would be "0 of 4 loaded" in 0.75rem grey type at the far end of the
+  // search bar. A reader who does not find that concludes the page broke.
   const page = newPage();
   recorded(page, "conv", TALKED_ABOUT);
   await signIn(page);
@@ -14784,25 +14899,101 @@ test("a list that was empty BEFORE the search says why in its own words, not the
   assert.equal(page.el("empty-state").hidden, false, "the invitation to start talking went away");
 });
 
-test("WITH THE BAR IN THE HEADER TOO, THE FIELD GETS THE ROW RATHER THAN HALF OF IT", async () => {
-  // The one collision `#129 message-search` has with `#58 control-bar`, and the only placement it
-  // can happen in. Two elastic things in a 375px header is a search field about a word wide, which
-  // is a field nobody can read what they typed in. The bar yields for the duration and comes back
-  // the moment the glass shuts — it is one tap away throughout, so nothing is actually lost.
+test("WITH THE BAR IN THE HEADER, SEARCHING LEAVES IT THERE, BECAUSE THE FIELD FLOATS OVER THE LIST", async () => {
+  // REWRITTEN BY `#197 floating-search`. This used to be the one collision `#129 message-search`
+  // had with `#58 control-bar`: the field opened in the header row, two elastic things in a 375px
+  // header is a search field about a word wide, and so the bar yielded the row for the duration.
+  // The field opens over the top of the LIST now, in both placements, so the collision is gone and
+  // so is the yielding — a reader who put the bar up there keeps it while they search.
   const page = newPage();
+  recorded(page, "conv", TALKED_ABOUT);
   await signIn(page);
+  await page.settle();
   await page.el("open-settings").click();
   page.el("bar-placement").value = "top";
   await page.el("bar-placement").dispatch("change");
   await page.el("close-settings").click();
   assert.equal(page.el("control-bar").hidden, false, "the fixture never got the bar up there");
+  assert.equal(page.el("topbar").hidden, false, "the bar is in a header that is not shown");
 
   await search(page, "runner");
-  assert.equal(page.el("control-bar").hidden, true, "the field and the bar are splitting the row");
-  assert.equal(page.el("topbar").hidden, false, "yielding the bar took the header with it");
+  assert.equal(page.el("control-bar").hidden, false, "opening the search took the bar away");
+  assert.equal(page.el("topbar").hidden, false, "opening the search took the header away");
+  assert.equal(page.el("search-field").hidden, false, "the field did not open");
+  assert.equal(unfiltered(page, "transcript").length, 3, "the search stopped filtering up here");
 
   await page.el("search-toggle").click();
-  assert.equal(page.el("control-bar").hidden, false, "shutting the glass did not give the bar back");
+  assert.equal(page.el("control-bar").hidden, false, "shutting the glass moved the bar");
+  assert.equal(unfiltered(page, "transcript").length, 4);
+});
+
+test("THE GLASS GROWS INTO A BAR OVER THE LIST, THE PILL GIVES WAY, AND CLOSING FOLDS IT BACK", async () => {
+  // `#197 floating-search`. The glass and the freshness pill share one line over the top of the
+  // list, so the open bar — field, count and glass, along that line — would be drawn straight over
+  // the pill if the pill stayed. It gives way, exactly as it gives way to a pull, and comes back
+  // the moment the bar folds. `data-searching` on #screen-main is what web/voice.css keys the
+  // bar's shape and the room at the head of the list off; asserted here because nothing else can
+  // see whether the script ever sets it.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1", content: "the mac runner stalled" }),
+    message({ id: "2", content: "a different subject" }),
+  ]);
+  const pill = page.el("channel-freshness");
+  const searching = () => page.el("screen-main").hasAttribute("data-searching");
+  assert.equal(pill.hidden, false, "the fixture never put the pill on the line");
+  assert.equal(searching(), false, "the bar ships open");
+  assert.equal(page.el("topbar").hidden, true, "the header came back over the channel");
+
+  await page.el("search-toggle").click();
+  assert.equal(searching(), true, "the bar did not open over the list");
+  assert.equal(page.el("search-field").hidden, false, "the field did not open");
+  assert.equal(pill.hidden, true, "the open bar is drawn over the pill");
+  assert.equal(page.el("topbar").hidden, true, "opening the search spent a header row after all");
+  // The pill's ROOM stays reserved while the pill steps aside, as it does for a pull: it is keyed
+  // to there being something to say, and the bar's own room replaces it in the stylesheet.
+  assert.equal(page.el("pane-discord").hasAttribute("data-freshness"), true);
+
+  await page.el("search-field").setValue("stalled");
+  assert.equal(unfiltered(page, "discord-log").length, 1, "the floating field does not filter");
+  assert.equal(page.el("search-count").hidden, false, "the count is not on the bar");
+  assert.equal(page.el("search-count").textContent, "1 of 2 loaded");
+
+  await page.el("search-toggle").click();
+  assert.equal(searching(), false, "closing left the bar's room at the head of the list");
+  assert.equal(pill.hidden, false, "the pill did not come back when the bar folded");
+  assert.equal(page.el("search-field").hidden, true);
+  assert.equal(unfiltered(page, "discord-log").length, 2, "folding the bar left the filter on");
+
+  // Escape folds it the same way.
+  await search(page, "stalled");
+  assert.equal(pill.hidden, true);
+  await page.el("search-field").dispatch("keydown", { key: "Escape" });
+  assert.equal(searching(), false, "Escape left the bar open");
+  assert.equal(pill.hidden, false, "Escape left the pill hidden");
+});
+
+test("the open bar makes room for itself at the head of the list, in place of the pill's", () => {
+  // The bar floats, so without room reserved under it the first match — the one a filter leaves
+  // at the very top — would be underneath it. The room is padding inside the scroller, the way
+  // `#32 freshness-pill-overlap` made room for the pill, and it REPLACES the pill's room rather
+  // than stacking under it: the pill is not on screen while the bar is.
+  assert.match(
+    cssBlock("#screen-main[data-searching] #scroll-area"),
+    /padding-top:\s*calc\(var\(--float-line\) \+ var\(--search-bar\) \/ 2 \+ 0\.35rem\)/,
+    "the list does not make room for the open bar"
+  );
+  assert.match(
+    cssBlock("#screen-main[data-searching] #pane-discord[data-freshness]"),
+    /padding-top:\s*0/,
+    "the pill's room stacks under the bar's"
+  );
+  // ...and the bar is a panel of its own, so the count is not printed onto a message underneath.
+  const open = cssBlock("#screen-main[data-searching] #search-float");
+  assert.match(open, /background:\s*var\(--panel\)/);
+  assert.match(open, /height:\s*var\(--search-bar\)/);
+  assert.match(open, /left:\s*calc\(var\(--float-edge\) \+ env\(safe-area-inset-left\)\)/);
 });
 
 test("every list of messages is a list the filter reaches", () => {

@@ -2516,9 +2516,18 @@ claim is false more often than it is true.
 
 ### Finding something in what is on screen
 
-A magnifying glass in the corner of the header opens a field, and the field filters **the messages
-already loaded** — the channel and the voice transcript alike, because they are one switch apart
-and a filter that came off when you looked at the other list would be worse than none.
+A magnifying glass floating over the top-right corner of the list opens a field, and the field
+filters **the messages already loaded** — the channel and the voice transcript alike, because they
+are one switch apart and a filter that came off when you looked at the other list would be worse
+than none.
+
+The glass **costs no row** (`#197 floating-search`). It sits on the same line as the freshness pill
+("Live · updated 07:23"), drawn the pill's height and hit at 44px, so the header stays off the main
+screen whenever it has nothing else to carry. Tapped, it grows along that line into a bar across
+the top of the list — field, count, and the glass again to close it — which is also the one place
+an on-screen keyboard never covers. The pill steps aside while the bar is open, and the list makes
+room for the bar at its head so the first match is never underneath it. A reader who moved the
+control bar to the top keeps it there while searching: the field no longer shares that row.
 
 **Every term has to match**, and matching is substring rather than whole-word: a second word is
 typed to narrow, and "runner" has to find "runners". **Double quotes group words into one term**,

@@ -1518,9 +1518,10 @@ function setAllFolded(folded) {
 
 // --- searching what is on screen --------------------------------------------------------------
 //
-// `#129 message-search`. A magnifying glass in the corner of the header, and a field that hides
-// every row it does not match — in BOTH lists, because they sit one switch apart and a reader
-// moves between them without thinking about which one they are in.
+// `#129 message-search`. A magnifying glass floating at the top corner of the list (in the header
+// until `#197 floating-search`), and a field that hides every row it does not match — in BOTH
+// lists, because they sit one switch apart and a reader moves between them without thinking about
+// which one they are in.
 //
 // IT FILTERS, IT DOES NOT FETCH, and that distinction got sharper the moment `#128
 // transcript-history` landed: what is on screen is now a bounded suffix of a much longer record,
@@ -1666,7 +1667,7 @@ function applySearch() {
   el("search-count").textContent = terms.length === 0 ? "" : `${matched} of ${loaded} loaded`;
   // Nothing matched is a RESULT, and it has to be stated where the messages were. Every row is
   // still in the list, so neither pane's own empty state fires, and without this the reader gets
-  // a blank screen whose only explanation is a 0.75rem count in the far corner of the header.
+  // a blank screen whose only explanation is a 0.75rem count at the far end of the search bar.
   // Not raised over a list that was empty to begin with: there the pane already says why.
   el("search-empty").hidden = terms.length === 0 || matched > 0 || loaded === 0;
 }
@@ -1685,7 +1686,17 @@ function setSearchOpen(open) {
     el("search-field").value = "";
   }
   el("search-toggle").setAttribute("aria-pressed", open ? "true" : "false");
+  // `#197 floating-search`. The open bar floats over the top of the list, and web/voice.css keys
+  // two things off this: the bar's own shape, and the room the list makes for it at its head so
+  // the first match is never underneath. That room is added ABOVE a reader who may have scrolled
+  // down, which is exactly the change `holdingReader` exists for.
+  holdingReader(() => {
+    if (open) el("screen-main").setAttribute("data-searching", "");
+    else el("screen-main").removeAttribute("data-searching");
+  });
   renderControlBar();
+  // The pill shares the line the bar grows along, and gives way to it.
+  renderChannelFreshness();
   renderScrollTools();
   if (open) {
     el("search-field").focus();
@@ -3679,33 +3690,31 @@ function renderControlBar() {
   ];
   // `#129 message-search`. On the main screen and nowhere else: there is nothing to filter on
   // Settings, Help or the reply screen, and on the sign-in screen there is nothing at all. Not
-  // suppressed by text mode — the glass is in the header and the field is in the bar, so they are
-  // not competing for the same width unless the reader has also moved the bar up here.
+  // suppressed by text mode, and not by the bar's placement either: since `#197 floating-search`
+  // the glass and its field float over the top of the LIST, so they never compete with the bar
+  // for width — in the dock or in the header.
   el("search-toggle").hidden = currentScreen !== "main";
   el("search-field").hidden = el("search-toggle").hidden || !searchOpen;
   el("search-count").hidden = el("search-field").hidden;
-  el("control-bar").hidden =
-    members.every((member) => member.hidden) ||
-    // ...and while the field is open the header row belongs to IT. Two elastic items on a 375px
-    // phone is a search field the width of a word. The bar is one tap away — closing the search
-    // brings it straight back — and this only ever fires for a reader who has moved the bar up
-    // here, which is not the default.
-    (searchOpen && placement === "top");
-  // The header collapses when it holds nothing. With the bar at the bottom that WAS the ordinary
+  // The bar used to yield the header row to an open search field when the reader had moved it up
+  // there, because the two were sharing one 375px row. The field is not in that row any more, so
+  // the bar stays where the reader put it, searching or not.
+  el("control-bar").hidden = members.every((member) => member.hidden);
+  // The header collapses when it holds nothing. With the bar at the bottom that is the ordinary
   // case on the main screen, and an empty 2.4rem strip across the top of a phone is exactly the
   // real estate `#58 control-bar` exists to reclaim. It is a hide of the whole grid row, so the
   // body grows into it rather than leaving a band of empty panel.
   //
-  // `#129 message-search` put something in it, which is why the main screen now keeps the row.
-  // That is not a reversal of `#58`: the complaint there was an EMPTY strip, priced at 2.4rem and
-  // buying nothing. The strip now carries the one control that works on both lists, and the test
-  // that used to say the header costs no row says instead that it never stands empty.
+  // `#129 message-search` put its glass in the strip's corner and so kept the row on every main
+  // screen, on the argument that a strip holding a control is not an empty one. The owner's verdict
+  // on the result was "wasteful": a full-width band bought for one small icon. `#197
+  // floating-search` floats the glass over the list beside the freshness pill instead, and the
+  // header is back to costing a row only when it has a title, a way back, or the bar to carry.
   el("topbar").hidden =
     el("close-settings").hidden &&
     el("close-reply").hidden &&
     el("close-threads").hidden &&
     el("topbar-title").hidden &&
-    el("search-toggle").hidden &&
     (placement !== "top" || el("control-bar").hidden);
 }
 
@@ -6118,7 +6127,10 @@ function renderChannelFreshness() {
           : current;
   pill.textContent = text;
   pill.setAttribute("data-state", channelFreshness);
-  pill.hidden = text === "" || currentView !== "discord" || !el("pull-refresh").hidden;
+  // It gives way to a pull, and — since `#197 floating-search` put the search glass on the same
+  // line — to the open search bar, which grows along that line across the top of the list.
+  pill.hidden =
+    text === "" || currentView !== "discord" || !el("pull-refresh").hidden || searchOpen;
   reserveFreshnessRoom(text !== "");
 }
 

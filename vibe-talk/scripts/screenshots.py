@@ -1918,9 +1918,10 @@ def _act_message_search(driver: Driver) -> None:
 
     Driven over the CHANNEL rather than the transcript because that is where the layout risk is:
     the seeded backlog is long-winded on purpose, so the list really has rows to remove, and the
-    header really has a field, a count and a glass competing for a 375px row. Whether those three
-    fit — or whether a long query pushes the glass off the edge — is a flex question only a layout
-    engine answers, and it is the reason `.search-field` carries `min-width: 0` at all.
+    bar floating over the top of the list (`#197 floating-search`) really has a field, a count and
+    a glass competing for a 375px band. Whether those three fit — or whether a long query pushes
+    the glass off the edge — is a flex question only a layout engine answers, and it is the reason
+    `.search-field` carries `min-width: 0` at all.
 
     A QUOTED phrase, because that is the clause of the request that is invisible in any other
     frame: the seeded messages say "runner" several times over and "mac runner" exactly once, so
@@ -2985,16 +2986,20 @@ SCENES: tuple[Scene, ...] = (
                 "const p = document.getElementById('control-pane').getBoundingClientRect(); "
                 "return b.height > 0 && b.top >= s.bottom - 1 && b.bottom <= p.top + 1; })()",
             ),
-            # ...and the payoff, restated by `#129 message-search`. It used to be that with
-            # nothing left in the header the header was gone, and the body had grown into the row.
-            # The magnifying glass now lives up there on every main screen, so the row is back --
-            # but what `#58` was actually about was a strip standing EMPTY above the transcript,
-            # and this is not that. The claim the picture still has to carry is the narrower one:
-            # the bar really left the header, rather than being drawn in both places at once.
+            # ...and the payoff. With nothing left in the header the header is gone, and the body
+            # has grown into the row. `#129 message-search` put its glass up there and kept the
+            # row on every main screen; `#197 floating-search` floats the glass over the top of
+            # the list instead, so the picture carries `#58`'s whole claim again: no strip above
+            # the transcript, the bar really out of the header rather than drawn in both places,
+            # and the glass still reachable -- over the list, below where the header was.
             (
-                "the header holds the search glass and no trace of the bar",
-                "window.__visible('topbar') && window.__visible('search-toggle') "
-                "&& document.getElementById('control-bar-top').children.length === 0",
+                "the header is gone, the bar left no trace up there, and the glass floats over "
+                "the list",
+                "!window.__visible('topbar') && window.__visible('search-toggle') "
+                "&& document.getElementById('control-bar-top').children.length === 0 "
+                "&& (() => { const g = document.getElementById('search-toggle')"
+                ".getBoundingClientRect(); const s = document.getElementById('scroll-area')"
+                ".getBoundingClientRect(); return g.top >= s.top && g.right <= s.right; })()",
             ),
             (
                 "the switch is still reachable down there",
@@ -3397,17 +3402,22 @@ SCENES: tuple[Scene, ...] = (
             ),
             (
                 # The layout claim, and the reason this scene runs on iphone-se as well. Field,
-                # count and glass, left to right, sharing ONE band inside the header -- not two,
-                # and nothing pushed past the right edge. `.search-field` carries `min-width: 0`
-                # for exactly this, because a flex item's default minimum is its content width and
-                # a long query would otherwise shove the glass off a 375px screen.
-                "field, count and glass are one row, in that order, inside the header",
+                # count and glass, left to right, sharing ONE band -- the floating bar over the top
+                # of the list since `#197 floating-search`, where the header row used to be asked
+                # for -- and nothing pushed past the right edge. `.search-field` carries
+                # `min-width: 0` for exactly this, because a flex item's default minimum is its
+                # content width and a long query would otherwise shove the glass off a 375px
+                # screen. The header is not up at all: opening the search costs no row either.
+                "field, count and glass are one row, in that order, on the bar over the list",
                 "(() => { const f = document.getElementById('search-field').getBoundingClientRect(); "
                 "const c = document.getElementById('search-count').getBoundingClientRect(); "
                 "const g = document.getElementById('search-toggle').getBoundingClientRect(); "
-                "const bar = document.getElementById('topbar').getBoundingClientRect(); "
+                "const bar = document.getElementById('search-float').getBoundingClientRect(); "
+                "const s = document.getElementById('scroll-area').getBoundingClientRect(); "
                 "return f.width > 80 && c.width > 0 && g.width > 0 "
                 "&& f.right <= c.left + 1 && c.right <= g.left + 1 && g.right <= bar.right + 1 "
+                "&& bar.top >= s.top - 1 && bar.right <= s.right + 1 "
+                "&& !window.__visible('topbar') "
                 "&& f.top < c.bottom && c.top < f.bottom "
                 "&& f.top < g.bottom && g.top < f.bottom; })()",
             ),

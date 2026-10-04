@@ -82,6 +82,24 @@
   --freshness-top: 0.4rem;
   --freshness-pad: 0.25rem;
   --freshness-line: 1rem;
+  /* `#197 floating-search`. The pill's whole height (the 2px is its border), and the line through
+     its middle that the search glass is centred on — derived from the tokens above rather than
+     restated, so the glass follows the pill wherever the pill is moved. */
+  --freshness-box: calc(2 * var(--freshness-pad) + var(--freshness-line) + 2px);
+  --float-line: calc(var(--freshness-top) + var(--freshness-box) / 2);
+  /* The glass is DRAWN the pill's height, so the two read as one band, and it is HIT at 44px, the
+     touch target both platforms' guidelines ask for. The difference is an invisible margin around
+     the disc (`#search-toggle::after`), not a bigger disc. */
+  --search-disc: var(--freshness-box);
+  --search-hit: 2.75rem;
+  /* The open bar: tall enough for a 16px field, short enough that, centred on the same line, it
+     still starts inside the list rather than over whatever is above it. */
+  --search-bar: 2.4rem;
+  /* How far the floating line keeps from the list's edges, and the space between pill and glass.
+     Small on purpose: on a 360px phone the longest thing the pill says and the glass only just
+     share the line, and every pixel spent here comes off the end of that sentence. */
+  --float-edge: 0.5rem;
+  --float-gap: 0.3rem;
 }
 
 @media (prefers-color-scheme: light) {
@@ -147,10 +165,10 @@ body {
  * the one that gets `1fr` any more.
  *
  * That is the defect this block fixes, and it was visible: web/voice.js hides #topbar outright
- * whenever it holds nothing. Until `#129 message-search` put a magnifying glass up there that was
- * the ORDINARY main-screen state with the control bar in its default bottom placement (`#58
- * control-bar` — an empty 2.4rem strip at the top of a phone is rent nobody is paying); it is now
- * the sign-in screen's, which is still enough to spring the trap. With the header gone,
+ * whenever it holds nothing. That is the ORDINARY main-screen state with the control bar in its
+ * default bottom placement (`#58 control-bar` — an empty 2.4rem strip at the top of a phone is
+ * rent nobody is paying), and it is again since `#197 floating-search` moved the magnifying glass
+ * that `#129 message-search` had put up there out over the list. With the header gone,
  * #frame-body took the `auto` row and THE DOCK TOOK `1fr` — so the dock stretched to whatever
  * space the content left over, and the controls sat at the TOP of that stretched box. The owner
  * saw the effect exactly as it is:
@@ -205,12 +223,14 @@ body {
 
 /* ---------------------------------------------------------------------------- the top bar --- */
 
-/* A title bar and a way back, the search glass, and — only when the reader has asked for it there
-   — the control bar. `#58 control-bar` moved the gear and the view switch out of here into a strip
-   of their own, because on the main screen with the default placement this header then held
-   NOTHING, and an empty 2.4rem row at the top of a phone is exactly the rent that issue exists to
-   stop paying. web/voice.js still hides the header outright when it is empty; since `#129
-   message-search` the main screen is no longer one of the times it is. */
+/* A title bar and a way back, and — only when the reader has asked for it there — the control bar.
+   `#58 control-bar` moved the gear and the view switch out of here into a strip of their own,
+   because on the main screen with the default placement this header then held NOTHING, and an
+   empty 2.4rem row at the top of a phone is exactly the rent that issue exists to stop paying.
+   web/voice.js hides the header outright when it is empty. `#129 message-search` briefly made the
+   main screen an exception by parking its glass in the corner here, which the owner called a
+   wasteful strip; `#197 floating-search` floats the glass over the list instead, so on the main
+   screen with the bar in the dock the header is gone again. */
 #topbar {
   display: block;
   padding: 0.45rem calc(0.7rem + env(safe-area-inset-right)) 0.45rem
@@ -233,26 +253,24 @@ body {
   letter-spacing: 0.01em;
 }
 
-/* `#129 message-search`. The glass sits in the CORNER whatever else is in the row: with the bar in
-   the dock it is the only thing here, and a flex row would otherwise put it on the left, which is
-   not where a hand goes looking for it. */
-#search-toggle {
-  margin-left: auto;
+/* `#197 floating-search`. With the header gone, nothing on the main screen was applying the TOP
+   safe-area inset: it lived only in the header's padding above, so a notch or a status bar drawn
+   over the page (`viewport-fit=cover`) would sit on the first line of the list and on the floating
+   glass. The body takes it over whenever the header is not there to. A sibling selector and not a
+   script, because the header's `hidden` is already the one statement of whether it is up. */
+#topbar[hidden] + #frame-body {
+  padding-top: env(safe-area-inset-top);
 }
 
-/* Pressed is the open state, and it has to be legible at a glance — the field beside it is the
-   other half of the signal, but the icon is what the eye returns to. */
-#search-toggle[aria-pressed="true"] {
-  color: var(--ink);
-}
-
-/* Elastic, so the field takes the row when it opens. `min-width: 0` because a flex item's default
+/* Elastic, so the field takes the bar when it opens. `min-width: 0` because a flex item's default
    minimum is its content width, and without it a long query pushes the glass off the edge of a
-   375px phone instead of scrolling inside the field. */
+   375px phone instead of scrolling inside the field. `align-self: stretch` so its height is the
+   bar's, whatever the font's line height makes of 16px. */
 .search-field {
   flex: 1 1 auto;
+  align-self: stretch;
   min-width: 0;
-  padding: 0.3rem 0.6rem;
+  padding: 0.25rem 0.6rem;
   background: var(--bg);
   border: 1px solid var(--edge);
   border-radius: 999px;
@@ -1639,27 +1657,56 @@ body {
    starts under it. Padding INSIDE the scroller, so #scroll-area keeps its size and nothing else on
    the screen moves; `renderChannelFreshness` holds a scrolled reader's place while it changes.
    One line, ellipsised, so that the reservation is exact: a pill that wrapped to two on a narrow
-   phone would outgrow it. */
+   phone would outgrow it.
+
+   `#197 floating-search`. The anchor is a zero-height LINE through the pill's middle, and the
+   search glass sits on it too, at the right-hand end: the owner asked for the glass "on the same
+   vertical height as the refresh status floating widget", and centring both on one line makes that
+   a fact of the layout rather than two sums that happen to agree. The pill is a flex item on the
+   line and the glass is positioned at its end, so the line's right padding is the glass's room.
+
+   The pill stays CENTRED over the list while it fits beside the glass — the spacer before it is
+   the glass's width again, so the two sides balance. A longer sentence takes the spacer first and
+   slides left, and is ellipsised only when it would otherwise run under the glass. That is the
+   difference between "Refresh failed · showing messages from 07:23" keeping its time on a 360px
+   phone and losing it. */
 #channel-freshness-anchor {
   /* The scroller's own grid cell, at its top: auto-placed, it took the tabs' row. */
   grid-row: 3;
   grid-column: 1;
   align-self: start;
   position: relative;
+  /* Above the scroller, whose mask makes it a stacking context of its own. */
+  z-index: 2;
   height: 0;
+  margin-top: var(--float-line);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0
+    calc(var(--float-edge) + var(--search-disc) + var(--float-gap) + env(safe-area-inset-right)) 0
+    calc(var(--float-edge) + env(safe-area-inset-left));
 }
 
+/* The balance on the left for the glass's room on the right. It is the ONLY thing on the line that
+   shrinks, so the pill slides before it is cut. (Two shrinkable items share a shortfall in
+   proportion, however lopsided their factors, so a pill that could shrink at all lost a fraction
+   of a pixel to every slide — and a fraction of a pixel is enough to ellipsise the time.) */
+#channel-freshness-anchor::before {
+  content: "";
+  flex: 0 1 calc(var(--search-disc) + var(--float-gap));
+}
+
+/* Never shrunk by the line; capped at its width instead, which is where the ellipsis starts. */
 #channel-freshness {
-  position: absolute;
-  z-index: 2;
-  top: var(--freshness-top);
-  left: 50%;
-  transform: translateX(-50%);
+  flex: 0 0 auto;
+  max-width: 100%;
+  min-width: 0;
   box-sizing: border-box;
-  width: max-content;
-  max-width: calc(100% - 2rem);
   margin: 0;
-  padding: var(--freshness-pad) 0.75rem;
+  /* 0.6rem rather than the 0.75rem #pull-refresh has: on a 360px phone the glass beside it takes
+     what the pill used to spend on air, and the longest sentence here still has to fit. */
+  padding: var(--freshness-pad) 0.6rem;
   line-height: var(--freshness-line);
   white-space: nowrap;
   overflow: hidden;
@@ -1685,6 +1732,90 @@ body {
    the gap between it and the header. The 2px is the pill's border. */
 #pane-discord[data-freshness] {
   padding-top: calc(var(--freshness-top) + 2 * var(--freshness-pad) + var(--freshness-line) + 2px);
+}
+
+/* `#197 floating-search`. The glass: a disc the pill's height at the right-hand end of the line,
+   in the pill's own panel, edge and shadow, so the two read as one band and neither as the louder.
+   Positioned rather than a flex item so that it stays in the corner when the pill is not on the
+   line (the call view has none) and so that, open, it can take the whole line without the pill's
+   arithmetic having a say. `translateY(-50%)` centres it on the line at whatever height it is. */
+#search-float {
+  position: absolute;
+  top: 0;
+  right: calc(var(--float-edge) + env(safe-area-inset-right));
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+#search-toggle {
+  position: relative;
+  width: var(--search-disc);
+  height: var(--search-disc);
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--edge);
+  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
+}
+
+#search-toggle .icon {
+  width: 0.95rem;
+  height: 0.95rem;
+}
+
+/* The 44px target, drawn as nothing. A pseudo-element is part of its button for hit-testing, so a
+   tap anywhere in this square presses the glass while the disc stays the pill's size. Its box is
+   measured from the button's padding box, hence the border's 1px on every side.
+
+   Centred on the disc vertically, but NOT sideways: the disc sits --float-edge from the list's
+   right edge, which is less than half the difference, so the square reaches exactly to that edge
+   and makes up the rest on the left. Centred, it stuck a pixel out of the viewport, and a page one
+   pixel wider than the phone is the overflow `#36 thread-view-phone-overflow` exists to forbid. It
+   reaches a few px over the pill's end, which takes no taps (`pointer-events: none`), and a few px
+   above the list's top edge, which is padding on whatever row is there — never the thread
+   heading's Back button. */
+#search-toggle::after {
+  content: "";
+  position: absolute;
+  inset: calc((var(--search-disc) - var(--search-hit)) / 2 - 1px)
+    calc(-1 * var(--float-edge) - 1px)
+    calc((var(--search-disc) - var(--search-hit)) / 2 - 1px)
+    calc(var(--search-disc) + var(--float-edge) - var(--search-hit) - 1px);
+}
+
+/* OPEN: the glass grows along the line into a bar across the top of the list, and the pill has
+   given way to it (`renderChannelFreshness`). The bar is a panel of its own, because the count is
+   small grey type and would otherwise be printed straight onto whatever message is underneath. */
+#screen-main[data-searching] #search-float {
+  left: calc(var(--float-edge) + env(safe-area-inset-left));
+  height: var(--search-bar);
+  padding: 0.2rem 0.35rem 0.2rem 0.2rem;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
+}
+
+/* Pressed is the open state, and it has to be legible at a glance — the field beside it is the
+   other half of the signal, but the icon is what the eye returns to. Inside the bar it sheds its
+   own disc: a ring within a ring reads as a second, separate control. */
+#search-toggle[aria-pressed="true"] {
+  color: var(--ink);
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+/* ...and the list makes room for the bar at its head while it is open, the way #pane-discord makes
+   room for the pill, so the first match is never under it. The pill is not on screen while the bar
+   is, so its room gives way to this rather than stacking under it. */
+#screen-main[data-searching] #scroll-area {
+  padding-top: calc(var(--float-line) + var(--search-bar) / 2 + 0.35rem);
+}
+
+#screen-main[data-searching] #pane-discord[data-freshness] {
+  padding-top: 0;
 }
 
 /* Armed reads differently from merely being dragged, because the difference is the whole of what
@@ -2851,6 +2982,15 @@ textarea {
     right: auto;
     left: 50%;
     transform: translateX(calc(var(--reading-width) / 2 - 100% - 0.6rem));
+  }
+
+  /* `#197 floating-search`, for the same reason: the line the pill and the search glass float on
+     is the column's, so the glass sits at the column's top corner rather than at the far edge of
+     the window, and the open bar is as wide as what it searches. */
+  #channel-freshness-anchor {
+    justify-self: center;
+    width: 100%;
+    max-width: var(--reading-width);
   }
 
   /* A percentage inset is proportionate inside a capped column and absurd across a full-width

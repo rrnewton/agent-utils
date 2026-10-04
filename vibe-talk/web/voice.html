@@ -80,38 +80,14 @@
         <div id="control-bar-top"></div>
 
         <!--
-          `#129 message-search`. The corner a phone keeps a magnifying glass in, and the reason
-          the header is allowed to cost a row again after `#58 control-bar` reclaimed it: that
-          issue's complaint was an EMPTY 2.4rem strip, which is rent nobody is paying. A strip
-          holding the one control that is useful on both lists is not that.
-
-          The field opens IN THIS ROW rather than under it, the way `#59 text-entry-button`
-          expands in the control bar, so the header never becomes two bands — which is the older
-          promise and still worth keeping. A reader who has ALSO moved the bar up here gets the
-          bar for the duration, not a share of the row: two elastic things on a 375px phone is a
-          search field the width of a word. Closing the glass brings the bar straight back.
-
-          The count says the DENOMINATOR is what has been loaded. Since `#128 transcript-history`
-          the record on screen is a bounded suffix of a longer one, so "no matches" has to be
-          distinguishable from "not here" by a reader who has not scrolled up yet.
+          `#129 message-search` used to keep its magnifying glass at the end of this row, and that
+          is why the header cost a row on every main screen: a 2.4rem strip, plus the status-bar
+          inset, holding one small icon in its corner. `#197 floating-search` took it out — the
+          owner's word for that strip was "wasteful" — and the glass now floats over the top of the
+          list beside the freshness pill (see #channel-freshness-anchor below). This row is back to
+          what `#58 control-bar` left it: a title bar with a way back, or the control bar when the
+          reader has asked for it up here, and otherwise not on screen at all.
         -->
-        <input
-          id="search-field"
-          class="search-field"
-          type="search"
-          autocomplete="off"
-          placeholder="Search loaded messages"
-          aria-label="Search loaded messages"
-          title="Filters the messages already on screen. Quote a phrase to match it whole."
-          hidden
-        />
-        <span id="search-count" class="search-count" role="status" aria-live="polite" hidden></span>
-        <button id="search-toggle" class="icon-button" type="button" aria-label="Search messages" title="Search messages" aria-pressed="false" hidden>
-          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="10.5" cy="10.5" r="6.5" />
-            <path d="m15.3 15.3 4.2 4.2" />
-          </svg>
-        </button>
       </div>
     </header>
 
@@ -216,9 +192,54 @@
             appearing resizes nothing; the channel pane reserves its height at the head of the
             list instead, so it never covers the header either. It is a status and not an alert:
             it is spoken once when it changes, never interrupts.
+
+            `#197 floating-search`. The anchor is now the LINE everything floating over the top of
+            the list is centred on, and the search glass shares it: the owner asked for the glass
+            as "a floating icon ... on the same vertical height as the refresh status floating
+            widget", and two things centred on one line cannot drift apart the way two things each
+            positioned by their own arithmetic can. The pill stays centred over the list; the glass
+            sits at the right-hand end of the same line, a disc the pill's height, so the two read
+            as one band of status rather than as a status and a stray button.
           -->
           <div id="channel-freshness-anchor">
             <p id="channel-freshness" data-state="fresh" role="status" aria-live="polite" hidden></p>
+            <!--
+              `#129 message-search`, floating since `#197 floating-search`. Closed, this is the glass
+              and nothing else. Open, it grows along the line into a bar across the top of the list
+              — field, count, and the glass as its way out — and the pill gives way to it, as it
+              already gives way to a pull. At the top of the list is also where an on-screen
+              keyboard never reaches: it rises from the bottom, so the field and the first matches
+              under it stay in view while the reader types. The list reserves the bar's height at
+              its head while it is open, so the first match is never underneath it.
+
+              ONE place in both placements of the control bar. With the bar moved up into the
+              header the glass still floats here, so the field no longer competes with the bar for
+              a 375px row and neither has to yield to the other.
+
+              The count says the DENOMINATOR is what has been loaded. Since `#128
+              transcript-history` the record on screen is a bounded suffix of a longer one, so "no
+              matches" has to be distinguishable from "not here" by a reader who has not scrolled
+              up yet.
+            -->
+            <div id="search-float" role="search">
+              <input
+                id="search-field"
+                class="search-field"
+                type="search"
+                autocomplete="off"
+                placeholder="Search loaded messages"
+                aria-label="Search loaded messages"
+                title="Filters the messages already on screen. Quote a phrase to match it whole."
+                hidden
+              />
+              <span id="search-count" class="search-count" role="status" aria-live="polite" hidden></span>
+              <button id="search-toggle" class="icon-button" type="button" aria-label="Search messages" title="Search messages" aria-pressed="false" hidden>
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="10.5" cy="10.5" r="6.5" />
+                  <path d="m15.3 15.3 4.2 4.2" />
+                </svg>
+              </button>
+            </div>
           </div>
 
           <!-- THE one scrolling element on the page. -->
@@ -227,7 +248,7 @@
               `#129 message-search`. A filter that matches nothing otherwise leaves a BLANK
               region and no explanation: every row is still in the list, so neither pane's own
               empty state fires, and the only thing saying what happened is "0 of 13 loaded" in
-              small grey type in the corner of the header. That is not an answer to "where did
+              small grey type at the end of the search bar. That is not an answer to "where did
               my messages go", and a reader who does not find it concludes the page broke.
 
               ONE notice for both panes, because only one of them is ever on screen, and at the
