@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import fnmatch
+import itertools
 import json
 import os
+import random
 import subprocess
+import sys
 import types
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 import pytest
@@ -434,3 +438,448 @@ def test_registered_record_planning_uses_its_share(tmp_path: Path) -> None:
     assert row["cache_status"] == "complete"
     assert row["cache_bytes"] == _allocated(cache)
     assert not [r for r in row["reasons"] if r.startswith("cache inspection")]
+
+
+def _tracked_by_every_glob(
+    vcs: cli._GitVcs, checkout: Path, cache_globs: Sequence[str]
+) -> tuple[str, ...]:
+    """``_GitVcs.tracked_cache_paths`` as it was before the index: the same
+    body, with ``vcs`` for ``self``, so the matcher also runs at the same
+    stack depth when both are called from the same frame."""
+
+    if not cache_globs:
+        return ()
+    indexed = vcs._run(checkout, ["ls-files", "--recurse-submodules", "-z"])
+    committed = vcs._run(
+        checkout,
+        ["ls-tree", "-r", "--name-only", "-z", "HEAD"],
+    )
+    paths = [
+        path
+        for output in (indexed.stdout, committed.stdout)
+        for path in output.split("\x00")
+        if path
+        and any(
+            cli._cache_glob_contains_path(pattern, path) for pattern in cache_globs
+        )
+    ]
+    return tuple(dict.fromkeys(paths))
+
+
+LISTED_CHECKOUT = Path("/listed-checkout-is-never-read")
+
+
+def _listed(indexed: Sequence[str], committed: Sequence[str] = ()) -> cli._GitVcs:
+    """A Git boundary whose index and HEAD listings are given, not read."""
+
+    listings = {
+        "ls-files": "".join(f"{path}\x00" for path in indexed),
+        "ls-tree": "".join(f"{path}\x00" for path in committed),
+    }
+
+    class Listed(cli._GitVcs):
+        @staticmethod
+        def _run(
+            repository: Path, args: Sequence[str], **options: object
+        ) -> subprocess.CompletedProcess[str]:
+            assert repository == LISTED_CHECKOUT and not options
+            return subprocess.CompletedProcess(list(args), 0, listings[args[0]], "")
+
+    return Listed()
+
+
+# '**', wildcards and classes in the first component (which validation refuses
+# but direct callers may pass), '?' in and after the first component, dotfiles,
+# a trailing slash, leading and doubled separators, an unclosed '[', literal
+# ']' and '\', and globs with no components at all.
+TRICKY_GLOBS = (
+    *LIVE_SHAPED,
+    "**",
+    "**/target",
+    "*/target",
+    "t*",
+    "t?rget",
+    "?arget/**",
+    "ignored/?/target",
+    "a/?/**",
+    "[tT]arget",
+    "[!x]arget",
+    "t[a-c]rget",
+    ".cache",
+    ".cache/**",
+    ".*",
+    "target/",
+    "/target",
+    "ignored//target",
+    "./target",
+    "a/b/c",
+    "a/[bc]/**",
+    "a\\b",
+    "x]y",
+    "[",
+    "a/**/**/c",
+    "",
+    "/",
+)
+COMPONENTS = (
+    "target", "Target", "xarget", "targets", ".cache", ".target", "ignored",
+    "a", "b", "c", "node_modules", "[", "a\\b", "x]y", ".", "",
+)
+# Every join of up to three components, so empty components produce leading,
+# trailing and doubled separators, and the empty path itself is included.
+TRICKY_PATHS = tuple(
+    "/".join(combination)
+    for length in range(0, 4)
+    for combination in itertools.product(COMPONENTS, repeat=length)
+)
+
+
+def test_cache_path_selection_equals_testing_every_glob() -> None:
+    assert len(TRICKY_PATHS) == 1 + 16 + 16**2 + 16**3
+    # HEAD lists a subset in reverse plus paths the index lacks, so the union
+    # and its order are exercised too.
+    vcs = _listed(
+        TRICKY_PATHS,
+        (*reversed(TRICKY_PATHS[::7]), "target/head-only", ".cache/head-only"),
+    )
+    generator = random.Random(20261003)
+    glob_sets: list[tuple[str, ...]] = [
+        LIVE_SHAPED,
+        TRICKY_GLOBS,
+        *((pattern,) for pattern in TRICKY_GLOBS),
+        *(
+            tuple(generator.sample(TRICKY_GLOBS, generator.randint(2, 6)))
+            for _ in range(20)
+        ),
+    ]
+    selected_somewhere = 0
+    for cache_globs in glob_sets:
+        expected = _tracked_by_every_glob(vcs, LISTED_CHECKOUT, cache_globs)
+        assert vcs.tracked_cache_paths(LISTED_CHECKOUT, cache_globs) == expected, (
+            cache_globs
+        )
+        selected_somewhere += bool(expected)
+    # The comparison is not vacuous: most glob sets select some paths.
+    assert selected_somewhere > len(glob_sets) // 2
+
+
+def _spy_on_matcher(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    tested: list[tuple[str, str]] = []
+    real = cli._cache_glob_contains_path
+
+    def spy(pattern: str, path: str) -> bool:
+        tested.append((pattern, path))
+        return real(pattern, path)
+
+    monkeypatch.setattr(cli, "_cache_glob_contains_path", spy)
+    return tested
+
+
+def test_cache_path_selection_tests_only_globs_sharing_the_first_component(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tested = _spy_on_matcher(monkeypatch)
+    source = [f"src/module{index}/target/file{index}.rs" for index in range(10_000)]
+    paths = [*source, "target/debug/x.o", "ignored/a/target/y", "ignored/a/b", "targets/z"]
+    vcs = _listed(paths)
+
+    assert vcs.tracked_cache_paths(LISTED_CHECKOUT, LIVE_SHAPED) == (
+        "target/debug/x.o",
+        "ignored/a/target/y",
+    )
+    # The first path is tested against every glob, as before, because testing
+    # 'ignored/**/target' against it compiles 'ignored' with fnmatch. After
+    # that no source path is tested against any glob; each candidate is tested
+    # only against the globs that begin with its first component, in order,
+    # until one accepts it.
+    assert tested == [
+        *((pattern, source[0]) for pattern in LIVE_SHAPED),
+        ("target", "target/debug/x.o"),
+        ("ignored/**/target", "ignored/a/target/y"),
+        ("ignored/**/target", "ignored/a/b"),
+        ("ignored/**/target-debug", "ignored/a/b"),
+        ("ignored/**/components-target", "ignored/a/b"),
+    ]
+
+    # A glob with no literal first component is still tested against every path.
+    tested.clear()
+    assert vcs.tracked_cache_paths(LISTED_CHECKOUT, ("**/file7.rs",)) == (
+        "src/module7/target/file7.rs",
+    )
+    assert len(tested) == len(paths)
+
+
+def _first_component(text: str) -> str:
+    return next((part for part in text.split("/") if part), "")
+
+
+def _spy_on_matcher_and_fnmatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[str, str, frozenset[str]]]:
+    """Record each matcher call with the patterns it passed to ``fnmatch``,
+    which compiles and caches a pattern the first time it meets it."""
+
+    calls: list[tuple[str, str, frozenset[str]]] = []
+    compared: list[str] = []
+    real_fnmatchcase = fnmatch.fnmatchcase
+    real_matcher = cli._cache_glob_contains_path
+
+    def fnmatchcase_spy(name: str, pattern: str) -> bool:
+        compared.append(pattern)
+        return real_fnmatchcase(name, pattern)
+
+    def matcher_spy(pattern: str, path: str) -> bool:
+        start = len(compared)
+        accepted = real_matcher(pattern, path)
+        calls.append((pattern, path, frozenset(compared[start:])))
+        return accepted
+
+    monkeypatch.setattr(fnmatch, "fnmatchcase", fnmatchcase_spy)
+    monkeypatch.setattr(cli, "_cache_glob_contains_path", matcher_spy)
+    return calls
+
+
+def test_cache_path_selection_tests_globs_in_their_original_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tested = _spy_on_matcher_and_fnmatch(monkeypatch)
+    # Anchored and unanchored globs interleaved, so an index that tested the
+    # anchored ones first would call the matcher in a different order.
+    cache_globs = (
+        "ignored/**/target", "t*", "target/", "**/c", "ignored/a", "[ab]/**",
+        "target", "a/b", "*/target", "ignored/**/target-debug",
+    )
+    for paths in (TRICKY_PATHS, ("target/x", "ignored/a/b/c", "a/b/c", "zz/c")):
+        vcs = _listed(paths)
+        tested.clear()
+        expected = _tracked_by_every_glob(vcs, LISTED_CHECKOUT, cache_globs)
+        every_glob_calls = list(tested)
+        tested.clear()
+        assert vcs.tracked_cache_paths(LISTED_CHECKOUT, cache_globs) == expected
+        made = [(pattern, path) for pattern, path, _ in tested]
+        # The index makes the calls testing every glob makes, in the same
+        # order, leaving some out. Each (glob, path) pair occurs once here, so
+        # the alignment is unique.
+        position = 0
+        compiled: set[str] = set()
+        left_out = 0
+        for pattern, path, compares in every_glob_calls:
+            if position < len(made) and made[position] == (pattern, path):
+                position += 1
+                compiled |= compares
+                continue
+            left_out += 1
+            # It leaves out only a call to a glob whose literal first component
+            # differs from the path's, and only once every pattern that call
+            # would pass to fnmatch has been passed by a call it did make, so
+            # leaving it out changes no result, no exception, and no compile.
+            first = _first_component(pattern)
+            if (
+                not first
+                or any(character in first for character in "*?[")
+                or first == _first_component(path)
+                or not compares <= compiled
+            ):
+                pytest.fail(
+                    f"left out {(pattern, path)}, which compares {sorted(compares)} "
+                    f"with only {sorted(compiled)} compiled by earlier calls"
+                )
+        if position != len(made):
+            pytest.fail(f"call {position} of the index, {made[position]}, is out of order")
+        assert left_out > 0
+
+
+def _every_glob_outcome(
+    vcs: cli._GitVcs, cache_globs: Sequence[str]
+) -> tuple[str, ...] | None:
+    try:
+        return _tracked_by_every_glob(vcs, LISTED_CHECKOUT, cache_globs)
+    except RecursionError:
+        return None
+
+
+def _indexed_outcome(
+    vcs: cli._GitVcs, cache_globs: Sequence[str]
+) -> tuple[str, ...] | None:
+    try:
+        return vcs.tracked_cache_paths(LISTED_CHECKOUT, cache_globs)
+    except RecursionError:
+        return None
+
+
+def _deep_glob(count: int) -> str:
+    return "target/" + "/".join(["**"] * count)
+
+
+def test_cache_path_selection_overflows_exactly_where_testing_every_glob_does() -> None:
+    # The matcher recurses once per '**' component, so a glob with about as
+    # many components as the recursion limit overflows it, and validation
+    # accepts such a glob. Where it overflows depends on how deep the stack
+    # already is when the matcher runs, which the index must not change: find
+    # the deepest glob the old method still decides, then compare both methods
+    # on either side of it, with the deep glob alone, after a glob that
+    # accepts first, before one, and after a glob the index skips.
+    vcs = _listed(("target/file",))
+    decided, overflowed = 1, sys.getrecursionlimit() + 20
+    assert _every_glob_outcome(vcs, (_deep_glob(decided),)) == ("target/file",)
+    assert _every_glob_outcome(vcs, (_deep_glob(overflowed),)) is None
+    while overflowed - decided > 1:
+        middle = (decided + overflowed) // 2
+        if _every_glob_outcome(vcs, (_deep_glob(middle),)) is None:
+            overflowed = middle
+        else:
+            decided = middle
+    for count in range(decided - 2, overflowed + 3):
+        deep = _deep_glob(count)
+        for cache_globs in ((deep,), ("**", deep), (deep, "**"), ("src", deep)):
+            assert _indexed_outcome(vcs, cache_globs) == _every_glob_outcome(
+                vcs, cache_globs
+            ), (count, cache_globs[0][:20])
+    # A path the deep glob cannot contain never reaches it.
+    source = _listed(("src/file",))
+    deep = _deep_glob(overflowed + 20)
+    assert _indexed_outcome(source, (deep, "**")) == ("src/file",)
+    assert _every_glob_outcome(source, (deep, "**")) == ("src/file",)
+
+
+Method = Callable[[cli._GitVcs, Sequence[str]], tuple[str, ...] | None]
+_FRESH = itertools.count()
+
+
+def _terminal_literal_outcome(
+    method: Method,
+    glob_templates: Sequence[str],
+    listing_templates: Sequence[str],
+    count: int,
+) -> tuple[str, ...] | None:
+    """Run ``method`` with ``{deep}`` a glob of ``count`` '**' components ending
+    in ``{z}``, a literal no earlier run has used, so fnmatch has not compiled
+    it yet; the result names it 'Z'."""
+
+    literal = f"z{next(_FRESH):07d}"
+    deep = "target/" + "**/" * count + literal
+    vcs = _listed([template.format(z=literal) for template in listing_templates])
+    outcome = method(
+        vcs, [template.format(z=literal, deep=deep) for template in glob_templates]
+    )
+    if outcome is None:
+        return None
+    return tuple(path.replace(literal, "Z") for path in outcome)
+
+
+def _last_decided(
+    method: Method, glob_templates: Sequence[str], listing_templates: Sequence[str]
+) -> int:
+    decided, overflowed = 1, sys.getrecursionlimit() + 20
+    assert _terminal_literal_outcome(method, glob_templates, listing_templates, decided)
+    assert (
+        _terminal_literal_outcome(method, glob_templates, listing_templates, overflowed)
+        is None
+    )
+    while overflowed - decided > 1:
+        middle = (decided + overflowed) // 2
+        if (
+            _terminal_literal_outcome(method, glob_templates, listing_templates, middle)
+            is None
+        ):
+            overflowed = middle
+        else:
+            decided = middle
+    return decided
+
+
+COMPILING_CASES = (
+    # Testing every glob compiles the literal while testing '{z}/**', which
+    # the index skips for 'target/...', so the deep match finds it compiled.
+    (("{z}/**", "{deep}"), ("target/{z}",)),
+    # Here the deep match itself compiles it, at the bottom of its recursion.
+    (("{deep}", "{z}/**"), ("target/{z}",)),
+    # Only a path with at least as many components as the glob compiles it.
+    (("{z}/*/q", "{deep}"), ("a", "b/c/d", "target/{z}")),
+    # A path with no components compiles nothing.
+    (("{z}/**", "{deep}"), ("/", "target/{z}")),
+    # An all-literal glob is compared without fnmatch, so compiles nothing.
+    (("{z}/q", "{z}/*/r", "{deep}"), ("a/b", "c/d/e", "target/{z}")),
+    # A glob after the one that accepts a path is not tested against it.
+    (("node_modules", "{z}/**", "{deep}"), ("node_modules/a", "target/{z}")),
+)
+
+
+@pytest.mark.parametrize(("glob_templates", "listing_templates"), COMPILING_CASES)
+def test_cache_path_selection_compiles_patterns_where_testing_every_glob_does(
+    glob_templates: tuple[str, ...], listing_templates: tuple[str, ...]
+) -> None:
+    # fnmatch compiles a pattern the first time it meets it, which takes about
+    # a dozen frames, so a deep '**' match that meets an uncompiled literal
+    # overflows earlier than one that finds it compiled. A test the index
+    # skips can compile such a literal, so the index must leave the deepest
+    # glob each method decides where it was.
+    decided = _last_decided(_every_glob_outcome, glob_templates, listing_templates)
+    assert _last_decided(_indexed_outcome, glob_templates, listing_templates) == decided
+    for count in (decided - 1, decided, decided + 1):
+        assert _terminal_literal_outcome(
+            _indexed_outcome, glob_templates, listing_templates, count
+        ) == _terminal_literal_outcome(
+            _every_glob_outcome, glob_templates, listing_templates, count
+        ), count
+
+
+def test_compiling_a_literal_first_moves_where_a_deep_glob_overflows() -> None:
+    # Without this difference the test above could not tell the methods apart.
+    compiled_first, compiled_deep = COMPILING_CASES[0], COMPILING_CASES[1]
+    assert _last_decided(_every_glob_outcome, *compiled_first) > _last_decided(
+        _every_glob_outcome, *compiled_deep
+    )
+
+
+def _git(checkout: Path, *arguments: str) -> None:
+    subprocess.run(
+        [
+            "git", "-C", str(checkout), "-c", "user.name=fixture",
+            "-c", "user.email=fixture@example.invalid", *arguments,
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+def test_tracked_cache_paths_is_unchanged_on_a_real_checkout(tmp_path: Path) -> None:
+    checkout = tmp_path / "checkout"
+    _git_checkout(checkout)
+    for relative in (
+        "src/main.rs",
+        "src/target.rs",
+        "targets/keep",
+        "target/committed.o",
+        "node_modules/pkg/index.js",
+        "ignored/x/y/target/z",
+        "ignored/x/target-debug/w",
+        ".cache/blob",
+        ".target/hidden",
+        "a b/target/space",
+        "Target/upper",
+        "x]y/bracket",
+    ):
+        (checkout / relative).parent.mkdir(parents=True, exist_ok=True)
+        (checkout / relative).write_bytes(relative.encode())
+    _git(checkout, "add", "-A")
+    _git(checkout, "commit", "-q", "-m", "tracked")
+    # One path only in HEAD and one only in the index, so the listings differ
+    # and the order of the union matters.
+    _git(checkout, "rm", "-q", "--cached", "target/committed.o")
+    (checkout / "target/staged.o").write_bytes(b"staged")
+    _git(checkout, "add", "target/staged.o")
+
+    tracked = cli._GitVcs().tracked_cache_paths(checkout, LIVE_SHAPED)
+    assert tracked == (
+        "ignored/x/target-debug/w",
+        "ignored/x/y/target/z",
+        "node_modules/pkg/index.js",
+        "target/staged.o",
+        "target/committed.o",
+    )
+    assert tracked == _tracked_by_every_glob(cli._GitVcs(), checkout, LIVE_SHAPED)
+    for cache_globs in (TRICKY_GLOBS, *((pattern,) for pattern in TRICKY_GLOBS)):
+        assert cli._GitVcs().tracked_cache_paths(
+            checkout, cache_globs
+        ) == _tracked_by_every_glob(cli._GitVcs(), checkout, cache_globs), cache_globs
