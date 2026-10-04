@@ -373,3 +373,201 @@ fn only_a_bridge_whose_every_post_carries_the_nonce_promises_one_post_per_key() 
     discord.thread_api = ThreadApi::Off;
     assert!(client(discord));
 }
+
+/// Everything a recording bridge was asked to post: the path, and the JSON body.
+type Posts = Arc<std::sync::Mutex<Vec<(String, Value)>>>;
+
+/// vibe-talk in front of a registration bridge with the bridge thread API, the shape for which a
+/// key is promised to post once. The bridge records every post and answers the ones numbered in
+/// `fail` (from 1, across the whole test) with the incident's 502 — a send that timed out with
+/// nobody knowing whether it went out first.
+async fn recording_bridge(
+    fail: &'static [usize],
+) -> (axum::Router, Posts, tokio::task::JoinHandle<()>) {
+    let posts: Posts = Arc::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    let seen = Arc::clone(&posts);
+    let bridge = axum::Router::new().fallback(move |uri: axum::http::Uri, body: axum::body::Bytes| {
+        let seen = Arc::clone(&seen);
+        async move {
+            let value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let content = value["content"].as_str().unwrap_or_default().to_owned();
+            let path = uri.path().to_owned();
+            let count = {
+                let mut seen = seen.lock().expect("posts");
+                seen.push((path.clone(), value));
+                seen.len()
+            };
+            if fail.contains(&count) {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    r#"{"message":"upstream send timed out"}"#.to_owned(),
+                );
+            }
+            let thread = path
+                .split("/threads/")
+                .nth(1)
+                .and_then(|rest| rest.split('/').next())
+                .map(|id| {
+                    serde_json::json!({
+                        "id": id, "root_message_id": null, "is_root": false,
+                        "reply_count": null, "reply_count_exact": false,
+                    })
+                });
+            let message = serde_json::json!({
+                "id": format!("9194{count:04}"), "channel_id": WRITE_CHANNEL, "content": content,
+                "timestamp": "2026-10-04T10:20:00Z", "thread": thread,
+                "author": {"id": "7", "username": "bridge", "bot": true},
+            });
+            (StatusCode::OK, message.to_string())
+        }
+    });
+    let task = tokio::spawn(async move { axum::serve(listener, bridge).await.expect("serve") });
+    let mut config = testing::config();
+    let discord = config.discord_mut().expect("discord provider");
+    discord.api_base = base;
+    discord.provider_name = "Google Chat".to_owned();
+    discord.channel_registration = true;
+    discord.thread_api = vibe_talk::threads::ThreadApi::Bridge;
+    let (mut state, _) = testing::state();
+    state.replace_chat(Arc::new(HttpDiscordClient::new(discord).expect("client")));
+    (router(state), posts, task)
+}
+
+/// One keyed reply into a thread, as the page sends it.
+async fn keyed_thread_reply(app: &axum::Router, text: &str) -> (StatusCode, Value) {
+    let body = serde_json::json!({
+        "text": text, "thread_id": "t_194", "idempotency_key": "outgoing-key_3",
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/channels/{WRITE_CHANNEL}/reply"))
+        .header("authorization", format!("Bearer {WRITE_TOKEN}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("request");
+    let response = app.clone().oneshot(request).await.expect("response");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    (status, serde_json::from_slice(&bytes).expect("json"))
+}
+
+/// A 207 without its `unsent` text, which is pages long here, for an assertion to print.
+fn brief(answer: &Value) -> Value {
+    let mut answer = answer.clone();
+    if let Some(fields) = answer.as_object_mut() {
+        fields.remove("unsent");
+    }
+    answer
+}
+
+/// `#195 send-resilience`. The page sends a 207's `unsent` text again on its own where the 207
+/// says `resumable`, and tells the reader that cannot post twice. Through the thread route the
+/// incident's sends took, the post that failed has to go upstream again as the same words under
+/// the same nonce — including for a long message whose fenced block sat in a part that DID post,
+/// which once moved every later cut, and for a fenced message nothing of which posted.
+#[tokio::test]
+async fn a_resumable_remainder_goes_upstream_again_as_the_post_that_failed() {
+    // Part 1 posts, part 2 fails, and the retry of the remainder succeeds.
+    let (app, posts, task) = recording_bridge(&[2]).await;
+    // No word longer than three letters, so a space falls inside any four characters: wherever
+    // the four characters once reserved for a closing fence are, a cut is there to move.
+    let prose: Vec<String> = (0..1500)
+        .map(|i| format!("row {} is ok", i % 100))
+        .collect();
+    let text = format!("```sh\nls -l\n```\n\n{}", prose.join(" "));
+    let (status, partial) = keyed_thread_reply(&app, &text).await;
+    let shown = brief(&partial);
+    assert_eq!(status, StatusCode::MULTI_STATUS, "{shown}");
+    assert_eq!(partial["posted"], 1, "{shown}");
+    assert_eq!(partial["retryable"], true, "{shown}");
+    assert_eq!(
+        partial["resumable"], true,
+        "prose behind a posted fence was left to the reader: {shown}"
+    );
+    let unsent = partial["unsent"].as_str().expect("unsent").to_owned();
+    let (status, done) = keyed_thread_reply(&app, &unsent).await;
+    assert_eq!(status, StatusCode::OK, "{done}");
+    {
+        let posts = posts.lock().expect("posts");
+        assert!(posts.len() > 3, "the fixture did not split three ways");
+        assert!(
+            posts
+                .iter()
+                .all(|(path, _)| path.ends_with("/threads/t_194/messages")),
+            "a post left the thread route"
+        );
+        let (failed, again) = (&posts[1].1, &posts[2].1);
+        assert_eq!(
+            again["content"], failed["content"],
+            "the retry cut the failed part differently"
+        );
+        assert_eq!(
+            again["nonce"], failed["nonce"],
+            "the retry asked for the failed part under another request id"
+        );
+        assert!(failed["nonce"]
+            .as_str()
+            .is_some_and(|nonce| nonce.starts_with("outgoing-key_3.")));
+    }
+    task.abort();
+
+    // A fenced message long enough to split, nothing of which posted: `unsent` is the text as
+    // sent, so sending it again is the same request rather than the parts joined back up.
+    let (app, posts, task) = recording_bridge(&[1]).await;
+    let code = format!("```rust\n{}```", "let answer = 42;\n".repeat(300));
+    let (status, partial) = keyed_thread_reply(&app, &code).await;
+    let shown = brief(&partial);
+    assert_eq!(status, StatusCode::MULTI_STATUS, "{shown}");
+    assert_eq!(partial["posted"], 0, "{shown}");
+    assert_eq!(partial["unsent"], code.as_str());
+    assert_eq!(partial["resumable"], true, "{shown}");
+    let (status, _) = keyed_thread_reply(&app, &code).await;
+    assert_eq!(status, StatusCode::OK);
+    {
+        let posts = posts.lock().expect("posts");
+        assert_eq!(posts[1].1["content"], posts[0].1["content"]);
+        assert_eq!(posts[1].1["nonce"], posts[0].1["nonce"]);
+    }
+    task.abort();
+}
+
+/// `#195 send-resilience`. Where sending the remainder again would NOT repeat the failed post
+/// exactly, the 207 says so, and the page leaves it to the reader: here the failed part opened
+/// and closed inside a code block, so the fence markers the server added at its cuts come back
+/// as ordinary text and the cuts move.
+#[tokio::test]
+async fn a_remainder_that_would_be_cut_differently_is_not_offered_as_resumable() {
+    let (app, posts, task) = recording_bridge(&[2]).await;
+    let code = format!("```rust\n{}```", "let answer = 42;\n".repeat(400));
+    let (status, partial) = keyed_thread_reply(&app, &code).await;
+    let shown = brief(&partial);
+    assert_eq!(status, StatusCode::MULTI_STATUS, "{shown}");
+    assert_eq!(partial["posted"], 1, "{shown}");
+    assert_eq!(
+        partial["retryable"], true,
+        "the cause is still a moment: {shown}"
+    );
+    assert_eq!(
+        partial["resumable"], false,
+        "a remainder whose failed part would change was offered as safe: {shown}"
+    );
+    // What resending it WOULD have done, which is why it is not offered.
+    let failed = posts.lock().expect("posts")[1].1.clone();
+    let (status, _) = keyed_thread_reply(&app, partial["unsent"].as_str().expect("unsent")).await;
+    assert_eq!(status, StatusCode::OK);
+    let again = posts.lock().expect("posts")[2].1.clone();
+    assert_ne!(
+        again["nonce"], failed["nonce"],
+        "the fixture no longer exercises a moved cut"
+    );
+    task.abort();
+}

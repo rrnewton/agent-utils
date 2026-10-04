@@ -20898,6 +20898,7 @@ test("a send the chat service was too slow to confirm goes again on its own, und
   const page = await keyedChannel();
   page.replyResponse = async () => json(207, {
     error: "partially_posted", posted: 0, unsent: "did this go out", detail: SLOW_SEND, retryable: true,
+    resumable: true,
   });
   await sendChannel(page, "did this go out");
   const row = outgoingRows(page)[0];
@@ -20953,7 +20954,7 @@ test("a refusal is never sent again on its own, keyed or not", async () => {
   const page = await keyedChannel();
   // The provider said no: the server marks the 207 as not worth retrying.
   page.replyResponse = async () => json(207, {
-    error: "partially_posted", posted: 0, unsent: "refused words", retryable: false,
+    error: "partially_posted", posted: 0, unsent: "refused words", retryable: false, resumable: true,
     detail: 'Example Chat returned HTTP 400: {"message":"not allowed in this space"}',
   });
   await sendChannel(page, "refused words");
@@ -20978,7 +20979,7 @@ test("where no provider promises one post per key, a lost send waits for the rea
   await signIn(page);
   await showDiscord(page, []);
   page.replyResponse = async () => json(207, {
-    error: "partially_posted", posted: 0, unsent: "maybe delivered", retryable: true,
+    error: "partially_posted", posted: 0, unsent: "maybe delivered", retryable: true, resumable: true,
     detail: "Example Chat request failed: connection reset by peer",
   });
   await sendChannel(page, "maybe delivered");
@@ -21098,6 +21099,7 @@ test("after part of a message posted, the rest goes again on its own only if it 
   const page = await keyedChannel();
   page.replyResponse = async () => json(207, {
     error: "partially_posted", posted: 1, unsent: "the second part", detail: SLOW_SEND, retryable: true,
+    resumable: true,
   });
   await sendChannel(page, "the first part. the second part");
   assert.match(outgoingRows(page)[0].text(), /1 part confirmed\. Sending… .*Retrying in 5 s\./);
@@ -21108,13 +21110,16 @@ test("after part of a message posted, the rest goes again on its own only if it 
     "the retry repeated the posted part or changed its key");
 
   // A reply's remainder goes again WITH the reply target, so its first part would be a different
-  // request from the one that failed: that is left to the reader.
+  // request from the one that failed: that is left to the reader. The page decides this itself;
+  // the fixture claims otherwise to show it does not lean on the server's `resumable`, which the
+  // server never sets for a reply's remainder.
   const replied = await keyedChannel();
   replied.messages = [message({ id: "1944", content: "a question" })];
   await reReadChannel(replied);
   await openReplyOn(replied, replied.messages);
   replied.replyResponse = async () => json(207, {
     error: "partially_posted", posted: 1, unsent: "the rest of the answer", detail: SLOW_SEND, retryable: true,
+    resumable: true,
   });
   await replied.el("reply-text").setValue("an answer. the rest of the answer");
   await replied.el("reply-send").click();
@@ -21125,6 +21130,71 @@ test("after part of a message posted, the rest goes again on its own only if it 
   replied.expireTimers(RETRY_FIRST_MS);
   await settleSend(replied);
   assert.equal(replied.repliesPosted.length, 1, "a reply's remainder was retried on its own");
+});
+
+test("a remainder the server cannot resend as the same request waits for the reader and promises nothing", async () => {
+  // The server says `resumable: false` where sending the unsent text again would not repeat the
+  // part that failed under its own words and key — a code block cut across it, say. The provider
+  // could not recognise that retry, so neither an automatic one nor the row's promise is safe.
+  const page = await keyedChannel();
+  page.replyResponse = async () => json(207, {
+    error: "partially_posted", posted: 1, unsent: "the rest of the block", detail: SLOW_SEND,
+    retryable: true, resumable: false,
+  });
+  await sendChannel(page, "a long block. the rest of the block");
+  const row = outgoingRows(page)[0];
+  assert.equal(row.getAttribute("data-send-state"), "unconfirmed", "a retry was armed");
+  assert.match(row.text(), /1 part confirmed\. Delivery unconfirmed\. Check history before retrying/);
+  assert.doesNotMatch(row.text(), /cannot post it twice|Retrying in/);
+  page.expireTimers(RETRY_FIRST_MS);
+  await settleSend(page);
+  assert.equal(page.repliesPosted.length, 1, "a remainder that is not the same request went on its own");
+  // Nor does a later failure win it back: the part whose arrival nobody knows stays unknown.
+  page.replyResponse = errorResponse(502, "chat_error", SLOW_SEND);
+  await outgoingRetry(row).click();
+  await settleSend(page);
+  assert.equal(page.repliesPosted.length, 2);
+  assert.match(outgoingRows(page)[0].text(), /Check history before retrying/);
+  page.expireTimers(RETRY_FIRST_MS);
+  await settleSend(page);
+  assert.equal(page.repliesPosted.length, 2, "a later 502 re-armed the automatic retry");
+  assert.equal(savedOutgoing(page)[0].keyedOnly, false, "a reload would forget it");
+
+  // A 207 that does not say, from a server older than the field, proves nothing either.
+  const older = await keyedChannel();
+  older.replyResponse = async () => json(207, {
+    error: "partially_posted", posted: 0, unsent: "older server", detail: SLOW_SEND, retryable: true,
+  });
+  await sendChannel(older, "older server");
+  assert.match(outgoingRows(older)[0].text(), /Check history before retrying/);
+  older.expireTimers(RETRY_FIRST_MS);
+  await settleSend(older);
+  assert.equal(older.repliesPosted.length, 1);
+});
+
+test("a gateway's own error page in front of the server is retried where the key makes it safe", async () => {
+  // Not this server's JSON, so it names no chat service; but nothing answered, like any 5xx.
+  const page = await keyedChannel();
+  page.replyResponse = async () => ({ ok: false, status: 502, text: async () => "<html>Bad Gateway</html>" });
+  await sendChannel(page, "through a proxy");
+  const row = outgoingRows(page)[0];
+  assert.equal(row.getAttribute("data-send-state"), "retrying", "a gateway 502 was left to the reader");
+  assert.match(row.text(), /Sending… vibe-talk did not answer \(HTTP 502\)\. Retrying in 5 s\./);
+  page.replyResponse = sentOk;
+  page.expireTimers(RETRY_FIRST_MS);
+  await settleSend(page);
+  assert.equal(page.repliesPosted.length, 2);
+  assert.deepEqual(posted(page)[1], posted(page)[0]);
+  assert.equal(outgoingRows(page).length, 0);
+});
+
+test("a waiting row's cause reads as a sentence before the countdown", async () => {
+  const page = await keyedChannel();
+  page.replyResponse = errorResponse(502, "chat_error",
+    'Example Chat returned HTTP 502: {"message":"upstream command exited 1"}');
+  await sendChannel(page, "one more try");
+  assert.match(outgoingRows(page)[0].text(),
+    /Sending… Example Chat could not answer: upstream command exited 1\. Retrying in 5 s\./);
 });
 
 test("signing out cancels every automatic retry", async () => {

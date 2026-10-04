@@ -1169,7 +1169,8 @@ managed-mode writable choice from the UI. Managed message posts carry a path-saf
 once per logical post and kept unchanged across internal HTTP retries; bridges must pass that value
 through as their provider request id. When the caller of the reply route sends an `idempotency_key`,
 each part's nonce is derived from that key and the part's own text instead, so the caller's retry of
-the same text reuses the same request id (`#195 send-resilience`). Direct Discord posts do not carry this bridge-only field. The bridge must
+the same text reuses the same request id (`#195 send-resilience`); a `207` says whether its unsent
+remainder keeps that property (`resumable`). Direct Discord posts do not carry this bridge-only field. The bridge must
 implement idempotent `DELETE /channels/{id}`: deleting an already-absent registration still succeeds
 with `204 No Content`. Opt in with `discord.channel_registration = true`. Settings then accepts a
 channel link or provider reference, lets the bridge resolve it to the stable id used by vibe-talk,
@@ -1462,7 +1463,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/api/v1/channels/{id}/timeline?view=&thread_id=&limit=&before=` | read | main channel, thread list, flattened history, or one thread; opaque backward cursor |
 | GET | `/api/v1/channels/{id}/count?since=&cap=` | read | a bounded, honest count |
 | POST | `/api/v1/channels/{id}/resolve` | read | **semantic random access** |
-| POST | `/api/v1/channels/{id}/reply` | **write** | `{text, thread_id?, reply_to?, idempotency_key?}` — post to the channel or selected thread; quoting a message is optional. A split post that fails part-way answers `207` with `{posted, unsent, retryable}`; `idempotency_key` (1–64 of `A-Z a-z 0-9 - _`) names the post across attempts, and where client-config reports `idempotent_posts_supported` the same key and text are posted at most once (`#195 send-resilience`) |
+| POST | `/api/v1/channels/{id}/reply` | **write** | `{text, thread_id?, reply_to?, idempotency_key?}` — post to the channel or selected thread; quoting a message is optional. A split post that fails part-way answers `207` with `{posted, unsent, retryable, resumable}`; `idempotency_key` (1–64 of `A-Z a-z 0-9 - _`) names the post across attempts, and where client-config reports `idempotent_posts_supported` the same key and text are posted at most once (`#195 send-resilience`). `unsent` is the request's own text when nothing posted; `resumable` says whether sending `unsent` again repeats the failed part under the same words and key, which a split code block can prevent |
 | POST | `/api/v1/channels/{id}/ask` | **write** | slow path — answers 501 in v0 |
 | GET | `/api/v1/post-proposals?wait=&seen=` | **write** | the one post waiting for the owner's confirmation, or `null`; `wait` (seconds, at most 25) holds the request until it changes from serial `seen` — see "Posting is two-phase" |
 | POST | `/api/v1/post-proposals` | **write** | `{channel_id, text, reply_to?}` — propose a post, as `post_reply` does; supersedes any pending one; answers `{sent: false, serial, result}`, where `result` is `post_reply`'s sentence, and no handle |

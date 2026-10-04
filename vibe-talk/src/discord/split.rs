@@ -78,9 +78,16 @@ pub fn split_to(text: &str, limit: usize) -> Vec<String> {
         // also acting as the "do not cut too early" floor, so a blank line comfortably inside the
         // budget fell below the search window and the cut landed mid-sentence instead.
         //
-        // The reservation is conservative — taken whenever the text contains a fence at all,
-        // because whether THIS part ends inside one is only known after the cut is chosen.
-        let hard = if text.contains("```") {
+        // The reservation is conservative — taken whenever this part reopens a fence or what is
+        // left contains one, because whether THIS part ends inside one is only known after the cut
+        // is chosen.
+        //
+        // What is LEFT, not the whole text: a fence already behind the cut cannot end this part
+        // inside one. And it keeps the cuts of a remainder the same when the remainder is split on
+        // its own — the property a retry of a 207's unsent text relies on (`#195 send-resilience`,
+        // `ops::reply_scoped`), which a reservation decided by a fence in a part already posted
+        // would break.
+        let hard = if !prefix.is_empty() || rest.windows(3).any(|w| w == ['`', '`', '`']) {
             budget.saturating_sub(4).max(1)
         } else {
             budget
@@ -247,6 +254,30 @@ mod tests {
             parts[1].starts_with("```rust"),
             "the reopened fence lost its language"
         );
+    }
+
+    /// `#195 send-resilience`. A 207 hands back the unsent parts joined, and a retry splits that
+    /// on its own. Behind the last fence, that must cut exactly where splitting the whole message
+    /// did: the part whose arrival nobody knows has to go again as the same words, or the provider
+    /// cannot recognise it. Reserving room for a closing fence because of a fence in a part
+    /// already posted moved every later cut.
+    #[test]
+    fn a_remainder_behind_every_fence_splits_where_the_whole_message_did() {
+        let prose: Vec<String> = (0..60).map(|i| format!("word{i} goes here")).collect();
+        let text = format!("```sh\nls -l\n```\n\n{}", prose.join(" "));
+        let parts = split_to(&text, 60);
+        assert!(parts.len() > 4, "the fixture did not split: {parts:?}");
+        for index in 1..parts.len() {
+            if parts[index..].iter().any(|part| part.contains("```")) {
+                continue;
+            }
+            let remainder = parts[index..].join("");
+            assert_eq!(
+                split_to(&remainder, 60),
+                parts[index..],
+                "the remainder from part {index} was cut somewhere else"
+            );
+        }
     }
 
     #[test]

@@ -2448,7 +2448,9 @@ function setPromptsOpen(open) {
  * What {@link api} throws: an ordinary Error, plus the facts a caller branches on.
  *
  * `timedOut` and `shownInPill` are the page's own, from `#195 send-resilience`: the page stopped
- * waiting for the answer, and the freshness pill already says the read failed.
+ * waiting for the answer, and the freshness pill already says the read failed. `gatewayStatus` is
+ * the status of a failed answer that was not this server's JSON — a proxy's own 502 or 504 page —
+ * kept apart from `status` so nothing words it as the chat service's failure.
  *
  * @typedef {Error & {
  *   network?: boolean,
@@ -2458,6 +2460,7 @@ function setPromptsOpen(open) {
  *   detail?: string,
  *   timedOut?: boolean,
  *   shownInPill?: boolean,
+ *   gatewayStatus?: number,
  * }} ApiRequestError
  */
 
@@ -2498,7 +2501,9 @@ async function api(path, options) {
   try {
     payload = text ? JSON.parse(text) : null;
   } catch (_error) {
-    throw new Error(`vibe-talk returned non-JSON (HTTP ${response.status})`);
+    const error = /** @type {ApiRequestError} */ (new Error(`vibe-talk returned non-JSON (HTTP ${response.status})`));
+    if (!response.ok) error.gatewayStatus = response.status;
+    throw error;
   }
   if (!response.ok) {
     // The server's error body is part of the wire contract. Anything else on a failed response —
@@ -7137,7 +7142,9 @@ function outgoingStatus(entry) {
   }
   if (waiting) {
     const seconds = Math.max(1, Math.round((waiting.at - Date.now()) / 1000));
-    return `${prefix}Sending… ${entry.detail} Retrying in ${seconds} s.`.replace(/\s+/g, " ");
+    // The cause is often a provider's clause without a full stop; another sentence follows it here.
+    const cause = entry.detail && !/[.!?…]$/.test(entry.detail.trim()) ? `${entry.detail.trim()}.` : entry.detail;
+    return `${prefix}Sending… ${cause} Retrying in ${seconds} s.`.replace(/\s+/g, " ");
   }
   if (entry.state === "unconfirmed") {
     return retriesItself(entry)
@@ -7393,6 +7400,12 @@ async function dispatchOutgoingMessage(entry, job) {
       // Said by the server, which knows whether the provider answered or merely failed to; an
       // older server does not say, and its 207 is left to the reader.
       transient = payload.retryable === true && Boolean(entry.remaining);
+      // Also the server's to say: whether sending the unsent text again repeats the part that
+      // failed as the same request, under the words and key it had. Where it does not — a code
+      // block cut across that part, a part repeated among those posted — no later attempt can be
+      // recognised as this one, so this entry can never again prove a retry safe. Not said, by an
+      // older server, is not proof either.
+      if (payload.resumable !== true) entry.keyedOnly = false;
       return;
     }
     const parts = payload && Array.isArray(payload.parts) && payload.parts.length
@@ -7424,9 +7437,12 @@ async function dispatchOutgoingMessage(entry, job) {
     // which a row that may retry by itself must not say.
     entry.detail = redact(error.network
       ? "The connection to vibe-talk failed before delivery was confirmed."
-      : readableFailure(error, chatServiceOf(entry.channel)));
-    // Never a refusal: a 4xx is an answer, and asking again asks the same question.
-    transient = Boolean(error.network || error.timedOut || error.status >= 500 || error.status === 408);
+      : error.gatewayStatus >= 500 ? `vibe-talk did not answer (HTTP ${error.gatewayStatus}).`
+        : readableFailure(error, chatServiceOf(entry.channel)));
+    // Never a refusal: a 4xx is an answer, and asking again asks the same question. A gateway's
+    // own 5xx page in front of this server is as unanswered as the server's own 5xx.
+    transient = Boolean(error.network || error.timedOut || error.status >= 500 || error.status === 408 ||
+      error.gatewayStatus >= 500);
   } finally {
     if (timer !== null) clearTimeout(timer);
     job.cancel = null;
@@ -7445,7 +7461,9 @@ async function dispatchOutgoingMessage(entry, job) {
 // have landed, so sending it again is only safe where the second request is recognised as the
 // first. The server says where that is (`idempotent_posts_supported`): there each entry's id goes
 // with every attempt as its idempotency key, the server binds it to each part's text, and the
-// provider posts it at most once. There, and only there, a transient failure goes again after
+// provider posts it at most once. After a partial post that holds for the unsent remainder only
+// where the server says the remainder is `resumable` — the part that failed goes again as the same
+// words under the same key. There, and only there, a transient failure goes again after
 // 5 s, 15 s and 45 s, sooner when the connection returns or the page comes back into view, and
 // then stops and offers Retry. Everywhere else the only automatic send is one that never left the
 // device — held while it knew it was offline.
@@ -7473,7 +7491,8 @@ function channelPostsOnce(channel) {
  *
  * Not for a remainder that starts with the reply, though. After a 207 the unsent text goes again
  * with the reply target, which makes its first part a different request from the part that failed
- * — and that part is exactly the one whose arrival nobody knows.
+ * — and that part is exactly the one whose arrival nobody knows. (The server's 207 says so as well,
+ * by not calling that remainder `resumable`; this does not depend on it.)
  */
 function retriesItself(entry) {
   return entry.keyedOnly === true && channelPostsOnce(entry.channel) &&
@@ -7537,8 +7556,8 @@ function resumeOutgoingRetries() {
   }
 }
 
-// The browser's own word that the connection is back. The fixture pages in the suite have no
-// `window.addEventListener`; a browser always does.
+// The browser's own word that the connection is back. Guarded because a page loaded without a
+// full window — some harnesses build one by hand — has no `window.addEventListener`.
 if (typeof window.addEventListener === "function") {
   window.addEventListener("online", () => resumeOutgoingRetries());
 }

@@ -1421,6 +1421,13 @@ pub struct PartialReplyResponse {
     /// that sending `unsent` again later could succeed. False for a refusal, which would only be
     /// refused again. `#195 send-resilience`; see [`crate::chat::ChatError::is_transient`].
     pub retryable: bool,
+    /// Whether sending `unsent` again — with the same `idempotency_key`, thread and reply target
+    /// — asks the provider for the part that failed under the very words and key it had, and
+    /// for nothing already posted. Only then can a provider that honours the key recognise a
+    /// retry of the part whose arrival nobody knows, so only then may a caller retry on its own
+    /// or say a retry cannot post twice. When nothing posted, `unsent` is the request's own text
+    /// and this is always true. `#195 send-resilience`; see `ops::unsent_remainder`.
+    pub resumable: bool,
 }
 
 /// `POST /api/v1/channels/{channel_id}/reply` — the only route that speaks in the owner's name.
@@ -1449,6 +1456,7 @@ pub async fn reply(
             unsent,
             cause,
             retryable,
+            resumable,
         }) => Ok((
             StatusCode::MULTI_STATUS,
             Json(PartialReplyResponse {
@@ -1457,6 +1465,7 @@ pub async fn reply(
                 posted,
                 unsent,
                 retryable,
+                resumable,
             }),
         )
             .into_response()),
@@ -1643,6 +1652,7 @@ pub async fn commit_post(
             unsent,
             cause,
             retryable,
+            resumable,
         })) => Ok((
             StatusCode::MULTI_STATUS,
             Json(PartialReplyResponse {
@@ -1651,6 +1661,7 @@ pub async fn commit_post(
                 posted,
                 unsent,
                 retryable,
+                resumable,
             }),
         )
             .into_response()),

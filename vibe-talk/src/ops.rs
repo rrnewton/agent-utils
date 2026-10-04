@@ -63,6 +63,10 @@ pub enum OpError {
         cause: String,
         /// Whether that failure was a moment rather than an answer; see [`ChatError::is_transient`].
         retryable: bool,
+        /// Whether sending `unsent` again, with the same key, thread and reply target, asks the
+        /// provider for the part that failed under the very words and key it had, and for
+        /// nothing already posted. See [`unsent_remainder`].
+        resumable: bool,
     },
 
     /// The configured chat provider failed, or refused the request before it was sent.
@@ -968,7 +972,8 @@ pub async fn reply(
 /// `idempotency_key` names this post across attempts — `#195 send-resilience`. A caller that
 /// lost an answer sends the same text again under the same key, and every part goes upstream
 /// under the same per-part key it had the first time ([`part_key`]); a provider for which
-/// [`ChatClient::supports_idempotent_posts`] holds then posts it at most once.
+/// [`ChatClient::supports_idempotent_posts`] holds then posts it at most once. After a 207 the
+/// same holds for the unsent text only where the 207 says `resumable`; see [`unsent_remainder`].
 ///
 /// [`ChatClient::supports_idempotent_posts`]: crate::chat::ChatClient::supports_idempotent_posts
 pub async fn reply_scoped(
@@ -1001,25 +1006,25 @@ pub async fn reply_scoped(
         )));
     }
 
+    let keys = idempotency_key.map(|key| part_keys(key, &parts));
     let mut posted: Vec<Message> = Vec::new();
     for (index, part) in parts.iter().enumerate() {
         // Only the FIRST part answers the message. Discord threads a reply from one message, and
         // pointing every part at the same parent would render as several separate answers to the
         // same thing rather than as one answer that ran long.
         let parent = if index == 0 { reply_to.as_ref() } else { None };
-        let earlier_twins = parts[..index].iter().filter(|other| *other == part).count();
-        let key = idempotency_key.map(|key| part_key(key, part, earlier_twins));
+        let key = keys.as_ref().map(|keys| keys[index].as_str());
         let sent = match thread_id {
             Some(thread) => {
                 state
                     .chat
-                    .post_in_thread_keyed(&info.id, thread, part, parent, key.as_deref())
+                    .post_in_thread_keyed(&info.id, thread, part, parent, key)
                     .await
             }
             None => {
                 state
                     .chat
-                    .post_message_keyed(&info.id, part, parent, key.as_deref())
+                    .post_message_keyed(&info.id, part, parent, key)
                     .await
             }
         };
@@ -1038,11 +1043,12 @@ pub async fn reply_scoped(
                 // again and post the first half twice. So the caller is told exactly how much
                 // landed AND handed back the text that did not, which is the only copy of it left
                 // once their draft is cleared.
-                let unsent: String = parts[index..].join("");
+                let (unsent, resumable) = unsent_remainder(text, &parts, index, reply_to.is_some());
                 return Err(OpError::PartiallyPosted {
                     posted: posted.len(),
                     unsent,
                     retryable: cause.is_transient(),
+                    resumable,
                     cause: cause.to_string(),
                 });
             }
@@ -1077,10 +1083,11 @@ fn validate_idempotency_key(key: &str) -> Result<(), OpError> {
 /// Bound to the TEXT rather than to the part's position, because the position is not stable
 /// across attempts. A 207 hands the caller back the unsent remainder, and its retry sends only
 /// that — so the part that failed ambiguously, the one whose arrival nobody knows, is part 0 of
-/// the retry where it was part 2 of the first attempt. Its text is the same, so its key is too,
-/// and the provider that may already hold it is asked for the same post rather than a new one.
-/// The same binding means a key reused for different words can never be answered with a post of
-/// other words.
+/// the retry where it was part 2 of the first attempt. Where splitting the remainder cuts that
+/// part where the first attempt did its text is the same, so its key is too, and the provider
+/// that may already hold it is asked for the same post rather than a new one. That "where" is
+/// checked, not assumed: [`unsent_remainder`]. The same binding means a key reused for different words can
+/// never be answered with a post of other words.
 ///
 /// `earlier_twins` counts identical parts before this one in the same request, so a post that
 /// repeats a whole part posts it twice, as written, rather than collapsing into one.
@@ -1095,6 +1102,57 @@ pub fn part_key(key: &str, part: &str, earlier_twins: usize) -> String {
         (hash ^ u64::from(byte)).wrapping_mul(PRIME)
     });
     format!("{key}.{fingerprint:016x}.{earlier_twins}")
+}
+
+/// The upstream key of every part of one post, in order: [`part_key`] with each part's count of
+/// identical parts before it.
+#[must_use]
+pub fn part_keys(key: &str, parts: &[String]) -> Vec<String> {
+    parts
+        .iter()
+        .enumerate()
+        .map(|(index, part)| {
+            let earlier_twins = parts[..index].iter().filter(|other| *other == part).count();
+            part_key(key, part, earlier_twins)
+        })
+        .collect()
+}
+
+/// What a 207 hands back once part `index` of `parts` (split from `text`) failed: the text the
+/// caller should send if it sends anything again, and whether sending it — with the same key,
+/// thread and reply target — provably asks again for the part that failed, as the same request,
+/// and for nothing already posted.
+///
+/// `#195 send-resilience`. The page retries a 207 on its own only when this says so, and tells
+/// the reader a retry "cannot post it twice"; both rest on the part that failed — the one that
+/// may have landed with its answer lost — going upstream again as the same words under the same
+/// key. That is checked here rather than assumed, because the splitter does not promise it:
+///
+/// - **Nothing posted.** The remainder is the caller's own `text`, byte for byte, not the parts
+///   joined back up. Sending it again is the same request, so it splits and is keyed exactly as
+///   it was. (Joined parts carry any fence the splitter closed and reopened, and splitting THOSE
+///   cuts somewhere else.)
+/// - **Some posted.** The joined remainder has to split so that its FIRST part is exactly the
+///   part that failed. It need not when a fence straddled a cut: the closing and reopening
+///   markers this server added become ordinary text the second time, and the cut moves. The
+///   parts after it were never attempted, so where they are cut posts nothing twice.
+/// - **No part of the retry may repeat a part already posted.** Twins are counted afresh in
+///   each request, so such a part would be keyed as its posted twin and silently collapse into
+///   it — and the part that failed, if it is one, would not be keyed as it was.
+/// - **A reply.** Only the first part of the first attempt answered the message; the remainder
+///   sent again with the reply target makes its first part a different request.
+///
+/// False here leaves the 207 to the reader, which is what every 207 was before keys existed.
+fn unsent_remainder(text: &str, parts: &[String], index: usize, replying: bool) -> (String, bool) {
+    if index == 0 {
+        return (text.to_owned(), true);
+    }
+    let unsent = parts[index..].join("");
+    let again = crate::discord::split::split_for_discord(&unsent);
+    let resumable = !replying
+        && again.first() == Some(&parts[index])
+        && !again.iter().any(|part| parts[..index].contains(part));
+    (unsent, resumable)
 }
 
 fn validate_thread_id(thread_id: &str) -> Result<(), OpError> {
@@ -2317,5 +2375,90 @@ mod tests {
                 .code(),
             "chat_error"
         );
+    }
+
+    /// `#195 send-resilience`. What a 207's `resumable` stands for, over messages of every shape
+    /// and every part one could fail at: sending the unsent text again asks for the part that
+    /// failed under its own words and key, and keys nothing as a part already posted, which a
+    /// provider honouring keys would silently drop.
+    #[test]
+    fn a_resumable_remainder_asks_for_the_failed_part_as_the_same_request() {
+        use crate::discord::split::split_for_discord;
+
+        let prose = |n: usize| -> String {
+            (0..n)
+                .map(|i| format!("sentence {i} of the answer."))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let code = |lines: usize| format!("```rust\n{}```", "let answer = 42;\n".repeat(lines));
+        let block = "a line of the same log output\n".repeat(66);
+        let texts = [
+            ("prose", prose(700)),
+            (
+                "fence then prose",
+                format!("```sh\nls -l\n```\n\n{}", prose(500)),
+            ),
+            (
+                "prose then fence",
+                format!("{}\n\n{}", prose(300), code(200)),
+            ),
+            ("one long fence", code(600)),
+            (
+                "fence between prose",
+                format!("{}\n\n{}\n\n{}", prose(150), code(150), prose(150)),
+            ),
+            ("repeated parts", format!("{block}\n{block}\n{block}")),
+        ];
+        let mut refused = Vec::new();
+        for (name, text) in &texts {
+            let parts = split_for_discord(text);
+            assert!(parts.len() > 2, "{name}: the fixture did not split");
+            let keys = part_keys("outgoing-key", &parts);
+            for index in 0..parts.len() {
+                let (unsent, resumable) = unsent_remainder(text, &parts, index, false);
+                if index == 0 {
+                    assert_eq!(
+                        &unsent, text,
+                        "{name}: nothing posted, yet the text changed"
+                    );
+                    assert!(resumable, "{name}: the same request was called unsafe");
+                }
+                if !resumable {
+                    refused.push((*name, index));
+                    continue;
+                }
+                let retry = split_for_discord(&unsent);
+                let again = part_keys("outgoing-key", &retry);
+                assert_eq!(
+                    retry[0], parts[index],
+                    "{name}: retrying from part {index} cuts the failed part differently"
+                );
+                assert_eq!(
+                    again[0], keys[index],
+                    "{name}: retrying from part {index} asks for the failed part under another key"
+                );
+                assert!(
+                    !again.iter().any(|key| keys[..index].contains(key)),
+                    "{name}: retrying from part {index} would collapse into a posted part"
+                );
+            }
+        }
+        // The cases the reviewer of `#194` found: prose behind a fence that already posted is
+        // resumed; a part opened and closed inside a split fence, and a part repeated among those
+        // posted, are not.
+        assert!(
+            !refused
+                .iter()
+                .any(|(name, _)| *name == "prose" || *name == "fence then prose"),
+            "a remainder that splits the same way was left to the reader: {refused:?}"
+        );
+        assert!(refused.contains(&("one long fence", 1)), "{refused:?}");
+        assert!(refused.contains(&("repeated parts", 1)), "{refused:?}");
+        // A reply's remainder would go again with the reply target on its first part.
+        let text = prose(700);
+        let parts = split_for_discord(&text);
+        assert!(!unsent_remainder(&text, &parts, 1, true).1);
+        assert!(unsent_remainder(&text, &parts, 0, true).1);
     }
 }
