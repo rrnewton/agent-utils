@@ -591,21 +591,14 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 parked = {"middle": 0 < before["top"] and before["gap"] > 100,
                           "newest": before["gap"] <= 2, "top": before["top"] == 0}[where]
                 check(parked, f"{label}: could not park the reader at the {where}: {before}")
-                # The panel clears two ways: by timing out while the recovering read is in flight,
-                # which re-anchors the list itself and so hides a clear that holds nobody, and by
-                # the reader's own dismissal with nothing in flight. The last recovery clears only
-                # the pill.
-                for step in ("fail", "recover", "fail", "dismiss", "recover"):
-                    if step == "dismiss":
-                        page.click("#dismiss-error")
-                        page.wait_for_timeout(100)
-                    else:
-                        poll_channel(step == "fail")
+                # A failed POLL is carried by the pill alone since `#195 send-resilience`: nobody asked
+                # for that read, so the error panel stays down and only the pill's room is made at the
+                # head of the list. Twice, so a second failure after a recovery is held the same way.
+                for step in ("fail", "recover", "fail", "recover"):
+                    poll_channel(step == "fail")
                     after = place("")
                     state = f"{label}, reader at the {where}: {step}"
-                    # Held, not hidden: the panel is up as soon as the pill says so, and the list
-                    # gives up room only at its head.
-                    check(after["banner"] == float(step == "fail"), f"{state} but the error panel is {after}")
+                    check(after["banner"] == 0.0, f"{state} but a background refresh raised the error panel: {after}")
                     check(abs(after["bottom"] - before["bottom"]) < 1, f"{state} and moved the list's foot: {after}")
                     if where == "middle":
                         moved = after["row"] - before["row"]
