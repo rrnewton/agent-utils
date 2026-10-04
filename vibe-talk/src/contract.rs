@@ -116,6 +116,12 @@ pub struct ClientConfigResponse {
     /// absent and the deployment-wide flags are that provider's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ProviderDescription>,
+    /// Why message summaries cannot work on this deployment at all, when the server knows.
+    ///
+    /// Present means the page disables the summaries control and says this instead of letting
+    /// every long row fail one request at a time. Absent means summaries may work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summaries_unavailable: Option<String>,
     /// The scope of the token that asked.
     ///
     /// The caller's own scope, so it discloses nothing it did not already hold. The page needs it

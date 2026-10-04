@@ -198,6 +198,16 @@ pub trait Summarizer: Send + Sync {
         PROMPT
     }
 
+    /// Why this backend cannot summarise anything at all, when that is knowable without asking it.
+    ///
+    /// A deployment-level gap (no credentials, no model configured) refuses every summary the
+    /// same way, so the page is told up front and disables the control, rather than letting the
+    /// reader switch summaries on and watch every long row turn red. `None` means it may work;
+    /// individual requests can still fail.
+    fn unavailable_reason(&self) -> Option<String> {
+        None
+    }
+
     /// Summarise one message.
     ///
     /// # Errors

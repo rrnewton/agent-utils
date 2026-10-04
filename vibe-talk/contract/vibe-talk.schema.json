@@ -143,6 +143,13 @@
           "description": "Whether this server rewrites message bodies for speech before anything says them.\n\nHere for the same reason as `replay_enabled`: Settings has to be able to describe what this\ndeployment does, and the page cannot infer this one from any message it holds. An empty\n`spoken_content` means \"the rewrite changed nothing\" just as often as it means \"the pass is\noff\" — deliberately, see [`crate::model::Message::spoken_content`] — so a page guessing from\nthe data would tell the operator the feature was off every time the channel was plain prose.\nThey are flipping this switch to compare two runs; guessing is exactly what they cannot do.",
           "type": "boolean"
         },
+        "summaries_unavailable": {
+          "description": "Why message summaries cannot work on this deployment at all, when the server knows.\n\nPresent means the page disables the summaries control and says this instead of letting\nevery long row fail one request at a time. Absent means summaries may work.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "threading_supported": {
           "description": "Whether the backend supports channel, thread-list, and flattened timelines.",
           "type": "boolean"

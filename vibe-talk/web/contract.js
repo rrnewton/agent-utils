@@ -67,7 +67,7 @@ return errors === 0;
 validate57.evaluated = {"props":{"detail":true,"error":true},"dynamicProps":false,"dynamicItems":false};
 
 exports.ClientConfigResponse = validate58;
-const schema33 = {"properties":{"channel_discovery_supported":{"type":"boolean"},"channel_registration_supported":{"type":"boolean"},"channels":{"items":{"$ref":"#/$defs/ChannelInfo"},"type":"array"},"chat_provider_name":{"type":"string"},"conversational_voice":{"$ref":"#/$defs/VoiceDescription"},"elevenlabs_agent_id":{"type":["string","null"]},"live_delivery":{"$ref":"#/$defs/LiveDelivery"},"live_poll_seconds":{"format":"uint64","minimum":0,"type":"integer"},"owner_author_id":{"type":["string","null"]},"providers":{"items":{"$ref":"#/$defs/ProviderDescription"},"type":"array"},"read_aloud":{"$ref":"#/$defs/Description"},"replay_enabled":{"type":"boolean"},"self_author_id":{"type":["string","null"]},"speech_prep_enabled":{"type":"boolean"},"threading_supported":{"type":"boolean"},"token_scope":{"$ref":"#/$defs/TokenScope"},"upstream_read_mark_supported":{"type":"boolean"},"version":{"type":"string"}},"required":["chat_provider_name","channels","elevenlabs_agent_id","conversational_voice","read_aloud","version","replay_enabled","self_author_id","owner_author_id","live_poll_seconds","live_delivery","channel_registration_supported","channel_discovery_supported","upstream_read_mark_supported","threading_supported","speech_prep_enabled","token_scope"],"type":"object"};
+const schema33 = {"properties":{"channel_discovery_supported":{"type":"boolean"},"channel_registration_supported":{"type":"boolean"},"channels":{"items":{"$ref":"#/$defs/ChannelInfo"},"type":"array"},"chat_provider_name":{"type":"string"},"conversational_voice":{"$ref":"#/$defs/VoiceDescription"},"elevenlabs_agent_id":{"type":["string","null"]},"live_delivery":{"$ref":"#/$defs/LiveDelivery"},"live_poll_seconds":{"format":"uint64","minimum":0,"type":"integer"},"owner_author_id":{"type":["string","null"]},"providers":{"items":{"$ref":"#/$defs/ProviderDescription"},"type":"array"},"read_aloud":{"$ref":"#/$defs/Description"},"replay_enabled":{"type":"boolean"},"self_author_id":{"type":["string","null"]},"speech_prep_enabled":{"type":"boolean"},"summaries_unavailable":{"type":["string","null"]},"threading_supported":{"type":"boolean"},"token_scope":{"$ref":"#/$defs/TokenScope"},"upstream_read_mark_supported":{"type":"boolean"},"version":{"type":"string"}},"required":["chat_provider_name","channels","elevenlabs_agent_id","conversational_voice","read_aloud","version","replay_enabled","self_author_id","owner_author_id","live_poll_seconds","live_delivery","channel_registration_supported","channel_discovery_supported","upstream_read_mark_supported","threading_supported","speech_prep_enabled","token_scope"],"type":"object"};
 const schema36 = {"properties":{"instance_id":{"type":["string","null"]},"name":{"type":"string"},"settings_url":{"type":["string","null"]}},"required":["name"],"type":"object"};
 const schema37 = {"oneOf":[{"const":"off","type":"string"},{"const":"poll","type":"string"},{"const":"push","type":"string"}]};
 const schema42 = {"oneOf":[{"const":"read","type":"string"},{"const":"write","type":"string"}]};
@@ -1030,10 +1030,11 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.threading_supported !== undefined){
+if(data.summaries_unavailable !== undefined){
+let data19 = data.summaries_unavailable;
 const _errs44 = errors;
-if(typeof data.threading_supported !== "boolean"){
-validate58.errors = [{instancePath:instancePath+"/threading_supported",schemaPath:"#/properties/threading_supported/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if((typeof data19 !== "string") && (data19 !== null)){
+validate58.errors = [{instancePath:instancePath+"/summaries_unavailable",schemaPath:"#/properties/summaries_unavailable/type",keyword:"type",params:{type: schema33.properties.summaries_unavailable.type},message:"must be string,null"}];
 return false;
 }
 var valid0 = _errs44 === errors;
@@ -1042,14 +1043,26 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.token_scope !== undefined){
-let data20 = data.token_scope;
+if(data.threading_supported !== undefined){
 const _errs46 = errors;
+if(typeof data.threading_supported !== "boolean"){
+validate58.errors = [{instancePath:instancePath+"/threading_supported",schemaPath:"#/properties/threading_supported/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+return false;
+}
+var valid0 = _errs46 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
+if(data.token_scope !== undefined){
+let data21 = data.token_scope;
 const _errs48 = errors;
+const _errs50 = errors;
 let valid8 = false;
 let passing1 = null;
-const _errs49 = errors;
-if(typeof data20 !== "string"){
+const _errs51 = errors;
+if(typeof data21 !== "string"){
 const err7 = {instancePath:instancePath+"/token_scope",schemaPath:"#/$defs/TokenScope/oneOf/0/type",keyword:"type",params:{type: "string"},message:"must be string"};
 if(vErrors === null){
 vErrors = [err7];
@@ -1059,7 +1072,7 @@ vErrors.push(err7);
 }
 errors++;
 }
-if("read" !== data20){
+if("read" !== data21){
 const err8 = {instancePath:instancePath+"/token_scope",schemaPath:"#/$defs/TokenScope/oneOf/0/const",keyword:"const",params:{allowedValue: "read"},message:"must be equal to constant"};
 if(vErrors === null){
 vErrors = [err8];
@@ -1069,13 +1082,13 @@ vErrors.push(err8);
 }
 errors++;
 }
-var _valid1 = _errs49 === errors;
+var _valid1 = _errs51 === errors;
 if(_valid1){
 valid8 = true;
 passing1 = 0;
 }
-const _errs51 = errors;
-if(typeof data20 !== "string"){
+const _errs53 = errors;
+if(typeof data21 !== "string"){
 const err9 = {instancePath:instancePath+"/token_scope",schemaPath:"#/$defs/TokenScope/oneOf/1/type",keyword:"type",params:{type: "string"},message:"must be string"};
 if(vErrors === null){
 vErrors = [err9];
@@ -1085,7 +1098,7 @@ vErrors.push(err9);
 }
 errors++;
 }
-if("write" !== data20){
+if("write" !== data21){
 const err10 = {instancePath:instancePath+"/token_scope",schemaPath:"#/$defs/TokenScope/oneOf/1/const",keyword:"const",params:{allowedValue: "write"},message:"must be equal to constant"};
 if(vErrors === null){
 vErrors = [err10];
@@ -1095,7 +1108,7 @@ vErrors.push(err10);
 }
 errors++;
 }
-var _valid1 = _errs51 === errors;
+var _valid1 = _errs53 === errors;
 if(_valid1 && valid8){
 valid8 = false;
 passing1 = [passing1, 1];
@@ -1119,44 +1132,45 @@ validate58.errors = vErrors;
 return false;
 }
 else {
-errors = _errs48;
+errors = _errs50;
 if(vErrors !== null){
-if(_errs48){
-vErrors.length = _errs48;
+if(_errs50){
+vErrors.length = _errs50;
 }
 else {
 vErrors = null;
 }
 }
 }
-var valid0 = _errs46 === errors;
+var valid0 = _errs48 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.upstream_read_mark_supported !== undefined){
-const _errs53 = errors;
+const _errs55 = errors;
 if(typeof data.upstream_read_mark_supported !== "boolean"){
 validate58.errors = [{instancePath:instancePath+"/upstream_read_mark_supported",schemaPath:"#/properties/upstream_read_mark_supported/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
-return false;
-}
-var valid0 = _errs53 === errors;
-}
-else {
-var valid0 = true;
-}
-if(valid0){
-if(data.version !== undefined){
-const _errs55 = errors;
-if(typeof data.version !== "string"){
-validate58.errors = [{instancePath:instancePath+"/version",schemaPath:"#/properties/version/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
 var valid0 = _errs55 === errors;
 }
 else {
 var valid0 = true;
+}
+if(valid0){
+if(data.version !== undefined){
+const _errs57 = errors;
+if(typeof data.version !== "string"){
+validate58.errors = [{instancePath:instancePath+"/version",schemaPath:"#/properties/version/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+return false;
+}
+var valid0 = _errs57 === errors;
+}
+else {
+var valid0 = true;
+}
 }
 }
 }
@@ -1185,7 +1199,7 @@ return false;
 validate58.errors = vErrors;
 return errors === 0;
 }
-validate58.evaluated = {"props":{"channel_discovery_supported":true,"channel_registration_supported":true,"channels":true,"chat_provider_name":true,"conversational_voice":true,"elevenlabs_agent_id":true,"live_delivery":true,"live_poll_seconds":true,"owner_author_id":true,"providers":true,"read_aloud":true,"replay_enabled":true,"self_author_id":true,"speech_prep_enabled":true,"threading_supported":true,"token_scope":true,"upstream_read_mark_supported":true,"version":true},"dynamicProps":false,"dynamicItems":false};
+validate58.evaluated = {"props":{"channel_discovery_supported":true,"channel_registration_supported":true,"channels":true,"chat_provider_name":true,"conversational_voice":true,"elevenlabs_agent_id":true,"live_delivery":true,"live_poll_seconds":true,"owner_author_id":true,"providers":true,"read_aloud":true,"replay_enabled":true,"self_author_id":true,"speech_prep_enabled":true,"summaries_unavailable":true,"threading_supported":true,"token_scope":true,"upstream_read_mark_supported":true,"version":true},"dynamicProps":false,"dynamicItems":false};
 
 exports.VoiceSession = validate62;
 const schema43 = {"properties":{"input_sample_rate":{"format":"uint32","minimum":0,"type":"integer"},"output_sample_rate":{"format":"uint32","minimum":0,"type":"integer"},"protocol":{"type":"string"},"provider":{"type":"string"},"valid_for_seconds":{"format":"uint32","minimum":0,"type":["integer","null"]},"websocket_url":{"type":"string"}},"required":["websocket_url","protocol","provider","input_sample_rate","output_sample_rate"],"type":"object"};

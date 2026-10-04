@@ -518,6 +518,12 @@ impl Summarizer for AgentSummarizer {
         "the ElevenLabs conversational agent, over a pooled text-only WebSocket"
     }
 
+    fn unavailable_reason(&self) -> Option<String> {
+        crate::elevenlabs::credentials(&self.inner.elevenlabs)
+            .err()
+            .map(|error| error.to_string())
+    }
+
     fn backend(&self) -> &'static str {
         BACKEND
     }
@@ -710,6 +716,35 @@ mod tests {
         // ...and the next summary gets a fresh one rather than a dangling handle.
         summarise(&under, "much later").await.expect("answers");
         assert_eq!(vendor.chats().len(), 2);
+    }
+
+    #[test]
+    fn missing_credentials_are_reported_before_anything_is_asked() {
+        let vendor = Arc::new(FakeElevenLabs::new());
+        let wired_up = summarizer(&vendor, PoolPolicy::default());
+        assert_eq!(wired_up.unavailable_reason(), None);
+        for (agent, key) in [
+            (None, Some(VALID_API_KEY)),
+            (Some(KNOWN_AGENT_ID), None),
+            (None, None),
+        ] {
+            let unwired = AgentSummarizer::new(
+                Arc::clone(&vendor) as Arc<dyn TextChatProvider>,
+                elevenlabs(agent, key),
+                PoolPolicy::default(),
+            );
+            let reason = unwired
+                .unavailable_reason()
+                .expect("an unconfigured agent is unavailable");
+            assert!(
+                reason.contains("elevenlabs"),
+                "the reason does not name the setting: {reason}"
+            );
+        }
+        assert!(
+            vendor.chats().is_empty(),
+            "checking availability talked to the vendor"
+        );
     }
 
     #[tokio::test]

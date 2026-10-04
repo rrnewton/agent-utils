@@ -179,6 +179,13 @@ declare namespace VibeTalk {
      */
     speech_prep_enabled: boolean;
     /**
+     * Why message summaries cannot work on this deployment at all, when the server knows.
+     *
+     * Present means the page disables the summaries control and says this instead of letting
+     * every long row fail one request at a time. Absent means summaries may work.
+     */
+    summaries_unavailable?: string | null;
+    /**
      * Whether the backend supports channel, thread-list, and flattened timelines.
      */
     threading_supported: boolean;

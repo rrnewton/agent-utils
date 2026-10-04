@@ -1049,6 +1049,15 @@ let summariesUnavailable = "";
 let summaryRecheck = false;
 
 /**
+ * Why the SERVER says it cannot summarise at all, from client-config, or "" when it may.
+ *
+ * Known before anything is asked, so the control is disabled up front with this as its reason:
+ * switching summaries on and watching every long row turn red after several seconds is the
+ * experience this replaces.
+ */
+let summariesDisabledByServer = "";
+
+/**
  * Put one row into the state the map says it is in.
  *
  * THIS function writes the failure mark, and the reason is the REBUILD, not this function's call
@@ -1380,6 +1389,7 @@ function reportSummaryFailures() {
 }
 
 function setSummaryMode(on) {
+  if (on && summariesDisabledByServer) return;
   summaryMode = on;
   el("summarise").setAttribute("aria-pressed", on ? "true" : "false");
   el("summarise-label").textContent = on ? SUMMARY_MODE_ON : SUMMARY_MODE_OFF;
@@ -1447,6 +1457,10 @@ function renderScrollTools() {
   // a mode that changes nothing, since a voice turn has no message id to key a summary under.
   el("summarise").hidden =
     currentView !== "discord" || !folds.some((entry) => entry.id !== null);
+  el("summarise").disabled = summariesDisabledByServer !== "";
+  el("summarise").title = summariesDisabledByServer
+    ? `Summaries are unavailable on this server: ${summariesDisabledByServer}`
+    : "Show a one-line summary in place of each long message.";
   // The way back. Only where a marker can mean something, and only when one is set.
   el("jump-marker").hidden = currentView !== "discord" || placeMarker === null;
   // `#129 message-search`. Re-derived from the lists, exactly like everything above it: whatever
@@ -12473,6 +12487,10 @@ function applyClientConfig(config) {
       : "off";
   upstreamReadMarkSupported = config.upstream_read_mark_supported === true;
   deploymentCapabilities.upstreamReadMark = upstreamReadMarkSupported;
+  summariesDisabledByServer =
+    typeof config.summaries_unavailable === "string" ? config.summaries_unavailable.trim() : "";
+  if (summariesDisabledByServer && summaryMode) setSummaryMode(false);
+  renderScrollTools();
   deploymentCapabilities.liveDelivery = liveDelivery;
   deploymentCapabilities.livePollSeconds = livePollSeconds;
   // The picker already holds a channel; the flags above are the deployment's, and that channel's

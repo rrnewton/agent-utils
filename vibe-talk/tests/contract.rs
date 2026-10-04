@@ -172,6 +172,7 @@ fn client_config(
                 owner_author_id: None,
             },
         ],
+        summaries_unavailable: (!full).then(|| "elevenlabs.api_key is not configured".into()),
         token_scope: scope,
     }
 }

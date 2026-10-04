@@ -1061,6 +1061,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         owner_author_id: page.ownerAuthorId,
         // Absent unless a test describes providers, as an older single-provider server sends it.
         providers: page.providers,
+        // Absent unless a test says the server cannot summarise at all.
+        summaries_unavailable: page.summariesUnavailable,
         token_scope: page.tokenScope,
       }),
     /**
@@ -7929,6 +7931,21 @@ async function refreshDiscord(page, messages) {
   await reReadChannel(page);
   return page.el("discord-log").children;
 }
+
+test("a server that cannot summarise disables the control up front instead of failing every row", async () => {
+  const page = newPage();
+  page.summariesUnavailable = "elevenlabs.api_key is not configured";
+  await signIn(page);
+  await showDiscord(page, [message({ id: "7000000000000000002", content: longMessage("deploy") })]);
+
+  const chip = page.el("summarise");
+  assert.equal(chip.hidden, false, "the control vanished rather than saying why it is unavailable");
+  assert.equal(chip.disabled, true, "a server without a summariser offered summaries");
+  assert.match(chip.title, /elevenlabs\.api_key is not configured/);
+  await turnSummariesOn(page);
+  assert.equal(chip.getAttribute("aria-pressed"), "false", "the disabled control entered summary mode");
+  assert.deepStrictEqual(page.summaryAsks, [], "a disabled control still asked for summaries");
+});
 
 test("nothing is summarised until the reader asks for it, and then the long rows are", async () => {
   // The default costs NOTHING. Collapsing to a prefix is free and stays the default; a page that

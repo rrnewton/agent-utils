@@ -744,6 +744,7 @@ pub async fn client_config(
         self_author_id: state.chat.self_author_id(),
         owner_author_id: state.chat.owner_author_id(),
         providers,
+        summaries_unavailable: state.summarizer.unavailable_reason(),
         token_scope: scope.into(),
     }))
 }
