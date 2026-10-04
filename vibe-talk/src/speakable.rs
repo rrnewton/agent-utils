@@ -371,13 +371,22 @@ fn strip_line(line: &str) -> String {
     strip_inline(body)
 }
 
+/// Longest angle-bracket form read as one, in characters. Every Discord form is far shorter; the
+/// bound keeps a message full of stray `<` from re-copying the rest of the line at each one.
+const ANGLE_FORM_CHARS: usize = 128;
+
+/// Whether `chars` begins with `marker`, without copying the rest of the line.
+fn starts_with_chars(chars: &[char], marker: &str) -> bool {
+    let mut held = chars.iter();
+    marker.chars().all(|wanted| held.next() == Some(&wanted))
+}
+
 /// Remove inline markers, resolve links to their text, and name the things that have no sound.
 fn strip_inline(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
     while i < chars.len() {
-        let rest: String = chars[i..].iter().collect();
         // `[label](url)` reads as its label. A listener cannot use a URL and cannot write it down.
         if chars[i] == '[' {
             if let Some((label, consumed)) = link_at(&chars[i..]) {
@@ -389,6 +398,7 @@ fn strip_inline(text: &str) -> String {
         // Discord's angle-bracket forms: `<@123>`, `<#123>`, `<@&123>`, `<:name:123>`, `<t:…>`.
         // `<t:…>` is a TIME and is left for `speak_times`; the rest have no useful sound.
         if chars[i] == '<' {
+            let rest: String = chars[i..].iter().take(ANGLE_FORM_CHARS).collect();
             if let Some((said, consumed)) = angle_form_at(&rest) {
                 out.push_str(&said);
                 i += consumed;
@@ -399,9 +409,21 @@ fn strip_inline(text: &str) -> String {
         // strikethrough go the same way: the words inside them are still the message.
         let marker = ["***", "**", "~~", "||", "__", "*", "_", "`"]
             .into_iter()
-            .find(|m| rest.starts_with(m));
+            .find(|m| starts_with_chars(&chars[i..], m));
         if let Some(marker) = marker {
-            i += marker.chars().count();
+            let len = marker.chars().count();
+            // `#200 reply-context`. An underscore INSIDE a word is part of a name — snake_case,
+            // SCREAMING_SNAKE_CASE — not emphasis, as CommonMark has it. Dropping it ran the parts
+            // together into one unsayable word; a space lets the voice say each part.
+            let inside_word = marker.starts_with('_')
+                && i.checked_sub(1)
+                    .and_then(|j| chars.get(j))
+                    .is_some_and(|c| c.is_alphanumeric())
+                && chars.get(i + len).is_some_and(|c| c.is_alphanumeric());
+            if inside_word {
+                out.push(' ');
+            }
+            i += len;
             continue;
         }
         out.push(chars[i]);
@@ -737,6 +759,34 @@ mod tests {
         assert_eq!(say("## A heading"), "A heading");
         assert_eq!(say("> quoted text"), "quoted text");
         assert_eq!(say("run `make validate` now"), "run make validate now");
+    }
+
+    #[test]
+    fn an_underscore_inside_a_name_is_a_pause_not_glue() {
+        // `#200 reply-context`: identifiers were spoken as one run-together word.
+        assert_eq!(
+            say("set RUNNER_E2E_EMPTY_WORKDIR first"),
+            "set RUNNER E2E EMPTY WORKDIR first"
+        );
+        assert_eq!(say("call parse_thread_id now"), "call parse thread id now");
+        // Emphasis at word edges is still only emphasis.
+        assert_eq!(say("this is _really_ done"), "this is really done");
+        assert_eq!(say("open __init__.py"), "open init.py");
+    }
+
+    #[test]
+    fn markers_and_brackets_are_stripped_in_linear_time() {
+        // Every character used to copy the rest of the line, so a long line from a stranger cost
+        // the square of its length before a word was spoken.
+        let line = "a_<".repeat(70_000);
+        let started = std::time::Instant::now();
+        let stripped = strip_inline(&line);
+        assert!(stripped.starts_with("a<a<"), "{}", &stripped[..12]);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
