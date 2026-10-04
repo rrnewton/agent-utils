@@ -295,7 +295,10 @@ It runs `scripts/setup-hooks.sh` in a repository when all of these hold:
 - the script is a regular file, not a symlink, with the owner-execute bit set;
 - the repository's common Git directory lies inside the new checkout's own Git directory, which
   is true of a submodule initialized in this slot and false of the checkout itself, whose
-  configuration every slot shares.
+  configuration every slot shares;
+- the repository's own configuration sets no `core.hooksPath` yet. Hooks that a post-provision
+  hook already installed there (for example a project's own hook dispatcher) are left in place
+  rather than replaced by the repository's installer.
 
 The script runs from that repository's root, with stdin closed, with `GIT_DIR`, `GIT_WORK_TREE`,
 `GIT_INDEX_FILE`, `GIT_COMMON_DIR`, and the other variables that would point Git elsewhere removed
@@ -311,11 +314,12 @@ hooks: | the last lines of its combined stdout and stderr
 hooks: skipped; no repository private to this slot has an executable scripts/setup-hooks.sh (3 checked)
 ```
 
-A checkout whose own script was not run because its configuration is shared gets a
-`hooks: not run:` line. With `--format json` the lines go to stderr, and the result object gains
+A checkout whose own script was not run because its configuration is shared, or a repository
+whose hooks were already configured, gets a `hooks: not run:` line. With `--format json` the lines go to stderr, and the result object gains
 `setup_hooks`: `script`, `timeout_seconds`, `repositories_checked`, and one entry per repository
 that has the script, with `path`, `status` (`ran`, `failed`, `timed-out`, `failed-to-start`,
-`not-executable`, `not-run-shared-git-config`, or `inspection-failed`), `returncode`,
+`not-executable`, `not-run-shared-git-config`, `not-run-hooks-already-configured`, or
+`inspection-failed`), `returncode`,
 `output_tail` (at most 20 lines from the last 4 KiB), and `detail`. A creation finished later by
 `recover` does not run installers; run the script by hand in that case.
 

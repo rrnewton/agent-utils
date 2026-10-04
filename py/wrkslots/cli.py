@@ -20495,8 +20495,8 @@ class SetupHookResult:
     """What happened to one repository's hook installer during 'create'.
 
     ``status`` is one of: ran (exit status 0), failed, timed-out,
-    failed-to-start, not-executable, not-run-shared-git-config, or
-    inspection-failed.
+    failed-to-start, not-executable, not-run-shared-git-config,
+    not-run-hooks-already-configured, or inspection-failed.
     """
 
     path: str
@@ -20529,6 +20529,30 @@ def _setup_hooks_git_dirs(repository: Path) -> tuple[Path, Path]:
     if len(lines) != 2 or not all(lines):
         raise StateError(f"git rev-parse in {repository} printed {completed.stdout!r}")
     return Path(lines[0]).resolve(), Path(lines[1]).resolve()
+
+
+def _setup_hooks_configured_path(repository: Path) -> str | None:
+    """Return ``repository``'s own core.hooksPath, or None when it sets none.
+
+    Only the repository's local configuration counts: a global or system
+    setting says nothing about whether this slot's repository was set up.
+    """
+
+    completed = _GitVcs._run(
+        repository,
+        ["config", "--local", "--get", "core.hooksPath"],
+        check=False,
+        timeout_seconds=_SETUP_HOOKS_GIT_SECONDS,
+        timeout_refusal=f"git config in {repository} did not finish",
+    )
+    if completed.returncode == 1:
+        return None
+    if completed.returncode != 0:
+        raise StateError(
+            f"git config --local --get core.hooksPath in {repository} exited "
+            f"{completed.returncode}: {completed.stderr.strip()}"
+        )
+    return completed.stdout.strip()
 
 
 def _setup_hooks_repositories(checkout: Path) -> list[Path]:
@@ -20696,6 +20720,25 @@ def _run_setup_hook_installers(
                     )
                 )
                 continue
+            # A post-provision hook may already have installed hooks here (for
+            # example a project's own hook dispatcher); the
+            # installer would replace that setting, so it is left alone.
+            try:
+                configured = _setup_hooks_configured_path(repository)
+            except (Refusal, StateError, OSError, ValueError) as exc:
+                results.append(
+                    SetupHookResult(str(repository), "inspection-failed", detail=str(exc))
+                )
+                continue
+            if configured is not None:
+                results.append(
+                    SetupHookResult(
+                        str(repository),
+                        "not-run-hooks-already-configured",
+                        detail=f"core.hooksPath is already {configured}",
+                    )
+                )
+                continue
             results.append(_run_one_setup_hook_installer(repository))
     return checked, results
 
@@ -20710,7 +20753,7 @@ def _print_setup_hook_results(
         if result.status == "ran":
             print(f"hooks: ran {where} (rc 0)", file=stream)
             continue
-        if result.status == "not-run-shared-git-config":
+        if result.status in ("not-run-shared-git-config", "not-run-hooks-already-configured"):
             print(f"hooks: not run: {where}; {result.detail}", file=stream)
             continue
         if result.status == "failed":
@@ -20733,6 +20776,8 @@ def _print_setup_hook_results(
             for line in result.output_tail.splitlines():
                 print(f"hooks: | {line}", file=stream)
     if all(result.status == "not-run-shared-git-config" for result in results):
+        # A repository whose hooks were already configured is not in this set:
+        # its "not run" line says its hooks are in place.
         print(
             f"hooks: skipped; no repository private to this slot has an executable "
             f"{SETUP_HOOKS_SCRIPT} ({checked} checked)",
@@ -48303,7 +48348,8 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "configured URL is recorded. Omit --owner-pid only when that owner will immediately "
             "run adopt. After the slot is registered, create runs scripts/setup-hooks.sh in each "
             "submodule initialized in the new checkouts whose Git configuration is private to "
-            "the slot, from that submodule's root, for at most 60 seconds each; the outcome is "
+            "the slot and sets no core.hooksPath yet, from that submodule's root, for at most "
+            "60 seconds each; the outcome is "
             "printed as 'hooks:' lines (setup_hooks in --format json), and a failing installer "
             "is reported without failing or undoing the creation."
         ),

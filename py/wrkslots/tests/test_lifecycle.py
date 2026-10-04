@@ -27214,6 +27214,43 @@ def test_create_runs_slot_private_submodule_setup_hooks_from_its_root(
     assert f"hooks: ran scripts/setup-hooks.sh in {submodule} (rc 0)" in made.stdout
 
 
+def test_create_leaves_hooks_a_post_provision_hook_already_configured(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    marker = tmp_path / "installer-marker"
+    add_installer_submodule(
+        tmp_path,
+        project,
+        repository,
+        f"#!/bin/sh\ngit config core.hooksPath .githooks\ntouch {shlex.quote(str(marker))}\n",
+    )
+    # A later post-provision hook installs a dispatcher, as a project-level
+    # installer would.
+    update_configuration(
+        project,
+        post_provision_hooks=[
+            _SETUP_HOOKS_SUBMODULE_UPDATE,
+            "git -C hooked config core.hooksPath /composite/dispatcher",
+        ],
+    )
+
+    made = create(project, env={"GIT_CONFIG_GLOBAL": "/dev/null"})
+
+    assert made.returncode == 0, made.stderr
+    submodule = checkout(project) / "hooked"
+    assert not marker.exists()
+    assert (
+        git(submodule, "config", "--get", "core.hooksPath").stdout.strip()
+        == "/composite/dispatcher"
+    )
+    assert (
+        f"hooks: not run: scripts/setup-hooks.sh in {submodule}; "
+        "core.hooksPath is already /composite/dispatcher" in made.stdout
+    )
+    assert "hooks: WARNING" not in made.stdout
+
+
 def test_create_does_not_run_setup_hooks_in_a_checkout_sharing_git_config(
     tmp_path: Path,
 ) -> None:
@@ -27346,7 +27383,7 @@ def test_setup_hooks_output_file_failure_is_a_result_not_a_raise(
     def no_space(*_args: object, **_kwargs: object) -> object:
         raise OSError(errno.ENOSPC, "No space left on device")
 
-    monkeypatch.setattr(wrkslots.tempfile, "TemporaryFile", no_space)
+    monkeypatch.setattr(tempfile, "TemporaryFile", no_space)
 
     result = wrkslots._run_one_setup_hook_installer(repository)
 
