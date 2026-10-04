@@ -9362,7 +9362,9 @@ test("mark read through here targets the newest part without archiving the row",
   assert.equal(rows.length, 1, "the fixture did not produce one combined row");
   const control = upstreamReadButton(rows[0]);
   assert.equal(control.hidden, false, "the advertised provider action stayed hidden");
-  assert.equal(control.textContent, "Mark read through here");
+  // Named for what it changes: the chat service's own marker, for the whole space.
+  assert.equal(control.textContent, "Mark read in Discord · whole space");
+  assert.match(control.getAttribute("title"), /Discord's own read marker for the whole space/);
   // It lives under the row's ⋯ menu, closed until asked for, so it costs the row no width.
   assert.equal(rowMore(rows[0]).hidden, false, "the ⋯ menu holding the action is not offered");
   assert.equal(rowMoreMenu(rows[0]).hidden, true, "the ⋯ menu was open before it was asked for");
@@ -12738,9 +12740,13 @@ test("an error attaches to the next turn_complete, even when it arrives between 
   agentTurn(page, socket, 2, { amplitude: SILENT }); // takes the error's verdict: not counted
   await page.settle();
   assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["error_frame"]);
-  agentTurn(page, socket, 3, { amplitude: SILENT }); // judged again, and the run continues
+  // `vibe-talk-v1`: an error ENDS the session, so the page has hung up and released the
+  // microphone. Anything the old socket still delivers is not judged as part of a live call.
+  assert.equal(page.tracks.every((track) => track.stops > 0), true, "the microphone stayed open");
+  assert.match(page.el("error").textContent, /Tap Talk to start a new call/);
+  agentTurn(page, socket, 3, { amplitude: SILENT });
   await page.settle();
-  assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["error_frame", "silent_turns"]);
+  assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["error_frame"]);
 });
 
 test("a greeting that never comes and then completes silently is logged as both, once each", async () => {

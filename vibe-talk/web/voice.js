@@ -4714,11 +4714,18 @@ function handleVibeTalk(message) {
       upsertSpoken(who, message.turn, said, final);
       break;
     }
-    case "error":
-      showError(message.message || message.detail || "the voice provider reported an error");
+    case "error": {
+      const said = message.message || message.detail || "the voice provider reported an error";
       noteAgentError();
       reportHealth("error_frame");
+      // `vibe-talk-v1`: an error ENDS the session — no `turn_complete` follows. Hanging up here is
+      // what stops the page streaming the microphone into a session the server has already
+      // closed: left open, every audio frame came back as another copy of this error and the
+      // phone kept reporting the microphone in use until the reader found Hang up.
+      if (session.socket && session.protocol === "vibe-talk-v1") stop();
+      showError(`The voice session ended: ${said}. Tap Talk to start a new call.`);
       break;
+    }
     case "turn_complete": {
       // Read before `vibeTalkTurnComplete` clears it: closing the page's own audio segment is not
       // a request for a reply, so an empty answer to it says nothing about the service.
@@ -9389,11 +9396,16 @@ function discordNode(messages) {
   const upstreamRead = document.createElement("button");
   upstreamRead.className = "upstream-read-button";
   upstreamRead.setAttribute("type", "button");
+  // NAMED FOR WHAT IT CHANGES. It moves the chat service's OWN read marker — visible in that
+  // service's app — and only for the whole conversation: Google Chat lets a thread's read state be
+  // read but not set. The owner took it for this app's own read tracking, which is Done.
+  const service = chatProviderName || "the chat service";
   upstreamRead.setAttribute(
     "title",
-    "Move the source chat service's read cursor through this message. Thread behavior depends on the provider."
+    `Move ${service}'s own read marker for the whole space to this message, so ${service} shows ` +
+      "it and everything before it as read. This app's Done is separate."
   );
-  upstreamRead.textContent = "Mark read through here";
+  upstreamRead.textContent = `Mark read in ${service} · whole space`;
   upstreamRead.hidden = !upstreamReadMarkSupported;
   // A combined row stands for every constituent in order. Marking through the NEWEST one includes
   // the complete row; using its first id would leave an invisible tail unread upstream.

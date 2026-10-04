@@ -1191,8 +1191,8 @@ the list whenever `discord.channel_registration` is on, and a bridge without the
 answers the first read with one of those statuses. Every string the bridge returns is drawn as text.
 
 A compatible provider bridge may separately implement `POST /channels/{id}/read` and opt in with
-`discord.upstream_read_marks = true`. The web app then offers **Mark read through here** on each
-message. That action advances the provider's monotone cursor through the selected message; it does
+`discord.upstream_read_marks = true`. The web app then offers **Mark read in** *the service* under each
+message's **⋯** menu, labelled with the scope it moves (the whole space). That action advances the provider's monotone cursor through the selected message; it does
 not write vibe-talk's local read mark and does not archive the message. Thread-level behavior is
 defined by the provider. The bridge may return JSON or an empty successful response such as `204
 No Content`. Direct Discord deployments must leave the setting off.
@@ -2326,7 +2326,8 @@ different route rather than filtering the rows already on screen, so there is on
 direct Discord case: a bot has no ack to send and no read-state field to read. Marking something
 dealt with here does **not** mark it read in the source service, and reading it there does **not**
 clear it here. A deployment whose provider bridge explicitly supports upstream read marks gets a
-separate **Mark read through here** action; it never changes Done/archive state.
+separate **Mark read in** *the service* action, under each message's **⋯** menu; it moves that
+service's own read marker and never changes Done/archive state.
 
 **The store is single-tenant.** Every mark is yours, with no column saying whose. Sharing
 one deployment between two people would silently merge their inboxes; that is not a
