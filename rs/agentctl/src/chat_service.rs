@@ -30,8 +30,9 @@ use crate::agent::{AgentError, AgentRuntime, DrainOptions, QueueMessageState};
 use crate::chat_events::{self, PaneEvent, PaneEventStream, PaneEventWake};
 use crate::chat_runtime::{
     self, AckResult, BridgeConfiguration, BridgeState, ChatRuntimeError, CommandOutboundTransport,
-    CoordinatorDeliveryResult, OutboundCancellation, OutboundFailure, ReplyRoute, ReplyRouteEntry,
-    ReplyStoreOutcome, RootMessageSubmission, RootMessageTransport, SNAPSHOT_LINES,
+    CoordinatorDeliveryResult, DeliveryAlarm, DeliveryEntry, OutboundCancellation, OutboundFailure,
+    ReplyRoute, ReplyRouteEntry, ReplyStoreOutcome, RequestPhase, RootMessageSubmission,
+    RootMessageTransport, SNAPSHOT_LINES,
 };
 use crate::client::HerdrClient;
 use crate::subagents::{ManagedAgents, ManagedApi};
@@ -75,6 +76,11 @@ const REPLY_WAKE_CAPACITY: usize = 64;
 const REPLY_WAKE_PREFIX: &str = "reply:";
 // The longest path a Unix socket address holds on Linux: 108 bytes, less the terminating NUL.
 const MAX_SOCKET_PATH_BYTES: usize = 107;
+// How often `chat run` scans the request records for prompts not typed and tries again to type
+// them, and how often it logs again a request whose prompt it is still trying to type: see
+// `DeliveryTiming`.
+const DELIVERY_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+const DELIVERY_STALL_REPEAT: Duration = Duration::from_secs(600);
 
 /// A service or command failure with its original typed source where available.
 #[derive(Debug)]
@@ -138,6 +144,34 @@ pub struct ServiceOptions {
     pub delivery: DrainOptions,
     /// Period between disk-backed recovery snapshots.
     pub reconciliation_interval: Duration,
+    /// When `chat run` tries again to type prompts and reports them as stalled.
+    pub timing: DeliveryTiming,
+}
+
+/// When `chat run` tries again to type the prompts of requests it has admitted, and when it
+/// reports a request whose prompt has not reached the agent as stalled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeliveryTiming {
+    /// Period between scans of the request records. When a scan falls due while Herdr last
+    /// reported the agent's pane `idle` or `done`, the service tries again to type each prompt the
+    /// scan finds waiting to be typed; a prompt whose delivery is uncertain is never typed again.
+    pub retry_interval: Duration,
+    /// Age after admission at which a request whose prompt is not known to have reached the agent
+    /// is stalled.
+    pub stall_after: Duration,
+    /// Period between log lines about a stalled request whose prompt the service is still trying
+    /// to type.
+    pub stall_repeat: Duration,
+}
+
+impl Default for DeliveryTiming {
+    fn default() -> Self {
+        Self {
+            retry_interval: DELIVERY_RETRY_INTERVAL,
+            stall_after: chat_runtime::DELIVERY_STALL_AFTER,
+            stall_repeat: DELIVERY_STALL_REPEAT,
+        }
+    }
 }
 
 /// Machine-readable work completed during one bounded local pass.
@@ -2158,12 +2192,20 @@ impl<A: ManagedApi + ?Sized> chat_runtime::CoordinatorDelivery for CancellableDe
     }
 
     fn drain(&self, agent_name: &str, options: DrainOptions) -> std::result::Result<(), String> {
+        self.drain_reporting(agent_name, options).map(|_| ())
+    }
+
+    fn drain_reporting(
+        &self,
+        agent_name: &str,
+        options: DrainOptions,
+    ) -> std::result::Result<Option<String>, String> {
         if self.runtime.cancelled() {
             return Err("chat delivery was cancelled before queue drain".to_owned());
         }
         self.manager
             .drain_with_runtime(agent_name, options, &self.runtime)
-            .map(|_| ())
+            .map(|result| result.blocked)
             .map_err(|error| error.to_string())
     }
 
@@ -2206,6 +2248,15 @@ impl chat_runtime::CoordinatorDelivery for TypingWatch<'_> {
     fn drain(&self, agent_name: &str, options: DrainOptions) -> std::result::Result<(), String> {
         self.typed.set(true);
         self.delivery.drain(agent_name, options)
+    }
+
+    fn drain_reporting(
+        &self,
+        agent_name: &str,
+        options: DrainOptions,
+    ) -> std::result::Result<Option<String>, String> {
+        self.typed.set(true);
+        self.delivery.drain_reporting(agent_name, options)
     }
 
     fn screen(&self, agent_name: &str) -> std::result::Result<String, String> {
@@ -3017,6 +3068,8 @@ fn spawn_signal_worker(
 struct TurnEvidence {
     // Herdr last reported the pane as `working`.
     herdr: bool,
+    // Herdr last reported the pane as `idle` or `done`, the only statuses in which a drain types.
+    ready: bool,
     // The last read of the loop's own that could tell showed a running turn, or a later pass
     // asked for a prompt or a notice to be typed, or a later output event's screen showed a
     // running turn.
@@ -3026,6 +3079,7 @@ struct TurnEvidence {
 impl TurnEvidence {
     fn status(&mut self, status: &str) {
         self.herdr = status == "working";
+        self.ready = matches!(status, "idle" | "done");
     }
 
     /// A screen the loop read itself, after every prompt it had asked to be typed.
@@ -3047,6 +3101,10 @@ impl TurnEvidence {
 
     fn working(&self) -> bool {
         self.herdr || self.screen
+    }
+
+    fn ready(&self) -> bool {
+        self.ready
     }
 }
 
@@ -3108,6 +3166,10 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     enqueue_report_backlog(&mut direct_keys, &recovery, overflowed);
     notes.log(&recovery);
     turn.report(&recovery);
+    // The first scan logs the requests already stalled and writes the alarm. It types nothing:
+    // the recovery pass has just tried every prompt waiting to be typed.
+    let mut watch = DeliveryWatch::new(options.timing);
+    watch.scan(state);
     let mut poll_at = next_saturated_poll(&routes, &initial);
     // Consecutive failed reads of the saturated poll, which logs the first and the recovery.
     let mut poll_failures = 0_u64;
@@ -3126,13 +3188,24 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
         take_provider_notices(notices, stop, &mut direct_keys, overflowed)?;
         take_reply_wakes(state, reply_wakes, &mut direct_keys, overflowed);
         let recover = direct_keys.is_empty() && overflowed.swap(false, Ordering::SeqCst);
-        if (recover || !direct_keys.is_empty()) && poll_failures == 0 {
+        // A rescan tries every prompt waiting to be typed, so a due scan retries none of its own
+        // when one runs. Nor does it while Herdr last reported the pane in a status other than
+        // `idle` or `done`: a drain types only in those, so a retry could only fail, at the cost of
+        // a few durable writes, or wait for one when a ready timeout is set. When the pane settles
+        // in one of them, the event Herdr sends starts a rescan.
+        let mut retry = false;
+        if watch.due() {
+            watch.scan(state);
+            retry = !recover && turn.ready() && !watch.retry_keys.is_empty();
+        }
+        if (recover || retry || !direct_keys.is_empty()) && poll_failures == 0 {
             // A rescan may type a prompt, and so may a pass that handles queued request keys,
-            // whether the chat provider reported them or an earlier pass left them for later. The
-            // prompt's echo and the turn it starts can push a reply block of the turn before off
-            // the screen before the pane is read again, and Herdr may not yet have reported that
-            // the turn ended, so each such pass reads the pane first, unless a failed read is
-            // waiting for its retry.
+            // whether the chat provider reported them or an earlier pass left them for later, and
+            // so may a retry of the prompts a scan found waiting to be typed. The prompt's echo
+            // and the turn it starts can push a reply block of the turn before off the screen
+            // before the pane is read again, and Herdr may not yet have reported that the turn
+            // ended, so each such pass reads the pane first, unless a failed read is waiting for
+            // its retry.
             poll_at = Some(Instant::now());
         }
         if poll_at.is_some_and(|at| Instant::now() >= at) {
@@ -3203,6 +3276,37 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
             for key in &report.processed_keys {
                 routes.replace(key, state.next_reply_route(key)?);
             }
+        }
+        if retry {
+            // Each prompt is tried oldest first until one is still waiting: a drain types every
+            // prompt in the queue's inbox in order, so it would stop at the same point for the
+            // rest. After a drain types them all, the passes for the rest find their prompts typed
+            // and only record that.
+            let mut report = CycleReport::default();
+            for key in &watch.retry_keys {
+                if control.stopped() {
+                    break;
+                }
+                let pass = process_keys(
+                    state,
+                    manager,
+                    options.delivery,
+                    std::slice::from_ref(key),
+                    &mut control,
+                )?;
+                let waiting = pass.has_errors() || pass.delivery_pending.contains(key);
+                report.merge(pass);
+                if waiting {
+                    break;
+                }
+            }
+            notes.log(&report);
+            turn.report(&report);
+            for key in &report.processed_keys {
+                routes.replace(key, state.next_reply_route(key)?);
+            }
+            // Log the prompts the retry typed now rather than at the next scan.
+            watch.scan(state);
         }
 
         if Instant::now() >= next_reconciliation {
@@ -3299,7 +3403,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
         if let Some(active) = stream.as_mut() {
             let subscribed_pane = active.pane_id().to_owned();
             let timeout = if direct_keys.is_empty() {
-                [poll_at, lookup_retry_at]
+                [poll_at, lookup_retry_at, Some(watch.next_scan)]
                     .into_iter()
                     .flatten()
                     .fold(next_reconciliation, Instant::min)
@@ -3483,7 +3587,9 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                 }
             }
         } else {
-            let wait_until = next_reconciliation.min(output_retry_at.max(Instant::now()));
+            let wait_until = next_reconciliation
+                .min(output_retry_at.max(Instant::now()))
+                .min(watch.next_scan);
             let wait_until = poll_at.map_or(wait_until, |at| at.min(wait_until));
             let timeout = if direct_keys.is_empty() {
                 wait_until
@@ -3767,6 +3873,226 @@ impl NoteLog {
         self.order.push_back(note.to_owned());
         true
     }
+}
+
+/// What `chat run` does, apart from the passes that type prompts as requests arrive, about
+/// prompts that have not reached the agent. Every `retry_interval` it scans the request records,
+/// logs the stalled requests as [`StallLog`] describes, keeps `delivery-alarm.json` in the state
+/// directory current, and lists the requests whose prompts it should try to type again: those
+/// whose records say pending or submitting.
+struct DeliveryWatch {
+    timing: DeliveryTiming,
+    next_scan: Instant,
+    // The requests the last scan found pending or submitting, oldest admission first.
+    retry_keys: Vec<String>,
+    log: StallLog,
+    // The alarm last written, so the file is written only when the list changes.
+    written: Option<DeliveryAlarm>,
+    // Whether the last scan failed, so only the first failure and the recovery are logged.
+    failing: bool,
+}
+
+impl DeliveryWatch {
+    fn new(timing: DeliveryTiming) -> Self {
+        Self {
+            timing,
+            next_scan: Instant::now(),
+            retry_keys: Vec::new(),
+            log: StallLog::default(),
+            written: None,
+            failing: false,
+        }
+    }
+
+    fn due(&self) -> bool {
+        Instant::now() >= self.next_scan
+    }
+
+    /// Scan the request records now, and set the next scan one `retry_interval` later. A scan
+    /// that cannot read the records lists nothing to retry; one that cannot write the alarm still
+    /// lists what it found. Neither stops the service, and the next scan tries again.
+    fn scan(&mut self, state: &BridgeState) {
+        self.next_scan = Instant::now() + self.timing.retry_interval;
+        self.retry_keys.clear();
+        let entries = match state.delivery_entries() {
+            Ok(entries) => entries,
+            Err(error) => {
+                self.failed(format_args!(
+                    "its request records could not be read: {error}"
+                ));
+                return;
+            }
+        };
+        let now_millis = chat_runtime::unix_millis();
+        for line in self.log.update(&entries, now_millis, &self.timing) {
+            service_log(line);
+        }
+        self.retry_keys = entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.phase,
+                    RequestPhase::Pending | RequestPhase::Submitting
+                )
+            })
+            .map(|entry| entry.key.clone())
+            .collect();
+        let alarm = DeliveryAlarm::new(&entries, now_millis, self.timing.stall_after);
+        if self.written.as_ref() != Some(&alarm) {
+            if let Err(error) = state.write_delivery_alarm(&alarm) {
+                self.failed(format_args!(
+                    "delivery-alarm.json could not be written: {error}"
+                ));
+                return;
+            }
+            self.written = Some(alarm);
+        }
+        if self.failing {
+            service_log("agentctl: the scan for prompts not typed works again");
+            self.failing = false;
+        }
+    }
+
+    fn failed(&mut self, detail: fmt::Arguments<'_>) {
+        if !self.failing {
+            service_log(format_args!(
+                "agentctl: the scan for prompts not typed failed; trying again every {}s: {detail}",
+                self.timing.retry_interval.as_secs()
+            ));
+            self.failing = true;
+        }
+    }
+}
+
+/// The stalled requests `chat run` has logged. A request is logged when a scan first finds it
+/// stalled, as [`DeliveryEntry::stalled`] decides, again every `stall_repeat` while the service
+/// is still trying to type its prompt, when its delivery becomes uncertain or stops being
+/// uncertain, and once more when its prompt is typed, a reply shows that its prompt reached the
+/// agent, or it is no longer retained. A request whose delivery is uncertain is never typed
+/// again, so it is not logged again while it stays stalled; status and `delivery-alarm.json` keep
+/// listing it.
+#[derive(Debug, Default)]
+struct StallLog {
+    logged: BTreeMap<String, LoggedStall>,
+}
+
+#[derive(Debug)]
+struct LoggedStall {
+    // When the last line about the request was logged.
+    at_millis: u64,
+    admitted_at_millis: u64,
+    uncertain: bool,
+}
+
+impl StallLog {
+    /// The lines to log for `entries`, the retained requests at `now_millis`, oldest admission
+    /// first, then those for requests logged before that are no longer retained.
+    fn update(
+        &mut self,
+        entries: &[DeliveryEntry],
+        now_millis: u64,
+        timing: &DeliveryTiming,
+    ) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut retained = BTreeSet::new();
+        for entry in entries {
+            retained.insert(entry.key.as_str());
+            let key = &entry.key;
+            let age = || age_text(now_millis.saturating_sub(entry.admitted_at_millis));
+            let reason = entry.reason.as_deref().unwrap_or("no reason was recorded");
+            let uncertain = entry.phase == RequestPhase::DeliveryUncertain;
+            let phase = chat_runtime::request_phase_name(&entry.phase);
+            let stalled = || {
+                if uncertain {
+                    format!(
+                        "agentctl: chat request {key} is not typed after {} and its delivery is uncertain, so it is not typed again: {reason}",
+                        age()
+                    )
+                } else {
+                    format!(
+                        "agentctl: chat request {key} is not typed after {} ({phase}); trying again every {}s while Herdr reports the agent idle or done: {reason}",
+                        age(),
+                        timing.retry_interval.as_secs()
+                    )
+                }
+            };
+            match self.logged.get_mut(key) {
+                Some(_) if entry.reached_agent() => {
+                    if entry.phase == RequestPhase::Delivered {
+                        let typed_at = entry.delivered_at_millis.unwrap_or(now_millis);
+                        let age = age_text(typed_at.saturating_sub(entry.admitted_at_millis));
+                        lines.push(format!("agentctl: chat request {key} typed after {age}"));
+                    } else {
+                        lines.push(format!(
+                            "agentctl: chat request {key} reached the agent within {}: the agent stored a reply to it",
+                            age()
+                        ));
+                    }
+                    self.logged.remove(key);
+                }
+                Some(logged) if logged.uncertain != uncertain => {
+                    lines.push(stalled());
+                    logged.at_millis = now_millis;
+                    logged.uncertain = uncertain;
+                }
+                Some(logged)
+                    if !uncertain
+                        && Duration::from_millis(now_millis.saturating_sub(logged.at_millis))
+                            >= timing.stall_repeat =>
+                {
+                    lines.push(format!(
+                        "agentctl: chat request {key} is still not typed after {} ({phase}): {reason}",
+                        age()
+                    ));
+                    logged.at_millis = now_millis;
+                }
+                Some(_) => {}
+                None if entry.stalled(now_millis, timing.stall_after) => {
+                    lines.push(stalled());
+                    self.logged.insert(
+                        key.clone(),
+                        LoggedStall {
+                            at_millis: now_millis,
+                            admitted_at_millis: entry.admitted_at_millis,
+                            uncertain,
+                        },
+                    );
+                }
+                None => {}
+            }
+        }
+        let retired = self
+            .logged
+            .keys()
+            .filter(|key| !retained.contains(key.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in retired {
+            if let Some(logged) = self.logged.remove(&key) {
+                let age = age_text(now_millis.saturating_sub(logged.admitted_at_millis));
+                lines.push(format!(
+                    "agentctl: chat request {key} is no longer retained, {age} after admission; no scan saw its prompt reach the agent"
+                ));
+            }
+        }
+        lines
+    }
+}
+
+/// `millis` rounded to the nearest tenth of a minute while that is below 120.0 minutes, else to
+/// the nearest tenth of an hour while that is below 48.0 hours, else to the nearest tenth of a
+/// day.
+fn age_text(millis: u64) -> String {
+    let tenths = millis.saturating_add(3_000) / 6_000;
+    if tenths < 1_200 {
+        return format!("{}.{} min", tenths / 10, tenths % 10);
+    }
+    let tenths = millis.saturating_add(180_000) / 360_000;
+    if tenths < 480 {
+        return format!("{}.{} h", tenths / 10, tenths % 10);
+    }
+    let tenths = millis.saturating_add(4_320_000) / 8_640_000;
+    format!("{}.{} d", tenths / 10, tenths % 10)
 }
 
 /// Name up to `ALREADY_REPORTED_LOG_IDS` already reported reply IDs and count the rest.
@@ -7633,6 +7959,35 @@ esac
         limit: Duration,
         transport: Option<CommandOutboundTransport>,
         wake_root: Option<&Path>,
+        done: impl FnMut(&dyn Fn(ProviderNotice), &dyn Fn()) -> bool + Send,
+    ) {
+        run_owner_loop_timed(
+            fixture,
+            state,
+            herdr,
+            reconciliation_interval,
+            DeliveryTiming::default(),
+            DrainOptions::default(),
+            limit,
+            transport,
+            wake_root,
+            done,
+        );
+    }
+
+    /// `run_owner_loop_with`, with `timing` as the loop's delivery timing and `delivery` as the
+    /// options of the passes that type prompts.
+    #[allow(clippy::too_many_arguments)]
+    fn run_owner_loop_timed(
+        fixture: &crate::subagents::tests::Fixture,
+        state: &BridgeState,
+        herdr: &OwnerLoopHerdr,
+        reconciliation_interval: Duration,
+        timing: DeliveryTiming,
+        delivery: DrainOptions,
+        limit: Duration,
+        transport: Option<CommandOutboundTransport>,
+        wake_root: Option<&Path>,
         mut done: impl FnMut(&dyn Fn(ProviderNotice), &dyn Fn()) -> bool + Send,
     ) {
         let manager = fixture.manager();
@@ -7672,8 +8027,9 @@ esac
                 &herdr.client,
                 &manager,
                 ServiceOptions {
-                    delivery: DrainOptions::default(),
+                    delivery,
                     reconciliation_interval,
+                    timing,
                 },
                 &stop,
                 &cancellation,
@@ -9017,6 +9373,7 @@ esac
                 ServiceOptions {
                     delivery: DrainOptions::default(),
                     reconciliation_interval: Duration::from_secs(1),
+                    timing: DeliveryTiming::default(),
                 },
             )
             .expect("tick");
@@ -9038,6 +9395,7 @@ esac
         ServiceOptions {
             delivery: DrainOptions::default(),
             reconciliation_interval: Duration::from_secs(1),
+            timing: DeliveryTiming::default(),
         }
     }
 
@@ -10057,5 +10415,377 @@ printf '{"version":1,"id":"%s","action":"send","ok":true,"receipt":{"message_id"
                 "[worker] third answer"
             ]
         );
+    }
+
+    /// The options `chat run` gives the passes that type prompts by default: no wait for the agent
+    /// to be ready, up to 5 seconds for a typed prompt to start work, and one attempt.
+    fn chat_run_delivery() -> DrainOptions {
+        DrainOptions {
+            ready_timeout: Duration::ZERO,
+            working_timeout: Duration::from_secs(5),
+            max_attempts: 1,
+        }
+    }
+
+    /// `chat run`'s delivery timing, written out so that a test of the lines it logs does not
+    /// change with the defaults.
+    const TEST_TIMING: DeliveryTiming = DeliveryTiming {
+        retry_interval: Duration::from_secs(10),
+        stall_after: Duration::from_secs(60),
+        stall_repeat: Duration::from_secs(600),
+    };
+
+    fn delivery_entry(key: &str, phase: RequestPhase, admitted_at_millis: u64) -> DeliveryEntry {
+        DeliveryEntry {
+            key: key.to_owned(),
+            phase,
+            admitted_at_millis,
+            delivered_at_millis: None,
+            replies: 0,
+            reason: Some(format!("{key} waits")),
+        }
+    }
+
+    #[test]
+    fn an_age_is_shown_in_tenths_of_the_largest_unit_that_keeps_it_readable() {
+        for (millis, shown) in [
+            (0, "0.0 min"),
+            (2_999, "0.0 min"),
+            (3_000, "0.1 min"),
+            (59_999, "1.0 min"),
+            (90_000, "1.5 min"),
+            (7_196_999, "119.9 min"),
+            (7_197_000, "2.0 h"),
+            (90_000_000, "25.0 h"),
+            (172_619_999, "47.9 h"),
+            (172_620_000, "2.0 d"),
+            (259_200_000, "3.0 d"),
+            (604_800_000, "7.0 d"),
+            (u64::MAX, "213503982334.6 d"),
+        ] {
+            assert_eq!(age_text(millis), shown, "{millis} ms");
+        }
+    }
+
+    #[test]
+    fn herdr_reports_an_agent_ready_for_a_prompt_only_when_idle_or_done() {
+        let mut turn = TurnEvidence::default();
+        assert!(!turn.ready());
+        for (status, ready) in [
+            ("idle", true),
+            ("working", false),
+            ("done", true),
+            ("blocked", false),
+            ("unknown", false),
+            ("", false),
+        ] {
+            turn.status(status);
+            assert_eq!(turn.ready(), ready, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn a_prompt_still_tried_is_logged_when_it_stalls_every_repeat_period_and_when_it_is_typed() {
+        let mut log = StallLog::default();
+        let pending = |phase| vec![delivery_entry("k1", phase, 1_000_000)];
+        assert_eq!(
+            log.update(&pending(RequestPhase::Pending), 1_059_999, &TEST_TIMING),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            log.update(&pending(RequestPhase::Pending), 1_060_000, &TEST_TIMING),
+            ["agentctl: chat request k1 is not typed after 1.0 min (pending); trying again every 10s while Herdr reports the agent idle or done: k1 waits"]
+        );
+        assert_eq!(
+            log.update(&pending(RequestPhase::Submitting), 1_659_999, &TEST_TIMING),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            log.update(&pending(RequestPhase::Submitting), 1_660_000, &TEST_TIMING),
+            ["agentctl: chat request k1 is still not typed after 11.0 min (submitting): k1 waits"]
+        );
+        let mut typed = delivery_entry("k1", RequestPhase::Delivered, 1_000_000);
+        typed.delivered_at_millis = Some(1_690_000);
+        typed.reason = None;
+        // The age is the request's when its prompt was typed, not when the scan saw it typed.
+        assert_eq!(
+            log.update(std::slice::from_ref(&typed), 1_700_000, &TEST_TIMING),
+            ["agentctl: chat request k1 typed after 11.5 min"]
+        );
+        assert_eq!(
+            log.update(std::slice::from_ref(&typed), 1_710_000, &TEST_TIMING),
+            Vec::<String>::new()
+        );
+        assert!(log.logged.is_empty());
+    }
+
+    #[test]
+    fn a_prompt_whose_delivery_is_uncertain_is_logged_when_it_stalls_and_when_a_reply_shows_it_arrived(
+    ) {
+        let mut log = StallLog::default();
+        let mut uncertain = delivery_entry("k2", RequestPhase::DeliveryUncertain, 0);
+        assert_eq!(
+            log.update(std::slice::from_ref(&uncertain), 120_000, &TEST_TIMING),
+            ["agentctl: chat request k2 is not typed after 2.0 min and its delivery is uncertain, so it is not typed again: k2 waits"]
+        );
+        // No retry follows, so nothing is repeated, however long the request waits.
+        assert_eq!(
+            log.update(std::slice::from_ref(&uncertain), 86_520_000, &TEST_TIMING),
+            Vec::<String>::new()
+        );
+        uncertain.replies = 1;
+        assert_eq!(
+            log.update(std::slice::from_ref(&uncertain), 259_200_000, &TEST_TIMING),
+            ["agentctl: chat request k2 reached the agent within 3.0 d: the agent stored a reply to it"]
+        );
+        assert!(log.logged.is_empty());
+
+        // A request whose delivery becomes uncertain, and later stops being uncertain, is logged
+        // at each change.
+        let mut log = StallLog::default();
+        let entry = |phase| vec![delivery_entry("k3", phase, 0)];
+        assert_eq!(
+            log.update(&entry(RequestPhase::Pending), 60_000, &TEST_TIMING),
+            ["agentctl: chat request k3 is not typed after 1.0 min (pending); trying again every 10s while Herdr reports the agent idle or done: k3 waits"]
+        );
+        assert_eq!(
+            log.update(&entry(RequestPhase::DeliveryUncertain), 70_000, &TEST_TIMING),
+            ["agentctl: chat request k3 is not typed after 1.2 min and its delivery is uncertain, so it is not typed again: k3 waits"]
+        );
+        assert_eq!(
+            log.update(
+                &entry(RequestPhase::DeliveryUncertain),
+                670_000,
+                &TEST_TIMING
+            ),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            log.update(&entry(RequestPhase::Pending), 680_000, &TEST_TIMING),
+            ["agentctl: chat request k3 is not typed after 11.3 min (pending); trying again every 10s while Herdr reports the agent idle or done: k3 waits"]
+        );
+    }
+
+    #[test]
+    fn a_stalled_request_that_is_retired_is_logged_once_and_one_typed_in_time_never() {
+        let mut log = StallLog::default();
+        let mut silent = delivery_entry("k5", RequestPhase::Pending, 30_000);
+        silent.reason = None;
+        let mut prompt = delivery_entry("k6", RequestPhase::Delivered, 0);
+        prompt.delivered_at_millis = Some(30_000);
+        let entries = [
+            delivery_entry("k4", RequestPhase::Pending, 0),
+            prompt,
+            silent,
+            delivery_entry("k7", RequestPhase::DeliveryUncertain, 30_000),
+        ];
+        // Lines follow the order of the entries, which is the order of admission.
+        assert_eq!(
+            log.update(&entries, 90_000, &TEST_TIMING),
+            [
+                "agentctl: chat request k4 is not typed after 1.5 min (pending); trying again every 10s while Herdr reports the agent idle or done: k4 waits",
+                "agentctl: chat request k5 is not typed after 1.0 min (pending); trying again every 10s while Herdr reports the agent idle or done: no reason was recorded",
+                "agentctl: chat request k7 is not typed after 1.0 min and its delivery is uncertain, so it is not typed again: k7 waits",
+            ]
+        );
+        assert_eq!(
+            log.update(&entries[1..2], 100_000, &TEST_TIMING),
+            [
+                "agentctl: chat request k4 is no longer retained, 1.7 min after admission; no scan saw its prompt reach the agent",
+                "agentctl: chat request k5 is no longer retained, 1.2 min after admission; no scan saw its prompt reach the agent",
+                "agentctl: chat request k7 is no longer retained, 1.2 min after admission; no scan saw its prompt reach the agent",
+            ]
+        );
+        // k6 was typed before it stalled, so its retirement is not logged either.
+        assert_eq!(log.update(&[], 110_000, &TEST_TIMING), Vec::<String>::new());
+        assert!(log.logged.is_empty());
+    }
+
+    #[test]
+    fn a_scan_lists_the_prompts_to_try_again_even_when_it_cannot_write_the_alarm() {
+        // The first request waits to be typed. The queue reports the second's prompt as possibly
+        // typed already, so its delivery is uncertain and it is not tried again. Every request
+        // is stalled at once.
+        let (state, waiting, root) = state_with_request();
+        thread::sleep(Duration::from_millis(2));
+        let uncertain = admit_more_requests(&state, 1).remove(0);
+        let message_id = state.inspect_request(&uncertain).expect("inspect request")["delivery"]
+            ["message_id"]
+            .as_str()
+            .expect("queue message ID")
+            .to_owned();
+        let delivery = RecordingDelivery::default();
+        delivery
+            .states
+            .lock()
+            .expect("states")
+            .insert(message_id, QueueMessageState::Inflight);
+        let mut transport = None;
+        let report = process_keys_with_delivery(
+            &state,
+            &delivery,
+            DrainOptions::default(),
+            std::slice::from_ref(&uncertain),
+            &mut PassControl {
+                transport: &mut transport,
+                stop: None,
+            },
+        )
+        .expect("pass");
+        assert_eq!(report.delivery_uncertain, std::slice::from_ref(&uncertain));
+        let mut watch = DeliveryWatch::new(DeliveryTiming {
+            retry_interval: Duration::from_secs(3_600),
+            stall_after: Duration::ZERO,
+            stall_repeat: Duration::from_secs(3_600),
+        });
+        let listed = || {
+            let alarm = state.read_delivery_alarm().expect("delivery alarm");
+            assert_eq!(alarm.stall_after_seconds, 0);
+            alarm
+                .stalled
+                .into_iter()
+                .map(|stalled| (stalled.key, stalled.phase))
+                .collect::<Vec<_>>()
+        };
+        assert!(watch.due());
+        watch.scan(&state);
+        assert!(!watch.due());
+        assert!(!watch.failing);
+        assert_eq!(watch.retry_keys, std::slice::from_ref(&waiting));
+        assert_eq!(
+            listed(),
+            [
+                (waiting.clone(), "pending".to_owned()),
+                (uncertain.clone(), "delivery_uncertain".to_owned()),
+            ]
+        );
+
+        // A directory where the alarm belongs makes writing it fail. The scan still lists the
+        // prompts to try again, among them that of a request admitted since.
+        let alarm_path = root.join("delivery-alarm.json");
+        fs::remove_file(&alarm_path).expect("remove the alarm");
+        fs::create_dir(&alarm_path).expect("block the alarm");
+        thread::sleep(Duration::from_millis(2));
+        let third = admitted_worker_message(&state, 3, "three");
+        watch.scan(&state);
+        assert!(watch.failing);
+        assert_eq!(watch.retry_keys, [waiting.clone(), third.clone()]);
+        fs::remove_dir(&alarm_path).expect("unblock the alarm");
+        watch.scan(&state);
+        assert!(!watch.failing);
+        assert_eq!(
+            listed(),
+            [
+                (waiting.clone(), "pending".to_owned()),
+                (uncertain, "delivery_uncertain".to_owned()),
+                (third.clone(), "pending".to_owned()),
+            ]
+        );
+        assert_eq!(watch.retry_keys, [waiting, third]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn the_owner_loop_types_a_prompt_left_waiting_once_herdr_reports_the_agent_ready() {
+        // A request arrives while the agent works, so the pass at startup leaves its prompt
+        // waiting. Herdr reports the agent working and sends no event, not even when the agent
+        // settles, and no reconciliation is due within the hour, so only a retry after one of the
+        // loop's scans of the request records, which fall due every 50 ms here, can type the
+        // prompt. While Herdr reports the agent working, the loop does not retry: for ten scan
+        // periods and more, the request keeps the reason the pass at startup recorded, which a
+        // retry would replace. Once Herdr reports the agent idle, the retry after the next scan
+        // types the prompt, and the scan after the retry takes the request off the alarm.
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        *fixture.client.scroll.lock().expect("scroll") = Some(SCREEN_ONLY);
+        *fixture.client.status.lock().expect("status") = Some("working".to_owned());
+        let (_, state) = worker_bridge_state(&fixture, true);
+        let key = admitted_worker_request(&state);
+        fixture.client.runs.lock().expect("runs").clear();
+        let herdr = owner_loop_herdr(&fixture.root, "herdr", |_| Vec::new());
+        let entry = || {
+            state
+                .delivery_entries()
+                .expect("delivery entries")
+                .into_iter()
+                .find(|entry| entry.key == key)
+                .expect("the request")
+        };
+        let alarmed = || {
+            state
+                .read_delivery_alarm()
+                .is_some_and(|alarm| alarm.stalled.iter().any(|stalled| stalled.key == key))
+        };
+        let lookups = || fixture.client.pane_info_calls.load(AtomicOrdering::SeqCst);
+        let typed = || fixture.client.runs.lock().expect("runs").len();
+        // When the alarm first listed the request, and the number of status lookups by then.
+        let mut listed_at: Option<(Instant, u64)> = None;
+        // The request's reason when the alarm first listed it.
+        let mut listed_reason = None;
+        // The request's reason and the number of prompts typed when Herdr began to report the
+        // agent idle.
+        let mut while_working = None;
+        run_owner_loop_timed(
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_secs(3_600),
+            DeliveryTiming {
+                retry_interval: Duration::from_millis(50),
+                stall_after: Duration::ZERO,
+                stall_repeat: Duration::from_secs(3_600),
+            },
+            chat_run_delivery(),
+            Duration::from_secs(15),
+            None,
+            None,
+            |_, _| {
+                let Some((at, before)) = listed_at else {
+                    if alarmed() {
+                        listed_reason = Some(entry().reason);
+                        listed_at = Some((Instant::now(), lookups()));
+                    }
+                    return false;
+                };
+                if while_working.is_none() {
+                    if at.elapsed() >= Duration::from_millis(500) && lookups() >= before + 5 {
+                        while_working = Some((entry().reason, typed()));
+                        *fixture.client.status.lock().expect("status") = Some("idle".to_owned());
+                    }
+                    return false;
+                }
+                entry().phase == RequestPhase::Delivered && !alarmed()
+            },
+        );
+        let listed_reason = listed_reason
+            .expect("the alarm never listed the request")
+            .expect("the pass at startup recorded no reason");
+        assert!(
+            listed_reason.contains("last status=working"),
+            "{listed_reason}"
+        );
+        let (reason_while_working, typed_while_working) =
+            while_working.expect("the loop never looked the status up five times");
+        assert_eq!(
+            reason_while_working.as_deref(),
+            Some(listed_reason.as_str())
+        );
+        assert_eq!(typed_while_working, 0);
+        let prompts = fixture.client.runs.lock().expect("runs").clone();
+        assert_eq!(prompts.len(), 1, "{prompts:#?}");
+        assert!(
+            prompts[0].contains("_001> at the beginning"),
+            "{}",
+            prompts[0]
+        );
+        let request = entry();
+        assert_eq!(request.phase, RequestPhase::Delivered);
+        assert!(request.delivered_at_millis.is_some());
+        assert_eq!(
+            state.read_delivery_alarm().expect("delivery alarm").stalled,
+            Vec::new()
+        );
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
     }
 }

@@ -132,7 +132,9 @@ SIGINT/SIGTERM interrupt that wait through a local wake descriptor. While the
 agent works and a request is open, `run` also reads the pane itself every 2
 seconds, as described below. A disk-backed terminal and delivery reconciliation
 occurs every 300 seconds by default and can be changed with
-`--reconcile-interval`.
+`--reconcile-interval`. Every 10 seconds `run` also scans the request records
+for prompts left waiting to be typed and tries them again while the agent is
+idle or done, as described under Prompt delivery below.
 
 A provider `Gap` is a terminal continuity warning in protocol v1. Its reason does not
 contain a recoverable range or completeness proof, so the host journals the
@@ -694,8 +696,9 @@ enough, because herdr's status rules can report a Claude Code pane that is
 running a turn as idle. The service looks herdr's status up at each
 reconciliation and after each wait for an output event. Such a wait ends when
 herdr reports a matched line or a change of the agent's status to `working`,
-`idle`, or `done`, when a read, a reconciliation, or the retry of a failed
-lookup is due, or when a provider notice or a signal arrives. While no output
+`idle`, or `done`, when a read, a reconciliation, a scan of the request
+records, or the retry of a failed lookup is due, or when a provider notice or
+a signal arrives. While no output
 subscription works, the herdr status by which the service counts the agent as
 working comes only from the lookup at each reconciliation; the lookups that it
 makes to subscribe, to read the pane, or to type a prompt do not change that
@@ -726,8 +729,9 @@ yet; the reads then go on only if herdr reports the agent as working.
 
 Two more reads are made at once in the same way, whether or not a request is
 open, unless a failed read is waiting for its retry. One comes before each pass
-that handles queued requests, whether new ones from the chat or ones an earlier
-pass left for later, and before the rescan the service makes when new requests
+that handles queued requests, whether new ones from the chat, ones an earlier
+pass left for later, or ones a scan of the request records found waiting to be
+typed, and before the rescan the service makes when new requests
 arrive faster than it can queue them: typing their prompts, and the turn that
 starts, can push a block of the turn before off the screen before herdr reports
 that turn's end. The other comes when herdr reports that the pane settled idle
@@ -1115,6 +1119,92 @@ ledger is explicitly reset. A valid receipt starts its 60-second retention
 window; retrying an expired completed reservation must pass the current budget
 again. A full ledger holds new sends until completed entries expire. This can
 conservatively hold replies after a failed attempt.
+
+## Prompt delivery
+
+A request's prompt reaches the agent through the agent's queue. The pass that
+handles a request puts its prompt in the queue, and the queue types it only
+while herdr reports the agent's pane `idle` or `done`. It refuses while herdr
+reports `blocked`, and for any other status it waits up to `--ready-timeout`,
+which is 0 by default, so that by default a pass does not wait for the agent.
+Nothing is typed either when the pane's composer holds text that nobody
+submitted, since the prompt would join that text, or when the queue cannot be
+read or the read before typing fails. Such a request stays `pending`, or
+`submitting` when the pass could not read what the queue did with its prompt,
+and its record keeps the reason, which `chat inspect` shows in
+`delivery.error`. A request whose prompt the queue may have begun to type is
+`delivery_uncertain` instead, and its prompt is never typed again, because a
+second copy could reach the agent.
+
+Every 10 seconds `run` scans the request records. When a scan falls due while
+the last herdr status that a lookup returned, at a reconciliation or after a
+wait as described above, is `idle` or `done`, the service tries again to type
+the prompts of the requests the scan found `pending` or `submitting`. It tries
+them oldest admission first and stops at the first one that still waits,
+because the queue types its prompts in order, unless the rescan for requests
+that arrive faster than they can be queued runs at the same time and tries them
+all itself. It tries none while that status is another one, since the queue
+types only in `idle` or `done`; when the pane settles idle or done, the
+recovery scan that herdr's event starts tries every prompt still waiting. A
+retry is a pass that handles queued requests, so the pane is read before it as
+described above. The first scan comes when `run` starts, just after the
+recovery scan that tries every waiting prompt, and tries none itself.
+
+A request is stalled once 60 seconds have passed since its admission while its
+prompt is not known to have reached the agent, that is, while the prompt is not
+typed and the agent has stored no reply to the request. A `delivery_uncertain`
+request with a stored reply is therefore not stalled: the agent can store a
+reply only after it reads the prompt.
+
+The service logs a line when a scan first finds a request stalled. The line
+names the request's key and age and the reason its record keeps, or says
+`no reason was recorded`. While the service is still trying to type the prompt,
+the line also names the phase, and the service logs it again every 600 seconds,
+with `is still not typed after`, for as long as the request stays stalled. The
+line for a `delivery_uncertain` request says instead that its prompt is not
+typed again, and the service does not repeat it, though it logs a line again
+whenever a logged request's delivery becomes uncertain or stops being
+uncertain. Once a logged request's prompt is known to have reached the agent,
+one more line says so: `typed after` with the time from admission to typing, or
+`reached the agent within` with the request's age when a reply the agent stored
+shows that the prompt arrived. A logged request that leaves the state directory
+first gets one line with `is no longer retained`. Ages are rounded to a tenth of
+a minute, of an hour, or of a day. A refusal to type over a composer draft
+quotes the start of the draft, which is someone's own words, so these lines,
+`chat status`, and `delivery-alarm.json` show `(text not shown)` in its place;
+`chat inspect` shows the recorded reason as it is.
+
+Each scan also keeps `delivery-alarm.json` in the state directory current. Its
+`schema` is `agentctl-chat-delivery-alarm/v1`, `stall_after_seconds` is the age
+at which a request is stalled, and `stalled` lists the stalled requests, oldest
+admission first, each with its `key`, `phase`, `admitted_at_millis`, and
+`reason`, which is null while no attempt has recorded one. The file holds no
+ages, so `run` writes it at its first scan and afterwards only when the list
+changes: when a request becomes stalled, is typed, reaches the agent, or leaves
+the state directory, or when a stalled request changes its phase or reason.
+Only `run` writes the file, so it does not change while no service runs, and a
+failed write leaves the list written before. When a scan cannot read the
+request records or write the file, the service logs one line saying so, keeps
+running, tries again at each scan, and logs one more line when a scan works
+again. A scan that cannot write the file still tries the prompts it found
+waiting.
+
+`chat status` reports the same list in `delivery_alarm`, as
+`stall_after_seconds` and `stalled`, computed from the request records at the
+time of the call; each of its entries also carries `age_seconds`, the whole
+seconds since admission. Its `deliveries` object counts the retained requests:
+`replied`, those with at least one reply sent; `admitted_not_typed`, the others
+whose prompts are not known to have reached the agent; and
+`typed_not_replied`, the rest, whose prompts are typed or for which the agent
+stored a reply that is not sent. Its `requests` array lists every retained
+request, oldest admission first, with `key`, `phase`, `admitted_at_millis`,
+`ack_completed_at_millis`, `delivered_at_millis`, `first_reply_sent_at_millis`,
+`replies_captured`, `replies_sent`, `replies_closed`, `age_seconds`, and
+`reason`. `first_reply_sent_at_millis` is null while no reply is sent or when
+the first reply's record cannot be read, `replies_closed` says whether the
+request is closed, and `age_seconds` and `reason` are null once the prompt is
+known to have reached the agent. Like the rest of `chat status`, these need no
+running service.
 
 ## Service management
 

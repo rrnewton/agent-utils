@@ -690,6 +690,7 @@ impl ChatOperate {
                 max_attempts: self.max_attempts,
             },
             reconciliation_interval: Duration::from_secs_f64(self.reconcile_interval),
+            timing: crate::chat_service::DeliveryTiming::default(),
         }
     }
 }
