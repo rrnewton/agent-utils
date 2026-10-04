@@ -4,9 +4,12 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::io;
+use std::net::Shutdown;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::path::Path;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixDatagram;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
@@ -28,7 +31,7 @@ use crate::chat_events::{self, PaneEvent, PaneEventStream, PaneEventWake};
 use crate::chat_runtime::{
     self, AckResult, BridgeConfiguration, BridgeState, ChatRuntimeError, CommandOutboundTransport,
     CoordinatorDeliveryResult, OutboundCancellation, OutboundFailure, ReplyRoute, ReplyRouteEntry,
-    RootMessageSubmission, RootMessageTransport, SNAPSHOT_LINES,
+    ReplyStoreOutcome, RootMessageSubmission, RootMessageTransport, SNAPSHOT_LINES,
 };
 use crate::client::HerdrClient;
 use crate::subagents::{ManagedAgents, ManagedApi};
@@ -65,6 +68,13 @@ const ALREADY_REPORTED_LOG_IDS: usize = 8;
 // Hello, while an as-yet-unconnected generation also owns its complete Hello deadline.
 const PROCESS_AND_JOIN_MARGIN_SECONDS: u64 = 7;
 const SYSTEMD_GRACEFUL_STOP_DIAGNOSTIC_DEADLINE: Duration = Duration::from_secs(70);
+// The datagram socket in the state directory on which `chat reply` wakes a running service, the
+// request keys its listener holds for the owner loop, and the text before the key in a datagram.
+const REPLY_WAKE_SOCKET: &str = ".wake.sock";
+const REPLY_WAKE_CAPACITY: usize = 64;
+const REPLY_WAKE_PREFIX: &str = "reply:";
+// The longest path a Unix socket address holds on Linux: 108 bytes, less the terminating NUL.
+const MAX_SOCKET_PATH_BYTES: usize = 107;
 
 /// A service or command failure with its original typed source where available.
 #[derive(Debug)]
@@ -320,6 +330,281 @@ pub fn close(state_root: &Path, key: &str) -> Result<Value, ChatServiceError> {
     Ok(json!({"closed": key}))
 }
 
+/// What `chat reply` did with one reply.
+#[derive(Debug)]
+pub enum ReplyCommandOutcome {
+    /// The request holds the reply, stored now or before; the value is the command's JSON result.
+    Stored(Value),
+    /// Nothing was stored, and the same command can succeed later; the text says why.
+    TryAgain(String),
+}
+
+/// Store one reply for an open request, as [`BridgeState::submit_reply`] describes, and then ask
+/// a `chat run` that serves the same state directory with `--offer-reply-command` to send it at
+/// once. The state is opened without the recovery that `chat run`, `chat tick` and `chat close`
+/// perform when they open it, so this is safe while the service runs. The result's
+/// `service_woken` says whether the wake was sent to a socket of the current user at the state
+/// directory's wake socket path; nothing confirms that a service received it. A service that does
+/// not sends the reply at its next reconciliation, when the agent goes idle, or when it starts.
+pub fn reply(
+    state_root: &Path,
+    key: &str,
+    identifier: &str,
+    body: &str,
+) -> Result<ReplyCommandOutcome, ChatServiceError> {
+    let state = BridgeState::inspect(state_root)?;
+    let stored = match with_termination_deferred(|| state.submit_reply(key, identifier, body))? {
+        ReplyStoreOutcome::Stored(stored) => stored,
+        ReplyStoreOutcome::TryAgain(reason) => return Ok(ReplyCommandOutcome::TryAgain(reason)),
+    };
+    // A reply already sent needs no wake.
+    let service_woken = stored.phase != "sent" && wake_service(state_root, key);
+    Ok(ReplyCommandOutcome::Stored(json!({
+        "request": key,
+        "reply_id": identifier,
+        "outcome": if stored.already_stored { "already_stored" } else { "stored" },
+        "ordinal": stored.ordinal,
+        "phase": stored.phase,
+        "service_woken": service_woken,
+    })))
+}
+
+/// Run `body` with SIGHUP, SIGINT, SIGQUIT and SIGTERM blocked in the calling thread; one that
+/// arrives meanwhile takes effect once `body` returns. A reply is stored by writing the reply and
+/// then its request's count of replies. A command stopped between them would leave a reply that
+/// a running service has not counted, and the service's next capture of another text for that
+/// request would then fail until a restart counts it.
+fn with_termination_deferred<T>(body: impl FnOnce() -> T) -> T {
+    struct Restore(Option<libc::sigset_t>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.as_ref() {
+                // SAFETY: `previous` is the mask pthread_sigmask reported for this thread.
+                unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, previous, std::ptr::null_mut()) };
+            }
+        }
+    }
+    // SAFETY: sigemptyset initializes `blocked` before any other use, and pthread_sigmask only
+    // reads `blocked` and writes `previous`.
+    let restore = unsafe {
+        let mut blocked = std::mem::zeroed::<libc::sigset_t>();
+        let mut previous = std::mem::zeroed::<libc::sigset_t>();
+        libc::sigemptyset(&mut blocked);
+        for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
+            libc::sigaddset(&mut blocked, signal);
+        }
+        let blocked = libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut previous) == 0;
+        Restore(blocked.then_some(previous))
+    };
+    let result = body();
+    drop(restore);
+    result
+}
+
+/// Send `key` to the wake socket of a service running on the state directory `root`, at the path
+/// that `reply_wake_socket` gives, without waiting. Whether the datagram was sent: not when that
+/// path is too long, when no service listens there, when the path is not a socket that the
+/// current user owns, or when the socket's queue is full.
+fn wake_service(root: &Path, key: &str) -> bool {
+    let Ok(path) = reply_wake_socket(root) else {
+        return false;
+    };
+    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+        return false;
+    };
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    if !metadata.file_type().is_socket() || metadata.uid() != unsafe { libc::geteuid() } {
+        return false;
+    }
+    let Ok(socket) = UnixDatagram::unbound() else {
+        return false;
+    };
+    socket.set_nonblocking(true).is_ok()
+        && socket
+            .send_to(format!("{REPLY_WAKE_PREFIX}{key}").as_bytes(), &path)
+            .is_ok()
+}
+
+/// The wake socket of the state directory `root`, by the absolute path that a prompt's
+/// `chat reply` command names the directory with, so the command can reach any socket a service
+/// binds. Refused when that path is longer than a socket address holds: a directory whose
+/// absolute path is longer than 96 bytes, not counting a trailing slash.
+fn reply_wake_socket(root: &Path) -> io::Result<PathBuf> {
+    let path = std::path::absolute(root)?.join(REPLY_WAKE_SOCKET);
+    if path.as_os_str().len() > MAX_SOCKET_PATH_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "the socket's absolute path {} is longer than the {MAX_SOCKET_PATH_BYTES} bytes a socket address holds",
+                path.display()
+            ),
+        ));
+    }
+    Ok(path)
+}
+
+/// The request key that one wake datagram names, when it is well formed.
+fn reply_wake_key(datagram: &[u8]) -> Option<String> {
+    let key = std::str::from_utf8(datagram.strip_prefix(REPLY_WAKE_PREFIX.as_bytes())?).ok()?;
+    chat_runtime::valid_key(key).then(|| key.to_owned())
+}
+
+/// The wake socket of a `chat run` with `--offer-reply-command`. Its thread receives the request
+/// keys that `chat reply` sends after it stores a reply, hands each to the owner loop, and ends
+/// the loop's wait, so the loop sends the reply at once instead of at its next reconciliation.
+struct ReplyWakeListener {
+    worker: ServiceWorker,
+    // A second handle on the thread's socket, so `stop` can end a receive that is waiting.
+    socket: UnixDatagram,
+    stopping: Arc<AtomicBool>,
+    path: PathBuf,
+    // The device and inode of the socket file this listener bound, so it removes only that file.
+    identity: (u64, u64),
+}
+
+impl ReplyWakeListener {
+    /// Bind the wake socket of the state directory `root`, at the path that `reply_wake_socket`
+    /// gives, and start its thread. The runner lease makes this the only service on that
+    /// directory, so a socket of the current user already there was left by an earlier run and is
+    /// replaced; anything else at the path is left alone. A failure is logged and leaves the
+    /// service without a listener, as without the option.
+    fn start(
+        root: &Path,
+        wakes: mpsc::SyncSender<String>,
+        output_wake: SharedWake,
+        overflowed: Arc<AtomicBool>,
+    ) -> Option<Self> {
+        match reply_wake_socket(root)
+            .and_then(|path| Self::bind(path, wakes, output_wake, overflowed))
+        {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                service_log(format_args!(
+                    "agentctl: chat reply wake socket {}: {error}; replies that chat reply stores are sent at the next reconciliation or when the agent goes idle",
+                    root.join(REPLY_WAKE_SOCKET).display()
+                ));
+                None
+            }
+        }
+    }
+
+    fn bind(
+        path: PathBuf,
+        wakes: mpsc::SyncSender<String>,
+        output_wake: SharedWake,
+        overflowed: Arc<AtomicBool>,
+    ) -> io::Result<Self> {
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                // SAFETY: geteuid takes no arguments and cannot fail.
+                if !metadata.file_type().is_socket() || metadata.uid() != unsafe { libc::geteuid() }
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "the path holds something other than a socket of this user",
+                    ));
+                }
+                std::fs::remove_file(&path)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let socket = UnixDatagram::bind(&path)?;
+        let metadata = match std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .and_then(|()| std::fs::symlink_metadata(&path))
+        {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                // Bound a moment ago, so the file is this socket's.
+                let _ = std::fs::remove_file(&path);
+                return Err(error);
+            }
+        };
+        let identity = (metadata.dev(), metadata.ino());
+        let stopping = Arc::new(AtomicBool::new(false));
+        let (done_sender, done) = mpsc::sync_channel(1);
+        let spawned = socket.try_clone().and_then(|receiver| {
+            let stopping = Arc::clone(&stopping);
+            thread::Builder::new()
+                .name("agentctl-chat-reply-wake".to_owned())
+                .spawn(move || {
+                    receive_reply_wakes(&receiver, &stopping, &wakes, &output_wake, &overflowed);
+                    let _ = done_sender.send(());
+                })
+        });
+        match spawned {
+            Ok(handle) => Ok(Self {
+                worker: ServiceWorker { handle, done },
+                socket,
+                stopping,
+                path,
+                identity,
+            }),
+            Err(error) => {
+                remove_reply_wake_socket(&path, identity);
+                Err(error)
+            }
+        }
+    }
+
+    /// End the thread by `deadline` and remove the socket file, unless another file has taken
+    /// its place. A command that sends after this finds no listener.
+    fn stop(self, deadline: Instant) -> Result<(), ChatServiceError> {
+        self.stopping.store(true, Ordering::SeqCst);
+        // Ends a receive that is waiting, and makes a later one return at once.
+        let _ = self.socket.shutdown(Shutdown::Read);
+        let joined = join_worker_until(self.worker, "chat reply wake", deadline);
+        remove_reply_wake_socket(&self.path, self.identity);
+        joined
+    }
+}
+
+/// The wake socket's thread: hand each well-formed request key to the owner loop and end its
+/// wait, until `stopping` is set. A queue that is full asks the loop for a recovery pass instead,
+/// which finds every request with a reply to send.
+fn receive_reply_wakes(
+    socket: &UnixDatagram,
+    stopping: &AtomicBool,
+    wakes: &mpsc::SyncSender<String>,
+    output_wake: &SharedWake,
+    overflowed: &AtomicBool,
+) {
+    // A well-formed datagram is 70 bytes, so one cut to this length is refused.
+    let mut buffer = [0_u8; 128];
+    while !stopping.load(Ordering::SeqCst) {
+        match socket.recv(&mut buffer) {
+            Ok(length) => {
+                let Some(key) = reply_wake_key(&buffer[..length]) else {
+                    continue;
+                };
+                match wakes.try_send(key) {
+                    Ok(()) => {}
+                    Err(mpsc::TrySendError::Full(_)) => overflowed.store(true, Ordering::SeqCst),
+                    Err(mpsc::TrySendError::Disconnected(_)) => break,
+                }
+                wake_output(output_wake);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                service_log(format_args!(
+                    "agentctl: chat reply wake socket stopped receiving: {error}; replies that chat reply stores are sent at the next reconciliation or when the agent goes idle"
+                ));
+                break;
+            }
+        }
+    }
+}
+
+/// Remove the wake socket file at `path` while it is still the file with `identity`. A file left
+/// behind is replaced at the next start, and a command that sends to it finds no listener.
+fn remove_reply_wake_socket(path: &Path, identity: (u64, u64)) {
+    if std::fs::symlink_metadata(path)
+        .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == identity)
+    {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Signal one systemd-supplied main process through an inode-bound pidfd and wait for exact exit.
 ///
 /// The 70-second internal deadline is diagnostic. On expiry this helper deliberately remains in
@@ -494,7 +779,42 @@ pub fn run_with_ignored_text_prefixes<A: ManagedApi + ?Sized>(
     options: ServiceOptions,
     ignored_text_prefixes: Vec<String>,
 ) -> Result<Value, ChatServiceError> {
-    let state = BridgeState::open(state_root)?.with_ignored_text_prefixes(ignored_text_prefixes)?;
+    run_with_settings(
+        state_root,
+        client,
+        manager,
+        options,
+        RunSettings {
+            ignored_text_prefixes,
+            ..RunSettings::default()
+        },
+    )
+}
+
+/// Settings that apply to one `chat run` process only; the saved configuration remains
+/// unchanged.
+#[derive(Clone, Debug, Default)]
+pub struct RunSettings {
+    /// Admission exclusions: owner messages whose text starts with one of these are not admitted.
+    pub ignored_text_prefixes: Vec<String>,
+    /// Name `agentctl chat reply` in each request prompt that gives the two reply marker lines,
+    /// as [`BridgeState::with_reply_command_offered`] describes, and listen on the state
+    /// directory's wake socket so a reply that command stores is sent at once.
+    pub offer_reply_command: bool,
+}
+
+/// Run with process-local settings; the saved configuration remains unchanged.
+pub fn run_with_settings<A: ManagedApi + ?Sized>(
+    state_root: &Path,
+    client: &HerdrClient,
+    manager: &ManagedAgents<'_, A>,
+    options: ServiceOptions,
+    settings: RunSettings,
+) -> Result<Value, ChatServiceError> {
+    let offer_reply_command = settings.offer_reply_command;
+    let state = BridgeState::open(state_root)?
+        .with_ignored_text_prefixes(settings.ignored_text_prefixes)?
+        .with_reply_command_offered(offer_reply_command);
     let _resume_request = state.subscribe_request()?;
     validate_service_outbound(state.config())?;
     let outbound_cancellation = OutboundCancellation::new()?;
@@ -600,6 +920,18 @@ pub fn run_with_ignored_text_prefixes<A: ManagedApi + ?Sized>(
             return Err(error);
         }
     };
+    let (reply_wake_sender, reply_wakes) = mpsc::sync_channel(REPLY_WAKE_CAPACITY);
+    // Bound before the owner loop's first recovery pass, which sends any reply stored earlier.
+    let reply_wake = if offer_reply_command {
+        ReplyWakeListener::start(
+            state_root,
+            reply_wake_sender,
+            Arc::clone(&output_wake),
+            Arc::clone(&overflowed),
+        )
+    } else {
+        None
+    };
 
     let result = run_owner_loop(
         &state,
@@ -611,6 +943,7 @@ pub fn run_with_ignored_text_prefixes<A: ManagedApi + ?Sized>(
         &output_wake,
         &overflowed,
         &notice_receiver,
+        &reply_wakes,
         &mut outbound,
     );
 
@@ -637,6 +970,11 @@ pub fn run_with_ignored_text_prefixes<A: ManagedApi + ?Sized>(
     }
     if let Some(worker) = ack_worker {
         if let Err(error) = join_ack_worker_until(worker, &ack_cancellation, shutdown_deadline) {
+            stop.record_cleanup_error(error.to_string());
+        }
+    }
+    if let Some(listener) = reply_wake {
+        if let Err(error) = listener.stop(shutdown_deadline) {
             stop.record_cleanup_error(error.to_string());
         }
     }
@@ -2723,6 +3061,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     output_wake: &SharedWake,
     overflowed: &AtomicBool,
     notices: &mpsc::Receiver<ProviderNotice>,
+    reply_wakes: &mpsc::Receiver<String>,
     transport: &mut Option<CommandOutboundTransport>,
 ) -> Result<(), ChatServiceError> {
     let owner_runtime = StopRuntime::new(stop);
@@ -2785,6 +3124,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     let mut next_reconciliation = Instant::now() + options.reconciliation_interval;
     while !stop.is_stopped() {
         take_provider_notices(notices, stop, &mut direct_keys, overflowed)?;
+        take_reply_wakes(state, reply_wakes, &mut direct_keys, overflowed);
         let recover = direct_keys.is_empty() && overflowed.swap(false, Ordering::SeqCst);
         if (recover || !direct_keys.is_empty()) && poll_failures == 0 {
             // A rescan may type a prompt, and so may a pass that handles queued request keys,
@@ -3239,6 +3579,29 @@ fn take_provider_notices(
         }
     }
     Ok(())
+}
+
+/// Move up to `REPLY_WAKE_CAPACITY` request keys that `chat reply` sent into `direct_keys`,
+/// keeping only those of requests that hold a reply not sent yet, so a wake can only bring forward
+/// a send that a recovery pass would make. A closed channel means no wake socket listens.
+fn take_reply_wakes(
+    state: &BridgeState,
+    wakes: &mpsc::Receiver<String>,
+    direct_keys: &mut DirectKeyQueue,
+    overflowed: &AtomicBool,
+) {
+    let mut keys = Vec::new();
+    for _ in 0..REPLY_WAKE_CAPACITY {
+        let Ok(key) = wakes.try_recv() else {
+            break;
+        };
+        if state.has_unsent_reply(&key) {
+            keys.push(key);
+        }
+    }
+    if !keys.is_empty() {
+        enqueue_direct_keys(direct_keys, keys, overflowed);
+    }
 }
 
 fn enqueue_direct_keys(queued: &mut DirectKeyQueue, keys: Vec<String>, overflowed: &AtomicBool) {
@@ -7244,15 +7607,51 @@ esac
         herdr: &OwnerLoopHerdr,
         reconciliation_interval: Duration,
         limit: Duration,
+        done: impl FnMut(&dyn Fn(ProviderNotice), &dyn Fn()) -> bool + Send,
+    ) {
+        run_owner_loop_with(
+            fixture,
+            state,
+            herdr,
+            reconciliation_interval,
+            limit,
+            None,
+            None,
+            done,
+        );
+    }
+
+    /// `run_owner_loop_notified`, with `transport` as the loop's outbound transport, and with the
+    /// wake socket that `chat run --offer-reply-command` binds listening in `wake_root`, when
+    /// that is given, from before the loop starts until after it ends.
+    #[allow(clippy::too_many_arguments)]
+    fn run_owner_loop_with(
+        fixture: &crate::subagents::tests::Fixture,
+        state: &BridgeState,
+        herdr: &OwnerLoopHerdr,
+        reconciliation_interval: Duration,
+        limit: Duration,
+        transport: Option<CommandOutboundTransport>,
+        wake_root: Option<&Path>,
         mut done: impl FnMut(&dyn Fn(ProviderNotice), &dyn Fn()) -> bool + Send,
     ) {
         let manager = fixture.manager();
         let stop = StopState::default();
         let cancellation: SharedCancellation = Arc::default();
         let output_wake: SharedWake = Arc::default();
-        let overflowed = AtomicBool::new(false);
+        let overflowed = Arc::new(AtomicBool::new(false));
         let (notices, notice_receiver) = mpsc::sync_channel(PROVIDER_NOTICE_CAPACITY);
-        let mut transport = None;
+        let (reply_wake_sender, reply_wakes) = mpsc::sync_channel(REPLY_WAKE_CAPACITY);
+        let listener = wake_root.map(|root| {
+            ReplyWakeListener::bind(
+                root.join(REPLY_WAKE_SOCKET),
+                reply_wake_sender,
+                Arc::clone(&output_wake),
+                Arc::clone(&overflowed),
+            )
+            .expect("listen for reply wakes")
+        });
+        let mut transport = transport;
         thread::scope(|scope| {
             scope.spawn(|| {
                 let notify = |notice| send_notice(&notices, notice, &output_wake, &overflowed);
@@ -7281,6 +7680,7 @@ esac
                 &output_wake,
                 &overflowed,
                 &notice_receiver,
+                &reply_wakes,
                 &mut transport,
             );
             // The loop ends at its next check of the stop, or with a cancelled Herdr call when
@@ -7292,6 +7692,11 @@ esac
                 );
             }
         });
+        if let Some(listener) = listener {
+            listener
+                .stop(Instant::now() + Duration::from_secs(5))
+                .expect("stop the reply wake listener");
+        }
     }
 
     #[test]
@@ -8980,5 +9385,677 @@ request. No open chat request has been sent to you."]
                 .is_empty()
         );
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// A new private directory for a reply wake socket.
+    fn wake_root() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "agentctl-chat-wake-{}-{}",
+            std::process::id(),
+            NEXT_STATE.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        fs::create_dir(&root).expect("create wake root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("private wake root");
+        root
+    }
+
+    /// A reply wake listener on the wake socket in `root`, which hands keys to a channel that
+    /// holds `capacity` of them, with the receiving end of that channel and the flag the listener
+    /// sets when the channel is full.
+    fn reply_wake_listener(
+        root: &Path,
+        capacity: usize,
+    ) -> (ReplyWakeListener, mpsc::Receiver<String>, Arc<AtomicBool>) {
+        let (sender, wakes) = mpsc::sync_channel(capacity);
+        let overflowed = Arc::new(AtomicBool::new(false));
+        let listener = ReplyWakeListener::bind(
+            root.join(REPLY_WAKE_SOCKET),
+            sender,
+            Arc::default(),
+            Arc::clone(&overflowed),
+        )
+        .expect("bind the reply wake socket");
+        (listener, wakes, overflowed)
+    }
+
+    /// The error of a reply wake listener that cannot bind the wake socket in `root`.
+    fn reply_wake_bind_error(root: &Path) -> io::Error {
+        let (sender, _wakes) = mpsc::sync_channel(1);
+        match ReplyWakeListener::bind(
+            root.join(REPLY_WAKE_SOCKET),
+            sender,
+            Arc::default(),
+            Arc::new(AtomicBool::new(false)),
+        ) {
+            Ok(listener) => {
+                let _ = listener.stop(Instant::now() + Duration::from_secs(5));
+                panic!("bound the reply wake socket in place of another file");
+            }
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn a_reply_wake_names_exactly_one_request_key() {
+        let key = "0123456789abcdef".repeat(4);
+        assert_eq!(
+            reply_wake_key(format!("reply:{key}").as_bytes()),
+            Some(key.clone())
+        );
+        for datagram in [
+            b"reply:".to_vec(),
+            key.clone().into_bytes(),
+            format!("wake:{key}").into_bytes(),
+            format!(" reply:{key}").into_bytes(),
+            format!("reply:{}", key.to_uppercase()).into_bytes(),
+            format!("reply:{key}\n").into_bytes(),
+            format!("reply:{key}0").into_bytes(),
+            format!("reply:{}", &key[1..]).into_bytes(),
+            [b"reply:".as_slice(), [0xff_u8; 64].as_slice()].concat(),
+        ] {
+            assert_eq!(reply_wake_key(&datagram), None, "{datagram:?}");
+        }
+    }
+
+    #[test]
+    fn the_reply_wake_socket_hands_each_well_formed_key_to_the_loop_until_it_stops() {
+        let root = wake_root();
+        let path = root.join(REPLY_WAKE_SOCKET);
+        let (listener, wakes, overflowed) = reply_wake_listener(&root, REPLY_WAKE_CAPACITY);
+        let metadata = fs::symlink_metadata(&path).expect("socket metadata");
+        assert!(metadata.file_type().is_socket());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let key = "0123456789abcdef".repeat(4);
+        let sender = UnixDatagram::unbound().expect("unbound socket");
+        for datagram in [b"reply:".as_slice(), b"garbage".as_slice(), key.as_bytes()] {
+            sender
+                .send_to(datagram, &path)
+                .expect("send a malformed wake");
+        }
+        assert!(wake_service(&root, &key));
+        // The socket keeps its datagrams in order, so the listener read and dropped the
+        // malformed ones before this one.
+        assert_eq!(wakes.recv_timeout(Duration::from_secs(5)), Ok(key.clone()));
+        assert_eq!(wakes.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert!(!overflowed.load(AtomicOrdering::SeqCst));
+        listener
+            .stop(Instant::now() + Duration::from_secs(5))
+            .expect("stop the listener");
+        assert!(
+            fs::symlink_metadata(&path).is_err(),
+            "the socket file remains"
+        );
+        assert!(!wake_service(&root, &key));
+        // The thread has ended and dropped its end of the channel.
+        assert_eq!(wakes.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_reply_wake_that_finds_the_loops_queue_full_asks_for_a_recovery_pass() {
+        let root = wake_root();
+        let (listener, wakes, overflowed) = reply_wake_listener(&root, 1);
+        let first = "0".repeat(64);
+        assert!(wake_service(&root, &first));
+        assert!(wake_service(&root, &"1".repeat(64)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !overflowed.load(AtomicOrdering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(overflowed.load(AtomicOrdering::SeqCst));
+        assert_eq!(wakes.try_recv(), Ok(first));
+        assert_eq!(wakes.try_recv(), Err(mpsc::TryRecvError::Empty));
+        listener
+            .stop(Instant::now() + Duration::from_secs(5))
+            .expect("stop the listener");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn the_reply_wake_socket_replaces_only_a_socket_that_an_earlier_run_left() {
+        let root = wake_root();
+        let path = root.join(REPLY_WAKE_SOCKET);
+        let key = "0123456789abcdef".repeat(4);
+        // A regular file is left alone, and no wake is sent to it.
+        fs::write(&path, "not a socket").expect("write a regular file");
+        assert_eq!(
+            reply_wake_bind_error(&root).kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("regular file"),
+            "not a socket"
+        );
+        assert!(!wake_service(&root, &key));
+        fs::remove_file(&path).expect("remove the regular file");
+
+        // So is a link, even to a socket that receives.
+        let elsewhere = root.join("elsewhere.sock");
+        let target = UnixDatagram::bind(&elsewhere).expect("bind another socket");
+        target.set_nonblocking(true).expect("nonblocking socket");
+        std::os::unix::fs::symlink(&elsewhere, &path).expect("link to the other socket");
+        assert_eq!(
+            reply_wake_bind_error(&root).kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read_link(&path).expect("link"), elsewhere);
+        assert!(!wake_service(&root, &key));
+        let mut buffer = [0_u8; 128];
+        assert_eq!(
+            target.recv(&mut buffer).map_err(|error| error.kind()),
+            Err(io::ErrorKind::WouldBlock)
+        );
+        fs::remove_file(&path).expect("remove the link");
+
+        // A socket file of this user that no listener holds is replaced, and the new socket
+        // receives.
+        drop(UnixDatagram::bind(&path).expect("bind a socket and leave its file"));
+        let (listener, wakes, _) = reply_wake_listener(&root, 1);
+        assert!(wake_service(&root, &key));
+        assert_eq!(wakes.recv_timeout(Duration::from_secs(5)), Ok(key));
+        // A file that took the socket's place by the time the listener stops is kept.
+        fs::remove_file(&path).expect("remove the socket file");
+        fs::write(&path, "replacement").expect("write a replacement");
+        listener
+            .stop(Instant::now() + Duration::from_secs(5))
+            .expect("stop the listener");
+        assert_eq!(
+            fs::read_to_string(&path).expect("replacement"),
+            "replacement"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn the_service_listens_for_reply_wakes_only_in_a_state_directory_of_at_most_96_bytes() {
+        // A socket address holds at most 107 bytes of path, and the socket's name takes 11 of
+        // them.
+        let root = wake_root();
+        let directory = |length: usize| {
+            let name = length
+                .checked_sub(root.as_os_str().len() + 1)
+                .filter(|name| *name > 0)
+                .expect("a temporary directory path shorter than 95 bytes");
+            let directory = root.join("d".repeat(name));
+            fs::create_dir(&directory).expect("create state directory");
+            assert_eq!(directory.as_os_str().len(), length);
+            directory
+        };
+        let (fits, too_long) = (directory(96), directory(97));
+        let key = "0123456789abcdef".repeat(4);
+        let (sender, wakes) = mpsc::sync_channel(1);
+        let overflowed = Arc::new(AtomicBool::new(false));
+        assert!(ReplyWakeListener::start(
+            &too_long,
+            sender.clone(),
+            Arc::default(),
+            Arc::clone(&overflowed)
+        )
+        .is_none());
+        assert!(!wake_service(&too_long, &key));
+        let listener = ReplyWakeListener::start(&fits, sender, Arc::default(), overflowed)
+            .expect("listen in a directory of 96 bytes");
+        assert!(wake_service(&fits, &key));
+        assert_eq!(wakes.recv_timeout(Duration::from_secs(5)), Ok(key));
+        listener
+            .stop(Instant::now() + Duration::from_secs(5))
+            .expect("stop the listener");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn the_wake_socket_is_named_by_the_absolute_path_that_a_prompt_prints() {
+        // The bytes a directory's absolute path may take: a socket address holds 107, and the
+        // separator and the socket's name take 11 of them.
+        let room = MAX_SOCKET_PATH_BYTES - 1 - REPLY_WAKE_SOCKET.len();
+        assert_eq!(room, 96);
+        // A relative name is measured by the absolute path it names, so one whose absolute path
+        // is too long is refused however short it is.
+        let cwd = std::env::current_dir().expect("working directory");
+        let fits = (room - 1)
+            .checked_sub(cwd.as_os_str().len())
+            .filter(|name| *name > 0)
+            .expect("a working directory shorter than 95 bytes");
+        let named = reply_wake_socket(Path::new(&"d".repeat(fits))).expect("a name that fits");
+        let absolute = cwd.join("d".repeat(fits)).join(REPLY_WAKE_SOCKET);
+        assert_eq!(named.as_os_str(), absolute.as_os_str());
+        assert_eq!(named.as_os_str().len(), MAX_SOCKET_PATH_BYTES);
+        let longer = PathBuf::from("d".repeat(fits + 1));
+        assert!(longer.join(REPLY_WAKE_SOCKET).as_os_str().len() < MAX_SOCKET_PATH_BYTES);
+        assert_eq!(
+            reply_wake_socket(&longer)
+                .expect_err("a name whose absolute path is too long")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        // Every spelling of a directory of 96 bytes names the same socket of 107 bytes, though
+        // two of them are longer than 96 bytes as written.
+        let root = wake_root();
+        let name = room
+            .checked_sub(root.as_os_str().len() + 1)
+            .filter(|name| *name > 0)
+            .expect("a temporary directory path shorter than 95 bytes");
+        let directory = root.join("d".repeat(name));
+        fs::create_dir(&directory).expect("create state directory");
+        assert_eq!(directory.as_os_str().len(), room);
+        let spelled = |suffix: &str| {
+            let mut path = directory.clone().into_os_string();
+            path.push(suffix);
+            PathBuf::from(path)
+        };
+        let socket = directory.join(REPLY_WAKE_SOCKET);
+        for spelling in [spelled(""), spelled("/"), spelled("/./.")] {
+            let named = reply_wake_socket(&spelling).expect("a directory of 96 bytes");
+            assert_eq!(
+                named.as_os_str(),
+                socket.as_os_str(),
+                "{}",
+                spelling.display()
+            );
+        }
+        // A service started with the longest spelling listens where a command that names the
+        // directory plainly sends its wake, and a command may use that spelling too.
+        let key = "0123456789abcdef".repeat(4);
+        let (sender, wakes) = mpsc::sync_channel(2);
+        let listener = ReplyWakeListener::start(
+            &spelled("/./."),
+            sender,
+            Arc::default(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("listen in a directory of 96 bytes");
+        assert!(wake_service(&directory, &key));
+        assert_eq!(wakes.recv_timeout(Duration::from_secs(5)), Ok(key.clone()));
+        assert!(wake_service(&spelled("/./."), &key));
+        assert_eq!(wakes.recv_timeout(Duration::from_secs(5)), Ok(key));
+        listener
+            .stop(Instant::now() + Duration::from_secs(5))
+            .expect("stop the listener");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// The calling thread's signal mask.
+    fn blocked_signals() -> libc::sigset_t {
+        // SAFETY: with no new set, pthread_sigmask only writes the thread's mask to `current`.
+        unsafe {
+            let mut current = std::mem::zeroed::<libc::sigset_t>();
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut current),
+                0
+            );
+            current
+        }
+    }
+
+    /// Change the calling thread's mask for `signals` as `how` says.
+    fn mask_signals(how: libc::c_int, signals: &[libc::c_int]) {
+        // SAFETY: sigemptyset initializes `set` before any other use, and pthread_sigmask only
+        // reads it.
+        unsafe {
+            let mut set = std::mem::zeroed::<libc::sigset_t>();
+            libc::sigemptyset(&mut set);
+            for signal in signals {
+                libc::sigaddset(&mut set, *signal);
+            }
+            assert_eq!(libc::pthread_sigmask(how, &set, std::ptr::null_mut()), 0);
+        }
+    }
+
+    /// The members of `signals` that `mask` blocks, in the order of `signals`.
+    fn blocked_among(mask: &libc::sigset_t, signals: &[libc::c_int]) -> Vec<libc::c_int> {
+        signals
+            .iter()
+            .copied()
+            // SAFETY: `mask` is an initialized signal set.
+            .filter(|signal| unsafe { libc::sigismember(mask, *signal) } == 1)
+            .collect()
+    }
+
+    #[test]
+    fn deferring_termination_blocks_four_signals_and_restores_the_mask() {
+        use libc::{SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2};
+        let signals = [SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2];
+        // A thread of its own, so its signal mask is this test's to set.
+        thread::spawn(move || {
+            mask_signals(
+                libc::SIG_UNBLOCK,
+                &[SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1],
+            );
+            mask_signals(libc::SIG_BLOCK, &[SIGUSR2]);
+            let inside = with_termination_deferred(blocked_signals);
+            assert_eq!(
+                blocked_among(&inside, &signals),
+                [SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR2]
+            );
+            // The mask the thread had before, not merely one without the four.
+            assert_eq!(blocked_among(&blocked_signals(), &signals), [SIGUSR2]);
+            let unwound = std::panic::catch_unwind(|| {
+                with_termination_deferred::<()>(|| {
+                    panic!("a store that panics, as this test expects")
+                })
+            });
+            assert!(unwound.is_err());
+            assert_eq!(blocked_among(&blocked_signals(), &signals), [SIGUSR2]);
+        })
+        .join()
+        .expect("signal mask thread");
+    }
+
+    #[test]
+    fn chat_reply_holds_termination_signals_while_it_stores_a_reply() {
+        use libc::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+        let termination = [SIGHUP, SIGINT, SIGQUIT, SIGTERM];
+        // A thread of its own, so its signal mask and the store's probe are this test's to set.
+        thread::spawn(move || {
+            mask_signals(libc::SIG_UNBLOCK, &termination);
+            let (state, key, root) = state_with_request();
+            let identifier = state
+                .next_reply_route(&key)
+                .expect("reply route")
+                .expect("open request")
+                .identifier;
+            let held = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let probe_held = std::rc::Rc::clone(&held);
+            crate::chat_runtime::BETWEEN_REPLY_WRITES.with(|probe| {
+                *probe.borrow_mut() = Some(Box::new(move || {
+                    probe_held
+                        .borrow_mut()
+                        .push(blocked_among(&blocked_signals(), &termination));
+                }));
+            });
+            let first = reply(&root, &key, &identifier, "answer");
+            crate::chat_runtime::BETWEEN_REPLY_WRITES.with(|probe| probe.borrow_mut().take());
+            // The command wrote the reply, and then its request, with all four signals held.
+            assert_eq!(*held.borrow(), [termination.to_vec()]);
+            assert_eq!(
+                blocked_among(&blocked_signals(), &termination),
+                Vec::<libc::c_int>::new()
+            );
+            let outcome = |result: Result<ReplyCommandOutcome, ChatServiceError>| match result
+                .expect("chat reply")
+            {
+                ReplyCommandOutcome::Stored(result) => {
+                    (result["outcome"].clone(), result["ordinal"].clone())
+                }
+                ReplyCommandOutcome::TryAgain(reason) => panic!("try again: {reason}"),
+            };
+            assert_eq!(outcome(first), (json!("stored"), json!(1)));
+            // The request counts the reply: the same text is one it already stored, which a reply
+            // written without its request's count would not be.
+            assert_eq!(
+                outcome(reply(&root, &key, &identifier, "answer")),
+                (json!("already_stored"), json!(1))
+            );
+            let request = state.inspect_request(&key).expect("inspect request");
+            assert_eq!(request["replies"].as_array().map(Vec::len), Some(1));
+            fs::remove_dir_all(root).expect("cleanup");
+        })
+        .join()
+        .expect("signal mask thread");
+    }
+
+    #[test]
+    fn a_reply_wake_queues_only_a_request_with_a_reply_to_send() {
+        let (state, key, root) = state_with_request();
+        let identifier = state
+            .next_reply_route(&key)
+            .expect("reply route")
+            .expect("open request")
+            .identifier;
+        let (sender, wakes) = mpsc::sync_channel(REPLY_WAKE_CAPACITY);
+        let overflowed = AtomicBool::new(false);
+        let mut direct_keys = DirectKeyQueue::default();
+        for wake in [key.clone(), "f".repeat(64)] {
+            sender.send(wake).expect("queue a wake");
+        }
+        take_reply_wakes(&state, &wakes, &mut direct_keys, &overflowed);
+        assert!(direct_keys.is_empty());
+        assert_eq!(wakes.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert!(matches!(
+            state.submit_reply(&key, &identifier, "answer"),
+            Ok(ReplyStoreOutcome::Stored(_))
+        ));
+        for _ in 0..2 {
+            sender.send(key.clone()).expect("queue a wake");
+        }
+        take_reply_wakes(&state, &wakes, &mut direct_keys, &overflowed);
+        assert_eq!(direct_keys.take(MAX_DIRECT_REQUEST_KEYS), [key]);
+        assert!(!overflowed.load(AtomicOrdering::SeqCst));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn chat_reply_stores_a_text_once_and_says_whether_a_service_was_woken() {
+        let (state, key, root) = state_with_request();
+        let identifier = state
+            .next_reply_route(&key)
+            .expect("reply route")
+            .expect("open request")
+            .identifier;
+        let stored = |body: &str| match reply(&root, &key, &identifier, body).expect("chat reply") {
+            ReplyCommandOutcome::Stored(result) => result,
+            ReplyCommandOutcome::TryAgain(reason) => panic!("try again: {reason}"),
+        };
+        let expected = |outcome: &str, ordinal: u32| {
+            json!({
+                "request": key,
+                "reply_id": identifier,
+                "outcome": outcome,
+                "ordinal": ordinal,
+                "phase": "pending",
+                "service_woken": false,
+            })
+        };
+        // No service listens on this state.
+        assert_eq!(stored("answer\n"), expected("stored", 1));
+        assert_eq!(stored("answer"), expected("already_stored", 1));
+        let refused = reply(&root, &key, "anything", "other").expect_err("an ID of no prompt");
+        assert!(
+            refused
+                .to_string()
+                .contains("the reply ID is not one that this request's prompt gives"),
+            "{refused}"
+        );
+        // Nor does a regular file where the wake socket would be.
+        fs::write(root.join(REPLY_WAKE_SOCKET), "not a socket").expect("write a regular file");
+        assert_eq!(stored("other"), expected("stored", 2));
+        // Only a short reply ID depends on the reply alias record, so only it waits for the
+        // record to be usable.
+        fs::write(root.join("reply-aliases.json"), "{").expect("spoil the alias record");
+        match reply(&root, &key, "001", "third").expect("chat reply") {
+            ReplyCommandOutcome::TryAgain(reason) => {
+                assert!(reason.contains("is unusable"), "{reason}");
+            }
+            ReplyCommandOutcome::Stored(result) => panic!("stored {result}"),
+        }
+        assert_eq!(stored("third"), expected("stored", 3));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// What the driver of `a_service_that_offers_chat_reply_sends_each_reply_it_stores_at_once`
+    /// found at each step, kept to be checked after the owner loop stops, since a panic in the
+    /// driver would leave the loop running.
+    struct ReplyWakeRun {
+        first_sent: bool,
+        second: Result<(u32, bool), String>,
+        second_held: bool,
+        third: Result<Value, String>,
+        all_sent: bool,
+        repeated: Result<Value, String>,
+    }
+
+    /// Store replies of the request `key` while an owner loop serves `state` with a wake socket:
+    /// one directly, which no wake announces, and then one with `chat reply`.
+    fn drive_reply_wakes(
+        state: &BridgeState,
+        root: &Path,
+        key: &str,
+        identifier: &str,
+        subscriptions: &AtomicU64,
+    ) -> ReplyWakeRun {
+        let within = |limit: Duration, done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + limit;
+            while !done() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            done()
+        };
+        // The loop subscribes only after its startup passes, which send the first reply, so no
+        // pass that could send the next one is running once it has; the pause adds a margin.
+        let first_sent = within(Duration::from_secs(10), &|| {
+            subscriptions.load(AtomicOrdering::SeqCst) >= 1 && !state.has_unsent_reply(key)
+        });
+        thread::sleep(Duration::from_millis(300));
+        let second = match state.submit_reply(key, identifier, "second answer") {
+            Ok(ReplyStoreOutcome::Stored(stored)) => Ok((stored.ordinal, stored.already_stored)),
+            Ok(ReplyStoreOutcome::TryAgain(reason)) => Err(format!("try again: {reason}")),
+            Err(error) => Err(error.to_string()),
+        };
+        thread::sleep(Duration::from_secs(1));
+        let second_held = state.has_unsent_reply(key);
+        let command = |body: &str| match reply(root, key, identifier, body) {
+            Ok(ReplyCommandOutcome::Stored(result)) => Ok(result),
+            Ok(ReplyCommandOutcome::TryAgain(reason)) => Err(format!("try again: {reason}")),
+            Err(error) => Err(error.to_string()),
+        };
+        let third = command("third answer\n");
+        let all_sent = within(Duration::from_secs(5), &|| !state.has_unsent_reply(key));
+        let repeated = command("first answer");
+        ReplyWakeRun {
+            first_sent,
+            second,
+            second_held,
+            third,
+            all_sent,
+            repeated,
+        }
+    }
+
+    #[test]
+    fn a_service_that_offers_chat_reply_sends_each_reply_it_stores_at_once() {
+        // With no reconciliation due within the hour and no pane event, the owner loop sends a
+        // reply stored after its startup only when a wake from `chat reply` reaches it.
+        let fixture = crate::subagents::tests::Fixture::new();
+        fixture.start(None);
+        *fixture.client.scroll.lock().expect("scroll") = Some(SCREEN_ONLY);
+        let (root, state) = worker_bridge_state(&fixture, true);
+        let (key, _) = delivered_worker_request(&state);
+        let identifier = state
+            .next_reply_route(&key)
+            .expect("reply route")
+            .expect("open request")
+            .identifier;
+        // Stored before the loop starts, so its startup sends it.
+        assert!(matches!(
+            state.submit_reply(&key, &identifier, "first answer"),
+            Ok(ReplyStoreOutcome::Stored(stored)) if stored.ordinal == 1 && !stored.already_stored
+        ));
+        let helper = fixture.root.join("send-helper");
+        fs::copy(
+            fs::canonicalize("/bin/sh").expect("canonical shell"),
+            &helper,
+        )
+        .expect("copy outbound helper");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).expect("helper mode");
+        let sends = fixture.root.join("sends");
+        let script = r#"
+IFS= read -r request || exit 2
+case "$request" in
+  *'"action":"send"'*) ;;
+  *) exit 3 ;;
+esac
+printf '%s\n' "$request" >> "$1" || exit 4
+id=${request#*\"id\":\"}
+id=${id%%\"*}
+printf '{"version":1,"id":"%s","action":"send","ok":true,"receipt":{"message_id":"spaces/example/messages/reply"}}\n' "$id"
+"#;
+        let transport = CommandOutboundTransport::new(
+            helper,
+            vec![
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from(script),
+                std::ffi::OsString::from("agentctl-chat-reply-wake-helper"),
+                sends.clone().into_os_string(),
+            ],
+            &[],
+            Duration::from_secs(2),
+            Duration::from_millis(50),
+        )
+        .expect("pin outbound helper");
+        let herdr = owner_loop_herdr(&fixture.root, "reply-wake", |_| Vec::new());
+        let mut observed = None;
+        let observation = &mut observed;
+        let driver_state = state.clone();
+        let driver_root = root.clone();
+        let driver_key = key.clone();
+        let driver_identifier = identifier.clone();
+        let subscriptions = Arc::clone(&herdr.subscriptions);
+        run_owner_loop_with(
+            &fixture,
+            &state,
+            &herdr,
+            Duration::from_secs(3_600),
+            Duration::from_secs(30),
+            Some(transport),
+            Some(&root),
+            move |_, _| {
+                *observation = Some(drive_reply_wakes(
+                    &driver_state,
+                    &driver_root,
+                    &driver_key,
+                    &driver_identifier,
+                    &subscriptions,
+                ));
+                true
+            },
+        );
+        drop(herdr.release);
+        herdr.server.join().expect("herdr stand-in");
+        let observed = observed.expect("the driver ran");
+        assert!(observed.first_sent, "the loop's startup sent no reply");
+        assert_eq!(observed.second, Ok((2, false)));
+        assert!(
+            observed.second_held,
+            "a reply that no wake announced was sent before the reconciliation"
+        );
+        let expected = |outcome: &str, ordinal: u32, phase: &str, service_woken: bool| {
+            json!({
+                "request": key,
+                "reply_id": identifier,
+                "outcome": outcome,
+                "ordinal": ordinal,
+                "phase": phase,
+                "service_woken": service_woken,
+            })
+        };
+        assert_eq!(observed.third, Ok(expected("stored", 3, "pending", true)));
+        // The wake sends every reply that waits, in order.
+        assert!(
+            observed.all_sent,
+            "the woken loop did not send the stored replies"
+        );
+        assert_eq!(
+            observed.repeated,
+            Ok(expected("already_stored", 1, "sent", false))
+        );
+        // Each reply was sent once, with its own text, in the order the replies were stored.
+        let texts = fs::read_to_string(&sends)
+            .expect("sent requests")
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).expect("send request")["text"]
+                    .as_str()
+                    .expect("send text")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            [
+                "[worker] first answer",
+                "[worker] second answer",
+                "[worker] third answer"
+            ]
+        );
     }
 }

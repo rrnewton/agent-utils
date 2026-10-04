@@ -495,6 +495,11 @@ enum ChatCommand {
     Tick(ChatOperate),
     /// Run event-driven provider and Herdr subscriptions until SIGINT or SIGTERM
     Run(ChatRun),
+    /// Store one reply for an open request from a file, and wake a running service to send it
+    #[command(
+        after_help = "Example:\n  agentctl chat reply --bridge-state ~/.local/state/agentctl/chat \\\n    --request <KEY> --reply-id 001 --file reply.md\n\nWhen `chat run` has --offer-reply-command and outbound replies are enabled, each request prompt\nprints this command with the service's own executable, the absolute path of its state\ndirectory, the request key, and the reply ID, unless no file is left at that executable's path\nor one of those words cannot be printed safely; then the prompt gives only the two marker\nlines.\n\nThe command stores the file's text as a reply of that request, as if the service had read it\nbetween the reply ID's two marker lines on the agent's screen, and the service sends it like\nany reply it reads. Line breaks at the end of the file are dropped. A text the request already\nholds is not stored again, so running the command twice sends it once. It then asks a service\nrunning on the same state directory with --offer-reply-command to send the reply at once;\notherwise the reply is sent at the service's next reconciliation, when the agent goes idle, or\nwhen the service starts.\n\nOn success it prints one JSON object: request, reply_id, outcome (stored or already_stored),\nordinal, phase, and service_woken, which says whether the wake was sent to a socket of the\ncurrent user in the state directory; nothing confirms that a service received it. Exit\nstatus: 0 when the request holds the reply; 1 when the reply is refused, with the reason on\nstandard error and nothing stored, as for an empty or blank text or one over 30,000 bytes;\n1 also when the state cannot be read or written, or when the result cannot be printed after\nthe reply was stored; 75 when nothing was stored but the same command can succeed later; 2\nfor a usage error, which includes a file that cannot be read or is not UTF-8. It never\ncontacts Herdr, a helper, or a provider."
+    )]
+    Reply(ChatReply),
     /// Stop accepting fenced replies for one exact retained request
     Close(ChatClose),
     /// Internal systemd ExecStop helper for one inode-bound main-process pidfd
@@ -599,12 +604,63 @@ impl ChatPublish {
 }
 
 #[derive(Args)]
+struct ChatReply {
+    #[command(flatten)]
+    state: ChatState,
+    /// Exact 64-character lowercase hexadecimal request key
+    #[arg(long)]
+    request: String,
+    /// Reply ID that the request's prompt gives in its two marker lines
+    #[arg(long, value_name = "ID", allow_hyphen_values = true)]
+    reply_id: String,
+    /// UTF-8 file containing the reply, read with a 30,000-byte bound
+    #[arg(long, value_name = "PATH")]
+    file: PathBuf,
+}
+
+impl ChatReply {
+    /// The reply file's text. A file that cannot be read or is not UTF-8 is a usage error. A text
+    /// over the bound is refused like any reply the service refuses, and so is an empty or blank
+    /// one, which the store refuses.
+    fn read_reply(&self) -> Result<String, Failure> {
+        let maximum = crate::chat_runtime::MAX_REPLY_BYTES;
+        let unreadable = |error: io::Error| {
+            Failure::Usage(format!("cannot read {}: {error}", self.file.display()))
+        };
+        let file = fs::File::open(&self.file).map_err(unreadable)?;
+        let limit = u64::try_from(maximum).unwrap_or(u64::MAX).saturating_add(1);
+        let mut bytes = Vec::with_capacity(maximum.saturating_add(1));
+        file.take(limit)
+            .read_to_end(&mut bytes)
+            .map_err(unreadable)?;
+        if bytes.len() > maximum {
+            return Err(Failure::Chat(
+                crate::chat_service::ChatServiceError::Runtime(
+                    crate::chat_runtime::ChatRuntimeError::Invalid(format!(
+                        "chat reply exceeds {maximum} UTF-8 bytes"
+                    )),
+                ),
+            ));
+        }
+        String::from_utf8(bytes).map_err(|_| {
+            Failure::Usage(format!(
+                "{} does not contain valid UTF-8",
+                self.file.display()
+            ))
+        })
+    }
+}
+
+#[derive(Args)]
 struct ChatRun {
     #[command(flatten)]
     operate: ChatOperate,
     /// Ignore new messages starting with PREFIX after leading whitespace (case-sensitive; repeat up to 32 times; default: none). Prefixes must be nonempty, at most 256 UTF-8 bytes, without control characters; applies only to this run.
     #[arg(long = "ignore-text-prefix", value_name = "PREFIX", value_parser = chat_ignored_text_prefix)]
     ignored_text_prefixes: Vec<String>,
+    /// Print an `agentctl chat reply` command in each request prompt that gives the two reply marker lines, as a way to send a reply at once, and listen for its wakes on the state directory's .wake.sock (default: off). A prompt leaves the command out when no file is left at this executable's path or a word of the command cannot be printed safely, and the service does not listen when the socket's absolute path exceeds 107 bytes. The agent must be able to run this executable and write the state directory; applies only to this run.
+    #[arg(long)]
+    offer_reply_command: bool,
 }
 
 #[derive(Args)]
@@ -1278,6 +1334,26 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             write_json(&result).map_err(Failure::Output)?;
             Ok(0)
         }
+        ChatCommand::Reply(value) => {
+            let body = value.read_reply()?;
+            match crate::chat_service::reply(
+                &value.state.bridge_state,
+                &value.request,
+                &value.reply_id,
+                &body,
+            )
+            .map_err(Failure::Chat)?
+            {
+                crate::chat_service::ReplyCommandOutcome::Stored(result) => {
+                    write_json(&result).map_err(Failure::Output)?;
+                    Ok(0)
+                }
+                crate::chat_service::ReplyCommandOutcome::TryAgain(reason) => {
+                    eprintln!("agentctl: {reason}");
+                    Ok(75)
+                }
+            }
+        }
         ChatCommand::Close(value) => {
             let result = crate::chat_service::close(&value.state.bridge_state, &value.request)
                 .map_err(Failure::Chat)?;
@@ -1310,12 +1386,15 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             let client =
                 HerdrClient::with_executable("direct", &herdr_bin).map_err(AgentError::from)?;
             let manager = ManagedAgents::new(&client, &registry)?;
-            let result = crate::chat_service::run_with_ignored_text_prefixes(
+            let result = crate::chat_service::run_with_settings(
                 &value.operate.state.bridge_state,
                 &client,
                 &manager,
                 options,
-                value.ignored_text_prefixes,
+                crate::chat_service::RunSettings {
+                    ignored_text_prefixes: value.ignored_text_prefixes,
+                    offer_reply_command: value.offer_reply_command,
+                },
             )
             .map_err(Failure::Chat)?;
             write_json(&result).map_err(Failure::Output)?;
@@ -1756,6 +1835,80 @@ mod tests {
             "/tmp/chat-state",
             "--ignore-text-prefix",
             "[assistant",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn chat_reply_takes_a_reply_id_that_starts_with_a_hyphen_and_needs_every_argument() {
+        let key = "0123456789abcdef".repeat(4);
+        let arguments = [
+            "--bridge-state",
+            "/tmp/chat-state",
+            "--request",
+            key.as_str(),
+            "--reply-id",
+            "-AbC_1",
+            "--file",
+            "reply.md",
+        ];
+        let parsed =
+            Cli::try_parse_from(["agentctl", "chat", "reply"].into_iter().chain(arguments))
+                .unwrap();
+        let Some(Commands::Chat(Chat {
+            command: ChatCommand::Reply(reply),
+        })) = parsed.command
+        else {
+            panic!("expected chat reply");
+        };
+        assert_eq!(
+            reply.state.bridge_state,
+            std::path::Path::new("/tmp/chat-state")
+        );
+        assert_eq!(reply.request, key);
+        assert_eq!(reply.reply_id, "-AbC_1");
+        assert_eq!(reply.file, std::path::Path::new("reply.md"));
+        for missing in 0..4 {
+            let rest = arguments
+                .chunks(2)
+                .enumerate()
+                .filter(|(index, _)| *index != missing)
+                .flat_map(|(_, pair)| pair.iter().copied());
+            assert!(
+                Cli::try_parse_from(["agentctl", "chat", "reply"].into_iter().chain(rest)).is_err(),
+                "parsed without {}",
+                arguments[2 * missing]
+            );
+        }
+        // Only `chat run` takes the flag that offers the command, and it is off by default.
+        for (flag, offered) in [(None, false), (Some("--offer-reply-command"), true)] {
+            let parsed = Cli::try_parse_from(
+                [
+                    "agentctl",
+                    "chat",
+                    "run",
+                    "--bridge-state",
+                    "/tmp/chat-state",
+                ]
+                .into_iter()
+                .chain(flag),
+            )
+            .unwrap();
+            let Some(Commands::Chat(Chat {
+                command: ChatCommand::Run(run),
+            })) = parsed.command
+            else {
+                panic!("expected chat run");
+            };
+            assert_eq!(run.offer_reply_command, offered);
+        }
+        assert!(Cli::try_parse_from([
+            "agentctl",
+            "chat",
+            "tick",
+            "--bridge-state",
+            "/tmp/chat-state",
+            "--offer-reply-command",
         ])
         .is_err());
     }

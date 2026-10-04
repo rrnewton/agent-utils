@@ -302,6 +302,66 @@ bridge never received are absent; the provider's own thread is the complete
 record. Like `inspect`, it reads under the shared state lock and never writes
 state or contacts Herdr, a helper, or a provider.
 
+A reply printed between its two marker lines reaches the user only if the
+service reads it from the agent's screen, and a terminal agent can redraw or
+clear its screen before that read. With `chat run --offer-reply-command`, each
+prompt of an outbound-enabled bridge also offers a way that does not depend on
+the screen: write the reply to a file and run the exact command the prompt
+prints, which starts with the absolute path of the service's own executable:
+
+```sh
+/opt/agentctl/bin/agentctl chat reply \
+  --bridge-state /home/me/.local/state/agentctl/project-chat \
+  --request 64_LOWERCASE_HEX_CHARACTERS --reply-id 001 --file PATH_TO_YOUR_REPLY
+```
+
+When no file is left at the executable's path, or a word of that command, that
+path included, cannot be printed safely on one line, the prompt gives only the
+two marker lines. The prompt asks the agent to send each reply one way only,
+and to print a reply between the two lines at the end of its turn if the
+command fails twice for it.
+
+`reply` stores the file's text as a reply of the request, as if the service had
+read it between the two marker lines of `--reply-id`, and the service sends it
+like any reply it reads. The same rules apply. The ID must be one that the
+request's prompt gives: the request's reply alias, or `<nonce>_<ordinal>` with
+any valid ordinal. Neither the key nor the ID is a secret; both must match so
+that a reply meant for another request is refused. The file is read with a
+30,000-byte bound, the line breaks at its end are dropped, and the text must be
+nonempty, hold no terminal control characters, fit in 30,000 UTF-8 bytes once
+the agent label is added, and have no line that is a reply marker line. A closed
+or retired request takes no more replies. A text the request already holds,
+read from the screen or stored by an earlier command, is not stored again, so
+running the command twice sends that text once. The command prints one JSON
+object with `request`, `reply_id`, `outcome` (`stored` or `already_stored`),
+`ordinal`, `phase` and `service_woken`, and exits 0. A refused reply exits 1
+with the reason on standard error and stores nothing; that includes an empty or
+blank text and a file over 30,000 bytes. A state that cannot be read or written
+also exits 1, and so does a result that cannot be printed after the reply was
+stored. Exit 75 means nothing was stored and the same command can succeed later.
+A usage error exits 2, and so does a file that cannot be read or is not UTF-8.
+The command never contacts Herdr, a helper, or a provider. It is safe while
+`chat run` runs, because it opens the state without the recovery that
+`chat run`, `chat tick` and `chat close` perform when they open it, and it holds
+off SIGHUP, SIGINT, SIGQUIT and SIGTERM while it stores the reply.
+
+A service running with `--offer-reply-command` listens on a datagram socket,
+`.wake.sock` in its state directory. After it stores a reply that is not sent
+yet, `reply` sends the request key to that socket, and the service sends the
+reply at once instead of at its next reconciliation. `service_woken` says
+whether the key was sent to a socket of the current user at that path; nothing
+confirms that a service received it. Without a listening service, the reply is
+sent at the next reconciliation, when the agent goes idle, or when the service
+next starts. A socket address holds at most 107 bytes of path, and the service
+binds the socket by the same absolute path that the prompt's command names, so
+a service whose state directory has an absolute path longer than 96 bytes, not
+counting a trailing slash, cannot listen: it logs why and runs on without the
+socket, as does a service that finds something other than a socket of its own
+user at that path. The prompt offers the command only with this option, because
+the agent must be able to run the service's executable and write the state
+directory. Like `--ignore-text-prefix`, the option applies only to the run it
+is given to.
+
 An owner or operator can explicitly publish a new root message through the
 configured outbound helper without pretending it is a reply:
 

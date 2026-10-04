@@ -2311,7 +2311,22 @@ pub(crate) fn sync_directory(path: &Path) -> AgentResult<()> {
     sync_directory_io(path).map_err(|error| io_error("sync durable queue directory", path, error))
 }
 
+/// A test's hook for [`DIRECTORY_SYNC_HOOK`].
+#[cfg(test)]
+pub(crate) type DirectorySyncHook = Box<dyn FnMut(&Path) -> io::Result<()>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Called on this thread with each directory just before it is synced, so a test can record
+    /// the syncs or make one fail.
+    pub(crate) static DIRECTORY_SYNC_HOOK: std::cell::RefCell<Option<DirectorySyncHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn sync_directory_io(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    DIRECTORY_SYNC_HOOK
+        .with(|hook| hook.borrow_mut().as_mut().map_or(Ok(()), |hook| hook(path)))?;
     OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)

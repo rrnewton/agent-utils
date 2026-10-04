@@ -47,7 +47,7 @@ const MAX_AGENT_LABEL_BYTES: usize = 400;
 const MAX_IGNORED_TEXT_PREFIXES: usize = 32;
 const MAX_IGNORED_TEXT_PREFIX_BYTES: usize = 256;
 const REPLY_NONCE_BYTES: usize = 16;
-const MAX_REPLY_BYTES: usize = 30_000;
+pub(crate) const MAX_REPLY_BYTES: usize = 30_000;
 const MAX_REPLY_RECORD_BYTES: usize = 64 * 1_024;
 const MAX_REPLY_ORDINAL: u32 = 999_999;
 const MAX_REQUEST_REPLIES: u32 = 4_096;
@@ -3450,6 +3450,8 @@ pub struct BridgeState {
     config: BridgeConfiguration,
     // Admission policy belongs to this process generation, never to serialized configuration.
     ignored_text_prefixes: Arc<[String]>,
+    // Whether request prompts name the `chat reply` command; also process-local.
+    offer_reply_command: bool,
     #[cfg(test)]
     admission_fault_after: Arc<std::sync::Mutex<Option<usize>>>,
     #[cfg(test)]
@@ -3462,6 +3464,14 @@ pub struct BridgeState {
     confirm_fault_after: Arc<std::sync::Mutex<Option<usize>>>,
     #[cfg(test)]
     gap_retry_runner_probe: Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<File>>>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Called on this thread once a capture has written its reply files and before it writes
+    /// their request, so a test can observe the process while a store is half done.
+    pub(crate) static BETWEEN_REPLY_WRITES: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Revalidate and pin the configured provider executable without launching it.
@@ -3548,6 +3558,7 @@ impl BridgeState {
             root: root.to_path_buf(),
             config,
             ignored_text_prefixes: Arc::from([]),
+            offer_reply_command: false,
             #[cfg(test)]
             admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -3633,6 +3644,7 @@ impl BridgeState {
             root: root.to_path_buf(),
             config: envelope.config,
             ignored_text_prefixes: Arc::from([]),
+            offer_reply_command: false,
             #[cfg(test)]
             admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -3663,6 +3675,18 @@ impl BridgeState {
         }
         self.ignored_text_prefixes = prefixes.into();
         Ok(self)
+    }
+
+    /// Set whether each request prompt that gives the two marker lines, which only outbound
+    /// replies do, also gives the agent the `chat reply` command, which stores a reply from a file
+    /// at once instead of waiting for the service to read it between those lines. Like ignored
+    /// prefixes, this belongs to this process and is never saved. A prompt gives the command only
+    /// while a file is at this executable's path and every word of the command, that path
+    /// included, prints safely on one line.
+    #[must_use]
+    pub fn with_reply_command_offered(mut self, offered: bool) -> Self {
+        self.offer_reply_command = offered;
+        self
     }
 
     /// Borrow the immutable authority configuration.
@@ -4900,7 +4924,7 @@ Complete this request using your normal instructions and tools. Outbound chat is
 call between them.",
             ),
         };
-        Ok(format!(
+        let mut prompt = format!(
             "The user's request arrived through the configured chat bridge.\n\
 {context}\n\
 {}\n\n\
@@ -4908,7 +4932,23 @@ Complete this request using your normal instructions and tools. You may send one
 Include the line <CHAT_REPLY_{reply_id}> at the beginning of your response and end with </CHAT_REPLY_{reply_id}>. \
 Lines between will be sent to the user as a chat message. {numbering}",
             record.message.text,
-        ))
+        );
+        // Offered only with the two lines, so a reply has a way out when the command fails.
+        if let Some(command) = self
+            .offer_reply_command
+            .then(|| self.reply_command(env::current_exe(), key, &reply_id))
+            .flatten()
+        {
+            prompt.push_str(&format!(
+                "\n\nTo send a reply at once, before your turn ends, write its text to a file, \
+without the two lines, and run this command with the file's path in place of \
+PATH_TO_YOUR_REPLY: {command}\nRun it once for each reply; running it again with the same text \
+does not send that text twice. Send each reply one way only, by this command or between the two \
+lines, not both. If the command fails twice for a reply, print that reply between the two lines \
+at the end of your turn instead."
+            ));
+        }
+        Ok(prompt)
     }
 
     /// The lines that follow the first line of every request prompt: source, sender, thread, any
@@ -4955,6 +4995,28 @@ Lines between will be sent to the user as a chat message. {numbering}",
             history_program(env::current_exe()),
             shell_word(root.to_str()?)?,
             shell_word(thread_id)?,
+        );
+        (neutral_capture_syntax(&command) == command).then_some(command)
+    }
+
+    /// The exact `chat reply` command for this state, request and reply ID, run by `executable`,
+    /// with `PATH_TO_YOUR_REPLY` in place of the reply file, or `None` when no file is at the
+    /// executable's path, a word of it cannot be printed safely on one line, or the command holds
+    /// reply syntax, as for [`Self::thread_history_command`]. Unlike that command, it is never
+    /// printed with the bare `agentctl`, which could run another build or none: the agent runs it
+    /// to send a reply.
+    fn reply_command(
+        &self,
+        executable: io::Result<PathBuf>,
+        key: &str,
+        reply_id: &str,
+    ) -> Option<String> {
+        let root = std::path::absolute(&self.root).ok()?;
+        let command = format!(
+            "{} chat reply --bridge-state {} --request {key} --reply-id {} --file PATH_TO_YOUR_REPLY",
+            executable_word(executable)?,
+            shell_word(root.to_str()?)?,
+            shell_word(reply_id)?,
         );
         (neutral_capture_syntax(&command) == command).then_some(command)
     }
@@ -5138,6 +5200,16 @@ and the replies captured for them. The provider's own thread is the complete rec
             .collect();
         pending.sort();
         Ok(pending.into_iter().map(|(_, key)| key).collect())
+    }
+
+    /// Whether `key` names a request that holds a reply not sent yet. A failure to tell reads as
+    /// `false`, because a recovery pass finds every such request anyway.
+    pub fn has_unsent_reply(&self, key: &str) -> bool {
+        let Ok(_snapshot) = self.lock_state_snapshot() else {
+            return false;
+        };
+        self.read_request(key)
+            .is_ok_and(|request| request.next_send_ordinal < request.next_reply_ordinal)
     }
 
     /// Capture complete blocks for every request through one bounded pane-snapshot parse, as if
@@ -6111,6 +6183,130 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         self.persist_checkpoint(&mut checkpoint)
     }
 
+    /// Store one reply for an open request, as if the service had read its text between the two
+    /// marker lines of `identifier`, so the service sends it like any reply it reads. The
+    /// identifier must be a reply ID that the request's prompt gives: its reply alias, or
+    /// `<nonce>_<ordinal>` with any valid ordinal. Neither the key nor the ID is a secret;
+    /// requiring both to match catches a reply meant for another request. Line breaks at the end
+    /// of `body` are dropped. A text the request already holds, read from the screen or stored by
+    /// an earlier call, is not stored again, and the result names the ordinal that holds it. The
+    /// rest of a capture's rules apply as well: a text read under the request's alias before its
+    /// prompt reached the coordinator, or a table that a stored reply shows at other widths, is
+    /// refused. Every refusal is a [`ChatRuntimeError::Invalid`] error, and a refused call
+    /// stores nothing, because every bound is checked before the reply is written. An I/O error
+    /// after that can leave the reply written but uncounted by its request; the same call with
+    /// the same text counts it, and so does the service's next start.
+    pub fn submit_reply(
+        &self,
+        key: &str,
+        identifier: &str,
+        body: &str,
+    ) -> Result<ReplyStoreOutcome> {
+        if !self.config.outbound_enabled {
+            return Err(ChatRuntimeError::invalid(
+                "chat reply requires outbound_enabled=true",
+            ));
+        }
+        if !valid_key(key) {
+            return Err(ChatRuntimeError::invalid(
+                "chat request key must be 64 lowercase hexadecimal characters",
+            ));
+        }
+        let body = body.trim_end_matches(['\r', '\n']);
+        validate_reply_body(body)?;
+        // Such a line would end or start a block wherever the text is shown in the pane.
+        if body
+            .lines()
+            .any(|line| parse_marker(&undecorate(line).0).is_some())
+        {
+            return Err(ChatRuntimeError::invalid(
+                "a line of the reply is a reply marker line",
+            ));
+        }
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let request = match self.read_request(key) {
+            Ok(request) => request,
+            Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(ChatRuntimeError::invalid(
+                    if self.retired_key(key)?.is_some() {
+                        "the request is retired, so it takes no more replies"
+                    } else {
+                        "no request has this key"
+                    },
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if request.reply_closed {
+            return Err(ChatRuntimeError::invalid(
+                "the request's replies are closed",
+            ));
+        }
+        // As for a capture, a reply alias record that cannot be read leaves every alias
+        // unrecognized. Only a short ID depends on it, so only a call with one can try again.
+        let aliases = match self.read_reply_aliases() {
+            Ok(record) => Some(record),
+            Err(error) if parse_reply_alias(identifier).is_some() => {
+                return Ok(ReplyStoreOutcome::TryAgain(error.to_string()));
+            }
+            Err(_) => None,
+        };
+        let alias = aliases.as_ref().and_then(|record| record.alias_of(key));
+        let alias_ids = alias
+            .map(|alias| (format_reply_alias(alias), request.reply_nonce.clone()))
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let nonces = BTreeSet::from([request.reply_nonce.clone()]);
+        if recognized_reply_marker(identifier, &nonces, &alias_ids).is_none() {
+            return Err(ChatRuntimeError::invalid(
+                "the reply ID is not one that this request's prompt gives",
+            ));
+        }
+        let withheld = alias
+            .zip(aliases.as_ref())
+            .map(|(alias, record)| record.withheld_identities(alias))
+            .unwrap_or_default();
+        let capture = self.capture_scanned_replies_locked(
+            key,
+            &[ScannedReply {
+                identifier: identifier.to_owned(),
+                body: body.to_owned(),
+            }],
+            Vec::new(),
+            &withheld,
+        )?;
+        if let Some(refusal) = capture.refused.first() {
+            return Err(ChatRuntimeError::invalid(refusal.reason.clone()));
+        }
+        let (ordinal, already_stored) = match capture.ordinals.first() {
+            Some(ordinal) => (*ordinal, false),
+            None => (self.stored_ordinal_locked(key, body)?, true),
+        };
+        let phase = reply_phase_name(&self.read_reply(key, ordinal)?.phase);
+        Ok(ReplyStoreOutcome::Stored(StoredReply {
+            ordinal,
+            already_stored,
+            phase,
+        }))
+    }
+
+    /// The ordinal of the newest reply of `key` with the text of `body`, as a capture compares
+    /// texts.
+    fn stored_ordinal_locked(&self, key: &str, body: &str) -> Result<u32> {
+        let plain = ReplyIdentity::of(body).plain;
+        let request = self.read_request(key)?;
+        for ordinal in (1..request.next_reply_ordinal).rev() {
+            if ReplyIdentity::of(&self.read_reply(key, ordinal)?.body).plain == plain {
+                return Ok(ordinal);
+            }
+        }
+        Err(ChatRuntimeError::invalid(
+            "the reply was neither stored nor found among the request's replies",
+        ))
+    }
+
     fn retire_for_capacity_locked(
         &self,
         checkpoint: &mut Checkpoint,
@@ -6675,6 +6871,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let mut unknown_ids = Vec::new();
         let mut expected = request.next_reply_ordinal;
         let mut captured = Vec::new();
+        let mut unwritten = Vec::new();
         let mut checkpoint = self.read_checkpoint()?;
 
         for block in blocks {
@@ -6765,8 +6962,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                 continue;
             }
             if !exists {
-                write_document(&path, &reply)?;
-                agent::sync_directory(&self.root.join("replies"))?;
+                unwritten.push((path, reply));
             }
             request.reply_count = request.reply_count.saturating_add(1);
             request.reply_bytes = next_request_bytes;
@@ -6781,7 +6977,24 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             validate_checkpoint(&checkpoint)?;
             request.next_reply_ordinal = expected;
             request.validate(key)?;
-            self.write_request_accounted(&request, &mut checkpoint)?;
+            // Every bound is checked before the first reply is written, so a refusal leaves no
+            // reply that its request does not count.
+            let request_bytes = self.accounted_request_bytes(&request, &checkpoint)?;
+            for (path, reply) in &unwritten {
+                write_document(path, reply)?;
+            }
+            // An earlier attempt can rename a reply file into place and then fail to sync the
+            // directory; this attempt counts that file without writing it, so the directory is
+            // synced whether or not a file was written now.
+            agent::sync_directory(&self.root.join("replies"))?;
+            #[cfg(test)]
+            BETWEEN_REPLY_WRITES.with(|probe| {
+                if let Some(probe) = probe.borrow_mut().as_mut() {
+                    probe();
+                }
+            });
+            write_document(&self.request_path(key), &request)?;
+            checkpoint.request_bytes = request_bytes;
             checkpoint.updated_at_millis = unix_millis();
             write_document(&self.root.join("checkpoint.json"), &checkpoint)?;
         }
@@ -7086,6 +7299,19 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         record: &RequestRecord,
         checkpoint: &mut Checkpoint,
     ) -> Result<()> {
+        let request_bytes = self.accounted_request_bytes(record, checkpoint)?;
+        write_document(&self.request_path(&record.key), record)?;
+        checkpoint.request_bytes = request_bytes;
+        Ok(())
+    }
+
+    /// The checkpoint's request byte total once `record` replaces its stored copy, refused when
+    /// the record or the total would exceed its bound. Writes nothing.
+    fn accounted_request_bytes(
+        &self,
+        record: &RequestRecord,
+        checkpoint: &Checkpoint,
+    ) -> Result<u64> {
         record.validate(&record.key)?;
         let (_, old_bytes): (RequestRecord, u64) =
             read_document_sized(&self.request_path(&record.key), MAX_REQUEST_RECORD_BYTES)?;
@@ -7106,9 +7332,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                 "chat request byte population limit reached",
             ));
         }
-        write_document(&self.request_path(&record.key), record)?;
-        checkpoint.request_bytes = next_total;
-        Ok(())
+        Ok(next_total)
     }
 
     fn persist_checkpoint(&self, checkpoint: &mut Checkpoint) -> Result<()> {
@@ -9030,7 +9254,7 @@ fn batch_fingerprint(batch: &DeliveryBatch) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(identity)))
 }
 
-fn valid_key(value: &str) -> bool {
+pub(crate) fn valid_key(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -9176,6 +9400,27 @@ impl fmt::Display for ReplyRefusal {
             self.identifier, self.block, self.reason
         )
     }
+}
+
+/// What [`BridgeState::submit_reply`] did with one reply. A refusal is an error instead.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReplyStoreOutcome {
+    /// The request holds the reply, stored now or before.
+    Stored(StoredReply),
+    /// Nothing was stored, because the reply alias record cannot be read, so a reply alias cannot
+    /// be checked; the text says why. The same call can succeed once the record is repaired.
+    TryAgain(String),
+}
+
+/// A reply that a request holds, as [`BridgeState::submit_reply`] reports it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoredReply {
+    /// The request's internal ordinal of the reply, which orders sending.
+    pub ordinal: u32,
+    /// Whether the request already held a reply with this text, so nothing new was stored.
+    pub already_stored: bool,
+    /// Whether the reply is `pending`, `sending`, or `sent`.
+    pub phase: &'static str,
 }
 
 /// What one capture shows for one request nonce, in screen order.
@@ -11163,17 +11408,18 @@ fn shell_word(value: &str) -> Option<String> {
 }
 
 /// The program word of a printed `chat thread` command: the absolute path of the running
-/// executable, because a service need not have `agentctl` on `PATH`. Linux reports an executable
-/// whose file was deleted or replaced as `<path> (deleted)`; the word is then the path without
-/// that suffix while a file is there, normally the replacement build. With no file to name, the
-/// word is the bare `agentctl`.
+/// executable, because a service need not have `agentctl` on `PATH`, as `executable_word` gives
+/// it. With no such word, it is the bare `agentctl`.
 fn history_program(executable: io::Result<PathBuf>) -> String {
-    let Some(path) = executable
-        .ok()
-        .and_then(|path| path.into_os_string().into_string().ok())
-    else {
-        return "agentctl".to_owned();
-    };
+    executable_word(executable).unwrap_or_else(|| "agentctl".to_owned())
+}
+
+/// The absolute path of the running executable as one shell word. Linux reports an executable
+/// whose file was deleted or replaced as `<path> (deleted)`; the word is then the path without
+/// that suffix while a file is there, normally the replacement build. `None` when no file can be
+/// named or its path cannot be printed as one word on one line.
+fn executable_word(executable: io::Result<PathBuf>) -> Option<String> {
+    let path = executable.ok()?.into_os_string().into_string().ok()?;
     let named = [Some(path.as_str()), path.strip_suffix(" (deleted)")]
         .into_iter()
         .flatten()
@@ -11182,7 +11428,7 @@ fn history_program(executable: io::Result<PathBuf>) -> String {
             candidate.is_absolute() && candidate.is_file()
         })
         .and_then(shell_word);
-    named.unwrap_or_else(|| "agentctl".to_owned())
+    named
 }
 
 /// The current UTC time as `YYYY-MM-DDTHH:MM:SSZ`, the prefix of every service log line.
@@ -26464,6 +26710,687 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                 .collect::<Vec<_>>()
                 .join("\n")
         );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    fn stored_reply(ordinal: u32, already_stored: bool) -> ReplyStoreOutcome {
+        ReplyStoreOutcome::Stored(StoredReply {
+            ordinal,
+            already_stored,
+            phase: "pending",
+        })
+    }
+
+    /// The next reply ordinal of `key`, after checking that no reply file holds it, so a refused
+    /// `submit_reply` can be shown to have stored nothing.
+    fn next_reply_ordinal(state: &BridgeState, key: &str) -> u32 {
+        let next = state.read_request(key).expect("request").next_reply_ordinal;
+        assert!(!state.reply_path(key, next).exists(), "reply {next} exists");
+        next
+    }
+
+    #[test]
+    fn a_reply_stored_by_command_is_held_once_whichever_way_it_arrives_first() {
+        // `chat reply` stores a reply as if it had been read between the two marker lines, so a
+        // text that also reaches the screen is held once, whichever comes first, and running the
+        // command again stores nothing new.
+        let (state, key, nonce, root) = open_request("reply-command-stores-once");
+        let id = format!("{nonce}_1");
+        assert!(!state.has_unsent_reply(&key));
+        assert_eq!(
+            state
+                .submit_reply(&key, &id, "first answer\r\n\n")
+                .expect("store"),
+            stored_reply(1, false)
+        );
+        assert_eq!(
+            state.read_reply(&key, 1).expect("reply").body,
+            "first answer"
+        );
+        assert!(state.has_unsent_reply(&key));
+        // Again, under another ID the prompt gives, and laid out as a narrower screen shows it.
+        assert_eq!(
+            state
+                .submit_reply(&key, &id, "first answer")
+                .expect("store again"),
+            stored_reply(1, true)
+        );
+        assert_eq!(
+            state
+                .submit_reply(&key, &format!("{nonce}_7"), "first\n  answer")
+                .expect("store again, re-wrapped"),
+            stored_reply(1, true)
+        );
+        let capture = state
+            .capture_snapshot(&reply_block(&id, "first answer"))
+            .expect("capture the printed copy");
+        assert!(capture.replies.is_empty(), "{capture:?}");
+        assert!(capture.refused.is_empty(), "{capture:?}");
+        // A text read from the screen first is already held when the command runs.
+        let second = format!("{nonce}_2");
+        let capture = state
+            .capture_snapshot(&reply_block(&second, "second answer"))
+            .expect("capture a second answer");
+        assert_eq!(capture.replies, [(key.clone(), vec![2])]);
+        assert_eq!(
+            state
+                .submit_reply(&key, &second, "second answer")
+                .expect("store the printed answer"),
+            stored_reply(2, true)
+        );
+        assert_eq!(next_reply_ordinal(&state, &key), 3);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_reply_stored_again_after_its_directory_sync_failed_syncs_the_directory_first() {
+        // A store can rename a reply file into place and then fail to sync `replies/`. The same
+        // call again counts that file without writing it, and it must still sync `replies/`
+        // before the request counts the reply, or a crash could lose a reply reported stored.
+        let (state, key, nonce, root) = open_request("reply-command-sync-retry");
+        let id = format!("{nonce}_1");
+        let replies = root.join("replies");
+        let synced = std::rc::Rc::new(std::cell::RefCell::new(Vec::<PathBuf>::new()));
+        agent::DIRECTORY_SYNC_HOOK.with(|hook| {
+            let synced = std::rc::Rc::clone(&synced);
+            let replies = replies.clone();
+            let mut failed = false;
+            *hook.borrow_mut() = Some(Box::new(move |path: &Path| {
+                synced.borrow_mut().push(path.to_path_buf());
+                if !failed && path == replies {
+                    failed = true;
+                    return Err(io::Error::from_raw_os_error(libc::EIO));
+                }
+                Ok(())
+            }));
+        });
+        state
+            .submit_reply(&key, &id, "first answer")
+            .expect_err("the directory sync after the rename fails");
+        assert!(state.reply_path(&key, 1).exists(), "the renamed file stays");
+        assert_eq!(state.read_request(&key).expect("request").reply_count, 0);
+        synced.borrow_mut().clear();
+        assert_eq!(
+            state
+                .submit_reply(&key, &id, "first answer")
+                .expect("store again"),
+            stored_reply(1, false)
+        );
+        agent::DIRECTORY_SYNC_HOOK.with(|hook| *hook.borrow_mut() = None);
+        let synced = synced.borrow().clone();
+        let position = |directory: &Path| synced.iter().position(|path| path == directory);
+        let replies_at = position(&replies).expect("the second call syncs replies/");
+        let requests_at = position(&root.join("requests")).expect("it writes the request");
+        assert!(replies_at < requests_at, "{synced:?}");
+        assert_eq!(state.read_request(&key).expect("request").reply_count, 1);
+        assert_eq!(
+            state.read_reply(&key, 1).expect("reply").body,
+            "first answer"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_reply_command_takes_only_an_id_that_the_requests_prompt_gives() {
+        let root = temporary("reply-command-ids");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let keys = admitted(&state, 2);
+        for (key, alias) in keys.iter().zip(["001", "002"]) {
+            let prompt = prompted(&state, key);
+            assert!(
+                prompt.contains(&format!(
+                    "Include the line <CHAT_REPLY_{alias}> at the beginning"
+                )),
+                "{prompt}"
+            );
+        }
+        let nonces = keys
+            .iter()
+            .map(|key| state.read_request(key).expect("request").reply_nonce)
+            .collect::<Vec<_>>();
+        let other_request = format!("{}_1", nonces[1]);
+        let no_ordinal = nonces[0].clone();
+        let zero_ordinal = format!("{}_0", nonces[0]);
+        for identifier in [
+            "002",
+            "000",
+            "1",
+            "01",
+            "",
+            "anything",
+            other_request.as_str(),
+            no_ordinal.as_str(),
+            zero_ordinal.as_str(),
+        ] {
+            let error = state
+                .submit_reply(&keys[0], identifier, "answer")
+                .expect_err(identifier);
+            assert!(
+                error
+                    .to_string()
+                    .contains("the reply ID is not one that this request's prompt gives"),
+                "{identifier}: {error}"
+            );
+        }
+        assert_eq!(next_reply_ordinal(&state, &keys[0]), 1);
+        assert_eq!(
+            state
+                .submit_reply(&keys[0], "001", "by alias")
+                .expect("store by alias"),
+            stored_reply(1, false)
+        );
+        assert_eq!(
+            state
+                .submit_reply(&keys[0], &format!("{}_2", nonces[0]), "by long ID")
+                .expect("store by long ID"),
+            stored_reply(2, false)
+        );
+        assert_eq!(
+            state
+                .submit_reply(&keys[1], "002", "by alias")
+                .expect("store for the second request"),
+            stored_reply(1, false)
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_refused_reply_command_stores_nothing() {
+        let (state, key, nonce, root) = open_request("reply-command-refusals");
+        let id = format!("{nonce}_1");
+        let oversize = "x".repeat(MAX_REPLY_BYTES + 1);
+        // As for a capture, the agent label that the service puts before a reply counts toward
+        // the bound, so the largest reply leaves room for it.
+        let largest = "x".repeat(MAX_REPLY_BYTES - "[codex coordinator] ".len());
+        let unlabelled_maximum = "x".repeat(MAX_REPLY_BYTES);
+        let whole_block = format!("before\n{}after", reply_block(&id, "inside"));
+        let closing = reply_block("999", "x");
+        let closing_line = format!(
+            "done\n  {}",
+            closing.lines().last().expect("closing marker line")
+        );
+        for (body, reason) in [
+            ("", "must be nonempty and at most 30000 UTF-8 bytes"),
+            (" \n\r\n", "must be nonempty and at most 30000 UTF-8 bytes"),
+            (
+                oversize.as_str(),
+                "must be nonempty and at most 30000 UTF-8 bytes",
+            ),
+            (
+                unlabelled_maximum.as_str(),
+                "agent-labelled chat reply exceeds 30000 UTF-8 bytes",
+            ),
+            (
+                "red \u{1b}[31malert",
+                "contains terminal control characters",
+            ),
+            ("bell\u{7}", "contains terminal control characters"),
+            (
+                whole_block.as_str(),
+                "a line of the reply is a reply marker line",
+            ),
+            (
+                closing_line.as_str(),
+                "a line of the reply is a reply marker line",
+            ),
+        ] {
+            let error = state.submit_reply(&key, &id, body).expect_err(reason);
+            assert!(error.to_string().contains(reason), "{reason}: {error}");
+        }
+        let all_ones = "f".repeat(64);
+        let upper = key.to_uppercase();
+        assert_ne!(upper, key);
+        for (request, reason) in [
+            (
+                "NOT-A-KEY",
+                "chat request key must be 64 lowercase hexadecimal characters",
+            ),
+            (
+                upper.as_str(),
+                "chat request key must be 64 lowercase hexadecimal characters",
+            ),
+            (all_ones.as_str(), "no request has this key"),
+        ] {
+            let error = state
+                .submit_reply(request, &id, "answer")
+                .expect_err(reason);
+            assert!(error.to_string().contains(reason), "{reason}: {error}");
+        }
+        assert_eq!(next_reply_ordinal(&state, &key), 1);
+        state.close_replies(&key).expect("close replies");
+        for body in ["answer", largest.as_str()] {
+            let error = state.submit_reply(&key, &id, body).expect_err("closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("the request's replies are closed"),
+                "{error}"
+            );
+        }
+        assert_eq!(next_reply_ordinal(&state, &key), 1);
+        fs::remove_dir_all(root).expect("cleanup");
+
+        let (state, key, nonce, root) = open_request("reply-command-largest");
+        assert_eq!(
+            state
+                .submit_reply(&key, &format!("{nonce}_1"), &largest)
+                .expect("store the largest reply"),
+            stored_reply(1, false)
+        );
+        assert_eq!(state.read_reply(&key, 1).expect("reply").body, largest);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Put `request` in place of its stored copy, and its byte count in the checkpoint, as a store
+    /// does.
+    fn replace_request(state: &BridgeState, root: &Path, request: &RequestRecord) {
+        let state_lock = agent::open_private_lock(&root.join(".state.lock"), "fixture state lock")
+            .expect("open state lock");
+        state_lock.lock_exclusive().expect("lock fixture state");
+        let mut checkpoint = state.read_checkpoint().expect("checkpoint");
+        state
+            .write_request_accounted(request, &mut checkpoint)
+            .expect("replace request");
+        state
+            .persist_checkpoint(&mut checkpoint)
+            .expect("persist request accounting");
+    }
+
+    /// Set the checkpoint's count of request bytes to `bytes`, as if other requests held them.
+    fn set_request_bytes(state: &BridgeState, root: &Path, bytes: u64) {
+        let state_lock = agent::open_private_lock(&root.join(".state.lock"), "fixture state lock")
+            .expect("open state lock");
+        state_lock.lock_exclusive().expect("lock fixture state");
+        let mut checkpoint = state.read_checkpoint().expect("checkpoint");
+        checkpoint.request_bytes = bytes;
+        state
+            .persist_checkpoint(&mut checkpoint)
+            .expect("persist request accounting");
+    }
+
+    /// `request` with a provider payload that makes its stored record exactly as long as a
+    /// request record may be.
+    fn largest_request(mut request: RequestRecord) -> RequestRecord {
+        let padded = |request: &mut RequestRecord, elements: usize, pad: usize| {
+            // Each element of the array takes a line of its own in the stored record, so the
+            // record reaches its bound while the payload stays within the payload's own bound.
+            request.message.provider_payload = Some(ProviderPayloadDocument {
+                schema: "fixture.message.v1".to_owned(),
+                data: Map::from_iter([
+                    (
+                        "fill".to_owned(),
+                        Value::Array(vec![Value::from(0); elements]),
+                    ),
+                    ("pad".to_owned(), Value::String("x".repeat(pad))),
+                ]),
+            });
+            encoded_document_bytes(request).expect("request record size")
+        };
+        let one = padded(&mut request, 1, 0);
+        let per_element = padded(&mut request, 2, 0) - one;
+        let elements = 1 + (MAX_REQUEST_RECORD_BYTES - one) / per_element;
+        let short = MAX_REQUEST_RECORD_BYTES - padded(&mut request, elements, 0);
+        assert_eq!(
+            padded(&mut request, elements, short),
+            MAX_REQUEST_RECORD_BYTES
+        );
+        request
+            .validate(&request.key)
+            .expect("a request of the largest size");
+        request
+    }
+
+    #[test]
+    fn a_reply_that_its_request_record_cannot_count_is_refused_and_writes_nothing() {
+        let (state, key, nonce, root) = open_request("reply-record-bound");
+        let id = format!("{nonce}_1");
+        let original = state.read_request(&key).expect("request");
+        replace_request(&state, &root, &largest_request(original.clone()));
+        let before = state_tree(&root);
+        // Counting any reply would make the request's record longer than its bound, whether the
+        // reply comes from the command or from the screen.
+        for body in ["first answer", "another answer"] {
+            let error = state
+                .submit_reply(&key, &id, body)
+                .expect_err("a record at its bound");
+            assert!(
+                error
+                    .to_string()
+                    .contains("request record exceeds 524288 bytes"),
+                "{error}"
+            );
+            let error = state
+                .capture_snapshot(&reply_block(&id, body))
+                .expect_err("a record at its bound");
+            assert!(
+                error
+                    .to_string()
+                    .contains("request record exceeds 524288 bytes"),
+                "{error}"
+            );
+            assert_eq!(state_tree(&root), before, "{body}");
+        }
+        // No reply is left for a start to count.
+        let reopened = BridgeState::open(&root).expect("reopen state");
+        assert_eq!(next_reply_ordinal(&reopened, &key), 1);
+        // Once the record has room, a reply with another text is the first.
+        replace_request(&reopened, &root, &original);
+        assert_eq!(
+            reopened
+                .submit_reply(&key, &id, "another answer")
+                .expect("store a reply"),
+            stored_reply(1, false)
+        );
+        assert_eq!(
+            reopened.read_reply(&key, 1).expect("reply").body,
+            "another answer"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_reply_that_the_request_byte_population_cannot_count_is_refused_and_writes_nothing() {
+        let (state, key, nonce, root) = open_request("reply-population-bound");
+        let id = format!("{nonce}_1");
+        let request_bytes = state.read_checkpoint().expect("checkpoint").request_bytes;
+        set_request_bytes(&state, &root, MAX_REQUEST_BYTES);
+        let before = state_tree(&root);
+        // A reply makes its request's record longer, which no byte of the population is left for.
+        for body in ["first answer", "another answer"] {
+            let error = state
+                .submit_reply(&key, &id, body)
+                .expect_err("a full population");
+            assert!(
+                error
+                    .to_string()
+                    .contains("chat request byte population limit reached"),
+                "{error}"
+            );
+            let error = state
+                .capture_snapshot(&reply_block(&id, body))
+                .expect_err("a full population");
+            assert!(
+                error
+                    .to_string()
+                    .contains("chat request byte population limit reached"),
+                "{error}"
+            );
+            assert_eq!(state_tree(&root), before, "{body}");
+        }
+        set_request_bytes(&state, &root, request_bytes);
+        assert_eq!(
+            state
+                .submit_reply(&key, &id, "another answer")
+                .expect("store a reply"),
+            stored_reply(1, false)
+        );
+        assert_eq!(
+            state.read_reply(&key, 1).expect("reply").body,
+            "another answer"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_reply_command_is_refused_without_outbound_chat_or_after_retirement() {
+        let root = temporary("reply-command-inbound-only");
+        let mut configuration = config();
+        configuration.outbound_enabled = false;
+        configuration.ack_reaction = None;
+        let state = BridgeState::initialize(&root, configuration).expect("initialize state");
+        let key = admitted(&state, 1).remove(0);
+        let nonce = state.read_request(&key).expect("request").reply_nonce;
+        let error = state
+            .submit_reply(&key, &format!("{nonce}_1"), "answer")
+            .expect_err("inbound only");
+        assert!(
+            error
+                .to_string()
+                .contains("chat reply requires outbound_enabled=true"),
+            "{error}"
+        );
+        assert_eq!(next_reply_ordinal(&state, &key), 1);
+        fs::remove_dir_all(root).expect("cleanup");
+
+        let (state, key, root) =
+            state_with_old_request("reply-command-retired", config_without_reaction());
+        let nonce = state.read_request(&key).expect("request").reply_nonce;
+        state
+            .set_delivery_phase(&key, RequestPhase::Delivered, None)
+            .expect("mark delivered");
+        state.close_replies(&key).expect("close and retire");
+        assert!(state.retired_key(&key).expect("retired key").is_some());
+        let error = state
+            .submit_reply(&key, &format!("{nonce}_1"), "late answer")
+            .expect_err("retired");
+        assert!(
+            error
+                .to_string()
+                .contains("the request is retired, so it takes no more replies"),
+            "{error}"
+        );
+        assert!(!state.reply_path(&key, 1).exists());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_reply_command_keeps_the_capture_rules_for_redrawn_tables_and_guessed_ids() {
+        let (state, key, nonce, root) = open_request("reply-command-redrawn-table");
+        let capture = state
+            .capture_snapshot(&reply_block(
+                &format!("{nonce}_1"),
+                "│ 1 │ ab  │\n│ 2 │ cd  │",
+            ))
+            .expect("stored table");
+        assert_eq!(capture.replies, [(key.clone(), vec![1])]);
+        let error = state
+            .submit_reply(&key, &format!("{nonce}_2"), "│ 1 │ abc  │\n│ 2 │ d    │")
+            .expect_err("the table at other widths");
+        assert!(
+            error.to_string().contains("redrawn at another width"),
+            "{error}"
+        );
+        assert_eq!(next_reply_ordinal(&state, &key), 2);
+        fs::remove_dir_all(root).expect("cleanup");
+
+        // A block under 002 was read before the second request's prompt was typed, so its text
+        // was written for another request and is never sent to the second one.
+        let (state, keys, coordinator, root) = one_delivered_one_queued("reply-command-guessed-id");
+        let gate = state.prompt_gate(&coordinator, None).expect("gate");
+        let capture = state
+            .capture_snapshot_with_gate(&guessed_block(), &gate)
+            .expect("capture");
+        assert!(capture.replies.is_empty(), "{capture:?}");
+        assert_eq!(withheld_aliases(&state), [2]);
+        let error = state
+            .submit_reply(&keys[1], "002", "an answer meant for the first request")
+            .expect_err("the guessed text");
+        assert!(
+            error
+                .to_string()
+                .contains("was read under this request's ID before the request's prompt reached"),
+            "{error}"
+        );
+        assert_eq!(next_reply_ordinal(&state, &keys[1]), 1);
+        // A screen block under 002 names no request, but the command also names the second
+        // request by its key, so a new text it stores under 002 is that request's. The key and ID
+        // are matched to catch a reply meant for another request; neither is a secret.
+        assert_eq!(
+            state
+                .submit_reply(&keys[1], "002", "the second request's answer")
+                .expect("store a new text"),
+            stored_reply(1, false)
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn an_unusable_alias_record_makes_a_short_id_try_again_while_a_long_id_works() {
+        let root = temporary("reply-command-alias-unusable");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let key = admitted(&state, 1).remove(0);
+        assert!(
+            prompted(&state, &key).contains("Include the line <CHAT_REPLY_001> at the beginning")
+        );
+        let nonce = state.read_request(&key).expect("request").reply_nonce;
+        let path = root.join("reply-aliases.json");
+        let saved = fs::read(&path).expect("alias record");
+        let mut record: Value = serde_json::from_slice(&saved).expect("alias record JSON");
+        record["next_alias"] = json!(1);
+        fs::write(
+            &path,
+            serde_json::to_vec(&record).expect("encode alias record"),
+        )
+        .expect("spoil alias record");
+        let ReplyStoreOutcome::TryAgain(reason) = state
+            .submit_reply(&key, "001", "by alias")
+            .expect("try again")
+        else {
+            panic!("a short ID cannot be checked against an unusable alias record");
+        };
+        assert!(
+            reason.contains("reply-aliases.json") && reason.contains("is unusable"),
+            "{reason}"
+        );
+        assert_eq!(next_reply_ordinal(&state, &key), 1);
+        assert_eq!(
+            state
+                .submit_reply(&key, &format!("{nonce}_1"), "by long ID")
+                .expect("store by long ID"),
+            stored_reply(1, false)
+        );
+        fs::write(&path, &saved).expect("restore alias record");
+        assert_eq!(
+            state
+                .submit_reply(&key, "001", "by alias")
+                .expect("store by alias"),
+            stored_reply(2, false)
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_prompt_gives_the_reply_command_only_when_offered_and_printable() {
+        let root = temporary("reply-command-prompt");
+        let state = BridgeState::initialize(&root, config())
+            .expect("initialize state")
+            .with_reply_command_offered(true);
+        let key = admitted(&state, 1).remove(0);
+        let prompt = prompted(&state, &key);
+        let root_word = shell_word(
+            std::path::absolute(&root)
+                .expect("absolute root")
+                .to_str()
+                .expect("UTF-8 root"),
+        )
+        .expect("printable root");
+        let program = shell_word(
+            env::current_exe()
+                .expect("test executable")
+                .to_str()
+                .expect("UTF-8 test executable"),
+        )
+        .expect("printable test executable");
+        assert!(
+            prompt.ends_with(&format!(
+                "Lines between will be sent to the user as a chat message. Use the same two lines \
+for every reply, with no tool call between them.\n\n\
+To send a reply at once, before your turn ends, write its text to a file, without the two lines, \
+and run this command with the file's path in place of PATH_TO_YOUR_REPLY: {program} chat reply \
+--bridge-state {root_word} --request {key} --reply-id 001 --file PATH_TO_YOUR_REPLY\n\
+Run it once for each reply; running it again with the same text does not send that text twice. \
+Send each reply one way only, by this command or between the two lines, not both. If the command \
+fails twice for a reply, print that reply between the two lines at the end of your turn instead."
+            )),
+            "{prompt}"
+        );
+        assert_eq!(prompt.matches("chat reply").count(), 1, "{prompt}");
+        fs::remove_dir_all(root).expect("cleanup");
+
+        // Not offered, or without outbound chat, no prompt names the command.
+        let (state, key, _, root) = open_request("reply-command-not-offered");
+        let prompt = prompted(&state, &key);
+        assert!(prompt.contains("<CHAT_REPLY_001>"), "{prompt}");
+        assert!(!prompt.contains("chat reply"), "{prompt}");
+        assert!(!prompt.contains("PATH_TO_YOUR_REPLY"), "{prompt}");
+        fs::remove_dir_all(root).expect("cleanup");
+        let root = temporary("reply-command-inbound-prompt");
+        let mut configuration = config();
+        configuration.outbound_enabled = false;
+        configuration.ack_reaction = None;
+        let state = BridgeState::initialize(&root, configuration)
+            .expect("initialize state")
+            .with_reply_command_offered(true);
+        let key = admitted(&state, 1).remove(0);
+        let prompt = state.prompt(&key, "").expect("render prompt");
+        assert!(!prompt.contains("chat reply"), "{prompt}");
+        fs::remove_dir_all(root).expect("cleanup");
+
+        // A state directory whose path holds reply syntax or a line break would print a command
+        // that holds the syntax or spans two lines, so the prompt gives only the two lines.
+        for name in ["reply-command-```-root", "reply-command-\n-root"] {
+            let root = temporary(name);
+            let state = BridgeState::initialize(&root, config())
+                .expect("initialize state")
+                .with_reply_command_offered(true);
+            let key = admitted(&state, 1).remove(0);
+            let prompt = prompted(&state, &key);
+            assert!(
+                prompt.ends_with(
+                    "Use the same two lines for every reply, with no tool call between them."
+                ),
+                "{prompt}"
+            );
+            assert!(!prompt.contains("PATH_TO_YOUR_REPLY"), "{prompt}");
+            fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn a_reply_command_is_left_out_when_the_executable_has_no_printable_path() {
+        let root = temporary("reply-command-executable");
+        let state = BridgeState::initialize(&root, config())
+            .expect("initialize state")
+            .with_reply_command_offered(true);
+        let key = admitted(&state, 1).remove(0);
+        let program = root.join("agentctl-build");
+        fs::write(&program, b"").expect("program file");
+        let command = state
+            .reply_command(Ok(program.clone()), &key, "001")
+            .expect("printable command");
+        assert!(
+            command.starts_with(&format!(
+                "{} chat reply --bridge-state ",
+                program.to_str().expect("UTF-8 path")
+            )),
+            "{command}"
+        );
+        // A `chat thread` command names each of these as the bare `agentctl`, which could run
+        // another build or none, so no reply command is printed for them.
+        let line_break = root.join("agent\nctl");
+        fs::write(&line_break, b"").expect("program file with a line break");
+        let gone = root.join("gone");
+        let deleted = PathBuf::from(format!("{} (deleted)", gone.display()));
+        for executable in [
+            Some(line_break),
+            Some(gone),
+            Some(deleted),
+            Some(PathBuf::from("relative-agentctl")),
+            None,
+        ] {
+            let reported = || {
+                executable
+                    .clone()
+                    .ok_or_else(|| io::Error::other("no executable"))
+            };
+            assert_eq!(history_program(reported()), "agentctl", "{executable:?}");
+            assert_eq!(executable_word(reported()), None, "{executable:?}");
+            assert_eq!(
+                state.reply_command(reported(), &key, "001"),
+                None,
+                "{executable:?}"
+            );
+        }
         fs::remove_dir_all(root).expect("cleanup");
     }
 }
