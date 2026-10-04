@@ -27125,6 +27125,214 @@ def test_create_json_keeps_hook_progress_off_machine_readable_stdout(
     assert "hook-progress" in made.stderr
 
 
+_SETUP_HOOKS_SUBMODULE_UPDATE = (
+    "env -u GIT_DIR git -c protocol.file.allow=always submodule update --init --recursive"
+)
+
+
+def add_installer_submodule(
+    tmp_path: Path, project: Path, repository: Path, script: str | None
+) -> None:
+    """Add submodule 'hooked', with ``script`` as its scripts/setup-hooks.sh."""
+
+    remote = tmp_path / "hooked.git"
+    source = tmp_path / "hooked-source"
+    subprocess.run(
+        ["git", "init", "--bare", "--initial-branch=main", str(remote)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "clone", str(remote), str(source)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git(source, "config", "user.name", "Wrkslots Test")
+    git(source, "config", "user.email", "wrkslots@example.invalid")
+    (source / "hooked.txt").write_text("hooked\n", encoding="utf-8")
+    git(source, "add", "hooked.txt")
+    if script is not None:
+        installer = source / "scripts" / "setup-hooks.sh"
+        installer.parent.mkdir()
+        installer.write_text(script, encoding="utf-8")
+        installer.chmod(0o755)
+        git(source, "add", "scripts/setup-hooks.sh")
+    git(source, "commit", "-m", "hooked base")
+    git(source, "push", "-u", "origin", "main")
+    git(
+        repository,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        str(remote),
+        "hooked",
+    )
+    git(repository, "commit", "-m", "add hooked submodule")
+    git(repository, "push", "origin", "main")
+    update_configuration(project, post_provision_hooks=[_SETUP_HOOKS_SUBMODULE_UPDATE])
+
+
+def test_create_runs_slot_private_submodule_setup_hooks_from_its_root(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    marker = tmp_path / "installer-marker"
+    add_installer_submodule(
+        tmp_path,
+        project,
+        repository,
+        textwrap.dedent(
+            """\
+            #!/bin/sh
+            set -eu
+            git config core.hooksPath .githooks
+            printf '%s\\n%s\\n' "$PWD" "${GIT_DIR-unset}" > "$HOOK_MARKER"
+            """
+        ),
+    )
+
+    # An ambient GIT_DIR naming the primary repository must not redirect the
+    # installer's Git there.
+    made = create(
+        project,
+        env={"GIT_DIR": str(repository / ".git"), "HOOK_MARKER": str(marker)},
+    )
+
+    assert made.returncode == 0, made.stderr
+    submodule = checkout(project) / "hooked"
+    assert marker.read_text(encoding="utf-8").splitlines() == [
+        str(submodule.resolve()),
+        "unset",
+    ]
+    assert (
+        git(submodule, "config", "--get", "core.hooksPath").stdout.strip() == ".githooks"
+    )
+    assert git(repository, "config", "--get", "core.hooksPath", check=False).returncode == 1
+    assert f"hooks: ran scripts/setup-hooks.sh in {submodule} (rc 0)" in made.stdout
+
+
+def test_create_does_not_run_setup_hooks_in_a_checkout_sharing_git_config(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    marker = tmp_path / "root-installer-ran"
+    installer = repository / "scripts" / "setup-hooks.sh"
+    installer.parent.mkdir()
+    installer.write_text(f"#!/bin/sh\ntouch {shlex.quote(str(marker))}\n", encoding="utf-8")
+    installer.chmod(0o755)
+    git(repository, "add", "scripts/setup-hooks.sh")
+    git(repository, "commit", "-m", "root installer")
+    git(repository, "push", "origin", "main")
+
+    made = create(project)
+
+    assert made.returncode == 0, made.stderr
+    assert not marker.exists()
+    assert (
+        f"hooks: not run: scripts/setup-hooks.sh in {checkout(project)}; "
+        "its Git configuration" in made.stdout
+    )
+    assert "hooks: skipped; no repository private to this slot" in made.stdout
+
+
+def test_create_states_a_skip_when_no_setup_hooks_script_exists(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+
+    made = create(project)
+
+    assert made.returncode == 0, made.stderr
+    assert len(active_slots(project)) == 1
+    assert (
+        "hooks: skipped; no repository private to this slot has an executable "
+        "scripts/setup-hooks.sh (3 checked)"
+    ) in made.stdout
+    assert "hooks: ran" not in made.stdout
+
+
+def test_failing_setup_hooks_installer_is_reported_and_creation_stands(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    add_installer_submodule(
+        tmp_path,
+        project,
+        repository,
+        "#!/bin/sh\necho installer-stdout-line\necho installer-stderr-line >&2\nexit 7\n",
+    )
+
+    made = create(project)
+
+    assert made.returncode == 0, made.stderr
+    assert len(active_slots(project)) == 1
+    submodule = checkout(project) / "hooked"
+    assert (
+        f"hooks: WARNING scripts/setup-hooks.sh in {submodule} failed (rc 7); "
+        "the slot was created without these Git hooks"
+    ) in made.stdout
+    assert "hooks: | installer-stdout-line" in made.stdout
+    assert "hooks: | installer-stderr-line" in made.stdout
+
+    made_json = raw_command(
+        project,
+        "create",
+        "slot02",
+        "--format",
+        "json",
+        "--slot-type",
+        "agent",
+        "--coordinator-authorized",
+        "--agent",
+        "codex-2",
+        "--task",
+        "task-slot02",
+        "--purpose",
+        "test slot02",
+        "--owner-pid",
+        str(os.getpid()),
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--repo",
+        "product=repo",
+        "--branch",
+        "product=codex/task2",
+    )
+
+    assert made_json.returncode == 0, made_json.stderr
+    assert len(active_slots(project)) == 2
+    payload = json.loads(made_json.stdout)
+    results = payload["setup_hooks"]["results"]
+    assert payload["setup_hooks"]["repositories_checked"] == 2
+    assert [(item["status"], item["returncode"]) for item in results] == [("failed", 7)]
+    assert results[0]["path"] == str(checkout(project, "slot02") / "hooked")
+    assert results[0]["output_tail"] == "installer-stdout-line\ninstaller-stderr-line"
+    assert "failed (rc 7)" in made_json.stderr
+
+
+def test_setup_hooks_installer_is_stopped_at_its_time_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    installer = repository / "scripts" / "setup-hooks.sh"
+    installer.parent.mkdir(parents=True)
+    installer.write_text("#!/bin/sh\necho started\nexec sleep 30\n", encoding="utf-8")
+    installer.chmod(0o755)
+    monkeypatch.setattr(wrkslots, "SETUP_HOOKS_TIMEOUT_SECONDS", 0.5)
+
+    started = time.monotonic()
+    result = wrkslots._run_one_setup_hook_installer(repository)
+
+    assert time.monotonic() - started < 10
+    assert result.status == "timed-out"
+    assert result.output_tail == "started"
+    assert result.returncode is not None and result.returncode < 0
+
+
 def test_failed_post_provision_hook_is_loud_and_recovery_resumes_hooks(
     tmp_path: Path,
 ) -> None:

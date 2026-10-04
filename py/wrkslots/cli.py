@@ -42,7 +42,7 @@ import urllib.parse
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Set as AbstractSet
 from pathlib import Path
-from typing import NoReturn, TypedDict, TypeVar
+from typing import IO, NoReturn, TextIO, TypedDict, TypeVar
 
 from wrkslots import __version__, imagecmd, sandbox, slotimage, yamlconfig
 
@@ -20469,6 +20469,270 @@ def _run_post_provision_hooks(
     return total
 
 
+# A repository's own Git hook installer, run by 'create' after the slot is
+# registered.  See _run_setup_hook_installers for which repositories qualify.
+SETUP_HOOKS_SCRIPT = "scripts/setup-hooks.sh"
+SETUP_HOOKS_TIMEOUT_SECONDS = 60.0
+SETUP_HOOKS_TAIL_BYTES = 4096
+SETUP_HOOKS_TAIL_LINES = 20
+_SETUP_HOOKS_GIT_SECONDS = 30.0
+_SETUP_HOOKS_TERM_GRACE_SECONDS = 2.0
+# Ambient settings that would point the installer's Git at another repository.
+_SETUP_HOOKS_CLEARED_ENV = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class SetupHookResult:
+    """What happened to one repository's hook installer during 'create'.
+
+    ``status`` is one of: ran (exit status 0), failed, timed-out,
+    failed-to-start, not-executable, not-run-shared-git-config, or
+    inspection-failed.
+    """
+
+    path: str
+    status: str
+    returncode: int | None = None
+    output_tail: str = ""
+    detail: str = ""
+
+    def to_obj(self) -> dict[str, object]:
+        return {
+            "path": self.path,
+            "script": SETUP_HOOKS_SCRIPT,
+            "status": self.status,
+            "returncode": self.returncode,
+            "output_tail": self.output_tail,
+            "detail": self.detail,
+        }
+
+
+def _setup_hooks_git_dirs(repository: Path) -> tuple[Path, Path]:
+    """Return the absolute Git directory and common directory of ``repository``."""
+
+    completed = _GitVcs._run(
+        repository,
+        ["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
+        timeout_seconds=_SETUP_HOOKS_GIT_SECONDS,
+        timeout_refusal=f"git rev-parse in {repository} did not finish",
+    )
+    lines = completed.stdout.splitlines()
+    if len(lines) != 2 or not all(lines):
+        raise StateError(f"git rev-parse in {repository} printed {completed.stdout!r}")
+    return Path(lines[0]).resolve(), Path(lines[1]).resolve()
+
+
+def _setup_hooks_repositories(checkout: Path) -> list[Path]:
+    """Return ``checkout`` and every initialized submodule below it, recursively."""
+
+    completed = _GitVcs._run(
+        checkout,
+        [
+            "submodule",
+            "foreach",
+            "--quiet",
+            "--recursive",
+            'printf "%s\\0" "$displaypath"',
+        ],
+        timeout_seconds=_SETUP_HOOKS_GIT_SECONDS,
+        timeout_refusal=f"git submodule foreach in {checkout} did not finish",
+    )
+    return [checkout] + [
+        checkout / name for name in completed.stdout.split("\0") if name
+    ]
+
+
+def _output_tail(stream: IO[bytes]) -> str:
+    """Return at most the last SETUP_HOOKS_TAIL_LINES lines of ``stream``."""
+
+    stream.seek(0, os.SEEK_END)
+    size = stream.tell()
+    stream.seek(max(0, size - SETUP_HOOKS_TAIL_BYTES))
+    text = stream.read().decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if size > SETUP_HOOKS_TAIL_BYTES and lines:
+        lines = lines[1:]  # the first line was probably cut
+    return "\n".join(lines[-SETUP_HOOKS_TAIL_LINES:])
+
+
+def _run_one_setup_hook_installer(repository: Path) -> SetupHookResult:
+    """Run ``repository``'s installer once, bounded, with its output captured."""
+
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in _SETUP_HOOKS_CLEARED_ENV
+    }
+    script = repository / SETUP_HOOKS_SCRIPT
+    # The output goes to a file rather than a pipe, so a descendant that keeps
+    # running after the installer exits cannot hold 'create' open.
+    with tempfile.TemporaryFile() as output:
+        try:
+            process = subprocess.Popen(
+                [str(script)],
+                cwd=repository,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            return SetupHookResult(str(repository), "failed-to-start", detail=str(exc))
+        try:
+            returncode = process.wait(timeout=SETUP_HOOKS_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=_SETUP_HOOKS_TERM_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(OSError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            return SetupHookResult(
+                str(repository),
+                "timed-out",
+                returncode=process.returncode,
+                output_tail=_output_tail(output),
+                detail=f"stopped after {SETUP_HOOKS_TIMEOUT_SECONDS:g} s",
+            )
+        return SetupHookResult(
+            str(repository),
+            "ran" if returncode == 0 else "failed",
+            returncode=returncode,
+            output_tail=_output_tail(output),
+        )
+
+
+def _run_setup_hook_installers(
+    config: Config, checkouts: Sequence[Checkout]
+) -> tuple[int, list[SetupHookResult]]:
+    """Run each new repository's own scripts/setup-hooks.sh; never raise.
+
+    A repository qualifies when its Git configuration is private to this slot:
+    its common Git directory lies inside the per-worktree Git directory of the
+    checkout 'create' just added.  That is true of a submodule initialized in
+    the new checkout, whose Git directory lives under
+    <common>/worktrees/<checkout>/modules/, and false of the checkout itself,
+    whose configuration is shared by every worktree of the repository, so a
+    hook setting made once in the primary checkout already applies there and
+    re-running the installer would rewrite state other slots use.  The script
+    must be a regular, executable file; it runs from the repository root, with
+    stdin closed, ambient GIT_DIR-style variables removed, and a bound of
+    SETUP_HOOKS_TIMEOUT_SECONDS.  The slot is already registered, so a failure
+    is reported, never raised.
+
+    Returns the number of repositories inspected and one result for each
+    repository that has the script.
+    """
+
+    checked = 0
+    results: list[SetupHookResult] = []
+    for checkout in checkouts:
+        try:
+            checkout_path = _stored_path(config, checkout.path, "checkout path")
+        except (Refusal, StateError, OSError, ValueError) as exc:
+            results.append(SetupHookResult(checkout.path, "inspection-failed", detail=str(exc)))
+            continue
+        try:
+            slot_git_dir, _ = _setup_hooks_git_dirs(checkout_path)
+            repositories = _setup_hooks_repositories(checkout_path)
+        except (Refusal, StateError, OSError, ValueError) as exc:
+            results.append(
+                SetupHookResult(str(checkout_path), "inspection-failed", detail=str(exc))
+            )
+            continue
+        for repository in repositories:
+            checked += 1
+            script = repository / SETUP_HOOKS_SCRIPT
+            try:
+                mode = script.lstat().st_mode
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                results.append(
+                    SetupHookResult(str(repository), "inspection-failed", detail=str(exc))
+                )
+                continue
+            if not stat.S_ISREG(mode) or not mode & stat.S_IXUSR:
+                results.append(
+                    SetupHookResult(
+                        str(repository),
+                        "not-executable",
+                        detail=f"{SETUP_HOOKS_SCRIPT} is not a regular executable file",
+                    )
+                )
+                continue
+            try:
+                _, common_dir = _setup_hooks_git_dirs(repository)
+            except (Refusal, StateError, OSError, ValueError) as exc:
+                results.append(
+                    SetupHookResult(str(repository), "inspection-failed", detail=str(exc))
+                )
+                continue
+            if not common_dir.is_relative_to(slot_git_dir):
+                results.append(
+                    SetupHookResult(
+                        str(repository),
+                        "not-run-shared-git-config",
+                        detail=f"its Git configuration {common_dir} is shared beyond this slot",
+                    )
+                )
+                continue
+            results.append(_run_one_setup_hook_installer(repository))
+    return checked, results
+
+
+def _print_setup_hook_results(
+    checked: int, results: Sequence[SetupHookResult], *, stream: TextIO
+) -> None:
+    """Print one 'hooks:' line per result, or the stated skip when nothing ran."""
+
+    for result in results:
+        where = f"{SETUP_HOOKS_SCRIPT} in {result.path}"
+        if result.status == "ran":
+            print(f"hooks: ran {where} (rc 0)", file=stream)
+            continue
+        if result.status == "not-run-shared-git-config":
+            print(f"hooks: not run: {where}; {result.detail}", file=stream)
+            continue
+        if result.status == "failed":
+            outcome = f"failed (rc {result.returncode})"
+        elif result.status == "timed-out":
+            outcome = f"timed out ({result.detail})"
+        elif result.status == "failed-to-start":
+            outcome = f"could not start: {result.detail}"
+        elif result.status == "not-executable":
+            outcome = f"not run: {result.detail}"
+        else:
+            outcome = f"not inspected: {result.detail}"
+        print(
+            f"hooks: WARNING {where} {outcome}; the slot was created without "
+            "these Git hooks",
+            file=stream,
+        )
+        if result.output_tail:
+            print("hooks: output tail:", file=stream)
+            for line in result.output_tail.splitlines():
+                print(f"hooks: | {line}", file=stream)
+    if all(result.status == "not-run-shared-git-config" for result in results):
+        print(
+            f"hooks: skipped; no repository private to this slot has an executable "
+            f"{SETUP_HOOKS_SCRIPT} ({checked} checked)",
+            file=stream,
+        )
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     _require_coordinator_authorized(args, "worktree creation")
     args.slot_type = _require_slot_type(args, "worktree creation")
@@ -20718,12 +20982,23 @@ def _cmd_create(args: argparse.Namespace) -> int:
             _global_rows(after_states, after_archives),
             args.slot,
         )
+    # The slot is registered and every checkout is materialized, including the
+    # post-provision hooks' submodules; installers run outside the lock and
+    # cannot undo or fail the creation.
+    hooks_checked, hook_results = _run_setup_hook_installers(config, record.checkouts)
     if args.format == "json":
+        _print_setup_hook_results(hooks_checked, hook_results, stream=sys.stderr)
         print(
             json.dumps(
                 {
                     "slot": record.slot,
                     "slot_type": record.slot_type,
+                    "setup_hooks": {
+                        "script": SETUP_HOOKS_SCRIPT,
+                        "timeout_seconds": SETUP_HOOKS_TIMEOUT_SECONDS,
+                        "repositories_checked": hooks_checked,
+                        "results": [result.to_obj() for result in hook_results],
+                    },
                     "agent": record.agent,
                     "generation": record.generation,
                     "owner_process": "unbound" if owner is None else "bound",
@@ -20759,6 +21034,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             )
         if owner is None:
             print("owner_process=unbound; run 'wrkslots adopt' before heartbeat or finish")
+        _print_setup_hook_results(hooks_checked, hook_results, stream=sys.stdout)
     return 0
 
 
@@ -48018,7 +48294,11 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "and later Git evidence use the same NAME. The configured origin is used by default. "
             "When --remote-url is supplied, the selected remote must match it; otherwise its "
             "configured URL is recorded. Omit --owner-pid only when that owner will immediately "
-            "run adopt."
+            "run adopt. After the slot is registered, create runs scripts/setup-hooks.sh in each "
+            "submodule initialized in the new checkouts whose Git configuration is private to "
+            "the slot, from that submodule's root, for at most 60 seconds each; the outcome is "
+            "printed as 'hooks:' lines (setup_hooks in --format json), and a failing installer "
+            "is reported without failing or undoing the creation."
         ),
         formatter_class=_HelpFormatter,
     )

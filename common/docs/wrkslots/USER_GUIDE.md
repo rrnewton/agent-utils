@@ -280,6 +280,45 @@ explicit state-path arguments remain CLI refusals. JSON reports typed CPU second
 seconds, and work counters for the registry, liveness, process-census, cache-planning,
 cache-census, registered-row, and storage phases.
 
+## Git hook installers in new submodules
+
+A repository can ship its own Git hook installer as an executable `scripts/setup-hooks.sh`, which
+typically sets `core.hooksPath`. A setting made once in the primary checkout reaches every linked
+worktree of that repository, because they share one configuration. A submodule initialized inside
+a new slot is different: its Git directory lives under that worktree's own Git directory
+(`<common>/worktrees/<name>/modules/...`), so it starts with no hook setting at all.
+
+After `create` has registered the slot, and so after the post-provision hooks have initialized
+submodules, it looks at each new checkout and every initialized submodule below it, recursively.
+It runs `scripts/setup-hooks.sh` in a repository when all of these hold:
+
+- the script is a regular file, not a symlink, with the owner-execute bit set;
+- the repository's common Git directory lies inside the new checkout's own Git directory, which
+  is true of a submodule initialized in this slot and false of the checkout itself, whose
+  configuration every slot shares.
+
+The script runs from that repository's root, with stdin closed, with `GIT_DIR`, `GIT_WORK_TREE`,
+`GIT_INDEX_FILE`, `GIT_COMMON_DIR`, and the other variables that would point Git elsewhere removed
+from its environment, and for at most 60 seconds; then its process group receives SIGTERM, and
+SIGKILL two seconds later. It runs outside the mutation lock, and nothing it does can fail or undo
+the creation. `create` still exits 0, and reports every outcome:
+
+```text
+hooks: ran scripts/setup-hooks.sh in /work/slots/s1/product/sub (rc 0)
+hooks: WARNING scripts/setup-hooks.sh in /work/slots/s1/product/sub failed (rc 7); the slot was created without these Git hooks
+hooks: output tail:
+hooks: | the last lines of its combined stdout and stderr
+hooks: skipped; no repository private to this slot has an executable scripts/setup-hooks.sh (3 checked)
+```
+
+A checkout whose own script was not run because its configuration is shared gets a
+`hooks: not run:` line. With `--format json` the lines go to stderr, and the result object gains
+`setup_hooks`: `script`, `timeout_seconds`, `repositories_checked`, and one entry per repository
+that has the script, with `path`, `status` (`ran`, `failed`, `timed-out`, `failed-to-start`,
+`not-executable`, `not-run-shared-git-config`, or `inspection-failed`), `returncode`,
+`output_tail` (at most 20 lines from the last 4 KiB), and `detail`. A creation finished later by
+`recover` does not run installers; run the script by hand in that case.
+
 ## Time-to-live and process evidence
 
 `init --heartbeat-ttl-seconds SECONDS` records the default copied into every new slot. `heartbeat`
