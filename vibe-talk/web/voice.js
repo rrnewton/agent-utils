@@ -10387,10 +10387,10 @@ function discordNode(messages) {
   const upstreamBoundary = messages[messages.length - 1];
   // `row-more-menu`. Rarely used, and the widest label on the row, so it lives under a "⋯" menu
   // rather than taking a line of the row's width: room the thread tag's reply count needs. The menu
-  // is the home for further per-message options; it appears only when it has something to offer.
+  // is the home for further per-message options. Copy is always one of them, so the menu is always
+  // offered; the provider's read marker joins it only where the server advertises that write.
   const more = document.createElement("span");
   more.className = "row-more";
-  more.hidden = !upstreamReadMarkSupported;
   const moreButton = document.createElement("button");
   moreButton.className = "row-more-button";
   moreButton.setAttribute("type", "button");
@@ -10410,7 +10410,19 @@ function discordNode(messages) {
     setMenu(false);
     guardQuietly(() => markReadUpstream(String(upstreamBoundary.id)))();
   });
-  menu.append(upstreamRead);
+  // `#198 copy-message-text`. The row's whole text as written — every constituent of a combined
+  // row, in order, which is what the reader sees as one message — so it can be pasted elsewhere.
+  // The source text rather than what the row draws: a pasted message should keep its own markup.
+  const copy = document.createElement("button");
+  copy.className = "row-copy-button";
+  copy.setAttribute("type", "button");
+  copy.setAttribute("title", "Copy this message's text to the clipboard");
+  copy.textContent = "Copy text";
+  copy.addEventListener("click", () => {
+    setMenu(false);
+    guardQuietly(() => copyMessageText(content))();
+  });
+  menu.append(copy, upstreamRead);
   more.append(moreButton, menu);
   meta.append(more);
   // `#50 todo-view`. The non-gestural way to say "dealt with", and the one a keyboard can reach.
@@ -10464,6 +10476,39 @@ function discordNode(messages) {
   // not on the row — see the note above about where the snowflake lives.
   searchable(li, message.author, content);
   return li;
+}
+
+/**
+ * Put a message's text on the clipboard, and say whether it went.
+ *
+ * The asynchronous Clipboard API first: it needs a secure context and a user gesture, both of which
+ * a tap on the ⋯ menu over HTTPS provides. The old selection-and-copy path only where that API is
+ * absent, and a plain sentence when neither works — never a silent no-op the reader mistakes for a
+ * copy. `#198 copy-message-text`.
+ */
+async function copyMessageText(text) {
+  const value = String(text || "");
+  let copied = false;
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      await navigator.clipboard.writeText(value);
+      copied = true;
+    } else if (typeof document.execCommand === "function") {
+      const scratch = document.createElement("textarea");
+      scratch.value = value;
+      scratch.setAttribute("readonly", "");
+      scratch.style.position = "fixed";
+      scratch.style.opacity = "0";
+      document.body.append(scratch);
+      scratch.select();
+      copied = document.execCommand("copy");
+      scratch.remove();
+    }
+  } catch (_error) {
+    copied = false;
+  }
+  setStatus(copied ? "Copied the message text." : "This browser would not copy to the clipboard.");
+  return copied;
 }
 
 // `#62 message-count-accuracy`, carried across from web/app.js where it was fixed first.

@@ -1507,6 +1507,13 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     language: "en-US",
     // `#195 send-resilience`. What the browser believes about the connection; see `setOnline`.
     onLine: true,
+    // `#198 copy-message-text`. The asynchronous Clipboard API, recording what was written.
+    clipboard: {
+      writeText: async (text) => {
+        if (page.clipboardRefuses) throw new Error("NotAllowedError");
+        page.clipboard = text;
+      },
+    },
     mediaDevices: {
       getUserMedia: async (constraints) => {
         // Rebuilt in THIS realm, key for key. The page's object is made inside the vm context, so
@@ -9570,13 +9577,46 @@ test("source-provider read marking is absent unless the server advertises it", a
   const rows = await showDiscord(page, backlog(2));
 
   assert.ok(upstreamReadButton(rows[0]), "the capability-controlled action has no stable control");
-  assert.equal(rowMore(rows[0]).hidden, true, "an empty ⋯ menu was offered");
+  // The menu itself stays: Copy text is always in it (`#198 copy-message-text`).
+  assert.equal(rowMore(rows[0]).hidden, false, "the ⋯ menu holding Copy text is not offered");
   assert.equal(
     upstreamReadButton(rows[0]).hidden,
     true,
     "a provider that cannot mark read was offered a write that will fail"
   );
   assert.deepStrictEqual(page.upstreamReadCalls, []);
+});
+
+test("Copy text in the ⋯ menu copies the whole row's text, and says so", async () => {
+  // `#198 copy-message-text`. Every constituent of a combined row, in order, as written.
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [
+    message({ id: "8000000000000000200", content: "first half of a **long** answer",
+      timestamp: "2026-08-19T04:31:00.000Z" }),
+    message({ id: "8000000000000000201", content: "second half, with a path like a_b_c.txt",
+      timestamp: "2026-08-19T04:31:01.000Z" }),
+  ]);
+  assert.equal(rows.length, 1, "the fixture did not produce one combined row");
+  const copy = rows[0].descendants().find((node) => node.className === "row-copy-button");
+  assert.ok(copy, "the ⋯ menu has no Copy text");
+  assert.equal(copy.textContent, "Copy text");
+  await rowMoreButton(rows[0]).click();
+  await copy.click();
+  await page.settle();
+  assert.match(page.clipboard, /^first half of a \*\*long\*\* answer/, "the source text was not copied");
+  assert.match(page.clipboard, /second half, with a path like a_b_c\.txt$/, "the combined row lost its tail");
+  assert.equal(rowMoreMenu(rows[0]).hidden, true, "the ⋯ menu stayed open after copying");
+  assert.equal(page.el("status").textContent, "Copied the message text.");
+
+  // A refusal is said, never mistaken for a copy.
+  page.clipboardRefuses = true;
+  page.clipboard = undefined;
+  await rowMoreButton(rows[0]).click();
+  await copy.click();
+  await page.settle();
+  assert.equal(page.clipboard, undefined);
+  assert.equal(page.el("status").textContent, "This browser would not copy to the clipboard.");
 });
 
 test("mark read through here targets the newest part without archiving the row", async () => {
