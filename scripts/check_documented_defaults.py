@@ -897,6 +897,68 @@ PINS: tuple[Pin, ...] = (
             ),
         ),
     ),
+    Pin(
+        "chat-delivery-retry-seconds",
+        "the period at which `chat run` scans its request records for prompts left waiting to be"
+        " typed, in seconds",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_service.rs",
+                r"(?m)^const DELIVERY_RETRY_INTERVAL: Duration = Duration::from_secs\((?P<value>[\d_]+)\);$",
+                "the Rust scan period",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"Every\s+(?P<value>[A-Za-z\d,]+)\s+seconds\s+`run`\s+also\s+scans\s+the\s+request\s+records",
+                "the scan period the chat guide's run paragraph states",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"Every\s+(?P<value>[A-Za-z\d,]+)\s+seconds\s+`run`\s+scans\s+the\s+request\s+records\.",
+                "the scan period the chat guide's prompt delivery section states",
+            ),
+        ),
+    ),
+    Pin(
+        "chat-delivery-stall-seconds",
+        "the age after admission at which a request whose prompt has not reached the agent is"
+        " stalled, in seconds",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_runtime.rs",
+                r"(?m)^pub\(crate\) const DELIVERY_STALL_AFTER: Duration = Duration::from_secs\((?P<value>[\d_]+)\);$",
+                "the Rust stall age",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"stalled\s+once\s+(?P<value>[A-Za-z\d,]+)\s+seconds\s+have\s+passed\s+since\s+its\s+admission",
+                "the stall age the chat guide states",
+            ),
+        ),
+    ),
+    Pin(
+        "chat-delivery-stall-repeat-seconds",
+        "the period at which `chat run` logs again a stalled request whose prompt it is still"
+        " trying to type, in seconds",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_service.rs",
+                r"(?m)^const DELIVERY_STALL_REPEAT: Duration = Duration::from_secs\((?P<value>[\d_]+)\);$",
+                "the Rust repeat period",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"service\s+logs\s+it\s+again\s+every\s+(?P<value>[A-Za-z\d,]+)\s+seconds",
+                "the repeat period the chat guide states",
+            ),
+        ),
+    ),
 )
 
 

@@ -97,6 +97,10 @@ const MAX_BURNED_REPLY_ALIASES: usize = 1_024;
 // live requests measured on 2026-10-01, a prompt waited from the start of its delivery to its
 // arrival a median of 0.3 s, a p90 of 15.5 s, and at most 58 minutes.
 const MAX_WITHHELD_REPLIES: usize = 256;
+// Requests this process retired after recording their prompts typed, kept until `chat run`'s next
+// scan takes them: one for each request the state can hold. At this bound the oldest are
+// forgotten first.
+const MAX_TYPED_RETIREMENTS: usize = MAX_REQUESTS as usize;
 // A record at every bound above, with 20-digit numbers, encodes to under 940 KiB.
 const MAX_REPLY_ALIAS_BYTES: usize = 1_024 * 1_024;
 // Distinct reply operations one thread may attempt within the window before its breaker trips.
@@ -125,6 +129,12 @@ const MAX_GAP_RETRIES: usize = 64;
 const MAX_ADMISSION_INTENT_BYTES: usize = 1_024 * 1_024;
 /// Stable read-only JSON schema emitted by `agentctl chat inspect`.
 pub const REQUEST_INSPECTION_SCHEMA: &str = "agentctl-chat-request-inspection/v1";
+// The schema of `delivery-alarm.json`, the list of stalled requests that `chat run` keeps in the
+// state directory: see `DeliveryAlarm`.
+const DELIVERY_ALARM_SCHEMA: &str = "agentctl-chat-delivery-alarm/v1";
+const DELIVERY_ALARM_FILE: &str = "delivery-alarm.json";
+// A request admitted this long ago whose prompt is not typed is stalled.
+pub(crate) const DELIVERY_STALL_AFTER: Duration = Duration::from_secs(60);
 // The one provider payload schema whose quoted-message metadata the prompt shows. Every other
 // schema stays opaque, so its prompt simply has no quote.
 const GOOGLE_CHAT_MESSAGE_SCHEMA: &str = "google.chat.message.v1";
@@ -1636,7 +1646,7 @@ impl ReplyBreakerRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum RequestPhase {
+pub(crate) enum RequestPhase {
     Pending,
     Submitting,
     Delivered,
@@ -1961,7 +1971,7 @@ enum ReplyPhase {
     Sent,
 }
 
-fn request_phase_name(phase: &RequestPhase) -> &'static str {
+pub(crate) fn request_phase_name(phase: &RequestPhase) -> &'static str {
     match phase {
         RequestPhase::Pending => "pending",
         RequestPhase::Submitting => "submitting",
@@ -1984,6 +1994,97 @@ fn reply_phase_name(phase: &ReplyPhase) -> &'static str {
         ReplyPhase::Pending => "pending",
         ReplyPhase::Sending => "sending",
         ReplyPhase::Sent => "sent",
+    }
+}
+
+/// One retained request's prompt delivery, as `chat run` watches it: see
+/// [`BridgeState::delivery_entries`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeliveryEntry {
+    pub(crate) key: String,
+    pub(crate) phase: RequestPhase,
+    pub(crate) admitted_at_millis: u64,
+    pub(crate) delivered_at_millis: Option<u64>,
+    /// Why the last attempt left the prompt untyped, as the request records it, with every quoted
+    /// composer draft removed as [`without_composer_preview`] removes it. `None` once the prompt
+    /// is typed, and while no attempt has recorded a reason.
+    pub(crate) reason: Option<String>,
+}
+
+impl DeliveryEntry {
+    fn new(record: &RequestRecord) -> Self {
+        let typed = record.phase == RequestPhase::Delivered;
+        Self {
+            key: record.key.clone(),
+            phase: record.phase.clone(),
+            admitted_at_millis: record.admitted_at_millis,
+            delivered_at_millis: record.delivered_at_millis,
+            reason: record
+                .delivery_error
+                .as_deref()
+                .filter(|_| !typed)
+                .map(without_composer_preview),
+        }
+    }
+
+    /// Whether the request records its prompt as typed: its phase is `delivered`.
+    pub(crate) fn typed(&self) -> bool {
+        self.phase == RequestPhase::Delivered
+    }
+
+    /// Whether, `stall_after` or more after the request was admitted, the request does not record
+    /// its prompt as typed at `now_millis`. The phase alone decides: a reply the agent has stored
+    /// does not, because a prompt whose delivery is uncertain stays uncertain until an operator
+    /// settles it.
+    pub(crate) fn stalled(&self, now_millis: u64, stall_after: Duration) -> bool {
+        !self.typed()
+            && Duration::from_millis(now_millis.saturating_sub(self.admitted_at_millis))
+                >= stall_after
+    }
+}
+
+/// The requests whose prompts are stalled, as `chat run` writes them to `delivery-alarm.json` in
+/// the state directory each time the list changes. It holds no ages, so the file changes only
+/// when a request becomes stalled, is typed or retired, or changes its phase or reason.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeliveryAlarm {
+    pub(crate) schema: String,
+    pub(crate) stall_after_seconds: u64,
+    /// Oldest admission first.
+    pub(crate) stalled: Vec<StalledRequest>,
+}
+
+/// One stalled request in a [`DeliveryAlarm`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StalledRequest {
+    pub(crate) key: String,
+    /// `pending`, `submitting` or `delivery_uncertain`.
+    pub(crate) phase: String,
+    pub(crate) admitted_at_millis: u64,
+    /// As [`DeliveryEntry::reason`].
+    pub(crate) reason: Option<String>,
+}
+
+impl DeliveryAlarm {
+    /// The alarm at `now_millis` for `entries`, oldest admission first: each request whose prompt
+    /// is stalled by then.
+    pub(crate) fn new(entries: &[DeliveryEntry], now_millis: u64, stall_after: Duration) -> Self {
+        Self {
+            schema: DELIVERY_ALARM_SCHEMA.to_owned(),
+            stall_after_seconds: stall_after.as_secs(),
+            stalled: entries
+                .iter()
+                .filter(|entry| entry.stalled(now_millis, stall_after))
+                .map(|entry| StalledRequest {
+                    key: entry.key.clone(),
+                    phase: request_phase_name(&entry.phase).to_owned(),
+                    admitted_at_millis: entry.admitted_at_millis,
+                    reason: entry.reason.clone(),
+                })
+                .collect(),
+        }
     }
 }
 
@@ -3325,6 +3426,15 @@ pub(crate) trait CoordinatorDelivery {
         options: DrainOptions,
     ) -> std::result::Result<(), String>;
     fn drain(&self, agent_name: &str, options: DrainOptions) -> std::result::Result<(), String>;
+    /// [`Self::drain`], also saying why it stopped before typing every prompt in the queue's
+    /// inbox, if it did. A delivery that cannot say gives `None`.
+    fn drain_reporting(
+        &self,
+        agent_name: &str,
+        options: DrainOptions,
+    ) -> std::result::Result<Option<String>, String> {
+        self.drain(agent_name, options).map(|()| None)
+    }
     /// Read the coordinator's pane as a capture reads it, without persisting a snapshot. A
     /// request's prompt is written only after this read, and a reply ID it assigns is never a
     /// number the read shows, so no block already in the pane can be taken as a reply to that
@@ -3413,6 +3523,16 @@ impl<A: ManagedApi + ?Sized> CoordinatorDelivery for ManagedAgents<'_, A> {
             .map_err(|error| error.to_string())
     }
 
+    fn drain_reporting(
+        &self,
+        agent_name: &str,
+        options: DrainOptions,
+    ) -> std::result::Result<Option<String>, String> {
+        ManagedAgents::drain(self, agent_name, options)
+            .map(|result| result.blocked)
+            .map_err(|error| error.to_string())
+    }
+
     fn screen(&self, agent_name: &str) -> std::result::Result<String, String> {
         ManagedAgents::peek_capture_with_runtime(
             self,
@@ -3452,6 +3572,10 @@ pub struct BridgeState {
     ignored_text_prefixes: Arc<[String]>,
     // Whether request prompts name the `chat reply` command; also process-local.
     offer_reply_command: bool,
+    // The requests this process retired with their prompts recorded as typed, and when each was
+    // typed, oldest retirement first, until `take_typed_retirements` takes them. A retired
+    // request's record is gone and its tombstone keeps no delivery time.
+    typed_retirements: Arc<std::sync::Mutex<VecDeque<(String, u64)>>>,
     #[cfg(test)]
     admission_fault_after: Arc<std::sync::Mutex<Option<usize>>>,
     #[cfg(test)]
@@ -3464,6 +3588,9 @@ pub struct BridgeState {
     confirm_fault_after: Arc<std::sync::Mutex<Option<usize>>>,
     #[cfg(test)]
     gap_retry_runner_probe: Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<File>>>>,
+    // How many more reads of each request's reply route fail, as an I/O error, before they work.
+    #[cfg(test)]
+    route_faults: Arc<std::sync::Mutex<BTreeMap<String, usize>>>,
 }
 
 #[cfg(test)]
@@ -3559,6 +3686,7 @@ impl BridgeState {
             config,
             ignored_text_prefixes: Arc::from([]),
             offer_reply_command: false,
+            typed_retirements: Arc::default(),
             #[cfg(test)]
             admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -3571,6 +3699,8 @@ impl BridgeState {
             confirm_fault_after: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             gap_retry_runner_probe: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            route_faults: Arc::default(),
         })
     }
 
@@ -3645,6 +3775,7 @@ impl BridgeState {
             config: envelope.config,
             ignored_text_prefixes: Arc::from([]),
             offer_reply_command: false,
+            typed_retirements: Arc::default(),
             #[cfg(test)]
             admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -3657,6 +3788,8 @@ impl BridgeState {
             confirm_fault_after: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             gap_retry_runner_probe: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            route_faults: Arc::default(),
         })
     }
 
@@ -4670,7 +4803,7 @@ impl BridgeState {
         })
     }
 
-    fn confirm_batch_commit(&self, admission: &BatchAdmission) -> Result<()> {
+    pub(crate) fn confirm_batch_commit(&self, admission: &BatchAdmission) -> Result<()> {
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
@@ -4757,7 +4890,70 @@ impl BridgeState {
         acknowledgements.insert("pending".to_owned(), Value::from(0));
         acknowledgements.insert("sending".to_owned(), Value::from(0));
         acknowledgements.insert("acked".to_owned(), Value::from(0));
-        for (record, _) in self.request_records()? {
+        let now_millis = unix_millis();
+        let mut records = self.request_records()?;
+        records.sort_by(|(left, _), (right, _)| {
+            (left.admitted_at_millis, &left.key).cmp(&(right.admitted_at_millis, &right.key))
+        });
+        let mut requests = Vec::with_capacity(records.len());
+        let mut stalled = Vec::new();
+        let (mut not_typed, mut not_replied, mut replied) = (0_u64, 0_u64, 0_u64);
+        for (record, _) in &records {
+            let entry = DeliveryEntry::new(record);
+            // The send pointer advances only after the reply is recorded as sent, so a crash
+            // between the two leaves it behind; the replies already recorded as sent beyond it
+            // count too, as the next send's repair would count them.
+            let mut replies_sent = record.next_send_ordinal.saturating_sub(1);
+            let mut ordinal = record.next_send_ordinal.max(1);
+            while ordinal < record.next_reply_ordinal {
+                match self.read_reply(&record.key, ordinal) {
+                    Ok(reply) if reply.phase == ReplyPhase::Sent => {
+                        replies_sent = replies_sent.saturating_add(1);
+                        ordinal = ordinal.saturating_add(1);
+                    }
+                    _ => break,
+                }
+            }
+            // The first reply's file outlives its send for as long as the request is retained.
+            let first_reply_sent_at_millis = if replies_sent > 0 {
+                self.read_reply(&record.key, 1)
+                    .ok()
+                    .and_then(|reply| reply.sent_at_millis)
+            } else {
+                None
+            };
+            let waiting = !entry.typed();
+            let age_seconds =
+                waiting.then(|| now_millis.saturating_sub(record.admitted_at_millis) / 1_000);
+            if replies_sent > 0 {
+                replied += 1;
+            } else if waiting {
+                not_typed += 1;
+            } else {
+                not_replied += 1;
+            }
+            if entry.stalled(now_millis, DELIVERY_STALL_AFTER) {
+                stalled.push(serde_json::json!({
+                    "key": record.key,
+                    "phase": request_phase_name(&record.phase),
+                    "admitted_at_millis": record.admitted_at_millis,
+                    "age_seconds": age_seconds,
+                    "reason": entry.reason,
+                }));
+            }
+            requests.push(serde_json::json!({
+                "key": record.key,
+                "phase": request_phase_name(&record.phase),
+                "admitted_at_millis": record.admitted_at_millis,
+                "ack_completed_at_millis": record.ack_completed_at_millis,
+                "delivered_at_millis": record.delivered_at_millis,
+                "first_reply_sent_at_millis": first_reply_sent_at_millis,
+                "replies_captured": record.reply_count,
+                "replies_sent": replies_sent,
+                "replies_closed": record.reply_closed,
+                "age_seconds": age_seconds,
+                "reason": if waiting { entry.reason } else { None },
+            }));
             let key = match record.phase {
                 RequestPhase::Pending => "pending",
                 RequestPhase::Submitting => "submitting",
@@ -4814,9 +5010,44 @@ impl BridgeState {
             "retirement_sequence": checkpoint.retirement_sequence,
             "phases": phases,
             "acknowledgements": acknowledgements,
+            "deliveries": {
+                "admitted_not_typed": not_typed,
+                "typed_not_replied": not_replied,
+                "replied": replied,
+            },
+            "delivery_alarm": {
+                "stall_after_seconds": DELIVERY_STALL_AFTER.as_secs(),
+                "stalled": stalled,
+            },
+            "requests": requests,
             "reply_breaker": self.reply_breaker_status(),
             "reply_alias_problem": self.reply_alias_problem(),
         }))
+    }
+
+    /// Each retained request's prompt delivery, oldest admission first, read without contacting a
+    /// provider or coordinator.
+    pub(crate) fn delivery_entries(&self) -> Result<Vec<DeliveryEntry>> {
+        let _snapshot = self.lock_state_snapshot()?;
+        let mut entries = self
+            .request_records()?
+            .iter()
+            .map(|(record, _)| DeliveryEntry::new(record))
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            (left.admitted_at_millis, &left.key).cmp(&(right.admitted_at_millis, &right.key))
+        });
+        Ok(entries)
+    }
+
+    /// Replace `delivery-alarm.json` in the state directory with `alarm`.
+    pub(crate) fn write_delivery_alarm(&self, alarm: &DeliveryAlarm) -> Result<()> {
+        write_document(&self.root.join(DELIVERY_ALARM_FILE), alarm)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_delivery_alarm(&self) -> Option<DeliveryAlarm> {
+        read_document(&self.root.join(DELIVERY_ALARM_FILE), 1 << 20).ok()
     }
 
     /// Inspect one exact active retained request without provider, helper, or coordinator access.
@@ -5251,6 +5482,10 @@ and the replies captured for them. The provider's own thread is the complete rec
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        // As in `reply_route_entries`: a retirement left partway can have replaced a slot of the
+        // retired-route ring that the checkpoint still names.
+        let mut checkpoint = self.read_checkpoint()?;
+        self.complete_pending_retirement_locked(&mut checkpoint)?;
         let records = self.request_records()?;
         let retired_routes = self.retired_routes()?;
         // A feedback record that cannot be read only disables this filter. Fence feedback reads
@@ -6086,12 +6321,19 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             .collect())
     }
 
-    /// Build the bounded active-and-closed nonce index during startup or explicit recovery.
+    /// Build the bounded active-and-closed nonce index during startup or explicit recovery. A
+    /// retirement that an earlier call left partway is completed first: it can have replaced the
+    /// oldest slot of a full retired-route ring before it advanced the checkpoint, and the ring is
+    /// read by the checkpoint.
     pub fn reply_route_entries(&self) -> Result<Vec<ReplyRouteEntry>> {
         if !self.config.outbound_enabled {
             return Ok(Vec::new());
         }
-        let _snapshot = self.lock_state_snapshot()?;
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let mut checkpoint = self.read_checkpoint()?;
+        self.complete_pending_retirement_locked(&mut checkpoint)?;
         let alias_record = self.read_reply_aliases().ok();
         let aliases = alias_record
             .as_ref()
@@ -6129,6 +6371,19 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
     pub fn next_reply_route(&self, key: &str) -> Result<Option<ReplyRoute>> {
         if !self.config.outbound_enabled {
             return Ok(None);
+        }
+        #[cfg(test)]
+        {
+            let mut faults = self.route_faults.lock().expect("route fault lock");
+            if let Some(remaining) = faults.get_mut(key) {
+                *remaining -= 1;
+                if *remaining == 0 {
+                    faults.remove(key);
+                }
+                return Err(ChatRuntimeError::Io(io::Error::from_raw_os_error(
+                    libc::EIO,
+                )));
+            }
         }
         let _snapshot = self.lock_state_snapshot()?;
         let record = match self.read_request(key) {
@@ -6470,6 +6725,23 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                 "retirement audit record exceeds its bounded artifact size",
             ));
         }
+        // Hand the typed time over before the first durable step of the retirement. Once the
+        // retirement record exists, recovery completes the retirement even when a later step
+        // fails, through paths that hand nothing over, and the request record that held the time
+        // can already be gone. A retirement that fails before its record exists leaves the request
+        // record in place, delivered, and the next attempt hands the time over again. The scan sets
+        // aside every request the handover names, retained or not, and goes by the handover for
+        // it; a retained one is delivered, and its record holds the same time for later scans.
+        if let Some(typed_at) = request.delivered_at_millis {
+            let mut retired = self
+                .typed_retirements
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if retired.len() == MAX_TYPED_RETIREMENTS {
+                retired.pop_front();
+            }
+            retired.push_back((key.to_owned(), typed_at));
+        }
         write_document(&retirement_path, &retirement)?;
         self.retirement_boundary()?;
         self.write_retirement_receipt_chunks(&retirement, &replies, &reply_chunks)?;
@@ -6479,6 +6751,40 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         self.retirement_boundary()?;
         self.finish_prepared_retirement_locked(checkpoint, &retirement_path, &mut retirement)?;
         Ok(true)
+    }
+
+    /// Make the next `count` reads of `key`'s reply route fail with an I/O error.
+    #[cfg(test)]
+    pub(crate) fn fail_route_reads(&self, key: &str, count: usize) {
+        let mut faults = self.route_faults.lock().expect("route fault lock");
+        if count == 0 {
+            faults.remove(key);
+        } else {
+            faults.insert(key.to_owned(), count);
+        }
+    }
+
+    /// Whether every read of a reply route that `fail_route_reads` made fail has been tried.
+    #[cfg(test)]
+    pub(crate) fn route_faults_spent(&self) -> bool {
+        self.route_faults
+            .lock()
+            .expect("route fault lock")
+            .is_empty()
+    }
+
+    /// Take the requests this process retired, or began to retire, since the last call with
+    /// their prompts recorded as typed, each with the time its prompt was recorded typed: at
+    /// most `MAX_TYPED_RETIREMENTS`, the most recent.
+    pub(crate) fn take_typed_retirements(&self) -> BTreeMap<String, u64> {
+        std::mem::take(
+            &mut *self
+                .typed_retirements
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_iter()
+        .collect()
     }
 
     fn finish_prepared_retirement_locked(
@@ -7262,7 +7568,17 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
-        let mut record = self.read_request(key)?;
+        let record = self.read_request(key)?;
+        self.set_delivery_phase_locked(record, phase, detail)
+    }
+
+    /// [`Self::set_delivery_phase`] for `record`, read under the state lock the caller holds.
+    fn set_delivery_phase_locked(
+        &self,
+        mut record: RequestRecord,
+        phase: RequestPhase,
+        detail: Option<&str>,
+    ) -> Result<RequestRecord> {
         let submitting = phase == RequestPhase::Submitting;
         let delivered = phase == RequestPhase::Delivered;
         record.phase = phase;
@@ -7279,10 +7595,77 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         self.write_request_accounted(&record, &mut checkpoint)?;
         if record.phase == RequestPhase::Delivered {
             self.persist_checkpoint(&mut checkpoint)?;
-            let _ = self.retire_if_eligible_locked(&mut checkpoint, key)?;
+            let _ = self.retire_if_eligible_locked(&mut checkpoint, &record.key)?;
         }
         self.persist_checkpoint(&mut checkpoint)?;
         Ok(record)
+    }
+
+    /// Record `key`'s prompt as typed if the request still waits for it: its phase is `pending`
+    /// or `submitting`. Gives whether it recorded it. A request whose delivery is uncertain, or
+    /// whose prompt is already recorded as typed, is left as it is.
+    fn record_typed_if_waiting(&self, key: &str) -> Result<bool> {
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let record = self.read_request(key)?;
+        if !matches!(
+            record.phase,
+            RequestPhase::Pending | RequestPhase::Submitting
+        ) {
+            return Ok(false);
+        }
+        self.set_delivery_phase_locked(record, RequestPhase::Delivered, None)?;
+        Ok(true)
+    }
+
+    /// Record `key`'s prompt as typed if the request waits for it and the coordinator's queue
+    /// reports its prompt processed, which happens when a drain made for another request typed
+    /// it: a drain types the prompts in the queue's inbox in the order they were queued, until it
+    /// reaches one it cannot type, whichever requests they belong to. Gives whether it recorded
+    /// it, or an error that says which step failed: reading the request record, reading its queue
+    /// entry, or recording its prompt as typed and retiring it if that makes it retirable.
+    ///
+    /// Only a request whose delivery has started is looked up: one in phase `pending` or
+    /// `submitting` with a delivery start time. Its prompt may not have reached the queue, in
+    /// which case the queue reports nothing and nothing is recorded. A request whose delivery is
+    /// uncertain is never changed, and a request retired meanwhile gives `false`. The queue is
+    /// read through `delivery` without holding the state lock, as [`deliver_request_with`] reads
+    /// it; the phase is changed only after reading the request again under the lock.
+    pub(crate) fn record_processed_prompt(
+        &self,
+        delivery: &dyn CoordinatorDelivery,
+        key: &str,
+    ) -> std::result::Result<bool, String> {
+        let record = match self.read_request(key) {
+            Ok(record) => record,
+            Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(error) => return Err(format!("its request record could not be read: {error}")),
+        };
+        if !matches!(
+            record.phase,
+            RequestPhase::Pending | RequestPhase::Submitting
+        ) || record.delivery_started_at_millis.is_none()
+        {
+            return Ok(false);
+        }
+        match delivery
+            .message_state(&self.config.agent_name, &record.delivery_message_id)
+            .map_err(|error| format!("its queue entry could not be read: {error}"))?
+        {
+            Some(QueueMessageState::Processed) => match self.record_typed_if_waiting(key) {
+                Ok(recorded) => Ok(recorded),
+                Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    Ok(false)
+                }
+                Err(error) => Err(format!(
+                    "recording its prompt as typed, or retiring it after that, failed: {error}"
+                )),
+            },
+            _ => Ok(false),
+        }
     }
 
     fn retry_eligible_retirement(&self, key: &str) -> Result<()> {
@@ -8489,7 +8872,8 @@ fn drive_fence_feedback(
                 "fence feedback may already have reached the coordinator".to_owned(),
             ));
         }
-        // Either one types every prompt in the queue's inbox.
+        // Either one drains the queue, which types the prompts in its inbox in the order they
+        // were queued until it reaches one it cannot type.
         Some(QueueMessageState::Pending) => {
             guard_typing(state, delivery, None).and_then(|()| delivery.drain(agent_name, options))
         }
@@ -8845,6 +9229,8 @@ pub(crate) fn deliver_request_with(
         }
     };
 
+    // Why a drain that did not fail left prompts in the queue's inbox, if it says.
+    let mut blocked = None;
     let operation_error = match observed {
         Some(QueueMessageState::Processed) => None,
         Some(QueueMessageState::Inflight | QueueMessageState::Failed) => {
@@ -8852,9 +9238,16 @@ pub(crate) fn deliver_request_with(
             state.set_delivery_phase(key, RequestPhase::DeliveryUncertain, Some(detail))?;
             return Ok(CoordinatorDeliveryResult::Uncertain(detail.to_owned()));
         }
-        // Either one types every prompt in the queue's inbox.
+        // Either one drains the queue, which types the prompts in its inbox in the order they
+        // were queued until it reaches one it cannot type.
         Some(QueueMessageState::Pending) => match guard_typing(state, delivery, None) {
-            Ok(()) => delivery.drain(agent_name, options).err(),
+            Ok(()) => match delivery.drain_reporting(agent_name, options) {
+                Ok(reason) => {
+                    blocked = reason;
+                    None
+                }
+                Err(error) => Some(error),
+            },
             Err(error) => Some(error),
         },
         None => match prompt_screen(state, delivery, agent_name) {
@@ -8892,6 +9285,7 @@ pub(crate) fn deliver_request_with(
         }
         Ok(Some(QueueMessageState::Pending) | None) => {
             let detail = operation_error
+                .or_else(|| blocked.map(|reason| format!("request remains pending: {reason}")))
                 .unwrap_or_else(|| "coordinator is not ready; request remains pending".to_owned());
             state.set_delivery_phase(key, RequestPhase::Pending, Some(&detail))?;
             Ok(CoordinatorDeliveryResult::Pending(detail))
@@ -11101,6 +11495,46 @@ fn bounded_detail(value: &str, maximum: usize) -> String {
     value[..boundary].to_owned()
 }
 
+// What a refusal to type over the agent's draft says just before it quotes the start of the draft.
+const COMPOSER_PREVIEW_MARKER: &str = "composer already holds unsubmitted text ";
+
+/// `detail` with every quoted composer draft replaced by `(text not shown)`. A refusal to type
+/// over text in the agent's composer quotes the start of that text, which is the agent's or a
+/// person's words, so logs and status show the refusal without it. When the quote is missing, or
+/// cut short as a bounded detail can cut it, the rest of `detail` is dropped.
+fn without_composer_preview(detail: &str) -> String {
+    let mut shown = String::with_capacity(detail.len());
+    let mut rest = detail;
+    while let Some(start) = rest.find(COMPOSER_PREVIEW_MARKER) {
+        let after = start + COMPOSER_PREVIEW_MARKER.len();
+        shown.push_str(&rest[..after]);
+        shown.push_str("(text not shown)");
+        match quoted_end(&rest[after..]) {
+            Some(end) => rest = &rest[after + end..],
+            None => return shown,
+        }
+    }
+    shown.push_str(rest);
+    shown
+}
+
+/// The length of the double-quoted string, with backslash escapes, at the start of `text`; `None`
+/// when `text` does not start with one or it has no closing quote.
+fn quoted_end(text: &str) -> Option<usize> {
+    let body = text.strip_prefix('"')?;
+    let mut escaped = false;
+    for (index, character) in body.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            return Some(index + 2);
+        }
+    }
+    None
+}
+
 /// A provider value printed on one line: every control character and Unicode line or paragraph
 /// separator becomes U+FFFD, so the value cannot end its line or make a later capture fail, and
 /// no reply marker or code fence can form in it.
@@ -11497,7 +11931,7 @@ fn validate_outbound_body(agent_label: &str, body: &str) -> Result<()> {
     Ok(())
 }
 
-fn unix_millis() -> u64 {
+pub(crate) fn unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -27391,6 +27825,415 @@ fails twice for a reply, print that reply between the two lines at the end of yo
                 "{executable:?}"
             );
         }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_composer_draft_quoted_in_a_refusal_is_not_shown() {
+        // The refusal to type over a draft quotes the draft's start as Rust's `{:?}` prints it.
+        let refusal = |draft: &str| {
+            format!(
+                "pane p1 composer already holds unsubmitted text {draft:?}; refusing to append to it; nothing was typed"
+            )
+        };
+        let hidden = "pane p1 composer already holds unsubmitted text (text not shown); refusing to append to it; nothing was typed";
+        assert_eq!(
+            without_composer_preview(&refusal("a private draft")),
+            hidden
+        );
+        // Quotes and backslashes in the draft are escaped, so they do not end the quote.
+        assert_eq!(
+            without_composer_preview(&refusal("say \"stop\" \\ then \\\"go\\\"")),
+            hidden
+        );
+        assert_eq!(
+            without_composer_preview(&format!(
+                "request remains pending: {}",
+                refusal("a private draft")
+            )),
+            format!("request remains pending: {hidden}")
+        );
+        assert_eq!(
+            without_composer_preview(&format!(
+                "{} / {}",
+                refusal("first draft"),
+                refusal("second draft")
+            )),
+            format!("{hidden} / {hidden}")
+        );
+        // A quote a bounded detail cut short, or none at all, takes the rest of the detail with it.
+        assert_eq!(
+            without_composer_preview(
+                "pane p1 composer already holds unsubmitted text \"a private dra"
+            ),
+            "pane p1 composer already holds unsubmitted text (text not shown)"
+        );
+        assert_eq!(
+            without_composer_preview(
+                "pane p1 composer already holds unsubmitted text a private draft; refusing"
+            ),
+            "pane p1 composer already holds unsubmitted text (text not shown)"
+        );
+        let other = "pane p1 did not become idle/done within 0s; last status=working";
+        assert_eq!(without_composer_preview(other), other);
+        assert_eq!(without_composer_preview(""), "");
+    }
+
+    #[test]
+    fn the_delivery_alarm_lists_each_request_not_typed_after_the_stall_age() {
+        let entry = |key: &str, phase: RequestPhase, admitted_at_millis: u64| DeliveryEntry {
+            key: key.to_owned(),
+            phase,
+            admitted_at_millis,
+            delivered_at_millis: None,
+            reason: Some(format!("{key} waits")),
+        };
+        // The phase alone decides: a reply the agent stored does not take a request off the list,
+        // as `status_says_how_far_each_prompt_got_and_lists_the_stalled_requests` shows.
+        let entries = [
+            entry("a", RequestPhase::Pending, 0),
+            // One millisecond short of the stall age.
+            entry("b", RequestPhase::Pending, 1),
+            entry("c", RequestPhase::Submitting, 0),
+            entry("d", RequestPhase::Delivered, 0),
+            entry("e", RequestPhase::DeliveryUncertain, 0),
+        ];
+        let alarm = DeliveryAlarm::new(&entries, 60_000, Duration::from_secs(60));
+        let stalled = |key: &str, phase: &str| StalledRequest {
+            key: key.to_owned(),
+            phase: phase.to_owned(),
+            admitted_at_millis: 0,
+            reason: Some(format!("{key} waits")),
+        };
+        assert_eq!(
+            alarm,
+            DeliveryAlarm {
+                schema: "agentctl-chat-delivery-alarm/v1".to_owned(),
+                stall_after_seconds: 60,
+                stalled: vec![
+                    stalled("a", "pending"),
+                    stalled("c", "submitting"),
+                    stalled("e", "delivery_uncertain"),
+                ],
+            }
+        );
+        assert_eq!(
+            DeliveryAlarm::new(&entries, 59_999, Duration::from_secs(60)).stalled,
+            Vec::new()
+        );
+        let document = serde_json::to_value(&alarm).expect("encode alarm");
+        let names = |value: &Value| {
+            let mut names = value
+                .as_object()
+                .expect("object")
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            names(&document),
+            ["schema", "stall_after_seconds", "stalled"]
+        );
+        assert_eq!(
+            names(&document["stalled"][0]),
+            ["admitted_at_millis", "key", "phase", "reason"]
+        );
+        let decoded: DeliveryAlarm = serde_json::from_value(document.clone()).expect("decode");
+        assert_eq!(decoded, alarm);
+        let mut extended = document;
+        extended["unexpected"] = Value::from(1);
+        assert!(serde_json::from_value::<DeliveryAlarm>(extended).is_err());
+    }
+
+    #[test]
+    fn status_says_how_far_each_prompt_got_and_lists_the_stalled_requests() {
+        // Six requests, each in a state of its own:
+        //   k1  pending for 120 s, refused because the agent's composer held a draft
+        //   k2  pending, admitted just now
+        //   k3  typed, with no reply
+        //   k4  typed, and its one reply stored and sent
+        //   k5  delivery uncertain for 150 s; the agent stored a reply, not yet sent, which does
+        //       not make the prompt typed: only the phase does
+        //   k6  delivery uncertain for 180 s, with no reply
+        let root = temporary("delivery-status");
+        let state =
+            BridgeState::initialize(&root, config_without_reaction()).expect("initialize state");
+        let keys = (1..=6)
+            .map(|index| {
+                state
+                    .admit_batch(&indexed_delivery(index, index))
+                    .expect("admit request")
+                    .new_request_keys
+                    .remove(0)
+            })
+            .collect::<Vec<_>>();
+        let [k1, k2, k3, k4, k5, k6] = <[String; 6]>::try_from(keys).expect("six keys");
+        let mut transport = FakeReplyTransport::default();
+        for key in [&k4, &k5] {
+            let route = state
+                .next_reply_route(key)
+                .expect("route")
+                .expect("open route");
+            state
+                .capture_replies(key, &reply_block(&route.identifier, "an answer"))
+                .expect("capture reply");
+        }
+        state
+            .publish_one(&k4, &mut transport)
+            .expect("publish reply")
+            .expect("provider receipt");
+        let now = unix_millis();
+        let draft = "a private draft";
+        let composer = format!(
+            "request remains pending: pane p1 composer already holds unsubmitted text {draft:?}; refusing to append to it; nothing was typed"
+        );
+        let uncertain = "coordinator queue reports a possibly submitted request";
+        let set = |key: &str,
+                   phase: RequestPhase,
+                   admitted_ago: u64,
+                   delivered_ago: Option<u64>,
+                   error: Option<&str>| {
+            let mut record = state.read_request(key).expect("request");
+            record.phase = phase;
+            record.admitted_at_millis = now - admitted_ago;
+            record.delivered_at_millis = delivered_ago.map(|ago| now - ago);
+            if record.delivered_at_millis.is_some() {
+                // A typed prompt's record also says when its typing started.
+                record.delivery_started_at_millis = record.delivered_at_millis;
+            }
+            record.delivery_error = error.map(str::to_owned);
+            let mut checkpoint = state.read_checkpoint().expect("checkpoint");
+            state
+                .write_request_accounted(&record, &mut checkpoint)
+                .expect("write request");
+            state
+                .persist_checkpoint(&mut checkpoint)
+                .expect("persist checkpoint");
+        };
+        set(&k1, RequestPhase::Pending, 120_000, None, Some(&composer));
+        set(&k3, RequestPhase::Delivered, 90_000, Some(85_000), None);
+        set(&k4, RequestPhase::Delivered, 100_000, Some(95_000), None);
+        set(
+            &k5,
+            RequestPhase::DeliveryUncertain,
+            150_000,
+            None,
+            Some(uncertain),
+        );
+        set(
+            &k6,
+            RequestPhase::DeliveryUncertain,
+            180_000,
+            None,
+            Some(uncertain),
+        );
+
+        let status = state.status().expect("status");
+        let shown = "request remains pending: pane p1 composer already holds unsubmitted text (text not shown); refusing to append to it; nothing was typed";
+        assert!(!status.to_string().contains(draft), "{status:#}");
+        assert_eq!(
+            status["deliveries"],
+            json!({"admitted_not_typed": 4, "typed_not_replied": 1, "replied": 1})
+        );
+        assert_eq!(
+            status["phases"],
+            json!({"pending": 2, "submitting": 0, "delivered": 2, "delivery_uncertain": 2})
+        );
+        // Ages are whole seconds, and the status is read a little after `now`.
+        let age = |value: &Value, at_least: u64| {
+            let age = value.as_u64().expect("age in seconds");
+            assert!((at_least..at_least + 30).contains(&age), "age {age}");
+        };
+        let alarm = &status["delivery_alarm"];
+        assert_eq!(alarm["stall_after_seconds"], 60);
+        let stalled = alarm["stalled"].as_array().expect("stalled requests");
+        assert_eq!(stalled.len(), 3, "{alarm:#}");
+        for (entry, key, phase, admitted_ago, reason, at_least) in [
+            (
+                &stalled[0],
+                &k6,
+                "delivery_uncertain",
+                180_000,
+                uncertain,
+                180,
+            ),
+            (
+                &stalled[1],
+                &k5,
+                "delivery_uncertain",
+                150_000,
+                uncertain,
+                150,
+            ),
+            (&stalled[2], &k1, "pending", 120_000, shown, 120),
+        ] {
+            assert_eq!(entry["key"], key.as_str());
+            assert_eq!(entry["phase"], phase);
+            assert_eq!(entry["admitted_at_millis"], now - admitted_ago);
+            assert_eq!(entry["reason"], reason);
+            age(&entry["age_seconds"], at_least);
+        }
+
+        let requests = status["requests"].as_array().expect("requests");
+        assert_eq!(requests.len(), 6);
+        let request = |key: &str| {
+            requests
+                .iter()
+                .find(|request| request["key"] == key)
+                .unwrap_or_else(|| panic!("no request {key}"))
+        };
+        for request in requests {
+            let mut names = request
+                .as_object()
+                .expect("request")
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            names.sort();
+            assert_eq!(
+                names,
+                [
+                    "ack_completed_at_millis",
+                    "admitted_at_millis",
+                    "age_seconds",
+                    "delivered_at_millis",
+                    "first_reply_sent_at_millis",
+                    "key",
+                    "phase",
+                    "reason",
+                    "replies_captured",
+                    "replies_closed",
+                    "replies_sent",
+                ]
+            );
+        }
+        let summary = |key: &str| {
+            let request = request(key);
+            (
+                request["phase"].as_str().expect("phase").to_owned(),
+                request["replies_captured"].as_u64().expect("captured"),
+                request["replies_sent"].as_u64().expect("sent"),
+                request["reason"].clone(),
+            )
+        };
+        assert_eq!(
+            summary(&k1),
+            ("pending".to_owned(), 0, 0, Value::from(shown))
+        );
+        assert_eq!(summary(&k2), ("pending".to_owned(), 0, 0, Value::Null));
+        assert_eq!(summary(&k3), ("delivered".to_owned(), 0, 0, Value::Null));
+        assert_eq!(summary(&k4), ("delivered".to_owned(), 1, 1, Value::Null));
+        assert_eq!(
+            summary(&k5),
+            (
+                "delivery_uncertain".to_owned(),
+                1,
+                0,
+                Value::from(uncertain)
+            )
+        );
+        assert_eq!(
+            summary(&k6),
+            (
+                "delivery_uncertain".to_owned(),
+                0,
+                0,
+                Value::from(uncertain)
+            )
+        );
+        // Only a request whose prompt is not recorded as typed has an age.
+        age(&request(&k1)["age_seconds"], 120);
+        age(&request(&k2)["age_seconds"], 0);
+        age(&request(&k5)["age_seconds"], 150);
+        age(&request(&k6)["age_seconds"], 180);
+        for key in [&k3, &k4] {
+            assert_eq!(request(key)["age_seconds"], Value::Null, "{key}");
+        }
+        assert_eq!(request(&k3)["delivered_at_millis"], now - 85_000);
+        assert_eq!(request(&k4)["delivered_at_millis"], now - 95_000);
+        assert_eq!(request(&k1)["delivered_at_millis"], Value::Null);
+        let sent_at = state
+            .read_reply(&k4, 1)
+            .expect("sent reply")
+            .sent_at_millis
+            .expect("sent time");
+        assert_eq!(request(&k4)["first_reply_sent_at_millis"], sent_at);
+        for key in [&k1, &k2, &k3, &k5, &k6] {
+            assert_eq!(
+                request(key)["first_reply_sent_at_millis"],
+                Value::Null,
+                "{key}"
+            );
+        }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn status_counts_a_reply_recorded_as_sent_beyond_a_send_pointer_left_behind() {
+        let root = temporary("delivery-status-lagging-send");
+        let state =
+            BridgeState::initialize(&root, config_without_reaction()).expect("initialize state");
+        let key = state
+            .admit_batch(&indexed_delivery(1, 1))
+            .expect("admit request")
+            .new_request_keys
+            .remove(0);
+        let route = state
+            .next_reply_route(&key)
+            .expect("route")
+            .expect("open route");
+        state
+            .capture_replies(&key, &reply_block(&route.identifier, "an answer"))
+            .expect("capture reply");
+        let mut transport = FakeReplyTransport::default();
+        state
+            .publish_one(&key, &mut transport)
+            .expect("publish reply")
+            .expect("provider receipt");
+        // A crash after the reply was recorded as sent and before the send pointer advanced
+        // leaves the pointer at the reply.
+        let mut record = state.read_request(&key).expect("request");
+        assert_eq!(record.next_send_ordinal, 2);
+        record.next_send_ordinal = 1;
+        let mut checkpoint = state.read_checkpoint().expect("checkpoint");
+        state
+            .write_request_accounted(&record, &mut checkpoint)
+            .expect("write request");
+        state
+            .persist_checkpoint(&mut checkpoint)
+            .expect("persist checkpoint");
+
+        let status = state.status().expect("status");
+        let sent_at = state
+            .read_reply(&key, 1)
+            .expect("sent reply")
+            .sent_at_millis
+            .expect("sent time");
+        let request = &status["requests"][0];
+        assert_eq!(request["key"], key.as_str());
+        assert_eq!(request["replies_sent"], 1, "{status:#}");
+        assert_eq!(request["first_reply_sent_at_millis"], sent_at);
+        assert_eq!(
+            status["deliveries"],
+            json!({"admitted_not_typed": 0, "typed_not_replied": 0, "replied": 1})
+        );
+        // The next send repairs the pointer without sending the reply again, so status counted
+        // what that repair counts.
+        assert_eq!(
+            state.publish_one(&key, &mut transport).expect("repair"),
+            None
+        );
+        assert_eq!(transport.submissions.len(), 1);
+        assert_eq!(
+            state.read_request(&key).expect("request").next_send_ordinal,
+            2
+        );
+        assert_eq!(
+            state.status().expect("status")["requests"][0]["replies_sent"],
+            1
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 }
