@@ -483,11 +483,19 @@
           an element invented at runtime fails there rather than silently at the roadside.
         -->
         <section id="screen-reply" class="screen" hidden>
-          <p id="reply-target-meta" class="hint"></p>
-          <!-- Its OWN scroll, contained: reading a long message you are answering must not move
+          <!-- `#200 reply-context`. ONE scroll, holding the conversation the message being
+               answered is in: its earlier messages, oldest at the top, then the message itself.
+               It opens at the message, so the context is above it and reached by scrolling up,
+               and the composer below it stays on screen. Contained: reading back must not move
                the channel behind it, and a flick that reaches the end must not become a page
-               gesture. -->
-          <div id="reply-target"></div>
+               gesture. The rows are built by `renderReplyContext` in web/voice.js. -->
+          <div id="reply-scroll">
+            <button id="reply-context-more" class="secondary" type="button" hidden>Load earlier messages</button>
+            <p id="reply-context-state" class="hint" aria-live="polite" hidden></p>
+            <ul id="reply-context" class="messages" aria-label="Earlier messages"></ul>
+            <p id="reply-target-meta" class="hint"></p>
+            <div id="reply-target"></div>
+          </div>
           <label for="reply-text">Your reply</label>
           <textarea id="reply-text" rows="4" placeholder="write a reply"></textarea>
           <!-- `#185 reply-new-thread`. Where Send will post, said before it does: a reply goes

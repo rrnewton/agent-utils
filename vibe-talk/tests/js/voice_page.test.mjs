@@ -349,7 +349,19 @@ const FIXTURE_TREE = {
   // list could not check it. It is also what `setPlacement` re-parents, so the move has something
   // real to move.
   "control-bar": ["open-settings", "bar-pack", "prompts-tray", "compose-text", "send-text", "view-switch"],
+  // `#200 reply-context`. The reply screen's one scroll: the earlier messages, oldest at the top,
+  // then the message being answered. The SECOND element the model scrolls — see `SCROLLERS`.
+  "reply-scroll": ["reply-context-more", "reply-context-state", "reply-context", "reply-target-meta", "reply-target"],
 };
+
+/**
+ * The elements the page scrolls: the channel and transcript's shared area, and the reply screen's
+ * conversation. Every other element holds a position of zero, as a box that does not scroll does.
+ */
+const SCROLLERS = new Set(["scroll-area", "reply-scroll"]);
+
+/** The reply screen's viewport, so "the message being answered is in view" means something. */
+const REPLY_VIEWPORT_PX = 200;
 
 /** Where web/voice.html defines an id: which line, and how deeply indented. */
 /**
@@ -477,17 +489,17 @@ class FakeElement {
    * So the position a test can observe is the position a browser would really have: never past
    * `scrollHeight - clientHeight`, never below zero.
    *
-   * AND ONLY ONE ELEMENT HAS A POSITION AT ALL. Everything else is pinned to zero, which is what a
-   * browser reports for a box that does not scroll — and it is a deliberate correction to what
-   * this comment used to claim. The clamp alone does NOT put those elements at zero: the ceiling
-   * is `scrollHeight - clientHeight`, every element but #scroll-area is given a `clientHeight` of
-   * zero, and so the ceiling for all of them was their whole content height. `#discord-log` would
-   * happily hold a scroll position of 500.
+   * AND ONLY THE ELEMENTS IN `SCROLLERS` HAVE A POSITION AT ALL. Everything else is pinned to
+   * zero, which is what a browser reports for a box that does not scroll — and it is a deliberate
+   * correction to what this comment used to claim. The clamp alone does NOT put those elements at
+   * zero: the ceiling is `scrollHeight - clientHeight`, every element but the scrollers is given a
+   * `clientHeight` of zero, and so the ceiling for all of them was their whole content height.
+   * `#discord-log` would happily hold a scroll position of 500.
    *
-   * That the model has exactly one scrolling box is a fact about the page and is checked as one:
-   * web/voice.css gives three other elements their own overflow, and none of them is inside the
-   * layout tree above — see "the fixture carries a scroll position for the ONE element the page
-   * ever scrolls".
+   * That the model has exactly these scrolling boxes is a fact about the page and is checked as
+   * one: web/voice.css gives other elements their own overflow, and none of them is inside the
+   * layout tree above — see "the fixture carries a scroll position for the elements the page
+   * scrolls, and for no other".
    */
   get scrollTop() {
     return this.scrollPosition;
@@ -495,7 +507,7 @@ class FakeElement {
 
   set scrollTop(value) {
     const furthest =
-      this.id === "scroll-area" ? Math.max(0, this.scrollHeight - this.clientHeight) : 0;
+      SCROLLERS.has(this.id) ? Math.max(0, this.scrollHeight - this.clientHeight) : 0;
     this.scrollPosition = Math.max(0, Math.min(Number(value) || 0, furthest));
   }
 
@@ -543,7 +555,7 @@ class FakeElement {
   scrollBox() {
     let node = this.parentNode;
     while (node) {
-      if (node.id === "scroll-area") {
+      if (SCROLLERS.has(node.id)) {
         return node;
       }
       node = node.parentNode;
@@ -562,7 +574,7 @@ class FakeElement {
         }
         top += sibling.height();
       }
-      if (node.parentNode.id === "scroll-area") {
+      if (SCROLLERS.has(node.parentNode.id)) {
         return top;
       }
       node = node.parentNode;
@@ -673,7 +685,13 @@ class FakeElement {
     this.children.push(...kids);
   }
 
+  /**
+   * Replace EVERY child, the element's own text with them. `textContent` here stands for the text
+   * node a browser would hold as a child, and `replaceChildren` removes that too: a title bar set
+   * to "Reply" and then given child lines reads as its lines, not "Reply" and its lines.
+   */
   replaceChildren(...kids) {
+    this.textContent = "";
     for (const old of this.children) {
       old.parentNode = null;
     }
@@ -995,6 +1013,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     }
   }
   elements.get("scroll-area").clientHeight = SCROLL_VIEWPORT_PX;
+  elements.get("reply-scroll").clientHeight = REPLY_VIEWPORT_PX;
   const page = {
     elements,
     el: (id) => {
@@ -2518,6 +2537,11 @@ const TUNING_BANDS = {
     "threads the picker lists before '… Older threads'. Fewer than five and the thread discussed " +
     "this morning is already a second screen away; past about a dozen the phone's native picker " +
     "no longer fits one screen and scrolls, which is what the owner asked it to stop doing"],
+  // `#200 reply-context`: the earlier messages drawn over the one being answered.
+  REPLY_CONTEXT_LIMIT: [4, 30,
+    "earlier messages the reply screen draws before 'Load earlier messages'. Under about four the " +
+    "question being answered is often already off the top; past a few dozen the screen builds a " +
+    "long history on every Reply, most of it never scrolled to"],
   THREAD_TITLE_CHARS: [16, 48,
     "longest first-message prefix the picker uses as a thread name. Under about sixteen characters " +
     "a name says nothing; past a few words a phone's native picker, which draws options large, " +
@@ -3356,7 +3380,9 @@ test("the header shows two things at a time, and which two depends on the screen
   const [line] = await showDiscord(page, [message({ id: "1", content: "hello" })]);
   await replyButton(line).click();
   assert.deepStrictEqual(showing(), ["close-reply", "topbar-title"]);
-  assert.equal(page.el("topbar-title").textContent, "Reply", "the title bar still says Settings");
+  // `#200 reply-context`: and then where the reply goes, which on a channel without threads is
+  // its main space.
+  assert.match(page.el("topbar-title").text(), /^Reply · Main · /, "the title bar still says Settings");
 
   await page.el("close-reply").click();
   assert.deepStrictEqual(showing(), ["view-switch", "open-settings"]);
@@ -7852,6 +7878,76 @@ test("a fenced code block is taken verbatim, not parsed", async () => {
   );
 });
 
+test("an underscore inside a word is text, and only an underscore at a word's edge is emphasis", async () => {
+  // `#200 reply-context`. An identifier in SCREAMING_SNAKE_CASE lost two underscores and had its
+  // middle word italicised, and a snake_case name inside an attribute went the same way: `_` in the
+  // middle of a word opened and closed emphasis. CommonMark's rule for `_` is that it opens only
+  // where no letter or digit comes before it and closes only where none comes after; `*` may be
+  // used inside a word, and still is.
+  const page = newPage();
+  await signIn(page);
+  /** [what was posted, the text the row shows, its emphasised fragments, its code spans] */
+  const cases = [
+    ["call parse_reply_body before render_row", "call parse_reply_body before render_row", [], []],
+    ["set ALPHA_E2E_EMPTY_DIR and BETA_V2_LIMIT_9", "set ALPHA_E2E_EMPTY_DIR and BETA_V2_LIMIT_9", [], []],
+    ["#![feature(sample_inner_flag)]", "#![feature(sample_inner_flag)]", [], []],
+    ["see /srv/sample_tree/src_dir/file_name.rs", "see /srv/sample_tree/src_dir/file_name.rs", [], []],
+    ["__init__.py is a file name", "__init__.py is a file name", [], []],
+    ["this is _really_ needed", "this is really needed", ["really"], []],
+    ["_starts_ and ends _here_", "starts and ends here", ["starts", "here"], []],
+    ["(_like this_), and _this_.", "(like this), and this.", ["like this", "this"], []],
+    ["_snake_case_ stays one word", "snake_case stays one word", ["snake_case"], []],
+    ["`keep_this_raw` and `_this_ too`", "keep_this_raw and _this_ too", [], ["keep_this_raw", "_this_ too"]],
+    ["*intra*word and in*side*", "intraword and inside", ["intra", "side"], []],
+    // A closer belongs to the nearest opener before it, so a name that starts with an underscore
+    // does not open an emphasis that runs on to the next real one.
+    ["call _private_helper then _really_ do it", "call _private_helper then really do it", ["really"], []],
+    ["_lead_name and _tail_", "_lead_name and tail", ["tail"], []],
+    ["see (_inner_) here", "see (inner) here", ["inner"], []],
+    // A decomposed accent is part of its letter, so the underscore after it is inside a word.
+    ["cafe\u0301_x_ here", "cafe\u0301_x_ here", [], []],
+  ];
+  const lines = await showDiscord(page, cases.map(([content], i) => message({ id: String(700 + i), content })));
+  cases.forEach(([content, shown, emphasised, code], i) => {
+    const body = lines[i].descendants().find((node) => node.className === "body");
+    const of = (tag) => body.descendants().filter((node) => node.tagName === tag).map((node) => node.textContent);
+    assert.equal(body.text(), shown, `${JSON.stringify(content)} was drawn as ${JSON.stringify(body.text())}`);
+    assert.deepStrictEqual(of("em"), emphasised, `${JSON.stringify(content)} emphasised the wrong text`);
+    assert.deepStrictEqual(of("code"), code, `${JSON.stringify(content)} lost a code span`);
+  });
+});
+
+test("a line full of underscores renders in time that grows with its length, not with its square", async () => {
+  // `#200 reply-context`, from review. Each underscore made the pattern look ahead for its closer,
+  // and the check that it may open at all only ran once one was found, so a line of underscores
+  // that cannot close — a run of identifiers — was read to its end once per underscore: 4.7s for
+  // 100,000 characters, on the page's one thread, on every refresh that redraws the row. The
+  // emphasis now reaches at most 255 characters, which bounds the look-ahead.
+  const page = newPage();
+  await signIn(page);
+  const runOn = "a_".repeat(50000);
+  const openers = " _a".repeat(33334);
+  const within = `_${"w".repeat(255)}_`;
+  const beyond = `_${"w".repeat(256)}_`;
+  const started = performance.now();
+  const lines = await showDiscord(page, [runOn, openers, within, beyond].map((content, i) =>
+    message({ id: String(790 + i), content })));
+  const took = performance.now() - started;
+  // `hasClass`, as the first two are long enough to be folded, which adds a class.
+  const body = (line) => line.descendants().find((node) => node.hasClass("body"));
+  const emphasised = (line) =>
+    body(line).descendants().filter((node) => node.tagName === "em").map((node) => node.textContent);
+  assert.equal(body(lines[0]).text(), runOn, "a run of identifiers was not drawn as written");
+  assert.equal(body(lines[1]).text(), openers, "a run of openers with no closer was not drawn as written");
+  // The bound, at its edge: 255 characters of emphasis are emphasis, and 256 are the text written.
+  assert.deepStrictEqual(emphasised(lines[2]), ["w".repeat(255)]);
+  assert.deepStrictEqual(emphasised(lines[3]), []);
+  assert.equal(body(lines[3]).text(), beyond);
+  // Generous, because this host may be loaded: the bounded pattern takes tens of milliseconds here,
+  // and the unbounded one took seconds.
+  assert.ok(took < 1500, `200,000 characters of underscores took ${Math.round(took)}ms to draw`);
+});
+
 test("a blockquote renders as a quote rather than as a stray angle bracket", async () => {
   const page = newPage();
   await signIn(page);
@@ -8017,7 +8113,7 @@ test("AND THE NEWEST MESSAGE IS REALLY ON THE SCREEN WHEN IT GETS THERE", async 
   );
 });
 
-test("the fixture carries a scroll position for the ONE element the page ever scrolls", async () => {
+test("the fixture carries a scroll position for the elements the page scrolls, and for no other", async () => {
   // The docstring on `FakeElement.scrollTop` used to say that the clamp put every other element at
   // zero "the way the real thing does". It did not: the ceiling is `scrollHeight - clientHeight`,
   // and every element but #scroll-area has a clientHeight of zero and a content height that is
@@ -8031,13 +8127,19 @@ test("the fixture carries a scroll position for the ONE element the page ever sc
   assert.ok(log.scrollHeight > 500, "the log is too short for this to be asking anything");
   log.scrollTop = 500;
   assert.equal(log.scrollTop, 0, "an element the page never scrolls is holding a scroll position");
-  // ...and the one that does scroll still clamps to the range a browser would allow, rather than
+  // ...and the ones that do scroll still clamp to the range a browser would allow, rather than
   // to zero. Both halves, because either alone is satisfiable by breaking the other.
   const area = page.el("scroll-area");
   area.scrollTop = area.scrollHeight * 2;
   assert.equal(area.scrollTop, area.scrollHeight - area.clientHeight);
+  // `#200 reply-context` gave the reply screen a scroll of its own, and the model the second box.
+  await replyButton(log.children[log.children.length - 1]).click();
+  const reply = page.el("reply-scroll");
+  assert.ok(reply.scrollHeight > reply.clientHeight, "the reply screen does not overflow, so this asks nothing");
+  reply.scrollTop = reply.scrollHeight * 2;
+  assert.equal(reply.scrollTop, reply.scrollHeight - reply.clientHeight);
 
-  // WHY the model is allowed only one: the stylesheet's other scrolling elements are outside the
+  // WHY the model is allowed only these: the stylesheet's other scrolling elements are outside the
   // layout tree this fixture models, so nothing here has to have an opinion about them. Computed
   // from web/voice.css rather than listed, so giving #discord-log its own overflow fails here.
   const scrollers = new Set();
@@ -8049,16 +8151,18 @@ test("the fixture carries a scroll position for the ONE element the page ever sc
       if (selector) scrollers.add(selector);
     }
   }
-  assert.ok(scrollers.has("#scroll-area"), "the one element this model scrolls no longer scrolls");
+  for (const id of SCROLLERS) {
+    assert.ok(scrollers.has(`#${id}`), `#${id}, which this model scrolls, no longer scrolls`);
+  }
   const modelled = new Set(
     Object.keys(FIXTURE_TREE).concat(...Object.values(FIXTURE_TREE))
   );
   for (const selector of scrollers) {
     const id = selector.replace(/^#/, "");
     assert.ok(
-      id === "scroll-area" || !modelled.has(id),
+      SCROLLERS.has(id) || !modelled.has(id),
       `${selector} scrolls in web/voice.css AND is inside the fixture's layout tree, so the ` +
-        "model's one-scrolling-box assumption has stopped being true of the page"
+        "model's scrolling boxes have stopped being the page's"
     );
   }
 });
@@ -11858,10 +11962,13 @@ test("the reply screen shows the message being answered, in full, with its id", 
   // NOT folded. The fold exists so a list can be skimmed; there is one message here and answering
   // it is the reason you are looking at it.
   assert.equal(foldButton(page.el("reply-target")), undefined, "the message you are answering was folded");
-  // Its own scrolling box, so a long one does not push the reply control off the screen.
-  const target = cssBlock("#reply-target");
-  assert.match(target, /overflow-y:\s*auto/);
-  assert.match(target, /overscroll-behavior:\s*contain/);
+  // Its own scrolling box, so a long one does not push the reply control off the screen. Since
+  // `#200 reply-context` that box is the conversation the message is in, the message included.
+  const scroll = cssBlock("#reply-scroll");
+  assert.match(scroll, /overflow-y:\s*auto/);
+  assert.match(scroll, /overscroll-behavior:\s*contain/);
+  assertMarkupContains("reply-scroll", "reply-target");
+  assert.ok(!markupHolds("reply-scroll", "reply-text"), "the composer scrolls away with the message");
 });
 
 // --- the inbox view ---------------------------------------------------------------------------
@@ -19891,6 +19998,355 @@ test("Reply offers no new thread on a root the page has since learnt was answere
 
   await replyButton(rowOf(page, "210")).click();
   assert.equal(page.el("reply-branch-row").hidden, true, "a new thread was offered on a root that has replies");
+});
+
+// --- the conversation a reply goes into ----------------------------------------------------------
+//
+// `#200 reply-context`. The reply screen's title bar names the thread the reply goes into in the
+// thread picker's own words, and the messages that came before the one being answered are drawn
+// above it, read-only, with the screen opening at the message.
+
+/**
+ * A channel with one discussion: an announcement `300`, the discussion's root `301` and its five
+ * answers `302`..`306`, an aside `307` on the main channel after it, and `308`, a main-channel
+ * question whose thread nobody has answered, which is the one Reply can start a thread from.
+ */
+function discussionData() {
+  const thread = { id: "spaces/A/threads/discussion", root_message_id: "301", is_root: true,
+    reply_count: 5, reply_count_exact: true };
+  const lone = { id: "spaces/A/threads/lone", root_message_id: "308", is_root: true,
+    reply_count: 0, reply_count_exact: true };
+  const answer = { ...thread, is_root: false };
+  const messages = [
+    message({ id: "300", content: "an announcement before the discussion" }),
+    message({ id: "301", content: "a discussion opens here", thread }),
+    message({ id: "302", content: "the first answer", thread: answer }),
+    message({ id: "303", content: "the second answer", thread: answer }),
+    message({ id: "304", content: "the third answer", thread: answer }),
+    message({ id: "305", content: "the fourth answer", thread: answer }),
+    message({ id: "306", content: "the fifth answer", thread: answer }),
+    message({ id: "307", content: "an aside on the main channel" }),
+    message({ id: "308", content: "an open question", thread: lone }),
+  ];
+  // Longer than the picker shows, so the picker's option and the heading over the thread differ.
+  const threads = [{ id: thread.id, root: messages[1], title: "Long discussion of the storage migration",
+    reply_count: 5, reply_count_exact: true, updated_at: messages[6].timestamp }];
+  return { messages, threads, thread };
+}
+
+async function discussionPage(setup = () => {}) {
+  const page = newPage();
+  page.threadingSupported = true;
+  const data = discussionData();
+  page.threads = data.threads;
+  setup(page);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  return { page, data };
+}
+
+/** The ids of the earlier messages drawn over the one being answered, top to bottom. */
+const contextIds = (page) => page.el("reply-context").children.map((li) => li.getAttribute("data-id"));
+const replyTitle = (page) => page.el("topbar-title").text();
+
+test("the reply screen's title names the thread it posts into as the picker does, and Main by the channel's name", async () => {
+  const { page, data } = await discussionPage((p) => {
+    p.channels = [{ ...CHANNEL, alias: "the planning room" }];
+  });
+  const value = `thread:${data.thread.id}`;
+
+  // A main-channel message: the channel's main space, by the name the owner gave the channel.
+  await replyButton(rowOf(page, "300")).click();
+  assert.equal(replyTitle(page), "Reply · Main · the planning room");
+  await page.el("reply-cancel").click();
+
+  // Inside the thread: the picker's own label for it, with the name less shortened, exactly as the
+  // heading over the thread reads. The title bar cuts what does not fit; the picker cuts at a count.
+  await pickThread(page, value);
+  const option = optionLabel(page, value);
+  const heading = headingLabel(page);
+  assert.match(option, / · 5 · Long discussion of the stor…$/, `the picker's label is not what this test expects: ${option}`);
+  assert.match(heading, / · 5 · Long discussion of the storage migration$/);
+  await replyButton(rowOf(page, "304")).click();
+  assert.equal(replyTitle(page), `Reply · ${heading}`, "the title bar and the heading name the thread differently");
+  assert.ok(replyTitle(page).startsWith(`Reply · ${option.slice(0, -1)}`),
+    `the title bar "${replyTitle(page)}" does not begin with the picker's "${option}"`);
+  await page.el("reply-cancel").click();
+
+  // From All, a thread's answer is named by ITS thread, not by the view it was opened from.
+  await pickThread(page, "flat");
+  await replyButton(rowOf(page, "303")).click();
+  assert.equal(replyTitle(page), `Reply · ${heading}`);
+  await page.el("reply-cancel").click();
+
+  // The new-thread box moves the destination, and the title goes with it, there and back.
+  await pickThread(page, "main");
+  await replyButton(rowOf(page, "308")).click();
+  assert.equal(page.el("reply-branch-row").hidden, false, "this fixture offers no new thread");
+  assert.equal(replyTitle(page), "Reply · Main · the planning room");
+  page.el("reply-branch").checked = true;
+  await page.el("reply-branch").dispatch("change");
+  assert.equal(replyTitle(page), "Reply · New thread · an open question");
+  assert.match(page.el("reply-destination").textContent, /new thread/);
+  page.el("reply-branch").checked = false;
+  await page.el("reply-branch").dispatch("change");
+  assert.equal(replyTitle(page), "Reply · Main · the planning room");
+  assert.match(page.el("reply-destination").textContent, /main channel/);
+
+  // Leaving puts the title bar back to nothing of the reply's.
+  await page.el("reply-cancel").click();
+  assert.equal(page.el("topbar-title").hidden, true);
+});
+
+test("the reply screen's title gives the name a line of its own, so a phone cuts the facts before the name", async () => {
+  // `#200 reply-context`. As one line, "Reply · 38w · 14 · <name>", a phone cut the end, and the
+  // end is the name, the one part that identifies the thread: at 412px with the font at 130%, six
+  // characters of it were left. "Reply" and the facts are now a smaller line, cut first, and the
+  // name has the bar's width and two lines before it is cut. As text it is unchanged: the picker's
+  // label after "Reply", the seam between the lines spoken and not drawn.
+  const { page, data } = await discussionPage((p) => {
+    p.channels = [{ ...CHANNEL, alias: "the planning room" }];
+  });
+  const lines = () => page.el("topbar-title").children.map((part) => [part.className, part.textContent]);
+  await pickThread(page, `thread:${data.thread.id}`);
+  const facts = page.el("thread-facts").textContent;
+  await replyButton(rowOf(page, "304")).click();
+  assert.deepEqual(lines(), [
+    ["title-lead", `Reply · ${facts}`],
+    ["sr-only", " · "],
+    ["title-name", "Long discussion of the storage migration"],
+  ]);
+  assert.equal(lines()[2][1], page.el("thread-title").textContent, "the title's name is not the heading's");
+  await page.el("reply-cancel").click();
+
+  await pickThread(page, "main");
+  await replyButton(rowOf(page, "308")).click();
+  assert.deepEqual(lines(), [["title-lead", "Reply · Main"], ["sr-only", " · "], ["title-name", "the planning room"]]);
+  await page.el("reply-branch").setChecked(true);
+  assert.deepEqual(lines(), [["title-lead", "Reply · New thread"], ["sr-only", " · "], ["title-name", "an open question"]]);
+
+  // What draws those lines so. This fixture lays nothing out, so it reads the rules: the name may
+  // wrap to a second line and is then cut, the lead stays one line and gives way first, and the
+  // title as a whole is no longer the single cut line it was.
+  const name = cssBlock("#topbar-title .title-name");
+  assert.match(name, /display:\s*-webkit-box/);
+  assert.match(name, /-webkit-box-orient:\s*vertical/);
+  assert.match(name, /-webkit-line-clamp:\s*2;/);
+  assert.match(name, /overflow:\s*hidden/, "without overflow: hidden the clamp cuts nothing");
+  assert.match(name, /overflow-wrap:\s*anywhere/, "a name that is one long token runs under the clip");
+  assert.doesNotMatch(name, /nowrap/, "the name is held to one line");
+  const lead = cssBlock("#topbar-title .title-lead");
+  assert.match(lead, /white-space:\s*nowrap/);
+  assert.match(lead, /text-overflow:\s*ellipsis/);
+  assert.doesNotMatch(cssBlock("#topbar-title"), /nowrap|ellipsis/, "the whole title is one cut line again");
+  // At the inherited line height the two lines of a short name were taller than the bar's own
+  // 2.4rem row, so every reply screen paid for the split; at a heading's they fit inside it.
+  assert.match(cssBlock("#topbar-title"), /line-height:\s*1\.2;/);
+  assert.match(cssBlock(".sr-only"), /clip-path:\s*inset\(50%\)/, "the seam between the lines is drawn");
+});
+
+test("a read that places an unplaced message renames the reply screen and moves its earlier messages", async () => {
+  const { page, first, standard } = await unplacedArrival();
+  await replyButton(rowOf(page, "206")).click();
+  assert.match(replyTitle(page), /^Reply · lead team · thread not known yet$/);
+  assert.match(page.el("reply-destination").textContent, /not known yet/);
+
+  // The channel's own poll reads it, with the reply screen still up.
+  page.timeline = standard;
+  await reReadChannel(page);
+  assert.equal(page.screen(), "reply", "the read took the reader off the reply screen");
+  assert.equal(replyTitle(page), `Reply · ${optionLabel(page, `thread:${first.id}`)}`,
+    "the title bar still does not know where the reply goes");
+  assert.match(page.el("reply-destination").textContent, /thread this message belongs to/);
+  assert.deepEqual(contextIds(page), ["201", "202"], "the earlier messages are not the thread's");
+
+  // ...and Send goes there at once, with no placement read of its own.
+  distinctReplies(page);
+  const reads = page.timelineCalls.length;
+  await page.el("reply-text").setValue("placed after all");
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.deepEqual(page.repliesPosted.at(-1).body, { text: "placed after all", reply_to: "206", thread_id: first.id });
+  assert.equal(page.timelineCalls.length, reads, "the send read the channel again to place a placed message");
+});
+
+test("the earlier messages of the thread are drawn above the message being answered, oldest first, and none after it", async () => {
+  const { page, data } = await discussionPage();
+  await pickThread(page, `thread:${data.thread.id}`);
+  await replyButton(rowOf(page, "304")).click();
+
+  assert.deepEqual(contextIds(page), ["301", "302", "303"]);
+  assert.match(page.el("reply-target").text(), /the third answer/);
+  assert.doesNotMatch(page.el("reply-context").text(), /third|fourth|fifth/,
+    "a message from after the one being answered is in its context");
+  const pane = page.el("reply-scroll").children;
+  assert.ok(pane.indexOf(page.el("reply-context")) < pane.indexOf(page.el("reply-target")),
+    "the earlier messages are not above the message");
+  // Drawn as the channel draws its rows: the same row, the same rendered text.
+  const root = page.el("reply-context").children[0];
+  assert.equal(root.className, "discord-message");
+  assert.match(root.descendants().find((node) => node.className === "body").text(), /a discussion opens here/);
+
+  // A draft still belongs to its message, context or not.
+  await page.el("reply-text").setValue("a half-written answer");
+  await page.el("reply-cancel").click();
+  await replyButton(rowOf(page, "304")).click();
+  assert.equal(page.el("reply-text").value, "a half-written answer", "the draft was lost");
+  assert.deepEqual(contextIds(page), ["301", "302", "303"]);
+  await page.el("reply-cancel").click();
+
+  // On Main, what came before on the main channel, and none of the thread's answers.
+  await pickThread(page, "main");
+  await replyButton(rowOf(page, "307")).click();
+  assert.deepEqual(contextIds(page), ["300", "301"]);
+});
+
+test("the earlier messages are read-only: no Reply, Done, more options, thread tag or gesture", async () => {
+  const { page } = await discussionPage();
+  await pickThread(page, "flat");
+  await replyButton(rowOf(page, "307")).click();
+  const rows = page.el("reply-context").children;
+  assert.deepEqual(contextIds(page), ["300", "301"], "this fixture's context is not what the test expects");
+  for (const row of rows) {
+    for (const control of ["reply-button", "done-button", "row-more", "upstream-read-button", "thread-badge",
+      "thread-replies"]) {
+      assert.equal(row.descendants().find((node) => node.hasClass(control)), undefined,
+        `an earlier message carries a ${control}`);
+    }
+    for (const gesture of ["pointerdown", "pointermove", "pointerup", "click"]) {
+      assert.equal((row.listeners.get(gesture) || []).length, 0, `a short earlier message answers ${gesture}`);
+    }
+  }
+  const asked = page.requests.length;
+  await rows[1].click();
+  await page.settle();
+  assert.equal(page.requests.length, asked, "touching an earlier message asked the server for something");
+  assert.equal(page.screen(), "reply");
+});
+
+test("a long earlier message is folded as on the channel, and the message opens it", async () => {
+  const page = newPage();
+  await signIn(page);
+  const long = longMessage("an earlier explanation");
+  await openReplyOn(page, [message({ id: "401", content: long }), message({ id: "402", content: "and so?" })], 1);
+  const [row] = page.el("reply-context").children;
+  const body = row.descendants().find((node) => node.hasClass("body"));
+  assert.equal(body.className, "body clamped", "a long earlier message is drawn in full");
+  await row.click();
+  assert.equal(body.className, "body", "the message did not open");
+  assert.equal(foldButton(row).getAttribute("aria-expanded"), "true");
+  // Its control is the keyboard's way in, and it closes it again.
+  await foldButton(row).click();
+  assert.equal(body.className, "body clamped");
+});
+
+test("the reply screen opens at the message being answered, with what came before it above", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    await signIn(page);
+    const lines = await showDiscord(page, [...tallChannel(6), message({ id: "99", content: "the question" })]);
+    await replyButton(lines[lines.length - 1]).click();
+    const pane = page.el("reply-scroll");
+    assert.ok(pane.scrollHeight > pane.clientHeight * 2, "the reply screen does not overflow, so this asks nothing");
+    return { page, pane };
+  };
+  const { page, pane } = await run();
+  assert.equal(contextIds(page).length, 6);
+  // The whole message is in view, and the earlier ones are above it: reached by scrolling up.
+  const meta = page.el("reply-target-meta").getBoundingClientRect();
+  const target = page.el("reply-target").getBoundingClientRect();
+  assert.ok(meta.top >= 0 && target.bottom <= pane.clientHeight,
+    `the message is not in view: ${meta.top}..${target.bottom} in ${pane.clientHeight}`);
+  assert.ok(pane.scrollTop > 0, "the screen opened at the top of the context, not at the message");
+  assert.ok(page.el("reply-context").children[0].getBoundingClientRect().bottom <= 0,
+    "the oldest earlier message is on screen, so the message is not where the screen opened");
+
+  // THE CONTROL: without the scroll, the screen opens on the oldest earlier message instead.
+  const control = await run(brokenScript(
+    "  pane.scrollTop = Math.min(top, pane.scrollHeight - pane.clientHeight);", "  void top;"));
+  assert.ok(control.page.el("reply-target-meta").getBoundingClientRect().top >= control.pane.clientHeight,
+    "with the scroll deleted the message was still in view, so this test cannot tell the two apart");
+
+  // A message taller than the screen opens at its first line.
+  const tall = newPage();
+  await signIn(tall);
+  const tallLines = await showDiscord(tall, [...tallChannel(3), message({ id: "98", content: longMessage("x").repeat(4) })]);
+  await replyButton(tallLines[tallLines.length - 1]).click();
+  assert.equal(tall.el("reply-target-meta").getBoundingClientRect().top, 0, "a tall message did not open at its start");
+});
+
+test("the earlier messages start at REPLY_CONTEXT_LIMIT, and Load earlier shows the rest the page holds without asking", async () => {
+  const limit = sourceConstant("REPLY_CONTEXT_LIMIT");
+  const page = newPage();
+  await signIn(page);
+  const messages = Array.from({ length: limit + 5 }, (_, i) => message({ id: String(500 + i), content: `note ${i}` }));
+  const lines = await showDiscord(page, messages);
+  await replyButton(lines[lines.length - 1]).click();
+  const held = messages.slice(0, -1).map((m) => m.id);
+  assert.deepEqual(contextIds(page), held.slice(-limit), "the newest earlier messages are not the ones shown");
+  const more = page.el("reply-context-more");
+  assert.equal(more.hidden, false, "nothing offers the earlier messages the page holds");
+  const meta = page.el("reply-target-meta");
+  const before = meta.getBoundingClientRect().top;
+  const asked = page.requests.length;
+  await more.click();
+  await page.settle();
+  assert.deepEqual(contextIds(page), held);
+  assert.equal(page.requests.length, asked, "showing what the page holds asked the server");
+  assert.equal(more.hidden, true, "Load earlier is offered with nothing left to load");
+  assert.equal(meta.getBoundingClientRect().top, before, "the message being answered moved");
+});
+
+test("Load earlier pages the thread back from the server on its cursor, with a GET a read token can make", async () => {
+  const cursor = "opaque cursor /&?";
+  const thread = { id: "spaces/A/threads/paged", root_message_id: "601", is_root: true,
+    reply_count: 7, reply_count_exact: true };
+  const all = [
+    message({ id: "601", content: "a paged discussion opens", thread }),
+    ...Array.from({ length: 7 }, (_, i) =>
+      // Long, so the screen scrolls and holding the message in place is something it has to do.
+      message({ id: String(602 + i), content: longMessage(`answer ${i + 1}`), thread: { ...thread, is_root: false } })),
+  ];
+  const summary = { id: thread.id, root: all[0], title: "Paged discussion", reply_count: 7,
+    reply_count_exact: true, updated_at: all[7].timestamp };
+  const page = newPage();
+  page.threadingSupported = true;
+  page.threads = [summary];
+  // Read-scope: the context only ever reads.
+  page.tokenScope = "read";
+  const standard = page.timeline;
+  // The thread's newest page is its last four answers; the page before it, the root and the rest.
+  page.timeline = async (path) => {
+    const url = new URL(path, "http://fixture.test");
+    if (url.searchParams.get("view") !== "thread") return standard(path);
+    const older = url.searchParams.get("before") === cursor;
+    return json(200, timelineAnswer({ view: "thread", messages: older ? all.slice(0, 4) : all.slice(4),
+      thread: summary, has_threads: true, has_more: !older, next_before: older ? null : cursor }));
+  };
+  await signIn(page);
+  await showDiscord(page, all);
+  await pickThread(page, `thread:${thread.id}`);
+  await replyButton(rowOf(page, "607")).click();
+  assert.deepEqual(contextIds(page), ["605", "606"], "the newest page's earlier answers are not shown");
+  const more = page.el("reply-context-more");
+  assert.equal(more.hidden, false, "nothing offers the thread's older messages");
+
+  const writes = () => page.requests.filter((request) => !request.startsWith("GET")).length;
+  const writesBefore = writes();
+  const meta = page.el("reply-target-meta");
+  const before = meta.getBoundingClientRect().top;
+  await more.click();
+  await page.settle();
+  const read = page.requests.at(-1);
+  assert.match(read, /^GET /, `Load earlier made a ${read}`);
+  assert.ok(read.includes("view=thread") && read.includes(`thread_id=${encodeURIComponent(thread.id)}`) &&
+    read.includes(`before=${encodeURIComponent(cursor)}`), `Load earlier did not page the thread back: ${read}`);
+  assert.equal(writes(), writesBefore, "Load earlier wrote something");
+  assert.deepEqual(contextIds(page), ["601", "602", "603", "604", "605", "606"]);
+  assert.equal(more.hidden, true, "the thread's root is here and Load earlier is still offered");
+  assert.equal(meta.getBoundingClientRect().top, before, "the message being answered moved");
+  assert.equal(page.el("reply-context-state").hidden, true);
+  assert.equal(page.el("error").hidden, true, `a read token raised an error: ${page.el("error").textContent}`);
 });
 
 // The outbox posts the messages bound for one destination in the order they were sent. A reply

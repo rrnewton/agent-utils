@@ -64,6 +64,15 @@ without saying which thread it is in, and that no read has placed since, is plac
 **All** before the reply is posted; if that read fails, nothing is posted and the reply keeps its
 text for **Retry**. Until it is placed, whatever you send next in that channel waits for it.
 
+**The reply screen says where the reply goes, and shows what came before.** Its title bar names
+the thread the reply posts into as the thread picker and the heading over a thread name it (age and
+replies, then the name, which gets a line of its own so a phone does not cut it away), or **Main**
+and the channel's name, and it follows the **Start a new thread** box.
+Above the message being answered are the messages before it in its thread, or on the main channel,
+oldest at the top, drawn as the channel draws them but with nothing on them to tap. The screen opens
+at the message, so they are a scroll up. The newest twelve the app holds come first; **Load earlier
+messages** shows the rest, and then reads earlier pages of that thread, or of Main, from the server.
+
 **A normal text box at the bottom.** Scroll below the newest message to write to the channel or
 selected thread. **Send** posts without requiring a message to reply to. Drafts are kept separately
 for each channel and thread. This composer scrolls with history.

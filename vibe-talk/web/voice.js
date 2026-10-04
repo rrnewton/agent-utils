@@ -82,7 +82,8 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
  *   | "help-link-storage" | "jump-marker" | "jump-newest" | "load-older" | "load-older-turns"
  *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings"
  *   | "post-confirm-cancel" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-new" | "read-speed" | "remove-channel"
- *   | "rename-channel" | "reply-cancel" | "reply-send" | "save-alias" | "save-token"
+ *   | "rename-channel" | "reply-cancel" | "reply-context-more" | "reply-send" | "save-alias"
+ *   | "save-token"
  *   | "search-toggle" | "send-text" | "speaker" | "summarise" | "talk" | "text-entry"
  *   | "thread-back" | "thread-directory-more" | "thread-directory-retry" | "todo-filter"
  *   | "undo-dismiss" | "view-switch"} id
@@ -6314,6 +6315,9 @@ function renderChannelNavigation() {
     el(`channel-view-${view}`).setAttribute("aria-pressed", channelView === view ? "true" : "false");
   }
   renderThreadHeading();
+  // `#200 reply-context`. The reply screen names its thread from the same store, so a read that
+  // names the thread, or places the message being answered, redraws it as well.
+  followReplyStore();
   el("thread-list").hidden = channelView !== "threads";
   el("discord-log").hidden = channelView === "threads";
   el("channel-compose-label").textContent = selectedThreadId ? "Reply in this thread" : "Message the main channel";
@@ -7896,9 +7900,50 @@ const SAFE_LINK = /^https?:\/\//i;
  * Groups, in the order they are tried: code span, bold, strikethrough, italic (asterisk), italic
  * (underscore), link, user mention, channel mention. Code is first so that backticked text is
  * taken verbatim; a construct is not parsed across a line break.
+ *
+ * AN UNDERSCORE INSIDE A WORD IS TEXT. `#200 reply-context`: `ABC_E2E_DEF` was drawn as "ABC",
+ * an italic "E2E" and "DEF", two underscores gone, and a snake_case feature name inside an
+ * attribute lost its underscores the same way. CommonMark's rule for `_`, which `*` does not
+ * share: it opens emphasis only where no letter or digit comes before it, and closes only where
+ * none comes after. The pattern holds the closing half: it passes over a closer with a letter, a
+ * digit or an underscore after it, so `_snake_case_` is one emphasis. `underscoreEmphasis` holds
+ * the opening half: in the pattern it would be a lookbehind, which Safari before 16.4 does not
+ * compile, and a pattern that does not compile stops the whole page. Neither half may touch a
+ * space or a second underscore, so `__init__.py` is text: a doubled underscore is no construct
+ * here. `*` keeps emphasising inside a word, as CommonMark allows. A combining mark counts as part
+ * of the letter it sits on, so a decomposed accent before an underscore keeps it inside the word.
+ *
+ * A CLOSER BELONGS TO THE NEAREST OPENER BEFORE IT, as in CommonMark. The emphasised text may not
+ * pass an underscore that could open one itself — one after a space or punctuation, before
+ * something that is not a space — so in "call _private_helper then _really_ do it" only
+ * "really" is emphasised, rather than everything from "private" with a stray underscore inside.
+ *
+ * AND IT REACHES AT MOST 255 CHARACTERS. Each underscore makes the pattern look ahead for its
+ * closer, and the opening check only runs once one is found, so an underscore that cannot close
+ * — every one in a long run of identifiers — used to read to the end of its line. That is the
+ * line's length once per underscore. Measured on one line of `a_a_a…` in Node: 0.2s at 20,000
+ * characters, 0.8s at 40,000, which is the longest message Slack allows, and 4.7s at 100,000, on
+ * the page's one thread and again on every refresh that redraws the row. Bounded, each underscore
+ * costs at most the bound (40,000 characters take 25ms), and an emphasis longer than that is shown
+ * as the text it was written as.
  */
 const INLINE =
-  /`([^`\n]+)`|\*\*([^*\n]+)\*\*|~~([^~\n]+)~~|\*([^*\n]+)\*|_([^_\n]+)_|\[([^\]\n]*)\]\(([^)\s]*)\)|<@!?(\d+)>|<#(\d+)>/g;
+  /`([^`\n]+)`|\*\*([^*\n]+)\*\*|~~([^~\n]+)~~|\*([^*\n]+)\*|_(?![\s_])((?:[\p{L}\p{M}\p{N}_]|[^\p{L}\p{M}\p{N}_\n](?!_[^\s_])){0,254}?[^\s_])_(?![\p{L}\p{M}\p{N}_])|\[([^\]\n]*)\]\(([^)\s]*)\)|<@!?(\d+)>|<#(\d+)>/gu;
+
+/**
+ * A letter, a mark on one, a digit, or an underscore: what an emphasis underscore may not have on
+ * its outer side.
+ */
+const WORDLIKE = /^[\p{L}\p{M}\p{N}_]$/u;
+
+/**
+ * Whether an underscore pair the pattern found opens where CommonMark lets it: at the start of the
+ * text, or after something that is not a letter, a mark, a digit or another underscore.
+ */
+function underscoreEmphasis(text, match) {
+  const before = [...text.slice(Math.max(0, match.index - 2), match.index)].pop() || "";
+  return !WORDLIKE.test(before);
+}
 
 function styled(tag, className, text) {
   const node = document.createElement(tag);
@@ -7940,6 +7985,13 @@ function renderInline(parent, text) {
   let at = 0;
   let match = INLINE.exec(text);
   while (match !== null) {
+    // An underscore inside a word: text, not an opener. Look again from the character after it, so
+    // a construct that starts inside what it would have covered is still found.
+    if (match[5] !== undefined && !underscoreEmphasis(text, match)) {
+      INLINE.lastIndex = match.index + 1;
+      match = INLINE.exec(text);
+      continue;
+    }
     if (match.index > at) {
       parent.append(plain(text.slice(at, match.index)));
     }
@@ -10239,11 +10291,16 @@ function regroupChannelRows() {
 }
 
 /**
- * One ROW: one message, or several drawn as one. Takes a group, never a bare message.
+ * What a channel row IS before anything can be done with it: its identity, its author line and its
+ * text. Takes a group, never a bare message.
+ *
+ * `#200 reply-context`. Split out of `discordNode` so that the earlier messages above a reply are
+ * drawn by the channel's own renderer rather than by a second one that would drift from it.
+ * Everything a reader can DO to a row — fold, reply, mark, swipe — is added by `discordNode`.
  *
  * @param {Array<object>} messages the row's constituents, oldest first, at least one.
  */
-function discordNode(messages) {
+function channelRowFrame(messages) {
   const message = messages[0];
   const li = document.createElement("li");
   // `#56 message-hover-highlight`. A class of its own rather than styling `#discord-log li`
@@ -10328,6 +10385,17 @@ function discordNode(messages) {
   const content = combinedContent(messages);
   renderMarkdownInto(body, content);
   li.append(meta, body);
+  return { li, meta, body, content };
+}
+
+/**
+ * One ROW: one message, or several drawn as one. Takes a group, never a bare message.
+ *
+ * @param {Array<object>} messages the row's constituents, oldest first, at least one.
+ */
+function discordNode(messages) {
+  const message = messages[0];
+  const { li, meta, body, content } = channelRowFrame(messages);
   // The SAME call the voice transcript makes, on the same arguments, so the two lists cannot end
   // up with two idioms for the one behaviour. `#47 scrollback-stability`. The one extra argument
   // is the message id, which is what `#49 cached-summaries` keys a summary under — the transcript
@@ -12077,7 +12145,10 @@ function persistDrafts() {
 
 let replyTarget = null;
 let replyChannelId = null;
-/** Where the reply on screen goes, as `replyRoute` decided when it opened. */
+/**
+ * Where the reply on screen goes, as `replyRoute` decided when it opened — or since, when a read
+ * placed a message the stream had left unplaced. See `followReplyStore`.
+ */
 let replyRouting = { thread: null, branch: null, unknown: false, note: "" };
 // Where the reader was in the channel when they opened this. Captured with the SAME mechanism the
 // fold control uses (`#47 scrollback-stability`), not a second one.
@@ -12113,6 +12184,9 @@ function rememberDraft() {
  * THE ANSWER GOES TO THE FIRST CONSTITUENT, and the meta line says which id that is. The quoted
  * text above it is the whole row, because that is what the reader tapped Reply on — showing only
  * the primary would read as the app having lost the rest of the message.
+ *
+ * `#200 reply-context`. Above it, the messages that came before it where it is, and in the title
+ * bar, the thread the reply goes into. See `renderReplyContext` and `renderReplyTitle`.
  */
 function openReply(messages) {
   const message = messages[0];
@@ -12123,7 +12197,6 @@ function openReply(messages) {
   // from the last reply: the default is to answer where the message is.
   el("reply-branch").checked = false;
   el("reply-branch-row").hidden = !replyRouting.branch;
-  renderReplyDestination();
   // BEFORE the screen changes: once #screen-main is hidden nothing in it has a rectangle, so the
   // anchor has to be taken while the reader can still see it.
   replyScrollMark = captureScroll();
@@ -12137,12 +12210,21 @@ function openReply(messages) {
   } · id ${message.id}`;
   el("reply-text").value = drafts.get(message.id) || "";
   el("reply-state").textContent = "";
+  resetReplyContext();
+  renderReplyContext();
   showScreen("reply");
+  // AFTER: the title bar is the screen's to name only once it is up, and only a pane on screen has
+  // a height to open at.
+  renderReplyDestination();
+  showReplyMessage();
 }
 
 /**
  * Say where Send will post, in the words of the choice the reader has made. Silent for a plain
  * main-channel reply, which is what Reply has always done and needs no note.
+ *
+ * `#200 reply-context`. The title bar names the same destination, so the two cannot disagree: the
+ * new-thread box and a read that places the message redraw both, here.
  */
 function renderReplyDestination() {
   const note = el("reply-destination");
@@ -12152,6 +12234,30 @@ function renderReplyDestination() {
       : "Posts in the main channel as a reply to this message."
     : replyRouting.note;
   note.hidden = note.textContent === "";
+  if (currentScreen === "reply" && replyTarget) renderReplyTitle();
+}
+
+/**
+ * The title bar over the reply screen: "Reply" and where the reply goes, on a smaller line, and
+ * under it the name of that place on a line of its own.
+ *
+ * A line of its own because the name is what identifies the thread, and as the end of one line it
+ * was the part cut. On a 412px phone with the system font at 130%, "Reply · 38w · 14 · " left
+ * six characters of the name, and the age and the reply count tell one thread from another no
+ * better than nothing. The picker can lead with the facts because Android opens it as a list that
+ * shows the whole option; nothing opens a title bar. So the facts keep their place and their
+ * order, and the name gets the bar's width and a second line before it is cut (web/voice.css).
+ *
+ * Read aloud, and as text, it is still the picker's label after "Reply": the seam between the two
+ * lines is spoken, and only the line break is drawn.
+ */
+function renderReplyTitle() {
+  const [where, name] = replyDestination();
+  el("topbar-title").replaceChildren(
+    styled("span", "title-lead", [SCREEN_TITLES.reply, where].filter((part) => part !== "").join(" · ")),
+    styled("span", "sr-only", " · "),
+    styled("span", "title-name", name)
+  );
 }
 
 function closeReply() {
@@ -12162,6 +12268,7 @@ function closeReply() {
     replyScrollMark = null;
   }
   replyTarget = null;
+  resetReplyContext();
 }
 
 /** Hand the captured target and text to the same durable outbox as the normal composer. */
@@ -12195,10 +12302,304 @@ async function sendReply() {
   // its eventual completion.
   replyTarget = null;
   replyScrollMark = null;
+  resetReplyContext();
   showScreen("main");
   showView("discord");
   scrollToNewest();
   await completion;
+}
+
+// --- the conversation a reply goes into ---------------------------------------------------------
+//
+// `#200 reply-context`. The owner, of the reply screen: "We should certainly show the thread
+// identity at the top when we're doing a reply to a message. In fact, even while we feature the
+// message we're replying to prominently like this, I would like the prior messages in the thread to
+// be rendered above so that if we scroll up, we see them when we're doing this reply."
+//
+// So the title bar names the thread the reply goes into, exactly as the thread picker does, and the
+// messages that came before the one being answered — in its thread, or on the main channel — are
+// drawn above it by the channel's own row renderer. The screen opens at the message; what came
+// before is a scroll up. They are what the page already holds, the newest REPLY_CONTEXT_LIMIT of
+// them first, and "Load earlier messages" reveals more, reading a page from the server once the
+// page holds no more.
+
+/**
+ * How many earlier messages are drawn above the one being answered before "Load earlier messages".
+ * About two phone screens of ordinary rows, long ones folded to their opening lines as they are on
+ * the channel: enough to see what is being answered, and not a wall of history the screen would
+ * then have to be scrolled past to reach the message.
+ */
+const REPLY_CONTEXT_LIMIT = 12;
+
+/**
+ * The earlier messages on the reply screen. `generation` retires a read the reader has left behind;
+ * `shown` is how many are drawn; `cursor` is where the next server page starts; `opened` is the
+ * folded rows the reader opened, so a redraw does not fold them again; `drawn` is what the list
+ * holds now, so a refresh that changed nothing above the message does not rebuild it.
+ */
+const replyContext = {
+  generation: 0, shown: REPLY_CONTEXT_LIMIT, cursor: null, loading: false, error: "",
+  opened: new Set(), drawn: "",
+};
+
+/** Forget the last reply's earlier messages, and any read still on its way for them. */
+function resetReplyContext() {
+  Object.assign(replyContext, {
+    generation: replyContext.generation + 1, shown: REPLY_CONTEXT_LIMIT, loading: false, error: "",
+    drawn: "",
+  });
+  replyContext.opened.clear();
+  el("reply-context").replaceChildren();
+  // The channel's own walk back through this place, where it has one: the next page is the one
+  // before the deepest it reached. A view restored from the device keeps no cursor.
+  const thread = replyPlace();
+  const cover = threadingSupported && replyTarget
+    ? channelCanon.views.get(viewKey(thread ? "thread" : "main", thread)) : null;
+  replyContext.cursor = cover && cover.live && cover.cursor ? cover.cursor : null;
+}
+
+/**
+ * The thread the message being answered is in, or null for the main channel — which, for a channel
+ * registered as one conversation, is that conversation. Where the earlier messages come from.
+ */
+function replyPlace() {
+  const thread = replyRouting.thread;
+  return threadingSupported && thread && thread !== channelCanon.scope ? String(thread) : null;
+}
+
+/**
+ * What the title bar calls the place the reply goes into, as [where, name]: the thread, in the
+ * thread picker's own words — its age and replies, then its name — with the name less shortened,
+ * as the heading over an open thread gives it; or "Main" and the channel's name. Joined with
+ * " · ", the thread's pair IS the picker's label. Asked of the store each time it is drawn, as
+ * the heading is, so a name that arrives later is the name shown.
+ *
+ * The thread a ticked "Start a new thread" box would start is named as the picker will name it,
+ * by the message it starts from, after "New thread" — it has no age or replies of its own yet.
+ */
+function replyDestination() {
+  const channel = channelName(knownChannel(replyChannelId));
+  if (replyRouting.unknown) return [channel, "thread not known yet"];
+  if (replyRouting.branch && el("reply-branch").checked) {
+    return ["New thread", threadName(threadChoice(replyRouting.branch, null, replyTarget), Infinity)];
+  }
+  const thread = replyPlace();
+  if (!thread) return ["Main", channel];
+  const summary = channelCanon.threads.find((held) => String(held.id) === thread) ||
+    (String(selectedThreadId) === thread ? selectedThread : null);
+  const choice = threadIndex().get(thread) || threadChoice(thread, summary);
+  return [threadFacts(choice), threadName(choice, Infinity)];
+}
+
+/**
+ * The earlier messages where the message being answered is, oldest first, and whether the server
+ * may hold older ones than these.
+ *
+ * FROM THE STORE, and under its rule: a projection never invents coverage. A thread's messages are
+ * complete from the floor of that thread's own pages or of All's, whichever reaches further back,
+ * and Main's likewise; a message held from further back than both may have unread neighbours, and
+ * is left out rather than drawn beside a gap nothing admits to. A thread begins at its root, so once
+ * the root is here there is nothing older to ask for. A channel read as plain pages of history holds
+ * exactly the rows on screen, and has no earlier page to read from here.
+ */
+function replyContextPool() {
+  const id = String(replyTarget.id);
+  if (!threadingSupported) {
+    const held = [...el("discord-log").children].flatMap(rowMessages);
+    const at = held.findIndex((message) => String(message.id) === id);
+    return { earlier: at > 0 ? held.slice(0, at) : [], more: false };
+  }
+  if (channelCanon.channel !== String(replyChannelId)) return { earlier: [], more: false };
+  const thread = replyPlace();
+  const view = thread ? "thread" : "main";
+  const ids = new Set();
+  let more = true;
+  for (const [key, from] of [[view, thread], ["flat", null]]) {
+    const rows = projectView(key, from);
+    if (!rows) continue;
+    if (!channelCanon.views.get(viewKey(key, from)).more) more = false;
+    for (const message of rows) {
+      if (inView(message, view, thread)) ids.add(String(message.id));
+    }
+  }
+  const all = channelCanon.messages;
+  const at = all.findIndex((message) => String(message.id) === id);
+  const when = timeOf(replyTarget, "timestamp");
+  const earlier = all.filter((message, index) => ids.has(String(message.id)) && String(message.id) !== id &&
+    (at >= 0 ? index < at : timeOf(message, "timestamp") < when));
+  const begins = (message) => threadOf(message) === thread && message.thread.is_root === true;
+  if (thread && (begins(replyTarget) || earlier.some(begins))) more = false;
+  return { earlier, more };
+}
+
+/** Draw the earlier messages, and the control and the sentence over them. */
+function renderReplyContext() {
+  const list = el("reply-context");
+  const { earlier, more } = replyTarget ? replyContextPool() : { earlier: [], more: false };
+  const shown = earlier.slice(Math.max(0, earlier.length - replyContext.shown));
+  const drawn = JSON.stringify(shown.map((message) => [String(message.id), message.content]));
+  if (drawn !== replyContext.drawn) {
+    list.replaceChildren(...glom(shown).map(replyContextRow));
+    replyContext.drawn = drawn;
+  }
+  list.hidden = shown.length === 0;
+  const button = el("reply-context-more");
+  button.hidden = earlier.length <= shown.length && !more;
+  button.disabled = replyContext.loading;
+  const state = el("reply-context-state");
+  state.textContent = replyContext.loading
+    ? "Loading earlier messages…"
+    : replyContext.error
+      ? `Earlier messages did not load: ${replyContext.error.replace(/[.\s]+$/, "")}. Try again.`
+      : "";
+  state.hidden = state.textContent === "";
+}
+
+/**
+ * One of the earlier messages: the channel's row, to read and nothing else.
+ *
+ * No Reply, Done or ⋯, no thread tag and no swipe. This screen answers one message, and an act on
+ * another from here would happen somewhere the reader cannot see. A long one is folded to its
+ * opening lines as on the channel, and the message is the control that opens it, with the fold
+ * button a keyboard reaches; nothing about it is remembered past this screen, and nothing is
+ * summarised.
+ */
+function replyContextRow(messages) {
+  const { li, meta, body, content } = channelRowFrame(messages);
+  const message = messages[0];
+  // The speaker treatment the channel gives the row, from the same census: the two principals are
+  // told apart by colour, and everyone else is named.
+  const who = bucketFor(message.author_id, message.author_is_bot, replyChannelId);
+  li.setAttribute("data-who", who);
+  const named = childByClass(li, "msg-author");
+  if (named) named.hidden = who === "me" || who === "coder";
+  if (content.length <= COLLAPSE_OVER_CHARS) return li;
+  const id = String(message.id);
+  const fold = document.createElement("button");
+  fold.className = "fold";
+  fold.setAttribute("type", "button");
+  const draw = () => {
+    const open = replyContext.opened.has(id);
+    body.className = open ? "body" : "body clamped";
+    li.setAttribute("data-collapsed", open ? "false" : "true");
+    fold.textContent = open ? FOLD_LESS : FOLD_MORE;
+    fold.setAttribute("aria-expanded", open ? "true" : "false");
+  };
+  fold.addEventListener("click", () => {
+    if (replyContext.opened.has(id)) replyContext.opened.delete(id);
+    else replyContext.opened.add(id);
+    draw();
+  });
+  // As `tapRow` does: never a tap meant for a control or a link, nor one ending a selection.
+  li.addEventListener("click", (event) => {
+    const target = /** @type {Element | null} */ (event && event.target);
+    if (target && typeof target.closest === "function" && target.closest("button, a")) return;
+    const selection = typeof getSelection === "function" ? getSelection() : null;
+    if (selection && String(selection) !== "") return;
+    fold.click();
+  });
+  meta.append(fold);
+  draw();
+  return li;
+}
+
+/**
+ * Change what is above the message being answered without moving it. Rows added over a reader at
+ * the top of the context would otherwise push down what they were reading by their own height,
+ * and the message with it.
+ */
+function holdingReplyMessage(mutate) {
+  const pane = el("reply-scroll");
+  const anchor = el("reply-target-meta");
+  const before = anchor.getBoundingClientRect().top;
+  mutate();
+  pane.scrollTop += anchor.getBoundingClientRect().top - before;
+}
+
+/**
+ * Open at the message being answered: all of it in view with as much of what came before as fits
+ * above it, or — when it is taller than the pane — its first line at the top. The composer is
+ * below the pane, so it is in view either way.
+ */
+function showReplyMessage() {
+  const pane = el("reply-scroll");
+  const top = el("reply-target-meta").getBoundingClientRect().top - pane.getBoundingClientRect().top +
+    pane.scrollTop;
+  pane.scrollTop = Math.min(top, pane.scrollHeight - pane.clientHeight);
+}
+
+/**
+ * "Load earlier messages": more of what the page holds first, then a page from the server — the
+ * thread's own timeline for a message in a thread, Main's for one on the main channel. A read, and
+ * nothing else, so a read-only token is enough. It lands in the store as every read does, so the
+ * channel's own views have it from then on.
+ *
+ * With no cursor yet it reads the newest page, which gives it one, and if that told it nothing it
+ * did not already hold, the page before: one tap, at most two reads, and something to show for it.
+ */
+async function loadEarlierReplyContext() {
+  if (!replyTarget || replyContext.loading) return;
+  const { earlier, more } = replyContextPool();
+  if (earlier.length > replyContext.shown) {
+    replyContext.shown += REPLY_CONTEXT_LIMIT;
+    holdingReplyMessage(renderReplyContext);
+    return;
+  }
+  if (!more) return;
+  const generation = replyContext.generation;
+  const channel = String(replyChannelId);
+  const thread = replyPlace();
+  const view = thread ? "thread" : "main";
+  Object.assign(replyContext, { loading: true, error: "" });
+  holdingReplyMessage(renderReplyContext);
+  try {
+    for (let reads = 0; reads < 2; reads += 1) {
+      const cursor = replyContext.cursor;
+      let path = withThreadQuery(
+        `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=${view}&limit=${DISCORD_PAGE_LIMIT}`, thread);
+      if (cursor) path += `&before=${encodeURIComponent(cursor)}`;
+      const payload = await apiDecoded("TimelineResponse", path);
+      if (generation !== replyContext.generation || String(el("discord-channel").value) !== channel) return;
+      foldTimelinePage(payload, Boolean(cursor), view, thread);
+      replyContext.cursor = payload.has_more === true ? payload.next_before || null : null;
+      saveChannelScope();
+      const now = replyContextPool();
+      if (now.earlier.length > earlier.length || !now.more || !replyContext.cursor) break;
+    }
+    replyContext.shown += REPLY_CONTEXT_LIMIT;
+  } catch (error) {
+    if (generation === replyContext.generation) {
+      replyContext.error = (error && (error.detail || error.message)) || "the server did not answer";
+    }
+  } finally {
+    if (generation === replyContext.generation) {
+      replyContext.loading = false;
+      holdingReplyMessage(renderReplyContext);
+      // The page may have named the thread: its summary rides on every thread page.
+      renderReplyDestination();
+    }
+  }
+}
+
+/**
+ * The reply screen follows the store, as the heading over an open thread does. A read that places
+ * a message the stream left unplaced settles where its reply goes — the title, the note, the
+ * new-thread choice and the earlier messages all say so at once — and a read that names the thread
+ * renames it. Called with every redraw of the channel's navigation, which every read makes.
+ */
+function followReplyStore() {
+  if (currentScreen !== "reply" || !replyTarget) return;
+  if (replyRouting.unknown) {
+    const settled = replyRoute(replyTarget);
+    if (!settled.unknown) {
+      replyRouting = settled;
+      el("reply-branch").checked = false;
+      el("reply-branch-row").hidden = !settled.branch;
+      holdingReplyMessage(resetReplyContext);
+    }
+  }
+  renderReplyDestination();
+  holdingReplyMessage(renderReplyContext);
 }
 
 // --- keeping the channel view fresh -----------------------------------------------------------
@@ -14509,6 +14910,7 @@ el("close-reply").addEventListener("click", closeReply);
 el("reply-cancel").addEventListener("click", closeReply);
 el("reply-send").addEventListener("click", guardQuietly(sendReply));
 el("reply-branch").addEventListener("change", renderReplyDestination);
+el("reply-context-more").addEventListener("click", guardQuietly(loadEarlierReplyContext));
 // A draft survives leaving the screen without sending, so it is written as it is typed rather than
 // only on the way out — a way out that is not a control (the browser's own back, a reload) would
 // otherwise lose it.
