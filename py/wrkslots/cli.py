@@ -339,6 +339,9 @@ _ABSENT_VALIDATE_JOURNAL_REQUIRED = frozenset(
         "items",
     }
 )
+# Present only when the batch also retires a validation-batch seal whose
+# removal process exited after sealing targets that are now absent.
+_ABSENT_VALIDATE_JOURNAL_OPTIONAL = frozenset({"orphaned_seal"})
 _ABSENT_AGENT_JOURNAL_REQUIRED = frozenset(
     {
         "schema",
@@ -1123,6 +1126,22 @@ class AbsentValidateRow:
     slot: str
     generation: int
     record_sha256: str
+
+
+@dataclasses.dataclass(frozen=True)
+class _OrphanedValidateSeal:
+    """Audit evidence for a validation-batch seal whose removal process exited.
+
+    ``seal_sha256`` and ``actor_exit`` describe the seal as it was proven
+    orphaned when the batch was planned; ``targets`` lists every sealed
+    ``(slot, generation)`` pair.
+    """
+
+    seal_sha256: str
+    created_at: str
+    actor: ProcessIdentity
+    actor_exit: str
+    targets: tuple[tuple[str, int], ...]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -8676,7 +8695,7 @@ def _validate_journal_shape(
         _exact_keys(
             raw,
             _ABSENT_VALIDATE_JOURNAL_REQUIRED,
-            set(),
+            _ABSENT_VALIDATE_JOURNAL_OPTIONAL,
             "absent-validation-row journal",
         )
         _absent_validate_batch_items(dataclasses.replace(config, machine=machine), raw)
@@ -19658,10 +19677,14 @@ def _refuse_partial_state(
         )
     seal_journals = _validate_batch_seal_journals(config)
     if seal_journals and not allow_validate_batch_seals:
-        raise Refusal(
-            f"interrupted validation-batch seal recorded in {seal_journals[0]}; "
-            "run 'wrkslots recover' first"
-        )
+        raise _interrupted_validate_batch_seal_refusal(seal_journals[0])
+
+
+def _interrupted_validate_batch_seal_refusal(path: Path) -> Refusal:
+    return Refusal(
+        f"interrupted validation-batch seal recorded in {path}; "
+        "run 'wrkslots recover' first"
+    )
 
 
 def _outstanding_journals(config: Config) -> list[Path]:
@@ -29273,7 +29296,10 @@ def _recover_validate_batch_seal_journal(
             continue
         if not path_present:
             errors.append(
-                f"sealed target {slot} is absent while its ACTIVE row remains"
+                f"sealed target {slot} is absent while its ACTIVE row remains; "
+                "seal recovery cannot archive a row.  If the seal's removal "
+                "process has exited, archive the row and retire the seal with "
+                "'wrkslots recover-absent-validate-rows --input FILE --apply'"
             )
             unresolved.append(
                 _private_cleanup_target_to_obj(config, slot, generation, target)
@@ -45792,10 +45818,252 @@ def _assert_absent_validate_rows_safe(config: Config, records: Sequence[ActiveRe
     _assert_absent_validate_systemd_unrelated(rows, bindings, processes)
 
 
+_ORPHANED_VALIDATE_SEAL_KEYS = frozenset(
+    {"seal_sha256", "created_at", "actor", "actor_exit", "targets"}
+)
+
+
+def _validate_batch_seal_actor_exit(actor: ProcessIdentity) -> str:
+    """Return why a seal's removal process is provably gone, or refuse.
+
+    This applies the same proof as `_assert_absent_validate_owners_dead`: only
+    a changed boot, an absent PID, or a PID with different start ticks proves
+    that the recorded process generation exited.  Matching start ticks stay
+    live, including a zombie that has not been reaped, and a seal recorded
+    under another stable host identity is indeterminate here.
+    """
+
+    current_host = _host_id()
+    if actor.host_id != current_host:
+        raise Refusal(
+            f"validation-batch seal actor belongs to stable host {actor.host_id!r}, "
+            f"not current host {current_host}; its liveness is indeterminate here"
+        )
+    if actor.boot_id != _boot_id(Path("/proc")):
+        return f"seal actor PID {actor.pid} belonged to a machine boot that ended"
+    ticks = _process_start_ticks(Path("/proc") / str(actor.pid))
+    if ticks is None:
+        return f"seal actor PID {actor.pid} has exited"
+    if ticks != actor.start_ticks:
+        return f"seal actor PID {actor.pid} was reused; the recorded generation exited"
+    raise Refusal(
+        f"validation-batch seal actor PID {actor.pid} generation is still live; "
+        "its removal may still be running"
+    )
+
+
+def _orphaned_validate_batch_seal(
+    config: Config,
+    items: Sequence[AbsentValidateRow],
+    *,
+    recorded: _OrphanedValidateSeal | None = None,
+) -> _OrphanedValidateSeal | None:
+    """Prove that the current validation-batch seal is orphaned over absent rows.
+
+    A batch removal publishes its seal before it deletes sealed storage.  If
+    that removal process dies after the storage is gone, seal-only recovery has
+    nothing to restore and cannot archive the ACTIVE row, while absent-row
+    recovery refuses every seal: neither command can finish.  This proof admits
+    exactly that state.  Every sealed path must be absent, the seal actor's
+    process generation must have provably exited, and every sealed target must
+    be either an ACTIVE validation row of the sealed generation that ``items``
+    names or a row already archived at that generation.  Any other seal
+    refuses, so a live removal, a present path, a non-validation row, or a
+    generation mismatch still blocks.
+
+    Returns ``None`` when no seal journal exists.  ``recorded`` binds a resumed
+    batch to the seal that its plan proved orphaned.
+    """
+
+    if not _validate_batch_seal_journals(config):
+        return None
+    loaded = _load_validate_batch_seal_journal(config)
+    assert loaded is not None
+    path, raw, targets = loaded
+    contents, _identity = _read_regular_file_identity(
+        path, "validation-batch seal journal", 1024 * 1024
+    )
+    try:
+        reread = json.loads(contents)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise StateError(f"validation-batch seal journal is malformed JSON: {exc}") from exc
+    if not _json_equal(reread, raw):
+        raise Refusal(f"validation-batch seal journal changed while it was inspected: {path}")
+    if not targets:
+        raise _interrupted_validate_batch_seal_refusal(path)
+    actor = _identity_from_obj(raw["actor"], "validation-batch seal journal.actor")
+    assert actor is not None
+    created_at = _as_str(raw["created_at"], "validation-batch seal journal.created_at")
+    sealed = tuple((slot, generation) for slot, generation, _target in targets)
+    if recorded is not None and (
+        recorded.created_at != created_at
+        or recorded.actor != actor
+        or not set(sealed) <= set(recorded.targets)
+    ):
+        raise Refusal(
+            f"validation-batch seal {path} is not the orphaned seal this interrupted "
+            "batch recorded; run 'wrkslots recover' first"
+        )
+    actor_exit = _validate_batch_seal_actor_exit(actor)
+    requested = {
+        (item.slot, item.generation) for item in items if item.machine == config.machine
+    }
+    active = {
+        record.slot: record for state in _load_all_active(config) for record in state.slots
+    }
+    archived = {
+        (_as_str(entry.get("slot"), "archive slot"), entry.get("generation"))
+        for archive in _load_all_archives(config)
+        for entry in archive.records
+    }
+    for slot, generation, target in targets:
+        if target.path.exists() or target.path.is_symlink():
+            raise Refusal(
+                f"sealed target {slot} is still present at {target.path}; run "
+                "'wrkslots recover' to restore it"
+            )
+        current = active.get(slot)
+        if current is None:
+            if (slot, generation) not in archived:
+                raise Refusal(
+                    f"sealed target {slot} has neither an ACTIVE row nor an archive "
+                    f"entry at generation {generation}"
+                )
+            continue
+        if current.slot_type != "validate":
+            raise Refusal(
+                f"sealed target {slot} is now a {current.slot_type} row, not a "
+                "validation row"
+            )
+        if current.generation != generation:
+            raise Refusal(
+                f"sealed target {slot} no longer has validation generation {generation}"
+            )
+        if (slot, generation) not in requested:
+            raise Refusal(
+                f"sealed target {slot} generation {generation} is absent but this input "
+                "does not name its row; include the exact row to retire the orphaned seal"
+            )
+    return _OrphanedValidateSeal(
+        seal_sha256=hashlib.sha256(contents).hexdigest(),
+        created_at=created_at,
+        actor=actor,
+        actor_exit=actor_exit,
+        targets=sealed,
+    )
+
+
+def _orphaned_validate_seal_to_obj(seal: _OrphanedValidateSeal) -> dict[str, object]:
+    return {
+        "seal_sha256": seal.seal_sha256,
+        "created_at": seal.created_at,
+        "actor": _identity_to_obj(seal.actor),
+        "actor_exit": seal.actor_exit,
+        "targets": [
+            {"slot": slot, "generation": generation} for slot, generation in seal.targets
+        ],
+    }
+
+
+def _orphaned_validate_seal_from_journal(
+    raw: Mapping[str, object],
+) -> _OrphanedValidateSeal | None:
+    if "orphaned_seal" not in raw:
+        return None
+    label = "absent-validation-row journal.orphaned_seal"
+    value = _as_mapping(raw["orphaned_seal"], label)
+    _exact_keys(value, _ORPHANED_VALIDATE_SEAL_KEYS, set(), label)
+    digest = _as_str(value["seal_sha256"], f"{label}.seal_sha256")
+    if not DIGEST_RE.fullmatch(digest):
+        raise StateError(f"{label}.seal_sha256 is invalid")
+    created_at = _as_str(value["created_at"], f"{label}.created_at")
+    _parse_timestamp(created_at, f"{label}.created_at")
+    actor = _identity_from_obj(value["actor"], f"{label}.actor")
+    if actor is None:
+        raise StateError(f"{label} has no actor")
+    actor_exit = _as_str(value["actor_exit"], f"{label}.actor_exit")
+    if not actor_exit:
+        raise StateError(f"{label} has no actor exit evidence")
+    targets: list[tuple[str, int]] = []
+    for index, entry in enumerate(_as_list(value["targets"], f"{label}.targets")):
+        target_label = f"{label}.targets[{index}]"
+        target = _as_mapping(entry, target_label)
+        _exact_keys(target, {"slot", "generation"}, set(), target_label)
+        targets.append(
+            (
+                _validate_name(_as_str(target["slot"], f"{target_label}.slot"), "slot"),
+                _as_int(target["generation"], f"{target_label}.generation", minimum=1),
+            )
+        )
+    if not targets or len({slot for slot, _generation in targets}) != len(targets):
+        raise StateError(f"{label}.targets is empty or repeats a slot")
+    return _OrphanedValidateSeal(digest, created_at, actor, actor_exit, tuple(targets))
+
+
+def _orphaned_validate_seal_note(seal: _OrphanedValidateSeal) -> str:
+    return (
+        f"orphaned validation-batch seal created {seal.created_at} "
+        f"(SHA-256 {seal.seal_sha256}); {seal.actor_exit}"
+    )
+
+
+def _retire_orphaned_validate_batch_seal(
+    config: Config,
+    items: Sequence[AbsentValidateRow],
+    recorded: _OrphanedValidateSeal,
+) -> bool:
+    """Retire the recorded orphaned seal once its rows are archived.
+
+    Seal-only recovery is the single deletion path: it re-checks that every
+    target is absent with an exact archive entry before removing the seal.
+    """
+
+    if not _validate_batch_seal_journals(config):
+        return False
+    _orphaned_validate_batch_seal(config, items, recorded=recorded)
+    _recover_validate_batch_seal_journal(
+        config,
+        recovery_kind=_ValidateBatchSealRecoveryKind.SEAL_ONLY,
+        emit=False,
+    )
+    return True
+
+
+def _refuse_generic_recovery_of_orphaned_seal_batch(config: Config) -> None:
+    """Send an interrupted orphaned-seal batch back to the command that owns it.
+
+    Generic recovery handles a validation-batch seal only beside its paired
+    finish journal.  An absent-validation-row batch that retires an orphaned
+    seal resumes only through 'recover-absent-validate-rows', which re-proves
+    the seal orphaned before it changes anything.
+    """
+
+    journals = _outstanding_journals(config)
+    if len(journals) != 1:
+        return
+    path = journals[0]
+    raw: object
+    if path.exists() or path.is_symlink():
+        raw = _read_json(path, "recovery journal")
+    else:
+        raw = _pending_journal_for_path(config, path)
+    if (
+        isinstance(raw, Mapping)
+        and raw.get("kind") == "recover-absent-validate-rows"
+        and "orphaned_seal" in raw
+    ):
+        raise Refusal(
+            f"interrupted absent-validation-row batch {path} is retiring an orphaned "
+            "validation-batch seal; rerun 'wrkslots recover-absent-validate-rows "
+            "--input FILE --apply' with the same input to finish it"
+        )
+
+
 def _absent_validate_archive_entry(
     record: ActiveRecord,
     item: AbsentValidateRow,
     finished_at: str,
+    orphaned_seal: _OrphanedValidateSeal | None = None,
 ) -> dict[str, object]:
     value: dict[str, object] = {
         "archive_id": f"{record.machine}:{record.slot}:{record.generation}:{finished_at}",
@@ -45823,6 +46091,10 @@ def _absent_validate_archive_entry(
         "salvage": [],
         "checkouts": [_checkout_to_obj(checkout) for checkout in record.checkouts],
     }
+    if orphaned_seal is not None and (item.slot, item.generation) in orphaned_seal.targets:
+        validation = value["validation"]
+        assert isinstance(validation, list)
+        validation.append(f"retired {_orphaned_validate_seal_note(orphaned_seal)}")
     if record.layout is not None:
         value["layout"] = record.layout
     if record.import_source is not None:
@@ -45985,6 +46257,8 @@ def _absent_validate_rows_state(
 def _plan_absent_validate_rows(
     config: Config,
     items: Sequence[AbsentValidateRow],
+    *,
+    orphaned_seal: _OrphanedValidateSeal | None = None,
 ) -> tuple[tuple[AbsentValidateRow, ActiveRecord, dict[str, object]], ...]:
     if any(item.machine != config.machine for item in items):
         raise Refusal(
@@ -46024,7 +46298,13 @@ def _plan_absent_validate_rows(
             raise StateError(f"validation row {item.slot} is both active and archived")
         active_records.append(record)
         finished_at = _utc_now()
-        planned.append((item, record, _absent_validate_archive_entry(record, item, finished_at)))
+        planned.append(
+            (
+                item,
+                record,
+                _absent_validate_archive_entry(record, item, finished_at, orphaned_seal),
+            )
+        )
     _assert_absent_validate_rows_safe(config, active_records)
     return tuple(planned)
 
@@ -46052,8 +46332,9 @@ def _absent_validate_batch_journal(
     input_sha256: str,
     planned: Sequence[tuple[AbsentValidateRow, ActiveRecord, Mapping[str, object]]],
     coordinator: ProcessIdentity,
+    orphaned_seal: _OrphanedValidateSeal | None = None,
 ) -> dict[str, object]:
-    return {
+    journal: dict[str, object] = {
         "schema": SCHEMA,
         "kind": "recover-absent-validate-rows",
         "machine": config.machine,
@@ -46071,6 +46352,9 @@ def _absent_validate_batch_journal(
             for item, record, archive_entry in planned
         ],
     }
+    if orphaned_seal is not None:
+        journal["orphaned_seal"] = _orphaned_validate_seal_to_obj(orphaned_seal)
+    return journal
 
 
 def _absent_validate_batch_items(
@@ -46079,9 +46363,10 @@ def _absent_validate_batch_items(
     _exact_keys(
         raw,
         _ABSENT_VALIDATE_JOURNAL_REQUIRED,
-        set(),
+        _ABSENT_VALIDATE_JOURNAL_OPTIONAL,
         "absent-validation-row journal",
     )
+    orphaned_seal = _orphaned_validate_seal_from_journal(raw)
     if (
         _as_int(raw["schema"], "absent-validation-row journal.schema") != SCHEMA
         or raw["kind"] != "recover-absent-validate-rows"
@@ -46126,7 +46411,7 @@ def _absent_validate_batch_items(
             archive_entry.get("finished_at"), f"{label}.archive_entry.finished_at"
         )
         _parse_timestamp(finished_at, f"{label}.archive_entry.finished_at")
-        expected = _absent_validate_archive_entry(record, item, finished_at)
+        expected = _absent_validate_archive_entry(record, item, finished_at, orphaned_seal)
         if not _json_equal(archive_entry, expected):
             raise StateError(f"{label}.archive_entry differs from its exact input row")
         result.append((item, record, archive_entry))
@@ -46165,6 +46450,13 @@ def _recover_absent_validate_rows(
         )
     _assert_caller_process(coordinator, "coordinator")
     cursor, items = _absent_validate_batch_items(config, raw)
+    batch_rows = tuple(item for item, _record, _entry in items)
+    orphaned_seal = _orphaned_validate_seal_from_journal(raw)
+    seal_journals = _validate_batch_seal_journals(config)
+    if seal_journals:
+        if orphaned_seal is None:
+            raise _interrupted_validate_batch_seal_refusal(seal_journals[0])
+        _orphaned_validate_batch_seal(config, batch_rows, recorded=orphaned_seal)
     journal = dict(raw)
     states, archives = _absent_validate_rows_state(
         config,
@@ -46301,7 +46593,14 @@ def _recover_absent_validate_rows(
     if after != before:
         raise StateError("absent-validation-row recovery changed an unrelated registry row")
     _clear_journal(config, journal, event_writer=writer)
-    return tuple(item for item, _record, _entry in items)
+    if orphaned_seal is not None and _validate_batch_seal_journals(config):
+        # Seal recovery refuses beside any non-create journal, so the seal is
+        # retired only after this journal clears.  A crash here leaves every
+        # sealed row archived and absent, which both this command and
+        # seal-only recovery accept.
+        _interrupt_for_test("after-absent-validate-journal-before-seal")
+        _retire_orphaned_validate_batch_seal(config, batch_rows, orphaned_seal)
+    return batch_rows
 
 
 def _emit_absent_validate_outcomes(
@@ -46351,20 +46650,39 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
         else:
             coordinator = None
         with _mutation_locks(config, args.wait_lock):
-            _refuse_partial_state(config)
+            # A validation-batch seal still blocks this command unless
+            # `_orphaned_validate_batch_seal` proves it is orphaned over the
+            # absent rows this command archives.
+            _refuse_partial_state(config, allow_validate_batch_seals=True)
+            seal_journals = _validate_batch_seal_journals(config)
             journals = _outstanding_journals(config)
             if journals:
                 if len(journals) != 1:
+                    if seal_journals:
+                        raise _interrupted_validate_batch_seal_refusal(seal_journals[0])
                     raise StateError("multiple interrupted mutations require inspection")
                 path, raw = _load_journal(config)
                 if raw.get("kind") != "recover-absent-validate-rows":
+                    if seal_journals:
+                        raise _interrupted_validate_batch_seal_refusal(seal_journals[0])
                     raise Refusal(
                         f"another interrupted mutation is recorded in {path}; "
                         "run wrkslots recover"
                     )
+                _cursor, items = _absent_validate_batch_items(config, raw)
+                resumed_seal: _OrphanedValidateSeal | None = None
+                if seal_journals:
+                    recorded_seal = _orphaned_validate_seal_from_journal(raw)
+                    if recorded_seal is None:
+                        raise _interrupted_validate_batch_seal_refusal(seal_journals[0])
+                    _orphaned_validate_batch_seal(
+                        config,
+                        tuple(item for item, _record, _entry in items),
+                        recorded=recorded_seal,
+                    )
+                    resumed_seal = recorded_seal
                 if raw.get("input_sha256") != input_sha256:
                     raise Refusal("absent-validation-row input differs from the interrupted batch")
-                _cursor, items = _absent_validate_batch_items(config, raw)
                 journal_keys = {
                     (item.machine, item.slot, item.generation) for item, _record, _entry in items
                 }
@@ -46384,6 +46702,12 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
                         "interrupted batch and has no exact prior recovery"
                     )
                 if not args.apply:
+                    if resumed_seal is not None:
+                        print(
+                            "planned: retire "
+                            f"{_orphaned_validate_seal_note(resumed_seal)}",
+                            file=sys.stderr,
+                        )
                     _emit_absent_validate_outcomes(
                         [
                             (
@@ -46406,6 +46730,11 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
                     return 0
                 assert coordinator is not None
                 _recover_absent_validate_rows(config, path, raw, coordinator)
+                if resumed_seal is not None:
+                    print(
+                        f"retired {_orphaned_validate_seal_note(resumed_seal)}",
+                        file=sys.stderr,
+                    )
                 _emit_absent_validate_outcomes(
                     [
                         (
@@ -46431,11 +46760,21 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
             already_recovered_keys = _already_recovered_absent_validate_keys(
                 archives, requested
             )
-            planned = _plan_absent_validate_rows(config, requested)
+            orphaned_seal = (
+                _orphaned_validate_batch_seal(config, requested) if seal_journals else None
+            )
+            planned = _plan_absent_validate_rows(
+                config, requested, orphaned_seal=orphaned_seal
+            )
             planned_keys = {
                 (item.machine, item.slot, item.generation) for item, _record, _entry in planned
             }
             if not args.apply:
+                if orphaned_seal is not None:
+                    print(
+                        f"planned: retire {_orphaned_validate_seal_note(orphaned_seal)}",
+                        file=sys.stderr,
+                    )
                 _emit_absent_validate_outcomes(
                     [
                         (
@@ -46458,7 +46797,9 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
                 return 0
             assert coordinator is not None
             if planned:
-                journal = _absent_validate_batch_journal(config, input_sha256, planned, coordinator)
+                journal = _absent_validate_batch_journal(
+                    config, input_sha256, planned, coordinator, orphaned_seal
+                )
                 _write_journal(config, journal)
                 _interrupt_for_test("after-absent-validate-batch-journal")
                 _recover_absent_validate_rows(
@@ -46476,6 +46817,12 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
                     if key[2] not in target_slots
                 } != {key: value for key, value in before.items() if key[2] not in target_slots}:
                     raise StateError("absent-validation-row recovery changed an unrelated row")
+            elif orphaned_seal is not None:
+                # Every sealed row already carries its exact archive entry, so
+                # only the orphaned seal remains to retire.
+                _retire_orphaned_validate_batch_seal(config, requested, orphaned_seal)
+            if orphaned_seal is not None:
+                print(f"retired {_orphaned_validate_seal_note(orphaned_seal)}", file=sys.stderr)
             _emit_absent_validate_outcomes(
                 [
                     (
@@ -47190,6 +47537,7 @@ def _cmd_recover(
             selected_slot = getattr(args, "slot", None)
             selected_path: Path | None
             if seal_journals:
+                _refuse_generic_recovery_of_orphaned_seal_batch(config)
                 loaded_seal = _load_validate_batch_seal_journal(config)
                 assert loaded_seal is not None
                 _seal_path, _seal_raw, sealed_targets = loaded_seal

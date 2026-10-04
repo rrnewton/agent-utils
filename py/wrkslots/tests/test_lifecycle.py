@@ -42174,6 +42174,416 @@ def test_absent_validate_batch_resumes_each_durable_boundary(
     assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
 
+_DEAD_SEAL_ACTOR_PID = 2_147_483_647
+
+
+def seal_absent_validate_row(
+    project: Path,
+    repository: Path,
+    *,
+    slot: str = "slot01",
+    actor_dead: bool = True,
+    remove_storage: bool = True,
+) -> tuple[wrkslots.Config, Path, wrkslots.ActiveRecord]:
+    """Reproduce a batch removal that died after sealing a now-absent checkout.
+
+    The removal publishes its seal journal, the process that owns it exits, and
+    a later sweep deletes the checkout while its ACTIVE row remains.
+    """
+
+    prepare_dead_validate_slots(project, (slot,))
+    interrupted = raw_command(
+        project,
+        "remove-validate-batch",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        f"{slot}=1",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-validate-batch-seal-target"},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    seal_path = wrkslots._validate_batch_seal_journal_path(config)
+    assert seal_path.is_file()
+    if actor_dead:
+        seal = json.loads(seal_path.read_text(encoding="utf-8"))
+        seal["actor"]["pid"] = _DEAD_SEAL_ACTOR_PID
+        wrkslots._write_validate_batch_seal_journal(config, seal)
+    record = wrkslots._find_record(wrkslots._load_active(config), slot)
+    if remove_storage:
+        make_validate_row_absent(project, repository, record)
+        assert not wrkslots._slot_directory(config, slot, "validate").exists()
+    return config, seal_path, record
+
+
+def recover_seal_only(project: Path) -> int:
+    return wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+        ]
+    )
+
+
+def assert_orphaned_seal_retired(
+    project: Path,
+    config: wrkslots.Config,
+    seal_path: Path,
+    seal_bytes: bytes,
+    slot: str = "slot01",
+) -> None:
+    assert not seal_path.exists()
+    assert active_slots(project) == []
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+    entry = next(
+        record for record in wrkslots._load_archive(config).records if record["slot"] == slot
+    )
+    seal = json.loads(seal_bytes)
+    assert entry["physical_storage"] == "removed"
+    assert entry["limitations"] == ["validation outcome unknown"]
+    validation = entry["validation"]
+    assert isinstance(validation, list)
+    assert validation[-1] == (
+        "retired orphaned validation-batch seal created "
+        f"{seal['created_at']} (SHA-256 {hashlib.sha256(seal_bytes).hexdigest()}); "
+        f"seal actor PID {_DEAD_SEAL_ACTOR_PID} has exited"
+    )
+    # The read-only classification a validation launch runs first no longer
+    # refuses on the seal.
+    wrkslots._refuse_partial_state(config)
+    classified = io.StringIO()
+    with contextlib.redirect_stdout(classified):
+        status = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "classify-create-journals",
+                "next-validate",
+                "--slot-type",
+                "validate",
+                "--agent",
+                "validate-next",
+                "--format",
+                "json",
+            ]
+        )
+    assert status == 0
+    classification = json.loads(classified.getvalue())
+    assert classification["blocking"] is False
+    assert classification["journals"] == []
+
+
+def test_orphaned_validation_seal_over_absent_row_is_retired_with_the_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    config, seal_path, record = seal_absent_validate_row(project, repository)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    active_path = control_directory(project) / "ACTIVE.testhost.json"
+
+    # Seal-only recovery has nothing to restore and must not archive a row, so
+    # it refuses; it now names the command that completes the recovery.
+    assert recover_seal_only(project) == 3
+    refused = capsys.readouterr().err
+    assert "sealed target slot01 is absent while its ACTIVE row remains" in refused
+    assert "wrkslots recover-absent-validate-rows --input FILE --apply" in refused
+    assert seal_path.is_file()
+    seal_bytes = seal_path.read_bytes()
+    active_before = active_path.read_bytes()
+    input_path = write_absent_validate_input(project, [record])
+
+    assert run_absent_validate_recovery(project, input_path, apply=False, output_format="json") == 0
+    planned = capsys.readouterr()
+    assert [row["outcome"] for row in json.loads(planned.out)["rows"]] == ["planned"]
+    assert "planned: retire orphaned validation-batch seal" in planned.err
+    assert f"seal actor PID {_DEAD_SEAL_ACTOR_PID} has exited" in planned.err
+    assert seal_path.read_bytes() == seal_bytes
+    assert active_path.read_bytes() == active_before
+
+    assert run_absent_validate_recovery(project, input_path, apply=True, output_format="json") == 0
+    applied = capsys.readouterr()
+    assert [row["outcome"] for row in json.loads(applied.out)["rows"]] == ["recovered"]
+    assert "retired orphaned validation-batch seal" in applied.err
+    assert_orphaned_seal_retired(project, config, seal_path, seal_bytes)
+
+    assert run_absent_validate_recovery(project, input_path, apply=True, output_format="json") == 0
+    replay = json.loads(capsys.readouterr().out)
+    assert [row["outcome"] for row in replay["rows"]] == ["already-recovered"]
+
+
+@pytest.mark.parametrize(
+    "point",
+    (
+        "after-absent-validate-batch-journal",
+        "after-absent-validate-archive",
+        "after-absent-validate-row",
+        "after-absent-validate-active-delete",
+        "after-absent-validate-journal-before-seal",
+    ),
+)
+def test_orphaned_validation_seal_retirement_resumes_each_durable_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    point: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    config, seal_path, record = seal_absent_validate_row(project, repository)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    seal_bytes = seal_path.read_bytes()
+    input_path = write_absent_validate_input(project, [record])
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(observed: str) -> None:
+        if observed == point:
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_absent_validate_recovery(project, input_path, apply=True)
+    journal_cleared = point == "after-absent-validate-journal-before-seal"
+    assert (control_directory(project) / "ACTIVE.testhost.journal").is_file() != journal_cleared
+    assert seal_path.is_file()
+    capsys.readouterr()
+    if not journal_cleared:
+        # Generic recovery does not own the interrupted batch; it names the
+        # command that does and changes nothing.
+        interrupted = tree_snapshot(control_directory(project))
+        assert recover_seal_only(project) == 3
+        assert "rerun 'wrkslots recover-absent-validate-rows" in capsys.readouterr().err
+        assert tree_snapshot(control_directory(project)) == interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    assert run_absent_validate_recovery(project, input_path, apply=True, output_format="json") == 0
+    resumed = capsys.readouterr()
+    assert [row["outcome"] for row in json.loads(resumed.out)["rows"]] == [
+        "already-recovered" if journal_cleared else "recovered"
+    ]
+    assert "retired orphaned validation-batch seal" in resumed.err
+    assert_orphaned_seal_retired(project, config, seal_path, seal_bytes)
+
+
+def test_seal_only_recovery_retires_an_orphaned_seal_once_its_rows_are_archived(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    config, seal_path, record = seal_absent_validate_row(project, repository)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    input_path = write_absent_validate_input(project, [record])
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(observed: str) -> None:
+        if observed == "after-absent-validate-journal-before-seal":
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_absent_validate_recovery(project, input_path, apply=True)
+    assert seal_path.is_file()
+    assert active_slots(project) == []
+
+    # A crash between the cleared batch journal and the seal retirement leaves
+    # every sealed row archived and absent, which seal-only recovery accepts.
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    assert recover_seal_only(project) == 0
+    assert not seal_path.exists()
+    wrkslots._refuse_partial_state(config)
+
+
+def _seal_actor_on_another_host(project: Path, repository: Path) -> str:
+    config = wrkslots._load_config(str(project), "testhost")
+    seal_path = wrkslots._validate_batch_seal_journal_path(config)
+    seal = json.loads(seal_path.read_text(encoding="utf-8"))
+    seal["actor"]["host_id"] = "0" * 32
+    wrkslots._write_validate_batch_seal_journal(config, seal)
+    return "liveness is indeterminate here"
+
+
+def _seal_names_newer_generation(project: Path, repository: Path) -> str:
+    config = wrkslots._load_config(str(project), "testhost")
+    seal_path = wrkslots._validate_batch_seal_journal_path(config)
+    seal = json.loads(seal_path.read_text(encoding="utf-8"))
+    seal["targets"][0]["generation"] = 2
+    wrkslots._write_validate_batch_seal_journal(config, seal)
+    return "sealed target slot01 no longer has validation generation 2"
+
+
+def _seal_names_agent_row(project: Path, repository: Path) -> str:
+    made = create(project, slot="agent01", agent="agent-a")
+    assert made.returncode == 0, made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    sealed_path = wrkslots._slot_directory(config, "agent01", "validate")
+    assert not sealed_path.exists()
+    seal_path = wrkslots._validate_batch_seal_journal_path(config)
+    seal = json.loads(seal_path.read_text(encoding="utf-8"))
+    seal["targets"].append(
+        {
+            **seal["targets"][0],
+            "slot": "agent01",
+            "path": sealed_path.relative_to(config.root).as_posix(),
+        }
+    )
+    wrkslots._write_validate_batch_seal_journal(config, seal)
+    return "sealed target agent01 is now a agent row, not a validation row"
+
+
+def _seal_names_unregistered_slot(project: Path, repository: Path) -> str:
+    config = wrkslots._load_config(str(project), "testhost")
+    sealed_path = wrkslots._slot_directory(config, "ghost01", "validate")
+    assert not sealed_path.exists()
+    seal_path = wrkslots._validate_batch_seal_journal_path(config)
+    seal = json.loads(seal_path.read_text(encoding="utf-8"))
+    seal["targets"].append(
+        {
+            **seal["targets"][0],
+            "slot": "ghost01",
+            "path": sealed_path.relative_to(config.root).as_posix(),
+        }
+    )
+    wrkslots._write_validate_batch_seal_journal(config, seal)
+    return "sealed target ghost01 has neither an ACTIVE row nor an archive entry at generation 1"
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    (
+        ("live-actor", "validation-batch seal actor PID {pid} generation is still live"),
+        ("present-path", "sealed target slot01 is still present at"),
+        ("foreign-host-actor", None),
+        ("newer-generation", None),
+        ("agent-row", None),
+        ("unregistered-slot", None),
+        ("row-not-in-input", "sealed target slot01 generation 1 is absent but this input"),
+    ),
+)
+def test_orphaned_validation_seal_retirement_keeps_every_other_seal_refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    case: str,
+    expected: str | None,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    config, seal_path, record = seal_absent_validate_row(
+        project,
+        repository,
+        actor_dead=case != "live-actor",
+        remove_storage=case != "present-path",
+    )
+    rows = [record]
+    if case == "foreign-host-actor":
+        expected = _seal_actor_on_another_host(project, repository)
+    elif case == "newer-generation":
+        expected = _seal_names_newer_generation(project, repository)
+    elif case == "agent-row":
+        expected = _seal_names_agent_row(project, repository)
+        rows.append(wrkslots._find_record(wrkslots._load_active(config), "agent01"))
+    elif case == "unregistered-slot":
+        expected = _seal_names_unregistered_slot(project, repository)
+    elif case == "row-not-in-input":
+        rows = [
+            prepare_absent_validate_row(project, repository, slot="slot02", agent="validate-b")
+        ]
+    assert expected is not None
+    expected = expected.format(pid=os.getpid())
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    input_path = write_absent_validate_input(project, rows)
+    seal_before = seal_path.read_bytes()
+    active_path = control_directory(project) / "ACTIVE.testhost.json"
+    archive_path = control_directory(project) / "ARCHIVED.testhost.json"
+    active_before = active_path.read_bytes()
+    archive_before = archive_path.read_bytes() if archive_path.exists() else None
+    capsys.readouterr()
+
+    for apply in (False, True):
+        assert run_absent_validate_recovery(project, input_path, apply=apply) == 3
+        assert expected in capsys.readouterr().err
+        assert seal_path.read_bytes() == seal_before
+        assert active_path.read_bytes() == active_before
+        assert (archive_path.read_bytes() if archive_path.exists() else None) == archive_before
+        assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+    if case == "present-path":
+        assert wrkslots._slot_directory(config, "slot01", "validate").is_dir()
+    with pytest.raises(wrkslots.Refusal, match="interrupted validation-batch seal"):
+        wrkslots._refuse_partial_state(config)
+
+
+def test_interrupted_seal_retirement_refuses_a_seal_it_did_not_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    config, seal_path, record = seal_absent_validate_row(project, repository)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    input_path = write_absent_validate_input(project, [record])
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(observed: str) -> None:
+        if observed == "after-absent-validate-batch-journal":
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_absent_validate_recovery(project, input_path, apply=True)
+    # A different seal now stands where the recorded one was.
+    seal = json.loads(seal_path.read_text(encoding="utf-8"))
+    seal["created_at"] = "2020-01-01T00:00:00+00:00"
+    wrkslots._write_validate_batch_seal_journal(config, seal)
+    interrupted = tree_snapshot(control_directory(project))
+    capsys.readouterr()
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    for apply in (False, True):
+        assert run_absent_validate_recovery(project, input_path, apply=apply) == 3
+        assert "is not the orphaned seal this interrupted batch recorded" in (
+            capsys.readouterr().err
+        )
+        assert tree_snapshot(control_directory(project)) == interrupted
+
+
+def test_interrupted_batch_without_seal_evidence_still_refuses_a_seal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    _config, seal_path, _sealed = seal_absent_validate_row(project, repository)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    # Model a batch journal recorded with no seal evidence: hold the seal
+    # outside the control directory while an unrelated batch starts.
+    held_seal = tmp_path / "held-seal.journal"
+    shutil.copy2(seal_path, held_seal)
+    seal_path.unlink()
+    record = prepare_absent_validate_row(project, repository, slot="slot02", agent="validate-b")
+    input_path = write_absent_validate_input(project, [record])
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(observed: str) -> None:
+        if observed == "after-absent-validate-batch-journal":
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_absent_validate_recovery(project, input_path, apply=True)
+    shutil.copy2(held_seal, seal_path)
+    interrupted = tree_snapshot(control_directory(project))
+    capsys.readouterr()
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    for apply in (False, True):
+        assert run_absent_validate_recovery(project, input_path, apply=apply) == 3
+        assert "interrupted validation-batch seal recorded in" in capsys.readouterr().err
+        assert tree_snapshot(control_directory(project)) == interrupted
+
+
 def test_absent_validate_recovery_parses_event_history_in_bounded_passes_at_127_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
