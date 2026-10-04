@@ -736,9 +736,9 @@ pub trait StateStore: Send + Sync {
     /// Channels the owner added from inside the app, oldest first.
     ///
     /// These join the configured ones in the allowlist. They are kept apart from those because
-    /// only these can be removed again from the app: the configured ones are a fact about a file
-    /// this server reads and does not write, and quietly "removing" one would last until restart
-    /// and then come back.
+    /// only these can be FORGOTTEN from the app: the configured ones are a fact about a file this
+    /// server reads and does not write, so deleting one would last until restart and then come
+    /// back. Taking one of those off the list is [`StateStore::hide_channel`] instead.
     ///
     /// # Errors
     ///
@@ -768,6 +768,39 @@ pub trait StateStore: Send + Sync {
     ///
     /// [`StoreError`] when the backend cannot be written.
     async fn remove_added_channel(&self, channel: &ChannelId) -> Result<(), StoreError>;
+
+    /// Configured channels the owner took off his list, in no particular order.
+    /// `#199 removable-config-channels`.
+    ///
+    /// The configuration file says which channels EXIST; this says which of them he does not
+    /// want to see. Kept apart from both the file, which this server never writes, and the added
+    /// channels, which are a different lifecycle: removing an added channel forgets it, while a
+    /// configured one can only be hidden, because the file will name it again on every start.
+    ///
+    /// An id here that the file no longer names is inert rather than an error. It hides nothing
+    /// while the file leaves the channel out, and hides it again if the file puts it back, which
+    /// is what the owner last asked for.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] when the backend cannot be read.
+    async fn hidden_channels(&self) -> Result<Vec<ChannelId>, StoreError>;
+
+    /// Record that the owner took a configured channel off his list. Hiding one that is already
+    /// hidden is not an error and keeps the original instant.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] when the backend cannot be written.
+    async fn hide_channel(&self, channel: &ChannelId, at_ms: i64) -> Result<(), StoreError>;
+
+    /// Put a hidden configured channel back on the list. Showing one that is not hidden is not an
+    /// error.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] when the backend cannot be written.
+    async fn unhide_channel(&self, channel: &ChannelId) -> Result<(), StoreError>;
 
     /// Give a channel a local name, replacing any alias it already had.
     ///

@@ -110,6 +110,18 @@ impl StateStore for DisabledStore {
         refuse()
     }
 
+    async fn hidden_channels(&self) -> Result<Vec<ChannelId>, StoreError> {
+        refuse()
+    }
+
+    async fn hide_channel(&self, _: &ChannelId, _: i64) -> Result<(), StoreError> {
+        refuse()
+    }
+
+    async fn unhide_channel(&self, _: &ChannelId) -> Result<(), StoreError> {
+        refuse()
+    }
+
     async fn set_channel_alias(&self, _: &ChannelId, _: &str) -> Result<ChannelAlias, StoreError> {
         refuse()
     }

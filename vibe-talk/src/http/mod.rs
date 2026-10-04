@@ -201,7 +201,15 @@ fn routes(state: AppState) -> Router {
         // `#19 channel-browser`. WRITE scope too: it lists every channel the bridge can see, and
         // exists only to choose one to add. See `api::channel_directory`.
         .route("/api/v1/channel-directory", get(api::channel_directory))
+        // `#199 removable-config-channels`. DELETE takes any channel off the list: an added one is
+        // forgotten, a configured one is hidden, because this server never writes its file. The
+        // second route shows a hidden one again. WRITE scope both, and NO MCP TOOL for either —
+        // the list is the owner's, for the `#39` reason below. See `api::remove_channel`.
         .route("/api/v1/channels/{channel_id}", delete(api::remove_channel))
+        .route(
+            "/api/v1/channels/{channel_id}/hidden",
+            delete(api::show_channel),
+        )
         .route("/api/v1/channels/{channel_id}/todo", get(api::todo))
         .route("/api/v1/channels/{channel_id}/dismiss", post(api::dismiss))
         .route("/api/v1/channels/{channel_id}/restore", post(api::restore))

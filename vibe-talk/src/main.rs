@@ -523,6 +523,7 @@ async fn main() -> anyhow::Result<()> {
         store,
         spoken_names: Arc::new(vibe_talk::speakable::SharedNames::new()),
         added_channels: Arc::new(std::sync::RwLock::new(Vec::new())),
+        hidden_channels: Arc::new(std::sync::RwLock::new(std::collections::BTreeSet::new())),
         channel_registration_lock: Arc::new(tokio::sync::Mutex::new(())),
         voice_health_budget: Arc::new(vibe_talk::voice_health::LogBudget::new()),
         speech_tickets: Arc::new(vibe_talk::speech_tickets::SpeechTickets::new()),
@@ -546,6 +547,20 @@ async fn main() -> anyhow::Result<()> {
         // wrong. A real backend failure degrades the same way and says so, for the same reason an
         // unreadable alias does not stop the channel being read.
         Err(error) => tracing::warn!(%error, "could not restore channels added in the app"),
+    }
+    // `#199 removable-config-channels`. Configured channels the owner took off his list stay off
+    // it. A store that cannot be read degrades to showing them, which is the state the file
+    // describes and the one that loses nothing.
+    match state.restore_hidden_channels().await {
+        Ok(restored) => {
+            if restored > 0 {
+                tracing::info!(
+                    hidden = restored,
+                    "configured channels the owner removed in the app stay off the list"
+                );
+            }
+        }
+        Err(error) => tracing::warn!(%error, "could not restore the hidden configured channels"),
     }
     state.refresh_routes();
     for entry in providers.entries() {

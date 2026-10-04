@@ -1512,6 +1512,40 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_configured_channel_the_owner_hid_is_not_polled() {
+        // `#199 removable-config-channels`. Hidden means off the list everywhere, and a poller
+        // that kept reading the channel would still be spending the shared rate limit on it and
+        // publishing to anyone who had a stream open.
+        let (state, fake) = crate::testing::state();
+        let hidden = ChannelId(crate::testing::WRITE_CHANNEL.to_owned());
+        fake.seed(&hidden, "codex", "present before the first poll");
+        state
+            .hidden_channels
+            .write()
+            .expect("hidden-channel list")
+            .insert(hidden.clone());
+        let mut cursors = BTreeMap::new();
+        poll_state_loop(
+            &state,
+            None,
+            state.chat.as_ref(),
+            50,
+            Duration::ZERO,
+            &mut cursors,
+            Some(1),
+        )
+        .await;
+        assert!(
+            !cursors.contains_key(&hidden),
+            "a hidden configured channel was polled"
+        );
+        assert!(
+            cursors.contains_key(&ChannelId(crate::testing::READ_CHANNEL.to_owned())),
+            "the channel still on the list was not polled"
+        );
+    }
+
     /// Run `ticks` ticks of the loop against `channel` and answer how long the loop WAITED.
     ///
     /// The clock is paused by the caller, so this is exact rather than approximate: tokio advances

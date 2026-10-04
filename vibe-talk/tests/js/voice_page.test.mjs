@@ -1097,6 +1097,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         // `#196 auto-read-noise`. Absent when a test sets it to `undefined`, as an older server
         // (or one whose store is failing) sends it.
         noise_rules: page.noiseRules,
+        // `#199 removable-config-channels`. Absent when nothing is hidden, as the server omits it.
+        hidden_channels: page.hiddenChannels.length
+          ? page.hiddenChannels.map((channel) => ({ alias: null, added: false, ...channel }))
+          : undefined,
       }),
     /**
      * The channels this server is configured for, as the server would serialize them.
@@ -1114,6 +1118,14 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     addChannelCalls: [],
     /** Every remove request. */
     removeChannelCalls: [],
+    /**
+     * Configured channels taken off the list. `#199 removable-config-channels`. Removing a channel
+     * that is not `added` moves it here, as the server hides rather than forgets one; Show again
+     * moves it back.
+     */
+    hiddenChannels: [],
+    /** Every Show again request, by channel id. */
+    showChannelCalls: [],
     /** Make adding fail the way the server does when the bot cannot read the channel. */
     addChannelError: null,
     /** Every alias write the page made, in order, as `METHOD body`. */
@@ -1805,8 +1817,32 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       const removal = /^\/api\/v1\/channels\/([^/]+)$/.exec(String(path));
       if (removal && (options && options.method) === "DELETE") {
         page.removeChannelCalls.push(removal[1]);
+        const removed = page.channels.find((c) => String(c.id) === removal[1]);
         page.channels = page.channels.filter((c) => String(c.id) !== removal[1]);
-        return json(200, { channel: { id: removal[1] }, channels: page.channels });
+        if (removed && removed.added !== true) page.hiddenChannels = [...page.hiddenChannels, removed];
+        return json(200, {
+          channel: removed || { id: removal[1] },
+          channels: page.channels,
+          hidden_channels: page.hiddenChannels,
+        });
+      }
+      const shown = /^\/api\/v1\/channels\/([^/]+)\/hidden$/.exec(String(path));
+      if (shown && (options && options.method) === "DELETE") {
+        page.showChannelCalls.push(shown[1]);
+        const restored = page.hiddenChannels.find((c) => String(c.id) === shown[1]);
+        if (!restored) return json(404, { error: "unknown_channel", detail: "not configured" });
+        page.hiddenChannels = page.hiddenChannels.filter((c) => c !== restored);
+        // Configured channels first, as the server lists them.
+        page.channels = [
+          ...page.channels.filter((c) => c.added !== true),
+          restored,
+          ...page.channels.filter((c) => c.added === true),
+        ];
+        return json(200, {
+          channel: restored,
+          channels: page.channels,
+          hidden_channels: page.hiddenChannels,
+        });
       }
       const alias = /^\/api\/v1\/channels\/([^/]+)\/alias$/.exec(String(path));
       if (alias) {
@@ -17451,19 +17487,10 @@ test("...and a channel the bot cannot read is refused IN THE SERVER'S OWN WORDS"
   );
 });
 
-test("REMOVE IS OFFERED FOR A CHANNEL ADDED HERE, AND NOT FOR ONE FROM THE FILE", async () => {
-  // A configured channel is read from a file this server never writes, so removing it from the app
-  // would last until the next restart and then undo itself. Not offering the button is the honest
-  // version of a refusal the server makes anyway.
+test("REMOVING A CHANNEL ADDED HERE FORGETS IT", async () => {
   const page = newPage();
   await signIn(page);
   await page.el("open-settings").click();
-  assert.equal(
-    page.el("remove-channel").hidden,
-    true,
-    "a configured channel was offered a Remove button that cannot work"
-  );
-  assert.match(page.el("remove-channel-state").text(), /configuration file/);
 
   await page.el("open-add-channel").click();
   page.el("new-channel-id").value = "1110000000000000004";
@@ -17479,6 +17506,81 @@ test("REMOVE IS OFFERED FOR A CHANNEL ADDED HERE, AND NOT FOR ONE FROM THE FILE"
     page.el("discord-channel").children.map((o) => o.value),
     ["1110000000000000001"],
     "the removed channel is still in the picker"
+  );
+  assert.match(page.el("remove-channel-state").text(), /no longer in the picker/);
+  assert.equal(
+    page.el("hidden-channels").hidden,
+    true,
+    "a forgotten added channel was offered back as a hidden configured one"
+  );
+});
+
+test("REMOVE IS OFFERED FOR A CHANNEL FROM THE FILE, WHICH IS HIDDEN AND CAN BE SHOWN AGAIN", async () => {
+  // `#199 removable-config-channels`. The owner could not take the deployment's one configured
+  // channel off his list: the button was not offered, because the server refused. The server now
+  // hides such a channel durably, so the button is offered and what it did is said afterwards.
+  const page = newPage();
+  await signIn(page);
+  await page.el("open-settings").click();
+  assert.equal(
+    page.el("remove-channel").hidden,
+    false,
+    "a channel from the configuration file still cannot be removed from the list"
+  );
+  assert.equal(page.el("hidden-channels").hidden, true, "an empty hidden list was shown");
+
+  await page.el("remove-channel").click();
+  await page.settle();
+  assert.deepEqual(page.removeChannelCalls, [CHANNEL.id]);
+  assert.deepEqual(
+    page.el("discord-channel").children.map((o) => o.value),
+    [],
+    "the hidden channel is still in the picker"
+  );
+  assert.match(page.el("remove-channel-state").text(), /configuration file/);
+  assert.match(page.el("remove-channel-state").text(), /shown again/);
+  // THE EMPTY STATE: the list is empty, and the box says what to do rather than that the server
+  // has no channels, which is not true.
+  assert.match(page.el("channel-facts").text(), /channel list is empty/);
+  assert.doesNotMatch(page.el("channel-facts").text(), /no channels configured/);
+  assert.equal(page.el("open-add-channel").hidden, false, "the empty list offers no way to add one");
+  assert.equal(page.el("hidden-channels").hidden, false, "the hidden channel is not offered back");
+  const rows = page.el("hidden-channel-list").children;
+  assert.equal(rows.length, 1);
+  assert.match(rows[0].children[0].text(), new RegExp(CHANNEL.label));
+  const showAgain = rows[0].children[1];
+  assert.equal(showAgain.text(), "Show again");
+
+  await showAgain.click();
+  await page.settle();
+  assert.deepEqual(page.showChannelCalls, [CHANNEL.id]);
+  assert.deepEqual(
+    page.el("discord-channel").children.map((o) => o.value),
+    [CHANNEL.id],
+    "Show again did not put the channel back in the picker"
+  );
+  assert.equal(page.el("settings-channel").value, CHANNEL.id);
+  assert.equal(page.el("hidden-channels").hidden, true, "a shown channel is still listed as hidden");
+  assert.match(page.el("remove-channel-state").text(), /Shown again/);
+});
+
+test("the hidden channels client-config reports are offered back under the owner's own names", async () => {
+  // Hidden on another device, or before this page loaded: the server's list is the truth, and a
+  // channel he renamed is offered back under his name for it.
+  const page = newPage();
+  page.hiddenChannels = [
+    { id: "1110000000000000007", label: "home base", alias: "the base", writable: true },
+  ];
+  await signIn(page);
+  await page.el("open-settings").click();
+  assert.equal(page.el("hidden-channels").hidden, false);
+  const rows = page.el("hidden-channel-list").children;
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].children[0].text(), "the base");
+  assert.equal(
+    page.el("discord-channel").children.map((o) => o.value).includes("1110000000000000007"),
+    false,
+    "a hidden channel was put in the picker"
   );
 });
 

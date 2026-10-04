@@ -91,6 +91,13 @@ pub struct AppState {
     /// design. Loaded once at startup and kept in step by the add and remove routes; the store is
     /// what makes it survive a restart, not what is read on the hot path.
     pub added_channels: Arc<std::sync::RwLock<Vec<AddedChannel>>>,
+    /// Configured channels the owner took off his list. `#199 removable-config-channels`.
+    ///
+    /// Subtracted from the configured allowlist by [`AppState::channel`] and
+    /// [`AppState::all_channels`], so every listing, every channel-scoped route, the live poller,
+    /// diagnostics and the MCP tools stop seeing one at once rather than each having to remember
+    /// to filter. In memory beside the store for the reason [`AppState::added_channels`] is.
+    pub hidden_channels: Arc<std::sync::RwLock<std::collections::BTreeSet<ChannelId>>>,
     /// Serializes managed register/probe/persist and unregister/remove transactions.
     ///
     /// The provider and local store cannot share a transaction. Holding this lock across both
@@ -145,6 +152,70 @@ impl AppState {
         }
         self.refresh_routes();
         Ok(count)
+    }
+
+    /// Restore which configured channels the owner took off his list.
+    ///
+    /// Read once at startup, beside [`AppState::restore_added_channels`] and for the same reason:
+    /// the allowlist is consulted synchronously on every request.
+    pub async fn restore_hidden_channels(&self) -> Result<usize, crate::store::StoreError> {
+        let restored = self.store.hidden_channels().await?;
+        let count = restored.len();
+        {
+            let mut slot = self.hidden_channels.write().map_err(|_| {
+                crate::store::StoreError::Backend(
+                    "the in-memory hidden-channel list lock is poisoned".to_owned(),
+                )
+            })?;
+            *slot = restored.into_iter().collect();
+        }
+        self.refresh_routes();
+        Ok(count)
+    }
+
+    /// Whether the owner took this configured channel off his list.
+    fn is_hidden(&self, id: &ChannelId) -> bool {
+        self.hidden_channels
+            .read()
+            .is_ok_and(|hidden| hidden.contains(id))
+    }
+
+    /// The configured channel named `id`, hidden or not, or `None` when the file does not name it.
+    ///
+    /// For the two routes that act on a configured channel BECAUSE it is configured — taking one
+    /// off the list and putting it back. Everything else asks [`AppState::channel`], which does
+    /// not answer for a hidden one.
+    #[must_use]
+    pub fn configured_channel(&self, id: &str) -> Option<ChannelInfo> {
+        self.config
+            .channels
+            .iter()
+            .find(|c| c.id.as_str() == id)
+            .cloned()
+    }
+
+    /// The configured channels the owner took off his list, in configuration order.
+    ///
+    /// A hidden id the file no longer names is left out: there is nothing to show again.
+    #[must_use]
+    pub fn hidden_configured_channels(&self) -> Vec<ChannelInfo> {
+        self.config
+            .channels
+            .iter()
+            .filter(|c| self.is_hidden(&c.id))
+            .cloned()
+            .collect()
+    }
+
+    /// The configured channels still on the list, in configuration order.
+    #[must_use]
+    pub fn listed_configured_channels(&self) -> Vec<ChannelInfo> {
+        self.config
+            .channels
+            .iter()
+            .filter(|c| !self.is_hidden(&c.id))
+            .cloned()
+            .collect()
     }
 
     /// Serve every channel through `client` alone, as a single-provider deployment would.
@@ -207,10 +278,14 @@ impl AppState {
     /// Configured channels are searched first, then the ones added from inside the app. A
     /// configured entry WINS: the file is the operator's standing statement, and an added row that
     /// shadowed it could silently change whether the bridge may post somewhere.
+    ///
+    /// A configured channel the owner took off his list is not answered for at all, exactly as an
+    /// added channel he removed is not: off the list means unreachable, not merely unlisted. It
+    /// still wins over an added row with the same id, so hiding it cannot uncover one.
     #[must_use]
     pub fn channel(&self, id: &str) -> Option<ChannelInfo> {
         if let Some(found) = self.config.channels.iter().find(|c| c.id.as_str() == id) {
-            return Some(found.clone());
+            return (!self.is_hidden(&found.id)).then(|| found.clone());
         }
         self.added_channels
             .read()
@@ -221,15 +296,19 @@ impl AppState {
     }
 
     /// Every channel this server will answer for: configured first, then added, in that order.
+    ///
+    /// Hidden configured channels are left out, and an added row sharing one's id stays out too —
+    /// the same precedence [`AppState::channel`] applies.
     #[must_use]
     pub fn all_channels(&self) -> Vec<ChannelInfo> {
-        let mut all = self.config.channels.clone();
+        let mut all = self.listed_configured_channels();
         if let Ok(added) = self.added_channels.read() {
             for channel in added
                 .iter()
                 .map(|row| added_channel_info(row, &self.providers))
             {
-                if !all.iter().any(|c| c.id == channel.id) {
+                let configured = self.config.channels.iter().any(|c| c.id == channel.id);
+                if !configured && !all.iter().any(|c| c.id == channel.id) {
                     all.push(channel);
                 }
             }
@@ -267,12 +346,54 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
+    use crate::model::ChannelId;
     use crate::testing;
 
     #[test]
     fn an_unconfigured_channel_is_invisible() {
         let (state, _fake) = testing::state();
         assert!(state.channel("999").is_none());
+        assert!(state.channel(testing::READ_CHANNEL).is_some());
+    }
+
+    #[test]
+    fn a_hidden_configured_channel_is_unreachable_and_cannot_uncover_an_added_row() {
+        // `#199 removable-config-channels`. An added row under a configured id predates the file
+        // naming it; hiding the configured channel must not quietly promote that row, whose write
+        // policy the operator never stated in the file.
+        let (state, _fake) = testing::state();
+        let id = ChannelId(testing::WRITE_CHANNEL.to_owned());
+        state
+            .added_channels
+            .write()
+            .expect("added list")
+            .push(crate::store::AddedChannel {
+                channel: id.clone(),
+                label: "shadow".to_owned(),
+                writable: false,
+                registration_provider: None,
+                added_at_ms: 1,
+            });
+        state
+            .hidden_channels
+            .write()
+            .expect("hidden list")
+            .insert(id.clone());
+
+        assert!(state.channel(id.as_str()).is_none());
+        assert!(state.all_channels().iter().all(|c| c.id != id));
+        assert_eq!(
+            state
+                .hidden_configured_channels()
+                .iter()
+                .map(|c| c.label.as_str())
+                .collect::<Vec<_>>(),
+            ["lead team"]
+        );
+        assert!(
+            state.configured_channel(id.as_str()).is_some(),
+            "the file still names it, which is what lets it be shown again"
+        );
         assert!(state.channel(testing::READ_CHANNEL).is_some());
     }
 

@@ -731,6 +731,11 @@ pub async fn client_config(
     Ok(Json(ClientConfigResponse {
         chat_provider_name: state.chat.provider_name().to_owned(),
         channels: ops::channels(&state).await,
+        hidden_channels: if scope >= Scope::Write {
+            ops::hidden_channels(&state).await
+        } else {
+            Vec::new()
+        },
         elevenlabs_agent_id: state.config.elevenlabs.agent_id.clone(),
         conversational_voice: state.conversation.describe(),
         read_aloud: state.speech.describe(),
@@ -3454,13 +3459,60 @@ pub struct AddChannelRequest {
     writable: Present<bool>,
 }
 
-/// What happened when a channel was added.
+/// What happened when a channel was added, removed, or shown again.
 #[derive(Debug, Serialize)]
 pub struct AddChannelResponse {
-    /// The channel now in the allowlist.
+    /// The channel the change was about.
     pub channel: ChannelInfo,
     /// Every channel, so the page can redraw its pickers from one answer.
     pub channels: Vec<ChannelInfo>,
+    /// Configured channels now off the list, so Settings can redraw what it offers to show again
+    /// from the same answer. `#199 removable-config-channels`.
+    pub hidden_channels: Vec<ChannelInfo>,
+}
+
+/// The answer every change to the channel list gives: the channel it was about, and the list as
+/// it now stands both ways.
+///
+/// The channel is taken from those lists when it is in one, so it wears the owner's alias exactly
+/// as the pickers will; a channel that has left both, an added one just removed, is answered as
+/// given.
+async fn channel_list_answer(state: &AppState, channel: ChannelInfo) -> Response {
+    let channels = ops::channels(state).await;
+    let hidden_channels = ops::hidden_channels(state).await;
+    let channel = channels
+        .iter()
+        .chain(&hidden_channels)
+        .find(|listed| listed.id == channel.id)
+        .cloned()
+        .unwrap_or(channel);
+    no_store(Json(AddChannelResponse {
+        channel,
+        channels,
+        hidden_channels,
+    }))
+}
+
+/// Put a hidden configured channel back on the list, store first and then memory.
+///
+/// The store first for the reason [`add_channel`] writes it first: a store that refused would
+/// otherwise leave the channel showing until the next restart and then silently gone again.
+async fn unhide_configured_channel(state: &AppState, id: &ChannelId) -> Result<(), ApiError> {
+    state.store.unhide_channel(id).await?;
+    if let Ok(mut hidden) = state.hidden_channels.write() {
+        hidden.remove(id);
+    }
+    state.refresh_routes();
+    tracing::info!(channel = %id, "configured channel shown again in the app");
+    Ok(())
+}
+
+/// The configured channel `id` when the owner has hidden it, so that asking to ADD it can put it
+/// back instead of refusing a channel he can no longer see. `#199 removable-config-channels`.
+fn hidden_configured(state: &AppState, id: &str) -> Option<ChannelInfo> {
+    state
+        .configured_channel(id)
+        .filter(|channel| state.channel(channel.id.as_str()).is_none())
 }
 
 /// `POST /api/v1/channels` — add a channel without editing a file or redeploying.
@@ -3476,6 +3528,10 @@ pub struct AddChannelResponse {
 /// correct one. So this reads a message before agreeing, and hands back the probe's own words when
 /// it cannot — the same sentences the startup check uses, rather than a second opinion about the
 /// same failure.
+///
+/// ADDING A CONFIGURED CHANNEL THE OWNER HID SHOWS IT AGAIN. `#199 removable-config-channels`. To
+/// him it is not on the list, so the directory offers it and a pasted id names it; refusing it as
+/// "already configured" would leave no way back through the act he reached for.
 pub async fn add_channel(
     State(state): State<AppState>,
     _scope: WriteScope,
@@ -3520,6 +3576,13 @@ pub async fn add_channel(
                     "give a channel link or provider reference",
                 )
             })?;
+        // A configured channel the owner hid is not "already a channel" to him: the directory
+        // offers it as one he can add, and adding it shows it again. Nothing is registered
+        // upstream for it, because the file, not this route, is what owns it.
+        if let Some(configured) = hidden_configured(&state, source) {
+            unhide_configured_channel(&state, &configured.id).await?;
+            return Ok(channel_list_answer(&state, configured).await);
+        }
         let source_is_static = state
             .config
             .channels
@@ -3587,6 +3650,21 @@ pub async fn add_channel(
                 state.chat.provider_name()
             ),
         ));
+    }
+    if let Some(configured) = hidden_configured(&state, id) {
+        // The same as a hidden source above: a direct id, or a link that resolved to one. The
+        // file's label and write policy stand, not the ones in this request, because the file is
+        // what owns the channel. A registration the bridge just answered is left alone for the
+        // reason given below: the id is owned outside this transaction, so nothing here may
+        // delete it upstream. A direct add holds no lifecycle lock yet, and takes it here so that
+        // showing the channel cannot interleave with a concurrent hide.
+        let _hide_lifecycle = if managed {
+            None
+        } else {
+            Some(state.channel_registration_lock.lock().await)
+        };
+        unhide_configured_channel(&state, &configured.id).await?;
+        return Ok(channel_list_answer(&state, configured).await);
     }
     if state
         .config
@@ -3705,10 +3783,7 @@ pub async fn add_channel(
     }
     state.refresh_routes();
     tracing::info!(channel = %candidate.id, writable = candidate.writable, managed, provider = provider_key.as_deref().unwrap_or_default(), "channel added or reconciled in the app");
-    Ok(no_store(Json(AddChannelResponse {
-        channel: candidate,
-        channels: ops::channels(&state).await,
-    })))
+    Ok(channel_list_answer(&state, candidate).await)
 }
 
 async fn rollback_registration(
@@ -3725,29 +3800,40 @@ async fn rollback_registration(
     state.refresh_routes();
 }
 
-/// `DELETE /api/v1/channels/{channel_id}` — take back a channel added in the app.
+/// `DELETE /api/v1/channels/{channel_id}` — take a channel off the list.
 ///
-/// ONLY ONE THAT WAS ADDED HERE. A configured channel comes from a file this server reads and does
-/// not write, so "removing" one would last until the next restart and then undo itself — which is
-/// worse than refusing, because the reader would believe it had gone.
+/// TWO KINDS OF CHANNEL, TWO MEANINGS, ONE VERB FOR THE OWNER. `#199 removable-config-channels`.
+/// One added in the app is forgotten: its row goes, and a managed registration is withdrawn
+/// upstream. One from the configuration file is HIDDEN: this server never writes that file, so
+/// deleting the channel would last until the next restart and then undo itself — the reason this
+/// route used to refuse. Recording the hide in the store is what makes it last instead; the file
+/// still says the channel exists, and `DELETE .../hidden` or adding it again brings it back.
+///
+/// Either way it stops being reachable, not only listed, because [`AppState::channel`] stops
+/// answering for it. Hiding a configured channel touches nothing upstream. Without a store the
+/// hide is refused by name rather than held in memory until the next restart, which would be the
+/// same silent undo the old refusal existed to prevent.
+///
+/// WRITE scope, and NO MCP TOOL, for the reason [`set_alias`] has none: the list is the owner's.
 pub async fn remove_channel(
     State(state): State<AppState>,
     _scope: WriteScope,
     Path(channel_id): Path<String>,
 ) -> Result<Response, ApiError> {
     let _managed_lifecycle = state.channel_registration_lock.lock().await;
-    if state
-        .config
-        .channels
-        .iter()
-        .any(|c| c.id.as_str() == channel_id)
-    {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "channel_is_configured",
-            "that channel comes from this server's configuration file, so it cannot be removed \
-             from the app. Take it out of the file and restart.",
-        ));
+    if let Some(configured) = state.configured_channel(&channel_id) {
+        // Idempotent: hiding one already hidden keeps the first instant and answers the same list,
+        // so a retry after a lost answer is not an error.
+        state
+            .store
+            .hide_channel(&configured.id, crate::store::now_ms())
+            .await?;
+        if let Ok(mut hidden) = state.hidden_channels.write() {
+            hidden.insert(configured.id.clone());
+        }
+        state.refresh_routes();
+        tracing::info!(channel = %channel_id, "configured channel hidden in the app");
+        return Ok(channel_list_answer(&state, configured).await);
     }
     let added_channel = state.added_channels.read().ok().and_then(|added| {
         added
@@ -3787,8 +3873,9 @@ pub async fn remove_channel(
     }
     state.refresh_routes();
     tracing::info!(channel = %channel_id, "channel removed in the app");
-    Ok(no_store(Json(AddChannelResponse {
-        channel: ChannelInfo {
+    Ok(channel_list_answer(
+        &state,
+        ChannelInfo {
             id: crate::model::ChannelId(channel_id),
             label: String::new(),
             writable: false,
@@ -3796,6 +3883,31 @@ pub async fn remove_channel(
             added: true,
             provider: None,
         },
-        channels: ops::channels(&state).await,
-    })))
+    )
+    .await)
+}
+
+/// `DELETE /api/v1/channels/{channel_id}/hidden` — show a hidden configured channel again.
+/// `#199 removable-config-channels`.
+///
+/// The one channel route that addresses a channel OUTSIDE the allowlist, and only ever one the
+/// configuration file names: anything else is `unknown_channel`, so this cannot admit a channel
+/// the operator never listed. Showing one that is not hidden answers the list as it stands.
+///
+/// WRITE scope, and NO MCP TOOL, the same as taking it off.
+pub async fn show_channel(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path(channel_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let _managed_lifecycle = state.channel_registration_lock.lock().await;
+    let Some(configured) = state.configured_channel(&channel_id) else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unknown_channel",
+            "only a channel named in this server's configuration file can be hidden or shown again",
+        ));
+    };
+    unhide_configured_channel(&state, &configured.id).await?;
+    Ok(channel_list_answer(&state, configured).await)
 }

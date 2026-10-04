@@ -32,10 +32,10 @@ declare namespace VibeTalk {
      * Whether this channel was added from inside the app rather than named in the configuration
      * file.
      *
-     * The page needs it for one decision: only an added channel can be REMOVED from the app. A
-     * configured one comes from a file this server reads and never writes, so taking it out here
-     * would last until the next restart and then undo itself — the server refuses that, and this
-     * is what stops the app offering a button whose whole outcome is a refusal.
+     * The page needs it to say what Remove will do. Removing an added channel forgets it. A
+     * configured one comes from a file this server reads and never writes, so removing it HIDES
+     * it instead — the file still names it, and Settings can show it again. `#199
+     * removable-config-channels`.
      */
     added: boolean;
     /**
@@ -109,6 +109,16 @@ declare namespace VibeTalk {
      * widget. The API key never leaves the server.
      */
     elevenlabs_agent_id: string | null;
+    /**
+     * Channels from the configuration file the owner took off his list, in configuration order.
+     * `#199 removable-config-channels`.
+     *
+     * Settings lists them so each can be shown again; `channels` above already leaves them out.
+     * Sent only to a write-scope caller, because showing one again takes that scope and a
+     * read-scope credential has no use for the names of channels the owner put away. Absent when
+     * none are hidden, and from an older server, which could not hide one.
+     */
+    hidden_channels?: ChannelInfo[];
     /**
      * Whether a post sent again under the same `idempotency_key` is posted at most once.
      *

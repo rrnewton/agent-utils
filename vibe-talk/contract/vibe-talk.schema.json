@@ -27,7 +27,7 @@
       "properties": {
         "added": {
           "default": false,
-          "description": "Whether this channel was added from inside the app rather than named in the configuration\nfile.\n\nThe page needs it for one decision: only an added channel can be REMOVED from the app. A\nconfigured one comes from a file this server reads and never writes, so taking it out here\nwould last until the next restart and then undo itself — the server refuses that, and this\nis what stops the app offering a button whose whole outcome is a refusal.",
+          "description": "Whether this channel was added from inside the app rather than named in the configuration\nfile.\n\nThe page needs it to say what Remove will do. Removing an added channel forgets it. A\nconfigured one comes from a file this server reads and never writes, so removing it HIDES\nit instead — the file still names it, and Settings can show it again. `#199\nremovable-config-channels`.",
           "type": "boolean"
         },
         "alias": {
@@ -99,6 +99,13 @@
             "string",
             "null"
           ]
+        },
+        "hidden_channels": {
+          "description": "Channels from the configuration file the owner took off his list, in configuration order.\n`#199 removable-config-channels`.\n\nSettings lists them so each can be shown again; `channels` above already leaves them out.\nSent only to a write-scope caller, because showing one again takes that scope and a\nread-scope credential has no use for the names of channels the owner put away. Absent when\nnone are hidden, and from an older server, which could not hide one.",
+          "items": {
+            "$ref": "#/$defs/ChannelInfo"
+          },
+          "type": "array"
         },
         "idempotent_posts_supported": {
           "description": "Whether a post sent again under the same `idempotency_key` is posted at most once.\n\n`#195 send-resilience`. The page retries a send whose answer it lost — a timeout, a 502 —\non its own only when this is true, because only then can the retry not post the message\ntwice. Sent only when true: absent, from this server or an older one, means false.",

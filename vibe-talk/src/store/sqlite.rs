@@ -183,6 +183,22 @@ pub const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (channel_id, message_id)
     ) STRICT;
     ",
+    // v9 — configured channels the owner took off his list. `#199 removable-config-channels`.
+    //
+    // The configuration file stays the statement of which channels exist, and this server still
+    // never writes it; a row here records only that the owner does not want one of them. That is
+    // what makes a removal from the app outlast a restart without the file and the app disagreeing
+    // about who owns the channel.
+    //
+    // Bounded by the configured channels, one row each at most, so `Retention` does not reach it.
+    // The purge leaves it alone for the reason it leaves `added_channels` alone: these two tables
+    // are the shape of the channel list, mirrored in memory, not a record of anything read or said.
+    "
+    CREATE TABLE hidden_channels (
+        channel_id   TEXT    PRIMARY KEY NOT NULL,
+        hidden_at_ms INTEGER NOT NULL
+    ) STRICT;
+    ",
 ];
 
 /// A [`StateStore`] backed by one SQLite file.
@@ -892,6 +908,48 @@ impl StateStore for SqliteStore {
             connection
                 .execute(
                     "DELETE FROM added_channels WHERE channel_id = ?1",
+                    rusqlite::params![channel],
+                )
+                .map_err(backend)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn hidden_channels(&self) -> Result<Vec<ChannelId>, StoreError> {
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare("SELECT channel_id FROM hidden_channels ORDER BY channel_id ASC")
+                .map_err(backend)?;
+            let rows = statement
+                .query_map([], |row| Ok(ChannelId(row.get::<_, String>(0)?)))
+                .map_err(backend)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(backend)
+        })
+        .await
+    }
+
+    async fn hide_channel(&self, channel: &ChannelId, at_ms: i64) -> Result<(), StoreError> {
+        let channel = channel.0.clone();
+        self.with_connection(move |connection| {
+            connection
+                .execute(
+                    "INSERT INTO hidden_channels (channel_id, hidden_at_ms) VALUES (?1, ?2)
+                     ON CONFLICT(channel_id) DO NOTHING",
+                    rusqlite::params![channel, at_ms],
+                )
+                .map_err(backend)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn unhide_channel(&self, channel: &ChannelId) -> Result<(), StoreError> {
+        let channel = channel.0.clone();
+        self.with_connection(move |connection| {
+            connection
+                .execute(
+                    "DELETE FROM hidden_channels WHERE channel_id = ?1",
                     rusqlite::params![channel],
                 )
                 .map_err(backend)?;
@@ -2355,6 +2413,71 @@ mod tests {
         );
         assert!(rows.iter().any(|row| row.channel.as_str() == "managed-new"
             && row.registration_provider.as_deref() == Some("https://bridge.example/v1")));
+    }
+
+    #[tokio::test]
+    async fn hidden_channels_arrive_on_an_existing_file_and_outlast_a_restart_and_a_purge() {
+        // `#199 removable-config-channels`. The file in the wild is a v8 file with an owner's
+        // list already in it, so that is what is upgraded here rather than a fresh one.
+        let dir = TempDir::new("sqlite-hidden-channels");
+        let file = dir.path().join("vibe-talk.sqlite3");
+        {
+            let connection = Connection::open(&file).expect("open old database");
+            for migration in &MIGRATIONS[..8] {
+                connection
+                    .execute_batch(migration)
+                    .expect("apply old schema");
+            }
+            connection
+                .execute(
+                    "INSERT INTO added_channels
+                        (channel_id, label, writable, registration_provider, added_at_ms)
+                     VALUES ('added-old', 'added before hiding existed', 0, NULL, 7)",
+                    [],
+                )
+                .expect("insert old row");
+            connection
+                .pragma_update(None, "user_version", 8_i64)
+                .expect("stamp old schema");
+        }
+
+        let configured = ChannelId("1111111111".to_owned());
+        {
+            let store = SqliteStore::open(&file, Retention::default()).expect("migrate");
+            assert!(
+                store.hidden_channels().await.expect("read").is_empty(),
+                "an upgraded file must hide nothing the owner did not hide"
+            );
+            assert_eq!(
+                store.added_channels().await.expect("read").len(),
+                1,
+                "the upgrade lost an added channel"
+            );
+            store.hide_channel(&configured, 10).await.expect("hide");
+            store
+                .hide_channel(&configured, 20)
+                .await
+                .expect("hiding twice is not an error");
+        }
+
+        let reopened = SqliteStore::open(&file, Retention::default()).expect("reopen");
+        assert_eq!(
+            reopened.hidden_channels().await.expect("reload"),
+            vec![configured.clone()],
+            "a hidden channel came back after a restart"
+        );
+        reopened.purge_everything().await.expect("purge");
+        assert_eq!(
+            reopened.hidden_channels().await.expect("after purge"),
+            vec![configured.clone()],
+            "the purge reshaped the channel list, which it leaves alone like added channels"
+        );
+        reopened.unhide_channel(&configured).await.expect("show");
+        reopened
+            .unhide_channel(&configured)
+            .await
+            .expect("showing one that is not hidden is not an error");
+        assert!(reopened.hidden_channels().await.expect("read").is_empty());
     }
 
     #[test]

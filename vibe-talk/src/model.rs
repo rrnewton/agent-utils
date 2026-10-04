@@ -297,10 +297,10 @@ pub struct ChannelInfo {
     /// Whether this channel was added from inside the app rather than named in the configuration
     /// file.
     ///
-    /// The page needs it for one decision: only an added channel can be REMOVED from the app. A
-    /// configured one comes from a file this server reads and never writes, so taking it out here
-    /// would last until the next restart and then undo itself — the server refuses that, and this
-    /// is what stops the app offering a button whose whole outcome is a refusal.
+    /// The page needs it to say what Remove will do. Removing an added channel forgets it. A
+    /// configured one comes from a file this server reads and never writes, so removing it HIDES
+    /// it instead — the file still names it, and Settings can show it again. `#199
+    /// removable-config-channels`.
     #[serde(default)]
     pub added: bool,
     /// Key of the configured chat provider this channel is read through.

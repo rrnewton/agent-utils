@@ -11434,7 +11434,7 @@ async function loadDiscord(options) {
   const keepPosition = Boolean(options && options.keepPosition);
   const channel = el("discord-channel").value;
   if (!channel) {
-    setStatus("no channel to read — this server has none configured.");
+    setStatus(NO_CHANNEL_TO_READ);
     return;
   }
   if (discordFetchInFlight) {
@@ -11598,7 +11598,7 @@ async function loadTodo(options) {
   const keepPosition = Boolean(options && options.keepPosition);
   const channel = el("discord-channel").value;
   if (!channel) {
-    setStatus("no channel to read — this server has none configured.");
+    setStatus(NO_CHANNEL_TO_READ);
     return;
   }
   if (discordFetchInFlight) {
@@ -13800,6 +13800,24 @@ function channelName(channel) {
 /** What the server last said the channels were, including the names the owner gave them. */
 let knownChannels = [];
 
+/**
+ * Configured channels the owner took off his list, as the server last reported them. `#199
+ * removable-config-channels`. Only Settings reads this, to offer each one back; a server that
+ * cannot hide one, or a sign-in it was not sent to, leaves it empty.
+ */
+let hiddenChannels = [];
+
+/**
+ * What the page says where a channel would be when the list is empty: in Settings, which holds both
+ * ways out, and on the status line of a read that has nothing to read. Not "this server has no
+ * channels", which stopped being the only way to get here once a configured one could be hidden.
+ */
+const EMPTY_CHANNEL_LIST =
+  "Your channel list is empty. Add a channel, or show a hidden one again below.";
+const NO_CHANNEL_TO_READ =
+  "no channel to read — your channel list is empty. " +
+  "Add one, or show a hidden one again, in Settings.";
+
 /** Whether the provider bridge resolves channel links or references into stable channel ids. */
 let channelRegistrationSupported = false;
 
@@ -13961,19 +13979,70 @@ function fillChannelSelect(id) {
 }
 
 /**
- * Whether Remove is offered for this channel, and it is offered for exactly one kind.
+ * Remove is offered for every channel on the list. `#199 removable-config-channels`.
  *
- * A channel from the configuration file cannot be taken out from the app: that file is read at
- * startup and never written, so it would come back on the next restart. The SERVER refuses it too —
- * this only avoids putting up a button whose entire outcome is a refusal.
+ * It used to be offered only for a channel added here, because the server refused the others: a
+ * configured channel comes from a file it never writes. The server now HIDES one of those instead,
+ * durably, so the owner's one verb works on whatever he is looking at, and what it did is said
+ * after he presses it rather than as a reason the button is missing.
  */
 function renderRemoveChannel(channel) {
-  const removable = channel !== null && channel !== undefined && channel.added === true;
-  el("remove-channel").hidden = !removable;
-  el("remove-channel-state").textContent =
-    removable || !channel
-      ? ""
-      : "This one is in the server's configuration file, so it is removed by editing that.";
+  el("remove-channel").hidden = channel === null || channel === undefined;
+  el("remove-channel-state").textContent = "";
+}
+
+/**
+ * Draw the hidden configured channels, each with Show again, or take the list away when there
+ * are none. Names go through `channelName` like every picker, so a channel he renamed is offered
+ * back under his name for it.
+ */
+function renderHiddenChannels() {
+  const rows = hiddenChannels.map((channel) => {
+    const row = document.createElement("li");
+    const name = document.createElement("span");
+    name.className = "directory-name";
+    name.textContent = channelName(channel);
+    const show = document.createElement("button");
+    show.type = "button";
+    show.className = "secondary";
+    show.textContent = "Show again";
+    show.setAttribute("aria-label", `Show ${channelName(channel)} again`);
+    show.addEventListener("click", guardQuietly(() => showChannelAgain(channel)));
+    row.append(name, show);
+    return row;
+  });
+  el("hidden-channel-list").replaceChildren(...rows);
+  el("hidden-channels").hidden = rows.length === 0;
+}
+
+/** Take the server's whole answer about the list: both pickers, the hidden list, the cache. */
+function adoptChannelList(payload) {
+  if (payload && Array.isArray(payload.channels)) knownChannels = payload.channels;
+  if (payload && Array.isArray(payload.hidden_channels)) hiddenChannels = payload.hidden_channels;
+  saveCacheChannels();
+  fillChannelSelect("discord-channel");
+  fillChannelSelect("settings-channel");
+  renderHiddenChannels();
+}
+
+/** Put a hidden configured channel back on the list, and point the channel box at it. */
+async function showChannelAgain(channel) {
+  const said = el("remove-channel-state");
+  let payload = null;
+  try {
+    payload = await api(`/api/v1/channels/${encodeURIComponent(channel.id)}/hidden`, {
+      method: "DELETE",
+    });
+  } catch (error) {
+    said.textContent = error.message;
+    return;
+  }
+  const previousChannel = el("discord-channel").value;
+  adoptChannelList(payload);
+  el("settings-channel").value = String(channel.id);
+  renderChannelBox();
+  said.textContent = `Shown again. "${channelName(channel)}" is back in the picker.`;
+  if (el("discord-channel").value !== previousChannel) await changeSelectedChannel();
 }
 
 /** Add the channel named in the form, and put the answer where it can be read. */
@@ -14008,10 +14077,7 @@ async function addChannel() {
   }
   // Redrawn from the answer rather than from a re-read: the server hands back the whole list
   // precisely so the two pickers and the editor cannot disagree about what exists.
-  knownChannels = payload.channels || knownChannels;
-  saveCacheChannels();
-  fillChannelSelect("discord-channel");
-  fillChannelSelect("settings-channel");
+  adoptChannelList(payload);
   const addedId = String((payload.channel && payload.channel.id) || id);
   el("settings-channel").value = addedId;
   renderChannelBox();
@@ -14019,7 +14085,10 @@ async function addChannel() {
   el("new-channel-label").value = "";
   el("new-channel-writable").checked = false;
   showChannelPanel(null);
-  said.textContent = `Added. "${label}" is now in the channel picker.`;
+  // Named from the answer: adding a configured channel the owner hid shows it again under the
+  // file's label or his alias for it, not the name typed here. `#199 removable-config-channels`.
+  const added = channelName(payload.channel || { label });
+  said.textContent = `Added. "${added}" is now in the channel picker.`;
 }
 
 // --- browsing channels ---------------------------------------------------------------------
@@ -14223,21 +14292,24 @@ async function addDirectoryChannel(entry) {
     return;
   }
   channelDirectory.adding.delete(entry.source);
-  knownChannels = payload.channels || knownChannels;
-  saveCacheChannels();
-  fillChannelSelect("discord-channel");
-  fillChannelSelect("settings-channel");
+  adoptChannelList(payload);
   entry.tracked = true;
   entry.channel_id = payload.channel && payload.channel.id ? String(payload.channel.id) : null;
   renderChannelDirectory();
-  said.textContent = `Added. "${label}" is now in the channel picker.`;
+  // Named from the answer, for the reason `addChannel` gives.
+  const added = channelName(payload.channel || { label });
+  said.textContent = `Added. "${added}" is now in the channel picker.`;
 }
 
-/** Take back a channel that was added here. */
+/**
+ * Take a channel off the list: forgotten when it was added here, hidden when it came from the
+ * configuration file. The server decides which from the channel itself; the page only says which
+ * one happened.
+ */
 async function removeChannel() {
   const id = el("settings-channel").value;
   const channel = knownChannel(id);
-  if (!channel || channel.added !== true) {
+  if (!channel) {
     return;
   }
   const said = el("remove-channel-state");
@@ -14250,7 +14322,7 @@ async function removeChannel() {
   }
   const previousChannel = el("discord-channel").value;
   forgetChannelScopes((channel) => channel === String(id));
-  knownChannels = payload.channels || [];
+  adoptChannelList(payload);
   // The directory is cached while Settings stays open. Put a removed source back into its real
   // state immediately; otherwise reopening Browse in the same page still said "Already added"
   // and offered no way to add it again.
@@ -14261,11 +14333,12 @@ async function removeChannel() {
     }
   }
   renderChannelDirectory();
-  saveCacheChannels();
-  fillChannelSelect("discord-channel");
-  fillChannelSelect("settings-channel");
   renderChannelBox();
-  said.textContent = "Removed. It is no longer in the picker.";
+  said.textContent =
+    channel.added === true
+      ? "Removed. It is no longer in the picker."
+      : `Removed from your list. "${channelName(channel)}" is still in this server's ` +
+        "configuration file, so it can be shown again below.";
   if (el("discord-channel").value !== previousChannel) await changeSelectedChannel();
 }
 
@@ -14287,7 +14360,7 @@ function renderAliasEditor() {
   const channel = knownChannel(el("settings-channel").value);
   if (!channel) {
     el("channel-alias").value = "";
-    el("channel-facts").textContent = "This server has no channels configured.";
+    el("channel-facts").textContent = EMPTY_CHANNEL_LIST;
     el("alias-state").textContent = "";
     renderRemoveChannel(null);
     return;
@@ -14510,6 +14583,8 @@ function applyClientConfig(config) {
   // `#39 channel-alias`. Both pickers are drawn from the same list and through the same naming
   // rule, so the name in the bar and the name in Settings are one answer rather than two.
   knownChannels = config.channels || [];
+  hiddenChannels = Array.isArray(config.hidden_channels) ? config.hidden_channels : [];
+  renderHiddenChannels();
   channelRegistrationSupported = config.channel_registration_supported === true;
   channelDiscoverySupported =
     channelRegistrationSupported && config.channel_discovery_supported === true;

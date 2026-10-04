@@ -133,6 +133,23 @@ pub async fn channels(state: &AppState) -> Vec<ChannelInfo> {
         .collect()
 }
 
+/// The configured channels the owner took off his list, wearing his own names, so Settings can
+/// offer each one back under the name he knew it by. `#199 removable-config-channels`.
+pub async fn hidden_channels(state: &AppState) -> Vec<ChannelInfo> {
+    let hidden = state.hidden_configured_channels();
+    if hidden.is_empty() {
+        return hidden;
+    }
+    let aliases = aliases(state).await;
+    hidden
+        .into_iter()
+        .map(|mut channel| {
+            channel.alias = aliases.get(channel.id.as_str()).cloned();
+            channel
+        })
+        .collect()
+}
+
 /// The configured channel a caller named, by id or by the name it was given.
 ///
 /// A model asked about "lead team" passes "lead team", however clearly the tool description
@@ -1278,7 +1295,8 @@ pub struct InboxEntry {
 /// Inbox state for every configured channel, in configuration order. Read scope.
 ///
 /// Every configured channel appears, including the ones with no mark: "never marked" is a state
-/// the interface has to be able to show, and an absent row would read as "no such channel".
+/// the interface has to be able to show, and an absent row would read as "no such channel". One
+/// the owner took off his list does not, because to him it is no longer a channel he reads.
 ///
 /// # Errors
 ///
@@ -1286,13 +1304,12 @@ pub struct InboxEntry {
 pub async fn inbox(state: &AppState) -> Result<Vec<InboxEntry>, OpError> {
     let marks = state.store.read_marks().await?;
     Ok(state
-        .config
-        .channels
-        .iter()
+        .listed_configured_channels()
+        .into_iter()
         .map(|channel| {
             let mark = marks.iter().find(|m| m.channel == channel.id);
             InboxEntry {
-                channel: channel.clone(),
+                channel,
                 last_read: mark.map(|m| m.last_read.clone()),
                 marked_at_ms: mark.map(|m| m.marked_at_ms),
             }

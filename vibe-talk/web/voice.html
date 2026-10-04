@@ -641,10 +641,10 @@
               <div class="channel-actions">
                 <button id="rename-channel" class="secondary" type="button" aria-expanded="false" aria-controls="rename-fields">Rename</button>
                 <!--
-                  Removing is only offered for a channel that was ADDED here. One from the
-                  configuration file cannot be taken out from the app: the file is read at startup
-                  and never written, so it would come back on the next restart. The server refuses
-                  that too — this only avoids offering a button whose whole outcome is a refusal.
+                  `#199 removable-config-channels`. Offered for EVERY channel on the list. One added
+                  here is forgotten. One from the configuration file is hidden instead, because the
+                  server never writes that file — it would otherwise come back on the next restart
+                  — and the hidden list below offers it back.
                 -->
                 <button id="remove-channel" class="secondary" type="button" hidden>Remove</button>
                 <button id="open-add-channel" class="secondary" type="button" aria-expanded="false" aria-controls="add-channel-fields">Add a channel</button>
@@ -653,6 +653,17 @@
                 <button id="open-browse-channels" class="secondary" type="button" aria-expanded="false" aria-controls="browse-channel-fields" hidden>Browse channels</button>
               </div>
               <p id="remove-channel-state" class="hint" aria-live="polite"></p>
+
+              <!--
+                `#199 removable-config-channels`. Configured channels taken off the list, each with
+                the one act that puts it back. Hidden while there are none. Rows are built by
+                `renderHiddenChannels` in web/voice.js, in the directory's row shape: a name and a
+                button.
+              -->
+              <div id="hidden-channels" hidden>
+                <p class="hint">Hidden channels from this server's configuration:</p>
+                <ul id="hidden-channel-list" class="channel-directory" aria-label="Hidden channels"></ul>
+              </div>
 
               <div id="rename-fields" hidden>
                 <label for="channel-alias">Call it</label>
@@ -1307,10 +1318,11 @@
                 is not somewhere the agent can be told to post.
               </p>
               <p class="hint">
-                A channel added here can be <strong>removed</strong> here. One that came from the
-                server's configuration file cannot: that file is read when the server starts and is
-                never written by it, so removing it from the app would last until the next restart
-                and then undo itself.
+                Any channel can be <strong>removed</strong> from your list here. One added here is
+                forgotten. One that came from the server's configuration file is
+                <strong>hidden</strong> instead, because the server never writes that file: it stays
+                off your list across restarts, and <strong>Show again</strong> under Hidden channels
+                puts it back. Adding it again from Browse or by its id does the same.
               </p>
               <h2>What to call a channel</h2>
               <p class="hint">

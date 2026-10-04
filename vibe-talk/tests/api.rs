@@ -3877,9 +3877,10 @@ async fn adding_or_removing_a_channel_needs_write_scope() {
     );
 }
 
-/// An added channel can be taken back; a CONFIGURED one cannot.
+/// An added channel is FORGOTTEN when it is removed. A configured one is hidden instead, which
+/// `tests/hidden_channels.rs` pins. `#199 removable-config-channels`.
 #[tokio::test]
-async fn only_a_channel_added_in_the_app_can_be_removed_from_it() {
+async fn removing_a_channel_added_in_the_app_forgets_it() {
     let (harness, store, _ids) = todo_harness();
     let fresh = "7777777777777777777";
     harness
@@ -3894,19 +3895,6 @@ async fn only_a_channel_added_in_the_app_can_be_removed_from_it() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-
-    // A configured channel is a fact about a file this server does not write. Pretending to remove
-    // it would last until the next restart and then undo itself.
-    let (status, body) = call(
-        &harness,
-        "DELETE",
-        &format!("/api/v1/channels/{WRITE_CHANNEL}"),
-        Some(WRITE_TOKEN),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["error"], "channel_is_configured");
 
     let (status, body) = call(
         &harness,
@@ -3926,6 +3914,11 @@ async fn only_a_channel_added_in_the_app_can_be_removed_from_it() {
         "the removed channel is still in the list: {body}"
     );
     assert!(store.added_channels().await.expect("read back").is_empty());
+    assert!(
+        store.hidden_channels().await.expect("read back").is_empty(),
+        "forgetting an added channel must not also record it as a hidden configured one"
+    );
+    assert_eq!(body["hidden_channels"], serde_json::json!([]));
 
     // ...and it stops being reachable, which is the part that matters.
     let (status, _body) = call(

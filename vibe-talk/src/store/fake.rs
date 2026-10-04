@@ -59,6 +59,8 @@ struct State {
     aliases: BTreeMap<String, (String, i64)>,
     /// Channels added from inside the app: id -> (label, writable, provider, added_at_ms).
     added: BTreeMap<String, (String, bool, Option<String>, i64)>,
+    /// Configured channels taken off the list: id -> when. `#199 removable-config-channels`.
+    hidden: BTreeMap<String, i64>,
     /// The owner's saved noise rules; `None` until he saves a list. `#196 auto-read-noise`.
     noise_rules: Option<Vec<String>>,
     /// `(channel, message)` to `(when it was exempted, insertion order)`: the "not noise" list,
@@ -446,6 +448,26 @@ impl StateStore for FakeStore {
         let mut state = self.lock();
         armed(&mut state)?;
         state.added.remove(channel.as_str());
+        Ok(())
+    }
+
+    async fn hidden_channels(&self) -> Result<Vec<ChannelId>, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        Ok(state.hidden.keys().cloned().map(ChannelId).collect())
+    }
+
+    async fn hide_channel(&self, channel: &ChannelId, at_ms: i64) -> Result<(), StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        state.hidden.entry(channel.0.clone()).or_insert(at_ms);
+        Ok(())
+    }
+
+    async fn unhide_channel(&self, channel: &ChannelId) -> Result<(), StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        state.hidden.remove(channel.as_str());
         Ok(())
     }
 

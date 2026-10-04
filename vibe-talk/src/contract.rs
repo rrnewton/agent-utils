@@ -47,6 +47,15 @@ pub struct ClientConfigResponse {
     pub chat_provider_name: String,
     /// Configured channels.
     pub channels: Vec<ChannelInfo>,
+    /// Channels from the configuration file the owner took off his list, in configuration order.
+    /// `#199 removable-config-channels`.
+    ///
+    /// Settings lists them so each can be shown again; `channels` above already leaves them out.
+    /// Sent only to a write-scope caller, because showing one again takes that scope and a
+    /// read-scope credential has no use for the names of channels the owner put away. Absent when
+    /// none are hidden, and from an older server, which could not hide one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_channels: Vec<ChannelInfo>,
     /// ElevenLabs agent id, when the deployment has one. Not a secret: it identifies a public
     /// widget. The API key never leaves the server.
     pub elevenlabs_agent_id: Option<String>,

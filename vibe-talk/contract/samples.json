@@ -42,6 +42,16 @@
         "settings_url": "https://voice.example/settings"
       },
       "elevenlabs_agent_id": "agent",
+      "hidden_channels": [
+        {
+          "added": false,
+          "alias": null,
+          "id": "3333333333",
+          "label": "home base",
+          "provider": "discord",
+          "writable": true
+        }
+      ],
       "idempotent_posts_supported": true,
       "live_delivery": "push",
       "live_poll_seconds": 5,

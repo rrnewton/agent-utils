@@ -1116,7 +1116,11 @@ question is a fresh Discord fetch, and it stays that way. There is exactly one s
 * **noise rules and "not noise" marks** — which placeholder messages count as read
   automatically, one list for the whole deployment, and the messages you rescued from it. Two ids
   and an instant per mark, bounded by the same count as the "dealt with" marks. See "Messages read
-  automatically". `#196 auto-read-noise`.
+  automatically". `#196 auto-read-noise`; and
+* **hidden configured channels** — which channels from the configuration file you took off your
+  list. One id and an instant per row, one row per configured channel at most. Like the channels
+  added in the app, these are the shape of the list rather than a record of anything read, so the
+  purge leaves both alone. See "Taking a channel off the list". `#199 removable-config-channels`.
 
 The first three are your own record. The last is a derived cache, bounded by the same
 retention as the rest, erased by the same purge, and never filled by a read-scope token.
@@ -1469,8 +1473,9 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/api/v1/channels` | read | configured channels |
 | POST | `/api/v1/channels` | **write** | direct mode: `{id,label,writable}`; managed mode: `{source,label}` — validate and add a tracked channel |
 | GET | `/api/v1/channel-directory?q=&limit=&cursor=` | **write** | managed mode: one page of the channels the bridge can see, each marked `tracked` when already a channel here |
-| DELETE | `/api/v1/channels/{id}` | **write** | remove a channel added in the app; managed mode also unregisters it upstream |
-| GET | `/api/v1/client-config` | read | what the web app needs at startup, including the caller's own `token_scope` |
+| DELETE | `/api/v1/channels/{id}` | **write** | take a channel off the list: one added in the app is forgotten (managed mode also unregisters it upstream); one from the configuration file is hidden — see "Taking a channel off the list" |
+| DELETE | `/api/v1/channels/{id}/hidden` | **write** | show a hidden configured channel again; `unknown_channel` for anything the file does not name |
+| GET | `/api/v1/client-config` | read | what the web app needs at startup, including the caller's own `token_scope`; a write-scope caller also gets `hidden_channels` |
 | POST | `/api/v1/live/events` | ingest | accept one normalized create/update/delete event from an external provider adapter |
 | POST | `/api/v1/live/hints` | ingest | content-free `{channel_id}` wake-up for that polled provider's existing cursor |
 | GET | `/api/v1/diagnostics` | read | re-run the startup checks now, structured, with a remedy on every failure — see above |
@@ -2695,6 +2700,48 @@ still takes it, because "erase everything" has to mean everything.
 
 Out of scope, and stated so nobody reads more into it: the agent changing an alias, renaming
 anything in Discord, and multi-channel addressing itself — which this only prepares for.
+
+### Taking a channel off the list
+
+`#199 removable-config-channels`. Every channel in the list can be removed from Settings, including
+the ones the configuration file names. The owner could not remove the deployment's one configured
+channel: the server refused to delete a channel its file names, and the page did not offer the
+button.
+
+**One verb, two meanings, decided by the server.** `DELETE /api/v1/channels/{id}` on a channel
+added in the app forgets it, as before. On a configured channel it **hides** it instead. The server
+reads that file and never writes it, so deleting the channel would last until the next restart and
+then undo itself. A hide is a row in the store, and it lasts. The file still says which channels
+exist; the store records which of them you took off your list. Without a store the hide is refused
+with `storage_not_configured`, rather than held in memory until the next restart.
+
+**Hidden means gone everywhere, not just unlisted.** A hidden channel leaves `GET /api/v1/channels`,
+client-config's `channels`, the inbox, the live poller, diagnostics, and everything the voice agent
+is told. Every channel-scoped route answers `unknown_channel` for it, exactly as for a channel the
+file never named, so nothing reads it, posts there, or streams it. All of that follows from one
+place: `AppState::channel` and `AppState::all_channels` subtract the hidden set, and every consumer
+already goes through them.
+
+**Getting it back.** Settings lists *Hidden channels from this server's configuration*, each with
+**Show again** (`DELETE /api/v1/channels/{id}/hidden`). Adding it again also works, by its id or
+from Browse channels, where a hidden channel is offered like any channel not on the list. Either
+way the file's label and write policy apply, not the ones typed when adding it. Adding from Browse
+still asks the bridge to resolve the link, as every add does, but nothing is ever unregistered
+upstream for a configured channel, and hiding one touches nothing upstream at all. client-config
+sends the hidden list only to a write-scope caller, because only that scope can show one again.
+
+**With every channel hidden** the list is simply empty. The page says so and points at Settings,
+where *Add a channel* and the hidden list are. The server answers every listing with an empty one.
+
+**Only the owner edits the list.** Both routes take the write token, and there is no MCP tool for
+either, for the `#39 channel-alias` reason: the list is the owner's. `tests/hidden_channels.rs`
+asserts that with the write token.
+
+What it does not change: `[[channels]]` must still name at least one channel. A deployment can
+reach an empty list at runtime, but a file with no channels is still refused, because that is far
+more often a configuration mistake than a deliberate choice. The startup probe still reads every
+channel the file names, hidden or not, because it checks the file, not your list. An id hidden and
+then removed from the file stays recorded, and hides the channel again if the file names it later.
 
 ### Messages read automatically
 

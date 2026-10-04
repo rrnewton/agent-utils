@@ -126,6 +126,17 @@ fn client_config(
                 ..channel()
             },
         ],
+        // `#199 removable-config-channels`. Present only in the full sample, as the server sends
+        // it only to a write-scope caller with something hidden.
+        hidden_channels: if full {
+            vec![ChannelInfo {
+                id: ChannelId("3333333333".into()),
+                label: "home base".into(),
+                ..channel()
+            }]
+        } else {
+            Vec::new()
+        },
         elevenlabs_agent_id: full.then(|| "agent".into()),
         conversational_voice: VoiceDescription {
             name: "voice".into(),
