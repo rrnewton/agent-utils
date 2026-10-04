@@ -1468,10 +1468,11 @@ def _glob_matches_path(pattern: str, path: str) -> bool:
 def _cache_glob_contains_path(pattern: str, path: str) -> bool:
     """Whether any prefix of ``path`` is the cache directory named by ``pattern``.
 
-    This decides one path against one cache glob, and every checkout inspection
-    calls it once per path per glob over complete ``git ls-files`` and
-    ``git ls-tree`` listings, so it is the hottest loop in a large registry's
-    audit. Two properties keep it cheap without changing which paths it accepts:
+    This decides one path against one cache glob. ``tracked_cache_paths``
+    calls it for the globs ``_CacheGlobIndex`` says can contain a path and
+    for the other globs whose call reaches ``fnmatch``; it leaves out the
+    rest, which return False with no effect.
+    Two properties keep it cheap without changing which paths it accepts:
     only a prefix whose component count equals the pattern's own can match
     unless a ``**`` component absorbs a variable number, and a pattern whose
     components are all literal is decided by comparing the components directly
@@ -1490,6 +1491,159 @@ def _cache_glob_contains_path(pattern: str, path: str) -> bool:
     if len(pattern_parts) > len(path_parts):
         return False
     return _glob_parts_match(pattern_parts, path_parts[: len(pattern_parts)])
+
+
+_CacheGlobPlan = tuple[tuple[str, ...], tuple[tuple[str, tuple[str, ...]], ...]]
+"""Which cache globs ``tracked_cache_paths`` tests against a path, in order.
+
+The first element is the run of skipped globs whose tests reach ``fnmatch``
+before the first glob that can contain the path; then comes each glob that can
+contain the path, paired with the run of skipped globs whose tests reach
+``fnmatch`` after it, up to the next such glob.
+"""
+
+
+def _cache_glob_is_unanchored(first: str) -> bool:
+    return first == "**" or any(character in first for character in "*?[")
+
+
+class _CacheGlobIndex:
+    """For a set of cache globs, which globs ``tracked_cache_paths`` must test
+    against a path.
+
+    ``_cache_glob_contains_path`` matches a pattern's first component against
+    the path's first component, so a pattern whose first component is literal
+    can contain only paths whose first component is exactly that string; for
+    any other path it returns False. A pattern whose first component is ``**``
+    or has a wildcard can contain any path: validation refuses that form, but a
+    caller that has not validated its globs still gets those patterns tested.
+    A pattern with no components contains no path and is left out. The globs
+    kept for a path keep their order in ``cache_globs``, so a caller that stops
+    at the first accepting pattern makes the calls it would make trying every
+    pattern in turn, minus calls that return False.
+
+    A call that returns False is not always free of side effects. For a
+    pattern with a wildcard or ``**`` the matcher compares the first components
+    with ``fnmatch.fnmatchcase``, which compiles the pattern's first component
+    into a bounded least-recently-used cache, through ``re``'s own caches, or
+    refreshes it there. A later, deeply recursive ``**`` match needs more stack
+    if it meets a string that is not in that cache, and the compile itself
+    needs stack, so what the caches hold, and where a compile happens, can
+    decide whether a glob raises RecursionError. Such a call happens when the
+    path has a component, the pattern is not all literal, and the pattern has
+    ``**`` or no more components than the path. Those calls are not left out:
+    each plan lists them, in order, as runs between the globs that can contain
+    the path, so the caller still makes them, from the same place. Only calls
+    that cannot reach ``fnmatch`` are left out.
+    """
+
+    def __init__(self, cache_globs: tuple[str, ...]) -> None:
+        self._globs = tuple(
+            (pattern, parts)
+            for pattern in cache_globs
+            if (parts := _glob_pattern_parts(pattern))
+        )
+        reaching = [
+            parts
+            for _, parts in self._globs
+            if not _cache_glob_is_unanchored(parts[0])
+            and not _glob_parts_are_literal(parts)
+        ]
+        # Paths with more components than any skipped pattern without '**'
+        # make the same skipped calls, so they share a plan.
+        self._length_limit = max(
+            (len(parts) for parts in reaching if "**" not in parts), default=0
+        )
+        # How many distinct first components the runs can pass to fnmatch.
+        self.skipped_components = len({parts[0] for parts in reaching})
+        self._plans: dict[tuple[str, int], _CacheGlobPlan] = {}
+
+    def plan(self, path: str) -> _CacheGlobPlan:
+        first = path.partition("/")[0] or _first_path_component(path)
+        if not first:
+            length = 0
+        elif self._length_limit:
+            length = min(
+                sum(1 for part in path.split("/") if part), self._length_limit + 1
+            )
+        else:
+            length = 1
+        key = (first, length)
+        plan = self._plans.get(key)
+        if plan is None:
+            plan = self._plans[key] = self._build(first, length)
+        return plan
+
+    def _build(self, first: str, length: int) -> _CacheGlobPlan:
+        runs: list[list[str]] = [[]]
+        kept: list[str] = []
+        for pattern, parts in self._globs:
+            head = parts[0]
+            if head == first or _cache_glob_is_unanchored(head):
+                kept.append(pattern)
+                runs.append([])
+            elif (
+                length
+                and ("**" in parts or len(parts) <= length)
+                and not _glob_parts_are_literal(parts)
+            ):
+                runs[-1].append(pattern)
+        return (
+            tuple(runs[0]),
+            tuple((pattern, tuple(run)) for pattern, run in zip(kept, runs[1:])),
+        )
+
+
+@functools.lru_cache(maxsize=None)
+def _cache_glob_index(cache_globs: tuple[str, ...]) -> _CacheGlobIndex:
+    return _CacheGlobIndex(cache_globs)
+
+
+def _fnmatch_cache_size() -> int:
+    """How many patterns ``fnmatch`` keeps compiled, or 0 if that is unknown."""
+
+    cache_info = getattr(getattr(fnmatch, "_compile_pattern", None), "cache_info", None)
+    size = getattr(cache_info(), "maxsize", None) if callable(cache_info) else None
+    return size if isinstance(size, int) else 0
+
+
+def _cache_globs_to_test(
+    plan: _CacheGlobPlan, last_run: list[tuple[str, ...]]
+) -> Iterator[str]:
+    """Yield the globs a plan says to test against a path, in order.
+
+    ``tracked_cache_paths`` resumes this generator only after the test of the
+    pattern it yielded returned False. A run's tests all return False, and each
+    passes ``fnmatch`` only its pattern's first component. ``last_run`` holds
+    the run made last when no test has used ``fnmatch`` since; the caller
+    shares it between paths only when ``fnmatch`` can keep every first
+    component the runs can pass it. Then making that run again would find
+    each component compiled and leave ``fnmatch``'s cache, and ``re``'s, as
+    they were, so it is not made again, which keeps the paths no glob can
+    contain cheap.
+    """
+
+    first_run, kept = plan
+    if first_run and first_run != last_run[0]:
+        yield from first_run
+        last_run[0] = first_run
+    for pattern, run in kept:
+        last_run[0] = ()
+        yield pattern
+        if run:
+            yield from run
+            last_run[0] = run
+
+
+def _first_path_component(path: str) -> str:
+    """The first component ``_cache_glob_contains_path`` sees in ``path``.
+
+    The matcher skips empty components, so a leading or repeated separator
+    does not change which component comes first; a path with no components
+    yields the empty string, which no glob is indexed under.
+    """
+
+    return next((part for part in path.split("/") if part), "")
 
 
 def _validate_hook(value: str) -> str:
@@ -11135,13 +11289,30 @@ class _GitVcs:
             checkout,
             ["ls-tree", "-r", "--name-only", "-z", "HEAD"],
         )
+        # A listing holds tens of thousands of paths and nearly none are cache,
+        # so testing every path against every glob made this the audit's
+        # largest cost. Each path is tested against the globs that can contain
+        # it and, in place, against the other globs whose test reaches fnmatch
+        # and so compiles or refreshes a pattern there (see _CacheGlobIndex),
+        # all in their original order. Every glob left out would have returned
+        # False with no effect. When the same run of skipped tests was just
+        # made, and fnmatch can hold everything such runs pass it, the run is
+        # not repeated. The selection stays inline, as it was, so the matcher
+        # runs at the same stack depth and a glob deep enough to approach the
+        # recursion limit succeeds or fails exactly as before.
+        index = _cache_glob_index(tuple(cache_globs))
+        shared = index.skipped_components <= _fnmatch_cache_size()
+        last_run: list[tuple[str, ...]] = [()]
         paths = [
             path
             for output in (indexed.stdout, committed.stdout)
             for path in output.split("\x00")
             if path
             and any(
-                _cache_glob_contains_path(pattern, path) for pattern in cache_globs
+                _cache_glob_contains_path(pattern, path)
+                for pattern in _cache_globs_to_test(
+                    index.plan(path), last_run if shared else [()]
+                )
             )
         ]
         return tuple(dict.fromkeys(paths))
