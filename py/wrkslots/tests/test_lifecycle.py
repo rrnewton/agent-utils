@@ -42216,6 +42216,17 @@ def seal_absent_validate_row(
     return config, seal_path, record
 
 
+def allow_orphaned_seal_recovery(project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Admit absent-row recovery and an authoritative view of every process.
+
+    Same-boot proof that a seal actor exited counts only from the initial PID
+    namespace; pin that answer so the tests do not depend on where they run.
+    """
+
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    monkeypatch.setattr(wrkslots, "_in_initial_pid_namespace", lambda: True)
+
+
 def recover_seal_only(project: Path) -> int:
     return wrkslots.main(
         [
@@ -42281,7 +42292,7 @@ def test_orphaned_validation_seal_over_absent_row_is_retired_with_the_row(
 ) -> None:
     project, repository, _remote = make_project(tmp_path)
     config, seal_path, record = seal_absent_validate_row(project, repository)
-    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    allow_orphaned_seal_recovery(project, monkeypatch)
     active_path = control_directory(project) / "ACTIVE.testhost.json"
 
     # Seal-only recovery has nothing to restore and must not archive a row, so
@@ -42332,7 +42343,7 @@ def test_orphaned_validation_seal_retirement_resumes_each_durable_boundary(
 ) -> None:
     project, repository, _remote = make_project(tmp_path)
     config, seal_path, record = seal_absent_validate_row(project, repository)
-    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    allow_orphaned_seal_recovery(project, monkeypatch)
     seal_bytes = seal_path.read_bytes()
     input_path = write_absent_validate_input(project, [record])
 
@@ -42373,7 +42384,7 @@ def test_seal_only_recovery_retires_an_orphaned_seal_once_its_rows_are_archived(
 ) -> None:
     project, repository, _remote = make_project(tmp_path)
     config, seal_path, record = seal_absent_validate_row(project, repository)
-    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    allow_orphaned_seal_recovery(project, monkeypatch)
     input_path = write_absent_validate_input(project, [record])
 
     class Interrupted(RuntimeError):
@@ -42493,7 +42504,7 @@ def test_orphaned_validation_seal_retirement_keeps_every_other_seal_refusal(
         ]
     assert expected is not None
     expected = expected.format(pid=os.getpid())
-    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    allow_orphaned_seal_recovery(project, monkeypatch)
     input_path = write_absent_validate_input(project, rows)
     seal_before = seal_path.read_bytes()
     active_path = control_directory(project) / "ACTIVE.testhost.json"
@@ -42520,7 +42531,7 @@ def test_interrupted_seal_retirement_refuses_a_seal_it_did_not_record(
 ) -> None:
     project, repository, _remote = make_project(tmp_path)
     config, seal_path, record = seal_absent_validate_row(project, repository)
-    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    allow_orphaned_seal_recovery(project, monkeypatch)
     input_path = write_absent_validate_input(project, [record])
 
     class Interrupted(RuntimeError):
@@ -42554,7 +42565,7 @@ def test_interrupted_batch_without_seal_evidence_still_refuses_a_seal(
 ) -> None:
     project, repository, _remote = make_project(tmp_path)
     _config, seal_path, _sealed = seal_absent_validate_row(project, repository)
-    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    allow_orphaned_seal_recovery(project, monkeypatch)
     # Model a batch journal recorded with no seal evidence: hold the seal
     # outside the control directory while an unrelated batch starts.
     held_seal = tmp_path / "held-seal.journal"
@@ -42582,6 +42593,73 @@ def test_interrupted_batch_without_seal_evidence_still_refuses_a_seal(
         assert run_absent_validate_recovery(project, input_path, apply=apply) == 3
         assert "interrupted validation-batch seal recorded in" in capsys.readouterr().err
         assert tree_snapshot(control_directory(project)) == interrupted
+
+
+def test_restricted_pid_namespace_cannot_prove_an_orphaned_seal_actor_exited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    config, seal_path, record = seal_absent_validate_row(project, repository)
+    allow_orphaned_seal_recovery(project, monkeypatch)
+    input_path = write_absent_validate_input(project, [record])
+    seal_bytes = seal_path.read_bytes()
+    restricted = (
+        f"validation-batch seal actor PID {_DEAD_SEAL_ACTOR_PID} has no matching process "
+        "in this restricted PID namespace"
+    )
+
+    def assert_refused_without_change() -> None:
+        before = tree_snapshot(control_directory(project))
+        for apply in (False, True):
+            assert run_absent_validate_recovery(project, input_path, apply=apply) == 3
+            assert restricted in capsys.readouterr().err
+            assert tree_snapshot(control_directory(project)) == before
+        assert seal_path.read_bytes() == seal_bytes
+
+    # Same boot, absent PID: a nested PID namespace may simply not see the
+    # actor, so neither the plan nor the apply accepts it while the row is
+    # ACTIVE.
+    monkeypatch.setattr(wrkslots, "_in_initial_pid_namespace", lambda: False)
+    capsys.readouterr()
+    assert_refused_without_change()
+    assert [row.slot for row in wrkslots._load_active(config).slots] == ["slot01"]
+
+    # Nor once every sealed row is already archived and only the seal remains.
+    monkeypatch.setattr(wrkslots, "_in_initial_pid_namespace", lambda: True)
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(observed: str) -> None:
+        if observed == "after-absent-validate-journal-before-seal":
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    with pytest.raises(Interrupted):
+        run_absent_validate_recovery(project, input_path, apply=True)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    assert active_slots(project) == []
+    assert seal_path.read_bytes() == seal_bytes
+    monkeypatch.setattr(wrkslots, "_in_initial_pid_namespace", lambda: False)
+    capsys.readouterr()
+    assert_refused_without_change()
+
+    # A changed boot proves the exit from any process view.
+    seal = json.loads(seal_bytes)
+    seal["actor"]["boot_id"] = "0" * 32
+    wrkslots._write_validate_batch_seal_journal(config, seal)
+    rebooted_bytes = seal_path.read_bytes()
+    assert run_absent_validate_recovery(project, input_path, apply=True, output_format="json") == 0
+    resumed = capsys.readouterr()
+    assert [row["outcome"] for row in json.loads(resumed.out)["rows"]] == ["already-recovered"]
+    assert (
+        "retired orphaned validation-batch seal created "
+        f"{seal['created_at']} (SHA-256 {hashlib.sha256(rebooted_bytes).hexdigest()}); "
+        f"seal actor PID {_DEAD_SEAL_ACTOR_PID} belonged to a machine boot that ended"
+    ) in resumed.err
+    # The archive keeps the audit line the interrupted run wrote from the
+    # initial PID namespace.
+    assert_orphaned_seal_retired(project, config, seal_path, seal_bytes)
 
 
 def test_absent_validate_recovery_parses_event_history_in_bounded_passes_at_127_rows(

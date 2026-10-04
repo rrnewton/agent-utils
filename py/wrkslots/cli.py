@@ -45826,11 +45826,20 @@ _ORPHANED_VALIDATE_SEAL_KEYS = frozenset(
 def _validate_batch_seal_actor_exit(actor: ProcessIdentity) -> str:
     """Return why a seal's removal process is provably gone, or refuse.
 
-    This applies the same proof as `_assert_absent_validate_owners_dead`: only
-    a changed boot, an absent PID, or a PID with different start ticks proves
-    that the recorded process generation exited.  Matching start ticks stay
-    live, including a zombie that has not been reaped, and a seal recorded
+    Only a changed boot, an absent PID, or a PID with different start ticks
+    proves that the recorded process generation exited.  Matching start ticks
+    stay live, including a zombie that has not been reaped, and a seal recorded
     under another stable host identity is indeterminate here.
+
+    A changed boot is proof from any process view.  Within the same boot, an
+    absent PID or different start ticks are proof only from the initial PID
+    namespace, as `_assert_absent_agent_registered_liveness` requires for an
+    owner generation: a caller in a nested PID namespace cannot see a live
+    actor outside its view, so a missing or different /proc entry there proves
+    nothing.  The batch removal retires its own seal under a second lock hold
+    after its last row is archived and its storage is gone, so a recovery that
+    accepted such evidence could retire the seal of a removal that is still
+    running.
     """
 
     current_host = _host_id()
@@ -45842,14 +45851,20 @@ def _validate_batch_seal_actor_exit(actor: ProcessIdentity) -> str:
     if actor.boot_id != _boot_id(Path("/proc")):
         return f"seal actor PID {actor.pid} belonged to a machine boot that ended"
     ticks = _process_start_ticks(Path("/proc") / str(actor.pid))
+    if ticks is not None and ticks == actor.start_ticks:
+        raise Refusal(
+            f"validation-batch seal actor PID {actor.pid} generation is still live; "
+            "its removal may still be running"
+        )
+    if not _in_initial_pid_namespace():
+        raise Refusal(
+            f"validation-batch seal actor PID {actor.pid} has no matching process in "
+            "this restricted PID namespace, which cannot see every process and so "
+            "cannot prove that the actor exited; rerun from the initial PID namespace"
+        )
     if ticks is None:
         return f"seal actor PID {actor.pid} has exited"
-    if ticks != actor.start_ticks:
-        return f"seal actor PID {actor.pid} was reused; the recorded generation exited"
-    raise Refusal(
-        f"validation-batch seal actor PID {actor.pid} generation is still live; "
-        "its removal may still be running"
-    )
+    return f"seal actor PID {actor.pid} was reused; the recorded generation exited"
 
 
 def _orphaned_validate_batch_seal(
