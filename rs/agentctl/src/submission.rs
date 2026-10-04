@@ -44,6 +44,13 @@ pub const FIRST_RETRY: Duration = Duration::from_millis(500);
 pub const MAX_RETRY: Duration = Duration::from_secs(4);
 /// Screen polling interval while waiting.
 pub const POLL: Duration = Duration::from_millis(100);
+/// Longest extra wait for printed evidence once weaker evidence has proved a submission.
+///
+/// A busy agent shows its running-turn marker before the key and after it, so that marker proves
+/// only that the prompt left the composer. The screen is then read every [`POLL`] for at most
+/// this long, without sending another key, for something the pane printed after the key. The
+/// submission deadline does not shorten this wait.
+pub const PRINT_GRACE: Duration = Duration::from_secs(2);
 
 const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
 const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
@@ -75,6 +82,11 @@ pub struct SubmissionReceipt {
     pub elapsed: Duration,
     /// The screen observation that established the submission.
     pub evidence: String,
+    /// Whether `evidence` is something the pane printed after the submission key: the prompt
+    /// or its paste placeholder above the composer, or a queued-message or running-turn marker
+    /// that no screen read before the key showed. A running-turn marker that was already
+    /// showing, as it always is on a busy agent, proves only that the prompt left the composer.
+    pub printed: bool,
 }
 
 /// How a prompt submission was established.
@@ -429,6 +441,126 @@ pub(crate) fn running_turn(screen: &str) -> Option<bool> {
     Some(marked)
 }
 
+/// The queued-message marker among the rows `running_turn` searches, if `screen` shows one.
+fn queue_marker(screen: &str) -> Option<&'static str> {
+    let rows = render_screen(screen);
+    let last = rows
+        .iter()
+        .rposition(|(plain, _)| plain.iter().any(|character| !character.is_whitespace()))?;
+    rows[(last + 1).saturating_sub(RUNNING_TURN_ROWS)..=last]
+        .iter()
+        .find_map(|(plain, _)| {
+            let row = text_of(plain);
+            QUEUE_MARKERS
+                .iter()
+                .copied()
+                .find(|marker| row.contains(marker))
+        })
+}
+
+/// Whether the `rows` rows that end at the last row with text show a queued-message marker, and
+/// whether they show any marker of a running turn.
+fn markers_within(screen: &str, rows: usize) -> (bool, bool) {
+    let rendered = render_screen(screen);
+    let Some(last) = rendered
+        .iter()
+        .rposition(|(plain, _)| plain.iter().any(|character| !character.is_whitespace()))
+    else {
+        return (false, false);
+    };
+    let mut queued = false;
+    let mut running = false;
+    for (plain, _) in &rendered[(last + 1).saturating_sub(rows)..=last] {
+        let row = text_of(plain);
+        let queue = QUEUE_MARKERS.iter().any(|marker| row.contains(marker));
+        queued |= queue;
+        running |= queue || row.contains(WORKING_MARKER);
+    }
+    (queued, running)
+}
+
+/// What the screen reads before the submission key took effect showed: their markers, the most
+/// copies of the whole prompt above the composer, and, for each paste placeholder the composer
+/// showed for this prompt, the most copies of it above the composer.
+#[derive(Clone, Debug, Default)]
+struct ShownBefore {
+    queue_marker: bool,
+    running_turn: bool,
+    /// The prompt without its blanks.
+    prompt: String,
+    prompt_copies: usize,
+    /// Each numbered placeholder label the composer showed for this paste, without its blanks,
+    /// such as `[Pastedtext#3+12lines]`, and its most copies above the composer.
+    labels: Vec<(String, usize)>,
+    /// The text above the composer before the paste, without its blanks.
+    before_paste: String,
+}
+
+impl ShownBefore {
+    fn new(text: &str) -> Self {
+        Self {
+            prompt: compact(text),
+            ..Self::default()
+        }
+    }
+
+    /// Note the screen read before the paste.
+    fn note_before_paste(&mut self, view: &ComposerView) {
+        self.before_paste = compact(&view.transcript);
+        self.prompt_copies = self.before_paste.matches(self.prompt.as_str()).count();
+    }
+
+    /// Note what a screen read after the paste and before the key took effect shows. A tall
+    /// composer can push a marker above the rows `running_turn` searches, and the marker comes
+    /// back into them once the prompt leaves the composer, so the rows the composer takes are
+    /// searched as well. The composer was empty before the paste, so a numbered placeholder it
+    /// shows stands for this prompt, unless the prompt's own text holds that label.
+    fn note(&mut self, screen: &str, view: Option<&ComposerView>) {
+        let composer_rows = view.map_or(0, |view| view.composer.lines().count());
+        let (queued, running) = markers_within(screen, RUNNING_TURN_ROWS + composer_rows);
+        self.queue_marker |= queued || queue_marker(screen).is_some();
+        self.running_turn |= running || running_turn(screen) == Some(true);
+        let Some(view) = view else {
+            return;
+        };
+        for label in placeholder_labels(&view.composer) {
+            if !self.prompt.contains(label.as_str())
+                && !self.labels.iter().any(|(known, _)| *known == label)
+            {
+                let copies = self.before_paste.matches(label.as_str()).count();
+                self.labels.push((label, copies));
+            }
+        }
+        let transcript = compact(&view.transcript);
+        self.prompt_copies = self
+            .prompt_copies
+            .max(transcript.matches(self.prompt.as_str()).count());
+        for (label, copies) in &mut self.labels {
+            *copies = (*copies).max(transcript.matches(label.as_str()).count());
+        }
+    }
+}
+
+/// The numbered paste placeholders in `text`, `[Pasted text #N ...]`, each whole and without its
+/// blanks, so that `#12` is not found inside `#123`. Claude Code numbers each paste, so the label
+/// names one paste. `[Pasted Content N chars]` names only a length that another paste can share,
+/// so it is not returned.
+fn placeholder_labels(text: &str) -> Vec<String> {
+    let mut labels = Vec::new();
+    let mut rest = text;
+    while let Some(position) = rest.find("[Pasted ") {
+        let tail = &rest[position..];
+        if let Some(close) = tail.char_indices().take(80).find(|(_, c)| *c == ']') {
+            let label = &tail[..=close.0];
+            if label.starts_with("[Pasted text #") && paste_placeholders(label) == 1 {
+                labels.push(compact(label));
+            }
+        }
+        rest = &tail["[Pasted ".len()..];
+    }
+    labels
+}
+
 fn compact(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
@@ -493,6 +625,35 @@ fn corroborated(before: &ComposerView, after: &ComposerView, text: &str) -> Opti
     None
 }
 
+/// Describe what the pane printed after the submission key, if `after` shows any of it: more
+/// copies above the composer of the whole prompt, or of a numbered placeholder the composer
+/// showed for it, than any earlier read showed, or a marker that no earlier read showed. Each of
+/// these names this prompt: another prompt's copy, even one built from the same template, is not
+/// the whole of this one, and another paste has another number. `shown` says what the earlier
+/// reads showed.
+fn printed(after: &ComposerView, after_screen: &str, shown: &ShownBefore) -> Option<String> {
+    let transcript = compact(&after.transcript);
+    if transcript.matches(shown.prompt.as_str()).count() > shown.prompt_copies {
+        return Some("prompt text appeared above the composer".to_owned());
+    }
+    if shown
+        .labels
+        .iter()
+        .any(|(label, copies)| transcript.matches(label.as_str()).count() > *copies)
+    {
+        return Some("pasted prompt appeared above the composer".to_owned());
+    }
+    if !shown.queue_marker {
+        if let Some(marker) = queue_marker(after_screen) {
+            return Some(format!("agent queue marker appeared ({marker:?})"));
+        }
+    }
+    if !shown.running_turn && running_turn(after_screen) == Some(true) {
+        return Some("agent started reporting an active turn".to_owned());
+    }
+    None
+}
+
 fn submit_key(harness: &str, view: &ComposerView) -> &'static str {
     // A busy Codex steers the active turn on Enter and queues on Tab. It shows
     // the Tab hint only while it is busy and holds staged text.
@@ -508,6 +669,9 @@ fn submit_key(harness: &str, view: &ComposerView) -> &'static str {
 /// The submission key is repeated with a doubling wait while the exact text is
 /// still staged, so a key the agent dropped is retried without typing the
 /// prompt twice. A key is never repeated once the text has left the composer.
+///
+/// When only a marker that was already showing proves the submission, the screen is read for
+/// up to [`PRINT_GRACE`] more for printed evidence, and the receipt says which kind it got.
 pub fn submit_verified(
     terminal: &dyn PromptTerminal,
     pane_id: &str,
@@ -543,12 +707,20 @@ pub fn submit_verified(
             ))
         }
     };
+    let mut shown = ShownBefore {
+        queue_marker: queue_marker(&screen).is_some(),
+        // A screen that cannot tell, such as one that shows the paste hint in place of the status
+        // row, may be hiding a running turn.
+        running_turn: running_turn(&screen) != Some(false),
+        ..ShownBefore::new(text)
+    };
     let Some(before) = composer_view(harness, &screen) else {
         return refuse(format!(
             "pane {pane_id} does not show a recognisable {harness} composer \
              (a dialog or menu may be open); nothing was typed"
         ));
     };
+    shown.note_before_paste(&before);
     let draft = before.composer_solid.trim();
     if !draft.is_empty() {
         let preview: String = draft
@@ -580,7 +752,10 @@ pub fn submit_verified(
         if runtime.cancelled() {
             return cancelled_after_typing();
         }
-        if let Some(view) = composer_view(harness, &terminal.read_screen(pane_id)?) {
+        let screen = terminal.read_screen(pane_id)?;
+        let view = composer_view(harness, &screen);
+        shown.note(&screen, view.as_ref());
+        if let Some(view) = view {
             if staged(&view, text, placeholders_before) {
                 break view;
             }
@@ -608,9 +783,11 @@ pub fn submit_verified(
             return cancelled_after_typing();
         }
         let now = runtime.monotonic();
-        let current = composer_view(harness, &terminal.read_screen(pane_id)?);
+        let screen = terminal.read_screen(pane_id)?;
+        let current = composer_view(harness, &screen);
         match current {
             Some(current) if staged(&current, text, placeholders_before) => {
+                shown.note(&screen, Some(&current));
                 left_composer = false;
                 if now >= submit_deadline {
                     return Err(AdapterError::unavailable(format!(
@@ -632,12 +809,38 @@ pub fn submit_verified(
             Some(current) => {
                 left_composer = true;
                 if let Some(evidence) = corroborated(&before, &current, text) {
-                    return Ok(Submission::Verified(SubmissionReceipt {
+                    let mut receipt = SubmissionReceipt {
                         key,
                         key_presses: presses,
                         elapsed: now.saturating_sub(started),
                         evidence,
-                    }));
+                        printed: false,
+                    };
+                    // No key is sent from here on: the prompt has left the composer.
+                    let grace_deadline = now.saturating_add(PRINT_GRACE);
+                    let mut observed = Some((current, screen, now));
+                    loop {
+                        if let Some((view, screen, read_at)) = &observed {
+                            if let Some(evidence) = printed(view, screen, &shown) {
+                                receipt.elapsed = read_at.saturating_sub(started);
+                                receipt.evidence = evidence;
+                                receipt.printed = true;
+                                break;
+                            }
+                        }
+                        if runtime.monotonic() >= grace_deadline || runtime.cancelled() {
+                            break;
+                        }
+                        runtime.sleep(POLL);
+                        let Ok(screen) = terminal.read_screen(pane_id) else {
+                            break;
+                        };
+                        let read_at = runtime.monotonic();
+                        observed = composer_view(harness, &screen)
+                            .filter(|view| !staged(view, text, placeholders_before))
+                            .map(|view| (view, screen, read_at));
+                    }
+                    return Ok(Submission::Verified(receipt));
                 }
             }
             None => {}
@@ -1924,6 +2127,414 @@ mod tests {
         assert_eq!(
             running_turn(&rows(quoted, "  ⏵⏵ auto mode on")),
             Some(false)
+        );
+    }
+
+    /// Plays a screen from before the paste, one while the paste is staged, and then each
+    /// screen of `after` in turn, one per read after the submission key, repeating the last.
+    struct Frames {
+        before: String,
+        staged: String,
+        after: Vec<String>,
+        phase: std::sync::Mutex<usize>,
+        reads_after_key: std::sync::Mutex<usize>,
+        keys: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Frames {
+        fn new(before: String, staged: String, after: Vec<String>) -> Self {
+            Self {
+                before,
+                staged,
+                after,
+                phase: std::sync::Mutex::new(0),
+                reads_after_key: std::sync::Mutex::new(0),
+                keys: std::sync::Mutex::default(),
+            }
+        }
+    }
+
+    impl PromptTerminal for Frames {
+        fn read_screen(&self, _pane_id: &str) -> Result<String> {
+            match *self.phase.lock().unwrap() {
+                0 => Ok(self.before.clone()),
+                1 => Ok(self.staged.clone()),
+                _ => {
+                    let mut reads = self.reads_after_key.lock().unwrap();
+                    let frame = self.after[(*reads).min(self.after.len() - 1)].clone();
+                    *reads += 1;
+                    Ok(frame)
+                }
+            }
+        }
+
+        fn send_text(&self, _pane_id: &str, _text: &str) -> Result<()> {
+            *self.phase.lock().unwrap() = 1;
+            Ok(())
+        }
+
+        fn send_keys(&self, _pane_id: &str, keys: &str) -> Result<()> {
+            self.keys.lock().unwrap().push(keys.to_owned());
+            if keys == "Enter" {
+                *self.phase.lock().unwrap() = 2;
+            }
+            Ok(())
+        }
+    }
+
+    const IDLE_STATUS: &str = "  ⏵⏵ auto mode on";
+    const BUSY_STATUS: &str = "  ⏵⏵ auto mode on · esc to interrupt";
+    const PASTE_STATUS: &str = "  paste again to expand";
+    /// The placeholder Claude Code draws in its empty input box while messages are queued.
+    const QUEUED_PLACEHOLDER: &str =
+        "\u{1b}[7mP\u{1b}[0m\u{1b}[2mress up to edit queued messages\u{1b}[22m";
+
+    /// A plain Claude Code screen: `transcript` rows, the input box holding `composer`, and the
+    /// status row.
+    fn claude_screen(transcript: &[&str], composer: &str, status: &str) -> String {
+        let rule = "─".repeat(40);
+        let mut rows: Vec<String> = transcript.iter().map(|row| (*row).to_owned()).collect();
+        rows.extend([
+            rule.clone(),
+            format!("❯\u{a0}{composer}"),
+            rule,
+            status.to_owned(),
+        ]);
+        rows.join("\n") + "\n"
+    }
+
+    /// Submit `prompt` to `frames` as Claude Code, returning the receipt and the time it took.
+    fn submit_frames(frames: &Frames, prompt: &str) -> (SubmissionReceipt, Duration) {
+        let clock = Clock::default();
+        let outcome = submit_verified(
+            frames,
+            "w1:p1",
+            "claude",
+            prompt,
+            SubmitTimeouts::default(),
+            &clock,
+        );
+        (
+            receipt(outcome),
+            clock.monotonic() - Duration::from_millis(1_000_000),
+        )
+    }
+
+    #[test]
+    fn a_prompt_drawn_above_the_composer_is_printed_evidence() {
+        for (harness, busy) in [
+            ("claude", false),
+            ("claude", true),
+            ("codex", false),
+            ("codex", true),
+        ] {
+            let screen = FakeScreen::new(harness, busy);
+            let receipt = receipt(submit(&screen, "run the tests"));
+            assert!(receipt.printed, "{harness} busy={busy}: {receipt:?}");
+            assert_eq!(
+                receipt.evidence, "prompt text appeared above the composer",
+                "{harness} busy={busy}"
+            );
+        }
+
+        // The captured busy Claude Code screens: Enter queued the paste and drew it in full.
+        let replay = Replay::new(
+            claude_busy::before(),
+            claude_busy::staged(),
+            claude_busy::queued(),
+        );
+        let receipt = receipt(submit_verified(
+            &replay,
+            "w1:p1",
+            "claude",
+            claude_busy::PROMPT,
+            SubmitTimeouts::default(),
+            &Clock::default(),
+        ));
+        assert!(receipt.printed, "{receipt:?}");
+        assert_eq!(receipt.evidence, "prompt text appeared above the composer");
+    }
+
+    #[test]
+    fn a_running_turn_marker_that_was_already_showing_is_not_printed_evidence() {
+        let busy = claude_screen(&["• earlier"], "", BUSY_STATUS);
+        let frames = Frames::new(
+            busy.clone(),
+            claude_screen(&["• earlier"], "run the tests", BUSY_STATUS),
+            vec![busy],
+        );
+        let (receipt, took) = submit_frames(&frames, "run the tests");
+        assert_eq!(receipt.evidence, "agent reports an active turn");
+        assert!(!receipt.printed, "{receipt:?}");
+        // The first read after the key proved the submission. The reads that then looked for
+        // printed evidence, for `PRINT_GRACE`, sent no key.
+        assert_eq!(receipt.elapsed, POLL);
+        assert_eq!(took, POLL + PRINT_GRACE);
+        assert_eq!(*frames.keys.lock().unwrap(), ["Enter"]);
+    }
+
+    #[test]
+    fn printed_evidence_that_follows_a_marker_already_showing_is_waited_for() {
+        let busy = claude_screen(&["• earlier"], "", BUSY_STATUS);
+        let queued = claude_screen(&["• earlier", "❯ run the tests"], "", BUSY_STATUS);
+        let frames = Frames::new(
+            busy.clone(),
+            claude_screen(&["• earlier"], "run the tests", BUSY_STATUS),
+            vec![busy.clone(), busy.clone(), busy, queued],
+        );
+        let (receipt, took) = submit_frames(&frames, "run the tests");
+        assert_eq!(receipt.evidence, "prompt text appeared above the composer");
+        assert!(receipt.printed, "{receipt:?}");
+        // Reads 100 ms apart: the fourth after the key showed the prompt.
+        assert_eq!(receipt.elapsed, 4 * POLL);
+        assert_eq!(took, 4 * POLL);
+        assert_eq!(*frames.keys.lock().unwrap(), ["Enter"]);
+    }
+
+    #[test]
+    fn a_queued_message_marker_that_appears_after_the_key_is_printed_evidence() {
+        let frames = Frames::new(
+            claude_screen(&["• earlier"], "", BUSY_STATUS),
+            claude_screen(&["• earlier"], "run the tests", BUSY_STATUS),
+            vec![claude_screen(
+                &["• earlier"],
+                QUEUED_PLACEHOLDER,
+                BUSY_STATUS,
+            )],
+        );
+        let (receipt, took) = submit_frames(&frames, "run the tests");
+        assert_eq!(
+            receipt.evidence,
+            "agent queue marker appeared (\"Press up to edit queued messages\")"
+        );
+        assert!(receipt.printed, "{receipt:?}");
+        assert_eq!((receipt.elapsed, took), (POLL, POLL));
+    }
+
+    #[test]
+    fn a_queued_message_marker_that_was_already_showing_is_not_printed_evidence() {
+        let queued = claude_screen(&["• earlier"], QUEUED_PLACEHOLDER, BUSY_STATUS);
+        let frames = Frames::new(
+            queued.clone(),
+            claude_screen(&["• earlier"], "run the tests", BUSY_STATUS),
+            vec![queued],
+        );
+        let (receipt, took) = submit_frames(&frames, "run the tests");
+        assert!(!receipt.printed, "{receipt:?}");
+        assert_eq!(took, POLL + PRINT_GRACE);
+    }
+
+    #[test]
+    fn a_running_turn_marker_that_appears_after_the_key_is_printed_evidence() {
+        let frames = Frames::new(
+            claude_screen(&["• earlier"], "", IDLE_STATUS),
+            claude_screen(&["• earlier"], "run the tests", IDLE_STATUS),
+            vec![claude_screen(&["• earlier"], "", BUSY_STATUS)],
+        );
+        let (receipt, took) = submit_frames(&frames, "run the tests");
+        assert_eq!(receipt.evidence, "agent started reporting an active turn");
+        assert!(receipt.printed, "{receipt:?}");
+        assert_eq!((receipt.elapsed, took), (POLL, POLL));
+    }
+
+    #[test]
+    fn a_prompt_row_shown_while_the_prompt_was_staged_is_not_printed_evidence() {
+        let before = claude_screen(&["• earlier"], "", BUSY_STATUS);
+        let staged = claude_screen(
+            &["• earlier", "❯ run the tests"],
+            "run the tests",
+            BUSY_STATUS,
+        );
+        let after = claude_screen(&["• earlier", "❯ run the tests"], "", BUSY_STATUS);
+        let frames = Frames::new(before, staged, vec![after]);
+        let (receipt, _) = submit_frames(&frames, "run the tests");
+        assert!(!receipt.printed, "{receipt:?}");
+        assert_eq!(*frames.keys.lock().unwrap(), ["Enter"]);
+    }
+
+    #[test]
+    fn a_placeholder_row_shown_while_the_prompt_was_staged_is_not_printed_evidence() {
+        let before = claude_screen(&["• earlier"], "", BUSY_STATUS);
+        let staged = claude_screen(
+            &["• earlier", "❯ [Pasted text #923 +10 lines]"],
+            "[Pasted text #924 +10 lines]",
+            BUSY_STATUS,
+        );
+        let after = claude_screen(
+            &["• earlier", "❯ [Pasted text #923 +10 lines]"],
+            "",
+            BUSY_STATUS,
+        );
+        let frames = Frames::new(before, staged, vec![after]);
+        let (receipt, _) = submit_frames(&frames, claude_busy::PROMPT);
+        assert!(!receipt.printed, "{receipt:?}");
+        assert_eq!(*frames.keys.lock().unwrap(), ["Enter"]);
+    }
+
+    #[test]
+    fn a_new_prompt_ending_like_an_older_row_is_printed_evidence_by_its_start() {
+        // The older row scrolls away as the new one appears, so the count of rows ending like the
+        // prompt does not grow, but the count of rows starting like it does.
+        let tail = "x".repeat(40);
+        let old_row = format!("❯ OLD unrelated request {tail}");
+        let prompt = format!("NEW current request {tail}");
+        let new_row = format!("❯ {prompt}");
+        let frames = Frames::new(
+            claude_screen(&["• earlier", old_row.as_str()], "", BUSY_STATUS),
+            claude_screen(&["• earlier", old_row.as_str()], &prompt, BUSY_STATUS),
+            vec![claude_screen(
+                &["• earlier", new_row.as_str()],
+                "",
+                BUSY_STATUS,
+            )],
+        );
+        let (receipt, _) = submit_frames(&frames, &prompt);
+        assert!(receipt.printed, "{receipt:?}");
+        assert_eq!(receipt.evidence, "prompt text appeared above the composer");
+        assert_eq!(*frames.keys.lock().unwrap(), ["Enter"]);
+    }
+
+    #[test]
+    fn a_new_chat_prompt_sharing_its_edges_with_an_older_row_is_printed_evidence() {
+        let header = "The user's request arrived through the configured chat bridge.";
+        let trailer = "Complete this request using your normal instructions and tools. Use the \
+                       same two lines for every reply, with no tool call between them.";
+        let old_prompt =
+            format!("{header}\nSource: spaces/example/messages/old\nOld request body\n\n{trailer}");
+        let prompt =
+            format!("{header}\nSource: spaces/example/messages/new\nNew request body\n\n{trailer}");
+        let old_row = format!("❯ {old_prompt}");
+        let new_row = format!("❯ {prompt}");
+        let frames = Frames::new(
+            claude_screen(&["• earlier", old_row.as_str()], "", BUSY_STATUS),
+            claude_screen(&["• earlier", old_row.as_str()], &prompt, BUSY_STATUS),
+            vec![claude_screen(
+                &["• earlier", new_row.as_str()],
+                "",
+                BUSY_STATUS,
+            )],
+        );
+        let (receipt, _) = submit_frames(&frames, &prompt);
+        assert!(receipt.printed, "{receipt:?}");
+        assert_eq!(*frames.keys.lock().unwrap(), ["Enter"]);
+    }
+
+    #[test]
+    fn a_running_turn_marker_above_a_tall_staged_composer_is_not_printed_evidence() {
+        /// Frames whose Tab key, which a busy Codex queues with, also takes effect.
+        struct TabFrames(Frames);
+        impl PromptTerminal for TabFrames {
+            fn read_screen(&self, pane_id: &str) -> Result<String> {
+                self.0.read_screen(pane_id)
+            }
+            fn send_text(&self, pane_id: &str, text: &str) -> Result<()> {
+                self.0.send_text(pane_id, text)
+            }
+            fn send_keys(&self, pane_id: &str, keys: &str) -> Result<()> {
+                self.0.send_keys(pane_id, keys)?;
+                if keys == "Tab" {
+                    *self.0.phase.lock().unwrap() = 2;
+                }
+                Ok(())
+            }
+        }
+        let prompt = (0..20)
+            .map(|n| format!("request line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let before = "• earlier\n› \u{1b}[2mAsk Codex to do anything\u{1b}[22m\n\n  99% context\n"
+            .to_owned();
+        // The turn started while the prompt was staged; its progress row sits above a composer
+        // of 20 rows, out of the rows `running_turn` searches.
+        let mut staged_rows = vec![
+            "• earlier".to_owned(),
+            "• Working (esc to interrupt)".to_owned(),
+        ];
+        staged_rows.extend(
+            prompt
+                .lines()
+                .enumerate()
+                .map(|(index, line)| format!("{} {line}", if index == 0 { "›" } else { " " })),
+        );
+        staged_rows.extend([
+            String::new(),
+            "  tab to queue message                 99% context".to_owned(),
+        ]);
+        let staged = staged_rows.join("\n") + "\n";
+        assert_eq!(running_turn(&staged), Some(false));
+        let after = "• earlier\n• Working (esc to interrupt)\n› \u{1b}[2mAsk Codex to do \
+                     anything\u{1b}[22m\n\n  99% context\n"
+            .to_owned();
+        assert_eq!(
+            composer_view("codex", &staged).unwrap().transcript,
+            composer_view("codex", &after).unwrap().transcript
+        );
+        let frames = TabFrames(Frames::new(before, staged, vec![after]));
+        let receipt = receipt(submit_verified(
+            &frames,
+            "w1:p1",
+            "codex",
+            &prompt,
+            SubmitTimeouts::default(),
+            &Clock::default(),
+        ));
+        assert!(!receipt.printed, "{receipt:?}");
+        assert_eq!(*frames.0.keys.lock().unwrap(), ["Tab"]);
+    }
+
+    #[test]
+    fn a_running_turn_marker_shown_while_the_prompt_was_staged_is_not_printed_evidence() {
+        // The turn started between the paste and the key, so the marker after the key is not
+        // something the key caused.
+        let frames = Frames::new(
+            claude_screen(&["• earlier"], "", IDLE_STATUS),
+            claude_screen(&["• earlier"], "run the tests", BUSY_STATUS),
+            vec![claude_screen(&["• earlier"], "", BUSY_STATUS)],
+        );
+        let (receipt, _) = submit_frames(&frames, "run the tests");
+        assert_eq!(receipt.evidence, "agent reports an active turn");
+        assert!(!receipt.printed, "{receipt:?}");
+    }
+
+    #[test]
+    fn a_paste_hint_before_the_paste_may_hide_a_running_turn() {
+        // Claude Code draws the hint in place of its status row for a while after any paste, so
+        // the screen before this paste cannot tell whether a turn was already running.
+        let frames = Frames::new(
+            claude_screen(&["• earlier"], "", PASTE_STATUS),
+            claude_screen(&["• earlier"], "[Pasted text #924 +10 lines]", PASTE_STATUS),
+            vec![claude_screen(&["• earlier"], "", BUSY_STATUS)],
+        );
+        let (receipt, took) = submit_frames(&frames, claude_busy::PROMPT);
+        assert_eq!(receipt.evidence, "agent reports an active turn");
+        assert!(!receipt.printed, "{receipt:?}");
+        assert_eq!(took, POLL + PRINT_GRACE);
+    }
+
+    #[test]
+    fn stop_ends_the_wait_for_printed_evidence_at_the_next_poll() {
+        let busy = claude_screen(&["• earlier"], "", BUSY_STATUS);
+        let frames = Frames::new(
+            busy.clone(),
+            claude_screen(&["• earlier"], "run the tests", BUSY_STATUS),
+            vec![busy],
+        );
+        let runtime = StoppingClock {
+            clock: Clock::default(),
+            stop_after: Duration::from_millis(500),
+        };
+        let receipt = receipt(submit_verified(
+            &frames,
+            "w1:p1",
+            "claude",
+            "run the tests",
+            SubmitTimeouts::default(),
+            &runtime,
+        ));
+        assert!(!receipt.printed, "{receipt:?}");
+        assert_eq!(
+            runtime.monotonic() - Duration::from_millis(1_000_000),
+            Duration::from_millis(500)
         );
     }
 }

@@ -480,6 +480,13 @@ pub trait AgentRuntime {
     fn delivery_wait_chunk(&self) -> Option<Duration> {
         None
     }
+    /// Note that a queue drain typed the queued prompt `message_id`, and that the pane printed
+    /// it after the submission key. The drain calls this before it records the prompt as
+    /// processed, so a note saved here is not lost when the drain stops in between. The default
+    /// ignores the note.
+    fn prompt_printed(&self, message_id: &str) {
+        let _ = message_id;
+    }
 }
 
 /// Production wall-clock runtime for readiness polling.
@@ -835,7 +842,10 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                 blocked = Some(detail);
                 break;
             }
-            Ok(Delivered::Confirmed) => {
+            Ok(Delivered::Confirmed { printed }) => {
+                if printed {
+                    runtime.prompt_printed(&identifier);
+                }
                 document.insert("delivery_state".to_owned(), json!("processed"));
                 document.insert("confirmed_at".to_owned(), json!(unix_seconds()));
                 atomic_json(&inflight_path, &Value::Object(document))?;
@@ -1288,7 +1298,10 @@ fn wait_ready<A: AgentApi + ?Sized>(
 /// Result of one delivery that did not fail after typing began.
 enum Delivered {
     /// The prompt was submitted and confirmed.
-    Confirmed,
+    Confirmed {
+        /// Whether the screen showed something the pane printed after the submission key.
+        printed: bool,
+    },
     /// Nothing was typed, so the prompt remains safe to retry.
     NotStaged(String),
 }
@@ -1311,7 +1324,11 @@ fn deliver_one<A: AgentApi + ?Sized>(
     match submission {
         // The screen already proved the prompt left the composer. A lifecycle
         // transition adds nothing and is absent when the agent queues the prompt.
-        Submission::Verified(_) => return Ok(Delivered::Confirmed),
+        Submission::Verified(receipt) => {
+            return Ok(Delivered::Confirmed {
+                printed: receipt.printed,
+            })
+        }
         Submission::NotStaged(reason) => return Ok(Delivered::NotStaged(reason)),
         Submission::Unconfirmed => {}
     }
@@ -1319,7 +1336,7 @@ fn deliver_one<A: AgentApi + ?Sized>(
         let millis = working_timeout.as_millis().clamp(1, u64::MAX.into()) as u64;
         return client
             .wait_agent_status_with_runtime(&info.pane_id, "working", millis, runtime)
-            .map(|()| Delivered::Confirmed)
+            .map(|()| Delivered::Confirmed { printed: false })
             .map_err(|error| {
                 AgentError::delivery(format!(
                     "pane {} did not confirm idle/done -> working submission: {error}",
@@ -1347,7 +1364,7 @@ fn deliver_one<A: AgentApi + ?Sized>(
         let wait = chunk.min(remaining);
         let millis = wait.as_millis().clamp(1, u64::MAX.into()) as u64;
         match client.wait_agent_status_with_runtime(&info.pane_id, "working", millis, runtime) {
-            Ok(()) => return Ok(Delivered::Confirmed),
+            Ok(()) => return Ok(Delivered::Confirmed { printed: false }),
             Err(error) => last_error = Some(error.to_string()),
         }
     }
@@ -2982,6 +2999,92 @@ mod tests {
         contradiction.pane_id = Some("w1:p9".to_owned());
         let error = resolve_target(&fake, &contradiction).unwrap_err();
         assert!(error.to_string().contains("expected exact pane"));
+    }
+
+    /// A runtime that keeps `FakeRuntime`'s clock and notes each prompt reported printed, with
+    /// how many prompts the queue at `queue` had in `inflight` and `processed` at that moment.
+    #[derive(Default)]
+    struct PrintNotingRuntime {
+        clock: FakeRuntime,
+        printed: Mutex<Vec<String>>,
+        queue: Option<PathBuf>,
+        queue_when_printed: Mutex<Vec<(usize, usize)>>,
+    }
+
+    impl AgentRuntime for PrintNotingRuntime {
+        fn monotonic(&self) -> Duration {
+            self.clock.monotonic()
+        }
+
+        fn sleep(&self, duration: Duration) {
+            self.clock.sleep(duration);
+        }
+
+        fn prompt_printed(&self, message_id: &str) {
+            self.printed
+                .lock()
+                .expect("printed prompts")
+                .push(message_id.to_owned());
+            if let Some(queue) = &self.queue {
+                let count = |name: &str| json_paths(&queue.join(name)).expect("queue files").len();
+                self.queue_when_printed
+                    .lock()
+                    .expect("queue counts")
+                    .push((count("inflight"), count("processed")));
+            }
+        }
+    }
+
+    #[test]
+    fn a_drain_notes_a_prompt_only_when_the_pane_printed_it_after_the_submission_key() {
+        let directory = TestDirectory::new("printed");
+        let fake = FakeAgent::with_screen(crate::submission::fake::FakeScreen::new("codex", false));
+        let runtime = PrintNotingRuntime {
+            queue: Some(directory.path().to_owned()),
+            ..PrintNotingRuntime::default()
+        };
+        let result = send_with_runtime(
+            &fake,
+            &target(),
+            directory.path(),
+            "print me",
+            DrainOptions::default(),
+            &runtime,
+        )
+        .unwrap();
+        assert_eq!(result.outcome, QueueOutcome::Delivered);
+        assert_eq!(
+            *runtime.printed.lock().expect("printed prompts"),
+            [result.message_id]
+        );
+        // The note comes while the prompt is still in flight, before the queue records it as
+        // processed, so a stop between the two does not lose it.
+        assert_eq!(
+            *runtime.queue_when_printed.lock().expect("queue counts"),
+            [(1, 0)]
+        );
+        assert_eq!(
+            json_paths(&directory.path().join("processed"))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Without a screen to read, only the working state confirms the delivery.
+        let directory = TestDirectory::new("unprinted");
+        let fake = FakeAgent::new(&["idle"]);
+        let runtime = PrintNotingRuntime::default();
+        let result = send_with_runtime(
+            &fake,
+            &target(),
+            directory.path(),
+            "trust me",
+            DrainOptions::default(),
+            &runtime,
+        )
+        .unwrap();
+        assert_eq!(result.delivered, [result.message_id]);
+        assert!(runtime.printed.lock().expect("printed prompts").is_empty());
     }
 
     #[test]

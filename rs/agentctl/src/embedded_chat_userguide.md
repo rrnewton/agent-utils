@@ -1246,6 +1246,86 @@ null while no reply is sent or when the first reply's record cannot be read,
 `reason` are null once the prompt is recorded as typed. Like the rest of
 `chat status`, these need no running service.
 
+When `ack_reaction` is set, the service also adds ✅ to a request's Chat
+message once the pane has printed the request's prompt. After the queue presses
+the key that submits a prompt, it looks on the screen for something the pane
+printed after the key: more copies above the composer of the whole prompt,
+blanks left out, or of a numbered paste placeholder the composer showed for
+this prompt, such as `[Pasted text #924 +10 lines]`, than any read before the
+key showed; a queued-message marker; or a running-turn marker that no read
+before the key showed. Each of these names this prompt: an older prompt built
+from the same template is not the whole of this one, and another paste has
+another number. A placeholder that names only a length, `[Pasted Content N
+chars]`, is not evidence, since another paste can have the same length, and
+nor is placeholder text that is part of the prompt itself. A prompt too long to
+show whole and shown without a numbered placeholder earns ✅ only by a marker. A
+busy agent shows its running-turn marker before the key and after it, so a
+marker that was already showing proves only that the prompt left the composer. When that is all the queue finds, it reads the screen
+every 100 milliseconds for up to 2 more seconds, pressing no other key, for
+printed evidence. The prompt is recorded as typed either way, but only a prompt
+with printed evidence earns ✅. Only a submission checked against the Claude
+Code or Codex composer, as described here, gives that evidence. Any other
+submission is recorded as typed once the pane's own confirmation succeeds:
+herdr reporting the pane `working`, or the check of its screen after the key
+that some panes' adapters make. That confirmation carries no printed evidence,
+so such a prompt earns no ✅. The delivery
+alarm above covers a prompt that is not recorded as typed at all.
+
+`chat init` refuses ✅ as the `ack_reaction`, since ✅ marks a printed prompt. A
+state made before with ✅ as its acknowledgement still opens; its
+acknowledgement already shows ✅ once the request is acknowledged, and no
+separate receipt is added.
+
+Each prompt that a drain types and the queue finds printed earns its request
+✅, subject to the limits below, including the other requests' prompts that the
+drain reaches and those it types while it delivers a routing-error prompt. A request admitted while
+`ack_reaction` was `null` earns none. The service saves the ✅ as soon as the
+queue finds the prompt printed, before the queue records the prompt as
+processed and before the pass records it as typed, as
+`receipt-reactions/KEY.json` in the bridge state directory, where KEY is the
+request's key, with the request's channel and message and an operation ID that
+every attempt to add the reaction reuses, so that a retry after a failure or a
+restart repeats one operation. The file is removed once the helper reports the
+reaction added. Saving does not wait for the reaction, and a request can retire
+before its ✅ is added, since the file names the message itself. A printed
+prompt earns none when the process ends after the queue finds it printed and
+before the file is written, or when the file cannot be written, which the pass
+reports as an error.
+
+At most 2,048 ✅ reactions wait at once. Prompt delivery and chat intake never
+wait for room: a ✅ earned while 2,048 wait is lost, and the loss is counted in
+`receipt-reactions-lost.json` in the state directory. `chat status` reports the
+count as `lost` in `receipt_reactions`, with `oldest_lost_key`, the key of the
+first request that lost one, and as `receipt_reactions_lost` in
+`delivery_alarm`, with `count` and `oldest_key`. In `chat run`,
+`delivery-alarm.json` holds the same `receipt_reactions_lost` once any ✅ is
+lost; as for stalled requests, only `run` writes that file. The count is kept
+for the life of the state directory. When losses start, the pass that loses
+the first ✅ puts one line in `receipt_loss_alerts`, naming the request, and no
+other until a ✅ has been saved since; `chat run` logs that line, and `chat
+tick` prints it in its report. A pass also lists the keys whose ✅ it lost in
+`receipts_lost`.
+
+In `chat run`, the worker that adds reaction ACKs, described under
+Configuration, adds the ✅ reactions too, one at a time through its bounded
+queue, after every ACK it has waiting, including those that did not fit in its
+queue and those whose retry is due. A ✅ that does not fit stays saved, and the
+worker lists the saved ones again after draining its queue. A failed or
+uncertain ✅ keeps its file and its operation ID and waits at least 60 seconds
+before the worker tries it again; the file records when that attempt was made,
+so a restart waits out the rest of the 60 seconds too. When `run` starts, it
+hands the worker every ✅ already saved. `chat tick` adds at most four saved ✅
+reactions each time it runs, least recently tried first, so one that always
+fails does not hold back the rest. The outbound helper receives each as the
+same `ensure_reaction` request as an ACK, with `✅` as its emoji, so a helper
+must accept ✅ as well as the configured `ack_reaction`. A saved reaction's
+path, `receipt-reactions/KEY.json`, that holds something other than a regular
+file is not opened and counts as failing; nor is the record of losses opened
+when it is not a regular file. `chat status` reports `receipt_reactions`, with `reaction`, which is
+`✅`; `waiting`, the number saved and not yet added; `failing`, how many of
+those failed at their last attempt or cannot be read; and the `lost` and
+`oldest_lost_key` above.
+
 ## Service management
 
 `chat run` is a foreground process and exits cleanly after SIGINT or SIGTERM.

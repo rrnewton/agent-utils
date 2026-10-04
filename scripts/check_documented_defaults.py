@@ -959,6 +959,114 @@ PINS: tuple[Pin, ...] = (
             ),
         ),
     ),
+    # The ✅ receipt reaction: how long the queue looks for printed evidence, how often it reads
+    # the screen meanwhile, and the bounds on adding the reactions it saves.
+    Pin(
+        "chat-print-grace-seconds",
+        "the longest extra wait for evidence that the pane printed a submitted prompt, in seconds",
+        code=(
+            Site(
+                "rs/agentctl/src/submission.rs",
+                r"(?m)^pub const PRINT_GRACE: Duration = Duration::from_secs\((?P<value>[\d_]+)\);$",
+                "the Rust grace period",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"for\s+up\s+to\s+(?P<value>[A-Za-z\d,]+)\s+more\s+seconds,\s+pressing\s+no\s+other\s+key",
+                "the grace period the chat guide states",
+            ),
+        ),
+    ),
+    Pin(
+        "chat-submission-poll-millis",
+        "how often the queue reads the screen while it waits on a submitted prompt, in milliseconds",
+        code=(
+            Site(
+                "rs/agentctl/src/submission.rs",
+                r"(?m)^pub const POLL: Duration = Duration::from_millis\((?P<value>[\d_]+)\);$",
+                "the Rust screen polling interval",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"reads\s+the\s+screen\s+every\s+(?P<value>[A-Za-z\d,]+)\s+milliseconds\s+for\s+up\s+to",
+                "the polling interval the chat guide states for printed evidence",
+            ),
+        ),
+    ),
+    Pin(
+        "chat-ack-retry-seconds",
+        "the least time `chat run` waits before it tries a failed or uncertain reaction again, in"
+        " seconds",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_service.rs",
+                r"(?m)^const ACK_RETRY_DELAY: Duration = Duration::from_secs\((?P<value>[\d_]+)\);$",
+                "the Rust retry delay",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"wait\s+at\s+least\s+(?P<value>[A-Za-z\d,]+)\s+seconds\s+before\s+an\s+in-process\s+retry",
+                "the ACK retry delay the chat guide states",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"waits\s+at\s+least\s+(?P<value>[A-Za-z\d,]+)\s+seconds\s+before\s+the\s+worker\s+tries\s+it\s+again",
+                "the receipt reaction retry delay the chat guide states",
+            ),
+        ),
+    ),
+    Pin(
+        "chat-keys-per-pass",
+        "the requests one chat pass handles, and the saved ✅ reactions one `chat tick` adds",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_service.rs",
+                r"(?m)^const MAX_KEYS_PER_PASS: usize = (?P<value>[\d_]+);$",
+                "the Rust per-pass bound",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"That\s+pass\s+handles\s+at\s+most\s+(?P<value>[A-Za-z\d,]+)\s+requests",
+                "the startup recovery pass bound the chat guide states",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"`chat\s+tick`\s+adds\s+at\s+most\s+(?P<value>[A-Za-z\d,]+)\s+saved\s+✅\s+reactions",
+                "the receipt reactions per tick the chat guide states",
+            ),
+        ),
+    ),
+    Pin(
+        "chat-request-limit",
+        "the active requests one chat state holds, and the ✅ reactions that may wait at once",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_runtime.rs",
+                r"(?m)^const MAX_REQUESTS: u64 = (?P<value>[\d_]+);$",
+                "the Rust request cap",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"The\s+active\s+population\s+remains\s+capped\s+at\s+(?P<value>[A-Za-z\d,]+)\s+requests",
+                "the request cap the chat guide states",
+            ),
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"At\s+most\s+(?P<value>[A-Za-z\d,]+)\s+✅\s+reactions\s+wait\s+at\s+once",
+                "the receipt reaction cap the chat guide states",
+            ),
+        ),
+    ),
 )
 
 

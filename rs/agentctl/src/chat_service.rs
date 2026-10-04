@@ -1,6 +1,6 @@
 //! Launchable orchestration for the durable chat runtime.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::io;
@@ -185,6 +185,13 @@ pub struct CycleReport {
     pub delivery_uncertain: Vec<String>,
     /// Request keys whose configured acknowledgement is reconciled.
     pub acknowledged: Vec<String>,
+    /// Request keys whose ✅ receipt reaction was added during this pass.
+    pub receipted: Vec<String>,
+    /// Request keys whose ✅ receipt reaction was lost during this pass because too many were
+    /// waiting.
+    pub receipts_lost: Vec<String>,
+    /// One line for each time such losses started during this pass; `chat run` also logs it.
+    pub receipt_loss_alerts: Vec<String>,
     /// Newly captured reply ordinals by request key.
     pub captured: Vec<(String, Vec<u32>)>,
     /// Provider message receipts for replies sent during this pass.
@@ -225,6 +232,8 @@ impl CycleReport {
         self.delivery_uncertain
             .append(&mut other.delivery_uncertain);
         self.acknowledged.append(&mut other.acknowledged);
+        self.receipted.append(&mut other.receipted);
+        self.receipts_lost.append(&mut other.receipts_lost);
         self.captured.append(&mut other.captured);
         self.sent.append(&mut other.sent);
         self.snapshot_truncated |= other.snapshot_truncated;
@@ -237,6 +246,8 @@ impl CycleReport {
         self.recovery_requested |= other.recovery_requested;
         self.processed_keys.append(&mut other.processed_keys);
         self.prompt_typed |= other.prompt_typed;
+        self.receipt_loss_alerts
+            .append(&mut other.receipt_loss_alerts);
     }
 
     fn error(&mut self, operation: &str, key: &str, error: impl fmt::Display) {
@@ -884,6 +895,12 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
 
     if let Some(queue) = ack_queue.as_ref() {
         queue.enqueue(state.pending_ack_keys()?);
+        match state.receipt_reaction_attempts() {
+            Ok(attempts) => queue_saved_receipts(queue, attempts),
+            Err(error) => service_log(format_args!(
+                "agentctl: chat receipt reactions could not be listed: {error}"
+            )),
+        }
     }
     let stop = Arc::new(StopState {
         ack_queue: ack_queue.clone(),
@@ -1064,7 +1081,14 @@ struct AckQueueState {
     pending: VecDeque<String>,
     retained: BTreeSet<String>,
     retry_at: BTreeMap<String, Instant>,
+    // The ✅ receipt reactions to add, kept as the acknowledgements above are.
+    receipts: VecDeque<String>,
+    receipts_retained: BTreeSet<String>,
+    receipt_retry_at: BTreeMap<String, Instant>,
     rescan: bool,
+    // Receipt reactions that did not fit wait for their own rescan, after the queued ones, so a
+    // full receipt queue never puts a rescan ahead of the acknowledgements.
+    receipt_rescan: bool,
     stopped: bool,
 }
 
@@ -1076,6 +1100,7 @@ struct AckQueue {
 
 enum AckWork {
     Request(String),
+    Receipt(String),
     Reconcile,
 }
 
@@ -1108,6 +1133,55 @@ impl AckQueue {
         self.changed.notify_one();
     }
 
+    /// Queue the ✅ receipt reactions saved under `keys`, as `enqueue` queues acknowledgements.
+    fn enqueue_receipts(&self, keys: impl IntoIterator<Item = String>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.stopped {
+            return;
+        }
+        let now = Instant::now();
+        for key in keys {
+            if state.receipts_retained.contains(&key)
+                || state
+                    .receipt_retry_at
+                    .get(&key)
+                    .is_some_and(|retry| *retry > now)
+            {
+                continue;
+            }
+            if state.receipts_retained.len() >= ACK_QUEUE_CAPACITY {
+                // The reaction stays saved, and the worker lists the saved ones again after
+                // draining this queue.
+                state.receipt_rescan = true;
+                continue;
+            }
+            state.receipt_retry_at.remove(&key);
+            state.receipts_retained.insert(key.clone());
+            state.receipts.push_back(key);
+        }
+        self.changed.notify_one();
+    }
+
+    /// Hold the ✅ receipt reaction saved under `key` until `due`, as a failed one is held: a
+    /// reaction whose last attempt failed less than `ACK_RETRY_DELAY` ago, as at a restart.
+    fn defer_receipt(&self, key: String, due: Instant) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.stopped
+            || state.receipts_retained.contains(&key)
+            || state.receipt_retry_at.len() >= MAX_DIRECT_REQUEST_KEYS
+        {
+            return;
+        }
+        state.receipt_retry_at.insert(key, due);
+        self.changed.notify_one();
+    }
+
     fn stop(&self) {
         let mut state = self
             .state
@@ -1131,15 +1205,37 @@ impl AckQueue {
             if let Some(key) = state.pending.pop_front() {
                 return Some(AckWork::Request(key));
             }
+            // Acknowledgements that did not fit, or whose retry is due, come before any receipt
+            // reaction.
             if state.rescan {
                 state.rescan = false;
                 return Some(AckWork::Reconcile);
             }
-            let next_retry = state.retry_at.values().min().copied();
+            let now = Instant::now();
+            if state.retry_at.values().any(|retry| *retry <= now) {
+                state.retry_at.retain(|_, deadline| *deadline > now);
+                return Some(AckWork::Reconcile);
+            }
+            // Before the receipt rescan, which lists the saved receipt reactions again: a rescan
+            // that came first would find the queued ones already queued and ask for another.
+            if let Some(key) = state.receipts.pop_front() {
+                return Some(AckWork::Receipt(key));
+            }
+            if state.receipt_rescan {
+                state.receipt_rescan = false;
+                return Some(AckWork::Reconcile);
+            }
+            let next_retry = state
+                .retry_at
+                .values()
+                .chain(state.receipt_retry_at.values())
+                .min()
+                .copied();
             if let Some(retry) = next_retry {
                 let now = Instant::now();
                 if retry <= now {
                     state.retry_at.retain(|_, deadline| *deadline > now);
+                    state.receipt_retry_at.retain(|_, deadline| *deadline > now);
                     return Some(AckWork::Reconcile);
                 }
                 state = self
@@ -1175,6 +1271,49 @@ impl AckQueue {
         }
         self.changed.notify_one();
     }
+
+    /// Note that the worker finished with the ✅ receipt reaction under `key`, as `finished`
+    /// notes an acknowledgement.
+    fn receipt_finished(&self, key: &str, failed: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.receipts_retained.remove(key);
+        if failed {
+            // A reaction that failed stays saved, and the state holds at most one for each
+            // request, so this map is bounded by the request limit as well.
+            if state.receipt_retry_at.len() < MAX_DIRECT_REQUEST_KEYS {
+                state
+                    .receipt_retry_at
+                    .insert(key.to_owned(), Instant::now() + ACK_RETRY_DELAY);
+            }
+        } else {
+            state.receipt_retry_at.remove(key);
+        }
+        self.changed.notify_one();
+    }
+}
+
+/// Queue the saved ✅ receipt reactions listed in `attempts`, holding each whose last attempt
+/// failed less than `ACK_RETRY_DELAY` ago until that delay has passed, so a restart does not try
+/// it again sooner.
+fn queue_saved_receipts(queue: &AckQueue, attempts: Vec<(String, Option<u64>)>) {
+    let now_millis = chat_runtime::unix_millis();
+    let now = Instant::now();
+    let mut due = Vec::new();
+    for (key, attempted) in attempts {
+        let left = attempted.and_then(|at| {
+            ACK_RETRY_DELAY
+                .checked_sub(Duration::from_millis(now_millis.saturating_sub(at)))
+                .filter(|left| !left.is_zero())
+        });
+        match left {
+            Some(left) => queue.defer_receipt(key, now + left),
+            None => due.push(key),
+        }
+    }
+    queue.enqueue_receipts(due);
 }
 
 /// Start the ACK worker thread. It writes each failed acknowledgement as one line through `log`;
@@ -1202,8 +1341,24 @@ fn spawn_ack_worker(
                             log_report(&report, &log);
                             wake_output(&output_wake);
                         }
+                        AckWork::Receipt(key) => {
+                            let result = state.ensure_receipt_reaction(&key, &mut transport);
+                            queue.receipt_finished(&key, result.is_err());
+                            let mut report = CycleReport::default();
+                            record_receipt_reaction(&mut report, &key, result);
+                            log_report(&report, &log);
+                        }
                         AckWork::Reconcile => match state.pending_ack_keys() {
-                            Ok(keys) => queue.enqueue(keys),
+                            Ok(keys) => {
+                                queue.enqueue(keys);
+                                match state.receipt_reaction_attempts() {
+                                    Ok(attempts) => queue_saved_receipts(&queue, attempts),
+                                    Err(error) => log(format_args!(
+                                        "agentctl: chat receipt reactions could not be listed: \
+                                         {error}"
+                                    )),
+                                }
+                            }
                             Err(error) => {
                                 stop.record_cleanup_error(format!("ACK recovery failed: {error}"));
                                 stop.stop();
@@ -1375,6 +1530,7 @@ fn recover_pass<A: ManagedApi + ?Sized>(
     if keys.len() > MAX_KEYS_PER_PASS {
         report.more_work = true;
     }
+    add_receipt_reactions(state, control, &mut report);
     *routes = RouteCache::from_entries(state.reply_route_entries()?);
     Ok(report)
 }
@@ -1411,12 +1567,14 @@ fn process_keys_with_delivery(
     if keys.is_empty() {
         return Ok(CycleReport::default());
     }
-    let typed = Cell::new(false);
+    let notes = TypingNotes::default();
+    let async_ack = control.stop.and_then(|stop| stop.ack_queue.as_ref());
     let coordinator = &TypingWatch {
         delivery: coordinator,
-        typed: &typed,
+        notes: &notes,
+        state,
+        receipts: async_ack,
     };
-    let async_ack = control.stop.and_then(|stop| stop.ack_queue.as_ref());
     if let Some(queue) = async_ack {
         queue.enqueue(keys.iter().cloned());
     }
@@ -1492,8 +1650,9 @@ fn process_keys_with_delivery(
             }
             Err(error) => report.error("deliver", key, error),
         }
+        report_receipt_errors(&notes, &mut report);
     }
-    report.prompt_typed = typed.get();
+    report.prompt_typed = notes.typed.get();
     if let Some(transport) = control.transport.as_mut() {
         let mut sends = 0_usize;
         for key in keys.iter().take(MAX_KEYS_PER_PASS) {
@@ -1532,6 +1691,62 @@ fn record_acknowledgement(
         Ok(AckResult::Disabled) => {}
         Ok(AckResult::Acked(_)) => report.acknowledged.push(key.to_owned()),
         Err(error) => report.error("acknowledge", key, error),
+    }
+}
+
+/// Report each ✅ receipt reaction that `TypingWatch` could not save or lost, and its log lines.
+fn report_receipt_errors(notes: &TypingNotes, report: &mut CycleReport) {
+    for error in notes.receipt_errors.take() {
+        report.error("receipt-reaction", "state", error);
+    }
+    report.receipts_lost.append(&mut notes.receipts_lost.take());
+    report
+        .receipt_loss_alerts
+        .append(&mut notes.log_lines.take());
+}
+
+/// Add the ✅ receipt reactions saved in the state, at most `MAX_KEYS_PER_PASS` of them, least
+/// recently tried first, unless an acknowledgement worker adds them.
+fn add_receipt_reactions(
+    state: &BridgeState,
+    control: &mut PassControl<'_>,
+    report: &mut CycleReport,
+) {
+    if control.stop.is_some_and(|stop| stop.ack_queue.is_some()) {
+        return;
+    }
+    let Some(transport) = control.transport.as_mut() else {
+        return;
+    };
+    let keys = match state.receipt_reactions_by_attempt() {
+        Ok(keys) => keys,
+        Err(error) => {
+            report.error("receipt-reaction", "state", error);
+            return;
+        }
+    };
+    if keys.len() > MAX_KEYS_PER_PASS {
+        report.more_work = true;
+    }
+    for key in keys.iter().take(MAX_KEYS_PER_PASS) {
+        if control.stop.is_some_and(StopState::is_stopped) {
+            report.more_work = true;
+            return;
+        }
+        let result = state.ensure_receipt_reaction(key, transport);
+        record_receipt_reaction(report, key, result);
+    }
+}
+
+fn record_receipt_reaction(
+    report: &mut CycleReport,
+    key: &str,
+    result: Result<Option<chat_runtime::ReactionReceipt>, ChatRuntimeError>,
+) {
+    match result {
+        Ok(Some(_)) => report.receipted.push(key.to_owned()),
+        Ok(None) => {}
+        Err(error) => report.error("receipt-reaction", key, error),
     }
 }
 
@@ -1578,7 +1793,7 @@ with other text, so the oldest were not read",
         control.log(line);
     }
     if !capture.unknown_ids.is_empty() || !capture.covered_ids.is_empty() {
-        let typed = Cell::new(false);
+        let notes = TypingNotes::default();
         let result = deliver_feedback(
             state,
             manager,
@@ -1586,9 +1801,11 @@ with other text, so the oldest were not read",
             &capture.covered_ids,
             delivery,
             control.stop,
-            &typed,
+            &notes,
         );
-        report.prompt_typed = typed.get();
+        report.prompt_typed = notes.typed.get();
+        // A drain types every queued prompt, so the notice may have carried request prompts in.
+        report_receipt_errors(&notes, &mut report);
         match result {
             Ok(CoordinatorDeliveryResult::Pending(_)) => report.more_work = true,
             Ok(CoordinatorDeliveryResult::Uncertain(_)) => {}
@@ -2182,13 +2399,7 @@ impl<A: ManagedApi + ?Sized> chat_runtime::CoordinatorDelivery for CancellableDe
         message_id: &str,
         options: DrainOptions,
     ) -> std::result::Result<(), String> {
-        if self.runtime.cancelled() {
-            return Err("chat delivery was cancelled before prompt submission".to_owned());
-        }
-        self.manager
-            .send_identified_with_runtime(agent_name, prompt, options, message_id, &self.runtime)
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        self.submit_reporting_printed(agent_name, prompt, message_id, options, &|_| {})
     }
 
     fn drain(&self, agent_name: &str, options: DrainOptions) -> std::result::Result<(), String> {
@@ -2200,11 +2411,53 @@ impl<A: ManagedApi + ?Sized> chat_runtime::CoordinatorDelivery for CancellableDe
         agent_name: &str,
         options: DrainOptions,
     ) -> std::result::Result<Option<String>, String> {
+        self.drain_reporting_printed(agent_name, options, &|_| {})
+    }
+
+    fn submit_reporting_printed(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        message_id: &str,
+        options: DrainOptions,
+        printed: &dyn Fn(&str),
+    ) -> std::result::Result<(), String> {
+        if self.runtime.cancelled() {
+            return Err("chat delivery was cancelled before prompt submission".to_owned());
+        }
+        self.manager
+            .send_identified_with_runtime(
+                agent_name,
+                prompt,
+                options,
+                message_id,
+                &chat_runtime::PrintReporter {
+                    runtime: &self.runtime,
+                    printed,
+                },
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn drain_reporting_printed(
+        &self,
+        agent_name: &str,
+        options: DrainOptions,
+        printed: &dyn Fn(&str),
+    ) -> std::result::Result<Option<String>, String> {
         if self.runtime.cancelled() {
             return Err("chat delivery was cancelled before queue drain".to_owned());
         }
         self.manager
-            .drain_with_runtime(agent_name, options, &self.runtime)
+            .drain_with_runtime(
+                agent_name,
+                options,
+                &chat_runtime::PrintReporter {
+                    runtime: &self.runtime,
+                    printed,
+                },
+            )
             .map(|result| result.blocked)
             .map_err(|error| error.to_string())
     }
@@ -2216,12 +2469,59 @@ impl<A: ManagedApi + ?Sized> chat_runtime::CoordinatorDelivery for CancellableDe
     }
 }
 
-/// A delivery that sets `typed` once it is asked to type into the pane: `submit` types a prompt
-/// and `drain` types the queued ones. Either may have typed even when it fails, so `typed` says
-/// that a prompt may have reached the pane, not that one did.
+/// What a pass's deliveries did in the pane, as `TypingWatch` notes it.
+#[derive(Default)]
+struct TypingNotes {
+    /// A delivery was asked to type into the pane, so a prompt may have reached it.
+    typed: Cell<bool>,
+    /// Saves of receipt reactions that failed, for the pass to report.
+    receipt_errors: RefCell<Vec<ChatRuntimeError>>,
+    /// The requests whose receipt reactions were lost because too many were waiting.
+    receipts_lost: RefCell<Vec<String>>,
+    /// A line for the service log for each time such losses started.
+    log_lines: RefCell<Vec<String>>,
+}
+
+/// A delivery that notes in `notes` when it is asked to type into the pane: `submit` types a
+/// prompt and `drain` types the queued ones. Either may have typed even when it fails, so
+/// `typed` says that a prompt may have reached the pane, not that one did. It also saves the ✅
+/// receipt reaction of each request prompt that the delivery reports the pane printed, at once:
+/// the queue reports it before it records the prompt as processed, and before the pass records
+/// the prompt as typed, which can retire the request. A saved reaction goes to `receipts` when
+/// `chat run` has an acknowledgement worker.
 struct TypingWatch<'a> {
     delivery: &'a dyn chat_runtime::CoordinatorDelivery,
-    typed: &'a Cell<bool>,
+    notes: &'a TypingNotes,
+    state: &'a BridgeState,
+    receipts: Option<&'a Arc<AckQueue>>,
+}
+
+impl TypingWatch<'_> {
+    fn note_printed(&self, message_id: &str) {
+        if chat_runtime::request_key_of_message(message_id).is_none() {
+            return;
+        }
+        match self.state.save_receipt_reactions(&[message_id.to_owned()]) {
+            Ok(saves) => {
+                if saves.losses_began {
+                    self.notes.log_lines.borrow_mut().push(format!(
+                        "agentctl: chat receipt reactions: {} are already waiting, so the {} that \
+                         request {} earned is lost; later losses are counted in `chat status` and \
+                         delivery-alarm.json, and logged again only once a {} has been saved",
+                        chat_runtime::MAX_RECEIPT_REACTIONS,
+                        chat_runtime::RECEIPT_REACTION,
+                        saves.lost.first().map_or("?", String::as_str),
+                        chat_runtime::RECEIPT_REACTION,
+                    ));
+                }
+                self.notes.receipts_lost.borrow_mut().extend(saves.lost);
+                if let Some(queue) = self.receipts {
+                    queue.enqueue_receipts(saves.saved);
+                }
+            }
+            Err(error) => self.notes.receipt_errors.borrow_mut().push(error),
+        }
+    }
 }
 
 impl chat_runtime::CoordinatorDelivery for TypingWatch<'_> {
@@ -2240,14 +2540,12 @@ impl chat_runtime::CoordinatorDelivery for TypingWatch<'_> {
         message_id: &str,
         options: DrainOptions,
     ) -> std::result::Result<(), String> {
-        self.typed.set(true);
-        self.delivery
-            .submit(agent_name, prompt, message_id, options)
+        self.submit_reporting_printed(agent_name, prompt, message_id, options, &|_| {})
     }
 
     fn drain(&self, agent_name: &str, options: DrainOptions) -> std::result::Result<(), String> {
-        self.typed.set(true);
-        self.delivery.drain(agent_name, options)
+        self.drain_reporting_printed(agent_name, options, &|_| {})
+            .map(|_| ())
     }
 
     fn drain_reporting(
@@ -2255,8 +2553,42 @@ impl chat_runtime::CoordinatorDelivery for TypingWatch<'_> {
         agent_name: &str,
         options: DrainOptions,
     ) -> std::result::Result<Option<String>, String> {
-        self.typed.set(true);
-        self.delivery.drain_reporting(agent_name, options)
+        self.drain_reporting_printed(agent_name, options, &|_| {})
+    }
+
+    fn submit_reporting_printed(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        message_id: &str,
+        options: DrainOptions,
+        printed: &dyn Fn(&str),
+    ) -> std::result::Result<(), String> {
+        self.notes.typed.set(true);
+        self.delivery.submit_reporting_printed(
+            agent_name,
+            prompt,
+            message_id,
+            options,
+            &|id: &str| {
+                self.note_printed(id);
+                printed(id);
+            },
+        )
+    }
+
+    fn drain_reporting_printed(
+        &self,
+        agent_name: &str,
+        options: DrainOptions,
+        printed: &dyn Fn(&str),
+    ) -> std::result::Result<Option<String>, String> {
+        self.notes.typed.set(true);
+        self.delivery
+            .drain_reporting_printed(agent_name, options, &|id: &str| {
+                self.note_printed(id);
+                printed(id);
+            })
     }
 
     fn screen(&self, agent_name: &str) -> std::result::Result<String, String> {
@@ -2264,8 +2596,8 @@ impl chat_runtime::CoordinatorDelivery for TypingWatch<'_> {
     }
 }
 
-/// `chat_runtime::deliver_fence_feedback_covering` through the service's delivery, which sets
-/// `typed` as `TypingWatch` does.
+/// `chat_runtime::deliver_fence_feedback_covering` through the service's delivery, which notes
+/// in `notes` what it typed as `TypingWatch` does.
 fn deliver_feedback<A: ManagedApi + ?Sized>(
     state: &BridgeState,
     manager: &ManagedAgents<'_, A>,
@@ -2273,7 +2605,7 @@ fn deliver_feedback<A: ManagedApi + ?Sized>(
     covered_ids: &[(String, String)],
     options: DrainOptions,
     stop: Option<&StopState>,
-    typed: &Cell<bool>,
+    notes: &TypingNotes,
 ) -> Result<CoordinatorDeliveryResult, ChatRuntimeError> {
     match stop {
         Some(stop) => chat_runtime::deliver_fence_feedback_covering(
@@ -2283,7 +2615,9 @@ fn deliver_feedback<A: ManagedApi + ?Sized>(
                     manager,
                     runtime: StopRuntime::new(stop),
                 },
-                typed,
+                notes,
+                state,
+                receipts: stop.ack_queue.as_ref(),
             },
             unknown_ids,
             covered_ids,
@@ -2293,7 +2627,9 @@ fn deliver_feedback<A: ManagedApi + ?Sized>(
             state,
             &TypingWatch {
                 delivery: manager,
-                typed,
+                notes,
+                state,
+                receipts: None,
             },
             unknown_ids,
             covered_ids,
@@ -3877,9 +4213,13 @@ struct NoteLog {
 }
 
 impl NoteLog {
-    /// Log a report's errors, and each of its notes that this process has not logged yet.
+    /// Log a report's errors and receipt loss alerts, and each of its notes that this process
+    /// has not logged yet.
     fn log(&mut self, report: &CycleReport) {
         log_report(report, &|line| service_log(line));
+        for alert in &report.receipt_loss_alerts {
+            service_log(format_args!("{alert}"));
+        }
         for note in &report.notes {
             if self.first_time(note) {
                 service_log(format_args!("agentctl: chat reply capture: {note}"));
@@ -3922,7 +4262,7 @@ struct DeliveryWatch {
     // The alarm last written, so the file is written only when the list changes. `None` until a
     // write succeeds, and again from the start of each write until it succeeds: a failed write
     // can have replaced the file before it failed, so the next scan writes it again.
-    written: Option<DeliveryAlarm>,
+    written: Option<(DeliveryAlarm, chat_runtime::LostReceiptReactions)>,
     // The requests whose prompts a scan recorded as typed and whose reply routes no read has
     // given since, because each read failed. Each scan reads them again.
     unrouted: BTreeSet<String>,
@@ -4088,9 +4428,19 @@ impl DeliveryWatch {
             .map(|entry| entry.key.clone())
             .collect();
         let alarm = DeliveryAlarm::new(&entries, now_millis, self.timing.stall_after);
+        let lost = match state.lost_receipt_reactions() {
+            Ok(lost) => lost,
+            Err(error) => {
+                problem.get_or_insert_with(|| {
+                    format!("the lost receipt reactions could not be read: {error}")
+                });
+                return (typed, problem);
+            }
+        };
+        let alarm = (alarm, lost);
         if self.written.as_ref() != Some(&alarm) {
             self.written = None;
-            match state.write_delivery_alarm(&alarm) {
+            match state.write_delivery_alarm(&alarm.0, &alarm.1) {
                 Ok(()) => self.written = Some(alarm),
                 Err(error) => {
                     problem.get_or_insert_with(|| {
@@ -4803,6 +5153,87 @@ mod tests {
         }
     }
 
+    /// A delivery that types each prompt with `inner`, then reports that the pane printed the
+    /// prompts named in `also_printed` and the one it typed, as a drain that types every prompt
+    /// waiting in the queue reports them.
+    struct PrintingDelivery<'a> {
+        inner: &'a dyn chat_runtime::CoordinatorDelivery,
+        also_printed: Vec<String>,
+    }
+
+    impl chat_runtime::CoordinatorDelivery for PrintingDelivery<'_> {
+        fn message_state(
+            &self,
+            agent_name: &str,
+            message_id: &str,
+        ) -> std::result::Result<Option<QueueMessageState>, String> {
+            self.inner.message_state(agent_name, message_id)
+        }
+
+        fn submit(
+            &self,
+            agent_name: &str,
+            prompt: &str,
+            message_id: &str,
+            options: DrainOptions,
+        ) -> std::result::Result<(), String> {
+            self.inner.submit(agent_name, prompt, message_id, options)
+        }
+
+        fn drain(
+            &self,
+            agent_name: &str,
+            options: DrainOptions,
+        ) -> std::result::Result<(), String> {
+            self.inner.drain(agent_name, options)
+        }
+
+        fn submit_reporting_printed(
+            &self,
+            agent_name: &str,
+            prompt: &str,
+            message_id: &str,
+            options: DrainOptions,
+            printed: &dyn Fn(&str),
+        ) -> std::result::Result<(), String> {
+            self.inner.submit(agent_name, prompt, message_id, options)?;
+            for id in &self.also_printed {
+                printed(id);
+            }
+            printed(message_id);
+            Ok(())
+        }
+
+        fn screen(&self, agent_name: &str) -> std::result::Result<String, String> {
+            self.inner.screen(agent_name)
+        }
+    }
+
+    /// A reaction transport that reports the message, emoji, and operation ID of each reaction
+    /// it is asked to add, and adds it.
+    struct EmojiObservingTransport {
+        submitted: mpsc::Sender<(String, String, String)>,
+    }
+
+    impl chat_runtime::ReactionTransport for EmojiObservingTransport {
+        fn ensure_reaction(
+            &mut self,
+            submission: chat_runtime::ReactionSubmission<'_>,
+        ) -> Result<chat_runtime::ReactionReceipt, OutboundFailure> {
+            self.submitted
+                .send((
+                    submission.message_id.to_owned(),
+                    submission.emoji.to_owned(),
+                    submission.request_id.to_owned(),
+                ))
+                .expect("observe reaction");
+            Ok(chat_runtime::ReactionReceipt {
+                reaction_id: format!("{}/reactions/ack", submission.message_id),
+                already_present: false,
+            })
+        }
+    }
+
     #[test]
     fn async_ack_does_not_block_later_intake_or_delivery_and_shutdown_owns_inflight() {
         let (state, key, root) = state_with_request();
@@ -4892,6 +5323,606 @@ mod tests {
             "pending"
         );
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn the_acknowledgement_worker_adds_the_receipt_reaction_a_printed_prompt_earned() {
+        let (state, key, root) = state_with_request();
+        let queue = Arc::new(AckQueue::default());
+        let stop = Arc::new(StopState {
+            ack_queue: Some(Arc::clone(&queue)),
+            ..StopState::default()
+        });
+        let (submitted, submissions) = mpsc::channel();
+        let worker = spawn_ack_worker(
+            state.clone(),
+            Arc::clone(&queue),
+            EmojiObservingTransport { submitted },
+            Arc::clone(&stop),
+            Arc::new(Mutex::new(None)),
+            captured_service_log,
+        )
+        .expect("spawn ACK worker");
+        queue.enqueue([key.clone()]);
+        let recording = RecordingDelivery::default();
+        let mut transport = None;
+        let report = process_keys_with_delivery(
+            &state,
+            &PrintingDelivery {
+                inner: &recording,
+                also_printed: Vec::new(),
+            },
+            DrainOptions::default(),
+            std::slice::from_ref(&key),
+            &mut PassControl {
+                transport: &mut transport,
+                stop: Some(&stop),
+            },
+        )
+        .expect("delivery pass");
+        assert_eq!(report.delivered, vec![key.clone()]);
+        assert!(
+            report.errors.is_empty(),
+            "unexpected errors: {:?}",
+            report.errors
+        );
+
+        let acknowledgement = submissions
+            .recv_timeout(Duration::from_secs(5))
+            .expect("acknowledgement");
+        let receipt = submissions
+            .recv_timeout(Duration::from_secs(5))
+            .expect("receipt reaction");
+        assert_eq!(acknowledgement.0, "spaces/example/messages/one");
+        assert_eq!(acknowledgement.1, "🤖");
+        assert_eq!(receipt.0, "spaces/example/messages/one");
+        assert_eq!(receipt.1, "\u{2705}");
+        assert_ne!(receipt.2, acknowledgement.2);
+        stop.stop();
+        join_worker_until(worker, "ACK", Instant::now() + Duration::from_secs(5))
+            .expect("join ACK worker");
+        assert!(
+            submissions.try_recv().is_err(),
+            "each reaction is added once"
+        );
+        assert!(state
+            .pending_receipt_reactions()
+            .expect("nothing waits")
+            .is_empty());
+        assert_eq!(
+            state.inspect_request(&key).expect("request")["acknowledgement"]["phase"],
+            "acked"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn the_acknowledgement_worker_adds_a_receipt_reaction_saved_before_a_restart() {
+        let (state, key, root) = state_with_request();
+        assert_eq!(
+            state
+                .save_receipt_reactions(&[format!("chat-{key}")])
+                .expect("save receipt reaction")
+                .saved,
+            vec![key.clone()]
+        );
+        drop(state);
+        let state = BridgeState::open(&root).expect("restart durable state");
+        let queue = Arc::new(AckQueue::default());
+        let stop = Arc::new(StopState {
+            ack_queue: Some(Arc::clone(&queue)),
+            ..StopState::default()
+        });
+        let (submitted, submissions) = mpsc::channel();
+        let worker = spawn_ack_worker(
+            state.clone(),
+            Arc::clone(&queue),
+            EmojiObservingTransport { submitted },
+            Arc::clone(&stop),
+            Arc::new(Mutex::new(None)),
+            captured_service_log,
+        )
+        .expect("spawn ACK worker");
+        // A rescan lists the saved acknowledgements and receipt reactions again.
+        queue.state.lock().expect("queue state").rescan = true;
+        queue.changed.notify_one();
+        let acknowledgement = submissions
+            .recv_timeout(Duration::from_secs(5))
+            .expect("acknowledgement");
+        let receipt = submissions
+            .recv_timeout(Duration::from_secs(5))
+            .expect("receipt reaction");
+        assert_eq!(acknowledgement.1, "🤖");
+        assert_eq!(receipt.0, "spaces/example/messages/one");
+        assert_eq!(receipt.1, "\u{2705}");
+        assert_ne!(receipt.2, acknowledgement.2);
+        stop.stop();
+        join_worker_until(worker, "ACK", Instant::now() + Duration::from_secs(5))
+            .expect("join ACK worker");
+        assert!(state
+            .pending_receipt_reactions()
+            .expect("nothing waits")
+            .is_empty());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_pass_without_an_acknowledgement_worker_adds_the_receipt_reaction_itself() {
+        let (state, key, root) = state_with_request();
+        let helper = root.join("reaction-helper");
+        fs::copy(
+            fs::canonicalize("/bin/sh").expect("canonical shell"),
+            &helper,
+        )
+        .expect("copy reaction helper");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).expect("helper mode");
+        let requests = root.join("reaction-requests");
+        let script = r#"
+IFS= read -r request || exit 2
+case "$request" in
+  *'"action":"ensure_reaction"'*) ;;
+  *) exit 3 ;;
+esac
+printf '%s\n' "$request" >> "$1" || exit 4
+id=${request#*\"id\":\"}
+id=${id%%\"*}
+printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"reaction_id":"spaces/example/messages/one/reactions/ack","already_present":false}}\n' "$id"
+"#;
+        let mut transport = Some(
+            CommandOutboundTransport::new(
+                helper,
+                vec![
+                    std::ffi::OsString::from("-c"),
+                    std::ffi::OsString::from(script),
+                    std::ffi::OsString::from("agentctl-chat-reaction-helper"),
+                    requests.clone().into_os_string(),
+                ],
+                &[],
+                Duration::from_secs(2),
+                Duration::from_millis(50),
+            )
+            .expect("pin reaction helper"),
+        );
+        let recording = RecordingDelivery::default();
+        let report = process_keys_with_delivery(
+            &state,
+            &PrintingDelivery {
+                inner: &recording,
+                also_printed: vec![format!("chat-feedback-{}", "0".repeat(64))],
+            },
+            DrainOptions::default(),
+            std::slice::from_ref(&key),
+            &mut PassControl {
+                transport: &mut transport,
+                stop: None,
+            },
+        )
+        .expect("delivery pass");
+        assert_eq!(report.delivered, vec![key.clone()]);
+        assert_eq!(report.acknowledged, vec![key.clone()]);
+        assert!(report.receipted.is_empty());
+        assert!(
+            report.errors.is_empty(),
+            "unexpected errors: {:?}",
+            report.errors
+        );
+        assert_eq!(
+            state.pending_receipt_reactions().expect("saved reaction"),
+            vec![key.clone()]
+        );
+
+        // `chat run` leaves the reaction to its acknowledgement worker.
+        let with_worker = StopState {
+            ack_queue: Some(Arc::new(AckQueue::default())),
+            ..StopState::default()
+        };
+        let mut report = CycleReport::default();
+        add_receipt_reactions(
+            &state,
+            &mut PassControl {
+                transport: &mut transport,
+                stop: Some(&with_worker),
+            },
+            &mut report,
+        );
+        assert!(report.receipted.is_empty());
+        assert_eq!(
+            state.pending_receipt_reactions().expect("still saved"),
+            vec![key.clone()]
+        );
+
+        let mut report = CycleReport::default();
+        add_receipt_reactions(
+            &state,
+            &mut PassControl {
+                transport: &mut transport,
+                stop: None,
+            },
+            &mut report,
+        );
+        assert_eq!(report.receipted, vec![key.clone()]);
+        assert!(
+            report.errors.is_empty(),
+            "unexpected errors: {:?}",
+            report.errors
+        );
+        assert!(state
+            .pending_receipt_reactions()
+            .expect("nothing waits")
+            .is_empty());
+        let sent = fs::read_to_string(&requests)
+            .expect("reaction requests")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("reaction request"))
+            .collect::<Vec<_>>();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0]["emoji"], "🤖");
+        assert_eq!(sent[1]["emoji"], "\u{2705}");
+        assert_eq!(sent[1]["channel_id"], "spaces/example");
+        assert_eq!(sent[1]["message_id"], "spaces/example/messages/one");
+        assert_ne!(sent[0]["id"], sent[1]["id"]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_prompt_typed_without_evidence_that_the_pane_printed_it_earns_no_receipt_reaction() {
+        let (state, key, root) = state_with_request();
+        let recording = RecordingDelivery::default();
+        let mut transport = None;
+        let report = process_keys_with_delivery(
+            &state,
+            &recording,
+            DrainOptions::default(),
+            std::slice::from_ref(&key),
+            &mut PassControl {
+                transport: &mut transport,
+                stop: None,
+            },
+        )
+        .expect("delivery pass");
+        assert_eq!(report.delivered, vec![key]);
+        assert_eq!(recording.prompts.lock().expect("prompts").len(), 1);
+        assert!(state
+            .pending_receipt_reactions()
+            .expect("nothing saved")
+            .is_empty());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn prompts_that_name_no_request_do_not_crowd_out_a_receipt_reaction() {
+        let (state, key, root) = state_with_request();
+        let recording = RecordingDelivery::default();
+        let absent = (0..MAX_DIRECT_REQUEST_KEYS)
+            .map(|index| format!("chat-{index:064x}"))
+            .collect::<Vec<_>>();
+        assert!(!absent.contains(&format!("chat-{key}")));
+        let delivery = PrintingDelivery {
+            inner: &recording,
+            also_printed: (0..MAX_DIRECT_REQUEST_KEYS)
+                .map(|index| format!("unrelated-{index}"))
+                .chain(absent)
+                .collect(),
+        };
+        let mut transport = None;
+        let report = process_keys_with_delivery(
+            &state,
+            &delivery,
+            DrainOptions::default(),
+            std::slice::from_ref(&key),
+            &mut PassControl {
+                transport: &mut transport,
+                stop: None,
+            },
+        )
+        .expect("delivery pass");
+        assert_eq!(report.delivered, vec![key.clone()]);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let saved = state.pending_receipt_reactions().expect("saved receipts");
+        fs::remove_dir_all(root).expect("cleanup");
+        assert_eq!(saved, vec![key]);
+    }
+
+    #[test]
+    fn a_request_retired_when_its_prompt_is_typed_keeps_the_receipt_reaction_it_earned() {
+        let (state, mut admission, root) = state_admitting_request(Some("🤖"));
+        state
+            .confirm_batch_commit(&admission)
+            .expect("confirm batch commit");
+        let key = admission.new_request_keys.remove(0);
+        let (submitted, _submissions) = mpsc::channel();
+        let mut ack_transport = EmojiObservingTransport { submitted };
+        state
+            .ensure_ack(&key, &mut ack_transport)
+            .expect("finish the acknowledgement");
+        // With its replies closed, recording the prompt as typed retires the request at once.
+        state.close_replies(&key).expect("close the replies");
+        let recording = RecordingDelivery::default();
+        let delivery = PrintingDelivery {
+            inner: &recording,
+            also_printed: Vec::new(),
+        };
+        let mut transport = None;
+        let report = process_keys_with_delivery(
+            &state,
+            &delivery,
+            DrainOptions::default(),
+            std::slice::from_ref(&key),
+            &mut PassControl {
+                transport: &mut transport,
+                stop: None,
+            },
+        )
+        .expect("delivery pass");
+        assert_eq!(report.delivered, vec![key.clone()]);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(state
+            .delivery_entries()
+            .expect("retained requests")
+            .is_empty());
+        let saved = state.pending_receipt_reactions().expect("saved receipts");
+        fs::remove_dir_all(root).expect("cleanup");
+        assert_eq!(saved, vec![key]);
+    }
+
+    #[test]
+    fn a_tick_reaches_a_receipt_reaction_behind_ones_that_always_fail() {
+        let (state, key, root) = state_with_request();
+        state
+            .save_receipt_reactions(&[format!("chat-{key}")])
+            .expect("save");
+        let directory = root.join("receipt-reactions");
+        let mut seed: Value = serde_json::from_slice(
+            &fs::read(directory.join(format!("{key}.json"))).expect("saved receipt"),
+        )
+        .expect("receipt JSON");
+        // Four records with lower keys that name a channel the configuration does not hold, so
+        // every attempt at them fails before the helper runs.
+        for index in 0..MAX_KEYS_PER_PASS {
+            let lower = format!("{index:064x}");
+            assert!(lower < key);
+            seed["key"] = json!(lower);
+            seed["channel_id"] = json!("spaces/unconfigured");
+            let path = directory.join(format!("{lower}.json"));
+            fs::write(&path, serde_json::to_vec(&seed).expect("serialize")).expect("write");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("private");
+        }
+        let helper = root.join("failing-helper");
+        fs::copy(fs::canonicalize("/bin/sh").expect("shell"), &helper).expect("copy shell");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).expect("executable");
+        let mut transport = Some(
+            CommandOutboundTransport::new(
+                helper,
+                vec![
+                    std::ffi::OsString::from("-c"),
+                    std::ffi::OsString::from("exit 99"),
+                ],
+                &[],
+                Duration::from_secs(2),
+                Duration::from_millis(50),
+            )
+            .expect("helper transport"),
+        );
+        let mut report = CycleReport::default();
+        add_receipt_reactions(
+            &state,
+            &mut PassControl {
+                transport: &mut transport,
+                stop: None,
+            },
+            &mut report,
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+        assert_eq!(report.errors.len(), MAX_KEYS_PER_PASS);
+        assert!(
+            format!("{:?}", report.errors).contains(&key),
+            "the one receipt that can reach the helper is tried first: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn receipt_reactions_lost_at_the_bound_are_counted_shown_and_logged_once_per_episode() {
+        let (state, first, root) = state_with_request();
+        let mut more = admit_more_requests(&state, 2);
+        let (second, third) = (more.remove(0), more.remove(0));
+        // Fill the waiting reactions to the bound with saved reactions of other requests.
+        let directory = root.join("receipt-reactions");
+        fs::create_dir(&directory).expect("receipt directory");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).expect("private");
+        let mut fillers = Vec::new();
+        for index in 0..chat_runtime::MAX_RECEIPT_REACTIONS {
+            let key = format!("{index:064x}");
+            let path = directory.join(format!("{key}.json"));
+            let record = json!({
+                "schema": "agentctl-chat-receipt-reaction/v1",
+                "key": key,
+                "channel_id": "spaces/example",
+                "message_id": format!("spaces/example/messages/filler-{index}"),
+                "emoji": "\u{2705}",
+                "request_id": "123e4567-e89b-42d3-a456-426614174000",
+                "recorded_at_millis": 1,
+            });
+            fs::write(&path, serde_json::to_vec(&record).expect("encode")).expect("filler");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("private");
+            fillers.push(path);
+        }
+        let recording = RecordingDelivery::default();
+        let delivery = PrintingDelivery {
+            inner: &recording,
+            also_printed: Vec::new(),
+        };
+        let mut transport = None;
+        let mut pass = |key: &String| {
+            process_keys_with_delivery(
+                &state,
+                &delivery,
+                DrainOptions::default(),
+                std::slice::from_ref(key),
+                &mut PassControl {
+                    transport: &mut transport,
+                    stop: None,
+                },
+            )
+            .expect("delivery pass")
+        };
+        // The prompt is delivered and the ✅ is lost; the first loss logs one line.
+        let report = pass(&first);
+        assert_eq!(report.delivered, std::slice::from_ref(&first));
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.receipts_lost, std::slice::from_ref(&first));
+        assert_eq!(report.receipt_loss_alerts.len(), 1);
+        assert!(report.receipt_loss_alerts[0].contains(&format!("request {first} earned is lost")));
+        // `chat tick` prints its report as JSON, which carries both.
+        let document = serde_json::to_value(&report).expect("encode report");
+        assert_eq!(document["receipts_lost"], json!([first]));
+        assert_eq!(
+            document["receipt_loss_alerts"],
+            json!(report.receipt_loss_alerts)
+        );
+        // A second loss in the same episode is counted but not logged again.
+        let report = pass(&second);
+        assert_eq!(report.delivered, std::slice::from_ref(&second));
+        assert_eq!(report.receipts_lost, std::slice::from_ref(&second));
+        assert!(report.receipt_loss_alerts.is_empty());
+
+        let status = state.status().expect("status");
+        assert_eq!(status["receipt_reactions"]["lost"], 2);
+        assert_eq!(
+            status["receipt_reactions"]["oldest_lost_key"],
+            first.as_str()
+        );
+        assert_eq!(
+            status["delivery_alarm"]["receipt_reactions_lost"],
+            json!({"count": 2, "oldest_key": first})
+        );
+        let mut watch = DeliveryWatch::new(DeliveryTiming::default());
+        let mut routes = RouteCache::new(Vec::new());
+        watch.scan(&state, &recording, &mut routes);
+        let alarm: Value = serde_json::from_slice(
+            &fs::read(root.join("delivery-alarm.json")).expect("delivery alarm"),
+        )
+        .expect("alarm JSON");
+        assert_eq!(
+            alarm["receipt_reactions_lost"],
+            json!({"count": 2, "oldest_key": first})
+        );
+
+        // Once there is room, a ✅ is saved and the episode ends; the count stays.
+        fs::remove_file(fillers.pop().expect("a filler")).expect("make room");
+        let report = pass(&third);
+        assert!(report.receipts_lost.is_empty());
+        assert!(report.receipt_loss_alerts.is_empty());
+        let status = state.status().expect("status");
+        assert_eq!(status["receipt_reactions"]["lost"], 2);
+        assert_eq!(status["receipt_reactions"]["waiting"], 2_048);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_restart_waits_out_the_retry_delay_of_a_receipt_reaction_that_just_failed() {
+        let (state, recent, root) = state_with_request();
+        let mut more = admit_more_requests(&state, 2);
+        let (old, fresh) = (more.remove(0), more.remove(0));
+        let printed = [&recent, &old, &fresh]
+            .iter()
+            .map(|key| format!("chat-{key}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            state
+                .save_receipt_reactions(&printed)
+                .expect("save")
+                .saved
+                .len(),
+            3
+        );
+        // One failed just now and one failed over a minute ago; the third was never tried.
+        let directory = root.join("receipt-reactions");
+        let now = chat_runtime::unix_millis();
+        for (key, attempted) in [(&recent, now), (&old, now - 61_000)] {
+            let path = directory.join(format!("{key}.json"));
+            let mut record: Value =
+                serde_json::from_slice(&fs::read(&path).expect("record")).expect("JSON");
+            record["error"] = json!("provider outcome unknown");
+            record["attempted_at_millis"] = json!(attempted);
+            fs::write(&path, serde_json::to_vec(&record).expect("encode")).expect("write");
+        }
+        drop(state);
+        let state = BridgeState::open(&root).expect("restart");
+        let queue = AckQueue::default();
+        queue_saved_receipts(&queue, state.receipt_reaction_attempts().expect("attempts"));
+        let queued = queue.state.lock().expect("queue state");
+        let mut waiting = queued.receipts.iter().cloned().collect::<Vec<_>>();
+        waiting.sort();
+        let mut expected = vec![old.clone(), fresh.clone()];
+        expected.sort();
+        assert_eq!(waiting, expected);
+        let due = queued.receipt_retry_at[&recent];
+        assert!(due > Instant::now() + Duration::from_secs(50));
+        assert!(due <= Instant::now() + ACK_RETRY_DELAY);
+        drop(queued);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn receipt_reactions_queue_after_acknowledgements_and_before_a_rescan() {
+        let queue = AckQueue::default();
+        queue.enqueue_receipts(["receipt".to_owned()]);
+        queue.enqueue(["request".to_owned()]);
+        queue.state.lock().expect("queue state").receipt_rescan = true;
+        assert!(matches!(queue.next(), Some(AckWork::Request(key)) if key == "request"));
+        assert!(matches!(queue.next(), Some(AckWork::Receipt(key)) if key == "receipt"));
+        assert!(matches!(queue.next(), Some(AckWork::Reconcile)));
+
+        // Acknowledgements that overflowed the queue are listed again before any receipt.
+        let queue = AckQueue::default();
+        queue.enqueue((0..=ACK_QUEUE_CAPACITY).map(|index| format!("request-{index}")));
+        queue.enqueue_receipts(["receipt".to_owned()]);
+        for index in 0..ACK_QUEUE_CAPACITY {
+            let key = format!("request-{index}");
+            assert!(matches!(queue.next(), Some(AckWork::Request(actual)) if actual == key));
+            queue.finished(&key, false);
+        }
+        assert!(matches!(queue.next(), Some(AckWork::Reconcile)));
+        assert!(matches!(queue.next(), Some(AckWork::Receipt(key)) if key == "receipt"));
+
+        // An acknowledgement whose retry is due is listed again before any receipt.
+        let queue = AckQueue::default();
+        queue.enqueue(["request".to_owned()]);
+        assert!(matches!(queue.next(), Some(AckWork::Request(key)) if key == "request"));
+        queue.finished("request", true);
+        queue.enqueue_receipts(["receipt".to_owned()]);
+        {
+            let mut state = queue.state.lock().expect("queue state");
+            let due = Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("a past instant");
+            state.retry_at.insert("request".to_owned(), due);
+        }
+        assert!(matches!(queue.next(), Some(AckWork::Reconcile)));
+        assert!(matches!(queue.next(), Some(AckWork::Receipt(key)) if key == "receipt"));
+
+        // A reaction in flight, or one that failed a moment ago, is not queued again.
+        queue.enqueue_receipts(["receipt".to_owned()]);
+        assert!(queue.state.lock().expect("queue state").receipts.is_empty());
+        queue.receipt_finished("receipt", true);
+        queue.enqueue_receipts(["receipt".to_owned()]);
+        {
+            let state = queue.state.lock().expect("queue state");
+            assert!(state.receipts.is_empty());
+            assert!(state.receipt_retry_at.contains_key("receipt"));
+        }
+        queue.receipt_finished("receipt", false);
+        queue.enqueue_receipts(["receipt".to_owned()]);
+        assert!(matches!(queue.next(), Some(AckWork::Receipt(key)) if key == "receipt"));
+
+        // A full queue leaves the rest saved, for a rescan to list.
+        let queue = AckQueue::default();
+        queue.enqueue_receipts((0..=ACK_QUEUE_CAPACITY).map(|index| format!("receipt-{index}")));
+        let state = queue.state.lock().expect("queue state");
+        assert_eq!(state.receipts.len(), ACK_QUEUE_CAPACITY);
+        assert!(state.receipt_rescan);
+        assert!(!state.rescan);
     }
 
     #[test]

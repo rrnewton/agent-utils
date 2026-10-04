@@ -133,6 +133,29 @@ pub const REQUEST_INSPECTION_SCHEMA: &str = "agentctl-chat-request-inspection/v1
 // state directory: see `DeliveryAlarm`.
 const DELIVERY_ALARM_SCHEMA: &str = "agentctl-chat-delivery-alarm/v1";
 const DELIVERY_ALARM_FILE: &str = "delivery-alarm.json";
+// The schema of each file in `receipt-reactions/`, a ✅ reaction that a request earned and that is
+// not on its message yet: see `ReceiptReactionRecord`.
+const RECEIPT_REACTION_SCHEMA: &str = "agentctl-chat-receipt-reaction/v1";
+const RECEIPT_REACTION_DIRECTORY: &str = "receipt-reactions";
+// The reaction a request's message gets once the coordinator's pane prints the request's prompt.
+pub(crate) const RECEIPT_REACTION: &str = "✅";
+// As many waiting reactions as the requests the state can hold. A reaction can outlive its
+// request's retirement, so the request cap does not bound them.
+pub(crate) const MAX_RECEIPT_REACTIONS: usize = MAX_REQUESTS as usize;
+const MAX_RECEIPT_REACTION_ERROR_BYTES: usize = 2_000;
+// The schema of `receipt-reactions-lost.json`, which counts the ✅ reactions lost because
+// `MAX_RECEIPT_REACTIONS` were already waiting: see `ReceiptReactionLoss`.
+const RECEIPT_REACTION_LOSS_SCHEMA: &str = "agentctl-chat-receipt-reactions-lost/v1";
+const RECEIPT_REACTION_LOSS_FILE: &str = "receipt-reactions-lost.json";
+const MAX_RECEIPT_REACTION_LOSS_BYTES: usize = 4 * 1_024;
+// Room for the largest record the state can write: JSON spells a control character in six bytes,
+// so the channel, the message and a saved error may each take six times their own size.
+const MAX_RECEIPT_REACTION_BYTES: usize = 64 * 1_024;
+const _: () = assert!(
+    MAX_RECEIPT_REACTION_BYTES
+        >= 6 * (2 * chat_subscription::MAX_RESOURCE_ID_BYTES + MAX_RECEIPT_REACTION_ERROR_BYTES)
+            + 1_024
+);
 // A request admitted this long ago whose prompt is not typed is stalled.
 pub(crate) const DELIVERY_STALL_AFTER: Duration = Duration::from_secs(60);
 // The one provider payload schema whose quoted-message metadata the prompt shows. Every other
@@ -2088,6 +2111,102 @@ impl DeliveryAlarm {
     }
 }
 
+/// The ✅ receipt reactions lost because `MAX_RECEIPT_REACTIONS` were already waiting, saved as
+/// `receipt-reactions-lost.json` in the state directory. Prompt delivery never waits for room, so
+/// a ✅ earned while the reactions are full is dropped, and this record keeps that visible: how
+/// many were lost, the first request that lost one, and whether losses are going on now, so the
+/// service logs one line when they start rather than one for each.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceiptReactionLoss {
+    schema: String,
+    lost: u64,
+    oldest_lost_key: String,
+    oldest_lost_at_millis: u64,
+    newest_lost_at_millis: u64,
+    /// Losses are going on: none has been followed by a saved ✅ yet.
+    episode_open: bool,
+}
+
+/// How many ✅ receipt reactions this state lost because too many were waiting, and the request
+/// that lost the first, as `chat status` and `delivery-alarm.json` report them.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LostReceiptReactions {
+    pub(crate) count: u64,
+    pub(crate) oldest_key: Option<String>,
+}
+
+/// What [`BridgeState::save_receipt_reactions`] did.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ReceiptSaves {
+    /// The keys of the requests whose ✅ was saved.
+    pub(crate) saved: Vec<String>,
+    /// The keys of the requests whose ✅ was lost because too many were waiting.
+    pub(crate) lost: Vec<String>,
+    /// These losses start an episode: the losses before them, if any, were followed by a saved ✅.
+    pub(crate) losses_began: bool,
+}
+
+/// The alarm as `delivery-alarm.json` holds it: the stalled requests and, once any was lost, the
+/// ✅ receipt reactions lost.
+#[derive(Serialize)]
+struct DeliveryAlarmDocument<'a> {
+    #[serde(flatten)]
+    alarm: &'a DeliveryAlarm,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt_reactions_lost: Option<&'a LostReceiptReactions>,
+}
+
+/// A ✅ receipt reaction that a request earned and that is not on its message yet, saved as
+/// `receipt-reactions/<key>.json` in the state directory. A request earns it when a queue drain
+/// types its prompt and the pane prints that prompt after the submission key: see
+/// [`BridgeState::save_receipt_reactions`]. The reaction is added with the operation ID saved here,
+/// so a retry after a failure or a restart repeats one operation instead of adding a second
+/// reaction, and the file is removed once the reaction is on. The record names the message itself
+/// because the request may be retired before its reaction is added.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceiptReactionRecord {
+    schema: String,
+    key: String,
+    channel_id: String,
+    message_id: String,
+    emoji: String,
+    request_id: String,
+    /// Why the last attempt to add the reaction failed, if it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    recorded_at_millis: u64,
+    /// When that failed attempt was made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attempted_at_millis: Option<u64>,
+}
+
+impl ReceiptReactionRecord {
+    fn validate(&self, key: &str) -> Result<()> {
+        if self.schema != RECEIPT_REACTION_SCHEMA
+            || self.key != key
+            || !valid_key(key)
+            || self.emoji != RECEIPT_REACTION
+            || !valid_operation_uuid(&self.request_id)
+            || self
+                .error
+                .as_ref()
+                .is_some_and(|error| error.len() > MAX_RECEIPT_REACTION_ERROR_BYTES)
+        {
+            return Err(ChatRuntimeError::invalid(
+                "saved receipt reaction is inconsistent",
+            ));
+        }
+        ChannelId::new(self.channel_id.clone())
+            .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
+        chat_subscription::MessageId::new(self.message_id.clone())
+            .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReplyRecord {
@@ -3435,6 +3554,32 @@ pub(crate) trait CoordinatorDelivery {
     ) -> std::result::Result<Option<String>, String> {
         self.drain(agent_name, options).map(|()| None)
     }
+    /// [`Self::submit`], also passing to `printed` the queue message ID of each prompt it typed
+    /// with evidence that the pane printed the prompt after its submission key. A drain types
+    /// every prompt waiting in the queue, so the IDs may name other requests' prompts as well as
+    /// `message_id`. A delivery that cannot tell passes none.
+    fn submit_reporting_printed(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        message_id: &str,
+        options: DrainOptions,
+        printed: &dyn Fn(&str),
+    ) -> std::result::Result<(), String> {
+        let _ = printed;
+        self.submit(agent_name, prompt, message_id, options)
+    }
+    /// [`Self::drain_reporting`], also passing to `printed` the queue message ID of each prompt
+    /// it typed with that evidence, as [`Self::submit_reporting_printed`] does.
+    fn drain_reporting_printed(
+        &self,
+        agent_name: &str,
+        options: DrainOptions,
+        printed: &dyn Fn(&str),
+    ) -> std::result::Result<Option<String>, String> {
+        let _ = printed;
+        self.drain_reporting(agent_name, options)
+    }
     /// Read the coordinator's pane as a capture reads it, without persisting a snapshot. A
     /// request's prompt is written only after this read, and a reply ID it assigns is never a
     /// number the read shows, so no block already in the pane can be taken as a reply to that
@@ -3533,6 +3678,48 @@ impl<A: ManagedApi + ?Sized> CoordinatorDelivery for ManagedAgents<'_, A> {
             .map_err(|error| error.to_string())
     }
 
+    fn submit_reporting_printed(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        message_id: &str,
+        options: DrainOptions,
+        printed: &dyn Fn(&str),
+    ) -> std::result::Result<(), String> {
+        ManagedAgents::send_identified_with_runtime(
+            self,
+            agent_name,
+            prompt,
+            options,
+            message_id,
+            &PrintReporter {
+                runtime: &agent::SystemRuntime::default(),
+                printed,
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    }
+
+    fn drain_reporting_printed(
+        &self,
+        agent_name: &str,
+        options: DrainOptions,
+        printed: &dyn Fn(&str),
+    ) -> std::result::Result<Option<String>, String> {
+        ManagedAgents::drain_with_runtime(
+            self,
+            agent_name,
+            options,
+            &PrintReporter {
+                runtime: &agent::SystemRuntime::default(),
+                printed,
+            },
+        )
+        .map(|result| result.blocked)
+        .map_err(|error| error.to_string())
+    }
+
     fn screen(&self, agent_name: &str) -> std::result::Result<String, String> {
         ManagedAgents::peek_capture_with_runtime(
             self,
@@ -3541,6 +3728,36 @@ impl<A: ManagedApi + ?Sized> CoordinatorDelivery for ManagedAgents<'_, A> {
             &agent::SystemRuntime::default(),
         )
         .map_err(|error| error.to_string())
+    }
+}
+
+/// A runtime that behaves as `runtime` and also passes each printed prompt's queue message ID to
+/// `printed`: how a delivery implements [`CoordinatorDelivery::submit_reporting_printed`].
+pub(crate) struct PrintReporter<'a> {
+    pub(crate) runtime: &'a dyn agent::AgentRuntime,
+    pub(crate) printed: &'a dyn Fn(&str),
+}
+
+impl agent::AgentRuntime for PrintReporter<'_> {
+    fn monotonic(&self) -> Duration {
+        self.runtime.monotonic()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        self.runtime.sleep(duration);
+    }
+
+    fn cancelled(&self) -> bool {
+        self.runtime.cancelled()
+    }
+
+    fn delivery_wait_chunk(&self) -> Option<Duration> {
+        self.runtime.delivery_wait_chunk()
+    }
+
+    fn prompt_printed(&self, message_id: &str) {
+        self.runtime.prompt_printed(message_id);
+        (self.printed)(message_id);
     }
 }
 
@@ -3644,6 +3861,14 @@ impl BridgeState {
     /// Create a new private bridge state directory.
     pub fn initialize(root: &Path, config: BridgeConfiguration) -> Result<Self> {
         config.validate()?;
+        // ✅ marks a request whose prompt the pane printed, so a new state does not take it as the
+        // acknowledgement as well. A state made before keeps it and adds no separate receipt.
+        if config.ack_reaction.as_deref() == Some(RECEIPT_REACTION) {
+            return Err(ChatRuntimeError::invalid(format!(
+                "ack_reaction cannot be {RECEIPT_REACTION}, which marks a request whose prompt \
+                 the pane printed; choose another emoji"
+            )));
+        }
         let existed = fs::symlink_metadata(root).is_ok();
         agent::create_private_directory(root, "chat state directory", true, true)?;
         if existed && fs::read_dir(root)?.next().is_some() {
@@ -3757,6 +3982,10 @@ impl BridgeState {
                 root.join("retirement-receipts"),
                 "chat retirement receipt directory",
             ),
+            (
+                root.join(RECEIPT_REACTION_DIRECTORY),
+                "chat receipt reaction directory",
+            ),
         ] {
             if fs::symlink_metadata(&directory).is_ok() {
                 agent::validate_private_directory(&directory, label, false)?;
@@ -3854,6 +4083,10 @@ impl BridgeState {
             self.root.join("retirements"),
         ] {
             agent::cleanup_atomic_json_temporaries(&directory)?;
+        }
+        let receipt_reactions = self.root.join(RECEIPT_REACTION_DIRECTORY);
+        if !path_is_absent(&receipt_reactions)? {
+            agent::cleanup_atomic_json_temporaries(&receipt_reactions)?;
         }
         let mut checkpoint = self.read_checkpoint()?;
         self.repair_boundary_commit_locked(&mut checkpoint)?;
@@ -5010,6 +5243,7 @@ impl BridgeState {
             "retirement_sequence": checkpoint.retirement_sequence,
             "phases": phases,
             "acknowledgements": acknowledgements,
+            "receipt_reactions": self.receipt_reaction_status()?,
             "deliveries": {
                 "admitted_not_typed": not_typed,
                 "typed_not_replied": not_replied,
@@ -5018,6 +5252,7 @@ impl BridgeState {
             "delivery_alarm": {
                 "stall_after_seconds": DELIVERY_STALL_AFTER.as_secs(),
                 "stalled": stalled,
+                "receipt_reactions_lost": self.lost_receipt_reactions_locked()?,
             },
             "requests": requests,
             "reply_breaker": self.reply_breaker_status(),
@@ -5040,14 +5275,401 @@ impl BridgeState {
         Ok(entries)
     }
 
-    /// Replace `delivery-alarm.json` in the state directory with `alarm`.
-    pub(crate) fn write_delivery_alarm(&self, alarm: &DeliveryAlarm) -> Result<()> {
-        write_document(&self.root.join(DELIVERY_ALARM_FILE), alarm)
+    /// Replace `delivery-alarm.json` in the state directory with `alarm`, and `lost` once any ✅
+    /// receipt reaction was lost.
+    pub(crate) fn write_delivery_alarm(
+        &self,
+        alarm: &DeliveryAlarm,
+        lost: &LostReceiptReactions,
+    ) -> Result<()> {
+        write_document(
+            &self.root.join(DELIVERY_ALARM_FILE),
+            &DeliveryAlarmDocument {
+                alarm,
+                receipt_reactions_lost: (lost.count > 0).then_some(lost),
+            },
+        )
     }
 
     #[cfg(test)]
     pub(crate) fn read_delivery_alarm(&self) -> Option<DeliveryAlarm> {
         read_document(&self.root.join(DELIVERY_ALARM_FILE), 1 << 20).ok()
+    }
+
+    /// Save a ✅ receipt reaction for each request whose queue message ID is in `message_ids`:
+    /// the prompts that a queue drain typed with evidence that the pane printed them after the
+    /// submission key. See [`ReceiptReactionRecord`]. An ID that is not a request's is ignored, as
+    /// is a request that is retired, was admitted without an acknowledgement reaction, or already
+    /// has a ✅ waiting. Nothing is saved when this state has no acknowledgement reaction. A ✅
+    /// that finds `MAX_RECEIPT_REACTIONS` already waiting is lost and counted in
+    /// [`ReceiptReactionLoss`].
+    pub(crate) fn save_receipt_reactions(&self, message_ids: &[String]) -> Result<ReceiptSaves> {
+        // An acknowledgement that is itself ✅ already shows it at admission, so a receipt would
+        // say nothing more.
+        if self
+            .config
+            .ack_reaction
+            .as_deref()
+            .is_none_or(|reaction| reaction == RECEIPT_REACTION)
+        {
+            return Ok(ReceiptSaves::default());
+        }
+        let mut keys: Vec<&str> = Vec::new();
+        for message_id in message_ids {
+            if let Some(key) = request_key_of_message(message_id) {
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+        }
+        if keys.is_empty() {
+            return Ok(ReceiptSaves::default());
+        }
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let directory = self.root.join(RECEIPT_REACTION_DIRECTORY);
+        let mut prepared = false;
+        let mut saves = ReceiptSaves::default();
+        for key in keys {
+            let request = match self.read_request(key) {
+                Ok(request) => request,
+                Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if request.ack_phase == AckPhase::Disabled {
+                continue;
+            }
+            if !prepared {
+                if path_is_absent(&directory)? {
+                    agent::create_private_directory(
+                        &directory,
+                        "chat receipt reaction directory",
+                        false,
+                        true,
+                    )?;
+                    agent::sync_directory(&self.root)?;
+                } else {
+                    agent::validate_private_directory(
+                        &directory,
+                        "chat receipt reaction directory",
+                        false,
+                    )?;
+                }
+                prepared = true;
+            }
+            let path = directory.join(format!("{key}.json"));
+            if !path_is_absent(&path)? {
+                continue;
+            }
+            if fs::read_dir(&directory)?.count() >= MAX_RECEIPT_REACTIONS {
+                saves.lost.push(key.to_owned());
+                continue;
+            }
+            let record = ReceiptReactionRecord {
+                schema: RECEIPT_REACTION_SCHEMA.to_owned(),
+                key: key.to_owned(),
+                channel_id: request.message.channel_id,
+                message_id: request.message.message_id,
+                emoji: RECEIPT_REACTION.to_owned(),
+                request_id: random_operation_uuid()?,
+                error: None,
+                recorded_at_millis: unix_millis(),
+                attempted_at_millis: None,
+            };
+            record.validate(key)?;
+            write_document(&path, &record)?;
+            saves.saved.push(key.to_owned());
+        }
+        let loss_path = self.root.join(RECEIPT_REACTION_LOSS_FILE);
+        let loss = self.read_receipt_reaction_loss()?;
+        if !saves.lost.is_empty() {
+            let now = unix_millis();
+            let lost = u64::try_from(saves.lost.len()).unwrap_or(u64::MAX);
+            let record = match loss {
+                Some(mut loss) => {
+                    saves.losses_began = !loss.episode_open;
+                    loss.lost = loss.lost.saturating_add(lost);
+                    loss.newest_lost_at_millis = now;
+                    loss.episode_open = true;
+                    loss
+                }
+                None => {
+                    saves.losses_began = true;
+                    ReceiptReactionLoss {
+                        schema: RECEIPT_REACTION_LOSS_SCHEMA.to_owned(),
+                        lost,
+                        oldest_lost_key: saves.lost[0].clone(),
+                        oldest_lost_at_millis: now,
+                        newest_lost_at_millis: now,
+                        episode_open: true,
+                    }
+                }
+            };
+            write_document(&loss_path, &record)?;
+        } else if let Some(mut loss) = loss.filter(|loss| loss.episode_open) {
+            if !saves.saved.is_empty() {
+                loss.episode_open = false;
+                write_document(&loss_path, &loss)?;
+            }
+        }
+        Ok(saves)
+    }
+
+    /// Read `receipt-reactions-lost.json`, if this state has lost a ✅. The caller holds the state
+    /// lock.
+    fn read_receipt_reaction_loss(&self) -> Result<Option<ReceiptReactionLoss>> {
+        let path = self.root.join(RECEIPT_REACTION_LOSS_FILE);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(ChatRuntimeError::invalid(
+                    "the record of lost receipt reactions is not a regular file",
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(ChatRuntimeError::Io(error)),
+        }
+        let loss: ReceiptReactionLoss = read_document(&path, MAX_RECEIPT_REACTION_LOSS_BYTES)?;
+        if loss.schema != RECEIPT_REACTION_LOSS_SCHEMA
+            || loss.lost == 0
+            || !valid_key(&loss.oldest_lost_key)
+        {
+            return Err(ChatRuntimeError::invalid(
+                "the record of lost receipt reactions is inconsistent",
+            ));
+        }
+        Ok(Some(loss))
+    }
+
+    /// The ✅ receipt reactions this state lost because too many were waiting.
+    pub(crate) fn lost_receipt_reactions(&self) -> Result<LostReceiptReactions> {
+        let _snapshot = self.lock_state_snapshot()?;
+        self.lost_receipt_reactions_locked()
+    }
+
+    fn lost_receipt_reactions_locked(&self) -> Result<LostReceiptReactions> {
+        Ok(self
+            .read_receipt_reaction_loss()?
+            .map(|loss| LostReceiptReactions {
+                count: loss.lost,
+                oldest_key: Some(loss.oldest_lost_key),
+            })
+            .unwrap_or_default())
+    }
+
+    /// Return the keys of the requests whose ✅ receipt reaction waits to be added, in key order.
+    #[cfg(test)]
+    pub(crate) fn pending_receipt_reactions(&self) -> Result<Vec<String>> {
+        let _snapshot = self.lock_state_snapshot()?;
+        self.receipt_reaction_keys()
+    }
+
+    /// Return the key of each waiting ✅ receipt reaction, in key order, with when its last failed
+    /// attempt was made, if it failed and can be read.
+    pub(crate) fn receipt_reaction_attempts(&self) -> Result<Vec<(String, Option<u64>)>> {
+        let _snapshot = self.lock_state_snapshot()?;
+        Ok(self
+            .receipt_reaction_keys()?
+            .into_iter()
+            .map(|key| {
+                let attempted = self
+                    .read_receipt_reaction(&key)
+                    .ok()
+                    .flatten()
+                    .and_then(|record| record.attempted_at_millis);
+                (key, attempted)
+            })
+            .collect())
+    }
+
+    /// Return the keys of the waiting ✅ receipt reactions, least recently tried first: those not
+    /// tried yet, then those whose last attempt failed, oldest attempt first, then those that
+    /// cannot be read. A caller that tries a few at a time so reaches every one in turn.
+    pub(crate) fn receipt_reactions_by_attempt(&self) -> Result<Vec<String>> {
+        let _snapshot = self.lock_state_snapshot()?;
+        let mut ordered = Vec::new();
+        for key in self.receipt_reaction_keys()? {
+            let rank = match self.read_receipt_reaction(&key) {
+                Ok(Some(record)) => record.attempted_at_millis.map_or((0, 0), |at| (1, at)),
+                Ok(None) => continue,
+                Err(_) => (2, 0),
+            };
+            ordered.push((rank, key));
+        }
+        ordered.sort();
+        Ok(ordered.into_iter().map(|(_, key)| key).collect())
+    }
+
+    /// The keys of the files in `receipt-reactions/`, in key order. The caller holds the state
+    /// lock.
+    fn receipt_reaction_keys(&self) -> Result<Vec<String>> {
+        let directory = self.root.join(RECEIPT_REACTION_DIRECTORY);
+        if path_is_absent(&directory)? {
+            return Ok(Vec::new());
+        }
+        agent::validate_private_directory(&directory, "chat receipt reaction directory", false)?;
+        let mut keys = Vec::new();
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            if agent::is_atomic_json_temporary(&entry.path())? {
+                continue;
+            }
+            let name = entry.file_name();
+            let key = name
+                .to_str()
+                .and_then(|name| name.strip_suffix(".json"))
+                .filter(|key| valid_key(key))
+                .ok_or_else(|| {
+                    ChatRuntimeError::invalid("unexpected chat receipt reaction artifact")
+                })?;
+            keys.push(key.to_owned());
+            if keys.len() > MAX_RECEIPT_REACTIONS {
+                return Err(ChatRuntimeError::invalid(
+                    "chat receipt reaction population exceeds its cap",
+                ));
+            }
+        }
+        keys.sort();
+        Ok(keys)
+    }
+
+    /// Read the ✅ receipt reaction waiting under `key`, if there is one. The caller holds the
+    /// state lock.
+    fn read_receipt_reaction(&self, key: &str) -> Result<Option<ReceiptReactionRecord>> {
+        let directory = self.root.join(RECEIPT_REACTION_DIRECTORY);
+        if path_is_absent(&directory)? {
+            return Ok(None);
+        }
+        agent::validate_private_directory(&directory, "chat receipt reaction directory", false)?;
+        let path = directory.join(format!("{key}.json"));
+        // Opening a FIFO would block while the state lock is held, so only a regular file is
+        // opened.
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(ChatRuntimeError::invalid(
+                    "saved receipt reaction is not a regular file",
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(ChatRuntimeError::Io(error)),
+        }
+        let record: ReceiptReactionRecord = match read_document(&path, MAX_RECEIPT_REACTION_BYTES) {
+            Ok(record) => record,
+            Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        record.validate(key)?;
+        if !self.config.channel_ids.contains(&record.channel_id) {
+            return Err(ChatRuntimeError::invalid(
+                "saved receipt reaction names an unconfigured channel",
+            ));
+        }
+        Ok(Some(record))
+    }
+
+    /// Add the ✅ receipt reaction waiting under `key` to its message, then remove its file: see
+    /// [`ReceiptReactionRecord`]. Every attempt passes `transport` the operation ID saved with
+    /// the reaction, so a retry after a failure or a restart repeats one operation. A failure is
+    /// saved with the reaction, which stays waiting. Return `None` when no reaction waits under
+    /// `key`.
+    pub(crate) fn ensure_receipt_reaction(
+        &self,
+        key: &str,
+        transport: &mut dyn ReactionTransport,
+    ) -> Result<Option<ReactionReceipt>> {
+        if !valid_key(key) {
+            return Err(ChatRuntimeError::invalid(
+                "chat request key must be 64 lowercase hexadecimal characters",
+            ));
+        }
+        let path = self
+            .root
+            .join(RECEIPT_REACTION_DIRECTORY)
+            .join(format!("{key}.json"));
+        let snapshot = {
+            let state_lock =
+                agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+            state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+            match self.read_receipt_reaction(key)? {
+                Some(record) => record,
+                None => return Ok(None),
+            }
+        };
+        // A receipt whose reaction ID cannot be kept is a failed attempt like a transport error,
+        // so it is saved with the reaction and counted as failing.
+        let outcome = match transport.ensure_reaction(ReactionSubmission {
+            channel_id: &snapshot.channel_id,
+            message_id: &snapshot.message_id,
+            emoji: &snapshot.emoji,
+            request_id: &snapshot.request_id,
+        }) {
+            Ok(receipt) => validate_single_line(
+                &receipt.reaction_id,
+                "provider reaction id",
+                chat_subscription::MAX_RESOURCE_ID_BYTES,
+            )
+            .map(|()| receipt)
+            .map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        let receipt = match outcome {
+            Ok(receipt) => receipt,
+            Err(detail) => {
+                let state_lock =
+                    agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+                state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+                if let Some(mut record) = self.read_receipt_reaction(key)? {
+                    if record.request_id == snapshot.request_id {
+                        record.error =
+                            Some(bounded_detail(&detail, MAX_RECEIPT_REACTION_ERROR_BYTES));
+                        record.attempted_at_millis = Some(unix_millis());
+                        write_document(&path, &record)?;
+                    }
+                }
+                return Err(ChatRuntimeError::invalid(format!(
+                    "outbound receipt reaction failed: {detail}"
+                )));
+            }
+        };
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        if self
+            .read_receipt_reaction(key)?
+            .is_some_and(|record| record.request_id == snapshot.request_id)
+        {
+            fs::remove_file(&path)?;
+            agent::sync_directory(&self.root.join(RECEIPT_REACTION_DIRECTORY))?;
+        }
+        Ok(Some(receipt))
+    }
+
+    /// The `receipt_reactions` section of [`Self::status`]: the ✅ reactions waiting, and how many
+    /// of them failed at their last attempt or cannot be read. The caller holds the state lock.
+    fn receipt_reaction_status(&self) -> Result<Value> {
+        let keys = self.receipt_reaction_keys()?;
+        let mut failing = 0_u64;
+        for key in &keys {
+            match self.read_receipt_reaction(key) {
+                Ok(Some(record)) if record.error.is_none() => {}
+                Ok(None) => {}
+                Ok(Some(_)) | Err(_) => failing += 1,
+            }
+        }
+        let lost = self.lost_receipt_reactions_locked()?;
+        Ok(json!({
+            "reaction": RECEIPT_REACTION,
+            "waiting": keys.len(),
+            "failing": failing,
+            "lost": lost.count,
+            "oldest_lost_key": lost.oldest_key,
+        }))
     }
 
     /// Inspect one exact active retained request without provider, helper, or coordinator access.
@@ -9646,6 +10268,14 @@ fn batch_fingerprint(batch: &DeliveryBatch) -> Result<String> {
         "events": events,
     }))?;
     Ok(format!("{:x}", Sha256::digest(identity)))
+}
+
+/// The request key in a request prompt's queue message ID, `chat-<key>`. Other prompts, such as
+/// reply-fence feedback, have IDs that name no request.
+pub(crate) fn request_key_of_message(message_id: &str) -> Option<&str> {
+    message_id
+        .strip_prefix("chat-")
+        .filter(|key| valid_key(key))
 }
 
 pub(crate) fn valid_key(value: &str) -> bool {
@@ -25526,6 +26156,800 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
         );
         assert_eq!(transport.submissions.len(), 2);
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    fn saved_receipt_reaction(root: &Path, key: &str) -> ReceiptReactionRecord {
+        read_document(
+            &root
+                .join(RECEIPT_REACTION_DIRECTORY)
+                .join(format!("{key}.json")),
+            MAX_RECEIPT_REACTION_BYTES,
+        )
+        .expect("saved receipt reaction")
+    }
+
+    #[test]
+    fn a_printed_prompt_earns_one_saved_receipt_reaction_added_with_one_stable_uuid() {
+        let root = temporary("receipt-reaction");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request");
+        let key = admission.new_request_keys[0].clone();
+        let message_id = format!("chat-{key}");
+        // A drain reports every prompt it typed: a notice's, another request's that is gone, and
+        // the same prompt twice. Only a request's own message earns a reaction, once.
+        assert_eq!(
+            state
+                .save_receipt_reactions(&[
+                    message_id.clone(),
+                    message_id.clone(),
+                    format!("chat-feedback-{}", "0".repeat(64)),
+                    format!("chat-{}", "0".repeat(64)),
+                    "chat-not-a-key".to_owned(),
+                ])
+                .expect("save receipt reaction")
+                .saved,
+            vec![key.clone()]
+        );
+        let saved = saved_receipt_reaction(&root, &key);
+        assert_eq!(saved.emoji, "\u{2705}");
+        assert_eq!(saved.channel_id, "spaces/example");
+        assert_eq!(saved.message_id, "spaces/example/messages/one");
+        assert!(valid_operation_uuid(&saved.request_id));
+        assert!(saved.error.is_none());
+        // A prompt printed again keeps the reaction already waiting, with its operation ID.
+        assert!(state
+            .save_receipt_reactions(std::slice::from_ref(&message_id))
+            .expect("save again")
+            .saved
+            .is_empty());
+        assert_eq!(saved_receipt_reaction(&root, &key), saved);
+        assert_eq!(
+            state.pending_receipt_reactions().expect("pending"),
+            vec![key.clone()]
+        );
+        assert_eq!(
+            state.status().expect("status")["receipt_reactions"],
+            serde_json::json!({
+                "reaction": "\u{2705}",
+                "waiting": 1,
+                "failing": 0,
+                "lost": 0,
+                "oldest_lost_key": null
+            })
+        );
+
+        let mut transport = FakeReactionTransport {
+            fail_once: true,
+            ..FakeReactionTransport::default()
+        };
+        let error = state
+            .ensure_receipt_reaction(&key, &mut transport)
+            .expect_err("the first attempt fails");
+        assert!(error
+            .to_string()
+            .contains("outbound receipt reaction failed"));
+        assert!(saved_receipt_reaction(&root, &key)
+            .error
+            .is_some_and(|error| error.contains("provider outcome unknown")));
+        assert_eq!(
+            state.pending_receipt_reactions().expect("still pending"),
+            vec![key.clone()]
+        );
+        assert_eq!(
+            state.status().expect("status")["receipt_reactions"],
+            serde_json::json!({
+                "reaction": "\u{2705}",
+                "waiting": 1,
+                "failing": 1,
+                "lost": 0,
+                "oldest_lost_key": null
+            })
+        );
+        drop(state);
+
+        let state = BridgeState::open(&root).expect("reopen state");
+        let receipt = state
+            .ensure_receipt_reaction(&key, &mut transport)
+            .expect("retry the reaction")
+            .expect("a reaction was waiting");
+        assert_eq!(
+            receipt.reaction_id,
+            "spaces/example/messages/one/reactions/robot"
+        );
+        assert_eq!(
+            transport.submissions,
+            vec![
+                (
+                    "spaces/example".to_owned(),
+                    "spaces/example/messages/one".to_owned(),
+                    "\u{2705}".to_owned(),
+                    saved.request_id.clone(),
+                );
+                2
+            ]
+        );
+        assert!(state
+            .pending_receipt_reactions()
+            .expect("nothing pending")
+            .is_empty());
+        assert_eq!(
+            state.status().expect("status")["receipt_reactions"],
+            serde_json::json!({
+                "reaction": "\u{2705}",
+                "waiting": 0,
+                "failing": 0,
+                "lost": 0,
+                "oldest_lost_key": null
+            })
+        );
+        assert!(state
+            .ensure_receipt_reaction(&key, &mut transport)
+            .expect("nothing waits")
+            .is_none());
+        assert_eq!(transport.submissions.len(), 2);
+        // The reaction is separate from the acknowledgement, which keeps its own bookkeeping.
+        assert_eq!(
+            state.read_request(&key).expect("request").ack_phase,
+            AckPhase::Pending
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn no_receipt_reaction_is_saved_without_an_acknowledgement_reaction() {
+        let root = temporary("receipt-reaction-disabled");
+        let state =
+            BridgeState::initialize(&root, config_without_reaction()).expect("initialize state");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request");
+        let key = &admission.new_request_keys[0];
+        assert!(state
+            .save_receipt_reactions(&[format!("chat-{key}")])
+            .expect("save nothing")
+            .saved
+            .is_empty());
+        assert!(!root.join(RECEIPT_REACTION_DIRECTORY).exists());
+        assert!(state
+            .pending_receipt_reactions()
+            .expect("nothing pending")
+            .is_empty());
+        assert_eq!(
+            state.status().expect("status")["receipt_reactions"]["waiting"],
+            0
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn receipt_reactions_are_bounded_and_startup_removes_interrupted_saves() {
+        let root = temporary("receipt-reaction-bounds");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request");
+        let key = admission.new_request_keys[0].clone();
+        let directory = root.join(RECEIPT_REACTION_DIRECTORY);
+        agent::create_private_directory(&directory, "test receipt reaction directory", false, true)
+            .expect("receipt reaction directory");
+        for index in 0..MAX_RECEIPT_REACTIONS {
+            fs::write(directory.join(format!("filler-{index}")), b"").expect("filler");
+        }
+        // With no room, the ✅ is lost and counted, and the losses start an episode.
+        let saves = state
+            .save_receipt_reactions(&[format!("chat-{key}")])
+            .expect("a full directory loses the reaction");
+        assert!(saves.saved.is_empty());
+        assert_eq!(saves.lost, std::slice::from_ref(&key));
+        assert!(saves.losses_began);
+        assert!(!directory.join(format!("{key}.json")).exists());
+        let lost = state.lost_receipt_reactions().expect("lost reactions");
+        assert_eq!(
+            lost,
+            LostReceiptReactions {
+                count: 1,
+                oldest_key: Some(key.clone()),
+            }
+        );
+        // A second loss in the same episode is counted, and starts nothing.
+        let saves = state
+            .save_receipt_reactions(&[format!("chat-{key}")])
+            .expect("lose another");
+        assert!(!saves.losses_began);
+        assert_eq!(state.lost_receipt_reactions().expect("lost").count, 2);
+        for index in 0..MAX_RECEIPT_REACTIONS {
+            fs::remove_file(directory.join(format!("filler-{index}"))).expect("remove filler");
+        }
+
+        // A save interrupted by a crash leaves an atomic temporary, which is not a reaction and
+        // which startup removes.
+        let residue = directory.join(".message.123.456");
+        fs::write(&residue, b"interrupted atomic write").expect("plant residue");
+        fs::set_permissions(&residue, fs::Permissions::from_mode(0o600)).expect("residue mode");
+        assert!(state
+            .pending_receipt_reactions()
+            .expect("a temporary is not a reaction")
+            .is_empty());
+        drop(state);
+        let state = BridgeState::open(&root).expect("reopen state");
+        assert!(!residue.exists());
+        assert_eq!(
+            state
+                .save_receipt_reactions(&[format!("chat-{key}")])
+                .expect("save receipt reaction")
+                .saved,
+            vec![key.clone()]
+        );
+        // A saved ✅ ends the episode; the count stays.
+        let loss: ReceiptReactionLoss =
+            read_document(&root.join(RECEIPT_REACTION_LOSS_FILE), 4_096).expect("loss record");
+        assert!(!loss.episode_open);
+        assert_eq!(loss.lost, 2);
+        assert_eq!(loss.oldest_lost_key, key);
+        BridgeState::inspect(&root).expect("inspect a state with a waiting receipt reaction");
+        drop(state);
+        BridgeState::open(&root).expect("open a state with a waiting receipt reaction");
+
+        // Anything else in the directory is refused rather than ignored.
+        fs::write(directory.join("unexpected.json"), b"{}").expect("plant artifact");
+        let state = BridgeState::open(&root).expect("reopen state");
+        assert!(state
+            .pending_receipt_reactions()
+            .expect_err("an unexpected artifact")
+            .to_string()
+            .contains("unexpected chat receipt reaction artifact"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_receipt_reaction_saved_with_the_largest_helper_error_can_still_be_retried() {
+        /// A helper that refuses every reaction with the longest detail the wire accepts, spelled
+        /// in control characters, which JSON saves in six bytes each.
+        #[derive(Default)]
+        struct EscapedFailureTransport {
+            calls: usize,
+        }
+        impl ReactionTransport for EscapedFailureTransport {
+            fn ensure_reaction(
+                &mut self,
+                submission: ReactionSubmission<'_>,
+            ) -> std::result::Result<ReactionReceipt, OutboundFailure> {
+                self.calls += 1;
+                let payload = serde_json::to_vec(&serde_json::json!({
+                    "version": 1,
+                    "id": submission.request_id,
+                    "action": "ensure_reaction",
+                    "ok": false,
+                    "error": {
+                        "code": "quota",
+                        "detail": "\u{1}".repeat(2_000),
+                        "outcome": "unknown",
+                        "retryable": true,
+                    }
+                }))
+                .expect("wire response");
+                decode_reaction_response(&payload, &submission)
+            }
+        }
+        let root = temporary("receipt-escaped-error");
+        // Quotes and backslashes take two bytes each once saved.
+        let channel = "\\\"".repeat(900);
+        let mut configuration = config();
+        configuration.channel_ids = vec![channel.clone()];
+        let state = BridgeState::initialize(&root, configuration).expect("initialize");
+        let message = InboundMessage::new(
+            ChannelId::new(channel.clone()).expect("valid channel"),
+            MessageId::new(format!("{channel}/messages/one")).expect("valid message"),
+            ThreadId::new(format!("{channel}/threads/one")).expect("valid thread"),
+            SenderId::new("users/owner").expect("valid sender"),
+            "run the tests",
+            "2026-09-21T12:00:00Z",
+            false,
+        )
+        .expect("valid inbound message");
+        let batch = DeliveryBatch::new(
+            EventSequence::new(1).expect("sequence"),
+            ProviderCursor::new("cursor-1").expect("cursor"),
+            DeliveryId::new("receipt-1").expect("receipt"),
+            vec![
+                CommittableEvent::Checkpoint,
+                CommittableEvent::message_created(message),
+            ],
+        )
+        .expect("valid delivery");
+        let key = state.admit_batch(&batch).expect("admit").new_request_keys[0].clone();
+        state
+            .save_receipt_reactions(&[format!("chat-{key}")])
+            .expect("save");
+        let mut transport = EscapedFailureTransport::default();
+        assert!(state.ensure_receipt_reaction(&key, &mut transport).is_err());
+        let file = root
+            .join(RECEIPT_REACTION_DIRECTORY)
+            .join(format!("{key}.json"));
+        let bytes = fs::metadata(file).expect("saved record").len();
+        assert!(bytes > 16 * 1_024, "the saved record is {bytes} bytes");
+        assert!(bytes <= MAX_RECEIPT_REACTION_BYTES as u64);
+        drop(state);
+        let reopened = BridgeState::open(&root).expect("reopen state");
+        let error = reopened
+            .ensure_receipt_reaction(&key, &mut transport)
+            .expect_err("the helper refuses again");
+        let calls = transport.calls;
+        fs::remove_dir_all(root).expect("cleanup");
+        assert!(error
+            .to_string()
+            .contains("outbound receipt reaction failed"));
+        assert_eq!(calls, 2, "the retry reaches the helper");
+    }
+
+    #[test]
+    fn a_reaction_id_the_state_cannot_keep_is_saved_as_a_failed_attempt() {
+        struct InvalidReceiptTransport;
+        impl ReactionTransport for InvalidReceiptTransport {
+            fn ensure_reaction(
+                &mut self,
+                submission: ReactionSubmission<'_>,
+            ) -> std::result::Result<ReactionReceipt, OutboundFailure> {
+                let payload = serde_json::to_vec(&serde_json::json!({
+                    "version": 1,
+                    "id": submission.request_id,
+                    "action": "ensure_reaction",
+                    "ok": true,
+                    "receipt": {
+                        "reaction_id": format!("{}/reactions/\nrobot", submission.message_id),
+                        "already_present": false,
+                    }
+                }))
+                .expect("helper response");
+                decode_reaction_response(&payload, &submission)
+            }
+        }
+        let root = temporary("receipt-invalid-helper-id");
+        let state = BridgeState::initialize(&root, config()).expect("initialize");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit");
+        let key = admission.new_request_keys[0].clone();
+        state
+            .save_receipt_reactions(&[format!("chat-{key}")])
+            .expect("save");
+        let error = state
+            .ensure_receipt_reaction(&key, &mut InvalidReceiptTransport)
+            .expect_err("reject a multiline reaction ID");
+        assert!(error
+            .to_string()
+            .contains("provider reaction id must be one nonempty line"));
+        let status = state.status().expect("status")["receipt_reactions"].clone();
+        let record = saved_receipt_reaction(&root, &key);
+        fs::remove_dir_all(root).expect("cleanup");
+        assert_eq!(status["waiting"], 1);
+        assert_eq!(status["failing"], 1, "the last attempt failed");
+        assert!(record.error.is_some());
+    }
+
+    #[test]
+    fn a_receipt_reaction_that_is_not_a_regular_file_is_refused_without_blocking() {
+        let root = temporary("receipt-fifo");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let key = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request")
+            .new_request_keys[0]
+            .clone();
+        let directory = root.join(RECEIPT_REACTION_DIRECTORY);
+        agent::create_private_directory(&directory, "receipt test directory", false, true)
+            .expect("directory");
+        let path = directory.join(format!("{key}.json"));
+        let fifo = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("FIFO path");
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let (sender, receiver) = mpsc::channel();
+        let child_state = state.clone();
+        let child_key = key.clone();
+        let child = std::thread::spawn(move || {
+            let result = child_state
+                .ensure_receipt_reaction(&child_key, &mut FakeReactionTransport::default());
+            sender.send(result.map(|_| ())).expect("report attempt");
+        });
+        let outcome = receiver.recv_timeout(Duration::from_secs(5));
+        if outcome.is_err() {
+            // Release a reader stuck opening the FIFO, so the test ends either way.
+            let _writer = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path);
+        }
+        child.join().expect("join reader");
+        let status = state.status().expect("status")["receipt_reactions"].clone();
+        fs::remove_dir_all(root).expect("cleanup");
+        let error = outcome
+            .expect("the attempt returns without blocking")
+            .expect_err("a FIFO is not a saved reaction");
+        assert!(error
+            .to_string()
+            .contains("saved receipt reaction is not a regular file"));
+        assert_eq!(status["waiting"], 1);
+        assert_eq!(status["failing"], 1);
+    }
+
+    #[test]
+    fn a_check_mark_acknowledgement_is_refused_for_a_new_state_and_adds_no_receipt_in_an_old_one() {
+        let root = temporary("receipt-check-mark-ack");
+        let mut configuration = config();
+        configuration.ack_reaction = Some(RECEIPT_REACTION.to_owned());
+        let Err(error) = BridgeState::initialize(&root, configuration) else {
+            panic!("a new state refuses a check mark acknowledgement");
+        };
+        assert!(error.to_string().contains("ack_reaction cannot be"));
+        assert!(!root.join("bridge.json").exists());
+
+        // A state made before keeps it: it opens, and its printed prompts add no receipt.
+        let root = temporary("receipt-check-mark-ack-old");
+        let state = BridgeState::initialize(&root, config()).expect("initialize");
+        let key = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit")
+            .new_request_keys[0]
+            .clone();
+        drop(state);
+        let path = root.join("bridge.json");
+        let mut envelope: Value =
+            serde_json::from_slice(&fs::read(&path).expect("bridge.json")).expect("JSON");
+        envelope["config"]["ack_reaction"] = json!(RECEIPT_REACTION);
+        fs::write(&path, serde_json::to_vec(&envelope).expect("encode")).expect("write");
+        let state = BridgeState::open(&root).expect("an old state still opens");
+        let saves = state
+            .save_receipt_reactions(&[format!("chat-{key}")])
+            .expect("save");
+        let exists = root.join(RECEIPT_REACTION_DIRECTORY).exists();
+        fs::remove_dir_all(root).expect("cleanup");
+        assert_eq!(saves, ReceiptSaves::default());
+        assert!(!exists);
+    }
+
+    #[test]
+    fn receipt_reactions_are_tried_least_recently_tried_first() {
+        let root = temporary("receipt-attempt-order");
+        let state = BridgeState::initialize(&root, config()).expect("initialize");
+        let mut keys = Vec::new();
+        for index in 1..=4 {
+            let admission = state
+                .admit_batch(&indexed_delivery_at(
+                    index,
+                    index,
+                    &format!("cursor-{index}"),
+                    &format!("request {index}"),
+                ))
+                .expect("admit");
+            state
+                .confirm_batch_commit(&admission)
+                .expect("confirm batch commit");
+            keys.push(admission.new_request_keys[0].clone());
+        }
+        let printed = keys
+            .iter()
+            .map(|key| format!("chat-{key}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            state
+                .save_receipt_reactions(&printed)
+                .expect("save")
+                .saved
+                .len(),
+            4
+        );
+        let directory = root.join(RECEIPT_REACTION_DIRECTORY);
+        let set_attempt = |key: &str, at: Option<u64>| {
+            let mut record = saved_receipt_reaction(&root, key);
+            record.error = at.map(|_| "provider outcome unknown".to_owned());
+            record.attempted_at_millis = at;
+            write_document(&directory.join(format!("{key}.json")), &record).expect("write");
+        };
+        set_attempt(&keys[0], Some(2_000));
+        set_attempt(&keys[1], Some(1_000));
+        set_attempt(&keys[2], None);
+        fs::write(directory.join(format!("{}.json", keys[3])), b"{}").expect("corrupt");
+        let ordered = state.receipt_reactions_by_attempt().expect("order");
+        fs::remove_dir_all(root).expect("cleanup");
+        assert_eq!(
+            ordered,
+            [
+                keys[2].clone(),
+                keys[1].clone(),
+                keys[0].clone(),
+                keys[3].clone()
+            ]
+        );
+    }
+
+    /// A Claude Code pane that shows `before` until a paste, `staged` until a key, then `after`.
+    struct PromptFrames {
+        before: String,
+        staged: String,
+        after: String,
+        phase: Mutex<usize>,
+        keys: Mutex<Vec<String>>,
+    }
+
+    impl PromptFrames {
+        fn new(before: String, staged: String, after: String) -> Self {
+            Self {
+                before,
+                staged,
+                after,
+                phase: Mutex::new(0),
+                keys: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Submit `prompt` and return whether the receipt says the pane printed it.
+        fn printed(&self, prompt: &str) -> bool {
+            let outcome = crate::submission::submit_verified(
+                self,
+                "w1:p1",
+                "claude",
+                prompt,
+                crate::submission::SubmitTimeouts::default(),
+                &VirtualClock::default(),
+            );
+            assert_eq!(*self.keys.lock().expect("keys"), ["Enter"]);
+            match outcome {
+                Ok(crate::submission::Submission::Verified(receipt)) => receipt.printed,
+                other => panic!("the prompt was not verified: {other:?}"),
+            }
+        }
+    }
+
+    impl crate::submission::PromptTerminal for PromptFrames {
+        fn read_screen(&self, _pane_id: &str) -> crate::error::Result<String> {
+            Ok(match *self.phase.lock().expect("phase") {
+                0 => self.before.clone(),
+                1 => self.staged.clone(),
+                _ => self.after.clone(),
+            })
+        }
+        fn send_text(&self, _pane_id: &str, _text: &str) -> crate::error::Result<()> {
+            *self.phase.lock().expect("phase") = 1;
+            Ok(())
+        }
+        fn send_keys(&self, _pane_id: &str, key: &str) -> crate::error::Result<()> {
+            self.keys.lock().expect("keys").push(key.to_owned());
+            *self.phase.lock().expect("phase") = 2;
+            Ok(())
+        }
+    }
+
+    /// A clock that moves only when the code under test sleeps.
+    #[derive(Default)]
+    struct VirtualClock(Mutex<Duration>);
+
+    impl agent::AgentRuntime for VirtualClock {
+        fn monotonic(&self) -> Duration {
+            *self.0.lock().expect("clock")
+        }
+        fn sleep(&self, duration: Duration) {
+            let mut now = self.0.lock().expect("clock");
+            *now = now.saturating_add(duration);
+        }
+    }
+
+    /// A busy Claude Code screen with `transcript` above a composer holding `composer`.
+    fn busy_claude_screen(transcript: &str, composer: &str) -> String {
+        let rule = "─".repeat(40);
+        format!(
+            "{transcript}\n{rule}\n❯\u{a0}{composer}\n{rule}\n  ⏵⏵ auto mode on · esc to interrupt\n"
+        )
+    }
+
+    /// A state holding two requests whose messages say `old` and `new`, with their keys.
+    fn two_requests(name: &str, old: &str, new: &str) -> (PathBuf, BridgeState, String, String) {
+        let root = temporary(name);
+        let state = BridgeState::initialize(&root, config()).expect("initialize bridge");
+        let first = state
+            .admit_batch(&indexed_delivery_at(1, 1, "cursor-1", old))
+            .expect("admit the first message");
+        state
+            .confirm_batch_commit(&first)
+            .expect("confirm first batch");
+        let second = state
+            .admit_batch(&indexed_delivery_at(2, 2, "cursor-2", new))
+            .expect("admit the second message");
+        state
+            .confirm_batch_commit(&second)
+            .expect("confirm second batch");
+        let (old_key, new_key) = (
+            first.new_request_keys[0].clone(),
+            second.new_request_keys[0].clone(),
+        );
+        (root, state, old_key, new_key)
+    }
+
+    #[test]
+    fn a_generated_chat_prompt_sharing_its_edges_with_an_older_one_is_printed_evidence() {
+        fn compact(text: &str) -> String {
+            text.chars()
+                .filter(|character| !character.is_whitespace())
+                .collect()
+        }
+        let (root, state, old_key, new_key) = two_requests(
+            "receipt-template-edges",
+            "Please inspect the old request body.",
+            "Please inspect the new request body.",
+        );
+        let old_prompt = state.prompt(&old_key, "").expect("old prompt");
+        let before = busy_claude_screen(&format!("❯ {old_prompt}"), "");
+        let prompt = state.prompt(&new_key, &before).expect("new prompt");
+        fs::remove_dir_all(root).expect("cleanup");
+        let (old, new) = (compact(&old_prompt), compact(&prompt));
+        assert_ne!(old, new);
+        // The two prompts share their first and last 40 non-blank characters.
+        assert_eq!(
+            old.chars().take(40).collect::<String>(),
+            new.chars().take(40).collect::<String>()
+        );
+        assert_eq!(
+            old.chars().rev().take(40).collect::<String>(),
+            new.chars().rev().take(40).collect::<String>()
+        );
+        // The old copy scrolls away as the new one appears.
+        let frames = PromptFrames::new(
+            before,
+            busy_claude_screen(&format!("❯ {old_prompt}"), &prompt),
+            busy_claude_screen(&format!("❯ {prompt}"), ""),
+        );
+        assert!(frames.printed(&prompt));
+    }
+
+    #[test]
+    fn an_older_prompt_from_the_same_template_shown_after_the_key_is_not_printed_evidence() {
+        let (root, state, old_key, new_key) = two_requests(
+            "receipt-older-echo",
+            "Please inspect the old request body.",
+            "Please inspect the new request body.",
+        );
+        let old_prompt = state.prompt(&old_key, "").expect("old prompt");
+        let before = busy_claude_screen("• earlier", "");
+        let prompt = state.prompt(&new_key, &before).expect("new prompt");
+        fs::remove_dir_all(root).expect("cleanup");
+        // An older queued prompt appears after the key; this prompt never does.
+        let frames = PromptFrames::new(
+            before,
+            busy_claude_screen("• earlier", &prompt),
+            busy_claude_screen(&format!("• earlier\n❯ {old_prompt}"), ""),
+        );
+        assert!(!frames.printed(&prompt));
+    }
+
+    #[test]
+    fn an_older_paste_placeholder_shown_after_the_key_is_not_printed_evidence() {
+        let (root, state, _, new_key) = two_requests(
+            "receipt-older-placeholder",
+            "Please inspect the old request body.",
+            "Please inspect the new request body.",
+        );
+        let before = busy_claude_screen("• earlier", "");
+        let prompt = state.prompt(&new_key, &before).expect("new prompt");
+        fs::remove_dir_all(root).expect("cleanup");
+        // This paste is #924; only an older #923 appears after the key.
+        let frames = PromptFrames::new(
+            before,
+            busy_claude_screen("• earlier", "[Pasted text #924 +10 lines]"),
+            busy_claude_screen("• earlier\n❯ [Pasted text #923 +10 lines]", ""),
+        );
+        assert!(!frames.printed(&prompt));
+    }
+
+    #[test]
+    fn a_placeholder_that_names_only_a_length_is_not_printed_evidence() {
+        let (root, state, _, new_key) = two_requests(
+            "receipt-length-placeholder",
+            "Please inspect the old request body.",
+            "Please inspect the new request body.",
+        );
+        let before = busy_claude_screen("• earlier", "");
+        let prompt = state.prompt(&new_key, &before).expect("new prompt");
+        fs::remove_dir_all(root).expect("cleanup");
+        // Another paste of the same length shows the same label.
+        let frames = PromptFrames::new(
+            before,
+            busy_claude_screen("• earlier", "[Pasted Content 1000 chars]"),
+            busy_claude_screen("• earlier\n❯ [Pasted Content 1000 chars]", ""),
+        );
+        assert!(!frames.printed(&prompt));
+    }
+
+    #[test]
+    fn placeholder_text_inside_a_prompt_is_not_its_paste_label() {
+        let (root, state, _, new_key) = two_requests(
+            "receipt-literal-placeholder",
+            "Please inspect the old request body.",
+            "Quote this: [Pasted text #7 +3 lines]",
+        );
+        let before = busy_claude_screen("• earlier", "");
+        let prompt = state.prompt(&new_key, &before).expect("new prompt");
+        fs::remove_dir_all(root).expect("cleanup");
+        assert!(prompt.contains("[Pasted text #7 +3 lines]"));
+        // The composer shows the prompt itself, with the label as text in it; an older row with
+        // that label appears after the key, and the prompt does not.
+        let frames = PromptFrames::new(
+            before,
+            busy_claude_screen("• earlier", &prompt),
+            busy_claude_screen("• earlier\n❯ [Pasted text #7 +3 lines]", ""),
+        );
+        assert!(!frames.printed(&prompt));
+    }
+
+    #[test]
+    fn a_long_generated_prompt_is_printed_evidence_by_its_own_placeholder() {
+        let body = "x".repeat(30_000);
+        let (root, state, _, new_key) = two_requests("receipt-long-prompt", &body, &body);
+        let before = busy_claude_screen("❯ [Pasted text #923 +300 lines]", "");
+        let prompt = state.prompt(&new_key, &before).expect("new prompt");
+        fs::remove_dir_all(root).expect("cleanup");
+        let frames = PromptFrames::new(
+            before,
+            busy_claude_screen(
+                "❯ [Pasted text #923 +300 lines]",
+                "[Pasted text #924 +300 lines]",
+            ),
+            busy_claude_screen(
+                "❯ [Pasted text #923 +300 lines]\n❯ [Pasted text #924 +300 lines]",
+                "",
+            ),
+        );
+        assert!(frames.printed(&prompt));
+    }
+
+    #[test]
+    fn a_print_reporter_passes_each_printed_prompt_to_its_runtime_and_to_its_caller() {
+        #[derive(Default)]
+        struct NotingRuntime {
+            slept: std::cell::Cell<Duration>,
+            noted: std::cell::RefCell<Vec<String>>,
+        }
+
+        impl agent::AgentRuntime for NotingRuntime {
+            fn monotonic(&self) -> Duration {
+                Duration::from_secs(7)
+            }
+
+            fn sleep(&self, duration: Duration) {
+                self.slept.set(self.slept.get() + duration);
+            }
+
+            fn cancelled(&self) -> bool {
+                true
+            }
+
+            fn delivery_wait_chunk(&self) -> Option<Duration> {
+                Some(Duration::from_millis(3))
+            }
+
+            fn prompt_printed(&self, message_id: &str) {
+                self.noted.borrow_mut().push(message_id.to_owned());
+            }
+        }
+
+        let runtime = NotingRuntime::default();
+        let reported = std::cell::RefCell::new(Vec::new());
+        let printed = |id: &str| reported.borrow_mut().push(id.to_owned());
+        let reporter = PrintReporter {
+            runtime: &runtime,
+            printed: &printed,
+        };
+        let reporter: &dyn agent::AgentRuntime = &reporter;
+        assert_eq!(reporter.monotonic(), Duration::from_secs(7));
+        reporter.sleep(Duration::from_millis(5));
+        assert_eq!(runtime.slept.get(), Duration::from_millis(5));
+        assert!(reporter.cancelled());
+        assert_eq!(
+            reporter.delivery_wait_chunk(),
+            Some(Duration::from_millis(3))
+        );
+        reporter.prompt_printed("chat-one");
+        assert_eq!(*runtime.noted.borrow(), ["chat-one"]);
+        assert_eq!(*reported.borrow(), ["chat-one"]);
     }
 
     #[test]
