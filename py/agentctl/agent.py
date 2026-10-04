@@ -1296,54 +1296,116 @@ class _TargetLock:
         self.close()
 
 
-def _lock_target(name: str, purpose: str) -> _TargetLock:
-    """Open and lock every file of one target lock in order, blocking on each."""
+def _flock_exclusive(descriptor: int, _path: str) -> None:
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+
+
+def _lock_target(
+    name: str, purpose: str, wait: Callable[[int, str], None] = _flock_exclusive
+) -> _TargetLock:
+    """Open and lock every file of one target lock in order, waiting on each with ``wait``."""
     lock = _TargetLock(())
     try:
-        for path in _target_lock_paths(name):
-            lock._descriptors.append(_lock_current_file(path, purpose))
+        paths = _target_lock_paths(name)
+        for path in paths:
+            _lock_current_file(path, purpose, lock._descriptors, wait)
+        _refresh_lock_files_when_due(
+            os.path.join(os.path.dirname(paths[0]), _LEGACY_REFRESH_MARKER),
+            os.path.dirname(paths[1]),
+        )
     except BaseException:
         lock.close()
         raise
     return lock
 
 
-def _flock_exclusive(descriptor: int, _path: str) -> None:
-    fcntl.flock(descriptor, fcntl.LOCK_EX)
-
-
 def _lock_current_file(
-    path: str, purpose: str, wait: Callable[[int, str], None] = _flock_exclusive
-) -> int:
+    path: str,
+    purpose: str,
+    held: list[int],
+    wait: Callable[[int, str], None] = _flock_exclusive,
+) -> None:
     """Lock the file at ``path``, retrying until it is still the file the path names.
+
+    The descriptor is appended to ``held`` as soon as it is opened, before it is locked, so the
+    caller owns it, and releases it on any failure, from the moment it can hold a lock.
 
     The host's daily cleaner deletes ``/tmp`` files by modification time, so it can unlink a
     lock file while a sender waits on it. A sender that then took the lock would hold a file no
     other process can open, while the next sender locked a fresh file at the same path; the
-    check after locking sends it back to contend on the file that is there. Setting the
-    modification time on every acquisition keeps a file that is still in use from ever looking
-    four days old to the cleaner, including while a process that takes only the ``/tmp`` file
-    holds it.
+    check after locking sends it back to contend on the file that is there. The file's
+    modification time is then set to now.
     """
     while True:
-        descriptor = _open_private_lock(path, purpose)
+        held.append(_open_private_lock(path, purpose))
+        descriptor = held[-1]
+        wait(descriptor, path)
+        locked = os.fstat(descriptor)
         try:
-            wait(descriptor, path)
-            held = os.fstat(descriptor)
-            try:
-                current = os.stat(path, follow_symlinks=False)
-            except FileNotFoundError:
-                current = None
-            if current is not None and (current.st_dev, current.st_ino) == (
-                held.st_dev,
-                held.st_ino,
-            ):
-                os.utime(descriptor)
-                return descriptor
-        except BaseException:
+            current = os.stat(path, follow_symlinks=False)
+        except FileNotFoundError:
+            current = None
+        if current is not None and (current.st_dev, current.st_ino) == (
+            locked.st_dev,
+            locked.st_ino,
+        ):
+            os.utime(descriptor)
+            return
+        os.close(held.pop())
+
+
+# The account-state file whose modification time records the last refresh of the /tmp lock
+# files. It lives outside /tmp, so the cleaner never removes it.
+_LEGACY_REFRESH_MARKER = "legacy-locks-refreshed"
+# How often senders refresh the /tmp lock files: far inside the cleaner's four days, and rare
+# enough that a steady stream of deliveries does not scan a directory each time.
+_LEGACY_REFRESH_SECONDS = 60 * 60
+
+
+def _refresh_lock_files_when_due(marker: str, directory: str) -> None:
+    """Refresh every lock file in ``directory`` unless ``marker`` shows a refresh within the
+    last ``_LEGACY_REFRESH_SECONDS``. A missing marker, or one dated in the future, is due."""
+    now = time.time()
+    try:
+        age: float | None = now - os.stat(marker).st_mtime
+    except OSError:
+        age = None
+    if age is not None and 0 <= age < _LEGACY_REFRESH_SECONDS:
+        return
+    # A marker that cannot be written only means the next sender refreshes again.
+    try:
+        descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            os.utime(descriptor, (now, now))
+        finally:
             os.close(descriptor)
-            raise
-        os.close(descriptor)
+    except OSError:
+        pass
+    _refresh_lock_files(directory)
+
+
+def _refresh_lock_files(directory: str) -> None:
+    """Set the modification time of every lock file in ``directory`` to now.
+
+    Refreshing only the file a sender locks leaves two gaps. The cleaner examines a file and
+    deletes it a moment later, so a file that was four days old when examined can be deleted
+    just after a sender refreshed and locked it. And a target no one sends to for four days
+    ages out while a process that takes only the ``/tmp`` file may still open it. Refreshing
+    the whole directory at least hourly means no file there reaches four days while any
+    process that takes both files delivers on the host. Failures are ignored: a file that another
+    sender is creating or the cleaner is deleting needs nothing from this sender, whose own
+    lock is already valid.
+    """
+    try:
+        entries = list(os.scandir(directory))
+    except OSError:
+        return
+    for entry in entries:
+        if entry.name.endswith(".lock"):
+            try:
+                os.utime(entry.path, follow_symlinks=False)
+            except OSError:
+                pass
 
 
 def _lock_resolved_target(

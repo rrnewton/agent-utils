@@ -1768,6 +1768,14 @@ fn lock_target_with(
     let [account_path, legacy_path] = target_lock_paths(name)?;
     let account = lock_current_file(&account_path, purpose, &mut wait)?;
     let legacy = lock_current_file(&legacy_path, purpose, &mut wait)?;
+    if let (Some(account_directory), Some(legacy_directory)) =
+        (account_path.parent(), legacy_path.parent())
+    {
+        refresh_lock_files_when_due(
+            &account_directory.join(LEGACY_REFRESH_MARKER),
+            legacy_directory,
+        );
+    }
     Ok(TargetLock {
         _account: account,
         _legacy: legacy,
@@ -1780,10 +1788,7 @@ fn lock_target_with(
 /// The host's daily cleaner deletes `/tmp` files by modification time, so it can unlink a lock
 /// file while a sender waits on it. A sender that then took the lock would hold a file no
 /// other process can open, while the next sender locked a fresh file at the same path; the
-/// check after locking sends it back to contend on the file that is there. Setting the
-/// modification time on every acquisition keeps a file that is still in use from ever
-/// looking four days old to the cleaner, including while a process that takes only the `/tmp`
-/// file holds it.
+/// check after locking sends it back to contend on the file that is there.
 fn lock_current_file(
     path: &Path,
     purpose: &str,
@@ -1804,6 +1809,70 @@ fn lock_current_file(
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(io_error(&format!("inspect {purpose}"), path, error)),
+        }
+    }
+}
+
+/// The account-state file whose modification time records the last refresh of the `/tmp` lock
+/// files. It lives outside `/tmp`, so the cleaner never removes it.
+const LEGACY_REFRESH_MARKER: &str = "legacy-locks-refreshed";
+
+/// How often senders refresh the `/tmp` lock files: far inside the cleaner's four days, and
+/// rare enough that a steady stream of deliveries does not scan a directory each time.
+const LEGACY_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Refresh every lock file in `directory` unless `marker` shows a refresh within the last
+/// [`LEGACY_REFRESH_INTERVAL`]. A missing marker, or one dated in the future, is due.
+fn refresh_lock_files_when_due(marker: &Path, directory: &Path) {
+    let now = SystemTime::now();
+    let fresh = fs::metadata(marker)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age < LEGACY_REFRESH_INTERVAL);
+    if fresh {
+        return;
+    }
+    // A marker that cannot be written only means the next sender refreshes again.
+    let _ = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(marker)
+        .and_then(|file| file.set_modified(now));
+    refresh_lock_files(directory);
+}
+
+/// Set the modification time of every lock file in `directory` to now.
+///
+/// Refreshing only the file a sender locks leaves two gaps. The cleaner examines a file and
+/// deletes it a moment later, so a file that was four days old when examined can be deleted
+/// just after a sender refreshed and locked it. And a target no one sends to for four days
+/// ages out while a process that takes only the `/tmp` file may still open it. Refreshing the
+/// whole directory at least hourly means no file there reaches four days while any process
+/// that takes both files delivers on the host. Failures are ignored: a file that another
+/// sender is creating or the cleaner is deleting needs nothing from this sender, whose own
+/// lock is already valid.
+fn refresh_lock_files(directory: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().as_bytes().ends_with(b".lock") {
+            continue;
+        }
+        let Ok(path) = CString::new(entry.path().as_os_str().as_bytes()) else {
+            continue;
+        };
+        // SAFETY: `path` is NUL-terminated and outlives the call; null times mean now.
+        unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                std::ptr::null(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            );
         }
     }
 }
@@ -3216,10 +3285,58 @@ mod tests {
     }
 
     #[test]
-    fn taking_a_target_lock_marks_both_files_used() {
+    fn lock_files_are_refreshed_only_when_the_marker_is_due() {
+        let root = test_target_lock_root().join("refresh-when-due");
+        let directory = root.join("legacy");
+        fs::create_dir_all(&directory).expect("create test directory");
+        let marker = root.join(LEGACY_REFRESH_MARKER);
+        let lock_file = directory.join("idle.lock");
+        let stale = SystemTime::now() - Duration::from_secs(5 * 24 * 60 * 60);
+        let age = |path: &Path, when: SystemTime| {
+            File::options()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)
+                .and_then(|file| file.set_modified(when))
+                .expect("set test file time");
+        };
+        let refreshed = || {
+            fs::metadata(&lock_file)
+                .and_then(|meta| meta.modified())
+                .unwrap()
+                > SystemTime::now() - Duration::from_secs(60)
+        };
+        let ages = [
+            ("fresh", SystemTime::now(), false),
+            ("due", SystemTime::now() - LEGACY_REFRESH_INTERVAL, true),
+            (
+                "future",
+                SystemTime::now() + Duration::from_secs(24 * 60 * 60),
+                true,
+            ),
+        ];
+        for (case, marked, expected) in ages {
+            age(&marker, marked);
+            age(&lock_file, stale);
+            refresh_lock_files_when_due(&marker, &directory);
+            assert_eq!(refreshed(), expected, "marker {case}");
+        }
+        fs::remove_file(&marker).expect("remove marker");
+        age(&lock_file, stale);
+        refresh_lock_files_when_due(&marker, &directory);
+        assert!(refreshed(), "missing marker");
+        assert!(marker.exists(), "the refresh is recorded");
+    }
+
+    #[test]
+    fn taking_a_target_lock_marks_every_lock_file_used() {
         // The cleaner deletes by modification time, and only a file it sees as four days old.
+        // The cleaner also deletes a file a moment after examining it, and a target no one
+        // sends to ages out, so every /tmp file is refreshed, not only this target's.
         let name = "marks-files-used";
-        let paths = target_lock_paths(name).expect("target lock paths");
+        let mut paths = target_lock_paths(name).expect("target lock paths").to_vec();
+        paths.push(target_lock_paths("an-idle-target").expect("idle target paths")[1].clone());
         let stale = SystemTime::now() - Duration::from_secs(5 * 24 * 60 * 60);
         for path in &paths {
             open_private_lock(path, "stale test lock")
@@ -3227,6 +3344,9 @@ mod tests {
                 .set_modified(stale)
                 .expect("age lock file");
         }
+        // No refresh recorded yet, as on a host's first new-edition delivery.
+        let marker = paths[0].with_file_name(LEGACY_REFRESH_MARKER);
+        let _ = fs::remove_file(&marker);
         let before = SystemTime::now() - Duration::from_secs(1);
         let lock = lock_target(name, "test target lock").expect("take target lock");
         for path in &paths {

@@ -639,25 +639,114 @@ def test_a_lock_file_unlinked_while_waited_on_is_not_held(tmp_path: Path) -> Non
             os.close(replacement.pop())
         fcntl.flock(descriptor, fcntl.LOCK_EX)
 
-    held = agent_api._lock_current_file(path, "test target lock", wait)
+    held: list[int] = []
     try:
-        assert waits == 2
-        current, locked = os.stat(path), os.fstat(held)
+        agent_api._lock_current_file(path, "test target lock", held, wait)
+        assert waits == 2 and len(held) == 1
+        current, locked = os.stat(path), os.fstat(held[0])
         assert (current.st_dev, current.st_ino) == (locked.st_dev, locked.st_ino)
     finally:
-        os.close(held)
+        for descriptor in held:
+            os.close(descriptor)
 
 
-def test_taking_a_target_lock_marks_both_files_used() -> None:
-    # The cleaner deletes by modification time, and only a file it sees as four days old.
+@pytest.mark.parametrize("failing", [0, 1], ids=["account-root", "legacy-root"])
+def test_a_failed_acquisition_releases_every_file_it_locked(failing: int) -> None:
+    # The descriptor belongs to the lock from the moment it is opened, so a failure after a
+    # file is locked (here, in the wait itself) releases it instead of leaking a held lock that
+    # would block every later sender for the life of the process.
+    import fcntl
+
+    name = "failed-acquisition"
+    paths = agent_api._target_lock_paths(name)
+    calls = 0
+
+    def wait(descriptor: int, _path: str) -> None:
+        nonlocal calls
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        if calls == failing:
+            raise RuntimeError("injected failure after locking")
+        calls += 1
+
+    with pytest.raises(RuntimeError, match="injected failure"):
+        agent_api._lock_target(name, "test target lock", wait)
+    for path in paths:
+        probe = agent_api._open_private_lock(path, "probe lock")
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(probe)
+
+
+def test_a_lock_descriptor_is_owned_before_it_is_locked(tmp_path: Path) -> None:
+    # Registering the descriptor can itself fail (MemoryError). If that happened after the
+    # flock, the caller would never see the descriptor and a long-lived process that survives
+    # the error would hold the lock forever. Registration must come first.
+    import fcntl
+
+    path = str(tmp_path / "target.lock")
+    unregistered: list[int] = []
+
+    class FailingRegistry(list[int]):
+        def append(self, descriptor: int) -> None:
+            unregistered.append(descriptor)
+            raise MemoryError("injected registration failure")
+
+    try:
+        with pytest.raises(MemoryError):
+            agent_api._lock_current_file(path, "test target lock", FailingRegistry())
+        probe = agent_api._open_private_lock(path, "probe lock")
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(probe)
+    finally:
+        for descriptor in unregistered:
+            os.close(descriptor)
+
+
+@pytest.mark.parametrize(
+    ("marker_age", "refreshed"),
+    [(0, False), (60 * 60, True), (-24 * 60 * 60, True), (None, True)],
+    ids=["fresh", "due", "future", "missing"],
+)
+def test_lock_files_are_refreshed_only_when_the_marker_is_due(
+    tmp_path: Path, marker_age: int | None, refreshed: bool
+) -> None:
+    import time
+
+    marker = tmp_path / agent_api._LEGACY_REFRESH_MARKER
+    directory = tmp_path / "legacy"
+    directory.mkdir()
+    lock_file = directory / "idle.lock"
+    lock_file.touch()
+    stale = time.time() - 5 * 24 * 60 * 60
+    os.utime(lock_file, (stale, stale))
+    if marker_age is not None:
+        marker.touch()
+        marked = time.time() - marker_age
+        os.utime(marker, (marked, marked))
+    agent_api._refresh_lock_files_when_due(str(marker), str(directory))
+    assert (lock_file.stat().st_mtime > time.time() - 60) is refreshed
+    assert marker.exists()
+
+
+def test_taking_a_target_lock_marks_every_lock_file_used() -> None:
+    # The cleaner deletes by modification time, and only a file it sees as four days old. It
+    # also deletes a file a moment after examining it, and a target no one sends to ages out,
+    # so every /tmp file is refreshed, not only this target's.
     import time
 
     name = "marks-files-used"
-    paths = agent_api._target_lock_paths(name)
+    paths = (*agent_api._target_lock_paths(name), agent_api._target_lock_paths("an-idle-target")[1])
     stale = time.time() - 5 * 24 * 60 * 60
     for path in paths:
         os.close(agent_api._open_private_lock(path, "stale test lock"))
         os.utime(path, (stale, stale))
+    # No refresh recorded yet, as on a host's first new-edition delivery.
+    marker = os.path.join(os.path.dirname(paths[0]), agent_api._LEGACY_REFRESH_MARKER)
+    if os.path.exists(marker):
+        os.unlink(marker)
     before = time.time() - 1
     with agent_api._lock_target(name, "test target lock"):
         for path in paths:

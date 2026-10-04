@@ -92,6 +92,8 @@ def _private_agentctl_target_locks(
     roots = (lock_root / "account", lock_root / "legacy")
     for root in roots:
         root.mkdir(mode=0o700)
+    # A just-recorded refresh of the legacy lock files, so a lock lookup does not scan.
+    (roots[0] / agentctl_agent._LEGACY_REFRESH_MARKER).touch(mode=0o600)
 
     def isolated_paths(name: str) -> tuple[str, str]:
         lock_name = agentctl_agent._target_lock_name(name)
