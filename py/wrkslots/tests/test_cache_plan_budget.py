@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import itertools
 import json
 import os
+import random
 import subprocess
 import types
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
@@ -434,3 +436,184 @@ def test_registered_record_planning_uses_its_share(tmp_path: Path) -> None:
     assert row["cache_status"] == "complete"
     assert row["cache_bytes"] == _allocated(cache)
     assert not [r for r in row["reasons"] if r.startswith("cache inspection")]
+
+
+def _every_glob(cache_globs: Sequence[str], paths: Sequence[str]) -> list[str]:
+    """Select cache paths the way checkout inspection did before the index:
+    test every path against every glob."""
+
+    return [
+        path
+        for path in paths
+        if any(cli._cache_glob_contains_path(pattern, path) for pattern in cache_globs)
+    ]
+
+
+# '**', wildcards and classes in the first component (which validation refuses
+# but direct callers may pass), dotfiles, a trailing slash, leading and doubled
+# separators, an unclosed '[', literal ']' and '\', and globs with no
+# components at all.
+TRICKY_GLOBS = (
+    *LIVE_SHAPED,
+    "**",
+    "**/target",
+    "*/target",
+    "t*",
+    "[tT]arget",
+    "[!x]arget",
+    "t[a-c]rget",
+    ".cache",
+    ".cache/**",
+    ".*",
+    "target/",
+    "/target",
+    "ignored//target",
+    "./target",
+    "a/b/c",
+    "a/[bc]/**",
+    "a\\b",
+    "x]y",
+    "[",
+    "a/**/**/c",
+    "",
+    "/",
+)
+COMPONENTS = (
+    "target", "Target", "xarget", "targets", ".cache", ".target", "ignored",
+    "a", "b", "c", "node_modules", "[", "a\\b", "x]y", ".", "",
+)
+# Every join of up to three components, so empty components produce leading,
+# trailing and doubled separators, and the empty path itself is included.
+TRICKY_PATHS = tuple(
+    "/".join(combination)
+    for length in range(0, 4)
+    for combination in itertools.product(COMPONENTS, repeat=length)
+)
+
+
+def test_cache_path_selection_equals_testing_every_glob() -> None:
+    assert len(TRICKY_PATHS) == 1 + 16 + 16**2 + 16**3
+    generator = random.Random(20261003)
+    glob_sets: list[tuple[str, ...]] = [
+        LIVE_SHAPED,
+        TRICKY_GLOBS,
+        *((pattern,) for pattern in TRICKY_GLOBS),
+        *(
+            tuple(generator.sample(TRICKY_GLOBS, generator.randint(2, 6)))
+            for _ in range(20)
+        ),
+    ]
+    selected_somewhere = 0
+    for cache_globs in glob_sets:
+        expected = _every_glob(cache_globs, TRICKY_PATHS)
+        assert cli._paths_inside_cache_globs(cache_globs, TRICKY_PATHS) == expected, (
+            cache_globs
+        )
+        selected_somewhere += bool(expected)
+    # The comparison is not vacuous: most glob sets select some paths.
+    assert selected_somewhere > len(glob_sets) // 2
+
+
+def test_cache_path_selection_tests_only_globs_sharing_the_first_component(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tested: list[tuple[str, str]] = []
+    real = cli._cache_glob_contains_path
+
+    def spy(pattern: str, path: str) -> bool:
+        tested.append((pattern, path))
+        return real(pattern, path)
+
+    monkeypatch.setattr(cli, "_cache_glob_contains_path", spy)
+    source = [f"src/module{index}/target/file{index}.rs" for index in range(10_000)]
+    paths = [*source, "target/debug/x.o", "ignored/a/target/y", "ignored/a/b", "targets/z"]
+
+    assert cli._paths_inside_cache_globs(LIVE_SHAPED, paths) == [
+        "target/debug/x.o",
+        "ignored/a/target/y",
+    ]
+    # No source path is tested against any glob; each candidate is tested only
+    # against the globs that begin with its first component, in order, until
+    # one accepts it.
+    assert tested == [
+        ("target", "target/debug/x.o"),
+        ("ignored/**/target", "ignored/a/target/y"),
+        ("ignored/**/target", "ignored/a/b"),
+        ("ignored/**/target-debug", "ignored/a/b"),
+        ("ignored/**/components-target", "ignored/a/b"),
+    ]
+
+    # A glob with no literal first component is still tested against every path.
+    tested.clear()
+    assert cli._paths_inside_cache_globs(("**/file7.rs",), paths) == [
+        "src/module7/target/file7.rs"
+    ]
+    assert len(tested) == len(paths)
+
+
+def _git(checkout: Path, *arguments: str) -> None:
+    subprocess.run(
+        [
+            "git", "-C", str(checkout), "-c", "user.name=fixture",
+            "-c", "user.email=fixture@example.invalid", *arguments,
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _tracked_by_every_glob(checkout: Path, cache_globs: Sequence[str]) -> tuple[str, ...]:
+    """The body ``_GitVcs.tracked_cache_paths`` had before the index."""
+
+    vcs = cli._GitVcs()
+    indexed = vcs._run(checkout, ["ls-files", "--recurse-submodules", "-z"])
+    committed = vcs._run(checkout, ["ls-tree", "-r", "--name-only", "-z", "HEAD"])
+    paths = [
+        path
+        for output in (indexed.stdout, committed.stdout)
+        for path in output.split("\x00")
+        if path
+    ]
+    return tuple(dict.fromkeys(_every_glob(cache_globs, paths)))
+
+
+def test_tracked_cache_paths_is_unchanged_on_a_real_checkout(tmp_path: Path) -> None:
+    checkout = tmp_path / "checkout"
+    _git_checkout(checkout)
+    for relative in (
+        "src/main.rs",
+        "src/target.rs",
+        "targets/keep",
+        "target/committed.o",
+        "node_modules/pkg/index.js",
+        "ignored/x/y/target/z",
+        "ignored/x/target-debug/w",
+        ".cache/blob",
+        ".target/hidden",
+        "a b/target/space",
+        "Target/upper",
+        "x]y/bracket",
+    ):
+        (checkout / relative).parent.mkdir(parents=True, exist_ok=True)
+        (checkout / relative).write_bytes(relative.encode())
+    _git(checkout, "add", "-A")
+    _git(checkout, "commit", "-q", "-m", "tracked")
+    # One path only in HEAD and one only in the index, so the listings differ
+    # and the order of the union matters.
+    _git(checkout, "rm", "-q", "--cached", "target/committed.o")
+    (checkout / "target/staged.o").write_bytes(b"staged")
+    _git(checkout, "add", "target/staged.o")
+
+    tracked = cli._GitVcs().tracked_cache_paths(checkout, LIVE_SHAPED)
+    assert tracked == (
+        "ignored/x/target-debug/w",
+        "ignored/x/y/target/z",
+        "node_modules/pkg/index.js",
+        "target/staged.o",
+        "target/committed.o",
+    )
+    assert tracked == _tracked_by_every_glob(checkout, LIVE_SHAPED)
+    for cache_globs in (TRICKY_GLOBS, *((pattern,) for pattern in TRICKY_GLOBS)):
+        assert cli._GitVcs().tracked_cache_paths(
+            checkout, cache_globs
+        ) == _tracked_by_every_glob(checkout, cache_globs), cache_globs
