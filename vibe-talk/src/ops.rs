@@ -430,6 +430,12 @@ pub struct Digest {
     /// `#196 auto-read-noise`. Reported rather than silently dropped, so a caller can say "and
     /// three placeholders" instead of making the channel sound quieter than it is.
     pub noise: usize,
+    /// The oldest message the window reached, placeholder or not: where a step back begins.
+    ///
+    /// Not the first entry. When every message in the window is a placeholder there IS no entry,
+    /// and a digest with no cursor leaves a caller no way past them to the older messages behind;
+    /// when only the oldest is one, stepping back from the first entry hands it over again.
+    pub oldest: Option<MessageId>,
 }
 
 /// One speakable line per recent message. Read scope.
@@ -455,6 +461,7 @@ pub async fn digest(
     } else {
         width
     };
+    let oldest = window.messages.first().map(|m| m.id.clone());
     let (noise, kept): (Vec<Message>, Vec<Message>) =
         window.messages.into_iter().partition(|m| m.noise);
     Ok(Digest {
@@ -462,6 +469,7 @@ pub async fn digest(
         entries: summary::digest(&kept, width),
         complete,
         noise: noise.len(),
+        oldest,
     })
 }
 

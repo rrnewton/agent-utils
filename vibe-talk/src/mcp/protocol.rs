@@ -548,7 +548,20 @@ fn page_header(page: &ops::Page) -> String {
         return format!("Page of {label} (id {id}): no messages in that part of the channel.\n");
     }
     let plural = if count == 1 { "message" } else { "messages" };
-    let onward = if let Some(cursor) = &page.next_before {
+    let onward = page_onward(page);
+    format!(
+        "Page of {label} (id {id}): {count} {plural} returned, oldest first. This is a PAGE, not \
+         the channel's total.{onward}\n"
+    )
+}
+
+/// The sentence that says where the next step of a walk starts, or that there is none.
+///
+/// Its own function since `#196 auto-read-noise`, because a page whose messages were ALL
+/// placeholders gets a different first sentence and still needs this one. Without it the walk
+/// stopped at the first run of placeholders, and everything older was out of the agent's reach.
+fn page_onward(page: &ops::Page) -> String {
+    if let Some(cursor) = &page.next_before {
         format!(
             " There are older messages beyond this page; call read_page again with \
              before={cursor} to step back."
@@ -562,11 +575,7 @@ fn page_header(page: &ops::Page) -> String {
         " There are more messages beyond this page.".to_owned()
     } else {
         " There is nothing beyond this page in that direction.".to_owned()
-    };
-    format!(
-        "Page of {label} (id {id}): {count} {plural} returned, oldest first. This is a PAGE, not \
-         the channel's total.{onward}\n"
-    )
+    }
 }
 
 /// The sentence that says how many messages the owner's noise rules left out, or nothing.
@@ -610,12 +619,15 @@ async fn run_page(state: &AppState, args: &Value) -> Result<String, OpError> {
     page.messages.retain(|m| !m.noise);
     let header = if page.messages.is_empty() && noise > 0 {
         // Not "no messages in that part of the channel", which would be false, and not a count
-        // the model would read out as news either.
+        // the model would read out as news either. The way onward is still said: a run of
+        // placeholders is not the end of the channel, and a walk that is not told where to step
+        // next stops at the first one.
         format!(
             "Page of {} (id {}): nothing to report — every message in this page is a placeholder \
-             the owner's noise rules mark as read.\n",
+             the owner's noise rules mark as read.{}\n",
             page.channel.display_name(),
-            page.channel.id
+            page.channel.id,
+            page_onward(&page)
         )
     } else {
         let header = page_header(&page);
@@ -682,6 +694,7 @@ async fn run_digest(state: &AppState, args: &Value) -> Result<String, OpError> {
         entries,
         complete,
         noise,
+        oldest,
     } = ops::digest(
         state,
         &channel_id,
@@ -689,11 +702,9 @@ async fn run_digest(state: &AppState, args: &Value) -> Result<String, OpError> {
         arg_u16(args, "width"),
     )
     .await?;
-    // The oldest entry is the front of the list, and it is the cursor a caller hands to read_page
-    // to reach what this digest could not.
-    let oldest = entries
-        .first()
-        .map(|e| crate::model::MessageId(e.id.clone()));
+    // `oldest` is the cursor a caller hands to read_page to reach what this digest could not: the
+    // oldest message the window REACHED, which is the front of the entries unless a placeholder
+    // sat below them. See `ops::Digest::oldest`.
     let header = digest_header(
         info.display_name(),
         &info.id,
@@ -702,9 +713,19 @@ async fn run_digest(state: &AppState, args: &Value) -> Result<String, OpError> {
         oldest.as_ref(),
     );
     let header = if entries.is_empty() && noise > 0 {
+        // `#196 auto-read-noise`. Still offers the step back when the window was not the whole
+        // channel, for the reason `page_onward` does: "nothing to report" about the most recent
+        // few is not "nothing older", and without a cursor the agent cannot get past them.
+        let step_back = match (&oldest, complete) {
+            (Some(id), false) => format!(
+                " There are older messages this fetch did not reach, and their count is unknown. \
+                 To reach them, call read_page with before={id}."
+            ),
+            _ => String::new(),
+        };
         format!(
             "Digest of {} (id {}): nothing to report — the recent messages are all placeholders \
-             the owner's noise rules mark as read.\n",
+             the owner's noise rules mark as read.{step_back}\n",
             info.display_name(),
             info.id
         )

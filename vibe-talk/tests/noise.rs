@@ -371,6 +371,85 @@ async fn the_agents_tools_leave_placeholders_out_and_say_how_many() {
 }
 
 #[tokio::test]
+async fn a_page_of_nothing_but_placeholders_still_says_how_to_step_back() {
+    // A walk back with a small limit can land on a run of placeholders, and in the owner's space
+    // they come in runs. "Nothing to report" WITHOUT the cursor ends the walk right there: the
+    // real messages behind the run are then out of the agent's reach, which is hiding messages —
+    // the one thing this feature must never do.
+    let harness = Harness::new();
+    let behind = harness.seed("alice", "The release notes are in the shared folder.");
+    let oldest_placeholder = harness.seed(AGENT, PLACEHOLDER);
+    harness.seed(AGENT, PLACEHOLDER);
+    harness.seed(AGENT, "Working...");
+    let page = harness
+        .tool_text(
+            "read_page",
+            json!({ "channel_id": READ_CHANNEL, "limit": 3 }),
+        )
+        .await;
+    assert!(page.contains("nothing to report"), "{page}");
+    let cursor = format!("before={}", oldest_placeholder.as_str());
+    assert!(
+        page.contains(&cursor),
+        "the walk was given no way past the placeholders: {page}"
+    );
+    // ...and the cursor it was given really does reach what is behind them.
+    let next = harness
+        .tool_text(
+            "read_page",
+            json!({
+                "channel_id": READ_CHANNEL,
+                "limit": 3,
+                "before": oldest_placeholder.as_str(),
+            }),
+        )
+        .await;
+    assert!(next.contains(behind.as_str()), "{next}");
+}
+
+#[tokio::test]
+async fn a_digest_steps_back_from_the_oldest_message_it_reached_placeholder_or_not() {
+    // The same gap in the digest: a window of nothing but placeholders has no entry to take a
+    // cursor from, and a short digest that says "there are older messages" without saying how to
+    // reach them leaves the agent guessing a bigger limit.
+    let harness = Harness::new();
+    let behind = harness.seed("alice", "The release notes are in the shared folder.");
+    let oldest_placeholder = harness.seed(AGENT, PLACEHOLDER);
+    harness.seed(AGENT, PLACEHOLDER);
+    harness.seed(AGENT, PLACEHOLDER);
+    let digest = harness
+        .tool_text(
+            "digest_channel",
+            json!({ "channel_id": READ_CHANNEL, "limit": 3 }),
+        )
+        .await;
+    assert!(digest.contains("nothing to report"), "{digest}");
+    assert!(!digest.contains(behind.as_str()), "{digest}");
+    let step_back = format!("read_page with before={}", oldest_placeholder.as_str());
+    assert!(
+        digest.contains(&step_back),
+        "the digest gave no way past the placeholders: {digest}"
+    );
+
+    // With a real message in the window too, the cursor is still the oldest message REACHED, not
+    // the oldest one kept: stepping back from the kept one would hand the placeholder below it
+    // over again.
+    let harness = Harness::new();
+    harness.seed("alice", "The release notes are in the shared folder.");
+    let oldest_placeholder = harness.seed(AGENT, PLACEHOLDER);
+    let answer = harness.seed(AGENT, "The notes moved to the team wiki last week.");
+    let digest = harness
+        .tool_text(
+            "digest_channel",
+            json!({ "channel_id": READ_CHANNEL, "limit": 2 }),
+        )
+        .await;
+    assert!(digest.contains(answer.as_str()), "{digest}");
+    let step_back = format!("read_page with before={}", oldest_placeholder.as_str());
+    assert!(digest.contains(&step_back), "{digest}");
+}
+
+#[tokio::test]
 async fn not_noise_rescues_one_message_and_leaves_the_rule_alone() {
     let harness = Harness::new();
     let c = harness.conversation();
