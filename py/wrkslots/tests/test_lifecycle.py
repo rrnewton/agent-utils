@@ -42216,15 +42216,29 @@ def seal_absent_validate_row(
     return config, seal_path, record
 
 
-def allow_orphaned_seal_recovery(project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def allow_orphaned_seal_recovery(
+    project: Path, monkeypatch: pytest.MonkeyPatch, *, real_census: bool = False
+) -> None:
     """Admit absent-row recovery and an authoritative view of every process.
 
     Same-boot proof that a seal actor exited counts only from the initial PID
-    namespace; pin that answer so the tests do not depend on where they run.
+    and time namespaces, through a /proc that hides no process; pin those
+    answers so the tests do not depend on where they run.
+
+    The seal actor these tests record is the pytest process itself, which is
+    alive; `seal_absent_validate_row` only replaces its PID.  Unless
+    `real_census` is set, the census of the machine's processes is pinned to
+    one in which that generation has exited.
     """
 
     allow_test_host_for_absent_validate_recovery(project, monkeypatch)
     monkeypatch.setattr(wrkslots, "_in_initial_pid_namespace", lambda: True)
+    monkeypatch.setattr(
+        wrkslots, "_reader_time_namespace", lambda: wrkslots._INITIAL_TIME_NAMESPACE_LINK
+    )
+    monkeypatch.setattr(wrkslots, "_proc_hidden_process_option", lambda: None)
+    if not real_census:
+        monkeypatch.setattr(wrkslots, "_process_census", lambda: [])
 
 
 def recover_seal_only(project: Path) -> int:
@@ -42660,6 +42674,210 @@ def test_restricted_pid_namespace_cannot_prove_an_orphaned_seal_actor_exited(
     # The archive keeps the audit line the interrupted run wrote from the
     # initial PID namespace.
     assert_orphaned_seal_retired(project, config, seal_path, seal_bytes)
+
+
+@pytest.mark.parametrize(
+    "point",
+    (None, "after-absent-validate-archive", "after-absent-validate-journal-before-seal"),
+)
+def test_a_live_seal_actor_recorded_under_a_nested_pid_is_found_by_its_start_ticks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    point: str | None,
+) -> None:
+    """A nested coordinator's recorded PID names nothing here; its ticks still match.
+
+    The recorded actor is the live pytest process under a PID that no process
+    of this namespace has, exactly what a coordinator in a nested PID namespace
+    records.  The real /proc census finds that generation, so neither a fresh
+    plan or apply nor a resumed recovery accepts the seal as orphaned.
+    """
+
+    project, repository, _remote = make_project(tmp_path)
+    config, seal_path, record = seal_absent_validate_row(project, repository)
+    allow_orphaned_seal_recovery(project, monkeypatch, real_census=True)
+    input_path = write_absent_validate_input(project, [record])
+    seal_bytes = seal_path.read_bytes()
+    actor = json.loads(seal_bytes)["actor"]
+    assert actor["pid"] == _DEAD_SEAL_ACTOR_PID
+    assert not Path(f"/proc/{_DEAD_SEAL_ACTOR_PID}").exists()
+    assert wrkslots._process_start_ticks(Path(f"/proc/{os.getpid()}")) == actor["start_ticks"]
+
+    if point is not None:
+        with monkeypatch.context() as exited:
+            exited.setattr(wrkslots, "_process_census", lambda: [])
+
+            class Interrupted(RuntimeError):
+                pass
+
+            def interrupt(observed: str) -> None:
+                if observed == point:
+                    raise Interrupted
+
+            exited.setattr(wrkslots, "_interrupt_for_test", interrupt)
+            with pytest.raises(Interrupted):
+                run_absent_validate_recovery(project, input_path, apply=True)
+        assert seal_path.read_bytes() == seal_bytes
+
+    capsys.readouterr()
+    before = tree_snapshot(control_directory(project))
+    for apply in (False, True):
+        assert run_absent_validate_recovery(project, input_path, apply=apply) == 3
+        refused = capsys.readouterr().err
+        assert (
+            f"has the start ticks of validation-batch seal actor PID {_DEAD_SEAL_ACTOR_PID}; "
+            "it may be the actor, recorded under the PID of a nested PID namespace"
+        ) in refused, refused
+        assert tree_snapshot(control_directory(project)) == before
+    assert seal_path.read_bytes() == seal_bytes
+    # Only the last boundary has already archived and removed the ACTIVE row.
+    assert ([row.slot for row in wrkslots._load_active(config).slots] == ["slot01"]) == (
+        point != "after-absent-validate-journal-before-seal"
+    )
+
+    # Once no process carries those start ticks, the same recovery completes.
+    monkeypatch.setattr(wrkslots, "_process_census", lambda: [])
+    assert run_absent_validate_recovery(project, input_path, apply=True, output_format="json") == 0
+    resumed = capsys.readouterr()
+    assert [row["outcome"] for row in json.loads(resumed.out)["rows"]] == [
+        "already-recovered" if point == "after-absent-validate-journal-before-seal" else "recovered"
+    ]
+    assert_orphaned_seal_retired(project, config, seal_path, seal_bytes)
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    (
+        (
+            "reader-time-namespace",
+            "cannot be proven gone from time namespace time:[4026532999], where start ticks",
+        ),
+        ("process-time-namespace", "process 4242 uses time namespace time:[4026532999]"),
+        ("children-time-namespace", "process 4242 uses time namespace time:[4026532999]"),
+        ("hidden-processes", "/proc is mounted with hidepid=invisible"),
+    ),
+)
+def test_a_seal_actor_census_that_cannot_see_every_start_tick_refuses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    case: str,
+    expected: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    config, seal_path, record = seal_absent_validate_row(project, repository)
+    allow_orphaned_seal_recovery(project, monkeypatch)
+    input_path = write_absent_validate_input(project, [record])
+    seal_bytes = seal_path.read_bytes()
+    shifted = "time:[4026532999]"
+    initial = wrkslots._INITIAL_TIME_NAMESPACE_LINK
+    if case == "reader-time-namespace":
+        monkeypatch.setattr(wrkslots, "_reader_time_namespace", lambda: shifted)
+    elif case == "hidden-processes":
+        monkeypatch.setattr(wrkslots, "_proc_hidden_process_option", lambda: "hidepid=invisible")
+    else:
+        links = (shifted, initial) if case == "process-time-namespace" else (initial, shifted)
+        census = [
+            wrkslots._CensusProcess(pid=4241, start_ticks=7, time_namespaces=None),
+            wrkslots._CensusProcess(pid=4242, start_ticks=8, time_namespaces=links),
+        ]
+        monkeypatch.setattr(wrkslots, "_process_census", lambda: census)
+
+    capsys.readouterr()
+    before = tree_snapshot(control_directory(project))
+    for apply in (False, True):
+        assert run_absent_validate_recovery(project, input_path, apply=apply) == 3
+        refused = capsys.readouterr().err
+        assert expected in refused, refused
+        assert tree_snapshot(control_directory(project)) == before
+    assert seal_path.read_bytes() == seal_bytes
+    assert [row.slot for row in wrkslots._load_active(config).slots] == ["slot01"]
+
+
+def _fake_proc_process(
+    proc: Path,
+    name: str,
+    *,
+    pid: int | None = None,
+    start_ticks: int = 100,
+    flags: int = 0,
+    time_namespaces: tuple[str, ...] = (),
+    stat: bool = True,
+) -> None:
+    pid_dir = proc / name
+    (pid_dir / "ns").mkdir(parents=True)
+    if stat:
+        fields = ["S", "1", "0", "0", "0", "-1", str(flags)] + ["0"] * 12 + [str(start_ticks)]
+        fields += ["0"] * 4
+        (pid_dir / "stat").write_text(
+            f"{pid if pid is not None else name} (a b) c) {' '.join(fields)}\n",
+            encoding="ascii",
+        )
+    for link_name, target in zip(("time", "time_for_children"), time_namespaces):
+        (pid_dir / "ns" / link_name).symlink_to(target)
+
+
+def test_process_census_lists_user_processes_with_their_time_namespaces(
+    tmp_path: Path,
+) -> None:
+    proc = tmp_path / "proc"
+    initial = wrkslots._INITIAL_TIME_NAMESPACE_LINK
+    shifted = "time:[4026532999]"
+    _fake_proc_process(proc, "10", start_ticks=501, time_namespaces=(initial, shifted))
+    _fake_proc_process(proc, "11", start_ticks=502, flags=wrkslots._PF_KTHREAD)
+    _fake_proc_process(proc, "12", start_ticks=503)
+    _fake_proc_process(proc, "13", stat=False)
+    _fake_proc_process(proc, "14", start_ticks=504, time_namespaces=(initial,))
+    (proc / "self").mkdir()
+    (proc / "mountinfo").write_text("", encoding="ascii")
+
+    census = sorted(wrkslots._process_census(proc), key=lambda process: process.pid)
+
+    # The kernel thread and the process that exited before its stat was read
+    # are not listed; unreadable time namespaces are recorded as unknown.
+    assert census == [
+        wrkslots._CensusProcess(pid=10, start_ticks=501, time_namespaces=(initial, shifted)),
+        wrkslots._CensusProcess(pid=12, start_ticks=503, time_namespaces=None),
+        wrkslots._CensusProcess(pid=14, start_ticks=504, time_namespaces=None),
+    ]
+
+    _fake_proc_process(proc, "15", pid=16)
+    with pytest.raises(wrkslots.Refusal, match="process generation is invalid for PID 15"):
+        wrkslots._process_census(proc)
+    with pytest.raises(wrkslots.Refusal, match="cannot list .* to take a process census"):
+        wrkslots._process_census(tmp_path / "missing")
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    (
+        ("rw", None),
+        ("rw,hidepid=0", None),
+        ("rw,hidepid=off", None),
+        ("rw,hidepid=2", "hidepid=2"),
+        ("rw,hidepid=invisible,gid=10", "hidepid=invisible"),
+        ("rw,hidepid=noaccess", "hidepid=noaccess"),
+    ),
+)
+def test_proc_hidden_process_option_reads_the_visible_proc_mount(
+    tmp_path: Path, options: str, expected: str | None
+) -> None:
+    proc = tmp_path / "proc"
+    (proc / "self").mkdir(parents=True)
+    mountinfo = proc / "self" / "mountinfo"
+    lines = [
+        "21 1 0:20 / / rw,relatime shared:1 - ext4 /dev/root rw,hidepid=2",
+        f"22 21 0:22 / {proc} rw,nosuid shared:12 - proc proc rw,hidepid=invisible",
+        f"23 22 0:23 / {proc} rw,nosuid shared:13 - proc proc {options}",
+    ]
+    mountinfo.write_text("\n".join(lines) + "\n", encoding="ascii")
+    # The last mount at the path is the one this process sees.
+    assert wrkslots._proc_hidden_process_option(proc) == expected
+
+    mountinfo.write_text(lines[0] + "\n", encoding="ascii")
+    with pytest.raises(wrkslots.Refusal, match="cannot find the mount of"):
+        wrkslots._proc_hidden_process_option(proc)
 
 
 def test_absent_validate_recovery_parses_event_history_in_bounded_passes_at_127_rows(

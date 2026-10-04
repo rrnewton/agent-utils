@@ -45840,6 +45840,19 @@ def _validate_batch_seal_actor_exit(actor: ProcessIdentity) -> str:
     after its last row is archived and its storage is gone, so a recovery that
     accepted such evidence could retire the seal of a removal that is still
     running.
+
+    ⚠️ THE RECORDED PID MAY NOT BE A PID OF THIS NAMESPACE.  Seal creation
+    accepts a coordinator in a nested PID namespace and records the PID that
+    namespace gave it, which names an unrelated process -- or none -- here.
+    The seal does not say which namespace recorded it, so the PID alone proves
+    nothing even from the initial namespace.  Start ticks do not depend on the
+    PID namespace, so the proof is a census instead: no process on the machine
+    may carry the actor's start ticks.  Start ticks do depend on the reader's
+    time namespace, so the census counts only from the initial time namespace,
+    and refuses while any process it can inspect runs in, or would start its
+    children in, another time namespace, where a seal could have been recorded
+    with offset ticks.  The time namespace of another user's process cannot be
+    read; that is the remaining trust limit.
     """
 
     current_host = _host_id()
@@ -45862,9 +45875,142 @@ def _validate_batch_seal_actor_exit(actor: ProcessIdentity) -> str:
             "this restricted PID namespace, which cannot see every process and so "
             "cannot prove that the actor exited; rerun from the initial PID namespace"
         )
+    _refuse_validate_batch_seal_actor_in_census(actor)
     if ticks is None:
         return f"seal actor PID {actor.pid} has exited"
     return f"seal actor PID {actor.pid} was reused; the recorded generation exited"
+
+
+# The kernel's fixed inode number for the initial time namespace
+# (PROC_TIME_INIT_INO).  /proc/<pid>/stat reports start ticks shifted by the
+# READER's time namespace offset, so only readers there see unshifted ticks.
+_INITIAL_TIME_NAMESPACE_LINK = "time:[4026531834]"
+
+
+@dataclasses.dataclass(frozen=True)
+class _CensusProcess:
+    pid: int
+    start_ticks: int
+    # The process's own time namespace and the one its children start in;
+    # None when it cannot be read (another user's process, or one that exited).
+    time_namespaces: tuple[str, ...] | None
+
+
+def _reader_time_namespace() -> str | None:
+    try:
+        return os.readlink("/proc/self/ns/time")
+    except OSError:
+        return None
+
+
+def _proc_hidden_process_option(proc: Path = Path("/proc")) -> str | None:
+    """Return the hidepid option that hides processes from this /proc, if any."""
+
+    try:
+        mountinfo = (proc / "self" / "mountinfo").read_text(encoding="utf-8")
+    except OSError as exc:
+        raise Refusal(
+            f"cannot read {proc / 'self' / 'mountinfo'} to confirm that {proc} shows "
+            f"every process: {exc}"
+        ) from exc
+    options: list[str] | None = None
+    for line in mountinfo.splitlines():
+        mount, separator, filesystem = line.partition(" - ")
+        mount_fields = mount.split()
+        filesystem_fields = filesystem.split()
+        if (
+            separator
+            and len(mount_fields) >= 5
+            and len(filesystem_fields) >= 3
+            and mount_fields[4] == str(proc)
+        ):
+            options = filesystem_fields[2].split(",")
+    if options is None:
+        raise Refusal(f"cannot find the mount of {proc} to confirm that it shows every process")
+    for option in options:
+        name, _equals, value = option.partition("=")
+        if name == "hidepid" and value not in {"0", "off"}:
+            return option
+    return None
+
+
+def _process_census(proc: Path = Path("/proc")) -> list[_CensusProcess]:
+    """Return every user process this /proc lists, with its start ticks."""
+
+    try:
+        names = os.listdir(proc)
+    except OSError as exc:
+        raise Refusal(f"cannot list {proc} to take a process census: {exc}") from exc
+    processes: list[_CensusProcess] = []
+    for name in names:
+        if not name.isdigit():
+            continue
+        pid_dir = proc / name
+        process_stat = _read_process_stat(pid_dir)
+        if process_stat is None or process_stat.flags & _PF_KTHREAD:
+            continue
+        links: list[str] = []
+        for link_name in ("time", "time_for_children"):
+            try:
+                links.append(os.readlink(pid_dir / "ns" / link_name))
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                break
+            except OSError as exc:
+                raise Refusal(
+                    f"time namespace of PID {name} is indeterminate because "
+                    f"{pid_dir / 'ns' / link_name} is unreadable: {exc}"
+                ) from exc
+        processes.append(
+            _CensusProcess(
+                pid=int(name),
+                start_ticks=process_stat.start_ticks,
+                time_namespaces=tuple(links) if len(links) == 2 else None,
+            )
+        )
+    return processes
+
+
+def _refuse_validate_batch_seal_actor_in_census(actor: ProcessIdentity) -> None:
+    """Refuse unless no process on the machine can be the seal actor.
+
+    Called only from the initial PID namespace; see
+    `_validate_batch_seal_actor_exit` for why the recorded PID is not enough.
+    """
+
+    reader_time = _reader_time_namespace()
+    if reader_time != _INITIAL_TIME_NAMESPACE_LINK:
+        raise Refusal(
+            f"validation-batch seal actor PID {actor.pid} cannot be proven gone from "
+            f"time namespace {reader_time or 'unknown'}, where start ticks read from "
+            "/proc are shifted from those the actor recorded; rerun from the initial "
+            "time namespace"
+        )
+    hidden = _proc_hidden_process_option()
+    if hidden is not None:
+        raise Refusal(
+            f"validation-batch seal actor PID {actor.pid} cannot be proven gone: /proc "
+            f"is mounted with {hidden}, which hides other users' processes"
+        )
+    census = _process_census()
+    for process in census:
+        if process.start_ticks == actor.start_ticks:
+            raise Refusal(
+                f"process {process.pid} has the start ticks of validation-batch seal "
+                f"actor PID {actor.pid}; it may be the actor, recorded under the PID "
+                "of a nested PID namespace, so its removal may still be running"
+            )
+    for process in census:
+        shifted = [
+            link
+            for link in process.time_namespaces or ()
+            if link != _INITIAL_TIME_NAMESPACE_LINK
+        ]
+        if shifted:
+            raise Refusal(
+                f"process {process.pid} uses time namespace {shifted[0]}, where a seal "
+                "actor's start ticks would be recorded shifted, so no census can prove "
+                f"that validation-batch seal actor PID {actor.pid} exited"
+            )
 
 
 def _orphaned_validate_batch_seal(
