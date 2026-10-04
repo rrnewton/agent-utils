@@ -1430,6 +1430,32 @@ body {
  * either direction. It is quiet because it is a standing fact rather than a message, and it
  * scrolls away with the top of the history rather than holding a strip of a phone screen.
  */
+/* `row-more-menu`. "⋯" on the row, and a small menu under it holding the rarely used actions. */
+.row-more {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.row-more-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 0.25rem);
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding: 0.4rem;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 0.6rem;
+  white-space: nowrap;
+}
+
+.row-more-menu[hidden] {
+  display: none;
+}
+
+.row-more-button,
 .done-button,
 .upstream-read-button {
   flex: 0 0 auto;

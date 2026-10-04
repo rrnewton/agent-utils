@@ -114,6 +114,8 @@ impl NativeThread {
             reply_count: self.replies,
             reply_count_exact: false,
             updated_at,
+            display_name: None,
+            summary: None,
         })
     }
 }

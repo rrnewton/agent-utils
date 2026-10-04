@@ -94,6 +94,8 @@ fn thread_summary(root: Option<Message>) -> ThreadSummary {
         reply_count: None,
         reply_count_exact: false,
         updated_at: "2026-09-25T12:00:00+00:00".into(),
+        display_name: None,
+        summary: None,
     }
 }
 

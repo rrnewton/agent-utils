@@ -575,6 +575,11 @@ declare namespace VibeTalk {
    */
   interface ThreadSummary {
     /**
+     * A short hyphenated name for the thread, chosen once by a summariser and then kept even if
+     * the thread drifts, so the reader always finds it under the same name. Absent until named.
+     */
+    display_name?: string | null;
+    /**
      * Opaque identifier used for reading or posting to this thread.
      */
     id: string;
@@ -590,6 +595,11 @@ declare namespace VibeTalk {
      * The original message, when available and readable.
      */
     root: Message | null;
+    /**
+     * One sentence on what the thread is about now, re-summarised as it grows. Absent until
+     * summarised. See [`thread_summary_due`] for when it is refreshed.
+     */
+    summary?: string | null;
     /**
      * Provider-supplied title, or a neutral fallback.
      */

@@ -5940,6 +5940,17 @@ function threadOf(message) {
     ? message.thread.id : null;
 }
 
+/** How many replies a thread has, from its summary or the message's own thread record. */
+function threadReplyCount(id, message) {
+  const summary = channelCanon.threads.find((held) => String(held.id) === String(id));
+  const count = summary && typeof summary.reply_count === "number"
+    ? summary.reply_count
+    : message && message.thread && typeof message.thread.reply_count === "number"
+      ? message.thread.reply_count
+      : null;
+  return count;
+}
+
 function threadForMessageId(id) {
   for (const row of el("discord-log").children) {
     const found = rowMessages(row).find((message) => String(message.id) === String(id));
@@ -6089,6 +6100,14 @@ async function changeChannelView(view, threadId = null, summary = null) {
     // active view; a tab switch itself must not become another network wait.
     return;
   }
+  // A THREAD IS A SUBSET OF ALL. Opened while All is covered and the thread is not, it inherits
+  // All's cover and is drawn as a filter of the messages already held: no loading screen for a
+  // narrowing of what is on the page. Older replies than All reached are still a scroll away.
+  if (view === "thread" && threadingSupported &&
+      channelCanon.channel === String(el("discord-channel").value) &&
+      !channelCanon.views.has(viewKey("thread", threadId)) && channelCanon.views.has(viewKey("flat"))) {
+    channelCanon.views.set(viewKey("thread", threadId), { ...channelCanon.views.get(viewKey("flat")), cursor: null });
+  }
   // Not drawn in this page yet, but covered by the channel's store — read earlier, or saved on
   // this device: project it, with no request. The stream and the poll keep it current from here.
   if (threadingSupported && channelCanon.channel === String(el("discord-channel").value) && drawProjection()) {
@@ -6136,8 +6155,11 @@ function catchUpHeldView() {
 const THREAD_DIRECTORY_REFRESH_MS = 60000;
 /** Most threads the selector lists, newest activity first; the list is for choosing, not paging. */
 const THREAD_SELECT_LIMIT = 40;
-/** Longest thread name shown in the selector, in characters; a select elides the rest anyway. */
-const THREAD_TITLE_CHARS = 60;
+/**
+ * Longest first-message prefix the selector uses as a name, in characters. Short on purpose: a
+ * phone's native picker draws its options large, and a sentence per option was unreadable.
+ */
+const THREAD_TITLE_CHARS = 28;
 
 const threadDirectoryReadAt = new Map();
 let threadDirectoryInFlight = null;
@@ -6149,6 +6171,30 @@ function threadNameFrom(text) {
   return line.length > THREAD_TITLE_CHARS ? `${line.slice(0, THREAD_TITLE_CHARS - 1)}…` : line;
 }
 
+/** "now", "5m", "2h", "3d", "6w": how long ago, as briefly as a picker option allows. */
+function briefAge(atMs) {
+  if (!Number.isFinite(atMs)) return "";
+  const minutes = Math.max(0, Math.floor((Date.now() - atMs) / 60000));
+  if (minutes < 1) return "now";
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours}h`;
+  const days = Math.floor(hours / 24);
+  return days < 14 ? `${days}d` : `${Math.floor(days / 7)}w`;
+}
+
+/**
+ * The name a thread goes by: a summarised display name when the server has one, then a title the
+ * provider gave it, then a short prefix of its first message.
+ */
+function threadDisplayName(summary, firstContent) {
+  const named = summary && typeof summary.display_name === "string" ? summary.display_name.trim() : "";
+  if (named) return named;
+  const title = summary && typeof summary.title === "string" ? summary.title.trim() : "";
+  if (title && title !== "Thread") return threadNameFrom(title);
+  return threadNameFrom(firstContent);
+}
+
 /** The threads this channel's store knows, newest activity first. */
 function threadChoices() {
   if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return [];
@@ -6158,10 +6204,11 @@ function threadChoices() {
     if (id === channelCanon.scope) continue;
     byId.set(id, {
       id,
-      title: summary.title || threadNameFrom(summary.root && summary.root.content),
+      title: threadDisplayName(summary, summary.root && summary.root.content),
       count: summary.reply_count,
       exact: summary.reply_count_exact,
       at: timeOf(summary, "updated_at"),
+      started: summary.root ? timeOf(summary.root, "timestamp") : NaN,
     });
   }
   for (const message of channelCanon.messages) {
@@ -6171,6 +6218,7 @@ function threadChoices() {
     const known = byId.get(id);
     if (known) {
       known.at = Math.max(known.at, at);
+      if (message.thread && message.thread.is_root && !Number.isFinite(known.started)) known.started = at;
     } else if (message.thread && message.thread.is_root) {
       byId.set(id, {
         id,
@@ -6178,6 +6226,7 @@ function threadChoices() {
         count: message.thread.reply_count,
         exact: message.thread.reply_count_exact,
         at,
+        started: at,
       });
     }
   }
@@ -6193,8 +6242,10 @@ function renderThreadSelect() {
   if (threadingSupported) {
     options.push(["flat", "All"]);
     for (const choice of choices) {
-      const count = typeof choice.count === "number" ? ` · ${threadCount(choice.count, choice.exact)}` : "";
-      options.push([`thread:${choice.id}`, `${choice.title}${count}`]);
+      // Age, replies, name: the two short facts first, because a phone's picker cuts the end off.
+      const age = briefAge(Number.isFinite(choice.started) ? choice.started : choice.at);
+      const parts = [age, typeof choice.count === "number" ? String(choice.count) : "", choice.title];
+      options.push([`thread:${choice.id}`, parts.filter((part) => part !== "").join(" · ")]);
     }
     if (channelView === "thread" && selectedThreadId &&
         !choices.some((choice) => choice.id === String(selectedThreadId))) {
@@ -6317,7 +6368,10 @@ function addThreadDecoration(meta, message, row) {
     badge.setAttribute("type", "button");
     badge.setAttribute("title", "Open this thread");
     badge.style.setProperty("--thread-hue", threadHue(id));
-    badge.textContent = "Thread";
+    // The reply count tells two tags apart at a glance, as their colours do.
+    const replies = threadReplyCount(id, message);
+    badge.textContent = replies === null ? "Thread" : `Thread ${replies}`;
+    if (replies !== null) badge.setAttribute("aria-label", `Open this thread, ${threadCount(replies, true)}`);
     badge.addEventListener("click", () => guardQuietly(() => openThread(id))());
     meta.append(badge);
   }
@@ -9344,10 +9398,34 @@ function discordNode(messages) {
   // A combined row stands for every constituent in order. Marking through the NEWEST one includes
   // the complete row; using its first id would leave an invisible tail unread upstream.
   const upstreamBoundary = messages[messages.length - 1];
-  upstreamRead.addEventListener("click", () =>
-    guardQuietly(() => markReadUpstream(String(upstreamBoundary.id)))()
-  );
-  meta.append(upstreamRead);
+  // `row-more-menu`. Rarely used, and the widest label on the row, so it lives under a "⋯" menu
+  // rather than taking a line of the row's width: room the thread tag's reply count needs. The menu
+  // is the home for further per-message options; it appears only when it has something to offer.
+  const more = document.createElement("span");
+  more.className = "row-more";
+  more.hidden = !upstreamReadMarkSupported;
+  const moreButton = document.createElement("button");
+  moreButton.className = "row-more-button";
+  moreButton.setAttribute("type", "button");
+  moreButton.setAttribute("aria-label", "More options for this message");
+  moreButton.setAttribute("aria-expanded", "false");
+  moreButton.setAttribute("title", "More options");
+  moreButton.textContent = "⋯";
+  const menu = document.createElement("span");
+  menu.className = "row-more-menu";
+  menu.hidden = true;
+  const setMenu = (open) => {
+    menu.hidden = !open;
+    moreButton.setAttribute("aria-expanded", open ? "true" : "false");
+  };
+  moreButton.addEventListener("click", () => setMenu(menu.hidden));
+  upstreamRead.addEventListener("click", () => {
+    setMenu(false);
+    guardQuietly(() => markReadUpstream(String(upstreamBoundary.id)))();
+  });
+  menu.append(upstreamRead);
+  more.append(moreButton, menu);
+  meta.append(more);
   // `#50 todo-view`. The non-gestural way to say "dealt with", and the one a keyboard can reach.
   // On EVERY channel row rather than only on rows built while the mode is on: the mode is a
   // filter over the same list, and a control that exists in one rendering and not another is a

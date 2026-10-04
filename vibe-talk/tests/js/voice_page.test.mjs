@@ -2393,9 +2393,10 @@ const TUNING_BANDS = {
   THREAD_SELECT_LIMIT: [10, 100,
     "most threads the picker lists. Fewer than ten and an active space hides the thread being " +
     "discussed; past a hundred a phone's native picker becomes a scroll nobody finishes"],
-  THREAD_TITLE_CHARS: [20, 120,
-    "longest thread name in the picker. Under twenty a name says nothing; past a line or so it " +
-    "is elided by the select anyway and only costs memory"],
+  THREAD_TITLE_CHARS: [16, 48,
+    "longest first-message prefix the picker uses as a thread name. Under about sixteen characters " +
+    "a name says nothing; past a few words a phone's native picker, which draws options large, " +
+    "wraps each option into a sentence nobody can scan"],
   STREAM_MAX_LEAD_SECONDS: [2, 8,
     "the most audio a streamed read may bank after repeated stalls. Under two seconds a drive " +
     "through patchy coverage is heard as one pause after another; past several seconds a tap on a " +
@@ -9022,6 +9023,9 @@ const doneButton = (li) => li.descendants().find((node) => node.className === "d
 /** The optional source-provider read control on a rendered row. */
 const upstreamReadButton = (li) =>
   li.descendants().find((node) => node.className === "upstream-read-button");
+const rowMore = (li) => li.descendants().find((node) => node.className === "row-more");
+const rowMoreButton = (li) => li.descendants().find((node) => node.className === "row-more-button");
+const rowMoreMenu = (li) => li.descendants().find((node) => node.className === "row-more-menu");
 
 /** The ids the channel list is currently showing, in order. */
 const shownIds = (page) =>
@@ -9329,6 +9333,7 @@ test("source-provider read marking is absent unless the server advertises it", a
   const rows = await showDiscord(page, backlog(2));
 
   assert.ok(upstreamReadButton(rows[0]), "the capability-controlled action has no stable control");
+  assert.equal(rowMore(rows[0]).hidden, true, "an empty ⋯ menu was offered");
   assert.equal(
     upstreamReadButton(rows[0]).hidden,
     true,
@@ -9358,6 +9363,12 @@ test("mark read through here targets the newest part without archiving the row",
   const control = upstreamReadButton(rows[0]);
   assert.equal(control.hidden, false, "the advertised provider action stayed hidden");
   assert.equal(control.textContent, "Mark read through here");
+  // It lives under the row's ⋯ menu, closed until asked for, so it costs the row no width.
+  assert.equal(rowMore(rows[0]).hidden, false, "the ⋯ menu holding the action is not offered");
+  assert.equal(rowMoreMenu(rows[0]).hidden, true, "the ⋯ menu was open before it was asked for");
+  await rowMoreButton(rows[0]).click();
+  assert.equal(rowMoreMenu(rows[0]).hidden, false, "⋯ did not open the menu");
+  assert.equal(rowMoreButton(rows[0]).getAttribute("aria-expanded"), "true");
 
   await control.click();
   await page.settle();
@@ -9368,6 +9379,7 @@ test("mark read through here targets the newest part without archiving the row",
     "the provider cursor stopped before the end of the combined row"
   );
   assert.deepStrictEqual(page.dismissCalls, [], "marking upstream silently archived the row here");
+  assert.equal(rowMoreMenu(rows[0]).hidden, true, "the ⋯ menu stayed open after its action ran");
   assert.equal(rowState(page, 0).archived, "false");
   assert.match(page.el("status").textContent, /source chat provider/);
 });
@@ -17611,8 +17623,10 @@ test("thread views show roots in Main and the bar's selector offers Main, All, a
   assert.deepStrictEqual(offered.slice(0, 2), [["main", "Main"], ["flat", "All"]]);
   assert.deepStrictEqual(offered.slice(2).map(([value]) => value).sort(),
     ["thread:spaces/A/threads/another", "thread:spaces/A/threads/one & two"]);
-  assert.ok(offered.some(([, label]) => label === "first thread root · 1 reply"),
-    `a thread was not named by its root: ${JSON.stringify(offered)}`);
+  // Age · replies · a short prefix of its first message, so a phone's large picker stays readable.
+  assert.ok(offered.some(([, label]) => /^\d+[mhdw] · 1 · first thread root$/.test(label) ||
+      /^now · 1 · first thread root$/.test(label)),
+    `a thread was not named by age, replies and its root: ${JSON.stringify(offered)}`);
   assert.equal(page.el("thread-select").value, "main");
   assert.deepEqual(page.el("discord-log").children.map((row) => row.getAttribute("data-id")), ["200", "201", "203"]);
   assert.equal(threadButton(page.el("discord-log").children[1]).textContent, "1 reply");
@@ -17665,8 +17679,43 @@ test("the bar's thread picker opens a thread, All, and Main, and touching it rea
   await page.settle();
   assert.equal(threadReads(), before + 1, "a second touch read the thread list again at once");
   // The summaries' own names win once they are known.
-  assert.ok(threadOptions(page).some(([, label]) => label === "First discussion · 1 reply"),
+  assert.ok(threadOptions(page).some(([, label]) => / · 1 · First discussion$/.test(label)),
     `the read thread list did not name the threads: ${JSON.stringify(threadOptions(page))}`);
+});
+
+test("a thread's summarised display name is what the picker calls it, when the server has one", async () => {
+  const page = newPage();
+  const data = threadData();
+  page.threadingSupported = true;
+  page.threads = data.threads.map((thread, i) => (i === 0 ? { ...thread, display_name: "deploy-rollback" } : thread));
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await page.el("thread-select").dispatch("pointerdown");
+  await page.settle();
+  const labels = threadOptions(page).map(([, label]) => label);
+  assert.ok(labels.some((label) => / · 1 · deploy-rollback$/.test(label)),
+    `the display name did not win over the title and the prefix: ${JSON.stringify(labels)}`);
+});
+
+test("a thread opened from All is a filter of what All holds, with no request, and Back restores All", async () => {
+  const page = await threadPage();
+  page.el("channel-view-flat").click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"]);
+  const reads = page.timelineCalls.length;
+
+  const badge = threadBadge(page.el("discord-log").children.find((row) => row.getAttribute("data-id") === "202"));
+  assert.ok(badge, "the All view has no thread tag to narrow by");
+  await badge.click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["201", "202"], "the thread was not the filtered subset of All");
+  assert.equal(page.timelineCalls.length, reads, "narrowing All to one thread went to the network");
+  assert.equal(page.el("channel-loading").hidden, true, "narrowing showed a loading screen");
+
+  await page.el("thread-back").click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"], "Back did not restore All");
+  assert.equal(page.timelineCalls.length, reads, "returning to All went to the network");
 });
 
 test("Hide read reprojects a cached threaded timeline without fetching", async () => {
@@ -17768,7 +17817,8 @@ test("All marks every threaded message with a stable colored Thread button and n
   const rows = page.el("discord-log").children;
   assert.equal(rows.length, 5, "messages crossed a thread boundary while combining");
   assert.equal(threadBadge(rows[0]), undefined);
-  for (const row of rows.slice(1)) assert.equal(threadBadge(row).textContent, "Thread");
+  // Each tag carries its thread's reply count after the word, so two tags read differently.
+  for (const row of rows.slice(1)) assert.match(threadBadge(row).textContent, /^Thread \d+$/);
   const color = (row) => threadBadge(row).style.getPropertyValue("--thread-hue");
   assert.equal(color(rows[1]), color(rows[2]));
   assert.notEqual(color(rows[1]), color(rows[3]));

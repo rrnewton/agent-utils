@@ -108,6 +108,43 @@ pub struct ThreadSummary {
     pub reply_count_exact: bool,
     /// Latest message activity, as an RFC 3339 timestamp.
     pub updated_at: String,
+    /// A short hyphenated name for the thread, chosen once by a summariser and then kept even if
+    /// the thread drifts, so the reader always finds it under the same name. Absent until named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// One sentence on what the thread is about now, re-summarised as it grows. Absent until
+    /// summarised. See [`thread_summary_due`] for when it is refreshed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+/// Whether a thread with `messages` messages, last summarised at `last` messages, is due again.
+///
+/// Backed off exponentially, then linearly: summarise at 1, 2, 4 and 8 messages, then every 10
+/// after that (18, 28, ...). Early on a thread's subject is still settling and each message
+/// changes it a lot; later one more message rarely does, and each summary costs a model call.
+/// `last` is `None` for a thread never summarised. The display name is chosen at the first
+/// summary and never changes; only the sentence follows this schedule.
+#[must_use]
+pub fn thread_summary_due(messages: u64, last: Option<u64>) -> bool {
+    const LINEAR_AFTER: u64 = 8;
+    const LINEAR_STEP: u64 = 10;
+    if messages == 0 {
+        return false;
+    }
+    let Some(last) = last else {
+        return true;
+    };
+    if messages <= last {
+        return false;
+    }
+    let next = if last < LINEAR_AFTER {
+        // 1 -> 2 -> 4 -> 8: the next power of two above the last summarised count.
+        (last + 1).next_power_of_two().min(LINEAR_AFTER)
+    } else {
+        last + LINEAR_STEP
+    };
+    messages >= next
 }
 
 /// One complete page from a channel view, never a silently truncated discovery result.
@@ -129,4 +166,38 @@ pub struct TimelinePage {
     pub next_before: Option<String>,
     /// Relevant provider limitation or scope information, if any.
     pub notice: Option<String>,
+}
+
+#[cfg(test)]
+mod summary_schedule_tests {
+    use super::thread_summary_due;
+
+    /// The counts at which a thread growing one message at a time is summarised.
+    fn schedule(up_to: u64) -> Vec<u64> {
+        let mut last = None;
+        let mut at = Vec::new();
+        for messages in 0..=up_to {
+            if thread_summary_due(messages, last) {
+                at.push(messages);
+                last = Some(messages);
+            }
+        }
+        at
+    }
+
+    #[test]
+    fn a_growing_thread_is_summarised_at_1_2_4_8_then_every_10() {
+        assert_eq!(schedule(40), [1, 2, 4, 8, 18, 28, 38]);
+    }
+
+    #[test]
+    fn a_thread_that_jumped_ahead_is_summarised_once_not_once_per_missed_step() {
+        assert!(thread_summary_due(30, Some(2)));
+        assert!(!thread_summary_due(30, Some(30)));
+        assert!(!thread_summary_due(3, Some(2)), "the step after 2 is 4");
+        assert!(
+            !thread_summary_due(0, None),
+            "an empty thread has nothing to summarise"
+        );
+    }
 }

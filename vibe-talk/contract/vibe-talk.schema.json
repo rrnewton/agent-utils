@@ -629,6 +629,13 @@
     "ThreadSummary": {
       "description": "One thread in the thread list, independent of the underlying provider's channel model.",
       "properties": {
+        "display_name": {
+          "description": "A short hyphenated name for the thread, chosen once by a summariser and then kept even if\nthe thread drifts, so the reader always finds it under the same name. Absent until named.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "id": {
           "description": "Opaque identifier used for reading or posting to this thread.",
           "type": "string"
@@ -656,6 +663,13 @@
             }
           ],
           "description": "The original message, when available and readable."
+        },
+        "summary": {
+          "description": "One sentence on what the thread is about now, re-summarised as it grows. Absent until\nsummarised. See [`thread_summary_due`] for when it is refreshed.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "title": {
           "description": "Provider-supplied title, or a neutral fallback.",

@@ -611,6 +611,8 @@ impl HttpSlackClient {
             reply_count: Some(root.reply_count()),
             reply_count_exact: true,
             updated_at: rfc3339(root.activity_micros()),
+            display_name: None,
+            summary: None,
         }
     }
 

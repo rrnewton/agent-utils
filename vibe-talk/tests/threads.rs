@@ -123,6 +123,8 @@ impl ChatClient for ThreadBackend {
             reply_count: Some(2),
             reply_count_exact: true,
             updated_at: "2026-09-20T01:00:00Z".to_owned(),
+            display_name: None,
+            summary: None,
         };
         Ok(TimelinePage {
             messages: if request.view == TimelineView::Threads {
