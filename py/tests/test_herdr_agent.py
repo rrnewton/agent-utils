@@ -589,6 +589,47 @@ def test_exact_pane_and_session_forms_share_one_target_lock(tmp_path: Path) -> N
     assert fake.runs == ["from pane", "from session"]
 
 
+def test_host_target_locks_live_in_account_state_not_a_cleaned_temporary_directory() -> None:
+    # The host's daily cleaner deletes files under these directories by modification time,
+    # and a lock file is never written, so a held lock there was deleted once it was four days
+    # old and a second sender locked a fresh file at the same path.
+    import pwd
+
+    host = agent_api._host_target_lock_root()
+    home = pwd.getpwuid(os.getuid()).pw_dir
+    assert host == os.path.join(home, ".local", "state", "agentctl", "target-locks")
+    for cleaned in ("/tmp", "/var/tmp", "/dev/shm"):
+        assert not (host == cleaned or host.startswith(cleaned + "/")), host
+    # Earlier editions keep the legacy name, so new editions must keep locking it too.
+    assert agent_api._legacy_host_target_lock_root() == f"/tmp/herdr-agent-target-locks-{os.getuid()}"
+
+
+@pytest.mark.parametrize("held", [0, 1], ids=["account-root", "legacy-root"])
+def test_a_target_lock_waits_for_a_holder_of_either_root(held: int) -> None:
+    # A holder of the legacy file is an earlier edition; a holder of the account file is a
+    # current one. A new sender must wait for both.
+    import fcntl
+
+    name = "either-root-holder"
+    path = agent_api._target_lock_paths(name)[held]
+    holder = agent_api._open_private_lock(path, "held test lock")
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    acquired = threading.Event()
+
+    def contend() -> None:
+        with agent_api._lock_target(name, "contended test lock"):
+            acquired.set()
+
+    contender = threading.Thread(target=contend, daemon=True)
+    try:
+        contender.start()
+        assert not acquired.wait(0.2), "a held root did not block the sender"
+    finally:
+        os.close(holder)
+    contender.join(5)
+    assert acquired.is_set() and not contender.is_alive()
+
+
 def test_working_confirmation_failure_never_resubmits_and_marks_ambiguous(tmp_path: object) -> None:
     fake = FakeAgentHerdr(["idle"])
 

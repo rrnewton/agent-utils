@@ -89,11 +89,15 @@ def _private_agentctl_target_locks(
     # temporaries while they write must not see a lock lookup do either.
     lock_root = tmp_path_factory.mktemp("agentctl-target-locks")
     lock_root.chmod(0o700)
+    roots = (lock_root / "account", lock_root / "legacy")
+    for root in roots:
+        root.mkdir(mode=0o700)
 
-    def isolated_path(pane_id: str) -> str:
-        return str(lock_root / agentctl_agent._target_lock_name(pane_id))
+    def isolated_paths(name: str) -> tuple[str, str]:
+        lock_name = agentctl_agent._target_lock_name(name)
+        return str(roots[0] / lock_name), str(roots[1] / lock_name)
 
-    monkeypatch.setattr(agentctl_agent, "_target_lock_path", isolated_path)
+    monkeypatch.setattr(agentctl_agent, "_target_lock_paths", isolated_paths)
 
 
 @pytest.fixture(autouse=True)

@@ -1358,14 +1358,8 @@ class ManagedAgents:
     @contextmanager
     def _pane_lock(self, pane_id: str) -> Iterator[None]:
         """Serialize cooperative control across registries for one exact pane."""
-        descriptor = agent._open_private_lock(
-            agent._target_lock_path(pane_id), "host-wide target lock"
-        )
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        with agent._lock_target(pane_id, "host-wide target lock"):
             yield
-        finally:
-            os.close(descriptor)
 
     def _save(self, record: AgentRecord) -> None:
         agent._atomic_json(str(self._directory(record.name) / "agent.json"), record.to_document())
@@ -1794,7 +1788,7 @@ class ManagedAgents:
                         name, directory, root, harness, pane_id, info
                     )
                 finally:
-                    os.close(target_lock)
+                    target_lock.close()
 
     def _adopt_locked(
         self, name: str, directory: Path, root: str, harness: str,
@@ -1944,12 +1938,10 @@ class ManagedAgents:
         # Independent registries can share the default workspace. Serialize label
         # resolution and creation host-wide, releasing before any harness startup.
         default_label = project_workspace or "subagents"
-        lock = agent._open_private_lock(
-            agent._target_lock_path(f"managed-workspace:{default_label}"),
-            "workspace allocation lock",
+        lock = agent._lock_target(
+            f"managed-workspace:{default_label}", "workspace allocation lock"
         )
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX)
             selected = workspace_id
             if selected is None and project_workspace is None:
                 selected = os.environ.get("HERDR_WORKSPACE_ID")
@@ -1978,7 +1970,7 @@ class ManagedAgents:
                 )
                 self._save(record)
         finally:
-            os.close(lock)
+            lock.close()
 
     def _checked(
         self, record: AgentRecord, *, ready: bool = False,

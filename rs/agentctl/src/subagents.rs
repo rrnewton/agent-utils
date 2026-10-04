@@ -2354,12 +2354,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         Ok(file)
     }
 
-    fn pane_lock(&self, pane_id: &str) -> Result<File> {
-        let path = agent::target_lock_path(pane_id)?;
-        let file = agent::open_private_lock(&path, "host-wide target lock")?;
-        file.lock_exclusive()
-            .map_err(|error| fail(error.to_string()))?;
-        Ok(file)
+    fn pane_lock(&self, pane_id: &str) -> Result<agent::TargetLock> {
+        agent::lock_target(pane_id, "host-wide target lock")
     }
 
     fn private_directory_identity(metadata: &fs::Metadata, label: &str) -> Result<(u64, u64)> {
@@ -3562,12 +3558,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         project_workspace: Option<&str>,
     ) -> Result<()> {
         let default_label = project_workspace.unwrap_or("subagents");
-        let lock = agent::open_private_lock(
-            &agent::target_lock_path(&format!("managed-workspace:{default_label}"))?,
+        let _lock = agent::lock_target(
+            &format!("managed-workspace:{default_label}"),
             "workspace allocation lock",
         )?;
-        lock.lock_exclusive()
-            .map_err(|error| fail(error.to_string()))?;
         let selected = options
             .workspace_id
             .clone()

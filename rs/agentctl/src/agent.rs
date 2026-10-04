@@ -734,7 +734,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
     let mut delivered = Vec::new();
     let mut quarantined = recover_inflight(&directories)?;
     let mut blocked = None;
-    let mut target_lock: Option<File> = None;
+    let mut target_lock: Option<TargetLock> = None;
     let mut locked_pane_id: Option<String> = None;
     let mut initial_info: Option<AgentPaneInfo> = None;
     for path in inbox_in_queue_order(&directories.inbox)? {
@@ -1734,30 +1734,92 @@ pub(crate) fn validate_target_authority(target: &Target) -> AgentResult<()> {
     }
 }
 
-pub(crate) fn target_lock_path(pane_id: &str) -> AgentResult<PathBuf> {
-    let root = target_lock_root();
-    create_private_directory(&root, "host-wide target lock directory", false, false)?;
-    Ok(root.join(format!("{}.lock", pane_lock_digest(pane_id))))
+/// One held host-wide target lock. Dropping it releases every file it holds.
+///
+/// It holds the file under the account-state root and, while editions that know only the
+/// shared `/tmp` root may still run, the compatibility file there as well, so a new and an
+/// old process still exclude each other. Both are taken in that fixed order by every new
+/// process, and an old process takes only the `/tmp` file, so the two orders cannot deadlock.
+pub(crate) struct TargetLock {
+    _account: File,
+    _legacy: File,
+}
+
+/// The lock files for one target name, in acquisition order: account state, then `/tmp`.
+pub(crate) fn target_lock_paths(name: &str) -> AgentResult<[PathBuf; 2]> {
+    let file = format!("{}.lock", pane_lock_digest(name));
+    let [account, legacy] = target_lock_roots()?;
+    create_private_directory(&account, "host-wide target lock directory", true, false)?;
+    create_private_directory(
+        &legacy,
+        "legacy host-wide target lock directory",
+        true,
+        false,
+    )?;
+    Ok([account.join(&file), legacy.join(file)])
+}
+
+/// Open and lock every file of one target lock in order, waiting on each with `wait`.
+fn lock_target_with(
+    name: &str,
+    purpose: &str,
+    mut wait: impl FnMut(&File, &Path) -> AgentResult<()>,
+) -> AgentResult<TargetLock> {
+    let [account_path, legacy_path] = target_lock_paths(name)?;
+    let account = open_private_lock(&account_path, purpose)?;
+    wait(&account, &account_path)?;
+    let legacy = open_private_lock(&legacy_path, purpose)?;
+    wait(&legacy, &legacy_path)?;
+    Ok(TargetLock {
+        _account: account,
+        _legacy: legacy,
+    })
+}
+
+/// Lock one target name, blocking until every holder releases it.
+pub(crate) fn lock_target(name: &str, purpose: &str) -> AgentResult<TargetLock> {
+    lock_target_with(name, purpose, |file, path| {
+        FileExt::lock_exclusive(file)
+            .map_err(|error| io_error(&format!("lock {purpose}"), path, error))
+    })
 }
 
 /// The directory every agentctl process for this user serialises pane delivery in.
-fn host_target_lock_root() -> PathBuf {
+///
+/// It is account state, resolved from the account database rather than `$HOME` or
+/// `$TMPDIR`, so callers with different environments still meet on one file. It must not be
+/// under `/tmp` or `/var/tmp`: the host's daily cleaner deletes files there by modification
+/// time, and a lock file is never written, so once the file was four days old the cleaner
+/// could delete it while it was held and a second sender would lock a fresh file at the same
+/// path.
+fn host_target_lock_root() -> AgentResult<PathBuf> {
+    Ok(crate::client::account_home()?.join(".local/state/agentctl/target-locks"))
+}
+
+/// The root earlier editions lock in. New editions lock it second, after the account root.
+fn legacy_host_target_lock_root() -> PathBuf {
     Path::new("/tmp").join(format!("herdr-agent-target-locks-{}", unsafe {
         libc::getuid()
     }))
 }
 
 #[cfg(not(test))]
-fn target_lock_root() -> PathBuf {
-    host_target_lock_root()
+fn target_lock_roots() -> AgentResult<[PathBuf; 2]> {
+    Ok([host_target_lock_root()?, legacy_host_target_lock_root()])
 }
 
-/// Unit tests lock a root private to this test process. The fixture panes (`w1:p1`) are
-/// real pane identities, so on the host root any concurrent holder (another checkout's
+/// Unit tests lock roots private to this test process. The fixture panes (`w1:p1`) are
+/// real pane identities, so on the host roots any concurrent holder (another checkout's
 /// validation, or a live agent on that pane) stalls them. Within one process the tests still
 /// share one root, so concurrent senders keep exercising the real cross-queue flock.
 #[cfg(test)]
-fn target_lock_root() -> PathBuf {
+fn target_lock_roots() -> AgentResult<[PathBuf; 2]> {
+    let root = test_target_lock_root();
+    Ok([root.join("account"), root.join("legacy")])
+}
+
+#[cfg(test)]
+fn test_target_lock_root() -> PathBuf {
     static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     extern "C" fn remove_root() {
         if let Some(root) = ROOT.get() {
@@ -1782,7 +1844,7 @@ fn target_lock_root() -> PathBuf {
 pub(crate) fn lock_resolved_target<A: AgentApi + ?Sized>(
     client: &A,
     target: &Target,
-) -> AgentResult<(File, AgentPaneInfo)> {
+) -> AgentResult<(TargetLock, AgentPaneInfo)> {
     lock_resolved_target_with_runtime(client, target, &SystemRuntime::default())
 }
 
@@ -1790,11 +1852,11 @@ pub(crate) fn lock_resolved_target_with_runtime<A: AgentApi + ?Sized>(
     client: &A,
     target: &Target,
     runtime: &dyn AgentRuntime,
-) -> AgentResult<(File, AgentPaneInfo)> {
+) -> AgentResult<(TargetLock, AgentPaneInfo)> {
     let initial = resolve_target_with_runtime(client, target, runtime)?;
-    let lock_path = target_lock_path(&initial.pane_id)?;
-    let lock = open_private_lock(&lock_path, "host-wide target lock")?;
-    lock_exclusive_with_runtime(&lock, &lock_path, "interactive-agent target", runtime)?;
+    let lock = lock_target_with(&initial.pane_id, "host-wide target lock", |file, path| {
+        lock_exclusive_with_runtime(file, path, "interactive-agent target", runtime)
+    })?;
     let confirmed = resolve_target_with_runtime(client, target, runtime)?;
     if confirmed.pane_id != initial.pane_id {
         return Err(AgentError::delivery(format!(
@@ -3010,23 +3072,66 @@ mod tests {
     }
 
     #[test]
-    fn unit_test_target_locks_live_outside_the_host_wide_root() {
-        // Only the root differs: the same pane digest a live agent or a real
-        // agentctl binary locks on the host resolves to a private file here, so
-        // neither can stall these tests and these tests never touch the host lock.
-        let host = host_target_lock_root();
+    fn unit_test_target_locks_live_outside_the_host_wide_roots() {
+        // Only the roots differ: the same pane digest a live agent or a real
+        // agentctl binary locks on the host resolves to private files here, so
+        // neither can stall these tests and these tests never touch the host locks.
+        let hosts = [
+            host_target_lock_root().expect("host target lock root"),
+            legacy_host_target_lock_root(),
+        ];
+        let isolated = target_lock_paths("w1:p1").expect("isolated target lock paths");
+        for path in &isolated {
+            for host in &hosts {
+                assert!(!path.starts_with(host), "{}", path.display());
+            }
+            assert_eq!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some(format!("{}.lock", pane_lock_digest("w1:p1")).as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn host_target_locks_live_in_account_state_not_a_cleaned_temporary_directory() {
+        // The host's daily cleaner deletes files under these directories by modification
+        // time, and a lock file is never written, so a held lock there was deleted once it
+        // was four days old and a second sender locked a fresh file at the same path.
+        let host = host_target_lock_root().expect("host target lock root");
+        let home = crate::client::account_home().expect("account home");
+        assert_eq!(host, home.join(".local/state/agentctl/target-locks"));
+        for cleaned in ["/tmp", "/var/tmp", "/dev/shm"] {
+            assert!(!host.starts_with(cleaned), "{}", host.display());
+        }
+        // Earlier editions keep the legacy name, so new editions must keep locking it too.
         assert_eq!(
-            host,
+            legacy_host_target_lock_root(),
             PathBuf::from(format!("/tmp/herdr-agent-target-locks-{}", unsafe {
                 libc::getuid()
             }))
         );
-        let isolated = target_lock_path("w1:p1").expect("isolated target lock path");
-        assert!(!isolated.starts_with(&host), "{}", isolated.display());
-        assert_eq!(
-            isolated.file_name().and_then(|name| name.to_str()),
-            Some(format!("{}.lock", pane_lock_digest("w1:p1")).as_str())
-        );
+    }
+
+    #[test]
+    fn a_target_lock_waits_for_a_holder_of_either_root() {
+        // A holder of the legacy file is an earlier edition; a holder of the account file
+        // is a current one. A new sender must wait for both.
+        let name = "either-root-holder";
+        for held in 0..2 {
+            let path = target_lock_paths(name).expect("target lock paths")[held].clone();
+            let holder = open_private_lock(&path, "held test lock").expect("open holder");
+            holder.lock_exclusive().expect("hold lock");
+            let runtime = CancelOnSleep::default();
+            let error = lock_target_with(name, "contended test lock", |file, path| {
+                lock_exclusive_with_runtime(file, path, "test contention", &runtime)
+            })
+            .err()
+            .expect("a held root blocks the sender");
+            assert!(error.to_string().contains("cancelled"), "{error}");
+            drop(holder);
+            let lock = lock_target(name, "uncontended test lock").expect("released lock");
+            drop(lock);
+        }
     }
 
     #[test]
@@ -3185,7 +3290,7 @@ mod tests {
         let lock_paths = [
             directory.path().join(".binding.lock"),
             directory.path().join(".delivery.lock"),
-            target_lock_path("cancel-lock-contention").expect("target lock path"),
+            target_lock_paths("cancel-lock-contention").expect("target lock paths")[0].clone(),
         ];
         for path in lock_paths {
             if let Some(parent) = path.parent() {

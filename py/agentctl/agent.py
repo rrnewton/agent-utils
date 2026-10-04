@@ -16,7 +16,7 @@ import re
 import stat
 import tempfile
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -1227,25 +1227,82 @@ def _target_lock_name(pane_id: str) -> str:
     return f"{hashlib.sha256(encoded).hexdigest()}.lock"
 
 
-def _target_lock_path(pane_id: str) -> str:
-    """Return the fixed host-wide lock path for one resolved live pane."""
-    lock_root = os.path.join("/tmp", f"herdr-agent-target-locks-{os.getuid()}")
-    os.makedirs(lock_root, mode=0o700, exist_ok=True)
-    _validate_private_directory(lock_root, "host-wide target lock directory")
-    return os.path.join(lock_root, _target_lock_name(pane_id))
+def _host_target_lock_root() -> str:
+    """Return the directory every agentctl process for this user serializes pane delivery in.
+
+    It is account state, resolved from the account database rather than ``$HOME`` or
+    ``$TMPDIR``, so callers with different environments still meet on one file. It must not be
+    under ``/tmp`` or ``/var/tmp``: the host's daily cleaner deletes files there by modification
+    time, and a lock file is never written, so once the file was four days old the cleaner could
+    delete it while it was held and a second sender would lock a fresh file at the same path.
+    """
+    return os.path.join(HerdrClient._account_home(), ".local", "state", "agentctl", "target-locks")
+
+
+def _legacy_host_target_lock_root() -> str:
+    """Return the root earlier editions lock in. New editions lock it second."""
+    return os.path.join("/tmp", f"herdr-agent-target-locks-{os.getuid()}")
+
+
+def _target_lock_paths(name: str) -> tuple[str, str]:
+    """Return the lock files for one target name in acquisition order: account state, then legacy."""
+    paths = []
+    for lock_root, purpose in (
+        (_host_target_lock_root(), "host-wide target lock directory"),
+        (_legacy_host_target_lock_root(), "legacy host-wide target lock directory"),
+    ):
+        os.makedirs(lock_root, mode=0o700, exist_ok=True)
+        _validate_private_directory(lock_root, purpose)
+        paths.append(os.path.join(lock_root, _target_lock_name(name)))
+    return paths[0], paths[1]
+
+
+class _TargetLock:
+    """One held host-wide target lock; closing it releases every file it holds.
+
+    It holds the file under the account-state root and, while editions that know only the
+    legacy ``/tmp`` root may still run, the legacy file as well, so a new and an old process
+    still exclude each other. Every new process takes both in that fixed order and an old
+    process takes only the legacy file, so the two orders cannot deadlock.
+    """
+
+    def __init__(self, descriptors: Sequence[int]) -> None:
+        self._descriptors = list(descriptors)
+
+    def close(self) -> None:
+        while self._descriptors:
+            os.close(self._descriptors.pop())
+
+    def __enter__(self) -> "_TargetLock":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+
+def _lock_target(name: str, purpose: str) -> _TargetLock:
+    """Open and lock every file of one target lock in order, blocking on each."""
+    lock = _TargetLock(())
+    try:
+        for path in _target_lock_paths(name):
+            descriptor = _open_private_lock(path, purpose)
+            lock._descriptors.append(descriptor)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+    except BaseException:
+        lock.close()
+        raise
+    return lock
 
 
 def _lock_resolved_target(
     client: HerdrClient, target: Target
-) -> tuple[int, str, AgentPaneInfo]:
+) -> tuple[_TargetLock, str, AgentPaneInfo]:
     """Lock the initially resolved pane and prove the target did not move while waiting."""
 
     initial = resolve_target(client, target)
-    lock_path = _target_lock_path(initial.pane_id)
-    descriptor = _open_private_lock(lock_path, "host-wide target lock")
+    lock = _lock_target(initial.pane_id, "host-wide target lock")
     keep_open = False
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
         confirmed = resolve_target(client, target)
         if confirmed.pane_id != initial.pane_id:
             raise AgentDeliveryError(
@@ -1253,10 +1310,10 @@ def _lock_resolved_target(
                 "while waiting for its host-wide lock"
             )
         keep_open = True
-        return descriptor, initial.pane_id, confirmed
+        return lock, initial.pane_id, confirmed
     finally:
         if not keep_open:
-            os.close(descriptor)
+            lock.close()
 
 
 def _bind_queue(
@@ -1667,7 +1724,7 @@ def _drain(
     quarantined: list[str] = []
     blocked: str | None = None
     descriptor = _open_private_lock(lock_path, "queue delivery lock")
-    target_descriptor = -1
+    target_lock: _TargetLock | None = None
     locked_pane_id = ""
     initial_info: AgentPaneInfo | None = None
     try:
@@ -1717,11 +1774,11 @@ def _drain(
                 # Readiness is entirely pre-injection. Keep the artifact in inbox while the pane
                 # is busy so a process death during an ordinary wait remains safely retryable.
                 try:
-                    if target_descriptor < 0:
+                    if target_lock is None:
                         # Resolve before choosing the lock so exact-pane and stable-session
                         # callers serialize on the same live pane. Re-resolve after acquisition
                         # and on every readiness poll so a moving session cannot escape the lock.
-                        target_descriptor, locked_pane_id, initial_info = _lock_resolved_target(
+                        target_lock, locked_pane_id, initial_info = _lock_resolved_target(
                             client, target
                         )
                     info = _wait_ready(
@@ -1815,8 +1872,8 @@ def _drain(
             if blocked is not None:
                 break
     finally:
-        if target_descriptor >= 0:
-            os.close(target_descriptor)
+        if target_lock is not None:
+            target_lock.close()
         os.close(descriptor)
     pending = tuple(name[:-5] for name in sorted(os.listdir(inbox)) if name.endswith(".json"))
     outcome = "pending" if blocked is not None else ("possibly_submitted" if quarantined else "delivered")
