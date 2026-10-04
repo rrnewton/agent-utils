@@ -6187,19 +6187,19 @@ function reserveFreshnessRoom(reserve) {
  *
  * `#189 restore-ui-state`. The view is decided again rather than reset to Main, so a channel the
  * saved shell called threadless whose provider has threads after all opens in All — here, once —
- * unless the reader chose a view. With the channel on screen it is read again for the view now up:
- * the read already on the wire was for the old one, and is set aside when it lands.
+ * unless the reader chose a view. Nothing is read here: with the channel on screen, what asked for
+ * sign-in reads the view now up next — a reopen's owed read, or the poll of a page that opened
+ * offline — and a read of its own would be a second one.
  */
 function reconcileChannelSnapshot(before) {
   if (before.key === channelContextKey() && before.threading === threadingSupported) return;
   clearChannelScreen();
   openChannelView();
   channelHasThreads = false;
-  const drawn = hydrateChannelScope();
+  hydrateChannelScope();
   restoreChannelComposer();
   renderControls();
   saveUiState();
-  if (currentView === "discord") refreshQuietly(() => loadDiscord(drawn ? { keepPosition: true } : undefined))();
 }
 
 // --- which view a channel opens in, and where the reader was, across a reload ----------------------
@@ -6443,8 +6443,8 @@ function returnToSavedPlace() {
 /**
  * Reopen on the channel when that is where the reader left the page — once, as soon as there is a
  * channel to show: at load from the saved shell, or after sign-in when there was none. Its view was
- * decided already, by `openChannelView`; this enters it, puts the reader back on their message,
- * and reads the view on screen exactly as entering it by the switch does — one newest page.
+ * decided already, by `openChannelView`; this enters it and puts the reader back on their message.
+ * The view's one newest page is owed from here, and `payReopenRead` reads it.
  */
 function reopenSavedView() {
   if (uiStateSettled) return;
@@ -6453,11 +6453,47 @@ function reopenSavedView() {
     showView("discord");
     returnToSavedPlace();
     holdChannelPlace();
+    reopenReadOwed = { after: timelineReadsStarted };
+  }
+  saveUiState();
+}
+
+/**
+ * The read a reopen owes the channel it put on screen, or null: `after` is the count of timeline
+ * reads when it was owed, so a read the reader made since — by the switch, by changing channel —
+ * has read the channel and paid it.
+ *
+ * NOT READ AT LOAD, though the rows are drawn then. A read sent before `/client-config` answers
+ * uses a token nobody has proved: refused, its failure lands over sign-in's own explanation of the
+ * refusal and arms a poll behind the sign-in form. And a read sent before the live stream attaches
+ * cannot answer for the stream's replay tail (`#43 replay-burst-double-read`): an edit out of that
+ * tail — an agent's placeholder edited in place, on nearly every reopen — waits on it in vain, and
+ * makes a second read of the same newest page.
+ */
+let reopenReadOwed = null;
+
+/**
+ * Read what the reopen put on screen, once sign-in has answered: at once on a channel without
+ * threads, whose replay is not accounted for by read, and on one with threads when the live stream
+ * has attached. A refusal reads nothing, and leaves it owed to the token that replaces this one.
+ */
+function payReopenRead() {
+  const owed = reopenReadOwed;
+  if (!owed) return;
+  reopenReadOwed = null;
+  const pay = () => {
+    // Signed out while it waited: owed to the next sign-in, as after a refusal.
+    if (!token()) {
+      reopenReadOwed = reopenReadOwed || owed;
+      return;
+    }
+    if (currentView !== "discord" || timelineReadsStarted !== owed.after) return;
     // Merged into the rows the snapshot drew, keeping the reader's message, as a channel change
     // does; with nothing drawn it is a first visit and settles on the newest.
     readEnteredChannel(channelFreshAt > 0);
-  }
-  saveUiState();
+  };
+  if (threadingSupported) whenLiveAttached(pay);
+  else pay();
 }
 
 // --- channel views, threads and the channel composer ------------------------------------------
@@ -11821,7 +11857,10 @@ async function loadDiscord(options) {
 // Both are follow-ups, and until the second one lands "dealt with" here is always DECLARED — which
 // is why nothing in this file has to decide what happens when derived and declared disagree.
 
-/** Is the reader looking at the to-do list rather than the whole channel? Session-only. */
+/**
+ * Is the reader looking at the to-do list rather than the whole channel? Kept across a reload with
+ * the rest of what was on screen, in `UI_STATE_KEY`. `#189 restore-ui-state`.
+ */
 let todoMode = false;
 
 /**
@@ -13330,6 +13369,12 @@ async function fetchResume() {
 
 /** Where the reconnect delay lives, so the suite can walk the page past it. */
 const LIVE_RETRY_MS = 5000;
+/**
+ * The longest a read waits for the stream to attach (`whenLiveAttached`). The server answers a
+ * stream as soon as it has subscribed it, so on an ordinary connection this is one round trip; a
+ * proxy that holds a streaming response back costs the reader this much of saved rows, no more.
+ */
+const LIVE_ATTACH_WAIT_MS = 3000;
 
 /** How much of a message's text is worth spending conversation time on. */
 const RELAY_MAX_CHARS = 400;
@@ -13560,6 +13605,34 @@ function stopChannelStream() {
   renderLiveState();
 }
 
+/** Reads waiting for the stream to attach, each to be run once. */
+const liveAttachWaiters = new Set();
+
+/**
+ * Run `then` once the stream being followed has attached — or failed, or ended, or not answered in
+ * `LIVE_ATTACH_WAIT_MS` — and at once when it already has, or nothing is being followed. A read
+ * begun after the attach answers for the stream's whole replay tail; one begun before it cannot.
+ * `#189 restore-ui-state`, for the read a reopen owes.
+ */
+function whenLiveAttached(then) {
+  if (liveChannel === null || liveAttached) {
+    then();
+    return;
+  }
+  const waiter = () => {
+    liveAttachWaiters.delete(waiter);
+    clearTimeout(timer);
+    then();
+  };
+  const timer = setTimeout(waiter, LIVE_ATTACH_WAIT_MS);
+  liveAttachWaiters.add(waiter);
+}
+
+/** The stream attached, or will not for now: nothing waits on it any longer. */
+function releaseLiveAttachWaiters() {
+  for (const waiter of [...liveAttachWaiters]) waiter();
+}
+
 /** Follow `channelId`, replacing any stream already running. */
 function startChannelStream(channelId) {
   stopChannelStream();
@@ -13603,6 +13676,8 @@ async function followChannel(channelId, generation) {
     }
     liveAttached = false;
     renderLiveState();
+    // Refused, or gone: a read held for the attach is not held through the retry delay as well.
+    releaseLiveAttachWaiters();
     const resumed = await liveRetryDelay(generation);
     if (!resumed) {
       return;
@@ -13642,6 +13717,7 @@ async function readChannelStream(channelId, generation) {
   liveAttachReads = timelineReadsStarted;
   liveAttached = true;
   renderLiveState();
+  releaseLiveAttachWaiters();
   const decoder = new TextDecoder();
   let buffer = "";
   for (;;) {
@@ -15003,6 +15079,9 @@ async function signIn() {
     showScreen("main");
     // Saved rows stay up, and say they are saved rather than current.
     if (channelFreshAt) setChannelFreshness(error.network ? "offline" : "failed");
+    // The token was not refused, and no stream will attach until `/client-config` answers: the
+    // reopen's read goes now, and the poll it arms is what asks again. `#189 restore-ui-state`.
+    payReopenRead();
     return true;
   }
   const drawn = { key: channelContextKey(), threading: threadingSupported };
@@ -15010,8 +15089,10 @@ async function signIn() {
   reconcileChannelSnapshot(drawn);
   clearError();
   showScreen("main");
-  // With no saved shell there was no channel to reopen on until now. `#189 restore-ui-state`.
+  // With no saved shell there was no channel to reopen on until now; with one, the channel went up
+  // at load and has waited for this to be read. `#189 restore-ui-state`.
   reopenSavedView();
+  payReopenRead();
   // Short, because the invitation itself now lives in the empty transcript — the largest thing on
   // an idle screen — rather than competing for the one strip where a phone shows text worst.
   setStatus("Ready.");
@@ -15672,8 +15753,9 @@ renderControls();
 // rows in it, and the proof arrives behind it. A refusal still ends on the sign-in screen, with
 // every saved row gone. `#18 offline-message-cache`.
 //
-// ...and up where the reader left it: on the channel, in their view, at their message, with the
-// view's one read on the wire before `/client-config` has answered. `#189 restore-ui-state`.
+// ...and up where the reader left it: on the channel, in their view, at their message. The view's
+// one read waits for the proof, and for the live stream it starts (`payReopenRead`).
+// `#189 restore-ui-state`.
 if (token()) {
   if (hydrateFromCache()) {
     showScreen("main");

@@ -10,7 +10,8 @@ one reader through:
   sign in, open the channel — in All, the default where the provider has threads — and read Threads
   and Main too -> reload with the network held: the page reopens on the channel in All by itself,
   its saved rows drawn before any answer (`#189 restore-ui-state`) -> one bounded newest-page read
-  of All merges a new row without duplicating -> switching views makes no request -> a reload with
+  of All, sent once the token is proved and the live stream has attached, merges a new row without
+  duplicating -> switching views makes no request -> a reload with
   the API unreachable reopens on Main, the view last chosen, at the message a reader parked mid-list
   was on, keeps the rows and says so -> a reload whose refresh fails keeps them and says that ->
   signing out removes them from the screen and the device. Before the reloads, a refresh also fails
@@ -699,7 +700,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             baseline = str(page.evaluate(GEOMETRY_JS)["area"])
 
             # 2. Reload with the history read held: the page reopens on the channel, in All, and the
-            # saved rows draw before any answer.
+            # saved rows draw before any answer. The read goes once /client-config has answered and
+            # the live stream has attached, and the pill says it is refreshing from then.
             api.timeline_gate.clear()
             with api.lock:
                 api.requests.clear()
@@ -709,6 +711,9 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             check(page.evaluate("() => document.getElementById('thread-select').value") == "flat",
                   f"{label}: the reload did not reopen in All")
             wait_rows(["200", "201", "202"], "the snapshot was not drawn before the network answered")
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and "refreshing" not in pill():
+                page.wait_for_timeout(50)
             text = pill()
             check(text.startswith("Saved ") and "refreshing" in text, f"pill while refreshing: {text!r}")
             check(geometry("refreshing", "2-saved-before-network") == baseline,
@@ -721,6 +726,13 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             check(len(reads) == 1, f"a cold start made {len(reads)} history reads: {reads}")
             check("view=flat" in reads[0] and "before=" not in reads[0],
                   f"the cold-start read was not the newest page of All: {reads[0]}")
+            # After the token was proved and the live stream answered: a read begun before the
+            # attach cannot answer for the stream's replay tail (`#43 replay-burst-double-read`).
+            with api.lock:
+                order = [r for r in api.requests if "/client-config" in r or "/stream" in r or r in reads]
+            kinds = ["config" if "/client-config" in r else "stream" if "/stream" in r else "read" for r in order]
+            check(kinds[:3] == ["config", "stream", "read"],
+                  f"the cold-start read did not wait for sign-in and the stream: {order}")
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline and not current(pill()):
                 page.wait_for_timeout(50)

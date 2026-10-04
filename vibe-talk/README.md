@@ -165,7 +165,9 @@ under `vibe-talk.voice.ui-state` and reopens on it:
 - **The message you were reading**, at the same height on the screen — the message, not a pixel
   offset. If you were on the newest message, or yours is no longer on the device, the newest.
 - **One read.** The reopened view is drawn from the saved messages first, and the single newest-page
-  read of a cold start is that view's.
+  read of a cold start is that view's. It waits until the server has accepted the token and the live
+  stream has attached, or three seconds have passed without it, so a refused token is reported as
+  such, and the stream's replay of what changed while the app was closed costs no second read.
 - **Checked on the way back.** A channel no longer listed, a thread the device no longer knows of, or
   a chat service that no longer has threads falls back to the default, and a damaged record is
   discarded. The record is tied to the token like the snapshot, and goes with it.
@@ -2028,10 +2030,11 @@ reads before its stream attaches — is asked, when it lands, which of the burst
 and one more read follows only for the rest. A reply in another thread is never on the main view's
 page, so it costs that one more read. A failed read queues nothing: what waited on it waits for the
 poll's read. A warm reload replaying its tail makes no channel read on the voice pane and only its
-entry read on the channel pane. An edit or removal from the tail waits the same way, for a read
-begun after the attach, because a page's copy of a message says nothing about which edit it has
-seen. The un-threaded channel view still re-reads for a replayed message that arrives during a
-read, as it does for a live one.
+entry read on the channel pane; a reload that reopens on the channel holds that read until the
+stream has attached, so it answers for the whole tail. An edit or removal from the tail waits the
+same way, for a read begun after the attach, because a page's copy of a message says nothing about
+which edit it has seen. The un-threaded channel view still re-reads for a replayed message that
+arrives during a read, as it does for a live one.
 
 **`user_message`, not `contextual_update`, and that is the substance of the feature.** A
 contextual update injects text into the agent's context *without consuming a turn*: the agent

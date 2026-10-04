@@ -1435,6 +1435,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     openStreams: [],
     /** Status the stream route answers with. Anything but 200 is a refusal the page must survive. */
     streamStatus: 200,
+    /** A promise the stream route waits on before answering, or null: a network slow to attach. */
+    streamHeld: null,
     /** The controller for the attach currently open, or undefined before the first one. */
     stream: () => page.openStreams[page.openStreams.length - 1],
     /** What the reply route answers. Swap it for an error to test the failure path. */
@@ -2032,6 +2034,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           lastEventId: sent["Last-Event-ID"] || null,
           authorization: sent.Authorization || null,
         });
+        if (page.streamHeld) await page.streamHeld;
         if (page.streamStatus !== 200) {
           return json(page.streamStatus, { error: "unknown_channel", detail: "no such channel" });
         }
@@ -2532,6 +2535,11 @@ const TUNING_BANDS = {
     "how long a dropped live stream waits before reconnecting. Under a second it hammers a " +
     "server that is already unwell; past a couple of minutes the channel view is stale for long " +
     "enough that the reader trusts it and should not"],
+  LIVE_ATTACH_WAIT_MS: [1000, 10000,
+    "how long a reopen's read waits for the live stream to attach. Under a second an ordinary " +
+    "phone connection has not answered yet, and an edit out of the replay tail costs a second " +
+    "read of the newest page; past ten seconds a proxy that holds the stream back leaves the " +
+    "reader looking at saved rows long after the server could have said what changed"],
   SUMMARY_LOOKAHEAD_PX: [100, 2000,
     "how far past the viewport a row is still summarised. Below about a hundred pixels the line " +
     "only starts being fetched once the row is fully on screen, so the reader watches it appear " +
@@ -5772,8 +5780,8 @@ async function showDiscord(page, messages) {
 /**
  * A reload of a page the reader left on the channel, whose channel read will find `messages`.
  *
- * `#189 restore-ui-state` reopens such a page ON the channel, and the view's one read goes out
- * while the script is still running — so what that read finds is arranged before a line of the page
+ * `#189 restore-ui-state` reopens such a page ON the channel, and the view's one read goes out on
+ * its own once sign-in has answered — so what that read finds is arranged before a line of the page
  * runs, and the switch is not thrown afterwards: it would leave the channel, not enter it.
  */
 const reloadWith = (store, messages, arrange = null) =>
@@ -21321,17 +21329,17 @@ test("a reload draws the saved timeline before any request answers, then merges 
   assert.equal(page.screen(), "main", "a reload with a saved channel waited for the network");
   assert.deepStrictEqual(shownIds(page), ["501", "502", "503"], "the saved rows were not drawn first");
   assert.equal(page.el("discord-channel").value, CHANNEL.id, "the picker waited for /client-config");
-  // `#189 restore-ui-state`: back on the channel it was left on, in the view it opened in — All —
-  // with that view's one read already on the wire.
+  // `#189 restore-ui-state`: back on the channel it was left on, in the view it opened in — All.
+  // Its one read waits for /client-config to prove the token.
   assert.equal(page.tab(), "discord", "a reload of a page left on the channel did not reopen there");
-  assert.deepStrictEqual(page.timelineCalls.map((call) => new URL(call, "http://fixture.test").searchParams.get("view")),
-    ["flat"], "the reopen did not read the view on screen, once");
+  assert.deepStrictEqual(page.timelineCalls, [], "the reopen read the channel with a token nobody had proved");
 
   await page.settle();
   assert.deepStrictEqual(shownIds(page), ["501", "502", "503"], "the reopen dropped the saved rows");
   assert.equal(freshness(page).hidden, false, "saved rows were presented as current");
-  assert.match(freshness(page).textContent, /^Saved \d{2}:\d{2} · refreshing…$/);
-  assert.equal(page.timelineCalls.length, 1, "the background refresh never started");
+  // Nothing is being read yet, and the pill does not say otherwise.
+  assert.match(freshness(page).textContent, /^Showing messages saved \d{2}:\d{2}$/);
+  assert.deepStrictEqual(page.timelineCalls, [], "the reopen read before /client-config answered");
 
   page.messages = [
     saved[0],
@@ -21340,6 +21348,11 @@ test("a reload draws the saved timeline before any request answers, then merges 
     message({ id: "504", content: "arrived while away" }),
   ];
   config.open();
+  await page.settle();
+  assert.deepStrictEqual(page.timelineCalls.map((call) => new URL(call, "http://fixture.test").searchParams.get("view")),
+    ["flat"], "the reopen did not read the view on screen, once");
+  assert.deepStrictEqual(shownIds(page), ["501", "502", "503"], "sign-in dropped the saved rows");
+  assert.match(freshness(page).textContent, /^Saved \d{2}:\d{2} · refreshing…$/);
   timeline.open();
   await page.settle();
   await page.settle();
@@ -21363,9 +21376,13 @@ test("a legacy page-mode channel is saved, drawn first on reload, and merged the
     reads = gate(p.channelPage);
     p.channelPage = reads.respond;
   });
-  // Drawn while the reopen's one read is still unanswered: from the device, not by the request.
+  // Drawn before anything answered — from the device, not by the request — and still up while the
+  // reopen's one read, sent once sign-in has answered, is out.
   assert.deepStrictEqual(shownIds(page), ["601", "602"]);
   assert.equal(page.tab(), "discord", "a reload of a page left on the channel did not reopen there");
+  assert.equal(page.pageReads, 0, "the reopen read the channel before /client-config answered");
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["601", "602"]);
   assert.equal(page.pageReads, 1, "the reopen did not make its one read");
 
   page.messages = [message({ id: "602", content: "two, edited" }), message({ id: "603", content: "three" })];
@@ -22826,13 +22843,14 @@ test("a reload of a scoped channel paints every held row from the device, with n
     serveScoped(p, data.summary);
     p.timeline = offline;
   });
-  // Drawn in the same task as the reopen's read went out (`#189 restore-ui-state`), so before it
-  // could answer — and this one never does.
   assert.deepStrictEqual(shownIds(page), held, "the saved replies were not drawn on reload");
   assert.equal(page.tab(), "discord", "a reload of a page left on the channel did not reopen there");
-  assert.equal(page.timelineCalls.length, 1, "the reopen did not make its one read");
+  assert.equal(page.timelineCalls.length, 0, "the saved rows waited for a read");
 
+  // The reopen's one read goes once sign-in has answered (`#189 restore-ui-state`), and this one
+  // never does.
   await page.settle();
+  assert.equal(page.timelineCalls.length, 1, "the reopen did not make its one read");
   assert.deepStrictEqual(shownIds(page), held, "offline, the reopen's failed read dropped saved replies");
   assert.equal(threadButton(page.el("discord-log").children[0]), undefined);
 });
@@ -23699,8 +23717,12 @@ test("a reload reopens the channel, the thread and Hide read as the reader left 
   assert.equal(page.el("thread-title").textContent, "First discussion", "the reopened thread has no name");
   assert.deepStrictEqual(shownIds(page), ["201", "202"], "the thread was not drawn from the device first");
   assert.equal(page.el("todo-filter").getAttribute("aria-pressed"), "true", "Hide read came back off");
-  assert.deepStrictEqual(readKinds(page), [`thread:${id}`], "the first read was not the thread on screen");
+  assert.deepStrictEqual(readKinds(page), [], "the reopen read before sign-in had answered");
 
+  // Sign-in answers and the stream attaches: the first read is the thread on screen.
+  await page.settle();
+  assert.deepStrictEqual(readKinds(page), [`thread:${id}`], "the first read was not the thread on screen");
+  assert.equal(page.el("thread-title").textContent, "First discussion", "sign-in lost the thread's name");
   reads.open();
   await page.settle();
   await page.settle();
@@ -23741,9 +23763,10 @@ test("a reload puts the reader back on the message they were reading, and on the
     await first.setVisibility("hidden");
     const page = newPage(first.storage, script, (p) => { p.messages = channel; });
     const row = () => page.el("discord-log").children.find((li) => li.getAttribute("data-id") === left.id);
-    // Less the line the reopen's read puts up over the rows while it is out, which a browser's own
-    // scroll anchoring absorbs and this fixture does not model; it goes when the read lands.
-    const before = row().getBoundingClientRect().top - page.el("channel-loading").getBoundingClientRect().height;
+    // Measured in the script's own task: drawn from the device, before sign-in has answered and so
+    // before the reopen's read puts its line up over the rows.
+    assert.equal(page.el("channel-loading").hidden, true, "the reopen read before sign-in answered");
+    const before = row().getBoundingClientRect().top;
     await reopenedChannel(page);
     return { page, left, before, after: row().getBoundingClientRect().top, store: first.storage };
   };
@@ -23829,8 +23852,9 @@ test("a saved view that no longer holds falls back to the default rather than fa
 });
 
 test("Main drawn before threads were known gives way to All once the provider says it has them", async () => {
-  // The device's shell predates the provider's threads, so the reopen draws and reads Main; then
-  // /client-config says otherwise, and the view nobody chose becomes All — once, with one read.
+  // The device's shell predates the provider's threads, so the reopen draws Main; then
+  // /client-config says otherwise before anything is read, and the view nobody chose becomes All —
+  // once, with one read, of All.
   const first = newPage();
   await signIn(first);
   await showDiscord(first, [message({ id: "330", content: "from before threads" })]);
@@ -23845,12 +23869,12 @@ test("Main drawn before threads were known gives way to All once the provider sa
   await page.settle();
   assert.equal(page.el("thread-select").value, "flat", "learning of threads did not open All");
   assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"]);
-  assert.deepStrictEqual(readKinds(page), ["page", "flat"]);
+  assert.deepStrictEqual(readKinds(page), ["flat"], "the Main the shell drew was read before All");
   page.expireTimers(DISCORD_POLL_MS);
   await page.settle();
   await page.settle();
   assert.equal(page.el("thread-select").value, "flat", "the view changed again");
-  assert.deepStrictEqual(readKinds(page), ["page", "flat", "flat"]);
+  assert.deepStrictEqual(readKinds(page), ["flat", "flat"]);
 });
 
 test("Hide read on a channel without threads reopens on the to-do list, read once", async () => {
@@ -23877,8 +23901,8 @@ test("a reload left on the call view reopens there, and reads no channel", async
 });
 
 test("a replay of what the reopen holds adds no read", async () => {
-  // The reopen reads before its stream attaches, so the burst may land after that read; a message
-  // it holds costs nothing. `#43 replay-burst-double-read`.
+  // The burst may land after the reopen's read, or while it is out; a message the device holds
+  // costs nothing either way. `#43 replay-burst-double-read`.
   const first = await threadPage();
   const data = threadData();
   const page = reloadWith(first.storage, data.messages, (p) => {
@@ -23891,6 +23915,161 @@ test("a replay of what the reopen holds adds no read", async () => {
   await deliver(page, page.stream(), replayedFrames([data.messages[0], data.messages[3]]));
   await page.settle();
   assert.deepStrictEqual(readKinds(page), ["flat"], "a replay of held messages read the channel again");
+});
+
+/**
+ * A warm threaded page left on the channel — in All, or in `view` when one is picked — reloaded over
+ * the same storage, so the reload reopens ON the channel: the path a reload takes by default, and
+ * not the one the `#43 replay-burst-double-read` counts above reload through. Sign-in has answered
+ * when it returns.
+ */
+async function warmChannelReopen(arrange = null, view = null) {
+  const data = threadData();
+  const first = await threadPage(view);
+  await first.setVisibility("hidden");
+  const page = reloadWith(first.storage, [...data.messages], (p) => {
+    p.threadingSupported = true;
+    p.threads = data.threads;
+    if (arrange) arrange(p);
+  });
+  await reopenedChannel(page);
+  return { page, data };
+}
+
+test("a reopen reads once its stream has attached, so an edit out of the tail costs no second read", async () => {
+  // Only a read begun after the attach answers for the stream's replay tail. Begun before it — at
+  // load, ahead of sign-in — an edit out of that tail waits on a read that cannot answer for it,
+  // and makes another: two reads of the newest page on nearly every reopen.
+  const { page, data } = await warmChannelReopen();
+  await page.settle();
+  assert.equal(page.streamOpens.length, 1, "the reopen never attached its live stream");
+  assert.deepStrictEqual(readKinds(page), ["flat"], "the reopen did not read All once");
+  const edited = { ...data.messages[0], content: "edited before the reload" };
+  await deliver(page, page.stream(),
+    sseUpdate("u1", edited, { replayed: true, from_tail: true }) +
+    sseDelete("d1", CHANNEL.id, "203", { replayed: true, from_tail: true }));
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(readKinds(page), ["flat"], "an edit the reopen's read had already seen was read again");
+  // The adapter's catch-up edit may be newer than that read, so it still gets one.
+  await deliver(page, page.stream(), sseUpdate("u2", edited, { replayed: true }));
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(readKinds(page), ["flat", "flat"], "a catch-up edit lost its read");
+
+  // As on a phone: the read is still on the wire when the burst lands.
+  let reads = null;
+  const { page: slow } = await warmChannelReopen((p) => {
+    reads = gate(p.timeline);
+    p.timeline = reads.respond;
+  });
+  assert.deepStrictEqual(readKinds(slow), ["flat"], "the reopen's read did not go out");
+  await deliver(slow, slow.stream(), sseUpdate("u1", edited, { replayed: true, from_tail: true }));
+  reads.open();
+  await slow.settle();
+  await slow.settle();
+  await slow.settle();
+  assert.deepStrictEqual(readKinds(slow), ["flat"], "a tail edit during the reopen's read queued another");
+});
+
+test("a reopen on Main reads nothing more for a reply out of the tail, in a thread Main does not show", async () => {
+  const reply = message({ id: "250", content: "answered before the reload",
+    thread: { ...threadData().messages[1].thread, is_root: false } });
+  const { page, data } = await warmChannelReopen((p) => {
+    p.messages.push(reply);
+    p.messages[1] = withReplies(p.messages[1], 2);
+  }, "main");
+  await page.settle();
+  assert.deepStrictEqual(readKinds(page), ["main"], "the reopen did not read the Main the reader chose");
+  await deliver(page, page.stream(), replayedFrames([data.messages[0], reply]));
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(readKinds(page), ["main"], "a reply the reopen's read had already seen was read again");
+  assert.equal(threadButton(rowShowing(page, "first thread root")).textContent, "2 replies");
+  assert.ok(!shownIds(page).includes("250"), "a thread reply was dropped into Main");
+});
+
+test("a stream slow to attach holds a reopen's read back a few seconds, and a refused one not at all", async () => {
+  const { page } = await warmChannelReopen((p) => {
+    p.streamHeld = new Promise(() => {});
+  });
+  assert.deepStrictEqual(readKinds(page), [], "the reopen read before its stream attached");
+  assert.equal(page.expireTimers(sourceConstant("LIVE_ATTACH_WAIT_MS")), 1, "nothing bounds the wait for the stream");
+  await page.settle();
+  assert.deepStrictEqual(readKinds(page), ["flat"], "a stream that never answered held the reopen's read back");
+
+  const { page: refused } = await warmChannelReopen((p) => {
+    p.streamStatus = 404;
+  });
+  assert.deepStrictEqual(readKinds(refused), ["flat"], "a refused stream held the reopen's read back");
+  const { page: off } = await warmChannelReopen((p) => {
+    p.liveDelivery = "off";
+  });
+  assert.equal(off.streamOpens.length, 0);
+  assert.deepStrictEqual(readKinds(off), ["flat"], "a server that streams nothing held the reopen's read back");
+});
+
+test("a token refused at a reopen is reported as sign-in reports it, and nothing reads with it", async () => {
+  // The saved rows go up at once, but nothing is read before /client-config has proved the token. A
+  // read racing it answered the refusal over sign-in's own explanation, and armed a poll that went
+  // on asking from behind the sign-in form.
+  const first = newPage();
+  await signIn(first);
+  await showDiscord(first, [message({ id: "1301", content: "read with a token since revoked" })]);
+  await first.setVisibility("hidden");
+  const revoked = errorResponse(401, "unauthorized", "token revoked");
+  const page = reloadPage(first.storage, (p) => {
+    p.onlineConfig = p.clientConfig;
+    p.clientConfig = revoked;
+    p.channelPage = revoked;
+  });
+  assert.equal(page.tab(), "discord", "the saved rows did not reopen on the channel");
+  await page.settle();
+  await page.settle();
+  assert.equal(page.screen(), "signin");
+  assert.equal(page.el("error").textContent, "This server refused that token: HTTP 401 unauthorized: token revoked");
+  assert.deepStrictEqual(page.requests, ["GET /api/v1/client-config"], "the channel was read with an unproven token");
+  page.expireTimers(DISCORD_POLL_MS);
+  await page.settle();
+  assert.deepStrictEqual(page.requests, ["GET /api/v1/client-config"], "the sign-in screen went on polling");
+
+  // A token that works, and the channel left behind the form is read for it — once.
+  page.clientConfig = page.onlineConfig;
+  page.channelPage = async () => json(200, { channel: CHANNEL, messages: [message({ id: "1302", content: "read again" })] });
+  await signIn(page);
+  await page.settle();
+  assert.equal(page.tab(), "discord");
+  assert.equal(page.pageReads, 1, "the channel on screen was not read once for the token that works");
+  assert.deepStrictEqual(shownIds(page), ["1302"]);
+});
+
+test("a page that opened offline reads once when the poll reaches the server, even for a provider grown threads", async () => {
+  const first = newPage();
+  await signIn(first);
+  await showDiscord(first, [message({ id: "801", content: "kept offline" })]);
+  await first.setVisibility("hidden");
+  const data = threadData();
+  const page = reloadWith(first.storage, data.messages, (p) => {
+    p.onlineConfig = p.clientConfig;
+    p.clientConfig = offline;
+    p.channelPage = offline;
+  });
+  await reopenedChannel(page);
+  await page.settle();
+  assert.match(freshness(page).textContent, /^Offline · showing messages saved \d{2}:\d{2}$/);
+  assert.deepStrictEqual(readKinds(page), ["page"], "the reopen did not try its one read");
+
+  // Back online, under a provider that has threads now. Sign-in redraws the channel in All, and
+  // the poll that asked for sign-in reads it: one read, not one for the redraw and one for the poll.
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.clientConfig = page.onlineConfig;
+  assert.ok(page.expireTimers(DISCORD_POLL_MS) > 0, "the failed reopen read did not arm the poll");
+  await page.settle();
+  await page.settle();
+  assert.equal(page.el("thread-select").value, "flat");
+  assert.deepStrictEqual(readKinds(page), ["page", "flat"], "reaching the server read the channel twice");
+  assertCurrent(page, "the recovered channel still says it is offline");
 });
 
 test("signing out forgets where the reader was, with the messages", async () => {
