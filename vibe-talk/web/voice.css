@@ -1602,6 +1602,27 @@ body {
   display: none;
 }
 
+/* `#202 read-through-here`. Every item in the ⋯ menu the same size, and the larger, easier one to
+   hit with a thumb: the menu's items were a pill the size of the row's own small controls beside a
+   full-size button, and the owner asked for the larger size throughout. */
+.row-more-menu > button,
+.row-more-menu > .upstream-read-button {
+  min-height: 2.75rem;
+  padding: 0.5rem 0.9rem;
+  border: 1px solid var(--edge);
+  border-radius: 0.6rem;
+  background: none;
+  color: var(--ink);
+  font: inherit;
+  font-size: 1rem;
+  letter-spacing: normal;
+  text-align: left;
+}
+
+.row-more-menu > button[hidden] {
+  display: none;
+}
+
 /* The rescue is offered only on a noise row; `renderChannelRows` sets `hidden`, and a class rule
    for the button's display must not overrule it. */
 .not-noise-button[hidden] {

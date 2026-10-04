@@ -10448,7 +10448,7 @@ function discordNode(messages) {
     `Move ${service}'s own read marker for the whole space to this message, so ${service} shows ` +
       "it and everything before it as read. This app's Done is separate."
   );
-  upstreamRead.textContent = `Mark read in ${service} · whole space`;
+  upstreamRead.textContent = `Mark read in ${service} only · whole space`;
   upstreamRead.hidden = !upstreamReadMarkSupported;
   // A combined row stands for every constituent in order. Marking through the NEWEST one includes
   // the complete row; using its first id would leave an invisible tail unread upstream.
@@ -10472,7 +10472,16 @@ function discordNode(messages) {
   const setMenu = (open) => {
     menu.hidden = !open;
     moreButton.setAttribute("aria-expanded", open ? "true" : "false");
+    // ONE menu open at a time: opening this one closes whichever was open, and a tap anywhere
+    // outside it, or Escape, closes it — what a phone's own pop-up menus do.
+    if (open) {
+      if (openRowMenu && openRowMenu.close !== closeMenu) openRowMenu.close();
+      openRowMenu = { root: more, close: closeMenu };
+    } else if (openRowMenu && openRowMenu.close === closeMenu) {
+      openRowMenu = null;
+    }
   };
+  const closeMenu = () => setMenu(false);
   moreButton.addEventListener("click", () => setMenu(menu.hidden));
   upstreamRead.addEventListener("click", () => {
     setMenu(false);
@@ -10490,7 +10499,26 @@ function discordNode(messages) {
     setMenu(false);
     guardQuietly(() => copyMessageText(content))();
   });
-  menu.append(copy, upstreamRead);
+  // `#202 read-through-here`. What the owner reached for the read marker to do: grey everything up
+  // to and including this row IN THIS APP — the same Done a row's own button records — so that with
+  // Hide read on, doing it on the newest row leaves an empty list. Where the provider's own marker
+  // can be moved too, it is, so the chat service's app agrees.
+  const readThrough = document.createElement("button");
+  readThrough.className = "row-read-through-button";
+  readThrough.setAttribute("type", "button");
+  readThrough.textContent = upstreamReadMarkSupported
+    ? `Mark read through here · also in ${service}`
+    : "Mark read through here";
+  readThrough.setAttribute(
+    "title",
+    "Mark this message and every message above it in this list as Done here" +
+      (upstreamReadMarkSupported ? `, and move ${service}'s own read marker for the whole space.` : ".")
+  );
+  readThrough.addEventListener("click", () => {
+    setMenu(false);
+    guardQuietly(() => markReadThroughHere(li, String(upstreamBoundary.id)))();
+  });
+  menu.append(readThrough, copy, upstreamRead);
   more.append(moreButton, menu);
   meta.append(more);
   // `#50 todo-view`. The non-gestural way to say "dealt with", and the one a keyboard can reach.
@@ -10544,6 +10572,54 @@ function discordNode(messages) {
   // not on the row — see the note above about where the snowflake lives.
   searchable(li, message.author, content);
   return li;
+}
+
+/** The one row ⋯ menu that is open, as `{root, close}`, or null. `#202 read-through-here`. */
+let openRowMenu = null;
+
+/** Whether `node` is `root` or inside it. Walked by hand so it holds for any element. */
+function nodeWithin(root, node) {
+  for (let at = node; at; at = at.parentNode) {
+    if (at === root) return true;
+  }
+  return false;
+}
+
+/** A tap anywhere outside the open ⋯ menu (or its button) closes it. */
+function closeRowMenuOutside(event) {
+  if (openRowMenu && !nodeWithin(openRowMenu.root, event && event.target)) openRowMenu.close();
+}
+
+/** Escape closes the open ⋯ menu. */
+function closeRowMenuOnEscape(event) {
+  if (openRowMenu && event && event.key === "Escape") openRowMenu.close();
+}
+
+/** Most ids one dismissal request carries; the server refuses a larger batch. */
+const DISMISS_BATCH = 99;
+
+/**
+ * Mark this row and every row above it in the list as Done here, and — where the provider allows
+ * it — move the provider's own read marker for the whole space through the row's newest message.
+ *
+ * The rows ON SCREEN, in the view on screen, are the set: in All that includes thread replies, in a
+ * thread only that thread. Rows already Done are left out of the count. `#202 read-through-here`.
+ */
+async function markReadThroughHere(row, upstreamId) {
+  const rows = [...el("discord-log").children];
+  const at = rows.indexOf(row);
+  if (at < 0) return;
+  const ids = rows.slice(0, at + 1).flatMap(idsOf).filter((id) => !archivedIds.has(id));
+  if (ids.length) await dismissMessages({ messages: ids });
+  let upstream = false;
+  if (upstreamReadMarkSupported && upstreamId) {
+    await markReadUpstream(upstreamId);
+    upstream = true;
+  }
+  const service = chatProviderName || "the chat service";
+  const count = `${ids.length} message${ids.length === 1 ? "" : "s"}`;
+  // Short enough for one line on a phone: the status line cuts a long sentence off.
+  setStatus(upstream ? `Marked ${count} read here and in ${service}.` : `Marked ${count} read.`);
 }
 
 /**
@@ -11791,10 +11867,23 @@ async function dismissMessages(body) {
   setStatus(`Saving ${requested.length} local change${requested.length === 1 ? "" : "s"}…`);
   let payload;
   try {
-    payload = await queueInboxWrite(() => api(
-      `/api/v1/channels/${encodeURIComponent(channel)}/dismiss`,
-      { method: "POST", body }
-    ));
+    payload = await queueInboxWrite(async () => {
+      const route = `/api/v1/channels/${encodeURIComponent(channel)}/dismiss`;
+      if (!body.messages || body.messages.length <= DISMISS_BATCH) {
+        return api(route, { method: "POST", body });
+      }
+      // `#202 read-through-here`: "through here" over a long list names more ids than one request
+      // may carry, so it goes in batches, and the undo covers all of them.
+      const stored = [];
+      for (let start = 0; start < body.messages.length; start += DISMISS_BATCH) {
+        const part = await api(route, {
+          method: "POST",
+          body: { messages: body.messages.slice(start, start + DISMISS_BATCH) },
+        });
+        stored.push(...(part.messages || []));
+      }
+      return { messages: stored };
+    });
   } catch (error) {
     archivedIds = previous;
     lastDismissal = previousDismissal;
@@ -14681,6 +14770,8 @@ el("width-grip").addEventListener("keydown", onGripKey);
 // distinguishes a socket that died because the reader switched apps from one that died because
 // something is broken.
 document.addEventListener("visibilitychange", onVisibility);
+document.addEventListener("pointerdown", closeRowMenuOutside);
+document.addEventListener("keydown", closeRowMenuOnEscape);
 
 el("talk").addEventListener("click", onTalk);
 /** Take the pace popover down. Safe to call when it is already down. */

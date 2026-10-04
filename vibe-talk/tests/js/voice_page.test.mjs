@@ -1472,6 +1472,12 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       return new FakeElement("", String(tag).toLowerCase());
     },
   };
+  /** Fire a document-level event (a tap's `pointerdown`, a `keydown`) at the page's listeners. */
+  page.documentEvent = async (type, event) => {
+    for (const fn of documentListeners.get(type) || []) {
+      await fn(event);
+    }
+  };
   /** Background the page, or bring it back — the property AND the event, as a browser does. */
   page.setVisibility = async (visibility) => {
     document.visibilityState = visibility;
@@ -2392,6 +2398,9 @@ const TUNING_BANDS = {
     "a device engine needs time to initialize but must not strand a tapped row indefinitely"],
   BROWSER_SPEECH_FINISH_MS: [30000, 120000,
     "short chunks at half speed may take many seconds; a hung engine must eventually release the row"],
+  DISMISS_BATCH: [1, 99,
+    "ids per dismissal request (#202 read-through-here); the server refuses a batch over its page " +
+    "ceiling of 99, and a batch of none would never finish"],
   OUTGOING_TIMEOUT_MS: [15000, 180000,
     "slow mobile sends need time to complete, but a lost response must not spin forever or block queued messages"],
   OUTGOING_RETRY_FIRST_MS: [2000, 15000,
@@ -9691,6 +9700,75 @@ test("source-provider read marking is absent unless the server advertises it", a
   assert.deepStrictEqual(page.upstreamReadCalls, []);
 });
 
+const readThroughButton = (li) => li.descendants().find((node) => node.className === "row-read-through-button");
+
+test("one ⋯ menu at a time, and a tap anywhere else or Escape closes it", async () => {
+  // `#202 read-through-here`. The owner photographed two menus open at once.
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, backlog(3));
+  await rowMoreButton(rows[0]).click();
+  assert.equal(rowMoreMenu(rows[0]).hidden, false);
+  await rowMoreButton(rows[1]).click();
+  assert.equal(rowMoreMenu(rows[1]).hidden, false, "the second menu did not open");
+  assert.equal(rowMoreMenu(rows[0]).hidden, true, "opening a second menu left the first open");
+  assert.equal(rowMoreButton(rows[0]).getAttribute("aria-expanded"), "false");
+
+  // A tap inside the open menu is not "elsewhere"...
+  await page.documentEvent("pointerdown", { target: readThroughButton(rows[1]) });
+  assert.equal(rowMoreMenu(rows[1]).hidden, false, "a tap inside the menu closed it");
+  // ...a tap on another row is.
+  await page.documentEvent("pointerdown", { target: rows[2] });
+  assert.equal(rowMoreMenu(rows[1]).hidden, true, "a tap elsewhere left the menu open");
+
+  await rowMoreButton(rows[2]).click();
+  await page.documentEvent("keydown", { key: "Escape" });
+  assert.equal(rowMoreMenu(rows[2]).hidden, true, "Escape left the menu open");
+  // Every item in the menu is drawn the same, larger size.
+  assert.match(CSS_CODE, /\.row-more-menu > button,\s*\.row-more-menu > \.upstream-read-button\s*\{[^}]*min-height: 2\.75rem/);
+});
+
+test("Mark read through here greys this row and everything above it, and empties Hide read at the newest", async () => {
+  // `#202 read-through-here`. The owner pressed the provider's read marker expecting the rows to go
+  // grey here; this is that act.
+  const page = newPage();
+  await signIn(page);
+  let rows = await showDiscord(page, backlog(4));
+  await rowMoreButton(rows[1]).click();
+  await readThroughButton(rows[1]).click();
+  await page.settle();
+  assert.deepStrictEqual(
+    page.dismissCalls.map((call) => call.messages),
+    [["8000000000000000000", "8000000000000000001"]],
+    "it did not mark exactly this row and the ones above it"
+  );
+  assert.deepStrictEqual(page.upstreamReadCalls, [], "it wrote to a provider that does not offer it");
+  assert.equal(page.el("status").textContent, "Marked 2 messages read.");
+
+  // On the newest row with Hide read on: nothing is left.
+  await turnTodoOn(page);
+  rows = [...page.el("discord-log").children];
+  const newest = rows[rows.length - 1];
+  await rowMoreButton(newest).click();
+  await readThroughButton(newest).click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), [], "Hide read still shows rows after marking through the newest");
+});
+
+test("Mark read through here also moves the provider's marker where it can, in one short line", async () => {
+  const page = newPage();
+  page.upstreamReadMarkSupported = true;
+  await signIn(page);
+  const rows = await showDiscord(page, backlog(3));
+  assert.equal(readThroughButton(rows[2]).textContent, "Mark read through here · also in Discord");
+  await rowMoreButton(rows[2]).click();
+  await readThroughButton(rows[2]).click();
+  await page.settle();
+  assert.equal(page.dismissCalls.length, 1);
+  assert.deepStrictEqual(page.upstreamReadCalls, [{ message_id: "8000000000000000002" }]);
+  assert.equal(page.el("status").textContent, "Marked 3 messages read here and in Discord.");
+});
+
 test("Copy text in the ⋯ menu copies the whole row's text, and says so", async () => {
   // `#198 copy-message-text`. Every constituent of a combined row, in order, as written.
   const page = newPage();
@@ -9744,7 +9822,7 @@ test("mark read through here targets the newest part without archiving the row",
   const control = upstreamReadButton(rows[0]);
   assert.equal(control.hidden, false, "the advertised provider action stayed hidden");
   // Named for what it changes: the chat service's own marker, for the whole space.
-  assert.equal(control.textContent, "Mark read in Discord · whole space");
+  assert.equal(control.textContent, "Mark read in Discord only · whole space");
   assert.match(control.getAttribute("title"), /Discord's own read marker for the whole space/);
   // It lives under the row's ⋯ menu, closed until asked for, so it costs the row no width.
   assert.equal(rowMore(rows[0]).hidden, false, "the ⋯ menu holding the action is not offered");
