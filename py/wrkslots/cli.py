@@ -20574,8 +20574,15 @@ def _run_one_setup_hook_installer(repository: Path) -> SetupHookResult:
     }
     script = repository / SETUP_HOOKS_SCRIPT
     # The output goes to a file rather than a pipe, so a descendant that keeps
-    # running after the installer exits cannot hold 'create' open.
-    with tempfile.TemporaryFile() as output:
+    # running after the installer exits cannot hold 'create' open.  The slot is
+    # already registered, so failing to make that file is a result, not a raise.
+    try:
+        output_file = tempfile.TemporaryFile()
+    except OSError as exc:
+        return SetupHookResult(
+            str(repository), "failed-to-start", detail=f"cannot create its output file: {exc}"
+        )
+    with output_file as output:
         try:
             process = subprocess.Popen(
                 [str(script)],

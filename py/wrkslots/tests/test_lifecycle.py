@@ -27333,6 +27333,29 @@ def test_setup_hooks_installer_is_stopped_at_its_time_bound(
     assert result.returncode is not None and result.returncode < 0
 
 
+def test_setup_hooks_output_file_failure_is_a_result_not_a_raise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    marker = tmp_path / "ran"
+    installer = repository / "scripts" / "setup-hooks.sh"
+    installer.parent.mkdir(parents=True)
+    installer.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+    installer.chmod(0o755)
+
+    def no_space(*_args: object, **_kwargs: object) -> object:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(wrkslots.tempfile, "TemporaryFile", no_space)
+
+    result = wrkslots._run_one_setup_hook_installer(repository)
+
+    assert result.status == "failed-to-start"
+    assert "cannot create its output file" in result.detail
+    assert "No space left on device" in result.detail
+    assert not marker.exists()
+
+
 def test_failed_post_provision_hook_is_loud_and_recovery_resumes_hooks(
     tmp_path: Path,
 ) -> None:
