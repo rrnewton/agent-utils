@@ -6306,9 +6306,14 @@ function threadName(choice, chars = THREAD_TITLE_CHARS) {
   return "Thread";
 }
 
-/** "13h · 16": how long ago the thread started and how many replies it has. */
+/**
+ * "13h · 16": how long since the thread was last active, and how many replies it has.
+ *
+ * Last ACTIVITY rather than when it started, because that is the order every list of threads is in:
+ * a start age put "38w" above "2h" in a list sorted newest-activity-first, which reads as unsorted.
+ */
 function threadFacts(choice) {
-  const age = briefAge(Number.isFinite(choice.started) ? choice.started : choice.at);
+  const age = briefAge(Number.isFinite(choice.at) ? choice.at : choice.started);
   return [age, typeof choice.count === "number" ? String(choice.count) : ""]
     .filter((part) => part !== "").join(" · ");
 }
@@ -6575,11 +6580,19 @@ async function loadThreadDirectory(older) {
     renderThreadDirectory();
     return;
   }
-  if (generation !== threadDirectory.generation || String(el("discord-channel").value) !== channel) return;
+  if (generation !== threadDirectory.generation) return;
+  if (String(el("discord-channel").value) !== channel) {
+    threadDirectory.loading = false;
+    return;
+  }
   foldTimelinePage(payload, older, "threads", null);
   // The newest page is the selector's background read as well; it need not ask again this minute.
   if (!older) threadDirectoryReadAt.set(channel, Date.now());
-  threadDirectory.cursor = payload.has_more === true ? payload.next_before || null : null;
+  const next = payload.has_more === true ? payload.next_before || null : null;
+  // A REOPENED screen re-reads the newest page, but the older pages already loaded are still in
+  // the store and on screen: Load older continues from the deepest one rather than walking the
+  // reader back through pages they have already seen.
+  if (older || !threadDirectory.cursor || !next) threadDirectory.cursor = next;
   threadDirectory.loading = false;
   renderThreadDirectory();
   renderThreadSelect();
@@ -6600,7 +6613,12 @@ function threadDirectorySentence(count) {
   }
   if (count === 0) return "No threads in this channel yet.";
   const listed = `${count} ${count === 1 ? "thread" : "threads"}, newest activity first`;
-  return state.cursor ? `${listed}. Older ones are on the server.` : `${listed}. That is all of them.`;
+  if (state.cursor) return `${listed}. Older ones are on the server.`;
+  // A provider that stopped scanning says so in the page's notice ("older threads are not
+  // listed"); "that is all of them" would then be a claim the server explicitly did not make.
+  const cover = channelCanon.views.get(viewKey("threads"));
+  const notice = cover && typeof cover.notice === "string" ? cover.notice.trim().replace(/[.\s]+$/, "") : "";
+  return notice ? `${listed}. ${notice.charAt(0).toUpperCase()}${notice.slice(1)}.` : `${listed}. That is all of them.`;
 }
 
 /** Draw the list. Every string is text; nothing from the chat service is parsed as markup. */
