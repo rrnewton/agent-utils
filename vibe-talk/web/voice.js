@@ -371,6 +371,9 @@ let screenBeforeSettings = "signin";
 let currentScreen = "signin";
 
 function showScreen(name) {
+  // The channel list is about to be hidden, and a hidden list has nothing left to measure: the
+  // reader's message is noted now, for a reopen. `#189 restore-ui-state`.
+  if (currentScreen === "main" && name !== "main") holdChannelPlace();
   for (const screen of SCREENS) {
     el(`screen-${screen}`).hidden = screen !== name;
   }
@@ -509,10 +512,17 @@ const viewScroll = { voice: null, discord: null };
 
 let threadingSupported = false;
 let channelHasThreads = false;
+// Main only until the channel's provider is known; `openChannelView` decides it from then on.
 let channelView = "main";
 let selectedThreadId = null;
 let selectedThread = null;
 let threadOrigin = "main";
+/**
+ * Whether the reader picked the view on screen — in this page or before a reload — rather than
+ * being given the default. `#189 restore-ui-state`: saved with the view, because only a choice
+ * outranks the default when the page reopens; a view nobody chose is the default again.
+ */
+let channelViewChosen = false;
 let timelineMessages = [];
 let timelineThreads = [];
 const channelContexts = new Map();
@@ -555,6 +565,8 @@ function showView(name) {
   if (leaving && leaving !== name) {
     const area = el("scroll-area");
     viewScroll[leaving] = { top: area.scrollTop, atNewest: atBottom(area) };
+    // ...and, leaving the channel, the message the reader was on, for a reopen. `#189 restore-ui-state`.
+    if (leaving === "discord") holdChannelPlace();
   }
   currentView = name;
   el("pane-voice").hidden = name !== "voice";
@@ -608,6 +620,7 @@ function showView(name) {
   // channel-selector-in-bar`.
   renderControlBar();
   renderChannelNavigation();
+  saveUiState();
 }
 
 // --- connection details -------------------------------------------------------------------------
@@ -5974,6 +5987,7 @@ function hydrateChannelScope() {
   screenBelongsToToken();
   if (threadingSupported) {
     if (channelCanon.channel !== String(channel)) loadCanon(channel);
+    if (channelView === "thread") inheritAllCover(selectedThreadId, selectedThread);
     return drawProjection();
   }
   const cache = readMessageCache();
@@ -6025,6 +6039,8 @@ function hydrateFromCache() {
   const provider = providerOfChannel(el("discord-channel").value);
   if (provider) threadingSupported = provider.threading_supported === true;
   renderChannelBox();
+  // Before the composer and the rows: both are the view's. `#189 restore-ui-state`.
+  openChannelView();
   restoreChannelComposer();
   hydrateChannelScope();
   return true;
@@ -6070,6 +6086,11 @@ function screenBelongsToToken() {
 function forgetMessages() {
   dropMessageCache();
   clearChannelScreen();
+  // ...nor where the reader was in it: the record names a thread this credential read, and the
+  // next one opens the channel as a first visit does. `#189 restore-ui-state`.
+  forgetUiState();
+  openChannelView();
+  restoreChannelComposer();
 }
 
 /** A channel read failed. Say so over the rows it leaves standing — or take them away. */
@@ -6161,17 +6182,282 @@ function reserveFreshnessRoom(reserve) {
   else toggle();
 }
 
-/** The page drew a snapshot for one channel and mode; `/client-config` may describe another. */
+/**
+ * The page drew a snapshot for one channel and mode; `/client-config` may describe another.
+ *
+ * `#189 restore-ui-state`. The view is decided again rather than reset to Main, so a channel the
+ * saved shell called threadless whose provider has threads after all opens in All — here, once —
+ * unless the reader chose a view. With the channel on screen it is read again for the view now up:
+ * the read already on the wire was for the old one, and is set aside when it lands.
+ */
 function reconcileChannelSnapshot(before) {
   if (before.key === channelContextKey() && before.threading === threadingSupported) return;
   clearChannelScreen();
-  channelView = "main";
-  selectedThreadId = null;
-  selectedThread = null;
+  openChannelView();
   channelHasThreads = false;
-  hydrateChannelScope();
+  const drawn = hydrateChannelScope();
   restoreChannelComposer();
   renderControls();
+  saveUiState();
+  if (currentView === "discord") refreshQuietly(() => loadDiscord(drawn ? { keepPosition: true } : undefined))();
+}
+
+// --- which view a channel opens in, and where the reader was, across a reload ----------------------
+//
+// `#189 restore-ui-state`. The owner, 2026-10-04: "Let's default to All view when opening the app
+// channel view. But let's save prior UI state if possible. When I kill and reopen my pwa I want to
+// see mostly the same thing." A phone reclaims an installed app whenever it likes, so a reopen is an
+// ordinary event, and it used to open on the call view, in Main, at the newest message, with Hide
+// read off, whatever the reader had been doing. The page now keeps one small record of what was on
+// screen and reopens on it: the call or the channel; which part of the channel — Main, All or a
+// thread, with the thread's summary so its heading has a name before anything is read; whether
+// read messages were hidden; and the message the reader's eye was on.
+//
+// NOT THE SCREEN. A reopen lands on the main screen whatever was up: Settings and Help are a tap
+// away, the Threads screen is a choice half made, and a reply keeps its draft without its screen
+// being reopened (`DRAFTS_KEY`). The selected channel already has its own key (`ACTIVE_CHANNEL_KEY`);
+// the record names it only so a view saved for one channel is never applied to another.
+//
+// A PLACE IS A MESSAGE, not a pixel offset — `captureScroll`'s anchor, put back by `restoreScroll`.
+// The rows above it are redrawn from the snapshot and then re-read, and an offset would land on
+// whatever happens to be there by then. A reader who was on the newest line stays on it, and one
+// whose message is gone lands on the newest, as a first visit does.
+//
+// CHECKED ON THE WAY BACK, because storage is a boundary like the network: a channel no longer
+// listed, a thread the channel's store no longer knows, or a provider that no longer has threads
+// falls back to the default, and a record that does not parse is deleted. It is scoped to the token
+// as the snapshot is, and forgotten with it: the thread's summary is something that credential read.
+
+const UI_STATE_KEY = "vibe-talk.voice.ui-state";
+const UI_STATE_VERSION = 1;
+/** The channel views a reopen comes back to. The Threads list is reached from the picker instead. */
+const REOPENED_VIEWS = ["main", "flat", "thread"];
+
+/**
+ * The view a channel opens in until the reader picks one: All where its provider has threads — every
+ * message, each tagged with its thread — and Main where it has none, because there Main IS the
+ * whole channel and All is not offered. The owner, again at 09:31: "My channel view seems to still
+ * default to Main. I want All."
+ */
+function defaultChannelView() {
+  return threadingSupported ? "flat" : "main";
+}
+
+const validSavedThread = (thread) => thread !== null && typeof thread === "object" &&
+  typeof thread.id === "string" && thread.id !== "" && ["main", "flat"].includes(thread.origin) &&
+  (thread.summary === null || VibeTalkContract.is("ThreadSummary", thread.summary));
+
+const validSavedPlace = (place) => place === null || (typeof place === "object" &&
+  typeof place.atNewest === "boolean" && (place.anchor === null || typeof place.anchor === "string") &&
+  Number.isFinite(place.offset));
+
+function validUiState(saved) {
+  return saved !== null && typeof saved === "object" && saved.v === UI_STATE_VERSION &&
+    typeof saved.identity === "string" && ["voice", "discord"].includes(saved.view) &&
+    typeof saved.todo === "boolean" && typeof saved.channel === "string" &&
+    REOPENED_VIEWS.includes(saved.channelView) && typeof saved.chosen === "boolean" &&
+    (saved.channelView === "thread" ? validSavedThread(saved.thread) : saved.thread === null) &&
+    validSavedPlace(saved.place);
+}
+
+function dropUiState() {
+  try {
+    localStorage.removeItem(UI_STATE_KEY);
+  } catch (_error) {
+    // Nothing was readable either, so there is nothing to reopen on.
+  }
+}
+
+/** The record saved for the token saved now, or null. A damaged one, or another token's, is deleted. */
+function readUiState() {
+  let raw = null;
+  try {
+    raw = localStorage.getItem(UI_STATE_KEY);
+  } catch (_error) {
+    return null;
+  }
+  if (raw === null) return null;
+  let saved = null;
+  try {
+    saved = JSON.parse(raw);
+  } catch (_error) {
+    saved = null;
+  }
+  const identity = tokenFingerprint(token());
+  if (identity && validUiState(saved) && saved.identity === identity) return saved;
+  dropUiState();
+  return null;
+}
+
+/**
+ * What the last page left, read once before anything is drawn. Later writes do not change it: it is
+ * what THIS page reopens on, not a mirror of the key.
+ */
+let savedUi = readUiState();
+/**
+ * The reader's own choice of channel view from that record, until they make another in this page.
+ * Every place the view is decided asks `openingChannelView`, so a choice the saved shell could not
+ * honour yet — a thread, in a channel the shell thought had none — is honoured once `/client-config`
+ * says it can be.
+ */
+let savedChoice = savedUi && savedUi.chosen ? savedUi : null;
+/**
+ * False until the page has reopened on `savedUi`, or the reader has done something of their own.
+ * Nothing is written before then: the call view the page puts up first is not where the reader was,
+ * and recording it would overwrite the record the reopen is about to use.
+ */
+let uiStateSettled = savedUi === null;
+/** The last place measured in the channel list, under the channel and view it is a place in. */
+let heldPlace = null;
+
+/** Sign-out, another token, a refusal: the record goes, and the page stops reopening on it. */
+function forgetUiState() {
+  dropUiState();
+  savedUi = null;
+  savedChoice = null;
+  uiStateSettled = true;
+  heldPlace = null;
+}
+
+/**
+ * Whether the selected channel's store still knows thread `id`: its summary, a message in it, or a
+ * page read for it. A thread the store has never heard of is not one to reopen into.
+ */
+function threadStillKnown(id) {
+  const channel = String(el("discord-channel").value);
+  if (channelCanon.channel !== channel) loadCanon(channel);
+  if (id === channelCanon.scope) return false;
+  return channelCanon.views.has(viewKey("thread", id)) ||
+    channelCanon.threads.some((summary) => String(summary.id) === id) ||
+    channelCanon.messages.some((message) => threadOf(message) === id);
+}
+
+/**
+ * The view to open the selected channel in: the reader's saved choice while it holds, and otherwise
+ * the default. A choice holds in the channel it was made in, on a provider that still has threads —
+ * Main included, since preferring Main to All is the owner's call to make — and a thread only while
+ * the channel's store still knows it.
+ */
+function openingChannelView() {
+  const saved = savedChoice;
+  const fallback = defaultChannelView();
+  if (saved && threadingSupported && saved.channel === String(el("discord-channel").value) &&
+      (saved.channelView !== "thread" || threadStillKnown(saved.thread.id))) {
+    const thread = saved.thread;
+    return {
+      view: saved.channelView, chosen: true,
+      thread: thread ? thread.id : null, summary: thread ? thread.summary : null,
+      origin: thread ? thread.origin : fallback,
+    };
+  }
+  return { view: fallback, chosen: false, thread: null, summary: null, origin: fallback };
+}
+
+/** Put the selected channel on the view it opens in. Draws nothing; every caller draws next. */
+function openChannelView() {
+  const opening = openingChannelView();
+  channelView = opening.view;
+  selectedThreadId = opening.thread;
+  selectedThread = opening.summary;
+  threadOrigin = opening.origin;
+  channelViewChosen = opening.chosen;
+  // A reopened thread is named from the store, like every thread, so the summary kept with the
+  // record goes into it when the store has none: the heading has its name before any read.
+  const summary = opening.summary;
+  if (summary && !channelCanon.threads.some((held) => String(held.id) === String(summary.id))) {
+    upsertThreadSummary(summary);
+  }
+}
+
+/** The channel and view a measured place belongs to. */
+const placeKey = () => JSON.stringify([String(el("discord-channel").value), viewKey()]);
+
+/**
+ * Note which message the reader's eye is on in the channel list, while there is one on screen to
+ * measure: before another view, another screen or the page going away hides it, since a hidden
+ * list has no boxes left to measure.
+ */
+function holdChannelPlace() {
+  if (currentScreen !== "main" || currentView !== "discord" || !REOPENED_VIEWS.includes(channelView)) return;
+  const mark = captureScroll();
+  const anchor = mark.anchor;
+  heldPlace = {
+    key: placeKey(),
+    place: {
+      atNewest: mark.pinned,
+      anchor: anchor ? anchor.getAttribute("data-context-id") || idsOf(anchor)[0] || null : null,
+      offset: anchor ? mark.top - el("scroll-area").getBoundingClientRect().top : 0,
+    },
+  };
+}
+
+/** The open thread's summary as the store holds it, for the heading a reopen draws first. */
+function savedThreadSummary() {
+  const id = String(selectedThreadId);
+  const summary = channelCanon.threads.find((held) => String(held.id) === id) || selectedThread;
+  return summary && VibeTalkContract.is("ThreadSummary", summary) ? summary : null;
+}
+
+/**
+ * Record what is on screen now. One small key, so it is written whenever the reader changes what
+ * they are looking at; the place is the one last measured, if it is a place in this view.
+ */
+function saveUiState() {
+  const identity = tokenFingerprint(token());
+  if (!uiStateSettled || !identity) return;
+  const reopens = REOPENED_VIEWS.includes(channelView) && (channelView !== "thread" || Boolean(selectedThreadId));
+  const thread = reopens && channelView === "thread" ? {
+    id: String(selectedThreadId),
+    origin: ["main", "flat"].includes(threadOrigin) ? threadOrigin : defaultChannelView(),
+    summary: savedThreadSummary(),
+  } : null;
+  storedExactly(UI_STATE_KEY, JSON.stringify({
+    v: UI_STATE_VERSION,
+    identity,
+    view: currentView === "discord" ? "discord" : "voice",
+    todo: todoMode,
+    channel: String(el("discord-channel").value),
+    channelView: reopens ? channelView : defaultChannelView(),
+    chosen: reopens && channelViewChosen,
+    thread,
+    place: heldPlace && heldPlace.key === placeKey() ? heldPlace.place : null,
+  }));
+}
+
+/**
+ * Put the reader back on the message the record says they were reading, at the same height in the
+ * window, when it is drawn in the view they left. Otherwise they stay on the newest message, where
+ * entering the view put them.
+ */
+function returnToSavedPlace() {
+  const saved = savedUi;
+  const place = saved ? saved.place : null;
+  if (!place || place.atNewest || !place.anchor || saved.channel !== String(el("discord-channel").value) ||
+      saved.channelView !== channelView || (saved.thread && saved.thread.id !== selectedThreadId)) return;
+  const row = [...visibleList().children].find((candidate) =>
+    candidate.getAttribute("data-context-id") === place.anchor || idsOf(candidate).includes(place.anchor));
+  if (!row) return;
+  restoreScroll({ pinned: false, anchor: row, top: el("scroll-area").getBoundingClientRect().top + place.offset });
+}
+
+/**
+ * Reopen on the channel when that is where the reader left the page — once, as soon as there is a
+ * channel to show: at load from the saved shell, or after sign-in when there was none. Its view was
+ * decided already, by `openChannelView`; this enters it, puts the reader back on their message,
+ * and reads the view on screen exactly as entering it by the switch does — one newest page.
+ */
+function reopenSavedView() {
+  if (uiStateSettled) return;
+  uiStateSettled = true;
+  if (savedUi && savedUi.view === "discord" && el("discord-channel").value && currentView !== "discord") {
+    showView("discord");
+    returnToSavedPlace();
+    holdChannelPlace();
+    // Merged into the rows the snapshot drew, keeping the reader's message, as a channel change
+    // does; with nothing drawn it is a first visit and settles on the newest.
+    readEnteredChannel(channelFreshAt > 0);
+  }
+  saveUiState();
 }
 
 // --- channel views, threads and the channel composer ------------------------------------------
@@ -6394,6 +6680,12 @@ async function changeChannelView(view, threadId = null, summary = null) {
   timelineMessages = held ? held.messages : [];
   timelineThreads = held ? held.threads : [];
   selectedThread = summary || (held && held.selected) || null;
+  // `#189 restore-ui-state`. The reader's own choice: it outranks the default from here on, and it
+  // is what a reopen comes back to.
+  channelViewChosen = true;
+  savedChoice = null;
+  uiStateSettled = true;
+  saveUiState();
   discordMoreAbove = held ? held.more : false;
   discordOlderCursor = held ? held.cursor : null;
   discordNewestId = held ? held.newest : null;
@@ -6417,14 +6709,7 @@ async function changeChannelView(view, threadId = null, summary = null) {
     // active view; a tab switch itself must not become another network wait.
     return;
   }
-  // A THREAD IS A SUBSET OF ALL. Opened while All is covered and the thread is not, it inherits
-  // All's cover and is drawn as a filter of the messages already held: no loading screen for a
-  // narrowing of what is on the page. Older replies than All reached are still a scroll away.
-  if (view === "thread" && threadingSupported &&
-      channelCanon.channel === String(el("discord-channel").value) &&
-      !channelCanon.views.has(viewKey("thread", threadId)) && channelCanon.views.has(viewKey("flat"))) {
-    channelCanon.views.set(viewKey("thread", threadId), { ...channelCanon.views.get(viewKey("flat")), cursor: null });
-  }
+  if (view === "thread") inheritAllCover(threadId, summary);
   // Not drawn in this page yet, but covered by the channel's store — read earlier, or saved on
   // this device: project it, with no request. The stream and the poll keep it current from here.
   if (threadingSupported && channelCanon.channel === String(el("discord-channel").value) && drawProjection()) {
@@ -6434,6 +6719,38 @@ async function changeChannelView(view, threadId = null, summary = null) {
   }
   scrollToNewest();
   await loadDiscord();
+}
+
+/**
+ * A THREAD IS A SUBSET OF ALL. Opened while All is covered and the thread is not, it inherits All's
+ * cover and is drawn as a filter of the messages already held: no loading screen for a narrowing of
+ * what is on the page — on opening it, and on reopening the page in it.
+ *
+ * ...when All reaches back to where the thread starts. `#189 restore-ui-state` made All the view a
+ * channel opens in, so All is nearly always covered, and an old thread — what the Threads screen is
+ * for — began before All's newest page: inherited, it drew empty, with no cursor to walk back on
+ * until the poll read it. That thread is read for itself instead.
+ */
+function inheritAllCover(threadId, summary) {
+  if (threadingSupported && channelCanon.channel === String(el("discord-channel").value) &&
+      !channelCanon.views.has(viewKey("thread", threadId)) && allReachesThread(threadId, summary)) {
+    channelCanon.views.set(viewKey("thread", threadId), { ...channelCanon.views.get(viewKey("flat")), cursor: null });
+  }
+}
+
+/**
+ * Whether All's cover reaches thread `id` from its first message: All is the whole channel, or the
+ * thread's root — held, or carried by its summary — is no older than the oldest row All covers.
+ */
+function allReachesThread(id, summary) {
+  const all = channelCanon.views.get(viewKey("flat"));
+  if (!all) return false;
+  if (!all.more) return true;
+  const held = channelCanon.threads.find((candidate) => String(candidate.id) === String(id)) || summary;
+  const root = channelCanon.messages.find((message) => threadOf(message) === String(id) && message.thread.is_root) ||
+    (held && held.root) || null;
+  const startedAt = timeOf(root, "timestamp");
+  return all.floor !== null && Number.isFinite(startedAt) && startedAt >= all.floor;
 }
 
 /** A held view missed what the stream delivered while it was hidden; the store did not. */
@@ -12007,6 +12324,9 @@ async function clearBacklog() {
 
 function setTodoMode(on) {
   todoMode = on;
+  // Kept across a reload, as the reader left it. `#189 restore-ui-state`.
+  uiStateSettled = true;
+  saveUiState();
   disarmBacklog();
   // An undo belongs to the act it undoes, and leaving the view is the reader moving on. Keeping
   // it would offer to restore messages into a list they are no longer looking at.
@@ -14690,6 +15010,8 @@ async function signIn() {
   reconcileChannelSnapshot(drawn);
   clearError();
   showScreen("main");
+  // With no saved shell there was no channel to reopen on until now. `#189 restore-ui-state`.
+  reopenSavedView();
   // Short, because the invitation itself now lives in the empty transcript — the largest thing on
   // an idle screen — rather than competing for the one strip where a phone shows text worst.
   setStatus("Ready.");
@@ -14847,6 +15169,17 @@ el("width-grip").addEventListener("keydown", onGripKey);
 document.addEventListener("visibilitychange", onVisibility);
 document.addEventListener("pointerdown", closeRowMenuOutside);
 document.addEventListener("keydown", closeRowMenuOnEscape);
+// `#189 restore-ui-state`. The last moments a phone promises this page before it may reclaim it —
+// hidden, or being unloaded — are when the reader's place is written down. Hidden comes first on
+// a phone, and is the one an installed app reliably gets before it is killed.
+const rememberUiState = () => {
+  holdChannelPlace();
+  saveUiState();
+};
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") rememberUiState();
+});
+window.addEventListener("pagehide", rememberUiState);
 
 el("talk").addEventListener("click", onTalk);
 /** Take the pace popover down. Safe to call when it is already down. */
@@ -15083,6 +15416,8 @@ el("reply-context-more").addEventListener("click", guardQuietly(loadEarlierReply
 el("reply-text").addEventListener("input", rememberDraft);
 el("view-switch").addEventListener("click", () => {
   const next = currentView === "voice" ? "discord" : "voice";
+  // The reader's own move, so the record follows it from here on. `#189 restore-ui-state`.
+  uiStateSettled = true;
   showView(next);
   if (next !== "discord") {
     stopDiscordPolling();
@@ -15094,10 +15429,14 @@ el("view-switch").addEventListener("click", () => {
   // KEEP THE POSITION when this entry was a return. `loadDiscord` with no options settles to the
   // newest message, which would undo the restore `showView` just performed — the two halves have
   // to agree or the fix is invisible.
-  const returning = viewRestored;
+  readEnteredChannel(viewRestored);
+});
+
+/** Read the channel just entered, and keep reading it while it stays on screen. */
+function readEnteredChannel(keepPosition) {
   guardQuietly(async () => {
     try {
-      await loadDiscord(returning ? { keepPosition: true } : undefined);
+      await loadDiscord(keepPosition ? { keepPosition: true } : undefined);
     } finally {
       // Armed after a failure too: offline is exactly when the reader needs the page to try again.
       if (currentView === "discord") {
@@ -15105,7 +15444,7 @@ el("view-switch").addEventListener("click", () => {
       }
     }
   })();
-});
+}
 // Both wrapped in a lambda rather than passed straight through: a DOM listener is handed the
 // EVENT as its first argument, and `loadDiscord`'s first argument is its options object. Reading
 // `keepPosition` off a MouseEvent happens to answer false, which is the right answer by accident
@@ -15123,9 +15462,11 @@ function changeSelectedChannel() {
   applyChannelProvider();
   rememberActiveChannel();
   rememberChannelDraft();
-  channelView = "main";
-  selectedThreadId = null;
-  selectedThread = null;
+  // `#189 restore-ui-state`. Another channel opens in ITS default — All where it has threads — and a
+  // choice made in the last one, saved or not, is not carried into it.
+  savedChoice = null;
+  uiStateSettled = true;
+  openChannelView();
   channelHasThreads = false;
   timelineMessages = [];
   timelineThreads = [];
@@ -15150,6 +15491,7 @@ function changeSelectedChannel() {
   const saved = hydrateChannelScope();
   renderChannelFreshness();
   if (saved) scrollToNewest();
+  saveUiState();
   // A stream follows ONE channel, and a cursor from the old one means nothing in the new one —
   // the same reason the walk-back cursor is dropped two lines above.
   startChannelStream(el("discord-channel").value);
@@ -15319,6 +15661,8 @@ if (token()) {
 // Before the first screen is shown, so the bar is in its home from the first frame rather than
 // visibly jumping out of the header once script catches up. `#58 control-bar`.
 setPlacement(storedPlacement());
+// Hide read as the reader left it, before the first row is drawn or read. `#189 restore-ui-state`.
+if (savedUi) todoMode = savedUi.todo;
 showView("voice");
 renderEmptyState();
 renderControls();
@@ -15327,8 +15671,14 @@ renderControls();
 // channel for that same token, in which case the application is up in this task, with the saved
 // rows in it, and the proof arrives behind it. A refusal still ends on the sign-in screen, with
 // every saved row gone. `#18 offline-message-cache`.
+//
+// ...and up where the reader left it: on the channel, in their view, at their message, with the
+// view's one read on the wire before `/client-config` has answered. `#189 restore-ui-state`.
 if (token()) {
-  if (hydrateFromCache()) showScreen("main");
+  if (hydrateFromCache()) {
+    showScreen("main");
+    reopenSavedView();
+  }
   guardQuietly(signIn)();
 } else {
   showScreen("signin");

@@ -7,12 +7,15 @@ Storage and service-worker registries, and layout at 412x915 and at a 1280x800 d
 those it serves the checked-out assets and a small fake API from one loopback origin, then walks
 one reader through:
 
-  sign in, read a channel in Main, Threads and All -> reload with the network held: the saved rows
-  are drawn before any answer -> one bounded newest-page read merges a new row without
-  duplicating -> switching views makes no request -> a reload with the API unreachable keeps the
-  rows and says so -> a reload whose refresh fails keeps them and says that -> signing out removes
-  them from the screen and the device. Before the reloads, a refresh also fails and recovers in
-  place, on the channel's own poll, under a reader at the top, in the middle and at the newest line.
+  sign in, open the channel — in All, the default where the provider has threads — and read Threads
+  and Main too -> reload with the network held: the page reopens on the channel in All by itself,
+  its saved rows drawn before any answer (`#189 restore-ui-state`) -> one bounded newest-page read
+  of All merges a new row without duplicating -> switching views makes no request -> a reload with
+  the API unreachable reopens on Main, the view last chosen, at the message a reader parked mid-list
+  was on, keeps the rows and says so -> a reload whose refresh fails keeps them and says that ->
+  signing out removes them from the screen and the device. Before the reloads, a refresh also fails
+  and recovers in place, on the channel's own poll, under a reader at the top, in the middle and at
+  the newest line.
 
 While the freshness pill is up — refreshing, offline, failed — it must cover neither the view tabs
 nor the list's header seam or first row, and #scroll-area must be the same box with it as without
@@ -542,8 +545,10 @@ def main() -> int:
     with sync_playwright() as playwright:
         for label, width, height, mobile in PROFILES:
             browser_version = walk(playwright.chromium, args, label, width, height, mobile)
-            print(f"{browser_version} {label} at {width}x{height}: snapshot drawn before the network,"
-                  " one newest-page read, local view switches, offline and failed states, the pill"
+            print(f"{browser_version} {label} at {width}x{height}: All by default, a reload reopened on the"
+                  " channel, its view and the reader's message, snapshot drawn before the network,"
+                  " one newest-page read of the"
+                  " view on screen, local view switches, offline and failed states, the pill"
                   " clear of the tabs and the header with #scroll-area unmoved, a scrolled reader"
                   " held in place as it and the error panel come and go, the search glass on the pill's"
                   " line with no header strip and a 44px target, the search bar opened by a real tap and"
@@ -620,6 +625,11 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             def view(name: str) -> None:
                 page.evaluate(f"() => document.getElementById('channel-view-{name}').click()")
 
+            def reopened(why: str) -> None:
+                """`#189 restore-ui-state`: a reload of a page left on the channel comes back on it."""
+                shown = page.evaluate("() => !document.getElementById('pane-discord').hidden")
+                check(bool(shown), f"{label}: {why}: the reload did not reopen on the channel")
+
             def failing(route: Route) -> None:
                 route.fulfill(status=502, content_type="application/json",
                               body=json.dumps({"error": "discord_error", "detail": "the provider is down"}))
@@ -661,8 +671,9 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 check(bool(found["picker"]), f"{label}, {state}: the bar's thread picker was not on screen")
                 return str(found["area"])
 
-            # 1. Sign in and read the channel in Main, Threads and All. The call view comes up first:
-            # its glass floats over the transcript with no header strip above it (`#197`).
+            # 1. Sign in and open the channel: in All, the default where the provider has threads
+            # (`#189 restore-ui-state`); then Threads and Main. The call view comes up first: its
+            # glass floats over the transcript with no header strip above it (`#197`).
             page.goto(url, wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
@@ -671,13 +682,15 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             shot("1-call-view-glass")
             check(not alone["problems"], f"{label}, the call view: {alone['problems']}")
             page.click("#view-switch")
-            wait_rows(["200", "201"], "Main after sign-in")
+            wait_rows(["200", "201", "202"], "All after sign-in")
+            check(page.evaluate("() => document.getElementById('thread-select').value") == "flat",
+                  f"{label}: a channel with threads did not open in All")
             view("threads")
             page.wait_for_selector("#thread-list > li", timeout=10_000)
-            view("flat")
-            wait_rows(["200", "201", "202"], "All after sign-in")
             view("main")
-            wait_rows(["200", "201"], "Main again")
+            wait_rows(["200", "201"], "Main after sign-in")
+            view("flat")
+            wait_rows(["200", "201", "202"], "All again")
             saved = json.loads(page.evaluate(f"() => localStorage.getItem({json.dumps(CACHE_KEY)})") or "{}")
             scope = saved.get("scopes", {}).get(CHANNEL["id"], {})
             check(sorted(scope.get("views", {})) == ["flat", "main", "threads"],
@@ -685,26 +698,29 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             shot("1-signed-in")
             baseline = str(page.evaluate(GEOMETRY_JS)["area"])
 
-            # 2. Reload with the history read held: the saved rows draw before any answer.
+            # 2. Reload with the history read held: the page reopens on the channel, in All, and the
+            # saved rows draw before any answer.
             api.timeline_gate.clear()
             with api.lock:
                 api.requests.clear()
                 api.messages.append(message(3, "posted while the page was closed"))
             page.reload(wait_until="load")
-            page.click("#view-switch")
-            wait_rows(["200", "201"], "the snapshot was not drawn before the network answered")
+            reopened("the reload with the read held")
+            check(page.evaluate("() => document.getElementById('thread-select').value") == "flat",
+                  f"{label}: the reload did not reopen in All")
+            wait_rows(["200", "201", "202"], "the snapshot was not drawn before the network answered")
             text = pill()
             check(text.startswith("Saved ") and "refreshing" in text, f"pill while refreshing: {text!r}")
             check(geometry("refreshing", "2-saved-before-network") == baseline,
                   f"{label}: #scroll-area is not the size it was before the reload")
 
-            # 3. One bounded newest page for the view on screen merges without duplicating.
+            # 3. One bounded newest page for the view on screen — All — merges without duplicating.
             api.timeline_gate.set()
-            wait_rows(["200", "201", "203"], "the refresh did not merge")
+            wait_rows(["200", "201", "202", "203"], "the refresh did not merge")
             reads = api.reads()
             check(len(reads) == 1, f"a cold start made {len(reads)} history reads: {reads}")
-            check("view=main" in reads[0] and "before=" not in reads[0],
-                  f"the cold-start read was not the newest page of Main: {reads[0]}")
+            check("view=flat" in reads[0] and "before=" not in reads[0],
+                  f"the cold-start read was not the newest page of All: {reads[0]}")
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline and not current(pill()):
                 page.wait_for_timeout(50)
@@ -713,13 +729,16 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                   f"{label}: #scroll-area changed size when the pill turned current")
             shot("3-merged")
 
-            # 4. Switching among views already covered is local.
+            # 4. Switching among views already covered is local. It ends on Main, the reader's
+            # choice, which the reloads below reopen on.
             view("threads")
             page.wait_for_selector("#thread-list > li", timeout=5_000)
-            view("flat")
-            wait_rows(["200", "201", "202", "203"], "All after the refresh")
             view("main")
-            wait_rows(["200", "201", "203"], "Main after switching back")
+            wait_rows(["200", "201", "203"], "Main after the refresh")
+            view("flat")
+            wait_rows(["200", "201", "202", "203"], "All after switching back")
+            view("main")
+            wait_rows(["200", "201", "203"], "Main again")
             check(len(api.reads()) == 1, f"switching views read history again: {api.reads()}")
             shot("4-switched-locally")
 
@@ -869,22 +888,38 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 check(affordance()[0] == "", f"{label}: the pull's result never went: {affordance()}")
                 cdp.detach()
 
+            # 4d. `#189 restore-ui-state`. A reader parked mid-list, whose app goes away, comes back
+            # on the same message. The tall rows are served in the stylesheet from here on, so every
+            # later load lays them out before the page's script runs, as a phone does; the reload
+            # is step 5's, with the API unreachable, so only the device can put the reader back.
+            def tall_rows(route: Route) -> None:
+                served = route.fetch()
+                route.fulfill(response=served,
+                              body=served.text() + "\n#discord-log > li[data-id] { min-height: 70vh; }\n")
+
+            page.route("**/voice.css", tall_rows)
+            reading = place("middle")
+            check(reading["top"] > 0 and reading["gap"] > 100, f"{label}: could not park the reader mid-list: {reading}")
+
             # 5. The API unreachable: the rows stay, and the pill says they are old.
             page.route("**/api/**", lambda route: route.abort("internetdisconnected"))
             page.reload(wait_until="load")
-            page.click("#view-switch")
+            reopened("offline")
             wait_rows(["200", "201", "203"], "the snapshot was not kept while offline")
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline and not pill().startswith("Offline"):
                 page.wait_for_timeout(50)
             check(pill().startswith("Offline · showing messages saved "), f"offline pill: {pill()!r}")
+            back = place("")
+            check(abs(back["row"] - reading["row"]) < 2,
+                  f"{label}: the reopen moved the reader's message by {back['row'] - reading['row']:.1f}px: {back}")
             geometry("offline", "5-offline")
             page.unroute("**/api/**")
 
             # 5b. The API reachable but failing: the rows stay, and the pill says the refresh failed.
             page.route(timeline_read, failing)
             page.reload(wait_until="load")
-            page.click("#view-switch")
+            reopened("a failing refresh")
             wait_rows(["200", "201", "203"], "the snapshot was not kept after a failed refresh")
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline and not pill().startswith("Refresh failed"):
@@ -930,14 +965,15 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             shot("7-signed-out")
 
             # 8. A fresh page and a READ-scope token: it reads the channel and asks for nothing it
-            # cannot have. Reloaded first, so the stored record has not been looked for yet.
+            # cannot have. Reloaded first, so the stored record has not been looked for yet. Signing
+            # out forgot where the reader was, so this opens on the call view, and the channel in All.
             page.reload(wait_until="load")
             console_errors.clear()
             refused.clear()
             page.fill("#api-token", READ_TOKEN)
             page.click("#save-token")
             page.click("#view-switch")
-            wait_rows(["200", "201", "203"], "a read-scope token did not read the channel")
+            wait_rows(["200", "201", "202", "203"], "a read-scope token did not read the channel")
             def storage_state() -> str:
                 return str(page.evaluate("() => document.getElementById('storage-state').textContent"))
 

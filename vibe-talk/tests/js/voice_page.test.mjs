@@ -2617,6 +2617,10 @@ const TUNING_BANDS = {
     "the whole snapshot in UTF-16 units. Browsers give an origin about five million of them, and " +
     "the outbox must never be the thing refused; below a hundred thousand a single long page of " +
     "assistant answers no longer fits"],
+  // `#189 restore-ui-state`. The record a reopen comes back to.
+  UI_STATE_VERSION: [1, 1,
+    "the saved view-and-place record's shape. Changing it reopens every device on the call view in " +
+    "the default channel view, once, which is the right answer to a new shape and must be seen"],
   HOLD_MS: [250, 1500,
     "how long a finger rests before the row shows who sent it and when. Below about a quarter of " +
     "a second an ordinary tap becomes a hold and the message stops folding; past a second and a " +
@@ -5762,6 +5766,26 @@ async function showDiscord(page, messages) {
   await page.el("view-switch").click();
   await page.settle();
   assert.equal(page.tab(), "discord", "the switch did not reach the channel view");
+  return page.el("discord-log").children;
+}
+
+/**
+ * A reload of a page the reader left on the channel, whose channel read will find `messages`.
+ *
+ * `#189 restore-ui-state` reopens such a page ON the channel, and the view's one read goes out
+ * while the script is still running — so what that read finds is arranged before a line of the page
+ * runs, and the switch is not thrown afterwards: it would leave the channel, not enter it.
+ */
+const reloadWith = (store, messages, arrange = null) =>
+  newPage(store, SCRIPT, (p) => {
+    p.messages = messages;
+    if (arrange) arrange(p);
+  });
+
+/** Its rows, once the reopen's read has landed — asserting that it did reopen on the channel. */
+async function reopenedChannel(page) {
+  await page.settle();
+  assert.equal(page.tab(), "discord", "a reload of a page left on the channel did not reopen there");
   return page.el("discord-log").children;
 }
 
@@ -11962,9 +11986,10 @@ test("a draft survives leaving without sending, and survives a reload", async ()
   assert.equal(page.el("reply-text").value, "half a thought about the first one");
   await page.el("reply-cancel").click();
 
-  // A RELOAD: same storage, brand new execution.
-  const reloaded = newPage(store);
+  // A RELOAD: same storage, brand new execution — back on the channel it was left on.
+  const reloaded = reloadWith(store, messages);
   await signIn(reloaded);
+  await reopenedChannel(reloaded);
   await openReplyOn(reloaded, messages, 0);
   assert.equal(
     reloaded.el("reply-text").value,
@@ -12518,11 +12543,11 @@ test("REPLYING TEACHES THE PAGE WHICH ACCOUNT IS ITS OWN, AND THAT ACCOUNT IS 'M
   assert.equal(store.get("vibe-talk.voice.self-id"), "1000000000000000009");
 
   // ...and it is remembered, so the next session already knows without another reply.
-  const again = newPage(store);
-  await signIn(again);
-  await showDiscord(again, [
+  const again = reloadWith(store, [
     message({ id: "1000000000000000050", author: "My Voice Bot", author_id: "1000000000000000009", author_is_bot: true }),
   ]);
+  await signIn(again);
+  await reopenedChannel(again);
   assert.equal(
     whoOf(again, 0),
     "me",
@@ -12550,9 +12575,9 @@ test("the reader's own choice beats every guess, and survives a reload", async (
   assert.equal(whoOf(page, 1), "bot", "the channel was not redrawn from the choice");
   assert.equal(select.getAttribute("data-guessed"), "false", "it still reads as a guess");
 
-  const again = newPage(store);
+  const again = reloadWith(store, crowd());
   await signIn(again);
-  await showDiscord(again, crowd());
+  await reopenedChannel(again);
   assert.equal(whoOf(again, 1), "bot", "the choice did not survive a reload");
 });
 
@@ -18475,10 +18500,10 @@ test("COMBINING IS ON BY DEFAULT, and the switch redraws the rows without re-rea
 
   // ...and the choice survives a reload, which is what makes it a setting rather than a mode.
   await page.el("combine-messages").setChecked(false);
-  const again = newPage(page.storage);
+  const again = reloadWith(page.storage, splitPost());
   await signIn(again);
   assert.equal(again.el("combine-messages").checked, false, "the switch came back on by itself");
-  assert.equal((await showDiscord(again, splitPost())).length, 2, "the rows combined anyway");
+  assert.equal((await reopenedChannel(again)).length, 2, "the rows combined anyway");
 });
 
 test("A MESSAGE ARRIVING SECONDS AFTER THE LAST JOINS ITS ROW, without moving the reader", async () => {
@@ -18745,13 +18770,41 @@ function threadData() {
   return { messages, threads };
 }
 
-async function threadPage() {
+/**
+ * A channel with two threads, entered from the call view. It opens in All, the default where the
+ * provider has threads (`#189 restore-ui-state`); `view` is one to pick in the bar's thread picker
+ * after that, as the reader would.
+ */
+async function threadPage(view = null) {
   const page = newPage();
   const data = threadData();
   page.threadingSupported = true;
   page.threads = data.threads;
   await signIn(page);
   await showDiscord(page, data.messages);
+  if (view) await pickThread(page, view);
+  return page;
+}
+
+/**
+ * The same channel, read only in Main: the reader chose Main in an earlier session, and this device
+ * no longer holds that session's snapshot — a full quota gives it up first — so the reopen reads
+ * Main alone. A thread opened here is read for itself, where one opened with All covered is drawn
+ * from All's rows (`#189 restore-ui-state` made All the default); this is the page the reading of a
+ * thread, its cursor and its walk back are tested on.
+ */
+async function mainOnlyThreadPage() {
+  const first = await threadPage("main");
+  first.storage.delete(MESSAGE_CACHE_KEY);
+  const data = threadData();
+  const page = reloadWith(first.storage, data.messages, (p) => {
+    p.threadingSupported = true;
+    p.threads = data.threads;
+  });
+  await reopenedChannel(page);
+  await page.settle();
+  assert.deepStrictEqual(page.timelineCalls.map((call) => new URL(call, "http://fixture.test").searchParams.get("view")),
+    ["main"], "the reopen read more than the Main the reader chose");
   return page;
 }
 
@@ -18874,6 +18927,11 @@ const threadOptions = (page) =>
 
 test("thread views show roots in Main and the bar's selector offers Main, All, and each thread", async () => {
   const page = await threadPage();
+  // `#189 restore-ui-state`: a channel whose provider has threads opens in All, read as All.
+  assert.equal(page.el("thread-select").value, "flat", "a threaded channel did not open in All");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"]);
+  assert.match(page.timelineCalls[0], /view=flat/);
+  await pickThread(page, "main");
   assert.equal(page.el("channel-view-tabs").hidden, true, "the tabs over the list came back");
   const offered = threadOptions(page);
   assert.deepStrictEqual(offered.slice(0, 2), [["main", "Main"], ["flat", "All"]]);
@@ -18890,7 +18948,7 @@ test("thread views show roots in Main and the bar's selector offers Main, All, a
   assert.ok(rootRow.children.indexOf(threadButton(rootRow)) > rootRow.children.findIndex((child) => child.className === "body"),
     "the thread reply-count decorator must sit underneath the root message");
   assert.equal(threadButton(page.el("discord-log").children[2]).textContent, "about 1 reply");
-  assert.match(page.timelineCalls[0], /view=main/);
+  assert.match(page.timelineCalls[1], /view=main/);
   assert.equal(page.pageReads, 0);
   const empty = newPage();
   empty.threadingSupported = true;
@@ -19010,6 +19068,10 @@ test("the heading over an open thread is the picker's option for it, less shorte
   page.threads = data.threads.map((thread, i) => (i === 0 ? { ...thread, title: long } : thread));
   await signIn(page);
   await showDiscord(page, data.messages);
+  // A finger touches the picker before it chooses, which reads the thread list in the background:
+  // its summary carries the long title. The thread itself is drawn from All, with no read.
+  await page.el("thread-select").dispatch("pointerdown");
+  await page.settle();
   await pickThread(page, `thread:${page.threads[0].id}`);
   const option = optionLabel(page, `thread:${page.threads[0].id}`);
   assert.equal(page.el("thread-title").textContent, long, "the heading did not give the name its room");
@@ -19024,7 +19086,8 @@ test("the heading over an open thread is the picker's option for it, less shorte
 });
 
 test("a display name that arrives after the thread opened renames the heading and the option together", async () => {
-  const page = await threadPage();
+  // A thread read for itself, whose answer names it before any thread list has been read.
+  const page = await mainOnlyThreadPage();
   const id = page.threads[0].id;
   await pickThread(page, `thread:${id}`);
   assert.equal(page.el("thread-title").textContent, "First discussion");
@@ -19139,7 +19202,12 @@ test("Older threads opens a Threads screen that pages back on the server's curso
   const standard = page.timeline;
   page.timeline = async (path) => {
     const url = new URL(path, "http://fixture.test");
-    if (url.searchParams.get("view") !== "threads") return standard(path);
+    // A channel with twenty threads has more history than one page: All's newest page does not
+    // reach back to the old threads, so opening one reads it (`#189 restore-ui-state`).
+    if (url.searchParams.get("view") !== "threads") {
+      const answer = JSON.parse(await (await standard(path)).text());
+      return json(200, { ...answer, has_more: true, next_before: "older-history" });
+    }
     // Each page oldest-first, as the server orders the threads view.
     const before = url.searchParams.get("before");
     const slice = before === cursor ? all.slice(10) : all.slice(0, 10);
@@ -19155,7 +19223,8 @@ test("Older threads opens a Threads screen that pages back on the server's curso
 
   await pickThread(page, "older");
   assert.equal(page.screen(), "threads", "Older threads did not open the Threads screen");
-  assert.equal(page.el("thread-select").value, "main", "the picker was left saying Older threads");
+  // Back on the view on screen — All, where the channel opened. `#189 restore-ui-state`.
+  assert.equal(page.el("thread-select").value, "flat", "the picker was left saying Older threads");
   assert.equal(page.el("topbar-title").textContent, "Threads");
   assert.equal(page.el("close-threads").hidden, false, "the Threads screen has no way back");
   const reads = () => page.timelineCalls.filter((call) => /view=threads/.test(call));
@@ -19224,8 +19293,8 @@ test("the Threads screen says when a read fails, keeps what it knew, and tries a
     : standard(path));
   await pickThread(page, "older");
   assert.equal(page.screen(), "threads");
-  // Back on Main at once, not only once a read succeeds: this one failed.
-  assert.equal(page.el("thread-select").value, "main", "the picker was left saying Older threads");
+  // Back on the view on screen, All, at once — not only once a read succeeds: this one failed.
+  assert.equal(page.el("thread-select").value, "flat", "the picker was left saying Older threads");
   assert.equal(page.el("thread-directory-list").children.length, 10, "the threads already known were dropped");
   assert.match(page.el("thread-directory-state").textContent, /^Could not load the thread list: the provider is down\./);
   assert.equal(page.el("thread-directory-retry").hidden, false, "a failed read offered no second try");
@@ -19301,18 +19370,22 @@ test("Threads is ordered oldest to newest, opens at bottom and returns to its sa
   const area = page.el("scroll-area");
   assert.equal(area.scrollTop, area.scrollHeight - area.clientHeight);
   area.scrollTop = 30;
+  const reads = page.timelineCalls.length;
   await list.children[0].children[0].click();
   assert.equal(page.el("thread-heading").hidden, false);
   assert.equal(page.el("thread-title").textContent, "First discussion");
   assert.deepEqual(page.el("discord-log").children.map((row) => row.getAttribute("data-id")), ["201", "202"]);
-  assert.equal(new URL(page.timelineCalls.at(-1), "http://fixture.test").searchParams.get("thread_id"), page.threads[0].id);
+  assert.equal(page.el("thread-select").value, `thread:${page.threads[0].id}`);
+  // Drawn from All, which the channel opened in and which holds the whole thread: no read.
+  assert.equal(page.timelineCalls.length, reads, "a thread All already holds was read again");
   await page.el("thread-back").click();
   assert.equal(list.hidden, false);
   assert.equal(area.scrollTop, 30, "returning from a thread discarded the list's position");
 });
 
 test("channel tabs cache fetched views and show when an uncached view is loading", async () => {
-  const page = await threadPage();
+  // From Main, picked over the default All (`#189 restore-ui-state`): the view this is about.
+  const page = await threadPage("main");
   const standard = page.timeline;
   let finish;
   page.timeline = (path) => path.includes("view=threads")
@@ -19337,7 +19410,8 @@ test("channel tabs cache fetched views and show when an uncached view is loading
 });
 
 test("a rightward swipe leaves a thread and restores Main without archiving a message", async () => {
-  const page = await threadPage();
+  // From Main, picked over the default All (`#189 restore-ui-state`): the view this is about.
+  const page = await threadPage("main");
   page.el("scroll-area").clientHeight = 40;
   page.el("scroll-area").scrollTop = 20;
   await threadButton(page.el("discord-log").children[1]).click();
@@ -19474,11 +19548,12 @@ test("main drafts and a thread's unsent remainder survive navigation and reload 
   assert.equal(savedOutgoing(page)[0].remaining, "unsent tail");
   await page.el("thread-back").click();
   assert.equal(page.el("channel-compose-text").value, "main draft");
-  const again = newPage(page.storage);
-  again.threadingSupported = true;
-  again.threads = page.threads;
+  const again = reloadWith(page.storage, page.messages, (p) => {
+    p.threadingSupported = true;
+    p.threads = page.threads;
+  });
   await signIn(again);
-  await showDiscord(again, page.messages);
+  await reopenedChannel(again);
   assert.equal(again.el("channel-compose-text").value, "main draft");
   await threadButton(again.el("discord-log").children[1]).click();
   assert.equal(again.el("channel-compose-text").value, "");
@@ -19487,7 +19562,8 @@ test("main drafts and a thread's unsent remainder survive navigation and reload 
 });
 
 test("a send completing after leaving a thread cannot clear or paint the main context", async () => {
-  const page = await threadPage();
+  // From Main, picked over the default All (`#189 restore-ui-state`): the view this is about.
+  const page = await threadPage("main");
   page.el("channel-compose-text").value = "keep main draft";
   await page.el("channel-compose-text").dispatch("input");
   await threadButton(page.el("discord-log").children[1]).click();
@@ -19505,7 +19581,7 @@ test("a send completing after leaving a thread cannot clear or paint the main co
 });
 
 test("thread paging encodes opaque cursors and ignores a response after context navigation", async () => {
-  const page = await threadPage();
+  const page = await mainOnlyThreadPage();
   const standard = page.timeline;
   let finishOlder;
   page.timeline = async (path) => {
@@ -19572,7 +19648,7 @@ test("a slow mode response cannot replace the view chosen after it", async () =>
 });
 
 test("prepending older thread messages preserves the visible message and viewport offset", async () => {
-  const page = await threadPage();
+  const page = await mainOnlyThreadPage();
   const old = page.messages[1];
   const recent = page.messages[2];
   recent.content = longMessage("recent answer");
@@ -19634,7 +19710,7 @@ test("a failed standalone send keeps its text in a retryable row and its compose
 });
 
 test("an expired older-thread cursor starts a fresh snapshot and makes older paging usable again", async () => {
-  const page = await threadPage();
+  const page = await mainOnlyThreadPage();
   let snapshots = 0;
   page.timeline = async (path) => {
     const before = new URL(path, "http://fixture.test").searchParams.get("before");
@@ -19837,10 +19913,9 @@ test("a pending send survives channel refresh, navigation and reload without rep
   assert.equal(outgoingRows(page)[0].getAttribute("data-outgoing-id"), localId);
   // A reload loses the browser's knowledge of the in-flight request. It must not pretend it
   // knows whether the provider accepted it, and must not create a second POST on its own.
-  const again = newPage(new Map(page.storage));
-  again.channels.push(other);
+  const again = reloadWith(new Map(page.storage), [], (p) => p.channels.push(other));
   await signIn(again);
-  await showDiscord(again, []);
+  await reopenedChannel(again);
   assert.equal(again.repliesPosted.length, 0);
   assert.equal(outgoingRows(again)[0].getAttribute("data-outgoing-id"), localId);
   assert.equal(outgoingRows(again)[0].getAttribute("data-send-state"), "unconfirmed");
@@ -19850,7 +19925,9 @@ test("a pending send survives channel refresh, navigation and reload without rep
 });
 
 test("retry retains its original channel, thread and reply target after navigation and reload", async () => {
-  const page = await threadPage();
+  // From Main, picked over the default All (`#189 restore-ui-state`): All would show the thread's
+  // unsent reply after leaving the thread, and Main is the view that must not.
+  const page = await threadPage("main");
   await threadButton(page.el("discord-log").children[1]).click();
   await replyButton(page.el("discord-log").children[1]).click();
   page.replyResponse = errorResponse(403, "refused", "permission changed");
@@ -19860,11 +19937,12 @@ test("retry retains its original channel, thread and reply target after navigati
   const original = page.repliesPosted[0];
   await page.el("thread-back").click();
   assert.equal(outgoingRows(page).length, 0);
-  const again = newPage(new Map(page.storage));
-  again.threadingSupported = true;
-  again.threads = page.threads;
+  const again = reloadWith(new Map(page.storage), page.messages, (p) => {
+    p.threadingSupported = true;
+    p.threads = page.threads;
+  });
   await signIn(again);
-  await showDiscord(again, page.messages);
+  await reopenedChannel(again);
   await threadButton(again.el("discord-log").children[1]).click();
   await outgoingRetry(outgoingRows(again)[0]).click();
   await again.settle();
@@ -20043,9 +20121,7 @@ test("a message the stream left unplaced is still unplaced after a reload, so it
     p.messages = page.messages;
     p.timeline = offline;
   });
-  await again.settle();
-  await again.el("view-switch").click();
-  await again.settle();
+  await reopenedChannel(again);
   assert.ok(rowOf(again, "206"), "the saved row was not drawn");
   await replyButton(rowOf(again, "206")).click();
   assert.equal(again.el("reply-destination").hidden, false);
@@ -20718,9 +20794,9 @@ test("a page closed while a reply was being placed says nothing was sent, not th
   await page.settle();
   assert.equal(page.repliesPosted.length, 0);
 
-  const again = newPage(new Map(page.storage));
+  const again = reloadWith(new Map(page.storage), []);
   await signIn(again);
-  await showDiscord(again, []);
+  await reopenedChannel(again);
   assert.equal(again.repliesPosted.length, 0, "a reload posted on its own");
   assert.deepEqual(outgoingRows(again).map((row) => row.getAttribute("data-send-state")), ["failed", "failed"]);
   for (const row of outgoingRows(again)) {
@@ -20796,9 +20872,9 @@ test("confirmed messages survive an older history snapshot and reconcile by prov
   // erase the user's message or relabel its known success as an unconfirmed send.
   await reReadChannel(page);
   assert.match(page.el("pane-discord").text(), /confirmed before history caught up/);
-  const again = newPage(new Map(page.storage));
+  const again = reloadWith(new Map(page.storage), []);
   await signIn(again);
-  await showDiscord(again, []);
+  await reopenedChannel(again);
   assert.equal(again.repliesPosted.length, 0);
   assert.match(again.el("pane-discord").text(), /confirmed before history caught up/);
   assert.equal(outgoingRows(again)[0].getAttribute("data-send-state"), "sent");
@@ -20817,10 +20893,11 @@ test("a later permission change disables retry without losing the saved message"
   await page.el("channel-compose-text").setValue("keep until I can send");
   await page.el("channel-send").click();
   await page.settle();
-  const again = newPage(new Map(page.storage));
-  again.channels = [{ ...CHANNEL, writable: false }];
+  const again = reloadWith(new Map(page.storage), [], (p) => {
+    p.channels = [{ ...CHANNEL, writable: false }];
+  });
   await signIn(again);
-  await showDiscord(again, []);
+  await reopenedChannel(again);
   const retry = outgoingRetry(outgoingRows(again)[0]);
   assert.equal(retry.disabled, true, "a read-only destination still offers to post the old message");
   // The fixture intentionally permits dispatch on a disabled button, proving the handler also
@@ -20843,9 +20920,9 @@ test("dismissing an unconfirmed local message removes it durably without posting
   assert.equal(outgoingRows(page).length, 0);
   assert.equal(savedOutgoing(page).length, 0);
   assert.equal(page.repliesPosted.length, 1);
-  const again = newPage(new Map(page.storage));
+  const again = reloadWith(new Map(page.storage), []);
   await signIn(again);
-  await showDiscord(again, []);
+  await reopenedChannel(again);
   assert.equal(outgoingRows(again).length, 0);
   assert.equal(again.repliesPosted.length, 0);
 });
@@ -21244,10 +21321,14 @@ test("a reload draws the saved timeline before any request answers, then merges 
   assert.equal(page.screen(), "main", "a reload with a saved channel waited for the network");
   assert.deepStrictEqual(shownIds(page), ["501", "502", "503"], "the saved rows were not drawn first");
   assert.equal(page.el("discord-channel").value, CHANNEL.id, "the picker waited for /client-config");
+  // `#189 restore-ui-state`: back on the channel it was left on, in the view it opened in — All —
+  // with that view's one read already on the wire.
+  assert.equal(page.tab(), "discord", "a reload of a page left on the channel did not reopen there");
+  assert.deepStrictEqual(page.timelineCalls.map((call) => new URL(call, "http://fixture.test").searchParams.get("view")),
+    ["flat"], "the reopen did not read the view on screen, once");
 
-  await page.el("view-switch").click();
   await page.settle();
-  assert.deepStrictEqual(shownIds(page), ["501", "502", "503"], "entering the view dropped the saved rows");
+  assert.deepStrictEqual(shownIds(page), ["501", "502", "503"], "the reopen dropped the saved rows");
   assert.equal(freshness(page).hidden, false, "saved rows were presented as current");
   assert.match(freshness(page).textContent, /^Saved \d{2}:\d{2} · refreshing…$/);
   assert.equal(page.timelineCalls.length, 1, "the background refresh never started");
@@ -21282,10 +21363,11 @@ test("a legacy page-mode channel is saved, drawn first on reload, and merged the
     reads = gate(p.channelPage);
     p.channelPage = reads.respond;
   });
+  // Drawn while the reopen's one read is still unanswered: from the device, not by the request.
   assert.deepStrictEqual(shownIds(page), ["601", "602"]);
-  assert.equal(page.pageReads, 0, "the saved rows were drawn by a request rather than from the device");
+  assert.equal(page.tab(), "discord", "a reload of a page left on the channel did not reopen there");
+  assert.equal(page.pageReads, 1, "the reopen did not make its one read");
 
-  await page.el("view-switch").click();
   page.messages = [message({ id: "602", content: "two, edited" }), message({ id: "603", content: "three" })];
   reads.open();
   await page.settle();
@@ -21309,7 +21391,8 @@ test("offline, the saved rows stay up and say how old they are, and the next pol
   });
   await page.settle();
   assert.equal(page.screen(), "main");
-  await page.el("view-switch").click();
+  // Reopened on the channel, whose read failed like everything else. `#189 restore-ui-state`.
+  assert.equal(page.tab(), "discord", "a reload of a page left on the channel did not reopen there");
   await page.settle();
 
   assert.deepStrictEqual(shownIds(page), ["701"], "a failed refresh took the saved rows away");
@@ -21400,11 +21483,17 @@ test("each scope keeps at most MESSAGE_CACHE_ROWS rows, and a reload walks back 
   const again = reloadPage(page.storage, (p) => {
     p.channelPage = async (path) => {
       paths.push(String(path));
-      return json(200, { channel: CHANNEL, messages: all.slice(60, 80), has_more: true, next_before: all[60].id });
+      // The reopen's newest page is the rows kept (`#189 restore-ui-state`); a step back from the
+      // oldest of them is the twenty before.
+      const older = /[?&]before=/.test(String(path));
+      return json(200, { channel: CHANNEL, messages: older ? all.slice(60, 80) : all.slice(80), has_more: true,
+        next_before: older ? all[60].id : all[80].id });
     };
   });
   assert.equal(again.el("discord-log").children.length, rows);
   assert.equal(again.el("load-older").hidden, false, "the trimmed snapshot offered no way further back");
+  await again.settle();
+  assert.equal(again.el("discord-log").children.length, rows, "the reopen's newest page changed the rows kept");
   await again.el("load-older").click();
   await again.settle();
   assert.match(paths.at(-1), new RegExp(`[?&]before=${all[80].id}(&|$)`));
@@ -21609,9 +21698,10 @@ test("a channel the server no longer lists takes its saved scopes with it", asyn
 const channelReads = (page) => page.requests.filter((request) => /^GET \/api\/v1\/channels\/[^/]+\/(timeline|page)\b/.test(request));
 
 test("one store per channel: every view it covered is drawn after a reload with no request", async () => {
-  const first = await threadPage();
+  // Opened in All, the default (`#189 restore-ui-state`); Main and the Threads list read on top. A
+  // thread is a subset of All, drawn from All's cover, so it costs no read of its own.
+  const first = await threadPage("main");
   const data = threadData();
-  const threadId = data.threads[0].id;
   await first.el("channel-view-threads").click();
   await first.settle();
   await first.el("thread-list").children[0].children[0].click();
@@ -21623,7 +21713,7 @@ test("one store per channel: every view it covered is drawn after a reload with 
   assert.deepStrictEqual(entry.messages.map((m) => m.id), ["200", "201", "202", "203", "204"],
     "the channel's rows were not held once, in time order");
   assert.deepStrictEqual(entry.threads.map((t) => t.id), data.threads.map((t) => t.id));
-  assert.deepStrictEqual(Object.keys(entry.views).sort(), ["flat", "main", `thread:${threadId}`, "threads"].sort());
+  assert.deepStrictEqual(Object.keys(entry.views).sort(), ["flat", "main", "threads"]);
 
   let reads = null;
   const page = reloadPage(first.storage, (p) => {
@@ -21632,15 +21722,15 @@ test("one store per channel: every view it covered is drawn after a reload with 
     reads = gate(p.timeline);
     p.timeline = reads.respond;
   });
-  assert.deepStrictEqual(channelReads(page), [], "a cold start read history before the channel was opened");
-  await page.el("view-switch").click();
+  // Reopened on All, where it was left, with that view's read on the wire and its rows up first.
+  assert.equal(page.tab(), "discord", "a reload of a page left on the channel did not reopen there");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"]);
   await page.settle();
-  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
   // Exactly ONE bounded newest page, for the channel and view on screen — not every saved view,
   // not every saved channel, not a walk back through history.
   assert.equal(channelReads(page).length, 1, `a cold start made ${channelReads(page).length} history reads`);
   const refresh = new URL(channelReads(page)[0].slice(4), "http://fixture.test");
-  assert.equal(refresh.searchParams.get("view"), "main");
+  assert.equal(refresh.searchParams.get("view"), "flat");
   assert.equal(refresh.searchParams.get("before"), null, "the cold-start refresh walked back into history");
   assert.equal(refresh.searchParams.get("limit"), String(sourceConstant("DISCORD_PAGE_LIMIT")));
 
@@ -21653,10 +21743,10 @@ test("one store per channel: every view it covered is drawn after a reload with 
   assert.deepStrictEqual(shownIds(page), ["201", "202"]);
   assert.equal(page.el("thread-title").textContent, "First discussion");
   page.el("thread-back").click();
-  page.el("channel-view-flat").click();
-  await page.settle();
-  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"]);
   page.el("channel-view-main").click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
+  page.el("channel-view-flat").click();
   await page.settle();
   assert.equal(channelReads(page).length, 1, "switching among covered views went to the network");
 
@@ -21664,12 +21754,12 @@ test("one store per channel: every view it covered is drawn after a reload with 
   reads.open();
   await page.settle();
   await page.settle();
-  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"]);
   assert.equal(channelReads(page).length, 1);
   assertCurrent(page, `the refreshed view still says: ${freshness(page).textContent}`);
 
-  // All was not refreshed: it says when it was saved, and does not claim to be refreshing.
-  await page.el("channel-view-flat").click();
+  // Main was not refreshed: it says when it was saved, and does not claim to be refreshing.
+  await page.el("channel-view-main").click();
   assert.equal(channelReads(page).length, 1);
   assert.match(freshness(page).textContent, /^Showing messages saved \d{2}:\d{2}$/);
   // The poll refreshes the view on screen, and only that one.
@@ -21677,8 +21767,8 @@ test("one store per channel: every view it covered is drawn after a reload with 
   await page.settle();
   await page.settle();
   assert.equal(channelReads(page).length, 2);
-  assert.match(channelReads(page)[1], /view=flat/);
-  assertCurrent(page, "the polled All view still says it is saved");
+  assert.match(channelReads(page)[1], /view=main/);
+  assertCurrent(page, "the polled Main view still says it is saved");
 });
 
 test("a refresh that lands after the reader switched away still makes its view current", async () => {
@@ -21696,9 +21786,11 @@ test("a refresh that lands after the reader switched away still makes its view c
     reads = gate(p.timeline);
     p.timeline = reads.respond;
   });
-  await page.el("view-switch").click();
+  // Reopened on Main, the view the reader chose last. `#189 restore-ui-state`.
+  assert.equal(page.tab(), "discord", "a reload of a page left on the channel did not reopen there");
   await page.settle();
   assert.equal(channelReads(page).length, 1);
+  assert.match(channelReads(page)[0], /view=main/);
   // Away before the cold-start page for Main arrives.
   page.el("channel-view-flat").click();
   await page.settle();
@@ -21753,15 +21845,16 @@ test("switching Main, Threads, All and a read thread in one page is local, and e
 });
 
 test("a view no page has covered is read, once", async () => {
+  // All is covered by the read that opened the channel in it (`#189 restore-ui-state`); Main is not.
   const page = await threadPage();
   const before = channelReads(page).length;
-  await page.el("channel-view-flat").click();
+  await page.el("channel-view-main").click();
   await page.settle();
   assert.equal(channelReads(page).length, before + 1);
-  assert.match(channelReads(page).at(-1), /view=flat/);
-  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"]);
-  await page.el("channel-view-main").click();
+  assert.match(channelReads(page).at(-1), /view=main/);
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
   await page.el("channel-view-flat").click();
+  await page.el("channel-view-main").click();
   await page.settle();
   assert.equal(channelReads(page).length, before + 1, "a covered view was read again");
 });
@@ -21786,9 +21879,7 @@ test("a cold start with several saved channels reads only the one on screen", as
   const page = reloadPage(first.storage, (p) => {
     p.channels = [{ ...CHANNEL }, other];
   });
-  await page.settle();
-  await page.el("view-switch").click();
-  await page.settle();
+  await reopenedChannel(page);
   assert.equal(channelReads(page).length, 1, `a cold start read ${channelReads(page).length} channels`);
   assert.match(channelReads(page)[0], new RegExp(`/channels/${CHANNEL.id}/page\\?`));
   assert.doesNotMatch(channelReads(page)[0], /before=/, "the cold-start refresh walked back into history");
@@ -21822,7 +21913,7 @@ test("a saved timeline waits for a live cursor, and a step back over the overlap
     reads = gate(serve(p));
     p.timeline = reads.respond;
   });
-  await page.el("view-switch").click();
+  assert.equal(page.tab(), "discord", "a reload of a page left on the channel did not reopen there");
   assert.deepStrictEqual(shownIds(page), all.slice(3).map((m) => m.id));
   assert.equal(page.el("load-older").hidden, true, "a saved snapshot offered an expired cursor");
   assert.match(page.el("channel-summary").text(), /older ones are not loaded/);
@@ -21860,7 +21951,7 @@ test("a delivered send is shown once from the snapshot, and only the server reti
     reads = gate(p.channelPage);
     p.channelPage = reads.respond;
   });
-  await page.el("view-switch").click();
+  assert.equal(page.tab(), "discord", "a reload of a page left on the channel did not reopen there");
   assert.deepStrictEqual(shownIds(page), ["1601"]);
   assert.equal(outgoingRows(page).length, 0, "the delivered send was drawn twice");
   assert.equal(savedOutgoing(page).length, 1, "the device's own copy retired the receipt");
@@ -22218,7 +22309,12 @@ test("a draft left pending by the last call is not offered in the next one", asy
 // used to re-read the newest page, so a warm reload made two identical reads of it — one of them
 // on the voice pane. These count the reads.
 
-/** A warm threaded page, saved to the device and reloaded over the same storage. */
+/**
+ * A warm threaded page, saved to the device and reloaded over the same storage.
+ *
+ * Left in Main and on the call view, so the reload opens there (`#189 restore-ui-state`) and its
+ * stream attaches before anything enters the channel — the order every count below is about.
+ */
 async function warmThreadReload(arrange) {
   const first = newPage();
   const data = threadData();
@@ -22226,6 +22322,8 @@ async function warmThreadReload(arrange) {
   first.threads = data.threads;
   await signIn(first);
   await showDiscord(first, data.messages);
+  await pickThread(first, "main");
+  await first.el("view-switch").click();
   const page = reloadPage(first.storage, (p) => {
     p.threadingSupported = true;
     p.threads = data.threads;
@@ -22728,12 +22826,14 @@ test("a reload of a scoped channel paints every held row from the device, with n
     serveScoped(p, data.summary);
     p.timeline = offline;
   });
+  // Drawn in the same task as the reopen's read went out (`#189 restore-ui-state`), so before it
+  // could answer — and this one never does.
   assert.deepStrictEqual(shownIds(page), held, "the saved replies were not drawn on reload");
-  assert.equal(page.timelineCalls.length, 0, "the saved rows waited for a read");
+  assert.equal(page.tab(), "discord", "a reload of a page left on the channel did not reopen there");
+  assert.equal(page.timelineCalls.length, 1, "the reopen did not make its one read");
 
-  await page.el("view-switch").click();
   await page.settle();
-  assert.deepStrictEqual(shownIds(page), held, "offline, entering the channel dropped saved replies");
+  assert.deepStrictEqual(shownIds(page), held, "offline, the reopen's failed read dropped saved replies");
   assert.equal(threadButton(page.el("discord-log").children[0]), undefined);
 });
 
@@ -22785,7 +22885,8 @@ test("an unthreaded channel is unchanged by the scope rule", async () => {
 });
 
 test("a channel with child threads keeps a root-only Main, even after visiting a thread", async () => {
-  const page = await threadPage();
+  // Main, picked over the default All (`#189 restore-ui-state`).
+  const page = await threadPage("main");
   const data = threadData();
   assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "Main is not the served root-only page");
   assert.equal(threadOptions(page).length, 4, "a threaded channel's picker lost its threads");
@@ -23110,10 +23211,11 @@ test("a reload never resumes an automatic retry, and a tapped Retry still goes u
   page.replyResponse = errorResponse(502, "chat_error", SLOW_SEND);
   await sendChannel(page, "before the app was closed");
   const key = posted(page)[0].idempotency_key;
-  const again = newPage(new Map(page.storage));
-  again.idempotentPostsSupported = true;
+  const again = reloadWith(new Map(page.storage), [], (p) => {
+    p.idempotentPostsSupported = true;
+  });
   await signIn(again);
-  await showDiscord(again, []);
+  await reopenedChannel(again);
   for (const wait of [RETRY_FIRST_MS, RETRY_FIRST_MS * RETRY_FACTOR]) again.expireTimers(wait);
   await settleSend(again);
   assert.equal(again.repliesPosted.length, 0, "reopening the app sent a message on its own");
@@ -23510,4 +23612,295 @@ test("the Read automatically group explains itself in Help, where its ? leads", 
   assert.match(help, /<code>\*<\/code>/, "Help does not say how a prefix rule is written");
   assert.match(help, /Not noise/, "Help does not say how to rescue a message a rule caught");
   assert.match(help, /voice\s+agent\s+cannot\s+change/, "Help does not say who may change the rules");
+});
+
+// --- the view a channel opens in, and reopening where the reader left off ------------------------
+//
+// `#189 restore-ui-state`. The owner, 2026-10-04: "Let's default to All view when opening the app
+// channel view. But let's save prior UI state if possible. When I kill and reopen my pwa I want to
+// see mostly the same thing." And at 09:31: "My channel view seems to still default to Main. I want
+// All." Every reload here is the fixture's: the same storage, a brand-new script.
+
+const UI_STATE_KEY = "vibe-talk.voice.ui-state";
+const savedUiState = (page) => JSON.parse(page.storage.get(UI_STATE_KEY) || "null");
+/** Each history read as `view`, `view:thread` or `page`, in order; a `before` read is marked. */
+const readKinds = (page) => channelReads(page).map((request) => {
+  const url = new URL(request.slice(4), "http://fixture.test");
+  const kind = url.pathname.endsWith("/page") ? "page" : url.searchParams.get("view");
+  const thread = url.searchParams.get("thread_id");
+  return `${kind}${thread ? `:${thread}` : ""}${url.searchParams.has("before") ? " (older)" : ""}`;
+});
+const providerOf = (key, threads) => ({
+  key, name: `${threads ? "Threaded" : "Plain"} Chat`, threading_supported: threads, live_delivery: "poll",
+  live_poll_seconds: 30, channel_registration_supported: false, channel_discovery_supported: false,
+  upstream_read_mark_supported: false, self_author_id: null, owner_author_id: null,
+});
+
+test("a channel opens in All where its provider has threads, and in Main where it has none", async () => {
+  const page = newPage();
+  const data = threadData();
+  const plain = { id: "1110000000000000301", label: "plain room", writable: true, provider: "plain" };
+  page.channels = [{ ...CHANNEL, provider: "threaded" }, plain];
+  page.providers = [providerOf("threaded", true), providerOf("plain", false)];
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.channelPage = async () => json(200, { channel: plain, messages: [message({ id: "310", channel_id: plain.id })] });
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  assert.equal(page.el("thread-select").value, "flat", "a channel with threads did not open in All");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"]);
+  assert.deepStrictEqual(readKinds(page), ["flat"], "the channel was not read once, as All");
+
+  // The reader prefers Main here. A choice in one channel is not carried into the next.
+  await pickThread(page, "main");
+  page.el("discord-channel").value = plain.id;
+  await page.el("discord-channel").dispatch("change");
+  await page.settle();
+  assert.equal(page.el("thread-select").value, "main", "a channel without threads did not open in Main");
+  assert.equal(page.el("thread-select").disabled, true);
+  assert.deepStrictEqual(shownIds(page), ["310"]);
+
+  page.el("discord-channel").value = CHANNEL.id;
+  await page.el("discord-channel").dispatch("change");
+  await page.settle();
+  assert.equal(page.el("thread-select").value, "flat", "coming back did not open in the default, All");
+  assert.equal(readKinds(page).at(-1), "flat");
+});
+
+test("a reload reopens the channel, the thread and Hide read as the reader left them, reading only that thread", async () => {
+  const first = newPage();
+  const data = threadData();
+  first.threadingSupported = true;
+  first.threads = data.threads;
+  await signIn(first);
+  await showDiscord(first, data.messages);
+  // A finger touches the picker before it chooses: that reads the thread list, which names it.
+  await first.el("thread-select").dispatch("pointerdown");
+  await first.settle();
+  const id = data.threads[0].id;
+  await pickThread(first, `thread:${id}`);
+  await turnTodoOn(first);
+  assert.deepStrictEqual(shownIds(first), ["201", "202"]);
+  await first.setVisibility("hidden");
+
+  let reads = null;
+  const page = reloadPage(first.storage, (p) => {
+    p.threadingSupported = true;
+    p.threads = data.threads;
+    p.messages = data.messages;
+    reads = gate(p.timeline);
+    p.timeline = reads.respond;
+  });
+  // In the same task as the script: nothing has answered.
+  assert.equal(page.screen(), "main");
+  assert.equal(page.tab(), "discord", "the page did not reopen on the channel it was left on");
+  assert.equal(page.el("thread-select").value, `thread:${id}`, "the thread was not reopened");
+  assert.equal(page.el("thread-heading").hidden, false);
+  assert.equal(page.el("thread-title").textContent, "First discussion", "the reopened thread has no name");
+  assert.deepStrictEqual(shownIds(page), ["201", "202"], "the thread was not drawn from the device first");
+  assert.equal(page.el("todo-filter").getAttribute("aria-pressed"), "true", "Hide read came back off");
+  assert.deepStrictEqual(readKinds(page), [`thread:${id}`], "the first read was not the thread on screen");
+
+  reads.open();
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["201", "202"]);
+  assert.deepStrictEqual(readKinds(page), [`thread:${id}`], "the reopen read more than one page");
+  assertCurrent(page, "the reopened thread still says it is saved");
+  // Back goes where the thread was opened from: All.
+  await page.el("thread-back").click();
+  assert.equal(page.el("thread-select").value, "flat");
+});
+
+test("the reader's own choice of Main outlives the default across a reload", async () => {
+  const first = await threadPage("main");
+  assert.equal(savedUiState(first).channelView, "main");
+  assert.equal(savedUiState(first).chosen, true, "picking Main was not recorded as a choice");
+  const page = reloadWith(first.storage, threadData().messages, (p) => {
+    p.threadingSupported = true;
+    p.threads = threadData().threads;
+  });
+  assert.equal(page.el("thread-select").value, "main", "the default overrode the reader's choice");
+  await reopenedChannel(page);
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
+  assert.deepStrictEqual(readKinds(page), ["main"], "the reopen read more than the view chosen");
+});
+
+test("a reload puts the reader back on the message they were reading, and on the newest when it is gone", async () => {
+  const channel = tallChannel();
+  const run = async (script) => {
+    const first = newPage();
+    await signIn(first);
+    await showDiscord(first, channel);
+    const area = first.el("scroll-area");
+    area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) * 0.5);
+    const anchor = first.el("discord-log").children.find((li) => li.getBoundingClientRect().bottom > 0);
+    const left = { id: anchor.getAttribute("data-id"), top: anchor.getBoundingClientRect().top };
+    assert.ok(area.scrollTop > 0 && !atBottomOf(area), "the reader was not parked mid-channel");
+    // The phone sends the app to the background, then kills it.
+    await first.setVisibility("hidden");
+    const page = newPage(first.storage, script, (p) => { p.messages = channel; });
+    const row = () => page.el("discord-log").children.find((li) => li.getAttribute("data-id") === left.id);
+    // Less the line the reopen's read puts up over the rows while it is out, which a browser's own
+    // scroll anchoring absorbs and this fixture does not model; it goes when the read lands.
+    const before = row().getBoundingClientRect().top - page.el("channel-loading").getBoundingClientRect().height;
+    await reopenedChannel(page);
+    return { page, left, before, after: row().getBoundingClientRect().top, store: first.storage };
+  };
+  const { page, left, before, after, store } = await run(SCRIPT);
+  assert.equal(before, left.top, "the reopen did not put the reader's message where it was");
+  assert.equal(after, left.top, "the reopen's read moved the reader off their message");
+  assert.equal(page.pageReads, 1, "the reopen read more than one page");
+
+  // THE CONTROL: with the return deleted the reader lands on the newest message, and this fails.
+  const control = await run(brokenScript(
+    "  restoreScroll({ pinned: false, anchor: row, top: el(\"scroll-area\").getBoundingClientRect().top + place.offset });",
+    "  void row;"
+  ));
+  assert.notEqual(control.before, control.left.top, "the test cannot tell a page that returns from one that does not");
+
+  // The message is gone from the device — its snapshot given up to the quota — so there is nothing
+  // to return to: the newest message, as a first visit.
+  store.delete(MESSAGE_CACHE_KEY);
+  const gone = reloadWith(store, channel.slice(-4));
+  await reopenedChannel(gone);
+  await gone.settle();
+  assert.ok(atBottomOf(gone.el("scroll-area")), "with the reader's message gone, the reopen did not go to the newest");
+});
+
+test("a saved view that no longer holds falls back to the default rather than failing", async () => {
+  // A thread the device no longer knows of — its snapshot is gone — opens the channel in All.
+  const inThread = await threadPage();
+  await pickThread(inThread, `thread:${inThread.threads[0].id}`);
+  inThread.storage.delete(MESSAGE_CACHE_KEY);
+  const lost = reloadWith(inThread.storage, threadData().messages, (p) => {
+    p.threadingSupported = true;
+    p.threads = threadData().threads;
+  });
+  await reopenedChannel(lost);
+  await lost.settle();
+  assert.equal(lost.el("thread-select").value, "flat", "an unknown thread was reopened");
+  assert.deepStrictEqual(readKinds(lost), ["flat"]);
+
+  // A provider that no longer has threads opens it in Main, its whole channel.
+  const threadless = await threadPage();
+  await pickThread(threadless, `thread:${threadless.threads[0].id}`);
+  threadless.storage.delete(MESSAGE_CACHE_KEY);
+  const plain = reloadWith(threadless.storage, [message({ id: "320", content: "no threads here now" })]);
+  await reopenedChannel(plain);
+  await plain.settle();
+  assert.equal(plain.el("thread-select").value, "main");
+  assert.equal(plain.el("thread-heading").hidden, true, "a thread heading stood over a channel without threads");
+  assert.deepStrictEqual(readKinds(plain), ["page"]);
+
+  // A channel the server no longer lists: the picker's first channel, in its default view.
+  const first = newPage();
+  first.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
+  first.threadingSupported = true;
+  first.threads = threadData().threads;
+  await signIn(first);
+  await showDiscord(first, threadData().messages);
+  first.el("discord-channel").value = OTHER_CHANNEL.id;
+  await first.el("discord-channel").dispatch("change");
+  await first.settle();
+  await pickThread(first, "main");
+  assert.equal(savedUiState(first).channel, OTHER_CHANNEL.id);
+  const unlisted = reloadWith(first.storage, threadData().messages, (p) => {
+    p.channels = [{ ...CHANNEL }];
+    p.threadingSupported = true;
+    p.threads = threadData().threads;
+  });
+  await reopenedChannel(unlisted);
+  await unlisted.settle();
+  assert.equal(unlisted.el("discord-channel").value, CHANNEL.id);
+  assert.equal(unlisted.el("thread-select").value, "flat", "a choice made in a removed channel was applied to another");
+  assert.match(channelReads(unlisted).at(-1), new RegExp(`/channels/${CHANNEL.id}/timeline\\?view=flat`));
+
+  // A record that does not parse, or is another version's, is deleted: the page opens as a first visit does.
+  for (const damaged of ["{\"v\":1,\"ident", JSON.stringify({ ...savedUiState(first), v: 99 })]) {
+    const store = new Map(first.storage);
+    store.set(UI_STATE_KEY, damaged);
+    const page = reloadWith(store, threadData().messages, (p) => { p.threadingSupported = true; });
+    assert.equal(page.tab(), "voice", "a damaged record reopened anything");
+    assert.notEqual(store.get(UI_STATE_KEY), damaged, "a damaged record was kept");
+    assert.equal(savedUiState(page).view, "voice", "the record left is not this page's own");
+    await page.settle();
+  }
+});
+
+test("Main drawn before threads were known gives way to All once the provider says it has them", async () => {
+  // The device's shell predates the provider's threads, so the reopen draws and reads Main; then
+  // /client-config says otherwise, and the view nobody chose becomes All — once, with one read.
+  const first = newPage();
+  await signIn(first);
+  await showDiscord(first, [message({ id: "330", content: "from before threads" })]);
+  assert.equal(savedUiState(first).chosen, false);
+  const data = threadData();
+  const page = reloadWith(first.storage, data.messages, (p) => {
+    p.threadingSupported = true;
+    p.threads = data.threads;
+  });
+  assert.equal(page.el("thread-select").value, "main");
+  await reopenedChannel(page);
+  await page.settle();
+  assert.equal(page.el("thread-select").value, "flat", "learning of threads did not open All");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"]);
+  assert.deepStrictEqual(readKinds(page), ["page", "flat"]);
+  page.expireTimers(DISCORD_POLL_MS);
+  await page.settle();
+  await page.settle();
+  assert.equal(page.el("thread-select").value, "flat", "the view changed again");
+  assert.deepStrictEqual(readKinds(page), ["page", "flat", "flat"]);
+});
+
+test("Hide read on a channel without threads reopens on the to-do list, read once", async () => {
+  const first = newPage();
+  await signIn(first);
+  await showDiscord(first, backlog());
+  await turnTodoOn(first);
+  assert.ok(first.todoReads > 0, "Hide read never read the to-do list");
+  const page = reloadWith(first.storage, backlog());
+  await reopenedChannel(page);
+  assert.equal(page.el("todo-filter").getAttribute("aria-pressed"), "true");
+  assert.equal(page.todoReads, 1, "the reopen did not read the to-do list once");
+  assert.equal(page.pageReads, 0, "the reopen read the whole channel under Hide read");
+});
+
+test("a reload left on the call view reopens there, and reads no channel", async () => {
+  const first = await threadPage();
+  await first.el("view-switch").click();
+  const page = reloadWith(first.storage, threadData().messages, (p) => { p.threadingSupported = true; });
+  await page.settle();
+  assert.equal(page.tab(), "voice");
+  assert.deepStrictEqual(readKinds(page), [], "a channel nobody is looking at was read");
+  assert.equal(page.el("thread-select").value, "flat", "the channel behind the call is not in its default");
+});
+
+test("a replay of what the reopen holds adds no read", async () => {
+  // The reopen reads before its stream attaches, so the burst may land after that read; a message
+  // it holds costs nothing. `#43 replay-burst-double-read`.
+  const first = await threadPage();
+  const data = threadData();
+  const page = reloadWith(first.storage, data.messages, (p) => {
+    p.threadingSupported = true;
+    p.threads = data.threads;
+  });
+  await reopenedChannel(page);
+  await page.settle();
+  assert.deepStrictEqual(readKinds(page), ["flat"]);
+  await deliver(page, page.stream(), replayedFrames([data.messages[0], data.messages[3]]));
+  await page.settle();
+  assert.deepStrictEqual(readKinds(page), ["flat"], "a replay of held messages read the channel again");
+});
+
+test("signing out forgets where the reader was, with the messages", async () => {
+  const page = await threadPage();
+  await pickThread(page, `thread:${page.threads[0].id}`);
+  assert.ok(page.storage.has(UI_STATE_KEY));
+  await page.el("forget-token").click();
+  assert.equal(page.storage.has(UI_STATE_KEY), false, "the record outlived the credential that read its thread");
+  const again = newPage(page.storage);
+  assert.equal(again.screen(), "signin");
+  await signIn(again);
+  assert.equal(again.tab(), "voice", "a signed-out record reopened the channel");
 });

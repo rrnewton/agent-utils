@@ -30,8 +30,11 @@ in your own words ("the one about the mac runner") and get *that* message back *
 `POST /api/v1/channels/{id}/resolve`, and it is the reason this exists rather than a
 text-to-speech bot.
 
-**Messages and threads.** The web app starts in the main channel. When the backend finds threads,
-three controls appear above the history:
+**Messages and threads.** The channel view opens in **All** where the channel's chat service has
+threads, and in **Main** — then the whole channel — where it has none, until you choose another
+view; the choice is kept across a reload (see
+[Reopening where you left off](#reopening-where-you-left-off)). When the backend finds threads,
+three views are offered:
 
 * **Main** shows channel messages, with a reply-count button below each thread root.
 * **Threads** lists root-message previews and reply counts, ordered by most recent activity at the
@@ -146,6 +149,26 @@ bounded snapshot of the channel rows it has already shown, in `localStorage` und
 This is chat text at rest in the browser profile. Anyone who can open that profile can read the
 most recent rows until the token is changed or you sign out. It is not an offline mode: without an
 app-shell service worker the page itself cannot load with no network, only keep what it has.
+
+### Reopening where you left off
+
+A phone closes an installed app whenever it needs the memory, and reopening it used to land on the
+call view, in Main, at the newest message. `/voice` now keeps one small record in `localStorage`
+under `vibe-talk.voice.ui-state` and reopens on it:
+
+- **The call or the channel**, whichever was up. Settings, Help, Reply and the Threads screen are
+  not reopened; a reply's draft is kept, as before.
+- **Main, All or the thread** that was open, in the channel that was selected, with the thread's
+  name in its heading. A channel you have not chosen a view in opens in All where its chat service
+  has threads and in Main where it has none; another channel opens in its own default.
+- **Hide read**, on or off.
+- **The message you were reading**, at the same height on the screen — the message, not a pixel
+  offset. If you were on the newest message, or yours is no longer on the device, the newest.
+- **One read.** The reopened view is drawn from the saved messages first, and the single newest-page
+  read of a cold start is that view's.
+- **Checked on the way back.** A channel no longer listed, a thread the device no longer knows of, or
+  a chat service that no longer has threads falls back to the default, and a damaged record is
+  discarded. The record is tied to the token like the snapshot, and goes with it.
 
 `make -C vibe-talk offline-cache-browser` walks that whole sequence in a real Chromium at an
 Android phone's size, against a loopback fake API. Pass `SCREENSHOTS=/tmp/shots` to keep one PNG
