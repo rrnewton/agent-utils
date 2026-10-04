@@ -22,7 +22,9 @@ there (`#33 error-banner-scroll-shift`).
 
 Opening a thread whose title is longer than the screen, with a long unbroken token and inline code
 in its reply, leaves the page no wider than the viewport and no shown part of the main screen past
-its right edge; on a phone the title is ellipsised instead (`#36 thread-view-phone-overflow`).
+its right edge; on a phone the title is ellipsised instead (`#36 thread-view-phone-overflow`). With
+every floating chip showing at once and that thread scrolled to its end, no chip covers the reply
+composer's text box or its Send button (`#194 thread-picker-polish`).
 
 Last, a fresh page signed in with a read-scope token reads the channel without a single 4xx answer
 or console error: the stored-conversation routes are write-scope, answered 403 here as the server
@@ -357,6 +359,31 @@ WIDTH_JS = """() => {
     return {problems: problems.slice(0, 8), clipped: title.scrollWidth > title.clientWidth};
 }"""
 
+# `#194 thread-picker-polish`. The owner photographed Summaries, Undo, Expand all and Collapse all
+# sitting on a thread's "Reply in this thread" box. Run with every chip forced up — the worst case —
+# this scrolls the thread to its end and returns what covers the composer: empty when no chip meets
+# the text box or Send, and both sit inside the list rather than below its foot.
+COMPOSER_JS = """async () => {
+    const area = document.getElementById('scroll-area');
+    const frames = () => new Promise((settled) => requestAnimationFrame(() => requestAnimationFrame(settled)));
+    await frames();
+    area.scrollTop = area.scrollHeight;
+    await frames();
+    const box = (e) => e.getBoundingClientRect();
+    const meets = (a, b) => a.top < b.bottom && b.top < a.bottom && a.left < b.right && b.left < a.right;
+    const chips = [...document.querySelectorAll('#scroll-tools .chip')].filter((c) => c.getClientRects().length > 0);
+    const problems = [];
+    if (chips.length < 4) problems.push(`only ${chips.length} chips are showing`);
+    if (area.scrollHeight - area.clientHeight - area.scrollTop > 2) problems.push('the thread is not at its end');
+    for (const id of ['channel-compose-text', 'channel-send']) {
+        const target = box(document.getElementById(id));
+        chips.filter((chip) => meets(box(chip), target))
+            .forEach((chip) => problems.push(`"${chip.textContent.trim()}" covers #${id}`));
+        if (target.bottom > box(area).bottom + 1) problems.push(`#${id} ends below the list`);
+    }
+    return problems;
+}"""
+
 # A phone, the common narrow Android width, and a desk: the desktop regime is `(min-width: 900px) and
 # (pointer: fine)`, so the last is a fine pointer without touch, not a wide phone. Below 360 the
 # pill's longest line is ellipsised, which the "cut short" check would report.
@@ -382,7 +409,8 @@ def main() -> int:
                   " one newest-page read, local view switches, offline and failed states, the pill"
                   " clear of the tabs and the header with #scroll-area unmoved, a scrolled reader"
                   " held in place as it and the error panel come and go, no Cache Storage or"
-                  " service worker, a long thread title ellipsised within the viewport, sign-out clears,"
+                  " service worker, a long thread title ellipsised within the viewport, the thread"
+                  " composer clear of every floating chip, sign-out clears,"
                   " a read-scope token reads with no refused request or console error")
     return 0
 
@@ -634,6 +662,16 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             shot("6b-long-thread-title")
             check(not found["problems"], f"{label}, a long-titled thread: {found['problems']}")
             check(bool(found["clipped"]) or not mobile, f"{label}: the long title was not ellipsised: {found}")
+
+            # 6c. Every floating chip up at once, over that thread scrolled to its end: none of them
+            # covers the reply composer, which keeps their measured height as room under itself
+            # (`#194 thread-picker-polish`). The rows are still 70vh tall from 4b, so the composer
+            # really is at the foot of the list, where the chips float.
+            forced = page.add_style_tag(content="#scroll-tools .chip[hidden] { display: inline-flex !important; }")
+            covered = [str(problem) for problem in page.evaluate(COMPOSER_JS)]
+            shot("6c-composer-clear-of-chips")
+            check(not covered, f"{label}, the thread composer under the floating chips: {covered}")
+            forced.evaluate("element => element.remove()")
             page.click("#thread-back")
 
             # 7. Signing out takes the rows off the screen and off the device.

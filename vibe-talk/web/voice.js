@@ -71,8 +71,8 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
  *   | "canned-summary" | "channel-directory-more" | "channel-directory-retry" | "channel-send"
  *   | "channel-view-flat" | "channel-view-main" | "channel-view-threads" | "clear-alias"
  *   | "clear-backlog" | "clear-view" | "close-browse-channels" | "close-help" | "close-reply"
- *   | "close-settings" | "collapse-all" | "dismiss-banner" | "dismiss-error" | "dismiss-status"
- *   | "expand-all" | "forget-conversations" | "forget-token" | "hang-up"
+ *   | "close-settings" | "close-threads" | "collapse-all" | "dismiss-banner" | "dismiss-error"
+ *   | "dismiss-status" | "expand-all" | "forget-conversations" | "forget-token" | "hang-up"
  *   | "help-link-canned-prompts" | "help-link-channel-alias" | "help-link-combining"
  *   | "help-link-connection" | "help-link-control-bar" | "help-link-identities"
  *   | "help-link-live-messages" | "help-link-mark-own" | "help-link-microphone"
@@ -82,7 +82,8 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
  *   | "post-confirm-cancel" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-new" | "read-speed" | "remove-channel"
  *   | "rename-channel" | "reply-cancel" | "reply-send" | "save-alias" | "save-token"
  *   | "search-toggle" | "send-text" | "speaker" | "summarise" | "talk" | "text-entry"
- *   | "thread-back" | "todo-filter" | "undo-dismiss" | "view-switch"} id
+ *   | "thread-back" | "thread-directory-more" | "thread-directory-retry" | "todo-filter"
+ *   | "undo-dismiss" | "view-switch"} id
  * @returns {HTMLButtonElement}
  */
 /**
@@ -126,12 +127,20 @@ let statusTimer = null;
 // The floating chips can wrap or disappear as actions become available. Keep the banner above
 // their measured height instead of giving both overlays the same bottom edge. Observing the tools
 // also handles font/viewport changes and their parent screen being hidden, without moving history.
+//
+// `#194 thread-picker-polish`. The same measurement is the room the channel composer keeps under
+// itself (see `#channel-composer` in web/voice.css), so the chips float over that room and not over
+// the box being typed in. That room is at the foot of the scrolled content, so a reader parked at
+// the newest line would be left short of it whenever it grew: keep that reader at the foot.
 if (typeof window.ResizeObserver === "function") {
   new window.ResizeObserver(([entry]) => {
     const height = entry.contentRect.height;
+    const area = el("scroll-area");
+    const pinned = currentScreen === "main" && currentView === "discord" && atBottom(area);
     el("frame-body").style.setProperty(
       "--scroll-tools-clearance", height > 0 ? `calc(${height}px + 0.5rem)` : "0px"
     );
+    if (pinned) area.scrollTop = area.scrollHeight;
   }).observe(el("scroll-tools"));
 }
 
@@ -350,10 +359,10 @@ function refusalSentence(error) {
 // the sign-in screen; the connection details and the knobs live in settings; the main screen is
 // the transcript and the two controls, and nothing else.
 
-const SCREENS = ["signin", "main", "settings", "reply", "help"];
+const SCREENS = ["signin", "main", "settings", "reply", "help", "threads"];
 
 /** What the header calls each screen that is a DESTINATION rather than the app itself. */
-const SCREEN_TITLES = { settings: "Settings", reply: "Reply", help: "Help" };
+const SCREEN_TITLES = { settings: "Settings", reply: "Reply", help: "Help", threads: "Threads" };
 
 let screenBeforeSettings = "signin";
 let currentScreen = "signin";
@@ -371,6 +380,8 @@ function showScreen(name) {
   el("close-settings").hidden = name !== "settings";
   el("close-reply").hidden = name !== "reply";
   el("close-help").hidden = name !== "help";
+  // `#194 thread-picker-polish`. The Threads screen returns to the channel it lists.
+  el("close-threads").hidden = name !== "threads";
   el("topbar-title").hidden = !destination;
   if (destination) {
     el("topbar-title").textContent = SCREEN_TITLES[name];
@@ -3559,6 +3570,7 @@ function renderControlBar() {
   el("topbar").hidden =
     el("close-settings").hidden &&
     el("close-reply").hidden &&
+    el("close-threads").hidden &&
     el("topbar-title").hidden &&
     el("search-toggle").hidden &&
     (placement !== "top" || el("control-bar").hidden);
@@ -6037,7 +6049,7 @@ function renderChannelNavigation() {
   for (const view of ["main", "threads", "flat"]) {
     el(`channel-view-${view}`).setAttribute("aria-pressed", channelView === view ? "true" : "false");
   }
-  el("thread-title").textContent = selectedThread && selectedThread.title ? selectedThread.title : "Thread";
+  renderThreadHeading();
   el("thread-list").hidden = channelView !== "threads";
   el("discord-log").hidden = channelView === "threads";
   el("channel-compose-label").textContent = selectedThreadId ? "Reply in this thread" : "Message the main channel";
@@ -6187,106 +6199,200 @@ function catchUpHeldView() {
 // offers come from the channel's store — summaries read earlier and the thread roots among the
 // messages already loaded — so opening it costs no request. Touching it also asks for the
 // channel's thread list in the background, at most once a minute, so the next look is complete.
+//
+// `#194 thread-picker-polish`. It lists one screenful, then "… Older threads", which opens the
+// Threads screen: every thread the channel has, paged from the server. And a thread is called the
+// same thing everywhere it is named — see `threadName`.
 
 /** How long a background read of one channel's thread list is reused by the selector. */
 const THREAD_DIRECTORY_REFRESH_MS = 60000;
-/** Most threads the selector lists, newest activity first; the list is for choosing, not paging. */
-const THREAD_SELECT_LIMIT = 40;
 /**
- * Longest first-message prefix the selector uses as a name, in characters. Short on purpose: a
- * phone's native picker draws its options large, and a sentence per option was unreadable.
+ * How many threads the selector lists before "… Older threads", newest activity first: ABOUT ONE
+ * PHONE SCREEN. `#194 thread-picker-polish`. The owner, of the forty it used to list: "It should
+ * show only about one screen worth". A phone's native picker draws each option as a row about a
+ * thumb high, and with Main and All above and "Older threads" below, eight threads is what fills
+ * one screen of it without the sheet scrolling. Every thread past them is on the Threads screen.
+ */
+const THREAD_SELECT_LIMIT = 8;
+/**
+ * Longest name the selector shows, in characters. Short on purpose: a phone's native picker draws
+ * its options large, and a sentence per option was unreadable. The heading over an open thread and
+ * the Threads screen have the room, and show the same name less shortened.
  */
 const THREAD_TITLE_CHARS = 28;
+/** The selector's last option, which opens the Threads screen rather than a view of the channel. */
+const OLDER_THREADS_OPTION = "older";
 
 const threadDirectoryReadAt = new Map();
 let threadDirectoryInFlight = null;
 
-/** A thread's name from its first message: the first line that says anything, shortened. */
-function threadNameFrom(text) {
+/** The first line of `text` that says anything, cut to `chars` with an ellipsis; "" when none. */
+function firstLineOf(text, chars) {
   const line = String(text || "").split("\n").map((part) => part.trim()).find((part) => part !== "") || "";
-  if (line === "") return "Thread";
-  return line.length > THREAD_TITLE_CHARS ? `${line.slice(0, THREAD_TITLE_CHARS - 1)}…` : line;
+  return line.length > chars ? `${line.slice(0, chars - 1)}…` : line;
 }
 
-/** "now", "5m", "2h", "3d", "6w": how long ago, as briefly as a picker option allows. */
+/**
+ * How long ago, as briefly as a picker option allows — and ONE SCALE wherever the page gives a
+ * thread's age: the selector, the heading over an open thread, and the Threads screen.
+ * `#194 thread-picker-polish`: the owner read "42h" in the selector and asked for days and hours.
+ *
+ *   under a minute     now
+ *   under an hour      59m
+ *   under a day        23h
+ *   under ten days     1d18h, and a whole day drops its "0h": 3d
+ *   under four weeks   12d    — by then the hours no longer tell two threads apart
+ *   under a year       6w
+ *   beyond             2y
+ *
+ * Every step truncates and never rounds, so an age reads as the last whole unit it has passed:
+ * 42 hours is 1d18h, never 2d, and 59 minutes is 59m, never 1h.
+ */
 function briefAge(atMs) {
   if (!Number.isFinite(atMs)) return "";
   const minutes = Math.max(0, Math.floor((Date.now() - atMs) / 60000));
   if (minutes < 1) return "now";
   if (minutes < 60) return `${minutes}m`;
   const hours = Math.floor(minutes / 60);
-  if (hours < 48) return `${hours}h`;
+  if (hours < 24) return `${hours}h`;
   const days = Math.floor(hours / 24);
-  return days < 14 ? `${days}d` : `${Math.floor(days / 7)}w`;
+  if (days < 10) return hours % 24 === 0 ? `${days}d` : `${days}d${hours % 24}h`;
+  if (days < 28) return `${days}d`;
+  return days < 365 ? `${Math.floor(days / 7)}w` : `${Math.floor(days / 365)}y`;
 }
 
 /**
- * The name a thread goes by: a summarised display name when the server has one, then a title the
- * provider gave it, then a short prefix of its first message.
+ * One thread as the page knows it: its summary and first message when the store holds them, when
+ * it started and was last active, and its reply count. What every place that names a thread is
+ * handed, so none of them can reach for a different field.
  */
-function threadDisplayName(summary, firstContent) {
-  const named = summary && typeof summary.display_name === "string" ? summary.display_name.trim() : "";
-  if (named) return named;
-  const title = summary && typeof summary.title === "string" ? summary.title.trim() : "";
-  if (title && title !== "Thread") return threadNameFrom(title);
-  return threadNameFrom(firstContent);
+function threadChoice(id, summary = null, root = null) {
+  const first = (summary && summary.root) || root || null;
+  const record = root && root.thread ? root.thread : null;
+  return {
+    id: String(id),
+    summary,
+    root: first,
+    count: summary ? summary.reply_count : record ? record.reply_count : null,
+    at: summary ? timeOf(summary, "updated_at") : timeOf(root, "timestamp"),
+    started: first ? timeOf(first, "timestamp") : NaN,
+  };
 }
 
-/** The threads this channel's store knows, newest activity first. */
-function threadChoices() {
-  if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return [];
+/**
+ * THE NAME A THREAD GOES BY, and the only place one is made: the selector's option, the heading
+ * over an open thread, the Threads screen, the Threads list and the seam over a thread all ask
+ * this, from the store, each time they draw.
+ *
+ * `#194 thread-picker-polish`. The owner found the heading over an open thread calling it one thing
+ * and the selector another. Each made its own name: the heading printed the `title` of whatever
+ * object opened the thread — the provider's raw title, the selector's already-shortened name, or
+ * nothing at all from a tag, so "Thread" — and never looked again, while the selector preferred the
+ * summariser's display name, which usually arrives after the thread is open.
+ *
+ * In order: the summariser's display name, the provider's title unless it is the neutral "Thread"
+ * placeholder, the first line of the first message. `chars` only shortens; it never changes the
+ * source, so the selector's name is always a prefix of the heading's.
+ */
+function threadName(choice, chars = THREAD_TITLE_CHARS) {
+  const summary = choice ? choice.summary : null;
+  const named = summary && typeof summary.display_name === "string" ? summary.display_name : "";
+  const title = summary && typeof summary.title === "string" && summary.title.trim() !== "Thread"
+    ? summary.title : "";
+  for (const source of [named, title, choice && choice.root ? choice.root.content : ""]) {
+    const name = firstLineOf(source, chars);
+    if (name) return name;
+  }
+  return "Thread";
+}
+
+/** "13h · 16": how long ago the thread started and how many replies it has. */
+function threadFacts(choice) {
+  const age = briefAge(Number.isFinite(choice.started) ? choice.started : choice.at);
+  return [age, typeof choice.count === "number" ? String(choice.count) : ""]
+    .filter((part) => part !== "").join(" · ");
+}
+
+/** Age, replies, name: the two short facts first, because a phone's picker cuts the end off. */
+function threadLabel(choice, chars = THREAD_TITLE_CHARS) {
+  return [threadFacts(choice), threadName(choice, chars)].filter((part) => part !== "").join(" · ");
+}
+
+/** Every thread this channel's store knows, by id: its summaries, and the roots among its messages. */
+function threadIndex() {
+  /** @type {Map<string, ReturnType<typeof threadChoice>>} */
   const byId = new Map();
+  if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return byId;
   for (const summary of channelCanon.threads) {
     const id = String(summary.id);
-    if (id === channelCanon.scope) continue;
-    byId.set(id, {
-      id,
-      title: threadDisplayName(summary, summary.root && summary.root.content),
-      count: summary.reply_count,
-      exact: summary.reply_count_exact,
-      at: timeOf(summary, "updated_at"),
-      started: summary.root ? timeOf(summary.root, "timestamp") : NaN,
-    });
+    if (id !== channelCanon.scope) byId.set(id, threadChoice(id, summary));
   }
   for (const message of channelCanon.messages) {
     const id = threadOf(message);
     if (!id || id === channelCanon.scope) continue;
     const at = timeOf(message, "timestamp");
+    const root = message.thread.is_root ? message : null;
     const known = byId.get(id);
-    if (known) {
-      known.at = Math.max(known.at, at);
-      if (message.thread && message.thread.is_root && !Number.isFinite(known.started)) known.started = at;
-    } else if (message.thread && message.thread.is_root) {
-      byId.set(id, {
-        id,
-        title: threadNameFrom(message.content),
-        count: message.thread.reply_count,
-        exact: message.thread.reply_count_exact,
-        at,
-        started: at,
-      });
+    if (!known) {
+      if (root) byId.set(id, threadChoice(id, null, root));
+      continue;
     }
+    if (Number.isFinite(at)) known.at = Number.isFinite(known.at) ? Math.max(known.at, at) : at;
+    if (root && !known.root) known.root = root;
+    if (root && !Number.isFinite(known.started)) known.started = at;
   }
-  return [...byId.values()].sort((a, b) => b.at - a.at).slice(0, THREAD_SELECT_LIMIT);
+  return byId;
 }
 
-/** Main, All, and each known thread, with the view on screen selected. */
+/** The threads this channel's store knows, newest activity first — all of them. */
+function threadChoices() {
+  const when = (choice) => (Number.isFinite(choice.at) ? choice.at : 0);
+  return [...threadIndex().values()].sort((a, b) => when(b) - when(a));
+}
+
+/**
+ * The thread on screen, named from the store like any other — or, before the store knows it, from
+ * the summary it was opened with. Null outside a thread.
+ */
+function openThreadChoice() {
+  if (channelView !== "thread" || !selectedThreadId) return null;
+  const id = String(selectedThreadId);
+  return threadIndex().get(id) || threadChoice(id, selectedThread);
+}
+
+/** What the seam over an open thread calls it: the selector's name, until there is none to give. */
+function openThreadName() {
+  const open = openThreadChoice();
+  const name = open ? threadName(open) : "Thread";
+  return name === "Thread" ? "this thread" : name;
+}
+
+/** Whether the server has said this channel has threads older than the ones read so far. */
+function olderThreadsOnServer() {
+  if (channelCanon.channel !== String(el("discord-channel").value)) return false;
+  const cover = channelCanon.views.get(viewKey("threads"));
+  return Boolean(cover && cover.more);
+}
+
+/** Main, All, a screenful of threads and the way to the rest, with the view on screen selected. */
 function renderThreadSelect() {
   const select = el("thread-select");
-  const choices = threadChoices();
   /** @type {Array<[string, string]>} */
   const options = [["main", "Main"]];
   if (threadingSupported) {
     options.push(["flat", "All"]);
-    for (const choice of choices) {
-      // Age, replies, name: the two short facts first, because a phone's picker cuts the end off.
-      const age = briefAge(Number.isFinite(choice.started) ? choice.started : choice.at);
-      const parts = [age, typeof choice.count === "number" ? String(choice.count) : "", choice.title];
-      options.push([`thread:${choice.id}`, parts.filter((part) => part !== "").join(" · ")]);
+    const choices = threadChoices();
+    const shown = choices.slice(0, THREAD_SELECT_LIMIT);
+    for (const choice of shown) options.push([`thread:${choice.id}`, threadLabel(choice)]);
+    // The thread on screen is always offered, so the selector can say which one it is — even when
+    // it is older than the first screenful, as one opened from the Threads screen usually is.
+    const open = openThreadChoice();
+    if (open && !shown.some((choice) => choice.id === open.id)) {
+      options.push([`thread:${open.id}`, threadLabel(open)]);
     }
-    if (channelView === "thread" && selectedThreadId &&
-        !choices.some((choice) => choice.id === String(selectedThreadId))) {
-      options.push([`thread:${selectedThreadId}`, (selectedThread && selectedThread.title) || "Thread"]);
+    // A channel that IS one thread has no others to page through.
+    if (!channelCanon.scope && (choices.length > shown.length || olderThreadsOnServer())) {
+      options.push([OLDER_THREADS_OPTION, "… Older threads"]);
     }
   }
   const current = channelView === "thread" && selectedThreadId
@@ -6303,6 +6409,8 @@ function renderThreadSelect() {
     }));
     select.setAttribute("data-options", signature);
   }
+  // Every redraw puts it back on the view on screen, which is also what keeps "Older threads" from
+  // standing selected once the screen it opens is up, or has been left.
   select.value = current;
   // A provider without threads has nothing to choose; the picker stays, saying so by being inert.
   select.disabled = !threadingSupported;
@@ -6311,9 +6419,24 @@ function renderThreadSelect() {
     : "This channel's chat service does not offer threads here, so Main is the whole channel.";
 }
 
-/** The reader picked Main, All, or a thread. */
+/**
+ * The heading over an open thread: the selector's own words for it, with the room to say more.
+ * `#194 thread-picker-polish`. The same facts and the same name, less shortened, so the heading and
+ * the option read as one identity. Redrawn with the selector, so a display name that arrives after
+ * the thread opened renames both at once.
+ */
+function renderThreadHeading() {
+  const open = openThreadChoice();
+  el("thread-title").textContent = open ? threadName(open, Infinity) : "Thread";
+  const facts = open ? threadFacts(open) : "";
+  el("thread-facts").textContent = facts;
+  el("thread-facts").hidden = facts === "";
+}
+
+/** The reader picked Main, All, a thread, or the way to the older ones. */
 function onThreadSelect() {
   const value = String(el("thread-select").value);
+  if (value === OLDER_THREADS_OPTION) return openThreadDirectory();
   if (value === "main" || value === "flat") {
     if (channelView === value) return undefined;
     return changeChannelView(value);
@@ -6321,9 +6444,9 @@ function onThreadSelect() {
   if (!value.startsWith("thread:")) return undefined;
   const id = value.slice("thread:".length);
   if (channelView === "thread" && String(selectedThreadId) === id) return undefined;
-  const known = channelCanon.threads.find((summary) => String(summary.id) === id);
-  const choice = threadChoices().find((candidate) => candidate.id === id);
-  return openThread(id, known || (choice ? { id, title: choice.title } : null));
+  // The store's summary when it has one. Never the option's own words: the heading names the
+  // thread from the store, and a shortened name handed in here would be shortened twice.
+  return openThread(id, channelCanon.threads.find((summary) => String(summary.id) === id) || null);
 }
 
 /** Read the channel's thread list in the background, so the selector names every thread. */
@@ -6342,6 +6465,7 @@ async function refreshThreadDirectory() {
     if (String(el("discord-channel").value) !== channel) return;
     foldTimelinePage(payload, false, "threads", null);
     renderThreadSelect();
+    renderThreadHeading();
   } catch (_error) {
     // The selector keeps offering what the store already knew; the next touch may ask again.
     threadDirectoryReadAt.delete(channel);
@@ -6360,6 +6484,160 @@ function closeThread() {
   return changeChannelView(threadOrigin);
 }
 
+// --- the Threads screen -------------------------------------------------------------------------
+//
+// `#194 thread-picker-polish`. The owner: the selector "shows too many threads with a scrollable
+// list. It should show only about one screen worth with an '... Older threads' option that pops up
+// a dedicated paginated selector page." This is that page. Every thread the store knows, newest
+// activity first, each named exactly as the selector names it plus the server's one-sentence
+// summary, and "Load older" steps back through the channel's thread list one server page at a
+// time, on the cursor the server hands back. Pages fold into the channel's store like any other
+// read, so a thread found here is one the selector and the heading can name.
+//
+// A SCREEN, like Reply, rather than a list over the channel: on a phone it needs the whole height,
+// and it has its own way back. Choosing a thread opens it and returns to the channel; leaving
+// returns the reader to the line they were reading.
+
+const threadDirectory = {
+  /** The channel the screen lists; a read for another one is dropped. */
+  channel: "",
+  /** The server's `next_before` for the next older page, or null when there is none. */
+  cursor: null,
+  loading: false,
+  /** Which read is in flight or failed: the first page, or an older one. */
+  older: false,
+  failed: false,
+  error: "",
+  generation: 0,
+  /** Where the reader was in the channel, taken before the screen hid it. */
+  mark: null,
+};
+
+/** Open the Threads screen from the selector, and read the channel's newest page of threads. */
+function openThreadDirectory() {
+  // The selector goes back to the view on screen first: "Older threads" is a way somewhere, not a
+  // view, and must not be what the selector says the reader is reading.
+  renderThreadSelect();
+  const channel = String(el("discord-channel").value);
+  if (!threadingSupported || !channel || channelCanon.scope) return undefined;
+  // BEFORE the screen changes, as Reply does: once #screen-main is hidden nothing in it has a box.
+  threadDirectory.mark = captureScroll();
+  if (threadDirectory.channel !== channel) {
+    threadDirectory.cursor = null;
+    threadDirectory.failed = false;
+  }
+  threadDirectory.channel = channel;
+  showScreen("threads");
+  return loadThreadDirectory(false);
+}
+
+/** Leave the Threads screen for the channel, at the line the reader left. */
+function closeThreadDirectory() {
+  if (currentScreen !== "threads") return;
+  showScreen("main");
+  if (threadDirectory.mark) restoreScroll(threadDirectory.mark);
+  threadDirectory.mark = null;
+  renderThreadSelect();
+}
+
+/** A row on the Threads screen was chosen: open that thread, back on the channel. */
+function openFromThreadDirectory(id) {
+  const channel = threadDirectory.channel;
+  closeThreadDirectory();
+  if (String(el("discord-channel").value) !== channel) return undefined;
+  if (channelView === "thread" && String(selectedThreadId) === id) return undefined;
+  return openThread(id, channelCanon.threads.find((summary) => String(summary.id) === id) || null);
+}
+
+/**
+ * Read a page of the channel's thread list: the newest, or the next older one. A failure keeps the
+ * rows already listed — they are still true — and says what failed beside a way to try again.
+ */
+async function loadThreadDirectory(older) {
+  const channel = threadDirectory.channel;
+  const cursor = older ? threadDirectory.cursor : null;
+  if (older && !cursor) return;
+  const generation = ++threadDirectory.generation;
+  Object.assign(threadDirectory, { loading: true, older, failed: false, error: "" });
+  renderThreadDirectory();
+  let path = `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=threads&limit=${DISCORD_PAGE_LIMIT}`;
+  if (cursor) path += `&before=${encodeURIComponent(cursor)}`;
+  let payload;
+  try {
+    payload = await apiDecoded("TimelineResponse", path);
+  } catch (error) {
+    if (generation !== threadDirectory.generation) return;
+    Object.assign(threadDirectory, {
+      loading: false,
+      failed: true,
+      error: (error && (error.detail || error.message)) || "the server did not answer",
+    });
+    renderThreadDirectory();
+    return;
+  }
+  if (generation !== threadDirectory.generation || String(el("discord-channel").value) !== channel) return;
+  foldTimelinePage(payload, older, "threads", null);
+  // The newest page is the selector's background read as well; it need not ask again this minute.
+  if (!older) threadDirectoryReadAt.set(channel, Date.now());
+  threadDirectory.cursor = payload.has_more === true ? payload.next_before || null : null;
+  threadDirectory.loading = false;
+  renderThreadDirectory();
+  renderThreadSelect();
+  renderThreadHeading();
+}
+
+/** The standing sentence over the list. */
+function threadDirectorySentence(count) {
+  const state = threadDirectory;
+  if (state.loading) {
+    if (state.older) return "Loading older threads…";
+    return count === 0 ? "Loading threads…" : `${count} known on this device · asking the server for more…`;
+  }
+  if (state.failed) {
+    const what = state.older ? "older threads" : "the thread list";
+    const why = state.error.replace(/[.\s]+$/, "");
+    return `Could not load ${what}: ${why}.${count ? " The threads below are the ones already known." : ""}`;
+  }
+  if (count === 0) return "No threads in this channel yet.";
+  const listed = `${count} ${count === 1 ? "thread" : "threads"}, newest activity first`;
+  return state.cursor ? `${listed}. Older ones are on the server.` : `${listed}. That is all of them.`;
+}
+
+/** Draw the list. Every string is text; nothing from the chat service is parsed as markup. */
+function renderThreadDirectory() {
+  const choices = threadChoices();
+  const open = channelView === "thread" && selectedThreadId ? String(selectedThreadId) : null;
+  el("thread-directory-list").replaceChildren(...choices.map((choice) => {
+    const row = document.createElement("li");
+    row.setAttribute("data-context-id", choice.id);
+    const button = document.createElement("button");
+    button.className = "thread-directory-open";
+    button.setAttribute("type", "button");
+    if (choice.id === open) button.setAttribute("aria-current", "true");
+    const label = document.createElement("span");
+    label.className = "thread-directory-label";
+    // The selector's own label, with the name given the room this screen has.
+    label.textContent = threadLabel(choice, Infinity);
+    button.append(label);
+    const said = choice.summary && typeof choice.summary.summary === "string" ? choice.summary.summary.trim() : "";
+    if (said) {
+      const sentence = document.createElement("span");
+      sentence.className = "thread-directory-summary";
+      sentence.textContent = said;
+      button.append(sentence);
+    }
+    button.addEventListener("click", () => guardQuietly(() => openFromThreadDirectory(choice.id))());
+    row.append(button);
+    return row;
+  }));
+  el("thread-directory-state").textContent = threadDirectorySentence(choices.length);
+  const more = el("thread-directory-more");
+  more.hidden = !threadDirectory.cursor || (threadDirectory.failed && threadDirectory.older);
+  more.disabled = threadDirectory.loading;
+  more.textContent = threadDirectory.loading && threadDirectory.older ? "Loading older…" : "Load older";
+  el("thread-directory-retry").hidden = !threadDirectory.failed;
+}
+
 function threadCard(summary) {
   const row = document.createElement("li");
   row.className = "thread-card";
@@ -6369,7 +6647,8 @@ function threadCard(summary) {
   button.className = "thread-open";
   button.setAttribute("type", "button");
   const title = document.createElement("strong");
-  title.textContent = summary.title || "Thread";
+  // `#194 thread-picker-polish`: the name the selector and the heading use, given the card's room.
+  title.textContent = threadName(threadChoice(summary.id, summary), Infinity);
   const meta = document.createElement("span");
   meta.className = "meta";
   meta.textContent = threadCount(summary.reply_count, summary.reply_count_exact);
@@ -6487,7 +6766,7 @@ function applyTimelinePage(payload, older = false, saved = false) {
   const label = channelView === "threads"
     ? `${timelineThreads.length} recent thread${timelineThreads.length === 1 ? "" : "s"}`
     : channelSummary(shown.length, loadedIsWhole(), channelView === "thread"
-      ? (selectedThread && selectedThread.title) || "this thread" : channelName(payload.channel));
+      ? openThreadName() : channelName(payload.channel));
   renderChannelSeam(label);
   return channelView === "threads" ? timelineThreads : shown;
 }
@@ -6507,7 +6786,7 @@ function renderCachedTimeline() {
       shown.length,
       loadedIsWhole(),
       channelView === "thread"
-        ? (selectedThread && selectedThread.title) || "this thread"
+        ? openThreadName()
         : channelName(knownChannel(el("discord-channel").value))
     ));
   };
@@ -13012,6 +13291,10 @@ for (const view of ["main", "threads", "flat"]) {
 }
 el("thread-back").addEventListener("click", guardQuietly(closeThread));
 el("thread-select").addEventListener("change", guardQuietly(onThreadSelect));
+// `#194 thread-picker-polish`. The Threads screen's way back, its next page, and its second try.
+el("close-threads").addEventListener("click", closeThreadDirectory);
+el("thread-directory-more").addEventListener("click", guardQuietly(() => loadThreadDirectory(true)));
+el("thread-directory-retry").addEventListener("click", guardQuietly(() => loadThreadDirectory(threadDirectory.older)));
 // Touching the picker is the cue that the reader wants the full list of threads.
 for (const type of ["focus", "pointerdown"]) {
   el("thread-select").addEventListener(type, () => {

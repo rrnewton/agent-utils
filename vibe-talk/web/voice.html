@@ -59,6 +59,13 @@
             <path d="M14.5 5 8 12l6.5 7" />
           </svg>
         </button>
+        <!-- `#194 thread-picker-polish`. The Threads screen gets its OWN way back as well: it returns
+             to the channel it lists, at the line the reader left. -->
+        <button id="close-threads" class="icon-button" type="button" aria-label="Back" title="Back" hidden>
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14.5 5 8 12l6.5 7" />
+          </svg>
+        </button>
         <span id="topbar-title" class="topbar-title" hidden>Settings</span>
 
         <!--
@@ -190,8 +197,13 @@
               <button id="channel-view-threads" type="button" aria-pressed="false">Threads</button>
               <button id="channel-view-flat" type="button" aria-pressed="false">All</button>
             </div>
+            <!--
+              `#194 thread-picker-polish`. The open thread's identity, in the thread picker's own
+              words — "13h · 16 · its name" — with the name less shortened, because there is room.
+            -->
             <div id="thread-heading" hidden>
               <button id="thread-back" class="secondary" type="button">← Back</button>
+              <span id="thread-facts" class="thread-facts" hidden></span>
               <span id="thread-title">Thread</span>
             </div>
           </div>
@@ -456,6 +468,23 @@
           <!-- A send that failed says so HERE, next to the text it did not send, and the text
                stays in the box. -->
           <p id="reply-state" class="hint" aria-live="polite"></p>
+        </section>
+
+        <!-- ------------------------------------------------------------------ threads screen -->
+        <!--
+          `#194 thread-picker-polish`. Every thread in the channel, where the bar's thread picker
+          lists only one screenful of them and then "… Older threads". Newest activity first, each
+          row named exactly as the picker names it plus the server's one-sentence summary; Load
+          older steps back one server page at a time. Rows are built by `renderThreadDirectory` in
+          web/voice.js; choosing one opens that thread on the channel.
+        -->
+        <section id="screen-threads" class="screen" hidden>
+          <p id="thread-directory-state" class="hint" role="status" aria-live="polite"></p>
+          <ul id="thread-directory-list" class="thread-directory" aria-label="Threads in this channel"></ul>
+          <div class="channel-actions">
+            <button id="thread-directory-more" class="secondary" type="button" hidden>Load older</button>
+            <button id="thread-directory-retry" class="secondary" type="button" hidden>Try again</button>
+          </div>
         </section>
 
         <!-- ----------------------------------------------------------------- settings screen -->

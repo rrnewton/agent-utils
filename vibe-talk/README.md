@@ -2527,8 +2527,24 @@ picker and always there on the channel view, chooses what part of that channel t
 
 - **Main** — messages posted to the channel itself, with each thread's first message;
 - **All** — every message, threads included, in one history;
-- then **each thread** by name (its first message's first line, or the provider's title), most
-  recently active first, with its reply count.
+- then **about one phone screen of threads** (eight), most recently active first, each as
+  `age · replies · name` — for example `1d18h · 16 · Release checklist`;
+- and, when the channel has more threads than that, **… Older threads**.
+
+A thread has **one name everywhere**: the summariser's display name when the server has one, else
+the provider's title, else its first message's first line. The picker shows it shortened; the
+heading over an open thread shows the same facts and the same name with more room, and both change
+together when a display name arrives later. Ages use one compact scale: `now`, `59m`, `23h`,
+`1d18h` (a whole day is just `3d`), `12d` from ten days, `6w` from four weeks, `2y` from a year.
+
+**… Older threads** opens the **Threads screen**: every thread in the channel, newest activity
+first, named exactly as the picker names them, with the server's one-sentence summary under each.
+**Load older** reads the next page of the channel's thread list; a failed read says so, keeps the
+rows already listed, and offers **Try again**. Choosing a thread opens it on the channel; the back
+arrow returns to the line you were reading. The screen only reads, so a read-scope token can use it.
+
+The floating chips over the list (Summaries, Undo, Expand all, …) keep their height clear under
+the channel composer, so scrolled to the end they never cover the box you are typing in.
 
 The threads it lists come from what the page already holds, so opening it costs no request.
 Touching it also reads the channel's thread list in the background, at most once a minute, so the

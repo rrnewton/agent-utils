@@ -1014,7 +1014,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     },
     /** Which screen is showing. Exactly one, or this throws — a page with none is a blank app. */
     screen() {
-      const showing = ["signin", "main", "settings", "reply", "help"].filter(
+      const showing = ["signin", "main", "settings", "reply", "help", "threads"].filter(
         (s) => !page.el(`screen-${s}`).hidden
       );
       assert.equal(showing.length, 1, `exactly one screen must show, not ${showing.join("+")}`);
@@ -2390,9 +2390,11 @@ const TUNING_BANDS = {
     "how long one background read of a channel's thread list is reused by the bar's picker. Under " +
     "ten seconds every touch of the picker is another history scan; past ten minutes a thread " +
     "started this morning is missing from the list all afternoon"],
-  THREAD_SELECT_LIMIT: [10, 100,
-    "most threads the picker lists. Fewer than ten and an active space hides the thread being " +
-    "discussed; past a hundred a phone's native picker becomes a scroll nobody finishes"],
+  // `#194 thread-picker-polish`: one phone screen of threads, then "… Older threads".
+  THREAD_SELECT_LIMIT: [5, 12,
+    "threads the picker lists before '… Older threads'. Fewer than five and the thread discussed " +
+    "this morning is already a second screen away; past about a dozen the phone's native picker " +
+    "no longer fits one screen and scrolls, which is what the owner asked it to stop doing"],
   THREAD_TITLE_CHARS: [16, 48,
     "longest first-message prefix the picker uses as a thread name. Under about sixteen characters " +
     "a name says nothing; past a few words a phone's native picker, which draws options large, " +
@@ -3203,7 +3205,10 @@ test("the header shows two things at a time, and which two depends on the screen
   // header holds in its own right. LAST, because it lives in the corner: the ways back are at the
   // leading edge where a thumb reaches for them, and the glass is at the trailing edge where a
   // phone application puts it.
-  assert.deepStrictEqual(ids, ["close-settings", "close-reply", "close-help", "search-toggle"]);
+  //
+  // `#194 thread-picker-polish` added a fourth way back, for the Threads screen, which returns to
+  // the channel it lists — at the leading edge with the others.
+  assert.deepStrictEqual(ids, ["close-settings", "close-reply", "close-help", "close-threads", "search-toggle"]);
 
   const page = newPage();
   const showing = () =>
@@ -3211,6 +3216,7 @@ test("the header shows two things at a time, and which two depends on the screen
       "close-settings",
       "close-reply",
       "close-help",
+      "close-threads",
       "topbar-title",
       "view-switch",
       "open-settings",
@@ -5615,7 +5621,7 @@ test("THE HEADER NEVER STANDS EMPTY, WHICH IS WHAT COSTING A ROW HAS TO BUY", as
   await signIn(page);
   assert.equal(page.el("topbar").hidden, false, "the search control has nowhere to be");
   assert.deepStrictEqual(
-    ["close-settings", "close-reply", "close-help", "topbar-title", "search-toggle"].filter(
+    ["close-settings", "close-reply", "close-help", "close-threads", "topbar-title", "search-toggle"].filter(
       (id) => !page.el(id).hidden
     ),
     ["search-toggle"],
@@ -17664,8 +17670,8 @@ test("thread views show roots in Main and the bar's selector offers Main, All, a
   assert.deepStrictEqual(offered.slice(2).map(([value]) => value).sort(),
     ["thread:spaces/A/threads/another", "thread:spaces/A/threads/one & two"]);
   // Age · replies · a short prefix of its first message, so a phone's large picker stays readable.
-  assert.ok(offered.some(([, label]) => /^\d+[mhdw] · 1 · first thread root$/.test(label) ||
-      /^now · 1 · first thread root$/.test(label)),
+  // The age is on `briefAge`'s one scale (`#194 thread-picker-polish`): now, 5m, 23h, 1d18h, 12d, 6w, 2y.
+  assert.ok(offered.some(([, label]) => /^(now|\d+[mhdwy]|\d+d\d+h) · 1 · first thread root$/.test(label)),
     `a thread was not named by age, replies and its root: ${JSON.stringify(offered)}`);
   assert.equal(page.el("thread-select").value, "main");
   assert.deepEqual(page.el("discord-log").children.map((row) => row.getAttribute("data-id")), ["200", "201", "203"]);
@@ -17735,6 +17741,297 @@ test("a thread's summarised display name is what the picker calls it, when the s
   const labels = threadOptions(page).map(([, label]) => label);
   assert.ok(labels.some((label) => / · 1 · deploy-rollback$/.test(label)),
     `the display name did not win over the title and the prefix: ${JSON.stringify(labels)}`);
+});
+
+// --- one name, one age scale, and the Threads screen (`#194 thread-picker-polish`) ---------------
+//
+// The owner, from a phone screenshot of an open thread: "I would like that thread identity at the
+// top to be consistent with the text we use in the drop down. Also the drop down shows times like
+// 42h but that should be 1d22h for consistency. It also shows too many threads with a scrollable
+// list. It should show only about one screen worth with an '... Older threads' option that pops up
+// a dedicated paginated selector page."
+
+/** The heading over an open thread, as the picker's option would read with the same name length. */
+const headingLabel = (page) => {
+  const facts = page.el("thread-facts");
+  return facts.hidden ? page.el("thread-title").textContent
+    : `${facts.textContent} · ${page.el("thread-title").textContent}`;
+};
+
+/** The picker's label for one value, or undefined when it does not offer it. */
+const optionLabel = (page, value) => (threadOptions(page).find(([offered]) => offered === value) || [])[1];
+
+/** Choose one of the picker's options the way a finger does. */
+async function pickThread(page, value) {
+  const picker = page.el("thread-select");
+  picker.value = value;
+  await picker.dispatch("change");
+  await page.settle();
+}
+
+/** A thread root posted `ageMs` before the fixture's clock, with a thread of its own. */
+function agedRoot(page, n, ageMs, content = `root number ${n}`) {
+  return message({
+    id: String(5000 + n), content,
+    timestamp: new Date(page.clock() - ageMs).toISOString(),
+    thread: { id: `spaces/A/threads/r${n}`, root_message_id: String(5000 + n), is_root: true,
+      reply_count: 0, reply_count_exact: true },
+  });
+}
+
+/** A thread summary as the server's thread list sends one, last active `hours` before the clock. */
+function agedSummary(page, n, hours, fields = {}) {
+  return {
+    id: `spaces/A/threads/s${n}`, root: null, title: `Planning thread number ${n}`,
+    reply_count: n, reply_count_exact: true,
+    updated_at: new Date(page.clock() - hours * 3600000).toISOString(), ...fields,
+  };
+}
+
+test("the heading over an open thread is the picker's option for it, less shortened", async () => {
+  const page = newPage();
+  const data = threadData();
+  page.threadingSupported = true;
+  // Longer than the picker's name, so the two can be told apart and the prefix relation checked.
+  const long = "First discussion of the rollout plan for the storage tier";
+  page.threads = data.threads.map((thread, i) => (i === 0 ? { ...thread, title: long } : thread));
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, `thread:${page.threads[0].id}`);
+  const option = optionLabel(page, `thread:${page.threads[0].id}`);
+  assert.equal(page.el("thread-title").textContent, long, "the heading did not give the name its room");
+  assert.equal(page.el("thread-facts").hidden, false, "the heading lost the age and reply count");
+  const facts = page.el("thread-facts").textContent;
+  assert.ok(option.startsWith(`${facts} · `), `the heading says "${facts}" and the option "${option}"`);
+  const short = option.slice(facts.length + " · ".length);
+  assert.ok(short.endsWith("…") && long.startsWith(short.slice(0, -1)),
+    `the option's name ${JSON.stringify(short)} is not the heading's, shortened`);
+  assert.ok(headingLabel(page).startsWith(option.slice(0, -1)),
+    `the heading reads "${headingLabel(page)}" and the picker "${option}"`);
+});
+
+test("a display name that arrives after the thread opened renames the heading and the option together", async () => {
+  const page = await threadPage();
+  const id = page.threads[0].id;
+  await pickThread(page, `thread:${id}`);
+  assert.equal(page.el("thread-title").textContent, "First discussion");
+  assert.equal(headingLabel(page), optionLabel(page, `thread:${id}`));
+  // The summariser names it later; the next read of the thread list carries the name.
+  page.threads[0] = { ...page.threads[0], display_name: "storage-rollout" };
+  await page.el("thread-select").dispatch("pointerdown");
+  await page.settle();
+  assert.equal(page.el("thread-title").textContent, "storage-rollout",
+    "the heading kept the name it was opened with");
+  assert.match(optionLabel(page, `thread:${id}`), / · storage-rollout$/);
+  assert.equal(headingLabel(page), optionLabel(page, `thread:${id}`),
+    "the heading and the picker disagree about the thread on screen");
+});
+
+test("a thread opened from a tag is named at once, as the picker names it, not 'Thread'", async () => {
+  // All draws a thread as a filter of what it holds, with no read, so nothing hands the heading a
+  // summary: it used to say "Thread" while the picker beside it named the thread by its root.
+  const page = await threadPage();
+  await pickThread(page, "flat");
+  const row = page.el("discord-log").children.find((li) => li.getAttribute("data-id") === "204");
+  await threadBadge(row).click();
+  await page.settle();
+  assert.equal(page.el("thread-title").textContent, "second thread root");
+  const value = "thread:spaces/A/threads/another";
+  assert.equal(page.el("thread-select").value, value);
+  assert.equal(headingLabel(page), optionLabel(page, value));
+});
+
+test("ages read as days and hours, never 42h, on one compact scale", async () => {
+  const MINUTE = 60000;
+  const HOUR = 60 * MINUTE;
+  const DAY = 24 * HOUR;
+  // [age, what the picker says]. Truncated, never rounded: 59m59s is still 59m.
+  const table = [
+    [59 * 1000, "now"],
+    [59 * MINUTE + 59 * 1000, "59m"],
+    [23 * HOUR + 59 * MINUTE, "23h"],
+    [42 * HOUR, "1d18h"],
+    [46 * HOUR, "1d22h"],
+    [72 * HOUR, "3d"],
+    [9 * DAY + 23 * HOUR, "9d23h"],
+    [10 * DAY + 5 * HOUR, "10d"],
+    [27 * DAY, "27d"],
+    [30 * DAY, "4w"],
+    [364 * DAY, "52w"],
+    [800 * DAY, "2y"],
+  ];
+  // Two pages, because the picker lists one screenful: the table is longer than that.
+  for (const rows of [table.slice(0, 6), table.slice(6)]) {
+    const page = newPage();
+    page.threadingSupported = true;
+    await signIn(page);
+    await showDiscord(page, rows.map(([age], i) => agedRoot(page, i, age)));
+    const labels = threadOptions(page).slice(2).map(([, label]) => label);
+    assert.deepStrictEqual(labels, rows.map(([, said], i) => `${said} · 0 · root number ${i}`));
+  }
+});
+
+test("the picker lists one screenful of threads, newest first, then the way to the older ones", async () => {
+  const page = newPage();
+  page.threadingSupported = true;
+  await signIn(page);
+  const roots = Array.from({ length: 12 }, (_, i) => agedRoot(page, i, (12 - i) * 3600000));
+  await showDiscord(page, roots);
+  const offered = threadOptions(page);
+  const cap = sourceConstant("THREAD_SELECT_LIMIT");
+  assert.deepStrictEqual(offered.slice(0, 2), [["main", "Main"], ["flat", "All"]]);
+  assert.deepStrictEqual(offered.slice(2, 2 + cap).map(([value]) => value),
+    Array.from({ length: cap }, (_, i) => `thread:spaces/A/threads/r${11 - i}`),
+    "the picker did not list the newest threads first, one screenful of them");
+  assert.deepStrictEqual(offered.at(-1), ["older", "… Older threads"]);
+  assert.equal(offered.length, 2 + cap + 1, "the picker listed more than one screenful");
+
+  // A channel with fewer threads than that, and a server that says there are no more: no way on.
+  const few = newPage();
+  few.threadingSupported = true;
+  await signIn(few);
+  await showDiscord(few, Array.from({ length: 5 }, (_, i) => agedRoot(few, i, (5 - i) * 3600000)));
+  await few.el("thread-select").dispatch("pointerdown");
+  await few.settle();
+  assert.ok(!threadOptions(few).some(([value]) => value === "older"),
+    "the picker offered older threads that do not exist");
+
+  // ...and the same five, with a thread list that says older ones exist: the way on is back.
+  const more = newPage();
+  more.threadingSupported = true;
+  await signIn(more);
+  await showDiscord(more, Array.from({ length: 5 }, (_, i) => agedRoot(more, i, (5 - i) * 3600000)));
+  const standard = more.timeline;
+  more.timeline = async (path) => (path.includes("view=threads")
+    ? json(200, timelineAnswer({ view: "threads", threads: [agedSummary(more, 1, 30)], has_threads: true,
+      has_more: true, next_before: "older-cursor" }))
+    : standard(path));
+  assert.ok(!threadOptions(more).some(([value]) => value === "older"));
+  await more.el("thread-select").dispatch("pointerdown");
+  await more.settle();
+  assert.deepStrictEqual(threadOptions(more).at(-1), ["older", "… Older threads"],
+    "the server said older threads exist and the picker offered no way to them");
+});
+
+test("Older threads opens a Threads screen that pages back on the server's cursor and opens a thread", async () => {
+  const page = newPage();
+  page.threadingSupported = true;
+  // Read-scope: the screen only ever reads, so a token that may not post can use all of it.
+  page.tokenScope = "read";
+  await signIn(page);
+  // Twenty threads on the server, s1 the newest; the channel's Main shows none of their roots.
+  const all = Array.from({ length: 20 }, (_, i) => agedSummary(page, i + 1, (i + 1) * 5,
+    i === 2 ? { summary: "Whether the storage tier moves on Tuesday." } : {}));
+  const cursor = "opaque cursor /&?";
+  const standard = page.timeline;
+  page.timeline = async (path) => {
+    const url = new URL(path, "http://fixture.test");
+    if (url.searchParams.get("view") !== "threads") return standard(path);
+    // Each page oldest-first, as the server orders the threads view.
+    const before = url.searchParams.get("before");
+    const slice = before === cursor ? all.slice(10) : all.slice(0, 10);
+    return json(200, timelineAnswer({ view: "threads", threads: [...slice].reverse(), has_threads: true,
+      has_more: before !== cursor, next_before: before !== cursor ? cursor : null }));
+  };
+  await showDiscord(page, [message({ id: "300", content: "main channel announcement" })]);
+  const writes = () => page.requests.filter((request) => !request.startsWith("GET")).length;
+  const writesBefore = writes();
+  await page.el("thread-select").dispatch("pointerdown");
+  await page.settle();
+  assert.deepStrictEqual(threadOptions(page).at(-1), ["older", "… Older threads"]);
+
+  await pickThread(page, "older");
+  assert.equal(page.screen(), "threads", "Older threads did not open the Threads screen");
+  assert.equal(page.el("thread-select").value, "main", "the picker was left saying Older threads");
+  assert.equal(page.el("topbar-title").textContent, "Threads");
+  assert.equal(page.el("close-threads").hidden, false, "the Threads screen has no way back");
+  const reads = () => page.timelineCalls.filter((call) => /view=threads/.test(call));
+  const rows = () => page.el("thread-directory-list").children;
+  const label = (li) => li.descendants().find((node) => node.className === "thread-directory-label").textContent;
+  assert.equal(rows().length, 10);
+  assert.deepStrictEqual(rows().map((li) => li.getAttribute("data-context-id")),
+    all.slice(0, 10).map((thread) => thread.id), "the rows are not newest activity first");
+  // The picker's own words: age · replies · name, with the name given this screen's room.
+  assert.equal(label(rows()[0]), "5h · 1 · Planning thread number 1");
+  assert.equal(label(rows()[1]), "10h · 2 · Planning thread number 2");
+  assert.equal(label(rows()[4]), "1d1h · 5 · Planning thread number 5");
+  assert.equal(optionLabel(page, `thread:${all[0].id}`), "5h · 1 · Planning thread number 1");
+  assert.match(rows()[2].text(), /Whether the storage tier moves on Tuesday\./,
+    "the server's one-sentence summary is not on the row");
+  assert.equal(page.el("thread-directory-more").hidden, false, "there is no way to older threads");
+  assert.match(page.el("thread-directory-state").textContent, /^10 threads, newest activity first\. Older ones/);
+
+  const before = reads().length;
+  await page.el("thread-directory-more").click();
+  await page.settle();
+  assert.equal(reads().length, before + 1);
+  assert.equal(new URL(reads().at(-1), "http://fixture.test").searchParams.get("before"), cursor,
+    "Load older did not step back on the server's cursor");
+  assert.equal(rows().length, 20);
+  assert.equal(rows().at(-1).getAttribute("data-context-id"), all[19].id);
+  assert.equal(page.el("thread-directory-more").hidden, true, "Load older offered past the last page");
+  assert.match(page.el("thread-directory-state").textContent, /That is all of them\.$/);
+
+  // An old thread, from the second page: it opens on the channel, and the picker names it — even
+  // though it is far past the picker's one screenful.
+  const old = all[14];
+  await rows().find((li) => li.getAttribute("data-context-id") === old.id).children[0].click();
+  await page.settle();
+  assert.equal(page.screen(), "main", "choosing a thread left the reader on the Threads screen");
+  assert.equal(page.tab(), "discord");
+  assert.equal(page.el("thread-heading").hidden, false, "the chosen thread did not open");
+  assert.equal(page.el("thread-select").value, `thread:${old.id}`);
+  assert.equal(page.el("thread-title").textContent, old.title);
+  assert.equal(headingLabel(page), optionLabel(page, `thread:${old.id}`));
+  assert.equal(page.el("thread-facts").textContent, "3d3h · 15");
+  assert.equal(new URL(page.timelineCalls.at(-1), "http://fixture.test").searchParams.get("thread_id"), old.id);
+
+  // Opened again and dismissed: the picker goes back to the thread on screen both times.
+  await pickThread(page, "older");
+  assert.equal(page.screen(), "threads");
+  assert.equal(page.el("thread-select").value, `thread:${old.id}`);
+  const current = rows().find((li) => li.getAttribute("data-context-id") === old.id).children[0];
+  assert.equal(current.getAttribute("aria-current"), "true", "the open thread is not marked");
+  await page.el("close-threads").click();
+  assert.equal(page.screen(), "main");
+  assert.equal(page.el("thread-select").value, `thread:${old.id}`);
+  assert.equal(writes(), writesBefore, "the Threads screen wrote something");
+});
+
+test("the Threads screen says when a read fails, keeps what it knew, and tries again", async () => {
+  const page = newPage();
+  page.threadingSupported = true;
+  await signIn(page);
+  const roots = Array.from({ length: 10 }, (_, i) => agedRoot(page, i, (10 - i) * 3600000));
+  await showDiscord(page, roots);
+  const standard = page.timeline;
+  let failing = true;
+  page.timeline = async (path) => (path.includes("view=threads") && failing
+    ? json(502, { error: "discord_error", detail: "the provider is down" })
+    : standard(path));
+  await pickThread(page, "older");
+  assert.equal(page.screen(), "threads");
+  // Back on Main at once, not only once a read succeeds: this one failed.
+  assert.equal(page.el("thread-select").value, "main", "the picker was left saying Older threads");
+  assert.equal(page.el("thread-directory-list").children.length, 10, "the threads already known were dropped");
+  assert.match(page.el("thread-directory-state").textContent, /^Could not load the thread list: the provider is down\./);
+  assert.equal(page.el("thread-directory-retry").hidden, false, "a failed read offered no second try");
+  failing = false;
+  await page.el("thread-directory-retry").click();
+  await page.settle();
+  assert.equal(page.el("thread-directory-retry").hidden, true);
+  assert.match(page.el("thread-directory-state").textContent, /^10 threads, newest activity first\./);
+});
+
+test("the floating chips keep their height clear under the composer, so they never cover it", () => {
+  // `#194 thread-picker-polish`. Scrolled to the end of a thread, Summaries, Undo, Expand all and
+  // Collapse all sat on top of the reply box. The geometry is asserted in a real browser by
+  // tests/offline_cache_browser.py; this pins the mechanism the fake DOM cannot lay out: the
+  // composer's own room is the chips' measured height, which the page writes from an observer.
+  assert.match(cssBlock("#channel-composer"), /padding:[^;]*var\(--scroll-tools-clearance, 0px\)/,
+    "the composer keeps no room for the chips under itself");
+  assert.match(SCRIPT_CODE, /new window\.ResizeObserver\([\s\S]*?"--scroll-tools-clearance"[\s\S]*?\.observe\(el\("scroll-tools"\)\)/,
+    "nothing measures the chips any more");
 });
 
 test("a thread opened from All is a filter of what All holds, with no request, and Back restores All", async () => {
