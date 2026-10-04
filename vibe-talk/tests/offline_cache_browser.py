@@ -11,12 +11,12 @@ one reader through:
   and Main too -> reload with the network held: the page reopens on the channel in All by itself,
   its saved rows drawn before any answer (`#189 restore-ui-state`) -> one bounded newest-page read
   of All, sent once the token is proved and the live stream has attached, merges a new row without
-  duplicating -> switching views makes no request -> a reload with
-  the API unreachable reopens on Main, the view last chosen, at the message a reader parked mid-list
-  was on, keeps the rows and says so -> a reload whose refresh fails keeps them and says that ->
-  signing out removes them from the screen and the device. Before the reloads, a refresh also fails
-  and recovers in place, on the channel's own poll, under a reader at the top, in the middle and at
-  the newest line.
+  duplicating -> switching views makes no request -> a reload with the API unreachable reopens on
+  Main, the view chosen in that channel and kept as its own (`#205 channel-view-memory`), at the
+  message a reader parked mid-list was on, keeps the rows and says so -> a reload whose refresh
+  fails keeps them and says that -> signing out removes them from the screen and the device. Before
+  the reloads, a refresh also fails and recovers in place, on the channel's own poll, under a reader
+  at the top, in the middle and at the newest line.
 
 While the freshness pill is up — refreshing, offline, failed — it must cover neither the view tabs
 nor the list's header seam or first row, and #scroll-area must be the same box with it as without
@@ -77,6 +77,7 @@ SCOPES = {f"Bearer {TOKEN}": "write", f"Bearer {READ_TOKEN}": "read"}
 CHANNEL = {"id": "1110000000000000001", "label": "lead team", "writable": True, "alias": None,
            "added": False}
 CACHE_KEY = "vibe-talk.voice.message-cache"
+UI_STATE_KEY = "vibe-talk.voice.ui-state"
 EPOCH = datetime(2026, 1, 5, 9, 0, tzinfo=timezone.utc)
 # `#36 thread-view-phone-overflow`: wider than a phone as words, and unbreakable at its tail.
 LONG_TOKEN = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0-0f1e2d3c4b5a69788796a5b4c3d2e1f0"
@@ -918,6 +919,12 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             page.reload(wait_until="load")
             reopened("offline")
             wait_rows(["200", "201", "203"], "the snapshot was not kept while offline")
+            # `#205 channel-view-memory`: Main came back as this channel's own choice, kept in the
+            # browser's storage with the channel it was chosen in.
+            record = json.loads(page.evaluate(f"() => localStorage.getItem({json.dumps(UI_STATE_KEY)})") or "{}")
+            chosen = [(entry.get("channel"), entry.get("channelView")) for entry in record.get("channels", [])]
+            check(record.get("v") == 2 and chosen == [(CHANNEL["id"], "main")],
+                  f"{label}: Main was not kept as the channel's choice: v{record.get('v')} {chosen}")
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline and not pill().startswith("Offline"):
                 page.wait_for_timeout(50)

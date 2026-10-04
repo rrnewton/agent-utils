@@ -32,7 +32,8 @@ text-to-speech bot.
 
 **Messages and threads.** The channel view opens in **All** where the channel's chat service has
 threads, and in **Main** — then the whole channel — where it has none, until you choose another
-view; the choice is kept across a reload (see
+view. The choice belongs to that channel: another channel opens in its own choice or its default,
+and coming back opens this one where you chose, across a reload too (see
 [Reopening where you left off](#reopening-where-you-left-off)). When the backend finds threads,
 three views are offered:
 
@@ -159,8 +160,14 @@ under `vibe-talk.voice.ui-state` and reopens on it:
 - **The call or the channel**, whichever was up. Settings, Help, Reply and the Threads screen are
   not reopened; a reply's draft is kept, as before.
 - **Main, All or the thread** that was open, in the channel that was selected, with the thread's
-  name in its heading. A channel you have not chosen a view in opens in All where its chat service
-  has threads and in Main where it has none; another channel opens in its own default.
+  name in its heading.
+- **The view you chose in every other channel.** Main, All or a thread chosen in a channel is that
+  channel's, so changing to it — in the same session or after a reopen — opens it there, with the
+  one read of that view a channel change makes. All is kept when you pick it, so a channel you put
+  back in All stays there whatever the default is. A channel you have not chosen a view in opens in
+  All where its chat service has threads and in Main where it has none. The 50 channels most
+  recently on screen keep their choice, and fewer when long thread roots would make the record
+  large; the least recently used give theirs up first.
 - **Hide read**, on or off.
 - **The message you were reading**, at the same height on the screen — the message, not a pixel
   offset. If you were on the newest message, or yours is no longer on the device, the newest.
@@ -170,7 +177,11 @@ under `vibe-talk.voice.ui-state` and reopens on it:
   such, and the stream's replay of what changed while the app was closed costs no second read.
 - **Checked on the way back.** A channel no longer listed, a thread the device no longer knows of, or
   a chat service that no longer has threads falls back to the default, and a damaged record is
-  discarded. The record is tied to the token like the snapshot, and goes with it.
+  discarded. A thread is known while the device keeps that channel's saved messages; once it has
+  fallen back, the channel stays in its default until you choose again. The record is tied to the
+  token like the snapshot, and goes with it; a channel the server stops listing loses its choice
+  when it loses its saved messages. A record from before each channel kept its own view is carried
+  forward: the view it held, if you had chosen it, becomes that channel's choice.
 
 `make -C vibe-talk offline-cache-browser` walks that whole sequence in a real Chromium at an
 Android phone's size, against a loopback fake API. Pass `SCREENSHOTS=/tmp/shots` to keep one PNG

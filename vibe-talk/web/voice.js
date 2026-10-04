@@ -517,12 +517,6 @@ let channelView = "main";
 let selectedThreadId = null;
 let selectedThread = null;
 let threadOrigin = "main";
-/**
- * Whether the reader picked the view on screen — in this page or before a reload — rather than
- * being given the default. `#189 restore-ui-state`: saved with the view, because only a choice
- * outranks the default when the page reopens; a view nobody chose is the default again.
- */
-let channelViewChosen = false;
 let timelineMessages = [];
 let timelineThreads = [];
 const channelContexts = new Map();
@@ -6309,10 +6303,20 @@ function reconcileChannelSnapshot(before) {
 // thread, with the thread's summary so its heading has a name before anything is read; whether
 // read messages were hidden; and the message the reader's eye was on.
 //
+// EACH CHANNEL KEEPS ITS OWN VIEW. `#205 channel-view-memory`. The owner, 2026-10-04 16:18: "All
+// should be the default but if changed the selection should be saved for that channel. Ideally it
+// should survive restarts." A choice used to last only until the channel changed: Main picked in
+// one channel, a look at another, and the first was in All again. The record now keeps the view the
+// reader chose in each channel — Main, All, or a thread with its summary — for the channels most
+// recently on screen, and changing to one of them, or reopening the app on it, opens it there. A
+// channel nobody chose a view in opens in its default. Picking All is kept as a choice too, though
+// it is the default today: what the reader picked is what the channel opens in, whatever the
+// default later becomes.
+//
 // NOT THE SCREEN. A reopen lands on the main screen whatever was up: Settings and Help are a tap
 // away, the Threads screen is a choice half made, and a reply keeps its draft without its screen
 // being reopened (`DRAFTS_KEY`). The selected channel already has its own key (`ACTIVE_CHANNEL_KEY`);
-// the record names it only so a view saved for one channel is never applied to another.
+// the record names it only so a place measured in one channel is never applied to another.
 //
 // A PLACE IS A MESSAGE, not a pixel offset — `captureScroll`'s anchor, put back by `restoreScroll`.
 // The rows above it are redrawn from the snapshot and then re-read, and an offset would land on
@@ -6321,11 +6325,20 @@ function reconcileChannelSnapshot(before) {
 //
 // CHECKED ON THE WAY BACK, because storage is a boundary like the network: a channel no longer
 // listed, a thread the channel's store no longer knows, or a provider that no longer has threads
-// falls back to the default, and a record that does not parse is deleted. It is scoped to the token
-// as the snapshot is, and forgotten with it: the thread's summary is something that credential read.
+// falls back to the default, a damaged choice is dropped on its own, and a record that does not
+// parse is deleted. It is scoped to the token as the snapshot is, and forgotten with it: a thread's
+// summary is something that credential read. A channel the server stops listing loses its choice
+// when it loses its saved rows.
 
 const UI_STATE_KEY = "vibe-talk.voice.ui-state";
-const UI_STATE_VERSION = 1;
+const UI_STATE_VERSION = 2;
+/** Channels whose chosen view is kept; the one least recently on screen is given up first. */
+const UI_STATE_CHANNELS = 50;
+/**
+ * The whole record, in UTF-16 code units. A remembered thread carries its summary, root message and
+ * all, so this rather than the count is what stops a few long roots from growing it without end.
+ */
+const UI_STATE_CHARS = 60000;
 /** The channel views a reopen comes back to. The Threads list is reached from the picker instead. */
 const REOPENED_VIEWS = ["main", "flat", "thread"];
 
@@ -6343,17 +6356,52 @@ const validSavedThread = (thread) => thread !== null && typeof thread === "objec
   typeof thread.id === "string" && thread.id !== "" && ["main", "flat"].includes(thread.origin) &&
   (thread.summary === null || VibeTalkContract.is("ThreadSummary", thread.summary));
 
+/** One channel's choice: Main, All, or a thread with where it was opened from and its summary. */
+const validChosenView = (entry) => entry !== null && typeof entry === "object" &&
+  typeof entry.channel === "string" && entry.channel !== "" && REOPENED_VIEWS.includes(entry.channelView) &&
+  (entry.channelView === "thread" ? validSavedThread(entry.thread) : entry.thread === null);
+
+/** A place names the view it was measured in, as `viewKey` does: "main", "flat" or "thread:<id>". */
 const validSavedPlace = (place) => place === null || (typeof place === "object" &&
-  typeof place.atNewest === "boolean" && (place.anchor === null || typeof place.anchor === "string") &&
-  Number.isFinite(place.offset));
+  typeof place.view === "string" && typeof place.atNewest === "boolean" &&
+  (place.anchor === null || typeof place.anchor === "string") && Number.isFinite(place.offset));
 
 function validUiState(saved) {
   return saved !== null && typeof saved === "object" && saved.v === UI_STATE_VERSION &&
     typeof saved.identity === "string" && ["voice", "discord"].includes(saved.view) &&
     typeof saved.todo === "boolean" && typeof saved.channel === "string" &&
-    REOPENED_VIEWS.includes(saved.channelView) && typeof saved.chosen === "boolean" &&
-    (saved.channelView === "thread" ? validSavedThread(saved.thread) : saved.thread === null) &&
-    validSavedPlace(saved.place);
+    validSavedPlace(saved.place) && Array.isArray(saved.channels);
+}
+
+/**
+ * A record from before `#205 channel-view-memory`, which kept one view, for the channel selected
+ * then, and whether the reader chose it. Carried forward rather than discarded, so the first page
+ * of this version reopens where the last one left off: a chosen view becomes that channel's choice,
+ * and the place says which view it was measured in. Null when it is not a sound record of that shape.
+ */
+function fromUiStateV1(saved) {
+  if (!(typeof saved.identity === "string" && ["voice", "discord"].includes(saved.view) &&
+      typeof saved.todo === "boolean" && typeof saved.channel === "string" &&
+      REOPENED_VIEWS.includes(saved.channelView) && typeof saved.chosen === "boolean" &&
+      (saved.channelView === "thread" ? validSavedThread(saved.thread) : saved.thread === null))) return null;
+  const view = viewKey(saved.channelView, saved.thread ? saved.thread.id : null);
+  return {
+    v: UI_STATE_VERSION, identity: saved.identity, view: saved.view, todo: saved.todo, channel: saved.channel,
+    place: saved.place === null ? null : { ...saved.place, view },
+    channels: saved.chosen ? [{ channel: saved.channel, channelView: saved.channelView, thread: saved.thread }] : [],
+  };
+}
+
+/** The sound choices, one per channel, the most recently on screen first, at most `UI_STATE_CHANNELS`. */
+function keptChoices(entries) {
+  const seen = new Set();
+  const kept = [];
+  for (const entry of entries) {
+    if (!validChosenView(entry) || seen.has(entry.channel)) continue;
+    seen.add(entry.channel);
+    kept.push(entry);
+  }
+  return kept.slice(0, UI_STATE_CHANNELS);
 }
 
 function dropUiState() {
@@ -6379,8 +6427,13 @@ function readUiState() {
   } catch (_error) {
     saved = null;
   }
+  if (saved !== null && typeof saved === "object" && saved.v === 1) saved = fromUiStateV1(saved);
   const identity = tokenFingerprint(token());
-  if (identity && validUiState(saved) && saved.identity === identity) return saved;
+  if (identity && validUiState(saved) && saved.identity === identity) {
+    // One channel's damaged choice costs that channel its choice, not every other channel theirs.
+    saved.channels = keptChoices(saved.channels);
+    return saved;
+  }
   dropUiState();
   return null;
 }
@@ -6391,12 +6444,14 @@ function readUiState() {
  */
 let savedUi = readUiState();
 /**
- * The reader's own choice of channel view from that record, until they make another in this page.
- * Every place the view is decided asks `openingChannelView`, so a choice the saved shell could not
- * honour yet — a thread, in a channel the shell thought had none — is honoured once `/client-config`
- * says it can be.
+ * `#205 channel-view-memory`. The view the reader chose in each channel, the channel most recently
+ * on screen first: from that record, and then as they choose. Every place a channel's view is
+ * decided asks `openingChannelView`, so a choice the saved shell could not honour yet — a thread,
+ * in a channel the shell thought had none — is honoured once `/client-config` says it can be.
  */
-let savedChoice = savedUi && savedUi.chosen ? savedUi : null;
+let chosenViews = savedUi ? savedUi.channels : [];
+/** The credential `chosenViews` were chosen under. See `chosenViewsNow`. */
+let chosenViewsIdentity = savedUi ? savedUi.identity : "";
 /**
  * False until the page has reopened on `savedUi`, or the reader has done something of their own.
  * Nothing is written before then: the call view the page puts up first is not where the reader was,
@@ -6410,9 +6465,37 @@ let heldPlace = null;
 function forgetUiState() {
   dropUiState();
   savedUi = null;
-  savedChoice = null;
+  chosenViews = [];
   uiStateSettled = true;
   heldPlace = null;
+}
+
+/**
+ * The chosen views, for the token saved now. Another tab, or the main app, can replace the token
+ * under this page without a sign-out here, and what the last one chose — summaries of threads it
+ * read among them — must neither open the new one's channels nor be written down under its name.
+ */
+function chosenViewsNow() {
+  const identity = tokenFingerprint(token());
+  if (chosenViewsIdentity !== identity) {
+    chosenViews = [];
+    chosenViewsIdentity = identity;
+  }
+  return chosenViews;
+}
+
+/** The view the reader chose in `channel`, or undefined when they have chosen none there. */
+const chosenView = (channel) => chosenViewsNow().find((entry) => entry.channel === String(channel));
+
+/** Keep `entry` as its channel's choice, first; past the bound, the channel least recently on screen goes. */
+function rememberChosenView(entry) {
+  chosenViews = [entry, ...chosenViewsNow().filter((held) => held.channel !== entry.channel)]
+    .slice(0, UI_STATE_CHANNELS);
+}
+
+/** Forget the choice made in every channel `gone` answers true for. */
+function forgetChosenViews(gone) {
+  chosenViews = chosenViewsNow().filter((entry) => !gone(entry.channel));
 }
 
 /**
@@ -6429,24 +6512,29 @@ function threadStillKnown(id) {
 }
 
 /**
- * The view to open the selected channel in: the reader's saved choice while it holds, and otherwise
- * the default. A choice holds in the channel it was made in, on a provider that still has threads —
- * Main included, since preferring Main to All is the owner's call to make — and a thread only while
- * the channel's store still knows it.
+ * The view to open the selected channel in: the one the reader chose there while it holds, and
+ * otherwise the default. A choice holds on a provider that still has threads — Main included, since
+ * preferring Main to All is the owner's call to make — and a thread only while the channel's store
+ * still knows it. A thread the store has lost is forgotten as it is passed over, so the channel
+ * opens in its default from then on, not back in the thread on some later visit whose read happens
+ * to mention it. A provider without threads only passes a choice over: the saved shell may say so
+ * of a provider `/client-config` then says has them.
  */
 function openingChannelView() {
-  const saved = savedChoice;
+  const channel = String(el("discord-channel").value);
+  const chosen = threadingSupported ? chosenView(channel) : undefined;
   const fallback = defaultChannelView();
-  if (saved && threadingSupported && saved.channel === String(el("discord-channel").value) &&
-      (saved.channelView !== "thread" || threadStillKnown(saved.thread.id))) {
-    const thread = saved.thread;
+  if (chosen && chosen.channelView === "thread" && !threadStillKnown(chosen.thread.id)) {
+    forgetChosenViews((id) => id === channel);
+  } else if (chosen) {
+    const thread = chosen.thread;
     return {
-      view: saved.channelView, chosen: true,
+      view: chosen.channelView,
       thread: thread ? thread.id : null, summary: thread ? thread.summary : null,
       origin: thread ? thread.origin : fallback,
     };
   }
-  return { view: fallback, chosen: false, thread: null, summary: null, origin: fallback };
+  return { view: fallback, thread: null, summary: null, origin: fallback };
 }
 
 /** Put the selected channel on the view it opens in. Draws nothing; every caller draws next. */
@@ -6456,7 +6544,6 @@ function openChannelView() {
   selectedThreadId = opening.thread;
   selectedThread = opening.summary;
   threadOrigin = opening.origin;
-  channelViewChosen = opening.chosen;
   // A reopened thread is named from the store, like every thread, so the summary kept with the
   // record goes into it when the store has none: the heading has its name before any read.
   const summary = opening.summary;
@@ -6480,6 +6567,7 @@ function holdChannelPlace() {
   heldPlace = {
     key: placeKey(),
     place: {
+      view: viewKey(),
       atNewest: mark.pinned,
       anchor: anchor ? anchor.getAttribute("data-context-id") || idsOf(anchor)[0] || null : null,
       offset: anchor ? mark.top - el("scroll-area").getBoundingClientRect().top : 0,
@@ -6494,6 +6582,18 @@ function savedThreadSummary() {
   return summary && VibeTalkContract.is("ThreadSummary", summary) ? summary : null;
 }
 
+/** The view on screen as its channel's choice, or null for a view no channel is reopened in. */
+function viewOnScreen() {
+  const channel = String(el("discord-channel").value);
+  if (!channel || !REOPENED_VIEWS.includes(channelView) || (channelView === "thread" && !selectedThreadId)) return null;
+  const thread = channelView === "thread" ? {
+    id: String(selectedThreadId),
+    origin: ["main", "flat"].includes(threadOrigin) ? threadOrigin : defaultChannelView(),
+    summary: savedThreadSummary(),
+  } : null;
+  return { channel, channelView, thread };
+}
+
 /**
  * Record what is on screen now. One small key, so it is written whenever the reader changes what
  * they are looking at; the place is the one last measured, if it is a place in this view.
@@ -6501,23 +6601,34 @@ function savedThreadSummary() {
 function saveUiState() {
   const identity = tokenFingerprint(token());
   if (!uiStateSettled || !identity) return;
-  const reopens = REOPENED_VIEWS.includes(channelView) && (channelView !== "thread" || Boolean(selectedThreadId));
-  const thread = reopens && channelView === "thread" ? {
-    id: String(selectedThreadId),
-    origin: ["main", "flat"].includes(threadOrigin) ? threadOrigin : defaultChannelView(),
-    summary: savedThreadSummary(),
-  } : null;
-  storedExactly(UI_STATE_KEY, JSON.stringify({
+  const channel = String(el("discord-channel").value);
+  const shown = viewOnScreen();
+  const chosen = chosenView(channel);
+  // The channel's choice, on screen: it is now the last to be given up, and an open thread's
+  // summary is taken again from the store, which may have named the thread since it was chosen.
+  if (shown && chosen && shown.channelView === chosen.channelView &&
+      (shown.thread && shown.thread.id) === (chosen.thread && chosen.thread.id)) {
+    rememberChosenView(shown);
+  }
+  const record = {
     v: UI_STATE_VERSION,
     identity,
     view: currentView === "discord" ? "discord" : "voice",
     todo: todoMode,
-    channel: String(el("discord-channel").value),
-    channelView: reopens ? channelView : defaultChannelView(),
-    chosen: reopens && channelViewChosen,
-    thread,
+    channel,
     place: heldPlace && heldPlace.key === placeKey() ? heldPlace.place : null,
-  }));
+    channels: chosenViews,
+  };
+  // Inside its bound by giving up the choices of the channels least recently on screen — never the
+  // selected channel's, which is one view and at most one thread's summary.
+  let encoded = JSON.stringify(record);
+  for (let last = record.channels.length - 1; encoded.length > UI_STATE_CHARS && last >= 0; last -= 1) {
+    if (record.channels[last].channel === channel) continue;
+    record.channels = record.channels.filter((_entry, index) => index !== last);
+    encoded = JSON.stringify(record);
+  }
+  chosenViews = record.channels;
+  storedExactly(UI_STATE_KEY, encoded);
 }
 
 /**
@@ -6529,7 +6640,7 @@ function returnToSavedPlace() {
   const saved = savedUi;
   const place = saved ? saved.place : null;
   if (!place || place.atNewest || !place.anchor || saved.channel !== String(el("discord-channel").value) ||
-      saved.channelView !== channelView || (saved.thread && saved.thread.id !== selectedThreadId)) return;
+      place.view !== viewKey()) return;
   const row = [...visibleList().children].find((candidate) =>
     candidate.getAttribute("data-context-id") === place.anchor || idsOf(candidate).includes(place.anchor));
   if (!row) return;
@@ -6813,9 +6924,12 @@ async function changeChannelView(view, threadId = null, summary = null) {
   timelineThreads = held ? held.threads : [];
   selectedThread = summary || (held && held.selected) || null;
   // `#189 restore-ui-state`. The reader's own choice: it outranks the default from here on, and it
-  // is what a reopen comes back to.
-  channelViewChosen = true;
-  savedChoice = null;
+  // is what a reopen comes back to — and, `#205 channel-view-memory`, what this channel opens in
+  // whenever the reader comes back to it. All too: what was picked, not whatever the default is.
+  const chosen = viewOnScreen();
+  if (chosen) rememberChosenView(chosen);
+  // The Threads list is not a view a channel opens in: picked, it leaves the channel to its default.
+  else forgetChosenViews((channel) => channel === String(el("discord-channel").value));
   uiStateSettled = true;
   saveUiState();
   discordMoreAbove = held ? held.more : false;
@@ -15377,6 +15491,13 @@ function applyClientConfig(config) {
   startChannelStream(select.value);
   clientConfigApplied = true;
   saveCacheShell(config);
+  // ...and the views chosen in channels it no longer lists, as their saved rows went: a thread's
+  // summary is the credential's reading too. `#205 channel-view-memory`.
+  const listed = new Set(knownChannels.map((channel) => String(channel.id)));
+  if (chosenViewsNow().some((entry) => !listed.has(entry.channel))) {
+    forgetChosenViews((channel) => !listed.has(channel));
+    saveUiState();
+  }
 }
 
 /**
@@ -15880,9 +16001,9 @@ function changeSelectedChannel() {
   applyChannelProvider();
   rememberActiveChannel();
   rememberChannelDraft();
-  // `#189 restore-ui-state`. Another channel opens in ITS default — All where it has threads — and a
-  // choice made in the last one, saved or not, is not carried into it.
-  savedChoice = null;
+  // `#205 channel-view-memory`. Another channel opens in the view the reader chose there, and in ITS
+  // default — All where it has threads — when they chose none: a choice made in the last channel is
+  // that channel's, and it waits there for the reader to come back. The first read is the view's.
   uiStateSettled = true;
   openChannelView();
   channelHasThreads = false;

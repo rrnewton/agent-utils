@@ -2639,9 +2639,19 @@ const TUNING_BANDS = {
     "the outbox must never be the thing refused; below a hundred thousand a single long page of " +
     "assistant answers no longer fits"],
   // `#189 restore-ui-state`. The record a reopen comes back to.
-  UI_STATE_VERSION: [1, 1,
-    "the saved view-and-place record's shape. Changing it reopens every device on the call view in " +
-    "the default channel view, once, which is the right answer to a new shape and must be seen"],
+  UI_STATE_VERSION: [2, 2,
+    "the saved view-and-place record's shape. The one before it is carried forward (#205 " +
+    "channel-view-memory); any other reopens every device on the call view, every channel in its " +
+    "default view, once, which is the right answer to a new shape and must be seen"],
+  // `#205 channel-view-memory`. The channels whose chosen view the record keeps.
+  UI_STATE_CHANNELS: [10, 200,
+    "channels whose chosen view is kept. Under ten, a reader moving among a dozen channels finds " +
+    "the ones they left longest ago back in the default; past a couple of hundred it mostly keeps " +
+    "choices made in channels nobody opens any more"],
+  UI_STATE_CHARS: [20000, 200000,
+    "the whole record in UTF-16 units. A remembered thread carries its root message, so under " +
+    "twenty thousand a few long roots push every other channel's choice out; past two hundred " +
+    "thousand a record of choices rivals the message snapshot for the quota"],
   HOLD_MS: [250, 1500,
     "how long a finger rests before the row shows who sent it and when. Below about a quarter of " +
     "a second an ordinary tap becomes a hold and the message stops folding; past a second and a " +
@@ -23699,7 +23709,7 @@ test("a channel opens in All where its provider has threads, and in Main where i
   assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"]);
   assert.deepStrictEqual(readKinds(page), ["flat"], "the channel was not read once, as All");
 
-  // The reader prefers Main here. A choice in one channel is not carried into the next.
+  // The reader prefers Main here. A choice in one channel is not carried into the next...
   await pickThread(page, "main");
   page.el("discord-channel").value = plain.id;
   await page.el("discord-channel").dispatch("change");
@@ -23708,11 +23718,12 @@ test("a channel opens in All where its provider has threads, and in Main where i
   assert.equal(page.el("thread-select").disabled, true);
   assert.deepStrictEqual(shownIds(page), ["310"]);
 
+  // ...but it is kept in the channel it was made in. `#205 channel-view-memory`.
   page.el("discord-channel").value = CHANNEL.id;
   await page.el("discord-channel").dispatch("change");
   await page.settle();
-  assert.equal(page.el("thread-select").value, "flat", "coming back did not open in the default, All");
-  assert.equal(readKinds(page).at(-1), "flat");
+  assert.equal(page.el("thread-select").value, "main", "coming back did not open in the view chosen here");
+  assert.equal(readKinds(page).at(-1), "main");
 });
 
 test("a reload reopens the channel, the thread and Hide read as the reader left them, reading only that thread", async () => {
@@ -23766,8 +23777,8 @@ test("a reload reopens the channel, the thread and Hide read as the reader left 
 
 test("the reader's own choice of Main outlives the default across a reload", async () => {
   const first = await threadPage("main");
-  assert.equal(savedUiState(first).channelView, "main");
-  assert.equal(savedUiState(first).chosen, true, "picking Main was not recorded as a choice");
+  assert.deepStrictEqual(savedUiState(first).channels, [{ channel: CHANNEL.id, channelView: "main", thread: null }],
+    "picking Main was not recorded as this channel's choice");
   const page = reloadWith(first.storage, threadData().messages, (p) => {
     p.threadingSupported = true;
     p.threads = threadData().threads;
@@ -23888,7 +23899,7 @@ test("Main drawn before threads were known gives way to All once the provider sa
   const first = newPage();
   await signIn(first);
   await showDiscord(first, [message({ id: "330", content: "from before threads" })]);
-  assert.equal(savedUiState(first).chosen, false);
+  assert.deepStrictEqual(savedUiState(first).channels, [], "a view nobody chose was recorded as a choice");
   const data = threadData();
   const page = reloadWith(first.storage, data.messages, (p) => {
     p.threadingSupported = true;
@@ -24112,6 +24123,310 @@ test("signing out forgets where the reader was, with the messages", async () => 
   assert.equal(again.screen(), "signin");
   await signIn(again);
   assert.equal(again.tab(), "voice", "a signed-out record reopened the channel");
+});
+
+// --- `#205 channel-view-memory`: each channel keeps the view the reader chose in it -------------
+//
+// The owner, 2026-10-04 16:18: "All should be the default but if changed the selection should be
+// saved for that channel. Ideally it should survive restarts. Stored in local client state ideally
+// but server side if needed." A choice used to last only until the channel changed. It is now kept
+// per channel, in the record `#189 restore-ui-state` reopens on.
+
+/** Two channels on providers with threads, each serving `threadData`: signed in, in the first, in All. */
+async function twoThreadedChannels() {
+  const page = newPage();
+  const data = threadData();
+  page.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  return page;
+}
+
+/** Pick channel `id` in the bar, as a finger does. The channel reads that made, as `readKinds` names them. */
+async function changeChannelTo(page, id) {
+  const before = readKinds(page).length;
+  page.el("discord-channel").value = id;
+  await page.el("discord-channel").dispatch("change");
+  await page.settle();
+  return readKinds(page).slice(before);
+}
+
+/** A reload over the same storage and the same two channels. */
+const reloadTwoChannels = (store, script = SCRIPT) => newPage(store, script, (p) => {
+  p.messages = threadData().messages;
+  p.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
+  p.threadingSupported = true;
+  p.threads = threadData().threads;
+});
+
+test("a channel reopens in the view chosen in it, one nobody chose a view in opens in All, and each reads only that view", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    const data = threadData();
+    page.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
+    page.threadingSupported = true;
+    page.threads = data.threads;
+    await signIn(page);
+    await showDiscord(page, data.messages);
+    await pickThread(page, "main");
+    const other = await changeChannelTo(page, OTHER_CHANNEL.id);
+    const otherView = page.el("thread-select").value;
+    const back = await changeChannelTo(page, CHANNEL.id);
+    return { page, other, otherView, back };
+  };
+  const { page, other, otherView, back } = await run(SCRIPT);
+  assert.equal(otherView, "flat", "a channel nobody chose a view in did not open in All");
+  assert.deepStrictEqual(other, ["flat"], "the other channel was not read once, as All");
+  assert.equal(page.el("thread-select").value, "main", "Main, chosen here, did not outlast a look at another channel");
+  assert.deepStrictEqual(back, ["main"], "coming back did not read Main, once");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
+  assert.deepStrictEqual(savedUiState(page).channels, [{ channel: CHANNEL.id, channelView: "main", thread: null }],
+    "a channel nobody chose a view in was recorded as choosing one");
+
+  // THE CONTROL: with the choice not kept, coming back opens in All, and this fails.
+  const control = await run(brokenScript("  if (chosen) rememberChosenView(chosen);", "  if (chosen) void chosen;"));
+  assert.equal(control.page.el("thread-select").value, "flat", "the test cannot tell a kept choice from none");
+
+  // The Threads list is not a view a channel opens in: picked, it leaves the channel to its default.
+  await page.el("channel-view-threads").click();
+  await page.settle();
+  assert.deepStrictEqual(savedUiState(page).channels, [], "the Threads list left Main standing as the channel's choice");
+
+  // All, picked, is a choice like any other: it outlasts a default that is no longer All.
+  await changeChannelTo(page, OTHER_CHANNEL.id);
+  await pickThread(page, "main");
+  await pickThread(page, "flat");
+  await page.setVisibility("hidden");
+  const mainByDefault = reloadTwoChannels(page.storage,
+    brokenScript('  return threadingSupported ? "flat" : "main";', '  return "main";'));
+  await reopenedChannel(mainByDefault);
+  assert.equal(mainByDefault.el("discord-channel").value, OTHER_CHANNEL.id);
+  assert.equal(mainByDefault.el("thread-select").value, "flat", "All, picked, gave way to the default");
+  assert.deepStrictEqual(readKinds(mainByDefault), ["flat"]);
+});
+
+test("a thread chosen in one channel and Main in another both outlast a reload", async () => {
+  const first = await twoThreadedChannels();
+  const id = first.threads[0].id;
+  // A finger touches the picker before it chooses: that reads the thread list, which names it.
+  await first.el("thread-select").dispatch("pointerdown");
+  await first.settle();
+  await pickThread(first, `thread:${id}`);
+  await changeChannelTo(first, OTHER_CHANNEL.id);
+  await pickThread(first, "main");
+  assert.deepStrictEqual(await changeChannelTo(first, CHANNEL.id), [`thread:${id}`], "coming back did not read the thread, once");
+  assert.equal(first.el("thread-select").value, `thread:${id}`, "the thread chosen here was not reopened");
+  assert.equal(first.el("thread-title").textContent, "First discussion");
+  assert.deepStrictEqual(shownIds(first), ["201", "202"]);
+  await changeChannelTo(first, OTHER_CHANNEL.id);
+  await first.setVisibility("hidden");
+
+  const page = reloadTwoChannels(first.storage);
+  assert.equal(page.el("discord-channel").value, OTHER_CHANNEL.id);
+  assert.equal(page.el("thread-select").value, "main", "the channel the app was left on did not reopen in its Main");
+  await reopenedChannel(page);
+  assert.deepStrictEqual(readKinds(page), ["main"], "the reopen read more than the view chosen");
+  assert.deepStrictEqual(await changeChannelTo(page, CHANNEL.id), [`thread:${id}`],
+    "the other channel did not reopen its thread with one read");
+  assert.equal(page.el("thread-select").value, `thread:${id}`);
+  assert.equal(page.el("thread-title").textContent, "First discussion", "the reopened thread has no name");
+  assert.deepStrictEqual(shownIds(page), ["201", "202"]);
+  // Back goes where the thread was opened from: All.
+  await page.el("thread-back").click();
+  await page.settle();
+  assert.equal(page.el("thread-select").value, "flat");
+});
+
+test("a chosen thread falls back to All once the device no longer knows it, and to Main where threads are gone", async () => {
+  const page = await twoThreadedChannels();
+  const id = page.threads[0].id;
+  await pickThread(page, `thread:${id}`);
+  await changeChannelTo(page, OTHER_CHANNEL.id);
+  // The device gives up its snapshot, and the first channel's thread with it.
+  page.storage.delete(MESSAGE_CACHE_KEY);
+  assert.deepStrictEqual(await changeChannelTo(page, CHANNEL.id), ["flat"], "the fallback did not read All, once");
+  assert.equal(page.el("thread-select").value, "flat", "a thread the device no longer knows was reopened");
+  assert.equal(page.el("thread-heading").hidden, true);
+  assert.deepStrictEqual(savedUiState(page).channels, [], "the lost thread is still kept as the channel's choice");
+  // All's read put the thread back in the store. The channel does not go back to it for that.
+  await changeChannelTo(page, OTHER_CHANNEL.id);
+  assert.deepStrictEqual(await changeChannelTo(page, CHANNEL.id), ["flat"]);
+  assert.equal(page.el("thread-select").value, "flat", "a thread given up came back on a later visit");
+
+  // A channel whose provider no longer has threads opens in Main, the whole channel, read once.
+  const data = threadData();
+  const providers = [{ ...CHANNEL, provider: "threaded" }, { ...OTHER_CHANNEL, provider: "elsewhere" }];
+  const before = newPage();
+  before.channels = providers;
+  before.providers = [providerOf("threaded", true), providerOf("elsewhere", true)];
+  before.threadingSupported = true;
+  before.threads = data.threads;
+  await signIn(before);
+  await showDiscord(before, data.messages);
+  await changeChannelTo(before, OTHER_CHANNEL.id);
+  await pickThread(before, `thread:${id}`);
+  await changeChannelTo(before, CHANNEL.id);
+  const after = reloadWith(before.storage, data.messages, (p) => {
+    p.channels = providers;
+    p.providers = [providerOf("threaded", true), providerOf("elsewhere", false)];
+    p.threadingSupported = true;
+    p.threads = data.threads;
+  });
+  await reopenedChannel(after);
+  assert.deepStrictEqual(await changeChannelTo(after, OTHER_CHANNEL.id), ["page"]);
+  assert.equal(after.el("thread-select").value, "main", "a channel without threads did not open in Main");
+  assert.equal(after.el("thread-heading").hidden, true, "a thread heading stood over a channel without threads");
+});
+
+test("the choices kept are bounded, and the channel least recently on screen gives its up first", async () => {
+  const LIMIT = sourceConstant("UI_STATE_CHANNELS");
+  const CHARS = sourceConstant("UI_STATE_CHARS");
+  const rooms = Array.from({ length: LIMIT + 5 }, (_unused, i) =>
+    ({ id: `33300000000000${String(i).padStart(5, "0")}`, label: `room ${i}`, writable: true }));
+  const roomIds = rooms.map((room) => room.id);
+  const first = await threadPage("main");
+  const record = savedUiState(first);
+  const reload = (choices) => {
+    const store = new Map(first.storage);
+    store.set(UI_STATE_KEY, JSON.stringify({ ...record, channels: choices }));
+    return reloadWith(store, threadData().messages, (p) => {
+      p.channels = [{ ...CHANNEL }, ...rooms];
+      p.threadingSupported = true;
+      p.threads = threadData().threads;
+    });
+  };
+
+  // More choices than the bound, the most recent first, as a record from a larger bound would hold.
+  const page = reload(rooms.map((room) => ({ channel: room.id, channelView: "main", thread: null })));
+  await reopenedChannel(page);
+  assert.deepStrictEqual(savedUiState(page).channels.map((entry) => entry.channel), roomIds.slice(0, LIMIT),
+    "a record past the bound was kept past it, or not by recency");
+  await pickThread(page, "main");
+  assert.deepStrictEqual(savedUiState(page).channels.map((entry) => entry.channel), [CHANNEL.id, ...roomIds.slice(0, LIMIT - 1)],
+    "a new choice did not push out the choice of the channel least recently on screen");
+  assert.deepStrictEqual(await changeChannelTo(page, rooms[0].id), ["main"], "a kept choice did not open its channel");
+  assert.equal(savedUiState(page).channels[0].channel, rooms[0].id, "a channel back on screen is not the last to go");
+
+  // A few long thread roots cannot grow the record past its size: the least recent give way.
+  const long = threadData().threads[0];
+  const page2 = reload(rooms.slice(0, 30).map((room, i) => {
+    const thread = `spaces/B/threads/${i}`;
+    return {
+      channel: room.id, channelView: "thread",
+      thread: { id: thread, origin: "flat",
+        summary: { ...long, id: thread, root: { ...long.root, content: "a long thread root. ".repeat(200) } } },
+    };
+  }));
+  await reopenedChannel(page2);
+  assert.ok(page2.storage.get(UI_STATE_KEY).length <= CHARS, "the record grew past its size");
+  const kept = savedUiState(page2).channels.map((entry) => entry.channel);
+  assert.ok(kept.length > 0 && kept.length < 30, `the size bound kept ${kept.length} of 30 choices`);
+  assert.deepStrictEqual(kept, roomIds.slice(0, kept.length), "the size bound did not give up the least recent first");
+});
+
+test("a record saved before each channel kept its own view is carried forward, not discarded", async () => {
+  // As the page before `#205 channel-view-memory` wrote it: one view, for the channel selected then,
+  // and whether the reader chose it.
+  const first = await threadPage();
+  const id = first.threads[0].id;
+  await first.el("thread-select").dispatch("pointerdown");
+  await first.settle();
+  await pickThread(first, `thread:${id}`);
+  await first.setVisibility("hidden");
+  const now = savedUiState(first);
+  const v1 = {
+    v: 1, identity: now.identity, view: "discord", todo: true, channel: CHANNEL.id,
+    channelView: "thread", chosen: true, thread: { id, origin: "flat", summary: now.channels[0].thread.summary },
+    place: null,
+  };
+  first.storage.set(UI_STATE_KEY, JSON.stringify(v1));
+  const page = reloadWith(first.storage, threadData().messages, (p) => {
+    p.threadingSupported = true;
+    p.threads = threadData().threads;
+  });
+  assert.equal(page.tab(), "discord", "a v1 record did not reopen the channel");
+  assert.equal(page.el("thread-select").value, `thread:${id}`, "the thread a v1 record chose was not reopened");
+  assert.equal(page.el("thread-title").textContent, "First discussion");
+  assert.equal(page.el("todo-filter").getAttribute("aria-pressed"), "true", "a v1 record's Hide read was lost");
+  await reopenedChannel(page);
+  assert.deepStrictEqual(readKinds(page), [`thread:${id}`], "the reopen read more than the thread");
+  const carried = savedUiState(page);
+  assert.equal(carried.v, 2);
+  assert.deepStrictEqual(carried.channels.map(({ channel, channelView, thread }) => [channel, channelView, thread.id, thread.origin]),
+    [[CHANNEL.id, "thread", id, "flat"]], "the v1 record's choice did not become its channel's");
+
+  // A place it kept is a place in the view it kept, and the reader comes back to their message.
+  const channel = tallChannel();
+  const tall = newPage();
+  await signIn(tall);
+  await showDiscord(tall, channel);
+  const area = tall.el("scroll-area");
+  area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) * 0.5);
+  const anchor = tall.el("discord-log").children.find((li) => li.getBoundingClientRect().bottom > 0);
+  const left = { id: anchor.getAttribute("data-id"), top: anchor.getBoundingClientRect().top };
+  await tall.setVisibility("hidden");
+  const kept = savedUiState(tall);
+  assert.equal(kept.place.view, "main");
+  const place = { ...kept.place };
+  delete place.view;
+  tall.storage.set(UI_STATE_KEY, JSON.stringify({
+    v: 1, identity: kept.identity, view: "discord", todo: false, channel: CHANNEL.id,
+    channelView: "main", chosen: false, thread: null, place,
+  }));
+  const back = newPage(tall.storage, SCRIPT, (p) => { p.messages = channel; });
+  const row = back.el("discord-log").children.find((li) => li.getAttribute("data-id") === left.id);
+  assert.equal(row.getBoundingClientRect().top, left.top, "a v1 record's place was not returned to");
+  await reopenedChannel(back);
+  assert.deepStrictEqual(savedUiState(back).channels, [], "a view the v1 record did not choose became a choice");
+
+  // One that is not a sound v1 record is deleted, as a damaged record is.
+  const store = new Map(first.storage);
+  store.set(UI_STATE_KEY, JSON.stringify({ ...v1, chosen: "yes" }));
+  const damaged = reloadWith(store, threadData().messages, (p) => { p.threadingSupported = true; });
+  assert.equal(damaged.tab(), "voice", "a damaged v1 record reopened anything");
+  assert.deepStrictEqual(savedUiState(damaged).channels, [], "a damaged v1 record left a choice behind");
+  await damaged.settle();
+});
+
+test("a channel the server stops listing loses its choice with its saved rows", async () => {
+  const first = await twoThreadedChannels();
+  await changeChannelTo(first, OTHER_CHANNEL.id);
+  await pickThread(first, `thread:${first.threads[0].id}`);
+  await changeChannelTo(first, CHANNEL.id);
+  await pickThread(first, "main");
+  assert.deepStrictEqual(savedUiState(first).channels.map((entry) => entry.channel), [CHANNEL.id, OTHER_CHANNEL.id]);
+  const page = reloadWith(first.storage, threadData().messages, (p) => {
+    p.threadingSupported = true;
+    p.threads = threadData().threads;
+  });
+  await reopenedChannel(page);
+  assert.deepStrictEqual(savedUiState(page).channels.map((entry) => entry.channel), [CHANNEL.id],
+    "a channel no longer listed kept its choice, and the summary of the thread it chose");
+});
+
+test("signing out, or a token replaced underneath the page, forgets every channel's choice", async () => {
+  const page = await twoThreadedChannels();
+  await pickThread(page, "main");
+  await changeChannelTo(page, OTHER_CHANNEL.id);
+  await pickThread(page, `thread:${page.threads[0].id}`);
+  assert.equal(savedUiState(page).channels.length, 2);
+  await page.el("forget-token").click();
+  assert.equal(page.storage.has(UI_STATE_KEY), false, "the choices outlived the credential that made them");
+  await signIn(page);
+  assert.equal(page.el("thread-select").value, "flat", "a signed-out choice reopened the channel on screen");
+  await changeChannelTo(page, CHANNEL.id);
+  assert.equal(page.el("thread-select").value, "flat", "a signed-out choice opened the other channel");
+
+  // Another tab, or the main app, replaces the token without a sign-out here.
+  const other = await twoThreadedChannels();
+  await pickThread(other, "main");
+  other.storage.set(TOKEN_STORAGE_KEY, "write-token-dddddddddddddddd");
+  await changeChannelTo(other, OTHER_CHANNEL.id);
+  await changeChannelTo(other, CHANNEL.id);
+  assert.equal(other.el("thread-select").value, "flat", "a choice made under the last token opened a channel for the new one");
+  assert.deepStrictEqual(savedUiState(other).channels, [], "the last token's choices were written under the new one's name");
 });
 
 // --- `#203 incremental-refresh`: a refresh asks only for what changed ---------------------------
