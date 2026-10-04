@@ -389,7 +389,9 @@ function showScreen(name) {
     // The composer lives in the control bar now, and leaving the call screen leaves text entry:
     // coming back should show the bar as it rests, not with a field standing open from a visit to
     // Settings. `#59 text-entry-button`. `renderControlBar` below is what actually redraws it.
-    textMode = false;
+    // UNLESS something is written there: a field that folds away under a half-typed message reads
+    // as the message being lost, even though the text is still in it. `#193 compose-draft-loss`.
+    if (!el("compose-text").value.trim()) textMode = false;
   }
   // Help is reached FROM settings and returns TO it, so it must not become the thing settings
   // remembers to go back to — that would make the gear's way out lead into the document the
@@ -2133,6 +2135,7 @@ function sendUserMessage(text, options) {
   noteTypedTurn(said);
   if (fromComposer) {
     el("compose-text").value = "";
+    rememberComposeDraft();
     el("compose-text").focus();
   }
   setStatus("Sent.");
@@ -2163,6 +2166,33 @@ function noteComposing() {
   }
   lastActivityAt = now;
   return true;
+}
+
+// `#193 compose-draft-loss`. What is typed into the call composer survives a reload or a killed
+// PWA, as the channel and reply composers already do. Cleared only by a send that went.
+const COMPOSE_DRAFT_KEY = "vibe-talk.voice.compose-draft";
+
+function rememberComposeDraft() {
+  const text = el("compose-text").value;
+  try {
+    if (text.trim()) {
+      if (!storedExactly(COMPOSE_DRAFT_KEY, text)) {
+        setStatus("This browser could not save what you typed. Keep this page open until you send it.");
+      }
+    } else {
+      localStorage.removeItem(COMPOSE_DRAFT_KEY);
+    }
+  } catch (_error) {
+    // Storage refused outright: the text is still in the field, which is all that can be kept.
+  }
+}
+
+function storedComposeDraft() {
+  try {
+    return localStorage.getItem(COMPOSE_DRAFT_KEY) || "";
+  } catch (_error) {
+    return "";
+  }
 }
 
 // `#59 text-entry-button`. The composer is not a row of its own any more: pressing Type CONVERTS
@@ -12891,7 +12921,11 @@ el("text-entry").addEventListener("click", guardQuietly(onTextEntry));
 // `guardQuietly`, NOT `guard`. `guard()` calls `teardown()`, so a send that failed would hang up on
 // the owner — which is the one thing a failed message must never do.
 el("send-text").addEventListener("click", guardQuietly(sendTyped));
-el("compose-text").addEventListener("input", noteComposing);
+el("compose-text").value = storedComposeDraft();
+el("compose-text").addEventListener("input", () => {
+  rememberComposeDraft();
+  noteComposing();
+});
 // `#60 canned-prompt-buttons`. ONE loop over the list: the field is restored, the field is saved
 // when it changes, and the button sends whatever the field says. A third canned prompt is one more
 // entry in `CANNED_PROMPTS` and one more pair of elements in web/voice.html — there is deliberately
@@ -12902,6 +12936,9 @@ el("compose-text").addEventListener("input", noteComposing);
 // markup would then be two different answers to "what does this button send".
 for (const entry of CANNED_PROMPTS) {
   /** @type {HTMLTextAreaElement} */ (el(entry.field)).value = storedPrompts()[entry.key];
+  // `input` as well as `change`: `change` waits for the field to lose focus, and a phone that kills
+  // the app while the field still has it never gets one. `#193 compose-draft-loss`.
+  el(entry.field).addEventListener("input", promptsChanged);
   el(entry.field).addEventListener("change", promptsChanged);
   el(entry.button).addEventListener("click", () => {
     // Shut FIRST, and whether or not the send goes. Choosing from a menu closes it — and when the

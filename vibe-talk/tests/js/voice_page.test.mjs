@@ -12950,6 +12950,40 @@ test("TYPING A MESSAGE SENDS user_message, AND NOTHING ELSE", async () => {
   assert.equal(page.el("compose-text").value, "", "the sent text was left in the box");
 });
 
+test("a half-typed message to the agent survives a trip to Settings and a reload", async () => {
+  // `#193 compose-draft-loss`. The channel and reply composers already kept their drafts; this one
+  // kept nothing, and folded the field away whenever the reader left the call screen, so a long
+  // message looked lost on the way back and WAS lost if the phone killed the app.
+  const store = new Map();
+  const page = newPage(store);
+  await signIn(page);
+  const socket = await startTalking(page);
+  await compose(page, "a long thought about the retry budget");
+
+  await page.el("open-settings").click();
+  await page.el("close-settings").click();
+  assert.equal(page.el("compose-text").hidden, false, "the field folded away under a draft");
+  assert.equal(page.el("compose-text").value, "a long thought about the retry budget");
+
+  const reloaded = newPage(store);
+  await signIn(reloaded);
+  assert.equal(
+    reloaded.el("compose-text").value,
+    "a long thought about the retry budget",
+    "the typed message did not survive a reload"
+  );
+
+  // A send that went is what ends the draft — not leaving, and not reloading.
+  await page.el("send-text").click();
+  assert.equal(typedFrames(socket).length, 1);
+  assert.equal(store.get("vibe-talk.voice.compose-draft"), undefined, "a sent message stayed a draft");
+
+  // ...and an empty field closes as it always did.
+  await page.el("open-settings").click();
+  await page.el("close-settings").click();
+  assert.equal(page.el("compose-text").hidden, true, "an empty field stayed open off its screen");
+});
+
 test("a typed turn and a spoken turn land in the SAME transcript", async () => {
   // The whole reason this is a client event rather than a second mode: as far as the conversation
   // is concerned, typing and speaking are the same act, so the record of them must be one record.
