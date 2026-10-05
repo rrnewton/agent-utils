@@ -12,18 +12,33 @@
 //! stdout is teed the same way (through a pseudo-terminal when gh-paced's stdout is a terminal)
 //! and fed to the scanner's header parser, so a `Retry-After` or `x-ratelimit-remaining: 0`
 //! header is seen. A command with a deadline (a watch) is sent SIGTERM when the deadline passes
-//! and SIGKILL [`KILL_GRACE_SECS`] later. A write lease descriptor is left open across exec so the
-//! lease lives as long as gh does.
+//! and SIGKILL [`KILL_GRACE_SECS`] later. The write lease descriptor and the snapshot lock
+//! descriptor are left open across exec, so the lease and the snapshot live as long as gh does.
+//!
+//! Each teed stream has two threads. The reader takes bytes from gh, feeds them to the scanner
+//! first, then queues them; the writer copies the queue to gh-paced's own stream. A slow
+//! consumer therefore never delays scanning, and gh feels the same back-pressure it would
+//! without gh-paced once [`TEE_QUEUE_BYTES`] are queued. After gh exits the reader stops
+//! applying back-pressure (all gh wrote is then at most a pipe's worth, already in the kernel)
+//! and stops at end of file, or once the stream has been silent for [`TEE_IDLE_SECS`] (a
+//! descendant holds it open), or [`TEE_AFTER_EXIT_SECS`] after gh exited, or after
+//! [`TEE_AFTER_EXIT_BYTES`] more bytes (a descendant keeps writing). The writer is then waited
+//! for without a time limit, so every byte read reaches the consumer however slowly it reads;
+//! if the consumer goes away (EPIPE), the rest is discarded and reading carries on. A user-sent
+//! INT, TERM, HUP or QUIT that arrives after gh has exited abandons whatever is still undelivered
+//! and is reported in [`Ran::late_signal`], so gh-paced can die by it after its bookkeeping
+//! rather than wait indefinitely on a consumer that has stopped reading.
 
 use crate::pushback::Scanner;
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// How the child ended.
@@ -37,6 +52,18 @@ pub enum Exit {
 
 /// Seconds between SIGTERM and SIGKILL when a deadline passes.
 pub const KILL_GRACE_SECS: f64 = 5.0;
+
+/// Bytes a tee holds for a slow consumer before gh has to wait for it, while gh runs.
+pub const TEE_QUEUE_BYTES: usize = 8 << 20;
+
+/// After gh exits, a tee stops reading once its stream has been silent this long.
+pub const TEE_IDLE_SECS: f64 = 2.0;
+
+/// After gh exits, a tee stops reading this long after the exit, whatever is still arriving.
+pub const TEE_AFTER_EXIT_SECS: f64 = 5.0;
+
+/// After gh exits, a tee stops reading after this many more bytes.
+pub const TEE_AFTER_EXIT_BYTES: usize = 64 << 20;
 
 /// One child process to run.
 #[derive(Debug, Clone)]
@@ -53,8 +80,8 @@ pub struct Invocation<'a> {
     /// Stop the child once it has run this many seconds (SIGTERM, then SIGKILL after
     /// [`KILL_GRACE_SECS`]). `None`: no limit.
     pub deadline_secs: Option<f64>,
-    /// A descriptor the child keeps open across exec (the write lease).
-    pub keep_fd: Option<RawFd>,
+    /// Descriptors the child keeps open across exec (the write lease, the snapshot lock).
+    pub keep_fds: Vec<RawFd>,
     /// Tee stdout through gh-paced and feed it to [`Scanner::feed_headers`].
     pub scan_stdout: bool,
 }
@@ -66,6 +93,9 @@ pub struct Ran {
     pub exit: Exit,
     /// The child was stopped because its deadline passed.
     pub deadline_hit: bool,
+    /// A user-sent signal that arrived after gh exited, while its output was still being
+    /// delivered; the undelivered rest was abandoned.
+    pub late_signal: Option<i32>,
 }
 
 /// Output of a captured (non-interactive) run.
@@ -96,6 +126,9 @@ pub struct RealRunner;
 
 static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 
+/// A forwarded signal that arrived when there was no child to forward it to.
+static LATE_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
 const FORWARDED: [libc::c_int; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
 
 extern "C" fn forward_signal(
@@ -119,6 +152,8 @@ extern "C" fn forward_signal(
             unsafe {
                 libc::kill(pid, sig);
             }
+        } else {
+            LATE_SIGNAL.store(sig, Ordering::SeqCst);
         }
     }
 }
@@ -262,25 +297,116 @@ enum Stream {
     Out,
 }
 
-/// Copy `src` to our stream and the scanner until EOF (EIO from a pty master counts as EOF).
-fn tee(mut src: File, which: Stream, scanner: Arc<Mutex<Scanner>>, done: mpsc::Sender<()>) {
-    let mut buf = vec![0u8; 16 * 1024];
+/// The queue between a tee's reader and writer.
+#[derive(Default)]
+struct TeeQueue {
+    chunks: VecDeque<Vec<u8>>,
+    bytes: usize,
+    /// The reader has stopped; the writer exits once the queue is empty.
+    closed: bool,
+    /// Our stream refused a write; later bytes are discarded.
+    broken: bool,
+}
+
+/// State shared by one tee's reader, its writer, and the thread waiting for gh.
+#[derive(Default)]
+struct Tee {
+    queue: Mutex<TeeQueue>,
+    changed: Condvar,
+    /// gh has exited.
+    child_exited: AtomicBool,
+}
+
+impl Tee {
+    fn lock(&self) -> std::sync::MutexGuard<'_, TeeQueue> {
+        self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Queue `bytes`, waiting while the queue is full and gh is still running.
+    fn push(&self, bytes: Vec<u8>) {
+        let mut q = self.lock();
+        while q.bytes >= TEE_QUEUE_BYTES && !q.broken && !self.child_exited.load(Ordering::SeqCst) {
+            q = self
+                .changed
+                .wait_timeout(q, Duration::from_millis(100))
+                .map(|(g, _)| g)
+                .unwrap_or_else(|e| e.into_inner().0);
+        }
+        if !q.broken {
+            q.bytes += bytes.len();
+            q.chunks.push_back(bytes);
+        }
+        drop(q);
+        self.changed.notify_all();
+    }
+
+    fn close(&self) {
+        self.lock().closed = true;
+        self.changed.notify_all();
+    }
+
+    fn child_exited(&self) {
+        self.child_exited.store(true, Ordering::SeqCst);
+        self.changed.notify_all();
+    }
+
+    /// Stop delivering: discard what is queued and anything read later.
+    fn abandon(&self) {
+        let mut q = self.lock();
+        q.broken = true;
+        q.chunks.clear();
+        q.bytes = 0;
+        drop(q);
+        self.changed.notify_all();
+    }
+}
+
+/// Wait up to `ms` for `fd` to become readable (or hung up). True when a read will not block.
+fn readable(fd: RawFd, ms: i32) -> bool {
+    let mut p = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: polling one valid descriptor with a stack pollfd.
+    let n = unsafe { libc::poll(&mut p, 1, ms) };
+    n > 0
+}
+
+/// Read `src` until it ends (EIO from a pty master counts as the end), feeding the scanner
+/// before queueing each chunk, and stopping early after gh's exit as described in the module
+/// documentation.
+fn tee_reader(mut src: File, which: Stream, scanner: Arc<Mutex<Scanner>>, tee: Arc<Tee>) {
+    let fd = src.as_raw_fd();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut last_data = Instant::now();
+    let mut exited_at: Option<Instant> = None;
+    let mut after_exit = 0usize;
     loop {
+        if exited_at.is_none() && tee.child_exited.load(Ordering::SeqCst) {
+            exited_at = Some(Instant::now());
+            last_data = Instant::now();
+        }
+        if let Some(at) = exited_at {
+            let now = Instant::now();
+            if now.duration_since(last_data).as_secs_f64() >= TEE_IDLE_SECS
+                || now.duration_since(at).as_secs_f64() >= TEE_AFTER_EXIT_SECS
+                || after_exit >= TEE_AFTER_EXIT_BYTES
+            {
+                break;
+            }
+        }
+        if !readable(fd, 100) {
+            continue;
+        }
         match src.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                // A closed or broken output must not stop the drain.
-                match which {
-                    Stream::Err => {
-                        let mut e = std::io::stderr();
-                        let _ = e.write_all(&buf[..n]);
-                        let _ = e.flush();
-                    }
-                    Stream::Out => {
-                        let mut o = std::io::stdout();
-                        let _ = o.write_all(&buf[..n]);
-                        let _ = o.flush();
-                    }
+                last_data = Instant::now();
+                if exited_at.is_some() {
+                    after_exit += n;
                 }
                 if let Ok(mut s) = scanner.lock() {
                     match which {
@@ -288,12 +414,53 @@ fn tee(mut src: File, which: Stream, scanner: Arc<Mutex<Scanner>>, done: mpsc::S
                         Stream::Out => s.feed_headers(&buf[..n]),
                     }
                 }
+                tee.push(buf[..n].to_vec());
             }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => break,
         }
     }
-    let _ = done.send(());
+    tee.close();
+}
+
+/// Copy the queue to our stream until the reader has stopped and the queue is empty. A write
+/// error (the consumer went away) marks the queue broken and discards the rest.
+fn tee_writer(which: Stream, tee: Arc<Tee>) {
+    loop {
+        let chunk = {
+            let mut q = tee.lock();
+            loop {
+                if let Some(c) = q.chunks.pop_front() {
+                    q.bytes -= c.len();
+                    break Some(c);
+                }
+                if q.closed {
+                    break None;
+                }
+                q = tee
+                    .changed
+                    .wait(q)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        };
+        tee.changed.notify_all();
+        let Some(chunk) = chunk else {
+            return;
+        };
+        let written = match which {
+            Stream::Err => {
+                let mut e = std::io::stderr();
+                e.write_all(&chunk).and_then(|()| e.flush())
+            }
+            Stream::Out => {
+                let mut o = std::io::stdout();
+                o.write_all(&chunk).and_then(|()| o.flush())
+            }
+        };
+        if written.is_err() {
+            tee.abandon();
+        }
+    }
 }
 
 /// A child stream gh-paced reads: the child's end goes into the Command, the reader is kept.
@@ -388,20 +555,20 @@ fn feed_stdin(child: &mut std::process::Child, data: Option<Vec<u8>>) {
 impl Runner for RealRunner {
     fn run(&self, inv: Invocation<'_>, scanner: &mut Scanner) -> Result<Ran, String> {
         let shared = Arc::new(Mutex::new(std::mem::take(scanner)));
-        let (done_tx, done_rx) = mpsc::channel();
         let err_cap = capture_for(2);
         let out_cap = if inv.scan_stdout {
             Some(capture_for(1))
         } else {
             None
         };
-        let keep_fd = inv.keep_fd;
+        let keep_fds = inv.keep_fds.clone();
         let set = signal_set();
         // SAFETY: blocking signals for this thread during spawn; restored below.
         let mut old: libc::sigset_t = unsafe { std::mem::zeroed() };
         unsafe {
             libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
         }
+        LATE_SIGNAL.store(0, Ordering::SeqCst);
         let installed = install_forwarders();
         // The Command (and its copies of the pty slaves) is dropped at the end of this block, so
         // the readers see EOF once the child and its descendants close the streams.
@@ -422,8 +589,8 @@ impl Runner for RealRunner {
                         }
                     }
                     libc::pthread_sigmask(libc::SIG_SETMASK, &child_mask, std::ptr::null_mut());
-                    if let Some(fd) = keep_fd {
-                        // Clear close-on-exec in the child only, so gh inherits the lease.
+                    for &fd in &keep_fds {
+                        // Clear close-on-exec in the child only, so gh inherits the lock.
                         if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
                             return Err(std::io::Error::last_os_error());
                         }
@@ -479,27 +646,47 @@ impl Runner for RealRunner {
                 Some(p.master)
             }
         };
-        let mut readers = 0;
+        let mut tees = Vec::new();
         for (src, which) in [(err_src, Stream::Err), (out_src, Stream::Out)] {
             if let Some(src) = src {
-                let s = Arc::clone(&shared);
-                let tx = done_tx.clone();
-                std::thread::spawn(move || tee(src, which, s, tx));
-                readers += 1;
+                let tee = Arc::new(Tee::default());
+                let (s, t) = (Arc::clone(&shared), Arc::clone(&tee));
+                let reader = std::thread::spawn(move || tee_reader(src, which, s, t));
+                let t = Arc::clone(&tee);
+                let writer = std::thread::spawn(move || tee_writer(which, t));
+                tees.push((tee, reader, writer));
             }
         }
-        drop(done_tx);
         feed_stdin(&mut child, inv.stdin);
         let status = wait_with_deadline(&mut child, inv.deadline_secs)
             .map_err(|e| format!("waiting for {}: {e}", inv.program.display()));
         CHILD_PID.store(0, Ordering::SeqCst);
-        // A grandchild (pager, credential helper) may keep a stream open after gh exits; give
-        // the readers two seconds in total to drain.
-        let drain_until = Instant::now() + Duration::from_secs(2);
-        for _ in 0..readers {
-            let left = drain_until.saturating_duration_since(Instant::now());
-            if done_rx.recv_timeout(left).is_err() {
-                break;
+        // Every reader stops on its own once gh has exited (see the module documentation); every
+        // writer then delivers what was read, however long the consumer takes, unless a user
+        // signal says to stop.
+        for (tee, _, _) in &tees {
+            tee.child_exited();
+        }
+        let late_signal = loop {
+            if tees
+                .iter()
+                .all(|(_, r, w)| r.is_finished() && w.is_finished())
+            {
+                break None;
+            }
+            let sig = LATE_SIGNAL.load(Ordering::SeqCst);
+            if sig != 0 {
+                for (tee, _, _) in &tees {
+                    tee.abandon();
+                }
+                break Some(sig);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        if late_signal.is_none() {
+            for (_, reader, writer) in tees {
+                let _ = reader.join();
+                let _ = writer.join();
             }
         }
         if let Ok(s) = shared.lock() {
@@ -508,6 +695,7 @@ impl Runner for RealRunner {
         status.map(|(s, deadline_hit)| Ran {
             exit: decode(s),
             deadline_hit,
+            late_signal,
         })
     }
 

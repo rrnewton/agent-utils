@@ -27,6 +27,7 @@ if [ "$1 $2" = "api rate_limit" ] && [ $# -eq 2 ]; then
   exit 0
 fi
 echo "$(date +%s.%N) start $*" >> "$log"
+if [ -n "${FAKE_GH_IGNORE_TERM:-}" ]; then trap '' TERM; fi
 if [ -n "${FAKE_GH_SIGSTATUS:-}" ]; then grep -E '^Sig(Blk|Ign)' /proc/$$/status > "$FAKE_GH_SIGSTATUS"; fi
 if [ -n "${FAKE_GH_STDIN_FILE:-}" ]; then cat > "$FAKE_GH_STDIN_FILE"; fi
 if [ -n "${FAKE_GH_NESTED:-}" ]; then
@@ -36,6 +37,11 @@ if [ -n "${FAKE_GH_NESTED:-}" ]; then
   echo "$(date +%s.%N) nested-rc $?" >> "$log"
 fi
 if [ -n "${FAKE_GH_SLEEP:-}" ]; then sleep "$FAKE_GH_SLEEP"; fi
+if [ -n "${FAKE_GH_BG:-}" ]; then
+  # Leave a background helper running past gh's exit, holding every inherited descriptor.
+  ( sleep "$FAKE_GH_BG"; echo "$(date +%s.%N) bg-end $*" >> "$log" ) >/dev/null 2>&1 &
+fi
+if [ -n "${FAKE_GH_STDOUT_BYTES:-}" ]; then head -c "$FAKE_GH_STDOUT_BYTES" /dev/zero | tr '\0' x; echo; fi
 if [ -n "${FAKE_GH_STDOUT:-}" ]; then printf '%s\n' "$FAKE_GH_STDOUT"; fi
 if [ -n "${FAKE_GH_STDERR:-}" ]; then printf '%s\n' "$FAKE_GH_STDERR" >&2; fi
 echo "$(date +%s.%N) end $*" >> "$log"
@@ -847,11 +853,99 @@ fn nesting_needs_the_inherited_lease_not_just_the_chain() {
     );
 }
 
+/// Opening a write's lease file again is not the inherited lease: the new descriptor holds no
+/// lock. A process that names the write's nonce in `GH_PACED_INFLIGHT_CHAIN` and passes such a
+/// descriptor waits for the write like any other.
+#[test]
+fn reopening_the_lease_file_does_not_prove_descent() {
+    let sb = Sandbox::new("reopen", BURSTY);
+    let outer = sb
+        .cmd(&["issue", "comment", "1", "--body", "outer"])
+        .env("FAKE_GH_SLEEP", "3")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for_log(&sb, "start issue comment 1");
+    let leases = lease_files(&sb);
+    assert_eq!(leases.len(), 1, "{leases:?}");
+    let st: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(sb.path("state/test.json")).unwrap())
+            .unwrap();
+    let nonce = st["in_flight"][0]["nonce"].as_str().unwrap().to_string();
+    let reopened = std::fs::File::open(sb.path("state").join(&leases[0])).unwrap();
+    let forged = sb
+        .cmd(&["issue", "comment", "2", "--body", "forged"])
+        .env("GH_PACED_INFLIGHT_CHAIN", &nonce)
+        .stdin(Stdio::from(reopened))
+        .output()
+        .unwrap();
+    let outer = outer.wait_with_output().unwrap();
+    assert_eq!(outer.status.code(), Some(0));
+    assert_eq!(forged.status.code(), Some(0), "{}", stderr(&forged));
+    let outer_end = event_time(&sb, "end", "issue comment 1");
+    let forged_start = event_time(&sb, "start", "issue comment 2");
+    assert!(
+        forged_start >= outer_end,
+        "the reopened lease skipped the wait: {:?}",
+        sb.log()
+    );
+    assert!(
+        stderr(&forged).contains("1 write(s) already in flight on this host"),
+        "{}",
+        stderr(&forged)
+    );
+}
+
+/// A write's slot lasts as long as anything gh started still holds the lease: when gh leaves a
+/// background helper running, the wrapper keeps the holder and the lease file, says so, and the
+/// next write waits for the helper. The lease is reaped once the helper exits.
+#[test]
+fn background_helper_keeps_the_write_slot() {
+    let sb = Sandbox::new("bg-holder", BURSTY);
+    let first = sb.run(
+        &["issue", "comment", "1", "--body", "first"],
+        &[("FAKE_GH_BG", "3")],
+    );
+    assert_eq!(first.status.code(), Some(0), "{}", stderr(&first));
+    assert!(
+        stderr(&first).contains("a process it started still holds this write's slot"),
+        "{}",
+        stderr(&first)
+    );
+    assert_eq!(lease_files(&sb).len(), 1, "the lease outlives gh");
+    let st: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(sb.path("state/test.json")).unwrap())
+            .unwrap();
+    assert_eq!(st["in_flight"].as_array().unwrap().len(), 1, "{st}");
+    let second = sb.run(&["issue", "comment", "2", "--body", "second"], &[]);
+    assert_eq!(second.status.code(), Some(0), "{}", stderr(&second));
+    let bg_end = event_time(&sb, "bg-end", "issue comment 1");
+    let second_start = event_time(&sb, "start", "issue comment 2");
+    assert!(
+        second_start >= bg_end,
+        "the second write started {} s before the helper exited",
+        bg_end - second_start
+    );
+    assert!(
+        stderr(&second).contains("1 write(s) already in flight on this host"),
+        "{}",
+        stderr(&second)
+    );
+    assert!(lease_files(&sb).is_empty(), "{:?}", lease_files(&sb));
+    let st: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(sb.path("state/test.json")).unwrap())
+            .unwrap();
+    assert_eq!(st["in_flight"].as_array().unwrap().len(), 0, "{st}");
+}
+
 /// A watch loop is stopped once it has polled for as long as its up-front charge covers, and the
 /// wrapper exits 75.
 #[test]
 fn watch_past_its_deadline_is_stopped() {
-    let cfg = r#"{"watch_cost": 2, "min_watch_interval_secs": 0,
+    // 6 tokens: 2 for startup (resolving the pull request), then 2 polls of 2 requests, 1 s
+    // apart: a 2 s budget.
+    let cfg = r#"{"watch_cost": 6, "min_watch_interval_secs": 0,
                   "read": {"per_minute": 60, "burst": 10, "per_hour": 500}}"#;
     let sb = Sandbox::new("deadline", cfg);
     let begun = Instant::now();
@@ -879,6 +973,38 @@ fn watch_past_its_deadline_is_stopped() {
     );
     let audit = std::fs::read_to_string(sb.path("state/test.audit.jsonl")).unwrap();
     assert!(audit.contains("\"deadline\""), "{audit}");
+}
+
+/// A watch that ignores SIGTERM at its deadline is sent SIGKILL `KILL_GRACE_SECS` (5 s) later,
+/// so a stuck gh cannot keep polling past what it paid for.
+#[test]
+fn watch_that_ignores_term_is_killed() {
+    let cfg = r#"{"watch_cost": 6, "min_watch_interval_secs": 0,
+                  "read": {"per_minute": 60, "burst": 10, "per_hour": 500}}"#;
+    let sb = Sandbox::new("deadline-kill", cfg);
+    let begun = Instant::now();
+    let o = sb
+        .cmd(&["pr", "checks", "1", "--watch", "--interval", "1"])
+        .env("FAKE_GH_SLEEP", "30")
+        .env("FAKE_GH_IGNORE_TERM", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let took = begun.elapsed().as_secs_f64();
+    assert_eq!(o.status.code(), Some(75), "{}", stderr(&o));
+    let err = stderr(&o);
+    assert!(err.contains("ran past its 2 s budget"), "{err}");
+    // TERM at 2 s is ignored; KILL follows 5 s later. Without the escalation the wrapper would
+    // wait for the full 30 s sleep.
+    assert!((6.9..20.0).contains(&took), "stopped after {took} s");
+    assert!(
+        !sb.log()
+            .iter()
+            .any(|(_, ev, a)| ev == "end" && a.starts_with("pr checks")),
+        "gh was killed before it finished: {:?}",
+        sb.log()
+    );
 }
 
 /// `gh api --include` prints the response headers on stdout. A Retry-After there sets the
@@ -918,4 +1044,162 @@ fn include_headers_on_stdout_set_the_cooldown() {
         "cooldown {} s",
         until - before
     );
+}
+
+/// A consumer that reads gh's output late loses none of it. The fake gh writes its output and exits
+/// at once while the consumer has not read a byte; it starts reading 4 s later, long after gh has
+/// gone. 120 KiB is more than one 64 KiB pipe holds, so part of it is still inside gh-paced when gh
+/// exits; 2 MiB is absorbed by the forwarding queue; 10 MiB is past the queue bound, so gh itself
+/// is held back until the consumer reads. Each case ends with a header block, which must still be
+/// seen behind the unread output and must set the cooldown.
+#[test]
+fn slow_consumer_receives_every_byte() {
+    let header = "HTTP/2.0 429 Too Many Requests\r\nRetry-After: 1200\r\n\r\n";
+    let cases: Vec<(Sandbox, usize, std::process::Child)> = [120 << 10, 2 << 20, 10 << 20]
+        .into_iter()
+        .map(|n: usize| {
+            let sb = Sandbox::new(&format!("slow-{n}"), FAST);
+            let child = sb
+                .cmd(&["api", "--include", "repos/o/r"])
+                .env("FAKE_GH_STDOUT_BYTES", n.to_string())
+                .env("FAKE_GH_STDOUT", header)
+                .env("FAKE_GH_EXIT", "1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            (sb, n, child)
+        })
+        .collect();
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    for (sb, n, child) in cases {
+        let o = child.wait_with_output().unwrap();
+        assert_eq!(o.status.code(), Some(1), "{n} bytes: {}", stderr(&o));
+        let expected = format!("{}\n{header}\n", "x".repeat(n));
+        assert_eq!(o.stdout.len(), expected.len(), "{n} bytes: {}", stderr(&o));
+        assert!(
+            o.stdout == expected.as_bytes(),
+            "{n} bytes: content differs"
+        );
+        assert!(
+            stderr(&o).contains("GH-PACED PUSHBACK [test]"),
+            "{n} bytes: {}",
+            stderr(&o)
+        );
+        let state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(sb.path("state/test.json")).unwrap())
+                .unwrap();
+        assert!(
+            state["cooldown"]["until"].as_f64().is_some(),
+            "{n} bytes: no cooldown: {state}"
+        );
+    }
+}
+
+/// Snapshot directories in the state directory, by name.
+fn snapshot_dirs(sb: &Sandbox) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(sb.path("state"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("snap-"))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Make a directory look `secs` seconds old.
+fn age_dir(path: &std::path::Path, secs: u64) {
+    let t = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+    std::fs::File::open(path).unwrap().set_modified(t).unwrap();
+}
+
+/// A process ID that has exited and been reaped.
+fn dead_pid() -> u32 {
+    let mut c = Command::new("/bin/true").spawn().unwrap();
+    let pid = c.id();
+    c.wait().unwrap();
+    pid
+}
+
+/// Every paced call, not only one that copies a file, removes abandoned snapshot directories: a
+/// dead creator, a free lock and past the grace period. A directory whose lock is still held is
+/// kept however old, and a local command touches nothing.
+#[test]
+fn every_paced_call_sweeps_abandoned_snapshots() {
+    let sb = Sandbox::new("sweep", FAST);
+    let pid = dead_pid();
+    let abandoned = sb.path(&format!("state/snap-{pid}-1-00000000000000d1"));
+    let held = sb.path(&format!("state/snap-{pid}-1-00000000000000d2"));
+    std::fs::create_dir_all(abandoned.join("0")).unwrap();
+    std::fs::write(abandoned.join("0/body.md"), "old copy").unwrap();
+    std::fs::create_dir_all(&held).unwrap();
+    let lock = std::fs::File::create(held.join(".lock")).unwrap();
+    // SAFETY: flock on a descriptor owned by `lock`, released when it is dropped.
+    assert_eq!(
+        unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX) },
+        0
+    );
+    age_dir(&abandoned, 3600);
+    age_dir(&held, 3600);
+    let o = sb.run(&["--version"], &[("FAKE_GH_STDOUT", "gh version 9.9.9")]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(
+        snapshot_dirs(&sb).len(),
+        2,
+        "a local command sweeps nothing"
+    );
+    let o = sb.run(&["pr", "view", "5"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(
+        snapshot_dirs(&sb),
+        vec![format!("snap-{pid}-1-00000000000000d2")],
+        "the abandoned directory is removed and the held one kept"
+    );
+    drop(lock);
+    let o = sb.run(&["pr", "view", "6"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(snapshot_dirs(&sb).is_empty(), "{:?}", snapshot_dirs(&sb));
+}
+
+/// gh inherits the snapshot lock, so a background helper gh leaves running keeps the copies of
+/// the files it may still read after the wrapper has exited, even from a sweep that finds the
+/// directory old and its creator dead. Once the helper exits the next paced call removes it.
+#[test]
+fn background_helper_keeps_the_snapshot() {
+    let sb = Sandbox::new("bg-snap", BURSTY);
+    let body = sb.path("body.md");
+    std::fs::write(&body, "a short note").unwrap();
+    let body_arg = format!("--body-file={}", body.display());
+    let first = sb.run(
+        &["issue", "comment", "1", &body_arg],
+        &[("FAKE_GH_BG", "3")],
+    );
+    assert_eq!(first.status.code(), Some(0), "{}", stderr(&first));
+    let dirs = snapshot_dirs(&sb);
+    assert_eq!(
+        dirs.len(),
+        1,
+        "the copies outlive the wrapper while the helper runs"
+    );
+    let snap = sb.path(&format!("state/{}", dirs[0]));
+    let started = event_time(&sb, "start", "issue comment 1 --body-file=");
+    let gh_args = sb.starts()[0].1.clone();
+    assert!(
+        gh_args.contains(&snap.display().to_string()),
+        "gh was given the copy: {gh_args}"
+    );
+    age_dir(&snap, 3600);
+    let o = sb.run(&["pr", "view", "5"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(
+        event_time(&sb, "start", "pr view 5") - started < 3.0,
+        "the sweep ran while the helper was alive"
+    );
+    assert_eq!(snapshot_dirs(&sb), dirs, "the helper's lock keeps it");
+    wait_for_log(&sb, "bg-end issue comment 1");
+    age_dir(&snap, 3600);
+    let o = sb.run(&["pr", "view", "6"], &[]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(snapshot_dirs(&sb).is_empty(), "{:?}", snapshot_dirs(&sb));
 }

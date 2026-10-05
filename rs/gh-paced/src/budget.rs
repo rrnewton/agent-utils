@@ -39,6 +39,12 @@ pub struct Bucket {
     /// Admitted calls in the last hour: `(time, cost)`, oldest first.
     #[serde(default)]
     pub window: Vec<(f64, u32)>,
+    /// Nothing in this class is admitted before this time (Unix seconds), whatever the limits
+    /// are by then. Set by state recovery: the lost history may have held a full hour of calls.
+    /// A window entry sized by the hourly cap in force at recovery would not do, because raising
+    /// the cap later (removing a tightening override) would reopen the class early.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_until: Option<f64>,
 }
 
 /// Limits after the global-feedback adjustment: halve rate, burst and hourly cap.
@@ -57,6 +63,7 @@ impl Bucket {
             level: limits.burst,
             updated: now,
             window: Vec::new(),
+            blocked_until: None,
         }
     }
 
@@ -66,18 +73,27 @@ impl Bucket {
             level: 0.0,
             updated: now,
             window: Vec::new(),
+            blocked_until: None,
         }
     }
 
-    /// An empty bucket whose hourly window is already full: nothing in this class is admitted
-    /// for the next hour. Used when the state file was unusable, because the lost history may
-    /// have held a full hour of calls.
-    pub fn saturated(limits: ClassLimits, now: f64) -> Self {
+    /// An empty bucket that admits nothing in this class for the next hour, independently of
+    /// the limits in force later (see [`Bucket::blocked_until`]). Used when the state file was
+    /// unusable, because the lost history may have held a full hour of calls.
+    pub fn saturated(now: f64) -> Self {
         Self {
             level: 0.0,
             updated: now,
-            window: vec![(now, limits.per_hour)],
+            window: Vec::new(),
+            blocked_until: Some(now + HOUR),
         }
+    }
+
+    /// Seconds until a recovery block ends (0 when there is none or it has passed).
+    pub fn blocked_wait(&self, now: f64) -> f64 {
+        self.blocked_until
+            .map(|b| round_up_ms(b - now))
+            .unwrap_or(0.0)
     }
 
     /// Refill for the time elapsed since the last update and drop window entries older than an
@@ -110,14 +126,19 @@ impl Bucket {
         round_up_ms((need - self.level) / rate)
     }
 
-    /// Seconds until the hourly window has room for `cost` (call refresh first). A cost larger
-    /// than the whole cap can never fit, so the wait is infinite and the caller refuses it.
+    /// Seconds until the hourly window has room for `cost` and any recovery block has ended
+    /// (call refresh first). A cost larger than the whole cap can never fit, so the wait is
+    /// infinite and the caller refuses it.
     pub fn hour_wait(&self, limits: ClassLimits, cost: u32, now: f64) -> f64 {
         let cap = u64::from(limits.per_hour);
         let cost = u64::from(cost);
         if cost > cap {
             return f64::INFINITY;
         }
+        self.window_wait(cap, cost, now).max(self.blocked_wait(now))
+    }
+
+    fn window_wait(&self, cap: u64, cost: u64, now: f64) -> f64 {
         let used = self.hour_used();
         if used + cost <= cap {
             return 0.0;
@@ -272,14 +293,16 @@ mod tests {
     }
 
     /// A saturated bucket (state recovery) admits nothing for a full hour, however long the
-    /// refill takes, and admits again once that hour has passed.
+    /// refill takes, and admits again once that hour has passed. The block does not depend on
+    /// the limits: it was a window entry of `per_hour` cost before, which shrank when the cap was
+    /// raised after recovery (a recovery under a tightened cap of 1 reopened after 900 s once the
+    /// tightening was removed). The block now holds for the full hour under every cap.
     #[test]
     fn saturated_bucket_blocks_for_an_hour() {
         let l = write_limits();
         let now = 1000.0;
-        let mut b = Bucket::saturated(l, now);
+        let mut b = Bucket::saturated(now);
         b.refresh(l, now);
-        assert_eq!(b.hour_used(), 30);
         assert!((b.hour_wait(l, 1, now) - HOUR).abs() < 1e-6);
         b.refresh(l, now + 600.0);
         assert_eq!(b.bucket_wait(l, 1), 0.0, "the token bucket refilled");
@@ -287,8 +310,20 @@ mod tests {
             b.hour_wait(l, 1, now + 600.0) > 2999.0,
             "the hour cap did not"
         );
+        for per_hour in [1, 30, 500, 5000] {
+            let raised = ClassLimits { per_hour, ..l };
+            assert!(
+                b.hour_wait(raised, 1, now + 900.0) > 2699.0,
+                "cap {per_hour} reopened the class early"
+            );
+        }
+        // The block survives a save and load.
+        let text = serde_json::to_string(&b).expect("encode");
+        let back: Bucket = serde_json::from_str(&text).expect("decode");
+        assert_eq!(back.blocked_until, Some(now + HOUR));
         b.refresh(l, now + HOUR + 0.01);
         assert_eq!(b.hour_wait(l, 1, now + HOUR + 0.01), 0.0);
+        assert_eq!(b.blocked_wait(now + HOUR + 0.01), 0.0);
     }
 
     #[test]

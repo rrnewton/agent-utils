@@ -56,6 +56,11 @@ then runs gh) replaces its final `exec <real gh> "$@"` with
 real gh as a child and returns its exit status (or dies by its signal). stdin,
 stdout and stderr pass through; if stderr is a terminal the child gets a
 pseudo-terminal for stderr, so gh still sees a TTY while gh-paced scans it.
+A teed stream (stderr, and stdout for `api --include`) is scanned before it is
+queued for the consumer, and every byte read is delivered however slowly the
+consumer reads; only a user's INT, TERM, HUP or QUIT after gh has exited
+abandons undelivered output, with a warning, and gh-paced then dies by that
+signal.
 
 **Classification.** Each command line is classified without touching the
 network:
@@ -69,10 +74,13 @@ network:
 | GIT_CREDENTIAL | `auth git-credential get` | 1 |
 
 Unknown commands, aliases, extensions and unreadable GraphQL queries are WRITE.
-`pr checks --watch` and `run watch` cost 20, are refused below a 30 s interval,
-and are stopped (exit 75) at `floor(cost / requests per poll) x interval`
-seconds, so a watch never polls more than it paid for. A cost above the class's
-hourly cap is refused at once.
+`pr checks --watch` and `run watch` cost 20 READ tokens. Every `--interval`
+value must be a plain positive whole number of seconds, at least 30, or the call
+is refused (exit 64). A watch is stopped (TERM, then KILL 5 s later; exit 75)
+at `floor((cost - 2) / requests per poll) x interval` seconds: 2 tokens pay for
+startup, and a poll is estimated at 4 requests for `run watch` and 2 for
+`pr checks --watch`, so 120 s and 270 s at a 30 s interval. A cost above the
+class's hourly cap is refused at once.
 
 **State.** One JSON state file per account on each host
 (`~/.local/state/gh-paced/<account>.json`), updated under an `flock` on a
@@ -80,10 +88,20 @@ separate `<account>.lock` and replaced atomically. The lock is never held across
 a sleep or a network call, and the clock is read only after it is taken. A
 write's in-flight slot is a lease: a file `<account>.lease-<nonce>` with an
 exclusive `flock` whose open file gh inherits, so the slot lasts until gh and
-everything holding that file exit, even if the wrapper is SIGKILLed. A state
-file that cannot be parsed is moved aside and replaced by a recovery state with
-every hourly window full, a 900 s cooldown, and the still-locked leases
-restored, so a lost hour of history is treated as fully used.
+everything holding that file exit, even if the wrapper is SIGKILLed. If the
+wrapper finishes while a process gh started still holds the lease, the slot and
+the file stay until that process exits. A nested gh-paced proves that it
+descends from a holder only by holding the holder's locked open file, which
+`/proc/self/fdinfo` shows (Linux lists a `flock` only for the open file that
+took it), so reopening the lease file proves nothing. A process counts as alive
+only while its PID and start time match and it is not a zombie. A state file
+that cannot be parsed is hard-linked aside and replaced, by one atomic rename,
+with a recovery state: every class blocked for 3,600 s (`blocked_until`, which
+does not depend on the configured limits, so raising a limit afterwards does not
+reopen the hour), a 900 s cooldown, and the still-locked leases restored. The
+latest pushback cooldown is also kept in `<account>.cooldown` and merged on
+every load, so a damaged state file cannot shorten a long `Retry-After` pause; a
+damaged cooldown file triggers the same recovery.
 
 **Admission.** A call is admitted when its bucket holds enough tokens (or is
 full, for a call that costs more than the burst) and the cost fits the
@@ -97,9 +115,11 @@ sleeps. If the time already slept plus the next wait exceeds
 **Account-wide feedback.** gh-paced refreshes the snapshot when none exists,
 when it is at least 300 s old, or after 50 admitted calls, at most once per 60 s
 and by one process at a time, never during a cooldown. The refresh costs one
-READ token, charged under the lock before the request is sent; with no READ
-room it is skipped. The numbers are re-checked on every admission pass, so after
-any sleep. At 50% or less
+READ token, charged under the lock before the request is sent. When a refresh
+is due and READ has no room for it, the call waits for room (and is refused past
+`GH_PACED_MAX_WAIT`) rather than run without current account numbers. The
+numbers are re-checked on every admission pass, so after any sleep. At 50% or
+less
 remaining (on `core`/`graphql`, plus `search` for SEARCH) the READ, SEARCH and
 WRITE budgets are halved; at 20% or less those calls block until the resource
 resets.
@@ -108,7 +128,10 @@ resets.
 limit`, `rate limit`, `HTTP 429`, `abuse`, `submitted too quickly`,
 `Retry-After: N`, and plain `HTTP 403`. For `api -i/--include`, stdout header
 blocks are also read (status 403/429, `Retry-After`, `X-RateLimit-Remaining:
-0`); response bodies are never matched. Any of them starts a cooldown of
+0`). A header block is acted on only in the shape gh prints it: a status line,
+header lines ending in CRLF, and a CRLF blank line; a response body that merely
+looks like headers (printed through `--jq`, say, with plain LF line ends) is
+never matched. Any of them starts a cooldown of
 max(Retry-After, 900 s), printed as a banner, and discards the snapshot. A plain
 403 also gets 900 s, and neither cooldown can be configured lower.
 
@@ -118,20 +141,31 @@ release notes files. A JSON request body counts at its full size, and every
 string inside it is also decoded and scanned. The call is refused (exit 65)
 when the total exceeds 8,192 bytes or any source has a base64-looking run
 longer than 1,000 characters. Any unbroken base64-alphabet run counts, hex
-and rulers included; the detector also joins consecutive base64-only lines
-that contain an upper-case letter, `+` or `/`, so line-wrapped encodings are
-caught while a list of lower-case SHAs is not. Body files are first copied to a
-private directory, and both the guard and gh read the copy, so a file cannot
-change between the check and the send. Forms where gh composes the body itself after
-the guard (editor, template, `--fill`, interactive prompt, `gist edit` without
-`--add`/`--remove`) are refused with exit 65. The limits can only be lowered by
-configuration. `GH_PACED_ALLOW_LARGE_BODY=1` skips the guard for one call.
+and rulers included, and the detector joins every block of consecutive lines
+that are each at least 20 base64-alphabet characters, whatever they contain, so
+line-wrapped encodings are caught; 26 or more bare 40-character SHAs, one per
+line, therefore count as a run over 1,000. Every argument of an alias,
+extension or unknown command, flag-shaped or not, is inspected as text. Body
+files are first copied to a private directory,
+`snap-<pid>-<start ticks>-<nonce>/`, holding a `.lock` file locked by the
+invocation and inherited by gh; both the guard and gh read the copy, so a file
+cannot change between the check and the send. The directory is removed when the
+invocation ends, unless a process gh started still holds the lock. Every paced
+invocation also sweeps directories whose lock is free, whose creator process
+has exited, and that are at least 60 s old (any other `snap-*` name after 24 h).
+Forms where gh composes the body itself after the guard (editor, template,
+`--fill`, `release create --notes-from-tag`, interactive prompt, `gist edit`
+without `--add`/`--remove`) are refused with exit 65; boolean flags are read for
+their value, so `--web=false` is not the web form. The limits can only be
+lowered by configuration. `GH_PACED_ALLOW_LARGE_BODY=1` skips the guard for one
+call.
 
 **Audit and status.** Each paced call appends a JSON line (time in UTC and ET,
 host, PID, event, class, cost, command, redacted argv, waited seconds, detail)
 to `<account>.audit.jsonl`. No bodies, tokens or environment are written; an
-endpoint loses its host, userinfo, query string and fragment, and an unknown
-command keeps only its flag names. `gh-paced status` prints the buckets,
+endpoint loses its host, userinfo, query string and fragment, an unknown
+command keeps only its flag names, and an unknown flag of a known command keeps
+its name but loses its value. `gh-paced status` prints the buckets,
 in-flight writes, cooldown, snapshot and last 5 records from local files only,
 without taking the lock or creating files.
 
@@ -227,8 +261,9 @@ read-only, with a fake gh and a scratch state directory:
 
 In the defaults row the fake gh's log shows one rate-limit refresh and one POST,
 the summary, sent from the private copy
-(`<state dir>/snap-<nonce>/0/SUMMARY.request.json`); no part reached it, and no
-copy was left behind. The audit log of that run holds no base64-alphabet run of
+(`<state dir>/snap-<nonce>/0/SUMMARY.request.json`; since round 2 the directory
+is named `snap-<pid>-<start ticks>-<nonce>`); no part reached it, and no copy
+was left behind. The audit log of that run holds no base64-alphabet run of
 100 characters or more. The round-1 binary refuses the two loosened
 configurations outright (exit 78, the configuration floors), so the last two
 rows, which show that each check alone refuses the parts, were measured with
@@ -332,6 +367,10 @@ primary allowance in that hour.
    `api -i/--include`, whose status line and headers are on stdout, header
    blocks are read (403/429, `Retry-After`, `X-RateLimit-Remaining: 0`) and
    bodies are not. (Round 1 found that a `Retry-After: 3600` there was missed.)
+   A header block counts only in the shape gh prints it: header lines and the
+   closing blank line end in CRLF, while jq output uses LF. (Round 2 found that a
+   `--jq .body` output holding a status line and `Retry-After: 99999` started a
+   false cooldown.)
 2. **GraphQL is classified by its query.** `api graphql` with a readable
    `query` is READ; a `mutation`, or a query that cannot be read (from a file
    gh-paced cannot open, say), is WRITE. Treating every GraphQL call as WRITE
@@ -346,11 +385,18 @@ primary allowance in that hour.
    `GH_NO_UPDATE_NOTIFIER=1` and `GH_NO_EXTENSION_UPDATE_NOTIFIER=1` unless the
    caller set them, because the release check is an unpaced request.
 6. **Watch loops are charged, bounded, and fast ones refused.** `pr checks
-   --watch` and `run watch` cost 20 tokens, are refused (exit 64) below a 30 s
-   interval unless `GH_PACED_ALLOW_FAST_WATCH=1`, and are stopped at
-   `floor(cost / requests per poll) x interval` seconds (TERM, KILL after 5 s,
-   exit 75), so a watch never polls beyond what it paid for. (Round 1 found the
-   earlier unbounded watch.)
+   --watch` and `run watch` cost 20 tokens and are refused (exit 64) below a
+   30 s interval unless `GH_PACED_ALLOW_FAST_WATCH=1`. Every `--interval`
+   value must be a plain positive decimal integer; zero, a negative value, or a
+   form such as `0x1e` is refused even with the override, because gh treats
+   zero or a negative interval as no sleep at all. A watch is stopped at
+   `floor((cost - 2) / requests per poll) x interval` seconds (TERM, KILL
+   after 5 s, exit 75), with 2 tokens for startup and an estimated 4 requests
+   per `run watch` poll (run, workflow, jobs, and a margin) and 2 per
+   `pr checks --watch` poll: 120 s and 270 s at 30 s. (Round 1 found the
+   earlier unbounded watch; round 2 found that `--interval -1` after a valid
+   value was ignored by gh-paced but honoured by gh, and that 2 requests per
+   `run watch` poll was too few.)
 7. **`--limit N` costs ceil(N/100) tokens** on list and search commands, the
    number of 100-item pages it may fetch.
 8. **`gh status` is SEARCH with cost 3.** It runs several search and GraphQL
@@ -369,20 +415,28 @@ primary allowance in that hour.
     70 for state errors, 78 for configuration errors (including a `--real-gh`
     that resolves to gh-paced), 127 when the real gh is missing.
 13. **A corrupt state file is quarantined** to `<account>.json.corrupt-<secs>`
-    and replaced with a recovery state: every class's hourly window full, a
-    `cooldown_secs` pause, and every still-locked write lease restored. The
-    account is paused on that host for an hour. (Round 1 showed that the
-    earlier empty buckets could reopen an exhausted hourly budget or erase a
-    cooldown.)
+    (a hard link, with `-1`, `-2`, ... appended if that name exists) and
+    replaced, by one atomic rename, with a recovery state: every class blocked
+    for 3,600 s, a `cooldown_secs` pause, and every still-locked write lease
+    restored. The block is a time (`blocked_until`), not a full window, so it
+    does not shrink when a limit is raised later. The account is paused on that
+    host for an hour. (Round 1 showed that the earlier empty buckets could
+    reopen an exhausted hourly budget or erase a cooldown; round 2 showed that a
+    crash between moving the file and saving the recovery state, or removing a
+    tightened `GH_PACED_WRITE_PER_HOUR` after recovery, reopened the account
+    early.)
 14. **LOCAL calls are not audited**, to keep the log about GitHub traffic.
 15. **GIT_CREDENTIAL is not blocked by the snapshot.** git operations do not use
     the API pools the snapshot reports; they keep their own bucket and the
     pushback cooldown still applies.
 16. **Nested gh-paced** (an extension calling gh) skips its own parent's write
     slot only when it proves descent twice: the parent's nonce is in
-    `GH_PACED_INFLIGHT_CHAIN` and the parent's lease file is among its own
-    inherited open files. It refuses past 8 levels (exit 75). (Round 1 found the
-    chain variable alone could be forged.)
+    `GH_PACED_INFLIGHT_CHAIN`, and it holds the parent's locked open file, shown
+    by a `flock` line with `WRITE` access in `/proc/self/fdinfo/<fd>`. Linux
+    lists that line only for the open file description that took the lock. It
+    refuses past 8 levels (exit 75). (Round 1 found the chain variable alone
+    could be forged; round 2 found that redirecting stdin from the lease file
+    could too.)
 17. **Configuration cannot weaken the safety floors.** Cooldowns are at least
     900 s, blocking starts at 20% or higher, halving at 50% or higher, the body
     limit is at most 8,192 bytes and the base64 limit at most 1,000 characters,
@@ -392,6 +446,51 @@ primary allowance in that hour.
 18. **Writes whose body gh composes later are refused** (exit 65): editor,
     template, `--fill`, interactive prompts on a terminal, and `gist edit`
     without `--add`/`--remove`. The guard cannot see those bodies.
+19. **Bare SHA lists count as base64.** Every block of consecutive lines that
+    are each at least 20 base64-alphabet characters is counted as one run,
+    whatever it contains, so 26 or more bare 40-character SHAs, one per line,
+    exceed the 1,000-character limit. The request named only base64, but the
+    detector cannot tell a digest list from a hex or lower-case encoding (round
+    2 showed `aaaa` repeated 300 times, wrapped at 76 columns, passing). The
+    same SHAs with a subject on each line are prose and count 40.
+20. **`release create --notes-from-tag` is refused** (exit 65), like the other
+    forms whose body gh composes: gh reads the tag annotation or commit message
+    after the guard and sends it as the release body.
+21. **Boolean flags are read for their value.** `--web=false`, `--editor=false`
+    and `--fill=false` mean what they mean to gh, both for the refusals and for
+    the web exemption.
+22. **Every argument of an alias, extension or unknown command is inspected as
+    body text**, flag-shaped or not (`--payload=<text>`, `--repo <text>`,
+    `-- <text>`), because the expansion may pass any of them to a body flag.
+23. **The audit log drops the values of unknown flags.** `api repos/o/r
+    --token=X` is recorded as `api <arg> --token`; the request asked for no
+    secrets in the log, and gh-paced cannot know what an unrecognised flag
+    carries.
+24. **A due refresh waits for READ room.** When the snapshot is due and READ
+    has no token for the refresh, READ, SEARCH and WRITE calls wait (or are
+    refused past `GH_PACED_MAX_WAIT`). Before round 2 the refresh was skipped
+    and, after a pushback had discarded the snapshot, a WRITE or SEARCH could
+    run with no account-wide numbers at all.
+25. **The cooldown is also kept in its own file** (`<account>.cooldown`), merged
+    on every load, so a damaged state file cannot shorten a long `Retry-After`
+    pause. The request named one state file.
+26. **A finished write keeps its slot while a descendant holds the lease.** gh
+    may leave a background process holding the inherited lease. The wrapper
+    then closes its own copy and leaves the holder record and lease file in
+    place; a later caller reaps them once the lock is free. Before round 2 the
+    slot was released while that process could still be writing.
+27. **Zombie processes count as dead.** A process whose PID and start time match
+    but whose state is `Z` or `X` no longer holds a refresh claim or a holder
+    record, so a killed, unreaped refresher cannot block callers indefinitely.
+28. **Output delivery is complete, not time-boxed.** After gh exits, the reader
+    stops at end of file, after 2 s of silence, 5 s after the exit, or after
+    64 MiB more (a background process may hold the stream open), and the writer
+    is then waited for without a time limit. Before round 2 a slow consumer lost
+    everything not delivered within 2 s (a mutant with the old cutoff delivered
+    65,536 of 122,935 bytes).
+29. **Snapshot directories are swept by ownership, not age alone.** See the
+    content-guard summary above. Before round 2 the sweep ran only for calls
+    that copied files, and could delete a live copy after 24 h.
 
 ## Review round 1 and the fixes
 
@@ -424,6 +523,53 @@ Seven of these tests were also checked by mutation: re-introducing the old
 behaviour (nested exclusion on the chain alone, clock before the lock, no stdout
 scan, no deadline, the orphan check by PID only, `status` taking the lock, and a
 warning only on the first in-flight check) makes the named test fail.
+
+## Review round 2 and the fixes
+
+Codex (same model and settings) reviewed `fb96152e..671d4ceb`: 93 tests passed,
+and it requested changes with 1 blocker, 13 major and 3 minor findings, plus
+three goalpost items. Of the 18 round-1 findings it rated 8 fixed and 10 partly
+fixed; every "partly" gap is one of the findings below, except two test-coverage
+gaps (rows 18 and 19). Each finding, its fix, and the test that fails without
+the fix:
+
+| # | Severity | Finding | Fix | Test |
+| --- | --- | --- | --- | --- |
+| 1 | blocker | `run watch --interval 30 --interval -1` accepted at 30 s; gh honours `-1` and never sleeps | every `--interval` value must be a plain positive integer, else exit 64 | `classify::non_positive_or_unreadable_intervals_are_refused` |
+| 2 | major | grouped shorthands (`pr list -dL1000`) hid the limit | pflag-compatible short-group parsing | `classify::grouped_shorthands_are_read` |
+| 3 | major | boolean flags judged by presence (`--web=false`) | effective boolean values | `guard::uninspectable_reads_boolean_values` |
+| 4 | major | `release create --notes-from-tag` passed uninspected | refused (exit 65) | `guard::notes_from_tag_is_refused` |
+| 5 | major | flag-shaped alias arguments escaped inspection | every alias argument is body text | `guard::alias_flag_shaped_arguments_are_inspected` |
+| 6 | major | an unknown `api` flag skipped pagination charging | pagination charged on every path | `classify::api_parser_follows_pflag_rules` and the paginate tests |
+| 7 | major | wrapped lower-case base64 exempt | exemption removed (departure 19) | `guard::base64_detection` |
+| 8 | major | lease descent forged by an independent open | `fdinfo` proof of the locked open file | `state::only_the_locked_open_file_proves_descent`, `cli::reopening_the_lease_file_does_not_prove_descent` |
+| 9 | major | finish freed a slot a descendant still held | holder and file kept while locked | `cli::background_helper_keeps_the_write_slot` |
+| 10 | major | recovery reopened early (crash mid-quarantine; limits raised later) | hard-link quarantine plus atomic save; `blocked_until`; cooldown file | `state::repeated_quarantine_keeps_every_damaged_file`, `state::cooldown_record_survives_a_damaged_state_file`, `state::damaged_cooldown_record_recovers_conservatively`, `budget::saturated_bucket_blocks_for_an_hour`, `replay::recovery_block_survives_raised_limits` |
+| 11 | major | no READ room skipped overdue feedback for WRITE and SEARCH | wait for READ room | `replay::exhausted_read_budget_does_not_skip_overdue_feedback` |
+| 12 | major | `run watch` makes at least 3 requests per poll, not 2 | 4 per poll plus 2 startup; `pr checks` 2 per poll | `classify::watch_loops_are_charged_and_fast_ones_refused` |
+| 13 | major | stdout drained for only 2 s; scanning after forwarding | scan before queueing; complete delivery; late-signal abandon | `cli::slow_consumer_receives_every_byte` |
+| 14 | major | unknown `api` flag values in the audit log | values redacted | `guard::unknown_flag_values_are_redacted` |
+| 15 | minor | body lines that look like headers reopened header parsing | CRLF header-block rule | `pushback::jq_body_that_looks_like_headers_is_not_a_header` |
+| 16 | minor | zombies counted as alive | `Z`/`X` are dead | `state::zombies_are_not_alive` |
+| 17 | minor | sweep skipped file-free calls and judged by age alone | sweep on every paced call; lock, creator and age rules | `snapshot::sweep_removes_only_abandoned_snapshot_directories`, `snapshot::inherited_lock_outlives_the_wrapper_copy`, `cli::every_paced_call_sweeps_abandoned_snapshots`, `cli::background_helper_keeps_the_snapshot` |
+| 18 | round-1 #8 gap | the watch test could not show the KILL escalation | fake gh that ignores TERM | `cli::watch_that_ignores_term_is_killed` |
+| 19 | round-1 #13 gap | the refresh test checked totals, not the order | the fake gh records the saved READ window when the refresh is sent | `replay::refresh_requests_are_charged_before_they_are_sent` |
+
+Goalpost items: the attached-shorthand guard case has full `BodySource`
+equality again; the "no READ room, skip the refresh" exemption is gone (row 11);
+and the wrapped-base64 exemption is gone (row 7).
+
+Mutation checks for round 2: re-introducing the old behaviour makes the named
+test fail for the `fdinfo` proof (row 8), the descendant-held slot (row 9), the
+limits-independent block (row 10), the refresh wait (row 11), the 2 s drain
+cutoff (row 13), three sweep mutants (no sweep in `run`, gh not inheriting the
+snapshot lock, the sweep ignoring the lock; row 17), and the KILL escalation
+(row 18: without it the test waited the fake gh's full 30 s).
+
+After these fixes `cargo test -p gh-paced` runs 113 tests, all passing: 75
+library, 24 CLI and 14 replay tests, against 93 at the round-2 head. The run
+takes about 12.5 s of wall time, most of it the CLI tests' real child
+processes (9.2 s).
 
 ## Test changes worth a reviewer's attention
 
@@ -468,9 +614,41 @@ follows a behaviour change the review asked for:
   mask; overriding a signal the caller had set to ignored (as `nohup` does); a
   guard that reported only its first reason; misaligned `status` columns.
 
+Round 2 changed these existing tests:
+
+- `classify::watch_loops_are_charged_and_fast_ones_refused`: the deadlines went
+  from 300 s to 120 s (`run watch`) and from 600 s to 270 s (`pr checks`), the
+  new per-poll estimates.
+- `cli::watch_past_its_deadline_is_stopped`: `watch_cost` in the test config
+  went from 2 to 6, so the 2-token startup plus 2 polls of 2 requests still
+  give the 2 s budget the test asserts.
+- `guard::base64_detection`: 40 bare SHAs now count 1,600 (they counted 40).
+- `guard`: the attached-shorthand case has full equality again (round 2's
+  goalpost finding).
+- `state::corrupt_state_is_quarantined_conservatively` and
+  `budget::saturated_bucket_blocks_for_an_hour`: `hour_used() == 30` became
+  `blocked_until == now + 3,600 s`, because the recovery block is no longer a
+  window entry; the budget test adds caps of 1, 30, 500 and 5,000 and requires
+  the block to hold under each. The quarantine test's
+  `!paths.state().exists()`, which asserted the gap row 10 closed, became
+  "the saved recovery state equals the loaded one".
+- `replay::corrupt_state_pauses_the_account_for_an_hour`: the refusal text is
+  now `read budget blocked until <time> after state recovery` (it was the
+  500/hour window text), and the saved buckets are asserted to carry the block
+  and no tokens. The refusal at +901 s and the run at +3,601 s are unchanged.
+- `state::inherited_file_ids_include_open_files` became
+  `only_the_locked_open_file_proves_descent`, and
+  `snapshot::sweep_removes_only_old_snapshot_directories` became
+  `sweep_removes_only_abandoned_snapshot_directories`, following the new rules.
+
 ## Open items
 
 - Budgets are per host; hosts do not share state. More than four hosts on one
   account need a tighter config file.
 - Classification works from command lines, not HTTP requests.
 - Pushback detection depends on gh's error wording.
+- The watch per-poll figures are estimates from gh's code paths, not
+  measurements. A `run watch` on a run with more than 100 jobs, or with several
+  jobs that fail during the watch, can make more requests than it paid for
+  before the deadline stops it; the deadline still bounds its wall time and the
+  30 s floor its rate.

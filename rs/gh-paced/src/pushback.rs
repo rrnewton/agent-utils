@@ -7,8 +7,12 @@
 //!
 //! `gh api --include` prints the HTTP status line and response headers on STDOUT instead, so for
 //! that form the wrapper also feeds stdout through [`Scanner::feed_headers`], which reads only
-//! header blocks (a `HTTP/<version> <status>` line up to the next blank line): the status code,
-//! `Retry-After`, and `X-RateLimit-Remaining`. Response bodies are never matched.
+//! header blocks: the status code, `Retry-After`, and `X-RateLimit-Remaining`. gh writes a block
+//! as a `HTTP/<version> <status>` line, then `Name: value` lines each ending in CR LF, then a
+//! blank CR LF line. A block counts only once that blank CR LF line arrives and only if every
+//! header line in it ended in CR LF; anything else (a body printed by `--jq`, with plain LF line
+//! ends, or a block cut short) is dropped, so body text that merely looks like a status line and
+//! headers does not start a cooldown.
 
 use crate::config::Config;
 
@@ -41,8 +45,16 @@ pub struct Scanner {
     line: Vec<u8>,
     /// The current stdout line is longer than [`MAX_HEADER_LINE`] and is being skipped.
     skipping: bool,
-    /// Inside a response header block on stdout.
-    in_headers: bool,
+    /// The stdout header block being read, not yet confirmed by its blank CR LF line.
+    pending: Option<HeaderBlock>,
+}
+
+/// What one stdout header block reported, kept until the block is confirmed.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct HeaderBlock {
+    status: u16,
+    retry_after: Option<f64>,
+    remaining_zero: bool,
 }
 
 /// The cooldown a scan calls for.
@@ -163,7 +175,7 @@ impl Scanner {
                 if self.line.len() >= MAX_HEADER_LINE {
                     self.line.clear();
                     self.skipping = true;
-                    self.in_headers = false;
+                    self.pending = None;
                 } else {
                     self.line.push(b);
                 }
@@ -171,27 +183,34 @@ impl Scanner {
         }
     }
 
+    /// One stdout line, without its LF. gh ends header lines and the blank line after them with
+    /// CR LF, so `crlf` (a CR before the LF) is part of what makes a line a header line.
     fn header_line(&mut self, raw: &[u8]) {
+        let crlf = raw.last() == Some(&b'\r');
         let line = strip_ansi(raw);
         let line = line.trim_ascii();
         if line.is_empty() {
-            self.in_headers = false;
+            if let (Some(block), true) = (self.pending.take(), crlf) {
+                self.commit(&block);
+            }
             return;
         }
         let lower = line.to_ascii_lowercase();
         if let Some(status) = http_status(&lower) {
-            self.in_headers = true;
-            match status {
-                429 => self.http_429 = true,
-                403 => self.http_403 = true,
-                _ => {}
-            }
+            // A new block starts; an unconfirmed earlier one is dropped.
+            self.pending = Some(HeaderBlock {
+                status,
+                ..HeaderBlock::default()
+            });
             return;
         }
-        if !self.in_headers {
+        let Some(block) = self.pending.as_mut() else {
             return;
-        }
-        let Some(colon) = lower.iter().position(|b| *b == b':') else {
+        };
+        let colon = lower.iter().position(|b| *b == b':');
+        let (true, Some(colon)) = (crlf, colon) else {
+            // Not gh's header format: this was body text, not a header block.
+            self.pending = None;
             return;
         };
         let name = lower[..colon].trim_ascii();
@@ -202,11 +221,24 @@ impl Scanner {
             .filter(|n| n.is_finite() && *n >= 0.0);
         match (name, number) {
             (b"retry-after", Some(n)) => {
-                self.retry_after = Some(self.retry_after.map_or(n, |old| old.max(n)));
+                block.retry_after = Some(block.retry_after.map_or(n, |old| old.max(n)));
             }
-            (b"x-ratelimit-remaining", Some(0.0)) => self.remaining_zero = true,
+            (b"x-ratelimit-remaining", Some(0.0)) => block.remaining_zero = true,
             _ => {}
         }
+    }
+
+    /// Record a confirmed header block.
+    fn commit(&mut self, block: &HeaderBlock) {
+        match block.status {
+            429 => self.http_429 = true,
+            403 => self.http_403 = true,
+            _ => {}
+        }
+        if let Some(n) = block.retry_after {
+            self.retry_after = Some(self.retry_after.map_or(n, |old| old.max(n)));
+        }
+        self.remaining_zero |= block.remaining_zero;
     }
 
     /// Matched pattern names.
@@ -373,9 +405,37 @@ mod tests {
         assert!(!s.remaining_zero && !s.http_403);
         assert!(s.verdict(&cfg).is_none());
         // An over-long line is skipped and ends the header block.
-        let long = format!("HTTP/2.0 200 OK\n{}\nRetry-After: 50\n", "x".repeat(10_000));
+        let long = format!(
+            "HTTP/2.0 200 OK\r\n{}\r\nRetry-After: 50\r\n\r\n",
+            "x".repeat(10_000)
+        );
         let s = headers(&[&long]);
         assert_eq!(s.retry_after, None);
+    }
+
+    /// `gh api --include --jq .body` prints the real header block, then the body through jq with
+    /// plain LF line ends. A body that holds a status line and headers at line starts is still
+    /// body text: it must not start a cooldown.
+    #[test]
+    fn jq_body_that_looks_like_headers_is_not_a_header() {
+        let cfg = Config::default();
+        let s = headers(&[
+            "HTTP/2.0 200 OK\nX-Ratelimit-Remaining: 4000\r\n\r\n",
+            "HTTP/2.0 403 Forbidden\nRetry-After: 99999\nX-Ratelimit-Remaining: 0\n\n",
+        ]);
+        assert!(!s.http_403 && !s.remaining_zero, "{s:?}");
+        assert_eq!(s.retry_after, None);
+        assert!(s.verdict(&cfg).is_none());
+        // One header line without its CR spoils the block, even if the rest have it.
+        let s = headers(&["HTTP/2.0 429 Too Many Requests\nRetry-After: 60\r\nVia: x\n\r\n"]);
+        assert!(s.verdict(&cfg).is_none(), "{s:?}");
+        // A block with no blank CR LF line after it (cut short) does not count.
+        let s = headers(&["HTTP/2.0 429 Too Many Requests\nRetry-After: 60\r\n"]);
+        assert!(s.verdict(&cfg).is_none(), "{s:?}");
+        // The exact form gh writes does count: an LF status line, CR LF headers and blank line.
+        let s = headers(&["HTTP/2.0 429 Too Many Requests\nRetry-After: 1200\r\n\r\n[]"]);
+        assert!(s.http_429);
+        assert_eq!(s.verdict(&cfg).expect("pushback").cooldown_secs, 1200.0);
     }
 
     #[test]

@@ -41,6 +41,7 @@ pub fn report(paths: &Paths, cfg: &Config, now: f64) -> Result<Value, String> {
                 "hour_used": b.hour_used(),
                 "per_hour": limits.per_hour,
                 "halved": halve,
+                "blocked_until": b.blocked_until.filter(|t| *t > now).map(|t| human(t, now, cfg.display_tz)),
                 "next_slot_secs": (b.bucket_wait(limits, 1).max(b.hour_wait(limits, 1, now)) * 10.0).ceil() / 10.0,
             }),
         );
@@ -138,9 +139,11 @@ pub fn render(v: &Value) -> String {
                     "now".to_string()
                 },
                 if c["halved"].as_bool().unwrap_or(false) {
-                    "  (halved)"
+                    "  (halved)".to_string()
+                } else if let Some(t) = c["blocked_until"].as_str() {
+                    format!("  (blocked after state recovery until {t})")
                 } else {
-                    ""
+                    String::new()
                 }
             ));
         }

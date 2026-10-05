@@ -90,7 +90,8 @@ EXIT STATUS
       the hourly cap, a watch outlasted its paid polls, or nesting too deep
   65  refused by the write content guard (body > 8 KiB, base64 run > 1000, a
       body gh composes itself, or a body file that cannot be copied)
-  64  usage error, or a refused command shape (watch interval under 30 s)
+  64  usage error, or a refused command shape (a watch interval under 30 s,
+      or one that is not a plain positive whole number of seconds)
   70  internal error: pacing state cannot be locked, read or written
   78  configuration error
   127 the real gh cannot be found or run
@@ -339,7 +340,7 @@ fn run_paced(account: Option<String>, real_gh: Option<String>, gh_args: Vec<Stri
         chain,
         depth,
         alive: &alive,
-        inherited_leases: state::inherited_file_ids(),
+        inherited_leases: state::inherited_locked_file_ids(),
         pid,
         start_ticks: state::process_start_ticks(pid).unwrap_or(0),
         nonce: state::new_nonce(now),

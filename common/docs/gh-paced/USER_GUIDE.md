@@ -60,10 +60,19 @@ setting (`!gh auth git-credential`) goes through the same wrapper. That means
 ## What passes through unchanged
 
 - **stdout** goes straight to the real gh's stdout, so pipes and `--json` output
-  are untouched.
+  are untouched. The one exception is `gh api -i/--include`, whose stdout is
+  copied through so its response headers can be read (see
+  [pushback](#github-pushback-and-the-cooldown)).
 - **stderr** is copied through while it is scanned for GitHub pushback (see
   below). When stderr is a terminal, gh sees a pseudo-terminal, so colours and
-  prompts behave as before.
+  prompts behave as before. A copied stream is scanned before it is passed on,
+  and every byte gh-paced reads from gh reaches the consumer however slowly the
+  consumer reads; gh feels the same back-pressure it would without gh-paced
+  once 8 MiB is queued. After gh exits, gh-paced keeps reading until end of
+  file, 2 s of silence, 5 s after the exit, or 64 MiB more, whichever comes
+  first, because a background process gh started may hold the stream open. If
+  you send INT, TERM, HUP or QUIT after gh has exited, the output not yet
+  delivered is dropped with a warning and gh-paced dies by that signal.
 - **stdin** and the controlling terminal are inherited. The one exception: a
   write whose body arrives on stdin (`--body-file -`, `--input -`, `-F body=@-`)
   is read first so the content guard can check it, then replayed to gh byte for
@@ -114,18 +123,25 @@ Some calls cost more than one token:
   because gh fetches up to 100 items per request.
 - Watch loops, `gh pr checks --watch` and `gh run watch`, keep polling for as
   long as they run. They cost 20 tokens up front (`watch_cost`), and the tokens
-  buy a fixed run time: `floor(cost / requests per poll) x interval` seconds,
-  where `gh run watch` makes 2 requests per poll and `gh pr checks --watch`
-  makes 1. At 30 s intervals that is 300 s for `run watch` and 600 s for
+  buy a fixed run time: `floor((cost - 2) / requests per poll) x interval`
+  seconds. 2 tokens pay for startup (finding the run or pull request); a
+  `gh run watch` poll is charged 4 requests (gh fetches the run, its workflow
+  and its jobs, and more for large or failing runs) and a `gh pr checks --watch`
+  poll 2. At 30 s intervals that is 120 s for `run watch` and 270 s for
   `pr checks --watch`. A watch still running at that deadline is stopped (TERM,
   then KILL 5 s later) and gh-paced exits 75. A polling interval shorter than
   30 s is refused (exit 64) unless `GH_PACED_ALLOW_FAST_WATCH=1` is set. Pass
-  `--interval 30` instead.
+  `--interval 30` instead. Every `--interval` value must be a plain positive
+  whole number of seconds (`30`, not `0`, `-1`, `030` or `0x1e`); anything else
+  is refused (exit 64) even with the override, because gh treats zero or a
+  negative interval as no sleep at all.
 - A call whose cost is larger than its class's hourly cap can never be
   admitted, so it is refused at once (exit 75) rather than after a wait.
 
 When a flag that sets a cost or a limit is repeated (`--interval`, `-L`), the
-most conservative value counts, whichever occurrence gh honours.
+most conservative value counts, whichever occurrence gh honours. Short flags
+are read the way gh reads them, including groups: `pr list -dL1000` is
+`-d -L 1000`.
 
 ## Budgets and the GitHub limits behind them
 
@@ -220,10 +236,11 @@ so it is paced too:
   once every 60 s (`rate_limit_min_refresh_secs`), never during a cooldown, and
   only one process on the host runs it at a time.
 - **Cost.** One READ token, charged under the lock before the request is sent,
-  so a refresh can never push the host past its READ budget. When the READ
-  bucket or hourly cap has no room for that token, the refresh is skipped and
-  the call is paced on the cached numbers (or the local budgets alone). It gives
-  up after 20 s.
+  so a refresh can never push the host past its READ budget. When a refresh is
+  due and the READ bucket or hourly cap has no room for that token, READ,
+  SEARCH and WRITE calls wait for room (or are refused past
+  `GH_PACED_MAX_WAIT`) rather than run without current account numbers. The
+  refresh gives up after 20 s.
 - **After a sleep.** Every admission pass re-reads the state, so a call that
   slept (for a bucket, a cooldown, or a write slot) checks the account-wide
   numbers again, refreshing first if a refresh has come due, before it is
@@ -257,10 +274,13 @@ reads is still found. It looks for:
 
 For `gh api -i/--include`, gh prints the HTTP status line and response headers
 on **stdout** instead. For that form only, gh-paced also reads stdout as it
-passes through, looking only inside header blocks (a `HTTP/<version> <status>`
-line up to the next blank line): a 403 or 429 status, `Retry-After`, and
-`X-RateLimit-Remaining: 0`. Text in a response body is never treated as a
-header. stdout itself is passed on unchanged.
+passes through, looking only inside header blocks: a 403 or 429 status,
+`Retry-After`, and `X-RateLimit-Remaining: 0`. A header block is recognised
+only in the shape gh prints it: an `HTTP/<version> <status>` line, header lines
+ending in CRLF, and a CRLF blank line, and it is acted on only when that blank
+line arrives. Text in a response body, including body lines printed through
+`--jq` that look like a status line and headers, is never treated as a header.
+stdout itself is passed on unchanged.
 
 Any limit signal (one of the phrases, HTTP 429, a `Retry-After` value, or
 `X-RateLimit-Remaining: 0`) starts a **cooldown** of the larger of `Retry-After`
@@ -304,6 +324,9 @@ Before running a WRITE, gh-paced reads every body source:
   and every string inside it is also scanned after JSON decoding, so a `body`
   field is caught however it is escaped;
 - `gh workflow run -f/-F` and `--json` (stdin);
+- for an alias, extension or unknown command, every argument, flag-shaped or
+  not (`--payload=<text>`, `--repo <text>`, `-- <text>`), because its
+  expansion may pass any of them to a body flag;
 - for any other write, `--body`, `--body-file` and `--input`.
 
 Every body file is first copied to a private snapshot (see
@@ -328,10 +351,11 @@ Base64-looking content is either of:
   encoding, and a long ruler of dashes all count, so nothing long slips through
   as a "word";
 - a block of consecutive lines, each at least 20 characters and made only of
-  base64-alphabet characters, counted together, when the block contains an
-  upper-case letter, `+` or `/`. That condition exempts a list of lower-case
-  hex digests (one commit SHA per line), which is still bounded by the size
-  limit.
+  base64-alphabet characters, counted together, whatever they contain. Line
+  wrapping therefore does not hide an encoding. A list of bare commit SHAs, one
+  per line, is such a block too: 26 or more 40-character SHAs exceed 1,000. Put
+  a word on each line (`<sha> fix the parser`), or point at a commit range,
+  instead.
 
 The refusal names every reason that applies. Files are read only up to the
 limit plus one byte, so a very large file is reported as "at least" that size:
@@ -360,10 +384,15 @@ cannot see it. These are refused with exit 65 unless
   without `--body`/`--body-file` (or `--web`); `pr review` without
   `--approve`, `--request-changes`, `--comment` or a body; `pr edit` /
   `issue edit` with no flags; `pr merge` without `--merge`, `--squash` or
-  `--rebase`; `release create` without `--notes`, `--notes-file`,
-  `--generate-notes` or `--notes-from-tag`;
+  `--rebase`; `release create` without `--notes`, `--notes-file` or
+  `--generate-notes`;
+- `release create --notes-from-tag` (gh reads the tag's annotation or commit
+  message after gh-paced has run and sends it as the release notes);
 - `gist edit` without `--add` or `--remove` (it opens an editor or replaces a
   file gh reads later).
+
+Boolean flags count by their value, as gh reads them: `--editor=false` is not
+the editor form, and `--web=false` is not the web form.
 
 The fix is always to write the text first and pass it with `--body` or
 `--body-file`.
@@ -402,18 +431,27 @@ the gh it started keeps the slot until gh itself exits. Other processes test a
 slot with a non-blocking shared `flock`; a lease that is no longer locked is
 cleared, and so is a holder from an older state file whose process has died.
 
+When the write ends but a process gh started still holds the lease (gh left a
+background helper running), gh-paced closes its own copy and leaves the slot
+taken; a later write clears it once that process has exited.
+
 A gh-paced started inside a gh run by another gh-paced (for example by an alias
 or extension that calls gh again) does not wait for its own parent's slot. It
 must prove that it descends from the holder in two ways: the holder's nonce is in
-`GH_PACED_INFLIGHT_CHAIN`, and the holder's lease file is among its own inherited
-open files. Setting the variable by hand is not enough. Nesting deeper than 8
-levels is refused (exit 75).
+`GH_PACED_INFLIGHT_CHAIN`, and it holds the holder's locked lease file, inherited
+from the holder. The second is checked in `/proc/self/fdinfo`, where Linux lists
+the `flock` only for the open file that took it, so opening the lease file
+again (for example redirecting stdin from it) proves nothing, and neither does
+setting the variable by hand. Nesting deeper than 8 levels is refused (exit 75).
+
+A process counts as running only while its PID and start time both match and
+it is not a zombie.
 
 Caveats of the lease design, all of which err toward fewer calls except the
 second:
 
-- a long-lived process that gh starts and that keeps the inherited file open
-  (a daemon) keeps the slot taken until it exits; later writes wait and are
+- a long-lived background process that gh starts and that keeps the inherited
+  file open keeps the slot taken until it exits; later writes wait and are
   refused after `GH_PACED_MAX_WAIT`;
 - deleting a lease file by hand frees the slot while its gh is still running;
 - a nested process that closed its inherited files waits for its parent like
@@ -515,23 +553,36 @@ account:
   at a stale time.
 - `<account>.audit.jsonl` is the append-only audit log, rotated to `.1` past
   10 MiB.
+- `<account>.cooldown` is a copy of the latest pushback cooldown, kept apart
+  from the state file. Every load takes the later of the two, so a damaged
+  state file cannot shorten a long `Retry-After` pause.
 - `<account>.lease-<nonce>` is one file per running write; its lock is the
   write's in-flight slot (see [Waiting and refusing](#waiting-and-refusing)).
-  It is removed when the write ends.
-- `snap-<nonce>/` holds one invocation's private copies of the body files it
-  sends (directories 0700, files 0600, at most 64 MiB per file). It is removed
-  when the invocation ends; one left behind by a killed wrapper is removed by a
-  later invocation once it is a day old.
+  It is removed when the write ends, unless a process gh started still holds
+  it.
+- `snap-<pid>-<start ticks>-<nonce>/` holds one invocation's private copies of
+  the body files it sends (directories 0700, files 0600, at most 64 MiB per
+  file), plus a `.lock` file that the invocation locks and gh inherits. It is
+  removed when the invocation ends, unless a process gh started still holds
+  that lock. Every paced call also removes directories whose lock is free,
+  whose creating process has exited, and that are at least 60 s old, so one left
+  behind by a killed wrapper does not linger; any other `snap-*` directory is
+  removed once it is a day old.
 
 The state file is replaced atomically (written to a temporary file, then
-renamed). A state file that cannot be parsed is moved aside to
-`<account>.json.corrupt-<unix-seconds>`. Because the lost file may have held a
-full hour of calls, gh-paced does not start from empty buckets. It writes a
-recovery state in which **every class's hourly window is full** as of that
-moment, a cooldown of `cooldown_secs` is in force, and every write whose lease
-is still locked is restored as in flight. Paced calls for that account on that
-host are therefore refused or delayed for the next hour, with a message that
-says the state file was unusable and where it was moved. It clears itself
+renamed). A state file that cannot be parsed is kept for inspection as
+`<account>.json.corrupt-<unix-seconds>` (a hard link; `-1`, `-2`, ... is
+appended if that name is taken) and replaced, by one rename, with a recovery
+state, so the state path never goes missing and a crash during recovery cannot
+leave a fresh start. Because the lost file may have held a full hour of calls,
+gh-paced does not start from empty buckets: in the recovery state **every class
+is blocked for the next hour** (a fixed end time, so raising a limit afterwards
+does not shorten it), a cooldown of `cooldown_secs` is in force, and every write
+whose lease is still locked is restored as in flight. An unreadable
+`<account>.cooldown` file is moved aside the same way and triggers the same
+recovery, because the pause it held is unknown. Paced calls for that account on
+that host are therefore refused or delayed for the next hour, with a message
+that says which file was unusable and where it was moved. It clears itself
 after an hour; do not delete state files to get around it.
 
 Each audit line records the UTC and US Eastern time, host, PID, event
@@ -541,7 +592,9 @@ and a short detail. In the argument summary, inline bodies are replaced by
 `<N bytes>`, header values are redacted, and a `gh api` endpoint loses its host,
 user name and password, query string and fragment (a query string can carry an
 `access_token`). For an alias, extension or unknown command, only flag names are
-kept and every other argument becomes `<arg>`. The log never contains request
+kept and every other argument becomes `<arg>`; an unrecognised flag of a known
+command keeps its name and loses its value (`--token=X` becomes `--token`).
+The log never contains request
 bodies, tokens or environment variables. LOCAL calls are not audited.
 
 `gh-paced status [--account NAME | --all] [--json]` reads these files and prints
@@ -558,7 +611,7 @@ other process is stuck.
 | gh's own | the call ran; gh-paced returns gh's status, or dies by gh's signal |
 | 75 | refused: the wait would exceed `GH_PACED_MAX_WAIT`, the cost can never fit under the hourly cap, a watch ran past the deadline its cost paid for, or gh-paced is nested too deep |
 | 65 | refused by the write content guard: body too large, base64-looking content, a body gh would compose itself, or a body file that cannot be copied for inspection |
-| 64 | usage error, or a refused command shape (a watch interval under 30 s) |
+| 64 | usage error, or a refused command shape (a watch interval under 30 s, or one that is not a positive whole number) |
 | 70 | internal error: the pacing state cannot be locked, read or written |
 | 78 | configuration error, or `--real-gh` resolves to gh-paced |
 | 127 | the real gh cannot be found or run |
@@ -578,6 +631,11 @@ next slot opens.
   GraphQL request whose query cannot be read is charged as WRITE.
 - **The in-flight slot is held by a lock on a file.** Deleting a lease file by
   hand frees the slot early; see [Waiting and refusing](#waiting-and-refusing).
+- **Watch charges are estimates.** The requests per poll are worked out from
+  what gh fetches, not measured. A `gh run watch` on a run with more than 100
+  jobs, or with several jobs that fail during the watch, can make more requests
+  than it paid for before its deadline; the deadline still bounds how long it
+  runs and the 30 s floor how often it polls.
 - **Pushback detection depends on gh's error text.** gh-paced recognises the
   phrases GitHub and gh use today. A change in that wording could hide a
   pushback, but GitHub's account-wide counters (above) still apply.
