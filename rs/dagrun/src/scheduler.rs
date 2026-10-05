@@ -683,6 +683,27 @@ fn proc_descendants(root: u32) -> (Vec<u32>, bool) {
     (out, complete)
 }
 
+/// Whether a parentage sweep from `root` can find anything at all.
+///
+/// Linux reparents a process's children when it exits, before it becomes a zombie, so a root that
+/// is gone, or a zombie with no thread left, has no children: the sweep would read every record in
+/// the process table and find nothing. That walk is the dominant cost of tearing down a finished
+/// step on a busy host, and it ran on every reap, including the one after the step's own exit.
+///
+/// A zombie is not always an exited process: a thread-group leader that called `pthread_exit`
+/// shows as a zombie while its other threads run, and its children stay attached to them, so a
+/// zombie keeps the sweep while its task directory lists any other thread. A root that is still
+/// running, or whose record or threads cannot be read, keeps the sweep.
+fn root_can_have_descendants(root: u32) -> bool {
+    match crate::procstat::read(root) {
+        Ok(Some(stat)) if matches!(stat.state, b'Z' | b'X' | b'x') => {
+            std::fs::read_dir(format!("/proc/{root}/task")).map_or(true, |tasks| tasks.count() > 1)
+        }
+        Ok(Some(_)) | Err(_) => true,
+        Ok(None) => false,
+    }
+}
+
 /// A sweep proves emptiness only when every process-table record was readable and no descendant
 /// remains in that snapshot. Whether a PID was newly discovered is irrelevant: an already
 /// signalled descendant can remain alive (or unreaped) and must keep the bounded sweep incomplete.
@@ -3196,7 +3217,7 @@ fn hard_reap(cgroups: &BoxedCgroups, tag: &str, pid: u32, nonce: Option<&str>) {
         }
     };
     let _ = signal_group(pid, libc::SIGKILL);
-    if !contained {
+    if !contained && root_can_have_descendants(pid) {
         let (swept, complete) = kill_descendants(pid);
         if swept > 0 {
             eprintln!(
@@ -6493,6 +6514,90 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
         );
         assert!(crate::procstat::parse(b"malformed", None).is_err());
         assert!(crate::procstat::parse(b"1 (x) S 0 nope", None).is_err());
+    }
+
+    /// The unboxed parentage sweep is skipped only for a root whose children Linux has already
+    /// reparented: one that is a zombie or gone. A running root keeps it.
+    #[test]
+    fn only_a_running_root_can_have_descendants_to_sweep() {
+        assert!(root_can_have_descendants(std::process::id()));
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert!(root_can_have_descendants(pid));
+        child.kill().unwrap();
+        // Until `wait`, the killed child stays a zombie.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while crate::procstat::read(pid)
+            .unwrap()
+            .is_some_and(|stat| stat.state != b'Z')
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the killed child never became a zombie"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!root_can_have_descendants(pid));
+        child.wait().unwrap();
+        assert!(!root_can_have_descendants(pid));
+    }
+
+    /// A leader that called `pthread_exit` is a zombie whose process still runs, so its children
+    /// stay reachable by parentage and the sweep must stay; once its last thread exits, it goes.
+    #[test]
+    fn a_zombie_leader_with_a_live_thread_keeps_the_descendant_sweep() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        let root = std::env::temp_dir().join(format!(
+            "dagrun-zombie-leader-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("helper.c");
+        let binary = root.join("helper");
+        std::fs::write(&source, include_str!("../tests/fixtures/proccpu-helper.c")).unwrap();
+        assert!(Command::new("cc")
+            .args(["-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .status()
+            .unwrap()
+            .success());
+        let mut child = Command::new(&binary)
+            .arg("leader")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line, "worker\n");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while crate::procstat::read(pid).unwrap().unwrap().state != b'Z' {
+            assert!(
+                Instant::now() < deadline,
+                "the leader never exited its own thread"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(root_can_have_descendants(pid));
+        // End of input makes the worker thread, the last one, exit the process.
+        drop(child.stdin.take());
+        while std::fs::read_dir(format!("/proc/{pid}/task")).map_or(0, |tasks| tasks.count()) > 1 {
+            assert!(Instant::now() < deadline, "the worker thread never exited");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!root_can_have_descendants(pid));
+        child.wait().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

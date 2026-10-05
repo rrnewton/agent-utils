@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import signal
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -11,10 +12,12 @@ import pytest
 import dagrun.teardown as teardown
 from dagrun.procstat import parse_process_stat
 from dagrun.teardown import (
+    _hard_reap,
     _kill_descendants,
     _live_process_group_from_stat,
     _live_process_groups,
     _proc_descendants,
+    _root_can_have_descendants,
 )
 
 
@@ -175,6 +178,56 @@ def test_descendant_kill_requires_a_complete_empty_sweep(
         (919191, signal.SIGKILL),
         (919191, signal.SIGKILL),
     ]
+
+
+def test_only_a_running_root_can_have_descendants_to_sweep(tmp_path: Path) -> None:
+    """A zombie or vanished root has no children left to reach, so its sweep is skipped."""
+    for pid, record, tasks in (
+        (100, _stat_record(100, b"runner"), (100,)),
+        (200, _stat_record(200, b"exited", state=b"Z"), (200,)),
+        (300, b"malformed", (300,)),
+        (500, _stat_record(500, b"leader", state=b"Z"), (500, 501)),
+    ):
+        (tmp_path / str(pid)).mkdir()
+        (tmp_path / str(pid) / "stat").write_bytes(record)
+        for task in tasks:
+            (tmp_path / str(pid) / "task" / str(task)).mkdir(parents=True)
+
+    assert _root_can_have_descendants(100, proc_root=tmp_path)
+    assert not _root_can_have_descendants(200, proc_root=tmp_path)
+    assert not _root_can_have_descendants(400, proc_root=tmp_path)
+    # An unreadable record proves nothing, so it keeps the sweep.
+    assert _root_can_have_descendants(300, proc_root=tmp_path)
+    # A leader that called pthread_exit is a zombie whose other threads still
+    # hold its children.
+    assert _root_can_have_descendants(500, proc_root=tmp_path)
+
+
+@dataclass
+class _Leader:
+    pid: int
+
+
+def test_hard_reap_sweeps_descendants_only_from_a_running_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The unboxed parentage sweep runs for a running root and is skipped for a dead one."""
+    swept: list[int] = []
+    running = {818181: True, 828282: False}
+
+    def kill_descendants(root: int) -> int:
+        swept.append(root)
+        return 0
+
+    monkeypatch.setattr(os, "killpg", lambda _pgid, _sig: None)
+    monkeypatch.setattr(teardown, "_kill_descendants", kill_descendants)
+    monkeypatch.setattr(
+        teardown, "_root_can_have_descendants", lambda root: running[root]
+    )
+    for pid in running:
+        _hard_reap(_Leader(pid), None, "g.step", None)
+
+    assert swept == [818181]
 
 
 def test_descendant_kill_warns_without_a_complete_empty_sweep(

@@ -113,6 +113,34 @@ def _proc_descendants(
     return out, complete
 
 
+def _root_can_have_descendants(root: int, *, proc_root: Path = Path("/proc")) -> bool:
+    """Whether a parentage sweep from ``root`` can find anything at all.
+
+    Linux reparents a process's children when it exits, before it becomes a
+    zombie, so a root that is gone, or a zombie with no thread left, has no
+    children: the sweep would read every record in the process table and find
+    nothing.  That walk is the dominant cost of tearing down a finished step on
+    a busy host, and it ran on every reap, including the one after the step's
+    own exit.
+
+    A zombie is not always an exited process: a thread-group leader that called
+    ``pthread_exit`` shows as a zombie while its other threads run, and its
+    children stay attached to them, so a zombie keeps the sweep while its task
+    directory lists any other thread.  A root that is still running, or whose
+    record or threads cannot be read, keeps the sweep.
+    """
+    try:
+        stat = parse_process_stat((proc_root / str(root) / "stat").read_bytes())
+    except OSError as exc:
+        return not _proc_entry_disappeared(exc)
+    if stat is None or stat.state not in ("Z", "X", "x"):
+        return True
+    try:
+        return len(os.listdir(proc_root / str(root) / "task")) > 1
+    except OSError:
+        return True
+
+
 def _kill_descendants(root: int) -> int:
     """SIGKILL descendants and require a complete empty scan before success.
 
@@ -353,7 +381,7 @@ def _hard_reap(
         except (ProcessLookupError, OSError):
             pass  # whole group already gone — an expected, benign race, not a degraded skip
 
-    if not contained:
+    if not contained and _root_can_have_descendants(pgid):
         swept = _kill_descendants(pgid)
         if swept:
             _warn(f"step {tag!r}: killed {swept} descendant(s) outside its process group")
