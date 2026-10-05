@@ -6837,16 +6837,38 @@ pub(crate) mod tests {
             ),
             _ => "echo 'not json'".to_owned(),
         };
-        fs::write(
+        write_executable(
             &script,
-            format!(
+            &format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$@\" > '{}'\n{body}\n",
                 root.join(format!("argv-{behaviour}")).display()
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        );
         script
+    }
+
+    /// Write `contents` to `path` as an executable script through a short-lived `sh`, so that no
+    /// descriptor open for writing to it ever exists in this process. A script that a test writes
+    /// itself and runs at once can fail with "Text file busy": a child that another test's thread
+    /// forks while the file is open keeps a copy of that descriptor until the child executes.
+    fn write_executable(path: &Path, contents: &str) {
+        use std::io::Write;
+        let mut writer = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("cat > \"$1\" && chmod 755 \"$1\"")
+            .arg("sh")
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("start the script writer");
+        writer
+            .stdin
+            .take()
+            .expect("writer stdin")
+            .write_all(contents.as_bytes())
+            .expect("send the script");
+        let status = writer.wait().expect("wait for the script writer");
+        assert!(status.success(), "could not write {}", path.display());
     }
 
     #[test]
