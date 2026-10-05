@@ -8,6 +8,21 @@ steps:
   # build that Playwright version names, so they depend on the step that installs both rather than
   # on whoever last ran `npm install` there. The directory tracks no lockfile (see its README); its
   # package.json pins @playwright/test exactly, and Playwright pins its own dependencies exactly.
+  # The browser checks run under scripts/with-node22, which prefers the pinned Node 22 release
+  # this step installs (official archive, sha256-verified, cached per user) over the host's node.
+  - group: setup
+    job: node22
+    desc: install the pinned Node 22 release, verified against its published sha256
+    cmd: scripts/provision-node22
+    jobs_flag: ""
+    labels: [validation-timeline, component-wrkviz]
+    timeout: 900
+    cpu_timeout: 300
+    hint:
+      est_duration_s: 2
+      classification: latency-bound
+      rss_baseline_bytes: 536870912
+
   - group: setup
     job: browser-deps
     desc: install the pinned Playwright and the Chromium build it drives
@@ -16,6 +31,7 @@ steps:
       cd py/tests/js/browser &&
       ../../../../scripts/with-node22 npx playwright install chromium
     jobs_flag: ""
+    deps: [setup.node22]
     labels: [validation-timeline, component-wrkviz]
     timeout: 900
     cpu_timeout: 600
