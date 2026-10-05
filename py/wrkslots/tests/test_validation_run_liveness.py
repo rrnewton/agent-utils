@@ -14,9 +14,13 @@ checkout even though the agent-name command says dead.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
-from collections.abc import Mapping, Sequence
+import subprocess
+import uuid
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -28,9 +32,11 @@ from wrkslots.tests.test_lifecycle import (
     checkout,
     create,
     expire_heartbeat,
+    interrupt_validate_batch,
     make_project,
     mark_owner_dead,
     prepare_absent_validate_row,
+    prepare_dead_validate_slots,
     run_absent_validate_recovery,
     set_liveness,
     stub_validate_batch_censuses,
@@ -98,12 +104,13 @@ def _write_run_handle(
     tree: Path,
     *,
     process_identity: Mapping[str, object] | None = None,
+    unit: str = RUN_UNIT,
 ) -> Path:
     handle = project / "ignored" / "validate" / "runs" / (
-        RUN_UNIT.removesuffix(".service") + ".json"
+        unit.removesuffix(".service") + ".json"
     )
     handle.parent.mkdir(parents=True, exist_ok=True)
-    value: dict[str, object] = {"checkout": str(tree), "unit": RUN_UNIT}
+    value: dict[str, object] = {"checkout": str(tree), "unit": unit}
     if process_identity is not None:
         value["process_identity"] = dict(process_identity)
     handle.write_text(json.dumps(value), encoding="utf-8")
@@ -717,3 +724,216 @@ def test_absent_row_recovery_sees_a_run_child_that_appears_during_the_unit_enume
     assert enumerated
     error = capsys.readouterr().err
     assert f"retained validation unit {RUN_UNIT} still has a live cgroup process" in error
+
+
+# The tests below leave the host-evidence seam in place: the retained handles,
+# this host's real process table (read on both sides of the unit enumeration)
+# and the boot id are all read for real, and the run's process is a real child.
+# Only the user-systemd enumeration is supplied, because some hosts that run
+# this suite have no user bus and a busy host's real unit population changes
+# under the enumeration; the enumeration's own parsing has its own tests.  The
+# run's unit has a unique name so no real unit or process on the host matches
+# it.  Each real process-table read is recorded, so a test can show that the
+# judgment read this host's table and saw (or no longer saw) the run's process.
+
+
+@dataclass(frozen=True)
+class _RealHost:
+    project: Path
+    slot_path: Path
+    tree: Path
+    unit: str
+    tables: list[tuple[wrkslots._AbsentProcessObservation, ...]]
+
+    def tables_with(self, generation: tuple[int, int]) -> int:
+        return sum(
+            any((process.pid, process.start_ticks) == generation for process in table)
+            for table in self.tables
+        )
+
+
+def _prepare_real_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _RealHost:
+    """One validation row whose recorded owner has exited, on the real host."""
+
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    tree = checkout(project, slot="slot01", slot_type="validate")
+    unit = f"wrkslots-test-{uuid.uuid4().hex}.service"
+    stub_validate_batch_censuses(monkeypatch)
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        wrkslots,
+        "_user_systemd_snapshot",
+        lambda: (_unit(Id=unit, ControlGroup=f"/user.slice/app.slice/{unit}"),),
+    )
+    # The suite's idle-host default replaces this seam; the marker keeps it.
+    assert wrkslots._validation_run_host_evidence.__module__ == wrkslots.__name__
+    tables: list[tuple[wrkslots._AbsentProcessObservation, ...]] = []
+    real_snapshot = wrkslots._absent_validate_process_snapshot
+
+    def recorded_snapshot(
+        proc_root: Path = Path("/proc"), *, include_owner_cgroups: bool = True
+    ) -> tuple[wrkslots._AbsentProcessObservation, ...]:
+        table = real_snapshot(proc_root, include_owner_cgroups=include_owner_cgroups)
+        tables.append(table)
+        return table
+
+    monkeypatch.setattr(wrkslots, "_absent_validate_process_snapshot", recorded_snapshot)
+    return _RealHost(project, slot_path, tree, unit, tables)
+
+
+@dataclass(frozen=True)
+class _RunProcess:
+    child: subprocess.Popen[bytes]
+    generation: tuple[int, int]
+
+
+@contextlib.contextmanager
+def _real_run_process(host: _RealHost) -> Iterator[_RunProcess]:
+    """Record a live child as the run's process generation in its handle."""
+
+    child = subprocess.Popen(
+        ["sleep", "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        start_ticks = wrkslots._process_start_ticks(Path("/proc") / str(child.pid))
+        assert start_ticks is not None
+        _write_run_handle(
+            host.project,
+            host.tree,
+            unit=host.unit,
+            process_identity={
+                "pid": child.pid,
+                "start_ticks": start_ticks,
+                "boot_id": wrkslots._boot_id(Path("/proc")),
+            },
+        )
+        yield _RunProcess(child, (child.pid, start_ticks))
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait()
+
+
+def _end_run(host: _RealHost, run: _RunProcess) -> None:
+    """The run's process exits and is reaped, so its generation is gone."""
+
+    run.child.kill()
+    run.child.wait()
+    host.tables.clear()
+
+
+def _assert_judged_live_run(host: _RealHost, run: _RunProcess, text: str) -> None:
+    """The refusal named the run's process, and the real table showed it."""
+
+    assert f"has live exact process generation {run.child.pid} for row slot01" in text
+    # Read on both sides of the unit enumeration.
+    assert host.tables_with(run.generation) >= 2
+
+
+def _assert_judged_ended_run(host: _RealHost, run: _RunProcess) -> None:
+    assert len(host.tables) >= 2
+    assert host.tables_with(run.generation) == 0
+
+
+def test_real_host_completed_removal_waits_for_the_run_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    host = _prepare_real_host(tmp_path, monkeypatch)
+
+    with _real_run_process(host) as run:
+        assert _remove_completed(host.project) == 3
+        error = capsys.readouterr().err
+        assert "validation-run authority reports the run may still use slot slot01" in error
+        _assert_judged_live_run(host, run, error)
+        _assert_retained(host.project, host.tree)
+
+        _end_run(host, run)
+        assert _remove_completed(host.project) == 0, capsys.readouterr().err
+        _assert_judged_ended_run(host, run)
+
+    assert not host.slot_path.exists()
+    assert active_slots(host.project) == []
+
+
+def _remove_batch(project: Path) -> int:
+    return wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove-validate-batch",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--slot",
+            "slot01=1",
+        ]
+    )
+
+
+def test_real_host_batch_seal_waits_for_the_run_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    host = _prepare_real_host(tmp_path, monkeypatch)
+    config = wrkslots._load_config(str(host.project), "testhost")
+
+    with _real_run_process(host) as run:
+        # A batch retains each refused slot and exits 1.
+        assert _remove_batch(host.project) == 1
+        output = capsys.readouterr().out
+        assert (
+            "RETAINED: slot01 reason=validation-run authority reports the run may "
+            "still use slot slot01"
+        ) in output
+        _assert_judged_live_run(host, run, output)
+        assert not wrkslots._validate_batch_seal_journal_path(config).exists()
+        _assert_retained(host.project, host.tree)
+
+        _end_run(host, run)
+        assert _remove_batch(host.project) == 0, capsys.readouterr()
+        _assert_judged_ended_run(host, run)
+
+    assert not host.slot_path.exists()
+    assert active_slots(host.project) == []
+
+
+def test_real_host_finish_recovery_waits_for_the_run_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    host = _prepare_real_host(tmp_path, monkeypatch)
+    interrupt_validate_batch(host.project, monkeypatch, "after-finish-journal", ("slot01",))
+    config = wrkslots._load_config(str(host.project), "testhost")
+    finish_path = wrkslots._journal_path(config)
+    assert finish_path.exists()
+    recover = [
+        "--project-root",
+        str(host.project),
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ]
+
+    # A run that starts on the checkout after the batch journaled its finish.
+    with _real_run_process(host) as run:
+        host.tables.clear()
+        assert wrkslots.main(recover) == 3
+        error = capsys.readouterr().err
+        _assert_judged_live_run(host, run, error)
+        assert finish_path.exists()
+        _assert_retained(host.project, host.tree)
+
+        _end_run(host, run)
+        assert wrkslots.main(recover) == 0, capsys.readouterr().err
+        _assert_judged_ended_run(host, run)
+
+    assert not host.slot_path.exists()
+    assert not finish_path.exists()
+    assert active_slots(host.project) == []
