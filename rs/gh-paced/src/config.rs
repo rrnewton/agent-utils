@@ -244,6 +244,34 @@ fn finite_at_least(name: &str, value: f64, min: f64) -> Result<f64, String> {
     Ok(value)
 }
 
+fn finite_in(name: &str, value: f64, min: f64, max: f64) -> Result<f64, String> {
+    if !value.is_finite() || value < min || value > max {
+        return Err(format!(
+            "{name} must be a finite number in {min}..={max}, got {value}"
+        ));
+    }
+    Ok(value)
+}
+
+/// Floors and caps that protect the account whatever the configured class rates are: a config
+/// file may make these stricter, never looser.
+pub mod floors {
+    /// Shortest cooldown after GitHub pushback, seconds (the requested 15 minutes).
+    pub const MIN_COOLDOWN_SECS: f64 = 900.0;
+    /// Highest account-wide fraction at which blocking may start (default and floor 20%).
+    pub const MIN_BLOCK_FRACTION: f64 = 0.2;
+    /// Highest account-wide fraction at which halving may start (default and floor 50%).
+    pub const MIN_HALVE_FRACTION: f64 = 0.5;
+    /// Largest write body without `GH_PACED_ALLOW_LARGE_BODY=1`, bytes.
+    pub const MAX_BODY_BYTES: usize = 8192;
+    /// Longest base64-looking run without `GH_PACED_ALLOW_LARGE_BODY=1`, characters.
+    pub const MAX_BASE64_RUN: usize = 1000;
+    /// Longest snapshot age before a refresh, seconds (the requested 5 minutes).
+    pub const MAX_REFRESH_SECS: f64 = 300.0;
+    /// Most admitted calls between refreshes (the requested 50).
+    pub const MAX_REFRESH_CALLS: u32 = 50;
+}
+
 fn clamp_class(class: Class, limits: &mut ClassLimits, warnings: &mut Vec<String>) {
     let (per_minute_ceiling, per_hour_ceiling) = ceiling(class);
     if let Some(max) = per_minute_ceiling {
@@ -353,40 +381,39 @@ impl FileConfig {
             c.max_wait_secs = finite_at_least("max_wait_secs", v, 0.0)?;
         }
         if let Some(v) = self.cooldown_secs {
-            // GitHub: without retry-after, "wait for at least one minute before retrying".
-            c.cooldown_secs = finite_at_least("cooldown_secs", v, 60.0)?;
+            c.cooldown_secs = finite_at_least("cooldown_secs", v, floors::MIN_COOLDOWN_SECS)?;
         }
         if let Some(v) = self.plain_403_cooldown_secs {
-            c.plain_403_cooldown_secs = finite_at_least("plain_403_cooldown_secs", v, 0.0)?;
+            c.plain_403_cooldown_secs =
+                finite_at_least("plain_403_cooldown_secs", v, floors::MIN_COOLDOWN_SECS)?;
         }
         if let Some(v) = self.rate_limit_refresh_secs {
-            c.rate_limit_refresh_secs = finite_at_least("rate_limit_refresh_secs", v, 60.0)?;
+            c.rate_limit_refresh_secs =
+                finite_in("rate_limit_refresh_secs", v, 60.0, floors::MAX_REFRESH_SECS)?;
         }
         if let Some(v) = self.rate_limit_refresh_calls {
-            c.rate_limit_refresh_calls = v.max(1);
+            if !(1..=floors::MAX_REFRESH_CALLS).contains(&v) {
+                return Err(format!(
+                    "rate_limit_refresh_calls must be in 1..={}, got {v}",
+                    floors::MAX_REFRESH_CALLS
+                ));
+            }
+            c.rate_limit_refresh_calls = v;
         }
         if let Some(v) = self.rate_limit_min_refresh_secs {
             c.rate_limit_min_refresh_secs =
-                finite_at_least("rate_limit_min_refresh_secs", v, 10.0)?;
+                finite_in("rate_limit_min_refresh_secs", v, 10.0, 300.0)?;
         }
         if let Some(v) = self.rate_limit_timeout_secs {
             c.rate_limit_timeout_secs = finite_at_least("rate_limit_timeout_secs", v, 1.0)?;
         }
         if let Some(v) = self.block_below_fraction {
-            if !(0.05..=0.9).contains(&v) {
-                return Err(format!(
-                    "block_below_fraction must be in 0.05..=0.9, got {v}"
-                ));
-            }
-            c.block_below_fraction = v;
+            c.block_below_fraction =
+                finite_in("block_below_fraction", v, floors::MIN_BLOCK_FRACTION, 0.9)?;
         }
         if let Some(v) = self.halve_below_fraction {
-            if !(0.05..=1.0).contains(&v) {
-                return Err(format!(
-                    "halve_below_fraction must be in 0.05..=1.0, got {v}"
-                ));
-            }
-            c.halve_below_fraction = v;
+            c.halve_below_fraction =
+                finite_in("halve_below_fraction", v, floors::MIN_HALVE_FRACTION, 1.0)?;
         }
         if c.halve_below_fraction < c.block_below_fraction {
             return Err(format!(
@@ -395,14 +422,20 @@ impl FileConfig {
             ));
         }
         if let Some(v) = self.max_body_bytes {
-            if !(256..=65_536).contains(&v) {
-                return Err(format!("max_body_bytes must be in 256..=65536, got {v}"));
+            if !(256..=floors::MAX_BODY_BYTES).contains(&v) {
+                return Err(format!(
+                    "max_body_bytes must be in 256..={}, got {v}",
+                    floors::MAX_BODY_BYTES
+                ));
             }
             c.max_body_bytes = v;
         }
         if let Some(v) = self.max_base64_run {
-            if v < 100 {
-                return Err(format!("max_base64_run must be at least 100, got {v}"));
+            if !(100..=floors::MAX_BASE64_RUN).contains(&v) {
+                return Err(format!(
+                    "max_base64_run must be in 100..={}, got {v}",
+                    floors::MAX_BASE64_RUN
+                ));
             }
             c.max_base64_run = v;
         }
@@ -605,9 +638,60 @@ mod tests {
         assert!(Config::load(Some(&path), true, &env).is_err());
         std::fs::write(&path, r#"{"cooldown_secs": 5}"#).unwrap();
         assert!(Config::load(Some(&path), true, &env).is_err());
+        std::fs::write(&path, r#"{"cooldown_secs": 1200}"#).unwrap();
+        assert_eq!(
+            Config::load(Some(&path), true, &env)
+                .unwrap()
+                .0
+                .cooldown_secs,
+            1200.0
+        );
         let missing = dir.join("missing.json");
         assert!(Config::load(Some(&missing), true, &env).is_err());
         assert!(Config::load(Some(&missing), false, &env).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The pushback cooldowns, the account-wide halve/block thresholds, the refresh cadence and
+    /// the content limits protect the account whatever the class rates are, so a config file can
+    /// only make them stricter.
+    #[test]
+    fn config_file_cannot_weaken_mandatory_protections() {
+        let dir = std::env::temp_dir().join(format!("gh-paced-floors-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.json");
+        let env = env_of(&[]);
+        let load = |json: &str| {
+            std::fs::write(&path, json).unwrap();
+            Config::load(Some(&path), true, &env)
+        };
+        for weaker in [
+            r#"{"cooldown_secs": 60}"#,
+            r#"{"cooldown_secs": 899}"#,
+            r#"{"plain_403_cooldown_secs": 0}"#,
+            r#"{"plain_403_cooldown_secs": 120}"#,
+            r#"{"block_below_fraction": 0.05}"#,
+            r#"{"block_below_fraction": 0.19}"#,
+            r#"{"halve_below_fraction": 0.3, "block_below_fraction": 0.2}"#,
+            r#"{"max_body_bytes": 8193}"#,
+            r#"{"max_body_bytes": 65536}"#,
+            r#"{"max_base64_run": 1001}"#,
+            r#"{"rate_limit_refresh_secs": 301}"#,
+            r#"{"rate_limit_refresh_calls": 51}"#,
+            r#"{"rate_limit_refresh_calls": 0}"#,
+            r#"{"rate_limit_min_refresh_secs": 3600}"#,
+        ] {
+            assert!(load(weaker).is_err(), "accepted {weaker}");
+        }
+        for stricter in [
+            r#"{"cooldown_secs": 3600}"#,
+            r#"{"plain_403_cooldown_secs": 1800}"#,
+            r#"{"block_below_fraction": 0.4, "halve_below_fraction": 0.8}"#,
+            r#"{"max_body_bytes": 4096, "max_base64_run": 200}"#,
+            r#"{"rate_limit_refresh_secs": 120, "rate_limit_refresh_calls": 10}"#,
+        ] {
+            assert!(load(stricter).is_ok(), "rejected {stricter}");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

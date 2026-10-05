@@ -1,13 +1,21 @@
-//! Streaming detector for GitHub pushback in gh's stderr.
+//! Streaming detector for GitHub pushback in gh's output.
 //!
 //! gh reports server refusals on stderr, for example `HTTP 403: API rate limit exceeded for
 //! user ID ...`, `You have exceeded a secondary rate limit`, or `was submitted too quickly`.
 //! The scanner sees stderr in chunks as it streams to the terminal, keeps a 4 KiB overlap so a
 //! phrase split across two reads is still found, and records which patterns matched.
+//!
+//! `gh api --include` prints the HTTP status line and response headers on STDOUT instead, so for
+//! that form the wrapper also feeds stdout through [`Scanner::feed_headers`], which reads only
+//! header blocks (a `HTTP/<version> <status>` line up to the next blank line): the status code,
+//! `Retry-After`, and `X-RateLimit-Remaining`. Response bodies are never matched.
 
 use crate::config::Config;
 
 const OVERLAP: usize = 4096;
+
+/// Longest stdout line kept while looking for header lines; longer lines are body text.
+const MAX_HEADER_LINE: usize = 8192;
 
 /// What the scanner saw.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -27,6 +35,14 @@ pub struct Scanner {
     pub too_quickly: bool,
     /// Largest `Retry-After: N` value seen, seconds.
     pub retry_after: Option<f64>,
+    /// A response header block reported `X-RateLimit-Remaining: 0`.
+    pub remaining_zero: bool,
+    /// Partial stdout line carried between [`Scanner::feed_headers`] calls.
+    line: Vec<u8>,
+    /// The current stdout line is longer than [`MAX_HEADER_LINE`] and is being skipped.
+    skipping: bool,
+    /// Inside a response header block on stdout.
+    in_headers: bool,
 }
 
 /// The cooldown a scan calls for.
@@ -53,6 +69,46 @@ fn find_all(hay: &[u8], needle: &[u8]) -> Vec<usize> {
 
 fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Drop ANSI escape sequences (gh colours header names when stdout is a terminal).
+fn strip_ansi(line: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(line.len());
+    let mut i = 0;
+    while i < line.len() {
+        if line[i] == 0x1b {
+            i += 1;
+            if line.get(i) == Some(&b'[') {
+                i += 1;
+                while i < line.len() && !(0x40..=0x7e).contains(&line[i]) {
+                    i += 1;
+                }
+            }
+            i += 1;
+        } else {
+            out.push(line[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The status code of a lower-cased `http/<version> <code> ...` status line.
+fn http_status(lower: &[u8]) -> Option<u16> {
+    let rest = lower.strip_prefix(b"http/")?;
+    let space = rest.iter().position(|b| *b == b' ')?;
+    let version = &rest[..space];
+    if version.is_empty() || !version.iter().all(|b| b.is_ascii_digit() || *b == b'.') {
+        return None;
+    }
+    let after = &rest[space + 1..];
+    if after.len() < 3 || !after[..3].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    if after.get(3).is_some_and(|b| *b != b' ') {
+        return None;
+    }
+    std::str::from_utf8(&after[..3]).ok()?.parse().ok()
 }
 
 impl Scanner {
@@ -93,6 +149,66 @@ impl Scanner {
         self.carry = text.split_off(keep);
     }
 
+    /// Scan the next chunk of `gh api --include` stdout for response header blocks.
+    pub fn feed_headers(&mut self, chunk: &[u8]) {
+        for &b in chunk {
+            if b == b'\n' {
+                if !self.skipping {
+                    let line = std::mem::take(&mut self.line);
+                    self.header_line(&line);
+                }
+                self.line.clear();
+                self.skipping = false;
+            } else if !self.skipping {
+                if self.line.len() >= MAX_HEADER_LINE {
+                    self.line.clear();
+                    self.skipping = true;
+                    self.in_headers = false;
+                } else {
+                    self.line.push(b);
+                }
+            }
+        }
+    }
+
+    fn header_line(&mut self, raw: &[u8]) {
+        let line = strip_ansi(raw);
+        let line = line.trim_ascii();
+        if line.is_empty() {
+            self.in_headers = false;
+            return;
+        }
+        let lower = line.to_ascii_lowercase();
+        if let Some(status) = http_status(&lower) {
+            self.in_headers = true;
+            match status {
+                429 => self.http_429 = true,
+                403 => self.http_403 = true,
+                _ => {}
+            }
+            return;
+        }
+        if !self.in_headers {
+            return;
+        }
+        let Some(colon) = lower.iter().position(|b| *b == b':') else {
+            return;
+        };
+        let name = lower[..colon].trim_ascii();
+        let value = lower[colon + 1..].trim_ascii();
+        let number = std::str::from_utf8(value)
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|n| n.is_finite() && *n >= 0.0);
+        match (name, number) {
+            (b"retry-after", Some(n)) => {
+                self.retry_after = Some(self.retry_after.map_or(n, |old| old.max(n)));
+            }
+            (b"x-ratelimit-remaining", Some(0.0)) => self.remaining_zero = true,
+            _ => {}
+        }
+    }
+
     /// Matched pattern names.
     pub fn matched(&self) -> Vec<&'static str> {
         let mut out = Vec::new();
@@ -117,18 +233,23 @@ impl Scanner {
         if self.retry_after.is_some() {
             out.push("Retry-After");
         }
+        if self.remaining_zero {
+            out.push("X-RateLimit-Remaining: 0");
+        }
         out
     }
 
     /// The cooldown this output calls for, if any: `max(Retry-After, cooldown_secs)` for a
-    /// rate-limit signal, `plain_403_cooldown_secs` for an HTTP 403 with no rate-limit wording.
+    /// rate-limit signal (wording, HTTP 429, `Retry-After`, or `X-RateLimit-Remaining: 0`),
+    /// `plain_403_cooldown_secs` for an HTTP 403 with no rate-limit signal.
     pub fn verdict(&self, cfg: &Config) -> Option<Pushback> {
         let limit_signal = self.secondary
             || self.rate_limit
             || self.http_429
             || self.abuse
             || self.too_quickly
-            || self.retry_after.is_some();
+            || self.retry_after.is_some()
+            || self.remaining_zero;
         let reason = self.matched().join(", ");
         if limit_signal {
             let secs = self.retry_after.unwrap_or(0.0).max(cfg.cooldown_secs);
@@ -188,14 +309,73 @@ mod tests {
 
     #[test]
     fn plain_403_uses_its_own_cooldown() {
+        // 1800 s: a value a configuration file may set (the floor is 900 s).
         let cfg = Config {
-            plain_403_cooldown_secs: 120.0,
+            plain_403_cooldown_secs: 1800.0,
             ..Config::default()
         };
         let s = scan(&["HTTP 403: Resource not accessible by integration\n"]);
         let v = s.verdict(&cfg).expect("pushback");
-        assert_eq!(v.cooldown_secs, 120.0);
+        assert_eq!(v.cooldown_secs, 1800.0);
         assert_eq!(v.reason, "HTTP 403");
+        assert_eq!(
+            Config::default().plain_403_cooldown_secs,
+            900.0,
+            "the default plain-403 cooldown is the 15-minute floor"
+        );
+    }
+
+    fn headers(chunks: &[&str]) -> Scanner {
+        let mut s = Scanner::new();
+        for c in chunks {
+            s.feed_headers(c.as_bytes());
+        }
+        s
+    }
+
+    /// `gh api --include` puts the status line and headers on stdout; a long `Retry-After`
+    /// there must set the cooldown, not the 900 s floor.
+    #[test]
+    fn include_headers_on_stdout_are_read() {
+        let cfg = Config::default();
+        let s = headers(&[
+            "HTTP/2.0 403 Forbidden\r\nContent-Type: application/json\r\nRetry-After: 3600\r\n",
+            "X-Ratelimit-Remaining: 0\r\n\r\n{\"message\":\"You have exceeded a secondary rate limit\"}\n",
+        ]);
+        assert!(s.http_403 && s.remaining_zero);
+        assert_eq!(s.retry_after, Some(3600.0));
+        assert_eq!(s.verdict(&cfg).expect("pushback").cooldown_secs, 3600.0);
+        // Split mid-line, coloured header names (stdout is a terminal), HTTP/1.1.
+        let s = headers(&[
+            "HTTP/1.1 429 Too Many Requests\r\n\u{1b}[1;34mRetry-",
+            "After\u{1b}[m: 120\r\n\r\n",
+        ]);
+        assert!(s.http_429);
+        assert_eq!(s.retry_after, Some(120.0));
+        assert_eq!(s.verdict(&cfg).expect("pushback").cooldown_secs, 900.0);
+        // Remaining 0 on a successful response still pauses: the hourly pool is empty.
+        let s = headers(&["HTTP/2.0 200 OK\r\nX-Ratelimit-Remaining: 0\r\n\r\n[]\n"]);
+        assert_eq!(s.verdict(&cfg).expect("pushback").cooldown_secs, 900.0);
+        // A healthy response is quiet.
+        let s = headers(&["HTTP/2.0 200 OK\r\nX-Ratelimit-Remaining: 4999\r\n\r\n[]\n"]);
+        assert!(s.verdict(&cfg).is_none());
+    }
+
+    /// Body text after the blank line is never read as headers, even when it looks like one.
+    #[test]
+    fn include_body_text_is_not_a_header() {
+        let cfg = Config::default();
+        let s = headers(&[
+            "HTTP/2.0 200 OK\r\nX-Ratelimit-Remaining: 10\r\n\r\n",
+            "Retry-After: 99999\nx-ratelimit-remaining: 0\nsee HTTP/2.0 403 in the docs\n",
+        ]);
+        assert_eq!(s.retry_after, None);
+        assert!(!s.remaining_zero && !s.http_403);
+        assert!(s.verdict(&cfg).is_none());
+        // An over-long line is skipped and ends the header block.
+        let long = format!("HTTP/2.0 200 OK\n{}\nRetry-After: 50\n", "x".repeat(10_000));
+        let s = headers(&[&long]);
+        assert_eq!(s.retry_after, None);
     }
 
     #[test]

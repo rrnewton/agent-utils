@@ -1,5 +1,8 @@
-//! One paced gh invocation: classify, guard, refresh the account snapshot, wait for admission,
-//! run gh, and record the outcome.
+//! One paced gh invocation: classify, copy the files it sends, guard, wait for admission
+//! (refreshing the account snapshot when due), run gh, and record the outcome.
+//!
+//! Every decision is made while holding the account lock and against a time read after the lock
+//! was taken, so a process that waited for the lock cannot charge a slot in the past.
 
 use crate::audit::{self, Record};
 use crate::budget::{halved, Bucket};
@@ -9,9 +12,11 @@ use crate::config::{ClassLimits, Config};
 use crate::guard::{self, Verdict};
 use crate::pushback::{Pushback, Scanner};
 use crate::ratelimit;
-use crate::runner::{Exit, Invocation, Runner};
-use crate::state::{self, Cooldown, Holder, Paths, State};
+use crate::runner::{Exit, Invocation, Ran, Runner};
+use crate::snapshot;
+use crate::state::{self, Cooldown, Holder, Lease, Paths, State};
 use crate::timefmt::human;
+use std::os::fd::RawFd;
 use std::path::PathBuf;
 
 /// Exit status when a budget, cooldown or recursion limit refuses the call.
@@ -25,10 +30,13 @@ pub const EXIT_INTERNAL: i32 = 70;
 /// Exit status when the real gh cannot be run.
 pub const EXIT_NO_GH: i32 = 127;
 
-/// How often a WRITE waiting for another in-flight WRITE re-checks, seconds.
-pub const IN_FLIGHT_POLL_SECS: f64 = 2.0;
-/// Shortest gap between repeated in-flight waiting warnings, seconds.
-pub const IN_FLIGHT_WARN_SECS: f64 = 30.0;
+/// How often a WRITE waiting for another in-flight WRITE re-checks, seconds. Every re-check
+/// prints a warning and writes a `throttle` audit record.
+pub const IN_FLIGHT_POLL_SECS: f64 = 5.0;
+/// How often a call waiting for another process's rate-limit refresh re-checks, seconds.
+pub const REFRESH_POLL_SECS: f64 = 1.0;
+/// The `command` recorded on the pause set by [`recovery_state`].
+pub const RECOVERY_COMMAND: &str = "(state recovery)";
 
 /// How the invocation ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,8 +76,14 @@ pub struct Wrapper<'a> {
     pub chain: Vec<String>,
     /// Nesting depth (`GH_PACED_DEPTH`).
     pub depth: u32,
-    /// Liveness test for in-flight holders.
+    /// Liveness test for in-flight holders and refresh claims (production:
+    /// `state::holder_alive_in`, the lease lock when there is one).
     pub alive: &'a dyn Fn(&Holder) -> bool,
+    /// Device and inode of every regular file this process inherited open
+    /// (`state::inherited_file_ids`). An in-flight WRITE is treated as this invocation's own
+    /// ancestor, and not waited for, only when its nonce is in [`Wrapper::chain`] AND its lease
+    /// file is in this list, which only a descendant of that WRITE's gh can arrange.
+    pub inherited_leases: Vec<(u64, u64)>,
     /// This process's ID.
     pub pid: u32,
     /// This process's start time in clock ticks.
@@ -83,8 +97,51 @@ enum WaitKind {
     Cooldown,
     Block,
     InFlight,
+    Refresh,
     Bucket,
     Hour,
+}
+
+impl WaitKind {
+    /// A polled wait re-checks every few seconds instead of sleeping until a known time.
+    fn polled(self) -> bool {
+        matches!(self, WaitKind::InFlight | WaitKind::Refresh)
+    }
+}
+
+/// What the refresh step decided for this admission pass.
+enum RefreshStep {
+    /// Nothing to do: proceed with the snapshot there is (possibly none).
+    Skip,
+    /// This process claimed the refresh and charged its READ token; run it outside the lock.
+    Run,
+    /// There is no snapshot and another live process is fetching one: wait for it.
+    WaitForOther,
+}
+
+/// A call that passed admission.
+struct Admitted {
+    waited: f64,
+    lease: Option<Lease>,
+}
+
+/// State used in place of an unusable state file: every class's hourly window counted as full
+/// (the lost history may have held a full hour of calls) and a pause of `cooldown_secs`.
+pub fn recovery_state(cfg: &Config, now: f64) -> State {
+    let mut st = State::new();
+    for class in Class::PACED {
+        st.buckets.insert(
+            class.name().to_string(),
+            Bucket::saturated(cfg.limits(class), now),
+        );
+    }
+    st.cooldown = Some(Cooldown {
+        until: now + cfg.cooldown_secs,
+        set_at: now,
+        reason: "the pacing state file was unusable and was quarantined".to_string(),
+        command: RECOVERY_COMMAND.to_string(),
+    });
+    st
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +202,28 @@ impl Wrapper<'_> {
         human(at, self.clock.now(), self.cfg.display_tz)
     }
 
+    fn holder(&self, class: Class, since: f64, lease: Option<String>) -> Holder {
+        Holder {
+            pid: self.pid,
+            start_ticks: self.start_ticks,
+            nonce: self.nonce.clone(),
+            class,
+            since,
+            lease,
+        }
+    }
+
+    /// True when `h` is the in-flight WRITE of an enclosing gh-paced (see
+    /// [`Wrapper::inherited_leases`]).
+    fn is_ancestor(&self, h: &Holder) -> bool {
+        self.chain.contains(&h.nonce)
+            && h.lease
+                .as_deref()
+                .filter(|n| self.paths.is_lease_name(n))
+                .and_then(|n| state::file_id(&self.paths.dir.join(n)))
+                .is_some_and(|id| self.inherited_leases.contains(&id))
+    }
+
     fn record(&self, event: &str, c: &Classification, summary: &str) -> Record {
         let mut r = Record::at(self.clock.now(), &self.host, event);
         r.class = c.class.name().to_string();
@@ -160,21 +239,24 @@ impl Wrapper<'_> {
         }
     }
 
-    /// Lock, load and reap. Returns the guard and the state, or an error message.
-    fn open_state(&mut self, now: f64) -> Result<(state::LockGuard, State), String> {
+    /// Lock, read the clock, load and reap (removing dead holders' lease files). The time is
+    /// read after the lock is held, so it is never older than the state it is applied to.
+    fn open_state(&mut self) -> Result<(state::LockGuard, State, f64), String> {
         let guard = state::lock(&self.paths)?;
-        let loaded = state::load(&self.paths, now, &|t| {
-            Class::PACED
-                .iter()
-                .map(|c| (c.name().to_string(), Bucket::empty(t)))
-                .collect()
-        });
+        let now = self.clock.now();
+        let cfg = self.cfg.clone();
+        let loaded = state::load(&self.paths, now, &|t| recovery_state(&cfg, t));
         if let Some(w) = &loaded.warning {
-            self.loud("WARNING", w);
+            let w = w.clone();
+            self.banner("WARNING", &[w]);
         }
         let mut st = loaded.state;
-        st.reap(self.alive);
-        Ok((guard, st))
+        for dead in st.reap(self.alive) {
+            if let Some(name) = &dead.lease {
+                state::remove_lease(&self.paths, name);
+            }
+        }
+        Ok((guard, st, now))
     }
 
     fn child_env(&self) -> Vec<(String, String)> {
@@ -199,14 +281,25 @@ impl Wrapper<'_> {
 
     /// Run one gh command line (without the program name).
     pub fn run(&mut self, args: &[String]) -> Outcome {
-        let c = classify(args, &self.cfg);
-        let rest = &args[c.rest_start.min(args.len())..];
-        let mut shown: Vec<String> = args[..c.rest_start.min(args.len())].to_vec();
-        shown.extend(guard::redact(&c, rest));
-        let summary = audit::summarize(&shown);
-        if c.class == Class::Local {
-            return self.spawn(args, None, &c).0;
+        let c0 = classify(args, &self.cfg);
+        if c0.class == Class::Local {
+            return self.spawn(args, None, &c0, None).0;
         }
+        let split = c0.rest_start.min(args.len());
+        let mut shown: Vec<String> = args[..split].to_vec();
+        shown.extend(guard::redact(&c0, &args[split..]));
+        let summary = audit::summarize(&shown);
+        // Copy every file the command sends, and inspect and send only the copies.
+        let (_snapshot, args) = match self.take_snapshot(&c0, args, split, &summary) {
+            Ok(x) => x,
+            Err(code) => return Outcome::Exit(code),
+        };
+        let args = args.as_slice();
+        let c = classify(args, &self.cfg);
+        if c.class == Class::Local {
+            return self.spawn(args, None, &c, None).0;
+        }
+        let rest = &args[c.rest_start.min(args.len())..];
         for w in c.warnings.clone() {
             self.loud("WARNING", &w);
         }
@@ -230,18 +323,51 @@ impl Wrapper<'_> {
             Ok(s) => s,
             Err(code) => return Outcome::Exit(code),
         };
-        if let Err(e) = self.maybe_refresh(&c) {
-            return self.internal_error("cannot refresh the rate-limit snapshot", &e);
-        }
-        let waited = match self.admit(&c, &summary) {
-            Ok(w) => w,
+        let admitted = match self.admit(&c, &summary) {
+            Ok(a) => a,
             Err(code) => return Outcome::Exit(code),
         };
-        let (outcome, scanner, exit) = self.spawn(args, stdin, &c);
-        if let Err(e) = self.finish(&c, &summary, exit, &scanner, waited) {
+        let keep_fd = admitted.lease.as_ref().map(Lease::fd);
+        let (outcome, scanner, ran) = self.spawn(args, stdin, &c, keep_fd);
+        if let Err(e) = self.finish(&c, &summary, ran, &scanner, admitted) {
             self.loud("ERROR", &format!("bookkeeping after gh exited failed: {e}"));
         }
+        if ran.is_some_and(|r| r.deadline_hit) {
+            return Outcome::Exit(EXIT_REFUSED);
+        }
         outcome
+    }
+
+    /// Copy the files `c0` sends (see [`snapshot`]) and return the argument list naming the
+    /// copies. Nothing is created when the command sends no file.
+    fn take_snapshot(
+        &mut self,
+        c0: &Classification,
+        args: &[String],
+        split: usize,
+        summary: &str,
+    ) -> Result<(snapshot::Snapshot, Vec<String>), i32> {
+        let rest0 = &args[split..];
+        let files = guard::file_sources(c0, rest0);
+        if files.is_empty() {
+            return Ok((snapshot::Snapshot::default(), args.to_vec()));
+        }
+        let taken = state::ensure_dir(&self.paths.dir).and_then(|()| {
+            snapshot::sweep(&self.paths.dir);
+            snapshot::take(&self.paths.dir, &self.nonce, &files, rest0)
+        });
+        match taken {
+            Ok((snap, new_rest)) => {
+                let mut out = args[..split].to_vec();
+                out.extend(new_rest);
+                Ok((snap, out))
+            }
+            Err(e) => {
+                let reason = format!("cannot copy a file the command sends for inspection: {e}");
+                self.refuse_content(c0, summary, &reason);
+                Err(EXIT_CONTENT)
+            }
+        }
     }
 
     fn audit_locked(&mut self, r: &Record) -> Result<(), String> {
@@ -255,27 +381,53 @@ impl Wrapper<'_> {
         args: &[String],
         stdin: Option<Vec<u8>>,
         c: &Classification,
-    ) -> (Outcome, Scanner, Option<Exit>) {
+        keep_fd: Option<RawFd>,
+    ) -> (Outcome, Scanner, Option<Ran>) {
         let mut scanner = Scanner::new();
-        let env = if c.class == Class::Local {
-            Vec::new()
-        } else {
-            self.child_env()
-        };
+        let local = c.class == Class::Local;
+        let env = if local { Vec::new() } else { self.child_env() };
         let real_gh = self.real_gh.clone();
         let inv = Invocation {
             program: &real_gh,
             args,
             stdin,
             env,
+            deadline_secs: if local { None } else { c.deadline_secs },
+            keep_fd,
+            scan_stdout: !local && c.api.as_ref().is_some_and(|a| a.include),
         };
         match self.runner.run(inv, &mut scanner) {
-            Ok(Exit::Code(n)) => (Outcome::Exit(n), scanner, Some(Exit::Code(n))),
-            Ok(Exit::Signal(s)) => (Outcome::Signal(s), scanner, Some(Exit::Signal(s))),
+            Ok(ran) => {
+                let outcome = match ran.exit {
+                    Exit::Code(n) => Outcome::Exit(n),
+                    Exit::Signal(s) => Outcome::Signal(s),
+                };
+                (outcome, scanner, Some(ran))
+            }
             Err(e) => {
                 self.loud("ERROR", &e);
                 (Outcome::Exit(EXIT_NO_GH), scanner, None)
             }
+        }
+    }
+
+    /// Print and audit a content-guard refusal.
+    fn refuse_content(&mut self, c: &Classification, summary: &str, reason: &str) {
+        self.banner(
+            "REFUSED",
+            &[
+                format!("content guard: {reason}"),
+                format!("not running `{}` (exit {EXIT_CONTENT})", c.command),
+                "GitHub text is for short human notes. Keep evidence on the host and post a pointer \
+                 (path + sha256, a tracked file, or a commit)."
+                    .to_string(),
+            ],
+        );
+        let mut r = self.record("refuse", c, summary);
+        r.rc = Some(EXIT_CONTENT);
+        r.detail = format!("content guard: {reason}");
+        if self.audit_locked(&r).is_err() {
+            self.loud("WARNING", "audit log not written for the content refusal");
         }
     }
 
@@ -298,6 +450,14 @@ impl Wrapper<'_> {
             );
             return Ok(None);
         }
+        if let Some(why) = guard::uninspectable(c, rest, self.stdin_is_tty) {
+            let reason = format!(
+                "{why}, after this guard would have run, so the body cannot be inspected; \
+                 pass it with --body or --body-file instead"
+            );
+            self.refuse_content(c, summary, &reason);
+            return Err(EXIT_CONTENT);
+        }
         let sources = guard::body_sources(c, rest, self.stdin_is_tty);
         let mut stdin_buf = None;
         if sources.iter().any(guard::BodySource::is_stdin) {
@@ -315,60 +475,65 @@ impl Wrapper<'_> {
         match guard::evaluate(&sources, &self.cfg, stdin_buf.as_deref()) {
             Verdict::Allow { .. } => Ok(stdin_buf),
             Verdict::Refuse(reason) => {
-                self.banner(
-                    "REFUSED",
-                    &[
-                        format!("content guard: {reason}"),
-                        format!("not running `{}` (exit {EXIT_CONTENT})", c.command),
-                        "GitHub text is for short human notes. Keep evidence on the host and post a pointer \
-                         (path + sha256, a tracked file, or a commit)."
-                            .to_string(),
-                    ],
-                );
-                let mut r = self.record("refuse", c, summary);
-                r.rc = Some(EXIT_CONTENT);
-                r.detail = format!("content guard: {reason}");
-                if self.audit_locked(&r).is_err() {
-                    self.loud("WARNING", "audit log not written for the content refusal");
-                }
+                self.refuse_content(c, summary, &reason);
                 Err(EXIT_CONTENT)
             }
         }
     }
 
-    /// Refresh the account-wide snapshot when it is due, outside the lock.
-    fn maybe_refresh(&mut self, c: &Classification) -> Result<(), String> {
-        if !paced_api(c.class) {
-            return Ok(());
+    /// Decide, under the lock, whether this pass refreshes the account-wide snapshot. A refresh
+    /// is due when the snapshot is missing, older than `rate_limit_refresh_secs`, or
+    /// `rate_limit_refresh_calls` paced calls old; it is never attempted during a cooldown, more
+    /// often than `rate_limit_min_refresh_secs`, while another live process holds the claim, or
+    /// when the READ budget has no token for it. Claiming charges that READ token at once.
+    fn refresh_step(&mut self, c: &Classification, st: &mut State, now: f64) -> RefreshStep {
+        if !paced_api(c.class) || c.api.as_ref().is_some_and(|a| a.endpoint == "rate_limit") {
+            return RefreshStep::Skip;
         }
-        if c.api.as_ref().is_some_and(|a| a.endpoint == "rate_limit") {
-            return Ok(());
+        if st.cooldown.as_ref().is_some_and(|cd| cd.until > now) {
+            return RefreshStep::Skip;
         }
-        let now = self.clock.now();
+        let age = st.rate_limit.as_ref().map(|s| now - s.fetched_at);
+        let due = age.is_none_or(|a| a >= self.cfg.rate_limit_refresh_secs)
+            || st.calls_since_refresh >= self.cfg.rate_limit_refresh_calls;
+        if !due {
+            return RefreshStep::Skip;
+        }
+        if st.refresh_claim.is_some() {
+            return if st.rate_limit.is_none() {
+                RefreshStep::WaitForOther
+            } else {
+                RefreshStep::Skip
+            };
+        }
+        if now - st.last_refresh_attempt < self.cfg.rate_limit_min_refresh_secs {
+            return RefreshStep::Skip;
+        }
+        let base = self.cfg.read;
+        let limits = match st
+            .rate_limit
+            .as_ref()
+            .and_then(|s| s.pressure(Class::Read, now))
         {
-            let (_guard, mut st) = self.open_state(now)?;
-            if st.cooldown.as_ref().is_some_and(|cd| cd.until > now) {
-                return Ok(());
-            }
-            let age = st.rate_limit.as_ref().map(|s| now - s.fetched_at);
-            let due = age.is_none_or(|a| a >= self.cfg.rate_limit_refresh_secs)
-                || st.calls_since_refresh >= self.cfg.rate_limit_refresh_calls;
-            if !due
-                || now - st.last_refresh_attempt < self.cfg.rate_limit_min_refresh_secs
-                || st.refresh_claim.is_some()
-            {
-                return Ok(());
-            }
-            st.refresh_claim = Some(Holder {
-                pid: self.pid,
-                start_ticks: self.start_ticks,
-                nonce: self.nonce.clone(),
-                class: Class::Read,
-                since: now,
-            });
-            st.last_refresh_attempt = now;
-            state::save(&self.paths, &st)?;
+            Some(p) if p.fraction <= self.cfg.halve_below_fraction => halved(base),
+            _ => base,
+        };
+        let bucket = st
+            .buckets
+            .entry(Class::Read.name().to_string())
+            .or_insert_with(|| Bucket::full(base, now));
+        bucket.refresh(limits, now);
+        if bucket.bucket_wait(limits, 1) > 0.0 || bucket.hour_wait(limits, 1, now) > 0.0 {
+            return RefreshStep::Skip;
         }
+        bucket.charge(1, now);
+        st.refresh_claim = Some(self.holder(Class::Read, now, None));
+        st.last_refresh_attempt = now;
+        RefreshStep::Run
+    }
+
+    /// Run the claimed refresh (outside the lock), then record its result under the lock.
+    fn run_refresh(&mut self) -> Result<(), String> {
         let args = vec!["api".to_string(), "rate_limit".to_string()];
         let real_gh = self.real_gh.clone();
         let result = self.runner.capture(
@@ -377,11 +542,13 @@ impl Wrapper<'_> {
                 args: &args,
                 stdin: None,
                 env: self.child_env(),
+                deadline_secs: None,
+                keep_fd: None,
+                scan_stdout: false,
             },
             self.cfg.rate_limit_timeout_secs,
         );
-        let now = self.clock.now();
-        let (_guard, mut st) = self.open_state(now)?;
+        let (_guard, mut st, now) = self.open_state()?;
         if st
             .refresh_claim
             .as_ref()
@@ -400,17 +567,11 @@ impl Wrapper<'_> {
             refusal: None,
             api: None,
             rest_start: 1,
+            deadline_secs: None,
         };
         let mut r = self.record("refresh", &rc_class, "api rate_limit");
         match result {
             Ok(cap) => {
-                let read = self.cfg.read;
-                let bucket = st
-                    .buckets
-                    .entry(Class::Read.name().to_string())
-                    .or_insert_with(|| Bucket::full(read, now));
-                bucket.refresh(read, now);
-                bucket.charge(1, now);
                 let mut sc = Scanner::new();
                 sc.feed(&cap.stderr);
                 if let Some(pb) = sc.verdict(&self.cfg) {
@@ -502,22 +663,42 @@ impl Wrapper<'_> {
         );
     }
 
-    /// Wait until the call fits every budget, then charge it. Returns seconds waited.
-    fn admit(&mut self, c: &Classification, summary: &str) -> Result<f64, i32> {
+    /// Wait until the call fits every budget, then charge it. A WRITE also takes the in-flight
+    /// slot and its lease. Each pass takes the lock, reads the clock, refreshes the account
+    /// snapshot first when that is due, and either admits or sleeps for the longest wait.
+    fn admit(&mut self, c: &Classification, summary: &str) -> Result<Admitted, i32> {
         let class = c.class;
         let base = self.cfg.limits(class);
         let mut waited = 0.0;
-        let mut last_in_flight_warn: Option<f64> = None;
         let mut halve_noted = false;
         loop {
-            let now = self.clock.now();
-            let (guard, mut st) = match self.open_state(now) {
+            let (guard, mut st, now) = match self.open_state() {
                 Ok(x) => x,
                 Err(e) => {
                     self.internal_error("cannot open pacing state", &e);
                     return Err(EXIT_INTERNAL);
                 }
             };
+            let mut waits: Vec<Wait> = Vec::new();
+            match self.refresh_step(c, &mut st, now) {
+                RefreshStep::Run => {
+                    let saved = state::save(&self.paths, &st);
+                    drop(guard);
+                    if let Err(e) = saved.and_then(|()| self.run_refresh()) {
+                        self.internal_error("cannot refresh the rate-limit snapshot", &e);
+                        return Err(EXIT_INTERNAL);
+                    }
+                    continue;
+                }
+                RefreshStep::WaitForOther => waits.push(Wait {
+                    secs: REFRESH_POLL_SECS,
+                    kind: WaitKind::Refresh,
+                    text: "another gh-paced process is fetching the account-wide rate-limit \
+                           snapshot and there is none yet"
+                        .to_string(),
+                }),
+                RefreshStep::Skip => {}
+            }
             let pressure = if paced_api(class) {
                 st.rate_limit.as_ref().and_then(|s| s.pressure(class, now))
             } else {
@@ -544,16 +725,20 @@ impl Wrapper<'_> {
                 }
                 halve_noted = true;
             }
-            let mut waits: Vec<Wait> = Vec::new();
             if let Some(cd) = &st.cooldown {
                 if cd.until > now {
+                    let text = if cd.command == RECOVERY_COMMAND {
+                        format!("pause after state recovery: {}", cd.reason)
+                    } else {
+                        format!(
+                            "cooldown after GitHub pushback ({}) on `{}`",
+                            cd.reason, cd.command
+                        )
+                    };
                     waits.push(Wait {
                         secs: cd.until - now,
                         kind: WaitKind::Cooldown,
-                        text: format!(
-                            "cooldown after GitHub pushback ({}) on `{}`",
-                            cd.reason, cd.command
-                        ),
+                        text,
                     });
                 }
             }
@@ -577,7 +762,7 @@ impl Wrapper<'_> {
                 let others: Vec<u32> = st
                     .in_flight
                     .iter()
-                    .filter(|h| h.class == Class::Write && !self.chain.contains(&h.nonce))
+                    .filter(|h| h.class == Class::Write && !self.is_ancestor(h))
                     .map(|h| h.pid)
                     .collect();
                 if u32::try_from(others.len()).unwrap_or(u32::MAX) >= self.cfg.write_max_in_flight {
@@ -630,20 +815,30 @@ impl Wrapper<'_> {
                 .max_by(|a, b| a.secs.total_cmp(&b.secs))
                 .cloned();
             let Some(w) = worst else {
+                let lease = if class == Class::Write {
+                    match state::create_lease(&self.paths, &self.nonce) {
+                        Ok(l) => Some(l),
+                        Err(e) => {
+                            drop(guard);
+                            self.internal_error("cannot take the write lease", &e);
+                            return Err(EXIT_INTERNAL);
+                        }
+                    }
+                } else {
+                    None
+                };
                 bucket.charge(c.cost, now);
-                if class == Class::Write {
-                    st.in_flight.push(Holder {
-                        pid: self.pid,
-                        start_ticks: self.start_ticks,
-                        nonce: self.nonce.clone(),
-                        class,
-                        since: now,
-                    });
+                if let Some(l) = &lease {
+                    let h = self.holder(class, now, Some(l.name.clone()));
+                    st.in_flight.push(h);
                 }
                 if class != Class::GitCredential {
                     st.calls_since_refresh = st.calls_since_refresh.saturating_add(1);
                 }
                 if let Err(e) = state::save(&self.paths, &st) {
+                    if let Some(l) = lease {
+                        state::remove_lease(&self.paths, &l.name);
+                    }
                     drop(guard);
                     self.internal_error("cannot save pacing state", &e);
                     return Err(EXIT_INTERNAL);
@@ -651,17 +846,46 @@ impl Wrapper<'_> {
                 let mut r = self.record("admit", c, summary);
                 r.waited_secs = waited;
                 self.write_audit(&r);
-                return Ok(waited);
+                return Ok(Admitted { waited, lease });
             };
             if let Err(e) = state::save(&self.paths, &st) {
                 drop(guard);
                 self.internal_error("cannot save pacing state", &e);
                 return Err(EXIT_INTERNAL);
             }
+            if !w.secs.is_finite() {
+                let text = format!(
+                    "`{}` costs {} {} tokens, more than the whole hourly cap of {}{}; it can never be admitted",
+                    c.command,
+                    c.cost,
+                    class.name(),
+                    limits.per_hour,
+                    if halve {
+                        " (halved because the account-wide budget is low)"
+                    } else {
+                        ""
+                    }
+                );
+                self.banner(
+                    "REFUSED",
+                    &[
+                        text.clone(),
+                        "lower --limit, drop --paginate, or split the work into smaller calls"
+                            .to_string(),
+                        format!("not running `{}` (exit {EXIT_REFUSED})", c.command),
+                    ],
+                );
+                let mut r = self.record("refuse", c, summary);
+                r.rc = Some(EXIT_REFUSED);
+                r.waited_secs = waited;
+                r.detail = text;
+                self.write_audit(&r);
+                return Err(EXIT_REFUSED);
+            }
             let max_wait = self.cfg.max_wait_secs;
             if waited + w.secs > max_wait {
                 let until = now + w.secs;
-                let wait_text = if w.kind == WaitKind::InFlight {
+                let wait_text = if w.kind.polled() {
                     format!("waited {} s for it", waited.ceil() as i64)
                 } else {
                     format!(
@@ -688,45 +912,29 @@ impl Wrapper<'_> {
                 self.write_audit(&r);
                 return Err(EXIT_REFUSED);
             }
-            let warn = match w.kind {
-                WaitKind::InFlight => {
-                    last_in_flight_warn.is_none_or(|t| now - t >= IN_FLIGHT_WARN_SECS)
-                }
-                _ => true,
-            };
-            if warn {
-                if w.kind == WaitKind::InFlight {
-                    last_in_flight_warn = Some(now);
-                    self.loud(
-                        "WARNING",
-                        &format!(
-                            "{}; waiting (re-checking every {} s)",
-                            w.text,
-                            fmt_num(IN_FLIGHT_POLL_SECS)
-                        ),
-                    );
-                } else {
-                    let text = format!(
-                        "{}; sleeping {} s (next slot {})",
-                        w.text,
-                        w.secs.ceil() as i64,
-                        self.when(now + w.secs)
-                    );
-                    self.loud("WARNING", &text);
-                }
-                let mut r = self.record("throttle", c, summary);
-                r.waited_secs = waited;
-                r.detail = w.text.clone();
-                self.write_audit(&r);
-            }
-            drop(guard);
-            let sleep_for = if w.kind == WaitKind::InFlight {
-                IN_FLIGHT_POLL_SECS
+            let text = if w.kind.polled() {
+                format!(
+                    "{}; waiting (re-checking every {} s, waited {} s so far)",
+                    w.text,
+                    fmt_num(w.secs),
+                    waited.ceil() as i64
+                )
             } else {
-                w.secs
+                format!(
+                    "{}; sleeping {} s (next slot {})",
+                    w.text,
+                    w.secs.ceil() as i64,
+                    self.when(now + w.secs)
+                )
             };
-            self.clock.sleep(sleep_for);
-            waited += sleep_for;
+            self.loud("WARNING", &text);
+            let mut r = self.record("throttle", c, summary);
+            r.waited_secs = waited;
+            r.detail = w.text.clone();
+            self.write_audit(&r);
+            drop(guard);
+            self.clock.sleep(w.secs);
+            waited += w.secs;
         }
     }
 
@@ -734,23 +942,48 @@ impl Wrapper<'_> {
         &mut self,
         c: &Classification,
         summary: &str,
-        exit: Option<Exit>,
+        ran: Option<Ran>,
         scanner: &Scanner,
-        waited: f64,
+        admitted: Admitted,
     ) -> Result<(), String> {
-        let now = self.clock.now();
-        let (_guard, mut st) = self.open_state(now)?;
+        let (_guard, mut st, now) = self.open_state()?;
         let nonce = self.nonce.clone();
         st.in_flight.retain(|h| h.nonce != nonce);
+        if let Some(lease) = admitted.lease {
+            state::remove_lease(&self.paths, &lease.name);
+        }
         if let Some(pb) = scanner.verdict(&self.cfg) {
             self.apply_pushback(&mut st, &pb, &c.command, now);
             let mut r = self.record("pushback", c, summary);
             r.detail = pb.reason.clone();
             self.write_audit(&r);
         }
+        if let Some(limit) = c
+            .deadline_secs
+            .filter(|_| ran.is_some_and(|r| r.deadline_hit))
+        {
+            let text = format!(
+                "`{}` ran past its {} s budget (its cost of {} tokens covers that many polls at \
+                 the interval given) and was stopped",
+                c.command,
+                limit.ceil() as i64,
+                c.cost
+            );
+            self.banner(
+                "DEADLINE",
+                &[
+                    text.clone(),
+                    format!("exit {EXIT_REFUSED}; re-run it if it still needs watching"),
+                ],
+            );
+            let mut r = self.record("deadline", c, summary);
+            r.detail = text;
+            r.rc = Some(EXIT_REFUSED);
+            self.write_audit(&r);
+        }
         let mut r = self.record("exit", c, summary);
-        r.waited_secs = waited;
-        match exit {
+        r.waited_secs = admitted.waited;
+        match ran.map(|r| r.exit) {
             Some(Exit::Code(n)) => r.rc = Some(n),
             Some(Exit::Signal(s)) => r.signal = Some(s),
             None => r.rc = Some(EXIT_NO_GH),

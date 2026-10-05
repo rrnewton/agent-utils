@@ -60,12 +60,23 @@ impl Bucket {
         }
     }
 
-    /// An empty bucket (after state corruption).
+    /// An empty bucket with no hourly history.
     pub fn empty(now: f64) -> Self {
         Self {
             level: 0.0,
             updated: now,
             window: Vec::new(),
+        }
+    }
+
+    /// An empty bucket whose hourly window is already full: nothing in this class is admitted
+    /// for the next hour. Used when the state file was unusable, because the lost history may
+    /// have held a full hour of calls.
+    pub fn saturated(limits: ClassLimits, now: f64) -> Self {
+        Self {
+            level: 0.0,
+            updated: now,
+            window: vec![(now, limits.per_hour)],
         }
     }
 
@@ -100,10 +111,13 @@ impl Bucket {
     }
 
     /// Seconds until the hourly window has room for `cost` (call refresh first). A cost larger
-    /// than the whole cap waits for an empty window and is then admitted alone.
+    /// than the whole cap can never fit, so the wait is infinite and the caller refuses it.
     pub fn hour_wait(&self, limits: ClassLimits, cost: u32, now: f64) -> f64 {
         let cap = u64::from(limits.per_hour);
-        let cost = u64::from(cost).min(cap);
+        let cost = u64::from(cost);
+        if cost > cap {
+            return f64::INFINITY;
+        }
         let used = self.hour_used();
         if used + cost <= cap {
             return 0.0;
@@ -205,18 +219,24 @@ mod tests {
         assert_eq!((h.per_minute, h.burst, h.per_hour), (1.0, 1.0, 15));
     }
 
+    /// A cost above the whole hourly cap can never fit, even in an empty window, so it is never
+    /// admitted (the wrapper refuses it at once instead of waiting).
     #[test]
-    fn oversized_cost_waits_for_an_empty_window() {
+    fn cost_above_the_hourly_cap_is_never_admitted() {
         let l = ClassLimits {
             per_minute: 60.0,
             burst: 10.0,
             per_hour: 5,
         };
         let mut b = Bucket::full(l, 0.0);
+        assert!(b.hour_wait(l, 50, 0.0).is_infinite(), "empty window");
+        assert!(b.hour_wait(l, 6, 0.0).is_infinite(), "one over the cap");
+        assert_eq!(b.hour_wait(l, 5, 0.0), 0.0, "exactly the cap fits");
         b.charge(1, 0.0);
         b.charge(1, 10.0);
         b.refresh(l, 20.0);
-        assert!((b.hour_wait(l, 50, 20.0) - 3590.0).abs() < 1e-9);
+        assert!(b.hour_wait(l, 50, 20.0).is_infinite());
+        assert!((b.hour_wait(l, 5, 20.0) - 3590.0).abs() < 1e-9);
     }
 
     /// At real Unix times a sleep of exactly the computed wait must be enough: the next check
@@ -249,6 +269,26 @@ mod tests {
                 now += 1.234;
             }
         }
+    }
+
+    /// A saturated bucket (state recovery) admits nothing for a full hour, however long the
+    /// refill takes, and admits again once that hour has passed.
+    #[test]
+    fn saturated_bucket_blocks_for_an_hour() {
+        let l = write_limits();
+        let now = 1000.0;
+        let mut b = Bucket::saturated(l, now);
+        b.refresh(l, now);
+        assert_eq!(b.hour_used(), 30);
+        assert!((b.hour_wait(l, 1, now) - HOUR).abs() < 1e-6);
+        b.refresh(l, now + 600.0);
+        assert_eq!(b.bucket_wait(l, 1), 0.0, "the token bucket refilled");
+        assert!(
+            b.hour_wait(l, 1, now + 600.0) > 2999.0,
+            "the hour cap did not"
+        );
+        b.refresh(l, now + HOUR + 0.01);
+        assert_eq!(b.hour_wait(l, 1, now + HOUR + 0.01), 0.0);
     }
 
     #[test]

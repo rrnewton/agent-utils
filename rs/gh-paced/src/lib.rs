@@ -20,6 +20,7 @@ pub mod guard;
 pub mod pushback;
 pub mod ratelimit;
 pub mod runner;
+pub mod snapshot;
 pub mod state;
 pub mod status;
 pub mod timefmt;

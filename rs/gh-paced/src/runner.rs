@@ -7,11 +7,18 @@
 //! and QUIT are forwarded to the child; terminal-generated signals already reach it because it
 //! shares the foreground process group. A child killed by a signal makes gh-paced die by the
 //! same signal after bookkeeping, so callers see the same status as from gh itself.
+//!
+//! For `gh api --include`, which prints the HTTP status line and response headers on stdout,
+//! stdout is teed the same way (through a pseudo-terminal when gh-paced's stdout is a terminal)
+//! and fed to the scanner's header parser, so a `Retry-After` or `x-ratelimit-remaining: 0`
+//! header is seen. A command with a deadline (a watch) is sent SIGTERM when the deadline passes
+//! and SIGKILL [`KILL_GRACE_SECS`] later. A write lease descriptor is left open across exec so the
+//! lease lives as long as gh does.
 
 use crate::pushback::Scanner;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -28,6 +35,9 @@ pub enum Exit {
     Signal(i32),
 }
 
+/// Seconds between SIGTERM and SIGKILL when a deadline passes.
+pub const KILL_GRACE_SECS: f64 = 5.0;
+
 /// One child process to run.
 #[derive(Debug, Clone)]
 pub struct Invocation<'a> {
@@ -40,6 +50,22 @@ pub struct Invocation<'a> {
     pub stdin: Option<Vec<u8>>,
     /// Extra environment variables for the child.
     pub env: Vec<(String, String)>,
+    /// Stop the child once it has run this many seconds (SIGTERM, then SIGKILL after
+    /// [`KILL_GRACE_SECS`]). `None`: no limit.
+    pub deadline_secs: Option<f64>,
+    /// A descriptor the child keeps open across exec (the write lease).
+    pub keep_fd: Option<RawFd>,
+    /// Tee stdout through gh-paced and feed it to [`Scanner::feed_headers`].
+    pub scan_stdout: bool,
+}
+
+/// How an interactive run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ran {
+    /// The child's exit.
+    pub exit: Exit,
+    /// The child was stopped because its deadline passed.
+    pub deadline_hit: bool,
 }
 
 /// Output of a captured (non-interactive) run.
@@ -57,8 +83,9 @@ pub struct Captured {
 
 /// Something that can run gh. Tests substitute a fake.
 pub trait Runner: Send + Sync {
-    /// Run interactively: stdout inherited, stderr streamed to our stderr and fed to `scanner`.
-    fn run(&self, inv: Invocation<'_>, scanner: &mut Scanner) -> Result<Exit, String>;
+    /// Run interactively: stdout inherited (or teed, see [`Invocation::scan_stdout`]), stderr
+    /// streamed to our stderr and fed to `scanner`.
+    fn run(&self, inv: Invocation<'_>, scanner: &mut Scanner) -> Result<Ran, String>;
     /// Run with stdout and stderr captured, killing the child after `timeout_secs`.
     fn capture(&self, inv: Invocation<'_>, timeout_secs: f64) -> Result<Captured, String>;
 }
@@ -173,7 +200,8 @@ struct Pty {
     slave: File,
 }
 
-fn open_pty() -> Option<Pty> {
+/// Open a pseudo-terminal whose window size is copied from descriptor `size_from`.
+fn open_pty(size_from: RawFd) -> Option<Pty> {
     // SAFETY: standard pty allocation; every returned descriptor is checked and owned.
     unsafe {
         let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
@@ -202,7 +230,7 @@ fn open_pty() -> Option<Pty> {
             libc::tcsetattr(slave, libc::TCSANOW, &tio);
         }
         let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(2, libc::TIOCGWINSZ, &mut ws) == 0 {
+        if libc::ioctl(size_from, libc::TIOCGWINSZ, &mut ws) == 0 {
             libc::ioctl(master, libc::TIOCSWINSZ, &ws);
         }
         Some(Pty {
@@ -212,9 +240,9 @@ fn open_pty() -> Option<Pty> {
     }
 }
 
-fn stderr_is_tty() -> bool {
+fn is_tty(fd: RawFd) -> bool {
     // SAFETY: isatty on a standard descriptor.
-    unsafe { libc::isatty(2) == 1 }
+    unsafe { libc::isatty(fd) == 1 }
 }
 
 fn decode(status: std::process::ExitStatus) -> Exit {
@@ -225,19 +253,40 @@ fn decode(status: std::process::ExitStatus) -> Exit {
     }
 }
 
-/// Copy `src` to our stderr and the scanner until EOF (EIO from a pty master counts as EOF).
-fn tee(mut src: File, scanner: Arc<Mutex<Scanner>>, done: mpsc::Sender<()>) {
+/// Which of our streams a tee copies to, and how the scanner reads it.
+#[derive(Clone, Copy)]
+enum Stream {
+    /// stderr: scanned for gh's error messages.
+    Err,
+    /// stdout of `gh api --include`: scanned for the status line and headers.
+    Out,
+}
+
+/// Copy `src` to our stream and the scanner until EOF (EIO from a pty master counts as EOF).
+fn tee(mut src: File, which: Stream, scanner: Arc<Mutex<Scanner>>, done: mpsc::Sender<()>) {
     let mut buf = vec![0u8; 16 * 1024];
-    let mut stderr = std::io::stderr();
     loop {
         match src.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                // A closed or broken stderr must not stop the drain.
-                let _ = stderr.write_all(&buf[..n]);
-                let _ = stderr.flush();
+                // A closed or broken output must not stop the drain.
+                match which {
+                    Stream::Err => {
+                        let mut e = std::io::stderr();
+                        let _ = e.write_all(&buf[..n]);
+                        let _ = e.flush();
+                    }
+                    Stream::Out => {
+                        let mut o = std::io::stdout();
+                        let _ = o.write_all(&buf[..n]);
+                        let _ = o.flush();
+                    }
+                }
                 if let Ok(mut s) = scanner.lock() {
-                    s.feed(&buf[..n]);
+                    match which {
+                        Stream::Err => s.feed(&buf[..n]),
+                        Stream::Out => s.feed_headers(&buf[..n]),
+                    }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -245,6 +294,73 @@ fn tee(mut src: File, scanner: Arc<Mutex<Scanner>>, done: mpsc::Sender<()>) {
         }
     }
     let _ = done.send(());
+}
+
+/// A child stream gh-paced reads: the child's end goes into the Command, the reader is kept.
+enum Capture {
+    /// Through a pseudo-terminal: the slave is the child's end.
+    Pty(Pty),
+    /// Through a pipe made by `Command`.
+    Pipe,
+}
+
+fn capture_for(fd: RawFd) -> Capture {
+    if is_tty(fd) {
+        if let Some(p) = open_pty(fd) {
+            return Capture::Pty(p);
+        }
+    }
+    Capture::Pipe
+}
+
+impl Capture {
+    fn child_end(&self) -> Stdio {
+        match self {
+            Capture::Pty(p) => p
+                .slave
+                .try_clone()
+                .map(Stdio::from)
+                .unwrap_or_else(|_| Stdio::piped()),
+            Capture::Pipe => Stdio::piped(),
+        }
+    }
+}
+
+/// Wait for the child, enforcing the deadline if there is one. Returns the status and whether
+/// the deadline stopped it.
+fn wait_with_deadline(
+    child: &mut std::process::Child,
+    deadline_secs: Option<f64>,
+) -> std::io::Result<(std::process::ExitStatus, bool)> {
+    let Some(limit) = deadline_secs else {
+        return child.wait().map(|s| (s, false));
+    };
+    let start = Instant::now();
+    let term_at = start + Duration::from_secs_f64(limit.max(0.0));
+    let mut kill_at: Option<Instant> = None;
+    loop {
+        if let Some(s) = child.try_wait()? {
+            return Ok((s, kill_at.is_some()));
+        }
+        let now = Instant::now();
+        match kill_at {
+            None if now >= term_at => {
+                if let Ok(pid) = i32::try_from(child.id()) {
+                    // SAFETY: signalling our own child, which has not been reaped yet.
+                    unsafe {
+                        libc::kill(pid, libc::SIGTERM);
+                    }
+                }
+                kill_at = Some(now + Duration::from_secs_f64(KILL_GRACE_SECS));
+            }
+            Some(k) if now >= k => {
+                let _ = child.kill();
+                return child.wait().map(|s| (s, true));
+            }
+            _ => {}
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn base_command(inv: &Invocation<'_>) -> Command {
@@ -270,10 +386,16 @@ fn feed_stdin(child: &mut std::process::Child, data: Option<Vec<u8>>) {
 }
 
 impl Runner for RealRunner {
-    fn run(&self, inv: Invocation<'_>, scanner: &mut Scanner) -> Result<Exit, String> {
+    fn run(&self, inv: Invocation<'_>, scanner: &mut Scanner) -> Result<Ran, String> {
         let shared = Arc::new(Mutex::new(std::mem::take(scanner)));
         let (done_tx, done_rx) = mpsc::channel();
-        let pty = if stderr_is_tty() { open_pty() } else { None };
+        let err_cap = capture_for(2);
+        let out_cap = if inv.scan_stdout {
+            Some(capture_for(1))
+        } else {
+            None
+        };
+        let keep_fd = inv.keep_fd;
         let set = signal_set();
         // SAFETY: blocking signals for this thread during spawn; restored below.
         let mut old: libc::sigset_t = unsafe { std::mem::zeroed() };
@@ -281,9 +403,9 @@ impl Runner for RealRunner {
             libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
         }
         let installed = install_forwarders();
-        // The Command (and its copy of the pty slave) is dropped at the end of this block, so
-        // the reader sees EOF once the child and its descendants close stderr.
-        let (spawn_result, piped) = {
+        // The Command (and its copies of the pty slaves) is dropped at the end of this block, so
+        // the readers see EOF once the child and its descendants close the streams.
+        let spawn_result = {
             let mut cmd = base_command(&inv);
             // The forwarded signals are blocked while spawning, and a child inherits the signal
             // mask. Give the child gh-paced's original mask back, after first resetting the
@@ -291,7 +413,7 @@ impl Runner for RealRunner {
             // default action in the child instead of running the parent's handler there.
             let child_mask = old;
             // SAFETY: the closure runs in the forked child before exec and only calls
-            // async-signal-safe functions (signal, pthread_sigmask) on copied data.
+            // async-signal-safe functions (signal, pthread_sigmask, fcntl) on copied data.
             unsafe {
                 cmd.pre_exec(move || {
                     for (i, s) in FORWARDED.into_iter().enumerate() {
@@ -300,6 +422,12 @@ impl Runner for RealRunner {
                         }
                     }
                     libc::pthread_sigmask(libc::SIG_SETMASK, &child_mask, std::ptr::null_mut());
+                    if let Some(fd) = keep_fd {
+                        // Clear close-on-exec in the child only, so gh inherits the lease.
+                        if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
                     Ok(())
                 });
             }
@@ -308,14 +436,12 @@ impl Runner for RealRunner {
             } else {
                 Stdio::inherit()
             });
-            cmd.stdout(Stdio::inherit());
-            let slave = pty.as_ref().and_then(|p| p.slave.try_clone().ok());
-            let piped = slave.is_none();
-            match slave {
-                Some(s) => cmd.stderr(Stdio::from(s)),
-                None => cmd.stderr(Stdio::piped()),
+            match &out_cap {
+                Some(c) => cmd.stdout(c.child_end()),
+                None => cmd.stdout(Stdio::inherit()),
             };
-            (cmd.spawn(), piped)
+            cmd.stderr(err_cap.child_end());
+            cmd.spawn()
         };
         let mut child = match spawn_result {
             Ok(c) => c,
@@ -332,35 +458,57 @@ impl Runner for RealRunner {
         unsafe {
             libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
         }
-        let source: Option<File> = if piped {
-            child
+        let err_src: Option<File> = match err_cap {
+            Capture::Pipe => child
                 .stderr
                 .take()
-                .map(|e| File::from(std::os::fd::OwnedFd::from(e)))
-        } else {
-            pty.map(|p| {
+                .map(|e| File::from(std::os::fd::OwnedFd::from(e))),
+            Capture::Pty(p) => {
                 drop(p.slave);
-                p.master
-            })
+                Some(p.master)
+            }
         };
-        let have_reader = source.is_some();
-        if let Some(src) = source {
-            let s = Arc::clone(&shared);
-            std::thread::spawn(move || tee(src, s, done_tx));
+        let out_src: Option<File> = match out_cap {
+            None => None,
+            Some(Capture::Pipe) => child
+                .stdout
+                .take()
+                .map(|o| File::from(std::os::fd::OwnedFd::from(o))),
+            Some(Capture::Pty(p)) => {
+                drop(p.slave);
+                Some(p.master)
+            }
+        };
+        let mut readers = 0;
+        for (src, which) in [(err_src, Stream::Err), (out_src, Stream::Out)] {
+            if let Some(src) = src {
+                let s = Arc::clone(&shared);
+                let tx = done_tx.clone();
+                std::thread::spawn(move || tee(src, which, s, tx));
+                readers += 1;
+            }
         }
+        drop(done_tx);
         feed_stdin(&mut child, inv.stdin);
-        let status = child
-            .wait()
+        let status = wait_with_deadline(&mut child, inv.deadline_secs)
             .map_err(|e| format!("waiting for {}: {e}", inv.program.display()));
         CHILD_PID.store(0, Ordering::SeqCst);
-        if have_reader {
-            // A grandchild (pager, credential helper) may keep stderr open after gh exits.
-            let _ = done_rx.recv_timeout(Duration::from_secs(2));
+        // A grandchild (pager, credential helper) may keep a stream open after gh exits; give
+        // the readers two seconds in total to drain.
+        let drain_until = Instant::now() + Duration::from_secs(2);
+        for _ in 0..readers {
+            let left = drain_until.saturating_duration_since(Instant::now());
+            if done_rx.recv_timeout(left).is_err() {
+                break;
+            }
         }
         if let Ok(s) = shared.lock() {
             *scanner = s.clone();
         }
-        status.map(decode)
+        status.map(|(s, deadline_hit)| Ran {
+            exit: decode(s),
+            deadline_hit,
+        })
     }
 
     fn capture(&self, inv: Invocation<'_>, timeout_secs: f64) -> Result<Captured, String> {
