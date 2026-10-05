@@ -2215,11 +2215,12 @@ mod tests {
             "web/voice.js",
             VOICE_JS,
             // Both pickers again, the head of the channel on each of its three writers, and the
-            // head of the to-do list.
+            // head of the to-do list. The older-page writer is `loadOlderPage`: `loadOlder` only
+            // hands out the step in flight since `#204 reply-arrow`.
             &[
                 "function fillChannelSelect(",
                 "function loadDiscord(",
-                "function loadOlder(",
+                "function loadOlderPage(",
                 "function restateChannelSeam(",
                 "function todoSummary(",
             ],
