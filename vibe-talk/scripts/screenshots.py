@@ -1182,6 +1182,14 @@ def _act_long_scroll(driver: Driver) -> None:
     driver.page.wait_for_function(
         "() => window.__text('talk-label') === 'Listening'", timeout=10_000
     )
+    # From the newest line. The transcript is kept on the server across a reload and across
+    # profiles (`#128 transcript-history`), so from the second scene to build it on there is a
+    # history already, and the page reopens it wherever it lands. Turns added from up that history
+    # are arrivals in the scrollback, and since `#207 scrollback-jump` the jump counts them: it read
+    # "19 new" in a scene promising one arrival, and "18 new" where 11 promises the plain "Newest".
+    # The reader of these scenes is following the call, so they start where a follower is.
+    driver.js("(() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; })()")
+    driver.page.wait_for_function("() => !window.__visible('jump-newest')", timeout=5_000)
     for who, text in LONG_TRANSCRIPT:
         driver.js(
             ("window.__userSays(" if who == "user" else "window.__agentSays(")
