@@ -378,8 +378,8 @@ validation slots. `audit`, `remove` (including `--validate-complete` and `remove
   process's generation cannot be read completely (unreadable evidence shows no run, so it is not
   reported `alive`), a handle repeats a JSON field (a repeated field has no single meaning, and keeping the last value
   could hide a live process or move the handle off its row), the row is registered on another
-  machine, or its owner was recorded on another host. All of this
-  evidence is local to the host, so a host without a reachable user service manager cannot prove a
+  machine, or its coordinator lease or owner names another stable host identity (an ownerless
+  row is judged by its lease, as in `recover-absent-validate-rows`). All of this evidence is local to the host, so a host without a reachable user service manager cannot prove a
   validation slot free.
 
 A unit names a row path when any of its property strings contains the path, in its recorded or

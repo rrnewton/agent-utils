@@ -15,6 +15,7 @@ checkout even though the agent-name command says dead.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import os
 import subprocess
@@ -937,3 +938,44 @@ def test_real_host_finish_recovery_waits_for_the_run_process(
     assert not host.slot_path.exists()
     assert not finish_path.exists()
     assert active_slots(host.project) == []
+
+
+@pytest.mark.parametrize(
+    ("lease_host", "expected"), [("foreign-host", "unverifiable"), (None, "dead")]
+)
+def test_an_ownerless_row_is_judged_local_by_its_coordinator_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lease_host: str | None,
+    expected: str,
+) -> None:
+    """An ownerless row's lease names the host that registered it.
+
+    With no owner, a host check that looks only at the owner accepts a row
+    registered on another host and judges it ``dead`` from this host's empty
+    evidence.  The same row is local when its lease names this host.
+    """
+
+    project, _tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+    record = state.slots[0]
+    lease = record.coordinator_lease
+    if lease_host is not None:
+        lease = dataclasses.replace(lease, host_id=lease_host)
+    ownerless = dataclasses.replace(record, owner=None, coordinator_lease=lease)
+    wrkslots._write_active_state(
+        config,
+        wrkslots._replace_record(state, ownerless),
+        action="test-ownerless",
+        slot=record.slot,
+    )
+
+    states = wrkslots._validation_run_liveness_states(
+        config, wrkslots._load_active(config).slots
+    )
+
+    state_name, message = states[("testhost", "slot01", 1)]
+    assert state_name == expected, message
+    if expected == "unverifiable":
+        assert "belongs to stable host foreign-host" in message

@@ -16590,8 +16590,9 @@ def _validation_run_liveness_states(
     process in its control group, and no active or queued user-systemd unit
     names those paths.  Positive evidence of a run is ``alive``.  Unreadable
     handle, process or user-systemd evidence, a row registered on another
-    machine, and an owner recorded on another host are ``unverifiable``,
-    because all of that evidence is local to this host.
+    machine, and a row whose coordinator lease or owner names another stable
+    host identity are ``unverifiable``, because all of that evidence is local
+    to this host.
 
     This replaces only the agent-name question.  Every caller still requires
     the exact recorded owner generation to be dead (or the caller to be that
@@ -16606,7 +16607,7 @@ def _validation_run_liveness_states(
     result: dict[tuple[str, str, int], tuple[str, str]] = {}
     local: list[ActiveRecord] = []
     try:
-        current_host = _host_id()
+        _host_id()
     except Refusal as exc:
         detail = _liveness_batch_diagnostic(
             f"validation-run evidence is unverifiable: {exc}"
@@ -16620,13 +16621,20 @@ def _validation_run_liveness_states(
                 f"validation row is registered on machine {record.machine}, and "
                 f"run, process and user-systemd evidence is local to {config.machine}",
             )
-        elif record.owner is not None and record.owner.host_id != current_host:
-            result[key] = (
-                "unverifiable",
-                "validation row owner was recorded on another host, and run, process "
-                "and user-systemd evidence is local to this host",
-            )
         else:
+            # An ownerless row has no owner host to compare, but its
+            # coordinator lease names the host that registered it.  Checking
+            # only the owner let ``--machine`` select a foreign shard's
+            # ownerless row and judge it ``dead`` from this host's evidence.
+            try:
+                _assert_absent_validate_row_is_local(record)
+            except Refusal as exc:
+                result[key] = (
+                    "unverifiable",
+                    f"{exc}, and run, process and user-systemd evidence is local to "
+                    f"this host",
+                )
+                continue
             local.append(record)
     if not local:
         return result
