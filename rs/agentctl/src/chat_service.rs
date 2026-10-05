@@ -6018,6 +6018,11 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
 
     #[test]
     fn async_ack_queue_overflow_recovers_durable_requests_without_blocking_intake() {
+        // The waits below bound how long the test may hang, not how fast the worker must be: each
+        // ACK is fsynced before the next starts, and under load one fsync can take longer than the
+        // former 2 s per-ACK receive timeout. What the test checks is that intake does not block
+        // and that every ACK, the overflowing one included, is recovered.
+        const HANG_GUARD: Duration = Duration::from_secs(60);
         let (state, key, root) = state_with_request();
         let mut keys = vec![key];
         keys.extend(admit_more_requests(&state, ACK_QUEUE_CAPACITY));
@@ -6046,16 +6051,10 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         .expect("spawn ACK worker");
         let mut observed = BTreeSet::new();
         for _ in &keys {
-            observed.insert(
-                starts
-                    .recv_timeout(Duration::from_secs(2))
-                    .expect("recovered ACK")
-                    .0,
-            );
+            observed.insert(starts.recv_timeout(HANG_GUARD).expect("recovered ACK").0);
         }
         stop.stop();
-        join_worker_until(worker, "ACK", Instant::now() + Duration::from_secs(1))
-            .expect("join ACK worker");
+        join_worker_until(worker, "ACK", Instant::now() + HANG_GUARD).expect("join ACK worker");
         assert_eq!(observed.len(), keys.len());
         assert!(state.pending_ack_keys().expect("remaining ACKs").is_empty());
         fs::remove_dir_all(root).expect("cleanup");
