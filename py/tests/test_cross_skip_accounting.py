@@ -1637,9 +1637,15 @@ def _validate_with_one_cross_node(
     seen: list[Path] = []
 
     def fake_run(
-        _selected: object, _components: object, *, all_contract: bool, coverage_dir: Path
+        _selected: object,
+        _components: object,
+        *,
+        all_contract: bool,
+        coverage_dir: Path,
+        host: object = None,
     ) -> int:
         assert all_contract
+        assert host == {}
         seen.append(coverage_dir)
         monkeypatch.setenv(COVERAGE_DIR_ENV, str(coverage_dir))
         monkeypatch.setenv("DAGRUN_OUTER_RUN", "cross.dagrun.cpuset-differential")
@@ -1654,6 +1660,8 @@ def _validate_with_one_cross_node(
     nodes = ["cross.dagrun.cpuset-differential"] if expected is None else expected
     monkeypatch.setattr(validate, "run", fake_run)
     monkeypatch.setattr(validate, "selected_cross_nodes", lambda *_args, **_kw: nodes)
+    # Hermetic: no host settings file from the machine running the tests.
+    monkeypatch.setattr(validate, "host_env", lambda _environ: {})
     return validate, seen
 
 

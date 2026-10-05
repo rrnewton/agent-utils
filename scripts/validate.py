@@ -26,6 +26,15 @@ Usage:
     python3 scripts/validate.py --all           # the entire portable contract, no selection
     python3 scripts/validate.py --list          # print the plan, run nothing
     python3 scripts/validate.py --self-test     # check the mapping itself, offline
+
+HOST SETTINGS. A host may need to tell the graph which npm binary to run, a package registry
+mirror, or a Node release mirror -- facts about the machine that the repository must not name.
+They go in ${XDG_CONFIG_HOME:-~/.config}/agent-utils/validate.env, one KEY=VALUE per line ('#'
+comments and blank lines allowed, VALUE taken literally), and only these keys are accepted:
+AGENT_UTILS_NPM, AGENT_UTILS_NODE_DIST_URL, npm_config_registry. Any other key, a malformed or
+repeated line, or an empty value stops validation before it starts. The values reach the
+validation graph's environment and nothing else; a variable already set in the caller's
+environment wins. Each run prints the file and the keys it set, never their values.
 """
 
 from __future__ import annotations
@@ -335,6 +344,58 @@ def changed_paths(base: str, *, repo_root: Path = REPO_ROOT) -> list[str]:
 #: PARTIAL cross node from a complete one.
 CROSS_COVERAGE_ENV = "AGENT_UTILS_CROSS_COVERAGE_DIR"
 
+#: The host settings validate.env may supply (see HOST SETTINGS in the module docstring).
+HOST_ENV_KEYS = ("AGENT_UTILS_NPM", "AGENT_UTILS_NODE_DIST_URL", "npm_config_registry")
+
+
+class HostEnvError(ValueError):
+    """validate.env is malformed or names a setting validation does not accept."""
+
+
+def host_env_path(environ: Mapping[str, str]) -> Path:
+    """Where this user's host settings live: $XDG_CONFIG_HOME, else ~/.config."""
+    config = environ.get("XDG_CONFIG_HOME") or str(Path(environ.get("HOME") or "~").expanduser() / ".config")
+    return Path(config) / "agent-utils" / "validate.env"
+
+
+def parse_host_env(text: str, source: str) -> dict[str, str]:
+    """Parse validate.env, refusing rather than ignoring anything it does not understand."""
+    values: dict[str, str] = {}
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        where = f"{source}:{number}"
+        if not sep or not key:
+            raise HostEnvError(f"{where}: expected KEY=VALUE, got {line!r}")
+        if key not in HOST_ENV_KEYS:
+            raise HostEnvError(f"{where}: {key!r} is not a host setting; allowed: {', '.join(HOST_ENV_KEYS)}")
+        if key in values:
+            raise HostEnvError(f"{where}: {key} is set twice")
+        if not value:
+            raise HostEnvError(f"{where}: {key} has an empty value")
+        values[key] = value
+    return values
+
+
+def host_env(environ: Mapping[str, str]) -> dict[str, str]:
+    """The settings validate.env adds to the graph's environment, announced by key only."""
+    path = host_env_path(environ)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    values = parse_host_env(text, str(path))
+    added = {key: value for key, value in values.items() if key not in environ}
+    kept = sorted(set(values) - set(added))
+    line = f"validate: host settings {path} set {', '.join(sorted(added)) or 'nothing'}"
+    if kept:
+        line += f"; already in the environment, kept: {', '.join(kept)}"
+    print(line, flush=True)
+    return added
+
 
 class CrossCoverage(NamedTuple):
     """What the cross verdict records of one validation run show."""
@@ -454,10 +515,12 @@ def run(
     *,
     all_contract: bool,
     coverage_dir: Path | None = None,
+    host: Mapping[str, str] | None = None,
 ) -> int:
     """Execute one flattened dagrun graph for the selected contract.
 
-    With `coverage_dir`, every cross differential node writes its verdict record there.
+    With `coverage_dir`, every cross differential node writes its verdict record there. `host`
+    is the validate.env settings, added to the graph's environment only.
     """
 
     cpu_count = os.cpu_count() or 1
@@ -484,6 +547,7 @@ def run(
     command.extend(shlex.split(extra))
     print(f"\n=== flattened validation DAG ({len(command)} argv entries) ===", flush=True)
     env = dict(os.environ)
+    env.update(host or {})
     if coverage_dir is not None:
         env[CROSS_COVERAGE_ENV] = str(coverage_dir)
     done = subprocess.run(command, cwd=REPO_ROOT, check=False, env=env)
@@ -1050,6 +1114,37 @@ def self_test() -> int:
                             f"    want={expected}\n    got ={committed_paths}"
                         )
 
+    good = parse_host_env(
+        "# host\n\nAGENT_UTILS_NPM = /usr/bin/npm\nnpm_config_registry=https://r.example/\n", "t"
+    )
+    if good != {"AGENT_UTILS_NPM": "/usr/bin/npm", "npm_config_registry": "https://r.example/"}:
+        failures.append(f"validate.env: a valid file parsed as {good!r}")
+    for bad, why in (
+        ("PATH=/tmp/evil\n", "an unknown key"),
+        ("AGENT_UTILS_NPM\n", "a line without '='"),
+        ("AGENT_UTILS_NPM=a\nAGENT_UTILS_NPM=b\n", "a repeated key"),
+        ("npm_config_registry=\n", "an empty value"),
+    ):
+        try:
+            parse_host_env(bad, "t")
+        except HostEnvError:
+            continue
+        failures.append(f"validate.env: {why} was accepted instead of refused")
+    if host_env_path({"XDG_CONFIG_HOME": "/x", "HOME": "/h"}) != Path("/x/agent-utils/validate.env"):
+        failures.append("validate.env: XDG_CONFIG_HOME was not honoured")
+    if host_env_path({"XDG_CONFIG_HOME": "", "HOME": "/h"}) != Path("/h/.config/agent-utils/validate.env"):
+        failures.append("validate.env: an empty XDG_CONFIG_HOME did not fall back to ~/.config")
+    with tempfile.TemporaryDirectory(prefix="validate-host-env-") as config:
+        if host_env({"XDG_CONFIG_HOME": config}) != {}:
+            failures.append("validate.env: a missing file added settings")
+        (Path(config) / "agent-utils").mkdir()
+        (Path(config) / "agent-utils" / "validate.env").write_text(
+            "AGENT_UTILS_NPM=/opt/npm\nnpm_config_registry=https://r.example/\n", encoding="utf-8"
+        )
+        added = host_env({"XDG_CONFIG_HOME": config, "AGENT_UTILS_NPM": "/caller/npm"})
+        if added != {"npm_config_registry": "https://r.example/"}:
+            failures.append(f"validate.env: the caller's own setting did not win: {added!r}")
+
     for failure in failures:
         print(f"FAIL  {failure}", file=sys.stderr)
     if failures:
@@ -1101,11 +1196,17 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    try:
+        host = host_env(os.environ)
+    except HostEnvError as error:
+        print(f"validate: {error}", file=sys.stderr)
+        return 2
+
     all_contract = args.all or selected == ALL_GROUPS
     # Every selected cross node must leave a record; one that does not cannot be confirmed.
     expected = selected_cross_nodes(selected, components, all_contract=all_contract)
     with tempfile.TemporaryDirectory(prefix="validate-cross-coverage-") as coverage:
-        code = run(selected, components, all_contract=all_contract, coverage_dir=Path(coverage))
+        code = run(selected, components, all_contract=all_contract, coverage_dir=Path(coverage), host=host)
         if code != 0:
             return code
         coverage_state = cross_coverage_report(Path(coverage), expected)
