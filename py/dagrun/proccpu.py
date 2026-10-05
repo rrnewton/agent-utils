@@ -113,13 +113,13 @@ def _poll(fd: int, deadline: float) -> int:
     return 0 if count == 0 else int(event.revents)
 
 
-def _read(fd: int, deadline: float) -> str:
+def _read(fd: int, deadline: float, limit: int = _MAX_RECORD) -> str:
     """Offset zero is essential: procfs must regenerate the phase-two record."""
     data = bytearray()
     libc = _libc()
     libc.pread64.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_longlong]
     libc.pread64.restype = ctypes.c_ssize_t
-    while len(data) <= _MAX_RECORD:
+    while len(data) <= limit:
         buffer = ctypes.create_string_buffer(1024)
         size = _native(lambda: int(libc.pread64(fd, buffer, len(buffer), len(data))), deadline)
         if size == 0:
@@ -134,6 +134,7 @@ class _Stat:
     group: int
     state: str
     ticks: int
+    session: int = 0
 
 
 def _stat(text: str) -> _Stat:
@@ -143,12 +144,13 @@ def _stat(text: str) -> _Stat:
         pid = int(text[:opening])
         fields = text[close + 1 :].split()
         group = int(fields[2])
+        session = int(fields[3])
         cpu = [int(fields[index]) for index in (11, 12, 13, 14)]
         if close < opening or pid <= 0 or group < 0 or len(fields[0]) != 1:
             raise ValueError("identity")
         if any(value < 0 or value > _U64_MAX for value in cpu) or sum(cpu) > _U64_MAX:
             raise ValueError("CPU overflow")
-        return _Stat(pid, group, fields[0], sum(cpu))
+        return _Stat(pid, group, fields[0], sum(cpu), session)
     except (ValueError, IndexError) as exc:
         raise Unavailable("malformed stat") from exc
 
@@ -182,6 +184,99 @@ def _allow_fds(required: int) -> None:
                 raise Unavailable("descriptor census bound")
     if used + required + _FD_RESERVE > soft:
         raise Unavailable("descriptor reserve")
+
+
+# PIDs below this are never handed out again after the allocator wraps (Linux
+# RESERVED_PIDS), so a lap of the PID space is at most pid_max - _RESERVED_PIDS steps.
+_RESERVED_PIDS = 300
+# /proc/stat holds one line per CPU; this bounds it on hosts with thousands of CPUs.
+_MAX_STAT_RECORD = 1 << 20
+
+
+@dataclass(frozen=True)
+class _Allocator:
+    """Where the kernel's PID allocator stands: the last PID it handed out and the live
+    task count (/proc/loadavg), and the tasks created since boot (/proc/stat processes).
+    Threads take their IDs from the same space, and all three count them."""
+
+    last_pid: int
+    tasks: int
+    forks: int
+
+
+def _parse_loadavg(text: str) -> tuple[int, int] | None:
+    fields = text.split()
+    try:
+        _, tasks = fields[3].split("/", 1)
+        return int(fields[4]), int(tasks)
+    except (IndexError, ValueError):
+        return None
+
+
+def _parse_forks(text: str) -> int | None:
+    values = [line[len("processes ") :] for line in text.splitlines() if line.startswith("processes ")]
+    if len(values) != 1:
+        return None
+    try:
+        return int(values[0].strip())
+    except ValueError:
+        return None
+
+
+def _reallocated(start: _Allocator, end: _Allocator, pid_max: int, pid: int) -> bool:
+    """Whether the allocator may have handed out pid again on its way from start to end.
+    It walks the PID space in a circle, one step per new task or per PID still in use, so
+    every PID it handed out lies on the arc after start.last_pid up to end.last_pid, unless
+    it may have gone the whole way round: then any PID may have been."""
+    created = end.forks - start.forks
+    if created < 0:
+        return True
+    if created + max(start.tasks, end.tasks) >= max(pid_max - _RESERVED_PIDS, 0):
+        return True
+    if created == 0:
+        return False
+    first, last = start.last_pid, end.last_pid
+    if first < last:
+        return first < pid <= last
+    return pid > first or pid <= last
+
+
+class _SessionCache:
+    """The session of each PID an earlier snapshot read. A process joins a group only
+    through setpgid, only within its own session, and changes its session only through
+    setsid, which makes its session its own PID. So a cached PID's session is now either the
+    cached one or the PID itself, and the PID is skipped only when neither is the session of
+    a registered group: then it can never be a member of one. That covers a child read
+    between fork and setsid that then leads a registered group. The cache holds sessions,
+    not verdicts, so a group registered later re-evaluates every cached PID without a read.
+    An entry is trusted only while the kernel cannot have reused its PID; when that cannot
+    be proven the cache is emptied and the next snapshot reads every PID."""
+
+    def __init__(self) -> None:
+        self.sessions: dict[int, int] = {}
+        self.at: _Allocator | None = None
+
+    def begin(self, now: _Allocator | None, pid_max: int | None) -> None:
+        previous = self.at
+        if previous is not None and now is not None and pid_max is not None:
+            self.sessions = {
+                pid: session for pid, session in self.sessions.items() if not _reallocated(previous, now, pid_max, pid)
+            }
+        else:
+            self.sessions.clear()
+        self.at = now
+
+    def skip(self, pid: int, sessions: set[int]) -> bool:
+        if pid in sessions:
+            return False
+        session = self.sessions.get(pid)
+        return session is not None and session not in sessions
+
+    def record(self, pid: int, session: int) -> None:
+        self.sessions[pid] = session
+
+    def retain(self, seen: set[int]) -> None:
+        self.sessions = {pid: session for pid, session in self.sessions.items() if pid in seen}
 
 
 class _Proc:
@@ -225,6 +320,35 @@ class _Proc:
 
     def open(self, path: str, deadline: float | None = None) -> int:
         return _openat(self.fd, path, time.monotonic() + _SCAN_SECONDS if deadline is None else deadline)
+
+    def _record(self, path: str, deadline: float, limit: int = _MAX_RECORD) -> str | None:
+        try:
+            fd = self.open(path, deadline)
+        except OSError:
+            return None
+        try:
+            return _read(fd, deadline, limit)
+        except (OSError, Unavailable):
+            return None
+        finally:
+            os.close(fd)
+
+    def allocator(self, deadline: float) -> _Allocator | None:
+        """The allocator position, or None if procfs does not report it."""
+        loadavg = self._record("loadavg", deadline)
+        stat = self._record("stat", deadline, _MAX_STAT_RECORD)
+        position = None if loadavg is None else _parse_loadavg(loadavg)
+        forks = None if stat is None else _parse_forks(stat)
+        if position is None or forks is None:
+            return None
+        return _Allocator(position[0], position[1], forks)
+
+    def pid_max(self, deadline: float) -> int | None:
+        text = self._record("sys/kernel/pid_max", deadline)
+        try:
+            return None if text is None else int(text.strip())
+        except ValueError:
+            return None
 
     def pid(self, pidfd: int, deadline: float) -> int:
         fd = self.open(f"self/fdinfo/{pidfd}", deadline)
@@ -311,12 +435,47 @@ class _Source(Protocol):
 
 
 class _KernelSource:
-    def __init__(self, proc: _Proc) -> None:
+    """The live procfs source. sessions are the registered groups' sessions, and cache
+    persists across snapshots for the shared registry."""
+
+    def __init__(self, proc: _Proc, sessions: set[int] | None = None, cache: _SessionCache | None = None) -> None:
         self.proc = proc
+        self.sessions = set() if sessions is None else sessions
+        self.cache = _SessionCache() if cache is None else cache
+        self.reads = 0
+
+    def _consider(self, pid: int, groups: set[int], rows: list[_Observation], deadline: float) -> None:
+        """Read pid's stat, cache its session and, if it is in one of groups, pair it."""
+        self.reads += 1
+        try:
+            fd = self.proc.open(f"{pid}/stat", deadline)
+            try:
+                hint = _stat(_read(fd, deadline))
+            finally:
+                os.close(fd)
+            self.cache.record(pid, hint.session)
+            if hint.group not in groups:
+                return
+            if len(rows) >= _MAX_MEMBERS:
+                raise Unavailable("member bound")
+            pair = self.proc.pair(pid, deadline)
+        except OSError as exc:
+            if _gone(exc):
+                return
+            raise
+        if pair.original.group not in groups:
+            pair.close()
+        else:
+            rows.append(pair)
 
     def samples(self, groups: set[int], deadline: float) -> list[_Observation]:
         rows: list[_Observation] = []
         try:
+            pid_max = self.proc.pid_max(deadline)
+            start = self.proc.allocator(deadline)
+            self.cache.begin(start, pid_max)
+            seen: set[int] = set()
+            skipped: list[int] = []
             with os.scandir(self.proc.fd) as entries:
                 for index, entry in enumerate(entries):
                     _check(deadline)
@@ -325,25 +484,18 @@ class _KernelSource:
                     if not entry.name.isascii() or not entry.name.isdigit():
                         continue
                     pid = int(entry.name)
-                    try:
-                        fd = self.proc.open(f"{pid}/stat", deadline)
-                        try:
-                            hint = _stat(_read(fd, deadline))
-                        finally:
-                            os.close(fd)
-                        if hint.group not in groups:
-                            continue
-                        if len(rows) >= _MAX_MEMBERS:
-                            raise Unavailable("member bound")
-                        pair = self.proc.pair(pid, deadline)
-                    except OSError as exc:
-                        if _gone(exc):
-                            continue
-                        raise
-                    if pair.original.group not in groups:
-                        pair.close()
-                    else:
-                        rows.append(pair)
+                    seen.add(pid)
+                    if self.cache.skip(pid, self.sessions):
+                        skipped.append(pid)
+                        continue
+                    self._consider(pid, groups, rows, deadline)
+            # A skipped PID may have been handed to a new task while this snapshot ran.
+            end = self.proc.allocator(deadline)
+            for pid in skipped:
+                if start is None or end is None or pid_max is None or _reallocated(start, end, pid_max, pid):
+                    _check(deadline)
+                    self._consider(pid, groups, rows, deadline)
+            self.cache.retain(seen)
             return rows
         except BaseException:
             for row in rows:
@@ -380,6 +532,8 @@ _snapshot: dict[int, int] = {}
 _snapshot_keys: set[int] = set()
 _snapshot_error: str | None = None
 _snapshot_started = float("-inf")
+_snapshot_reads = 0
+_census = _SessionCache()
 
 
 def _expire_compatibility(now: float) -> None:
@@ -403,6 +557,7 @@ class ProcessGroupCpu:
         self.proc: _Proc | None = None
         self.owner: _Pair | None = None
         self.pgid = pgid
+        self.session = 0
         self.key = -1
         self.shared = proc_root == Path("/proc")
         if not 1 < pgid <= 2147483647:
@@ -418,6 +573,8 @@ class ProcessGroupCpu:
                 self.owner = owner
                 if owner.original.group != pgid:
                     raise Unavailable("owner is not the process-group leader")
+                # A group leader cannot leave its session, so this is the group's session.
+                self.session = owner.original.session
                 _next_owner += 1
                 self.key = _next_owner
                 if self.shared:
@@ -453,7 +610,7 @@ class ProcessGroupCpu:
 
     def seconds(self) -> float:
         """Return checked own+waited CPU seconds from one authenticated observation."""
-        global _snapshot_at, _snapshot, _snapshot_keys, _snapshot_error, _snapshot_started
+        global _snapshot_at, _snapshot, _snapshot_keys, _snapshot_error, _snapshot_started, _snapshot_reads
         try:
             with _lock:
                 deadline = time.monotonic() + _SCAN_SECONDS
@@ -476,8 +633,9 @@ class ProcessGroupCpu:
                         active.append(owner)
                     _snapshot_started = time.monotonic()
                     _snapshot_keys = {owner.key for owner in owners}
+                    source = _KernelSource(self.proc, {owner.session for owner in active}, _census)
                     try:
-                        totals = _scan(_KernelSource(self.proc), {owner.pgid for owner in active}, deadline)
+                        totals = _scan(source, {owner.pgid for owner in active}, deadline)
                     except (OSError, Unavailable) as exc:
                         _snapshot = {}
                         _snapshot_error = str(exc)
@@ -492,6 +650,7 @@ class ProcessGroupCpu:
                                 values[owner.key] = totals[owner.pgid]
                         _snapshot = values
                         _snapshot_error = None
+                    _snapshot_reads = source.reads
                     _snapshot_at = time.monotonic()
                 self._authenticate(deadline)
                 if _snapshot_at - _snapshot_started > _SCAN_SECONDS:
