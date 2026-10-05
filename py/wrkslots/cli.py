@@ -42787,10 +42787,11 @@ def _retained_handles_for_absent_rows(
                     path = handles / directory_entry.name
                     if not stat.S_ISREG(metadata.st_mode):
                         raise Refusal(f"retained validation handle is unsafe: {path}")
-                    if metadata.st_size > 1024 * 1024:
-                        raise Refusal(
-                            f"retained validation handle exceeds the 1 MiB safety bound: {path}"
-                        )
+                    # Only the census as a whole is bounded.  A per-handle cap
+                    # of 1 MiB refused every absent-row recovery on the host
+                    # because one unrelated run record was 1,303,247 bytes,
+                    # while all 2,546 records together were 12,705,397 bytes
+                    # (2026-10-04).
                     total_bytes += metadata.st_size
                     if total_bytes > _RETAINED_HANDLE_BYTES_LIMIT:
                         raise Refusal(
@@ -42812,7 +42813,7 @@ def _retained_handles_for_absent_rows(
     for path in handle_paths:
         try:
             contents = _read_bounded_regular_file(
-                path, "retained validation handle", 1024 * 1024
+                path, "retained validation handle", _RETAINED_HANDLE_BYTES_LIMIT
             )
             total_bytes += len(contents)
             if total_bytes > _RETAINED_HANDLE_BYTES_LIMIT:

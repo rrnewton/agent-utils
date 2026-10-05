@@ -43110,6 +43110,31 @@ def test_retained_handle_binds_checkout_and_source_checkout_even_when_nontermina
     wrkslots._assert_retained_handle_processes_dead(bindings)
 
 
+def test_an_unrelated_retained_handle_over_one_mib_does_not_refuse_the_census(
+    tmp_path: Path,
+) -> None:
+    """Only the census of retained handles is bounded, not each handle.
+
+    On 2026-10-04 one run record was 1,303,247 bytes (a 4,862-entry
+    archived_orphaned_receipts list) while all 2,546 records together were
+    12,705,397 bytes.  A 1 MiB cap per handle refused every absent-row
+    recovery on the host for that one unrelated record.
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    config = wrkslots._load_config(str(project), "testhost")
+    handles = project / "ignored" / "validate" / "runs"
+    handles.mkdir(parents=True, exist_ok=True)
+    large = {
+        "checkout": str(project / "worktrees" / "validate" / "unrelated"),
+        "archived_orphaned_receipts": [f"/archive/{index:07d}/rows.jsonl" for index in range(60_000)],
+    }
+    (handles / "large.json").write_text(json.dumps(large), encoding="utf-8")
+    assert (handles / "large.json").stat().st_size > 1024 * 1024
+
+    assert wrkslots._retained_handles_for_absent_rows(config, ()) == {}
+
+
 @pytest.mark.parametrize("bound", ("count", "bytes", "deadline"))
 def test_retained_handle_enumeration_is_bounded_before_sorting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bound: str

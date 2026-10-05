@@ -835,9 +835,10 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # mapped partition. Of the three exited-representative census tests, the
     # two cases of the stubbed one are mapped and the real-process one is
     # ordinary.
-    assert len(all_tests) == 1832
+    # The retained-handle size test is mapped.
+    assert len(all_tests) == 1833
     assert len(ordinary) == 287
-    assert len(mapped) == 1545
+    assert len(mapped) == 1546
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
