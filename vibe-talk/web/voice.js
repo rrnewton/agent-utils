@@ -417,6 +417,8 @@ function showScreen(name) {
     screenBeforeSettings = name;
   }
   currentScreen = name;
+  // The jump is about the list on the main screen, and is gone with it. `#207 scrollback-jump`.
+  renderJumpNewest();
   // LAST, and after `currentScreen` is set: the bar decides what it shows from the screen that is
   // now up, and it is also what collapses the header when nothing is left in it. `#58 control-bar`.
   renderControlBar();
@@ -781,9 +783,13 @@ function restoreScroll(mark) {
   // A list that was replaced while we were away has taken the anchor with it, and there is nothing
   // left to measure against; leaving the position alone beats jumping somewhere arbitrary.
   if (!mark.anchor || !mark.anchor.parentNode) {
+    renderJumpNewest();
     return;
   }
   area.scrollTop += mark.anchor.getBoundingClientRect().top - mark.top;
+  // Wherever that put the reader decides the jump, now: up the history it is offered, on the
+  // newest line it is not. `#207 scrollback-jump`.
+  renderJumpNewest();
 }
 
 /**
@@ -801,14 +807,16 @@ function restoreScroll(mark) {
  * read a backlog, so that is the ordinary case, not a corner — and its cost was silence. The turn
  * belongs to a list nobody is looking at, so the only right act is to raise that list's chip.
  */
-function followIfPinned(pinned) {
+function followIfPinned(pinned, turns = 0) {
   if (pinned && currentView === "voice") {
     scrollToNewest();
     return;
   }
   // Named explicitly: this is only ever reached from `line()` and `seam()`, which append to the
   // transcript. Letting it default to `currentView` would raise a chip over the channel list.
-  setJumpNewest(true, "voice");
+  // `turns` is how many new turns this was, for the count the jump shows: a turn growing as it is
+  // spoken, or a seam, is a change below and not another message. `#207 scrollback-jump`.
+  setJumpNewest(true, "voice", turns);
 }
 
 /** The invitation only makes sense while there is nothing else in the transcript. */
@@ -1476,11 +1484,90 @@ const SUMMARY_MODE_ON = "Summaries on";
 // chip for a voice turn while the reader is looking at the channel — offering to jump them to the
 // bottom of a list nothing arrived in — and would leave a channel arrival with no chip at all.
 // The chip belongs to the list it is about.
+//
+// `#207 scrollback-jump` made it say HOW MUCH arrived, so it holds one of three things: `false`,
+// nothing arrived below the reader; a number, that many new messages did; or `true`, something
+// did that cannot be counted. A number never grows out of `true`: unknown plus three is still
+// unknown, and "3 new" over sixty would be a lie.
+/** @type {{voice: boolean | number, discord: boolean | number}} */
 const jumpNewestWanted = { voice: false, discord: false };
 
-function setJumpNewest(wanted, view = currentView) {
-  jumpNewestWanted[view] = wanted;
+/**
+ * Raise or lower the arrival on one list's jump. `arrived` is how many new messages it was for:
+ * 0 for a change below that is not a new message (a turn still being spoken, a seam), `null` for
+ * messages that cannot be counted.
+ */
+function setJumpNewest(wanted, view = currentView, arrived = 0) {
+  const held = jumpNewestWanted[view];
+  if (!wanted) jumpNewestWanted[view] = false;
+  else if (arrived === null || held === true) jumpNewestWanted[view] = true;
+  else jumpNewestWanted[view] = (held || 0) + arrived;
   renderScrollTools();
+}
+
+/**
+ * `#207 scrollback-jump`. The jump to the newest message is offered whenever the list on screen is
+ * scrolled away from it — not only when something arrives — because the reader who has wandered
+ * up the history is the one who wants the way back, whether or not anything new is waiting there.
+ *
+ * TWO DISTANCES, NOT ONE, so it cannot flicker. It goes away at `BOTTOM_SLACK_PX`, the page's own
+ * "at the newest" — the line `followIfPinned` follows from, so a reader it is offered to is a
+ * reader the page has stopped following — and comes back only past this, further up. In between
+ * it keeps whatever it was showing: a thumb resting on the boundary, or a fling decaying through
+ * it, crosses one of them once and does not toggle the control frame by frame.
+ *
+ * Measured against the very end of the list, as `atBottom` is, and so in the channel the composer
+ * below the newest message counts: tapping the jump lands on both, and that is where it lands.
+ */
+const SCROLLBACK_PX = 64;
+
+/** Whether each list is in its scrollback, as the jump last decided it. See `SCROLLBACK_PX`. */
+const inScrollback = { voice: false, discord: false };
+
+/** The largest count the jump spells out; past it, "99+ new". A wider chip says nothing more. */
+const JUMP_COUNT_MAX = 99;
+
+/**
+ * Show, hide and word the jump for the list on screen, from where that list is scrolled now.
+ *
+ * Cheap on purpose, because the scroll listener calls it on every event: a few reads of a layout
+ * the scroll has already computed, and a write only when something changed. Every programmatic
+ * placement of the reader ends in it as well — `renderScrollTools`, `restoreScroll`,
+ * `scrollToNewest` — so a restore that lands on the newest message never shows it, and one that
+ * lands up the history shows it at once rather than waiting for a scroll event to say so.
+ */
+function renderJumpNewest() {
+  const button = el("jump-newest");
+  let shown = false;
+  // Only over a list on screen. Anywhere else #scroll-area is hidden and measures nothing at all,
+  // and taking that zero for "at the newest" would forget where the list was left.
+  if (currentScreen === "main") {
+    const area = el("scroll-area");
+    const gap = area.scrollHeight - area.scrollTop - (area.clientHeight || 0);
+    if (gap <= BOTTOM_SLACK_PX) {
+      // At the newest, which is also all of a list too short to scroll. Nothing is below to jump
+      // to, and nothing that arrived is still unseen.
+      inScrollback[currentView] = false;
+      jumpNewestWanted[currentView] = false;
+    } else if (gap > SCROLLBACK_PX) {
+      inScrollback[currentView] = true;
+    }
+    shown = inScrollback[currentView] || jumpNewestWanted[currentView] !== false;
+  }
+  // The arrival changes what the ONE control says, rather than raising a second one beside it.
+  const arrived = jumpNewestWanted[currentView];
+  const count = typeof arrived === "number" && arrived > 0 ? arrived : 0;
+  const many = count > JUMP_COUNT_MAX ? `${JUMP_COUNT_MAX}+` : String(count);
+  const label = arrived === false ? "Newest" : count ? `${many} new` : "New";
+  const name = arrived === false
+    ? "Jump to the newest message"
+    : `Jump to the newest message, ${count ? `${many} new` : "something new below"}`;
+  if (button.hidden === shown) button.hidden = !shown;
+  if (el("jump-newest-label").textContent !== label) el("jump-newest-label").textContent = label;
+  if (button.getAttribute("aria-label") !== name) button.setAttribute("aria-label", name);
+  if (button.hasAttribute("data-arrivals") === (arrived === false)) {
+    button.toggleAttribute("data-arrivals", arrived !== false);
+  }
 }
 
 /** The folds in the list actually on screen. Collapse all acts on what you are looking at. */
@@ -1490,7 +1577,6 @@ function visibleFolds() {
 }
 
 function renderScrollTools() {
-  el("jump-newest").hidden = !jumpNewestWanted[currentView];
   // ONE snapshot for all three chips, so they cannot disagree about a list that changed between
   // two queries.
   const folds = visibleFolds();
@@ -1516,6 +1602,9 @@ function renderScrollTools() {
   // just changed a list has to leave the filter true of it. See `applySearch` for why this hangs
   // off the one function every mutation already ends with rather than off its own call sites.
   applySearch();
+  // LAST: it measures how far the list runs below the reader, and the filter just above can have
+  // taken most of the list away. `#207 scrollback-jump`.
+  renderJumpNewest();
 }
 
 /**
@@ -1802,7 +1891,7 @@ function line(who, text, atMs) {
   // A row arriving into a filtered list is filtered too. Without this, a live turn spoken while
   // the reader is searching lands on screen among the matches whether or not it is one.
   applySearch();
-  followIfPinned(pinned);
+  followIfPinned(pinned, 1);
   return li;
 }
 
@@ -12582,6 +12671,7 @@ let discordNewestId = null;
  *          anchorId?: string|null, anchorTop?: number, ownAct?: boolean}} how
  */
 function settleAfterRead(messages, how) {
+  const previous = discordNewestId;
   const newest = messages.length ? String(messages[messages.length - 1].id) : null;
   const moved = newest !== null && discordNewestId !== null && newest !== discordNewestId;
   const arrived = moved && how.ownAct !== true;
@@ -12601,7 +12691,11 @@ function settleAfterRead(messages, how) {
       how.area.scrollTop = how.previousTop;
     }
     if (arrived) {
-      setJumpNewest(true, "discord");
+      // How many, counted from the message that was newest before. When it is not in the list any
+      // more — more arrived than one read holds, or it was deleted — only that something did.
+      // `#207 scrollback-jump`.
+      const at = messages.findIndex((message) => String(message.id) === previous);
+      setJumpNewest(true, "discord", at >= 0 ? messages.length - 1 - at : null);
     }
   } else {
     scrollToNewest();
@@ -15152,7 +15246,7 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
     // Somewhere else in the history, or looking at the call. Offer the jump; never take it.
     // Never for a placeholder the server reads automatically (`#196 auto-read-noise`): an offer to
     // go and look at "Working…" is the interruption the owner asked to be rid of.
-    setJumpNewest(true, "discord");
+    setJumpNewest(true, "discord", 1);
   }
   renderScrollTools();
   // A row that arrived because the SERVER said so is a row like any other: if it is long and the
@@ -16913,11 +17007,11 @@ el("search-field").addEventListener("keydown", (event) => {
   }
 });
 // The chip is an offer to go somewhere the reader may simply go themselves. Once they are there it
-// has nothing left to say, so it takes itself away rather than waiting to be tapped.
+// has nothing left to say, so it takes itself away rather than waiting to be tapped — and since
+// `#207 scrollback-jump` it is offered the moment they scroll far enough up the history to want it.
+// Only the jump, not every chip: this runs on every scroll event. See `renderJumpNewest`.
 el("scroll-area").addEventListener("scroll", () => {
-  if (jumpNewestWanted[currentView] && atBottom(el("scroll-area"))) {
-    setJumpNewest(false);
-  }
+  renderJumpNewest();
   // `#204 reply-arrow`. The way back to a reply goes once the reply is on screen again, however
   // the reader brought it there: a chip offering to go where they already are is clutter.
   if (replyReturn !== null) {

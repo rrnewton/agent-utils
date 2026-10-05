@@ -2061,19 +2061,54 @@ body {
   display: none;
 }
 
-/* Over the bottom corner of the list, clear of the dock. `pointer-events: none` on the strip and
-   `auto` on the chips so the empty space beside them still scrolls the transcript under it. */
+/* Over the bottom of the list, clear of the dock. `pointer-events: none` on the strip and `auto`
+   on the chips so the empty space beside them still scrolls the transcript under it.
+
+   `#207 scrollback-jump`. ACROSS the list, inset like the rest of the row from both safe-area
+   edges, rather than in its right-hand corner: the jump to the newest message stands at the left
+   end and the other chips keep the right (`#jump-newest`, below). `wrap-reverse` decides what
+   gives way on a narrow phone with a large font: the row's FIRST line is its bottom one, so the
+   jump keeps the lower-left corner it is looked for in and the chips that do not fit beside it go
+   up a line, still at the right, never over it. They are the optional ones; the way back is the
+   control the reader reaches for without looking. */
 #scroll-tools {
   position: absolute;
   z-index: 2;
+  left: calc(0.75rem + env(safe-area-inset-left));
   right: calc(0.75rem + env(safe-area-inset-right));
   bottom: 0.5rem;
-  max-width: calc(100% - 1.5rem - env(safe-area-inset-left) - env(safe-area-inset-right));
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: wrap-reverse;
   justify-content: flex-end;
   gap: 0.4rem;
   pointer-events: none;
+}
+
+/* The auto margin takes whatever the line has spare, which is what puts every chip after the jump
+   at the right-hand end. */
+#jump-newest {
+  position: relative;
+  margin-inline-end: auto;
+}
+
+/* The 44px target, drawn as nothing, the idiom `#search-toggle::after` uses: a pseudo-element is
+   part of its button for hit-testing, so the chip stays the row's height while a thumb that lands
+   a few pixels above or below it still lands on it. `min` with 0 because a large font can draw the
+   chip taller than 44px, and then it is its own target. Measured from the padding box, so 100% is
+   the chip less its two borders. The row stands 0.5rem above the dock and the square reaches less
+   than that below the chip, so a tap on the dock's top edge is still the dock's. */
+#jump-newest::after {
+  content: "";
+  position: absolute;
+  inset: min(0px, calc((100% - 2.75rem) / 2));
+}
+
+/* Something arrived below while the reader was up in the history. The accent the armed pull and
+   the pressed toggles use, so "there is news down there" is told from "this is the way down" at a
+   glance and not by the word alone. */
+#jump-newest[data-arrivals] {
+  color: var(--accent);
+  border-color: var(--accent);
 }
 
 /* `#68 pull-to-refresh`. What the gesture says while it is happening, at the top edge of the list
@@ -3552,15 +3587,16 @@ textarea {
     margin-inline: auto;
   }
 
-  /* The chips belong to the LIST, not to the window. Anchored to the window's right edge they end
-     up half a screen away from the thing they act on, offering to scroll a column the reader is
-     not looking at the corner of. `left: 50%` puts the origin on the column's centre line; the
-     translate walks back by half the column, the chip's own width and a gutter, landing them just
-     inside the column's right edge. */
+  /* The chips belong to the LIST, not to the window. Anchored to the window's edges they end up
+     half a screen away from the thing they act on, offering to scroll a column the reader is not
+     looking at the corner of. `#207 scrollback-jump` spans the row across the column, a gutter
+     inside each of its edges, so the jump is at the column's lower left and the other chips at its
+     right: as wide as the column, or as the window when that is the narrower, and centred on it. */
   #scroll-tools {
     right: auto;
     left: 50%;
-    transform: translateX(calc(var(--reading-width) / 2 - 100% - 0.6rem));
+    width: calc(min(var(--reading-width), 100%) - 1.2rem);
+    transform: translateX(-50%);
   }
 
   /* `#197 floating-search`, for the same reason: the line the pill and the search glass float on

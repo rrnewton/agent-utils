@@ -28,6 +28,13 @@ On a touchscreen, a real finger parked at the newest line and drawn up past the 
 reads the channel once, says "Updated" at the foot of the list and does not reload the page; a drag
 short of the threshold reads nothing (`#188 pull-refresh-bottom`).
 
+At the newest line there is no jump to the newest message; halfway up the channel it is at the lower
+left of the chip row in the dark theme — legible, a 44px target, inside the list's column and above
+the dock, clear of the floating pills and of every other chip forced up beside it, at the ordinary
+type size and at 150%, where on a phone the row wraps and the others go up a line. A real tap a few
+pixels above the drawn chip lands on the newest message, reads nothing, starts no pull, and the jump
+is gone (`#207 scrollback-jump`).
+
 Opening a thread whose title is longer than the screen, with a long unbroken token and inline code
 in its reply, leaves the page no wider than the viewport and no shown part of the main screen past
 its right edge; on a phone the title is ellipsised instead (`#36 thread-view-phone-overflow`). With
@@ -896,6 +903,80 @@ CHIP_JS = """(id) => {""" + FLOAT_HELPERS_JS + """
     return {problems, contrast};
 }"""
 
+# `#207 scrollback-jump`. Park the reader (`where`: "newest", "middle", or null to stay put), let two
+# frames pass, and measure the jump to the newest message. `problems` is empty when it is at the lower
+# left of the chip row — the left end of the list's column, on the row's bottom line — inside the list
+# and above the dock, clear of every other chip shown and of the floating pills, legible against its
+# own chip in the colours in force, and pressed by a tap anywhere in a 44px square around its centre.
+# `gap` is how far the list runs below the reader.
+JUMP_JS = """async (where) => {""" + FLOAT_HELPERS_JS + """
+    const area = document.getElementById('scroll-area');
+    const range = area.scrollHeight - area.clientHeight;
+    if (where) area.scrollTop = {newest: area.scrollHeight, middle: Math.round(range / 2)}[where];
+    await new Promise((settled) => requestAnimationFrame(() => requestAnimationFrame(settled)));
+    const gap = area.scrollHeight - area.clientHeight - area.scrollTop;
+    const jump = document.getElementById('jump-newest');
+    if (!shown(jump)) return {shown: false, gap, label: '', problems: [], centre: [0, 0], top: 0, lines: 0};
+    const problems = [];
+    const j = box(jump), list = box(area), column = box(document.getElementById('pane-discord'));
+    if (j.left < list.left || j.right > list.right || j.top < list.top || j.bottom > list.bottom) {
+        problems.push('it is not inside the list');
+    }
+    if (j.left - column.left < 0 || j.left - column.left > 24) {
+        problems.push(`it is ${(j.left - column.left).toFixed(1)}px from the column's left edge`);
+    }
+    if (list.bottom - j.bottom > 16) problems.push(`it floats ${(list.bottom - j.bottom).toFixed(1)}px above the list's foot`);
+    if (j.bottom > box(document.getElementById('dock')).top + 0.5) problems.push('it is under the dock');
+    // Laid out, not merely un-hidden: the checks below force hidden chips up with a style, and those
+    // still carry the attribute.
+    const chips = [...document.querySelectorAll('#scroll-tools .chip')].filter((c) => c.getClientRects().length > 0);
+    const lines = new Set(chips.map((c) => Math.round(box(c).bottom))).size;
+    for (const chip of chips.filter((c) => c !== jump)) {
+        const c = box(chip), what = `"${chip.textContent.trim()}"`;
+        if (meets(j, c)) problems.push(`it overlaps ${what}`);
+        if (c.bottom > j.bottom + 0.5) problems.push(`${what} is on a line below it`);
+        if (c.left < j.right - 0.5 && c.bottom > j.top + 0.5) problems.push(`${what} is beside it on the left`);
+        if (c.right > list.right + 0.5) problems.push(`${what} runs off the list`);
+    }
+    for (const id of ['channel-freshness', 'status-line', 'pull-refresh']) {
+        const pill = document.getElementById(id);
+        if (shown(pill) && meets(j, box(pill))) problems.push(`it is under #${id}`);
+    }
+    // Legible: its words against its own chip, by the WCAG contrast ratio, normal text.
+    const rgb = (value) => (value.match(/[\\d.]+/g) || []).slice(0, 3).map(Number);
+    const lum = (value) => {
+        const [r, g, b] = rgb(value).map((v) => v / 255).map((v) => v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4);
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    };
+    const contrast = (style) => {
+        const [a, b] = [lum(style.color), lum(style.backgroundColor)].sort((x, y) => y - x);
+        return (a + 0.05) / (b + 0.05);
+    };
+    const plain = contrast(getComputedStyle(jump));
+    if (plain < 4.5) problems.push(`its words are ${plain.toFixed(2)}:1 against the chip`);
+    const flagged = jump.hasAttribute('data-arrivals');
+    jump.setAttribute('data-arrivals', '');
+    const arrival = contrast(getComputedStyle(jump));
+    if (!flagged) jump.removeAttribute('data-arrivals');
+    if (arrival < 4.5) problems.push(`its arrival accent is ${arrival.toFixed(2)}:1 against the chip`);
+    // The 44px target: 21px above, below and to either side of its centre is still the jump.
+    const cx = (j.left + j.right) / 2, cy = (j.top + j.bottom) / 2;
+    for (const [dx, dy] of [[0, 0], [0, -21], [0, 21], [-21, 0], [21, 0]]) {
+        const hit = document.elementFromPoint(cx + dx, cy + dy);
+        if (!hit || !jump.contains(hit)) problems.push(`a tap at (${dx}, ${dy})px from its centre lands on ${name(hit)}`);
+    }
+    return {shown: true, gap, label: jump.textContent.trim(), problems, centre: [cx, cy], top: j.top, lines};
+}"""
+
+# Where the newest channel row sits after a tap on the jump: `visible` when its end is inside the list.
+# Its end, not all of it: the rows are 70vh tall here and the composer follows them, so the whole of
+# the newest one does not fit above the composer on a phone.
+NEWEST_ROW_JS = """() => {
+    const rows = [...document.querySelectorAll('#discord-log > li[data-id]')];
+    const r = rows[rows.length - 1].getBoundingClientRect(), list = document.getElementById('scroll-area').getBoundingClientRect();
+    return {id: rows[rows.length - 1].getAttribute('data-id'), visible: r.bottom > list.top && r.bottom <= list.bottom + 0.5};
+}"""
+
 # A phone, the common narrow Android width, and a desk: the desktop regime is `(min-width: 900px) and
 # (pointer: fine)`, so the last is a fine pointer without touch, not a wide phone. Below 360 the
 # pill's longest line is ellipsised, which the "cut short" check would report.
@@ -936,7 +1017,9 @@ def main() -> int:
                   " one newest-page read of the"
                   " view on screen, local view switches, offline and failed states, the pill"
                   " clear of the tabs and the header with #scroll-area unmoved, a scrolled reader"
-                  " held in place as it and the error panel come and go, the search glass on the pill's"
+                  " held in place as it and the error panel come and go, the jump to the newest message"
+                  " at the lower left of the chip row whenever the list is scrolled back and gone at the"
+                  " newest line, a real tap on it landing there, the search glass on the pill's"
                   " line with no header strip and a 44px target, the search bar opened by a real tap and"
                   " folded with #scroll-area unmoved, Settings' title bar,"
                   f"{' a pull up past the newest line refreshes in place,' if mobile else ''} no Cache Storage or"
@@ -1226,6 +1309,54 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                             geometry("in place at the top", "4b-top")
                     before = after
             shot("4b-in-place")
+
+            # 4b2. `#207 scrollback-jump`, in the dark theme the owner reads in. At the newest line there
+            # is no jump; halfway up the channel it is at the lower left of the chip row, legible, hit at
+            # 44px and clear of everything around it — alone, beside every other chip forced up, and
+            # beside them at a large system font, where the row has to wrap and the others go up a line.
+            # Then a real tap a few pixels ABOVE the drawn chip lands on the newest message, reads
+            # nothing, starts no pull, and the jump is gone.
+            page.emulate_media(color_scheme="dark")
+            resting = page.evaluate(JUMP_JS, "newest")
+            check(float(resting["gap"]) <= 2, f"{label}: could not park the reader at the newest line: {resting}")
+            check(not resting["shown"], f"{label}: the jump to the newest message is up at the newest line")
+            back = page.evaluate(JUMP_JS, "middle")
+            shot("4b2-jump-scrolled-back")
+            check(bool(back["shown"]) and float(back["gap"]) > 100,
+                  f"{label}: halfway up the channel there is no jump to the newest message: {back}")
+            check(back["label"] == "Newest", f"{label}: the jump says {back['label']!r} with nothing new below")
+            check(not back["problems"], f"{label}, the jump halfway up the channel: {back['problems']}")
+            crowd = page.add_style_tag(content="#scroll-tools .chip[hidden] { display: inline-flex !important; }")
+            for size in ("100%", "150%"):
+                font = page.add_style_tag(content=f"html {{ font-size: {size} !important; }}")
+                crowded = page.evaluate(JUMP_JS, None)
+                shot(f"4b2-jump-beside-every-chip-{size.rstrip('%')}")
+                lines = int(crowded["lines"])
+                check(not crowded["problems"],
+                      f"{label}, the jump beside every chip at {size} type, {lines} lines: {crowded['problems']}")
+                # On a phone the full row does not fit one line, so this IS the overflow case.
+                check(lines >= 2 or not mobile, f"{label}: every chip at {size} type fit one line, so nothing wrapped")
+                font.evaluate("element => element.remove()")
+            crowd.evaluate("element => element.remove()")
+            ready = page.evaluate(JUMP_JS, None)
+            check(bool(ready["shown"]) and not ready["problems"], f"{label}: the jump before the tap: {ready}")
+            reads_before = len(api.reads())
+            tap_x, tap_y = float(ready["centre"][0]), float(ready["top"]) - 4
+            if mobile:
+                page.touchscreen.tap(tap_x, tap_y)
+            else:
+                page.mouse.click(tap_x, tap_y)
+            landed = page.evaluate(JUMP_JS, None)
+            newest = page.evaluate(NEWEST_ROW_JS)
+            shot("4b2-jump-tapped")
+            check(float(landed["gap"]) <= 2,
+                  f"{label}: a tap 4px above the jump left the newest line {float(landed['gap']):.1f}px below")
+            check(bool(newest["visible"]), f"{label}: after the tap the end of the newest message is not on screen: {newest}")
+            check(not landed["shown"], f"{label}: the jump is still up at the newest line")
+            check(len(api.reads()) == reads_before, f"{label}: the tap read the channel: {api.reads()[reads_before:]}")
+            check(bool(page.evaluate("() => document.getElementById('pull-refresh').hidden")),
+                  f"{label}: the tap started the pull's affordance")
+            page.emulate_media(color_scheme="light")
 
             # 4c. `#188 pull-refresh-bottom`, with a real finger: parked at the newest line, a drag UP
             # past the end of the list reads the channel once and says so at the foot of the list,

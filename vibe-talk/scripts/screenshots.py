@@ -1240,11 +1240,27 @@ def _act_one_expanded(driver: Driver) -> None:
     driver.settle(300)
 
 
+# `#207 scrollback-jump`. The jump to the newest message, saying `%s`, at the LEFT end of the chip
+# row: within a gutter of the left edge of the column it scrolls — the list on a phone, the reading
+# column on a desk — and of the list's foot, and clear of the dock below.
+JUMP_AT_LOWER_LEFT = (
+    "(() => { const j = document.getElementById('jump-newest').getBoundingClientRect(); "
+    "const a = document.getElementById('scroll-area').getBoundingClientRect(); "
+    "const pane = document.querySelector('#pane-voice:not([hidden]), #pane-discord:not([hidden])')"
+    ".getBoundingClientRect(); "
+    "const dock = document.getElementById('dock').getBoundingClientRect(); "
+    "return window.__visible('jump-newest') && window.__text('jump-newest-label') === '%s' "
+    "&& Math.abs(j.left - pane.left) < 40 && a.bottom - j.bottom < 24 && j.bottom <= dock.top + 1; })()"
+)
+
+
 def _act_jump_to_newest(driver: Driver) -> None:
-    """A turn arrives while the reader is up in the history: the view holds, and the chip appears.
+    """A turn arrives while the reader is up in the history: the view holds, and the jump says so.
 
     The page must NOT drag them down to it — and must not leave them unaware it happened either,
-    which is what the chip is for.
+    which is what the chip is for. Since `#207 scrollback-jump` the jump is already up before the
+    turn arrives, because the reader is in the scrollback; the arrival turns its "Newest" into
+    "1 new", on the same control.
 
     ITS OWN TRANSCRIPT, and that is the fix rather than tidying. `#74 scroll-test-strength` finding
     3: this scene used to inherit whatever `12-collapsed-long-transcript` left behind, so the frame
@@ -2578,7 +2594,8 @@ SCENES: tuple[Scene, ...] = (
     ),
     Scene(
         name="11-long-transcript-scrolled",
-        what="a long transcript, parked mid-scroll, exercising the header and dock edges",
+        what="a long transcript, parked mid-scroll, exercising the header and dock edges, with the "
+        "jump to the newest message at the lower left of the chip row",
         act=_act_long_scroll,
         expect=(
             (
@@ -2594,6 +2611,12 @@ SCENES: tuple[Scene, ...] = (
                 "the view is parked in the middle, not pinned to either end",
                 "(() => { const a = document.getElementById('scroll-area'); "
                 "return a.scrollTop > 50 && a.scrollTop < a.scrollHeight - a.clientHeight - 50; })()",
+            ),
+            (
+                # `#207 scrollback-jump`. Up whenever the list is scrolled back, not only after an
+                # arrival, and at the LEFT end of the chip row, over the list's bottom edge.
+                "the plain jump to the newest message is at the lower left of the list",
+                JUMP_AT_LOWER_LEFT % "Newest",
             ),
         ),
     ),
@@ -2628,10 +2651,18 @@ SCENES: tuple[Scene, ...] = (
     ),
     Scene(
         name="13-jump-to-newest",
-        what="a turn arrived while the reader was up in the history: the view held, the chip appeared",
+        what="a turn arrived while the reader was up in the history: the view held, and the jump at "
+        "the lower left says so",
         act=_act_jump_to_newest,
         expect=(
             ("the chip offering the newest line is on screen", "window.__visible('jump-newest')"),
+            (
+                # `#207 scrollback-jump`. The arrival changes what the ONE control says, in the
+                # accent, rather than raising a second chip; it is the same lower-left control as 11.
+                "it says one new turn arrived, in the accent, at the lower left of the list",
+                "document.getElementById('jump-newest').hasAttribute('data-arrivals') && "
+                + JUMP_AT_LOWER_LEFT % "1 new",
+            ),
             (
                 # `#74 scroll-test-strength`, finding 3. THE chip, singular, which is what this
                 # state's own description promises: the frame used to carry "Collapse all" as well,

@@ -452,6 +452,21 @@
 
           <div id="scroll-tools">
             <!--
+              `#207 scrollback-jump`. The way back to the newest message, FIRST in the row and so at
+              its left end, with every other chip at the right (web/voice.css). It is up whenever
+              the list on screen is scrolled away from its newest message, not only when something
+              arrives below: the reader who has wandered up the history is the one who wants the
+              way back. An arrival changes what it SAYS — "3 new", in the accent — rather than
+              raising a second control beside it. See `renderJumpNewest`.
+            -->
+            <button id="jump-newest" class="chip" type="button" aria-label="Jump to the newest message" hidden>
+              <svg class="chip-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 5v13" />
+                <path d="M6 12.5 12 19l6-6.5" />
+              </svg>
+              <span id="jump-newest-label">Newest</span>
+            </button>
+            <!--
               `#49 cached-summaries`. Summary mode is OPT-IN and it is a mode, not a per-row
               control: collapsing to a prefix stays the default and costs nothing, and a button on
               every long row would spend a model call every time a thumb slipped. It lives beside
@@ -489,13 +504,6 @@
             </button>
             <button id="collapse-all" class="chip" type="button" hidden>
               <span id="collapse-all-label">Collapse all</span>
-            </button>
-            <button id="jump-newest" class="chip" type="button" hidden>
-              <svg class="chip-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M12 5v13" />
-                <path d="M6 12.5 12 19l6-6.5" />
-              </svg>
-              <span id="jump-newest-label">Newest</span>
             </button>
           </div>
         </section>

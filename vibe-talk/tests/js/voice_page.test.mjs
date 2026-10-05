@@ -2483,6 +2483,13 @@ const BOTTOM_SLACK_PX = sourceConstant("BOTTOM_SLACK_PX");
 const atBottomOf = (area) =>
   area.scrollHeight - area.scrollTop - area.clientHeight <= BOTTOM_SLACK_PX;
 
+/**
+ * Whether the jump to the newest message is saying something ARRIVED below, rather than only
+ * offering the way down. Since `#207 scrollback-jump` the control is up whenever the list is
+ * scrolled back, so "nothing arrived" is no longer "hidden": it is this, false.
+ */
+const jumpSaysArrived = (page) => page.el("jump-newest").hasAttribute("data-arrivals");
+
 /** How often the channel view re-reads itself, unasked. Derived, for the same reason. */
 const DISCORD_POLL_MS = sourceConstant("DISCORD_POLL_MS");
 
@@ -2551,6 +2558,14 @@ const TUNING_BANDS = {
   BOTTOM_SLACK_PX: [1, 120,
     "slack absorbs rounding and a thumb stopped short; at a screenful it means the page follows " +
     "the newest line for a reader who has scrolled away from it"],
+  SCROLLBACK_PX: [32, 240,
+    "how far up the jump to the newest message comes back (#207 scrollback-jump). Within a line " +
+    "or so of BOTTOM_SLACK_PX the band between them is too thin to keep a fling decaying at the " +
+    "boundary from toggling it; past a third of a phone's list a reader several messages up the " +
+    "history is offered no way back"],
+  JUMP_COUNT_MAX: [9, 999,
+    "the largest arrival count the jump spells out (#207 scrollback-jump): under ten an ordinary " +
+    "burst already reads 9+, past three digits the chip crowds the row on a 360px phone"],
   COLLAPSE_OVER_CHARS: [120, 4000,
     "below about a hundred characters ordinary sentences fold, and above a few thousand nothing " +
     "ever does — either way the fold control stops meaning anything"],
@@ -5652,8 +5667,8 @@ test("YOUR OWN TURN DOES NOT YANK YOU TO THE BOTTOM once you have scrolled up", 
   // The control: the OLD rule, an unconditional scroll on every arrival. It has to fail.
   const control = await parked(
     brokenScript(
-      'function followIfPinned(pinned) {\n  if (pinned && currentView === "voice") {',
-      "function followIfPinned(pinned) {\n  if (true) {"
+      'function followIfPinned(pinned, turns = 0) {\n  if (pinned && currentView === "voice") {',
+      "function followIfPinned(pinned, turns = 0) {\n  if (true) {"
     )
   );
   assert.notEqual(
@@ -5745,7 +5760,7 @@ test("COLLAPSE ALL puts the list back in one tap, without moving the reader", as
   assert.equal(page.el("collapse-all").hidden, true, "the offer stayed after it was taken");
 });
 
-test("JUMP TO NEWEST appears only when something arrived off screen, and takes you there", async () => {
+test("JUMP TO NEWEST says a turn arrived off screen, and takes you there", async () => {
   const page = newPage();
   await startTalking(page);
   const area = fillTranscript(page);
@@ -8377,10 +8392,9 @@ test("SENDING A REPLY does not move you — the whole complaint, pinned", async 
 // and nothing was watching it. This is that half.
 //
 // TWO OF THESE ARE ALREADY HERE and are not repeated: "a turn arriving FOLLOWS the newest line for
-// a reader already at the bottom" and "JUMP TO NEWEST appears only when something arrived off
-// screen, and takes you there" are both about the transcript, both use a transcript tall enough to
-// scroll, and between them pin the two arrival cases — follow when pinned, hold still and raise the
-// chip when not. What was missing is everything about ENTERING and LEAVING this view.
+// a reader already at the bottom" and "JUMP TO NEWEST says a turn arrived off screen, and takes you
+// there" are both about the transcript, both use a transcript tall enough to scroll, and between
+// them pin the two arrival cases — follow when pinned, hold still and raise the chip when not. What was missing is everything about ENTERING and LEAVING this view.
 //
 // Writing them found two defects, neither of which the channel has:
 //
@@ -10804,10 +10818,12 @@ test("a to-do poll that returns the same list, and the reader's own act, raise n
   page.expireTimers(DISCORD_POLL_MS); // same page.messages: nothing new
   await page.settle();
   assert.equal(page.todoReads, 2, "the poll did not fire");
+  // The reader is up the list, so the way down is offered (`#207 scrollback-jump`) — but as the way
+  // down, not as news.
   assert.equal(
-    page.el("jump-newest").hidden,
-    true,
-    "an unchanged to-do list raised a chip; every 45 seconds it would nag about nothing"
+    jumpSaysArrived(page),
+    false,
+    "an unchanged to-do list raised an arrival; every 45 seconds it would nag about nothing"
   );
 
   const rows = page.el("discord-log").children;
@@ -10815,8 +10831,8 @@ test("a to-do poll that returns the same list, and the reader's own act, raise n
   await page.settle();
   assert.equal(shownIds(page).length, 11, "the dismissal did not take");
   assert.equal(
-    page.el("jump-newest").hidden,
-    true,
+    jumpSaysArrived(page),
+    false,
     "dealing with the newest row was reported back to the reader as an arrival"
   );
 });
@@ -15717,10 +15733,12 @@ test("a poll that returns the SAME messages does not offer to jump anywhere", as
   await page.settle();
 
   assert.equal(page.reads, 2);
+  // Up the list, so the way down is offered (`#207 scrollback-jump`), and offered as nothing more.
+  assert.equal(page.el("jump-newest-label").textContent, "Newest");
   assert.equal(
-    page.el("jump-newest").hidden,
-    true,
-    "an unchanged channel raised a chip; every 45 seconds it would nag about nothing"
+    jumpSaysArrived(page),
+    false,
+    "an unchanged channel raised an arrival; every 45 seconds it would nag about nothing"
   );
 });
 
@@ -15742,16 +15760,371 @@ test("a VOICE turn does not raise a chip over the channel list", async () => {
     }),
   });
 
+  // The channel's own jump is up, because the reader is at the top of the channel (`#207
+  // scrollback-jump`) — and it says nothing arrived, because nothing arrived in the channel.
   assert.equal(
-    page.el("jump-newest").hidden,
-    true,
-    "a transcript turn offered to jump the reader to the bottom of the CHANNEL"
+    jumpSaysArrived(page),
+    false,
+    "a transcript turn was announced on the jump over the CHANNEL"
   );
 
   // ...and the offer is waiting for them when they go back to the list it was about.
   await page.el("view-switch").click();
   await page.settle();
   assert.equal(page.tab(), "voice");
+});
+
+// --- the jump to the newest message, wherever the reader is up the history ---------------------
+//
+// `#207 scrollback-jump`. The owner: "whenever we're in the scroll back there's a jump to bottom
+// button in the lower left. In that same row with the summarys that expand collapse". The jump was
+// raised only by an arrival, at the right-hand end of the chip row. It is now up whenever the list
+// on screen is scrolled away from its newest message, it still says when something arrived below —
+// on the same control, as a count — and it is the first thing in the row, drawn at its left end.
+
+const SCROLLBACK_PX = sourceConstant("SCROLLBACK_PX");
+const JUMP_COUNT_MAX = sourceConstant("JUMP_COUNT_MAX");
+
+/** Whether the jump to the newest message is on screen at all. */
+const jumpShown = (page) => !page.el("jump-newest").hidden;
+
+/** What the jump says, and what it is called, in one value so a failure shows both. */
+const jumpWords = (page) =>
+  `${page.el("jump-newest-label").textContent} / ${page.el("jump-newest").getAttribute("aria-label")}`;
+
+/** A thumb's scroll: the list put `gap` px short of its end, and the browser saying it scrolled. */
+async function scrollToGap(page, gap) {
+  const area = page.el("scroll-area");
+  area.scrollTop = area.scrollHeight - area.clientHeight - gap;
+  assert.equal(
+    area.scrollHeight - area.clientHeight - area.scrollTop,
+    gap,
+    `the list cannot be put ${gap}px short of its end, so this proves nothing about that distance`
+  );
+  await area.dispatch("scroll");
+}
+
+/** Halfway up whatever list is on screen: a reader well into its history, far from both ends. */
+const halfway = (page) => {
+  const area = page.el("scroll-area");
+  return Math.round((area.scrollHeight - area.clientHeight) / 2);
+};
+
+test("THE JUMP IS UP WHENEVER THE CHANNEL IS SCROLLED BACK, and gone at the newest message", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, tallChannel());
+  const area = page.el("scroll-area");
+  assert.ok(area.scrollHeight > area.clientHeight * 2, "the channel does not overflow, so this proves nothing");
+  assert.equal(jumpShown(page), false, "the jump is up over a reader on the newest message");
+
+  await scrollToGap(page, halfway(page));
+  assert.equal(jumpShown(page), true, "a reader halfway up the channel was offered no way back");
+  assert.equal(jumpWords(page), "Newest / Jump to the newest message");
+  assert.equal(jumpSaysArrived(page), false, "nothing arrived, and the jump says something did");
+
+  await scrollToGap(page, 0);
+  assert.equal(jumpShown(page), false, "the jump outstayed the scrollback it was offered for");
+});
+
+test("...and the same over the voice transcript", async () => {
+  const page = newPage();
+  await startTalking(page);
+  fillTranscript(page);
+  assert.equal(jumpShown(page), false, "the jump is up over a reader on the newest turn");
+
+  await scrollToGap(page, halfway(page));
+  assert.equal(jumpShown(page), true, "a reader halfway up the transcript was offered no way back");
+  assert.equal(jumpWords(page), "Newest / Jump to the newest message");
+
+  await scrollToGap(page, 0);
+  assert.equal(jumpShown(page), false, "the jump outstayed the scrollback it was offered for");
+});
+
+test("a list that fits on the screen offers no jump, and one that shrinks to fit takes it away", async () => {
+  // Nothing to scroll is the newest message on screen: a control offering to go there is inert.
+  const page = newPage();
+  await startTalking(page);
+  youSay(page, SHORT_MESSAGE);
+  assistantSays(page, SHORT_MESSAGE);
+  const area = page.el("scroll-area");
+  assert.ok(area.scrollHeight <= area.clientHeight, "the transcript overflows, so this is not the case");
+  await area.dispatch("scroll");
+  assert.equal(jumpShown(page), false, "a transcript of two short turns offered a jump");
+
+  // A channel the reader is up, which a re-read then finds is two short messages: the list shrank
+  // under them to less than a screen, so there is no scrollback left to come back from.
+  countingChannel(page, channelOf(12));
+  await page.el("view-switch").click();
+  await page.settle();
+  await scrollToGap(page, halfway(page));
+  assert.equal(jumpShown(page), true, "the premise: a reader up the channel is offered the jump");
+  page.messages = [message({ id: "1", content: SHORT_MESSAGE }), message({ id: "2", content: SHORT_MESSAGE })];
+  page.expireTimers(DISCORD_POLL_MS);
+  await page.settle();
+  assert.ok(area.scrollHeight <= area.clientHeight, "the channel still overflows, so this is not the case");
+  assert.equal(jumpShown(page), false, `a channel that fits on the screen still offers "${jumpWords(page)}"`);
+});
+
+test("the jump does not flicker at its boundary: it comes at one distance and goes at another", async () => {
+  // A single distance is a boundary a resting thumb sits on and a decaying fling crosses on every
+  // frame, and the control would blink in the corner. Two distances with a band between them.
+  assert.ok(
+    SCROLLBACK_PX - BOTTOM_SLACK_PX >= LINE_PX,
+    `SCROLLBACK_PX ${SCROLLBACK_PX} leaves no band above BOTTOM_SLACK_PX ${BOTTOM_SLACK_PX}`
+  );
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    await signIn(page);
+    await showDiscord(page, tallChannel());
+    const seen = [];
+    const at = async (gap) => {
+      await scrollToGap(page, gap);
+      seen.push(jumpShown(page) ? "up" : "-");
+    };
+    // Up from the newest message, across both distances...
+    for (const gap of [BOTTOM_SLACK_PX + 1, SCROLLBACK_PX, SCROLLBACK_PX + 1]) await at(gap);
+    // ...a fling decaying back and forth through the band, and a thumb resting in it...
+    for (const gap of [SCROLLBACK_PX - 2, SCROLLBACK_PX + 3, SCROLLBACK_PX - 1, BOTTOM_SLACK_PX + 1, SCROLLBACK_PX]) {
+      await at(gap);
+    }
+    // ...down to the newest, and up into the band again from there.
+    for (const gap of [BOTTOM_SLACK_PX, BOTTOM_SLACK_PX + 1, SCROLLBACK_PX, BOTTOM_SLACK_PX + 5, SCROLLBACK_PX - 1]) {
+      await at(gap);
+    }
+    return seen;
+  };
+  assert.deepStrictEqual(await run(SCRIPT), [
+    "-", "-", "up",
+    "up", "up", "up", "up", "up",
+    "-", "-", "-", "-", "-",
+  ]);
+
+  // THE CONTROL: one distance instead of two. It toggles inside the band, and this has to see it.
+  const control = await run(brokenScript("    } else if (gap > SCROLLBACK_PX) {", "    } else {"));
+  assert.ok(control.slice(8).includes("up"), "the test cannot tell one distance from two");
+});
+
+test("an arrival below says HOW MANY on the same control, and taking it clears the count", async () => {
+  const page = newPage();
+  await startTalking(page);
+  const area = fillTranscript(page);
+  const parked = halfway(page);
+  await scrollToGap(page, parked);
+  assert.equal(jumpWords(page), "Newest / Jump to the newest message");
+
+  for (const n of [1, 2, 3]) assistantSays(page, longMessage(`while you were reading ${n}`));
+  assert.equal(area.scrollHeight - area.clientHeight - area.scrollTop > parked, true, "the turns did not land below");
+  assert.equal(jumpWords(page), "3 new / Jump to the newest message, 3 new");
+  assert.equal(jumpSaysArrived(page), true, "the count is not in the arrival's accent");
+  // ONE control. The arrival changed what it says, and raised nothing beside it.
+  assert.equal([...HTML_CODE.matchAll(/id="jump-newest"/g)].length, 1);
+
+  await page.el("jump-newest").click();
+  assert.ok(atBottomOf(area), "the tap did not land on the newest turn");
+  assert.equal(jumpShown(page), false, "the jump stayed after it was taken");
+  await scrollToGap(page, parked);
+  assert.equal(jumpWords(page), "Newest / Jump to the newest message", "the count came back after it was taken");
+
+  // ...and reaching the newest by hand clears it as surely as the tap does.
+  assistantSays(page, longMessage("one more"));
+  assert.equal(page.el("jump-newest-label").textContent, "1 new");
+  await scrollToGap(page, 0);
+  await scrollToGap(page, parked + LINE_PX);
+  assert.equal(jumpWords(page), "Newest / Jump to the newest message", "scrolling to the newest left the count up");
+});
+
+test("the channel counts what arrived on the stream and in a poll, and says New when it cannot count", async () => {
+  const live = newPage();
+  const stream = await withLiveChannel(live, tallChannel());
+  await scrollToGap(live, halfway(live));
+  await deliver(live, stream, sseMessage(message({ id: "200", content: "the first of two" })));
+  await deliver(live, stream, sseMessage(message({ id: "201", content: "and the second" })));
+  assert.equal(jumpWords(live), "2 new / Jump to the newest message, 2 new");
+
+  const polled = newPage();
+  await signIn(polled);
+  countingChannel(polled, channelOf(12));
+  await polled.el("view-switch").click();
+  await polled.settle();
+  await scrollToGap(polled, halfway(polled));
+  polled.messages = channelOf(12, 3);
+  polled.expireTimers(DISCORD_POLL_MS);
+  await polled.settle();
+  assert.equal(jumpWords(polled), "3 new / Jump to the newest message, 3 new");
+  // A count that runs past what the chip spells out says so rather than growing the chip.
+  polled.messages = channelOf(12, 3 + JUMP_COUNT_MAX);
+  polled.expireTimers(DISCORD_POLL_MS);
+  await polled.settle();
+  assert.equal(polled.el("jump-newest-label").textContent, `${JUMP_COUNT_MAX}+ new`);
+
+  // The message that was newest is not in the next read at all — more arrived than one read holds,
+  // or it went — so how many is unknown, and the jump says only that something is there.
+  const lost = newPage();
+  await signIn(lost);
+  countingChannel(lost, channelOf(12));
+  await lost.el("view-switch").click();
+  await lost.settle();
+  await scrollToGap(lost, halfway(lost));
+  lost.messages = Array.from({ length: 12 }, (_, i) =>
+    message({ id: String(500 + i), content: longMessage(`later ${i}`) }));
+  lost.expireTimers(DISCORD_POLL_MS);
+  await lost.settle();
+  assert.equal(jumpWords(lost), "New / Jump to the newest message, something new below");
+  assert.equal(jumpSaysArrived(lost), true);
+});
+
+test("a restore that lands up the history shows the jump at once; one that lands on the newest never does", async () => {
+  // Every one of these puts the reader somewhere WITHOUT a scroll event — a browser fires one
+  // later, the fixture never does — so each is the page deciding from where it put them.
+  const page = newPage();
+  await signIn(page);
+  const area = page.el("scroll-area");
+  area.scrollTop = 0; // the rows are drawn into a list scrolled to its top...
+  await showDiscord(page, tallChannel());
+  assert.ok(atBottomOf(area), "the premise: a first entry lands on the newest message");
+  assert.equal(jumpShown(page), false, "...and a first entry that lands on the newest offered the jump");
+
+  // Away and back from the newest message: back on the newest, and nothing offered.
+  await page.el("view-switch").click();
+  await page.settle();
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(jumpShown(page), false, "coming back to the newest message offered a jump to it");
+
+  // Away and back from halfway up: back halfway up, and the jump is there on arrival.
+  await scrollToGap(page, halfway(page));
+  const parked = area.scrollTop;
+  await page.el("view-switch").click();
+  await page.settle();
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(area.scrollTop, parked, "the premise: coming back keeps the reader's place");
+  assert.equal(jumpShown(page), true, "coming back to a place up the channel showed no way back");
+  assert.equal(jumpWords(page), "Newest / Jump to the newest message");
+
+  // Off the main screen there is no list to jump in; back on it, the place is put back and so is it.
+  await page.el("open-settings").click();
+  assert.equal(jumpShown(page), false, "the jump stood over Settings");
+  await page.el("close-settings").click();
+  assert.equal(jumpShown(page), true, "back from Settings, the jump did not come back with the place");
+  const row = page.el("discord-log").children.find((li) => li.getBoundingClientRect().bottom > 0);
+  await replyButton(row).click();
+  await page.settle();
+  assert.equal(page.screen(), "reply");
+  assert.equal(jumpShown(page), false, "the jump stood over the reply screen");
+  await page.el("close-reply").click();
+  await page.settle();
+  assert.equal(area.scrollTop, parked, "the premise: closing the reply puts the reader back");
+  assert.equal(jumpShown(page), true, "back from replying, the jump did not come back with the place");
+});
+
+test("a reload that puts the reader back up the channel shows the jump; one on the newest does not", async () => {
+  const channel = tallChannel();
+  const reload = async (park) => {
+    const first = newPage();
+    await signIn(first);
+    await showDiscord(first, channel);
+    park(first);
+    await first.setVisibility("hidden");
+    const page = newPage(first.storage, SCRIPT, (p) => { p.messages = channel; });
+    // In the script's own task, drawn from the device, before any read has answered.
+    const drawn = jumpShown(page);
+    await reopenedChannel(page);
+    return { drawn, read: jumpShown(page), page };
+  };
+  const midway = await reload((first) => { first.el("scroll-area").scrollTop = halfway(first); });
+  assert.ok(!atBottomOf(midway.page.el("scroll-area")), "the premise: the reload put the reader back mid-channel");
+  assert.equal(midway.drawn, true, "the reopen put the reader up the channel and offered no way back");
+  assert.equal(midway.read, true, "the reopen's read took the jump away from a reader still up the channel");
+
+  const newest = await reload(() => {});
+  assert.ok(atBottomOf(newest.page.el("scroll-area")), "the premise: the reload put the reader on the newest");
+  assert.equal(newest.drawn, false, "a reopen on the newest message offered a jump to it");
+  assert.equal(newest.read, false, "the reopen's read offered a jump to the newest message");
+});
+
+test("a tap on the jump only scrolls: no refresh, no fold, nothing read aloud", async () => {
+  const page = newPage();
+  await signIn(page);
+  countingChannel(page, channelOf(12));
+  await page.el("view-switch").click();
+  await page.settle();
+  const area = page.el("scroll-area");
+  await scrollToGap(page, halfway(page));
+  const rows = () => page.el("discord-log").children.map((li) =>
+    `${li.className} ${JSON.stringify([...li.attributes].sort())}`);
+  const before = { rows: rows(), reads: page.reads, speak: page.speakCalls.length, players: page.players.length };
+
+  await page.el("jump-newest").click();
+  await page.settle();
+
+  assert.ok(atBottomOf(area), "the tap did not land on the newest message");
+  assert.equal(page.reads, before.reads, "the tap read the channel: it was taken for the pull up past the end");
+  assert.equal(page.el("pull-refresh").hidden, true, "the tap put the pull's affordance up");
+  assert.equal(page.el("pull-refresh").getAttribute("data-state"), "idle");
+  assert.deepStrictEqual(rows(), before.rows, "the tap folded, marked or otherwise changed a row");
+  assert.equal(page.speakCalls.length, before.speak, "the tap read a message aloud");
+  assert.equal(page.players.length, before.players, "the tap started a player");
+  // Why none of them can hear it: it is outside the list, so no row's tap and no list gesture is
+  // ever given its touch.
+  assert.equal(markupHolds("scroll-area", "jump-newest"), false, "the jump is inside the list it scrolls");
+  assertMarkupContains("scroll-tools", "jump-newest");
+});
+
+test("each list has its own jump: scrolled back in the channel, the transcript shows its own state", async () => {
+  const page = newPage();
+  await talkingBesideAChannel(page);
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(page.tab(), "discord");
+  await scrollToGap(page, halfway(page));
+  assert.equal(jumpWords(page), "Newest / Jump to the newest message", "the premise: up the channel");
+
+  await page.el("view-switch").click(); // to the transcript, left on its newest turn
+  await page.settle();
+  assert.equal(page.tab(), "voice");
+  assert.equal(jumpShown(page), false, "the channel's scrollback was shown over the transcript's newest turn");
+
+  // The transcript up its own history, and a turn arriving below.
+  await scrollToGap(page, halfway(page));
+  assistantSays(page, longMessage("said while you read back"));
+  assert.equal(jumpWords(page), "1 new / Jump to the newest message, 1 new");
+
+  await page.el("view-switch").click(); // the channel: its own place, its own words
+  await page.settle();
+  assert.equal(jumpWords(page), "Newest / Jump to the newest message", "the transcript's arrival followed the reader to the channel");
+  assert.equal(jumpShown(page), true);
+  await page.el("view-switch").click(); // and back: the transcript's arrival is still waiting there
+  await page.settle();
+  assert.equal(jumpWords(page), "1 new / Jump to the newest message, 1 new");
+});
+
+test("the jump is the FIRST thing in the chip row, drawn at its left end with the others at the right", () => {
+  // DOM order is the layout's input: `margin-inline-end: auto` on the first item is what sends every
+  // later one to the right, and `wrap-reverse` is what keeps that first line at the bottom.
+  const tools = HTML_CODE.slice(HTML_CODE.indexOf('id="scroll-tools"'));
+  assert.equal(/\bid="([^"]+)"/.exec(tools.slice('id="scroll-tools"'.length))[1], "jump-newest",
+    "the jump is not the first thing in the chip row");
+  for (const id of ["jump-marker", "summarise", "undo-dismiss", "expand-all", "collapse-all"]) {
+    assertMarkupContains("scroll-tools", id);
+    assert.ok(markupPlace("jump-newest").at < markupPlace(id).at, `#${id} comes before the jump`);
+  }
+  const row = cssRules(CSS_CODE, "#scroll-tools")[0];
+  assert.match(row, /left:\s*calc\(0\.75rem \+ env\(safe-area-inset-left\)\)/, "the row does not reach the left, inside the safe area");
+  assert.match(row, /right:\s*calc\(0\.75rem \+ env\(safe-area-inset-right\)\)/, "the row does not reach the right, inside the safe area");
+  assert.match(row, /flex-wrap:\s*wrap-reverse/, "a wrapped row would lift the jump off the bottom line");
+  assert.match(row, /justify-content:\s*flex-end/, "the other chips are not kept at the right");
+  assert.match(cssBlock("#jump-newest"), /margin-inline-end:\s*auto/, "nothing sends the other chips to the right");
+  // Hit at 44px whatever it is drawn at.
+  assert.match(cssBlock("#jump-newest::after"), /inset:\s*min\(0px,\s*calc\(\(100% - 2\.75rem\) \/ 2\)\)/);
+  assert.match(cssBlock("#jump-newest[data-arrivals]"), /color:\s*var\(--accent\)/, "an arrival does not read differently");
+  // On a desk the row spans the reading column, not the window.
+  const desk = cssBlockIn("(min-width: 900px) and (pointer: fine)", "#scroll-tools");
+  assert.match(desk, /width:\s*calc\(min\(var\(--reading-width\), 100%\) - 1\.2rem\)/);
+  assert.match(desk, /transform:\s*translateX\(-50%\)/);
+  // Named before any script has run.
+  assert.match(HTML_CODE, /<button id="jump-newest"[^>]*aria-label="Jump to the newest message"/);
 });
 
 // --- the durable transcript (#48 transcript-storage) --------------------------------------------
