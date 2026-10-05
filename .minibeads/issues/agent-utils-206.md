@@ -1,10 +1,11 @@
 ---
 title: 'pin-message: our own pinned messages, a Pinned filter beside the search glass, and a regrouped ⋯ menu'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-10-05T05:57:11.184188803+00:00
-updated_at: 2026-10-05T05:57:11.184188803+00:00
+updated_at: 2026-10-05T07:48:22.503233694+00:00
+closed_at: 2026-10-05T07:48:22.503233564+00:00
 ---
 
 # Description

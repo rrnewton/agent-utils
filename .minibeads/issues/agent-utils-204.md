@@ -1,10 +1,11 @@
 ---
 title: 'reply-arrow: a visible up-arrow on a reply that jumps to the message it answers'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-10-04T20:17:24.249640395+00:00
-updated_at: 2026-10-04T20:17:24.249640395+00:00
+updated_at: 2026-10-05T07:48:22.498889399+00:00
+closed_at: 2026-10-05T07:48:22.498889269+00:00
 ---
 
 # Description
