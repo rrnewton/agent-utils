@@ -16133,6 +16133,7 @@ mod tests {
 
     #[test]
     fn pending_snapshot_excludes_concurrent_ack_retirement_until_files_are_read() {
+        const HANG_GUARD: Duration = Duration::from_secs(60);
         struct GatedReaction {
             started: std::sync::mpsc::Sender<()>,
             release: std::sync::mpsc::Receiver<()>,
@@ -16171,8 +16172,13 @@ mod tests {
             );
             finished.send(result).expect("report terminal ACK");
         });
+        // The two waits below bound how long the test may hang, not how fast the ACK must be:
+        // what the test checks is the order of the snapshot and the retirement. Measured at a load
+        // average near 170 on 316 cores, both waits took under 7 ms with the test alone, but up to
+        // 242 ms and 853 ms inside the full suite, where the retirement's fsyncs queue behind other
+        // tests', so one second was within 1.2 times of the slowest wait measured.
         starts
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(HANG_GUARD)
             .expect("ACK has released its state lock for transport");
 
         let keys = state
@@ -16189,7 +16195,7 @@ mod tests {
             .expect("read a coherent pending snapshot");
         assert!(keys.contains(&key));
         completion
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(HANG_GUARD)
             .expect("retirement proceeds after the snapshot")
             .expect("terminal ACK succeeds");
         writer.join().expect("join ACK writer");
