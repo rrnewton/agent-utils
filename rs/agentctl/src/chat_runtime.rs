@@ -8087,6 +8087,10 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                 }
             }
             let reply = self.read_reply(key, request.next_send_ordinal)?;
+            // Release the lock itself before the provider call, not only by closing this
+            // descriptor: a child process that another thread forked meanwhile holds a copy of
+            // the descriptor until it executes, and that copy would keep the lock held.
+            FileExt::unlock(&state_lock).map_err(ChatRuntimeError::Io)?;
             (request, reply)
         };
 

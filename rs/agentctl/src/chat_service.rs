@@ -8368,6 +8368,13 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
 
     #[test]
     fn stop_during_ack_waits_for_admitted_ack_and_never_starts_pending_reply() {
+        // The positive waits below, and the helper's own operation deadline, bound how long the
+        // test may hang, not how fast the helper must be: under load its shell starts a `sleep`
+        // process on every poll and the ACK is fsynced afterwards, which took over a second in a
+        // full-suite run. What the test checks is the order: the pass waits for the admitted ACK,
+        // a stop neither detaches nor cancels it, and the pending reply never starts. The 50 ms
+        // windows in which the pass must not return are unchanged.
+        const HANG_GUARD: Duration = Duration::from_secs(60);
         let (state, key, root) = state_with_request();
         let route = state
             .next_reply_route(&key)
@@ -8419,7 +8426,8 @@ esac
                 reply_started.clone().into_os_string(),
             ],
             &[],
-            Duration::from_secs(2),
+            // The longest operation deadline a helper may have.
+            Duration::from_secs(30),
             Duration::from_millis(50),
         )
         .expect("pin outbound helper");
@@ -8446,7 +8454,7 @@ esac
             finished.send(result).expect("publish pass result");
         });
 
-        let progress_deadline = Instant::now() + Duration::from_secs(1);
+        let progress_deadline = Instant::now() + HANG_GUARD;
         while !ack_entered.exists() || coordinator.prompts.lock().expect("prompts").is_empty() {
             assert!(
                 Instant::now() < progress_deadline,
@@ -8474,7 +8482,7 @@ esac
         );
         fs::write(&ack_release, b"release").expect("release admitted ACK");
         let report = finished_receiver
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(HANG_GUARD)
             .expect("pass returns after ACK reconciliation")
             .expect("stopped pass remains well-formed");
         worker.join().expect("pass worker joins");
@@ -12416,17 +12424,22 @@ printf '{"version":1,"id":"%s","action":"send","ok":true,"receipt":{"message_id"
             .lock()
             .expect("states")
             .insert(message_id, QueueMessageState::Processed);
+        let admitted = admitted_at_millis(&state, &key);
+        let before = chat_runtime::unix_millis();
         assert_eq!(
             watch.scan(&state, &delivery, &mut routes),
             std::slice::from_ref(&key)
         );
+        let after = chat_runtime::unix_millis();
         assert!(state
             .delivery_entries()
             .expect("delivery entries")
             .is_empty());
-        assert_eq!(
-            watch.said[1..],
-            [format!("agentctl: chat request {key} typed after 0.0 min")]
+        assert_eq!(watch.said.len(), 2, "{:?}", watch.said);
+        assert!(
+            typed_after_lines(&key, admitted, before, after).contains(&watch.said[1]),
+            "{:?}",
+            watch.said
         );
         assert!(!watch.failing);
         assert!(watch.log.logged.is_empty(), "{:?}", watch.log.logged);
@@ -12461,16 +12474,20 @@ printf '{"version":1,"id":"%s","action":"send","ok":true,"receipt":{"message_id"
             .expect("states")
             .insert(message_id, QueueMessageState::Processed);
 
+        let admitted = admitted_at_millis(&state, &key);
         let syncs = fail_requests_directory_sync(&root, AFTER_REQUEST_REMOVAL);
+        let before = chat_runtime::unix_millis();
         let typed = watch.scan(&state, &delivery, &mut routes);
+        let after = chat_runtime::unix_millis();
         clear_directory_sync_fault();
         assert_eq!(syncs.get(), 2);
         assert_eq!(typed, Vec::<String>::new());
         assert!(watch.failing);
         assert_eq!(watch.said.len(), 3, "{:?}", watch.said);
-        assert_eq!(
-            watch.said[1],
-            format!("agentctl: chat request {key} typed after 0.0 min")
+        assert!(
+            typed_after_lines(&key, admitted, before, after).contains(&watch.said[1]),
+            "{:?}",
+            watch.said
         );
         assert!(
             watch.said[2].starts_with(&format!(
@@ -12497,6 +12514,40 @@ printf '{"version":1,"id":"%s","action":"send","ok":true,"receipt":{"message_id"
         assert!(!watch.failing);
         assert!(watch.log.logged.is_empty(), "{:?}", watch.log.logged);
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// When `key` was admitted, as its record says.
+    fn admitted_at_millis(state: &BridgeState, key: &str) -> u64 {
+        state.inspect_request(key).expect("inspect request")["timestamps"]["admitted_at_millis"]
+            .as_u64()
+            .expect("admission time")
+    }
+
+    /// The lines a scan may log for `key`, admitted at `admitted_millis`, whose prompt was
+    /// recorded typed at some time from `from_millis` to `to_millis`: one for each age that the
+    /// log's rounding gives in that window. A test can bound the time a prompt is recorded typed
+    /// but not fix it, and under load the window can pass a rounding step.
+    fn typed_after_lines(
+        key: &str,
+        admitted_millis: u64,
+        from_millis: u64,
+        to_millis: u64,
+    ) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut at = from_millis;
+        loop {
+            let line = format!(
+                "agentctl: chat request {key} typed after {}",
+                age_text(at.saturating_sub(admitted_millis))
+            );
+            if !lines.contains(&line) {
+                lines.push(line);
+            }
+            if at >= to_millis {
+                return lines;
+            }
+            at = at.saturating_add(100).min(to_millis);
+        }
     }
 
     /// The sync of the requests directory that makes a request's delivered phase durable, when a
@@ -12913,6 +12964,8 @@ printf '{"version":1,"id":"%s","action":"send","ok":true,"receipt":{"message_id"
         assert_eq!(watch.retry_keys, std::slice::from_ref(&key));
         assert_eq!(watch.said.len(), 1, "{:?}", watch.said);
 
+        let admitted = admitted_at_millis(&state, &key);
+        let before = chat_runtime::unix_millis();
         let mut transport = None;
         let report = process_keys_with_delivery(
             &state,
@@ -12925,6 +12978,7 @@ printf '{"version":1,"id":"%s","action":"send","ok":true,"receipt":{"message_id"
             },
         )
         .expect("the retry");
+        let after = chat_runtime::unix_millis();
         assert_eq!(report.delivered, std::slice::from_ref(&key));
         assert!(state
             .delivery_entries()
@@ -12934,9 +12988,11 @@ printf '{"version":1,"id":"%s","action":"send","ok":true,"receipt":{"message_id"
             watch.scan(&state, &queue, &mut routes),
             Vec::<String>::new()
         );
-        assert_eq!(
-            watch.said[1..],
-            [format!("agentctl: chat request {key} typed after 0.0 min")]
+        assert_eq!(watch.said.len(), 2, "{:?}", watch.said);
+        assert!(
+            typed_after_lines(&key, admitted, before, after).contains(&watch.said[1]),
+            "{:?}",
+            watch.said
         );
         assert!(watch.log.logged.is_empty(), "{:?}", watch.log.logged);
         fs::remove_dir_all(root).expect("cleanup");
