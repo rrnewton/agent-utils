@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from collections.abc import Sequence
@@ -12,13 +13,17 @@ import pytest
 from wrkslots import cli as wrkslots
 from wrkslots.tests.test_lifecycle import (
     active_slots,
+    allow_test_host_for_absent_validate_recovery,
     create,
     make_project,
+    make_validate_row_absent,
     mark_owner_dead,
     raw_command_with_census_authority_stub,
     remove_completed_validation,
+    run_absent_validate_recovery,
     set_liveness,
     stub_validate_batch_censuses,
+    write_absent_validate_input,
 )
 
 
@@ -258,3 +263,81 @@ def test_failed_seal_rewrite_still_retires_the_invocations_seal(
     assert [row["slot"] for row in active_slots(project) if isinstance(row, dict)] == [
         "target"
     ]
+
+
+@pytest.mark.parametrize("sealer", ("dead", "live"))
+def test_seal_whose_target_was_reaped_does_not_deadlock_absent_row_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    sealer: str,
+) -> None:
+    """A dead invocation's seal of an already-removed target must not block recovery.
+
+    Host state, 2026-10-04: a validation removal sealed its target, its
+    authorizing coordinator (the seal's actor) exited, and the validation
+    checkout cleanup then deleted the target
+    directory, leaving the seal journal and an ACTIVE row whose directory is
+    absent.  'recover' refused because the target was absent while its row
+    remained, and 'recover-absent-validate-rows' refused because a seal
+    journal existed, each waiting for the other.  With the seal's coordinator
+    dead, 'recover' now retires the seal (there is no mode left to restore)
+    and keeps the row, and absent-row recovery then retires the row.  While
+    the seal's coordinator still runs, 'recover' still refuses and keeps the
+    journal.
+    """
+
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project, slot="target", slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    config = wrkslots._load_config(str(project), "testhost")
+    stub_validate_batch_censuses(monkeypatch)
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_a, **_k: None)
+    seal = wrkslots._validate_batch_seal_journal_path(config)
+
+    crashed = raw_command_with_census_authority_stub(
+        project,
+        *_remove_command(),
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-validate-batch-seal-target"},
+    )
+    assert crashed.returncode == 86, crashed.stderr
+    assert seal.exists()
+    record = wrkslots._find_record(wrkslots._load_active(config), "target")
+    make_validate_row_absent(project, repository, record)
+    assert not wrkslots._slot_directory(config, "target", "validate").exists()
+    # The seal records the authorizing coordinator as its actor: this live
+    # test process.  The production seal named a coordinator that had exited.
+    journal = json.loads(seal.read_text(encoding="utf-8"))
+    actor = wrkslots._read_process_identity(os.getpid())
+    if sealer == "dead":
+        actor = dataclasses.replace(actor, pid=2_147_483_647)
+    journal["actor"] = wrkslots._identity_to_obj(actor)
+    seal.write_text(json.dumps(journal, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    sealed = seal.read_bytes()
+
+    recovered = raw_command_with_census_authority_stub(
+        project,
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+
+    if sealer == "live":
+        assert recovered.returncode == 3, recovered.stderr
+        assert "is absent while its ACTIVE row remains" in recovered.stderr
+        assert "the seal's coordinator is live" in recovered.stderr
+        assert seal.read_bytes() == sealed
+        assert [row.slot for row in wrkslots._load_active(config).slots] == ["target"]
+        return
+    assert recovered.returncode == 0, recovered.stderr
+    assert "sealed target target was already absent" in recovered.stdout
+    assert not seal.exists()
+    assert [row.slot for row in wrkslots._load_active(config).slots] == ["target"]
+
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    rows = write_absent_validate_input(project, [record])
+    assert run_absent_validate_recovery(project, rows, apply=True) == 0, capsys.readouterr().err
+    assert active_slots(project) == []

@@ -29584,6 +29584,18 @@ def _recover_validate_batch_seal_journal(
     unresolved: list[dict[str, object]] = []
     errors: list[str] = []
     restored = 0
+    absent_rows: list[str] = []
+    # A seal only changes a target directory's mode. When that directory is
+    # gone there is nothing left to restore, so in a seal-only recovery whose
+    # recorded coordinator (the seal's actor, which authorized the removal) is
+    # proven dead an absent target is resolved and its ACTIVE
+    # row is left exactly as it is, for recover-absent-validate-rows, which
+    # re-proves storage, Git and process state before it retires the row.
+    # Refusing here deadlocked the two: that command refuses while any seal
+    # journal exists, and this one kept the journal for the absent target.
+    actor_state, actor_reason = _process_state(
+        _identity_from_obj(raw["actor"], "validation-batch seal journal.actor")
+    )
     for slot, generation, target in targets:
         current = records.get(slot)
         path_present = target.path.exists() or target.path.is_symlink()
@@ -29612,8 +29624,12 @@ def _recover_validate_batch_seal_journal(
             )
             continue
         if not path_present:
+            if paired_finish is None and actor_state == "dead":
+                absent_rows.append(slot)
+                continue
             errors.append(
-                f"sealed target {slot} is absent while its ACTIVE row remains"
+                f"sealed target {slot} is absent while its ACTIVE row remains "
+                f"(the seal's coordinator is {actor_state}: {actor_reason})"
             )
             unresolved.append(
                 _private_cleanup_target_to_obj(config, slot, generation, target)
@@ -29655,6 +29671,12 @@ def _recover_validate_batch_seal_journal(
             f"recovered validation-batch seals: restored={restored} "
             f"resolved={len(targets)}"
         )
+        for slot in absent_rows:
+            print(
+                f"sealed target {slot} was already absent, so it had no mode to "
+                "restore; its ACTIVE row remains for 'wrkslots "
+                "recover-absent-validate-rows'"
+            )
     return True
 
 
