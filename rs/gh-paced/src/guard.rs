@@ -3,9 +3,11 @@
 //! GitHub issue, comment and pull-request text is for short human-readable notes. This guard
 //! refuses a write whose body sources (inline flags, body files, `gh api` fields, `--input`
 //! request files, and stdin) total more than `max_body_bytes`, or contain a base64-looking run
-//! longer than `max_base64_run` characters. `GH_PACED_ALLOW_LARGE_BODY=1` skips it.
+//! longer than `max_base64_run` characters. It also refuses write forms whose body gh composes
+//! itself after the guard has run (an editor, a template, `--fill`, an interactive prompt),
+//! because their content cannot be inspected. `GH_PACED_ALLOW_LARGE_BODY=1` skips it.
 
-use crate::classify::Classification;
+use crate::classify::{normalize_endpoint, Classification};
 use crate::config::Config;
 use std::io::Read;
 
@@ -20,15 +22,29 @@ pub enum SourceKind {
     Stdin,
 }
 
+/// Where a file path sits in the argument list: `rest[index] == prefix + path`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArgLocation {
+    /// Index into the argument list after the command words.
+    pub index: usize,
+    /// Text before the path in that argument (`--body-file=`, `-F`, `body=@`, or empty).
+    pub prefix: String,
+}
+
 /// One place a write request takes body text from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BodySource {
-    /// The flag (or `<file>` for a positional file) that names this source.
+    /// The flag (or `<file>` / `<arg>` for a positional) that names this source.
     pub flag: String,
     /// Where the content comes from.
     pub kind: SourceKind,
-    /// The content is a JSON request body (`gh api --input`, `workflow run --json`).
+    /// The content is a JSON request body (`gh api --input`, `workflow run --json`, `--recover`).
     pub json: bool,
+    /// For a file source, where its path is in the argument list (used to substitute a snapshot).
+    pub location: Option<ArgLocation>,
+    /// Sources with the same key override each other (gh keeps the last); `None` for repeatable
+    /// sources such as positional files.
+    key: Option<String>,
 }
 
 impl BodySource {
@@ -40,7 +56,7 @@ impl BodySource {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
-    /// Inline text, or a path when the value is a file flag.
+    /// Inline text.
     Text,
     /// A path, `-` = stdin.
     File,
@@ -55,11 +71,19 @@ enum Kind {
 }
 
 struct Table {
+    /// Body-carrying long flags.
     long: &'static [(&'static str, Kind)],
-    short: &'static [(char, Kind)],
+    /// Body-carrying short flags, each mapped to its long name in `long`.
+    short: &'static [(char, &'static str)],
+    /// Other long flags that take a value (skipped).
     value_long: &'static [&'static str],
+    /// Other short flags that take a value (skipped).
     value_short: &'static str,
+    /// Positional arguments are files to upload (`gist create`).
     positional_files: bool,
+    /// Positional arguments are text of unknown meaning (aliases, extensions, other writes).
+    positional_text: bool,
+    /// stdin carries the value when no flag does and stdin is not a terminal (`secret set`).
     stdin_when_no_body: bool,
 }
 
@@ -69,12 +93,13 @@ const API: Table = Table {
         ("field", Kind::TypedField),
         ("input", Kind::Input),
     ],
-    short: &[('f', Kind::RawField), ('F', Kind::TypedField)],
+    short: &[('f', "raw-field"), ('F', "field")],
     value_long: &[
         "method", "header", "jq", "template", "preview", "cache", "hostname",
     ],
     value_short: "XHqtp",
     positional_files: false,
+    positional_text: false,
     stdin_when_no_body: false,
 };
 
@@ -84,10 +109,11 @@ const WORKFLOW_RUN: Table = Table {
         ("field", Kind::TypedField),
         ("json", Kind::JsonStdin),
     ],
-    short: &[('f', Kind::RawField), ('F', Kind::TypedField)],
+    short: &[('f', "raw-field"), ('F', "field")],
     value_long: &["ref", "repo"],
     value_short: "rR",
     positional_files: false,
+    positional_text: false,
     stdin_when_no_body: false,
 };
 
@@ -96,8 +122,9 @@ const CREATE: Table = Table {
         ("title", Kind::Text),
         ("body", Kind::Text),
         ("body-file", Kind::File),
+        ("recover", Kind::Input),
     ],
-    short: &[('t', Kind::Text), ('b', Kind::Text), ('F', Kind::File)],
+    short: &[('t', "title"), ('b', "body"), ('F', "body-file")],
     value_long: &[
         "base",
         "head",
@@ -108,19 +135,20 @@ const CREATE: Table = Table {
         "reviewer",
         "repo",
         "template",
-        "recover",
     ],
     value_short: "BHalmprRT",
     positional_files: false,
+    positional_text: false,
     stdin_when_no_body: false,
 };
 
 const COMMENT: Table = Table {
     long: &[("body", Kind::Text), ("body-file", Kind::File)],
-    short: &[('b', Kind::Text), ('F', Kind::File)],
+    short: &[('b', "body"), ('F', "body-file")],
     value_long: &["repo"],
     value_short: "R",
     positional_files: false,
+    positional_text: false,
     stdin_when_no_body: false,
 };
 
@@ -130,7 +158,7 @@ const EDIT: Table = Table {
         ("body", Kind::Text),
         ("body-file", Kind::File),
     ],
-    short: &[('t', Kind::Text), ('b', Kind::Text), ('F', Kind::File)],
+    short: &[('t', "title"), ('b', "body"), ('F', "body-file")],
     value_long: &[
         "base",
         "milestone",
@@ -146,6 +174,7 @@ const EDIT: Table = Table {
     ],
     value_short: "BmR",
     positional_files: false,
+    positional_text: false,
     stdin_when_no_body: false,
 };
 
@@ -155,19 +184,21 @@ const MERGE: Table = Table {
         ("body-file", Kind::File),
         ("subject", Kind::Text),
     ],
-    short: &[('b', Kind::Text), ('F', Kind::File), ('t', Kind::Text)],
+    short: &[('b', "body"), ('F', "body-file"), ('t', "subject")],
     value_long: &["author-email", "match-head-commit", "repo"],
     value_short: "AR",
     positional_files: false,
+    positional_text: false,
     stdin_when_no_body: false,
 };
 
 const CLOSE: Table = Table {
     long: &[("comment", Kind::Text)],
-    short: &[('c', Kind::Text)],
+    short: &[('c', "comment")],
     value_long: &["reason", "repo"],
     value_short: "rR",
     positional_files: false,
+    positional_text: false,
     stdin_when_no_body: false,
 };
 
@@ -177,7 +208,7 @@ const RELEASE: Table = Table {
         ("notes-file", Kind::File),
         ("title", Kind::Text),
     ],
-    short: &[('n', Kind::Text), ('F', Kind::File), ('t', Kind::Text)],
+    short: &[('n', "notes"), ('F', "notes-file"), ('t', "title")],
     value_long: &[
         "target",
         "discussion-category",
@@ -187,39 +218,43 @@ const RELEASE: Table = Table {
     ],
     value_short: "R",
     positional_files: false,
+    positional_text: false,
     stdin_when_no_body: false,
 };
 
 const GIST_CREATE: Table = Table {
     long: &[("desc", Kind::Text)],
-    short: &[('d', Kind::Text)],
+    short: &[('d', "desc")],
     value_long: &["filename"],
     value_short: "f",
     positional_files: true,
+    positional_text: false,
     stdin_when_no_body: false,
 };
 
 const GIST_EDIT: Table = Table {
     long: &[("desc", Kind::Text), ("add", Kind::File)],
-    short: &[('d', Kind::Text), ('a', Kind::File)],
+    short: &[('d', "desc"), ('a', "add")],
     value_long: &["filename", "remove"],
     value_short: "fr",
     positional_files: false,
+    positional_text: false,
     stdin_when_no_body: false,
 };
 
 const LABEL: Table = Table {
     long: &[("description", Kind::Text), ("name", Kind::Text)],
-    short: &[('d', Kind::Text), ('n', Kind::Text)],
+    short: &[('d', "description"), ('n', "name")],
     value_long: &["color", "repo"],
     value_short: "cR",
     positional_files: false,
+    positional_text: false,
     stdin_when_no_body: false,
 };
 
 const REPO: Table = Table {
     long: &[("description", Kind::Text)],
-    short: &[('d', Kind::Text)],
+    short: &[('d', "description")],
     value_long: &[
         "homepage",
         "team",
@@ -231,28 +266,33 @@ const REPO: Table = Table {
     ],
     value_short: "hgltpsr",
     positional_files: false,
+    positional_text: false,
     stdin_when_no_body: false,
 };
 
 const SECRET: Table = Table {
     long: &[("body", Kind::Text), ("env-file", Kind::File)],
-    short: &[('b', Kind::Text), ('f', Kind::File)],
+    short: &[('b', "body"), ('f', "env-file")],
     value_long: &["app", "env", "org", "visibility", "repos", "repo"],
     value_short: "aeovrRu",
     positional_files: false,
+    positional_text: false,
     stdin_when_no_body: true,
 };
 
+/// Any other write, including aliases and extensions: the common body flags, and every
+/// positional argument counted as inline text (an alias may turn one into a comment body).
 const GENERIC: Table = Table {
     long: &[
         ("body", Kind::Text),
         ("body-file", Kind::File),
         ("input", Kind::Input),
     ],
-    short: &[('b', Kind::Text)],
+    short: &[('b', "body")],
     value_long: &["repo"],
     value_short: "R",
     positional_files: false,
+    positional_text: true,
     stdin_when_no_body: false,
 };
 
@@ -275,61 +315,160 @@ fn table_for(c: &Classification) -> &'static Table {
     }
 }
 
-fn push_source(out: &mut Vec<BodySource>, flag: &str, kind: Kind, value: &str) {
-    let (source, json) = match kind {
-        Kind::Text => (SourceKind::Inline(value.to_string()), false),
-        Kind::File => {
+/// Location of `path` at the end of `rest[index]`.
+fn location(rest: &[String], index: usize, path: &str) -> Option<ArgLocation> {
+    let token = rest.get(index)?;
+    let cut = token.len().checked_sub(path.len())?;
+    if !token.ends_with(path) {
+        return None;
+    }
+    Some(ArgLocation {
+        index,
+        prefix: token[..cut].to_string(),
+    })
+}
+
+/// Record one body source. `name` is the canonical long name, `index` the argument holding
+/// `value` (so file paths can be located for snapshot substitution).
+fn push_source(
+    out: &mut Vec<BodySource>,
+    rest: &[String],
+    name: &str,
+    kind: Kind,
+    value: &str,
+    index: usize,
+) {
+    let flag = format!("--{name}");
+    let scalar_key = Some(name.to_string());
+    let field_key = |v: &str| -> Option<String> {
+        let key = v.split_once('=').map(|(k, _)| k).unwrap_or(v);
+        // `key[]=v` appends to an array; every other key overwrites an earlier value.
+        if key.contains("[]") {
+            None
+        } else {
+            Some(format!("field:{key}"))
+        }
+    };
+    let (source, json, loc, key) = match kind {
+        Kind::Text => (
+            SourceKind::Inline(value.to_string()),
+            false,
+            None,
+            scalar_key,
+        ),
+        Kind::File | Kind::Input => {
+            let json = kind == Kind::Input;
             if value == "-" {
-                (SourceKind::Stdin, false)
+                (SourceKind::Stdin, json, None, scalar_key)
             } else {
-                (SourceKind::File(value.to_string()), false)
+                (
+                    SourceKind::File(value.to_string()),
+                    json,
+                    location(rest, index, value),
+                    scalar_key,
+                )
             }
         }
         Kind::RawField => {
             let v = value.split_once('=').map(|(_, v)| v).unwrap_or(value);
-            (SourceKind::Inline(v.to_string()), false)
+            (
+                SourceKind::Inline(v.to_string()),
+                false,
+                None,
+                field_key(value),
+            )
         }
         Kind::TypedField => {
             let v = value.split_once('=').map(|(_, v)| v).unwrap_or(value);
             match v.strip_prefix('@') {
-                Some("-") => (SourceKind::Stdin, false),
-                Some(path) => (SourceKind::File(path.to_string()), false),
-                None => (SourceKind::Inline(v.to_string()), false),
+                Some("-") => (SourceKind::Stdin, false, None, field_key(value)),
+                Some(path) => (
+                    SourceKind::File(path.to_string()),
+                    false,
+                    location(rest, index, path),
+                    field_key(value),
+                ),
+                None => (
+                    SourceKind::Inline(v.to_string()),
+                    false,
+                    None,
+                    field_key(value),
+                ),
             }
         }
-        Kind::Input => {
-            if value == "-" {
-                (SourceKind::Stdin, true)
-            } else {
-                (SourceKind::File(value.to_string()), true)
-            }
-        }
-        Kind::JsonStdin => (SourceKind::Stdin, true),
+        Kind::JsonStdin => (SourceKind::Stdin, true, None, scalar_key),
     };
     out.push(BodySource {
-        flag: flag.to_string(),
+        flag,
         kind: source,
         json,
+        location: loc,
+        key,
     });
 }
 
-/// Find every body source on a WRITE command line. `rest` is the argument list after the
-/// command words. `stdin_is_tty` matters only for `secret set`/`variable set`, which read the
-/// value from stdin when no flag supplies it and stdin is not a terminal.
-pub fn body_sources(c: &Classification, rest: &[String], stdin_is_tty: bool) -> Vec<BodySource> {
-    scan(c, rest, stdin_is_tty).0
+/// Keep only the sources gh will actually send: for a scalar flag (`--body`, `-b`,
+/// `--body-file`) and for each `gh api` field key, the last occurrence wins, as in gh.
+fn effective(all: Vec<BodySource>) -> Vec<BodySource> {
+    let mut out: Vec<BodySource> = Vec::new();
+    for s in all {
+        if let Some(k) = &s.key {
+            out.retain(|o| o.key.as_ref() != Some(k));
+        }
+        out.push(s);
+    }
+    out
 }
 
-/// Replace inline body text in `rest` with `<N bytes>` markers (and `gh api` header values with
-/// `<redacted>`), for audit records and messages. File paths are kept.
+/// Every body source gh will send on a WRITE command line. `rest` is the argument list after
+/// the command words. `stdin_is_tty` matters only for `secret set`/`variable set`, which read the
+/// value from stdin when no flag supplies it and stdin is not a terminal.
+pub fn body_sources(c: &Classification, rest: &[String], stdin_is_tty: bool) -> Vec<BodySource> {
+    effective(scan(c, rest, stdin_is_tty).sources)
+}
+
+/// Every file gh may read while running this command, including overridden occurrences (gh
+/// reads some of those too). These are the files the wrapper snapshots.
+pub fn file_sources(c: &Classification, rest: &[String]) -> Vec<BodySource> {
+    scan(c, rest, true)
+        .sources
+        .into_iter()
+        .filter(|s| matches!(s.kind, SourceKind::File(_)))
+        .collect()
+}
+
+/// Replace inline body text in `rest` with `<N bytes>` markers, `gh api` header values with
+/// `<redacted>`, and a `gh api` endpoint with its normalised form (no host, userinfo, query or
+/// fragment), for audit records and messages. File paths are kept. For an alias, extension or
+/// unknown command, every argument that is not a flag name becomes `<arg>`.
 pub fn redact(c: &Classification, rest: &[String]) -> Vec<String> {
+    if crate::classify::is_unknown_command(c) {
+        return redact_unknown(rest);
+    }
     let mut out: Vec<String> = rest.to_vec();
-    for (idx, replacement) in scan(c, rest, true).1 {
+    for (idx, replacement) in scan(c, rest, true).redactions {
         if let Some(slot) = out.get_mut(idx) {
             *slot = replacement;
         }
     }
     out
+}
+
+/// Flag names only: `--name=value` and `-xvalue` lose their values, everything else is `<arg>`.
+pub fn redact_unknown(rest: &[String]) -> Vec<String> {
+    rest.iter()
+        .map(|t| {
+            if t == "--" {
+                t.clone()
+            } else if let Some(long) = t.strip_prefix("--") {
+                format!("--{}", long.split('=').next().unwrap_or(""))
+            } else if t.len() > 1 && t.starts_with('-') {
+                t.chars().take(2).collect()
+            } else {
+                "<arg>".to_string()
+            }
+        })
+        .collect()
 }
 
 fn inline_marker(kind: Kind, value: &str) -> Option<String> {
@@ -348,21 +487,72 @@ fn inline_marker(kind: Kind, value: &str) -> Option<String> {
 
 type Redactions = Vec<(usize, String)>;
 
-fn scan(c: &Classification, rest: &[String], stdin_is_tty: bool) -> (Vec<BodySource>, Redactions) {
+/// What one pass over the argument list found.
+struct Scan {
+    /// Every body source, in order, before last-wins resolution.
+    sources: Vec<BodySource>,
+    /// Audit replacements by argument index.
+    redactions: Redactions,
+    /// Canonical names of every flag present: long names, and `-x` for short flags that are not
+    /// body flags.
+    flags: Vec<String>,
+    /// Positional arguments.
+    positionals: usize,
+}
+
+fn scan(c: &Classification, rest: &[String], stdin_is_tty: bool) -> Scan {
     let table = table_for(c);
     let is_api = std::ptr::eq(table, &API);
     let mut out = Vec::new();
     let mut red: Redactions = Vec::new();
+    let mut flags: Vec<String> = Vec::new();
+    let mut positionals = 0usize;
+    let mut positional = |out: &mut Vec<BodySource>, red: &mut Redactions, idx: usize| {
+        let t = rest[idx].as_str();
+        if is_api {
+            // The first positional is the endpoint; gh api takes no other.
+            if positionals == 0 {
+                red.push((idx, normalize_endpoint(t)));
+            } else {
+                red.push((idx, "<arg>".to_string()));
+            }
+        } else if table.positional_files {
+            if t == "-" {
+                out.push(BodySource {
+                    flag: "<stdin>".into(),
+                    kind: SourceKind::Stdin,
+                    json: false,
+                    location: None,
+                    key: None,
+                });
+            } else {
+                out.push(BodySource {
+                    flag: "<file>".into(),
+                    kind: SourceKind::File(t.to_string()),
+                    json: false,
+                    location: location(rest, idx, t),
+                    key: None,
+                });
+            }
+        } else if table.positional_text {
+            out.push(BodySource {
+                flag: "<arg>".into(),
+                kind: SourceKind::Inline(t.to_string()),
+                json: false,
+                location: None,
+                key: None,
+            });
+        }
+        positionals += 1;
+    };
     let mut i = 0;
     while i < rest.len() {
         let at = i;
         let t = rest[i].as_str();
         i += 1;
         if t == "--" {
-            if table.positional_files {
-                for p in &rest[i..] {
-                    push_source(&mut out, "<file>", Kind::File, p);
-                }
+            for idx in i..rest.len() {
+                positional(&mut out, &mut red, idx);
             }
             break;
         }
@@ -371,19 +561,20 @@ fn scan(c: &Classification, rest: &[String], stdin_is_tty: bool) -> (Vec<BodySou
                 Some((n, v)) => (n, Some(v)),
                 None => (long, None),
             };
+            flags.push(name.to_string());
             if let Some((_, kind)) = table.long.iter().find(|(n, _)| *n == name) {
                 if *kind == Kind::JsonStdin {
                     if inline.is_none_or(|v| v != "false") {
-                        push_source(&mut out, t, *kind, "");
+                        push_source(&mut out, rest, name, *kind, "", at);
                     }
                     continue;
                 }
-                let value = match inline {
+                let (value, index) = match inline {
                     Some(v) => {
                         if let Some(m) = inline_marker(*kind, v) {
                             red.push((at, format!("--{name}={m}")));
                         }
-                        v.to_string()
+                        (v.to_string(), at)
                     }
                     None => {
                         let v = rest.get(i).cloned().unwrap_or_default();
@@ -391,10 +582,10 @@ fn scan(c: &Classification, rest: &[String], stdin_is_tty: bool) -> (Vec<BodySou
                             red.push((i, m));
                         }
                         i += 1;
-                        v
+                        (v, i - 1)
                     }
                 };
-                push_source(&mut out, &format!("--{name}"), *kind, &value);
+                push_source(&mut out, rest, name, *kind, &value, index);
             } else if table.value_long.contains(&name) {
                 if is_api && name == "header" {
                     match inline {
@@ -415,26 +606,34 @@ fn scan(c: &Classification, rest: &[String], stdin_is_tty: bool) -> (Vec<BodySou
         if t.len() > 1 && t.starts_with('-') {
             let chars: Vec<char> = t[1..].chars().collect();
             for (j, ch) in chars.iter().enumerate() {
-                if let Some((_, kind)) = table.short.iter().find(|(s, _)| s == ch) {
+                if let Some((_, name)) = table.short.iter().find(|(s, _)| s == ch) {
+                    flags.push((*name).to_string());
+                    let kind = table
+                        .long
+                        .iter()
+                        .find(|(n, _)| n == name)
+                        .map(|(_, k)| *k)
+                        .unwrap_or(Kind::Text);
                     let attached: String = chars[j + 1..].iter().collect();
-                    let value = if attached.is_empty() {
+                    let (value, index) = if attached.is_empty() {
                         let v = rest.get(i).cloned().unwrap_or_default();
-                        if let Some(m) = inline_marker(*kind, &v) {
+                        if let Some(m) = inline_marker(kind, &v) {
                             red.push((i, m));
                         }
                         i += 1;
-                        v
+                        (v, i - 1)
                     } else {
                         let v = attached.strip_prefix('=').unwrap_or(&attached).to_string();
-                        if let Some(m) = inline_marker(*kind, &v) {
+                        if let Some(m) = inline_marker(kind, &v) {
                             let prefix: String = chars[..=j].iter().collect();
                             red.push((at, format!("-{prefix}{m}")));
                         }
-                        v
+                        (v, at)
                     };
-                    push_source(&mut out, &format!("-{ch}"), *kind, &value);
+                    push_source(&mut out, rest, name, kind, &value, index);
                     break;
                 }
+                flags.push(format!("-{ch}"));
                 if table.value_short.contains(*ch) {
                     let attached: String = chars[j + 1..].iter().collect();
                     if is_api && *ch == 'H' {
@@ -455,18 +654,124 @@ fn scan(c: &Classification, rest: &[String], stdin_is_tty: bool) -> (Vec<BodySou
             }
             continue;
         }
-        if table.positional_files {
-            push_source(&mut out, "<file>", Kind::File, t);
-        }
+        positional(&mut out, &mut red, at);
+    }
+    if std::ptr::eq(table, &GIST_CREATE) && !out.iter().any(|s| s.flag != "--desc") {
+        // `gh gist create` with no files reads the gist content from stdin.
+        out.push(BodySource {
+            flag: "<stdin>".into(),
+            kind: SourceKind::Stdin,
+            json: false,
+            location: None,
+            key: None,
+        });
     }
     if table.stdin_when_no_body && out.is_empty() && !stdin_is_tty {
         out.push(BodySource {
             flag: "<stdin>".to_string(),
             kind: SourceKind::Stdin,
             json: false,
+            location: None,
+            key: None,
         });
     }
-    (out, red)
+    Scan {
+        sources: out,
+        redactions: red,
+        flags,
+        positionals,
+    }
+}
+
+/// A write whose body gh composes itself after this guard has run cannot be inspected: an
+/// editor, an issue template, `--fill` from commit messages, or an interactive prompt. Returns
+/// why, or `None` when every body the command sends is on the command line, in a file, or on
+/// stdin. `stdin_is_tty` is whether gh could prompt.
+pub fn uninspectable(c: &Classification, rest: &[String], stdin_is_tty: bool) -> Option<String> {
+    let s = scan(c, rest, stdin_is_tty);
+    let has = |names: &[&str]| s.flags.iter().any(|f| names.contains(&f.as_str()));
+    let body_flag = has(&["body", "body-file"]);
+    let web = has(&["web", "-w"]);
+    let cmd = c.command.as_str();
+    match (c.family.as_str(), c.sub.as_deref()) {
+        ("pr" | "issue", Some("create")) => {
+            if has(&["template", "-T"]) {
+                return Some(format!(
+                    "{cmd} --template fills the body from a template file gh reads later"
+                ));
+            }
+            if has(&["fill", "fill-first", "fill-verbose", "-f"]) {
+                return Some(format!(
+                    "{cmd} --fill composes the body from commit messages"
+                ));
+            }
+            if has(&["editor", "-e"]) {
+                return Some(format!("{cmd} --editor composes the body in an editor"));
+            }
+            if stdin_is_tty && !body_flag && !web && !has(&["recover"]) {
+                return Some(format!(
+                    "{cmd} without --body or --body-file prompts for the body interactively"
+                ));
+            }
+        }
+        ("pr" | "issue", Some("comment")) => {
+            if has(&["editor", "-e"]) {
+                return Some(format!("{cmd} --editor composes the body in an editor"));
+            }
+            if stdin_is_tty && !body_flag && !web && !has(&["delete-last"]) {
+                return Some(format!(
+                    "{cmd} without --body or --body-file prompts for the body interactively"
+                ));
+            }
+        }
+        ("pr", Some("review")) => {
+            let typed = has(&["approve", "-a", "request-changes", "-r", "comment", "-c"]);
+            if stdin_is_tty && !body_flag && !typed {
+                return Some(format!(
+                    "{cmd} without --approve, --request-changes, --comment or a body prompts interactively"
+                ));
+            }
+        }
+        ("pr" | "issue", Some("edit")) => {
+            let any_flag = s.flags.iter().any(|f| !matches!(f.as_str(), "repo" | "-R"));
+            if stdin_is_tty && !any_flag {
+                return Some(format!(
+                    "{cmd} with no flags prompts for the fields and the body interactively"
+                ));
+            }
+        }
+        ("pr", Some("merge")) => {
+            let method = has(&[
+                "merge",
+                "-m",
+                "squash",
+                "-s",
+                "rebase",
+                "-r",
+                "disable-auto",
+            ]);
+            if stdin_is_tty && !method {
+                return Some(format!(
+                    "{cmd} without --merge, --squash or --rebase prompts interactively and may open an editor for the commit body"
+                ));
+            }
+        }
+        ("release", Some("create")) => {
+            let notes = has(&["notes", "notes-file", "generate-notes", "notes-from-tag"]);
+            if stdin_is_tty && !notes {
+                return Some(format!(
+                    "{cmd} without --notes, --notes-file, --generate-notes or --notes-from-tag prompts for the notes interactively"
+                ));
+            }
+        }
+        ("gist", Some("edit")) if !has(&["add", "remove", "-r"]) || s.positionals > 1 => {
+            return Some(format!(
+                "{cmd} without --add or --remove opens an editor or replaces a file gh reads later"
+            ));
+        }
+        _ => {}
+    }
+    None
 }
 
 /// Keep a header's name and drop its value (it may carry a credential).
@@ -482,59 +787,42 @@ fn is_b64(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'_' | b'-')
 }
 
-#[derive(Default)]
-struct Mix {
-    upper: bool,
-    lower: bool,
-    digit: bool,
-}
-
-impl Mix {
-    fn add(&mut self, b: u8) {
-        self.upper |= b.is_ascii_uppercase();
-        self.lower |= b.is_ascii_lowercase();
-        self.digit |= b.is_ascii_digit();
-    }
-    fn mixed(&self) -> bool {
-        self.upper && self.lower && self.digit
-    }
-}
-
-/// Length of the longest base64-looking content in `text`: either one unbroken run of base64
-/// characters, or a block of consecutive lines (each at least 20 characters and made only of
-/// base64 characters) taken together. Content must mix upper case, lower case and digits to
-/// count, so hex digests, rulers and long words are not mistaken for base64.
+/// Length of the longest base64-looking content in `text`.
+///
+/// Two shapes count:
+///
+/// - one unbroken run of base64-alphabet characters, whatever it contains (a hex dump, a
+///   lower-case-only encoding and a ruler all count, so nothing long slips through as a "word");
+/// - a block of consecutive lines, each at least 20 characters and made only of base64-alphabet
+///   characters, taken together, when the block contains an upper-case letter, `+` or `/`. That
+///   condition exempts a list of lower-case hex digests (one SHA per line) and markdown rulers;
+///   such a list is still bounded by the body-size limit.
 pub fn longest_base64_run(text: &[u8]) -> usize {
     let mut best = 0;
     let mut run = 0;
-    let mut mix = Mix::default();
     for &b in text.iter().chain(std::iter::once(&b' ')) {
         if is_b64(b) {
             run += 1;
-            mix.add(b);
         } else {
-            if mix.mixed() && run > best {
-                best = run;
-            }
+            best = best.max(run);
             run = 0;
-            mix = Mix::default();
         }
     }
     let mut block = 0;
-    let mut block_mix = Mix::default();
+    let mut encoded_looking = false;
     for line in text.split(|&b| b == b'\n').chain(std::iter::once(&b""[..])) {
         let trimmed = trim_ascii(line);
         if trimmed.len() >= 20 && trimmed.iter().all(|&b| is_b64(b)) {
             block += trimmed.len();
-            for &b in trimmed {
-                block_mix.add(b);
-            }
+            encoded_looking |= trimmed
+                .iter()
+                .any(|&b| b.is_ascii_uppercase() || b == b'+' || b == b'/');
         } else {
-            if block_mix.mixed() && block > best {
+            if encoded_looking && block > best {
                 best = block;
             }
             block = 0;
-            block_mix = Mix::default();
+            encoded_looking = false;
         }
     }
     best
@@ -656,10 +944,32 @@ mod tests {
     use super::*;
     use crate::classify::classify;
 
+    fn argv(line: &[&str]) -> Vec<String> {
+        line.iter().map(|s| s.to_string()).collect()
+    }
+
     fn sources(line: &[&str]) -> Vec<BodySource> {
-        let args: Vec<String> = line.iter().map(|s| s.to_string()).collect();
+        let args = argv(line);
         let c = classify(&args, &Config::default());
         body_sources(&c, &args[c.rest_start..], true)
+    }
+
+    fn kinds(line: &[&str]) -> Vec<SourceKind> {
+        sources(line).into_iter().map(|s| s.kind).collect()
+    }
+
+    fn src(flag: &str, kind: SourceKind, json: bool) -> BodySource {
+        BodySource {
+            flag: flag.into(),
+            kind,
+            json,
+            location: None,
+            key: None,
+        }
+    }
+
+    fn inline(t: &str) -> SourceKind {
+        SourceKind::Inline(t.into())
     }
 
     fn b64ish(n: usize) -> String {
@@ -677,22 +987,20 @@ mod tests {
     fn finds_body_flags_per_command() {
         let s = sources(&["pr", "comment", "1", "-b", "hello"]);
         assert_eq!(s.len(), 1);
-        assert_eq!(s[0].kind, SourceKind::Inline("hello".into()));
+        assert_eq!(s[0].kind, inline("hello"));
+        assert_eq!(s[0].flag, "--body");
         let s = sources(&["pr", "create", "-d", "-b", "body", "-t", "title"]);
         assert_eq!(s.len(), 2, "-d is --draft (bool) in pr create: {s:?}");
         let s = sources(&["issue", "create", "--body-file", "-"]);
         assert!(s[0].is_stdin());
-        let s = sources(&["pr", "comment", "1", "-RFoo/Bar", "-bx"]);
         assert_eq!(
-            s,
-            vec![BodySource {
-                flag: "-b".into(),
-                kind: SourceKind::Inline("x".into()),
-                json: false
-            }]
+            kinds(&["pr", "comment", "1", "-RFoo/Bar", "-bx"]),
+            vec![inline("x")]
         );
-        let s = sources(&["pr", "comment", "1", "--body=inline"]);
-        assert_eq!(s[0].kind, SourceKind::Inline("inline".into()));
+        assert_eq!(
+            kinds(&["pr", "comment", "1", "--body=inline"]),
+            vec![inline("inline")]
+        );
         let s = sources(&["pr", "merge", "1", "--squash", "-t", "subj", "-b", "body"]);
         assert_eq!(s.len(), 2);
         let s = sources(&[
@@ -721,6 +1029,120 @@ mod tests {
         let s = sources(&["gist", "create", "-d", "desc", "a.txt", "-"]);
         assert_eq!(s.len(), 3);
         assert!(s[2].is_stdin());
+        // `--recover` replays a saved JSON draft: it is a body source like `--input`.
+        let s = sources(&["pr", "create", "--recover", "draft.json"]);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].kind, SourceKind::File("draft.json".into()));
+        assert!(s[0].json);
+        // `--template` names a template; its value is not a body source.
+        assert!(sources(&["issue", "create", "-T", "bug.md"]).is_empty());
+    }
+
+    /// gh composes the gist from stdin when no files are named.
+    #[test]
+    fn gist_create_without_files_reads_stdin() {
+        let s = sources(&["gist", "create", "-d", "desc"]);
+        assert_eq!(s.len(), 2, "{s:?}");
+        assert!(s[1].is_stdin());
+        let s = sources(&["gist", "create"]);
+        assert_eq!(s.len(), 1);
+        assert!(s[0].is_stdin());
+        let s = sources(&["gist", "create", "a.txt"]);
+        assert_eq!(s, file_sources_of(&["gist", "create", "a.txt"]));
+    }
+
+    fn file_sources_of(line: &[&str]) -> Vec<BodySource> {
+        let args = argv(line);
+        let c = classify(&args, &Config::default());
+        file_sources(&c, &args[c.rest_start..])
+    }
+
+    /// gh keeps the last value of a repeated scalar flag and of a repeated `gh api` field key,
+    /// so only that value is sent and inspected; array fields (`key[]=`) all go.
+    #[test]
+    fn repeated_flags_last_value_wins() {
+        let big = "word ".repeat(2000);
+        assert_eq!(
+            kinds(&["pr", "comment", "1", "--body", &big, "--body", "small"]),
+            vec![inline("small")]
+        );
+        assert_eq!(
+            kinds(&["pr", "comment", "1", "-b", &big, "--body=small"]),
+            vec![inline("small")]
+        );
+        assert_eq!(
+            kinds(&["pr", "comment", "1", "--body", "small", "-b", &big]),
+            vec![inline(&big)]
+        );
+        // Different flags are different sources.
+        assert_eq!(
+            sources(&["pr", "comment", "1", "-b", "x", "--body-file", "f.md"]).len(),
+            2
+        );
+        assert_eq!(
+            kinds(&["api", "x", "-f", "body=A", "-f", "body=B"]),
+            vec![inline("B")]
+        );
+        assert_eq!(
+            kinds(&["api", "x", "-f", "body=A", "-F", "body=@f.md"]),
+            vec![SourceKind::File("f.md".into())]
+        );
+        assert_eq!(
+            kinds(&["api", "x", "-f", "a[]=1", "-f", "a[]=2"]),
+            vec![inline("1"), inline("2")]
+        );
+        // Every file gh may read is still listed for the snapshot.
+        assert_eq!(
+            file_sources_of(&[
+                "pr",
+                "comment",
+                "1",
+                "--body-file",
+                "a.md",
+                "--body-file",
+                "b.md"
+            ])
+            .len(),
+            2
+        );
+    }
+
+    /// File sources carry where their path is, so the wrapper can substitute a snapshot.
+    #[test]
+    fn file_sources_record_their_argument_position() {
+        let loc = |line: &[&str]| -> Vec<(usize, String)> {
+            file_sources_of(line)
+                .into_iter()
+                .map(|s| {
+                    let l = s.location.expect("located");
+                    (l.index, l.prefix)
+                })
+                .collect()
+        };
+        assert_eq!(
+            loc(&["pr", "comment", "1", "--body-file", "a.md"]),
+            vec![(2, String::new())]
+        );
+        assert_eq!(
+            loc(&["pr", "comment", "1", "--body-file=a.md"]),
+            vec![(1, "--body-file=".to_string())]
+        );
+        assert_eq!(
+            loc(&["pr", "comment", "1", "-Fa.md"]),
+            vec![(1, "-F".to_string())]
+        );
+        assert_eq!(
+            loc(&["api", "x", "-F", "body=@a.md"]),
+            vec![(2, "body=@".to_string())]
+        );
+        assert_eq!(
+            loc(&["api", "x", "-Fbody=@a.md", "--input", "r.json"]),
+            vec![(1, "-Fbody=@".to_string()), (3, String::new())]
+        );
+        assert_eq!(
+            loc(&["gist", "create", "a.txt", "b.txt"]),
+            vec![(0, String::new()), (1, String::new())]
+        );
     }
 
     #[test]
@@ -738,37 +1160,177 @@ mod tests {
             "k=3",
         ]);
         assert_eq!(s.len(), 4);
-        assert_eq!(s[0].kind, SourceKind::Inline("hi".into()));
+        assert_eq!(s[0].kind, inline("hi"));
         assert_eq!(s[1].kind, SourceKind::File("x.md".into()));
         assert!(s[2].is_stdin());
-        assert_eq!(s[3].kind, SourceKind::Inline("3".into()));
+        assert_eq!(s[3].kind, inline("3"));
         let s = sources(&["api", "--method", "POST", "x", "--input", "req.json"]);
-        assert_eq!(
-            s,
-            vec![BodySource {
-                flag: "--input".into(),
-                kind: SourceKind::File("req.json".into()),
-                json: true
-            }]
-        );
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].flag, "--input");
+        assert_eq!(s[0].kind, SourceKind::File("req.json".into()));
+        assert!(s[0].json);
         let s = sources(&["api", "-H", "-f", "x", "-fbody=y"]);
         assert_eq!(s.len(), 1, "-f after -H is the header value: {s:?}");
     }
 
+    /// An alias or extension may turn any argument into body text, so each one counts.
+    #[test]
+    fn alias_arguments_count_as_body_text() {
+        let big = b64ish(1200);
+        let s = sources(&["my-alias", "first", &big]);
+        assert_eq!(s.len(), 2, "{s:?}");
+        assert_eq!(s[1].kind, inline(&big));
+        assert!(matches!(
+            evaluate(&s, &Config::default(), None),
+            Verdict::Refuse(m) if m.contains("base64")
+        ));
+    }
+
     #[test]
     fn secret_set_reads_stdin_only_when_not_a_terminal() {
-        let args: Vec<String> = ["secret", "set", "NAME"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let args = argv(&["secret", "set", "NAME"]);
         let c = classify(&args, &Config::default());
         assert!(body_sources(&c, &args[2..], true).is_empty());
         assert!(body_sources(&c, &args[2..], false)[0].is_stdin());
     }
 
+    fn refused(line: &[&str], tty: bool) -> Option<String> {
+        let args = argv(line);
+        let c = classify(&args, &Config::default());
+        uninspectable(&c, &args[c.rest_start..], tty)
+    }
+
+    /// Bodies gh composes after the guard has run (editor, template, --fill, interactive
+    /// prompt) cannot be inspected, so those forms are refused.
+    #[test]
+    fn uninspectable_forms_are_refused() {
+        let always: &[&[&str]] = &[
+            &["pr", "create", "-t", "x", "-b", "y", "--template", "t.md"],
+            &["issue", "create", "-T", "bug.md"],
+            &["pr", "create", "--fill"],
+            &["pr", "create", "-f"],
+            &["pr", "create", "--fill-first"],
+            &["pr", "create", "--fill-verbose"],
+            &["issue", "create", "-t", "x", "-e"],
+            &["pr", "create", "--editor"],
+            &["pr", "comment", "1", "-e"],
+            &["issue", "comment", "1", "--editor"],
+            &["gist", "edit", "abc"],
+            &["gist", "edit", "abc", "file.txt"],
+            &["gist", "edit", "abc", "src.txt", "--add", "name.txt"],
+        ];
+        for line in always {
+            assert!(refused(line, false).is_some(), "not refused: {line:?}");
+            assert!(refused(line, true).is_some(), "not refused (tty): {line:?}");
+        }
+        let prompts: &[&[&str]] = &[
+            &["pr", "create", "-t", "title"],
+            &["issue", "create"],
+            &["pr", "comment", "1"],
+            &["issue", "comment", "1", "--edit-last"],
+            &["pr", "review", "1"],
+            &["pr", "edit", "1"],
+            &["issue", "edit", "1", "-R", "o/r"],
+            &["pr", "merge", "1"],
+            &["pr", "merge", "1", "--auto", "-d"],
+            &["release", "create", "v1"],
+            &["release", "create", "v1", "-t", "title"],
+        ];
+        for line in prompts {
+            assert!(refused(line, true).is_some(), "not refused (tty): {line:?}");
+            assert!(
+                refused(line, false).is_none(),
+                "refused without a tty: {line:?}"
+            );
+        }
+        let fine: &[&[&str]] = &[
+            &["pr", "create", "-t", "x", "-b", "y"],
+            &["pr", "create", "-t", "x", "--body-file", "b.md"],
+            &["pr", "create", "--web"],
+            &["pr", "create", "--recover", "d.json"],
+            &["issue", "create", "-t", "x", "-F", "b.md"],
+            &["pr", "comment", "1", "-b", "x"],
+            &["pr", "comment", "1", "--edit-last", "-b", "x"],
+            &["pr", "comment", "1", "--delete-last"],
+            &["pr", "review", "1", "-a"],
+            &["pr", "review", "1", "-c", "-b", "x"],
+            &["pr", "edit", "1", "--add-label", "x"],
+            &["pr", "merge", "1", "--squash"],
+            &["pr", "merge", "1", "-r"],
+            &["pr", "merge", "1", "--disable-auto"],
+            &["release", "create", "v1", "--generate-notes"],
+            &["release", "create", "v1", "-n", "notes"],
+            &["release", "create", "v1", "-F", "n.md"],
+            &["gist", "edit", "abc", "--add", "new.txt"],
+            &["gist", "edit", "abc", "-a", "new.txt"],
+            &["gist", "edit", "abc", "--remove", "old.txt"],
+            &["gist", "edit", "abc", "-r", "old.txt"],
+            &["issue", "close", "1"],
+            &["label", "create", "bug"],
+        ];
+        for line in fine {
+            assert!(refused(line, true).is_none(), "refused: {line:?}");
+            assert!(refused(line, false).is_none(), "refused: {line:?}");
+        }
+    }
+
+    fn redacted(line: &[&str]) -> Vec<String> {
+        let args = argv(line);
+        let c = classify(&args, &Config::default());
+        let mut out = args[..c.rest_start].to_vec();
+        out.extend(redact(&c, &args[c.rest_start..]));
+        out
+    }
+
+    #[test]
+    fn redaction_drops_bodies_headers_and_endpoint_queries() {
+        assert_eq!(
+            redacted(&["pr", "comment", "1", "-b", "secret words", "-R", "o/r"]),
+            argv(&["pr", "comment", "1", "-b", "<12 bytes>", "-R", "o/r"])
+        );
+        assert_eq!(
+            redacted(&["api", "x", "-H", "Authorization: token SECRET"]),
+            argv(&["api", "x", "-H", "Authorization: <redacted>"])
+        );
+        let r = redacted(&[
+            "api",
+            "https://user:pw@api.github.com/repos/o/r/issues?access_token=github_pat_CANARY#frag",
+        ]);
+        assert_eq!(r, argv(&["api", "repos/o/r/issues"]));
+        let r = redacted(&["api", "repos/o/r/issues?access_token=github_pat_CANARY"]);
+        assert_eq!(r, argv(&["api", "repos/o/r/issues"]));
+    }
+
+    /// An alias or extension keeps only its name and its flag names.
+    #[test]
+    fn unknown_commands_keep_only_flag_names() {
+        let args = argv(&[
+            "my-alias",
+            "SECRET_WORDS",
+            "-b",
+            "BODY_CANARY",
+            "--token=TOKEN_CANARY",
+            "-xVALUE_CANARY",
+            "--",
+            "tail",
+        ]);
+        let c = classify(&args, &Config::default());
+        assert_eq!(c.command, "my-alias");
+        assert_eq!(c.rest_start, 1);
+        let r = redacted(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(
+            r,
+            argv(&["my-alias", "<arg>", "-b", "<arg>", "--token", "-x", "--", "<arg>"])
+        );
+        // An unrecognised flag before any command word.
+        let r = redacted(&["--weird", "SECRET"]);
+        assert_eq!(r, argv(&["--weird", "<arg>"]));
+    }
+
     #[test]
     fn base64_detection() {
-        assert_eq!(longest_base64_run(b"plain prose with words."), 0);
+        // Ordinary words are short runs ("prose", "words").
+        assert_eq!(longest_base64_run(b"plain prose with words."), 5);
         let blob = b64ish(1500);
         assert_eq!(longest_base64_run(blob.as_bytes()), 1500);
         // Wrapped at 76 columns, inside a fenced block, the lines still count together.
@@ -779,47 +1341,51 @@ mod tests {
             .collect();
         let text = format!("Here is data:\n```\n{wrapped}```\n");
         assert_eq!(longest_base64_run(text.as_bytes()), 1500);
-        // Hex digests and rulers do not count.
+        // Canonical base64 with no digits ("abc" repeated, and zero bytes) still counts, both
+        // as one run and wrapped.
+        for unit in ["YWJj", "AAAA"] {
+            let enc = unit.repeat(300);
+            assert_eq!(longest_base64_run(enc.as_bytes()), 1200, "{unit}");
+            let wrapped: String = enc
+                .as_bytes()
+                .chunks(76)
+                .map(|c| format!("{}\n", String::from_utf8_lossy(c)))
+                .collect();
+            assert_eq!(
+                longest_base64_run(wrapped.as_bytes()),
+                1200,
+                "{unit} wrapped"
+            );
+        }
+        // One unbroken run counts whatever its alphabet: a long hex dump and a long ruler too.
         let hex = "0123456789abcdef".repeat(100);
-        assert_eq!(longest_base64_run(hex.as_bytes()), 0);
-        assert_eq!(longest_base64_run("-".repeat(2000).as_bytes()), 0);
+        assert_eq!(longest_base64_run(hex.as_bytes()), 1600);
+        assert_eq!(longest_base64_run("-".repeat(2000).as_bytes()), 2000);
+        // A list of lower-case commit SHAs, one per line, is not a block (each line counts alone).
+        let shas: String = (0..40)
+            .map(|i| format!("{:040x}\n", 0x1234_5678_9abc_u64 * (i + 1)))
+            .collect();
+        assert_eq!(longest_base64_run(shas.as_bytes()), 40);
     }
 
     #[test]
     fn evaluate_size_and_base64() {
         let cfg = Config::default();
-        let ok = vec![BodySource {
-            flag: "-b".into(),
-            kind: SourceKind::Inline("x".repeat(4000)),
-            json: false,
-        }];
+        let ok = vec![src("-b", inline(&"x".repeat(4000)), false)];
+        // 4000 identical letters are one 4000-character run.
+        assert!(matches!(evaluate(&ok, &cfg, None), Verdict::Refuse(m) if m.contains("base64")));
+        let ok = vec![src("-b", inline(&"word ".repeat(800)), false)];
         assert_eq!(evaluate(&ok, &cfg, None), Verdict::Allow { bytes: 4000 });
-        let big = vec![BodySource {
-            flag: "-b".into(),
-            kind: SourceKind::Inline("word ".repeat(2000)),
-            json: false,
-        }];
+        let big = vec![src("-b", inline(&"word ".repeat(2000)), false)];
         assert!(matches!(evaluate(&big, &cfg, None),
             Verdict::Refuse(m) if m.contains("10000 bytes across 1 source(s), over the 8192-byte limit")
                 && !m.contains("base64")));
-        let enc = vec![BodySource {
-            flag: "-b".into(),
-            kind: SourceKind::Inline(b64ish(1200)),
-            json: false,
-        }];
+        let enc = vec![src("-b", inline(&b64ish(1200)), false)];
         assert!(matches!(evaluate(&enc, &cfg, None), Verdict::Refuse(m) if m.contains("base64")));
         // Two sources that are each small but together too large.
         let two = vec![
-            BodySource {
-                flag: "-t".into(),
-                kind: SourceKind::Inline("a ".repeat(2100)),
-                json: false,
-            },
-            BodySource {
-                flag: "-b".into(),
-                kind: SourceKind::Inline("b ".repeat(2100)),
-                json: false,
-            },
+            src("-t", inline(&"a ".repeat(2100)), false),
+            src("-b", inline(&"b ".repeat(2100)), false),
         ];
         assert!(matches!(evaluate(&two, &cfg, None),
             Verdict::Refuse(m) if m.contains("8400 bytes across 2 source(s)")));
@@ -830,30 +1396,17 @@ mod tests {
             .map(|c| String::from_utf8_lossy(c).to_string())
             .collect();
         let json = serde_json::json!({"body": lines.join("\n")}).to_string();
-        let src = vec![BodySource {
-            flag: "--input".into(),
-            kind: SourceKind::Stdin,
-            json: true,
-        }];
+        let stdin_src = vec![src("--input", SourceKind::Stdin, true)];
         assert!(matches!(
-            evaluate(&src, &cfg, Some(json.as_bytes())),
+            evaluate(&stdin_src, &cfg, Some(json.as_bytes())),
             Verdict::Refuse(_)
         ));
         // Unreadable file is refused, not waved through.
-        let missing = vec![BodySource {
-            flag: "-F".into(),
-            kind: SourceKind::File("/nonexistent/x".into()),
-            json: false,
-        }];
+        let missing = vec![src("-F", SourceKind::File("/nonexistent/x".into()), false)];
         assert!(matches!(evaluate(&missing, &cfg, None), Verdict::Refuse(_)));
         // Stdin source without a buffer is refused.
-        let unbuffered = vec![BodySource {
-            flag: "--input".into(),
-            kind: SourceKind::Stdin,
-            json: true,
-        }];
         assert!(matches!(
-            evaluate(&unbuffered, &cfg, None),
+            evaluate(&stdin_src, &cfg, None),
             Verdict::Refuse(_)
         ));
     }
@@ -868,12 +1421,12 @@ mod tests {
         let path = dir.join("part.request.json");
         let body = format!("part 01/21\n\n```\n{}\n```", b64ish(60_000));
         std::fs::write(&path, serde_json::json!({ "body": body }).to_string()).unwrap();
-        let src = vec![BodySource {
-            flag: "--input".into(),
-            kind: SourceKind::File(path.display().to_string()),
-            json: true,
-        }];
-        let verdict = evaluate(&src, &Config::default(), None);
+        let file_src = vec![src(
+            "--input",
+            SourceKind::File(path.display().to_string()),
+            true,
+        )];
+        let verdict = evaluate(&file_src, &Config::default(), None);
         let Verdict::Refuse(m) = verdict else {
             panic!("allowed: {verdict:?}")
         };
@@ -889,7 +1442,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            evaluate(&src, &Config::default(), None),
+            evaluate(&file_src, &Config::default(), None),
             Verdict::Allow { .. }
         ));
         let _ = std::fs::remove_dir_all(&dir);

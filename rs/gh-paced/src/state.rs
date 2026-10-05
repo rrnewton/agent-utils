@@ -4,13 +4,28 @@
 //!
 //! - `<account>.json`: buckets, hourly windows, in-flight writes, cooldown, rate-limit snapshot;
 //! - `<account>.lock`: the lock file every process takes before reading or writing the JSON;
-//! - `<account>.audit.jsonl`: the append-only audit log (see `audit`).
+//! - `<account>.audit.jsonl`: the append-only audit log (see `audit`);
+//! - `<account>.lease-<nonce>`: one file per running WRITE (see "Write leases" below);
+//! - `snap-<nonce>/`: private copies of the body files one running invocation sends.
 //!
 //! The lock is held only for short read-modify-write steps, never across a sleep or a network
 //! call. Saving writes a temporary file and renames it over the old one, so a crash leaves
-//! either the old or the new state. A file that cannot be parsed is moved aside to
-//! `<account>.json.corrupt-<unix-seconds>` and replaced with EMPTY buckets (every class must
-//! refill from zero), which errs on the side of fewer calls.
+//! either the old or the new state, and a reader without the lock (`status`) always sees one
+//! whole file. A file that cannot be parsed is moved aside to
+//! `<account>.json.corrupt-<unix-seconds>` and replaced by the caller's recovery state (the
+//! wrapper uses every hourly window full plus a pause, see `wrapper::recovery_state`), with every
+//! still-held write lease restored as an in-flight write.
+//!
+//! # Write leases
+//!
+//! A WRITE's in-flight slot must last as long as the gh process doing the write, not as long as
+//! the wrapper: if the wrapper is killed with SIGKILL, gh keeps running. So an admitted WRITE
+//! creates `<account>.lease-<nonce>`, takes an exclusive `flock` on it, and hands that open file
+//! to gh (the descriptor is inherited across exec). The kernel keeps the lock while ANY process
+//! still has that open file: the wrapper, gh, or anything gh started. A slot is live while its
+//! lease is locked; another process tests that with a non-blocking shared `flock` on a fresh open.
+//! A nested gh-paced (an alias or extension calling gh) proves it descends from the holder by
+//! having the lease file open itself, which only a descendant can (see `inherited_file_ids`).
 
 use crate::budget::Bucket;
 use crate::classify::Class;
@@ -40,6 +55,11 @@ pub struct Holder {
     pub class: Class,
     /// When the slot was taken (Unix seconds).
     pub since: f64,
+    /// Lease file name (in the state directory) whose lock tracks the slot's real lifetime.
+    /// `None` for a refresh claim and for state written by an older version: those fall back to
+    /// the PID and start time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<String>,
 }
 
 /// A host-wide pause after GitHub pushed back.
@@ -91,16 +111,19 @@ impl State {
         }
     }
 
-    /// Drop in-flight entries and refresh claims whose process has exited.
-    pub fn reap(&mut self, alive: &dyn Fn(&Holder) -> bool) -> usize {
-        let before = self.in_flight.len();
-        self.in_flight.retain(|h| alive(h));
+    /// Drop in-flight entries and refresh claims whose process has exited. Returns the dropped
+    /// in-flight entries, so the caller can remove their lease files.
+    pub fn reap(&mut self, alive: &dyn Fn(&Holder) -> bool) -> Vec<Holder> {
+        let (live, dead): (Vec<Holder>, Vec<Holder>) = std::mem::take(&mut self.in_flight)
+            .into_iter()
+            .partition(|h| alive(h));
+        self.in_flight = live;
         if let Some(claim) = &self.refresh_claim {
             if !alive(claim) {
                 self.refresh_claim = None;
             }
         }
-        before - self.in_flight.len()
+        dead
     }
 }
 
@@ -146,6 +169,18 @@ impl Paths {
     /// `<account>.audit.jsonl`.
     pub fn audit(&self) -> PathBuf {
         self.dir.join(format!("{}.audit.jsonl", self.account))
+    }
+
+    /// Lease file name for an invocation nonce.
+    pub fn lease_name(&self, nonce: &str) -> String {
+        format!("{}.lease-{nonce}", self.account)
+    }
+
+    /// True when `name` is a lease file name of this account (`<account>.lease-<16 hex>`), so a
+    /// name read from the state file cannot point outside the state directory.
+    pub fn is_lease_name(&self, name: &str) -> bool {
+        name.strip_prefix(&format!("{}.lease-", self.account))
+            .is_some_and(|n| n.len() == 16 && n.bytes().all(|b| b.is_ascii_hexdigit()))
     }
 }
 
@@ -227,12 +262,9 @@ pub struct Loaded {
 
 /// Load the account's state. Call only while holding [`lock`].
 ///
-/// `empty_buckets` builds the replacement buckets for a corrupt file (all classes empty).
-pub fn load(
-    paths: &Paths,
-    now: f64,
-    empty_buckets: &dyn Fn(f64) -> BTreeMap<String, Bucket>,
-) -> Loaded {
+/// `recovery` builds the state that replaces an unusable file; every lease file that is still
+/// locked is added to it as an in-flight write.
+pub fn load(paths: &Paths, now: f64, recovery: &dyn Fn(f64) -> State) -> Loaded {
     let path = paths.state();
     let text = match std::fs::read(&path) {
         Ok(t) => t,
@@ -244,7 +276,7 @@ pub fn load(
             }
         }
         Err(e) => {
-            return quarantine(paths, now, empty_buckets, &format!("cannot read: {e}"));
+            return quarantine(paths, now, recovery, &format!("cannot read: {e}"));
         }
     };
     match serde_json::from_slice::<State>(&text) {
@@ -256,15 +288,16 @@ pub fn load(
         Ok(state) => quarantine(
             paths,
             now,
-            empty_buckets,
+            recovery,
             &format!("unsupported version {}", state.version),
         ),
-        Err(e) => quarantine(paths, now, empty_buckets, &format!("cannot parse: {e}")),
+        Err(e) => quarantine(paths, now, recovery, &format!("cannot parse: {e}")),
     }
 }
 
-/// Load the account's state for display only: nothing is moved, quarantined or written. A
-/// missing file is a fresh state; an unusable file is an error. Call only while holding [`lock`].
+/// Load the account's state for display only: nothing is created, moved, quarantined or written,
+/// and no lock is needed (saves replace the file atomically). A missing file is a fresh state;
+/// an unusable file is an error.
 pub fn load_readonly(paths: &Paths) -> Result<State, String> {
     let path = paths.state();
     let text = match std::fs::read(&path) {
@@ -286,12 +319,7 @@ pub fn load_readonly(paths: &Paths) -> Result<State, String> {
     }
 }
 
-fn quarantine(
-    paths: &Paths,
-    now: f64,
-    empty_buckets: &dyn Fn(f64) -> BTreeMap<String, Bucket>,
-    why: &str,
-) -> Loaded {
+fn quarantine(paths: &Paths, now: f64, recovery: &dyn Fn(f64) -> State, why: &str) -> Loaded {
     let path = paths.state();
     let aside = paths.dir.join(format!(
         "{}.json.corrupt-{}",
@@ -299,8 +327,10 @@ fn quarantine(
         now.floor() as i64
     ));
     let moved = std::fs::rename(&path, &aside).is_ok();
-    let mut state = State::new();
-    state.buckets = empty_buckets(now);
+    let mut state = recovery(now);
+    let held = held_leases(paths, now);
+    let restored = held.len();
+    state.in_flight.extend(held);
     let where_ = if moved {
         format!("moved to {}", aside.display())
     } else {
@@ -309,11 +339,102 @@ fn quarantine(
     Loaded {
         state,
         warning: Some(format!(
-            "state file {} is unusable ({why}); {where_}; starting with EMPTY buckets",
+            "state file {} is unusable ({why}); {where_}; every hourly budget is treated as \
+             used up for the next hour and paced calls pause, and {restored} running write(s) \
+             were restored from their lease files",
             path.display()
         )),
         fresh: false,
     }
+}
+
+/// Every lease file of this account that is still locked, as in-flight WRITE holders.
+fn held_leases(paths: &Paths, now: f64) -> Vec<Holder> {
+    let Ok(entries) = std::fs::read_dir(&paths.dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !paths.is_lease_name(&name) || !lease_held(&paths.dir, &name) {
+            continue;
+        }
+        let nonce = name.rsplit('-').next().unwrap_or_default().to_string();
+        out.push(Holder {
+            pid: 0,
+            start_ticks: 0,
+            nonce,
+            class: Class::Write,
+            since: now,
+            lease: Some(name),
+        });
+    }
+    out.sort_by(|a, b| a.nonce.cmp(&b.nonce));
+    out
+}
+
+/// An open, exclusively locked lease file. Dropping it closes this process's copy; the lock
+/// lasts until every process that inherited the descriptor has closed it too.
+#[derive(Debug)]
+pub struct Lease {
+    file: File,
+    /// File name in the state directory.
+    pub name: String,
+}
+
+impl Lease {
+    /// The descriptor to keep open in the child.
+    pub fn fd(&self) -> std::os::fd::RawFd {
+        self.file.as_raw_fd()
+    }
+}
+
+/// Create and lock `<account>.lease-<nonce>`. Call while holding [`lock`].
+pub fn create_lease(paths: &Paths, nonce: &str) -> Result<Lease, String> {
+    let name = paths.lease_name(nonce);
+    let path = paths.dir.join(&name);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| format!("cannot create lease {}: {e}", path.display()))?;
+    // Blocking: the file is new with a random name, so the only other holder can be a prober's
+    // momentary shared lock.
+    // SAFETY: flock on a valid, owned file descriptor.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(format!("cannot lock lease {}: {err}", path.display()));
+    }
+    Ok(Lease { file, name })
+}
+
+/// Remove a lease file (after its holder finished or was found dead).
+pub fn remove_lease(paths: &Paths, name: &str) {
+    if paths.is_lease_name(name) {
+        let _ = std::fs::remove_file(paths.dir.join(name));
+    }
+}
+
+/// True when some process still holds the lock on lease file `name` in `dir`. A missing file is
+/// not held. Any error other than "would block" counts as held (fewer calls, not more).
+pub fn lease_held(dir: &Path, name: &str) -> bool {
+    let file = match File::open(dir.join(name)) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    // SAFETY: flock on a valid, owned file descriptor; the probe's lock is released when the
+    // file is closed at the end of this function.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+    if rc == 0 {
+        return false;
+    }
+    let err = std::io::Error::last_os_error();
+    err.kind() == std::io::ErrorKind::WouldBlock || err.kind() != std::io::ErrorKind::Interrupted
 }
 
 /// Save the account's state atomically. Call only while holding [`lock`].
@@ -351,6 +472,43 @@ pub fn process_start_ticks(pid: u32) -> Option<u64> {
 /// True when the process recorded in `h` is still running (same PID and start time).
 pub fn holder_alive(h: &Holder) -> bool {
     process_start_ticks(h.pid) == Some(h.start_ticks)
+}
+
+/// Liveness of a holder of `paths`' account: its lease lock when it has a valid lease name,
+/// otherwise its PID and start time.
+pub fn holder_alive_in(paths: &Paths, h: &Holder) -> bool {
+    match &h.lease {
+        Some(name) if paths.is_lease_name(name) => lease_held(&paths.dir, name),
+        _ => holder_alive(h),
+    }
+}
+
+/// Device and inode of a file.
+pub fn file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// Device and inode of every regular file this process has open. A lease file appears here only
+/// when it was inherited from the wrapper that holds it, which proves descent from that wrapper.
+pub fn inherited_file_ids() -> Vec<(u64, u64)> {
+    let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+        return Vec::new();
+    };
+    let fds: Vec<i32> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse().ok()))
+        .collect();
+    let mut out = Vec::new();
+    for fd in fds {
+        // SAFETY: fstat writes into a local stat buffer; a closed descriptor just fails.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut st) } == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFREG
+        {
+            out.push((st.st_dev, st.st_ino));
+        }
+    }
+    out
 }
 
 /// A random-enough identifier for this invocation (no credential material involved).
@@ -397,7 +555,7 @@ mod tests {
         let dir = tmpdir("rt");
         let paths = Paths::new(dir.clone(), "acct");
         let _g = lock(&paths).expect("lock");
-        let loaded = load(&paths, 10.0, &|_| BTreeMap::new());
+        let loaded = load(&paths, 10.0, &|_| State::new());
         assert!(loaded.fresh);
         let mut s = loaded.state;
         s.calls_since_refresh = 7;
@@ -407,29 +565,121 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
-        let again = load(&paths, 11.0, &|_| BTreeMap::new());
+        let again = load(&paths, 11.0, &|_| State::new());
         assert!(!again.fresh);
         assert_eq!(again.state.calls_since_refresh, 7);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn saturated_recovery(now: f64) -> State {
+        let mut s = State::new();
+        let limits = crate::config::ClassLimits {
+            per_minute: 2.0,
+            burst: 1.0,
+            per_hour: 30,
+        };
+        s.buckets
+            .insert("write".to_string(), Bucket::saturated(limits, now));
+        s
+    }
+
+    /// A corrupt file is moved aside and replaced by the caller's recovery state, with every
+    /// still-locked lease restored as an in-flight write (a dead lease is not).
     #[test]
-    fn corrupt_state_is_quarantined_with_empty_buckets() {
+    fn corrupt_state_is_quarantined_conservatively() {
         let dir = tmpdir("corrupt");
         let paths = Paths::new(dir.clone(), "acct");
+        let live = create_lease(&paths, "00000000000000aa").expect("lease");
+        drop(create_lease(&paths, "00000000000000bb").expect("lease"));
+        std::fs::write(dir.join("acct.lease-not-a-nonce"), b"").expect("write");
         std::fs::write(paths.state(), b"{not json").expect("write");
-        let loaded = load(&paths, 1234.0, &|now| {
-            let mut m = BTreeMap::new();
-            m.insert("write".to_string(), Bucket::empty(now));
-            m
-        });
-        assert!(loaded
-            .warning
-            .as_deref()
-            .is_some_and(|w| w.contains("EMPTY")));
+        let loaded = load(&paths, 1234.0, &saturated_recovery);
+        let warning = loaded.warning.expect("warning");
+        assert!(warning.contains("used up for the next hour"), "{warning}");
+        assert!(warning.contains("1 running write(s)"), "{warning}");
         assert_eq!(loaded.state.buckets["write"].level, 0.0);
+        assert_eq!(loaded.state.buckets["write"].hour_used(), 30);
+        assert_eq!(
+            loaded.state.in_flight.len(),
+            1,
+            "{:?}",
+            loaded.state.in_flight
+        );
+        assert_eq!(
+            loaded.state.in_flight[0].lease.as_deref(),
+            Some(live.name.as_str())
+        );
+        assert_eq!(loaded.state.in_flight[0].class, Class::Write);
         assert!(dir.join("acct.json.corrupt-1234").exists());
         assert!(!paths.state().exists());
+        drop(live);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lease is held while any open file description of it is open: the creating process's,
+    /// or a child's that inherited it. Another open of the same file probes it.
+    #[test]
+    fn lease_lifetime_follows_the_open_file() {
+        let dir = tmpdir("lease");
+        let paths = Paths::new(dir.clone(), "acct");
+        let lease = create_lease(&paths, "0123456789abcdef").expect("lease");
+        assert_eq!(lease.name, "acct.lease-0123456789abcdef");
+        let h = Holder {
+            pid: 0,
+            start_ticks: 0,
+            nonce: "0123456789abcdef".into(),
+            class: Class::Write,
+            since: 0.0,
+            lease: Some(lease.name.clone()),
+        };
+        assert!(lease_held(&dir, &lease.name));
+        assert!(
+            holder_alive_in(&paths, &h),
+            "pid 0 is ignored when a lease exists"
+        );
+        // A child that inherits the descriptor keeps the lease after this process lets go.
+        // SAFETY: duplicating a descriptor this test owns, without close-on-exec.
+        let inherited = unsafe { libc::dup(lease.fd()) };
+        assert!(inherited >= 0);
+        let mut child = std::process::Command::new("sleep")
+            .arg("2")
+            .spawn()
+            .expect("spawn sleep");
+        // SAFETY: closing the duplicate in this process; the child keeps its own copy.
+        unsafe {
+            libc::close(inherited);
+        }
+        let name = lease.name.clone();
+        drop(lease);
+        assert!(lease_held(&dir, &name), "the child still holds it");
+        child.wait().expect("wait");
+        assert!(
+            !lease_held(&dir, &name),
+            "released when the last holder exits"
+        );
+        assert!(!holder_alive_in(&paths, &h));
+        remove_lease(&paths, &name);
+        assert!(!dir.join(&name).exists());
+        assert!(!lease_held(&dir, &name), "a missing lease is not held");
+        // A name that is not this account's lease falls back to PID liveness.
+        let forged = Holder {
+            lease: Some("../../etc/passwd".into()),
+            ..h
+        };
+        assert!(!holder_alive_in(&paths, &forged));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inherited_file_ids_include_open_files() {
+        let dir = tmpdir("ids");
+        let path = dir.join("f");
+        std::fs::write(&path, b"x").expect("write");
+        let id = file_id(&path).expect("id");
+        assert!(!inherited_file_ids().contains(&id));
+        let f = File::open(&path).expect("open");
+        assert!(inherited_file_ids().contains(&id));
+        drop(f);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -443,6 +693,7 @@ mod tests {
             nonce: "n".into(),
             class: Class::Write,
             since: 0.0,
+            lease: None,
         };
         assert!(holder_alive(&h));
         let stale = Holder {
@@ -451,9 +702,9 @@ mod tests {
         };
         assert!(!holder_alive(&stale));
         let mut s = State::new();
-        s.in_flight = vec![h, stale];
-        assert_eq!(s.reap(&holder_alive), 1);
-        assert_eq!(s.in_flight.len(), 1);
+        s.in_flight = vec![h.clone(), stale.clone()];
+        assert_eq!(s.reap(&holder_alive), vec![stale]);
+        assert_eq!(s.in_flight, vec![h]);
     }
 
     #[test]

@@ -12,8 +12,11 @@ budget is used up, printing a loud warning line on stderr. It also:
 
 - reads GitHub's own account-wide numbers (`GET /rate_limit`) and slows down or
   stops as the remaining allowance shrinks;
-- pauses every call for 15 minutes after any rate-limit or abuse response;
-- refuses write bodies larger than 8 KiB or containing long base64 runs.
+- pauses every call for 15 minutes after any rate-limit, abuse or HTTP 403
+  response;
+- refuses write bodies larger than 8 KiB or containing long base64 runs, and
+  writes whose body gh would compose later (an editor, a template, `--fill`, an
+  interactive prompt): pass `--body` or `--body-file` instead.
 
 Every process on the host shares the budgets through one locked state file. The
 command's own output, exit status, stdin and terminal pass through unchanged.

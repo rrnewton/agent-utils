@@ -27,8 +27,10 @@ gh-paced sits between an account shim and the real gh. Every call is classified
 per-account budgets shared by every process on the host through a locked state
 file, and delayed with a loud stderr warning when a budget is exhausted. It
 also watches GitHub's own account-wide numbers (GET /rate_limit), backs off
-for 15 minutes after any rate-limit or abuse response, and refuses oversized or
-base64-laden write bodies. It never reads, prints or stores a token.
+for at least 15 minutes after any rate-limit, abuse or HTTP 403 response, and
+refuses oversized or base64-laden write bodies and bodies gh would compose
+itself (editor, template, --fill, prompt). Body files are copied privately so
+gh sends exactly what was checked. It never reads, prints or stores a token.
 
 USAGE
   gh-paced [--account NAME] [--real-gh PATH] -- <gh arguments...>
@@ -59,7 +61,10 @@ DEFAULT BUDGETS (per host, per account; four hosts assumed)
   WRITE            1 per 30 s, burst 1, 30/hour, 1 in flight
   GIT_CREDENTIAL   1 per 10 s, burst 1, 120/hour
   LOCAL            unpaced, unaudited (help, completion, config, alias, ...)
-  `gh api --paginate` costs 10 tokens; watch loops cost 20.
+  Unknown commands (aliases, extensions) are WRITE, even with --help.
+  `gh api --paginate` costs 10 tokens, for writes too. Watch loops cost 20 and
+  are stopped (exit 75) once they outlast the polls those tokens cover.
+  A cost above the class's hourly cap is refused at once (exit 75).
 
 ENVIRONMENT
   GH_PACED_ACCOUNT           default for --account
@@ -81,8 +86,10 @@ ENVIRONMENT
 
 EXIT STATUS
   gh's own status (or gh-paced dies by the same signal), except:
-  75  refused: the wait would exceed GH_PACED_MAX_WAIT, or nesting too deep
-  65  refused by the write content guard (body > 8 KiB or base64 run > 1000)
+  75  refused: the wait would exceed GH_PACED_MAX_WAIT, the cost can never fit
+      the hourly cap, a watch outlasted its paid polls, or nesting too deep
+  65  refused by the write content guard (body > 8 KiB, base64 run > 1000, a
+      body gh composes itself, or a body file that cannot be copied)
   64  usage error, or a refused command shape (watch interval under 30 s)
   70  internal error: pacing state cannot be locked, read or written
   78  configuration error
@@ -110,7 +117,8 @@ Shows, per class: tokens available and burst, refill rate, cost used in the
 last hour against the hourly cap, and seconds until the next one-token call
 fits. Also in-flight writes (PID, age, liveness), any active cooldown with its
 reason, the cached GET /rate_limit numbers and their age, and the last 5 audit
-records. Never contacts GitHub, never refreshes, never writes state.
+records. Takes no lock and creates no files; never contacts GitHub, never
+refreshes, never writes state.
 
 EXAMPLES
   gh-paced status --account octocat
@@ -314,12 +322,14 @@ fn run_paced(account: Option<String>, real_gh: Option<String>, gh_args: Vec<Stri
     let runner = RealRunner;
     let pid = std::process::id();
     let now = crate::clock::Clock::now(&clock);
-    let alive = |h: &state::Holder| state::holder_alive(h);
+    let paths = Paths::new(dir, &account);
+    let probe = paths.clone();
+    let alive = move |h: &state::Holder| state::holder_alive_in(&probe, h);
     let mut w = Wrapper {
         clock: &clock,
         runner: &runner,
         cfg,
-        paths: Paths::new(dir, &account),
+        paths,
         host: short_host(),
         real_gh,
         echo: true,
@@ -329,6 +339,7 @@ fn run_paced(account: Option<String>, real_gh: Option<String>, gh_args: Vec<Stri
         chain,
         depth,
         alive: &alive,
+        inherited_leases: state::inherited_file_ids(),
         pid,
         start_ticks: state::process_start_ticks(pid).unwrap_or(0),
         nonce: state::new_nonce(now),
