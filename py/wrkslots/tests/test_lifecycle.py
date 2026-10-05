@@ -44463,6 +44463,147 @@ def test_mountinfo_census_bound_is_per_census_and_independent_of_read_order(
     assert budget.input_remaining == 7
 
 
+@pytest.mark.parametrize("representative", ("exited", "running"))
+def test_mount_census_skips_a_lone_representative_that_exits_during_its_read(
+    monkeypatch: pytest.MonkeyPatch, representative: str
+) -> None:
+    """An exit during the census is terminal evidence, not changed evidence.
+
+    Process 2 is the only representative of mount namespace N2, and its
+    mountinfo read fails.  If it exited during the census it is a zombie: its
+    /proc directory and start ticks stay until it is reaped, but it holds no
+    mount reference, so N2 is skipped and process 1's use of the selected path
+    is still reported.  The census used to take matching start ticks for a
+    live process and re-raise "exited during mountinfo census", so one such
+    exit in each attempt refused every liveness census on a busy host.  If
+    process 2 still runs, its unreadable table refuses as before.
+    """
+
+    target = Path("/absent/validate/gone")
+    holder = (
+        f"41 35 8:1 /export/gone {target}/root rw,relatime - ext4 /dev/sda1 rw\n"
+    ).encode()
+    processes = (
+        wrkslots._AbsentProcessObservation(1, 17, "/other", "mnt:[N1]"),
+        wrkslots._AbsentProcessObservation(2, 17, "/other", "mnt:[N2]"),
+    )
+
+    def bounded_read(path: Path, _label: str, _limit: int) -> bytes:
+        if int(path.parent.name) == 2:
+            raise OSError(errno.EINVAL, os.strerror(errno.EINVAL))
+        return holder
+
+    monkeypatch.setattr(wrkslots, "_read_bounded_regular_file", bounded_read)
+    monkeypatch.setattr(wrkslots, "_process_start_ticks", lambda _path: 17)
+    monkeypatch.setattr(
+        wrkslots,
+        "_process_observation_is_active",
+        lambda process: process.pid != 2 or representative == "running",
+    )
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=30, stdout_limit=1, stderr_limit=1, input_limit=1
+    )
+
+    if representative == "exited":
+        assert wrkslots._absent_validate_mount_matches(
+            processes, {target: "gone"}, budget
+        ) == ((1, "gone", "mount", f"{target}/root"),)
+    else:
+        with pytest.raises(wrkslots.Refusal) as refused:
+            wrkslots._absent_validate_mount_matches(processes, {target: "gone"}, budget)
+        assert not isinstance(refused.value, wrkslots._ProcessEvidenceChanged)
+        assert str(refused.value).startswith("mount evidence is indeterminate for PID 2:")
+
+
+@pytest.mark.ordinary_environment
+def test_process_path_census_reports_a_live_user_while_unrelated_processes_exit_during_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unrelated processes exiting during the census must not hide a live user.
+
+    On a busy host processes exit all the time, and nearly every one has a
+    mount namespace of its own.  Here, in each of the census's three attempts,
+    one unrelated process, alone in a new user and mount namespace, is alive
+    when the census takes and preflights its snapshot, then exits and waits
+    unreaped as a zombie before its mountinfo is read (the read gets EINVAL).
+    The census used to refuse all three attempts with "relevant process
+    evidence changed during three liveness attempts"; the process whose
+    working directory is the slot must be reported instead.
+    """
+
+    slot = tmp_path / "slot"
+    slot.mkdir()
+    user = subprocess.Popen(["sleep", "3600"], cwd=slot, text=True)
+    libc = ctypes.CDLL(None, use_errno=True)
+    clone_newns, clone_newuser = 0x00020000, 0x10000000
+    children: list[tuple[int, int]] = []
+
+    def start_unrelated_process() -> int:
+        release_read, release_write = os.pipe()
+        ready_read, ready_write = os.pipe()
+        child = os.fork()
+        if child == 0:
+            try:
+                os.close(release_write)
+                os.close(ready_read)
+                libc.unshare(clone_newuser | clone_newns)
+                os.write(ready_write, b"r")
+                os.read(release_read, 1)
+            finally:
+                os._exit(0)
+        os.close(release_read)
+        os.close(ready_write)
+        os.read(ready_read, 1)
+        os.close(ready_read)
+        children.append((child, release_write))
+        return child
+
+    def is_zombie(pid: int) -> bool:
+        status = Path(f"/proc/{pid}/status").read_text(encoding="utf-8")
+        return any(
+            line.split()[1:2] == ["Z"] for line in status.splitlines() if line.startswith("State:")
+        )
+
+    real_snapshot = wrkslots._absent_validate_process_snapshot
+    real_maps_matches = wrkslots._absent_validate_maps_matches
+
+    def snapshot(
+        *, include_owner_cgroups: bool = True
+    ) -> tuple[wrkslots._AbsentProcessObservation, ...]:
+        unrelated = start_unrelated_process()
+        return tuple(
+            process
+            for process in real_snapshot(include_owner_cgroups=include_owner_cgroups)
+            if process.pid in (user.pid, unrelated)
+        )
+
+    def maps_then_unrelated_exit(
+        processes: Sequence[wrkslots._AbsentProcessObservation],
+        targets: Mapping[Path, str],
+        budget: wrkslots._ReadOnlyCommandBudget,
+    ) -> tuple[tuple[int, str, str, str], ...]:
+        matches = real_maps_matches(processes, targets, budget)
+        pid, release_write = children[-1]
+        os.close(release_write)
+        deadline = time.monotonic() + 10
+        while not is_zombie(pid):
+            assert time.monotonic() < deadline, f"PID {pid} did not exit"
+            time.sleep(0.01)
+        return matches
+
+    monkeypatch.setattr(wrkslots, "_absent_validate_process_snapshot", snapshot)
+    monkeypatch.setattr(wrkslots, "_absent_validate_maps_matches", maps_then_unrelated_exit)
+    try:
+        census = wrkslots._capture_process_path_census((slot,))
+        assert any(pid == user.pid for pid, *_rest in census.matches), census.matches
+    finally:
+        for pid, release_write in children:
+            with contextlib.suppress(OSError):
+                os.close(release_write)
+            os.waitpid(pid, 0)
+        terminate_process(user)
+
+
 @pytest.mark.parametrize("overflowing_process_active", (True, False))
 def test_mountinfo_census_overflow_is_not_discarded_by_representative_fallback(
     monkeypatch: pytest.MonkeyPatch, overflowing_process_active: bool

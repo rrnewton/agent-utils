@@ -43203,8 +43203,16 @@ def _absent_validate_mount_matches(
             references = candidate_references
             break
         if selected is None:
+            # A representative that exited during the census is skipped, as
+            # _preflight_process_observations skips one that exited before it:
+            # its terminal generation can hold no mount reference.  A zombie
+            # keeps its /proc directory and start ticks until it is reaped, so
+            # matching start ticks alone took it for a live process; on a busy
+            # host one such exit in every attempt refused the whole census as
+            # "relevant process evidence changed".  A representative whose read
+            # failed while it still runs refuses, as before.
             for process, failure in failures:
-                if _process_start_ticks(Path("/proc") / str(process.pid)) == process.start_ticks:
+                if _process_observation_is_active(process):
                     raise failure
             continue
         for observed, detail in references:

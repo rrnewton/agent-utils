@@ -832,10 +832,12 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     assert ordinary.isdisjoint(mapped)
     assert ordinary | mapped == all_tests
     # The seven setup-hooks tests of 3bae67a3, 1df79bf9 and db6cdf8b are in the
-    # mapped partition.
-    assert len(all_tests) == 1829
-    assert len(ordinary) == 286
-    assert len(mapped) == 1543
+    # mapped partition. Of the three exited-representative census tests, the
+    # two cases of the stubbed one are mapped and the real-process one is
+    # ordinary.
+    assert len(all_tests) == 1832
+    assert len(ordinary) == 287
+    assert len(mapped) == 1545
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
@@ -903,6 +905,7 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
         "test_lock_conflict_under_json_format_prints_a_json_refusal",
         "test_ownerless_validate_batch_removes_terminal_frozen_checkout",
         "test_process_entering_after_final_scan_before_path_move_is_not_deleted",
+        "test_process_path_census_reports_a_live_user_while_unrelated_processes_exit_during_it",
         "test_remove_agent_batch_removes_disk_image_slots",
         "test_remove_refuses_live_process_using_slot",
         "test_root_owned_executable_accepts_host_root_helper",
