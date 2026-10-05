@@ -2908,6 +2908,13 @@ fn spawn_provider(
         output_wake,
         move |stop, notices, output_wake| {
             let log = |line: fmt::Arguments<'_>| service_log(line);
+            let ended_with = |ended: &str| {
+                if let Err(error) = state.note_subscription_down(ended) {
+                    service_log(format_args!(
+                        "agentctl: chat provider: the provider health record could not be saved: {error}"
+                    ));
+                }
+            };
             run_provider_worker(
                 || {
                     provider_generation(
@@ -2923,6 +2930,7 @@ fn spawn_provider(
                 },
                 Instant::now,
                 &log,
+                &ended_with,
                 |delay| stop.wait(delay),
                 stop,
                 notices,
@@ -2955,15 +2963,18 @@ fn spawn_provider_worker(
 }
 
 /// Run provider generations until the service stops or a generation ends the worker. After a
-/// generation that may be retried, log why it ended and how long the worker waits, then wait.
-/// `generation` runs one generation, `now` reads the clock, `log` writes one service log line,
-/// and `wait` sleeps for the given time or until the service stops; production passes
-/// `provider_generation`, `Instant::now`, `service_log` and `StopState::wait`, and a test can
-/// script each of them.
+/// generation that may be retried, pass why it ended to `ended_with`, log it and how long the
+/// worker waits, then wait. `generation` runs one generation, `now` reads the clock, `log` writes
+/// one service log line, `ended_with` records the subscription as failing, and `wait` sleeps for
+/// the given time or until the service stops; production passes `provider_generation`,
+/// `Instant::now`, `service_log`, `BridgeState::note_subscription_down` and `StopState::wait`,
+/// and a test can script each of them.
+#[allow(clippy::too_many_arguments)]
 fn run_provider_worker(
     mut generation: impl FnMut() -> Result<(), ProviderGenerationError>,
     now: impl Fn() -> Instant,
     log: &dyn Fn(fmt::Arguments<'_>),
+    ended_with: &dyn Fn(&str),
     wait: impl Fn(Duration),
     stop: &StopState,
     notices: &mpsc::SyncSender<ProviderNotice>,
@@ -3000,6 +3011,7 @@ fn run_provider_worker(
         if stop.is_stopped() {
             break;
         }
+        ended_with(&ended);
         let delay = backoff.wait_after(now().saturating_duration_since(started));
         log(format_args!(
             "agentctl: chat provider: {ended}; reconnecting in {}s",
@@ -3155,6 +3167,11 @@ where
             "without a saved cursor"
         }
     ));
+    if let Err(error) = state.note_subscription_up() {
+        log(format_args!(
+            "agentctl: chat provider: the provider health record could not be saved: {error}"
+        ));
+    }
     loop {
         if stop.is_stopped() {
             cancel_provider(cancellation)
@@ -4266,6 +4283,7 @@ struct DeliveryWatch {
         DeliveryAlarm,
         chat_runtime::LostReceiptReactions,
         chat_runtime::RefusedReceiptReactions,
+        chat_runtime::ProviderDown,
     )>,
     // The requests whose prompts a scan recorded as typed and whose reply routes no read has
     // given since, because each read failed. Each scan reads them again.
@@ -4450,10 +4468,19 @@ impl DeliveryWatch {
                 return (typed, problem);
             }
         };
-        let alarm = (alarm, lost, refused);
+        let provider = match state.provider_down() {
+            Ok(provider) => provider,
+            Err(error) => {
+                problem.get_or_insert_with(|| {
+                    format!("the provider health record could not be read: {error}")
+                });
+                return (typed, problem);
+            }
+        };
+        let alarm = (alarm, lost, refused, provider);
         if self.written.as_ref() != Some(&alarm) {
             self.written = None;
-            match state.write_delivery_alarm(&alarm.0, &alarm.1, &alarm.2) {
+            match state.write_delivery_alarm(&alarm.0, &alarm.1, &alarm.2, &alarm.3) {
                 Ok(()) => self.written = Some(alarm),
                 Err(error) => {
                     problem.get_or_insert_with(|| {
@@ -5967,6 +5994,129 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
             key.as_str()
         );
         assert!(alarm.get("receipt_reactions_lost").is_none());
+    }
+
+    #[test]
+    fn a_failed_reconnect_reaches_the_delivery_alarm_file_and_leaves_it_once_subscribed() {
+        let (state, _key, root) = state_with_request();
+        let output_wake: SharedWake = Arc::new(Mutex::new(None));
+        let stop = Arc::new(StopState::default());
+        let (sender, _receiver) = mpsc::sync_channel::<ProviderNotice>(PROVIDER_NOTICE_CAPACITY);
+        let worker_state = state.clone();
+        let worker = spawn_provider_worker(
+            Arc::clone(&stop),
+            sender,
+            Arc::clone(&output_wake),
+            move |stop, notices, output_wake| {
+                // The outage of 2026-10-05: the stream drops, then the reconnect fails.
+                let mut script = VecDeque::from([
+                    "subscription backend failed: example_backend: delivery channel closed",
+                    "subscription backend failed: example_backend: operation failed: inspect \
+                     topic control worker: control child closed stdout during AwaitFirstResponse",
+                ]);
+                let waited = Cell::new(0);
+                run_provider_worker(
+                    || {
+                        Err(ProviderGenerationError::Retryable(
+                            script
+                                .pop_front()
+                                .expect("a scripted generation")
+                                .to_owned(),
+                        ))
+                    },
+                    Instant::now,
+                    &|_| {},
+                    &|ended| {
+                        worker_state
+                            .note_subscription_down(ended)
+                            .expect("record the subscription failing");
+                    },
+                    |_| {
+                        waited.set(waited.get() + 1);
+                        if waited.get() == 2 {
+                            stop.stop();
+                        }
+                    },
+                    stop,
+                    notices,
+                    output_wake,
+                );
+            },
+        )
+        .expect("spawn provider worker");
+        join_worker_until(
+            worker,
+            "chat provider",
+            Instant::now() + Duration::from_secs(30),
+        )
+        .expect("the worker ends once the service stops");
+        let read_alarm = || -> Value {
+            serde_json::from_slice(&fs::read(root.join("delivery-alarm.json")).expect("alarm"))
+                .expect("alarm JSON")
+        };
+        let mut watch = DeliveryWatch::new(DeliveryTiming::default());
+        let mut routes = RouteCache::new(Vec::new());
+        watch.scan(&state, &RecordingDelivery::default(), &mut routes);
+        let down = read_alarm();
+        state
+            .note_subscription_up()
+            .expect("what a generation that subscribes records");
+        watch.scan(&state, &RecordingDelivery::default(), &mut routes);
+        let recovered = read_alarm();
+        fs::remove_dir_all(root).expect("cleanup");
+
+        let reported = &down["subscription_down"];
+        assert_eq!(reported["failures"], 2);
+        assert_eq!(
+            reported["last_error_class"],
+            "control child closed stdout during AwaitFirstResponse"
+        );
+        assert!(reported["down_since_millis"].as_u64().is_some());
+        assert!(down.get("send_path_down").is_none());
+        assert!(recovered.get("subscription_down").is_none());
+    }
+
+    #[test]
+    fn a_generation_that_subscribes_ends_a_subscription_failure() {
+        let (state, _, root) = state_with_request();
+        for error in ["delivery channel closed", "control child closed stdout"] {
+            state
+                .note_subscription_down(error)
+                .expect("record the subscription failing");
+        }
+        let before = state.provider_down().expect("provider down");
+        let timeouts = ProcessPhaseTimeouts::new(
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+        )
+        .expect("valid process fixture timeouts");
+        let stop = StopState::default();
+        let cancellation: SharedCancellation =
+            Arc::new(Mutex::new(ProviderCancellationRegistry::default()));
+        let output_wake: SharedWake = Arc::new(Mutex::new(None));
+        let overflowed = AtomicBool::new(false);
+        let (notices, _receiver) = mpsc::sync_channel(PROVIDER_NOTICE_CAPACITY);
+        let ended = run_provider_generation(
+            &state,
+            &stop,
+            &cancellation,
+            &notices,
+            &output_wake,
+            &overflowed,
+            timeouts,
+            || Ok((EndingBackend, unused_cancellation())),
+            &|_| {},
+        );
+        let after = state.provider_down().expect("provider down");
+        let status = state.status().expect("status");
+        fs::remove_dir_all(root).expect("cleanup");
+        assert!(matches!(ended, Ok(())), "{ended:?}");
+        assert!(before.subscription_down.is_some());
+        assert_eq!(after, chat_runtime::ProviderDown::default());
+        assert!(status["provider_health"]["subscription"].is_null());
     }
 
     #[test]
@@ -7561,6 +7711,7 @@ retained events"
                     },
                     || clock.get(),
                     &|line| record.send(line.to_string()).expect("record a log line"),
+                    &|_| {},
                     |delay| {
                         record
                             .send(format!("wait {delay:?}"))
@@ -7635,6 +7786,7 @@ retained events"
                     || panic!("provider generation fixture panic"),
                     Instant::now,
                     &|line| panic!("a panicking generation logged: {line}"),
+                    &|ended| panic!("a panicking generation ended with: {ended}"),
                     |delay| panic!("a panicking generation waited {delay:?}"),
                     stop,
                     notices,

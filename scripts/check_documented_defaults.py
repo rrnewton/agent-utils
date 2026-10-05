@@ -998,6 +998,24 @@ PINS: tuple[Pin, ...] = (
         ),
     ),
     Pin(
+        "chat-provider-down-after-failures",
+        "how many failures in a row put a provider path in `delivery-alarm.json` as down",
+        code=(
+            Site(
+                "rs/agentctl/src/chat_runtime.rs",
+                r"(?m)^pub\(crate\) const PROVIDER_DOWN_AFTER_FAILURES: u64 = (?P<value>[\d_]+);$",
+                "the Rust failure count",
+            ),
+        ),
+        docs=(
+            Site(
+                "rs/agentctl/src/embedded_chat_userguide.md",
+                r"Once\s+a\s+path\s+has\s+failed\s+(?P<value>[A-Za-z\d,]+)\s+times\s+in\s+a\s+row",
+                "the failure count the chat guide states",
+            ),
+        ),
+    ),
+    Pin(
         "chat-ack-retry-seconds",
         "the least time `chat run` waits before it tries a failed or uncertain reaction again, in"
         " seconds",

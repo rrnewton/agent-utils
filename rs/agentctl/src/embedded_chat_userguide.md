@@ -1229,6 +1229,27 @@ running, tries again at each scan, and logs one more line when a scan works
 again. A scan that cannot write the file still tries the prompts it found
 waiting.
 
+`run` also records in `provider-health.json`, in the state directory, whether
+the provider subscription and the outbound send path are failing. The
+subscription fails each time a provider generation ends, including a stream
+the provider closes, and works again once a generation subscribes. The send
+path fails each time the outbound helper fails a reply, an acknowledgement or
+a ✅ in a way that can be retried or whose outcome is unknown, and works again
+once one is sent; a send the helper refuses as not applied and not retryable
+answers that one operation and changes neither. For a failing path the record
+holds `down_since_millis`, when its first failure in a row happened;
+`failures`, how many in a row; `last_failure_at_millis`; `last_error_class`,
+the helper's failure code for a send, such as `provider_authorization`, or for
+the subscription the provider's message after its last `": "`, such as
+`control child closed stdout during AwaitFirstResponse`; and
+`last_error`, the newest message. `chat status` reports both paths in
+`provider_health`, as `subscription` and `sends`, each null while it works,
+with `down_after_failures`. Once a path has failed 2 times in a row, its first
+failure and a retry, `delivery-alarm.json` holds it as `subscription_down` or
+`send_path_down`, and `chat status` reports the same in `delivery_alarm`. A
+routine reconnect, where the provider closes a stream and the next generation
+subscribes at once, is one failure and is never reported there.
+
 `chat status` reports the same list in `delivery_alarm`, as
 `stall_after_seconds` and `stalled`, computed from the request records at the
 time of the call; each of its entries also carries `age_seconds`, the whole

@@ -157,6 +157,23 @@ const RECEIPT_REACTION_REFUSAL_FILE: &str = "receipt-reactions-refused.json";
 const MAX_RECEIPT_REACTION_REFUSAL_BYTES: usize = 64 * 1_024;
 const _: () =
     assert!(MAX_RECEIPT_REACTION_REFUSAL_BYTES >= 6 * MAX_RECEIPT_REACTION_ERROR_BYTES + 1_024);
+// The schema of `provider-health.json`, which records whether the provider subscription and the
+// outbound send path are failing: see `ProviderHealthRecord`.
+const PROVIDER_HEALTH_SCHEMA: &str = "agentctl-chat-provider-health/v1";
+const PROVIDER_HEALTH_FILE: &str = "provider-health.json";
+const MAX_PROVIDER_ERROR_BYTES: usize = 2_000;
+const MAX_PROVIDER_ERROR_CLASS_BYTES: usize = 200;
+// Room for the largest record: two paths, each with an error and its class, which JSON may spell
+// in six times their own size.
+const MAX_PROVIDER_HEALTH_BYTES: usize = 32 * 1_024;
+const _: () = assert!(
+    MAX_PROVIDER_HEALTH_BYTES
+        >= 12 * (MAX_PROVIDER_ERROR_BYTES + MAX_PROVIDER_ERROR_CLASS_BYTES) + 1_024
+);
+/// A path is reported down in `delivery-alarm.json` once this many attempts in a row failed: the
+/// first failure and at least one retry. A routine reconnect, where the provider closes a stream
+/// and the next one subscribes at once, is one failure and is never reported.
+pub(crate) const PROVIDER_DOWN_AFTER_FAILURES: u64 = 2;
 // Room for the largest record the state can write: JSON spells a control character in six bytes,
 // so the channel, the message and a saved error may each take six times their own size.
 const MAX_RECEIPT_REACTION_BYTES: usize = 64 * 1_024;
@@ -2185,6 +2202,105 @@ pub(crate) struct RefusedReceiptReactions {
     pub(crate) last_detail: Option<String>,
 }
 
+/// Whether the provider subscription and the outbound send path are failing, as `chat run` saves
+/// it in `provider-health.json` in the state directory. A path is absent while it works: from its
+/// first failure after it last worked until it works again, it holds a [`PathFailure`]. The
+/// subscription works once a generation subscribes; the send path works once a reply, an
+/// acknowledgement or a ✅ is sent. A send the helper refuses as not applied and not retryable is
+/// a final answer about that one operation, not a failure of the path, so it neither starts nor
+/// ends a failure.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderHealthRecord {
+    schema: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subscription: Option<PathFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sends: Option<PathFailure>,
+}
+
+/// A path that failed and has not worked since: see [`ProviderHealthRecord`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PathFailure {
+    /// When the first of these failures happened.
+    pub(crate) down_since_millis: u64,
+    /// The failures in a row, with no success between them.
+    pub(crate) failures: u64,
+    pub(crate) last_failure_at_millis: u64,
+    /// The kind of the newest failure: for a send, the helper's failure code, such as
+    /// `provider_authorization`; for the subscription, the most specific part of the provider's
+    /// message, the text after its last `": "`.
+    pub(crate) last_error_class: String,
+    /// The newest failure's message, bounded.
+    pub(crate) last_error: String,
+}
+
+impl PathFailure {
+    /// Whether this failure has gone on long enough to report: see
+    /// [`PROVIDER_DOWN_AFTER_FAILURES`].
+    fn alarming(&self) -> bool {
+        self.failures >= PROVIDER_DOWN_AFTER_FAILURES
+    }
+
+    fn valid(&self) -> bool {
+        self.failures > 0
+            && self.down_since_millis <= self.last_failure_at_millis
+            && !self.last_error_class.is_empty()
+            && self.last_error_class.len() <= MAX_PROVIDER_ERROR_CLASS_BYTES
+            && self.last_error.len() <= MAX_PROVIDER_ERROR_BYTES
+    }
+}
+
+/// The paths that are down, as `chat status` and `delivery-alarm.json` report them: those whose
+/// failure [`PathFailure::alarming`] says to report.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub(crate) struct ProviderDown {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) subscription_down: Option<PathFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) send_path_down: Option<PathFailure>,
+}
+
+/// The class [`PathFailure::last_error_class`] records for a subscription failure `error`.
+fn subscription_error_class(error: &str) -> String {
+    let specific = error.rsplit(": ").next().unwrap_or(error).trim();
+    let specific = if specific.is_empty() {
+        "unknown"
+    } else {
+        specific
+    };
+    bounded_detail(specific, MAX_PROVIDER_ERROR_CLASS_BYTES)
+}
+
+/// `previous` with one more failure at `now`, of class `class` with message `error`, or the first
+/// failure when the path was working.
+fn next_failure(
+    previous: Option<PathFailure>,
+    now: u64,
+    class: String,
+    error: &str,
+) -> PathFailure {
+    let error = bounded_detail(error, MAX_PROVIDER_ERROR_BYTES);
+    match previous {
+        Some(mut failure) => {
+            failure.failures = failure.failures.saturating_add(1);
+            // A clock stepped back does not put the newest failure before the first.
+            failure.last_failure_at_millis = now.max(failure.down_since_millis);
+            failure.last_error_class = class;
+            failure.last_error = error;
+            failure
+        }
+        None => PathFailure {
+            down_since_millis: now,
+            failures: 1,
+            last_failure_at_millis: now,
+            last_error_class: class,
+            last_error: error,
+        },
+    }
+}
+
 /// What [`BridgeState::save_receipt_reactions`] did.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ReceiptSaves {
@@ -2206,6 +2322,8 @@ struct DeliveryAlarmDocument<'a> {
     receipt_reactions_lost: Option<&'a LostReceiptReactions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     receipt_reactions_refused: Option<&'a RefusedReceiptReactions>,
+    #[serde(flatten)]
+    provider: &'a ProviderDown,
 }
 
 /// A ✅ receipt reaction that a request earned and that is not on its message yet, saved as
@@ -5258,6 +5376,8 @@ impl BridgeState {
                 .unwrap_or(0);
             acknowledgements.insert(ack_key.to_owned(), Value::from(ack_count.saturating_add(1)));
         }
+        let provider_health = self.read_provider_health()?;
+        let provider_down = self.provider_down_locked()?;
         Ok(serde_json::json!({
             "subscription_plugin": self.config.subscription_plugin,
             "backend_configuration_schema": self.config.backend_configuration.as_ref().map(|value| &value.schema),
@@ -5300,11 +5420,18 @@ impl BridgeState {
                 "typed_not_replied": not_replied,
                 "replied": replied,
             },
+            "provider_health": {
+                "subscription": provider_health.subscription,
+                "sends": provider_health.sends,
+                "down_after_failures": PROVIDER_DOWN_AFTER_FAILURES,
+            },
             "delivery_alarm": {
                 "stall_after_seconds": DELIVERY_STALL_AFTER.as_secs(),
                 "stalled": stalled,
                 "receipt_reactions_lost": self.lost_receipt_reactions_locked()?,
                 "receipt_reactions_refused": self.refused_receipt_reactions_locked()?,
+                "subscription_down": provider_down.subscription_down,
+                "send_path_down": provider_down.send_path_down,
             },
             "requests": requests,
             "reply_breaker": self.reply_breaker_status(),
@@ -5328,12 +5455,14 @@ impl BridgeState {
     }
 
     /// Replace `delivery-alarm.json` in the state directory with `alarm`, `lost` once any ✅
-    /// receipt reaction was lost, and `refused` once the outbound helper refused any.
+    /// receipt reaction was lost, `refused` once the outbound helper refused any, and each
+    /// provider path that `provider` reports down.
     pub(crate) fn write_delivery_alarm(
         &self,
         alarm: &DeliveryAlarm,
         lost: &LostReceiptReactions,
         refused: &RefusedReceiptReactions,
+        provider: &ProviderDown,
     ) -> Result<()> {
         write_document(
             &self.root.join(DELIVERY_ALARM_FILE),
@@ -5341,8 +5470,134 @@ impl BridgeState {
                 alarm,
                 receipt_reactions_lost: (lost.count > 0).then_some(lost),
                 receipt_reactions_refused: (refused.count > 0).then_some(refused),
+                provider,
             },
         )
+    }
+
+    /// Read `provider-health.json`, if a provider path has failed. The caller holds the state
+    /// lock.
+    fn read_provider_health(&self) -> Result<ProviderHealthRecord> {
+        let path = self.root.join(PROVIDER_HEALTH_FILE);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(ChatRuntimeError::invalid(
+                    "the provider health record is not a regular file",
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(ProviderHealthRecord {
+                    schema: PROVIDER_HEALTH_SCHEMA.to_owned(),
+                    ..ProviderHealthRecord::default()
+                })
+            }
+            Err(error) => return Err(ChatRuntimeError::Io(error)),
+        }
+        let record: ProviderHealthRecord = read_document(&path, MAX_PROVIDER_HEALTH_BYTES)?;
+        if record.schema != PROVIDER_HEALTH_SCHEMA
+            || [&record.subscription, &record.sends]
+                .into_iter()
+                .flatten()
+                .any(|failure| !failure.valid())
+        {
+            return Err(ChatRuntimeError::invalid(
+                "the provider health record is inconsistent",
+            ));
+        }
+        Ok(record)
+    }
+
+    /// Apply `change` to the provider health record and save it if it changed.
+    fn update_provider_health(&self, change: impl FnOnce(&mut ProviderHealthRecord)) -> Result<()> {
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        self.update_provider_health_locked(change)
+    }
+
+    fn update_provider_health_locked(
+        &self,
+        change: impl FnOnce(&mut ProviderHealthRecord),
+    ) -> Result<()> {
+        let mut record = self.read_provider_health()?;
+        let before = record.clone();
+        change(&mut record);
+        if record == before {
+            return Ok(());
+        }
+        write_document(&self.root.join(PROVIDER_HEALTH_FILE), &record)
+    }
+
+    /// Record that a provider generation ended without subscribing, or that a subscribed one
+    /// ended, with `error` saying why. The subscription stays failing until a generation
+    /// subscribes: see [`Self::note_subscription_up`].
+    pub(crate) fn note_subscription_down(&self, error: &str) -> Result<()> {
+        let now = unix_millis();
+        self.update_provider_health(|record| {
+            record.subscription = Some(next_failure(
+                record.subscription.take(),
+                now,
+                subscription_error_class(error),
+                error,
+            ));
+        })
+    }
+
+    /// Record that a provider generation subscribed, which ends any subscription failure.
+    pub(crate) fn note_subscription_up(&self) -> Result<()> {
+        self.update_provider_health(|record| record.subscription = None)
+    }
+
+    /// Record the outcome of one outbound send: `Ok` for a send the provider applied, or the
+    /// helper's failure. The caller holds the state lock. A failure the helper reports as not
+    /// applied and not retryable is final for that operation only and changes nothing: see
+    /// [`ProviderHealthRecord`].
+    fn note_send_outcome_locked(
+        &self,
+        outcome: std::result::Result<(), &OutboundFailure>,
+    ) -> Result<()> {
+        match outcome {
+            Ok(()) => self.update_provider_health_locked(|record| record.sends = None),
+            Err(failure)
+                if failure.outcome == OutboundOutcome::NotApplied && !failure.retryable =>
+            {
+                Ok(())
+            }
+            Err(failure) => {
+                let now = unix_millis();
+                self.update_provider_health_locked(|record| {
+                    record.sends = Some(next_failure(
+                        record.sends.take(),
+                        now,
+                        bounded_detail(&failure.code, MAX_PROVIDER_ERROR_CLASS_BYTES),
+                        &failure.to_string(),
+                    ));
+                })
+            }
+        }
+    }
+
+    /// As [`Self::note_send_outcome_locked`], taking the state lock.
+    fn note_send_outcome(&self, outcome: std::result::Result<(), &OutboundFailure>) -> Result<()> {
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        self.note_send_outcome_locked(outcome)
+    }
+
+    /// The provider paths that are down, as `delivery-alarm.json` reports them.
+    pub(crate) fn provider_down(&self) -> Result<ProviderDown> {
+        let _snapshot = self.lock_state_snapshot()?;
+        self.provider_down_locked()
+    }
+
+    fn provider_down_locked(&self) -> Result<ProviderDown> {
+        let record = self.read_provider_health()?;
+        Ok(ProviderDown {
+            subscription_down: record.subscription.filter(PathFailure::alarming),
+            send_path_down: record.sends.filter(PathFailure::alarming),
+        })
     }
 
     #[cfg(test)]
@@ -5709,12 +5964,16 @@ impl BridgeState {
         // A receipt whose reaction ID cannot be kept is a failed attempt like a transport error,
         // so it is saved with the reaction and counted as failing.
         let mut refused = false;
-        let outcome = match transport.ensure_reaction(ReactionSubmission {
+        let ensured = transport.ensure_reaction(ReactionSubmission {
             channel_id: &snapshot.channel_id,
             message_id: &snapshot.message_id,
             emoji: &snapshot.emoji,
             request_id: &snapshot.request_id,
-        }) {
+        });
+        // Bookkeeping only, as in `publish_one`. A provider that answered, even with a reaction ID
+        // that cannot be kept, shows the send path works.
+        let _ = self.note_send_outcome(ensured.as_ref().map(|_| ()));
+        let outcome = match ensured {
             Ok(receipt) => validate_single_line(
                 &receipt.reaction_id,
                 "provider reaction id",
@@ -7837,6 +8096,8 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                 let state_lock =
                     agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
                 state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+                // Bookkeeping only, as in `publish_one`.
+                let _ = self.note_send_outcome_locked(Err(&error));
                 let mut request = self.read_request(key)?;
                 request.ack_phase = AckPhase::Sending;
                 request.ack_error = Some(bounded_detail(&error.to_string(), 2_000));
@@ -7858,6 +8119,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _ = self.note_send_outcome_locked(Ok(()));
         let mut request = self.read_request(key)?;
         if request.ack_request_id != request_snapshot.ack_request_id {
             return Err(ChatRuntimeError::invalid(
@@ -8289,16 +8551,20 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             (request, reply)
         };
 
-        let provider_message_id = transport
-            .send(ReplySubmission {
-                channel_id: &request_snapshot.message.channel_id,
-                thread_id: &request_snapshot.message.thread_id,
-                body: &outbound_text(&self.config.agent_label, &reply.body),
-                request_id: &reply.send_request_id,
-            })
-            .map_err(|error| {
-                ChatRuntimeError::invalid(format!("outbound chat send failed: {error}"))
-            })?;
+        let sent = transport.send(ReplySubmission {
+            channel_id: &request_snapshot.message.channel_id,
+            thread_id: &request_snapshot.message.thread_id,
+            body: &outbound_text(&self.config.agent_label, &reply.body),
+            request_id: &reply.send_request_id,
+        });
+        if let Err(failure) = &sent {
+            // The health record is bookkeeping: failing to update it never changes a send's
+            // result.
+            let _ = self.note_send_outcome(Err(failure));
+        }
+        let provider_message_id = sent.map_err(|error| {
+            ChatRuntimeError::invalid(format!("outbound chat send failed: {error}"))
+        })?;
         validate_single_line(
             &provider_message_id,
             "provider reply message id",
@@ -8308,6 +8574,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _ = self.note_send_outcome_locked(Ok(()));
         let mut current = self.read_reply(key, reply.ordinal)?;
         if current.body != reply.body || current.send_request_id != reply.send_request_id {
             return Err(ChatRuntimeError::invalid(
@@ -27298,6 +27565,195 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
         assert_eq!(refused.count, 2);
         assert_eq!(status["refused"], 2);
         assert_eq!(status["waiting"], 0);
+    }
+
+    /// A reaction transport that answers each call with the next scripted result.
+    struct ScriptedReactions(VecDeque<std::result::Result<ReactionReceipt, OutboundFailure>>);
+
+    impl ReactionTransport for ScriptedReactions {
+        fn ensure_reaction(
+            &mut self,
+            _submission: ReactionSubmission<'_>,
+        ) -> std::result::Result<ReactionReceipt, OutboundFailure> {
+            self.0.pop_front().expect("a scripted reaction result")
+        }
+    }
+
+    /// The failure the helper reported for every send on 2026-10-05 once it could not sign in.
+    fn authorization_failure() -> OutboundFailure {
+        OutboundFailure {
+            code: "provider_authorization".to_owned(),
+            detail:
+                "provider child could not mint its local authorization before any provider call"
+                    .to_owned(),
+            outcome: OutboundOutcome::NotApplied,
+            retryable: true,
+        }
+    }
+
+    fn reaction_added() -> ReactionReceipt {
+        ReactionReceipt {
+            reaction_id: "spaces/space/messages/message/reactions/reaction".to_owned(),
+            already_present: false,
+        }
+    }
+
+    #[test]
+    fn a_subscription_that_fails_again_after_it_dropped_is_reported_down_until_it_subscribes() {
+        let root = temporary("provider-subscription-down");
+        let state = BridgeState::initialize(&root, config()).expect("initialize");
+        state
+            .note_subscription_down(
+                "subscription backend failed: example_backend: delivery channel closed",
+            )
+            .expect("note the drop");
+        let dropped = state.status().expect("status");
+        let reported_after_drop = state.provider_down().expect("provider down");
+        state
+            .note_subscription_down(
+                "subscription backend failed: example_backend: operation failed: inspect topic \
+                 control worker: control child closed stdout during AwaitFirstResponse",
+            )
+            .expect("note the failed reconnect");
+        let failed = state.status().expect("status");
+        let down = state.provider_down().expect("provider down");
+        state.note_subscription_up().expect("note the subscription");
+        let recovered = state.status().expect("status");
+        let reported_after_up = state.provider_down().expect("provider down");
+        fs::remove_dir_all(root).expect("cleanup");
+
+        // A drop alone is a routine reconnect: recorded, not reported.
+        let first = &dropped["provider_health"]["subscription"];
+        assert_eq!(first["failures"], 1);
+        assert_eq!(first["last_error_class"], "delivery channel closed");
+        assert!(dropped["delivery_alarm"]["subscription_down"].is_null());
+        assert_eq!(reported_after_drop, ProviderDown::default());
+        // The failed reconnect after it is reported, as down since the drop.
+        let reported = down
+            .subscription_down
+            .expect("the subscription is reported down");
+        assert_eq!(reported.failures, PROVIDER_DOWN_AFTER_FAILURES);
+        assert_eq!(
+            reported.last_error_class,
+            "control child closed stdout during AwaitFirstResponse"
+        );
+        assert_eq!(
+            Some(reported.down_since_millis),
+            first["down_since_millis"].as_u64()
+        );
+        assert!(reported.last_failure_at_millis >= reported.down_since_millis);
+        assert!(down.send_path_down.is_none());
+        let alarmed = &failed["delivery_alarm"]["subscription_down"];
+        assert_eq!(alarmed["failures"], 2);
+        assert_eq!(
+            alarmed["last_error_class"],
+            "control child closed stdout during AwaitFirstResponse"
+        );
+        // Subscribing ends it.
+        assert!(recovered["provider_health"]["subscription"].is_null());
+        assert!(recovered["delivery_alarm"]["subscription_down"].is_null());
+        assert_eq!(reported_after_up, ProviderDown::default());
+    }
+
+    #[test]
+    fn repeated_retryable_send_failures_report_the_send_path_down_until_a_send_works() {
+        let (root, state, keys) = saved_receipt_reactions("provider-send-path-down", 1);
+        let mut acks = ScriptedReactions(VecDeque::from([
+            Err(authorization_failure()),
+            Err(authorization_failure()),
+            Ok(reaction_added()),
+        ]));
+        assert!(state.ensure_ack(&keys[0], &mut acks).is_err());
+        let reported_after_one = state.provider_down().expect("provider down");
+        assert!(state.ensure_ack(&keys[0], &mut acks).is_err());
+        let down = state.provider_down().expect("provider down");
+        // A final refusal answers one operation and says nothing about the path.
+        let mut refusal = FinalRefusal {
+            detail: "owner ACK request does not match its configured space and emoji".to_owned(),
+            calls: 0,
+        };
+        assert!(state
+            .ensure_receipt_reaction(&keys[0], &mut refusal)
+            .is_err());
+        let after_refusal = state.provider_down().expect("provider down");
+        let status = state.status().expect("status");
+        state
+            .ensure_ack(&keys[0], &mut acks)
+            .expect("the third ACK works");
+        let recovered = state.status().expect("status");
+        let reported_after_send = state.provider_down().expect("provider down");
+        fs::remove_dir_all(root).expect("cleanup");
+
+        assert_eq!(reported_after_one, ProviderDown::default());
+        let reported = down.send_path_down.expect("the send path is reported down");
+        assert_eq!(reported.failures, 2);
+        assert_eq!(reported.last_error_class, "provider_authorization");
+        assert!(reported
+            .last_error
+            .contains("could not mint its local authorization"));
+        assert!(down.subscription_down.is_none());
+        assert_eq!(refusal.calls, 1);
+        assert_eq!(after_refusal.send_path_down, Some(reported));
+        assert_eq!(
+            status["delivery_alarm"]["send_path_down"]["last_error_class"],
+            "provider_authorization"
+        );
+        assert_eq!(status["provider_health"]["sends"]["failures"], 2);
+        assert!(recovered["provider_health"]["sends"].is_null());
+        assert!(recovered["delivery_alarm"]["send_path_down"].is_null());
+        assert_eq!(reported_after_send, ProviderDown::default());
+    }
+
+    /// A reply transport that answers each call with the next scripted result.
+    struct ScriptedReplies(VecDeque<std::result::Result<String, OutboundFailure>>);
+
+    impl ReplyTransport for ScriptedReplies {
+        fn send(
+            &mut self,
+            _submission: ReplySubmission<'_>,
+        ) -> std::result::Result<String, OutboundFailure> {
+            self.0.pop_front().expect("a scripted reply result")
+        }
+    }
+
+    #[test]
+    fn reply_sends_that_keep_failing_report_the_send_path_down_until_one_is_sent() {
+        let (root, state, keys) = saved_receipt_reactions("provider-reply-send-down", 1);
+        let key = &keys[0];
+        let route = state
+            .next_reply_route(key)
+            .expect("route")
+            .expect("open route");
+        state
+            .capture_replies(
+                key,
+                &format!(
+                    "<CHAT_REPLY_{}>\nheld reply\n</CHAT_REPLY_{}>",
+                    route.identifier, route.identifier
+                ),
+            )
+            .expect("capture reply");
+        let mut replies = ScriptedReplies(VecDeque::from([
+            Err(authorization_failure()),
+            Err(authorization_failure()),
+            Ok("spaces/space/messages/reply".to_owned()),
+        ]));
+        assert!(state.publish_one(key, &mut replies).is_err());
+        let reported_after_one = state.provider_down().expect("provider down");
+        assert!(state.publish_one(key, &mut replies).is_err());
+        let down = state.provider_down().expect("provider down");
+        state
+            .publish_one(key, &mut replies)
+            .expect("the third send works")
+            .expect("provider receipt");
+        let reported_after_send = state.provider_down().expect("provider down");
+        fs::remove_dir_all(root).expect("cleanup");
+
+        assert_eq!(reported_after_one, ProviderDown::default());
+        let reported = down.send_path_down.expect("the send path is reported down");
+        assert_eq!(reported.failures, 2);
+        assert_eq!(reported.last_error_class, "provider_authorization");
+        assert_eq!(reported_after_send, ProviderDown::default());
     }
 
     #[test]
