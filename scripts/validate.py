@@ -189,6 +189,7 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     ("scripts/check_python_packages.py", frozenset({PYTHON_PACKAGES})),
     ("scripts/check_rust_packages.py", frozenset({RUST_PACKAGES})),
     ("scripts/with-node22", frozenset({TIMELINE_BROWSER})),
+    ("scripts/provision-node-packages", frozenset({TIMELINE_BROWSER, VIBE_TALK})),
     # These define the planner or executable graph itself; only the complete portable contract can prove a
     # change to them. The exact rules beat the repository-infrastructure component mapping.
     ("scripts/validate.py", frozenset(GROUPS)),
@@ -866,6 +867,11 @@ def self_test() -> int:
         ["scripts/with-node22"],
         {TIMELINE_BROWSER},
         "the pinned Node launcher is an input to the browser contract",
+    )
+    expect(
+        ["scripts/provision-node-packages"],
+        {TIMELINE_BROWSER, VIBE_TALK},
+        "the npm provisioning step is an input to both suites that install packages",
     )
     expect(
         [".github/workflows/cross-dagrun.yml"],

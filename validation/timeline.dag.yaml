@@ -4,6 +4,26 @@ resource_caps:
   browser: 1
 
 steps:
+  # The browser checks run Playwright from py/tests/js/browser/node_modules and drive the Chromium
+  # build that Playwright version names, so they depend on the step that installs both rather than
+  # on whoever last ran `npm install` there. The directory tracks no lockfile (see its README); its
+  # package.json pins @playwright/test exactly, and Playwright pins its own dependencies exactly.
+  - group: setup
+    job: browser-deps
+    desc: install the pinned Playwright and the Chromium build it drives
+    cmd: >-
+      scripts/provision-node-packages py/tests/js/browser &&
+      cd py/tests/js/browser &&
+      ../../../../scripts/with-node22 npx playwright install chromium
+    jobs_flag: ""
+    labels: [validation-timeline, component-wrkviz]
+    timeout: 900
+    cpu_timeout: 600
+    hint:
+      est_duration_s: 5
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   - group: browser
     job: functional
     desc: drive timeline interactions in Chromium
@@ -13,6 +33,7 @@ steps:
       cd py/tests/js/browser &&
       ../../../../scripts/with-node22 npx playwright test --reporter=line
     jobs_flag: ""
+    deps: [setup.browser-deps]
     labels: [validation-timeline, component-wrkviz]
     timeout: 600
     cpu_timeout: 900
@@ -30,6 +51,7 @@ steps:
       cd py/tests/js/browser &&
       ../../../../scripts/with-node22 node --test benchmark-site.test.cjs
     jobs_flag: ""
+    deps: [setup.browser-deps]
     labels: [validation-timeline, component-wrkviz]
     timeout: 600
     cpu_timeout: 900
@@ -48,6 +70,7 @@ steps:
       ../../../../scripts/with-node22 node --test benchmark-budget.test.cjs &&
       printf '\n' && cat benchmark-report.txt
     jobs_flag: ""
+    deps: [setup.browser-deps]
     labels: [validation-timeline, component-wrkviz]
     timeout: 600
     cpu_timeout: 900

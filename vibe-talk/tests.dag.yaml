@@ -82,12 +82,29 @@ steps:
 
   # The generated browser contract matches the schema, and voice.js type-checks against it. The
   # schema's own freshness against the Rust types is a `cargo test` in `test.unit`.
+  # The contract check runs the generator's tools (Ajv, TypeScript) from contract/node_modules, so
+  # it depends on the step that installs them from contract/package-lock.json rather than on
+  # whoever last ran `npm ci` in this checkout. A repeat run with the same lockfile does nothing.
+  - group: setup
+    job: contract-tools
+    desc: install the contract generator's lockfile-pinned tools
+    labels: [validation-vibe-talk]
+    cmd: scripts/provision-node-packages vibe-talk/contract
+    jobs_flag: ""
+    timeout: 600
+    cpu_timeout: 300
+    hint:
+      est_duration_s: 2
+      classification: latency-bound
+      rss_baseline_bytes: 536870912
+
   - group: check
     job: contract
     desc: generated browser contract is current, and tsc --checkJs over voice.js
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && make contract-check typecheck
     jobs_flag: ""
+    deps: [setup.contract-tools]
     cpu_timeout: 120
     hint:
       est_duration_s: 8
