@@ -1,5 +1,11 @@
 description: Tool-owned Rust regression suites
 
+# The suites build into rs/target/validation-tests, never rs/target itself. rs/target holds the
+# tracked launchers' cache (rs/bin/cargo-runner). `cargo test` relinks a package's binaries there
+# with its dev-dependency features, so the next launcher call, from any step running beside the
+# suite, found its stamped binary replaced and ran `cargo clean` for that package, deleting the
+# test binaries of the suite still running: a test that re-executed itself got ENOENT.
+
 resource_caps:
   cargo-target: 4
 
@@ -10,7 +16,7 @@ steps:
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
       RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
-      --target "$host_target" -p agentctl ${DAGRUN_EXTRA_ARGS}
+      --target "$host_target" --target-dir rs/target/validation-tests -p agentctl ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-agentctl]
     timeout: 1200
@@ -28,7 +34,7 @@ steps:
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
       RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
-      --target "$host_target" -p chat-subscription ${DAGRUN_EXTRA_ARGS}
+      --target "$host_target" --target-dir rs/target/validation-tests -p chat-subscription ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-agentctl]
     timeout: 600
@@ -41,7 +47,7 @@ steps:
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
       RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
-      --target "$host_target" -p chat-subscription-plugin ${DAGRUN_EXTRA_ARGS}
+      --target "$host_target" --target-dir rs/target/validation-tests -p chat-subscription-plugin ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-agentctl]
     timeout: 600
@@ -54,7 +60,7 @@ steps:
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
       RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
-      --target "$host_target" -p chat-subscription-fake ${DAGRUN_EXTRA_ARGS}
+      --target "$host_target" --target-dir rs/target/validation-tests -p chat-subscription-fake ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-agentctl]
     timeout: 600
@@ -67,7 +73,7 @@ steps:
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
       RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
-      --target "$host_target" -p dagrun ${DAGRUN_EXTRA_ARGS}
+      --target "$host_target" --target-dir rs/target/validation-tests -p dagrun ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-dagrun]
     delegated_children: true
@@ -81,7 +87,7 @@ steps:
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
       RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
-      --target "$host_target" -p herdr-run ${DAGRUN_EXTRA_ARGS}
+      --target "$host_target" --target-dir rs/target/validation-tests -p herdr-run ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-herdr-run]
     timeout: 600
@@ -94,7 +100,7 @@ steps:
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
       RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
-      --target "$host_target" -p pr-landing-planner ${DAGRUN_EXTRA_ARGS}
+      --target "$host_target" --target-dir rs/target/validation-tests -p pr-landing-planner ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-planner]
     timeout: 600
@@ -107,7 +113,7 @@ steps:
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
       RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
-      --target "$host_target" -p tick-hub ${DAGRUN_EXTRA_ARGS}
+      --target "$host_target" --target-dir rs/target/validation-tests -p tick-hub ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-tick-hub]
     timeout: 600
@@ -120,7 +126,7 @@ steps:
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
       RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
-      --target "$host_target" -p wrkslotsd ${DAGRUN_EXTRA_ARGS}
+      --target "$host_target" --target-dir rs/target/validation-tests -p wrkslotsd ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-wrkslots]
     timeout: 600

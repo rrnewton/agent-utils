@@ -4,8 +4,9 @@
 description: Shared repository hygiene, generated-document, build, and lint checks
 
 resource_caps:
-  # Workspace tests and clippy share rs/target. Count every Cargo consumer against one cap so a
-  # lint lane cannot silently turn four deliberately bounded test builds into five.
+  # Workspace tests and clippy are Cargo builds under rs/target. Count every Cargo consumer
+  # against one cap so a lint lane cannot silently turn four deliberately bounded test builds
+  # into five.
   cargo-target: 4
 
 steps:
