@@ -1,10 +1,11 @@
 ---
 title: 'channel-view-memory: remember the view the owner picked in each channel, across restarts'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-10-04T20:18:40.761308810+00:00
-updated_at: 2026-10-04T20:18:40.761308810+00:00
+updated_at: 2026-10-05T06:10:23.860091356+00:00
+closed_at: 2026-10-05T06:10:23.860091216+00:00
 ---
 
 # Description
