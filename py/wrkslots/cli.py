@@ -17186,6 +17186,7 @@ def _assert_slot_unused(
     agent_batch: _AgentRemoveBatchContext | None = None,
     canonical_path: Path | None = None,
     after_fence: bool = False,
+    before_image_fence: bool = False,
 ) -> None:
     while True:
         observation = _observe_slot_use_once(
@@ -17199,7 +17200,10 @@ def _assert_slot_unused(
             ignore_current_process=ignore_current_process,
             capture_generation=live_use_recheck is not None,
             **_agent_batch_use_check(
-                agent_batch, canonical_path, after_fence=after_fence
+                agent_batch,
+                canonical_path,
+                after_fence=after_fence,
+                before_image_fence=before_image_fence,
             ),
         )
         if observation is None:
@@ -17228,6 +17232,7 @@ def _observe_slot_use_once(
     agent_batch: _AgentRemoveBatchContext | None = None,
     canonical_path: Path | None = None,
     after_fence: bool = False,
+    before_image_fence: bool = False,
 ) -> _LiveUseObservation | None:
     try:
         current_directory = Path.cwd().resolve(strict=True)
@@ -17248,6 +17253,13 @@ def _observe_slot_use_once(
         ):
             raise StateError(
                 "an agent removal batch replaces only the ordinary lsof process check"
+            )
+        if before_image_fence:
+            return agent_batch.observe_image_before_fence(
+                slot_path,
+                record,
+                canonical_path=slot_path if canonical_path is None else canonical_path,
+                capture_generation=capture_generation,
             )
         if after_fence:
             if canonical_path is None:
@@ -29764,6 +29776,29 @@ def _begin_or_resume_path_fence(
                 f"slot {record.slot} changed after reclaim was prepared; preserve it and "
                 "rerun remove so the changed state is recorded"
             )
+        if (
+            finish.agent_batch is not None
+            and original in finish.agent_batch.image_targets
+        ):
+            # The fence below mounts the image again, possibly from another
+            # device, and the identity scan after it cannot match a process
+            # still in the old mount; lsof finds one now, by device and inode.
+            _assert_slot_unused(
+                original,
+                _record_for_slot_use_check(
+                    record,
+                    validate_complete=finish.validate_complete,
+                    allow_live_validate_owner=finish.allow_live_validate_owner,
+                    owner_consented=finish.owner_consented,
+                ),
+                live_use_recheck=finish.live_use_recheck,
+                **_agent_batch_use_check(
+                    finish.agent_batch, original, before_image_fence=True
+                ),
+            )
+        # A bounded scan above may finish in its termination grace after the
+        # remove-agent-batch item budget ran out; nothing is fenced then.
+        _item_seconds_left("the path fence")
         try:
             _rename_slot_path(config, original, fenced)
             _fsync_directory(original.parent)
@@ -32699,9 +32734,20 @@ class _AgentRemoveBatchContext:
     _AGENT_REMOVE_BATCH_ITEM_SECONDS), and ``last_seconds_before_deletion``
     is how long the last item held the registry lock before it began
     deleting, or None when it did not reach deletion.
+
+    ``image_targets`` names the image-backed targets.  The fence of such a
+    slot mounts its image again, possibly from another device, so the
+    identity scan after the fence cannot match a process still working in
+    the old mount, for example through a detached bind alias in a mount
+    namespace of its own, and would report the slot unused.  Immediately
+    before the fence of such a target, ``observe_image_before_fence`` runs
+    the ordinary lsof check, as 'remove --no-lock-budget' does there, held
+    to the item budget; it finds such a process while the old mount is
+    still the slot's.
     """
 
     identities: dict[Path, tuple[int, int]]
+    image_targets: frozenset[Path] = frozenset()
     census: _ProcessPathCensus = dataclasses.field(
         default_factory=lambda: _ProcessPathCensus((), (), owner_cgroup_complete=False)
     )
@@ -32716,6 +32762,8 @@ class _AgentRemoveBatchContext:
     fenced_scan_seconds: float = 0.0
     fenced_lsof_fallbacks: list[str] = dataclasses.field(default_factory=list)
     fenced_lsof_fallback_seconds: float = 0.0
+    image_lsof_check_count: int = 0
+    image_lsof_check_seconds: float = 0.0
     nested_git_evidence: list[dict[str, object]] = dataclasses.field(
         default_factory=list
     )
@@ -32751,6 +32799,42 @@ class _AgentRemoveBatchContext:
         )
         self.captured_at = time.monotonic()
         _interrupt_for_test("after-agent-batch-shared-census")
+
+    def observe_image_before_fence(
+        self,
+        check_path: Path,
+        record: ActiveRecord | None,
+        *,
+        canonical_path: Path,
+        capture_generation: bool,
+    ) -> _LiveUseObservation | None:
+        """Run the ordinary lsof check of an image-backed target just before its fence.
+
+        See ``image_targets``.  It is bounded like the lsof check after the
+        fence that ``observe_fenced`` falls back to.
+        """
+
+        if check_path != canonical_path or canonical_path not in self.image_targets:
+            raise StateError(
+                f"an agent removal batch checks only an image-backed slot's unfenced "
+                f"path with lsof before its fence, not {check_path}"
+            )
+        started = time.monotonic()
+        self.image_lsof_check_count += 1
+        try:
+            # lsof is itself held to the item budget and stopped when it runs
+            # out; this wait bounds the in-process scan that follows it.
+            return _run_item_scan(
+                lambda _cancel: _observe_slot_use_once(
+                    check_path, record, capture_generation=capture_generation
+                ),
+                "the lsof check of an image-backed slot before the path fence",
+                seconds=_AGENT_REMOVE_BATCH_LSOF_SECONDS,
+                grace=_AGENT_REMOVE_BATCH_TERM_GRACE_SECONDS
+                + _AGENT_REMOVE_BATCH_REAP_SECONDS,
+            )
+        finally:
+            self.image_lsof_check_seconds += time.monotonic() - started
 
     def observe(
         self,
@@ -32867,6 +32951,7 @@ class _AgentBatchUseCheck(TypedDict, total=False):
     agent_batch: _AgentRemoveBatchContext
     canonical_path: Path
     after_fence: bool
+    before_image_fence: bool
 
 
 def _agent_batch_use_check(
@@ -32874,13 +32959,16 @@ def _agent_batch_use_check(
     canonical_path: Path | None,
     *,
     after_fence: bool = False,
+    before_image_fence: bool = False,
 ) -> _AgentBatchUseCheck:
     """Keywords that route one slot-use check through an agent removal batch.
 
     Outside a batch this is empty, so every ordinary use check receives
     exactly the arguments it always has, and so does any replacement
     installed for it.  ``after_fence`` marks a check of the fenced path,
-    whose ``canonical_path`` names the slot's unfenced path.
+    whose ``canonical_path`` names the slot's unfenced path, and
+    ``before_image_fence`` the lsof check of an image-backed slot made just
+    before its fence.
     """
 
     if agent_batch is None:
@@ -32890,6 +32978,8 @@ def _agent_batch_use_check(
         keywords["canonical_path"] = canonical_path
     if after_fence:
         keywords["after_fence"] = True
+    if before_image_fence:
+        keywords["before_image_fence"] = True
     return keywords
 
 
@@ -33103,6 +33193,7 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
     records = {record.slot: record for record in state.slots}
     eligible: list[tuple[str, int, Path]] = []
     identities: dict[Path, tuple[int, int]] = {}
+    image_targets: set[Path] = set()
     for slot, generation in requested:
         try:
             interrupted = _interrupted_removal_journal(config, slot, wait_seconds)
@@ -33150,9 +33241,18 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
                 "whose storage is absent",
             )
             continue
+        try:
+            image_backed = _slot_image_at(config, slot_path) is not None
+        except Refusal as exc:
+            refuse(slot, generation, str(exc))
+            continue
+        if image_backed:
+            image_targets.add(slot_path)
         identities[slot_path] = identity
         eligible.append((slot, generation, slot_path))
-    context = _AgentRemoveBatchContext(identities)
+    context = _AgentRemoveBatchContext(
+        identities, image_targets=frozenset(image_targets)
+    )
     remaining_targets = [slot_path for _slot, _generation, slot_path in eligible]
     error: str | None = None
     # The item being attempted, so that an unexpected error can name it.
@@ -33307,6 +33407,8 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
         "fenced_lsof_fallbacks": len(context.fenced_lsof_fallbacks),
         "fenced_lsof_fallback_reasons": list(context.fenced_lsof_fallbacks),
         "fenced_lsof_fallback_seconds": round(context.fenced_lsof_fallback_seconds, 3),
+        "image_lsof_checks": context.image_lsof_check_count,
+        "image_lsof_check_seconds": round(context.image_lsof_check_seconds, 3),
         "item_budget_seconds": context.item_seconds,
         "seconds": round(time.monotonic() - started, 3),
     }
@@ -49340,8 +49442,10 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "devices, is on a filesystem other than btrfs, ext2, ext3, ext4, tmpfs, or xfs, "
             "or reading a "
             "process fails for a reason other than its exit or a permission lsof would also "
-            "lack), lsof decides exactly as remove --no-lock-budget does. Default remove of "
-            "one agent slot is a batch of one. "
+            "lack), lsof decides exactly as remove --no-lock-budget does. An image-backed "
+            "slot, whose fence can mount its image again from another device, also gets that "
+            "lsof check immediately before its fence, within the same time limit. Default "
+            "remove of one agent slot is a batch of one. "
             "Each slot is removed in its own registry-lock hold, and the lock is released "
             "between slots. A slot's work before its first deletion is limited to "
             f"{_AGENT_REMOVE_BATCH_ITEM_SECONDS:.0f} seconds of that hold, so other clients "

@@ -606,10 +606,17 @@ neither check without privilege, and every process's mount table is read. The JS
 scans after the fence in `fenced_process_scans`, their total time in `fenced_process_scan_seconds`,
 and the checks that `lsof` decided in `fenced_lsof_fallbacks`, with each reason in
 `fenced_lsof_fallback_reasons` and their total time in `fenced_lsof_fallback_seconds`. Like the
-checks `remove --no-lock-budget` makes after the fence, the scan and `lsof` read the fenced slot as it is when they
-run, so the fenced slot need not keep the device and inode it had before the fence. An image-backed
-slot does not keep them: its fence mounts the image again at the fenced path, and the new mount can
-have another device number (see "Disk-image slots" below).
+checks `remove --no-lock-budget` makes after the fence, the scan and `lsof` read the fenced slot as
+it is when they run.
+
+An image-backed slot needs one more check (see "Disk-image slots" below). Its fence mounts the image
+again at the fenced path, and the new mount can have another device number, so a process still
+working in the old mount, for example through a detached bind alias in a mount namespace of its own,
+matches nothing in the fenced tree. Immediately before the fence of an image-backed slot the batch
+therefore runs the ordinary `lsof` check of `remove --no-lock-budget`, held to the slot's time limit
+below, which finds such a process by device and inode while the old mount is still the slot's. The
+JSON report counts those checks in `image_lsof_checks`, with their total time in
+`image_lsof_check_seconds`.
 
 Each slot's work before its first deletion is limited to 60 seconds, counted from when the slot
 takes the registry lock, so that other clients waiting for the lock are not kept waiting past their
@@ -1277,7 +1284,11 @@ image mount is not treated as a process using the slot.
 
 A mount point cannot be renamed, so the path fence that removal uses unmounts the image, renames
 the empty mount point, and mounts the image again at the fenced path. The unmount refuses while
-anything still uses the file system, which is the same refusal the fence already expects.
+something uses that particular mount, which is the same refusal the fence already expects. A process
+working in another mount of the same file system, such as a bind copy in this or another mount
+namespace, does not stop it, and keeps the old mount after the image is mounted again. Removal
+therefore checks an image-backed slot with `lsof` before the fence, while the old mount is still the
+slot's mount.
 
 ### Converting an existing slot in place
 

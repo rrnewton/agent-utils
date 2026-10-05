@@ -838,8 +838,9 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # The retained-handle size test is mapped.
     # Of the eight batch-of-one remove tests, the image-backed one is ordinary
     # and the other seven are mapped.
-    assert len(all_tests) == 1841
-    assert len(ordinary) == 288
+    # The two image-backed remove-agent-batch use-check tests are ordinary.
+    assert len(all_tests) == 1843
+    assert len(ordinary) == 290
     assert len(mapped) == 1553
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
@@ -909,6 +910,8 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
         "test_ownerless_validate_batch_removes_terminal_frozen_checkout",
         "test_process_entering_after_final_scan_before_path_move_is_not_deleted",
         "test_process_path_census_reports_a_live_user_while_unrelated_processes_exit_during_it",
+        "test_remove_agent_batch_checks_an_image_backed_slot_with_lsof_before_its_fence",
+        "test_remove_agent_batch_refuses_before_fencing_when_the_image_check_outlasts_the_budget",
         "test_remove_agent_batch_removes_disk_image_slots",
         "test_remove_checks_an_image_backed_agent_slot_under_the_lock",
         "test_remove_refuses_live_process_using_slot",
