@@ -1054,9 +1054,23 @@ body {
  *
  * Opacity rather than a grey colour, deliberately: it composes with the light and dark themes, with
  * the hover treatment and with the accent border, none of which would survive a hard-coded ink.
+ *
+ * HOW FAR A ROW RECEDES is SAID by each state's rule, here and below, as amounts: `--row-opacity`,
+ * and for the states that also drain the colour `--row-filter` and `--row-grey` (1 for drained, 0
+ * for not). The consumer straight after this comment DRAWS them, on the whole row. Said rather than
+ * drawn by each rule because one kind of row cannot take them on the whole row: a reply, whose
+ * arrow is inside it and must not recede with it (`#204 reply-arrow`). That row draws the same
+ * amounts on its box instead; see the section on replies. The cascade is unchanged — each state's
+ * amount is declared where its opacity used to be, with the same weight and the same place in the
+ * file — so every row that is not a reply is drawn exactly as before.
  */
+#discord-log li.discord-message {
+  opacity: var(--row-opacity, 1);
+  filter: var(--row-filter, none);
+}
+
 #discord-log li.discord-message[data-replied="true"] {
-  opacity: 0.55;
+  --row-opacity: 0.55;
 }
 
 /*
@@ -1077,8 +1091,9 @@ body {
  */
 #discord-log li.discord-message[data-archived="true"],
 #discord-log li.discord-message[data-own-read="true"] {
-  opacity: 0.42;
-  filter: grayscale(1);
+  --row-opacity: 0.42;
+  --row-filter: grayscale(1);
+  --row-grey: 1;
 }
 
 /*
@@ -1092,8 +1107,9 @@ body {
  * rescued with Not noise when a rule caught a real message.
  */
 #discord-log li.discord-message[data-noise="true"] {
-  opacity: 0.32;
-  filter: grayscale(1);
+  --row-opacity: 0.32;
+  --row-filter: grayscale(1);
+  --row-grey: 1;
   font-size: 0.85em;
 }
 
@@ -1104,7 +1120,8 @@ body {
 #discord-log li.discord-message[data-archived="true"]:focus-within,
 #discord-log li.discord-message[data-own-read="true"]:focus-within,
 #discord-log li.discord-message[data-noise="true"]:focus-within {
-  filter: none;
+  --row-filter: none;
+  --row-grey: 0;
 }
 
 /*
@@ -1131,8 +1148,9 @@ body {
  * not care that the tile has its side borders removed.
  */
 #discord-log li.discord-message[data-reading="true"] {
-  opacity: 1;
-  filter: none;
+  --row-opacity: 1;
+  --row-filter: none;
+  --row-grey: 0;
   border-color: var(--warn);
   box-shadow: inset 0.25rem 0 0 var(--warn);
   background: color-mix(in srgb, var(--warn) 22%, var(--theirs));
@@ -1156,8 +1174,9 @@ body {
  * cannot. So the promise gets an edge and the event gets the surface.
  */
 #discord-log li.discord-message[data-pending="true"] {
-  opacity: 1;
-  filter: none;
+  --row-opacity: 1;
+  --row-filter: none;
+  --row-grey: 0;
   outline: 2px solid var(--accent);
   outline-offset: -2px;
   animation: pending-pulse 1.2s ease-in-out infinite;
@@ -1264,6 +1283,57 @@ body {
 #discord-log li.discord-message[data-is-reply="true"][data-who="coder"] {
   padding-left: 0.4rem;
   border-left: 1px solid var(--edge);
+  /* Its edge is the neutral one already, and it has no right side for the drained edge the veil
+     below draws to put one on. */
+  --reply-neutral-edge: transparent;
+}
+
+/*
+ * A REPLY RECEDES IN ITS BOX, NOT AS A ROW. A row's `opacity` and `filter` take everything inside
+ * it with them, the arrow included, and the replies that recede are the ones the owner meets most:
+ * his own, already read by default; ones he has swiped Done; ones somebody has answered. On those
+ * the arrow came out a faint grey, at about 2:1 against the page — the "useless" mark again. So a
+ * reply is drawn at full strength, and its state's amounts (see `data-replied`) are drawn on what
+ * is beside the arrow:
+ *
+ *   * THE FADE, as a veil of the page's own colour over the box, as opaque as the row would have
+ *     been transparent. Over the page that is the arithmetic `opacity` does, to the pixel, and the
+ *     gutter is outside it. It is the row's `::after`, which a lit row takes over (`data-landed`).
+ *   * THE COLOUR, drained from each part of the box but the arrow by `--row-filter`, and from the
+ *     box's own tint by a grey layer blended into its background at `--row-grey`: `saturation`
+ *     keeps the tint's lightness and takes the grey's absence of colour, which is what `grayscale`
+ *     does to it. The selector's extra weight keeps the layer when the hover, focus and summary
+ *     rules restate the row's `background`.
+ *
+ * The marker line a kept place draws above its row is outside the box, and stays at full strength
+ * on a reply: it is the reader's own way back, and not a state of the message.
+ */
+#discord-log li.discord-message[data-is-reply="true"][data-who] {
+  opacity: 1;
+  filter: none;
+  background-image: linear-gradient(rgb(128 128 128 / var(--row-grey, 0)), rgb(128 128 128 / var(--row-grey, 0)));
+  background-blend-mode: saturation;
+}
+
+#discord-log li.discord-message[data-is-reply="true"] > :not(.reply-jump) {
+  filter: var(--row-filter, none);
+}
+
+/* Over the padding box, and over the border by a one-pixel shadow rather than a negative inset: a
+   shadow is not scrollable overflow, and the agent's tile meets the edge of the list. The second
+   shadow, under the veil, is the border's colour drained: the neutral edge in place of a speaker's
+   tinted one, at `--row-grey`. */
+#discord-log li.discord-message[data-is-reply="true"]::after {
+  --row-veil: color-mix(in srgb, var(--bg) calc((1 - var(--row-opacity, 1)) * 100%), transparent);
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--row-veil);
+  box-shadow:
+    0 0 0 1px var(--row-veil),
+    0 0 0 1px color-mix(in srgb, var(--reply-neutral-edge, var(--edge)) calc(var(--row-grey, 0) * 100%), transparent);
+  pointer-events: none;
 }
 
 /*
@@ -1357,10 +1427,13 @@ body {
  * answers is usually dimmed as answered (`data-replied`) — the very row being looked for.
  */
 #discord-log li.discord-message[data-landed="true"] {
-  opacity: 1;
-  filter: none;
+  --row-opacity: 1;
+  --row-filter: none;
+  --row-grey: 0;
 }
 
+/* Declared after the veil a reply's box recedes under, and weighing the same, so on a lit reply
+   this takes the pseudo-element: a lit row is at full strength, and has no veil to draw. */
 #discord-log li.discord-message[data-landed="true"]::after {
   content: "";
   position: absolute;
@@ -1424,7 +1497,7 @@ body {
    tap on a touch screen leaves `:hover` stuck on the row it landed on, so a phone would end up with
    one permanently undimmed row and no way to clear it. Same rule, same reason, as the row tint. */
 #discord-log li.discord-message:focus-within {
-  opacity: 1;
+  --row-opacity: 1;
 }
 
 /* The swipe. `pan-y` gives the vertical axis to the scroller and keeps the horizontal one for the
@@ -1661,16 +1734,18 @@ body {
  *     agent writes most of a real backlog, so without the explicit bar here the mark down the edge
  *     would be missing on exactly the rows that fail most.
  *   * THE GREYSCALE. An archived or already-read row is `filter: grayscale(1)` at 42% opacity, and
- *     a greyscaled red is a grey. `filter: none; opacity: 1` is what makes the failure visible on
- *     a row the reader has filed — which is the case where they would otherwise never learn that
- *     the money was spent and nothing came back.
+ *     a greyscaled red is a grey. Amounts of no filter and full opacity (see `data-replied` for
+ *     how a row's amounts are drawn) are what make the failure visible on a row the reader has
+ *     filed — which is the case where they would otherwise never learn that the money was spent
+ *     and nothing came back.
  */
 #discord-log li.discord-message[data-summary-failed="true"] {
   background: var(--summary-fail-bg);
   border-color: var(--summary-fail-edge);
   border-left: 3px solid var(--summary-fail-edge);
-  filter: none;
-  opacity: 1;
+  --row-filter: none;
+  --row-grey: 0;
+  --row-opacity: 1;
 }
 
 /* The two words, in the failure's own ink. The tint says something is wrong at a glance; this is
@@ -2287,14 +2362,15 @@ body {
      here rather than outside, because `:hover` sticks to the last-tapped row on a touch screen and
      a phone would be left with exactly one permanently bright row. */
   #discord-log li.discord-message:hover {
-    opacity: 1;
+    --row-opacity: 1;
   }
 
   /* The archived row's colour, on the same terms and for the same reason. */
   #discord-log li.discord-message[data-archived="true"]:hover,
   #discord-log li.discord-message[data-own-read="true"]:hover,
   #discord-log li.discord-message[data-noise="true"]:hover {
-    filter: none;
+    --row-filter: none;
+    --row-grey: 0;
   }
 
   /* `#204 reply-arrow`. The arrow's disc, under the pointer, as it shows when pressed. */

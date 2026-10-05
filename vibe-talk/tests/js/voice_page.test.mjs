@@ -7604,6 +7604,42 @@ test("the arrow has a gutter of its own: one touch target, on every reply, whoev
     "the answered row stays dimmed while it is the one being pointed at");
 });
 
+test("...and the arrow does not recede with its row: a reply's state is drawn on its box", () => {
+  // A row's `opacity` and `filter` take everything inside it with them, and the arrow is inside
+  // the row. The replies that recede are the ones the owner meets most — his own, read by default;
+  // ones he swiped Done; ones somebody answered — and on those the arrow came out grey, at about
+  // 2:1 against the page. Chromium measures the drawn pixels (tests/offline_cache_browser.py);
+  // what is checked here is the arrangement that produces them.
+  const own = /(?<![-\w])/.source;
+  const reply = cssBlock('#discord-log li.discord-message[data-is-reply="true"][data-who]');
+  assert.match(reply, new RegExp(`${own}opacity:\\s*1\\b`), "a reply is still faded as a whole row, arrow and all");
+  assert.match(reply, new RegExp(`${own}filter:\\s*none`), "a reply is still greyed as a whole row, arrow and all");
+  // Each state SAYS how far a row recedes, rather than fading the row itself, so a reply can draw it
+  // elsewhere; every other row draws it as before, on the whole row.
+  for (const [state, amount] of [["data-replied", "0.55"], ["data-own-read", "0.42"], ["data-archived", "0.42"],
+    ["data-noise", "0.32"]]) {
+    const rule = cssBlock(`#discord-log li.discord-message[${state}="true"]`);
+    assert.match(rule, new RegExp(`--row-opacity:\\s*${amount.replace(".", "\\.")}`), `${state} no longer says how far it recedes`);
+    assert.doesNotMatch(rule, new RegExp(`${own}opacity:`), `${state} fades the whole row again, a reply's arrow with it`);
+  }
+  assert.match(cssBlock("#discord-log li.discord-message"), /opacity:\s*var\(--row-opacity, 1\)/,
+    "a row that is not a reply no longer recedes at all");
+  // The reply's box: veiled in the page's colour by as much as the row would have faded, its
+  // content greyed part by part with the arrow left out, and its tint drained under both.
+  const veil = cssBlock('#discord-log li.discord-message[data-is-reply="true"]::after');
+  assert.match(veil, /color-mix\(in srgb, var\(--bg\) calc\(\(1 - var\(--row-opacity, 1\)\) \* 100%\)/,
+    "a reply's box no longer fades by its state's amount");
+  assert.match(veil, /pointer-events:\s*none/, "the veil takes the taps meant for the reply's buttons");
+  assert.match(cssBlock('#discord-log li.discord-message[data-is-reply="true"] > :not(.reply-jump)'),
+    /filter:\s*var\(--row-filter, none\)/, "a reply's content is not greyed with its state");
+  assert.match(reply, /background-blend-mode:\s*saturation/, "a reply's tint is not drained with its state");
+  // A lit reply is at full strength, and the landing's own wash takes the pseudo-element: the same
+  // weight, so the later declaration wins.
+  assert.ok(CSS.indexOf('li.discord-message[data-is-reply="true"]::after {') <
+    CSS.indexOf('li.discord-message[data-landed="true"]::after {'),
+  "a reply's veil is declared after the landing, so a lit reply loses its light");
+});
+
 test("TAPPING THE ARROW brings the message it answers to the head of the list, lit", async () => {
   const page = newPage();
   await signIn(page);
@@ -7993,6 +8029,90 @@ test("IN MAIN, a message the page has never read opens All, and All is walked ba
   assert.equal(rowWithId(page, all[6].id)?.getAttribute("data-landed"), "true", "the walk did not land on it");
   assert.deepStrictEqual(savedUiState(page).channels.map((entry) => entry.channelView), ["flat"],
     "the channel is not kept in the view the jump left the reader in");
+});
+
+/**
+ * Main, reopened from a session left there on a device that no longer holds that session's
+ * snapshot, so All has never been read in this page and is not in the store; the second thread's
+ * root, which Main shows, answers the first thread's answer, which only All does. With `polled`, a
+ * poll of Main goes on the wire and is held there, so the tap on the arrow comes while it is in
+ * flight and All's read is queued behind it. `answer` is what the read of All is answered with.
+ */
+async function tapInMainWithoutAll({ polled = true, answer = null } = {}) {
+  const first = await threadPage("main");
+  first.storage.delete(MESSAGE_CACHE_KEY);
+  const data = threadData();
+  data.messages[3].reply_to = "202";
+  const page = reloadWith(first.storage, data.messages, (p) => {
+    p.threadingSupported = true;
+    p.threads = data.threads;
+  });
+  await reopenedChannel(page);
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "Main is not what this test assumes");
+  const serve = page.timeline;
+  let release = () => {};
+  const held = new Promise((resolve) => { release = resolve; });
+  let holding = polled;
+  page.timeline = async (path, options) => {
+    if (holding) {
+      holding = false;
+      await held;
+      return serve(path, options);
+    }
+    return answer && /view=flat/.test(String(path)) ? answer() : serve(path, options);
+  };
+  if (polled) {
+    page.expireTimers(DISCORD_POLL_MS);
+    await page.settle();
+    assert.equal(holding, false, "no poll went on the wire, so this proves nothing");
+  }
+  await tapArrow(page, rowWithId(page, "203"));
+  return { page, release };
+}
+
+/** Let the held poll land, and whatever was waiting behind it — a read, and a wait on that read. */
+async function landHeldPoll(page, release) {
+  release();
+  for (let i = 0; i < 20; i += 1) {
+    await page.settle();
+    page.expireTimers(PULL_WAIT_MS);
+  }
+  await page.settle();
+}
+
+const providerDown = () => json(502, { error: "discord_error", detail: "the provider is down" });
+
+test("...and All opened while a read is on the wire is waited for, not taken for an empty history", async () => {
+  // All has never been read here, so `changeChannelView` can only queue its read behind the poll's
+  // and return with nothing drawn. An empty list then is All NOT READ YET, not All read to its
+  // first message: it used to be said as "Not in this channel's history", and the row All brought
+  // in a moment later was never landed on.
+  const { page, release } = await tapInMainWithoutAll();
+  assert.equal(page.el("thread-select").value, "flat", "the jump did not open All");
+  assert.notEqual(page.el("status").textContent, "Not in this channel's history.",
+    "All not read yet was taken for All read to the beginning of the channel");
+
+  await landHeldPoll(page, release);
+  assert.equal(rowWithId(page, "202")?.getAttribute("data-landed"), "true",
+    "All's read landed and the jump never went to the message it brought in");
+  assert.match(statusText(page), /Here is the message it answers/);
+});
+
+test("...and if that read of All fails, the end of the channel is not claimed either", async () => {
+  // Queued behind a poll, and failing once it runs.
+  const { page, release } = await tapInMainWithoutAll({ answer: providerDown });
+  await landHeldPoll(page, release);
+  assert.equal(page.el("thread-select").value, "flat");
+  assert.equal(statusText(page), "Could not read All — try again.",
+    "a read that never landed was reported as the end of the channel's history");
+
+  // ...and read at once, with nothing in its way, and failing: the status line does not go on
+  // saying All is being opened.
+  const { page: direct } = await tapInMainWithoutAll({ polled: false, answer: providerDown });
+  assert.equal(direct.el("thread-select").value, "flat");
+  assert.equal(statusText(direct), "Could not read All — try again.",
+    "a failed read of All left the status line saying All was on its way");
 });
 
 const keepPlaceAt = async (page, row) => {

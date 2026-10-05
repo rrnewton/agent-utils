@@ -47,15 +47,19 @@ Last, a fresh page signed in with a read-scope token reads the channel without a
 or console error: the stored-conversation routes are write-scope, answered 403 here as the server
 answers them, and the page must not ask (`#38 read-token-conversation-probe`).
 
-Then, in a second fresh profile at each size, a channel whose foot holds three replies — one each
-from the owner, the agent and a third party — to messages above them (`#204 reply-arrow`). Every
-reply's arrow is a 44px square in the gutter to the left of its own box: touching the box, inside
-the list, within the row's height, covering none of the row's text or buttons, the thing a tap on
-it lands on, and in the accent at 3:1 or better — at the default type size, at 150% type and in
-the dark scheme, with the page no wider than the viewport. A real tap on the third party's arrow,
-from the newest line, brings the message it answers under the floating pill and lights it without
-folding the reply; "Back to reply", tapped, brings the reply back and goes; and in reading mode the
-arrow still only jumps, with no read of the reply asked for.
+Then, in a second fresh profile at each size, a channel whose foot holds five replies to messages
+above them (`#204 reply-arrow`): from the owner, the agent and a third party, and between them in
+every state a row recedes in — the owner's own, read by default; one somebody answered; one swiped
+Done; an automatic placeholder; and one in none of them. Every reply's arrow is a 44px square in
+the gutter to the left of its own box: touching the box, inside the list, within the row's height,
+covering none of the row's text or buttons, and the thing a tap on it lands on. On a screenshot of
+that square, the mark is drawn in the accent at 3:1 or better against the page beside it, however
+far its row recedes — measured in pixels, because a computed colour knows nothing of the opacity and
+filter of the row around it. All of that at the default type size, at 150% type and in the dark
+scheme, with the page no wider than the viewport. A real tap on the newest reply's arrow, from the
+newest line, brings the message it answers under the floating pill and lights it without folding
+the reply; "Back to reply", tapped, brings the reply back and goes; and in reading mode the arrow
+still only jumps, with no read of the reply asked for.
 
 Pass --screenshots DIR to keep a PNG of each step for review.
 """
@@ -63,6 +67,7 @@ Pass --screenshots DIR to keep a PNG of each step for review.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import mimetypes
 import os
@@ -77,7 +82,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, unquote, urlsplit
 
 if TYPE_CHECKING:
-    from playwright.sync_api import BrowserType, Route
+    from playwright.sync_api import BrowserType, FloatRect, Route
 
 
 WEB_ROOT = Path(__file__).resolve().parents[1] / "web"
@@ -199,9 +204,18 @@ def said(index: int, content: str, who: str = "coder", reply_to: str | None = No
     return {**message(index, content), **SPEAKERS[who], "reply_to": reply_to}
 
 
+# The reply the reader has swiped Done, as the server reports it.
+ARCHIVED_REPLY = "213"
+
+
 class ReplyApi(FakeApi):
     """`#204 reply-arrow`: a question, more than a screen of the agent's long answers under it, and
-    three replies at the foot — one from each kind of speaker, so every gutter is measured."""
+    five replies at the foot: from each kind of speaker, so every gutter is measured, and in every
+    state a row recedes in, so every arrow is seen as it is drawn on a row that has faded.
+
+    211, the owner's, is already read as his own and answered by 212; 212, the agent's, is answered
+    by 213; 213 is swiped Done; 214 is an automatic placeholder; 215 is in none of those, and is the
+    one tapped."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -212,12 +226,17 @@ class ReplyApi(FakeApi):
             *(said(i, f"Step {i}. {filler}") for i in range(1, 11)),
             said(11, "Restarted it from the console; it should report within the minute.", "me", "200"),
             said(12, "It reported at 03:42 and the queue is draining.", "coder", "211"),
-            said(13, "The same thing happened on the other runner last week: it was the disk.", "human", "200"),
+            said(13, "Good, that matches what the dashboard shows here.", "human", "212"),
+            {**said(14, "_Working…_", "coder", "213"), "noise": True},
+            said(15, "The same thing happened on the other runner last week: it was the disk.", "human", "200"),
         ]
         self.threads = []
 
     def client_config(self, scope: str) -> Json:
         return {**super().client_config(scope), "owner_author_id": OWNER_ID}
+
+    def timeline(self, query: dict[str, list[str]]) -> Json:
+        return {**super().timeline(query), "dismissed": [ARCHIVED_REPLY]}
 
 
 def handler_for(api: FakeApi) -> type[BaseHTTPRequestHandler]:
@@ -571,66 +590,114 @@ TITLE_BAR_JS = """() => {""" + FLOAT_HELPERS_JS + """
             glass: shown(document.getElementById('search-toggle'))};
 }"""
 
-# `#204 reply-arrow`. Every reply's arrow, measured where it is drawn, each row brought to the middle
-# of the list first. `problems` is empty when each arrow is a square at least 44px across in the
-# gutter left of its own row's box — touching that box, inside the list and the viewport, within the
-# row's own height so it cannot reach a neighbouring row — meets none of the row's text or controls,
-# is what a tap at its centre and near its corners lands on, draws a mark at least 20px each way,
-# and is coloured at 3:1 or better against the page behind it; and the list is no wider than itself.
-REPLY_ARROWS_JS = """async () => {""" + FLOAT_HELPERS_JS + """
+# `#204 reply-arrow`. The replies in the list, and what holds across the whole of it: no arrow on a row
+# that answers nothing, and the list and the page no wider than themselves.
+REPLY_LIST_JS = """() => {
     const area = document.getElementById('scroll-area');
-    const frames = () => new Promise((settled) => requestAnimationFrame(() => requestAnimationFrame(settled)));
     const problems = [];
-    const rows = [...document.querySelectorAll('#discord-log > li[data-is-reply="true"]')];
-    if (rows.length !== 3) problems.push(`${rows.length} replies to measure, not 3`);
+    const replies = [...document.querySelectorAll('#discord-log > li[data-is-reply="true"]')]
+        .map((row) => row.getAttribute('data-id'));
     if (document.querySelector('#discord-log > li:not([data-is-reply="true"]) > .reply-jump')) {
         problems.push('a row that answers nothing has an arrow');
-    }
-    const luminance = (css) => {
-        const [r, g, b] = css.match(/[0-9.]+/g).slice(0, 3).map((v) => {
-            const c = Number(v) / 255;
-            return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
-        });
-        return 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    };
-    const ground = luminance(getComputedStyle(document.body).backgroundColor);
-    const speakers = [];
-    for (const row of rows) {
-        const id = `${row.getAttribute('data-id')} (${row.getAttribute('data-who')})`;
-        speakers.push(row.getAttribute('data-who'));
-        row.scrollIntoView({block: 'center'});
-        await frames();
-        const arrow = row.querySelector(':scope > .reply-jump');
-        if (!shown(arrow)) { problems.push(`${id}: no arrow`); continue; }
-        const a = box(arrow), r = box(row), list = box(area);
-        const mark = box(arrow.querySelector('.reply-jump-mark'));
-        if (a.width < 43.5 || a.height < 43.5) problems.push(`${id}: the target is ${a.width}x${a.height}px`);
-        if (mark.width < 20 || mark.height < 20) problems.push(`${id}: the mark is ${mark.width}x${mark.height}px`);
-        if (Math.abs(a.right - r.left) > 1.5) problems.push(`${id}: the arrow ends at ${a.right}px and its box starts at ${r.left}px`);
-        if (a.left < list.left - 0.5 || a.left < -0.5) problems.push(`${id}: the arrow starts at ${a.left}px, off the list`);
-        if (a.top < r.top - 0.5 || a.bottom > r.bottom + 0.5) {
-            problems.push(`${id}: the arrow spans ${a.top}..${a.bottom}px of a row at ${r.top}..${r.bottom}px`);
-        }
-        for (const part of row.querySelectorAll('*')) {
-            if (arrow.contains(part) || !shown(part)) continue;
-            const p = box(part);
-            const across = Math.min(a.right, p.right) - Math.max(a.left, p.left);
-            const down = Math.min(a.bottom, p.bottom) - Math.max(a.top, p.top);
-            if (across > 0.5 && down > 0.5) problems.push(`${id}: the arrow covers ${name(part)}.${part.className}`);
-        }
-        for (const [x, y] of [[0.5, 0.5], [0.1, 0.1], [0.9, 0.1], [0.1, 0.9], [0.9, 0.9]]) {
-            const hit = document.elementFromPoint(a.left + a.width * x, a.top + a.height * y);
-            if (!hit || !arrow.contains(hit)) problems.push(`${id}: a tap at (${x}, ${y}) of the arrow lands on ${name(hit)}`);
-        }
-        const ink = luminance(getComputedStyle(arrow).color);
-        const contrast = (Math.max(ink, ground) + 0.05) / (Math.min(ink, ground) + 0.05);
-        if (contrast < 3) problems.push(`${id}: the arrow is ${contrast.toFixed(2)}:1 against the page`);
     }
     if (area.scrollWidth > area.clientWidth + 1) problems.push(`the list is ${area.scrollWidth}px wide in ${area.clientWidth}px`);
     const viewport = document.documentElement.clientWidth;
     if (document.documentElement.scrollWidth > viewport) problems.push(`the page is wider than its ${viewport}px viewport`);
-    return {problems, speakers};
+    return {problems, replies};
 }"""
+
+# One reply's arrow, measured where it is drawn, its row brought to the middle of the list first.
+# `problems` is empty when the arrow is a square at least 44px across in the gutter left of its own
+# row's box — touching that box, inside the list and the viewport, within the row's own height so it
+# cannot reach a neighbouring row — meets none of the row's text or controls, is what a tap at its
+# centre and near its corners lands on, and draws a mark at least 20px each way. `square` and `mark`
+# say where to look to see what it looks like (`ARROW_INK_JS`), `accent` is the colour it is drawn
+# in, and `state` is how far its row recedes.
+REPLY_ARROW_JS = """async (id) => {""" + FLOAT_HELPERS_JS + """
+    const area = document.getElementById('scroll-area');
+    const frames = () => new Promise((settled) => requestAnimationFrame(() => requestAnimationFrame(settled)));
+    const row = document.querySelector(`#discord-log > li[data-id="${id}"]`);
+    if (!row) return {problems: [`no row ${id}`]};
+    const label = `${id} (${row.getAttribute('data-who')})`;
+    const problems = [];
+    row.scrollIntoView({block: 'center'});
+    await frames();
+    const arrow = row.querySelector(':scope > .reply-jump');
+    if (!shown(arrow)) return {problems: [`${label}: no arrow`]};
+    const a = box(arrow), r = box(row), list = box(area);
+    const mark = box(arrow.querySelector('.reply-jump-mark'));
+    if (a.width < 43.5 || a.height < 43.5) problems.push(`${label}: the target is ${a.width}x${a.height}px`);
+    if (mark.width < 20 || mark.height < 20) problems.push(`${label}: the mark is ${mark.width}x${mark.height}px`);
+    if (Math.abs(a.right - r.left) > 1.5) problems.push(`${label}: the arrow ends at ${a.right}px and its box starts at ${r.left}px`);
+    if (a.left < list.left - 0.5 || a.left < -0.5) problems.push(`${label}: the arrow starts at ${a.left}px, off the list`);
+    if (a.top < r.top - 0.5 || a.bottom > r.bottom + 0.5) {
+        problems.push(`${label}: the arrow spans ${a.top}..${a.bottom}px of a row at ${r.top}..${r.bottom}px`);
+    }
+    for (const part of row.querySelectorAll('*')) {
+        if (arrow.contains(part) || !shown(part)) continue;
+        const p = box(part);
+        const across = Math.min(a.right, p.right) - Math.max(a.left, p.left);
+        const down = Math.min(a.bottom, p.bottom) - Math.max(a.top, p.top);
+        if (across > 0.5 && down > 0.5) problems.push(`${label}: the arrow covers ${name(part)}.${part.className}`);
+    }
+    for (const [x, y] of [[0.5, 0.5], [0.1, 0.1], [0.9, 0.1], [0.1, 0.9], [0.9, 0.9]]) {
+        const hit = document.elementFromPoint(a.left + a.width * x, a.top + a.height * y);
+        if (!hit || !arrow.contains(hit)) problems.push(`${label}: a tap at (${x}, ${y}) of the arrow lands on ${name(hit)}`);
+    }
+    const flag = (attribute) => row.getAttribute(attribute) === 'true';
+    const state = flag('data-noise') ? 'noise' : flag('data-archived') ? 'archived'
+        : flag('data-own-read') ? 'own-read' : flag('data-replied') ? 'replied' : 'plain';
+    return {problems, label, who: row.getAttribute('data-who'), state, accent: getComputedStyle(arrow).color,
+            square: {x: a.left, y: a.top, width: a.width, height: a.height},
+            mark: {x: mark.left - a.left, y: mark.top - a.top, width: mark.width, height: mark.height}};
+}"""
+
+# What an arrow looks like on the screen, from a screenshot of its square (`png`, base64): the page
+# behind it, from the square's empty lower-left corner, and the mark, as the pixel inside the mark's
+# box furthest in contrast from that, with the contrast between the two. From PIXELS, because a
+# computed colour says what colour the arrow is and nothing about the opacity and filter of the row
+# it is inside: that is how a mark drawn at 2:1, grey, on every row that had faded passed as the
+# accent at 3:1.
+ARROW_INK_JS = """async ({png, square, mark}) => {
+    const image = new Image();
+    image.src = `data:image/png;base64,${png}`;
+    await image.decode();
+    const canvas = document.createElement('canvas');
+    canvas.width = image.naturalWidth;
+    canvas.height = image.naturalHeight;
+    const context = canvas.getContext('2d');
+    context.drawImage(image, 0, 0);
+    const {data, width, height} = context.getImageData(0, 0, canvas.width, canvas.height);
+    const pixel = (x, y) => [0, 1, 2].map((channel) => data[(y * width + x) * 4 + channel]);
+    const luminance = (rgb) => {
+        const [r, g, b] = rgb.map((v) => {
+            const c = v / 255;
+            return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+        });
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    };
+    const contrast = (one, other) => {
+        const [x, y] = [luminance(one), luminance(other)];
+        return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05);
+    };
+    const scale = width / square.width;
+    const inset = Math.round(2 * scale);
+    const ground = pixel(inset, height - 1 - inset);
+    const [left, right] = [Math.floor(mark.x * scale), Math.ceil((mark.x + mark.width) * scale)];
+    const [top, bottom] = [Math.floor(mark.y * scale), Math.ceil((mark.y + mark.height) * scale)];
+    let ink = ground;
+    let best = 1;
+    for (let y = Math.max(0, top); y < Math.min(height, bottom); y += 1) {
+        for (let x = Math.max(0, left); x < Math.min(width, right); x += 1) {
+            const seen = contrast(pixel(x, y), ground);
+            if (seen > best) [best, ink] = [seen, pixel(x, y)];
+        }
+    }
+    return {ground, ink, contrast: best};
+}"""
+
+# Every state a row recedes in, and none: a ReplyApi channel has a reply in each.
+REPLY_STATES = {"own-read", "replied", "archived", "noise", "plain"}
 
 # Where a row is on the screen relative to the floating line over the head of the list and the
 # list's foot, and its state: is it lit, folded, being read or waiting to be. The floating line is
@@ -688,8 +755,8 @@ def main() -> int:
                   " a read-scope token reads with no refused request or console error")
             print(f"{reply_walk(playwright.chromium, args, label, width, height, mobile)} {label} at"
                   f" {width}x{height}: every reply's arrow a 44px target in the gutter left of its box, clear"
-                  " of the row's text and buttons, at the default type size, at 150% and in the dark"
-                  " scheme; a real"
+                  " of the row's text and buttons, drawn in the accent at 3:1 or better on every row"
+                  " that recedes, at the default type size, at 150% and in the dark scheme; a real"
                   f" {'tap' if mobile else 'click'} on it brought the message it answers under the floating"
                   " line, lit, without folding the reply or, in reading mode, reading it aloud; Back to reply"
                   " brought the reply back")
@@ -1219,25 +1286,52 @@ def reply_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
                 return found
 
             def arrows(state: str) -> None:
-                found = page.evaluate(REPLY_ARROWS_JS)
-                problems = [str(problem) for problem in found["problems"]]
+                if not mobile:
+                    # Off every arrow, so no square being photographed has its hover disc behind it.
+                    page.mouse.move(1, 1)
+                listed = page.evaluate(REPLY_LIST_JS)
+                problems = [str(problem) for problem in listed["problems"]]
+                speakers: set[str] = set()
+                states: set[str] = set()
+                for row_id in listed["replies"]:
+                    found = page.evaluate(REPLY_ARROW_JS, row_id)
+                    problems += [str(problem) for problem in found["problems"]]
+                    if "square" not in found:
+                        continue
+                    speakers.add(str(found["who"]))
+                    states.add(str(found["state"]))
+                    square = found["square"]
+                    clip: FloatRect = {"x": float(square["x"]), "y": float(square["y"]),
+                                       "width": float(square["width"]), "height": float(square["height"])}
+                    png = page.screenshot(clip=clip)
+                    drawn = page.evaluate(ARROW_INK_JS, {"png": base64.b64encode(png).decode("ascii"),
+                                                         "square": square, "mark": found["mark"]})
+                    which = f"{found['label']}, {found['state']}"
+                    if float(drawn["contrast"]) < 3:
+                        problems.append(f"{which}: the arrow is drawn {float(drawn['contrast']):.2f}:1 against"
+                                        f" the page, as {drawn['ink']} on {drawn['ground']}")
+                    accent = [round(float(value)) for value in re.findall(r"[0-9.]+", str(found["accent"]))[:3]]
+                    if max(abs(int(seen) - want) for seen, want in zip(drawn["ink"], accent)) > 24:
+                        problems.append(f"{which}: the arrow is drawn {drawn['ink']}, not the accent {accent}")
                 check(not problems, f"{label}, {state}: {problems}")
-                check(sorted(found["speakers"]) == ["coder", "human", "me"],
-                      f"{label}, {state}: the replies are from {found['speakers']}, not one of each speaker")
+                check(speakers == {"coder", "human", "me"},
+                      f"{label}, {state}: the replies are from {sorted(speakers)}, not every kind of speaker")
+                check(states == REPLY_STATES,
+                      f"{label}, {state}: the replies are {sorted(states)}, not one in every state a row recedes in")
 
             page.goto(url, wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
             page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
             page.click("#view-switch")
-            page.wait_for_selector('#discord-log > li[data-id="213"]', timeout=10_000)
+            page.wait_for_selector('#discord-log > li[data-id="215"]', timeout=10_000)
             arrows("at the default type size")
 
             # The reader at the newest line, the third party's answer on screen and the question
             # it answers more than a screen above it. A real tap on the arrow.
             page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")
             page.wait_for_timeout(200)
-            reply = where("213")
+            reply = where("215")
             question = where("200")
             check(number(question, "bottom") < number(question, "line"),
                   f"{label}: the question was on screen before the tap: {question}")
@@ -1248,31 +1342,31 @@ def reply_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
             check(number(landed, "line") - 0.5 <= number(landed, "top") < number(landed, "foot") - 40,
                   f"{label}: the question landed at {landed['top']}px, not under the floating line at"
                   f" {landed['line']}px: {landed}")
-            after = where("213")
+            after = where("215")
             check(after["collapsed"] == reply["collapsed"],
                   f"{label}: the tap on the arrow also folded or opened the reply: {reply} -> {after}")
             check(after["chip"] is not None, f"{label}: the reply is off screen and Back to reply is not offered")
 
             # The way back, by a real tap on the chip.
             tap(after, "chip", "Back to reply")
-            back = wait_for("213", "(r) => r.top < r.foot && r.bottom > r.line && r.chip === null",
+            back = wait_for("215", "(r) => r.top < r.foot && r.bottom > r.line && r.chip === null",
                             "Back to reply did not bring the reply back and go")
             shot("3-back-to-reply")
             check(back["landed"] == "true", f"{label}: Back to reply did not say where it landed: {back}")
 
             # In reading mode a tap on a row reads it aloud. A tap on its arrow still only jumps.
             page.evaluate("() => document.getElementById('read-aloud').click()")
-            page.evaluate("() => document.querySelector('#discord-log > li[data-id=\"213\"]')"
+            page.evaluate("() => document.querySelector('#discord-log > li[data-id=\"215\"]')"
                           ".scrollIntoView({block: 'center'})")
             page.wait_for_timeout(300)
             with api.lock:
                 seen = len(api.requests)
-            tap(where("213"), "arrow", "the reply's arrow in reading mode")
+            tap(where("215"), "arrow", "the reply's arrow in reading mode")
             wait_for("200", "(r) => r.landed === 'true' && r.top < r.foot", "in reading mode the arrow did not jump")
             page.wait_for_timeout(300)
             with api.lock:
                 spoken = [r for r in api.requests[seen:] if "/speak" in r or "/speech" in r]
-            reading = where("213")
+            reading = where("215")
             check(not spoken and reading["reading"] != "true" and reading["pending"] != "true",
                   f"{label}: in reading mode the arrow's tap started reading the reply: {spoken} {reading}")
             page.evaluate("() => document.getElementById('read-aloud').click()")

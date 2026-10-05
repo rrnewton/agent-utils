@@ -9577,12 +9577,13 @@ function jumpToMarker() {
 //      channel; and the reply itself is in it too, which keeps the way back one tap away. It is
 //      opened the way the picker opens it, so it is also the view this channel is kept in
 //      (`#205 channel-view-memory`): the page reopens where the reader was left, as for any change
-//      of view.
+//      of view. All that has to be read is waited for, behind any read already on the wire.
 //   3. FURTHER BACK THAN WHAT IS LOADED: older pages are read, at most REPLY_JUMP_PAGES of them,
 //      and the status line says so as each one is asked for. Bounded, because a message deleted
 //      upstream is never found, and an unbounded walk would read the whole channel looking for it.
 //   4. NOT FOUND: the status line says which — older than what is loaded even after the walk, or
 //      not in the channel's history at all — rather than leaving a tap that visibly did nothing.
+//      The second only when a read has said the history ends there (`historyReadToStart`).
 //
 // Every one of those sentences is short, because the status line is one line, ellipsised: on a
 // 360px phone about 38 characters of it show, and a sentence whose point came after that showed
@@ -9751,6 +9752,22 @@ function answeredElsewhere(id) {
   return held === null || !inView(held, channelView, selectedThreadId);
 }
 
+/**
+ * Whether a read has said the view on screen reaches back to the start of its history, so that a
+ * message not in it is not in that part of the channel at all.
+ *
+ * Not the same as nothing being above the rows. A view no read has landed for yet has nothing
+ * above it either: `discordMoreAbove` starts false. That is All, opened by a jump while another
+ * read held the line, and the message the jump is for may be on the page still to come. Where the
+ * provider has threads, only the store's cover for the view says which of the two it is.
+ */
+function historyReadToStart() {
+  if (discordMoreAbove !== false) return false;
+  if (!threadingSupported) return true;
+  const cover = channelCanon.views.get(viewKey());
+  return Boolean(cover) && cover.more === false;
+}
+
 /** The tap on a reply's arrow. See the head of this section for the order of the four cases. */
 async function jumpToAnswered(reply) {
   const target = String(reply.getAttribute("data-reply-to") || "");
@@ -9772,10 +9789,32 @@ async function jumpToAnswered(reply) {
   if (hiddenAsRead()) return;
   if (threadingSupported && channelView !== "flat" && answeredElsewhere(target)) {
     setStatus("Not in this view — opening All…");
-    await changeChannelView("flat");
     // The reader went somewhere else while All was being read: the tap is over.
-    if (ticket !== replyJumpTicket || String(el("discord-channel").value) !== channel || channelView !== "flat") return;
+    const stillAll = () =>
+      ticket === replyJumpTicket && String(el("discord-channel").value) === channel && channelView === "flat";
+    try {
+      await changeChannelView("flat");
+    } catch (error) {
+      // As for a step back that fails, below: reported where every failed read is, and the status
+      // line no longer says All is being opened.
+      if (stillAll()) setStatus("Could not read All — try again.");
+      throw error;
+    }
+    // All not held by this page nor covered by the store, and another read — a poll of Main, say —
+    // on the wire when the tap came: All's read is queued behind it, and `changeChannelView`
+    // returned with nothing drawn. Waited for, as a pull up waits for a read already in flight,
+    // because until All has landed an empty list says nothing about where the message is.
+    while (discordFetchInFlight && !channelCanon.views.has(viewKey()) && stillAll()) {
+      await new Promise((resolve) => setTimeout(resolve, PULL_WAIT_MS));
+    }
+    if (!stillAll()) return;
     if (landOnAnswered(target, from) || hiddenAsRead()) return;
+    if (!channelCanon.views.has(viewKey()) && el("discord-log").children.length === 0) {
+      // All's read failed, and that is reported where every failed read is. Nothing was learned
+      // about the message, so nothing is said about it either.
+      setStatus("Could not read All — try again.");
+      return;
+    }
   }
   let walked = 0;
   while (walked < REPLY_JUMP_PAGES && discordMoreAbove === true && discordOlderCursor) {
@@ -9796,7 +9835,7 @@ async function jumpToAnswered(reply) {
   }
   if (todoMode && !threadingSupported) {
     setStatus("Not in this list — Hide read is on.");
-  } else if (discordMoreAbove === false) {
+  } else if (historyReadToStart()) {
     setStatus("Not in this channel's history.");
   } else if (walked > 0) {
     setStatus(`Further back than ${walked} page${walked === 1 ? "" : "s"} — scroll up.`);
@@ -12083,7 +12122,8 @@ const PULL_RISE_PX = 40;
 const PULL_RESULT_MS = 2000;
 
 // How often a release that found a read already in flight looks again — the same interval
-// `refreshAfterLiveMutation` waits on for the same lock.
+// `refreshAfterLiveMutation` waits on for the same lock, and a reply's arrow waits on for All to
+// be read behind it (`#204 reply-arrow`).
 const PULL_WAIT_MS = 50;
 
 // What the affordance says in each state of the gesture. The reader is told it is armed BEFORE
