@@ -53,6 +53,9 @@ pub struct ApiCall {
     pub endpoint: String,
     /// `--paginate` or `--slurp` was given.
     pub paginate: bool,
+    /// `-i/--include` was given: gh prints the response status line and headers on stdout,
+    /// which the wrapper then scans for pushback.
+    pub include: bool,
 }
 
 /// The classifier's verdict for one command line.
@@ -78,6 +81,9 @@ pub struct Classification {
     pub api: Option<ApiCall>,
     /// Index in the argument vector where the arguments after the command words begin.
     pub rest_start: usize,
+    /// Wall-clock bound for a polling command (watch loops). The wrapper kills the child when it
+    /// runs this long, so a loop can never poll beyond the tokens it was charged.
+    pub deadline_secs: Option<f64>,
 }
 
 const LOCAL_FAMILIES: &[&str] = &[
@@ -158,6 +164,16 @@ fn read_subs(family: &str) -> &'static [&'static str] {
     }
 }
 
+/// Families that are gh's own commands (not an alias or an extension). The empty family is a
+/// bare `gh --help`.
+fn is_known_family(family: &str) -> bool {
+    family.is_empty()
+        || LOCAL_FAMILIES.contains(&family)
+        || NO_SUB_FAMILIES.contains(&family)
+        || !read_subs(family).is_empty()
+        || matches!(family, "auth" | "search")
+}
+
 fn is_flag(token: &str) -> bool {
     token.len() > 1 && token.starts_with('-')
 }
@@ -165,6 +181,9 @@ fn is_flag(token: &str) -> bool {
 struct Lead {
     words: Vec<String>,
     rest: usize,
+    /// Index just after the first command word (where an alias's or extension's own arguments
+    /// begin).
+    after_first: usize,
     unknown_flag: Option<String>,
 }
 
@@ -180,6 +199,7 @@ fn lead(args: &[String]) -> Lead {
     let mut words: Vec<String> = Vec::new();
     let mut i = 0;
     let mut unknown_flag = None;
+    let mut after_first = None;
     while i < args.len() {
         let t = args[i].as_str();
         if is_flag(t) {
@@ -200,6 +220,9 @@ fn lead(args: &[String]) -> Lead {
         }
         words.push(t.to_string());
         i += 1;
+        if words.len() == 1 {
+            after_first = Some(i);
+        }
         if words.len() == 1 && NO_SUB_FAMILIES.contains(&words[0].as_str()) {
             break;
         }
@@ -210,9 +233,11 @@ fn lead(args: &[String]) -> Lead {
             break;
         }
     }
+    let rest = i.min(args.len());
     Lead {
         words,
-        rest: i.min(args.len()),
+        rest,
+        after_first: after_first.unwrap_or(rest),
         unknown_flag,
     }
 }
@@ -225,35 +250,50 @@ fn is_help_request(args: &[String]) -> bool {
     }
 }
 
-/// Find the value of a flag given as `-X v`, `-Xv`, `-X=v`, `--long v` or `--long=v`.
-fn flag_value<'a>(rest: &'a [String], short: Option<char>, long: &str) -> Option<&'a str> {
+/// Every value of a flag given as `-X v`, `-Xv`, `-X=v`, `--long v` or `--long=v`, in order.
+///
+/// gh (pflag) lets the last occurrence of a scalar flag win. Callers that turn a value into a
+/// cost or a limit take the most conservative of all occurrences instead, so the answer does not
+/// depend on which occurrence gh honours.
+fn flag_values<'a>(rest: &'a [String], short: Option<char>, long: &str) -> Vec<&'a str> {
     let long_eq = format!("{long}=");
+    let mut out = Vec::new();
     let mut i = 0;
     while i < rest.len() {
         let t = rest[i].as_str();
         if t == "--" {
-            return None;
+            break;
         }
         if t == long {
-            return rest.get(i + 1).map(String::as_str);
+            if let Some(v) = rest.get(i + 1) {
+                out.push(v.as_str());
+            }
+            i += 2;
+            continue;
         }
         if let Some(v) = t.strip_prefix(long_eq.as_str()) {
-            return Some(v);
+            out.push(v);
+            i += 1;
+            continue;
         }
         if let Some(c) = short {
             let short_flag = format!("-{c}");
             if t == short_flag {
-                return rest.get(i + 1).map(String::as_str);
+                if let Some(v) = rest.get(i + 1) {
+                    out.push(v.as_str());
+                }
+                i += 2;
+                continue;
             }
             if let Some(v) = t.strip_prefix(short_flag.as_str()) {
                 if !t.starts_with("--") {
-                    return Some(v.strip_prefix('=').unwrap_or(v));
+                    out.push(v.strip_prefix('=').unwrap_or(v));
                 }
             }
         }
         i += 1;
     }
-    None
+    out
 }
 
 fn has_flag(rest: &[String], names: &[&str]) -> bool {
@@ -302,6 +342,7 @@ fn local(family: &str, sub: Option<String>, command: String, reason: &str) -> Cl
         refusal: None,
         api: None,
         rest_start: 0,
+        deadline_secs: None,
     }
 }
 
@@ -310,6 +351,10 @@ pub fn classify(args: &[String], cfg: &Config) -> Classification {
     let mut c = classify_inner(args, cfg);
     c.rest_start = if c.class == Class::Local {
         args.len()
+    } else if is_unknown_command(&c) {
+        // An alias or extension: everything after its name is its own argument list, which may
+        // carry body text, so none of it is treated as a command word.
+        lead(args).after_first
     } else {
         lead(args).rest
     };
@@ -334,12 +379,18 @@ fn classify_inner(args: &[String], cfg: &Config) -> Classification {
             .take_while(|t| !is_flag(t))
             .map(String::as_str)
             .collect();
-        return local(
-            words.first().copied().unwrap_or(""),
-            None,
-            format!("{} --help", words.join(" ")).trim().to_string(),
-            "help output is local",
-        );
+        let family = words.first().copied().unwrap_or("");
+        // Only gh's own commands are known to print help for `--help`. An alias or an extension
+        // receives the argument and may do anything with it (an alias ending in `-b` turns it
+        // into a comment body), so those stay WRITE.
+        if is_known_family(family) {
+            return local(
+                family,
+                None,
+                format!("{} --help", words.join(" ")).trim().to_string(),
+                "help output is local",
+            );
+        }
     }
     let lead = lead(args);
     let rest = &args[lead.rest..];
@@ -492,12 +543,30 @@ fn classify_inner(args: &[String], cfg: &Config) -> Classification {
         return c;
     }
     let known_family = !read_subs(family).is_empty() || family == "auth";
-    let reason = if known_family {
-        "subcommand that may create or change content"
-    } else {
-        "unknown command (alias, extension, or new gh command)"
-    };
-    fail_safe(family, sub_owned, command, reason)
+    if known_family {
+        return fail_safe(
+            family,
+            sub_owned,
+            command,
+            "subcommand that may create or change content",
+        );
+    }
+    // The second word of an alias or extension is an argument of unknown meaning (it may be a
+    // comment body or a token), so it is kept out of the command description and the audit.
+    fail_safe(
+        family,
+        None,
+        family.to_string(),
+        "unknown command (alias, extension, or new gh command)",
+    )
+}
+
+/// True when `c` is an alias, an extension, or a gh command this classifier does not know. The
+/// audit then records flag names only and replaces every other argument with `<arg>`.
+pub fn is_unknown_command(c: &Classification) -> bool {
+    c.class != Class::Local
+        && c.family != "api"
+        && (c.family.is_empty() || !is_known_family(&c.family))
 }
 
 fn paced(
@@ -519,6 +588,7 @@ fn paced(
         refusal: None,
         api: None,
         rest_start: 0,
+        deadline_secs: None,
     }
 }
 
@@ -535,37 +605,52 @@ fn fail_safe(family: &str, sub: Option<String>, command: String, why: &str) -> C
 
 /// `-L/--limit N` on a list or search: gh fetches up to 100 items per request.
 fn apply_limit_cost(c: &mut Classification, rest: &[String]) {
-    if let Some(v) = flag_value(rest, Some('L'), "--limit") {
-        if let Ok(n) = v.trim().parse::<u64>() {
-            let pages = n.div_ceil(100).max(1);
-            let pages = u32::try_from(pages).unwrap_or(u32::MAX);
-            if pages > c.cost {
-                c.warnings.push(format!(
-                    "--limit {n} may fetch {pages} pages; charging {pages} {} tokens",
-                    c.class.name()
-                ));
-                c.cost = pages;
-            }
+    // The largest of all `--limit` values, whichever occurrence gh honours.
+    let largest = flag_values(rest, Some('L'), "--limit")
+        .into_iter()
+        .filter_map(|v| v.trim().parse::<u64>().ok())
+        .max();
+    if let Some(n) = largest {
+        let pages = n.div_ceil(100).max(1);
+        let pages = u32::try_from(pages).unwrap_or(u32::MAX);
+        if pages > c.cost {
+            c.warnings.push(format!(
+                "--limit {n} may fetch {pages} pages; charging {pages} {} tokens",
+                c.class.name()
+            ));
+            c.cost = pages;
         }
     }
 }
 
 /// Watch loops poll GitHub for as long as they run.
+///
+/// The loop is charged `watch_cost` tokens up front and given a deadline that the purchased
+/// tokens cover: `(cost / requests per poll) * interval`. `gh run watch` makes two requests per
+/// poll (the run and its jobs); `gh pr checks --watch` makes one. The wrapper kills the child at
+/// the deadline, so a watch can never poll beyond what it paid for.
 fn apply_watch(c: &mut Classification, rest: &[String], cfg: &Config) {
-    let (is_watch, default_interval) = match (c.family.as_str(), c.sub.as_deref()) {
-        ("pr", Some("checks")) => (has_flag(rest, &["--watch"]), 10.0),
-        ("run", Some("watch")) => (true, 3.0),
-        _ => (false, 0.0),
-    };
+    let (is_watch, default_interval, requests_per_poll) =
+        match (c.family.as_str(), c.sub.as_deref()) {
+            ("pr", Some("checks")) => (has_flag(rest, &["--watch"]), 10.0, 1.0),
+            ("run", Some("watch")) => (true, 3.0, 2.0),
+            _ => (false, 0.0, 1.0),
+        };
     if !is_watch {
         return;
     }
-    let interval = flag_value(rest, Some('i'), "--interval")
-        .and_then(parse_seconds)
+    // The smallest of all `--interval` values, whichever occurrence gh honours.
+    let interval = flag_values(rest, Some('i'), "--interval")
+        .into_iter()
+        .filter_map(parse_seconds)
+        .reduce(f64::min)
         .unwrap_or(default_interval);
     c.cost = c.cost.max(cfg.watch_cost);
+    let polls = (f64::from(c.cost) / requests_per_poll).floor().max(1.0);
+    let deadline = polls * interval.max(1.0);
+    c.deadline_secs = Some(deadline);
     c.warnings.push(format!(
-        "{} polls GitHub every {interval} s until it finishes; charging {} read tokens up front",
+        "{} polls GitHub every {interval} s until it finishes; charging {} read tokens up front, which cover {polls} polls, so it is stopped after {deadline} s",
         c.command, c.cost
     ));
     if interval < cfg.min_watch_interval_secs && !cfg.allow_fast_watch {
@@ -604,6 +689,8 @@ pub struct ApiArgs {
     pub paginate: bool,
     /// `--slurp`.
     pub slurp: bool,
+    /// `-i/--include`.
+    pub include: bool,
     /// Positional arguments; the first is the endpoint.
     pub positionals: Vec<String>,
     /// First flag the parser did not recognise.
@@ -668,6 +755,7 @@ pub fn parse_api(rest: &[String]) -> ApiArgs {
                 match name {
                     "paginate" => a.paginate = true,
                     "slurp" => a.slurp = true,
+                    "include" => a.include = true,
                     _ => {}
                 }
             } else if a.unknown.is_none() {
@@ -692,6 +780,9 @@ pub fn parse_api(rest: &[String]) -> ApiArgs {
                     api_store(&mut a, &c.to_string(), value);
                     break;
                 } else if API_BOOL_SHORT.contains(&c) {
+                    if c == 'i' {
+                        a.include = true;
+                    }
                     j += 1;
                 } else {
                     if a.unknown.is_none() {
@@ -725,34 +816,77 @@ pub fn contains_word(text: &str, word: &str) -> bool {
     false
 }
 
-/// The GraphQL query text a `gh api graphql` call will send, when it can be read without
-/// consuming stdin.
-fn graphql_query(a: &ApiArgs) -> Option<String> {
+/// Largest file the classifier reads to inspect a GraphQL document.
+pub const MAX_INSPECT_BYTES: u64 = 1 << 20;
+
+/// Read a regular file of at most [`MAX_INSPECT_BYTES`] as UTF-8; anything else is `None`.
+fn read_small(path: &str) -> Option<String> {
+    use std::io::Read;
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_INSPECT_BYTES {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut buf = String::new();
+    file.take(MAX_INSPECT_BYTES + 1)
+        .read_to_string(&mut buf)
+        .ok()?;
+    if buf.len() as u64 > MAX_INSPECT_BYTES {
+        return None;
+    }
+    Some(buf)
+}
+
+/// Every GraphQL document a `gh api graphql` call may send, or `None` when any part of the
+/// request body cannot be inspected without consuming stdin.
+///
+/// With `--input`, gh sends that file as the request body and moves the fields into the URL; without
+/// it, the fields form the body. Rather than model which one GitHub reads, every candidate is
+/// collected and the call is READ only when none of them is a mutation:
+///
+/// - every `-f/-F query=...` value (a typed `@file` is read; `@-` is uninspectable);
+/// - a key such as `query[...]`, which gh nests into an object, is uninspectable;
+/// - `--input FILE` must be a JSON object with a string `query`; its raw text is also returned so
+///   the word `mutation` anywhere in it (a second operation, an escaped name) counts;
+/// - `--input -` is uninspectable.
+fn graphql_documents(a: &ApiArgs) -> Option<Vec<String>> {
+    let mut docs = Vec::new();
     for f in &a.raw_fields {
-        if let Some(q) = f.strip_prefix("query=") {
-            return Some(q.to_string());
+        let (key, value) = f.split_once('=').unwrap_or((f.as_str(), ""));
+        if key == "query" {
+            docs.push(value.to_string());
+        } else if key.starts_with("query[") {
+            return None;
         }
     }
     for f in &a.typed_fields {
-        if let Some(q) = f.strip_prefix("query=") {
-            if let Some(path) = q.strip_prefix('@') {
-                if path == "-" {
-                    return None;
-                }
-                return std::fs::read_to_string(path).ok();
+        let (key, value) = f.split_once('=').unwrap_or((f.as_str(), ""));
+        if key == "query" {
+            match value.strip_prefix('@') {
+                Some("-") => return None,
+                Some(path) => docs.push(read_small(path)?),
+                None => docs.push(value.to_string()),
             }
-            return Some(q.to_string());
+        } else if key.starts_with("query[") {
+            return None;
         }
     }
     if let Some(input) = &a.input {
         if input == "-" {
             return None;
         }
-        let text = std::fs::read_to_string(input).ok()?;
+        let text = read_small(input)?;
         let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-        return value.get("query")?.as_str().map(str::to_string);
+        let query = value.as_object()?.get("query")?.as_str()?.to_string();
+        docs.push(query);
+        docs.push(text);
     }
-    None
+    Some(docs)
+}
+
+/// True when `endpoint` (already normalised) is a GraphQL endpoint.
+fn is_graphql(endpoint: &str) -> bool {
+    endpoint == "graphql" || endpoint.ends_with("/graphql")
 }
 
 fn classify_api(rest: &[String], cfg: &Config) -> Classification {
@@ -771,6 +905,7 @@ fn classify_api(rest: &[String], cfg: &Config) -> Classification {
         method: method.clone(),
         endpoint: endpoint.clone(),
         paginate,
+        include: a.include,
     };
     let command = format!("api {method} {endpoint}").trim().to_string();
     let mut c = paced(Class::Write, 1, "api", None, command, "");
@@ -780,16 +915,22 @@ fn classify_api(rest: &[String], cfg: &Config) -> Classification {
         return c;
     }
     let read_method = matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS");
-    if endpoint == "graphql" && !read_method {
-        match graphql_query(&a) {
-            Some(q) if !contains_word(&q, "mutation") => {
+    if is_graphql(&endpoint) {
+        // Inspected for every method: `-X GET graphql -f query=mutation{...}` is still a
+        // mutation as far as this wrapper is concerned.
+        match graphql_documents(&a) {
+            Some(docs) if docs.is_empty() => {
+                c.reason =
+                    "GraphQL request with no query to inspect; classified WRITE (fail safe)".into()
+            }
+            Some(docs) if docs.iter().all(|d| !contains_word(d, "mutation")) => {
                 c.class = Class::Read;
                 c.reason = "GraphQL query without a mutation".into();
             }
             Some(_) => c.reason = "GraphQL mutation".into(),
             None => {
                 c.reason =
-                    "GraphQL request whose query cannot be inspected; classified WRITE (fail safe)"
+                    "GraphQL request whose body cannot be inspected; classified WRITE (fail safe)"
                         .into()
             }
         }
@@ -810,16 +951,15 @@ fn classify_api(rest: &[String], cfg: &Config) -> Classification {
     } else {
         c.reason = "fields or --input without -X GET make gh send a POST".into();
     }
-    if paginate && matches!(c.class, Class::Read | Class::Search) {
+    if paginate {
+        // A paginated write (a GraphQL mutation with a cursor, a POST that follows Link
+        // headers) can repeat the write once per page, so it pays the same N tokens as a read.
         c.cost = cfg.paginate_cost.max(1);
         c.warnings.push(format!(
             "--paginate fetches pages back to back; charging {} {} tokens for this one invocation",
             c.cost,
             c.class.name()
         ));
-    } else if paginate {
-        c.warnings
-            .push("--paginate on a write request: charged as one write".to_string());
     }
     c
 }
@@ -878,6 +1018,11 @@ mod tests {
         assert_eq!(class_of("pr comment 12 -b --help"), Class::Write);
         // `-h` that is not the last token is not treated as help.
         assert_eq!(class_of("pr comment -h 12 -b x"), Class::Write);
+        // An alias or extension receives `--help` as an argument and may still write.
+        assert_eq!(class_of("my-alias --help"), Class::Write);
+        assert_eq!(class_of("my-alias 12 --help"), Class::Write);
+        assert_eq!(class_of("some-extension -h"), Class::Write);
+        assert_eq!(cls("my-alias --help").command, "my-alias");
     }
 
     #[test]
@@ -1071,10 +1216,29 @@ mod tests {
         assert_eq!(cls("pr list --limit=250").cost, 3);
         assert_eq!(cls("pr list -L50").cost, 1);
         assert_eq!(cls("search issues x --limit 300").cost, 3);
-        // A paginated write is still one write token, but warned.
+        // A paginated write can repeat once per page, so it pays the same N tokens as a read.
         let c = cls("api --paginate -X POST repos/o/r/x");
-        assert_eq!((c.class, c.cost), (Class::Write, 1));
+        assert_eq!((c.class, c.cost), (Class::Write, 10));
         assert!(!c.warnings.is_empty());
+        let c = cls("api graphql --paginate -f query=mutation{x}");
+        assert_eq!((c.class, c.cost), (Class::Write, 10));
+    }
+
+    /// gh honours the last occurrence of a scalar flag; gh-paced takes the most conservative of
+    /// all occurrences, so neither order escapes the charge or the refusal.
+    #[test]
+    fn repeated_flags_use_the_most_conservative_value() {
+        assert_eq!(cls("pr list --limit 1 --limit 1000").cost, 10);
+        assert_eq!(cls("pr list --limit 1000 --limit 1").cost, 10);
+        assert_eq!(cls("pr list -L 1 --limit=1000").cost, 10);
+        assert!(cls("run watch 1 --interval 30 --interval 1")
+            .refusal
+            .is_some());
+        assert!(cls("run watch 1 -i 1 --interval 30").refusal.is_some());
+        assert!(cls("pr checks 1 --watch --interval 60 -i 2")
+            .refusal
+            .is_some());
+        assert!(cls("run watch 1 -i 30 --interval 45").refusal.is_none());
     }
 
     #[test]
@@ -1089,9 +1253,18 @@ mod tests {
         assert!(c.refusal.is_some(), "default 3 s interval is too fast");
         let c = cls("run watch 99 -i 30");
         assert!(c.refusal.is_none());
+        // 20 tokens buy 10 polls of 2 requests each, 30 s apart: stopped after 300 s.
+        assert_eq!(c.deadline_secs, Some(300.0));
+        // 20 tokens buy 20 polls of 1 request each, 30 s apart: stopped after 600 s.
+        assert_eq!(
+            cls("pr checks 12 --watch --interval 30").deadline_secs,
+            Some(600.0)
+        );
         let c = cls("pr checks 12");
         assert_eq!(c.cost, 1);
         assert!(c.refusal.is_none());
+        assert_eq!(c.deadline_secs, None);
+        assert_eq!(cls("pr view 12").deadline_secs, None);
         let cfg = Config {
             allow_fast_watch: true,
             ..Config::default()
@@ -1111,6 +1284,7 @@ mod tests {
             .collect();
         let a = parse_api(&args);
         assert_eq!(a.method.as_deref(), Some("POST"));
+        assert!(a.include, "-i in a combined short group");
         assert_eq!(a.raw_fields, vec!["-body=x".to_string()]);
         assert_eq!(
             a.positionals,
@@ -1123,6 +1297,13 @@ mod tests {
             .collect();
         let a = parse_api(&args);
         assert!(a.method.is_none(), "-X here is the value of -H");
+        assert!(!a.include);
+        assert!(cls("api --include repos/o/r").api.expect("api").include);
+        assert!(!cls("api repos/o/r").api.expect("api").include);
+        assert!(
+            !cls("api -H -i repos/o/r").api.expect("api").include,
+            "-i here is the value of -H"
+        );
         assert_eq!(normalize_endpoint("/repos/o/r?x=1"), "repos/o/r");
         assert_eq!(
             normalize_endpoint("https://api.github.com/graphql"),
@@ -1153,6 +1334,27 @@ mod tests {
         assert_eq!(line(&format!("-F query=@{}", m.display())), Class::Write);
         assert_eq!(line(&format!("--input {}", inp.display())), Class::Write);
         assert_eq!(line("-F query=@/nonexistent/file"), Class::Write);
+        // gh sends the --input file as the request body (fields move to the URL), so a query
+        // field cannot vouch for it: stdin cannot be inspected, and a mutation file is a write.
+        assert_eq!(
+            line("-f query=query{viewer{login}} --input -"),
+            Class::Write
+        );
+        assert_eq!(
+            line(&format!("-f query=query{{x}} --input {}", inp.display())),
+            Class::Write
+        );
+        let qin = dir.join("qin.json");
+        std::fs::write(&qin, r#"{"query": "query { viewer { login } }"}"#).unwrap();
+        assert_eq!(line(&format!("--input {}", qin.display())), Class::Read);
+        // Every query value counts, whichever gh keeps.
+        assert_eq!(line("-f query=query{x} -f query=mutation{y}"), Class::Write);
+        assert_eq!(line("-f query=mutation{y} -f query=query{x}"), Class::Write);
+        // GraphQL is inspected whatever the method.
+        assert_eq!(line("-X GET -f query=mutation{y}"), Class::Write);
+        assert_eq!(line("-X GET -f query=query{y}"), Class::Read);
+        // No query at all: nothing to vouch for a read.
+        assert_eq!(line(""), Class::Write);
         assert!(contains_word("mutation{x}", "mutation"));
         assert!(!contains_word("query { mutations }", "mutation"));
         std::fs::remove_dir_all(&dir).unwrap();

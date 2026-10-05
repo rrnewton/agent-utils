@@ -1,7 +1,8 @@
 //! `gh-paced status`: a read-only view of one account's (or every account's) pacing state.
 //!
-//! Status takes the account lock only long enough to read the state file; it never saves,
-//! never refreshes the GitHub snapshot, and never contacts GitHub.
+//! Status takes no lock and creates nothing: it reads the state file (which is always replaced
+//! whole, by rename) and the audit log, probes lease files for liveness, never saves, never
+//! refreshes the GitHub snapshot, and never contacts GitHub.
 
 use crate::audit;
 use crate::budget::{halved, Bucket};
@@ -17,10 +18,7 @@ pub const RECENT: usize = 5;
 
 /// Build the status report for one account at `now`.
 pub fn report(paths: &Paths, cfg: &Config, now: f64) -> Result<Value, String> {
-    let st: State = {
-        let _guard = state::lock(paths)?;
-        state::load_readonly(paths)?
-    };
+    let st: State = state::load_readonly(paths)?;
     let pressure_of = |class: Class| st.rate_limit.as_ref().and_then(|s| s.pressure(class, now));
     let mut classes = serde_json::Map::new();
     for class in Class::PACED {
@@ -55,7 +53,7 @@ pub fn report(paths: &Paths, cfg: &Config, now: f64) -> Result<Value, String> {
                 "pid": h.pid,
                 "class": h.class.name(),
                 "since_secs": (now - h.since).max(0.0).round(),
-                "alive": state::holder_alive(h),
+                "alive": state::holder_alive_in(paths, h),
             })
         })
         .collect();

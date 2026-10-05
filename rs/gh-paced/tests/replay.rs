@@ -12,9 +12,9 @@
 
 use gh_paced::classify::Class;
 use gh_paced::clock::{Clock, FakeClock};
-use gh_paced::config::Config;
+use gh_paced::config::{ClassLimits, Config};
 use gh_paced::pushback::Scanner;
-use gh_paced::runner::{Captured, Exit, Invocation, Runner};
+use gh_paced::runner::{Captured, Exit, Invocation, Ran, Runner};
 use gh_paced::state::{self, Holder, Paths};
 use gh_paced::wrapper::{Outcome, Wrapper, EXIT_CONTENT, EXIT_REFUSED};
 use std::path::{Path, PathBuf};
@@ -85,7 +85,7 @@ impl<'a> FakeGh<'a> {
 }
 
 impl Runner for FakeGh<'_> {
-    fn run(&self, inv: Invocation<'_>, scanner: &mut Scanner) -> Result<Exit, String> {
+    fn run(&self, inv: Invocation<'_>, scanner: &mut Scanner) -> Result<Ran, String> {
         self.runs.lock().unwrap().push(Call {
             at: self.clock.now(),
             args: inv.args.to_vec(),
@@ -93,7 +93,10 @@ impl Runner for FakeGh<'_> {
         let err = self.stderr.lock().unwrap().clone();
         scanner.feed(&err);
         self.clock.advance_to(self.clock.now() + CALL_SECS);
-        Ok(Exit::Code(0))
+        Ok(Ran {
+            exit: Exit::Code(0),
+            deadline_hit: false,
+        })
     }
 
     fn capture(&self, inv: Invocation<'_>, _timeout: f64) -> Result<Captured, String> {
@@ -155,6 +158,7 @@ fn gh(
         chain: Vec::new(),
         depth: 0,
         alive: &alive,
+        inherited_leases: Vec::new(),
         pid: 4242,
         start_ticks: 1,
         nonce: format!("{:016x}", NONCE.fetch_add(1, Ordering::SeqCst)),
@@ -565,5 +569,277 @@ fn retry_after_longer_than_the_default_is_honoured() {
     clock.advance_to(T0 + 1000.0);
     let (outcome, messages) = gh(&clock, &fake, &dir, &cfg, &get_args(1));
     assert_eq!(outcome, Outcome::Exit(EXIT_REFUSED), "{messages:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every budget decision uses a time read after the state lock is held. A call that waited for
+/// the lock while another process held it must not act on the time it started waiting: its
+/// window entries would be back-dated and its waits computed from a stale clock.
+#[test]
+fn time_is_read_after_the_lock_is_taken() {
+    let dir = scratch("late-lock");
+    let clock = FakeClock::new(T0);
+    let fake = FakeGh::new(&clock);
+    let cfg = Config::default();
+    let paths = Paths::new(dir.clone(), "replay");
+    let held = state::lock(&paths).unwrap();
+    std::thread::scope(|s| {
+        let worker = s.spawn(|| {
+            gh(
+                &clock,
+                &fake,
+                &dir,
+                &cfg,
+                &strings(&["pr", "comment", "1", "--body", "hi"]),
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!worker.is_finished(), "the call waits for the lock");
+        assert!(fake.runs().is_empty());
+        clock.advance_to(T0 + 100.0);
+        drop(held);
+        let (outcome, messages) = worker.join().unwrap();
+        assert_eq!(outcome, Outcome::Exit(0), "{messages:?}");
+    });
+    let st = state::load_readonly(&paths).unwrap();
+    let write = &st.buckets["write"].window;
+    assert_eq!(write.len(), 1, "{write:?}");
+    for (class, bucket) in &st.buckets {
+        assert!(
+            bucket.window.iter().all(|(t, _)| *t >= T0 + 100.0),
+            "{class} charged at the pre-lock time: {:?}",
+            bucket.window
+        );
+    }
+    assert!(fake.runs()[0].at >= T0 + 100.0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A corrupt state file is moved aside and replaced by a conservative state: every hourly budget
+/// counts as used and a pause runs, so a host that lost its history cannot burst. The
+/// conservative state is saved (the next call does not start fresh), and it ends after an hour.
+#[test]
+fn corrupt_state_pauses_the_account_for_an_hour() {
+    let dir = scratch("corrupt");
+    let clock = FakeClock::new(T0);
+    let fake = FakeGh::new(&clock);
+    let cfg = Config {
+        max_wait_secs: 60.0,
+        ..Config::default()
+    };
+    let garbage = b"{\"buckets\": {\"write\": {\"level\": 1.0, \"wind";
+    std::fs::write(dir.join("replay.json"), garbage).unwrap();
+    let (outcome, messages) = gh(&clock, &fake, &dir, &cfg, &get_args(0));
+    assert_eq!(outcome, Outcome::Exit(EXIT_REFUSED), "{messages:?}");
+    let text = messages.join("\n");
+    assert!(text.contains("is unusable"), "{text}");
+    assert!(
+        text.contains("treated as used up for the next hour"),
+        "{text}"
+    );
+    // The refusal names the longest wait: the full hourly window, not the shorter pause.
+    assert!(
+        text.contains("read budget 500/hour per host reached (500 used in the last hour)"),
+        "{text}"
+    );
+    let aside = dir.join(format!("replay.json.corrupt-{}", T0.floor() as i64));
+    assert_eq!(
+        std::fs::read(&aside).unwrap(),
+        garbage,
+        "kept for inspection"
+    );
+    let paths = Paths::new(dir.clone(), "replay");
+    let st = state::load_readonly(&paths).unwrap();
+    let cd = st.cooldown.expect("a recovery pause");
+    assert_eq!(cd.command, gh_paced::wrapper::RECOVERY_COMMAND);
+    assert!((cd.until - (T0 + cfg.cooldown_secs)).abs() < 1.0, "{cd:?}");
+    for class in [
+        Class::Read,
+        Class::Write,
+        Class::Search,
+        Class::GitCredential,
+    ] {
+        let b = &st.buckets[class.name()];
+        assert_eq!(
+            b.window.iter().map(|(_, c)| u64::from(*c)).sum::<u64>(),
+            u64::from(cfg.limits(class).per_hour),
+            "{class:?} window saturated"
+        );
+    }
+    // The recovery state was saved: the next call is refused without a second recovery.
+    let (outcome, messages) = gh(
+        &clock,
+        &fake,
+        &dir,
+        &cfg,
+        &strings(&["pr", "comment", "1", "--body", "hi"]),
+    );
+    assert_eq!(outcome, Outcome::Exit(EXIT_REFUSED), "{messages:?}");
+    let text = messages.join("\n");
+    assert!(!text.contains("is unusable"), "{text}");
+    assert!(
+        text.contains("write budget 30/hour per host reached (30 used in the last hour)"),
+        "{text}"
+    );
+    // After the pause, the hourly windows are still full.
+    clock.advance_to(T0 + 901.0);
+    let (outcome, messages) = gh(&clock, &fake, &dir, &cfg, &get_args(1));
+    assert_eq!(outcome, Outcome::Exit(EXIT_REFUSED), "{messages:?}");
+    assert!(
+        messages
+            .join("\n")
+            .contains("read budget 500/hour per host reached (500 used in the last hour)"),
+        "{messages:?}"
+    );
+    assert!(fake.runs().is_empty() && fake.captures.lock().unwrap().is_empty());
+    // An hour later calls run again.
+    clock.advance_to(T0 + 3601.0);
+    let (outcome, messages) = gh(&clock, &fake, &dir, &cfg, &get_args(2));
+    assert_eq!(outcome, Outcome::Exit(0), "{messages:?}");
+    assert_eq!(fake.runs().len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The account-wide snapshot is re-read after a sleep: a caller that slept out a cooldown
+/// refreshes before it runs and obeys what the new snapshot says.
+#[test]
+fn feedback_is_rechecked_after_a_sleep() {
+    let dir = scratch("recheck");
+    let clock = FakeClock::new(T0);
+    let fake = FakeGh::new(&clock);
+    let cfg = Config::default();
+    *fake.stderr.lock().unwrap() =
+        b"gh: You have exceeded a secondary rate limit. (HTTP 403)\n".to_vec();
+    let _ = gh(&clock, &fake, &dir, &cfg, &get_args(0));
+    fake.stderr.lock().unwrap().clear();
+    // While the caller below sleeps, the account drops to 18%, under the 20% floor.
+    *fake.core_remaining.lock().unwrap() = (900, T0 + 3600.0);
+    clock.advance_to(T0 + 10.0);
+    let (outcome, messages) = gh(&clock, &fake, &dir, &cfg, &get_args(1));
+    assert_eq!(outcome, Outcome::Exit(EXIT_REFUSED), "{messages:?}");
+    assert!(
+        clock.sleeps().iter().any(|s| *s > 850.0),
+        "slept out the cooldown: {:?}",
+        clock.sleeps()
+    );
+    let captures = fake.captures.lock().unwrap().clone();
+    assert_eq!(captures.len(), 2, "{captures:?}");
+    assert!(
+        captures[1] >= T0 + 900.0,
+        "refreshed after the sleep: {captures:?}"
+    );
+    assert!(
+        messages.join("\n").contains("at or below the 20% floor"),
+        "{messages:?}"
+    );
+    assert_eq!(fake.runs().len(), 1, "the second call never ran");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A rate-limit refresh is itself a READ request: it is charged before it is sent, and it is
+/// skipped when the READ budget has no room, so refreshes cannot push READ past its cap.
+#[test]
+fn refresh_requests_are_charged_before_they_are_sent() {
+    let dir = scratch("refresh-charge");
+    let clock = FakeClock::new(T0);
+    let fake = FakeGh::new(&clock);
+    let cfg = Config {
+        read: ClassLimits {
+            per_minute: 60.0,
+            burst: 10.0,
+            per_hour: 4,
+        },
+        max_wait_secs: 60.0,
+        ..Config::default()
+    };
+    // The first call's refresh and three calls fill the hourly cap of 4.
+    for i in 0..3 {
+        let (outcome, messages) = gh(&clock, &fake, &dir, &cfg, &get_args(i));
+        assert_eq!(outcome, Outcome::Exit(0), "{i}: {messages:?}");
+    }
+    assert_eq!(window_cost(&dir, Class::Read), 4);
+    // Later the snapshot is due for a refresh by age, but there is no READ token for it.
+    clock.advance_to(T0 + 400.0);
+    let (outcome, messages) = gh(&clock, &fake, &dir, &cfg, &get_args(3));
+    assert_eq!(outcome, Outcome::Exit(EXIT_REFUSED), "{messages:?}");
+    assert_eq!(fake.captures.lock().unwrap().len(), 1, "no unpaid refresh");
+    assert_eq!(
+        window_cost(&dir, Class::Read),
+        4,
+        "READ stayed within its cap"
+    );
+    assert_eq!(fake.runs().len(), 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A WRITE that finds another write in flight re-checks every 5 s and prints a warning on every
+/// check, so a long wait is never silent; it runs once the other write has ended.
+#[test]
+fn in_flight_wait_warns_on_every_poll() {
+    let dir = scratch("inflight-poll");
+    let clock = FakeClock::new(T0);
+    let fake = FakeGh::new(&clock);
+    let cfg = Config::default();
+    let paths = Paths::new(dir.clone(), "replay");
+    let other = "00000000000000ff";
+    {
+        let _g = state::lock(&paths).unwrap();
+        let mut st = state::State::new();
+        st.in_flight.push(Holder {
+            pid: 7,
+            start_ticks: 1,
+            nonce: other.into(),
+            class: Class::Write,
+            since: T0,
+            lease: None,
+        });
+        state::save(&paths, &st).unwrap();
+    }
+    let release = T0 + 20.0;
+    let alive = |h: &Holder| h.nonce != other || clock.now() < release;
+    let mut w = Wrapper {
+        clock: &clock,
+        runner: &fake,
+        cfg: cfg.clone(),
+        paths: paths.clone(),
+        host: "testhost".into(),
+        real_gh: PathBuf::from("/fake/gh"),
+        echo: false,
+        messages: Vec::new(),
+        stdin_is_tty: true,
+        stdin_reader: Box::new(|_| Ok(Vec::new())),
+        chain: Vec::new(),
+        depth: 0,
+        alive: &alive,
+        inherited_leases: Vec::new(),
+        pid: 4242,
+        start_ticks: 1,
+        nonce: format!("{:016x}", NONCE.fetch_add(1, Ordering::SeqCst)),
+    };
+    let outcome = w.run(&strings(&["issue", "comment", "1", "--body", "short note"]));
+    assert_eq!(outcome, Outcome::Exit(0), "{:?}", w.messages);
+    let warnings: Vec<&String> = w
+        .messages
+        .iter()
+        .filter(|m| m.contains("1 write(s) already in flight on this host (pid 7)"))
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        4,
+        "one warning per 5 s check: {:?}",
+        w.messages
+    );
+    assert!(
+        warnings.iter().all(|m| m.contains("re-checking every 5 s")),
+        "{warnings:?}"
+    );
+    let polls: Vec<f64> = clock.sleeps().into_iter().filter(|s| *s == 5.0).collect();
+    assert_eq!(polls.len(), 4, "{:?}", clock.sleeps());
+    let runs = fake.runs();
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert!(
+        runs[0].at >= release,
+        "ran while the other write was in flight: {runs:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
