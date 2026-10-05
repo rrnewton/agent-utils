@@ -423,8 +423,17 @@ fn effective(all: Vec<BodySource>) -> Vec<BodySource> {
 /// Every body source gh will send on a WRITE command line. `rest` is the argument list after
 /// the command words. `stdin_is_tty` matters only for `secret set`/`variable set`, which read the
 /// value from stdin when no flag supplies it and stdin is not a terminal.
+///
+/// For an alias, an extension or an unknown command, every source is kept: gh's last-wins rule
+/// does not apply to an alias's own arguments (`my-alias --body=A --body=B` may hand `A` to a
+/// body field through `$1`), so none of them is dropped.
 pub fn body_sources(c: &Classification, rest: &[String], stdin_is_tty: bool) -> Vec<BodySource> {
-    effective(scan(c, rest, stdin_is_tty).sources)
+    let all = scan(c, rest, stdin_is_tty).sources;
+    if crate::classify::is_unknown_command(c) {
+        all
+    } else {
+        effective(all)
+    }
 }
 
 /// Every file gh may read while running this command, including overridden occurrences (gh
@@ -510,7 +519,7 @@ struct Scan {
 }
 
 /// Go's `strconv.ParseBool`, which pflag uses for `--flag=value` on a boolean flag.
-fn parse_go_bool(v: &str) -> Option<bool> {
+pub(crate) fn parse_go_bool(v: &str) -> Option<bool> {
     match v {
         "1" | "t" | "T" | "TRUE" | "true" | "True" => Some(true),
         "0" | "f" | "F" | "FALSE" | "false" | "False" => Some(false),
@@ -1513,6 +1522,27 @@ mod tests {
         assert!(matches!(
             evaluate(&s, &Config::default(), None),
             Verdict::Refuse(m) if m.contains("base64")
+        ));
+        // gh's last-wins rule does not apply to an alias's arguments: every occurrence counts.
+        let body = format!("--body={big}");
+        for line in [
+            &["my-alias", body.as_str(), "--body=small"][..],
+            &["my-alias", "-b", big.as_str(), "-b", "small"],
+        ] {
+            let s = sources(line);
+            assert!(
+                matches!(
+                    evaluate(&s, &Config::default(), None),
+                    Verdict::Refuse(ref m) if m.contains("over the 8192-byte limit")
+                ),
+                "{line:?}: {s:?}"
+            );
+        }
+        // A known command keeps gh's last-wins rule.
+        let s = sources(&["issue", "comment", "1", body.as_str(), "--body=small"]);
+        assert!(matches!(
+            evaluate(&s, &Config::default(), None),
+            Verdict::Allow { .. }
         ));
         // A small alias call is still allowed.
         let s = sources(&["my-alias", "--flag=small", "-x", "words"]);
