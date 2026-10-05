@@ -62,8 +62,9 @@ DEFAULT BUDGETS (per host, per account; four hosts assumed)
   GIT_CREDENTIAL   1 per 10 s, burst 1, 120/hour
   LOCAL            unpaced, unaudited (help, completion, config, alias, ...)
   Unknown commands (aliases, extensions) are WRITE, even with --help.
-  `gh api --paginate` costs 10 tokens, for writes too. Watch loops cost 20 and
-  are stopped (exit 75) once they outlast the polls those tokens cover.
+  `gh api --paginate` costs 10 tokens, for writes too. Watch loops cost 20, an
+  estimate of their requests, and are stopped (exit 75) once they outlast the
+  polls that estimate allows; a large or failing run can make more requests.
   A cost above the class's hourly cap is refused at once (exit 75).
 
 ENVIRONMENT
@@ -87,7 +88,8 @@ ENVIRONMENT
 EXIT STATUS
   gh's own status (or gh-paced dies by the same signal), except:
   75  refused: the wait would exceed GH_PACED_MAX_WAIT, the cost can never fit
-      the hourly cap, a watch outlasted its paid polls, or nesting too deep
+      the hourly cap, a watch outlasted the polls its cost allows, or nesting
+      too deep
   65  refused by the write content guard (body > 8 KiB, base64 run > 1000, a
       body gh composes itself, or a body file that cannot be copied)
   64  usage error, or a refused command shape (a watch interval under 30 s,

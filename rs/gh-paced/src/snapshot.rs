@@ -282,6 +282,7 @@ mod tests {
     /// and does not follow later changes to the original.
     #[test]
     fn copies_replace_the_paths_and_vanish_on_drop() {
+        let _children = state::child_guard();
         let dir = tmpdir("copy");
         let body = dir.join("body.md");
         std::fs::write(&body, b"short note").expect("write");
@@ -384,6 +385,7 @@ mod tests {
     /// the grace period; a name that does not identify its creator falls back to the 24-hour age.
     #[test]
     fn sweep_removes_only_abandoned_snapshot_directories() {
+        let _children = state::child_guard();
         let dir = tmpdir("sweep");
         let day = 86400;
         // Creator 111 is "dead", creator 222 "alive" (start time 7 for both).
@@ -446,6 +448,7 @@ mod tests {
     /// dropping the snapshot leaves the directory while an inherited copy of the lock is open.
     #[test]
     fn inherited_lock_outlives_the_wrapper_copy() {
+        let _children = state::child_guard();
         let dir = tmpdir("inherit");
         let body = dir.join("body.md");
         std::fs::write(&body, b"note").expect("write");

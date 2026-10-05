@@ -591,6 +591,23 @@ pub fn lease_held(dir: &Path, name: &str) -> bool {
     err.kind() == std::io::ErrorKind::WouldBlock || err.kind() != std::io::ErrorKind::Interrupted
 }
 
+/// Keeps the tests that spawn a child apart from the tests that observe a lock being released.
+///
+/// Tests run as threads of one process. A spawned child holds a copy of every descriptor in the
+/// process, close-on-exec ones included, from the fork until its exec closes them, and the kernel
+/// can let the parent go on a moment before that. So a lock that one test has released can still
+/// read as held while another test's child is starting, and a sweep or a [`Drop`] that probes it
+/// then keeps a directory the test expects to be gone. A test that spawns a child holds this guard
+/// from before the spawn until the child is reaped. A test that releases a lock and then observes
+/// the release, directly or through code that probes it, holds the guard for its whole body.
+#[cfg(test)]
+pub(crate) fn child_guard() -> std::sync::MutexGuard<'static, ()> {
+    static CHILDREN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    CHILDREN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Save the account's state atomically. Call only while holding [`lock`].
 pub fn save(paths: &Paths, state: &State) -> Result<(), String> {
     let text = serde_json::to_vec_pretty(state).map_err(|e| format!("cannot encode state: {e}"))?;
@@ -916,6 +933,7 @@ mod tests {
     /// or a child's that inherited it. Another open of the same file probes it.
     #[test]
     fn lease_lifetime_follows_the_open_file() {
+        let _children = child_guard();
         let dir = tmpdir("lease");
         let paths = Paths::new(dir.clone(), "acct");
         let lease = create_lease(&paths, "0123456789abcdef").expect("lease");
@@ -1005,6 +1023,7 @@ mod tests {
     /// not alive, so it cannot keep a refresh claim; reaping drops it.
     #[test]
     fn zombies_are_not_alive() {
+        let _children = child_guard();
         let mut child = std::process::Command::new("true")
             .spawn()
             .expect("spawn true");

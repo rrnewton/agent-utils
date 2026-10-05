@@ -461,11 +461,16 @@ primary allowance in that hour.
     the web exemption.
 22. **Every argument of an alias, extension or unknown command is inspected as
     body text**, flag-shaped or not (`--payload=<text>`, `--repo <text>`,
-    `-- <text>`), because the expansion may pass any of them to a body flag.
+    `-- <text>`), and every occurrence of a repeated flag rather than only the
+    last, because the expansion may pass any of them to a body flag. (Round 3
+    found the last-occurrence pruning still applied to aliases.)
 23. **The audit log drops the values of unknown flags.** `api repos/o/r
     --token=X` is recorded as `api <arg> --token`; the request asked for no
     secrets in the log, and gh-paced cannot know what an unrecognised flag
-    carries.
+    carries. For the same reason a `gh api` call with an unrecognised flag has
+    the command `api <unparsed>`, since its endpoint cannot be told apart from
+    the flag's value. (Round 3 found `api GET CANARY` recorded for
+    `api --token CANARY repos/o/r`.)
 24. **A due refresh waits for READ room.** When the snapshot is due and READ
     has no token for the refresh, READ, SEARCH and WRITE calls wait (or are
     refused past `GH_PACED_MAX_WAIT`). Before round 2 the refresh was skipped
@@ -482,10 +487,12 @@ primary allowance in that hour.
 27. **Zombie processes count as dead.** A process whose PID and start time match
     but whose state is `Z` or `X` no longer holds a refresh claim or a holder
     record, so a killed, unreaped refresher cannot block callers indefinitely.
-28. **Output delivery is complete, not time-boxed.** After gh exits, the reader
-    stops at end of file, after 2 s of silence, 5 s after the exit, or after
-    64 MiB more (a background process may hold the stream open), and the writer
-    is then waited for without a time limit. Before round 2 a slow consumer lost
+28. **Every byte read from gh is delivered; reading after gh exits is
+    bounded.** After gh exits, the reader stops at end of file, after 2 s of
+    silence, 5 s after the exit, or after 64 MiB more (a background process may
+    hold the stream open), and the writer is then waited for without a time
+    limit. Output a background process writes after that cutoff is lost (a
+    round-3 known gap). Before round 2 a slow consumer lost
     everything not delivered within 2 s (a mutant with the old cutoff delivered
     65,536 of 122,935 bytes).
 29. **Snapshot directories are swept by ownership, not age alone.** See the
@@ -571,6 +578,79 @@ library, 24 CLI and 14 replay tests, against 93 at the round-2 head. The run
 takes about 12.5 s of wall time, most of it the CLI tests' real child
 processes (9.2 s).
 
+## Review round 3 and the follow-up commit
+
+Codex (same model and settings) reviewed `fb96152e..670eed40` and ran the
+tests: 113 passed (75 library, 24 CLI, 14 replay). It requested changes with 1
+blocker, 10 major and 2 minor findings. Of round 2's 17 findings it rated 10
+fixed and 7 partly fixed, and all three goalpost items fixed. Of the 10 round-1
+findings still open after round 2 it rated 4 fixed and 6 partly fixed.
+
+Its goalpost assessment found no weakened assertion, no failure relabelled as a
+pass and no deleted check. It answered "yes" on tolerances and exemptions for
+four things: the watch documentation admitting requests beyond the charge, the
+complete-header-block rule dropping interrupted signals, the 20-character
+minimum line length for wrapped base64 (which has an accepting test), and the
+post-exit output cutoffs. All four are in the known gaps below.
+
+That was the last of the three review rounds. The commit after `670eed40` fixes
+six findings and has **not** been reviewed by Codex:
+
+| Severity | Finding | Fix | Test that fails with the old behaviour restored |
+| --- | --- | --- | --- |
+| blocker | `extension exec foo --help` was LOCAL, so it ran unpaced, unchecked and unaudited; gh passes `--help` on to the extension, which may ignore it | `--help` is free only on a known command path that does not run an extension | `classify::help_detection_is_not_fooled_by_a_flag_value` |
+| major | `pr list --label -dL --limit 1000` cost 1: the value `-dL` was read as a group that swallowed the real `--limit` | recording a value no longer skips the token after it, so every token is still examined as a flag | `classify::grouped_shorthands_are_read` (two mutants) |
+| major | `pr list --limit=0x3e8` cost 1, but pflag parses Go base-0 integers (1000) | limits are parsed with Go's integer syntax: sign, `0x`/`0o`/`0b`, leading-zero octal, underscores | `classify::limit_values_are_read_as_gh_reads_them` (new) |
+| major | an alias's repeated flag was pruned to its last occurrence (`my-alias --body=<10 KiB> --body=small`) | no last-wins pruning for an alias, extension or unknown command | `guard::alias_flag_shaped_arguments_are_inspected` |
+| major | an unknown `gh api` flag's value became the audit `command` (`api GET CANARY` for `api --token CANARY repos/o/r`) | such a call is recorded as `api <unparsed>` with method and endpoint `<unparsed>`; refusal reasons keep only the flag name | `classify::paginate_and_limit_costs` (two mutants) |
+| minor | `pr checks 1 --watch=false` was charged 20 and refused as a watch | the effective boolean value is used; the last occurrence wins | `classify::watch_loops_are_charged_and_fast_ones_refused` |
+
+Mutation checks: each fix was reverted on its own (8 mutants; two rows have
+two) and its named test failed every time.
+
+The same commit fixes a test flake. `snapshot::sweep_removes_only_abandoned_snapshot_directories`
+failed in 1 of 8 parallel runs of the library tests on a host at a load average
+of about 190, and never when run alone (0 of 25) or single-threaded (0 of 6).
+Tests are threads of one process. A child that another test spawns
+(`state::lease_lifetime_follows_the_open_file` spawns `sleep 2`,
+`state::zombies_are_not_alive` spawns `true`) holds a copy of every descriptor,
+close-on-exec ones included, until its exec, so a lock that the sweep test has
+just released can still read as held. The fix is a test-only mutex,
+`state::child_guard`, held by the two spawning tests until their child is
+reaped and by the three tests that observe a release: the sweep test,
+`snapshot::inherited_lock_outlives_the_wrapper_copy` and
+`snapshot::copies_replace_the_paths_and_vanish_on_drop`. No assertion changed.
+With the fix: 0 failures in 30 parallel runs. Production needs no change: a
+directory kept because of such a transient holder is removed by a later sweep.
+
+Known gaps from round 3, not fixed, all listed in the user guide's
+Limitations. Line numbers refer to `670eed40`.
+
+- Watch per-poll charges are estimates with no enforced request bound
+  (major, `classify.rs:709`).
+- A detected pushback is recorded only after gh's output has been delivered,
+  so a consumer that stops reading delays the cooldown for other calls (major,
+  `runner.rs:670`).
+- A late signal waits for a blocked write: the writer thread holds Rust's
+  stderr lock inside `write_all`, and the warning needs the same lock. Codex
+  reproduced this; KILL still works (major, `runner.rs:452`).
+- After gh exits, reading stops after 2 s of silence, 5 s, or 64 MiB, so a
+  descendant that writes later loses that output and any pushback text in it
+  (major, `runner.rs:394`).
+- Base64 wrapped at fewer than 20 columns is not detected: `"aaaa"` repeated
+  300 times and wrapped at 16 columns passes (major, `guard.rs:932`).
+- A genuine header block cut off before its blank line loses its
+  `Retry-After`; gh's stderr text usually still gives the 900 s floor (major,
+  `pushback.rs:193`).
+- A response body containing a CRLF header block can start an unneeded
+  cooldown, which errs on the safe side (minor, `pushback.rs:199`).
+- No test injects a crash between quarantine and the recovery save (round 2,
+  row 10); that path was checked by tracing the operations only.
+
+After the follow-up commit `cargo test -p gh-paced` runs 114 tests, all
+passing: 76 library, 24 CLI and 14 replay. The run takes 12.6 s of wall time,
+9.2 s of it the CLI tests.
+
 ## Test changes worth a reviewer's attention
 
 Round 1 changed these existing tests. Every change makes the test stricter or
@@ -641,6 +721,12 @@ Round 2 changed these existing tests:
   `snapshot::sweep_removes_only_old_snapshot_directories` became
   `sweep_removes_only_abandoned_snapshot_directories`, following the new rules.
 
+The follow-up commit after round 3 removes or loosens no assertion. It adds
+assertions to five existing tests (help detection, grouped shorthands,
+pagination and limit costs, watch loops, alias inspection), adds one test
+(`limit_values_are_read_as_gh_reads_them`), and makes five tests take
+`state::child_guard` (see round 3).
+
 ## Open items
 
 - Budgets are per host; hosts do not share state. More than four hosts on one
@@ -652,3 +738,7 @@ Round 2 changed these existing tests:
   jobs that fail during the watch, can make more requests than it paid for
   before the deadline stops it; the deadline still bounds its wall time and the
   30 s floor its rate.
+- The other round-3 known gaps: pushback recorded only after output delivery,
+  a late signal waiting for a blocked write, post-exit output cutoffs, base64
+  wrapped under 20 columns, interrupted header blocks, CRLF bodies, and no
+  crash-injection test for quarantine (see round 3).

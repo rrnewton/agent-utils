@@ -262,8 +262,11 @@ fn is_help_request(args: &[String]) -> bool {
 /// takes the rest of the token (or the next argument). gh-paced does not know every command's
 /// boolean letters, so it treats every letter as possibly boolean and keeps scanning, stopping
 /// only at `=` (pflag gives the rest of the token to the letter before it) and at `R`, the global
-/// `--repo` shorthand, which always takes a value. A letter wrongly assumed boolean can only add
-/// a candidate, never hide one; callers choose the most conservative candidate.
+/// `--repo` shorthand, which always takes a value. Nor does it know which other flags take a
+/// value, so a token it reads as a value is still examined as a flag in its own right: in
+/// `--label -dL --limit 1000`, gh reads `-dL` as the label, and gh-paced records both `--limit`
+/// (from `-dL`) and `1000`. A wrong guess can only add a candidate, never hide one; callers
+/// choose the most conservative candidate.
 fn flag_values<'a>(rest: &'a [String], short: Option<char>, long: &str) -> Vec<&'a str> {
     let long_eq = format!("{long}=");
     let mut out = Vec::new();
@@ -277,7 +280,7 @@ fn flag_values<'a>(rest: &'a [String], short: Option<char>, long: &str) -> Vec<&
             if let Some(v) = rest.get(i + 1) {
                 out.push(v.as_str());
             }
-            i += 2;
+            i += 1;
             continue;
         }
         if let Some(v) = t.strip_prefix(long_eq.as_str()) {
@@ -293,8 +296,6 @@ fn flag_values<'a>(rest: &'a [String], short: Option<char>, long: &str) -> Vec<&
                         if let Some(v) = rest.get(i + 1) {
                             out.push(v.as_str());
                         }
-                        i += 2;
-                        continue;
                     }
                     GroupValue::Absent => {}
                 }
@@ -334,22 +335,54 @@ fn short_group_value(group: &str, target: char) -> GroupValue<'_> {
     GroupValue::Absent
 }
 
-fn has_flag(rest: &[String], names: &[&str]) -> bool {
+/// Whether a boolean long flag (`--watch`, `--watch=false`) is on, as gh would read it: the last
+/// occurrence wins. A value gh cannot parse as a boolean counts as on (gh exits with an error,
+/// so charging for it costs nothing real).
+fn bool_flag_set(rest: &[String], long: &str) -> bool {
+    let long_eq = format!("{long}=");
+    let mut on = false;
     for t in rest {
         if t == "--" {
-            return false;
+            break;
         }
-        if names.contains(&t.as_str()) {
-            return true;
-        }
-        if names
-            .iter()
-            .any(|n| n.starts_with("--") && t.starts_with(&format!("{n}=")))
-        {
-            return true;
+        if t == long {
+            on = true;
+        } else if let Some(v) = t.strip_prefix(long_eq.as_str()) {
+            on = crate::guard::parse_go_bool(v) != Some(false);
         }
     }
-    false
+    on
+}
+
+/// Parse an integer flag value the way pflag does (Go's `strconv.ParseInt(s, 0, 64)`): an
+/// optional sign, then `0x`/`0X` (hexadecimal), `0o`/`0O` or a bare leading `0` (octal), `0b`/`0B`
+/// (binary) or plain decimal digits, with `_` allowed between digits. Slightly more permissive
+/// than Go about where `_` may appear, which can only add a candidate value.
+fn parse_go_int(value: &str) -> Option<i128> {
+    let v = value.trim();
+    let (negative, digits) = match v.as_bytes().first() {
+        Some(b'-') => (true, &v[1..]),
+        Some(b'+') => (false, &v[1..]),
+        _ => (false, v),
+    };
+    let lower = digits.to_ascii_lowercase();
+    let (radix, body) = if let Some(b) = lower.strip_prefix("0x") {
+        (16, b)
+    } else if let Some(b) = lower.strip_prefix("0o") {
+        (8, b)
+    } else if let Some(b) = lower.strip_prefix("0b") {
+        (2, b)
+    } else if lower.len() > 1 && lower.starts_with('0') {
+        (8, &lower[1..])
+    } else {
+        (10, lower.as_str())
+    };
+    let body: String = body.chars().filter(|&c| c != '_').collect();
+    if body.is_empty() || body.len() > 70 {
+        return None;
+    }
+    let n = i128::from_str_radix(&body, radix).ok()?;
+    Some(if negative { -n } else { n })
 }
 
 /// Parse a watch `--interval` value the way gh must read it to sleep for that many seconds.
@@ -423,8 +456,11 @@ fn classify_inner(args: &[String], cfg: &Config) -> Classification {
         let family = words.first().copied().unwrap_or("");
         // Only gh's own commands are known to print help for `--help`. An alias or an extension
         // receives the argument and may do anything with it (an alias ending in `-b` turns it
-        // into a comment body), so those stay WRITE.
-        if is_known_family(family) {
+        // into a comment body), so those stay WRITE. `gh extension exec` is gh's own command but
+        // turns flag parsing off and hands every later argument, `--help` included, to the
+        // extension, so it stays WRITE too.
+        let runs_extension = family == "extension" && words.get(1).copied() == Some("exec");
+        if is_known_family(family) && !runs_extension {
             return local(
                 family,
                 None,
@@ -443,7 +479,7 @@ fn classify_inner(args: &[String], cfg: &Config) -> Classification {
             "gh".into(),
             &format!(
                 "unrecognised flag {} before the command",
-                lead.unknown_flag.as_deref().unwrap_or("?")
+                lead.unknown_flag.as_deref().map_or("?".into(), flag_name)
             ),
         );
     };
@@ -494,7 +530,10 @@ fn classify_inner(args: &[String], cfg: &Config) -> Classification {
                 family,
                 None,
                 family.to_string(),
-                &format!("unrecognised flag {flag} before the subcommand"),
+                &format!(
+                    "unrecognised flag {} before the subcommand",
+                    flag_name(flag)
+                ),
             );
         }
         return fail_safe(family, None, family.to_string(), "unknown command");
@@ -647,9 +686,13 @@ fn fail_safe(family: &str, sub: Option<String>, command: String, why: &str) -> C
 /// `-L/--limit N` on a list or search: gh fetches up to 100 items per request.
 fn apply_limit_cost(c: &mut Classification, rest: &[String]) {
     // The largest of all `--limit` values, whichever occurrence gh honours.
+    // Values are read as pflag reads them (`--limit=0x3e8` is 1000). A value gh cannot parse, or
+    // a negative one, makes gh exit with an error before any request.
     let largest = flag_values(rest, Some('L'), "--limit")
         .into_iter()
-        .filter_map(|v| v.trim().parse::<u64>().ok())
+        .filter_map(parse_go_int)
+        .filter(|&n| n > 0)
+        .map(|n| u64::try_from(n).unwrap_or(u64::MAX))
         .max();
     if let Some(n) = largest {
         let pages = n.div_ceil(100).max(1);
@@ -683,7 +726,7 @@ fn apply_limit_cost(c: &mut Classification, rest: &[String]) {
 fn apply_watch(c: &mut Classification, rest: &[String], cfg: &Config) {
     let (is_watch, default_interval, startup, requests_per_poll) =
         match (c.family.as_str(), c.sub.as_deref()) {
-            ("pr", Some("checks")) => (has_flag(rest, &["--watch"]), 10.0, 2, 2),
+            ("pr", Some("checks")) => (bool_flag_set(rest, "--watch"), 10.0, 2, 2),
             ("run", Some("watch")) => (true, 3.0, 2, 4),
             _ => (false, 0.0, 0, 1),
         };
@@ -861,6 +904,15 @@ pub fn parse_api(rest: &[String]) -> ApiArgs {
     a
 }
 
+/// A flag's name without its value: `--token=X` is `--token`, `-tX` is `-t`.
+fn flag_name(flag: &str) -> String {
+    if let Some(long) = flag.strip_prefix("--") {
+        format!("--{}", long.split('=').next().unwrap_or(""))
+    } else {
+        flag.chars().take(2).collect()
+    }
+}
+
 /// True when `text` contains `word` delimited by non-identifier characters.
 pub fn contains_word(text: &str, word: &str) -> bool {
     let bytes = text.as_bytes();
@@ -970,14 +1022,32 @@ fn classify_api(rest: &[String], cfg: &Config) -> Classification {
         paginate,
         include: a.include,
     };
-    let command = format!("api {method} {endpoint}").trim().to_string();
-    let mut c = paced(Class::Write, 1, "api", None, command, "");
-    c.api = Some(api);
     if let Some(flag) = &a.unknown {
-        c.reason = format!("unrecognised gh api flag {flag}; classified WRITE (fail safe)");
+        // The unknown flag may take a value, so the method and the endpoint gh-paced read may be
+        // that value (`api --token SECRET repos/o/r` reads `SECRET` as the endpoint). Neither is
+        // kept: the command recorded in the audit log and the state file is `api <unparsed>`.
+        let mut c = paced(
+            Class::Write,
+            1,
+            "api",
+            None,
+            "api <unparsed>".into(),
+            &format!(
+                "unrecognised gh api flag {}; classified WRITE (fail safe)",
+                flag_name(flag)
+            ),
+        );
+        c.api = Some(ApiCall {
+            method: "<unparsed>".into(),
+            endpoint: "<unparsed>".into(),
+            ..api
+        });
         charge_pagination(&mut c, paginate, cfg);
         return c;
     }
+    let command = format!("api {method} {endpoint}").trim().to_string();
+    let mut c = paced(Class::Write, 1, "api", None, command, "");
+    c.api = Some(api);
     let read_method = matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS");
     if is_graphql(&endpoint) {
         // Inspected for every method: `-X GET graphql -f query=mutation{...}` is still a
@@ -1093,6 +1163,13 @@ mod tests {
         assert_eq!(class_of("my-alias 12 --help"), Class::Write);
         assert_eq!(class_of("some-extension -h"), Class::Write);
         assert_eq!(cls("my-alias --help").command, "my-alias");
+        // `gh extension exec` hands `--help` to the extension, which may ignore it and write.
+        assert_eq!(class_of("extension exec foo --help"), Class::Write);
+        assert_eq!(class_of("extension exec foo -h"), Class::Write);
+        assert_eq!(class_of("extension exec --help"), Class::Write);
+        // gh's own extension subcommands still print help locally.
+        assert_eq!(class_of("extension list --help"), Class::Local);
+        assert_eq!(class_of("extension --help"), Class::Local);
     }
 
     #[test]
@@ -1293,6 +1370,26 @@ mod tests {
         let c = cls("api graphql --paginate -f query=mutation{x}");
         assert_eq!((c.class, c.cost), (Class::Write, 10));
         // An unrecognised flag makes the call WRITE, and must not drop the pagination charge.
+        // Its value may have been read as the method or endpoint, so neither is kept.
+        for line in [
+            "api --token CANARY repos/o/r",
+            "api --token=CANARY repos/o/r",
+            "api -ZCANARY repos/o/r",
+            "api --token -X CANARY repos/o/r",
+        ] {
+            let c = cls(line);
+            assert_eq!(
+                (c.class, c.command.as_str()),
+                (Class::Write, "api <unparsed>"),
+                "{line:?}"
+            );
+            let api = c.api.as_ref().unwrap();
+            for text in [&c.command, &c.reason, &api.method, &api.endpoint] {
+                assert!(!text.contains("CANARY"), "{line:?}: {text:?}");
+            }
+        }
+        assert!(!cls("--token=CANARY pr list").reason.contains("CANARY"));
+        assert!(!cls("pr --token=CANARY list").reason.contains("CANARY"));
         for line in [
             "api --allow-escape-sequences --paginate -X POST repos/o/r/x",
             "api --paginate --allow-escape-sequences -X POST repos/o/r/x",
@@ -1377,6 +1474,42 @@ mod tests {
         assert_eq!(short_group_value("dL", 'L'), GroupValue::Next);
         assert_eq!(short_group_value("RL5", 'L'), GroupValue::Absent);
         assert_eq!(short_group_value("d", 'L'), GroupValue::Absent);
+        // A token read as another flag's value is still examined as a flag: gh reads `-dL` as
+        // the label here, and then sees `--limit 1000`.
+        assert_eq!(cls("pr list --label -dL --limit 1000").cost, 10);
+        assert_eq!(cls("pr list --search -L -L 1000").cost, 10);
+        assert_eq!(cls("pr list --limit --limit=1000").cost, 10);
+    }
+
+    /// pflag reads integers with Go's base-prefix rules, so `--limit=0x3e8` is 1000.
+    #[test]
+    fn limit_values_are_read_as_gh_reads_them() {
+        for line in [
+            "pr list --limit=0x3e8",
+            "pr list -L 0X3E8",
+            "pr list --limit 0o1750",
+            "pr list --limit 01750",
+            "pr list --limit 0b1111101000",
+            "pr list --limit 1_000",
+            "pr list --limit +1000",
+            "pr list -L0x3e8",
+        ] {
+            assert_eq!(cls(line).cost, 10, "{line:?}");
+        }
+        // gh rejects a negative or unreadable limit before any request.
+        assert_eq!(cls("pr list --limit=-5000").cost, 1);
+        assert_eq!(cls("pr list --limit=lots").cost, 1);
+        assert_eq!(parse_go_int("0x3e8"), Some(1000));
+        assert_eq!(parse_go_int("-0b11"), Some(-3));
+        assert_eq!(parse_go_int("010"), Some(8));
+        assert_eq!(parse_go_int("0"), Some(0));
+        assert_eq!(parse_go_int("0x"), None);
+        assert_eq!(parse_go_int("12z"), None);
+        // Far beyond u64: still the most conservative charge, not dropped.
+        assert_eq!(
+            cls("pr list --limit 99999999999999999999999").cost,
+            u32::MAX
+        );
     }
 
     #[test]
@@ -1402,6 +1535,28 @@ mod tests {
         assert_eq!(c.cost, 1);
         assert!(c.refusal.is_none());
         assert_eq!(c.deadline_secs, None);
+        // `--watch` is a boolean: gh honours its value and its last occurrence.
+        for line in [
+            "pr checks 12 --watch=false",
+            "pr checks 12 --watch=0",
+            "pr checks 12 --watch --watch=F",
+        ] {
+            let c = cls(line);
+            assert_eq!((c.cost, c.deadline_secs), (1, None), "{line:?}");
+            assert!(c.refusal.is_none(), "{line:?}");
+        }
+        for line in [
+            "pr checks 12 --watch=false --watch",
+            "pr checks 12 --watch=true",
+            "pr checks 12 --watch=maybe",
+        ] {
+            let c = cls(line);
+            assert_eq!(c.cost, 20, "{line:?}");
+            assert!(
+                c.refusal.is_some(),
+                "{line:?}: default interval is too fast"
+            );
+        }
         assert_eq!(cls("pr view 12").deadline_secs, None);
         let cfg = Config {
             allow_fast_watch: true,
