@@ -1,0 +1,342 @@
+"""A validation row's liveness is answered by its run, not by an agent name.
+
+Validation launchers register a run label such as ``validate-<slot>`` as the
+row's agent.  No process carries that label, so the configured agent-liveness
+command cannot answer for it: on 2026-10-05 it reported every one of 54
+validation rows on one host ``unverifiable``, and ``remove --validate-complete``
+refused every completed checkout whose launcher had already exited.  These
+tests pin the replacement authority -- retained run handles, their exact
+process generations and units, and user-systemd state -- in both directions:
+removal succeeds when the run is provably over even though the agent-name
+command is unverifiable, and it refuses whenever the run may still be using the
+checkout even though the agent-name command says dead.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+
+import pytest
+
+from wrkslots import cli as wrkslots
+from wrkslots.tests.test_lifecycle import (
+    active_slots,
+    checkout,
+    create,
+    expire_heartbeat,
+    make_project,
+    mark_owner_dead,
+    set_liveness,
+    stub_validate_batch_censuses,
+)
+
+
+# These tests supply the host's process and user-systemd evidence themselves,
+# below the seam that the suite's idle-host default replaces.
+pytestmark = pytest.mark.validation_run_evidence
+
+RUN_UNIT = "validate-run-0001.service"
+
+
+def _unit(**overrides: str) -> dict[str, str]:
+    value = {
+        "Id": RUN_UNIT,
+        "LoadState": "loaded",
+        "ActiveState": "inactive",
+        "SubState": "dead",
+        "MainPID": "0",
+        "ControlGroup": f"/user.slice/app.slice/{RUN_UNIT}",
+        "WorkingDirectory": "",
+        "ExecStart": "",
+        "Environment": "",
+        "PendingJob": "no",
+    }
+    value.update(overrides)
+    return value
+
+
+def _prepare(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    agent_liveness: str,
+    units: Sequence[Mapping[str, str]] = (),
+    processes: Sequence[wrkslots._AbsentProcessObservation] = (),
+) -> tuple[Path, Path]:
+    """Create one completed validation row whose launcher has exited."""
+
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(
+        project,
+        agent="validate-slot01",
+        slot_type="validate",
+        branch=None,
+    )
+    assert made.returncode == 0, made.stderr
+    mark_owner_dead(project)
+    set_liveness(project, agent_liveness)
+    stub_validate_batch_censuses(monkeypatch)
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_a, **_k: None)
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", lambda: tuple(units))
+    monkeypatch.setattr(
+        wrkslots,
+        "_absent_validate_process_snapshot",
+        lambda **_kwargs: tuple(processes),
+    )
+    return project, checkout(project, slot_type="validate")
+
+
+def _write_run_handle(
+    project: Path,
+    tree: Path,
+    *,
+    process_identity: Mapping[str, object] | None = None,
+) -> Path:
+    handle = project / "ignored" / "validate" / "runs" / (
+        RUN_UNIT.removesuffix(".service") + ".json"
+    )
+    handle.parent.mkdir(parents=True, exist_ok=True)
+    value: dict[str, object] = {"checkout": str(tree), "unit": RUN_UNIT}
+    if process_identity is not None:
+        value["process_identity"] = dict(process_identity)
+    handle.write_text(json.dumps(value), encoding="utf-8")
+    return handle
+
+
+def _remove_completed(project: Path) -> int:
+    return wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove",
+            "slot01",
+            "--validate-complete",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        ]
+    )
+
+
+def _assert_retained(project: Path, tree: Path) -> None:
+    assert tree.is_dir()
+    assert len(active_slots(project)) == 1
+
+
+def test_completed_validation_removal_does_not_ask_agent_liveness_about_a_run_label(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The incident: the agent-name command cannot answer for a run label."""
+
+    project, tree = _prepare(
+        tmp_path,
+        monkeypatch,
+        agent_liveness="unverifiable",
+        units=(_unit(),),
+    )
+    _write_run_handle(project, tree)
+
+    removed = _remove_completed(project)
+
+    assert removed == 0, capsys.readouterr().err
+    assert not tree.exists()
+    assert active_slots(project) == []
+
+
+def test_completed_validation_removal_refuses_while_the_run_unit_is_active(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, tree = _prepare(
+        tmp_path,
+        monkeypatch,
+        agent_liveness="dead",
+        units=(_unit(ActiveState="active", SubState="running"),),
+    )
+    _write_run_handle(project, tree)
+
+    removed = _remove_completed(project)
+
+    error = capsys.readouterr().err
+    assert removed != 0
+    assert "validation-run authority reports the run may still use slot slot01" in error
+    assert f"retained validation unit {RUN_UNIT} may still use row slot01" in error
+    _assert_retained(project, tree)
+
+
+def test_completed_validation_removal_refuses_while_the_run_job_is_queued(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, tree = _prepare(
+        tmp_path,
+        monkeypatch,
+        agent_liveness="dead",
+        units=(_unit(PendingJob="yes"),),
+    )
+    _write_run_handle(project, tree)
+
+    removed = _remove_completed(project)
+
+    error = capsys.readouterr().err
+    assert removed != 0
+    assert f"retained validation unit {RUN_UNIT} may still use row slot01" in error
+    _assert_retained(project, tree)
+
+
+def test_completed_validation_removal_refuses_a_live_run_process_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, tree = _prepare(
+        tmp_path, monkeypatch, agent_liveness="dead", units=(_unit(),)
+    )
+    start_ticks = wrkslots._process_start_ticks(Path("/proc") / str(os.getpid()))
+    assert start_ticks is not None
+    _write_run_handle(
+        project,
+        tree,
+        process_identity={
+            "pid": os.getpid(),
+            "start_ticks": start_ticks,
+            "boot_id": wrkslots._boot_id(Path("/proc")),
+        },
+    )
+
+    removed = _remove_completed(project)
+
+    error = capsys.readouterr().err
+    assert removed != 0
+    assert f"has live exact process generation {os.getpid()} for row slot01" in error
+    _assert_retained(project, tree)
+
+
+def test_completed_validation_removal_refuses_a_process_left_in_the_run_cgroup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    straggler = wrkslots._AbsentProcessObservation(
+        pid=os.getpid() + 100_000,
+        start_ticks=17,
+        cgroup_path=f"/user.slice/app.slice/{RUN_UNIT}/payload",
+        mount_namespace="mnt:[test]",
+    )
+    project, tree = _prepare(
+        tmp_path,
+        monkeypatch,
+        agent_liveness="dead",
+        units=(_unit(),),
+        processes=(straggler,),
+    )
+    _write_run_handle(project, tree)
+
+    removed = _remove_completed(project)
+
+    error = capsys.readouterr().err
+    assert removed != 0
+    assert f"retained validation unit {RUN_UNIT} still has a live cgroup process" in error
+    _assert_retained(project, tree)
+
+
+def test_completed_validation_removal_refuses_an_active_unit_naming_the_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A run with no retained handle is still visible through its unit."""
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    unrecorded = _unit(
+        Id="unrecorded-run.service",
+        ActiveState="active",
+        SubState="running",
+        WorkingDirectory=str(tree),
+    )
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", lambda: (unrecorded,))
+
+    removed = _remove_completed(project)
+
+    error = capsys.readouterr().err
+    assert removed != 0
+    assert "user-systemd unit unrecorded-run.service names validation row slot01" in error
+    _assert_retained(project, tree)
+
+
+def test_completed_validation_removal_refuses_unreadable_run_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+
+    def unreadable() -> tuple[Mapping[str, str], ...]:
+        raise wrkslots.Refusal("cannot enumerate user-systemd state: no user bus")
+
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", unreadable)
+
+    removed = _remove_completed(project)
+
+    error = capsys.readouterr().err
+    assert removed != 0
+    assert "validation-run authority is unverifiable for slot slot01" in error
+    assert "no user bus" in error
+    _assert_retained(project, tree)
+
+
+def test_audit_judges_a_validation_row_by_its_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Audit and remove ask the same authority, so they cannot disagree."""
+
+    project, tree = _prepare(
+        tmp_path, monkeypatch, agent_liveness="unverifiable", units=(_unit(),)
+    )
+    _write_run_handle(project, tree)
+    expire_heartbeat(project)
+
+    def audit() -> str:
+        code = wrkslots.main(
+            ["--project-root", str(project), "audit", "--format", "json"]
+        )
+        captured = capsys.readouterr()
+        assert code == 0, captured.err
+        return captured.out
+
+    finished = json.loads(audit())
+    phases = {phase["name"]: phase for phase in finished["metrics"]["phases"]}
+    assert phases["liveness"]["work"] == {
+        "batch_invocations": 0,
+        "legacy_invocations": 0,
+        "subjects": 0,
+        "validation_run_subjects": 1,
+    }
+    row = finished["slots"][0]
+    assert row["liveness_state"] == "dead"
+    assert row["verdict"] == "DELETABLE", row["reasons"]
+
+    monkeypatch.setattr(
+        wrkslots,
+        "_user_systemd_snapshot",
+        lambda: (_unit(ActiveState="active", SubState="running"),),
+    )
+    running = json.loads(audit())
+    row = running["slots"][0]
+    assert row["liveness_state"] == "alive"
+    assert row["verdict"] == "BLOCKED"
+    assert any(
+        f"retained validation unit {RUN_UNIT} may still use row slot01" in reason
+        for reason in row["reasons"]
+    )

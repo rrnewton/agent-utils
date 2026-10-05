@@ -17,3 +17,28 @@ if str(PY_ROOT) not in sys.path:
 import os  # noqa: E402
 
 os.environ.setdefault("WRKSLOTS_INIT_REPRESENTATION", "worktree")
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def idle_validation_run_host(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Give each in-process test a host on which no validation run exists.
+
+    A validation row's liveness is answered from this host's live processes
+    and user-systemd units.  Lifecycle shards run in user namespaces and on
+    hosts with no user bus, where that evidence is unreadable, and on a busy
+    host the real unit population changes under the enumeration.  Neither is
+    what those tests examine.  Tests that examine the evidence itself carry
+    the ``validation_run_evidence`` marker and supply it themselves.  Child
+    processes get the same host from ``idle_validation_host``.
+    """
+
+    if request.node.get_closest_marker("validation_run_evidence") is not None:
+        return
+    from wrkslots import cli
+    from wrkslots.tests.idle_validation_host import no_validation_runs
+
+    monkeypatch.setattr(cli, "_validation_run_host_evidence", no_validation_runs)

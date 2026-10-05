@@ -566,7 +566,14 @@ def raw_command(
     env: dict[str, str] | None = None,
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    argv = [sys.executable, "-m", "wrkslots", "--project-root", str(project)]
+    # The child sees the same host as in-process tests: no validation run.
+    argv = [
+        sys.executable,
+        "-m",
+        "wrkslots.tests.idle_validation_host",
+        "--project-root",
+        str(project),
+    ]
     if machine is not None:
         argv.extend(("--machine", machine))
     argv.extend(args)
@@ -954,6 +961,7 @@ cli._capture_same_uid_process_path_census = test_same_uid_census
 cli._production_frozen_validation_authority_commit = cli._frozen_validation_authority_commit
 cli._frozen_validation_authority_commit = test_frozen_authority
 cli._OWNERLESS_VALIDATION_EXCLUSION_ROOTS = (Path('/tmp'),)
+cli._validation_run_host_evidence = lambda: ((), ())
 raise SystemExit(cli.main(sys.argv[1:]))
 """
     argv = [
@@ -16447,6 +16455,10 @@ def test_validate_remove_refuses_malformed_proof_without_sealing(
         ("record-generation", "exact slot generation"),
         ("path-swap", "scorecard-handoff"),
         ("hardlink", "share one regular-file identity"),
+        # The run record is also the run's retained handle; a second name for
+        # it in the handle directory claims a unit it is not named for, and the
+        # validation run authority refuses before the proof is read.
+        ("hardlink-run-record", "has no matching exact unit identity"),
         ("noncanonical-schema", "producer-schema path does not match"),
         ("noncanonical-handoff", "scorecard-handoff path does not match"),
     ),
@@ -16517,6 +16529,13 @@ def test_validate_remove_refuses_noncanonical_proof_role_binding(
             encoding="utf-8",
         )
     elif mutation == "hardlink":
+        handoff_path = artifacts["scorecard-handoff"]
+        handoff_path.unlink()
+        os.link(artifacts["service-result"], handoff_path)
+        rebind_validation_removal_artifact(
+            project, manifest, "scorecard-handoff", handoff_path
+        )
+    elif mutation == "hardlink-run-record":
         service_result = artifacts["service-result"]
         service_result.unlink()
         os.link(artifacts["run-record"], service_result)
@@ -16954,6 +16973,10 @@ def test_validate_removal_proof_survives_registered_finish_recovery(
         ),
         ("symlink", "crosses a symlink"),
         ("nonregular", "not a regular file"),
+        # The run record is also the run's retained handle, so the validation
+        # run authority, which runs before the proof recheck, refuses first.
+        ("symlink-run-record", "retained validation handle is unsafe"),
+        ("nonregular-run-record", "retained validation handle is unsafe"),
         ("stale-manifest", "regular-file identity changed"),
         ("retained-file-bytes", "retained scorecard file changed bytes"),
         ("retained-extra-file", "invalid file set"),
@@ -17019,11 +17042,21 @@ def test_validate_batch_rechecks_external_proof_after_private_seal(
         elif mutation == "unreadable":
             run_record.chmod(0)
         elif mutation == "symlink":
+            handoff = artifacts["scorecard-handoff"]
+            replacement = tmp_path / "replacement-handoff.json"
+            replacement.write_bytes(handoff.read_bytes())
+            handoff.unlink()
+            handoff.symlink_to(replacement)
+        elif mutation == "nonregular":
+            handoff = artifacts["scorecard-handoff"]
+            handoff.unlink()
+            handoff.mkdir()
+        elif mutation == "symlink-run-record":
             replacement = run_record.with_name("replacement-run-record.json")
             replacement.write_bytes(run_record.read_bytes())
             run_record.unlink()
             run_record.symlink_to(replacement)
-        elif mutation == "nonregular":
+        elif mutation == "nonregular-run-record":
             run_record.unlink()
             run_record.mkdir()
         elif mutation == "stale-manifest":
@@ -31457,18 +31490,29 @@ def test_audit_invokes_configured_batch_liveness_protocol(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    project, _repository, _remote = make_project(tmp_path, liveness_batch=True)
+    project, repository, _remote = make_project(tmp_path, liveness_batch=True)
+    made = create(
+        project, slot="batch-audit", agent="codex-batch", branch="codex/batch"
+    )
+    assert made.returncode == 0, made.stderr
+    commit_task(repository, checkout(project, "batch-audit"), "codex/batch")
+    assert finish(project, slot="batch-audit", agent="codex-batch").returncode == 0
+    # A validation row is judged by its run, not by the agent-name command,
+    # so it is not one of the command's subjects.
     made = create(
         project,
-        slot="batch-audit",
-        agent="codex-batch",
+        slot="validate-audit",
+        agent="validate-validate-audit",
         branch=None,
         slot_type="validate",
     )
     assert made.returncode == 0, made.stderr
-    mark_owner_dead(project)
+    mark_owner_dead(project, slot="batch-audit")
+    mark_owner_dead(project, slot="validate-audit")
     set_liveness(project, "dead")
-    expire_heartbeat(project)
+    monkeypatch.setattr(
+        wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(
         wrkslots,
         "_capture_process_path_census",
@@ -31487,9 +31531,13 @@ def test_audit_invokes_configured_batch_liveness_protocol(
         "batch_invocations": 1,
         "legacy_invocations": 0,
         "subjects": 1,
+        "validation_run_subjects": 1,
     }
-    assert payload["slots"][0]["liveness_state"] == "dead"
-    assert payload["slots"][0]["verdict"] == "DELETABLE"
+    rows = {row["slot"]: row for row in payload["slots"]}
+    assert rows["batch-audit"]["liveness_state"] == "dead"
+    assert rows["batch-audit"]["verdict"] == "DELETABLE", rows["batch-audit"]["reasons"]
+    assert rows["validate-audit"]["liveness_state"] == "dead"
+    assert rows["validate-audit"]["verdict"] == "DELETABLE", rows["validate-audit"]["reasons"]
 
 
 def test_audit_blocks_agent_slot_when_submodule_remote_differs_from_source(

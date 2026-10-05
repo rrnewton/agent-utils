@@ -31,8 +31,10 @@ type, task and purpose, owner process identity, coordinator history, heartbeat t
    evidence. A departed owner is not required to return: later reclaim can salvage from the recorded
    checkout state.
 5. Any later participant may run `remove`. Reclaim proceeds only when the heartbeat time-to-live is
-   expired, the registered running command reports dead, the exact owner process identity is dead,
-   and process, mount, Git, and path checks agree. Unknown evidence refuses; it is not treated as
+   expired, the row's liveness authority reports dead (the registered running command for an agent
+   slot, the validation run's own evidence for a validation slot; see "Time-to-live and process
+   evidence"), the exact owner process identity is dead, and process, mount, Git, and path checks
+   agree. Unknown evidence refuses; it is not treated as
    free. `--validate-complete` lets the exact live owner remove its completed validation slot, or
    lets a later participant remove it after proven owner death without waiting out the heartbeat.
    Process-use, path, and Git checks still run. A newly started validation removal first records an
@@ -329,10 +331,10 @@ that has the script, with `path`, `status` (`ran`, `failed`, `timed-out`, `faile
 updates the durable renewal time only for the exact owner process generation. Expiry is one required
 reclaim fact, never the whole decision.
 
-The registered running command receives the agent name as its only positional argument and receives
-`WRKSLOTS_PROJECT_ROOT`, `WRKSLOTS_SLOT`, `WRKSLOTS_AGENT`, `WRKSLOTS_MACHINE`, generation, and owner
-identity fields in the environment. `WRKSLOTS_SLOT_TYPE` and `WRKSLOTS_TASK` let a project-owned
-command consult validation-run evidence without guessing from a path. Its exit status means:
+The registered running command answers for agent slots only. It receives the agent name as its only
+positional argument and receives `WRKSLOTS_PROJECT_ROOT`, `WRKSLOTS_SLOT`, `WRKSLOTS_SLOT_TYPE`
+(always `agent`), `WRKSLOTS_TASK`, `WRKSLOTS_AGENT`, `WRKSLOTS_MACHINE`, generation, and owner
+identity fields in the environment. Its exit status means:
 
 - `0`: the registered mechanism verified the agent is dead;
 - `1`: the agent is alive, but only when standard output and standard error together hold exactly
@@ -359,6 +361,28 @@ result for every subject with the same subject ID and agent, a state of `dead`, 
 result makes every subject in that batch unverifiable. There is no permissive fallback after a
 configured batch command fails. Configurations without the optional command retain the established
 per-agent protocol.
+
+A validation slot's `agent` names a run, not a process that a liveness command can find, and a
+validation may outlive the agent that launched it. Neither registered command is asked about
+validation slots. `audit`, `remove` (including `--validate-complete` and `remove-validate-batch`),
+`recover`, and `recover-unbound-owner` ask the run itself, using the same evidence as
+`recover-absent-validate-rows` (see "Recover registered validation rows with absent storage"):
+
+- `dead`: every retained run handle under `ignored/validate/runs/` whose checkout names the slot
+  directory or a recorded checkout path has a dead process generation (when it records one) and an
+  inactive, unqueued service unit with no live process in its control group, and no active or
+  queued user-systemd unit names those paths;
+- `alive`: any of that evidence shows the run may still use the checkout;
+- `unverifiable`: a handle, the process table, or user-systemd state cannot be read completely,
+  the row is registered on another machine, or its owner was recorded on another host. All of this
+  evidence is local to the host, so a host without a reachable user service manager cannot prove a
+  validation slot free.
+
+Audit reports the number of validation rows it judged this way as the liveness phase's
+`validation_run_subjects`. A batch removal reads this evidence once while sealing and once more per
+slot immediately before deletion. A churning user-systemd snapshot refuses rather than guessing;
+rerun the removal. As for agent slots, only `dead` satisfies the reclaim condition, and the exact
+owner generation and the full process-use scan must independently agree.
 
 A slot imported from an older state file with no recorded owner identity cannot satisfy the
 owner-death condition, even after its heartbeat expires. `recover-unbound-owner` can record what was
@@ -895,7 +919,9 @@ when recorded, process generation to the present-tense liveness proof; its run s
 outcome. The configured agent-liveness probe is likewise not an ownership authority: an agent may
 restart elsewhere, while a validation may outlive the agent that launched it. The resource proof is
 the exact recorded owner generation, retained service identity when present, an all-process path and
-mount census, all user services/scopes/jobs, and absent Git and filesystem state.
+mount census, all user services/scopes/jobs, and absent Git and filesystem state. The same run
+handle, process, and user-systemd evidence is the liveness authority for validation slots whose
+storage still exists; see "Time-to-live and process evidence".
 
 The whole batch is preflighted before writing. Recovery then appends one archive transition per row,
 records that durable prefix, and appends one ACTIVE-removal transition per row. A crash may expose a

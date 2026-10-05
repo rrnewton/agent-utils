@@ -16,6 +16,7 @@ show_error_codes = true
 markers = [
     "ordinary_environment: requires host-visible process identities or the initial identity user namespace",
     "mapped_root_namespace: requires uid 0 in a nonidentity user namespace",
+    "validation_run_evidence: supplies its own validation-run process and user-systemd evidence instead of the idle-host default",
 ]
 
 # The test suite imports pytest, whose pytest.approx support pulls in numpy's

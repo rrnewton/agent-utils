@@ -16519,6 +16519,170 @@ def _refuse_registered_liveness(state: str, detail: str) -> NoReturn:
     )
 
 
+def _validation_run_host_evidence() -> tuple[
+    tuple[_AbsentProcessObservation, ...], tuple[Mapping[str, str], ...]
+]:
+    """Read this host's live processes and user-systemd units, each strictly.
+
+    Both reads refuse rather than return a partial population.  This is the
+    only host-wide evidence the validation-run authority reads; the retained
+    run handles are project files.
+    """
+
+    return _absent_validate_process_snapshot(), _user_systemd_snapshot()
+
+
+def _validation_run_liveness_states(
+    config: Config, records: Sequence[ActiveRecord]
+) -> dict[tuple[str, str, int], tuple[str, str]]:
+    """Answer the liveness question for validation rows from their runs.
+
+    A validation row's ``agent`` names a run, not a process that can be asked
+    about: validation launchers register labels such as ``validate-<slot>``
+    that no process carries, and a validation may outlive the agent that
+    started it.  Asking the configured agent-liveness command about such a
+    row has no answer.  On 2026-10-05 every one of 54 validation rows on one
+    host was ``unverifiable``, so no completed validation checkout could be
+    removed by anyone except its own still-running launcher.
+
+    The run is the authority instead, exactly as for
+    ``recover-absent-validate-rows``.  A row is ``dead`` only when every
+    retained run handle that names its slot or checkout path has a dead exact
+    process generation and an inactive, unqueued service unit with no live
+    process in its control group, and no active or queued user-systemd unit
+    names those paths.  Positive evidence of a run is ``alive``.  Unreadable
+    handle, process or user-systemd evidence, a row registered on another
+    machine, and an owner recorded on another host are ``unverifiable``,
+    because all of that evidence is local to this host.
+
+    This replaces only the agent-name question.  Every caller still requires
+    the exact recorded owner generation to be dead (or the caller to be that
+    live owner), and removal still runs its full process/path census.
+    """
+
+    if not records:
+        return {}
+    keys = [(record.machine, record.slot, record.generation) for record in records]
+    if any(record.slot_type != "validate" for record in records):
+        raise StateError("validation-run liveness applies only to validation rows")
+    result: dict[tuple[str, str, int], tuple[str, str]] = {}
+    local: list[ActiveRecord] = []
+    try:
+        current_host = _host_id()
+    except Refusal as exc:
+        detail = _liveness_batch_diagnostic(
+            f"validation-run evidence is unverifiable: {exc}"
+        )
+        return {key: ("unverifiable", detail) for key in keys}
+    for record in records:
+        key = (record.machine, record.slot, record.generation)
+        if record.machine != config.machine:
+            result[key] = (
+                "unverifiable",
+                f"validation row is registered on machine {record.machine}, and "
+                f"run, process and user-systemd evidence is local to {config.machine}",
+            )
+        elif record.owner is not None and record.owner.host_id != current_host:
+            result[key] = (
+                "unverifiable",
+                "validation row owner was recorded on another host, and run, process "
+                "and user-systemd evidence is local to this host",
+            )
+        else:
+            local.append(record)
+    if not local:
+        return result
+    try:
+        rows = tuple(
+            (record, _absent_validate_row_paths(config, record)) for record in local
+        )
+        bindings = _retained_handles_for_absent_rows(config, rows)
+        processes, snapshot = _validation_run_host_evidence()
+    except Refusal as exc:
+        detail = _liveness_batch_diagnostic(
+            f"validation-run evidence is unverifiable: {exc}"
+        )
+        result.update(
+            ((record.machine, record.slot, record.generation), ("unverifiable", detail))
+            for record in local
+        )
+        return result
+    for row in rows:
+        record = row[0]
+        key = (record.machine, record.slot, record.generation)
+        handles = {record.slot: bindings.get(record.slot, ())}
+        try:
+            _assert_retained_handle_processes_dead(handles)
+            _assert_absent_validate_systemd_unrelated(
+                (row,), handles, processes, snapshot=snapshot
+            )
+        except Refusal as exc:
+            result[key] = (
+                "alive",
+                _liveness_batch_diagnostic(f"validation run may still use the row: {exc}"),
+            )
+            continue
+        result[key] = (
+            "dead",
+            f"{len(handles[record.slot])} retained run handle(s) name this row, each "
+            "with a dead process generation and an inactive, unqueued unit with no "
+            "live process; no active or queued user-systemd unit names its paths",
+        )
+    return result
+
+
+def _owner_liveness_states(
+    config: Config, records: Sequence[ActiveRecord]
+) -> dict[tuple[str, str, int], tuple[str, str]]:
+    """Ask each row's liveness authority: the run for validation rows,
+    the registered liveness command for agent rows."""
+
+    validation = [record for record in records if record.slot_type == "validate"]
+    agents = [record for record in records if record.slot_type != "validate"]
+    result = _registered_liveness_states(config, agents)
+    result.update(_validation_run_liveness_states(config, validation))
+    return result
+
+
+def _assert_owner_liveness(
+    config: Config,
+    record: ActiveRecord,
+    *,
+    known: Mapping[tuple[str, str, int], tuple[str, str]] | None = None,
+) -> None:
+    """Require the row's liveness authority to report its owner dead.
+
+    ``known`` carries validation-run answers that the caller already read
+    under the same mutation lock, so a batch reads host evidence once.
+    """
+
+    if record.slot_type != "validate":
+        _assert_registered_liveness(config, record)
+        return
+    key = (record.machine, record.slot, record.generation)
+    answered = None if known is None else known.get(key)
+    state, detail = (
+        answered
+        if answered is not None
+        else _validation_run_liveness_states(config, (record,))[key]
+    )
+    if state == "dead":
+        return
+    if state == "alive":
+        raise Refusal(
+            f"validation-run authority reports the run may still use slot "
+            f"{record.slot}: {detail}. state: REFUSED -- no checkout was salvaged or "
+            "removed. remedy: let the validation run finish or stop its unit, then "
+            "rerun remove"
+        )
+    raise Refusal(
+        f"validation-run authority is unverifiable for slot {record.slot}: {detail}. "
+        "state: REFUSED -- no checkout was salvaged or removed; unknown use is not a "
+        "free slot. remedy: repair the named run-handle, process or user-systemd "
+        "evidence, then rerun remove"
+    )
+
+
 def _process_state(identity: ProcessIdentity | None) -> tuple[str, str]:
     if identity is None:
         return "indeterminate", "no owner process generation is recorded"
@@ -22095,7 +22259,7 @@ def _cmd_recover_unbound_owner(args: argparse.Namespace) -> int:
             raise Refusal(
                 f"slot {record.slot} has a historical owner; coordinator recovery cannot replace it"
             )
-        _assert_registered_liveness(config, record)
+        _assert_owner_liveness(config, record)
         _slot_path, final_checkouts = _handoff_preconditions(
             config, record, _GitVcs()
         )
@@ -27450,7 +27614,9 @@ def _audit_record(
     liveness_state, liveness_detail = (
         registered_liveness
         if registered_liveness is not None
-        else _registered_liveness_state(config, record)
+        else _owner_liveness_states(config, (record,))[
+            (record.machine, record.slot, record.generation)
+        ]
     )
     heartbeat_age, heartbeat_expired = _heartbeat_diagnosis(record)
     agent_running = not (
@@ -27727,18 +27893,22 @@ def _cmd_audit(args: argparse.Namespace) -> int:
             },
         )
         liveness_started = metrics.start()
-        registered_liveness = _registered_liveness_states(config, records)
+        # Validation rows are answered by their runs, agent rows by the
+        # registered command; see _validation_run_liveness_states.
+        registered_liveness = _owner_liveness_states(config, records)
+        agent_subjects = sum(record.slot_type != "validate" for record in records)
         metrics.finish(
             "liveness",
             liveness_started,
             {
                 "batch_invocations": int(
-                    bool(records) and config.liveness_batch_command is not None
+                    bool(agent_subjects) and config.liveness_batch_command is not None
                 ),
                 "legacy_invocations": (
-                    0 if config.liveness_batch_command is not None else len(records)
+                    0 if config.liveness_batch_command is not None else agent_subjects
                 ),
-                "subjects": len(records),
+                "subjects": agent_subjects,
+                "validation_run_subjects": len(records) - agent_subjects,
             },
         )
         census_started = metrics.start()
@@ -30847,7 +31017,7 @@ def _complete_prepared_private_finish(
         if handoff_writer is None:
             _assert_caller_process(coordinator, "validate owner")
     else:
-        _assert_registered_liveness(config, current)
+        _assert_owner_liveness(config, current)
     if (
         owner_state != "dead"
         and not live_validate_owner
@@ -31215,7 +31385,7 @@ def _cmd_remove(
             # gate on it.
             consent_liveness = _registered_liveness_state(config, record)
         else:
-            _assert_registered_liveness(config, record)
+            _assert_owner_liveness(config, record)
         # A release stops this generation's heartbeat (heartbeat refuses while
         # it is in effect) and is bound to the heartbeat stamp, so any renewal
         # voids it. Waiting for the time-to-live would only re-prove what the
@@ -31668,6 +31838,7 @@ def _seal_validate_batch_targets(
         _write_owned_validate_batch_seal_journal(config, seal_journal, owned_seal)
         _interrupt_for_test("after-validate-batch-seal-journal")
         records = {record.slot: record for state in states for record in state.slots}
+        run_liveness: dict[tuple[str, str, int], tuple[str, str]] | None = None
         for slot, generation in requested:
             try:
                 record = records.get(slot)
@@ -31696,7 +31867,22 @@ def _seal_validate_batch_targets(
                     if handoff_writer is None:
                         _assert_caller_process(coordinator, "validate owner")
                 else:
-                    _assert_registered_liveness(config, record)
+                    if run_liveness is None:
+                        # One read of host evidence answers every requested
+                        # validation row; the destructive phase asks again
+                        # for each target immediately before it fences.
+                        run_liveness = _validation_run_liveness_states(
+                            config,
+                            [
+                                records[name]
+                                for name in dict.fromkeys(
+                                    name for name, _generation in requested
+                                )
+                                if name in records
+                                and records[name].slot_type == "validate"
+                            ],
+                        )
+                    _assert_owner_liveness(config, record, known=run_liveness)
                 owner_unrecorded = _owner_record_is_absent(record)
                 if owner_state != "dead" and not live_validate_owner:
                     if not (single_validate_complete and owner_unrecorded):
@@ -35230,7 +35416,7 @@ def _recover_finish(
     if live_validate_owner:
         _assert_recovery_processes(coordinator, processes, "validate owner")
     elif owner_consent is None and owner_release is None:
-        _assert_registered_liveness(config, current)
+        _assert_owner_liveness(config, current)
     if not expired and not validate_complete and owner_release is None:
         raise Refusal(
             f"slot {current.slot} time-to-live is no longer expired after renewal; "
@@ -46547,8 +46733,17 @@ def _assert_absent_validate_systemd_unrelated(
     rows: Sequence[tuple[ActiveRecord, tuple[Path, ...]]],
     bindings: Mapping[str, tuple[_RetainedValidationHandle, ...]],
     processes: Sequence[_AbsentProcessObservation],
+    *,
+    snapshot: Sequence[Mapping[str, str]] | None = None,
 ) -> None:
-    snapshot = _user_systemd_snapshot()
+    """Refuse when a retained run unit or any active user unit may use a row.
+
+    ``snapshot`` lets one caller judge several rows against a single
+    user-systemd enumeration; when absent, this reads a fresh one.
+    """
+
+    if snapshot is None:
+        snapshot = _user_systemd_snapshot()
     by_name = {unit["Id"]: unit for unit in snapshot}
     for slot, handles in bindings.items():
         for handle in handles:
