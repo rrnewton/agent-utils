@@ -209,9 +209,15 @@ _COMMON_DOC_TERMS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("unrelated project", re.compile(r"\b(?:DeepScry|Hermit)\b", re.IGNORECASE)),
     ("source-tree docs path", re.compile(r"common/docs/", re.IGNORECASE)),
     ("source-tree script", re.compile(r"scripts/embed_userguides\.py", re.IGNORECASE)),
+    # scripts/setup-hooks.sh is not a path in this source tree (there is no such
+    # file here): it is the installer wrkslots runs inside the user's own
+    # repository, and its guide documents that file name and the output naming it.
     (
         "source-tree path",
-        re.compile(r"(?:^|[ (`])(?:py|rs|scripts|cross)/", re.IGNORECASE | re.MULTILINE),
+        re.compile(
+            r"(?:^|[ (`])(?:py/|rs/|cross/|scripts/(?!setup-hooks\.sh\b))",
+            re.IGNORECASE | re.MULTILINE,
+        ),
     ),
     ("unexpanded template syntax", re.compile(r"\{\{|\}\}")),
     (

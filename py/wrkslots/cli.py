@@ -20517,6 +20517,7 @@ class SetupHookResult:
     detail: str = ""
 
     def to_obj(self) -> dict[str, object]:
+        """Return this result as the JSON object 'create' reports for one repository."""
         return {
             "path": self.path,
             "script": SETUP_HOOKS_SCRIPT,

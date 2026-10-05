@@ -831,9 +831,11 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
 
     assert ordinary.isdisjoint(mapped)
     assert ordinary | mapped == all_tests
-    assert len(all_tests) == 1822
+    # The seven setup-hooks tests of 3bae67a3, 1df79bf9 and db6cdf8b are in the
+    # mapped partition.
+    assert len(all_tests) == 1829
     assert len(ordinary) == 286
-    assert len(mapped) == 1536
+    assert len(mapped) == 1543
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
