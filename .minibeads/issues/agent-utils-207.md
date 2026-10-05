@@ -1,10 +1,11 @@
 ---
 title: 'scrollback-jump: a jump-to-newest button at the lower left whenever the list is scrolled back'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-10-05T06:24:46.984981865+00:00
-updated_at: 2026-10-05T06:24:46.984981865+00:00
+updated_at: 2026-10-05T08:18:37.903672554+00:00
+closed_at: 2026-10-05T08:18:37.903671743+00:00
 ---
 
 # Description
