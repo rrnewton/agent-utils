@@ -36687,15 +36687,32 @@ def test_recover_absent_agent_row_refuses_a_retained_store_moved_once_the_reposi
     original_retain = wrkslots._retain_worktree_modules
 
     def held(*args: str) -> str:
-        return git(
-            tmp_path,
+        # Git is handed the descriptor and names it through its own
+        # /proc/self/fd. Inside the private user namespace this process holds
+        # every capability there and git, run as an ordinary user, holds none,
+        # so the kernel's capability check refuses git this process's
+        # /proc/PID/fd (EACCES), and git would see no repository at all.
+        args = (
             "--git-dir",
-            f"/proc/{os.getpid()}/fd/{descriptor}",
+            f"/proc/self/fd/{descriptor}",
             "--work-tree",
             str(tmp_path),
             *ABSENT_AGENT_TEST_IDENTITY,
             *args,
-        ).stdout.strip()
+        )
+        completed = subprocess.run(
+            ["git", "-C", str(tmp_path), *args],
+            text=True,
+            capture_output=True,
+            check=False,
+            pass_fds=(descriptor,),
+        )
+        if completed.returncode != 0:
+            raise AssertionError(
+                f"git {' '.join(args)} failed in {tmp_path}: "
+                f"{completed.stderr or completed.stdout}"
+            )
+        return completed.stdout.strip()
 
     def retain_then_move(
         kept_from: Path, kept_at: wrkslots._RetainedModules
