@@ -9,6 +9,13 @@
 //! missed. Ambiguous, missing or resource-limited evidence is unavailable, never zero.
 //! One shared observation retains at most 1024 members across 256 registered groups,
 //! with a one-second scan deadline and 64 descriptors reserved below the soft limit.
+//!
+//! Linux cannot list the members of a process group, so each snapshot walks every PID in
+//! procfs. It does not re-read every PID's stat: a [`SessionCache`] remembers the session
+//! of each PID an earlier snapshot read, and a PID is skipped when neither that session
+//! nor the PID itself (its session after a setsid) is the session of a registered group,
+//! because it can never join one of those groups. The cache
+//! trusts an entry only while the kernel cannot have handed that PID to a new task.
 //! Descriptor pressure can lower this ceiling. A shared refusal affects all readers
 //! of that snapshot; it does not permit a partial population to be reported.
 
@@ -105,6 +112,9 @@ fn read_record(file: &File, deadline: Instant) -> Result<String, Unavailable> {
     read_record_io(file, deadline).map_err(Unavailable::from)
 }
 fn read_record_io(file: &File, deadline: Instant) -> io::Result<String> {
+    read_bounded(file, deadline, MAX_RECORD)
+}
+fn read_bounded(file: &File, deadline: Instant, max: usize) -> io::Result<String> {
     let mut data = Vec::with_capacity(1024);
     let mut interrupts = 0;
     let mut block = [0_u8; 1024];
@@ -114,7 +124,7 @@ fn read_record_io(file: &File, deadline: Instant) -> io::Result<String> {
             Ok(0) => break,
             Ok(n) => {
                 data.extend_from_slice(&block[..n]);
-                if data.len() > MAX_RECORD {
+                if data.len() > max {
                     return Err(io::Error::other("oversized proc record"));
                 }
             }
@@ -133,6 +143,7 @@ fn read_record_io(file: &File, deadline: Instant) -> io::Result<String> {
 struct Stat {
     pid: u32,
     group: u32,
+    session: u32,
     state: char,
     ticks: u64,
 }
@@ -149,6 +160,7 @@ fn stat(text: &str) -> Result<Stat, Unavailable> {
         return Err(bad());
     }
     let group = fields[2].parse::<u32>().map_err(|_| bad())?;
+    let session = fields[3].parse::<u32>().map_err(|_| bad())?;
     let mut ticks = 0_u64;
     for index in [11, 12, 13, 14] {
         ticks = ticks
@@ -158,6 +170,7 @@ fn stat(text: &str) -> Result<Stat, Unavailable> {
     Ok(Stat {
         pid,
         group,
+        session,
         state: fields[0].chars().next().ok_or_else(bad)?,
         ticks,
     })
@@ -178,6 +191,102 @@ fn fd_pid(text: &str) -> Result<i64, Unavailable> {
         return Err(unavailable("invalid pidfd Pid"));
     }
     Ok(value)
+}
+
+/// PIDs below this are never handed out again after the allocator wraps (Linux
+/// `RESERVED_PIDS`), so a lap of the PID space is at most `pid_max - RESERVED_PIDS` steps.
+const RESERVED_PIDS: u64 = 300;
+/// /proc/stat holds one line per CPU; this bounds it on hosts with thousands of CPUs.
+const MAX_STAT_RECORD: usize = 1 << 20;
+
+/// Where the kernel's PID allocator stands: the last PID it handed out and the number of
+/// live tasks (both from /proc/loadavg), and the tasks created since boot (/proc/stat
+/// `processes`). Threads take their IDs from the same space, and all three count them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Allocator {
+    last_pid: u32,
+    tasks: u64,
+    forks: u64,
+}
+fn parse_loadavg(text: &str) -> Option<(u32, u64)> {
+    let fields: Vec<_> = text.split_whitespace().collect();
+    let (_, tasks) = fields.get(3)?.split_once('/')?;
+    Some((fields.get(4)?.parse().ok()?, tasks.parse().ok()?))
+}
+fn parse_forks(text: &str) -> Option<u64> {
+    let mut values = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("processes "));
+    let value = values.next()?.trim().parse().ok()?;
+    values.next().is_none().then_some(value)
+}
+
+/// Whether the allocator may have handed out PID `pid` again on its way from `from` to
+/// `to`. It walks the PID space in a circle, one step per new task or per PID still in
+/// use, so every PID it handed out lies on the arc after `from.last_pid` up to
+/// `to.last_pid`, unless it may have gone the whole way round: then any PID may have been.
+fn reallocated(from: Allocator, to: Allocator, pid_max: u32, pid: u32) -> bool {
+    let Some(created) = to.forks.checked_sub(from.forks) else {
+        return true;
+    };
+    let lap = u64::from(pid_max).saturating_sub(RESERVED_PIDS);
+    if created.saturating_add(from.tasks.max(to.tasks)) >= lap {
+        return true;
+    }
+    let (start, end) = (from.last_pid, to.last_pid);
+    if created == 0 {
+        return false;
+    }
+    if start < end {
+        start < pid && pid <= end
+    } else {
+        pid > start || pid <= end
+    }
+}
+
+/// The session of each PID an earlier snapshot read. A process joins a group only through
+/// setpgid, only within its own session, and changes its session only through setsid,
+/// which makes its session its own PID. So a cached PID's session is now either the
+/// cached one or the PID itself, and the PID is skipped only when neither is the session
+/// of a registered group: then it can never be a member of one. That covers a child read
+/// between fork and setsid that then leads a registered group. The cache holds sessions,
+/// not verdicts, so a group registered later re-evaluates every cached PID without a read.
+///
+/// An entry is trusted only while the kernel cannot have reused its PID, judged from
+/// [`Allocator`] positions; when that cannot be proven the cache is emptied, and the next
+/// snapshot reads every PID, as it did before there was a cache.
+#[derive(Default)]
+struct SessionCache {
+    sessions: HashMap<u32, u32>,
+    at: Option<Allocator>,
+}
+impl SessionCache {
+    /// Start a snapshot at allocator position `now`, dropping each entry whose PID the
+    /// allocator may have handed out since the previous snapshot started.
+    fn begin(&mut self, now: Option<Allocator>, pid_max: Option<u32>) {
+        match (self.at, now, pid_max) {
+            (Some(previous), Some(now), Some(pid_max)) => self
+                .sessions
+                .retain(|pid, _| !reallocated(previous, now, pid_max, *pid)),
+            _ => self.sessions.clear(),
+        }
+        self.at = now;
+    }
+    /// Whether this snapshot may skip reading `pid`.
+    fn skip(&self, pid: u32, sessions: &HashSet<u32>) -> bool {
+        !sessions.contains(&pid)
+            && self
+                .sessions
+                .get(&pid)
+                .is_some_and(|session| !sessions.contains(session))
+    }
+    fn record(&mut self, pid: u32, session: u32) {
+        self.sessions.insert(pid, session);
+    }
+    /// Forget PIDs that no longer exist.
+    fn retain(&mut self, seen: &HashSet<u32>) {
+        self.sessions.retain(|pid, _| seen.contains(pid));
+    }
 }
 
 struct Proc {
@@ -247,6 +356,29 @@ impl Proc {
             }
         }
         Err(io::Error::other("open interrupted repeatedly"))
+    }
+    /// The allocator position, or `None` if procfs does not report it.
+    fn allocator(&self, deadline: Instant) -> Option<Allocator> {
+        let loadavg = read_record_io(&self.open("loadavg", deadline).ok()?, deadline).ok()?;
+        let (last_pid, tasks) = parse_loadavg(&loadavg)?;
+        let stat = read_bounded(
+            &self.open("stat", deadline).ok()?,
+            deadline,
+            MAX_STAT_RECORD,
+        )
+        .ok()?;
+        Some(Allocator {
+            last_pid,
+            tasks,
+            forks: parse_forks(&stat)?,
+        })
+    }
+    fn pid_max(&self, deadline: Instant) -> Option<u32> {
+        read_record_io(&self.open("sys/kernel/pid_max", deadline).ok()?, deadline)
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
     }
     fn pid(&self, pidfd: &File, deadline: Instant) -> Result<i64, Unavailable> {
         let record = self.open(&format!("self/fdinfo/{}", pidfd.as_raw_fd()), deadline)?;
@@ -405,12 +537,63 @@ trait Source {
         deadline: Instant,
     ) -> Result<Vec<Self::Row>, Unavailable>;
 }
-struct KernelSource<'a>(&'a Proc, usize);
+/// The live procfs source. `sessions` are the sessions of the registered groups, and
+/// `cache` persists across snapshots in the [`Registry`].
+struct KernelSource<'a> {
+    proc: &'a Proc,
+    bound: usize,
+    sessions: HashSet<u32>,
+    cache: std::cell::RefCell<&'a mut SessionCache>,
+    /// How many stat files this snapshot read.
+    reads: std::cell::Cell<usize>,
+}
+impl KernelSource<'_> {
+    /// Read `pid`'s stat, cache its session and, if it is in one of `groups`, pair it.
+    fn consider(
+        &self,
+        pid: u32,
+        groups: &HashSet<u32>,
+        rows: &mut Vec<Pair>,
+        deadline: Instant,
+    ) -> Result<(), Unavailable> {
+        self.reads.set(self.reads.get() + 1);
+        let hint = match self
+            .proc
+            .open(&format!("{pid}/stat"), deadline)
+            .and_then(|file| read_record_io(&file, deadline))
+        {
+            Ok(text) => stat(&text)?,
+            Err(error) if gone(&error) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        self.cache.borrow_mut().record(pid, hint.session);
+        if !groups.contains(&hint.group) {
+            return Ok(());
+        }
+        if rows.len() >= self.bound {
+            return Err(unavailable("member bound"));
+        }
+        let pair = match self.proc.pair(pid, deadline) {
+            Ok(pair) => pair,
+            Err(PairError::Io(error)) if gone(&error) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if groups.contains(&pair.original.group) {
+            rows.push(pair);
+        }
+        Ok(())
+    }
+}
 impl Source for KernelSource<'_> {
     type Row = Pair;
     fn samples(&self, groups: &HashSet<u32>, deadline: Instant) -> Result<Vec<Pair>, Unavailable> {
+        let pid_max = self.proc.pid_max(deadline);
+        let start = self.proc.allocator(deadline);
+        self.cache.borrow_mut().begin(start, pid_max);
         let mut rows = Vec::new();
-        let entries = fs::read_dir(format!("/proc/self/fd/{}", self.0.root.as_raw_fd()))?;
+        let mut seen = HashSet::new();
+        let mut skipped = Vec::new();
+        let entries = fs::read_dir(format!("/proc/self/fd/{}", self.proc.root.as_raw_fd()))?;
         for (index, entry) in entries.enumerate() {
             check(deadline)?;
             if index >= MAX_ENTRIES {
@@ -427,30 +610,26 @@ impl Source for KernelSource<'_> {
             let pid = name
                 .parse::<u32>()
                 .map_err(|_| unavailable("invalid proc PID"))?;
-            let hint = match self
-                .0
-                .open(&format!("{pid}/stat"), deadline)
-                .and_then(|file| read_record_io(&file, deadline))
-            {
-                Ok(text) => stat(&text)?,
-                Err(error) if gone(&error) => continue,
-                Err(error) => return Err(error.into()),
-            };
-            if !groups.contains(&hint.group) {
+            seen.insert(pid);
+            if self.cache.borrow().skip(pid, &self.sessions) {
+                skipped.push(pid);
                 continue;
             }
-            if rows.len() >= self.1 {
-                return Err(unavailable("member bound"));
-            }
-            let pair = match self.0.pair(pid, deadline) {
-                Ok(pair) => pair,
-                Err(PairError::Io(error)) if gone(&error) => continue,
-                Err(error) => return Err(error.into()),
+            self.consider(pid, groups, &mut rows, deadline)?;
+        }
+        // A skipped PID may have been handed to a new task while this snapshot ran.
+        let end = self.proc.allocator(deadline);
+        for pid in skipped {
+            let fresh = match (start, end, pid_max) {
+                (Some(start), Some(end), Some(pid_max)) => reallocated(start, end, pid_max, pid),
+                _ => true,
             };
-            if groups.contains(&pair.original.group) {
-                rows.push(pair);
+            if fresh {
+                check(deadline)?;
+                self.consider(pid, groups, &mut rows, deadline)?;
             }
         }
+        self.cache.borrow_mut().retain(&seen);
         Ok(rows)
     }
 }
@@ -478,6 +657,8 @@ fn scan<S: Source>(
 struct Owner {
     key: u64,
     pgid: u32,
+    /// The group's session: its leader's, which a group leader cannot leave.
+    session: u32,
     proc: Proc,
     pair: Pair,
 }
@@ -499,6 +680,9 @@ impl Owner {
 struct Snapshot {
     started: Instant,
     captured: Instant,
+    /// Stat files the snapshot read, of the PIDs it walked.
+    #[cfg(test)]
+    reads: usize,
     keys: HashSet<u64>,
     values: Result<HashMap<u64, u64>, Unavailable>,
 }
@@ -508,6 +692,7 @@ struct Registry {
     owners: HashMap<u64, Weak<Owner>>,
     compatibility: HashMap<u32, (Arc<Owner>, Instant)>,
     snapshot: Option<Snapshot>,
+    census: SessionCache,
 }
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
 fn registry() -> &'static Mutex<Registry> {
@@ -547,6 +732,7 @@ impl Registry {
         let owner = Arc::new(Owner {
             key: self.next,
             pgid,
+            session: pair.original.session,
             proc,
             pair,
         });
@@ -566,23 +752,33 @@ impl Registry {
                 .filter(|entry| entry.authenticate(deadline).is_ok())
                 .collect();
             let groups = active.iter().map(|entry| entry.pgid).collect();
+            let source = KernelSource {
+                proc: &owner.proc,
+                bound: MAX_MEMBERS,
+                sessions: active.iter().map(|entry| entry.session).collect(),
+                cache: std::cell::RefCell::new(&mut self.census),
+                reads: std::cell::Cell::new(0),
+            };
             let started = Instant::now();
-            let values =
-                scan(&KernelSource(&owner.proc, MAX_MEMBERS), &groups, deadline).map(|totals| {
-                    let mut values = HashMap::new();
-                    for entry in active {
-                        // Authenticate again: the root may have detached during the scan.
-                        if entry.authenticate(deadline).is_ok() {
-                            if let Some(ticks) = totals.get(&entry.pgid) {
-                                values.insert(entry.key, *ticks);
-                            }
+            let values = scan(&source, &groups, deadline).map(|totals| {
+                let mut values = HashMap::new();
+                for entry in active {
+                    // Authenticate again: the root may have detached during the scan.
+                    if entry.authenticate(deadline).is_ok() {
+                        if let Some(ticks) = totals.get(&entry.pgid) {
+                            values.insert(entry.key, *ticks);
                         }
                     }
-                    values
-                });
+                }
+                values
+            });
+            #[cfg(test)]
+            let reads = source.reads.get();
             self.snapshot = Some(Snapshot {
                 started,
                 captured: Instant::now(),
+                #[cfg(test)]
+                reads,
                 keys: owners.iter().map(|entry| entry.key).collect(),
                 values,
             });
@@ -830,6 +1026,7 @@ mod tests {
                         let original = Stat {
                             pid: raw["pid"].as_u64().unwrap() as u32,
                             group: raw["group"].as_u64().unwrap() as u32,
+                            session: 0,
                             state: 'R',
                             ticks: raw["ticks"].as_u64().unwrap(),
                         };
@@ -842,6 +1039,7 @@ mod tests {
                                 pid: raw["fresh_pid"].as_u64().unwrap_or(u64::from(original.pid))
                                     as u32,
                                 group: original.group,
+                                session: 0,
                                 state: raw["state"].as_str().unwrap().chars().next().unwrap(),
                                 ticks: raw["fresh_ticks"].as_u64().unwrap_or(0),
                             }))
@@ -909,6 +1107,7 @@ mod tests {
                             row: Stat {
                                 pid: 100 + index,
                                 group: 100,
+                                session: 0,
                                 state: 'R',
                                 ticks: 1,
                             },
@@ -1105,8 +1304,15 @@ mod tests {
         let owner = registry
             .create(child.child.id(), Path::new("/proc"))
             .unwrap();
+        let mut cache = SessionCache::default();
         let bounded = scan(
-            &KernelSource(&owner.proc, 1),
+            &KernelSource {
+                proc: &owner.proc,
+                bound: 1,
+                sessions: HashSet::from([owner.session]),
+                cache: RefCell::new(&mut cache),
+                reads: std::cell::Cell::new(0),
+            },
             &HashSet::from([owner.pgid]),
             Instant::now() + SCAN_TIME,
         );
@@ -1116,6 +1322,7 @@ mod tests {
         registry.snapshot = Some(Snapshot {
             started: Instant::now(),
             captured: Instant::now(),
+            reads: 0,
             keys: HashSet::from([owner.key]),
             values: Err(unavailable("injected scanner EACCES")),
         });
@@ -1207,6 +1414,7 @@ mod tests {
                 Ok(Stat {
                     pid: 100,
                     group: 100,
+                    session: 0,
                     state: 'Z',
                     ticks: 999,
                 })
@@ -1571,5 +1779,127 @@ mod tests {
             }
             println!("native scheduler reason {stage}: {stderr}");
         }
+    }
+
+    /// The shared session-cache corpus, also run by the other-language edition, so both make the
+    /// same read decisions on the same snapshots.
+    #[test]
+    fn shared_session_cache_corpus() {
+        fn allocator(raw: &serde_json::Value) -> Option<Allocator> {
+            raw.as_object().map(|raw| Allocator {
+                last_pid: raw["last_pid"].as_u64().unwrap() as u32,
+                tasks: raw["tasks"].as_u64().unwrap(),
+                forks: raw["forks"].as_u64().unwrap(),
+            })
+        }
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/proccpu-session-cache.json"))
+                .unwrap();
+        for case in cases.as_array().unwrap() {
+            let pid_max = case["pid_max"].as_u64().map(|value| value as u32);
+            let mut cache = SessionCache::default();
+            for (index, step) in case["steps"].as_array().unwrap().iter().enumerate() {
+                let start = allocator(&step["allocator"]);
+                let end = step.get("end").map_or(start, allocator);
+                let sessions: HashSet<u32> = step["group_sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.as_u64().unwrap() as u32)
+                    .collect();
+                cache.begin(start, pid_max);
+                let mut read = Vec::new();
+                let mut skipped = Vec::new();
+                let mut seen = HashSet::new();
+                let processes: Vec<(u32, u32)> = step["processes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|raw| {
+                        (
+                            raw["pid"].as_u64().unwrap() as u32,
+                            raw["session"].as_u64().unwrap() as u32,
+                        )
+                    })
+                    .collect();
+                for &(pid, session) in &processes {
+                    seen.insert(pid);
+                    if cache.skip(pid, &sessions) {
+                        skipped.push((pid, session));
+                    } else {
+                        cache.record(pid, session);
+                        read.push(pid);
+                    }
+                }
+                for (pid, session) in skipped {
+                    let fresh = match (start, end, pid_max) {
+                        (Some(start), Some(end), Some(pid_max)) => {
+                            reallocated(start, end, pid_max, pid)
+                        }
+                        _ => true,
+                    };
+                    if fresh {
+                        cache.record(pid, session);
+                        read.push(pid);
+                    }
+                }
+                cache.retain(&seen);
+                read.sort_unstable();
+                let mut expected: Vec<u32> = step["read"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.as_u64().unwrap() as u32)
+                    .collect();
+                expected.sort_unstable();
+                assert_eq!(read, expected, "{} step {index}", case["name"]);
+            }
+            println!("session cache case: {}", case["name"]);
+        }
+    }
+
+    #[test]
+    fn allocator_records_parse_and_refuse_ambiguity() {
+        assert_eq!(
+            parse_loadavg("170.04 167.90 165.36 49/63307 3954637\n"),
+            Some((3954637, 63307))
+        );
+        assert_eq!(parse_loadavg("1.0 1.0 1.0 1/2"), None);
+        assert_eq!(
+            parse_forks("cpu  1 2 3\nprocesses 1547387564\nprocs_running 4\n"),
+            Some(1547387564)
+        );
+        assert_eq!(parse_forks("cpu 1\n"), None);
+        assert_eq!(parse_forks("processes 1\nprocesses 2\n"), None);
+    }
+
+    /// On the live host a second snapshot reads only the PIDs it could not skip, and
+    /// measures the same members.
+    #[test]
+    fn native_second_snapshot_skips_other_sessions() {
+        let mut child = Native::start("zombie");
+        let _ = child.line();
+        let mut registry = Registry::default();
+        let owner = registry
+            .create(child.child.id(), Path::new("/proc"))
+            .unwrap();
+        let first = registry.seconds(&owner).unwrap();
+        let cold = registry.snapshot.as_ref().unwrap().reads;
+        registry.snapshot = None;
+        let second = registry.seconds(&owner).unwrap();
+        let warm = registry.snapshot.as_ref().unwrap().reads;
+        println!(
+            "PROCCPU_SESSION_CACHE {}",
+            serde_json::json!({"cold_reads": cold, "warm_reads": warm, "cached_sessions": registry.census.sessions.len()})
+        );
+        assert!(first > 0.0 && second >= first);
+        assert!(
+            warm * 4 < cold,
+            "the second snapshot read {warm} stat files of the {cold} the first read"
+        );
+        child.send(b'r');
+        assert_eq!(child.line(), "reaped");
+        child.send(b'x');
+        assert!(child.child.wait().unwrap().success());
     }
 }

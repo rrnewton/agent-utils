@@ -567,3 +567,78 @@ def test_native_shared_sampling_cost_and_availability(native_helper: Path, group
             assert child.stdout is not None
             child.stdout.close()
     assert len(list(Path("/proc/self/fd").iterdir())) == before
+
+
+def test_shared_session_cache_corpus() -> None:
+    """The Rust edition runs the same corpus, so both make the same read decisions."""
+    data: object = json.loads((Path(__file__).parents[2] / "rs/dagrun/tests/fixtures/proccpu-session-cache.json").read_text())
+    assert isinstance(data, list)
+
+    def allocator(raw: object) -> cpu._Allocator | None:
+        if raw is None:
+            return None
+        assert isinstance(raw, dict)
+        return cpu._Allocator(raw["last_pid"], raw["tasks"], raw["forks"])
+
+    for case in data:
+        assert isinstance(case, dict)
+        pid_max = case.get("pid_max")
+        cache = cpu._SessionCache()
+        for index, step in enumerate(case["steps"]):
+            start = allocator(step["allocator"])
+            end = allocator(step["end"]) if "end" in step else start
+            sessions = set(step["group_sessions"])
+            cache.begin(start, pid_max)
+            read: list[int] = []
+            skipped: list[tuple[int, int]] = []
+            seen: set[int] = set()
+            for process in step["processes"]:
+                pid, session = process["pid"], process["session"]
+                seen.add(pid)
+                if cache.skip(pid, sessions):
+                    skipped.append((pid, session))
+                else:
+                    cache.record(pid, session)
+                    read.append(pid)
+            for pid, session in skipped:
+                if start is None or end is None or pid_max is None or cpu._reallocated(start, end, pid_max, pid):
+                    cache.record(pid, session)
+                    read.append(pid)
+            cache.retain(seen)
+            assert sorted(read) == sorted(step["read"]), f"{case['name']} step {index}"
+
+
+def test_allocator_records_parse_and_refuse_ambiguity() -> None:
+    assert cpu._parse_loadavg("170.04 167.90 165.36 49/63307 3954637\n") == (3954637, 63307)
+    assert cpu._parse_loadavg("1.0 1.0 1.0 1/2") is None
+    assert cpu._parse_forks("cpu  1 2 3\nprocesses 1547387564\nprocs_running 4\n") == 1547387564
+    assert cpu._parse_forks("cpu 1\n") is None
+    assert cpu._parse_forks("processes 1\nprocesses 2\n") is None
+
+
+def test_native_second_snapshot_skips_other_sessions(native_helper: Path) -> None:
+    """On the live host a second snapshot reads only the PIDs it could not skip, and
+    measures the same members."""
+    with subprocess.Popen([str(native_helper), "zombie"], start_new_session=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as child:
+        assert child.stdin is not None and child.stdout is not None
+        _line(child)
+        reader = cpu.ProcessGroupCpu(child.pid)
+        try:
+            with cpu._lock:
+                cpu._snapshot_at = float("-inf")
+                cpu._census.begin(None, None)
+            first = reader.seconds()
+            cold = cpu._snapshot_reads
+            with cpu._lock:
+                cpu._snapshot_at = float("-inf")
+            second = reader.seconds()
+            warm = cpu._snapshot_reads
+            print("PROCCPU_SESSION_CACHE", json.dumps({"edition": "python", "cold_reads": cold, "warm_reads": warm}))
+            assert first > 0 and second >= first
+            assert warm * 4 < cold, f"the second snapshot read {warm} stat files of the {cold} the first read"
+        finally:
+            reader.close()
+            child.stdin.write("r"); child.stdin.flush()
+            assert _line(child) == "reaped"
+            child.stdin.write("x"); child.stdin.flush()
+            assert child.wait(5) == 0
