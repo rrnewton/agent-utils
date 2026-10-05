@@ -752,9 +752,10 @@ _AGENT_REMOVE_BATCH_YIELD_SECONDS = 0.25
 # deleted the item runs to completion, since stopping partway would leave a
 # partly deleted slot, and its duration grows with the number of files in the
 # slot.  Nested-repository judgment is held to this budget too, where
-# ordinary remove allows it _NESTED_GIT_REMOVAL_SECONDS (900 seconds), so a
-# slot with slow nested checks can be refused here and removed by 'wrkslots
-# remove'.
+# 'wrkslots remove --no-lock-budget' allows it _NESTED_GIT_REMOVAL_SECONDS
+# (900 seconds), so a slot with slow nested checks can be refused here and
+# removed that way.  Ordinary remove of an agent slot runs as a batch of one
+# and has this budget too (see _single_remove_agent_batch).
 #
 # Measured on 2026-09-30 on one host.  With 4,100 to 4,300 processes at load
 # average 65 to 127, three small worktree slots held the lock for 17.3, 21.5
@@ -10310,8 +10311,8 @@ def _item_budget_refusal(what: str) -> Refusal:
     return Refusal(
         f"this remove-agent-batch item used its {seconds:g}-second budget for work "
         f"before deletion at {what}; nothing in the slot was deleted and the slot "
-        "was kept; retry it in a later batch, or remove it alone with 'wrkslots "
-        "remove', which has no such budget"
+        "was kept; retry it later, or remove it alone with 'wrkslots remove "
+        "--no-lock-budget', which has no such budget"
     )
 
 
@@ -30152,6 +30153,48 @@ def _finish_remove_paths(
             raise Refusal(
                 f"finished fenced slot contains unexpected entry: {unexpected[0]}"
             )
+        if private_fence_identity is None:
+            # The branch above checks the fenced slot for use before deleting
+            # it; a slot with no checkout left is checked here, so a removal
+            # resumed by 'wrkslots recover' checks it too.  Under the lock an
+            # agent removal batch, a batch of one included, checks use before
+            # the fence by path only; a use through an alias that only device
+            # and inode identify, begun after its lsof scan, is found here.  A
+            # refusal rolls the fence back.
+            try:
+                _resume_item_deadline()
+                _assert_slot_unused(
+                    fenced_slot,
+                    use_check_record,
+                    use_lsof=use_check_record is not None,
+                    ignore_invoking_ancestry=(
+                        finish.allow_live_validate_owner
+                        and record.slot_type == "validate"
+                    ),
+                    live_use_recheck=finish.live_use_recheck,
+                    **_agent_batch_use_check(
+                        finish.agent_batch,
+                        _slot_directory(config, record.slot, record.slot_type),
+                        after_fence=True,
+                    ),
+                )
+                _end_item_deadline()
+            except Refusal as exc:
+                if not removed:
+                    try:
+                        _rollback_path_fence(
+                            config,
+                            record,
+                            journal,
+                            vcs,
+                            journal_path=journal_path,
+                        )
+                    except Refusal as rollback:
+                        raise Refusal(
+                            f"{exc}; path-fence rollback failed: {rollback}; "
+                            "run 'wrkslots recover'"
+                        ) from rollback
+                raise
     for checkout in remaining:
         if private_fence_identity is not None and (
             _private_cleanup_fence_identity(config, fenced_slot)
@@ -30737,6 +30780,21 @@ def _cmd_remove(
     coordinator, runner, handoff_writer, proof_fd = _capture_remove_processes(
         args.coordinator_pid
     )
+    single_item = (
+        agent_batch is None
+        and private_cleanup is None
+        and not bool(args.validate_complete)
+        and not getattr(args, "no_lock_budget", False)
+    )
+    # A refusal of the lsof scan is reported at the first use check under the
+    # lock, where the ordinary check would refuse, so a retire-pending batch
+    # records its attempt first and moves on to its next candidate.
+    single_refusal: Refusal | None = None
+    if single_item:
+        try:
+            agent_batch = _single_remove_agent_batch(config, args.slot)
+        except Refusal as exc:
+            single_refusal = exc
     live_use_recheck = (
         private_cleanup.live_use_recheck
         if private_cleanup is not None
@@ -30944,6 +31002,30 @@ def _cmd_remove(
                     f"private cleanup path identity changed after its shared census: "
                     f"{slot_path}"
                 )
+        if single_refusal is not None:
+            raise single_refusal
+        if single_item and agent_batch is not None:
+            if (
+                time.monotonic() - agent_batch.captured_at
+                > _AGENT_REMOVE_BATCH_CENSUS_MAX_AGE_SECONDS
+            ):
+                # remove-agent-batch takes a new shared scan before an item
+                # whose scan is older than this; a single removal cannot take
+                # one under the lock, so it stops instead.
+                raise Refusal(
+                    f"the lsof scan of slot {args.slot} is more than "
+                    f"{_AGENT_REMOVE_BATCH_CENSUS_MAX_AGE_SECONDS:.0f} seconds old "
+                    "at its first use check under the registry lock; nothing was "
+                    "salvaged or removed; retry"
+                )
+            # The batch's checks skip the invoking process, which opens the
+            # slot while it removes it.  When lsof ran, before the lock, it had
+            # not yet opened it, so a descriptor, mapping or directory lsof
+            # reported for it was inherited and is a use, which the ordinary
+            # lsof check refused as it refuses any other.
+            agent_batch.census.assert_slot_unused(
+                slot_path, None, ignore_current_process=False
+            )
         _assert_slot_unused(
             slot_path,
             _record_for_slot_use_check(
@@ -32809,6 +32891,56 @@ def _agent_batch_use_check(
     if after_fence:
         keywords["after_fence"] = True
     return keywords
+
+
+def _single_remove_agent_batch(
+    config: Config, slot: str
+) -> _AgentRemoveBatchContext | None:
+    """Prepare ordinary remove of one agent slot as a remove-agent-batch of one.
+
+    The registry lock is held for a whole removal, and every client that
+    writes the registry waits for it.  Ordinary remove used to run ``lsof +D``
+    over the slot under that lock four times, and the cost of each run grows
+    with the number of files in the slot: on a 33 GB slot of 68,888 entries,
+    at load average about 260, one run took 9 to 18 seconds.  A batch of one
+    instead runs that single ``lsof +D`` here, before the lock is taken, and
+    uses remove-agent-batch's checks under the lock: before the path fence, a
+    fresh /proc scan and a check that the slot directory is the one lsof
+    covered; after the fence, the /proc scan that compares identities with
+    the fenced tree, which falls back to the ordinary lsof check only when it
+    cannot decide.  The item budget (_AGENT_REMOVE_BATCH_ITEM_SECONDS) bounds
+    the work before the first deletion, except the stretches it names.
+
+    The lock-free read here only selects the path to scan; the removal
+    decides everything again under the lock.  Returns None, so the ordinary
+    checks run instead, for a slot that is not an active agent slot with a
+    directory, for an image-backed slot, and on a host without lsof, where
+    the ordinary check has its own fallback.  The fence of an image-backed
+    slot mounts its image again, possibly from another device, so the scan
+    after the fence could not match a process still using the old mount.
+    """
+
+    if _lsof_executable() is None:
+        return None
+    try:
+        state = _load_active(config, require_repository=False)
+    except Refusal:
+        return None
+    record = next((item for item in state.slots if item.slot == slot), None)
+    if record is None or record.slot_type != "agent":
+        return None
+    slot_path = _slot_directory(config, slot, record.slot_type)
+    identity = _directory_identity(slot_path)
+    if identity is None:
+        return None
+    try:
+        if _slot_image_at(config, slot_path) is not None:
+            return None
+    except Refusal:
+        return None
+    context = _AgentRemoveBatchContext({slot_path: identity})
+    context.capture([slot_path])
+    return context
 
 
 def _removal_journal_candidate(config: Config, slot: str) -> Path | None:
@@ -49105,6 +49237,20 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "the validation removal proof"
         ),
     )
+    remove.add_argument(
+        "--no-lock-budget",
+        action="store_true",
+        help=(
+            "for an agent slot, run every process-use check with lsof while holding the "
+            "registry lock, with no budget on that hold. By default remove runs lsof once "
+            "before taking the lock, checks /proc under it, and gives the work before the "
+            f"first deletion a {_AGENT_REMOVE_BATCH_ITEM_SECONDS:.0f}-second budget of lock "
+            "hold, with the exceptions each remove-agent-batch item has (see the user guide). "
+            "Use this only for a slot that "
+            "default remove refused for that budget: other clients waiting for the lock can "
+            "time out meanwhile"
+        ),
+    )
     remove.set_defaults(handler=_cmd_remove)
 
     remove_validate_batch = subparsers.add_parser(
@@ -49194,15 +49340,16 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "devices, is on a filesystem other than btrfs, ext2, ext3, ext4, tmpfs, or xfs, "
             "or reading a "
             "process fails for a reason other than its exit or a permission lsof would also "
-            "lack), lsof decides exactly as remove does. "
+            "lack), lsof decides exactly as remove --no-lock-budget does. Default remove of "
+            "one agent slot is a batch of one. "
             "Each slot is removed in its own registry-lock hold, and the lock is released "
             "between slots. A slot's work before its first deletion is limited to "
             f"{_AGENT_REMOVE_BATCH_ITEM_SECONDS:.0f} seconds of that hold, so other clients "
             "waiting for the lock are not kept past their own limits: a command still "
             "running when the limit is reached is stopped (SIGTERM, then SIGKILL after "
             f"{_AGENT_REMOVE_BATCH_TERM_GRACE_SECONDS:.0f} seconds) and the slot is refused "
-            "and left in place, to be retried later or removed alone with remove, which has "
-            "no such limit. The Git registration repair right after the path fence, a "
+            "and left in place, to be retried later or removed alone with remove "
+            "--no-lock-budget, which has no such limit. The Git registration repair right after the path fence, a "
             "rollback of the fence, and the deletion itself are not limited, since stopping "
             "them would leave a removal that only 'wrkslots recover' can finish. "
             "A refused slot is reported with its reason and left in place; "

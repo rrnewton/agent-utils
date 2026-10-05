@@ -836,9 +836,11 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # two cases of the stubbed one are mapped and the real-process one is
     # ordinary.
     # The retained-handle size test is mapped.
-    assert len(all_tests) == 1833
-    assert len(ordinary) == 287
-    assert len(mapped) == 1546
+    # Of the eight batch-of-one remove tests, the image-backed one is ordinary
+    # and the other seven are mapped.
+    assert len(all_tests) == 1841
+    assert len(ordinary) == 288
+    assert len(mapped) == 1553
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
@@ -908,6 +910,7 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
         "test_process_entering_after_final_scan_before_path_move_is_not_deleted",
         "test_process_path_census_reports_a_live_user_while_unrelated_processes_exit_during_it",
         "test_remove_agent_batch_removes_disk_image_slots",
+        "test_remove_checks_an_image_backed_agent_slot_under_the_lock",
         "test_remove_refuses_live_process_using_slot",
         "test_root_owned_executable_accepts_host_root_helper",
         "test_run1773_historical_frozen_checkout_is_retained_without_blocking_entry",

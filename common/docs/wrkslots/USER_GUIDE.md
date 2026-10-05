@@ -531,11 +531,21 @@ until a newer `recover` runs or the owner exits.
 
 ## Remove a batch of agent slots
 
-`wrkslots remove` checks process use several times for one agent slot, and each check runs
-`lsof +D` while the registry lock is held. The cost of `lsof +D` follows the number of open
-descriptors on the whole machine, not the size of the slot, so on a busy machine one removal can
-hold the lock for minutes. To remove many reclaimable agent slots, name each exact slot and its
-current generation:
+`wrkslots remove` checks process use several times for one agent slot while the registry lock is
+held. `lsof +D` walks the whole slot and every open descriptor on the machine, so on a busy machine
+one such check of a large slot takes many seconds: on a 33 GB slot of 68,888 entries, at load
+average about 260, one took 9 to 18 seconds. Default `remove` of one agent slot is therefore a batch
+of one, as described below: its one `lsof +D` runs before the lock is taken, and its work before the
+first deletion has the same 60-second budget as each batch slot, with the same exceptions (listed
+below). A batch of one refuses, without salvaging or removing anything, when its `lsof` scan is more
+than 300 seconds old at its first process-use check under the lock. A slot that the invoking
+`wrkslots` process itself holds open, for example through an inherited descriptor, is refused as
+before. `remove --no-lock-budget` runs every check with `lsof +D` under the lock and has no such
+limit; use it only for a slot that default `remove` refused for the limit. Validation slots keep
+their existing checks. An image-backed agent slot, and any agent slot on a host without `lsof`, uses
+the checks under the lock, since the fence of an image-backed slot mounts its image again, possibly
+from another device. To remove many reclaimable agent slots, name each exact slot and its current
+generation:
 
 ```sh
 wrkslots remove-agent-batch --coordinator-pid "$COORDINATOR_PID" \
@@ -558,7 +568,7 @@ seconds when that is given.
 Only the `lsof` scan is shared, and only for the process-use checks made before the path fence.
 Before taking any lock, the batch runs one `lsof +D` over every requested slot directory and
 attributes each open file to the slot that contains it; a file it cannot attribute counts against
-every slot. Where `remove` would run `lsof` before the fence, the batch instead:
+every slot. Where `remove --no-lock-budget` would run `lsof` before the fence, the batch instead:
 
 1. confirms that the slot directory is still the directory the shared scan covered, by device and
    inode;
@@ -573,14 +583,14 @@ opened through a hard link outside the slot, which no `/proc` path names; it is 
 older than 300 seconds. Nothing is deleted before the fence. A slot that the shared scan saw in use
 is refused even if that process has since exited; run another batch or `remove` for it.
 
-The process-use checks after the fence guard deletion. `remove` runs `lsof +D` on the fenced path
-for each of them. The batch first scans `/proc` once instead. It records the device and inode of
+The process-use checks after the fence guard deletion. `remove --no-lock-budget` runs `lsof +D` on
+the fenced path for each of them. The batch first scans `/proc` once instead. It records the device and inode of
 every file and directory in the fenced slot, then compares each process's working directory, root,
 executable, open descriptors, and memory mappings with the slot, both by path and by device and
 inode. That is the comparison `lsof +D` makes, so a descriptor opened through a hard link, or a
 directory reached through a bind mount in another mount namespace, is found although no path names
 the slot. A Unix socket bound below the slot's path counts as use as well. When the scan cannot
-decide, `lsof +D` decides exactly as in `remove`. The scan cannot decide when:
+decide, `lsof +D` decides exactly as in `remove --no-lock-budget`. The scan cannot decide when:
 
 - the slot spans more than one device, or part of it cannot be read;
 - the slot is on a filesystem other than btrfs, ext2, ext3, ext4, tmpfs, or xfs, since on others,
@@ -596,7 +606,7 @@ neither check without privilege, and every process's mount table is read. The JS
 scans after the fence in `fenced_process_scans`, their total time in `fenced_process_scan_seconds`,
 and the checks that `lsof` decided in `fenced_lsof_fallbacks`, with each reason in
 `fenced_lsof_fallback_reasons` and their total time in `fenced_lsof_fallback_seconds`. Like the
-checks `remove` makes after the fence, the scan and `lsof` read the fenced slot as it is when they
+checks `remove --no-lock-budget` makes after the fence, the scan and `lsof` read the fenced slot as it is when they
 run, so the fenced slot need not keep the device and inode it had before the fence. An image-backed
 slot does not keep them: its fence mounts the image again at the fenced path, and the new mount can
 have another device number (see "Disk-image slots" below).
@@ -607,9 +617,9 @@ own limits. Each Git command, the registered liveness command, each nested-repos
 `/proc` scan, and `lsof` receive at most the time that remains. A command still running when the
 limit is reached receives SIGTERM, then SIGKILL 5 seconds later if it has not exited, and is then
 waited for up to 5 more seconds. The slot is refused and left in place, with its path fence rolled
-back if it had been made; retry it in a later batch or remove it alone with `remove`, which has no
-such limit. A slot whose nested repositories take long to check can therefore be
-refused by the batch and removed by `remove`. Three stretches are not limited, because stopping them
+back if it had been made; retry it later, or remove it alone with `remove --no-lock-budget`, which
+has no such limit. A slot whose nested repositories take long to check can therefore be
+refused by the batch and removed by `remove --no-lock-budget`. Three stretches are not limited, because stopping them
 partway would leave a removal that only `wrkslots recover` can finish: the local Git registration
 repair that follows the path-fence rename, a rollback of the path fence, and the deletion of the
 slot. Once the first file is deleted, the slot's removal runs to completion, and its duration grows
