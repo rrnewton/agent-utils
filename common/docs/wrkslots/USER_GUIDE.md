@@ -373,8 +373,10 @@ validation slots. `audit`, `remove` (including `--validate-complete` and `remove
   inactive, unqueued service unit with no live process in its control group, and no active or
   queued user-systemd unit names those paths;
 - `alive`: any of that evidence shows the run may still use the checkout;
-- `unverifiable`: a handle, the process table, or user-systemd state cannot be read completely,
-  the row is registered on another machine, or its owner was recorded on another host. All of this
+- `unverifiable`: a handle, the process table, or user-systemd state cannot be read completely, a
+  handle repeats a JSON field (a repeated field has no single meaning, and keeping the last value
+  could hide a live process or move the handle off its row), the row is registered on another
+  machine, or its owner was recorded on another host. All of this
   evidence is local to the host, so a host without a reachable user service manager cannot prove a
   validation slot free.
 
@@ -913,7 +915,8 @@ wrkslots recover-absent-validate-rows --input /path/to/rows.json --apply \
 ```
 
 The command refuses agent rows, changed generations or row digests, holds, any path or Git
-registration that still exists, unreadable handle/process/systemd evidence, and any live process or
+registration that still exists, unreadable handle/process/systemd evidence (including any handle
+that repeats a JSON field), and any live process or
 user service that may use the row. A retained run handle contributes its exact service unit and,
 when recorded, process generation to the present-tense liveness proof; its run state is not treated as a validation
 outcome. The configured agent-liveness probe is likewise not an ownership authority: an agent may

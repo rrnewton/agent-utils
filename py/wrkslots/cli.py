@@ -43468,15 +43468,17 @@ def _retained_handles_for_absent_rows(
                 raise Refusal(
                     "retained validation handle census exceeded its time bound"
                 )
-            value = json.loads(contents)
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            # A duplicated field has no single meaning, and a permissive
+            # decoder keeps the last value: an appended ``"process_identity":
+            # null`` would hide a live run process, and an appended
+            # ``checkout`` would move the handle off its row.
+            value = _strict_json_object(
+                contents, f"cannot prove retained validation handle is unrelated: {path}"
+            )
+        except (OSError, UnicodeError) as exc:
             raise Refusal(
                 f"cannot prove retained validation handle is unrelated: {path}: {exc}"
             ) from exc
-        if not isinstance(value, dict):
-            raise Refusal(
-                f"cannot prove retained validation handle is unrelated: {path} is not an object"
-            )
         related: set[str] = set()
         for field in ("checkout", "source_checkout"):
             raw = value.get(field)

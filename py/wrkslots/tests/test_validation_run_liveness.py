@@ -340,3 +340,53 @@ def test_audit_judges_a_validation_row_by_its_run(
         f"retained validation unit {RUN_UNIT} may still use row slot01" in reason
         for reason in row["reasons"]
     )
+
+
+def _live_identity() -> dict[str, object]:
+    start_ticks = wrkslots._process_start_ticks(Path("/proc") / str(os.getpid()))
+    assert start_ticks is not None
+    return {
+        "pid": os.getpid(),
+        "start_ticks": start_ticks,
+        "boot_id": wrkslots._boot_id(Path("/proc")),
+    }
+
+
+@pytest.mark.parametrize(
+    ("duplicated", "trailer"),
+    [
+        # A later null identity would hide the live process generation.
+        ("process_identity", '"process_identity": null'),
+        # A later checkout would move the handle off this row entirely.
+        ("checkout", '"checkout": "/elsewhere/unrelated-checkout"'),
+    ],
+)
+def test_completed_validation_removal_refuses_a_handle_with_a_duplicate_field(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    duplicated: str,
+    trailer: str,
+) -> None:
+    """A JSON object with two values for one field has no single meaning.
+
+    A permissive decoder keeps the last value.  Here the first values say the
+    run's process is live on this row's checkout, and the appended duplicate
+    would make the row look dead.  The handle is unreadable evidence instead.
+    """
+
+    project, tree = _prepare(
+        tmp_path, monkeypatch, agent_liveness="dead", units=(_unit(),)
+    )
+    handle = _write_run_handle(project, tree, process_identity=_live_identity())
+    text = handle.read_text(encoding="utf-8")
+    assert text.endswith("}")
+    handle.write_text(f"{text[:-1]}, {trailer}}}", encoding="utf-8")
+
+    removed = _remove_completed(project)
+
+    error = capsys.readouterr().err
+    assert removed != 0
+    assert "validation-run authority is unverifiable for slot slot01" in error
+    assert f"duplicate key {duplicated!r}" in error
+    _assert_retained(project, tree)
