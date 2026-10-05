@@ -48,12 +48,20 @@ or console error: the stored-conversation routes are write-scope, answered 403 h
 answers them, and the page must not ask (`#38 read-token-conversation-probe`).
 
 Then, in the dark theme, a second reader pins (`#206 pin-message`): a pin made elsewhere shows on its
-row as a "Pinned" chip whose words read against it, and a gold edge; a row's ⋯ menu opens as Copy
-text, Pin, and the two that mark read under a hairline and a caption, every item at least 44px tall
-and the menu on the screen; Pin shows at once and reaches the server; and the open search bar
-carries the Pinned filter immediately left of the glass — a 44px target every point of which
-presses it, clear of the glass's own square and of a field still 150px wide beside the count — whose
-tap shows the pins, clear of the bar, and which the glass takes away with the bar.
+row as a "Pinned" chip whose words read against it, and a gold edge; the ⋯ menus of that row and of
+an unpinned one open as Copy text, Pin, and the two that mark read under a hairline and a caption —
+for a provider that can move its own read marker, whose menu is the widest — every item at least
+44px tall, on the screen, and answering a tap at its centre; Pin shows at once and reaches the
+server; and the open search bar carries the Pinned filter immediately left of the glass — a 44px
+target every point of which presses it, clear of the glass's own square and of a field still 150px
+wide beside the count — whose tap shows the pins, clear of the bar, and which the glass takes away
+with the bar.
+
+And where a phone reader's own settings wrap a row's meta line — the page zoomed to a 313px
+viewport, or the root font at 115%, 130% and 150% — every row's ⋯ menu, and the pinned row's in the
+Pinned filter, opens wholly on the screen with every item a thumb can reach, in both provider shapes,
+and that row's Unpin is tapped for real. A menu hung from the "⋯" opened off the left of the screen
+wherever the "⋯" wrapped to the start of a line.
 
 Then, in a second fresh profile at each size, a channel whose foot holds five replies to messages
 above them (`#204 reply-arrow`): from the owner, the agent and a third party, and between them in
@@ -158,6 +166,10 @@ class FakeApi:
         self.pins: dict[str, Json] = {}
         self.pins_revision = 0
         self.serve_pins_revision = False
+        # The provider's shape. Discord's by default; the pin walks also take the one whose ⋯ menu is
+        # widest — a provider that can move its own read marker, so the read group holds two items.
+        self.provider_name = "Discord"
+        self.upstream_read = False
 
     def pin_list(self) -> Json:
         with self.lock:
@@ -193,7 +205,7 @@ class FakeApi:
         return {
             "token_scope": scope,
             "version": "browser-check",
-            "chat_provider_name": "Discord",
+            "chat_provider_name": self.provider_name,
             "channels": [CHANNEL],
             "live_poll_seconds": 30,
             "live_delivery": "poll",
@@ -207,7 +219,7 @@ class FakeApi:
             "self_author_id": None,
             "owner_author_id": None,
             "channel_discovery_supported": False,
-            "upstream_read_mark_supported": False,
+            "upstream_read_mark_supported": self.upstream_read,
             "speech_prep_enabled": True,
         }
 
@@ -814,18 +826,26 @@ PIN_BAR_JS = """() => {""" + FLOAT_HELPERS_JS + """
     return {problems, field: fl.width};
 }"""
 
-# A row's open ⋯ menu: Copy text, Pin, then the read group under a hairline and a caption, every item
-# at least 44px tall and as wide as the others, and the whole menu on the screen.
-MENU_JS = """() => {""" + FLOAT_HELPERS_JS + """
+# A row's open ⋯ menu: Copy text, Pin, then the read group under a hairline and a caption — two
+# items in it where the provider can move its own read marker, one where it cannot — every item at
+# least 44px tall and as wide as the others, and the whole menu ACROSS the screen wherever the "⋯"
+# that opened it sits: at a wrapping width the "⋯" lands at the start of a line, and a menu hung
+# from its right edge opened off the left of the screen. Every item then answers a real point at its
+# centre once the list is scrolled to it, which is what a thumb needs of it; the list is scrolled
+# vertically only, after the menu's own box is measured, so nothing slides it back on screen first.
+MENU_JS = """({list, id, upstream}) => {""" + FLOAT_HELPERS_JS + """
     const problems = [];
-    const menu = [...document.querySelectorAll('#discord-log .row-more-menu')].find(shown);
-    if (!menu) return {problems: ['no ⋯ menu is open'], items: []};
+    const row = document.querySelector(`#${list} > li[data-id="${id}"]`);
+    const menu = row && row.querySelector('.row-more-menu');
+    if (!menu || !shown(menu)) return {problems: [`row ${id}'s ⋯ menu is not open`], items: []};
     const names = [...menu.children].filter(shown).map((e) => e.className);
     if (names.join(' ') !== 'row-copy-button row-pin-button row-more-group') problems.push(`the menu holds ${names.join(', ')}`);
     const group = menu.querySelector('.row-more-group');
     const caption = group && group.querySelector('.row-more-caption');
     if (!caption || !shown(caption) || caption.textContent !== 'Mark read') problems.push('the read group has no caption');
     if (group && parseFloat(getComputedStyle(group).borderTopWidth) < 1) problems.push('the read group has no rule above it');
+    const grouped = group ? [...group.querySelectorAll('button')].filter(shown).length : 0;
+    if (grouped !== (upstream ? 2 : 1)) problems.push(`the read group offers ${grouped} items`);
     const buttons = [...menu.querySelectorAll('button')].filter(shown);
     for (const button of buttons) {
         const r = box(button);
@@ -835,7 +855,22 @@ MENU_JS = """() => {""" + FLOAT_HELPERS_JS + """
     const pin = menu.querySelector('.row-pin-button');
     if (group && pin && box(group).top < box(pin).bottom) problems.push('the read group is not below Pin');
     const m = box(menu), width = document.documentElement.clientWidth;
-    if (m.left < -0.5 || m.right > width + 0.5) problems.push(`the menu runs off the screen: ${Math.round(m.left)}..${Math.round(m.right)}`);
+    if (m.left < -0.5 || m.right > width + 0.5) {
+        problems.push(`the menu runs off the screen: ${Math.round(m.left)}..${Math.round(m.right)} of ${width}px`);
+    }
+    for (const button of buttons) {
+        const r = box(button);
+        if (r.left < -0.5 || r.right > width + 0.5) problems.push(`"${button.textContent}" runs off the screen`);
+    }
+    const area = document.getElementById('scroll-area'), parked = area.scrollTop;
+    for (const button of buttons) {
+        const a = box(area);
+        area.scrollTop += (box(button).top + box(button).bottom) / 2 - (a.top + a.bottom) / 2;
+        const r = box(button);
+        const hit = document.elementFromPoint((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+        if (!hit || !button.contains(hit)) problems.push(`a tap on "${button.textContent}" lands on ${name(hit)}`);
+    }
+    area.scrollTop = parked;
     return {problems, items: buttons.map((button) => button.textContent)};
 }"""
 
@@ -866,6 +901,14 @@ CHIP_JS = """(id) => {""" + FLOAT_HELPERS_JS + """
 # pill's longest line is ellipsised, which the "cut short" check would report.
 PROFILES = (("phone", 412, 915, True), ("phone-360", 360, 800, True), ("desktop", 1280, 800, False))
 
+# `#206 pin-message`. What a phone reader's own settings do to a row's meta line: the page zoomed,
+# which narrows the CSS viewport (115% on a 360px phone leaves 313px), or a larger system font,
+# stood in for by scaling the root font that every rem on the page follows. Either wraps the line
+# sooner and puts some row's "⋯" at the START of a line — the pinned row's first, its chip taking
+# room — and every menu must still open wholly on the screen. As (label, width, height, root %).
+MENU_SCALES = (("zoom-313", 313, 680, 100), ("font-115", 360, 800, 115), ("font-130", 412, 915, 130),
+               ("font-150", 360, 800, 150))
+
 
 def main() -> int:
     args = arguments()
@@ -883,9 +926,10 @@ def main() -> int:
         for label, width, height, mobile in PROFILES:
             pin_walk(playwright.chromium, args, label, width, height, mobile)
             print(f"{label} at {width}x{height}: a pin made elsewhere shown as a legible Pinned chip and an"
-                  " edge, the ⋯ menu as Copy text, Pin and the captioned read group at full size, Pin"
-                  " shown at once and stored, and the Pinned filter beside the glass with a 44px target"
-                  " clear of the glass and the field, showing the pins and folded away with the bar")
+                  " edge, the ⋯ menus of a pinned and an unpinned row as Copy text, Pin and the captioned"
+                  " two-item read group at full size and on the screen, Pin shown at once and stored, and"
+                  " the Pinned filter beside the glass with a 44px target clear of the glass and the field,"
+                  " showing the pins and folded away with the bar")
             browser_version = walk(playwright.chromium, args, label, width, height, mobile)
             print(f"{browser_version} {label} at {width}x{height}: All by default, a reload reopened on the"
                   " channel, its view and the reader's message, snapshot drawn before the network,"
@@ -906,6 +950,11 @@ def main() -> int:
                   f" {'tap' if mobile else 'click'} on it brought the message it answers under the floating"
                   " line, lit, without folding the reply or, in reading mode, reading it aloud; Back to reply"
                   " brought the reply back")
+        for label, width, height, root_percent in MENU_SCALES:
+            menu_walk(playwright.chromium, args, label, width, height, root_percent)
+            print(f"{label} at {width}x{height}, root font {root_percent}%: every row's ⋯ menu, the pinned"
+                  " row's in the Pinned filter too, on the screen with full-size items a tap reaches, in"
+                  " both provider shapes, and Unpin tapped for real")
     return 0
 
 
@@ -1542,10 +1591,8 @@ def reply_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
         thread.join()
 
 
-def pin_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int,
-             mobile: bool) -> None:
-    """`#206 pin-message`, in the dark theme the owner reads in, against a fresh fake API."""
-    api = FakeApi()
+def pinned_elsewhere(api: FakeApi) -> FakeApi:
+    """`api` with the thread root, row 201, already pinned — by another device, before this page."""
     api.serve_pins_revision = True
     api.pins["201"] = {
         "message_id": "201", "author": "ci-bot", "author_id": "1000000000000000001", "author_is_bot": True,
@@ -1553,6 +1600,116 @@ def pin_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width:
         "thread_id": "spaces/A/threads/one", "thread_root": True, "pinned_at_ms": 1_790_000_000_000,
     }
     api.pins_revision = 1
+    return api
+
+
+def menu_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int,
+              root_percent: int) -> None:
+    """`#206 pin-message`: every row's ⋯ menu on the screen where the meta line wraps, in both shapes.
+
+    A phone in the dark theme, at one of `MENU_SCALES`. Each row's menu in the channel is opened by a
+    real tap and measured, then the pinned row's in the Pinned filter, whose Unpin is then tapped for
+    real — the item a menu hung off the left of the screen put out of reach.
+    """
+    for provider, upstream in (("Discord", False), ("Google Chat", True)):
+        api = pinned_elsewhere(FakeApi())
+        api.provider_name, api.upstream_read = provider, upstream
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        shape = f"{label}, {provider}"
+        try:
+            with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-menus-") as profile:
+                context = chromium.launch_persistent_context(
+                    profile, headless=True, executable_path=args.browser_executable,
+                    viewport={"width": width, "height": height}, device_scale_factor=2.625,
+                    is_mobile=True, has_touch=True, color_scheme="dark",
+                )
+                page = context.pages[0]
+                if root_percent != 100:
+                    page.add_init_script(
+                        "document.addEventListener('DOMContentLoaded', () => {"
+                        " const larger = document.createElement('style');"
+                        f" larger.textContent = 'html {{ font-size: {root_percent}% !important; }}';"
+                        " document.head.append(larger); });")
+                errors: list[str] = []
+                page.on("pageerror", lambda error: errors.append(str(error)))
+
+                def until(script: str, why: str) -> None:
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline and not page.evaluate(script):
+                        page.wait_for_timeout(50)
+                    check(bool(page.evaluate(script)), f"{shape}: {why}")
+
+                def tap(selector: str) -> None:
+                    # Scrolled to the middle of the list first: at a large font a row's controls can
+                    # be past either end of it, and the floating bar sits over its top.
+                    found = page.evaluate(
+                        "(selector) => { const e = document.querySelector(selector);"
+                        " const area = document.getElementById('scroll-area');"
+                        " if (area.contains(e)) { const a = area.getBoundingClientRect(), b = e.getBoundingClientRect();"
+                        "   area.scrollTop += (b.top + b.bottom) / 2 - (a.top + a.bottom) / 2; }"
+                        " const b = e.getBoundingClientRect(); return [b.left + b.width / 2, b.top + b.height / 2]; }",
+                        selector)
+                    page.touchscreen.tap(float(found[0]), float(found[1]))
+
+                def menu_of(list_id: str, row_id: str) -> str:
+                    row = f'#{list_id} > li[data-id="{row_id}"]'
+                    hidden = f"document.querySelector('{row} .row-more-menu').hidden"
+                    tap(f"{row} .row-more-button")
+                    until(f"() => !{hidden}", f"row {row_id}'s ⋯ menu in #{list_id} did not open")
+                    menu = page.evaluate(MENU_JS, {"list": list_id, "id": row_id, "upstream": upstream})
+                    if args.screenshots:
+                        page.screenshot(path=str(args.screenshots / f"{label}-{provider.split()[0].lower()}-"
+                                                                     f"menu-{list_id}-{row_id}.png"))
+                    check(not menu["problems"], f"{shape}, row {row_id}'s ⋯ menu in #{list_id}: {menu['problems']}"
+                                                f" ({menu['items']})")
+                    return hidden
+
+                page.goto(f"http://127.0.0.1:{server.server_port}/voice", wait_until="load")
+                page.fill("#api-token", TOKEN)
+                page.click("#save-token")
+                page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
+                page.click("#view-switch")
+                until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 3",
+                      "the channel did not open")
+                until("() => { const c = document.querySelector('#discord-log > li[data-id=\"201\"] .pin-chip');"
+                      " return Boolean(c) && !c.hidden; }", "the pin made elsewhere never showed on its row")
+                for row_id in ("200", "201", "202"):
+                    hidden = menu_of("discord-log", row_id)
+                    page.keyboard.press("Escape")
+                    until(f"() => {hidden}", f"Escape left row {row_id}'s ⋯ menu open")
+
+                # The pinned row again, in the Pinned filter, and its Unpin reached by a thumb.
+                tap("#search-toggle")
+                until("() => !document.getElementById('pinned-filter').hidden", "the open bar has no Pinned filter")
+                tap("#pinned-filter")
+                until("() => document.querySelectorAll('#pinned-log > li[data-id]').length === 1",
+                      "the pinned row did not show in the filter")
+                menu_of("pinned-log", "201")
+                tap('#pinned-log > li[data-id="201"] .row-pin-button')
+                until("() => !document.querySelector('#pinned-log > li[data-id]')", "Unpin left the row in the filter")
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and "201" in api.pins:
+                    page.wait_for_timeout(50)
+                check("201" not in api.pins, f"{shape}: a tap on Unpin never reached the server")
+                check(not errors, f"{shape}: the page threw: {errors}")
+                context.close()
+        finally:
+            api.stopping.set()
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+
+def pin_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int,
+             mobile: bool) -> None:
+    """`#206 pin-message`, in the dark theme the owner reads in, against a fresh fake API."""
+    api = pinned_elsewhere(FakeApi())
+    # The shape whose ⋯ menu is widest: the read group holds both items, the longer label naming the
+    # service. `menu_walk` takes the one-item shape too.
+    api.provider_name, api.upstream_read = "Google Chat", True
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1604,13 +1761,18 @@ def pin_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width:
             shot("1-pinned-chip")
             check(not chip["problems"], f"{label}, the pinned chip in the dark theme: {chip['problems']}")
 
-            # The ⋯ menu, opened by a real tap.
-            tap('#discord-log > li[data-id="200"] .row-more-button')
-            until("() => [...document.querySelectorAll('#discord-log .row-more-menu')].some((m) => !m.hidden)",
-                  "the ⋯ menu did not open")
-            menu = page.evaluate(MENU_JS)
-            shot("2-menu")
-            check(not menu["problems"], f"{label}, the ⋯ menu: {menu['problems']} ({menu['items']})")
+            # The ⋯ menu, opened by a real tap: on the pinned row, whose chip takes room on its meta
+            # line, and closed by Escape; then on an unpinned one, left open for its Pin.
+            for row_id in ("201", "200"):
+                hidden = f"document.querySelector('#discord-log > li[data-id=\"{row_id}\"] .row-more-menu').hidden"
+                tap(f'#discord-log > li[data-id="{row_id}"] .row-more-button')
+                until(f"() => !{hidden}", f"row {row_id}'s ⋯ menu did not open")
+                menu = page.evaluate(MENU_JS, {"list": "discord-log", "id": row_id, "upstream": True})
+                shot(f"2-menu-{row_id}")
+                check(not menu["problems"], f"{label}, row {row_id}'s ⋯ menu: {menu['problems']} ({menu['items']})")
+                if row_id == "201":
+                    page.keyboard.press("Escape")
+                    until(f"() => {hidden}", "Escape left the ⋯ menu open")
 
             # Pin, shown at once and stored.
             tap('#discord-log > li[data-id="200"] .row-pin-button')

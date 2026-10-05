@@ -1825,9 +1825,28 @@ body {
  * either direction. It is quiet because it is a standing fact rather than a message, and it
  * scrolls away with the top of the history rather than holding a strip of a phone screen.
  */
-/* `row-more-menu`. "⋯" on the row, and a small menu under it holding the rarely used actions. */
-.row-more {
+/* `row-more-menu`. "⋯" on the row, and a small menu under it holding the rarely used actions.
+ *
+ * THE MENU HANGS FROM THE ROW'S META LINE, NOT FROM THE "⋯". It used to hang from the button, its
+ * right edge on the button's, which only works while the button is at the right of the row — and
+ * the meta line wraps, so on a narrow phone, under a larger system font, or with the "Pinned" chip
+ * taking room, the "⋯" lands at the START of a line and a menu right-aligned to it opened wholly
+ * off the left of the screen, Unpin included (`#206 pin-message`). Measured in Chromium, never in
+ * the page suite, which lays nothing out: tests/offline_cache_browser.py opens every row's menu at
+ * the widths and font sizes that wrap it.
+ *
+ * So the meta line is the menu's containing block, `.row-more` is not, and the menu's right edge is
+ * the row's: under the button whenever the button is at the end of its line, and inside the row
+ * wherever the button is. No `white-space: nowrap` — a menu wider than the row wraps its labels
+ * instead, each item growing taller rather than any item, or the menu, running off the screen.
+ */
+#discord-log .meta,
+#pinned-log .meta {
   position: relative;
+}
+
+.row-more {
+  position: static;
   flex: 0 0 auto;
 }
 
@@ -1839,11 +1858,12 @@ body {
   display: flex;
   flex-direction: column;
   gap: 0.3rem;
+  max-width: 100%;
   padding: 0.4rem;
   background: var(--panel);
   border: 1px solid var(--edge);
   border-radius: 0.6rem;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .row-more-menu[hidden] {

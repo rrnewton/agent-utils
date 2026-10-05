@@ -25780,6 +25780,23 @@ test("the ⋯ menu is Copy text, then Pin, then the two that mark read under one
   assert.match(cssBlock(".row-more-group > button"), /min-height: 2\.75rem/, "the grouped items shrank");
 });
 
+test("the ⋯ menu hangs from the row's meta line, so a ⋯ wrapped to the left cannot carry it off the screen", () => {
+  // The meta line wraps, and the "Pinned" chip, a narrow phone, a zoomed page or a larger system
+  // font each put a row's "⋯" at the START of a line. Hung from the button's right edge, the menu
+  // then opened wholly off the left of the screen, Unpin with it. This suite lays nothing out, so it
+  // pins the frame that rules that out; tests/offline_cache_browser.py measures it in Chromium.
+  for (const list of ["#discord-log", "#pinned-log"]) {
+    assert.match(cssBlock(`${list} .meta`), /position: relative/, `${list}'s meta line is not the menu's frame`);
+  }
+  assert.match(cssBlock(".row-more"), /position: static/, "the ⋯ is the menu's frame again");
+  assert.doesNotMatch(cssBlock(".row-more"), /position: relative/);
+  const menu = cssBlock(".row-more-menu");
+  assert.match(menu, /position: absolute/);
+  assert.match(menu, /right: 0/, "the menu's right edge is not the row's");
+  assert.match(menu, /max-width: 100%/, "a menu wider than the row is not held inside it");
+  assert.doesNotMatch(menu, /white-space: nowrap/, "the menu's labels cannot wrap, so it outgrows the row");
+});
+
 test("Pin shows on the row at once, sends the row as what to keep, and the answer confirms it", async () => {
   const page = newPage();
   await signIn(page);
