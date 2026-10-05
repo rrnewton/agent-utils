@@ -24,13 +24,17 @@ import pytest
 from wrkslots import cli as wrkslots
 from wrkslots.tests.test_lifecycle import (
     active_slots,
+    allow_test_host_for_absent_validate_recovery,
     checkout,
     create,
     expire_heartbeat,
     make_project,
     mark_owner_dead,
+    prepare_absent_validate_row,
+    run_absent_validate_recovery,
     set_liveness,
     stub_validate_batch_censuses,
+    write_absent_validate_input,
 )
 
 
@@ -586,3 +590,130 @@ def test_completed_validation_removal_names_unreadable_run_evidence_as_unverifia
     assert "process generation is indeterminate" in error
     assert "stop its unit" not in error
     _assert_retained(project, tree)
+
+
+def _run_child(cgroup: str, *, pid: int = 4_000_029) -> wrkslots._AbsentProcessObservation:
+    return wrkslots._AbsentProcessObservation(
+        pid=pid, start_ticks=31, cgroup_path=cgroup, mount_namespace="mnt:[test]"
+    )
+
+
+RUN_CGROUP = f"/user.slice/app.slice/{RUN_UNIT}"
+
+
+def _judge_with_process_tables(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    before: Sequence[wrkslots._AbsentProcessObservation],
+    after: Sequence[wrkslots._AbsentProcessObservation],
+) -> tuple[str, str]:
+    """Judge one row whose process table changes during the unit enumeration."""
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    _write_run_handle(project, tree)
+    enumerated = False
+
+    def units() -> tuple[Mapping[str, str], ...]:
+        nonlocal enumerated
+        enumerated = True
+        # The run started and finished during this enumeration.
+        return (_unit(),)
+
+    def processes(**_kwargs: object) -> tuple[wrkslots._AbsentProcessObservation, ...]:
+        return tuple(after if enumerated else before)
+
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", units)
+    monkeypatch.setattr(wrkslots, "_absent_validate_process_snapshot", processes)
+    config = wrkslots._load_config(str(project), "testhost")
+    states = wrkslots._validation_run_liveness_states(
+        config, wrkslots._load_active(config).slots
+    )
+    assert enumerated
+    assert len(states) == 1
+    return next(iter(states.values()))
+
+
+def test_a_run_child_that_appears_during_the_unit_enumeration_is_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The unit reads inactive and unqueued, but its child is still running.
+
+    The process table read before the enumeration is empty.  Judging the row
+    from it alone reports ``dead``, and the later path census does not look
+    at the run's control group, so a child holding no path escapes both.
+    """
+
+    state, message = _judge_with_process_tables(
+        tmp_path, monkeypatch, before=(), after=(_run_child(f"{RUN_CGROUP}/payload"),)
+    )
+
+    assert state == "alive", message
+    assert f"retained validation unit {RUN_UNIT} still has a live cgroup process" in message
+
+
+def test_a_run_child_that_leaves_the_run_cgroup_during_the_enumeration_is_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same exact process generation keeps the run's control group."""
+
+    state, message = _judge_with_process_tables(
+        tmp_path,
+        monkeypatch,
+        before=(_run_child(f"{RUN_CGROUP}/payload"),),
+        after=(_run_child("/user.slice/app.slice/elsewhere.scope"),),
+    )
+
+    assert state == "alive", message
+    assert f"retained validation unit {RUN_UNIT} still has a live cgroup process" in message
+
+
+def test_a_run_child_that_exited_during_the_enumeration_is_not_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A generation absent from the later table has exited."""
+
+    state, message = _judge_with_process_tables(
+        tmp_path, monkeypatch, before=(_run_child(f"{RUN_CGROUP}/payload"),), after=()
+    )
+
+    assert state == "dead", message
+
+
+def test_absent_row_recovery_sees_a_run_child_that_appears_during_the_unit_enumeration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """recover-absent-validate-rows judges the same evidence the same way.
+
+    Its census reads the process table, then the unit enumeration runs.  A
+    run that starts and finishes inside that enumeration leaves its unit
+    inactive and unqueued and its child in the unit's control group, which
+    only a table read after the enumeration shows.
+    """
+
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_validate_row(project, repository, slot="gone", agent="validate-a")
+    config = wrkslots._load_config(str(project), "testhost")
+    _write_run_handle(
+        project, wrkslots._stored_path(config, record.checkouts[0].path, "checkout")
+    )
+    input_path = write_absent_validate_input(project, [record])
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    enumerated = False
+
+    def units() -> tuple[Mapping[str, str], ...]:
+        nonlocal enumerated
+        enumerated = True
+        return (_unit(),)
+
+    def processes(**_kwargs: object) -> tuple[wrkslots._AbsentProcessObservation, ...]:
+        return (_run_child(f"{RUN_CGROUP}/payload"),) if enumerated else ()
+
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", units)
+    monkeypatch.setattr(wrkslots, "_absent_validate_process_snapshot", processes)
+
+    assert run_absent_validate_recovery(project, input_path, apply=False) == 3
+    assert enumerated
+    error = capsys.readouterr().err
+    assert f"retained validation unit {RUN_UNIT} still has a live cgroup process" in error

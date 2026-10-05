@@ -16527,17 +16527,47 @@ def _refuse_registered_liveness(state: str, detail: str) -> NoReturn:
     )
 
 
+def _processes_around_unit_enumeration(
+    before: Sequence[_AbsentProcessObservation],
+) -> tuple[tuple[_AbsentProcessObservation, ...], tuple[Mapping[str, str], ...]]:
+    """Enumerate user-systemd units, then reconcile ``before`` with a new table.
+
+    ``before`` is a process table read before this call.  The user-systemd
+    enumeration takes about 1.5 seconds on a busy host.  A run can start and
+    finish inside that window and leave a child in its control group: the
+    unit then reads inactive and unqueued, and ``before`` has no child.  The
+    table read after the enumeration does, so the returned processes are that
+    later table.  A process generation in both tables also keeps its earlier
+    control group, so a child that left a run's control group meanwhile is
+    still attributed to the run.  A generation only in ``before`` has exited
+    and is dropped.  Both reads refuse rather than return a partial
+    population.
+    """
+
+    units = _user_systemd_snapshot()
+    after = _absent_validate_process_snapshot()
+    current = set(after)
+    live = {(process.pid, process.start_ticks) for process in after}
+    moved = tuple(
+        process
+        for process in before
+        if (process.pid, process.start_ticks) in live and process not in current
+    )
+    return (*after, *moved), units
+
+
 def _validation_run_host_evidence() -> tuple[
     tuple[_AbsentProcessObservation, ...], tuple[Mapping[str, str], ...]
 ]:
     """Read this host's live processes and user-systemd units, each strictly.
 
-    Both reads refuse rather than return a partial population.  This is the
-    only host-wide evidence the validation-run authority reads; the retained
-    run handles are project files.
+    This is the only host-wide evidence the validation-run authority reads;
+    the retained run handles are project files.  The process table is read on
+    both sides of the user-systemd enumeration; see
+    ``_processes_around_unit_enumeration``.
     """
 
-    return _absent_validate_process_snapshot(), _user_systemd_snapshot()
+    return _processes_around_unit_enumeration(_absent_validate_process_snapshot())
 
 
 def _validation_run_liveness_states(
@@ -40431,7 +40461,9 @@ def _assert_absent_agent_liveness(
                 f"recorded owner for agent row {record.slot} is {owner_state}: {detail}"
             )
     rows = ((record, tuple(paths)),)
-    processes = _assert_absent_validate_processes_unrelated(rows)
+    processes, units = _processes_around_unit_enumeration(
+        _assert_absent_validate_processes_unrelated(rows)
+    )
     # The refusal directly above already required a proven-dead owner, so this
     # comparison could only ever have fired on a process that is not the owner.
     if _owner_cgroup_is_evidence(record) and record.owner is not None:
@@ -40441,7 +40473,9 @@ def _assert_absent_agent_liveness(
                     f"live process {process.pid} remains in recorded owner cgroup "
                     f"{record.owner.cgroup_path} for agent row {record.slot}"
                 )
-    _assert_absent_validate_systemd_unrelated(rows, {record.slot: ()}, processes)
+    _assert_absent_validate_systemd_unrelated(
+        rows, {record.slot: ()}, processes, snapshot=units
+    )
 
 
 def _absent_agent_rescue_ref(
@@ -46908,8 +46942,10 @@ def _assert_absent_validate_rows_safe(config: Config, records: Sequence[ActiveRe
     _assert_absent_validate_owners_dead(records)
     bindings = _retained_handles_for_absent_rows(config, rows)
     _assert_retained_handle_processes_dead(bindings)
-    processes = _assert_absent_validate_processes_unrelated(rows)
-    _assert_absent_validate_systemd_unrelated(rows, bindings, processes)
+    processes, units = _processes_around_unit_enumeration(
+        _assert_absent_validate_processes_unrelated(rows)
+    )
+    _assert_absent_validate_systemd_unrelated(rows, bindings, processes, snapshot=units)
 
 
 def _absent_validate_archive_entry(

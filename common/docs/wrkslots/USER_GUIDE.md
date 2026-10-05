@@ -389,6 +389,14 @@ or `-`. A unit naming `slot01/product`, `slot01/./product` or `--checkout=slot01
 `slot01`, and one naming its sibling `slot010` does not. This rule is shared with
 `recover-absent-validate-rows`.
 
+The process table is read both before and after the user-systemd enumeration, which takes about a
+second and a half on a busy host. A run that starts and finishes during the enumeration leaves its
+unit inactive and unqueued and may leave a child in the unit's control group; only the later table
+shows that child, so the later table is the one judged. A process generation present in both tables
+keeps the control group it had in the earlier one, and a generation present only in the earlier
+table has exited. `recover-absent-validate-rows` and `recover-absent-agent-rows` read the process
+table the same way.
+
 Audit reports the number of validation rows it judged this way as the liveness phase's
 `validation_run_subjects`. A batch removal reads this evidence once while sealing and once more per
 slot immediately before deletion. A churning user-systemd snapshot refuses rather than guessing;
