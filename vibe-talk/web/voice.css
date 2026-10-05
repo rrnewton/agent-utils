@@ -37,6 +37,11 @@
    * the width. Bounded in `rem`, not `%`, so a wider window spends the extra on words.
    */
   --speaker-inset: 1.5rem;
+  /* `#204 reply-arrow`. The gutter a reply is inset by, and the arrow in it is that square: one
+     touch target, 44px at the default size, in `rem` so it grows with the reader's type. Wider
+     than either speaker inset on a phone, so every reply leaves the same room for its arrow
+     whoever sent it. */
+  --reply-gutter: 2.75rem;
   /* The reader's own type size for message text. Settings drives it; see `--msg-scale`. */
   --msg-scale: 1;
   --dock: #191c22;
@@ -1233,17 +1238,151 @@ body {
 }
 
 /*
- * A REPLY SAYS SO. The mark sits first in the meta line, which puts it at the row's upper-left.
+ * A REPLY POINTS AT WHAT IT ANSWERS. `#204 reply-arrow`.
  *
- * Quiet — `--muted`, and smaller than the text — because it is a fact ABOUT the message, not part
- * of it. It also has to survive the `me` treatment: a reply the owner sent is already right-
- * indented and coloured as his, and that says who sent it rather than what it is.
+ * It used to say so with a small "↩" in the meta line, kept quiet on the reasoning that being a
+ * reply is a fact ABOUT a message. The owner, from his phone: "That's useless. What I wanted was a
+ * visible arrow from the left side of the box pointing upward." So a reply is inset from the left
+ * by one touch target, whoever sent it, and the arrow is drawn in that gutter: a line out of the
+ * box's left side that turns and points up at the messages above, in the accent, across most of
+ * the gutter. It is also the way there — see the section in web/voice.js.
+ *
+ * ONE INSET FOR EVERY SPEAKER. The owner's rows are already pushed in by `--speaker-inset` and a
+ * third party's by half of it, but neither is a touch target wide; the coding agent's tile runs
+ * edge to edge and has no left side at all. A reply from the agent is therefore the one tile that
+ * keeps a left edge, and a border to show it, because that edge is what the arrow comes out of.
+ * The extra attribute in each selector is what puts these over the speaker rules above.
+ *
+ * At least the arrow's height, so the arrow can never hang below its own row and over the head of
+ * the next one.
  */
-.reply-mark {
+#discord-log li.discord-message[data-is-reply="true"][data-who] {
+  margin-left: var(--reply-gutter);
+  min-height: var(--reply-gutter);
+}
+
+#discord-log li.discord-message[data-is-reply="true"][data-who="coder"] {
+  padding-left: 0.4rem;
+  border-left: 1px solid var(--edge);
+}
+
+/*
+ * The arrow's square: the whole gutter, from the row's top. Outside the row's box, so nothing it
+ * covers is text or a control — the row's own controls are all inside the box, and the gutter is
+ * this row's alone. `right: 100%` anchors it to the box's left side rather than to the list's
+ * edge, so the wider inset a desk gives the owner's rows still leaves the arrow touching its box.
+ */
+#discord-log .reply-jump {
+  position: absolute;
+  top: 0;
+  right: 100%;
+  width: var(--reply-gutter);
+  height: var(--reply-gutter);
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-end;
+  padding: 0;
+  background: none;
+  border: none;
+  border-radius: 0.6rem;
+  color: var(--accent);
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  cursor: pointer;
+}
+
+/*
+ * THE ARROW, drawn on an empty span in two pieces: the line, and its head. 32px by 24px at the
+ * default size, against the square's right-hand edge, which is the box's left side.
+ *
+ * The line is one box with two borders, so the corner between them is a real curve: up its left
+ * side, along its bottom into the row. Its bottom border leaves the box level with the meta line,
+ * which is where the eye already is, and its left border is the shaft. The head is a solid
+ * triangle centred on the shaft and overlapping its top, so the two cannot visibly come apart at
+ * any size. Everything is in `rem`, so the whole drawing grows with the reader's type.
+ */
+#discord-log .reply-jump-mark {
+  --reply-stroke: 0.1875rem;
+  --reply-shaft: 0.7rem;
+  position: relative;
   flex: 0 0 auto;
-  color: var(--muted);
-  font-size: 0.85rem;
-  line-height: 1;
+  width: 2rem;
+  height: 1.5rem;
+  margin-top: 0.1rem;
+}
+
+#discord-log .reply-jump-mark::before {
+  content: "";
+  position: absolute;
+  left: var(--reply-shaft);
+  right: 0;
+  top: 0.45rem;
+  bottom: 0.25rem;
+  border-left: var(--reply-stroke) solid currentColor;
+  border-bottom: var(--reply-stroke) solid currentColor;
+  border-bottom-left-radius: 0.55rem;
+}
+
+#discord-log .reply-jump-mark::after {
+  content: "";
+  position: absolute;
+  left: calc(var(--reply-shaft) + var(--reply-stroke) / 2);
+  top: 0;
+  transform: translateX(-50%);
+  border-left: 0.5rem solid transparent;
+  border-right: 0.5rem solid transparent;
+  border-bottom: 0.6rem solid currentColor;
+}
+
+/* Pressed, and reached by keyboard: a soft disc behind the arrow, so the target shows itself. A
+   pointer gets the same under hover, in the pointer query beside the row's own tint and for the
+   same reason — a touch screen leaves `:hover` stuck on whatever was tapped last. */
+#discord-log .reply-jump:active,
+#discord-log .reply-jump:focus-visible {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+#discord-log .reply-jump:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/*
+ * WHERE A JUMP LANDED, for a moment. The row the arrow — or "Back to reply" — took the reader to
+ * is ringed and washed in the accent, fading out, because a list scrolled under the reader by a
+ * tap otherwise gives no clue which row was the point.
+ *
+ * Laid over the row rather than painted on it, so it composes with every speaker colour and state
+ * beneath it; and the row comes back to full strength while it is lit, because the message a reply
+ * answers is usually dimmed as answered (`data-replied`) — the very row being looked for.
+ */
+#discord-log li.discord-message[data-landed="true"] {
+  opacity: 1;
+  filter: none;
+}
+
+#discord-log li.discord-message[data-landed="true"]::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  box-shadow: inset 0 0 0 2px var(--accent);
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  pointer-events: none;
+  /* As long as `REPLY_LANDED_MS`, after which web/voice.js takes the attribute away. */
+  animation: reply-landed 2s ease-out forwards;
+}
+
+@keyframes reply-landed {
+  0%, 45% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+/* Lit and then simply gone, for a reader who has asked the page not to animate. */
+@media (prefers-reduced-motion: reduce) {
+  #discord-log li.discord-message[data-landed="true"]::after {
+    animation: none;
+  }
 }
 
 /*
@@ -2156,6 +2295,11 @@ body {
   #discord-log li.discord-message[data-own-read="true"]:hover,
   #discord-log li.discord-message[data-noise="true"]:hover {
     filter: none;
+  }
+
+  /* `#204 reply-arrow`. The arrow's disc, under the pointer, as it shows when pressed. */
+  #discord-log .reply-jump:hover {
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
   }
 }
 
@@ -3182,6 +3326,13 @@ textarea {
   #discord-log li.discord-message[data-who="human"],
   #discord-log li.discord-message[data-who="bot"] {
     margin-inline: min(7%, 3rem);
+  }
+
+  /* `#204 reply-arrow`. A reply's gutter is a touch target wide everywhere, and the owner's own
+     inset is wider than that here: his reply keeps the larger of the two, so it is still drawn on
+     his side of the column. The arrow follows the box (`right: 100%`). */
+  #discord-log li.discord-message[data-is-reply="true"][data-who="me"] {
+    margin-left: max(var(--reply-gutter), min(15%, 6rem));
   }
 
   /* The identity rows go back to two tracks. The phone stacks them because 27 characters of option

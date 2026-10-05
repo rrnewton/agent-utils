@@ -441,6 +441,12 @@
               it; see `setPlaceMarker`.
             -->
             <button id="jump-marker" class="chip" type="button" hidden>My place</button>
+            <!--
+              `#204 reply-arrow`. The way back from a reply's arrow: offered only while the reply
+              that was tapped is off the screen, because the jump took the reader away from it.
+              See `landOnAnswered`.
+            -->
+            <button id="back-to-reply" class="chip" type="button" hidden>Back to reply</button>
             <button id="summarise" class="chip" type="button" aria-pressed="false" hidden>
               <span id="summarise-label">Summaries</span>
             </button>
@@ -1208,6 +1214,14 @@
                 only see answers that are <strong>loaded</strong>: a reply further back than you have
                 walked is invisible, and a message can be dimmed later than it should have been,
                 never earlier.
+              </p>
+              <p class="hint">
+                A message that is itself a <strong>reply</strong> is set in from the left, with an
+                arrow pointing up out of its left side. Tap the arrow to go to the message it
+                answers, which is lit for a moment: in this view if it is here, in
+                <strong>All</strong> if it is in another part of the channel, and a few older pages
+                back if it is not loaded yet. If it is further back than that, or gone, the status
+                line says so. <strong>Back to reply</strong> takes you back to where you tapped.
               </p>
               <p class="hint">
                 <strong>Archive</strong> is your own judgement, and it is recorded on the

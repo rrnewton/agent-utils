@@ -2608,6 +2608,20 @@ const TUNING_BANDS = {
     "earlier messages the reply screen draws before 'Load earlier messages'. Under about four the " +
     "question being answered is often already off the top; past a few dozen the screen builds a " +
     "long history on every Reply, most of it never scrolled to"],
+  // `#204 reply-arrow`: the tap on a reply's arrow, and where it lands.
+  REPLY_JUMP_PAGES: [2, 10,
+    "older pages one tap on a reply's arrow may read looking for what it answers. Fewer than two " +
+    "and a question asked shortly before the newest page is out of reach of the control made for " +
+    "it; past about ten, a tap on a reply to a deleted message reads hundreds of messages on a " +
+    "walk that cannot succeed while the reader waits"],
+  REPLY_LANDED_MS: [800, 5000,
+    "how long the row a jump lands on stays lit. Under most of a second the light is gone before " +
+    "the eye has followed the scroll; past a few seconds it is still lit after the reader has moved " +
+    "on, and reads as a state of the row rather than as where the jump landed"],
+  REPLY_LANDING_GAP_PX: [0, 24,
+    "how far under the floating pill a jumped-to row lands. Below zero its top edge is under the " +
+    "pill; past a couple of dozen pixels the room comes out of what is below it, which is where " +
+    "the reply the reader came from most often is"],
   THREAD_TITLE_CHARS: [16, 48,
     "longest first-message prefix the picker uses as a thread name. Under about sixteen characters " +
     "a name says nothing; past a few words a phone's native picker, which draws options large, " +
@@ -7455,10 +7469,11 @@ test("...and there is exactly ONE place, because a list of them is a second inbo
   assert.equal(rowState(page, 1).marked, "true");
 });
 
-test("A MESSAGE THAT IS ITSELF A REPLY SAYS SO", async () => {
+test("A MESSAGE THAT IS ITSELF A REPLY SAYS SO, with an arrow in the gutter to its left", async () => {
   // The channel already derived the OPPOSITE direction — `data-replied` marks a message somebody
   // answered — and had nothing for "this one is an answer", even though the pointer was already on
-  // the row. #97 reply-indicator.
+  // the row. #97 reply-indicator. That answer was a small glyph by the time, which the owner called
+  // useless and asked to be an arrow out of the box's left side: `#204 reply-arrow`.
   const page = newPage();
   await signIn(page);
   await showDiscord(page, [
@@ -7469,16 +7484,27 @@ test("A MESSAGE THAT IS ITSELF A REPLY SAYS SO", async () => {
   assert.equal(rowState(page, 0).isReply, "false", "the question was marked as an answer");
   assert.equal(rowState(page, 1).isReply, "true", "the answer is not marked at all");
 
-  const mark = row(page, 1).descendants().find((n) => n.className === "reply-mark");
-  assert.ok(mark, "there is no mark on the row, only an attribute nobody can see");
-  assert.equal(
-    row(page, 0).descendants().filter((n) => n.className === "reply-mark").length,
-    0,
-    "every row carries a reply mark"
-  );
+  const arrow = replyArrowOf(row(page, 1));
+  assert.ok(arrow, "there is no arrow on the reply, only an attribute nobody can see");
+  assert.equal(replyArrowOf(row(page, 0)), undefined, "a message that answers nothing grew an arrow");
+  // A control, and the FIRST thing in the row: a screen reader meets the way to the question
+  // before the answer's own words, and the stylesheet draws it in the gutter, not in the meta line.
+  assert.equal(arrow.tagName, "button");
+  assert.equal(arrow.getAttribute("type"), "button", "the arrow is not declared a plain button");
+  assert.equal(row(page, 1).children[0], arrow, "the arrow is not the first thing in the row");
+  // An arrow on its own is announced as "up arrow", or as nothing: it is named for what it DOES.
+  assert.equal(arrow.getAttribute("aria-label"), "Jump to the message this answers");
+  assert.equal(arrow.getAttribute("title"), "Jump to the message this answers");
+  // DRAWN, by the stylesheet: a typed glyph looks like whatever the phone's font makes of it.
+  assert.equal(arrow.text(), "", "the arrow is a typed glyph again");
 
-  // A bare arrow is announced as "left arrow" or as nothing, and neither says "reply".
-  assert.match(mark.text(), /reply/i, "the mark has no accessible name");
+  // The old glyph is gone from the meta line. What is left there is words, for a screen reader.
+  assert.doesNotMatch(row(page, 1).text(), /↩/, "the tiny glyph the owner called useless is still drawn");
+  assert.ok(!row(page, 1).descendants().some((n) => n.hasClass("reply-mark")), "the old mark is still built");
+  const said = row(page, 1).descendants().find((n) => n.hasClass("reply-said"));
+  assert.ok(said, "a screen reader is no longer told the row is a reply");
+  assert.ok(said.hasClass("sr-only"), "the meta line still DRAWS that the row is a reply");
+  assert.ok(!row(page, 0).descendants().some((n) => n.hasClass("reply-said")), "every row says it is a reply");
 });
 
 test("...and it is correct even when the message it answers is not loaded", async () => {
@@ -7495,6 +7521,478 @@ test("...and it is correct even when the message it answers is not loaded", asyn
     "true",
     "a reply to something outside the window stopped looking like a reply"
   );
+});
+
+// --- following a reply up to what it answers --------------------------------------------------
+//
+// `#204 reply-arrow`. The owner: "a visible arrow from the left side of the box pointing upward.
+// And clicking on the arrow should jump to the message it is a reply to."
+
+const replyArrowOf = (li) => li.children.find((node) => node.hasClass("reply-jump"));
+const REPLY_JUMP_PAGES = sourceConstant("REPLY_JUMP_PAGES");
+const REPLY_LANDED_MS = sourceConstant("REPLY_LANDED_MS");
+
+/**
+ * A tap on a reply's arrow as a browser delivers it: to the arrow, then — unless something stopped
+ * it — up to the row the arrow sits in, whose own handler folds the row or reads it aloud. The
+ * fixture does not bubble on its own, so this does what the browser would, and the row's handler
+ * sees a target it cannot ask `closest` of: a click that leaked would really fold the row here.
+ */
+async function tapArrow(page, li) {
+  const arrow = replyArrowOf(li);
+  assert.ok(arrow, "the row has no arrow to tap");
+  let stopped = false;
+  const event = { target: arrow, stopPropagation: () => { stopped = true; } };
+  await arrow.dispatch("click", event);
+  if (!stopped) await li.dispatch("click", event);
+  // A walk back is a read per page, each its own round of promises.
+  for (let i = 0; i < 4 * REPLY_JUMP_PAGES; i += 1) await page.settle();
+}
+
+const rowWithId = (page, id) =>
+  page.el("discord-log").children.find((li) => li.getAttribute("data-ids").split(" ").includes(id));
+
+/**
+ * What the status line said — asserted to FIT. The line is one line, ellipsised, and on a 360px
+ * phone about this many characters of it show (measured in Chromium); a sentence whose point came
+ * after that showed the reader only its preamble.
+ */
+const STATUS_PHONE_CHARS = 38;
+const statusText = (page) => {
+  const said = page.el("status").textContent;
+  assert.ok(said.length <= STATUS_PHONE_CHARS, `"${said}" is cut off on a phone's status line`);
+  return said;
+};
+const olderReads = (page) => page.pagesServed.filter((path) => /[?&]before=/.test(path));
+
+/** A tall channel: the question at the top, filler, and the answer to it last. */
+function questionFarAbove() {
+  return [
+    message({ id: "1000000000000000001", content: longMessage("is the runner wedged?") }),
+    ...Array.from({ length: 8 }, (_unused, i) =>
+      message({ id: `10000000000000000${10 + i}`, content: longMessage(`filler ${i}`) })),
+    message({ id: "1000000000000000099", content: longMessage("restarted it"), reply_to: "1000000000000000001" }),
+  ];
+}
+
+test("the arrow has a gutter of its own: one touch target, on every reply, whoever sent it", () => {
+  // The page suite cannot lay anything out; the real geometry — the arrow inside the gutter, clear
+  // of the row's text and buttons at 412 and 360 pixels — is checked in Chromium by
+  // tests/offline_cache_browser.py. What can be checked here is that the rules which produce it
+  // are the ones that say so.
+  const gutter = tokenValues(CSS_CODE, "--reply-gutter");
+  assert.deepStrictEqual(gutter, ["2.75rem"], "the gutter is not one 44px touch target");
+  const reply = cssBlock('#discord-log li.discord-message[data-is-reply="true"][data-who]');
+  assert.match(reply, /margin-left:\s*var\(--reply-gutter\)/, "a reply leaves no room for its arrow");
+  assert.match(reply, /min-height:\s*var\(--reply-gutter\)/, "a short reply lets its arrow hang over the next row");
+  // The agent's tile runs edge to edge and has no left side for the arrow to come out of.
+  assert.match(cssBlock('#discord-log li.discord-message[data-is-reply="true"][data-who="coder"]'),
+    /border-left:\s*1px solid/, "a reply from the agent has no left side");
+  const arrow = cssBlock("#discord-log .reply-jump");
+  assert.match(arrow, /position:\s*absolute/);
+  assert.match(arrow, /right:\s*100%/, "the arrow is not anchored to the box's left side");
+  assert.match(arrow, /width:\s*var\(--reply-gutter\)/, "the target is narrower than the gutter");
+  assert.match(arrow, /height:\s*var\(--reply-gutter\)/, "the target is shorter than a fingertip");
+  assert.match(arrow, /color:\s*var\(--accent\)/, "the arrow is not in the accent, so it is not legible on dark");
+  // The owner's own rows are inset further than the gutter on a desk; a reply keeps the larger.
+  assert.match(cssBlockIn("(min-width: 900px) and (pointer: fine)",
+    '#discord-log li.discord-message[data-is-reply="true"][data-who="me"]'),
+  /margin-left:\s*max\(var\(--reply-gutter\)/, "a reply of the owner's loses his side of the column on a desk");
+  // The landing is lit, and lit over whatever the row is, and still for a reader who asked for no motion.
+  assert.match(cssBlock('#discord-log li.discord-message[data-landed="true"]::after'), /--accent/);
+  assert.match(cssBlock('#discord-log li.discord-message[data-landed="true"]'), /opacity:\s*1/,
+    "the answered row stays dimmed while it is the one being pointed at");
+});
+
+test("TAPPING THE ARROW brings the message it answers to the head of the list, lit", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, questionFarAbove());
+  const area = page.el("scroll-area");
+  const question = rowWithId(page, "1000000000000000001");
+  const reply = rowWithId(page, "1000000000000000099");
+  assert.ok(area.scrollHeight > area.clientHeight * 3, "the channel does not overflow, so this proves nothing");
+  assert.ok(question.getBoundingClientRect().bottom < 0, "the question was already on screen");
+
+  await tapArrow(page, reply);
+
+  const top = question.getBoundingClientRect().top;
+  assert.ok(top >= 0 && top <= 3 * LINE_PX, `the question landed at ${top}px, not at the head of the list`);
+  assert.equal(question.getAttribute("data-landed"), "true", "nothing says which row the jump was for");
+  assert.match(statusText(page), /Here is the message it answers/);
+  // Lit for a moment, then put out.
+  assert.equal(page.expireTimers(REPLY_LANDED_MS), 1, "the light was never timed to go out");
+  assert.equal(question.getAttribute("data-landed"), null, "the landing stayed lit");
+});
+
+test("...and the reply stays one tap away: Back to reply, while the reply is off screen", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, questionFarAbove());
+  const area = page.el("scroll-area");
+  const reply = rowWithId(page, "1000000000000000099");
+  assert.equal(page.el("back-to-reply").hidden, true, "a way back is offered before anybody went anywhere");
+
+  await tapArrow(page, reply);
+  assert.equal(page.el("back-to-reply").hidden, false,
+    "the jump left the reply eight messages down with no way back");
+
+  await page.el("back-to-reply").click();
+  const box = reply.getBoundingClientRect();
+  assert.ok(box.top < area.clientHeight && box.bottom > 0,
+    `the reply is not on screen after Back to reply: ${box.top}`);
+  assert.equal(reply.getAttribute("data-landed"), "true", "the way back does not say where it landed either");
+  assert.equal(page.el("back-to-reply").hidden, true, "the way back outlived being used");
+
+  // ...and it also goes when the reader scrolls back to the reply on their own.
+  await tapArrow(page, reply);
+  assert.equal(page.el("back-to-reply").hidden, false);
+  area.scrollTop = area.scrollHeight;
+  await area.dispatch("scroll");
+  assert.equal(page.el("back-to-reply").hidden, true, "the chip offers to go where the reader already is");
+});
+
+test("...with no way back offered when the reply is still on screen after the jump", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1000000000000000001", content: "is the runner wedged?" }),
+    message({ id: "1000000000000000002", content: "restarted it", reply_to: "1000000000000000001" }),
+  ]);
+  await tapArrow(page, row(page, 1));
+  assert.equal(row(page, 0).getAttribute("data-landed"), "true");
+  assert.equal(page.el("back-to-reply").hidden, true, "a chip offers a way back to a reply that never left");
+});
+
+test("THE TAP IS THE ARROW'S: it neither folds the reply nor reads it aloud", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, questionFarAbove());
+  const reply = rowWithId(page, "1000000000000000099");
+  assert.equal(reply.getAttribute("data-collapsed"), "true", "the reply is not foldable, so this proves nothing");
+
+  await tapArrow(page, reply);
+  assert.equal(reply.getAttribute("data-collapsed"), "true", "tapping the arrow also opened the reply");
+
+  // In reading mode a tap on a row is a request to hear it. Not this tap.
+  await readButton(page).click();
+  await page.settle();
+  await tapArrow(page, reply);
+  assert.deepStrictEqual(page.speakCalls, [], "tapping the arrow started reading the reply aloud");
+  assert.ok(rows.every((li) => li.getAttribute("data-pending") !== "true"), "a read was queued by the arrow");
+  assert.equal(rowWithId(page, "1000000000000000001").getAttribute("data-landed"), "true",
+    "in reading mode the arrow stopped jumping");
+});
+
+test("A COMBINED ROW holds the message: the jump lands on that row", async () => {
+  // Combining is drawing, not data: the reply answers ONE message, and the row it is drawn in is
+  // whichever row holds it — here the second half of a post split in two.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    ...splitPost(),
+    message({
+      id: "1000000000000000003", author: "alice", author_id: "1000000000000000005", author_is_bot: false,
+      content: "which runner?", reply_to: "1000000000000000002", timestamp: "2026-08-19T04:40:00.000Z",
+    }),
+  ]);
+  assert.equal(page.el("discord-log").children.length, 2, "the split post was not drawn as one row");
+
+  await tapArrow(page, row(page, 1));
+  assert.equal(row(page, 0).getAttribute("data-landed"), "true", "a message inside a combined row was not found");
+  assert.match(statusText(page), /Here is the message it answers/);
+});
+
+test("NOT LOADED YET: the tap walks back through older pages until the message is there", async () => {
+  const page = newPage();
+  await signIn(page);
+  const all = pagedChannel(page, { steps: 4, size: 4 });
+  // The newest message answers one three pages further back.
+  all[all.length - 1].reply_to = all[2].id;
+  await showDiscord(page, []);
+  assert.equal(rowWithId(page, all[2].id), undefined, "the question was loaded already");
+
+  await tapArrow(page, row(page, page.el("discord-log").children.length - 1));
+
+  assert.equal(olderReads(page).length, 3,
+    `it read ${olderReads(page).length} older pages, not the three it needed`);
+  const question = rowWithId(page, all[2].id);
+  assert.ok(question, "the walk did not bring the question in");
+  assert.equal(question.getAttribute("data-landed"), "true", "the walk found it and did not go there");
+  assert.match(statusText(page), /Here is the message it answers/);
+});
+
+test("...a BOUNDED walk, which then says the message is further back than that", async () => {
+  // A message deleted upstream is never found. An unbounded walk would read the channel to its
+  // first message looking for it.
+  const page = newPage();
+  await signIn(page);
+  const all = pagedChannel(page, { steps: 3 * REPLY_JUMP_PAGES, size: 2 });
+  all[all.length - 1].reply_to = "990";
+  await showDiscord(page, []);
+
+  await tapArrow(page, row(page, page.el("discord-log").children.length - 1));
+  assert.equal(olderReads(page).length, REPLY_JUMP_PAGES, "the walk back was not bounded");
+  assert.equal(statusText(page), `Further back than ${REPLY_JUMP_PAGES} pages — scroll up.`);
+  assert.ok(!page.el("discord-log").children.some((li) => li.getAttribute("data-landed") === "true"),
+    "a row was lit for a message that was never found");
+});
+
+test("...and a step back already on the wire is waited for, not counted as a page it never read", async () => {
+  // The reader's own walk back — the button, or arriving at the top of the list — may be under way
+  // when the arrow is tapped. Turned away, the tap's walk would count that page without reading it
+  // and look for its message among rows that had not arrived.
+  const page = newPage();
+  await signIn(page);
+  const all = pagedChannel(page, { steps: 3, size: 4 });
+  all[all.length - 1].reply_to = all[1].id;
+  await showDiscord(page, []);
+  const serve = page.channelPage;
+  let release = null;
+  const held = new Promise((resolve) => { release = resolve; });
+  let holding = true;
+  page.channelPage = async (path) => {
+    if (holding && /[?&]before=/.test(String(path))) {
+      holding = false;
+      await held;
+    }
+    return serve(path);
+  };
+
+  const stepping = page.el("load-older").click();
+  const tapping = tapArrow(page, row(page, page.el("discord-log").children.length - 1));
+  release();
+  await stepping;
+  await tapping;
+
+  assert.equal(olderReads(page).length, 2,
+    `${olderReads(page).length} older reads, not the reader's one and the tap's one`);
+  assert.equal(rowWithId(page, all[1].id)?.getAttribute("data-landed"), "true",
+    "the message two pages back was not reached");
+});
+
+test("...and NOT IN THE HISTORY AT ALL is said as that, not as a tap that did nothing", async () => {
+  const page = newPage();
+  await signIn(page);
+  const all = pagedChannel(page, { steps: 2, size: 3 });
+  all[all.length - 1].reply_to = "990";
+  await showDiscord(page, []);
+  await tapArrow(page, row(page, page.el("discord-log").children.length - 1));
+  assert.equal(olderReads(page).length, 1, "the walk went on past the beginning of the channel");
+  assert.equal(statusText(page), "Not in this channel's history.");
+
+  // A server that does not say whether there is more is not walked, and is not told "deleted".
+  const quiet = newPage();
+  await signIn(quiet);
+  await showDiscord(quiet, [
+    message({ id: "1000000000000000002", content: "restarted it", reply_to: "999999999999999999" }),
+  ]);
+  await tapArrow(quiet, row(quiet, 0));
+  assert.equal(statusText(quiet), "Older than what is loaded.");
+});
+
+test("A SEARCH that hides the message is closed, so the row can be shown", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1000000000000000001", content: "is the runner wedged?" }),
+    message({ id: "1000000000000000002", content: "restarted it", reply_to: "1000000000000000001" }),
+  ]);
+  await search(page, "restarted");
+  assert.ok(row(page, 0).hasClass("search-hidden"), "the search did not hide the question");
+
+  await tapArrow(page, row(page, 1));
+  assert.ok(!row(page, 0).hasClass("search-hidden"), "the jump went to a row the search is hiding");
+  assert.equal(page.el("search-field").hidden, true, "the search was cleared and left open");
+  assert.equal(row(page, 0).getAttribute("data-landed"), "true");
+});
+
+test("IN ALL, a thread reply answering the main channel jumps within All", async () => {
+  const page = newPage();
+  const data = threadData();
+  // The second thread's answer answers the main channel's announcement.
+  data.messages[4].reply_to = "200";
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  assert.equal(page.el("thread-select").value, "flat");
+  const reads = page.timelineCalls.length;
+
+  await tapArrow(page, rowWithId(page, "204"));
+  assert.equal(rowWithId(page, "200").getAttribute("data-landed"), "true");
+  assert.equal(page.el("thread-select").value, "flat", "a jump inside All changed the view");
+  assert.equal(page.timelineCalls.length, reads, "a jump to a message already on screen went to the network");
+});
+
+test("IN MAIN, a reply to a message Main does not show opens All and lands there", async () => {
+  // Main shows thread roots and nothing inside a thread. All is the one view holding every message,
+  // so it is where "not found" means not in the channel — and it holds the reply too, so the way
+  // back is still the chip.
+  const page = newPage();
+  const data = threadData();
+  // The second thread's ROOT, which Main shows, answers the first thread's answer, which it does not.
+  data.messages[3].reply_to = "202";
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, "main");
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "Main is not what this test assumes");
+
+  await tapArrow(page, rowWithId(page, "203"));
+  assert.equal(page.el("thread-select").value, "flat", "the jump did not open All");
+  assert.equal(rowWithId(page, "202").getAttribute("data-landed"), "true",
+    "All opened and the message was not shown");
+  assert.match(statusText(page), /Here is the message it answers/);
+});
+
+test("IN A THREAD, a reply to the main channel opens All and lands there", async () => {
+  const page = newPage();
+  const data = threadData();
+  data.messages[4].reply_to = "200";
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, `thread:${data.threads[1].id}`);
+  assert.deepStrictEqual(shownIds(page), ["203", "204"], "the thread is not what this test assumes");
+
+  await tapArrow(page, rowWithId(page, "204"));
+  assert.equal(page.el("thread-select").value, "flat", "the jump did not leave the thread for All");
+  assert.equal(rowWithId(page, "200").getAttribute("data-landed"), "true");
+});
+
+test("HIDE READ hiding the message is said, not walked past", async () => {
+  const page = newPage();
+  page.threadingSupported = true;
+  page.dealtWith.add("301");
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "301", content: "is the runner wedged?" }),
+    message({ id: "302", content: "restarted it", reply_to: "301" }),
+  ]);
+  await page.el("todo-filter").click();
+  assert.deepStrictEqual(shownIds(page), ["302"]);
+  const reads = page.timelineCalls.length;
+
+  await tapArrow(page, rowWithId(page, "302"));
+  assert.equal(statusText(page), "Hide read is hiding that message.");
+  assert.equal(page.timelineCalls.length, reads, "it went looking for a message it already held");
+});
+
+test("...and when it is All that turns up the message Hide read is hiding, that is said too", async () => {
+  // From Main, a thread root answering a reply inside another thread: Main does not show the
+  // answer, so the tap opens All — where Hide read hides it as well. Said as that, rather than
+  // walked past to "older than what is loaded".
+  const page = newPage();
+  const data = threadData();
+  data.messages[3].reply_to = "202";
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.dealtWith.add("202");
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await page.el("todo-filter").click();
+  await page.settle();
+  await pickThread(page, "main");
+  assert.ok(shownIds(page).includes("203"), "the reply is not on screen in Main");
+
+  await tapArrow(page, rowWithId(page, "203"));
+  assert.equal(page.el("thread-select").value, "flat", "the jump did not open All");
+  assert.equal(statusText(page), "Hide read is hiding that message.");
+  assert.ok(!timelineReads(page).some((path) => /[?&]before=/.test(path)),
+    "it walked back looking for a message it already held");
+});
+
+test("...nor is a finger on the arrow the start of a swipe or a press-and-hold on the reply", async () => {
+  // The row follows a finger sideways to archive, and opens its details under one that rests. A
+  // finger on the arrow is pressing the arrow. A hold there would also leave the row's
+  // click-swallowing flag set behind a click the arrow keeps to itself, and the reader's next tap
+  // on any row would do nothing.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, questionFarAbove());
+  const reply = rowWithId(page, "1000000000000000099");
+  const mark = replyArrowOf(reply).children[0];
+  const commit = sourceConstant("SWIPE_COMMIT_PX") + 10;
+  const touch = (x) => ({ pointerId: 1, pointerType: "touch", clientX: x, clientY: 10, target: mark });
+
+  await reply.dispatch("pointerdown", touch(10));
+  assert.equal(page.expireTimers(HOLD_MS), 0, "a finger resting on the arrow armed the row's press-and-hold");
+  await reply.dispatch("pointermove", touch(10 + commit));
+  assert.ok(!reply.style.transform, "the row followed a finger that came down on its arrow");
+  await reply.dispatch("pointerup", touch(10 + commit));
+  await page.settle();
+  assert.deepEqual(page.dismissCalls, [], "a drag that began on the arrow archived the reply");
+  assert.ok(!reply.descendants().some((node) => node.hasClass("msg-details")), "the arrow opened the row's details");
+
+  await tapArrow(page, reply);
+  // The reader's next tap on the reply's own text is still a tap on the reply: it opens it.
+  await reply.dispatch("click", { target: reply });
+  assert.equal(reply.getAttribute("data-collapsed"), "false", "the tap after the arrow was swallowed");
+});
+
+/**
+ * `pagedChannel` for a provider with threads: a channel with no threads in it yet, so All and Main
+ * hold the same messages, read on the timeline route and walked back on the cursor it hands out.
+ */
+function pagedTimeline(page, { steps = 3, size = 4 } = {}) {
+  const all = Array.from({ length: steps * size }, (_unused, i) =>
+    message({ id: String(5000 + i), content: `message ${i}` }));
+  page.threadingSupported = true;
+  page.timeline = async (path) => {
+    const url = new URL(path, "http://fixture.test");
+    const before = url.searchParams.get("before");
+    const end = before ? all.findIndex((m) => m.id === before) : all.length;
+    const start = Math.max(0, end - size);
+    return json(200, timelineAnswer({
+      view: url.searchParams.get("view"), messages: all.slice(start, end), limit: size, has_threads: true,
+      has_more: start > 0, next_before: start > 0 ? all[start].id : null,
+    }));
+  };
+  return all;
+}
+
+const timelineReads = (page) => page.timelineCalls.filter((path) => /view=flat|view=main/.test(path));
+
+test("IN ALL, a message not loaded yet is walked back to on the timeline's own cursor", async () => {
+  const page = newPage();
+  const all = pagedTimeline(page, { steps: 4, size: 4 });
+  all[all.length - 1].reply_to = all[3].id;
+  await signIn(page);
+  await showDiscord(page, []);
+  assert.equal(page.el("thread-select").value, "flat");
+  assert.equal(rowWithId(page, all[3].id), undefined, "the question was loaded already");
+
+  await tapArrow(page, rowWithId(page, all[all.length - 1].id));
+  const older = timelineReads(page).filter((path) => /[?&]before=/.test(path));
+  assert.equal(older.length, 3, `it read ${older.length} older pages of All, not the three it needed`);
+  assert.ok(older.every((path) => /view=flat/.test(path)), "the walk read some other view than All");
+  assert.equal(rowWithId(page, all[3].id)?.getAttribute("data-landed"), "true", "the walk did not land on it");
+  assert.match(statusText(page), /Here is the message it answers/);
+});
+
+test("IN MAIN, a message the page has never read opens All, and All is walked back for it", async () => {
+  // Nothing says which part of the channel an unread message is in, so it is looked for where
+  // every message is. That is the view the reader is left in, so it is the one the channel keeps
+  // (`#205 channel-view-memory`): the page reopens where the jump left the reader.
+  const page = newPage();
+  const all = pagedTimeline(page, { steps: 4, size: 4 });
+  all[all.length - 1].reply_to = all[6].id;
+  await signIn(page);
+  await showDiscord(page, []);
+  await pickThread(page, "main");
+  assert.equal(page.el("thread-select").value, "main");
+
+  await tapArrow(page, rowWithId(page, all[all.length - 1].id));
+  assert.equal(page.el("thread-select").value, "flat", "the jump did not open All");
+  const older = timelineReads(page).filter((path) => /[?&]before=/.test(path));
+  assert.ok(older.length >= 1 && older.every((path) => /view=flat/.test(path)),
+    `the walk was not All's: ${older.join(", ")}`);
+  assert.equal(rowWithId(page, all[6].id)?.getAttribute("data-landed"), "true", "the walk did not land on it");
+  assert.deepStrictEqual(savedUiState(page).channels.map((entry) => entry.channelView), ["flat"],
+    "the channel is not kept in the view the jump left the reader in");
 });
 
 const keepPlaceAt = async (page, row) => {

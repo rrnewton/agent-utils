@@ -67,9 +67,9 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
  */
 /**
  * @overload
- * @param {"add-channel" | "add-noise-rule" | "audio-source" | "cancel-add-channel"
- *   | "cancel-rename" | "canned-blockers" | "canned-summary" | "channel-directory-more"
- *   | "channel-directory-retry" | "channel-send"
+ * @param {"add-channel" | "add-noise-rule" | "audio-source" | "back-to-reply"
+ *   | "cancel-add-channel" | "cancel-rename" | "canned-blockers" | "canned-summary"
+ *   | "channel-directory-more" | "channel-directory-retry" | "channel-send"
  *   | "channel-view-flat" | "channel-view-main" | "channel-view-threads" | "clear-alias"
  *   | "clear-backlog" | "clear-view" | "close-browse-channels" | "close-help" | "close-reply"
  *   | "close-settings" | "close-threads" | "collapse-all" | "dismiss-banner" | "dismiss-error"
@@ -1501,6 +1501,8 @@ function renderScrollTools() {
     : "Show a one-line summary in place of each long message.";
   // The way back. Only where a marker can mean something, and only when one is set.
   el("jump-marker").hidden = currentView !== "discord" || placeMarker === null;
+  // `#204 reply-arrow`. The other way back: to the reply a jump left, while it is off screen.
+  el("back-to-reply").hidden = currentView !== "discord" || replyReturnRow() === null;
   // `#129 message-search`. Re-derived from the lists, exactly like everything above it: whatever
   // just changed a list has to leave the filter true of it. See `applySearch` for why this hangs
   // off the one function every mutation already ends with rather than off its own call sites.
@@ -9554,6 +9556,255 @@ function jumpToMarker() {
   setStatus("back where you left off.");
 }
 
+// --- following a reply up to what it answers --------------------------------------------------
+//
+// `#204 reply-arrow`. The owner, from his phone: "The indication that a message is a reply is a
+// TINY little symbol to the left of the timestamp. That's useless. What I wanted was a visible
+// arrow from the left side of the box pointing upward. And clicking on the arrow should jump to
+// the message it is a reply to."
+//
+// So a reply is inset from the left by one touch target, and that gutter holds an arrow: out of
+// the row's left side, round the corner and up. It is a BUTTON the full width of the gutter at the
+// head of the row, and a tap on it takes the reader to the message the reply answers. Where that
+// message is decides what the tap has to do, in this order:
+//
+//   1. ON SCREEN in this view, in a row of its own or as one constituent of a combined row. That
+//      row is scrolled to the head of the list, under the floating pill and glass, and lit for a
+//      moment.
+//   2. NOT A MESSAGE THIS VIEW SHOWS — a thread reply seen from Main, a main-channel message seen
+//      from inside a thread — or one the page has never read: the tap opens All. All is the one
+//      view that holds every message, so it is the one view in which "not found" means not in the
+//      channel; and the reply itself is in it too, which keeps the way back one tap away. It is
+//      opened the way the picker opens it, so it is also the view this channel is kept in
+//      (`#205 channel-view-memory`): the page reopens where the reader was left, as for any change
+//      of view.
+//   3. FURTHER BACK THAN WHAT IS LOADED: older pages are read, at most REPLY_JUMP_PAGES of them,
+//      and the status line says so as each one is asked for. Bounded, because a message deleted
+//      upstream is never found, and an unbounded walk would read the whole channel looking for it.
+//   4. NOT FOUND: the status line says which — older than what is loaded even after the walk, or
+//      not in the channel's history at all — rather than leaving a tap that visibly did nothing.
+//
+// Every one of those sentences is short, because the status line is one line, ellipsised: on a
+// 360px phone about 38 characters of it show, and a sentence whose point came after that showed
+// only its preamble.
+//
+// THE WAY BACK is a chip, "Back to reply", over the list beside "My place". Leaving the reader where
+// the jump put them, and letting them scroll back, is what happens when the reply is still on
+// screen after the jump, and then no chip is offered. But a reply whose question was five pages up
+// is five pages down from where the tap landed, and the standing rule of this page is that the
+// reader does not lose their place (`#47 scrollback-stability`). The chip goes once it is used,
+// once the reply is back on screen however it got there, and once the list it points into is no
+// longer the one on screen.
+//
+// NONE OF THE ROW'S OWN ACTS FIRE. The arrow is inside the row, and a tap on the row folds it or
+// reads it aloud (`tapRow`): the arrow's click stops at the arrow. A finger that comes down on the
+// arrow is not the start of a swipe or a press-and-hold on the row either (`swipeable`).
+
+/** How many older pages one tap on a reply's arrow may read, looking for what the reply answers. */
+const REPLY_JUMP_PAGES = 5;
+
+/** How long the row a jump lands on stays lit: long enough to find, gone before it is clutter. */
+const REPLY_LANDED_MS = 2000;
+
+/** How far below the floating line a row lands, so its top edge is not flush against the pill. */
+const REPLY_LANDING_GAP_PX = 8;
+
+/** The arrow's accessible name and its tooltip. No channel data in it, for the reason Reply has none. */
+const REPLY_JUMP_NAME = "Jump to the message this answers";
+
+/** Every tap on an arrow takes a ticket, and a walk whose ticket has moved on stops where it is. */
+let replyJumpTicket = 0;
+
+/** The reply the last jump left, as `{ id, context }`, while "Back to reply" is offered; else null. */
+let replyReturn = null;
+
+/** The row lit by the last landing, and the timer that puts it out. */
+let replyLanded = null;
+
+/** The control in a reply's gutter. `li` is the reply's own row. */
+function replyArrow(li) {
+  const arrow = document.createElement("button");
+  arrow.className = "reply-jump";
+  arrow.setAttribute("type", "button");
+  arrow.setAttribute("aria-label", REPLY_JUMP_NAME);
+  arrow.setAttribute("title", REPLY_JUMP_NAME);
+  // The arrow itself is drawn by web/voice.css on this empty span: a line out of the row's side,
+  // round the corner and up, with a head on it. Drawn rather than typed, because a glyph is
+  // whatever the phone's font makes of it — "↰" is a hairline in one font and an emoji in
+  // another — and the owner asked for something he could see.
+  const mark = document.createElement("span");
+  mark.className = "reply-jump-mark";
+  mark.setAttribute("aria-hidden", "true");
+  arrow.append(mark);
+  arrow.addEventListener("click", (event) => {
+    // The row's own tap handler would fold the row, or start reading it aloud in reading mode. It
+    // already ignores a click on a button, and this does not rely on that: the click ends here.
+    if (event) event.stopPropagation();
+    guardQuietly(() => jumpToAnswered(li))();
+  });
+  return arrow;
+}
+
+/** The row on screen that holds message `id`: its own row, or the combined row it is part of. */
+function rowHolding(id) {
+  return [...el("discord-log").children].find((row) => idsOf(row).includes(String(id))) || null;
+}
+
+/**
+ * Where the floating line over the head of the list ends, in viewport pixels: the bottom of the
+ * freshness pill or of the search glass beside it, whichever is lower, or the list's own top when
+ * neither is up. A row put any higher than this is under them.
+ */
+function floatingClearance(area) {
+  let clear = area.getBoundingClientRect().top;
+  for (const id of ["channel-freshness", "search-float"]) {
+    const node = el(id);
+    if (node.hidden) continue;
+    const box = node.getBoundingClientRect();
+    if (box.height > 0) clear = Math.max(clear, box.bottom);
+  }
+  return clear;
+}
+
+/** Whether any of `row` shows between the floating line and the foot of the list. */
+function rowOnScreen(row) {
+  const area = el("scroll-area");
+  const box = row.getBoundingClientRect();
+  return box.bottom > floatingClearance(area) &&
+    box.top < area.getBoundingClientRect().top + area.clientHeight;
+}
+
+/**
+ * Put `row` at the head of the list, just under the floating line, and light it for a moment.
+ *
+ * At the HEAD rather than centred, because what follows a question is usually its answer: the most
+ * room below the row is the best chance the reply is still on screen, and then there is nothing to
+ * come back from. A row nearer the end of the list than a screenful stops where the list does.
+ */
+function revealRow(row) {
+  const area = el("scroll-area");
+  area.scrollTop += row.getBoundingClientRect().top - floatingClearance(area) - REPLY_LANDING_GAP_PX;
+  if (replyLanded) {
+    clearTimeout(replyLanded.timer);
+    replyLanded.row.removeAttribute("data-landed");
+  }
+  row.setAttribute("data-landed", "true");
+  const landed = {
+    row,
+    timer: setTimeout(() => {
+      row.removeAttribute("data-landed");
+      if (replyLanded === landed) replyLanded = null;
+    }, REPLY_LANDED_MS),
+  };
+  replyLanded = landed;
+}
+
+/**
+ * The reply "Back to reply" would return to: on screen in the list the jump left it in, or null.
+ * A different channel, view or thread is a different list, and the chip goes with the list.
+ */
+function replyReturnRow() {
+  if (replyReturn === null) return null;
+  if (replyReturn.context !== channelContextKey()) {
+    replyReturn = null;
+    return null;
+  }
+  return rowHolding(replyReturn.id);
+}
+
+/** "Back to reply": where the jump started, lit as the landing was. */
+function backToReply() {
+  const row = replyReturnRow();
+  replyReturn = null;
+  if (row) {
+    revealRow(row);
+    setStatus("Back at the reply.");
+  }
+  renderScrollTools();
+}
+
+/**
+ * Take the reader to the message `target` if a row on screen holds it, and offer the way back to
+ * the reply `from` if the landing took it off the screen. False, and nothing moved, when no row
+ * holds it.
+ */
+function landOnAnswered(target, from) {
+  const row = rowHolding(target);
+  if (!row) return false;
+  // The reader asked for this message by name. A search that filtered it out is closed rather
+  // than left standing over a row that cannot be scrolled to, because it is not drawn.
+  if (String(row.className).split(/\s+/).includes("search-hidden")) setSearchOpen(false);
+  revealRow(row);
+  const reply = rowHolding(from);
+  replyReturn = reply && reply !== row && !rowOnScreen(reply) ? { id: from, context: channelContextKey() } : null;
+  renderScrollTools();
+  setStatus("Here is the message it answers.");
+  return true;
+}
+
+/**
+ * Whether message `id` is one the view on screen cannot show: in another part of the channel, or
+ * never read by this page at all, so nothing says which part it is in.
+ */
+function answeredElsewhere(id) {
+  const held = heldMessage(id);
+  return held === null || !inView(held, channelView, selectedThreadId);
+}
+
+/** The tap on a reply's arrow. See the head of this section for the order of the four cases. */
+async function jumpToAnswered(reply) {
+  const target = String(reply.getAttribute("data-reply-to") || "");
+  const from = String(reply.getAttribute("data-id") || "");
+  if (!target) return;
+  const ticket = ++replyJumpTicket;
+  const channel = String(el("discord-channel").value);
+  if (landOnAnswered(target, from)) return;
+  // The reader's own filter, said plainly rather than walked past: the message is loaded, read,
+  // and Hide read is the reason it is not drawn. No walk would find it. Asked again wherever the
+  // list has just changed, because All, or an older page, may be what brings the message in.
+  const hiddenAsRead = () => {
+    if (!(todoMode && threadingSupported && timelineMessages.some((message) => String(message.id) === target))) {
+      return false;
+    }
+    setStatus("Hide read is hiding that message.");
+    return true;
+  };
+  if (hiddenAsRead()) return;
+  if (threadingSupported && channelView !== "flat" && answeredElsewhere(target)) {
+    setStatus("Not in this view — opening All…");
+    await changeChannelView("flat");
+    // The reader went somewhere else while All was being read: the tap is over.
+    if (ticket !== replyJumpTicket || String(el("discord-channel").value) !== channel || channelView !== "flat") return;
+    if (landOnAnswered(target, from) || hiddenAsRead()) return;
+  }
+  let walked = 0;
+  while (walked < REPLY_JUMP_PAGES && discordMoreAbove === true && discordOlderCursor) {
+    walked += 1;
+    const context = channelContextKey();
+    setStatus(`Looking further back: page ${walked} of ${REPLY_JUMP_PAGES}…`);
+    try {
+      await loadOlder();
+    } catch (error) {
+      // The failure itself is reported where every failed read is; this only stops the status
+      // line from going on saying a walk is under way.
+      if (ticket === replyJumpTicket) setStatus("Could not look further back.");
+      throw error;
+    }
+    // Another tap, another channel or another view: this walk is nobody's any more.
+    if (ticket !== replyJumpTicket || context !== channelContextKey()) return;
+    if (landOnAnswered(target, from) || hiddenAsRead()) return;
+  }
+  if (todoMode && !threadingSupported) {
+    setStatus("Not in this list — Hide read is on.");
+  } else if (discordMoreAbove === false) {
+    setStatus("Not in this channel's history.");
+  } else if (walked > 0) {
+    setStatus(`Further back than ${walked} page${walked === 1 ? "" : "s"} — scroll up.`);
+  } else {
+    setStatus("Older than what is loaded.");
+  }
+}
+
 function toggleMessageDetails(li, messages) {
   const message = messages[0];
   const open = childByClass(li, "msg-details");
@@ -10775,6 +11026,14 @@ function swipeable(li, messages) {
     if (!event || event.pointerType === "mouse") {
       return;
     }
+    // `#204 reply-arrow`. A finger on a reply's arrow is pressing the arrow, not the row: the row
+    // neither follows it sideways nor opens its details under it. A hold there would also leave
+    // `suppressNextRowClick` set behind a click the arrow keeps to itself, and the next tap on any
+    // row would be swallowed by it.
+    const arrow = childByClass(li, "reply-jump");
+    if (arrow && nodeWithin(arrow, event.target)) {
+      return;
+    }
     active = true;
     startX = event.clientX;
     startY = event.clientY;
@@ -11112,23 +11371,18 @@ function channelRowFrame(messages) {
   li.setAttribute("data-author-bot", message.author_is_bot ? "true" : "false");
   const meta = document.createElement("div");
   meta.className = "meta";
-  // The reply mark, FIRST in the meta line so it lands at the row's upper-left corner.
+  // A REPLY SAYS SO, to a screen reader, first in the meta line.
   //
-  // A span with an accessible name rather than a bare glyph: an arrow on its own is announced as
-  // "left arrow", or as nothing, and neither says "this is a reply". The glyph is `aria-hidden` so
-  // a screen reader reads the name and not the character beside it.
+  // Words, and nothing drawn. The glyph that used to be drawn here was a small "↩" beside the
+  // time, and the owner's verdict on it was "useless" (`#204 reply-arrow`): on the channel a reply
+  // is shown by the arrow `discordNode` puts in the gutter to its left, which also takes the reader
+  // to what it answers. These words remain for the reply screen's earlier messages, which carry no
+  // arrow because nothing on that screen navigates, and so a screen reader hears what the row is.
   if (message.reply_to) {
-    const mark = document.createElement("span");
-    mark.className = "reply-mark";
-    mark.setAttribute("title", "a reply");
-    const glyph = document.createElement("span");
-    glyph.setAttribute("aria-hidden", "true");
-    glyph.textContent = "↩";
     const said = document.createElement("span");
-    said.className = "sr-only";
+    said.className = "reply-said sr-only";
     said.textContent = "reply. ";
-    mark.append(glyph, said);
-    meta.append(mark);
+    meta.append(said);
   }
   const author = document.createElement("span");
   // An author name is channel data too, and a display name can be anything at all.
@@ -11162,6 +11416,10 @@ function channelRowFrame(messages) {
 function discordNode(messages) {
   const message = messages[0];
   const { li, meta, body, content } = channelRowFrame(messages);
+  // `#204 reply-arrow`. FIRST in the row, ahead of the meta line, so a screen reader meets the way
+  // to what this answers before the row's own words — and drawn by web/voice.css in the gutter to
+  // the row's left, where nothing else on the row is.
+  if (message.reply_to) li.replaceChildren(replyArrow(li), ...li.children);
   // The SAME call the voice transcript makes, on the same arguments, so the two lists cannot end
   // up with two idioms for the one behaviour. `#47 scrollback-stability`. The one extra argument
   // is the message id, which is what `#49 cached-summaries` keys a summary under — the transcript
@@ -11586,13 +11844,32 @@ function applyNewestPage(payload, saved = false) {
 }
 
 /**
+ * The step back under way, or null.
+ *
+ * `#204 reply-arrow`. A second caller while a step is in flight is handed THAT step rather than
+ * turned away. The automatic trigger and the button never notice the difference — they asked for
+ * a step, and one is coming — but the walk a reply's arrow makes counts the pages it reads, and
+ * one turned away would have counted a page it never saw and looked for its message too early.
+ */
+let olderStep = null;
+
+/**
  * One step further back.
  *
  * Guarded against re-entry rather than debounced: the automatic trigger fires on every scroll
  * event, and a phone produces a lot of those.
  */
-async function loadOlder() {
-  if (threadingSupported) return loadOlderTimeline();
+function loadOlder() {
+  if (olderStep === null) {
+    olderStep = (threadingSupported ? loadOlderTimeline() : loadOlderPage()).finally(() => {
+      olderStep = null;
+    });
+  }
+  return olderStep;
+}
+
+/** `loadOlder` for a provider without threads: one step of the plain channel page. */
+async function loadOlderPage() {
   if (discordMoreAbove !== true || !discordOlderCursor || olderFetchInFlight) {
     return;
   }
@@ -15759,6 +16036,7 @@ el("combine-messages").addEventListener("change", () => {
 });
 
 el("jump-marker").addEventListener("click", jumpToMarker);
+el("back-to-reply").addEventListener("click", backToReply);
 
 el("read-speed-range").addEventListener("input", () => {
   applyReadSpeed(el("read-speed-range").value);
@@ -16128,6 +16406,15 @@ el("search-field").addEventListener("keydown", (event) => {
 el("scroll-area").addEventListener("scroll", () => {
   if (jumpNewestWanted[currentView] && atBottom(el("scroll-area"))) {
     setJumpNewest(false);
+  }
+  // `#204 reply-arrow`. The way back to a reply goes once the reply is on screen again, however
+  // the reader brought it there: a chip offering to go where they already are is clutter.
+  if (replyReturn !== null) {
+    const reply = replyReturnRow();
+    if (reply === null || rowOnScreen(reply)) {
+      replyReturn = null;
+      renderScrollTools();
+    }
   }
   // ...and the other end of the same list: arriving at the top is a request for what is above it.
   // Both lists, because both of them now have something above them: the channel has older
