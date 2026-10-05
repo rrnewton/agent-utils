@@ -978,6 +978,13 @@ def test_command_timeout_contains_group_when_supervisor_is_stopped(
     """The old fallback killed only S's PGID, leaving its separately-sessioned C alive."""
     command_timeout = 5.0
     cleanup_grace = 8.0
+    # How long past the command timeout the worker may take before the test
+    # wakes the stopped supervisor to unblock it: a bound on hanging, not on
+    # how fast containment must be. The supervisor treats SIGCONT as
+    # cancellation and kills the group it supervises, so waking it sooner can
+    # empty that group in the middle of the emergency census, which then reads
+    # no members although containment was proceeding correctly.
+    hang_guard = 60.0
     pid_path = tmp_path / "stopped-supervisor-pids"
     child_script = "import os,time; os.close(0); os.close(1); os.close(2); time.sleep(60)"
     adapter = (
@@ -1046,7 +1053,7 @@ def test_command_timeout_contains_group_when_supervisor_is_stopped(
         if line.startswith("PPid:")
     ))
     os.kill(supervisor_pid, signal.SIGSTOP)
-    worker_deadline = invocation_started + command_timeout + cleanup_grace
+    worker_deadline = invocation_started + command_timeout + hang_guard
     worker.join(timeout=max(0, worker_deadline - time.monotonic()))
     if worker.is_alive():
         os.kill(supervisor_pid, signal.SIGCONT)
