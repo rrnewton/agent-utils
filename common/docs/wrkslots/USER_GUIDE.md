@@ -700,11 +700,11 @@ authenticated HTTPS salvage without admitting unrelated global Git configuration
 
 A repository path is resolved from the configured project root, not from the caller's current
 directory, and must be relative. Use an ordinary path inside the project root, or path components of
-the form `../NAME` for one direct sibling repository. This is a normalized-path rule rather than a
-byte-for-byte spelling requirement, but every other raw `..` traversal, every absolute path, and
-every path with a symlink component is refused. Wrkslots stores the normalized relative path,
-including `../NAME` for a sibling. Worktree destinations remain confined to the configured managed
-worktrees directory.
+the form `../NAME` or `../NAME/PATH` for a repository in one direct sibling directory. This is a
+normalized-path rule rather than a byte-for-byte spelling requirement, but every other raw `..`
+traversal, every absolute path, and every path with a symlink component is refused. Wrkslots stores
+the normalized relative path, including `../NAME/PATH` for a sibling. Worktree destinations remain
+confined to the configured managed worktrees directory.
 
 For a dirty or unpushed agent checkout, reclaim constructs a commit without changing the checkout's
 ordinary index or branch. It includes tracked and ordinary untracked files except configured cache
@@ -907,6 +907,36 @@ PID` resumes safely. Do not infer a validation result or run number from this re
 Cross-user process evidence uses passwordless `sudo -n` with fixed root-owned `find` and `grep`
 binaries and refuses if that read-only census is unavailable or incomplete. Use `--format json` when
 another tool needs the typed per-row outcome.
+
+## Relocate a moved source repository
+
+A checkout's recorded repository path is its Git evidence. When the source repository moves, for
+example from `../tools` to `../tools/tools`, `status` reports every row that names
+it as `repository-evidence-unavailable`, and no mutation of those rows can proceed. First repair the
+Git link of each present checkout, then plan and apply the relocation:
+
+```sh
+git -C ../tools/tools worktree repair PATH-OF-EACH-PRESENT-CHECKOUT
+wrkslots relocate-repository ../tools ../tools/tools
+wrkslots relocate-repository ../tools ../tools/tools --apply \
+  --coordinator-authorized --coordinator-pid "$COORDINATOR_PID"
+```
+
+The command changes only the repository path, and only on rows of this machine that record FROM.
+It refuses unless TO is the same repository: FROM must no longer be a Git repository; TO must be the
+top of one; every present checkout recorded under FROM must be a linked worktree whose Git directory
+lies in TO's common directory, that TO lists, and whose recorded branch exists in TO; and every
+affected checkout's recorded HEAD, start point, and remote URL must match TO. A clone of the same
+remote holds the same commits and URL, so the linked-worktree check is what tells the repository
+apart. A row whose storage is gone has no Git directory of its own, so at least one present checkout
+from the same FROM must vouch for the move, and every affected row moves in the same command. Rows
+without storage are written first, so an interrupted apply can be rerun while the present checkouts
+still record FROM. Each row gets one `repository-relocated` event. The plan prints each row's new
+record SHA-256 for a later `recover-absent-agent-row`.
+
+A wrkslots client without `../NAME/PATH` support refuses to read a registry that records such a path.
+Upgrade every client of the registry, including other checkouts that run their own copy of wrkslots
+against it, before `--apply`.
 
 ## Recover absent agent rows and ownerless agent worktrees
 

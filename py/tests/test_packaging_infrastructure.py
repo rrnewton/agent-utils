@@ -839,9 +839,11 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # Of the eight batch-of-one remove tests, the image-backed one is ordinary
     # and the other seven are mapped.
     # The two image-backed remove-agent-batch use-check tests are ordinary.
-    assert len(all_tests) == 1843
+    # The three relocate-repository tests (one success case and two refusal
+    # cases) are mapped.
+    assert len(all_tests) == 1846
     assert len(ordinary) == 290
-    assert len(mapped) == 1553
+    assert len(mapped) == 1556
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

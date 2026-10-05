@@ -8259,8 +8259,9 @@ def _registry_storage_inconsistencies(
                     "repository-evidence-unavailable",
                     "row",
                     f"cannot inspect repository for checkout {checkout.name}: {exc}",
-                    "restore the recorded source repository, then rerun 'wrkslots status'; "
-                    "no mutation may rely on unavailable Git evidence",
+                    "restore the recorded source repository, or record where it moved with "
+                    "'wrkslots relocate-repository', then rerun 'wrkslots status'; no mutation "
+                    "may rely on unavailable Git evidence",
                     slot=record.slot,
                     slot_type=record.slot_type,
                     machine=record.machine,
@@ -15496,6 +15497,16 @@ def _resolved_repository_path(
     return stored, absolute
 
 
+def _names_sibling_repository(parts: tuple[str, ...]) -> bool:
+    """Return whether relative components are ``../NAME`` or ``../NAME/PATH``."""
+
+    return (
+        len(parts) >= 2
+        and parts[0] == ".."
+        and all(part not in {".", ".."} for part in parts[1:])
+    )
+
+
 def _repository_path(
     config: Config, raw: str, *, allow_managed: bool = False
 ) -> tuple[str, Path]:
@@ -15503,27 +15514,28 @@ def _repository_path(
     if candidate.is_absolute():
         raise Refusal(
             f"repository path must be relative to {config.root}: {raw!r}; "
-            "use a path inside the project root or ../NAME components for one direct sibling"
+            "use a path inside the project root or ../NAME[/PATH] components inside one "
+            "direct sibling"
         )
     parts = candidate.parts
-    is_direct_sibling = (
-        len(parts) == 2 and parts[0] == ".." and parts[1] not in {".", ".."}
-    )
-    if ".." in parts and not is_direct_sibling:
+    is_sibling = _names_sibling_repository(parts)
+    if ".." in parts and not is_sibling:
         raise Refusal(
-            f"repository path must stay inside {config.root} or name one direct sibling "
-            f"with path components '../NAME'; other parent traversal is refused: {raw!r}"
+            f"repository path must stay inside {config.root} or one direct sibling, "
+            f"with path components '../NAME' or '../NAME/PATH'; other parent traversal is "
+            f"refused: {raw!r}"
         )
     normalized = Path(os.path.normpath(str(candidate)))
     if not normalized.parts:
         normalized = Path(".")
-    if is_direct_sibling:
+    if is_sibling:
         stored = normalized.as_posix()
-        unresolved = config.root.parent / parts[1]
-        if unresolved == config.root:
+        if config.root.parent / parts[1] == config.root:
             raise Refusal(
-                f"repository path {raw!r} aliases the project root; use '.' instead"
+                f"repository path {raw!r} aliases the project root; use a path inside it "
+                "instead"
             )
+        unresolved = config.root.parent.joinpath(*parts[1:])
         allowed_root = config.root.parent
     else:
         stored = "." if normalized == Path(".") else normalized.as_posix()
@@ -15559,23 +15571,22 @@ def _stored_repository_reference(
         allowed_root = config.root.parent
     else:
         parts = candidate.parts
-        direct_sibling = (
-            len(parts) == 2 and parts[0] == ".." and parts[1] not in {".", ".."}
-        )
-        if ".." in parts and not direct_sibling:
+        sibling = _names_sibling_repository(parts)
+        if ".." in parts and not sibling:
             raise Refusal(
-                f"stored repository path must stay inside {config.root} or name one direct "
-                f"sibling with path components '../NAME': {raw!r}"
+                f"stored repository path must stay inside {config.root} or one direct "
+                f"sibling, with path components '../NAME' or '../NAME/PATH': {raw!r}"
             )
         normalized = Path(os.path.normpath(str(candidate)))
-        if direct_sibling:
+        if sibling:
             stored = normalized.as_posix()
-            unresolved = config.root.parent / parts[1]
-            allowed_root = config.root.parent
-            if unresolved == config.root:
+            if config.root.parent / parts[1] == config.root:
                 raise Refusal(
-                    f"stored repository path {raw!r} aliases the project root; use '.' instead"
+                    f"stored repository path {raw!r} aliases the project root; use a path "
+                    "inside it instead"
                 )
+            unresolved = config.root.parent.joinpath(*parts[1:])
+            allowed_root = config.root.parent
         else:
             stored = "." if normalized == Path(".") else normalized.as_posix()
             unresolved = config.root / normalized
@@ -22113,6 +22124,212 @@ def _cmd_recover_unbound_owner(args: argparse.Namespace) -> int:
         f"recorded coordinator recovery evidence slot={updated.slot} "
         f"generation={updated.generation}"
     )
+    return 0
+
+
+def _cmd_relocate_repository(args: argparse.Namespace) -> int:
+    """Point the active rows that name a moved source repository at its new path.
+
+    A checkout's recorded repository path is its Git evidence, so this refuses
+    unless the new path is provably the same repository. Every present checkout
+    recorded under the old path must be a linked worktree of the new path: its
+    Git directory lies in the new path's common directory and the new path
+    lists it. Each present checkout's recorded branch, and every affected
+    checkout's recorded commits and remote URL, must be there too. A row whose
+    storage is gone has no Git directory of its own, so at least one present
+    checkout from the same old path must vouch for the move. Every affected row
+    on this machine moves together, absent rows first, so an interrupted apply
+    can be rerun while its witnesses still name the old path.
+    """
+
+    config = _load_config(args.project_root, args.machine)
+    if config.machine != _short_hostname():
+        raise Refusal("repository relocation must run on the rows' machine")
+    tail = "state: REFUSED -- no registry row was changed."
+    source, _source_path, _source_root = _stored_repository_reference(
+        config, args.source
+    )
+    target, target_path = _repository_path(config, args.target)
+    if target == source:
+        raise Refusal(f"repository {source!r} is already the recorded path. {tail}")
+    coordinator: ProcessIdentity | None = None
+    if args.apply:
+        _require_coordinator_authorized(args, "repository relocation")
+        if args.coordinator_pid is None:
+            raise Refusal("--apply requires --coordinator-pid")
+        coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
+    vcs = _GitVcs()
+    with _mutation_locks(config, args.wait_lock):
+        _refuse_partial_state(config)
+        _assert_no_journal(config)
+        states, archives = _validate_global_state(config, require_repository=False)
+        before = _global_rows(states, archives)
+        state = _load_active(config, require_repository=False)
+        affected = [
+            (record, checkout)
+            for record in state.slots
+            for checkout in record.checkouts
+            if _stored_repository_reference(config, checkout.repository)[0] == source
+        ]
+        if not affected:
+            raise Refusal(
+                f"no active row on {config.machine} names repository {source!r}. {tail}"
+            )
+        try:
+            _stored, old_path = _stored_repository_path(config, source)
+            still_present = vcs.repository_root(old_path) == old_path
+        except Refusal:
+            still_present = False
+        if still_present:
+            raise Refusal(
+                f"recorded repository {source!r} is still a Git repository; relocation "
+                f"applies only to a repository that moved away. {tail}"
+            )
+        try:
+            target_root = vcs.repository_root(target_path)
+            common = vcs.common_directory(target_path)
+        except Refusal as exc:
+            raise Refusal(
+                f"new repository path {target!r} is not a Git repository: {exc}. {tail}"
+            ) from exc
+        if target_root != target_path:
+            raise Refusal(
+                f"new repository path {target!r} is not a Git repository: it lies inside "
+                f"the Git worktree {target_root}. {tail}"
+            )
+        listed = vcs.listed_worktrees(target_path)
+        remote_digests: dict[str, str] = {}
+        witnesses: list[str] = []
+        planned: list[tuple[ActiveRecord, Checkout, bool, bool]] = []
+        for record, checkout in affected:
+            label = f"{record.slot}/{checkout.name}"
+            path = _stored_path_reference(config, checkout.path, "checkout path")
+            present = path.exists() or path.is_symlink()
+            if present:
+                if path.is_symlink() or not path.is_dir():
+                    raise Refusal(
+                        f"checkout {label} is not a real directory: {path}. {tail}"
+                    )
+                try:
+                    checkout_common, _git_directory = vcs.linked_worktree_git_directory(
+                        path
+                    )
+                except Refusal:
+                    checkout_common = None
+                if checkout_common != common or path.absolute() not in listed:
+                    raise Refusal(
+                        f"checkout {label} is not a linked worktree of {target_path}: its "
+                        f"Git directory is not in {common}, so the new path is a different "
+                        f"repository. {tail} remedy: if it is the same repository, run "
+                        f"'git -C {target_path} worktree repair {path}' and rerun"
+                    )
+                if not vcs.branch_exists(target_path, checkout.branch):
+                    raise Refusal(
+                        f"checkout {label} branch {checkout.branch!r} is not in "
+                        f"{target_path}, so the new path is a different repository. {tail}"
+                    )
+                witnesses.append(label)
+            commits = [checkout.head]
+            if SHA_RE.fullmatch(checkout.start_point):
+                commits.append(checkout.start_point)
+            for commit in commits:
+                if not vcs.commit_present(target_path, commit):
+                    raise Refusal(
+                        f"checkout {label} commit {commit} is not in {target_path}, so the "
+                        f"new path is a different repository. {tail}"
+                    )
+            if checkout.remote not in remote_digests:
+                remote_digests[checkout.remote] = vcs.remote_authority(
+                    target_path, checkout.remote
+                ).sha256
+            if remote_digests[checkout.remote] != checkout.remote_url_sha256:
+                raise Refusal(
+                    f"checkout {label} remote {checkout.remote!r} URL differs in "
+                    f"{target_path}. {tail}"
+                )
+            branch_present = present or vcs.branch_exists(target_path, checkout.branch)
+            planned.append((record, checkout, present, branch_present))
+        if not witnesses:
+            raise Refusal(
+                f"no checkout recorded under {source!r} is present, so nothing proves that "
+                f"{target!r} is the same repository. {tail}"
+            )
+        print(
+            f"REPOSITORY machine={config.machine} from={source} to={target} "
+            f"common_directory={common} witnesses={','.join(witnesses)}"
+        )
+        # A row whose checkouts are all absent moves first; see the docstring.
+        order = sorted(
+            {record.slot: record for record, _checkout, _present, _branch in planned}.values(),
+            key=lambda record: any(
+                present
+                for item, _checkout, present, _branch in planned
+                if item.slot == record.slot
+            ),
+        )
+        evidence_base = {
+            "from": source,
+            "to": target,
+            "common_directory": str(common),
+            "witnesses": witnesses,
+        }
+        current = state
+        for original in order:
+            moved = {
+                checkout.name
+                for record, checkout, _present, _branch in planned
+                if record.slot == original.slot
+            }
+            updated = dataclasses.replace(
+                original,
+                checkouts=tuple(
+                    dataclasses.replace(checkout, repository=target)
+                    if checkout.name in moved
+                    else checkout
+                    for checkout in original.checkouts
+                ),
+            )
+            _assert_record_paths(config, updated, require_repository=False)
+            outcome = "would-relocate"
+            if coordinator is not None:
+                _assert_caller_process(coordinator, "coordinator")
+                if _find_record(current, original.slot) != original:
+                    raise StateError(f"slot {original.slot} changed during relocation")
+                current = _replace_record(current, updated)
+                _write_active_state(
+                    config,
+                    current,
+                    action="repository-relocated",
+                    slot=updated.slot,
+                    evidence={**evidence_base, "checkouts": sorted(moved)},
+                    require_repository=False,
+                )
+                outcome = "relocated"
+            for record, checkout, present, branch_present in planned:
+                if record.slot != original.slot:
+                    continue
+                print(
+                    f"ROW machine={record.machine} slot={record.slot} "
+                    f"generation={record.generation} checkout={checkout.name} "
+                    f"storage={'present' if present else 'absent'} "
+                    f"branch={'present' if branch_present else 'absent'} "
+                    f"outcome={outcome} record_sha256={_record_sha256(updated)}"
+                )
+        if coordinator is None:
+            print(
+                "plan only: no registry row was changed; rerun with --apply "
+                "--coordinator-authorized --coordinator-pid PID to record it"
+            )
+            return 0
+        relocated = {record.slot: record for record in current.slots}
+        expected = dict(before)
+        for slot in {record.slot for record, _checkout, _present, _branch in planned}:
+            expected[("active", config.machine, slot)] = _record_to_obj(relocated[slot])
+        after_states, after_archives = _validate_global_state(
+            config, require_repository=False
+        )
+        if _global_rows(after_states, after_archives) != expected:
+            raise StateError("repository relocation changed an unrelated registry row")
     return 0
 
 
@@ -48084,8 +48301,8 @@ def _add_repo_options(parser: argparse.ArgumentParser) -> None:
         action="append",
         metavar="NAME=PATH",
         help=(
-            "relative source Git repository path inside the project root, or ../NAME path "
-            "components for one direct sibling; absolute paths, other parent traversal, "
+            "relative source Git repository path inside the project root, or ../NAME[/PATH] "
+            "path components inside one direct sibling; absolute paths, other parent traversal, "
             "and symlink components are refused. NAME labels the checkout and must match the "
             "other NAME=VALUE options (repeat once per checkout)"
         ),
@@ -48255,7 +48472,8 @@ Read-only: status, doctor, audit, import-existing without --apply, and
 clean-caches without --only or --yes. unpushed refreshes remote-tracking refs
 but does not mutate registry state.
 Mutating: init, create, register, import-existing --apply, adopt,
-recover-unbound-owner, heartbeat, hold, unhold, clean-caches deletion, finish,
+recover-unbound-owner, relocate-repository --apply, heartbeat, hold, unhold,
+clean-caches deletion, finish,
 write-handoff, release, read-handoff, retire-pending, remove,
 recover-absent-validate-rows --apply, and recover. Registry mutations take a state lock and append
 hash-linked events. ACTIVE and ARCHIVED are compatibility views derived from those events.
@@ -48936,6 +49154,44 @@ usage or audit gate unknown, 3 fail-closed refusal.
     recover_unbound.add_argument("--validation", action="append", required=True, metavar="TEXT", help="validation evidence (repeatable)")
     recover_unbound.add_argument("--limitation", action="append", metavar="TEXT", help="known limitation to retain (repeatable)")
     recover_unbound.set_defaults(handler=_cmd_recover_unbound_owner)
+
+    relocate = subparsers.add_parser(
+        "relocate-repository",
+        help="point the active rows that name a moved source repository at its new path",
+        description=(
+            "Rewrite the recorded repository path of every checkout on this machine that "
+            "names FROM, after the source repository moved to TO. The default is a read-only "
+            "plan. It refuses unless TO is the same repository: FROM must no longer be a Git "
+            "repository, TO must be one, every present checkout recorded under FROM must be a "
+            "linked worktree whose Git directory lies in TO's common directory and whose "
+            "recorded branch exists in TO, and every affected checkout's recorded commits and "
+            "remote URL must be in TO. At least one such present checkout must exist; it "
+            "vouches for rows whose storage is gone. Run 'git -C TO worktree repair PATH' "
+            "first for a checkout whose Git link still names FROM. Clients without "
+            "'../NAME/PATH' support cannot read a registry that records such a path, so "
+            "upgrade every client of the registry before --apply."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    relocate.add_argument("source", metavar="FROM", help="repository path the rows record")
+    relocate.add_argument(
+        "target",
+        metavar="TO",
+        help="new repository path, inside the project root or ../NAME[/PATH] in one sibling",
+    )
+    relocate.add_argument("--apply", action="store_true", help="record the relocation")
+    relocate.add_argument(
+        "--coordinator-authorized",
+        action="store_true",
+        help="confirm the coordinator ordered this registry change",
+    )
+    relocate.add_argument(
+        "--coordinator-pid",
+        type=int,
+        metavar="PID",
+        help="live coordinator PID; required with --apply",
+    )
+    relocate.set_defaults(handler=_cmd_relocate_repository)
 
     heartbeat = subparsers.add_parser(
         "heartbeat",

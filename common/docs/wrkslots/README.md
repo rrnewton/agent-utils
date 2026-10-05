@@ -83,10 +83,10 @@ Separate coordinator and owner processes must also be visible in the same Linux 
 `--remote NAME=REMOTE` when a checkout should use a different configured remote. Add
 `--remote-url NAME=URL` when the caller must verify that remote's exact fetch URL; otherwise
 wrkslots records the configured URL. Repository paths must be relative: use an ordinary path inside
-the project root, or path components of the form `../NAME` for one direct sibling repository. This
-is a normalized-path rule rather than a byte-for-byte spelling requirement, but every other raw
-`..` traversal, every absolute path, and every path with a symlink component is refused. Accepted
-paths are stored in normalized relative form. It creates a new linked worktree and local branch; it
+the project root, or path components of the form `../NAME` or `../NAME/PATH` for a repository in
+one direct sibling directory. This is a normalized-path rule rather than a byte-for-byte spelling
+requirement, but every other raw `..` traversal, every absolute path, and every path with a symlink
+component is refused. Accepted paths are stored in normalized relative form. It creates a new linked worktree and local branch; it
 never reclaims another slot to satisfy an allocation.
 
 To register a live slot that already exists on disk but has no active row, first inspect the exact
@@ -170,6 +170,10 @@ requires its exact SHA-256 after the coordinator reads it; that content is reche
 beside the registry as `HANDOFF-OWNERLESS-RETIRED.*.md`, never into the salvage commit. Any other
 uncommitted handoff file refuses. `recover-ownerless-agent-cache` relocates only its one explicitly supported cache
 tree outside the managed slot root; it is not an exemption for arbitrary directories.
+
+When a source repository moves, its rows report `repository-evidence-unavailable`.
+`relocate-repository FROM TO` rewrites the recorded path of every affected row on this machine after
+proving TO is the same repository; see the user guide.
 
 Agent handoffs can live outside their checkouts. `write-handoff` copies bounded UTF-8 from an exact
 live owner into a generation-bound control sidecar; it never exempts checkout dirt from `finish`.

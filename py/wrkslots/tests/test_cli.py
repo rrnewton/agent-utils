@@ -53,6 +53,7 @@ def test_every_command_help_explains_effect_and_inputs() -> None:
         "import-existing",
         "adopt",
         "recover-unbound-owner",
+        "relocate-repository",
         "heartbeat",
         "finish",
         "remove",
@@ -76,7 +77,7 @@ def test_every_command_help_explains_effect_and_inputs() -> None:
     assert "unless the owner is in this command's ancestry" in normalized_create
     assert "whose lifetime represents this one agent" in normalized_create
     assert "do not use a shared multiplexing supervisor" in normalized_create
-    assert "or ../NAME path components for one direct sibling" in normalized_create
+    assert "or ../NAME[/PATH] path components inside one direct sibling" in normalized_create
     assert (
         "absolute paths, other parent traversal, and symlink components are refused"
         in normalized_create

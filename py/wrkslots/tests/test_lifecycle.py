@@ -24807,6 +24807,19 @@ def test_repository_path_refuses_non_sibling_parent_forms_before_normalizing(
         wrkslots._repository_path(config, f"../{project.name}")
     with pytest.raises(wrkslots.Refusal, match="aliases the project root"):
         wrkslots._stored_repository_path(config, f"../{project.name}")
+    with pytest.raises(wrkslots.Refusal, match="aliases the project root"):
+        wrkslots._repository_path(config, f"../{project.name}/{repository.name}")
+    with pytest.raises(wrkslots.Refusal, match="aliases the project root"):
+        wrkslots._stored_repository_reference(
+            config, f"../{project.name}/{repository.name}"
+        )
+    with pytest.raises(wrkslots.Refusal, match="other parent traversal is refused"):
+        wrkslots._repository_path(config, f"../{alias.name}/../{repository.name}")
+    with pytest.raises(wrkslots.Refusal, match="'../NAME/PATH'"):
+        wrkslots._stored_repository_reference(config, "../sibling/../other")
+    nested = wrkslots._stored_repository_reference(config, "../sibling/inner")
+    assert nested[0] == "../sibling/inner"
+    assert nested[1] == tmp_path / "sibling" / "inner"
     with pytest.raises(
         wrkslots.Refusal, match="outside the managed worktrees directory"
     ):
@@ -26299,6 +26312,159 @@ def test_status_reports_missing_recorded_repository_but_create_refuses(
     assert refused.returncode == 3
     assert "source repository 'repo' does not exist or cannot be resolved" in refused.stderr
     assert not checkout(project, "slot02").exists()
+
+
+def moved_sibling_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path, Path]:
+    """Record a present and an absent slot from ../sibling, then move it to ../sibling/inner."""
+
+    monkeypatch.setattr(wrkslots, "_short_hostname", lambda: "testhost")
+    project, _unused_repository, remote = make_project(tmp_path)
+    sibling = tmp_path / "sibling"
+    subprocess.run(
+        ["git", "clone", str(remote), str(sibling)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    for index, slot in enumerate(("slot01", "slot02"), start=1):
+        made = create(
+            project,
+            slot=slot,
+            agent=f"codex-{index}",
+            branch=f"codex/{slot}",
+            repository_name=f"../{sibling.name}",
+        )
+        assert made.returncode == 0, made.stderr
+    shutil.rmtree(checkout(project, "slot02").parent)
+    git(sibling, "worktree", "prune")
+    git(sibling, "branch", "-D", "codex/slot02")
+    staging = tmp_path / "staging"
+    sibling.rename(staging)
+    sibling.mkdir()
+    moved = sibling / "inner"
+    staging.rename(moved)
+    git(moved, "worktree", "repair", str(checkout(project, "slot01")))
+    return project, moved, remote
+
+
+def registry_storage_findings(project: Path) -> list[dict[str, object]]:
+    status = command(project, "status", "--all-machines", "--format", "json")
+    assert status.returncode == 0, status.stderr
+    findings = json.loads(status.stdout)["registry_storage_inconsistencies"]
+    assert isinstance(findings, list)
+    return findings
+
+
+def relocate(project: Path, target: str, *, apply: bool) -> int:
+    args = [
+        "--project-root",
+        str(project),
+        "relocate-repository",
+        "../sibling",
+        target,
+    ]
+    if apply:
+        args.extend(
+            ("--apply", "--coordinator-authorized", "--coordinator-pid", str(os.getpid()))
+        )
+    return wrkslots.main(args)
+
+
+def test_relocate_repository_records_a_moved_sibling_repository(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, moved, _remote = moved_sibling_repository(tmp_path, monkeypatch)
+    unavailable = [
+        item
+        for item in registry_storage_findings(project)
+        if item["kind"] == "repository-evidence-unavailable"
+    ]
+    assert sorted(str(item["slot"]) for item in unavailable) == ["slot01", "slot02"]
+    assert "wrkslots relocate-repository" in str(unavailable[0]["remedy"])
+    before = active(project)
+    capsys.readouterr()
+
+    assert relocate(project, "../sibling/inner", apply=False) == 0
+    planned = capsys.readouterr().out
+    assert active(project) == before
+    assert "witnesses=slot01/product" in planned
+    assert (
+        "slot=slot02 generation=1 checkout=product storage=absent branch=absent "
+        "outcome=would-relocate"
+    ) in planned
+    assert (
+        "slot=slot01 generation=1 checkout=product storage=present branch=present "
+        "outcome=would-relocate"
+    ) in planned
+    assert "plan only: no registry row was changed" in planned
+
+    assert relocate(project, "../sibling/inner", apply=True) == 0
+    applied = capsys.readouterr().out
+    assert applied.index("slot=slot02") < applied.index("slot=slot01")
+    repositories: dict[str, object] = {}
+    for row in active_slots(project):
+        assert isinstance(row, dict)
+        repositories[str(row["slot"])] = row["checkouts"][0]["repository"]
+    for slot in ("slot01", "slot02"):
+        assert repositories[slot] == "../sibling/inner"
+    config = wrkslots._load_config(str(project), "testhost")
+    relocated = [
+        wrkslots._as_mapping(item["payload"], "test payload")
+        for item in wrkslots._load_events(config)
+        if item["kind"] == "active-state-recorded"
+        and wrkslots._as_mapping(item["payload"], "test payload")["action"]
+        == "repository-relocated"
+    ]
+    assert [item["slot"] for item in relocated] == ["slot02", "slot01"]
+    assert relocated[0]["evidence"] == {
+        "from": "../sibling",
+        "to": "../sibling/inner",
+        "common_directory": str(moved / ".git"),
+        "witnesses": ["slot01/product"],
+        "checkouts": ["product"],
+    }
+    findings = registry_storage_findings(project)
+    assert [(item["slot"], item["kind"]) for item in findings] == [
+        ("slot02", "row-without-directory")
+    ]
+
+
+@pytest.mark.parametrize("target", ("different-repository", "not-a-repository"))
+def test_relocate_repository_refuses_a_path_that_is_not_the_same_repository(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    target: str,
+) -> None:
+    project, moved, remote = moved_sibling_repository(tmp_path, monkeypatch)
+    candidate = moved.parent / target
+    if target == "different-repository":
+        # Same remote, commits, and branch name, but not the repository the
+        # checkouts belong to: only the linked-worktree check tells them apart.
+        subprocess.run(
+            ["git", "clone", str(remote), str(candidate)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        git(candidate, "branch", "codex/slot01", "origin/main")
+        expected = "is not a linked worktree of"
+    else:
+        candidate.mkdir()
+        expected = "is not a Git repository"
+    before = active(project)
+    capsys.readouterr()
+
+    for apply in (False, True):
+        assert relocate(project, f"../sibling/{target}", apply=apply) == 3
+        refused = capsys.readouterr()
+        assert expected in refused.err
+        assert "no registry row was changed" in refused.err
+        assert active(project) == before
 
 
 def test_status_reports_git_registration_without_an_active_row(
