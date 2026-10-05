@@ -1,0 +1,554 @@
+//! Command-line entry point: argument parsing, help, and wiring the real clock and runner.
+
+use crate::classify::classify;
+use crate::clock::RealClock;
+use crate::config::{config_path, Config};
+use crate::runner::{die_by_signal, stdin_is_tty, RealRunner};
+use crate::state::{self, Paths};
+use crate::status;
+use crate::wrapper::{Outcome, Wrapper, EXIT_NO_GH, EXIT_REFUSED, EXIT_USAGE};
+use std::ffi::OsString;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+/// Exit status for a configuration error (bad config file, bad environment value, bad path).
+pub const EXIT_CONFIG: i32 = 78;
+/// Deepest allowed nesting of gh-paced inside gh (an extension or alias that calls gh again).
+pub const MAX_DEPTH: u32 = 8;
+/// Real gh locations tried, in order, when neither `--real-gh` nor `GH_PACED_REAL_GH` is set.
+/// `PATH` is never searched: on a paced host `gh` on `PATH` is the wrapper itself.
+pub const DEFAULT_REAL_GH: [&str; 2] = ["/usr/bin/gh", "/usr/local/bin/gh"];
+
+const HELP: &str = "\
+gh-paced: client-side rate limiting for the GitHub CLI
+
+gh-paced sits between an account shim and the real gh. Every call is classified
+(READ, SEARCH, WRITE, GIT_CREDENTIAL or LOCAL), charged against per-host,
+per-account budgets shared by every process on the host through a locked state
+file, and delayed with a loud stderr warning when a budget is exhausted. It
+also watches GitHub's own account-wide numbers (GET /rate_limit), backs off
+for 15 minutes after any rate-limit or abuse response, and refuses oversized or
+base64-laden write bodies. It never reads, prints or stores a token.
+
+USAGE
+  gh-paced [--account NAME] [--real-gh PATH] -- <gh arguments...>
+  gh-paced status [--account NAME | --all] [--json]
+  gh-paced classify [--json] -- <gh arguments...>
+  gh-paced quickstart | userguide | help | --help | -h | --version
+
+PASS-THROUGH OPTIONS (before the required `--`)
+  --account NAME   GitHub login whose budgets apply (letters, digits, hyphens;
+                   at most 39). Default: $GH_PACED_ACCOUNT. Required.
+  --real-gh PATH   Absolute path of the real gh. Default: $GH_PACED_REAL_GH,
+                   else /usr/bin/gh, else /usr/local/bin/gh. PATH is never
+                   searched, and a path that resolves to gh-paced is refused.
+
+SUBCOMMANDS
+  status           Show budgets, in-flight writes, cooldown, the cached GitHub
+                   snapshot and recent audit records. Reads local state only;
+                   never contacts GitHub. `gh-paced status --help` for options.
+  classify         Print how a gh command line would be classified and charged.
+                   Touches no state and runs nothing.
+  quickstart       One-screen introduction.
+  userguide        Full reference: classes, budgets with GitHub citations,
+                   configuration, messages, multi-host arithmetic.
+
+DEFAULT BUDGETS (per host, per account; four hosts assumed)
+  READ             20/min, burst 10, 500/hour
+  SEARCH           5/min, burst 2, 150/hour
+  WRITE            1 per 30 s, burst 1, 30/hour, 1 in flight
+  GIT_CREDENTIAL   1 per 10 s, burst 1, 120/hour
+  LOCAL            unpaced, unaudited (help, completion, config, alias, ...)
+  `gh api --paginate` costs 10 tokens; watch loops cost 20.
+
+ENVIRONMENT
+  GH_PACED_ACCOUNT           default for --account
+  GH_PACED_REAL_GH           default for --real-gh
+  GH_PACED_MAX_WAIT          longest total sleep before refusing, seconds
+                             (default 900); a longer wait exits 75
+  GH_PACED_{READ,SEARCH,WRITE,GIT}_{PER_MINUTE,BURST,PER_HOUR}
+                             tighten a budget (a looser value is ignored with
+                             a warning)
+  GH_PACED_PAGINATE_COST     raise the --paginate cost (lower is ignored)
+  GH_PACED_DISPLAY_TZ        US-Eastern (default) or UTC for printed times
+  GH_PACED_ALLOW_LARGE_BODY  1 = skip the write content guard for this call
+  GH_PACED_ALLOW_FAST_WATCH  1 = allow watch intervals under 30 s
+  GH_PACED_STATE_DIR         state directory (default
+                             $XDG_STATE_HOME/gh-paced or ~/.local/state/gh-paced)
+  GH_PACED_CONFIG            config file (default
+                             $XDG_CONFIG_HOME/gh-paced/config.json or
+                             ~/.config/gh-paced/config.json)
+
+EXIT STATUS
+  gh's own status (or gh-paced dies by the same signal), except:
+  75  refused: the wait would exceed GH_PACED_MAX_WAIT, or nesting too deep
+  65  refused by the write content guard (body > 8 KiB or base64 run > 1000)
+  64  usage error, or a refused command shape (watch interval under 30 s)
+  70  internal error: pacing state cannot be locked, read or written
+  78  configuration error
+  127 the real gh cannot be found or run
+
+EXAMPLES
+  gh-paced --account octocat -- pr view 12 --json state
+  GH_PACED_MAX_WAIT=60 gh-paced --account octocat -- issue comment 7 --body-file note.md
+  gh-paced status --account octocat
+  gh-paced classify -- api -X POST repos/o/r/issues/1/comments -f body=hi
+";
+
+const STATUS_HELP: &str = "\
+gh-paced status: show one account's pacing state (local files only)
+
+USAGE
+  gh-paced status [--account NAME | --all] [--json]
+
+OPTIONS
+  --account NAME  Account to show. Default: $GH_PACED_ACCOUNT.
+  --all           Show every account with a state file in the state directory.
+  --json          Print JSON instead of text.
+
+Shows, per class: tokens available and burst, refill rate, cost used in the
+last hour against the hourly cap, and seconds until the next one-token call
+fits. Also in-flight writes (PID, age, liveness), any active cooldown with its
+reason, the cached GET /rate_limit numbers and their age, and the last 5 audit
+records. Never contacts GitHub, never refreshes, never writes state.
+
+EXAMPLES
+  gh-paced status --account octocat
+  gh-paced status --all --json
+";
+
+const CLASSIFY_HELP: &str = "\
+gh-paced classify: show how a gh command line would be paced
+
+USAGE
+  gh-paced classify [--json] -- <gh arguments...>
+
+OPTIONS
+  --json  Print JSON (class, cost, command, reason, warnings, refusal).
+
+Runs nothing and touches no state or network. Classification depends only on
+the arguments and the configuration (for --paginate and watch costs).
+
+EXAMPLES
+  gh-paced classify -- pr comment 5 --body hi
+  gh-paced classify --json -- api graphql -f query='query { viewer { login } }'
+";
+
+fn env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+fn loud_error(text: &str) {
+    eprintln!("GH-PACED ERROR {text}");
+}
+
+fn to_strings(args: impl Iterator<Item = OsString>) -> Result<Vec<String>, String> {
+    args.map(|a| {
+        a.into_string()
+            .map_err(|a| format!("argument {a:?} is not valid UTF-8; gh-paced cannot classify it"))
+    })
+    .collect()
+}
+
+fn load_config() -> Result<Config, i32> {
+    let path = config_path(&env_var);
+    let (path, explicit) = match &path {
+        Some((p, e)) => (Some(p.as_path()), *e),
+        None => (None, false),
+    };
+    match Config::load(path, explicit, &env_var) {
+        Ok((cfg, warnings)) => {
+            for w in warnings {
+                eprintln!("GH-PACED WARNING {w}");
+            }
+            Ok(cfg)
+        }
+        Err(e) => {
+            loud_error(&format!("configuration: {e}"));
+            Err(EXIT_CONFIG)
+        }
+    }
+}
+
+fn account_from(opt: Option<String>) -> Result<String, i32> {
+    let Some(account) = opt.or_else(|| env_var("GH_PACED_ACCOUNT").filter(|a| !a.is_empty()))
+    else {
+        loud_error("no account: pass --account NAME or set GH_PACED_ACCOUNT (see gh-paced --help)");
+        return Err(EXIT_USAGE);
+    };
+    if !state::valid_account(&account) {
+        loud_error(&format!(
+            "account {account:?} is not a valid GitHub login (letters, digits, hyphens; at most 39)"
+        ));
+        return Err(EXIT_USAGE);
+    }
+    Ok(account)
+}
+
+/// Resolve the real gh from an explicit option, the environment, then the fixed locations.
+pub fn resolve_real_gh(
+    opt: Option<&str>,
+    env: &dyn Fn(&str) -> Option<String>,
+    self_exe: Option<&Path>,
+) -> Result<PathBuf, (i32, String)> {
+    let chosen: Option<(PathBuf, &str)> = match opt {
+        Some(p) => Some((PathBuf::from(p), "--real-gh")),
+        None => env("GH_PACED_REAL_GH")
+            .filter(|p| !p.is_empty())
+            .map(|p| (PathBuf::from(p), "GH_PACED_REAL_GH")),
+    };
+    let path = match chosen {
+        Some((p, source)) => {
+            if !p.is_absolute() {
+                return Err((
+                    EXIT_CONFIG,
+                    format!("{source} must be an absolute path, got {}", p.display()),
+                ));
+            }
+            if !p.is_file() {
+                return Err((
+                    EXIT_NO_GH,
+                    format!("{source} {} does not exist or is not a file", p.display()),
+                ));
+            }
+            p
+        }
+        None => match DEFAULT_REAL_GH
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_file())
+        {
+            Some(p) => p,
+            None => {
+                return Err((
+                    EXIT_NO_GH,
+                    format!(
+                        "no real gh found at {}; pass --real-gh PATH",
+                        DEFAULT_REAL_GH.join(" or ")
+                    ),
+                ))
+            }
+        },
+    };
+    if let (Ok(real), Some(me)) = (
+        path.canonicalize(),
+        self_exe.and_then(|p| p.canonicalize().ok()),
+    ) {
+        if real == me {
+            return Err((
+                EXIT_CONFIG,
+                format!(
+                    "real gh {} is gh-paced itself; refusing to recurse",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(path)
+}
+
+fn short_host() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: gethostname writes at most buf.len() bytes into a valid buffer.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return "unknown".to_string();
+    }
+    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    let full = String::from_utf8_lossy(&buf[..end]).to_string();
+    full.split('.').next().unwrap_or("unknown").to_string()
+}
+
+fn read_stdin_capped(limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    std::io::stdin()
+        .lock()
+        .take(u64::try_from(limit).unwrap_or(u64::MAX))
+        .read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+fn run_paced(account: Option<String>, real_gh: Option<String>, gh_args: Vec<String>) -> i32 {
+    let account = match account_from(account) {
+        Ok(a) => a,
+        Err(code) => return code,
+    };
+    let depth: u32 = env_var("GH_PACED_DEPTH")
+        .and_then(|d| d.trim().parse().ok())
+        .unwrap_or(0);
+    if depth >= MAX_DEPTH {
+        eprintln!(
+            "GH-PACED REFUSED [{account}] gh-paced is nested {depth} deep (limit {MAX_DEPTH}); \
+             an alias or extension is probably calling gh in a loop (exit {EXIT_REFUSED})"
+        );
+        return EXIT_REFUSED;
+    }
+    let self_exe = std::env::current_exe().ok();
+    let real_gh = match resolve_real_gh(real_gh.as_deref(), &env_var, self_exe.as_deref()) {
+        Ok(p) => p,
+        Err((code, e)) => {
+            loud_error(&e);
+            return code;
+        }
+    };
+    let cfg = match load_config() {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let dir = match state::state_dir(&env_var) {
+        Ok(d) => d,
+        Err(e) => {
+            loud_error(&format!("state directory: {e}"));
+            return EXIT_CONFIG;
+        }
+    };
+    let chain: Vec<String> = env_var("GH_PACED_INFLIGHT_CHAIN")
+        .map(|c| {
+            c.split(',')
+                .filter(|n| !n.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let clock = RealClock;
+    let runner = RealRunner;
+    let pid = std::process::id();
+    let now = crate::clock::Clock::now(&clock);
+    let alive = |h: &state::Holder| state::holder_alive(h);
+    let mut w = Wrapper {
+        clock: &clock,
+        runner: &runner,
+        cfg,
+        paths: Paths::new(dir, &account),
+        host: short_host(),
+        real_gh,
+        echo: true,
+        messages: Vec::new(),
+        stdin_is_tty: stdin_is_tty(),
+        stdin_reader: Box::new(read_stdin_capped),
+        chain,
+        depth,
+        alive: &alive,
+        pid,
+        start_ticks: state::process_start_ticks(pid).unwrap_or(0),
+        nonce: state::new_nonce(now),
+    };
+    match w.run(&gh_args) {
+        Outcome::Exit(code) => code,
+        Outcome::Signal(sig) => die_by_signal(sig),
+    }
+}
+
+fn run_status(args: &[String]) -> i32 {
+    let mut account = None;
+    let mut all = false;
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                print!("{STATUS_HELP}");
+                return 0;
+            }
+            "--all" => all = true,
+            "--json" => json = true,
+            "--account" => {
+                i += 1;
+                let Some(a) = args.get(i) else {
+                    loud_error("--account needs a value");
+                    return EXIT_USAGE;
+                };
+                account = Some(a.clone());
+            }
+            other => {
+                if let Some(a) = other.strip_prefix("--account=") {
+                    account = Some(a.to_string());
+                } else {
+                    loud_error(&format!(
+                        "status: unknown argument {other:?} (see gh-paced status --help)"
+                    ));
+                    return EXIT_USAGE;
+                }
+            }
+        }
+        i += 1;
+    }
+    let cfg = match load_config() {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let dir = match state::state_dir(&env_var) {
+        Ok(d) => d,
+        Err(e) => {
+            loud_error(&format!("state directory: {e}"));
+            return EXIT_CONFIG;
+        }
+    };
+    let accounts = if all {
+        if account.is_some() {
+            loud_error("status: --all and --account are exclusive");
+            return EXIT_USAGE;
+        }
+        status::accounts(&dir)
+    } else {
+        match account_from(account) {
+            Ok(a) => vec![a],
+            Err(code) => return code,
+        }
+    };
+    let now = crate::clock::Clock::now(&RealClock);
+    let mut reports = Vec::new();
+    let mut rc = 0;
+    for a in &accounts {
+        match status::report(&Paths::new(dir.clone(), a), &cfg, now) {
+            Ok(r) => reports.push(r),
+            Err(e) => {
+                loud_error(&format!("status for {a}: {e}"));
+                rc = EXIT_CONFIG;
+            }
+        }
+    }
+    if json {
+        let v = if all {
+            serde_json::Value::Array(reports)
+        } else {
+            reports
+                .into_iter()
+                .next()
+                .unwrap_or(serde_json::Value::Null)
+        };
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+    } else if reports.is_empty() && all {
+        println!("gh-paced: no account state in {}", dir.display());
+    } else {
+        for r in &reports {
+            print!("{}", status::render(r));
+        }
+    }
+    rc
+}
+
+fn run_classify(args: &[String]) -> i32 {
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                print!("{CLASSIFY_HELP}");
+                return 0;
+            }
+            "--json" => json = true,
+            "--" => break,
+            other => {
+                loud_error(&format!(
+                    "classify: unknown argument {other:?}; put gh arguments after `--`"
+                ));
+                return EXIT_USAGE;
+            }
+        }
+        i += 1;
+    }
+    if i >= args.len() {
+        loud_error("classify: missing `--` before the gh arguments");
+        return EXIT_USAGE;
+    }
+    let cfg = match load_config() {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let gh_args = &args[i + 1..];
+    let c = classify(gh_args, &cfg);
+    if json {
+        let v = serde_json::json!({
+            "class": c.class.name(),
+            "cost": c.cost,
+            "command": c.command,
+            "reason": c.reason,
+            "warnings": c.warnings,
+            "refusal": c.refusal,
+        });
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+    } else {
+        println!("class:   {}", c.class.name());
+        println!("cost:    {}", c.cost);
+        println!("command: {}", c.command);
+        println!("reason:  {}", c.reason);
+        for w in &c.warnings {
+            println!("warning: {w}");
+        }
+        if let Some(r) = &c.refusal {
+            println!("REFUSED: {r}");
+        }
+    }
+    0
+}
+
+/// Run the command line (without the program name) and return the exit status.
+pub fn main(args: impl Iterator<Item = OsString>) -> i32 {
+    let args = match to_strings(args) {
+        Ok(a) => a,
+        Err(e) => {
+            loud_error(&e);
+            return EXIT_USAGE;
+        }
+    };
+    match args.first().map(String::as_str) {
+        None | Some("help" | "--help" | "-h") => {
+            print!("{HELP}");
+            return if args.is_empty() { EXIT_USAGE } else { 0 };
+        }
+        Some("--version") => {
+            println!("gh-paced {}", env!("CARGO_PKG_VERSION"));
+            return 0;
+        }
+        Some("quickstart") => {
+            print!("{}", crate::QUICKSTART);
+            return 0;
+        }
+        Some("userguide") => {
+            print!("{}", crate::USER_GUIDE);
+            return 0;
+        }
+        Some("status") => return run_status(&args[1..]),
+        Some("classify") => return run_classify(&args[1..]),
+        _ => {}
+    }
+    let mut account = None;
+    let mut real_gh = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "--" => {
+                return run_paced(account, real_gh, args[i + 1..].to_vec());
+            }
+            "--account" | "--real-gh" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    loud_error(&format!("{a} needs a value"));
+                    return EXIT_USAGE;
+                };
+                if a == "--account" {
+                    account = Some(v.clone());
+                } else {
+                    real_gh = Some(v.clone());
+                }
+            }
+            _ => {
+                if let Some(v) = a.strip_prefix("--account=") {
+                    account = Some(v.to_string());
+                } else if let Some(v) = a.strip_prefix("--real-gh=") {
+                    real_gh = Some(v.to_string());
+                } else {
+                    loud_error(&format!(
+                        "unknown argument {a:?}; gh arguments go after `--` (gh-paced --account NAME -- <gh args>)"
+                    ));
+                    return EXIT_USAGE;
+                }
+            }
+        }
+        i += 1;
+    }
+    loud_error("missing `--` before the gh arguments (gh-paced --account NAME -- <gh args>)");
+    EXIT_USAGE
+}

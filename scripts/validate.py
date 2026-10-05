@@ -183,6 +183,12 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     # `py/README.md.generated`, which `_rule_matches` prevents.
     ("py/README.md", frozenset({PYTHON_PACKAGES})),
     ("rs/README.md", frozenset({RUST_PACKAGES})),
+    # gh-paced is a Rust-only tool: it has no Python twin, no cross-language pair, and ships in no
+    # package. validation/components.json requires Python component tests, so it is routed here
+    # instead. Its crate tests carry the Rust workspace-tests label. It embeds its guides with
+    # include_str!, so a guide edit also rebuilds and tests the crate.
+    ("rs/gh-paced/", frozenset({RUST, RUST_WORKSPACE_TESTS})),
+    ("common/docs/gh-paced/", frozenset({DOCS, RUST, RUST_WORKSPACE_TESTS})),
     ("cross/", frozenset({CROSS})),
     ("common/docs/", frozenset({DOCS})),
     ("common/README.md", frozenset()),
@@ -770,6 +776,16 @@ def self_test() -> int:
         {DOCS},
         "embedded docs select their owning component",
         {"herdr-run"},
+    )
+    expect(
+        ["rs/gh-paced/src/wrapper.rs"],
+        {RUST, RUST_WORKSPACE_TESTS},
+        "the Rust-only gh-paced tool selects the Rust gate and the crate tests, not everything",
+    )
+    expect(
+        ["common/docs/gh-paced/USER_GUIDE.md"],
+        {DOCS, RUST, RUST_WORKSPACE_TESTS},
+        "gh-paced compiles its guides into the binary, so a guide edit re-tests the crate",
     )
     expect(
         ["skills/agentctl/SKILL.md"],
