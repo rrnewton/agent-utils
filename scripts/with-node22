@@ -3,13 +3,20 @@
 #
 # A developer shell may expose an older system Node even when nvm already has Node 22 installed.
 # Validation must not silently test under a different runtime from CI, and it must not download a
-# toolchain as a side effect. Prefer the active Node when it is exactly major 22; otherwise activate
-# an existing nvm installation and fail with an actionable message if neither route is available.
+# toolchain as a side effect. Prefer the pinned release scripts/provision-node22 installed and
+# verified, which validation provisions in its own step; otherwise the active Node when it is
+# exactly major 22; otherwise an existing nvm installation; and fail with an actionable message if
+# no route is available. This script never downloads anything itself.
 set -euo pipefail
 
 if [ "$#" -eq 0 ]; then
   echo "usage: scripts/with-node22 COMMAND [ARG ...]" >&2
   exit 2
+fi
+
+if pinned="$("$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/provision-node22" --bin-dir)"; then
+  PATH="$pinned:$PATH"
+  export PATH
 fi
 
 node_major() {

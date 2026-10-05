@@ -14,9 +14,11 @@ node --test benchmark-site.test.cjs
 node --test benchmark-budget.test.cjs
 ```
 
-The browser contract targets Node 22, matching CI. The `py/wrkviz` Make targets and repository
-validation activate an already-installed nvm Node 22 when the system `node` is older, and fail
-with an explicit requirement instead of silently testing against a different runtime.
+The browser contract targets Node 22, matching CI. Repository validation installs the pinned
+Node 22 release with `scripts/provision-node22` (the official archive, verified against its
+published sha256). The `py/wrkviz` Make targets and validation run through `scripts/with-node22`,
+which prefers that release, then an active Node 22, then an already-installed nvm Node 22, and
+fails with an explicit requirement instead of silently testing against a different runtime.
 
 Use `npm run test:headed` while iterating. The browser download and `node_modules/`
 are intentionally untracked; this directory does not vendor generated npm or browser
