@@ -4262,7 +4262,11 @@ struct DeliveryWatch {
     // The alarm last written, so the file is written only when the list changes. `None` until a
     // write succeeds, and again from the start of each write until it succeeds: a failed write
     // can have replaced the file before it failed, so the next scan writes it again.
-    written: Option<(DeliveryAlarm, chat_runtime::LostReceiptReactions)>,
+    written: Option<(
+        DeliveryAlarm,
+        chat_runtime::LostReceiptReactions,
+        chat_runtime::RefusedReceiptReactions,
+    )>,
     // The requests whose prompts a scan recorded as typed and whose reply routes no read has
     // given since, because each read failed. Each scan reads them again.
     unrouted: BTreeSet<String>,
@@ -4437,10 +4441,19 @@ impl DeliveryWatch {
                 return (typed, problem);
             }
         };
-        let alarm = (alarm, lost);
+        let refused = match state.refused_receipt_reactions() {
+            Ok(refused) => refused,
+            Err(error) => {
+                problem.get_or_insert_with(|| {
+                    format!("the refused receipt reactions could not be read: {error}")
+                });
+                return (typed, problem);
+            }
+        };
+        let alarm = (alarm, lost, refused);
         if self.written.as_ref() != Some(&alarm) {
             self.written = None;
-            match state.write_delivery_alarm(&alarm.0, &alarm.1) {
+            match state.write_delivery_alarm(&alarm.0, &alarm.1, &alarm.2) {
                 Ok(()) => self.written = Some(alarm),
                 Err(error) => {
                     problem.get_or_insert_with(|| {
@@ -5862,6 +5875,98 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         assert!(due <= Instant::now() + ACK_RETRY_DELAY);
         drop(queued);
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn the_acknowledgement_worker_tries_a_receipt_reaction_the_helper_refuses_for_good_once() {
+        /// A helper that accepts the acknowledgement's emoji and refuses ✅ for good, counting the
+        /// ✅ requests.
+        struct AckOnlyTransport {
+            receipts: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl chat_runtime::ReactionTransport for AckOnlyTransport {
+            fn ensure_reaction(
+                &mut self,
+                submission: chat_runtime::ReactionSubmission<'_>,
+            ) -> Result<chat_runtime::ReactionReceipt, OutboundFailure> {
+                if submission.emoji == chat_runtime::RECEIPT_REACTION {
+                    self.receipts
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return Err(OutboundFailure {
+                        code: "owner_ack_policy_mismatch".to_owned(),
+                        detail: "owner ACK request does not match its configured space and emoji"
+                            .to_owned(),
+                        outcome: chat_runtime::OutboundOutcome::NotApplied,
+                        retryable: false,
+                    });
+                }
+                Ok(chat_runtime::ReactionReceipt {
+                    reaction_id: format!("{}/reactions/ack", submission.message_id),
+                    already_present: false,
+                })
+            }
+        }
+        const HANG_GUARD: Duration = Duration::from_secs(60);
+        let (state, key, root) = state_with_request();
+        state
+            .save_receipt_reactions(&[format!("chat-{key}")])
+            .expect("save");
+        let receipts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let queue = Arc::new(AckQueue::default());
+        let stop = Arc::new(StopState {
+            ack_queue: Some(Arc::clone(&queue)),
+            ..StopState::default()
+        });
+        let worker = spawn_ack_worker(
+            state.clone(),
+            Arc::clone(&queue),
+            AckOnlyTransport {
+                receipts: Arc::clone(&receipts),
+            },
+            Arc::clone(&stop),
+            Arc::new(Mutex::new(None)),
+            captured_service_log,
+        )
+        .expect("spawn ACK worker");
+        queue.enqueue([key.clone()]);
+        queue.enqueue_receipts([key.clone()]);
+        let deadline = Instant::now() + HANG_GUARD;
+        while receipts.load(std::sync::atomic::Ordering::SeqCst) == 0
+            || !state
+                .pending_receipt_reactions()
+                .expect("pending")
+                .is_empty()
+        {
+            assert!(Instant::now() < deadline, "the refusal was not recorded");
+            thread::sleep(Duration::from_millis(10));
+        }
+        // What startup does: nothing is left to queue, so nothing is tried again.
+        queue_saved_receipts(&queue, state.receipt_reaction_attempts().expect("attempts"));
+        assert!(queue.state.lock().expect("queue state").receipts.is_empty());
+        stop.stop();
+        join_worker_until(worker, "ACK", Instant::now() + HANG_GUARD).expect("join worker");
+        assert_eq!(receipts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let status = state.status().expect("status");
+        assert_eq!(status["receipt_reactions"]["refused"], 1);
+        assert_eq!(status["receipt_reactions"]["waiting"], 0);
+        assert_eq!(
+            status["delivery_alarm"]["receipt_reactions_refused"]["oldest_key"],
+            key.as_str()
+        );
+        let mut watch = DeliveryWatch::new(DeliveryTiming::default());
+        let mut routes = RouteCache::new(Vec::new());
+        watch.scan(&state, &RecordingDelivery::default(), &mut routes);
+        let alarm: Value = serde_json::from_slice(
+            &fs::read(root.join("delivery-alarm.json")).expect("delivery alarm"),
+        )
+        .expect("alarm JSON");
+        fs::remove_dir_all(root).expect("cleanup");
+        assert_eq!(alarm["receipt_reactions_refused"]["count"], 1);
+        assert_eq!(
+            alarm["receipt_reactions_refused"]["oldest_key"],
+            key.as_str()
+        );
+        assert!(alarm.get("receipt_reactions_lost").is_none());
     }
 
     #[test]

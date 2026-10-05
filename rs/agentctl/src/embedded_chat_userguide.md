@@ -1313,7 +1313,15 @@ queue and those whose retry is due. A ✅ that does not fit stays saved, and the
 worker lists the saved ones again after draining its queue. A failed or
 uncertain ✅ keeps its file and its operation ID and waits at least 60 seconds
 before the worker tries it again; the file records when that attempt was made,
-so a restart waits out the rest of the 60 seconds too. When `run` starts, it
+so a restart waits out the rest of the 60 seconds too. A ✅ that the outbound
+helper refuses as not applied and not retryable, as a helper that accepts only
+the configured `ack_reaction` does, is not tried again: its file is removed,
+the service logs the refusal once, and it is counted in
+`receipt-reactions-refused.json` in the state directory. `chat status` reports
+the count as `refused` in `receipt_reactions`, with `oldest_refused_key` and
+`last_refusal`, the helper's newest reason, and as `receipt_reactions_refused`
+in `delivery_alarm`; in `chat run`, `delivery-alarm.json` holds the same once
+any ✅ is refused. When `run` starts, it
 hands the worker every ✅ already saved. `chat tick` adds at most four saved ✅
 reactions each time it runs, least recently tried first, so one that always
 fails does not hold back the rest. The outbound helper receives each as the
@@ -1323,8 +1331,8 @@ path, `receipt-reactions/KEY.json`, that holds something other than a regular
 file is not opened and counts as failing; nor is the record of losses opened
 when it is not a regular file. `chat status` reports `receipt_reactions`, with `reaction`, which is
 `✅`; `waiting`, the number saved and not yet added; `failing`, how many of
-those failed at their last attempt or cannot be read; and the `lost` and
-`oldest_lost_key` above.
+those failed at their last attempt or cannot be read; and the `lost`,
+`oldest_lost_key`, `refused`, `oldest_refused_key` and `last_refusal` above.
 
 ## Service management
 

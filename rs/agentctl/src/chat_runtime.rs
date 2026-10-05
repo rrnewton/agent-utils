@@ -148,6 +148,15 @@ const MAX_RECEIPT_REACTION_ERROR_BYTES: usize = 2_000;
 const RECEIPT_REACTION_LOSS_SCHEMA: &str = "agentctl-chat-receipt-reactions-lost/v1";
 const RECEIPT_REACTION_LOSS_FILE: &str = "receipt-reactions-lost.json";
 const MAX_RECEIPT_REACTION_LOSS_BYTES: usize = 4 * 1_024;
+// The schema of `receipt-reactions-refused.json`, which counts the ✅ reactions the outbound helper
+// refused as not applied and not retryable: see `ReceiptReactionRefusal`.
+const RECEIPT_REACTION_REFUSAL_SCHEMA: &str = "agentctl-chat-receipt-reactions-refused/v1";
+const RECEIPT_REACTION_REFUSAL_FILE: &str = "receipt-reactions-refused.json";
+// Room for the largest refusal record: JSON spells a control character in six bytes, so the
+// saved reason may take six times its own size.
+const MAX_RECEIPT_REACTION_REFUSAL_BYTES: usize = 64 * 1_024;
+const _: () =
+    assert!(MAX_RECEIPT_REACTION_REFUSAL_BYTES >= 6 * MAX_RECEIPT_REACTION_ERROR_BYTES + 1_024);
 // Room for the largest record the state can write: JSON spells a control character in six bytes,
 // so the channel, the message and a saved error may each take six times their own size.
 const MAX_RECEIPT_REACTION_BYTES: usize = 64 * 1_024;
@@ -2137,6 +2146,45 @@ pub(crate) struct LostReceiptReactions {
     pub(crate) oldest_key: Option<String>,
 }
 
+/// The ✅ receipt reactions the outbound helper refused as not applied and not retryable, saved
+/// as `receipt-reactions-refused.json` in the state directory. Such a refusal is final, as when
+/// the helper accepts only the acknowledgement's own emoji, so the reaction is dropped rather than
+/// tried again, and this record keeps the refusals visible.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceiptReactionRefusal {
+    schema: String,
+    refused: u64,
+    oldest_refused_key: String,
+    newest_refused_at_millis: u64,
+    /// The helper's reason for the newest refusal.
+    last_detail: String,
+    /// The refusal counted here whose reaction file may not be removed yet: set before the file
+    /// is removed and cleared after, so a refusal interrupted in between is finished without
+    /// asking the helper again or counting it twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    finalizing: Option<RefusalInFlight>,
+}
+
+/// The reaction a refusal was counted for, by request key and saved operation ID.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefusalInFlight {
+    key: String,
+    request_id: String,
+}
+
+/// How many ✅ receipt reactions the outbound helper refused, the request that had the first one
+/// refused, and the helper's newest reason, as `chat status` and `delivery-alarm.json` report
+/// them.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RefusedReceiptReactions {
+    pub(crate) count: u64,
+    pub(crate) oldest_key: Option<String>,
+    pub(crate) last_detail: Option<String>,
+}
+
 /// What [`BridgeState::save_receipt_reactions`] did.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ReceiptSaves {
@@ -2156,6 +2204,8 @@ struct DeliveryAlarmDocument<'a> {
     alarm: &'a DeliveryAlarm,
     #[serde(skip_serializing_if = "Option::is_none")]
     receipt_reactions_lost: Option<&'a LostReceiptReactions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt_reactions_refused: Option<&'a RefusedReceiptReactions>,
 }
 
 /// A ✅ receipt reaction that a request earned and that is not on its message yet, saved as
@@ -4088,6 +4138,7 @@ impl BridgeState {
         if !path_is_absent(&receipt_reactions)? {
             agent::cleanup_atomic_json_temporaries(&receipt_reactions)?;
         }
+        self.finish_receipt_reaction_refusal_locked()?;
         let mut checkpoint = self.read_checkpoint()?;
         self.repair_boundary_commit_locked(&mut checkpoint)?;
         self.recover_admission_locked(&checkpoint)
@@ -5253,6 +5304,7 @@ impl BridgeState {
                 "stall_after_seconds": DELIVERY_STALL_AFTER.as_secs(),
                 "stalled": stalled,
                 "receipt_reactions_lost": self.lost_receipt_reactions_locked()?,
+                "receipt_reactions_refused": self.refused_receipt_reactions_locked()?,
             },
             "requests": requests,
             "reply_breaker": self.reply_breaker_status(),
@@ -5275,18 +5327,20 @@ impl BridgeState {
         Ok(entries)
     }
 
-    /// Replace `delivery-alarm.json` in the state directory with `alarm`, and `lost` once any ✅
-    /// receipt reaction was lost.
+    /// Replace `delivery-alarm.json` in the state directory with `alarm`, `lost` once any ✅
+    /// receipt reaction was lost, and `refused` once the outbound helper refused any.
     pub(crate) fn write_delivery_alarm(
         &self,
         alarm: &DeliveryAlarm,
         lost: &LostReceiptReactions,
+        refused: &RefusedReceiptReactions,
     ) -> Result<()> {
         write_document(
             &self.root.join(DELIVERY_ALARM_FILE),
             &DeliveryAlarmDocument {
                 alarm,
                 receipt_reactions_lost: (lost.count > 0).then_some(lost),
+                receipt_reactions_refused: (refused.count > 0).then_some(refused),
             },
         )
     }
@@ -5444,6 +5498,54 @@ impl BridgeState {
         Ok(Some(loss))
     }
 
+    /// Read `receipt-reactions-refused.json`, if the outbound helper has refused a ✅. The caller
+    /// holds the state lock.
+    fn read_receipt_reaction_refusal(&self) -> Result<Option<ReceiptReactionRefusal>> {
+        let path = self.root.join(RECEIPT_REACTION_REFUSAL_FILE);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(ChatRuntimeError::invalid(
+                    "the record of refused receipt reactions is not a regular file",
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(ChatRuntimeError::Io(error)),
+        }
+        let refusal: ReceiptReactionRefusal =
+            read_document(&path, MAX_RECEIPT_REACTION_REFUSAL_BYTES)?;
+        if refusal.schema != RECEIPT_REACTION_REFUSAL_SCHEMA
+            || refusal.refused == 0
+            || !valid_key(&refusal.oldest_refused_key)
+            || refusal.last_detail.len() > MAX_RECEIPT_REACTION_ERROR_BYTES
+            || refusal.finalizing.as_ref().is_some_and(|finalizing| {
+                !valid_key(&finalizing.key) || !valid_operation_uuid(&finalizing.request_id)
+            })
+        {
+            return Err(ChatRuntimeError::invalid(
+                "the record of refused receipt reactions is inconsistent",
+            ));
+        }
+        Ok(Some(refusal))
+    }
+
+    /// The ✅ receipt reactions the outbound helper refused.
+    pub(crate) fn refused_receipt_reactions(&self) -> Result<RefusedReceiptReactions> {
+        let _snapshot = self.lock_state_snapshot()?;
+        self.refused_receipt_reactions_locked()
+    }
+
+    fn refused_receipt_reactions_locked(&self) -> Result<RefusedReceiptReactions> {
+        Ok(self
+            .read_receipt_reaction_refusal()?
+            .map(|refusal| RefusedReceiptReactions {
+                count: refusal.refused,
+                oldest_key: Some(refusal.oldest_refused_key),
+                last_detail: Some(refusal.last_detail),
+            })
+            .unwrap_or_default())
+    }
+
     /// The ✅ receipt reactions this state lost because too many were waiting.
     pub(crate) fn lost_receipt_reactions(&self) -> Result<LostReceiptReactions> {
         let _snapshot = self.lock_state_snapshot()?;
@@ -5576,8 +5678,10 @@ impl BridgeState {
     /// Add the ✅ receipt reaction waiting under `key` to its message, then remove its file: see
     /// [`ReceiptReactionRecord`]. Every attempt passes `transport` the operation ID saved with
     /// the reaction, so a retry after a failure or a restart repeats one operation. A failure is
-    /// saved with the reaction, which stays waiting. Return `None` when no reaction waits under
-    /// `key`.
+    /// saved with the reaction, which stays waiting, except a refusal the helper reports as not
+    /// applied and not retryable: that one is final, so the reaction's file is removed and the
+    /// refusal is counted in [`ReceiptReactionRefusal`]. Return `None` when no reaction waits
+    /// under `key`.
     pub(crate) fn ensure_receipt_reaction(
         &self,
         key: &str,
@@ -5596,6 +5700,7 @@ impl BridgeState {
             let state_lock =
                 agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
             state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+            self.finish_receipt_reaction_refusal_locked()?;
             match self.read_receipt_reaction(key)? {
                 Some(record) => record,
                 None => return Ok(None),
@@ -5603,6 +5708,7 @@ impl BridgeState {
         };
         // A receipt whose reaction ID cannot be kept is a failed attempt like a transport error,
         // so it is saved with the reaction and counted as failing.
+        let mut refused = false;
         let outcome = match transport.ensure_reaction(ReactionSubmission {
             channel_id: &snapshot.channel_id,
             message_id: &snapshot.message_id,
@@ -5616,7 +5722,10 @@ impl BridgeState {
             )
             .map(|()| receipt)
             .map_err(|error| error.to_string()),
-            Err(error) => Err(error.to_string()),
+            Err(error) => {
+                refused = error.outcome == OutboundOutcome::NotApplied && !error.retryable;
+                Err(error.to_string())
+            }
         };
         let receipt = match outcome {
             Ok(receipt) => receipt,
@@ -5626,11 +5735,24 @@ impl BridgeState {
                 state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
                 if let Some(mut record) = self.read_receipt_reaction(key)? {
                     if record.request_id == snapshot.request_id {
-                        record.error =
-                            Some(bounded_detail(&detail, MAX_RECEIPT_REACTION_ERROR_BYTES));
-                        record.attempted_at_millis = Some(unix_millis());
-                        write_document(&path, &record)?;
+                        let detail = bounded_detail(&detail, MAX_RECEIPT_REACTION_ERROR_BYTES);
+                        if refused {
+                            self.finalize_receipt_reaction_refusal(
+                                key,
+                                &snapshot.request_id,
+                                &detail,
+                            )?;
+                        } else {
+                            record.error = Some(detail);
+                            record.attempted_at_millis = Some(unix_millis());
+                            write_document(&path, &record)?;
+                        }
                     }
+                }
+                if refused {
+                    return Err(ChatRuntimeError::invalid(format!(
+                        "outbound receipt reaction refused, so it is not tried again: {detail}"
+                    )));
                 }
                 return Err(ChatRuntimeError::invalid(format!(
                     "outbound receipt reaction failed: {detail}"
@@ -5650,25 +5772,98 @@ impl BridgeState {
         Ok(Some(receipt))
     }
 
+    /// Count a final refusal of the ✅ waiting under `key` with operation ID `request_id`, then
+    /// remove its file. The count and the removal are not one write, so the refusal is marked as
+    /// finalizing in between: see [`Self::finish_receipt_reaction_refusal_locked`]. The caller
+    /// holds the state lock.
+    fn finalize_receipt_reaction_refusal(
+        &self,
+        key: &str,
+        request_id: &str,
+        detail: &str,
+    ) -> Result<()> {
+        let now = unix_millis();
+        let finalizing = Some(RefusalInFlight {
+            key: key.to_owned(),
+            request_id: request_id.to_owned(),
+        });
+        let record = match self.read_receipt_reaction_refusal()? {
+            Some(mut refusal) => {
+                refusal.refused = refusal.refused.saturating_add(1);
+                refusal.newest_refused_at_millis = now;
+                refusal.last_detail = detail.to_owned();
+                refusal.finalizing = finalizing;
+                refusal
+            }
+            None => ReceiptReactionRefusal {
+                schema: RECEIPT_REACTION_REFUSAL_SCHEMA.to_owned(),
+                refused: 1,
+                oldest_refused_key: key.to_owned(),
+                newest_refused_at_millis: now,
+                last_detail: detail.to_owned(),
+                finalizing,
+            },
+        };
+        write_document(&self.root.join(RECEIPT_REACTION_REFUSAL_FILE), &record)?;
+        self.finish_receipt_reaction_refusal_locked()
+    }
+
+    /// Finish a refusal that was counted but whose reaction file may still be there: remove the
+    /// file if it still holds the refused operation ID, then clear the mark. Nothing is counted
+    /// and the helper is not asked again. The caller holds the state lock.
+    fn finish_receipt_reaction_refusal_locked(&self) -> Result<()> {
+        let Some(mut refusal) = self.read_receipt_reaction_refusal()? else {
+            return Ok(());
+        };
+        let Some(finalizing) = refusal.finalizing.take() else {
+            return Ok(());
+        };
+        if self
+            .read_receipt_reaction(&finalizing.key)?
+            .is_some_and(|record| record.request_id == finalizing.request_id)
+        {
+            fs::remove_file(
+                self.root
+                    .join(RECEIPT_REACTION_DIRECTORY)
+                    .join(format!("{}.json", finalizing.key)),
+            )?;
+            agent::sync_directory(&self.root.join(RECEIPT_REACTION_DIRECTORY))?;
+        }
+        write_document(&self.root.join(RECEIPT_REACTION_REFUSAL_FILE), &refusal)
+    }
+
     /// The `receipt_reactions` section of [`Self::status`]: the ✅ reactions waiting, and how many
     /// of them failed at their last attempt or cannot be read. The caller holds the state lock.
     fn receipt_reaction_status(&self) -> Result<Value> {
         let keys = self.receipt_reaction_keys()?;
+        // A reaction whose refusal was counted but whose file is not removed yet failed its last
+        // attempt too, though its record does not say so.
+        let finalizing = self
+            .read_receipt_reaction_refusal()?
+            .and_then(|refusal| refusal.finalizing);
         let mut failing = 0_u64;
         for key in &keys {
             match self.read_receipt_reaction(key) {
-                Ok(Some(record)) if record.error.is_none() => {}
+                Ok(Some(record))
+                    if record.error.is_none()
+                        && !finalizing.as_ref().is_some_and(|finalizing| {
+                            finalizing.key == *key && finalizing.request_id == record.request_id
+                        }) => {}
                 Ok(None) => {}
                 Ok(Some(_)) | Err(_) => failing += 1,
             }
         }
         let lost = self.lost_receipt_reactions_locked()?;
+        let refused = self.refused_receipt_reactions_locked()?;
         Ok(json!({
             "reaction": RECEIPT_REACTION,
             "waiting": keys.len(),
             "failing": failing,
             "lost": lost.count,
             "oldest_lost_key": lost.oldest_key,
+            "refused": refused.count,
+            "oldest_refused_key": refused.oldest_key,
+            "last_refusal": refused.last_detail,
         }))
     }
 
@@ -26226,7 +26421,10 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                 "waiting": 1,
                 "failing": 0,
                 "lost": 0,
-                "oldest_lost_key": null
+                "oldest_lost_key": null,
+                "refused": 0,
+                "oldest_refused_key": null,
+                "last_refusal": null
             })
         );
 
@@ -26254,7 +26452,10 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                 "waiting": 1,
                 "failing": 1,
                 "lost": 0,
-                "oldest_lost_key": null
+                "oldest_lost_key": null,
+                "refused": 0,
+                "oldest_refused_key": null,
+                "last_refusal": null
             })
         );
         drop(state);
@@ -26291,7 +26492,10 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                 "waiting": 0,
                 "failing": 0,
                 "lost": 0,
-                "oldest_lost_key": null
+                "oldest_lost_key": null,
+                "refused": 0,
+                "oldest_refused_key": null,
+                "last_refusal": null
             })
         );
         assert!(state
@@ -26909,6 +27113,261 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             ),
         );
         assert!(frames.printed(&prompt));
+    }
+
+    #[test]
+    fn a_receipt_reaction_the_helper_refuses_for_good_is_dropped_counted_and_not_tried_again() {
+        /// A helper that refuses every reaction as the deployment's does when it accepts only the
+        /// acknowledgement's own emoji, with `outcome` and `retryable`, counting its calls.
+        struct RefusingTransport {
+            outcome: OutboundOutcome,
+            retryable: bool,
+            calls: usize,
+        }
+        impl ReactionTransport for RefusingTransport {
+            fn ensure_reaction(
+                &mut self,
+                _submission: ReactionSubmission<'_>,
+            ) -> std::result::Result<ReactionReceipt, OutboundFailure> {
+                self.calls += 1;
+                Err(OutboundFailure {
+                    code: "owner_ack_policy_mismatch".to_owned(),
+                    detail: "owner ACK request does not match its configured space and emoji"
+                        .to_owned(),
+                    outcome: self.outcome,
+                    retryable: self.retryable,
+                })
+            }
+        }
+        let root = temporary("receipt-refused");
+        let state = BridgeState::initialize(&root, config()).expect("initialize");
+        let mut keys = Vec::new();
+        for index in 1..=3 {
+            let admission = state
+                .admit_batch(&indexed_delivery_at(
+                    index,
+                    index,
+                    &format!("cursor-{index}"),
+                    &format!("request {index}"),
+                ))
+                .expect("admit");
+            state.confirm_batch_commit(&admission).expect("confirm");
+            keys.push(admission.new_request_keys[0].clone());
+        }
+        let printed = keys
+            .iter()
+            .map(|key| format!("chat-{key}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            state
+                .save_receipt_reactions(&printed)
+                .expect("save")
+                .saved
+                .len(),
+            3
+        );
+        let path = |key: &str| {
+            root.join(RECEIPT_REACTION_DIRECTORY)
+                .join(format!("{key}.json"))
+        };
+        // A refusal that may still apply, or whose outcome is unknown, stays waiting.
+        for (key, outcome, retryable) in [
+            (&keys[0], OutboundOutcome::NotApplied, true),
+            (&keys[1], OutboundOutcome::Unknown, false),
+        ] {
+            let mut transport = RefusingTransport {
+                outcome,
+                retryable,
+                calls: 0,
+            };
+            let error = state
+                .ensure_receipt_reaction(key, &mut transport)
+                .expect_err("the helper refuses");
+            assert!(error
+                .to_string()
+                .contains("outbound receipt reaction failed"));
+            assert!(path(key).exists());
+        }
+        // A refusal that did not apply and cannot succeed is final.
+        let mut transport = RefusingTransport {
+            outcome: OutboundOutcome::NotApplied,
+            retryable: false,
+            calls: 0,
+        };
+        let error = state
+            .ensure_receipt_reaction(&keys[2], &mut transport)
+            .expect_err("the helper refuses for good");
+        assert!(error
+            .to_string()
+            .contains("refused, so it is not tried again"));
+        let gone = !path(&keys[2]).exists();
+        let again = state
+            .ensure_receipt_reaction(&keys[2], &mut transport)
+            .expect("nothing waits");
+        let status = state.status().expect("status")["receipt_reactions"].clone();
+        let refused = state.refused_receipt_reactions().expect("refused");
+        fs::remove_dir_all(root).expect("cleanup");
+        assert!(gone);
+        assert!(again.is_none());
+        assert_eq!(transport.calls, 1);
+        assert_eq!(status["waiting"], 2);
+        assert_eq!(status["failing"], 2);
+        assert_eq!(status["refused"], 1);
+        assert_eq!(status["oldest_refused_key"], keys[2].as_str());
+        assert!(status["last_refusal"]
+            .as_str()
+            .expect("reason")
+            .contains("owner_ack_policy_mismatch"));
+        assert_eq!(refused.count, 1);
+        assert_eq!(refused.oldest_key.as_deref(), Some(keys[2].as_str()));
+    }
+
+    /// A helper that refuses every ✅ for good with `detail`, counting its calls.
+    struct FinalRefusal {
+        detail: String,
+        calls: usize,
+    }
+
+    impl ReactionTransport for FinalRefusal {
+        fn ensure_reaction(
+            &mut self,
+            _submission: ReactionSubmission<'_>,
+        ) -> std::result::Result<ReactionReceipt, OutboundFailure> {
+            self.calls += 1;
+            Err(OutboundFailure {
+                code: "owner_ack_policy_mismatch".to_owned(),
+                detail: self.detail.clone(),
+                outcome: OutboundOutcome::NotApplied,
+                retryable: false,
+            })
+        }
+    }
+
+    /// A state holding `count` requests whose ✅ receipt reactions are saved, with their keys.
+    fn saved_receipt_reactions(name: &str, count: u64) -> (PathBuf, BridgeState, Vec<String>) {
+        let root = temporary(name);
+        let state = BridgeState::initialize(&root, config()).expect("initialize");
+        let mut keys = Vec::new();
+        for index in 1..=count {
+            let admission = state
+                .admit_batch(&indexed_delivery_at(
+                    index,
+                    index,
+                    &format!("cursor-{index}"),
+                    &format!("request {index}"),
+                ))
+                .expect("admit");
+            state.confirm_batch_commit(&admission).expect("confirm");
+            keys.push(admission.new_request_keys[0].clone());
+        }
+        let printed = keys
+            .iter()
+            .map(|key| format!("chat-{key}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            state
+                .save_receipt_reactions(&printed)
+                .expect("save")
+                .saved
+                .len(),
+            keys.len()
+        );
+        (root, state, keys)
+    }
+
+    #[test]
+    fn a_refusal_saved_with_the_longest_escaped_reason_can_still_be_read_and_counted() {
+        let (root, state, keys) = saved_receipt_reactions("receipt-refusal-escaped", 2);
+        // Control characters take six bytes each once saved.
+        let mut transport = FinalRefusal {
+            detail: "\u{1}".repeat(MAX_RECEIPT_REACTION_ERROR_BYTES),
+            calls: 0,
+        };
+        for key in &keys {
+            assert!(state.ensure_receipt_reaction(key, &mut transport).is_err());
+        }
+        let bytes = fs::metadata(root.join(RECEIPT_REACTION_REFUSAL_FILE))
+            .expect("refusal record")
+            .len();
+        let refused = state.refused_receipt_reactions().expect("refused");
+        let status = state.status().expect("status")["receipt_reactions"].clone();
+        fs::remove_dir_all(root).expect("cleanup");
+        assert!(bytes > 8 * 1_024, "the refusal record is {bytes} bytes");
+        assert!(bytes <= MAX_RECEIPT_REACTION_REFUSAL_BYTES as u64);
+        assert_eq!(transport.calls, 2);
+        assert_eq!(refused.count, 2);
+        assert_eq!(status["refused"], 2);
+        assert_eq!(status["waiting"], 0);
+    }
+
+    #[test]
+    fn a_refusal_interrupted_before_its_file_is_removed_is_finished_without_asking_again() {
+        let (root, state, keys) = saved_receipt_reactions("receipt-refusal-interrupted", 2);
+        // The state a refusal of the first leaves when the process ends after counting it and
+        // before removing its file.
+        let interrupted = |key: &str| {
+            let saved = saved_receipt_reaction(&root, key);
+            write_document(
+                &root.join(RECEIPT_REACTION_REFUSAL_FILE),
+                &ReceiptReactionRefusal {
+                    schema: RECEIPT_REACTION_REFUSAL_SCHEMA.to_owned(),
+                    refused: 1,
+                    oldest_refused_key: key.to_owned(),
+                    newest_refused_at_millis: 1,
+                    last_detail: "owner_ack_policy_mismatch".to_owned(),
+                    finalizing: Some(RefusalInFlight {
+                        key: key.to_owned(),
+                        request_id: saved.request_id,
+                    }),
+                },
+            )
+            .expect("write the interrupted refusal");
+        };
+        let path = |key: &str| {
+            root.join(RECEIPT_REACTION_DIRECTORY)
+                .join(format!("{key}.json"))
+        };
+        interrupted(&keys[0]);
+        drop(state);
+        // Until it is finished, a read-only look counts it as refused and as failing.
+        let marked = BridgeState::inspect(&root)
+            .expect("inspect")
+            .status()
+            .expect("status")["receipt_reactions"]
+            .clone();
+        // Startup finishes it.
+        let state = BridgeState::open(&root).expect("reopen");
+        let gone_at_startup = !path(&keys[0]).exists();
+        let mut transport = FinalRefusal {
+            detail: "owner_ack_policy_mismatch".to_owned(),
+            calls: 0,
+        };
+        let first_again = state
+            .ensure_receipt_reaction(&keys[0], &mut transport)
+            .expect("nothing waits");
+        let after_startup = state.refused_receipt_reactions().expect("refused");
+        // So does the next attempt at any reaction, without a restart.
+        interrupted(&keys[1]);
+        let second_again = state
+            .ensure_receipt_reaction(&keys[1], &mut transport)
+            .expect("nothing waits");
+        let after_attempt = state.refused_receipt_reactions().expect("refused");
+        let gone_after_attempt = !path(&keys[1]).exists();
+        let record: ReceiptReactionRefusal =
+            read_document(&root.join(RECEIPT_REACTION_REFUSAL_FILE), 64 * 1_024)
+                .expect("refusal record");
+        fs::remove_dir_all(root).expect("cleanup");
+        assert_eq!(marked["waiting"], 2);
+        assert_eq!(marked["failing"], 1);
+        assert_eq!(marked["refused"], 1);
+        assert!(gone_at_startup);
+        assert!(first_again.is_none());
+        assert_eq!(after_startup.count, 1);
+        assert!(second_again.is_none());
+        assert!(gone_after_attempt);
+        assert_eq!(after_attempt.count, 1);
+        assert_eq!(transport.calls, 0, "the helper is not asked again");
+        assert!(record.finalizing.is_none());
     }
 
     #[test]
