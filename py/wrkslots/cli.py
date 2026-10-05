@@ -16556,17 +16556,94 @@ def _processes_around_unit_enumeration(
     return (*after, *moved), units
 
 
+# The kernel's fixed inode numbers for its initial PID and cgroup namespaces
+# (PROC_PID_INIT_INO and PROC_CGROUP_INIT_INO in include/linux/proc_ns.h).
+# Every other namespace gets a dynamically allocated inode, so a match proves
+# that this process sees the host's PIDs and control-group paths.  Reading
+# /proc/1/ns/* to compare instead needs ptrace access to PID 1, which an
+# unprivileged caller does not have (EACCES on the measured host).
+_INITIAL_NAMESPACE_INODES = (("pid", 0xEFFFFFFC), ("cgroup", 0xEFFFFFFB))
+
+
+def _namespace_inode(name: str) -> int:
+    return os.stat(f"/proc/self/ns/{name}").st_ino
+
+
+def _proc_superblock_options() -> tuple[str, ...]:
+    """Return the superblock options of the procfs mounted at ``/proc``."""
+
+    try:
+        lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise Refusal(f"cannot read this process's mount table: {exc}") from exc
+    options: tuple[str, ...] | None = None
+    for line in lines:
+        fields = line.split(" ")
+        if len(fields) < 5 or fields[4] != "/proc" or " - " not in line:
+            continue
+        tail = line.split(" - ", 1)[1].split(" ")
+        if len(tail) >= 3 and tail[0] == "proc":
+            # A later mount at the same point hides an earlier one.
+            options = tuple(tail[2].split(","))
+    if options is None:
+        raise Refusal("no process filesystem is mounted at /proc")
+    return options
+
+
+def _assert_host_process_view() -> None:
+    """Refuse unless ``/proc`` and control-group paths show the whole host.
+
+    Matching machine and boot identities do not show that this process can
+    see a host run.  In a child PID namespace the run and its children are
+    absent from /proc; in a child cgroup namespace their control-group paths
+    are rewritten relative to another root; and procfs mounted with
+    ``hidepid`` hides processes.  Any of them makes an absent run look
+    ``dead``.
+    """
+
+    for name, initial in _INITIAL_NAMESPACE_INODES:
+        try:
+            inode = _namespace_inode(name)
+        except OSError as exc:
+            raise Refusal(f"cannot read this process's {name} namespace: {exc}") from exc
+        if inode != initial:
+            raise Refusal(
+                f"this process is not in the host's initial {name} namespace (inode "
+                f"{inode}), so its process table need not show the recorded runs"
+            )
+    try:
+        own = os.readlink("/proc/self")
+    except OSError as exc:
+        raise Refusal(f"cannot resolve /proc/self: {exc}") from exc
+    if own != str(os.getpid()):
+        raise Refusal(
+            "/proc is not the process filesystem of this process's PID namespace"
+        )
+    hidden = [
+        option
+        for option in _proc_superblock_options()
+        if option.startswith("hidepid=") and option not in {"hidepid=0", "hidepid=off"}
+    ]
+    if hidden:
+        raise Refusal(
+            f"/proc is mounted with {hidden[-1]}, so its process table need not show "
+            "the recorded runs"
+        )
+
+
 def _validation_run_host_evidence() -> tuple[
     tuple[_AbsentProcessObservation, ...], tuple[Mapping[str, str], ...]
 ]:
     """Read this host's live processes and user-systemd units, each strictly.
 
     This is the only host-wide evidence the validation-run authority reads;
-    the retained run handles are project files.  The process table is read on
-    both sides of the user-systemd enumeration; see
-    ``_processes_around_unit_enumeration``.
+    the retained run handles are project files.  It first proves that this
+    process's view of processes and control groups is the host's; see
+    ``_assert_host_process_view``.  The process table is read on both sides
+    of the user-systemd enumeration; see ``_processes_around_unit_enumeration``.
     """
 
+    _assert_host_process_view()
     return _processes_around_unit_enumeration(_absent_validate_process_snapshot())
 
 

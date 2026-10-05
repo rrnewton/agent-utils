@@ -979,3 +979,56 @@ def test_an_ownerless_row_is_judged_local_by_its_coordinator_lease(
     assert state_name == expected, message
     if expected == "unverifiable":
         assert "belongs to stable host foreign-host" in message
+
+
+@pytest.mark.parametrize(
+    ("view", "detail"),
+    [
+        ("pid", "not in the host's initial pid namespace"),
+        ("cgroup", "not in the host's initial cgroup namespace"),
+        ("hidepid", "/proc is mounted with hidepid=invisible"),
+    ],
+)
+def test_a_restricted_process_view_is_unverifiable_not_dead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, view: str, detail: str
+) -> None:
+    """A process table that need not show the host's runs is not evidence.
+
+    In a child PID namespace, or under ``hidepid``, a host run and its
+    children are missing from /proc; in a child cgroup namespace their
+    control-group paths are relative to another root.  The empty table and
+    the empty unit list here would otherwise judge the row ``dead``.
+    """
+
+    project, _tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    if view == "hidepid":
+        monkeypatch.setattr(
+            wrkslots,
+            "_proc_superblock_options",
+            lambda: ("rw", "hidepid=invisible"),
+            raising=False,
+        )
+    else:
+        monkeypatch.setattr(
+            wrkslots,
+            "_namespace_inode",
+            lambda name: (
+                4_026_532_999 if name == view else os.stat(f"/proc/self/ns/{name}").st_ino
+            ),
+            raising=False,
+        )
+    config = wrkslots._load_config(str(project), "testhost")
+
+    states = wrkslots._validation_run_liveness_states(
+        config, wrkslots._load_active(config).slots
+    )
+
+    state, message = states[("testhost", "slot01", 1)]
+    assert state == "unverifiable", message
+    assert detail in message
+
+
+def test_this_host_process_view_is_the_host_view() -> None:
+    """The suite runs on the host, so the real view passes the proof."""
+
+    wrkslots._assert_host_process_view()
