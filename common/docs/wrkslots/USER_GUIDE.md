@@ -380,6 +380,13 @@ validation slots. `audit`, `remove` (including `--validate-complete` and `remove
   evidence is local to the host, so a host without a reachable user service manager cannot prove a
   validation slot free.
 
+A unit names a row path when any of its property strings contains the path, in its recorded or
+symlink-resolved spelling, either as read or after removing repeated slashes and `.` and `x/..`
+steps, followed by `/`, the end of the string, or a character other than a letter, digit, `.`, `_`
+or `-`. A unit naming `slot01/product`, `slot01/./product` or `--checkout=slot01:` therefore names
+`slot01`, and one naming its sibling `slot010` does not. This rule is shared with
+`recover-absent-validate-rows`.
+
 Audit reports the number of validation rows it judged this way as the liveness phase's
 `validation_run_subjects`. A batch removal reads this evidence once while sealing and once more per
 slot immediately before deletion. A churning user-systemd snapshot refuses rather than guessing;

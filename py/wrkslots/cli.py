@@ -46713,6 +46713,77 @@ def _user_systemd_snapshot() -> tuple[Mapping[str, str], ...]:
     raise AssertionError("bounded user-systemd retry loop did not return or refuse")
 
 
+# Characters that can continue the last component of a path name.  A row path
+# followed by one of them is the beginning of a sibling's name (``slot010``
+# beside ``slot01``).  Followed by anything else -- ``/``, the end of the text,
+# ``:``, ``=``, whitespace or a quote -- it names the row path or a path inside
+# it.  Treating every other character as a boundary errs toward "names".
+_PATH_NAME_CONTINUATION = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+)
+_REPEATED_SLASHES = re.compile(r"/{2,}")
+_CURRENT_DIRECTORY_STEP = re.compile(r"/\.(?=/|$)")
+_PARENT_DIRECTORY_STEP = re.compile(r"/(?!\.\.(?:/|$))[^/]+/\.\.(?=/|$)")
+_PARENT_DIRECTORY_STEPS_LIMIT = 64
+
+
+def _row_path_spellings(path: Path) -> tuple[str, ...]:
+    """Return the lexical and the symlink-resolved spelling of one row path."""
+
+    lexical = os.path.normpath(str(path))
+    return tuple(dict.fromkeys((lexical, os.path.realpath(lexical))))
+
+
+@functools.lru_cache(maxsize=4096)
+def _lexical_path_evidence(value: str) -> str:
+    """Return one unit property value with its paths in every lexical spelling.
+
+    A unit can name a row through a different spelling of the same path:
+    ``/project/./worktrees/validate/slot01``, ``//`` or ``x/../``.  Each
+    newline-separated string of the value is kept as read, with repeated
+    slashes and ``.`` steps removed, and after each single ``seg/..`` step is
+    removed, leftmost first.  Every stage is kept rather than only the last:
+    a property string can hold several paths and other words, and a later
+    ``..`` may remove the tail of an earlier path that the previous stage
+    still shows whole.  Keeping more spellings can only add matches.
+
+    More than 64 ``..`` steps in one string is refused rather than compared,
+    which bounds the work a hostile unit can cause.
+    """
+
+    forms: list[str] = []
+    for element in value.split("\n"):
+        forms.append(element)
+        current = _CURRENT_DIRECTORY_STEP.sub("", _REPEATED_SLASHES.sub("/", element))
+        forms.append(current)
+        for _step in range(_PARENT_DIRECTORY_STEPS_LIMIT):
+            popped = _PARENT_DIRECTORY_STEP.sub("", current, count=1)
+            if popped == current:
+                break
+            forms.append(popped)
+            current = popped
+        else:
+            if _PARENT_DIRECTORY_STEP.search(current) is not None:
+                raise Refusal(
+                    "a user-systemd property string has more than "
+                    f"{_PARENT_DIRECTORY_STEPS_LIMIT} parent-directory steps, so its "
+                    "paths cannot be compared with validation rows"
+                )
+    return "\n".join(dict.fromkeys(forms))
+
+
+def _evidence_names_path(evidence: str, spelling: str) -> bool:
+    """Whether ``evidence`` names the path ``spelling`` or a path inside it."""
+
+    start = evidence.find(spelling)
+    while start >= 0:
+        end = start + len(spelling)
+        if end == len(evidence) or evidence[end] not in _PATH_NAME_CONTINUATION:
+            return True
+        start = evidence.find(spelling, start + 1)
+    return False
+
+
 def _assert_retained_handle_processes_dead(
     bindings: Mapping[str, tuple[_RetainedValidationHandle, ...]],
 ) -> None:
@@ -46773,19 +46844,21 @@ def _assert_absent_validate_systemd_unrelated(
                     f"retained validation unit {handle.unit} still has a live process "
                     f"for row {slot}"
                 )
+    targets = tuple(
+        (record, path, _row_path_spellings(path)) for record, paths in rows for path in paths
+    )
     for unit in snapshot:
         active = unit["ActiveState"] not in {"inactive", "failed"}
         queued = unit["PendingJob"] == "yes"
         if not active and not queued:
             continue
-        observed = "\n".join(unit.values())
-        for record, paths in rows:
-            for path in paths:
-                if str(path) in observed:
-                    raise Refusal(
-                        f"user-systemd unit {unit['Id']} names validation row "
-                        f"{record.slot} path {path}"
-                    )
+        observed = "\n".join(_lexical_path_evidence(value) for value in unit.values())
+        for record, path, spellings in targets:
+            if any(_evidence_names_path(observed, spelling) for spelling in spellings):
+                raise Refusal(
+                    f"user-systemd unit {unit['Id']} names validation row "
+                    f"{record.slot} path {path}"
+                )
 
 
 def _assert_absent_validate_owners_dead(records: Sequence[ActiveRecord]) -> None:

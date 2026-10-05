@@ -390,3 +390,107 @@ def test_completed_validation_removal_refuses_a_handle_with_a_duplicate_field(
     assert "validation-run authority is unverifiable for slot slot01" in error
     assert f"duplicate key {duplicated!r}" in error
     _assert_retained(project, tree)
+
+
+def _slot_directory(project: Path) -> Path:
+    config = wrkslots._load_config(str(project), "testhost")
+    return wrkslots._slot_directory(config, "slot01", "validate")
+
+
+@pytest.mark.parametrize(
+    ("property_name", "spelling"),
+    [
+        ("ExecStart", "{parent}/./{name}"),
+        ("ExecStart", "--checkout={parent}//{name}/product"),
+        ("WorkingDirectory", "{parent}/elsewhere/../{name}"),
+        ("Environment", "RUN_ROOT={parent}/./{name}/./product"),
+        ("RequiresMountsFor", "{parent}/{name}/"),
+    ],
+)
+def test_completed_validation_removal_refuses_a_queued_unit_naming_an_alias_of_the_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    property_name: str,
+    spelling: str,
+) -> None:
+    """A queued job names the row through a different spelling of its path.
+
+    The job has not started, so no process or handle shows it yet.  Its unit
+    evidence names the row's directory with ``/./``, ``//`` or ``x/..``
+    steps; each spelling is the same path, so the row may still be used.
+    """
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    slot_directory = _slot_directory(project)
+    alias = spelling.format(parent=slot_directory.parent, name=slot_directory.name)
+    queued = _unit(Id="queued-run.service", PendingJob="yes", **{property_name: alias})
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", lambda: (queued,))
+
+    removed = _remove_completed(project)
+
+    error = capsys.readouterr().err
+    assert removed != 0
+    assert "validation-run authority reports the run may still use slot slot01" in error
+    assert "user-systemd unit queued-run.service names validation row slot01" in error
+    _assert_retained(project, tree)
+
+
+@pytest.mark.parametrize("sibling", ["slot010", "slot01-old", "slot01.bak", "slot01_next"])
+def test_completed_validation_removal_ignores_an_active_unit_naming_a_sibling_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    sibling: str,
+) -> None:
+    """``slot010`` begins with the text ``slot01`` but is a different path."""
+
+    project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
+    other = _slot_directory(project).parent / sibling
+    running = _unit(
+        Id="sibling-run.service",
+        ActiveState="active",
+        SubState="running",
+        WorkingDirectory=str(other),
+        ExecStart=f"/usr/bin/env\n--checkout={other}/product",
+        Environment=f"RUN_ROOT={other}",
+    )
+    monkeypatch.setattr(wrkslots, "_user_systemd_snapshot", lambda: (running,))
+
+    removed = _remove_completed(project)
+
+    assert removed == 0, capsys.readouterr().err
+    assert not tree.exists()
+    assert active_slots(project) == []
+
+
+def test_unit_path_evidence_keeps_each_normalization_stage(tmp_path: Path) -> None:
+    """One property string can hold several paths and other words.
+
+    The ``x/..`` later in this shell command would remove the tail of the row
+    path if only the fully reduced text were compared; the stage after the
+    first ``..`` step still shows the row path whole.
+    """
+
+    row = "/project/worktrees/validate/slot01"
+    command = "cd /project/worktrees/tmp/../validate/slot01 && ls build/../out"
+    evidence = wrkslots._lexical_path_evidence(command)
+    assert wrkslots._evidence_names_path(evidence, row)
+    assert not wrkslots._evidence_names_path(
+        wrkslots._lexical_path_evidence("/project/worktrees/validate/slot010"), row
+    )
+    assert wrkslots._evidence_names_path(
+        wrkslots._lexical_path_evidence(f"PATH=/usr/bin:{row}:/bin"), row
+    )
+
+    steps = "/a/.." * (wrkslots._PARENT_DIRECTORY_STEPS_LIMIT + 1)
+    with pytest.raises(wrkslots.Refusal, match="parent-directory steps"):
+        wrkslots._lexical_path_evidence(f"{steps}{row}")
+
+    real = tmp_path / "real"
+    (real / "worktrees").mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    spellings = wrkslots._row_path_spellings(link / "worktrees" / "validate" / "slot01")
+    resolved = wrkslots._lexical_path_evidence(f"{real}/worktrees/validate/slot01")
+    assert any(wrkslots._evidence_names_path(resolved, spelling) for spelling in spellings)
