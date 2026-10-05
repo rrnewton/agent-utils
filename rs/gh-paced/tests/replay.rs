@@ -16,6 +16,7 @@ use gh_paced::config::{ClassLimits, Config};
 use gh_paced::pushback::Scanner;
 use gh_paced::runner::{Captured, Exit, Invocation, Ran, Runner};
 use gh_paced::state::{self, Holder, Paths};
+use gh_paced::timefmt::human;
 use gh_paced::wrapper::{Outcome, Wrapper, EXIT_CONTENT, EXIT_REFUSED};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,6 +33,7 @@ const OFFSETS: [f64; 44] = [
 
 /// 2026-10-04T15:04:12.356Z, the first call.
 const T0: f64 = 1_791_126_252.356;
+const HOUR: f64 = 3600.0;
 
 /// Simulated duration of one gh call (the originals took 0.5 to 1.3 s).
 const CALL_SECS: f64 = 0.6;
@@ -50,6 +52,9 @@ struct FakeGh<'a> {
     clock: &'a FakeClock,
     runs: Mutex<Vec<Call>>,
     captures: Mutex<Vec<f64>>,
+    /// When set, each refresh records the READ hourly window as saved on disk at that moment.
+    state_dir: Mutex<Option<PathBuf>>,
+    read_at_capture: Mutex<Vec<u64>>,
     core_remaining: Mutex<(u64, f64)>,
     stderr: Mutex<Vec<u8>>,
 }
@@ -60,6 +65,8 @@ impl<'a> FakeGh<'a> {
             clock,
             runs: Mutex::new(Vec::new()),
             captures: Mutex::new(Vec::new()),
+            state_dir: Mutex::new(None),
+            read_at_capture: Mutex::new(Vec::new()),
             core_remaining: Mutex::new((4500, T0 + 3600.0)),
             stderr: Mutex::new(Vec::new()),
         }
@@ -96,12 +103,19 @@ impl Runner for FakeGh<'_> {
         Ok(Ran {
             exit: Exit::Code(0),
             deadline_hit: false,
+            late_signal: None,
         })
     }
 
     fn capture(&self, inv: Invocation<'_>, _timeout: f64) -> Result<Captured, String> {
         assert_eq!(inv.args, ["api", "rate_limit"]);
         self.captures.lock().unwrap().push(self.clock.now());
+        if let Some(dir) = self.state_dir.lock().unwrap().as_deref() {
+            self.read_at_capture
+                .lock()
+                .unwrap()
+                .push(window_cost(dir, Class::Read));
+        }
         let (remaining, reset) = *self.core_remaining.lock().unwrap();
         let body = format!(
             r#"{{"resources":{{"core":{{"limit":5000,"used":{},"remaining":{remaining},"reset":{}}},
@@ -615,8 +629,8 @@ fn time_is_read_after_the_lock_is_taken() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A corrupt state file is moved aside and replaced by a conservative state: every hourly budget
-/// counts as used and a pause runs, so a host that lost its history cannot burst. The
+/// A corrupt state file is moved aside and replaced by a conservative state: every class is
+/// blocked for the next hour and a pause runs, so a host that lost its history cannot burst. The
 /// conservative state is saved (the next call does not start fresh), and it ends after an hour.
 #[test]
 fn corrupt_state_pauses_the_account_for_an_hour() {
@@ -637,9 +651,12 @@ fn corrupt_state_pauses_the_account_for_an_hour() {
         text.contains("treated as used up for the next hour"),
         "{text}"
     );
-    // The refusal names the longest wait: the full hourly window, not the shorter pause.
+    // The refusal names the longest wait: the hour-long recovery block, not the shorter pause.
+    let block_ends = human(T0 + HOUR, T0, cfg.display_tz);
     assert!(
-        text.contains("read budget 500/hour per host reached (500 used in the last hour)"),
+        text.contains(&format!(
+            "read budget blocked until {block_ends} after state recovery"
+        )),
         "{text}"
     );
     let aside = dir.join(format!("replay.json.corrupt-{}", T0.floor() as i64));
@@ -660,11 +677,9 @@ fn corrupt_state_pauses_the_account_for_an_hour() {
         Class::GitCredential,
     ] {
         let b = &st.buckets[class.name()];
-        assert_eq!(
-            b.window.iter().map(|(_, c)| u64::from(*c)).sum::<u64>(),
-            u64::from(cfg.limits(class).per_hour),
-            "{class:?} window saturated"
-        );
+        let until = b.blocked_until.expect("a recovery block on disk");
+        assert!((until - (T0 + HOUR)).abs() < 1e-6, "{class:?} {b:?}");
+        assert_eq!(b.level, 0.0, "{class:?} starts with no tokens");
     }
     // The recovery state was saved: the next call is refused without a second recovery.
     let (outcome, messages) = gh(
@@ -678,23 +693,84 @@ fn corrupt_state_pauses_the_account_for_an_hour() {
     let text = messages.join("\n");
     assert!(!text.contains("is unusable"), "{text}");
     assert!(
-        text.contains("write budget 30/hour per host reached (30 used in the last hour)"),
+        text.contains(&format!(
+            "write budget blocked until {block_ends} after state recovery"
+        )),
         "{text}"
     );
-    // After the pause, the hourly windows are still full.
+    // After the pause, the block still holds.
     clock.advance_to(T0 + 901.0);
     let (outcome, messages) = gh(&clock, &fake, &dir, &cfg, &get_args(1));
     assert_eq!(outcome, Outcome::Exit(EXIT_REFUSED), "{messages:?}");
     assert!(
-        messages
-            .join("\n")
-            .contains("read budget 500/hour per host reached (500 used in the last hour)"),
+        messages.join("\n").contains(&format!(
+            "read budget blocked until {block_ends} after state recovery"
+        )),
         "{messages:?}"
     );
     assert!(fake.runs().is_empty() && fake.captures.lock().unwrap().is_empty());
     // An hour later calls run again.
     clock.advance_to(T0 + 3601.0);
     let (outcome, messages) = gh(&clock, &fake, &dir, &cfg, &get_args(2));
+    assert_eq!(outcome, Outcome::Exit(0), "{messages:?}");
+    assert_eq!(fake.runs().len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The recovery block does not depend on the limits in force when it was written. A host that
+/// recovers under a tight write limit and is then given a far larger one stays blocked until the
+/// hour is up: the lost history may have held a full hour of calls under either limit.
+#[test]
+fn recovery_block_survives_raised_limits() {
+    let dir = scratch("raised");
+    let clock = FakeClock::new(T0);
+    let fake = FakeGh::new(&clock);
+    let tight = Config {
+        max_wait_secs: 60.0,
+        write: ClassLimits {
+            per_hour: 1,
+            ..Config::default().write
+        },
+        ..Config::default()
+    };
+    std::fs::write(dir.join("replay.json"), b"not json").unwrap();
+    let comment = strings(&["pr", "comment", "1", "--body", "hi"]);
+    let (outcome, messages) = gh(&clock, &fake, &dir, &tight, &comment);
+    assert_eq!(outcome, Outcome::Exit(EXIT_REFUSED), "{messages:?}");
+    assert!(messages.join("\n").contains("is unusable"), "{messages:?}");
+    let raised = Config {
+        max_wait_secs: 60.0,
+        write: ClassLimits {
+            per_hour: 5000,
+            ..Config::default().write
+        },
+        read: ClassLimits {
+            per_hour: 5000,
+            ..Config::default().read
+        },
+        ..Config::default()
+    };
+    let block_ends = human(T0 + HOUR, T0 + 901.0, raised.display_tz);
+    for at in [901.0, 1800.0, 3500.0] {
+        clock.advance_to(T0 + at);
+        let (outcome, messages) = gh(&clock, &fake, &dir, &raised, &comment);
+        assert_eq!(
+            outcome,
+            Outcome::Exit(EXIT_REFUSED),
+            "at +{at}: {messages:?}"
+        );
+        let text = messages.join("\n");
+        assert!(
+            text.contains("write budget blocked until") && text.contains("after state recovery"),
+            "at +{at}: {text}"
+        );
+        if at == 901.0 {
+            assert!(text.contains(&block_ends), "{text}");
+        }
+    }
+    assert!(fake.runs().is_empty() && fake.captures.lock().unwrap().is_empty());
+    clock.advance_to(T0 + HOUR + 1.0);
+    let (outcome, messages) = gh(&clock, &fake, &dir, &raised, &comment);
     assert_eq!(outcome, Outcome::Exit(0), "{messages:?}");
     assert_eq!(fake.runs().len(), 1);
     let _ = std::fs::remove_dir_all(&dir);
@@ -736,8 +812,9 @@ fn feedback_is_rechecked_after_a_sleep() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A rate-limit refresh is itself a READ request: it is charged before it is sent, and it is
-/// skipped when the READ budget has no room, so refreshes cannot push READ past its cap.
+/// A rate-limit refresh is itself a READ request: it is charged before it is sent, and when the
+/// READ budget has no room the call waits for it rather than sending an unpaid refresh, so
+/// refreshes cannot push READ past its cap.
 #[test]
 fn refresh_requests_are_charged_before_they_are_sent() {
     let dir = scratch("refresh-charge");
@@ -752,12 +829,19 @@ fn refresh_requests_are_charged_before_they_are_sent() {
         max_wait_secs: 60.0,
         ..Config::default()
     };
+    *fake.state_dir.lock().unwrap() = Some(dir.clone());
     // The first call's refresh and three calls fill the hourly cap of 4.
     for i in 0..3 {
         let (outcome, messages) = gh(&clock, &fake, &dir, &cfg, &get_args(i));
         assert_eq!(outcome, Outcome::Exit(0), "{i}: {messages:?}");
     }
     assert_eq!(window_cost(&dir, Class::Read), 4);
+    // The refresh's token was already saved in the state file when the request was sent.
+    assert_eq!(
+        *fake.read_at_capture.lock().unwrap(),
+        [1],
+        "charged before it was sent"
+    );
     // Later the snapshot is due for a refresh by age, but there is no READ token for it.
     clock.advance_to(T0 + 400.0);
     let (outcome, messages) = gh(&clock, &fake, &dir, &cfg, &get_args(3));
@@ -769,6 +853,91 @@ fn refresh_requests_are_charged_before_they_are_sent() {
         "READ stayed within its cap"
     );
     assert_eq!(fake.runs().len(), 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// After a pushback the snapshot is discarded. If READ has no token left for the refresh when
+/// the pause ends, WRITE and SEARCH calls wait for one (or are refused past
+/// `GH_PACED_MAX_WAIT`) instead of running without current account feedback.
+#[test]
+fn exhausted_read_budget_does_not_skip_overdue_feedback() {
+    let dir = scratch("refresh-wait");
+    let clock = FakeClock::new(T0);
+    let fake = FakeGh::new(&clock);
+    let read = ClassLimits {
+        per_minute: 60.0,
+        burst: 10.0,
+        per_hour: 4,
+    };
+    let cfg = Config {
+        read,
+        max_wait_secs: 60.0,
+        ..Config::default()
+    };
+    // The first call's refresh and three calls fill the hourly READ cap of 4.
+    for i in 0..3 {
+        let (outcome, messages) = gh(&clock, &fake, &dir, &cfg, &get_args(i));
+        assert_eq!(outcome, Outcome::Exit(0), "{i}: {messages:?}");
+    }
+    assert_eq!(window_cost(&dir, Class::Read), 4);
+    // A write is pushed back: a 15-minute pause, and the snapshot is discarded.
+    *fake.stderr.lock().unwrap() =
+        b"gh: You have exceeded a secondary rate limit. (HTTP 403)\n".to_vec();
+    let comment = strings(&["pr", "comment", "1", "--body", "hi"]);
+    let (outcome, messages) = gh(&clock, &fake, &dir, &cfg, &comment);
+    assert_eq!(outcome, Outcome::Exit(0), "{messages:?}");
+    fake.stderr.lock().unwrap().clear();
+    let paths = Paths::new(dir.clone(), "replay");
+    let st = state::load_readonly(&paths).unwrap();
+    assert!(st.rate_limit.is_none(), "the snapshot was discarded");
+    let pause_ends = st.cooldown.as_ref().expect("a pause").until;
+    assert_eq!(fake.runs().len(), 4);
+    assert_eq!(fake.captures.lock().unwrap().len(), 1);
+    // The pause is over, but READ still has no token for the refresh.
+    clock.advance_to(pause_ends + 1.0);
+    let search = strings(&["search", "issues", "flaky"]);
+    for args in [&comment, &search] {
+        let (outcome, messages) = gh(&clock, &fake, &dir, &cfg, args);
+        assert_eq!(
+            outcome,
+            Outcome::Exit(EXIT_REFUSED),
+            "{args:?}: {messages:?}"
+        );
+        let text = messages.join("\n");
+        assert!(
+            text.contains(
+                "the account-wide rate-limit snapshot is due and the read budget has no token"
+            ),
+            "{args:?}: {text}"
+        );
+    }
+    assert_eq!(fake.runs().len(), 4, "nothing ran without feedback");
+    assert_eq!(fake.captures.lock().unwrap().len(), 1, "no unpaid refresh");
+    assert_eq!(
+        window_cost(&dir, Class::Read),
+        4,
+        "READ stayed within its cap"
+    );
+    // With room to wait, the write sleeps until READ has a token, refreshes, then runs.
+    let patient = Config {
+        max_wait_secs: 7200.0,
+        ..cfg.clone()
+    };
+    let (outcome, messages) = gh(&clock, &fake, &dir, &patient, &comment);
+    assert_eq!(outcome, Outcome::Exit(0), "{messages:?}");
+    let captures = fake.captures.lock().unwrap().clone();
+    assert_eq!(captures.len(), 2, "{messages:?}");
+    assert!(
+        captures[1] >= T0 + HOUR,
+        "the refresh waited for READ room: {captures:?}"
+    );
+    let runs = fake.runs();
+    assert_eq!(runs.len(), 5);
+    assert!(runs[4].at > captures[1], "the write ran after the refresh");
+    assert!(
+        window_cost(&dir, Class::Read) <= 4,
+        "READ stayed within its cap"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

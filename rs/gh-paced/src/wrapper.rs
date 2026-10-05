@@ -79,10 +79,12 @@ pub struct Wrapper<'a> {
     /// Liveness test for in-flight holders and refresh claims (production:
     /// `state::holder_alive_in`, the lease lock when there is one).
     pub alive: &'a dyn Fn(&Holder) -> bool,
-    /// Device and inode of every regular file this process inherited open
-    /// (`state::inherited_file_ids`). An in-flight WRITE is treated as this invocation's own
-    /// ancestor, and not waited for, only when its nonce is in [`Wrapper::chain`] AND its lease
-    /// file is in this list, which only a descendant of that WRITE's gh can arrange.
+    /// Device and inode of every regular file this process holds through a descriptor that
+    /// itself holds an exclusive `flock` (`state::inherited_locked_file_ids`). An in-flight WRITE
+    /// is treated as this invocation's own ancestor, and not waited for, only when its nonce is
+    /// in [`Wrapper::chain`] AND its lease file is in this list. Only a holder of that WRITE's
+    /// own locked open file (its gh, or a process gh started) qualifies; opening the lease file
+    /// again does not.
     pub inherited_leases: Vec<(u64, u64)>,
     /// This process's ID.
     pub pid: u32,
@@ -100,6 +102,7 @@ enum WaitKind {
     Refresh,
     Bucket,
     Hour,
+    RefreshBudget,
 }
 
 impl WaitKind {
@@ -117,6 +120,9 @@ enum RefreshStep {
     Run,
     /// There is no snapshot and another live process is fetching one: wait for it.
     WaitForOther,
+    /// A refresh is due but the READ budget has no token for it yet: wait this long (subject
+    /// to `GH_PACED_MAX_WAIT`) rather than run without current account feedback.
+    WaitForRead(f64),
 }
 
 /// A call that passed admission.
@@ -125,15 +131,14 @@ struct Admitted {
     lease: Option<Lease>,
 }
 
-/// State used in place of an unusable state file: every class's hourly window counted as full
-/// (the lost history may have held a full hour of calls) and a pause of `cooldown_secs`.
+/// State used in place of an unusable state file: every class blocked for the next hour
+/// whatever its limits are by then (the lost history may have held a full hour of calls) and a
+/// pause of `cooldown_secs`.
 pub fn recovery_state(cfg: &Config, now: f64) -> State {
     let mut st = State::new();
     for class in Class::PACED {
-        st.buckets.insert(
-            class.name().to_string(),
-            Bucket::saturated(cfg.limits(class), now),
-        );
+        st.buckets
+            .insert(class.name().to_string(), Bucket::saturated(now));
     }
     st.cooldown = Some(Cooldown {
         until: now + cfg.cooldown_secs,
@@ -283,21 +288,23 @@ impl Wrapper<'_> {
     pub fn run(&mut self, args: &[String]) -> Outcome {
         let c0 = classify(args, &self.cfg);
         if c0.class == Class::Local {
-            return self.spawn(args, None, &c0, None).0;
+            return self.spawn(args, None, &c0, Vec::new()).0;
         }
         let split = c0.rest_start.min(args.len());
         let mut shown: Vec<String> = args[..split].to_vec();
         shown.extend(guard::redact(&c0, &args[split..]));
         let summary = audit::summarize(&shown);
+        // Remove snapshot directories whose invocation has ended (see `snapshot::sweep`).
+        snapshot::sweep(&self.paths.dir);
         // Copy every file the command sends, and inspect and send only the copies.
-        let (_snapshot, args) = match self.take_snapshot(&c0, args, split, &summary) {
+        let (snapshot, args) = match self.take_snapshot(&c0, args, split, &summary) {
             Ok(x) => x,
             Err(code) => return Outcome::Exit(code),
         };
         let args = args.as_slice();
         let c = classify(args, &self.cfg);
         if c.class == Class::Local {
-            return self.spawn(args, None, &c, None).0;
+            return self.spawn(args, None, &c, Vec::new()).0;
         }
         let rest = &args[c.rest_start.min(args.len())..];
         for w in c.warnings.clone() {
@@ -327,8 +334,14 @@ impl Wrapper<'_> {
             Ok(a) => a,
             Err(code) => return Outcome::Exit(code),
         };
-        let keep_fd = admitted.lease.as_ref().map(Lease::fd);
-        let (outcome, scanner, ran) = self.spawn(args, stdin, &c, keep_fd);
+        let keep_fds: Vec<RawFd> = admitted
+            .lease
+            .as_ref()
+            .map(Lease::fd)
+            .into_iter()
+            .chain(snapshot.lock_fd())
+            .collect();
+        let (outcome, scanner, ran) = self.spawn(args, stdin, &c, keep_fds);
         if let Err(e) = self.finish(&c, &summary, ran, &scanner, admitted) {
             self.loud("ERROR", &format!("bookkeeping after gh exited failed: {e}"));
         }
@@ -352,10 +365,8 @@ impl Wrapper<'_> {
         if files.is_empty() {
             return Ok((snapshot::Snapshot::default(), args.to_vec()));
         }
-        let taken = state::ensure_dir(&self.paths.dir).and_then(|()| {
-            snapshot::sweep(&self.paths.dir);
-            snapshot::take(&self.paths.dir, &self.nonce, &files, rest0)
-        });
+        let taken = state::ensure_dir(&self.paths.dir)
+            .and_then(|()| snapshot::take(&self.paths.dir, &self.nonce, &files, rest0));
         match taken {
             Ok((snap, new_rest)) => {
                 let mut out = args[..split].to_vec();
@@ -381,7 +392,7 @@ impl Wrapper<'_> {
         args: &[String],
         stdin: Option<Vec<u8>>,
         c: &Classification,
-        keep_fd: Option<RawFd>,
+        keep_fds: Vec<RawFd>,
     ) -> (Outcome, Scanner, Option<Ran>) {
         let mut scanner = Scanner::new();
         let local = c.class == Class::Local;
@@ -393,14 +404,24 @@ impl Wrapper<'_> {
             stdin,
             env,
             deadline_secs: if local { None } else { c.deadline_secs },
-            keep_fd,
+            keep_fds,
             scan_stdout: !local && c.api.as_ref().is_some_and(|a| a.include),
         };
         match self.runner.run(inv, &mut scanner) {
             Ok(ran) => {
-                let outcome = match ran.exit {
-                    Exit::Code(n) => Outcome::Exit(n),
-                    Exit::Signal(s) => Outcome::Signal(s),
+                let outcome = match (ran.exit, ran.late_signal) {
+                    (Exit::Signal(s), _) => Outcome::Signal(s),
+                    (Exit::Code(n), Some(sig)) => {
+                        self.loud(
+                            "WARNING",
+                            &format!(
+                                "gh exited {n}; signal {sig} arrived while its output was still \
+                                 being delivered, so the rest of that output was dropped"
+                            ),
+                        );
+                        Outcome::Signal(sig)
+                    }
+                    (Exit::Code(n), None) => Outcome::Exit(n),
                 };
                 (outcome, scanner, Some(ran))
             }
@@ -484,8 +505,11 @@ impl Wrapper<'_> {
     /// Decide, under the lock, whether this pass refreshes the account-wide snapshot. A refresh
     /// is due when the snapshot is missing, older than `rate_limit_refresh_secs`, or
     /// `rate_limit_refresh_calls` paced calls old; it is never attempted during a cooldown, more
-    /// often than `rate_limit_min_refresh_secs`, while another live process holds the claim, or
-    /// when the READ budget has no token for it. Claiming charges that READ token at once.
+    /// often than `rate_limit_min_refresh_secs`, or while another live process holds the claim.
+    /// When the READ budget has no token for it, the call waits for one (subject to
+    /// `GH_PACED_MAX_WAIT`) instead of running without the feedback: after a pushback the
+    /// snapshot is discarded, and WRITE or SEARCH calls must not resume unchecked just because
+    /// READ is busy. Claiming charges that READ token at once.
     fn refresh_step(&mut self, c: &Classification, st: &mut State, now: f64) -> RefreshStep {
         if !paced_api(c.class) || c.api.as_ref().is_some_and(|a| a.endpoint == "rate_limit") {
             return RefreshStep::Skip;
@@ -523,8 +547,11 @@ impl Wrapper<'_> {
             .entry(Class::Read.name().to_string())
             .or_insert_with(|| Bucket::full(base, now));
         bucket.refresh(limits, now);
-        if bucket.bucket_wait(limits, 1) > 0.0 || bucket.hour_wait(limits, 1, now) > 0.0 {
-            return RefreshStep::Skip;
+        let wait = bucket
+            .bucket_wait(limits, 1)
+            .max(bucket.hour_wait(limits, 1, now));
+        if wait > 0.0 {
+            return RefreshStep::WaitForRead(wait);
         }
         bucket.charge(1, now);
         st.refresh_claim = Some(self.holder(Class::Read, now, None));
@@ -543,7 +570,7 @@ impl Wrapper<'_> {
                 stdin: None,
                 env: self.child_env(),
                 deadline_secs: None,
-                keep_fd: None,
+                keep_fds: Vec::new(),
                 scan_stdout: false,
             },
             self.cfg.rate_limit_timeout_secs,
@@ -645,6 +672,16 @@ impl Wrapper<'_> {
             }
         };
         st.rate_limit = None;
+        if extended {
+            if let Some(cd) = &st.cooldown {
+                if let Err(e) = state::save_cooldown(&self.paths, cd) {
+                    self.loud(
+                        "WARNING",
+                        &format!("cooldown record not written (the state file still has it): {e}"),
+                    );
+                }
+            }
+        }
         let effective = st.cooldown.as_ref().map(|c| c.until).unwrap_or(until);
         self.banner(
             "PUSHBACK",
@@ -695,6 +732,14 @@ impl Wrapper<'_> {
                     kind: WaitKind::Refresh,
                     text: "another gh-paced process is fetching the account-wide rate-limit \
                            snapshot and there is none yet"
+                        .to_string(),
+                }),
+                RefreshStep::WaitForRead(secs) => waits.push(Wait {
+                    secs,
+                    kind: WaitKind::RefreshBudget,
+                    text: "the account-wide rate-limit snapshot is due and the read budget has \
+                           no token for the request that fetches it; calls do not run without \
+                           current account feedback"
                         .to_string(),
                 }),
                 RefreshStep::Skip => {}
@@ -799,15 +844,26 @@ impl Wrapper<'_> {
             }
             let hw = bucket.hour_wait(limits, c.cost, now);
             if hw > 0.0 {
-                waits.push(Wait {
-                    secs: hw,
-                    kind: WaitKind::Hour,
-                    text: format!(
+                let blocked = bucket.blocked_wait(now);
+                let text = if hw.is_finite() && blocked > 0.0 && blocked + 1e-6 >= hw {
+                    format!(
+                        "{} budget blocked until {} after state recovery (the lost history may \
+                         have held a full hour of calls)",
+                        class.name(),
+                        self.when(now + blocked)
+                    )
+                } else {
+                    format!(
                         "{} budget {}/hour per host reached ({} used in the last hour)",
                         class.name(),
                         limits.per_hour,
                         bucket.hour_used()
-                    ),
+                    )
+                };
+                waits.push(Wait {
+                    secs: hw,
+                    kind: WaitKind::Hour,
+                    text,
                 });
             }
             let worst = waits
@@ -948,9 +1004,30 @@ impl Wrapper<'_> {
     ) -> Result<(), String> {
         let (_guard, mut st, now) = self.open_state()?;
         let nonce = self.nonce.clone();
-        st.in_flight.retain(|h| h.nonce != nonce);
+        // Close this process's copy of the lease first, then ask whether anyone else still holds
+        // it. gh has exited, but a process it started (a backgrounded helper, an alias's shell)
+        // may still hold the inherited descriptor and still be writing: its slot stays taken,
+        // with the holder entry and lease file kept, until it lets go and a later call reaps it.
+        let mut retained = false;
         if let Some(lease) = admitted.lease {
-            state::remove_lease(&self.paths, &lease.name);
+            let name = lease.name.clone();
+            drop(lease);
+            if state::lease_held(&self.paths.dir, &name) {
+                retained = true;
+                self.loud(
+                    "WARNING",
+                    &format!(
+                        "gh exited but a process it started still holds this write's slot \
+                         (lease {name} is locked); other writes on this host wait until that \
+                         process exits"
+                    ),
+                );
+            } else {
+                state::remove_lease(&self.paths, &name);
+            }
+        }
+        if !retained {
+            st.in_flight.retain(|h| h.nonce != nonce);
         }
         if let Some(pb) = scanner.verdict(&self.cfg) {
             self.apply_pushback(&mut st, &pb, &c.command, now);

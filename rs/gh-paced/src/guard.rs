@@ -440,9 +440,15 @@ pub fn file_sources(c: &Classification, rest: &[String]) -> Vec<BodySource> {
 /// Replace inline body text in `rest` with `<N bytes>` markers, `gh api` header values with
 /// `<redacted>`, and a `gh api` endpoint with its normalised form (no host, userinfo, query or
 /// fragment), for audit records and messages. File paths are kept. For an alias, extension or
-/// unknown command, every argument that is not a flag name becomes `<arg>`.
+/// unknown command, and for a `gh api` call with a flag the parser does not know, every argument
+/// that is not a flag name becomes `<arg>`: the unknown flag may take a value, and that value
+/// may be a credential. On other commands, the value of an unknown `--flag=value` (other than a
+/// boolean literal), the argument after an unknown bare flag, and a long run of unknown
+/// shorthand letters (`-tTOKEN`) are dropped too.
 pub fn redact(c: &Classification, rest: &[String]) -> Vec<String> {
-    if crate::classify::is_unknown_command(c) {
+    if crate::classify::is_unknown_command(c)
+        || (c.family == "api" && crate::classify::parse_api(rest).unknown.is_some())
+    {
         return redact_unknown(rest);
     }
     let mut out: Vec<String> = rest.to_vec();
@@ -493,66 +499,99 @@ struct Scan {
     sources: Vec<BodySource>,
     /// Audit replacements by argument index.
     redactions: Redactions,
-    /// Canonical names of every flag present: long names, and `-x` for short flags that are not
-    /// body flags.
-    flags: Vec<String>,
+    /// Every flag occurrence, in order: the canonical long name (or `-x` for a short flag that is
+    /// not a body flag) and its value as a boolean. A flag that takes a value records
+    /// `Some(true)` (present). A boolean records what gh would parse: `--web` and `-w` are
+    /// `Some(true)`, `--web=false` and `-w=0` are `Some(false)`, and a value gh cannot parse as a
+    /// boolean is `None` (gh exits with an error).
+    flags: Vec<(String, Option<bool>)>,
     /// Positional arguments.
     positionals: usize,
+}
+
+/// Go's `strconv.ParseBool`, which pflag uses for `--flag=value` on a boolean flag.
+fn parse_go_bool(v: &str) -> Option<bool> {
+    match v {
+        "1" | "t" | "T" | "TRUE" | "true" | "True" => Some(true),
+        "0" | "f" | "F" | "FALSE" | "false" | "False" => Some(false),
+        _ => None,
+    }
+}
+
+/// An argument of an alias, an extension or another write without a dedicated table, counted
+/// as inline text: gh may hand any of them, flag-shaped or not, to a body flag.
+fn generic_text(t: &str) -> BodySource {
+    BodySource {
+        flag: "<arg>".into(),
+        kind: SourceKind::Inline(t.to_string()),
+        json: false,
+        location: None,
+        key: None,
+    }
 }
 
 fn scan(c: &Classification, rest: &[String], stdin_is_tty: bool) -> Scan {
     let table = table_for(c);
     let is_api = std::ptr::eq(table, &API);
+    let generic = std::ptr::eq(table, &GENERIC);
     let mut out = Vec::new();
     let mut red: Redactions = Vec::new();
-    let mut flags: Vec<String> = Vec::new();
+    let mut flags: Vec<(String, Option<bool>)> = Vec::new();
     let mut positionals = 0usize;
-    let mut positional = |out: &mut Vec<BodySource>, red: &mut Redactions, idx: usize| {
-        let t = rest[idx].as_str();
-        if is_api {
-            // The first positional is the endpoint; gh api takes no other.
-            if positionals == 0 {
-                red.push((idx, normalize_endpoint(t)));
-            } else {
+    // Set after a boolean or unrecognised flag written without `=value`: if gh does not know
+    // that flag, the next argument may be its value, so the audit record drops it.
+    let mut after_unknown = false;
+    let mut positional =
+        |out: &mut Vec<BodySource>, red: &mut Redactions, idx: usize, after_unknown: bool| {
+            let t = rest[idx].as_str();
+            if after_unknown && !is_api {
                 red.push((idx, "<arg>".to_string()));
             }
-        } else if table.positional_files {
-            if t == "-" {
+            if is_api {
+                // The first positional is the endpoint; gh api takes no other.
+                if positionals == 0 {
+                    red.push((idx, normalize_endpoint(t)));
+                } else {
+                    red.push((idx, "<arg>".to_string()));
+                }
+            } else if table.positional_files {
+                if t == "-" {
+                    out.push(BodySource {
+                        flag: "<stdin>".into(),
+                        kind: SourceKind::Stdin,
+                        json: false,
+                        location: None,
+                        key: None,
+                    });
+                } else {
+                    out.push(BodySource {
+                        flag: "<file>".into(),
+                        kind: SourceKind::File(t.to_string()),
+                        json: false,
+                        location: location(rest, idx, t),
+                        key: None,
+                    });
+                }
+            } else if table.positional_text {
                 out.push(BodySource {
-                    flag: "<stdin>".into(),
-                    kind: SourceKind::Stdin,
+                    flag: "<arg>".into(),
+                    kind: SourceKind::Inline(t.to_string()),
                     json: false,
                     location: None,
                     key: None,
                 });
-            } else {
-                out.push(BodySource {
-                    flag: "<file>".into(),
-                    kind: SourceKind::File(t.to_string()),
-                    json: false,
-                    location: location(rest, idx, t),
-                    key: None,
-                });
             }
-        } else if table.positional_text {
-            out.push(BodySource {
-                flag: "<arg>".into(),
-                kind: SourceKind::Inline(t.to_string()),
-                json: false,
-                location: None,
-                key: None,
-            });
-        }
-        positionals += 1;
-    };
+            positionals += 1;
+        };
     let mut i = 0;
     while i < rest.len() {
         let at = i;
         let t = rest[i].as_str();
         i += 1;
+        let unknown_before = std::mem::take(&mut after_unknown);
         if t == "--" {
             for idx in i..rest.len() {
-                positional(&mut out, &mut red, idx);
+                positional(&mut out, &mut red, idx, false);
             }
             break;
         }
@@ -561,14 +600,16 @@ fn scan(c: &Classification, rest: &[String], stdin_is_tty: bool) -> Scan {
                 Some((n, v)) => (n, Some(v)),
                 None => (long, None),
             };
-            flags.push(name.to_string());
             if let Some((_, kind)) = table.long.iter().find(|(n, _)| *n == name) {
                 if *kind == Kind::JsonStdin {
-                    if inline.is_none_or(|v| v != "false") {
+                    let value = inline.map_or(Some(true), parse_go_bool);
+                    flags.push((name.to_string(), value));
+                    if value != Some(false) {
                         push_source(&mut out, rest, name, *kind, "", at);
                     }
                     continue;
                 }
+                flags.push((name.to_string(), Some(true)));
                 let (value, index) = match inline {
                     Some(v) => {
                         if let Some(m) = inline_marker(*kind, v) {
@@ -587,6 +628,15 @@ fn scan(c: &Classification, rest: &[String], stdin_is_tty: bool) -> Scan {
                 };
                 push_source(&mut out, rest, name, *kind, &value, index);
             } else if table.value_long.contains(&name) {
+                flags.push((name.to_string(), Some(true)));
+                if generic {
+                    out.push(generic_text(t));
+                    if inline.is_none() {
+                        if let Some(v) = rest.get(i) {
+                            out.push(generic_text(v));
+                        }
+                    }
+                }
                 if is_api && name == "header" {
                     match inline {
                         Some(v) => red.push((at, format!("--header={}", redact_header(v)))),
@@ -600,14 +650,31 @@ fn scan(c: &Classification, rest: &[String], stdin_is_tty: bool) -> Scan {
                 if inline.is_none() {
                     i += 1;
                 }
+            } else {
+                // A boolean, or a flag this table does not know.
+                let value = inline.map_or(Some(true), parse_go_bool);
+                flags.push((name.to_string(), value));
+                match inline {
+                    // Not a boolean literal: possibly a credential handed to an unknown flag.
+                    Some(_) if value.is_none() => red.push((at, format!("--{name}=<arg>"))),
+                    Some(_) => {}
+                    None => after_unknown = true,
+                }
+                if generic {
+                    out.push(generic_text(t));
+                }
             }
             continue;
         }
         if t.len() > 1 && t.starts_with('-') {
             let chars: Vec<char> = t[1..].chars().collect();
+            // Letters read as booleans (or unknown letters) before a value letter or the end.
+            let mut bool_letters = 0usize;
+            let mut consumed_body = false;
             for (j, ch) in chars.iter().enumerate() {
                 if let Some((_, name)) = table.short.iter().find(|(s, _)| s == ch) {
-                    flags.push((*name).to_string());
+                    consumed_body = true;
+                    flags.push(((*name).to_string(), Some(true)));
                     let kind = table
                         .long
                         .iter()
@@ -633,9 +700,14 @@ fn scan(c: &Classification, rest: &[String], stdin_is_tty: bool) -> Scan {
                     push_source(&mut out, rest, name, kind, &value, index);
                     break;
                 }
-                flags.push(format!("-{ch}"));
                 if table.value_short.contains(*ch) {
+                    flags.push((format!("-{ch}"), Some(true)));
                     let attached: String = chars[j + 1..].iter().collect();
+                    if generic && attached.is_empty() {
+                        if let Some(v) = rest.get(i) {
+                            out.push(generic_text(v));
+                        }
+                    }
                     if is_api && *ch == 'H' {
                         if attached.is_empty() {
                             if let Some(v) = rest.get(i) {
@@ -651,10 +723,35 @@ fn scan(c: &Classification, rest: &[String], stdin_is_tty: bool) -> Scan {
                     }
                     break;
                 }
+                // A boolean letter, or one this table does not know. pflag gives everything
+                // after `=` to the letter before it (`-w=false`).
+                bool_letters += 1;
+                if chars.get(j + 1) == Some(&'=') {
+                    let v: String = chars[j + 2..].iter().collect();
+                    let value = parse_go_bool(&v);
+                    flags.push((format!("-{ch}"), value));
+                    if value.is_none() {
+                        let prefix: String = chars[..=j].iter().collect();
+                        red.push((at, format!("-{prefix}=<arg>")));
+                    }
+                    break;
+                }
+                flags.push((format!("-{ch}"), Some(true)));
+                if j + 1 == chars.len() {
+                    after_unknown = true;
+                }
+            }
+            if bool_letters > 3 && !red.iter().any(|(idx, _)| *idx == at) {
+                // A long run of letters no table knows is more likely a value glued to an
+                // unknown shorthand (`-tTOKEN`) than a group of booleans.
+                red.push((at, format!("-{}<arg>", chars[0])));
+            }
+            if generic && !consumed_body {
+                out.push(generic_text(t));
             }
             continue;
         }
-        positional(&mut out, &mut red, at);
+        positional(&mut out, &mut red, at, unknown_before);
     }
     if std::ptr::eq(table, &GIST_CREATE) && !out.iter().any(|s| s.flag != "--desc") {
         // `gh gist create` with no files reads the gist content from stdin.
@@ -684,48 +781,69 @@ fn scan(c: &Classification, rest: &[String], stdin_is_tty: bool) -> Scan {
 }
 
 /// A write whose body gh composes itself after this guard has run cannot be inspected: an
-/// editor, an issue template, `--fill` from commit messages, or an interactive prompt. Returns
-/// why, or `None` when every body the command sends is on the command line, in a file, or on
-/// stdin. `stdin_is_tty` is whether gh could prompt.
+/// editor, an issue template, `--fill` from commit messages, release notes from a tag, or an
+/// interactive prompt. Returns why, or `None` when every body the command sends is on the
+/// command line, in a file, or on stdin. `stdin_is_tty` is whether gh could prompt.
+///
+/// Boolean flags are read for their effective value, as gh reads them: the last occurrence of
+/// any spelling wins, and `--web=false` is off. A flag that would make the body uninspectable
+/// counts when it is on or has a value gh cannot parse; a flag that exempts a form from the
+/// prompt rule counts only when it is definitely on.
 pub fn uninspectable(c: &Classification, rest: &[String], stdin_is_tty: bool) -> Option<String> {
     let s = scan(c, rest, stdin_is_tty);
-    let has = |names: &[&str]| s.flags.iter().any(|f| names.contains(&f.as_str()));
-    let body_flag = has(&["body", "body-file"]);
-    let web = has(&["web", "-w"]);
+    // None: absent. Some(v): the last occurrence of any of these spellings.
+    let value_of = |spellings: &[&str]| -> Option<Option<bool>> {
+        s.flags
+            .iter()
+            .rev()
+            .find(|(n, _)| spellings.contains(&n.as_str()))
+            .map(|(_, v)| *v)
+    };
+    let on = |spellings: &[&str]| matches!(value_of(spellings), Some(Some(true) | None));
+    let set = |spellings: &[&str]| value_of(spellings) == Some(Some(true));
+    let body_flag = set(&["body"]) || set(&["body-file"]);
+    let web = set(&["web", "-w"]);
     let cmd = c.command.as_str();
+    if c.family == "release" && on(&["notes-from-tag"]) {
+        return Some(format!(
+            "{cmd} --notes-from-tag takes the notes from a tag annotation or commit message that gh reads later"
+        ));
+    }
     match (c.family.as_str(), c.sub.as_deref()) {
         ("pr" | "issue", Some("create")) => {
-            if has(&["template", "-T"]) {
+            if on(&["template", "-T"]) {
                 return Some(format!(
                     "{cmd} --template fills the body from a template file gh reads later"
                 ));
             }
-            if has(&["fill", "fill-first", "fill-verbose", "-f"]) {
+            if on(&["fill", "-f"]) || on(&["fill-first"]) || on(&["fill-verbose"]) {
                 return Some(format!(
                     "{cmd} --fill composes the body from commit messages"
                 ));
             }
-            if has(&["editor", "-e"]) {
+            if on(&["editor", "-e"]) {
                 return Some(format!("{cmd} --editor composes the body in an editor"));
             }
-            if stdin_is_tty && !body_flag && !web && !has(&["recover"]) {
+            if stdin_is_tty && !body_flag && !web && !set(&["recover"]) {
                 return Some(format!(
                     "{cmd} without --body or --body-file prompts for the body interactively"
                 ));
             }
         }
         ("pr" | "issue", Some("comment")) => {
-            if has(&["editor", "-e"]) {
+            if on(&["editor", "-e"]) {
                 return Some(format!("{cmd} --editor composes the body in an editor"));
             }
-            if stdin_is_tty && !body_flag && !web && !has(&["delete-last"]) {
+            if stdin_is_tty && !body_flag && !web && !set(&["delete-last"]) {
                 return Some(format!(
                     "{cmd} without --body or --body-file prompts for the body interactively"
                 ));
             }
         }
         ("pr", Some("review")) => {
-            let typed = has(&["approve", "-a", "request-changes", "-r", "comment", "-c"]);
+            let typed = set(&["approve", "-a"])
+                || set(&["request-changes", "-r"])
+                || set(&["comment", "-c"]);
             if stdin_is_tty && !body_flag && !typed {
                 return Some(format!(
                     "{cmd} without --approve, --request-changes, --comment or a body prompts interactively"
@@ -733,7 +851,10 @@ pub fn uninspectable(c: &Classification, rest: &[String], stdin_is_tty: bool) ->
             }
         }
         ("pr" | "issue", Some("edit")) => {
-            let any_flag = s.flags.iter().any(|f| !matches!(f.as_str(), "repo" | "-R"));
+            let any_flag = s
+                .flags
+                .iter()
+                .any(|(f, v)| !matches!(f.as_str(), "repo" | "-R") && *v == Some(true));
             if stdin_is_tty && !any_flag {
                 return Some(format!(
                     "{cmd} with no flags prompts for the fields and the body interactively"
@@ -741,15 +862,10 @@ pub fn uninspectable(c: &Classification, rest: &[String], stdin_is_tty: bool) ->
             }
         }
         ("pr", Some("merge")) => {
-            let method = has(&[
-                "merge",
-                "-m",
-                "squash",
-                "-s",
-                "rebase",
-                "-r",
-                "disable-auto",
-            ]);
+            let method = set(&["merge", "-m"])
+                || set(&["squash", "-s"])
+                || set(&["rebase", "-r"])
+                || set(&["disable-auto"]);
             if stdin_is_tty && !method {
                 return Some(format!(
                     "{cmd} without --merge, --squash or --rebase prompts interactively and may open an editor for the commit body"
@@ -757,14 +873,16 @@ pub fn uninspectable(c: &Classification, rest: &[String], stdin_is_tty: bool) ->
             }
         }
         ("release", Some("create")) => {
-            let notes = has(&["notes", "notes-file", "generate-notes", "notes-from-tag"]);
+            let notes = set(&["notes"]) || set(&["notes-file"]) || set(&["generate-notes"]);
             if stdin_is_tty && !notes {
                 return Some(format!(
-                    "{cmd} without --notes, --notes-file, --generate-notes or --notes-from-tag prompts for the notes interactively"
+                    "{cmd} without --notes, --notes-file or --generate-notes prompts for the notes interactively"
                 ));
             }
         }
-        ("gist", Some("edit")) if !has(&["add", "remove", "-r"]) || s.positionals > 1 => {
+        ("gist", Some("edit"))
+            if !(set(&["add"]) || set(&["remove", "-r"])) || s.positionals > 1 =>
+        {
             return Some(format!(
                 "{cmd} without --add or --remove opens an editor or replaces a file gh reads later"
             ));
@@ -789,14 +907,14 @@ fn is_b64(b: u8) -> bool {
 
 /// Length of the longest base64-looking content in `text`.
 ///
-/// Two shapes count:
+/// Two shapes count, whatever characters of the alphabet they use (a hex dump, a lower-case-only
+/// encoding and a ruler all count, so nothing long slips through as a "word"):
 ///
-/// - one unbroken run of base64-alphabet characters, whatever it contains (a hex dump, a
-///   lower-case-only encoding and a ruler all count, so nothing long slips through as a "word");
+/// - one unbroken run of base64-alphabet characters;
 /// - a block of consecutive lines, each at least 20 characters and made only of base64-alphabet
-///   characters, taken together, when the block contains an upper-case letter, `+` or `/`. That
-///   condition exempts a list of lower-case hex digests (one SHA per line) and markdown rulers;
-///   such a list is still bounded by the body-size limit.
+///   characters, taken together. A list of bare commit SHAs, one per line, is such a block: 25
+///   or more of them exceed the default 1,000-character limit. Write them with some prose on
+///   each line, or set `GH_PACED_ALLOW_LARGE_BODY=1`.
 pub fn longest_base64_run(text: &[u8]) -> usize {
     let mut best = 0;
     let mut run = 0;
@@ -809,20 +927,13 @@ pub fn longest_base64_run(text: &[u8]) -> usize {
         }
     }
     let mut block = 0;
-    let mut encoded_looking = false;
     for line in text.split(|&b| b == b'\n').chain(std::iter::once(&b""[..])) {
         let trimmed = trim_ascii(line);
         if trimmed.len() >= 20 && trimmed.iter().all(|&b| is_b64(b)) {
             block += trimmed.len();
-            encoded_looking |= trimmed
-                .iter()
-                .any(|&b| b.is_ascii_uppercase() || b == b'+' || b == b'/');
         } else {
-            if encoded_looking && block > best {
-                best = block;
-            }
+            best = best.max(block);
             block = 0;
-            encoded_looking = false;
         }
     }
     best
@@ -993,9 +1104,16 @@ mod tests {
         assert_eq!(s.len(), 2, "-d is --draft (bool) in pr create: {s:?}");
         let s = sources(&["issue", "create", "--body-file", "-"]);
         assert!(s[0].is_stdin());
+        let s = sources(&["pr", "comment", "1", "-RFoo/Bar", "-bx"]);
         assert_eq!(
-            kinds(&["pr", "comment", "1", "-RFoo/Bar", "-bx"]),
-            vec![inline("x")]
+            s,
+            vec![BodySource {
+                flag: "--body".into(),
+                kind: inline("x"),
+                json: false,
+                location: None,
+                key: Some("body".into()),
+            }]
         );
         assert_eq!(
             kinds(&["pr", "comment", "1", "--body=inline"]),
@@ -1274,6 +1392,136 @@ mod tests {
         }
     }
 
+    /// Boolean flags count for their effective value: the last occurrence wins and `=false`
+    /// turns a flag off, so `--web=false` earns no exemption and `--editor=false` no refusal.
+    #[test]
+    fn uninspectable_reads_boolean_values() {
+        // Off: no exemption from the prompt rule on a terminal.
+        for line in [
+            &["issue", "comment", "1", "--web=false"][..],
+            &["pr", "comment", "1", "-w=0"],
+            &["pr", "comment", "1", "--web", "--web=false"],
+            &["pr", "create", "-t", "x", "--web=False"],
+            &["pr", "comment", "1", "--delete-last=f"],
+            &["pr", "review", "1", "--approve=false"],
+            &["pr", "review", "1", "-a=0"],
+            &["pr", "merge", "1", "--squash=false"],
+            &["pr", "merge", "1", "-s=F"],
+            &["pr", "edit", "1", "--web=false"],
+            &["release", "create", "v1", "--generate-notes=false"],
+            // A value gh cannot parse never earns an exemption.
+            &["pr", "comment", "1", "--web=yes"],
+        ] {
+            assert!(refused(line, true).is_some(), "not refused (tty): {line:?}");
+        }
+        // Off: no refusal for a form that would otherwise compose the body later.
+        for line in [
+            &["pr", "create", "-t", "x", "-b", "y", "--editor=false"][..],
+            &["pr", "create", "-t", "x", "-b", "y", "-e=0"],
+            &["pr", "create", "-t", "x", "-b", "y", "--fill=false"],
+            &["pr", "create", "-t", "x", "-b", "y", "-f=false"],
+            &[
+                "pr",
+                "create",
+                "-t",
+                "x",
+                "-b",
+                "y",
+                "--fill",
+                "--fill=false",
+            ],
+            &["pr", "create", "-t", "x", "-b", "y", "--fill-first=0"],
+            &["pr", "comment", "1", "-b", "x", "--editor=false"],
+            &[
+                "release",
+                "create",
+                "v1",
+                "-n",
+                "x",
+                "--notes-from-tag=false",
+            ],
+            &["pr", "comment", "1", "--web=false", "--web"],
+        ] {
+            assert!(refused(line, true).is_none(), "refused (tty): {line:?}");
+            assert!(refused(line, false).is_none(), "refused: {line:?}");
+        }
+        // On, or unparseable: refused.
+        for line in [
+            &[
+                "pr",
+                "create",
+                "-t",
+                "x",
+                "-b",
+                "y",
+                "--fill=false",
+                "--fill",
+            ][..],
+            &["pr", "create", "-t", "x", "-b", "y", "--fill=maybe"],
+            &["pr", "create", "-t", "x", "-b", "y", "--editor=1"],
+            &["pr", "create", "-t", "x", "-b", "y", "-e=T"],
+        ] {
+            assert!(refused(line, false).is_some(), "not refused: {line:?}");
+        }
+    }
+
+    /// gh fills `--notes-from-tag` notes from a tag annotation or commit message after the guard
+    /// has run, so the form is refused (`GH_PACED_ALLOW_LARGE_BODY=1` skips the whole guard).
+    #[test]
+    fn notes_from_tag_is_refused() {
+        for line in [
+            &["release", "create", "v1", "--notes-from-tag"][..],
+            &["release", "create", "v1", "-n", "x", "--notes-from-tag"],
+            &[
+                "release",
+                "create",
+                "v1",
+                "--notes-from-tag=true",
+                "--generate-notes",
+            ],
+            &["release", "edit", "v1", "--notes-from-tag"],
+        ] {
+            let why = refused(line, false).unwrap_or_default();
+            assert!(why.contains("--notes-from-tag"), "{line:?}: {why:?}");
+            assert!(refused(line, true).is_some(), "{line:?}");
+        }
+    }
+
+    /// An alias can hand any argument, flag-shaped or not, to a body flag in its expansion, so
+    /// every argument of an alias or extension is inspected as text.
+    #[test]
+    fn alias_flag_shaped_arguments_are_inspected() {
+        let big = "word ".repeat(2000);
+        let payload = format!("--payload={big}");
+        for line in [
+            &["my-alias", payload.as_str()][..],
+            &["my-alias", "--repo", big.as_str()],
+            &["my-alias", "-R", big.as_str()],
+            &["my-alias", "--", big.as_str()],
+        ] {
+            let s = sources(line);
+            assert!(
+                matches!(
+                    evaluate(&s, &Config::default(), None),
+                    Verdict::Refuse(ref m) if m.contains("over the 8192-byte limit")
+                ),
+                "{line:?}: {s:?}"
+            );
+        }
+        let enc = format!("--x={}", b64ish(1200));
+        let s = sources(&["my-alias", &enc]);
+        assert!(matches!(
+            evaluate(&s, &Config::default(), None),
+            Verdict::Refuse(m) if m.contains("base64")
+        ));
+        // A small alias call is still allowed.
+        let s = sources(&["my-alias", "--flag=small", "-x", "words"]);
+        assert!(matches!(
+            evaluate(&s, &Config::default(), None),
+            Verdict::Allow { .. }
+        ));
+    }
+
     fn redacted(line: &[&str]) -> Vec<String> {
         let args = argv(line);
         let c = classify(&args, &Config::default());
@@ -1299,6 +1547,47 @@ mod tests {
         assert_eq!(r, argv(&["api", "repos/o/r/issues"]));
         let r = redacted(&["api", "repos/o/r/issues?access_token=github_pat_CANARY"]);
         assert_eq!(r, argv(&["api", "repos/o/r/issues"]));
+    }
+
+    /// A flag the parser does not know may take a value, and the value may be a credential.
+    #[test]
+    fn unknown_flag_values_are_redacted() {
+        assert_eq!(
+            redacted(&["api", "repos/o/r", "--token=CANARY"]),
+            argv(&["api", "<arg>", "--token"])
+        );
+        assert_eq!(
+            redacted(&["api", "--token", "CANARY", "repos/o/r"]),
+            argv(&["api", "--token", "<arg>", "<arg>"])
+        );
+        assert_eq!(
+            redacted(&["api", "-ZCANARY", "repos/o/r"]),
+            argv(&["api", "-Z", "<arg>"])
+        );
+        for line in [
+            &["pr", "comment", "1", "-b", "x", "--tokn=CANARY"][..],
+            &["pr", "comment", "1", "--tokn", "CANARY"],
+            &["pr", "comment", "1", "-tCANARY"],
+            &["pr", "comment", "1", "-t=CANARY"],
+            &["pr", "view", "1", "--tokn=CANARY"],
+        ] {
+            let r = redacted(line);
+            assert!(!r.iter().any(|a| a.contains("CANARY")), "{line:?} -> {r:?}");
+        }
+        // Boolean literals and known value flags are kept.
+        assert_eq!(
+            redacted(&["pr", "comment", "1", "--web=false", "-R", "o/r", "-b", "x"]),
+            argv(&[
+                "pr",
+                "comment",
+                "1",
+                "--web=false",
+                "-R",
+                "o/r",
+                "-b",
+                "<1 bytes>"
+            ])
+        );
     }
 
     /// An alias or extension keeps only its name and its flag names.
@@ -1341,9 +1630,9 @@ mod tests {
             .collect();
         let text = format!("Here is data:\n```\n{wrapped}```\n");
         assert_eq!(longest_base64_run(text.as_bytes()), 1500);
-        // Canonical base64 with no digits ("abc" repeated, and zero bytes) still counts, both
-        // as one run and wrapped.
-        for unit in ["YWJj", "AAAA"] {
+        // Canonical base64 with no digits ("abc" repeated, zero bytes, and `i\xa6\x9a` repeated,
+        // which encodes to lower-case letters only) still counts, both as one run and wrapped.
+        for unit in ["YWJj", "AAAA", "aaaa"] {
             let enc = unit.repeat(300);
             assert_eq!(longest_base64_run(enc.as_bytes()), 1200, "{unit}");
             let wrapped: String = enc
@@ -1361,11 +1650,20 @@ mod tests {
         let hex = "0123456789abcdef".repeat(100);
         assert_eq!(longest_base64_run(hex.as_bytes()), 1600);
         assert_eq!(longest_base64_run("-".repeat(2000).as_bytes()), 2000);
-        // A list of lower-case commit SHAs, one per line, is not a block (each line counts alone).
+        // A list of bare lower-case commit SHAs, one per line, is a block too: hex is an
+        // encoding, and the detector cannot tell digests from data. 40 lines of 40 = 1600.
         let shas: String = (0..40)
             .map(|i| format!("{:040x}\n", 0x1234_5678_9abc_u64 * (i + 1)))
             .collect();
-        assert_eq!(longest_base64_run(shas.as_bytes()), 40);
+        assert_eq!(longest_base64_run(shas.as_bytes()), 1600);
+        // The same SHAs with a subject on each line are prose, not a block.
+        let log: String = (0..40)
+            .map(|i| format!("{:040x} fix the thing\n", 0x1234_5678_9abc_u64 * (i + 1)))
+            .collect();
+        assert_eq!(longest_base64_run(log.as_bytes()), 40);
+        // Short lines (under 20 characters) do not join a block.
+        let short: String = (0..200).map(|_| "abcdefghij\n").collect();
+        assert_eq!(longest_base64_run(short.as_bytes()), 10);
     }
 
     #[test]

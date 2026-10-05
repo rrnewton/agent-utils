@@ -250,11 +250,20 @@ fn is_help_request(args: &[String]) -> bool {
     }
 }
 
-/// Every value of a flag given as `-X v`, `-Xv`, `-X=v`, `--long v` or `--long=v`, in order.
+/// Every value of a flag given as `-X v`, `-Xv`, `-X=v`, `--long v` or `--long=v`, in order,
+/// including a shorthand inside a group such as `-dL1000`.
 ///
 /// gh (pflag) lets the last occurrence of a scalar flag win. Callers that turn a value into a
 /// cost or a limit take the most conservative of all occurrences instead, so the answer does not
 /// depend on which occurrence gh honours.
+///
+/// The result is a superset of what pflag would read. In a group, pflag consumes boolean
+/// shorthands one letter at a time until it meets a shorthand that takes a value, which then
+/// takes the rest of the token (or the next argument). gh-paced does not know every command's
+/// boolean letters, so it treats every letter as possibly boolean and keeps scanning, stopping
+/// only at `=` (pflag gives the rest of the token to the letter before it) and at `R`, the global
+/// `--repo` shorthand, which always takes a value. A letter wrongly assumed boolean can only add
+/// a candidate, never hide one; callers choose the most conservative candidate.
 fn flag_values<'a>(rest: &'a [String], short: Option<char>, long: &str) -> Vec<&'a str> {
     let long_eq = format!("{long}=");
     let mut out = Vec::new();
@@ -276,24 +285,53 @@ fn flag_values<'a>(rest: &'a [String], short: Option<char>, long: &str) -> Vec<&
             i += 1;
             continue;
         }
-        if let Some(c) = short {
-            let short_flag = format!("-{c}");
-            if t == short_flag {
-                if let Some(v) = rest.get(i + 1) {
-                    out.push(v.as_str());
-                }
-                i += 2;
-                continue;
-            }
-            if let Some(v) = t.strip_prefix(short_flag.as_str()) {
-                if !t.starts_with("--") {
-                    out.push(v.strip_prefix('=').unwrap_or(v));
+        if let (Some(c), Some(group)) = (short, t.strip_prefix('-')) {
+            if !group.is_empty() && !group.starts_with('-') {
+                match short_group_value(group, c) {
+                    GroupValue::Attached(v) => out.push(v),
+                    GroupValue::Next => {
+                        if let Some(v) = rest.get(i + 1) {
+                            out.push(v.as_str());
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    GroupValue::Absent => {}
                 }
             }
         }
         i += 1;
     }
     out
+}
+
+/// What a shorthand group (the token without its leading `-`) says about one value shorthand.
+#[derive(Debug, PartialEq, Eq)]
+enum GroupValue<'a> {
+    /// The letter is not in the group, or pflag would not read it as a flag.
+    Absent,
+    /// The letter takes the rest of the token (`-L100`, `-dL100`, `-L=100`).
+    Attached(&'a str),
+    /// The letter ends the token and takes the next argument (`-L 100`, `-dL 100`).
+    Next,
+}
+
+fn short_group_value(group: &str, target: char) -> GroupValue<'_> {
+    for (idx, ch) in group.char_indices() {
+        if ch == target {
+            let after = &group[idx + ch.len_utf8()..];
+            let after = after.strip_prefix('=').unwrap_or(after);
+            return if after.is_empty() {
+                GroupValue::Next
+            } else {
+                GroupValue::Attached(after)
+            };
+        }
+        if ch == '=' || ch == 'R' {
+            return GroupValue::Absent;
+        }
+    }
+    GroupValue::Absent
 }
 
 fn has_flag(rest: &[String], names: &[&str]) -> bool {
@@ -314,20 +352,23 @@ fn has_flag(rest: &[String], names: &[&str]) -> bool {
     false
 }
 
-/// Parse a gh duration-ish interval value in seconds (`30`, `30s`, `2m`).
-fn parse_seconds(value: &str) -> Option<f64> {
+/// Parse a watch `--interval` value the way gh must read it to sleep for that many seconds.
+///
+/// gh declares `--interval` as an integer flag (pflag `IntVar`, which parses with Go's
+/// `strconv.ParseInt(s, 0, 64)`), and sleeps `interval` seconds between polls; zero or a negative
+/// value means no sleep at all. Only a plain positive decimal integer is accepted here. Anything
+/// else is refused rather than guessed at: `0x1e` and `036` are valid integers to gh but in base
+/// 16 and base 8, and `30s` is rejected by gh anyway.
+fn parse_interval(value: &str) -> Option<f64> {
     let v = value.trim();
-    let (num, mult) = if let Some(n) = v.strip_suffix('s') {
-        (n, 1.0)
-    } else if let Some(n) = v.strip_suffix('m') {
-        (n, 60.0)
-    } else {
-        (v, 1.0)
-    };
-    num.parse::<f64>()
-        .ok()
-        .filter(|n| n.is_finite() && *n >= 0.0)
-        .map(|n| n * mult)
+    let plain = !v.is_empty()
+        && v.len() <= 9
+        && !v.starts_with('0')
+        && v.bytes().all(|b| b.is_ascii_digit());
+    if !plain {
+        return None;
+    }
+    v.parse::<u32>().ok().map(f64::from)
 }
 
 fn local(family: &str, sub: Option<String>, command: String, reason: &str) -> Classification {
@@ -626,31 +667,53 @@ fn apply_limit_cost(c: &mut Classification, rest: &[String]) {
 /// Watch loops poll GitHub for as long as they run.
 ///
 /// The loop is charged `watch_cost` tokens up front and given a deadline that the purchased
-/// tokens cover: `(cost / requests per poll) * interval`. `gh run watch` makes two requests per
-/// poll (the run and its jobs); `gh pr checks --watch` makes one. The wrapper kills the child at
-/// the deadline, so a watch can never poll beyond what it paid for.
+/// tokens are estimated to cover: `floor((cost - startup) / requests per poll) * interval`.
+///
+/// The per-poll figures are estimates with a margin, not a proof:
+///
+/// * `gh run watch` fetches the run, its workflow and its jobs on every poll (three requests),
+///   plus one more page per 100 jobs and one annotations request the first time each job is
+///   seen to fail. It is charged 4 per poll and 2 for startup (resolving the run).
+/// * `gh pr checks --watch` fetches the checks once per poll (one GraphQL request per 100
+///   checks). It is charged 2 per poll and 2 for startup (resolving the pull request).
+///
+/// A run with more than 100 jobs, or with several jobs that fail during the watch, can make more
+/// requests than it paid for before the deadline stops it. The deadline still bounds the run's
+/// wall time, and the interval floor bounds its request rate.
 fn apply_watch(c: &mut Classification, rest: &[String], cfg: &Config) {
-    let (is_watch, default_interval, requests_per_poll) =
+    let (is_watch, default_interval, startup, requests_per_poll) =
         match (c.family.as_str(), c.sub.as_deref()) {
-            ("pr", Some("checks")) => (has_flag(rest, &["--watch"]), 10.0, 1.0),
-            ("run", Some("watch")) => (true, 3.0, 2.0),
-            _ => (false, 0.0, 1.0),
+            ("pr", Some("checks")) => (has_flag(rest, &["--watch"]), 10.0, 2, 2),
+            ("run", Some("watch")) => (true, 3.0, 2, 4),
+            _ => (false, 0.0, 0, 1),
         };
     if !is_watch {
         return;
     }
-    // The smallest of all `--interval` values, whichever occurrence gh honours.
-    let interval = flag_values(rest, Some('i'), "--interval")
-        .into_iter()
-        .filter_map(parse_seconds)
+    // Every `--interval` value must be one gh sleeps for. gh honours the last occurrence, so a
+    // single non-positive or unreadable value anywhere is refused, and the smallest valid value
+    // sets the pace.
+    let values = flag_values(rest, Some('i'), "--interval");
+    if let Some(bad) = values.iter().find(|v| parse_interval(v).is_none()) {
+        c.refusal = Some(format!(
+            "{} has --interval {bad:?}, which is not a positive whole number of seconds; gh would poll without sleeping or reject it. Pass `--interval {}`",
+            c.command, cfg.min_watch_interval_secs
+        ));
+        return;
+    }
+    let interval = values
+        .iter()
+        .filter_map(|v| parse_interval(v))
         .reduce(f64::min)
         .unwrap_or(default_interval);
-    c.cost = c.cost.max(cfg.watch_cost);
-    let polls = (f64::from(c.cost) / requests_per_poll).floor().max(1.0);
-    let deadline = polls * interval.max(1.0);
+    c.cost = c.cost.max(cfg.watch_cost).max(startup + requests_per_poll);
+    let polls = (f64::from(c.cost - startup) / f64::from(requests_per_poll))
+        .floor()
+        .max(1.0);
+    let deadline = polls * interval;
     c.deadline_secs = Some(deadline);
     c.warnings.push(format!(
-        "{} polls GitHub every {interval} s until it finishes; charging {} read tokens up front, which cover {polls} polls, so it is stopped after {deadline} s",
+        "{} polls GitHub every {interval} s until it finishes; charging {} read tokens up front, estimated to cover startup plus {polls} polls of about {requests_per_poll} requests, so it is stopped after {deadline} s",
         c.command, c.cost
     ));
     if interval < cfg.min_watch_interval_secs && !cfg.allow_fast_watch {
@@ -912,6 +975,7 @@ fn classify_api(rest: &[String], cfg: &Config) -> Classification {
     c.api = Some(api);
     if let Some(flag) = &a.unknown {
         c.reason = format!("unrecognised gh api flag {flag}; classified WRITE (fail safe)");
+        charge_pagination(&mut c, paginate, cfg);
         return c;
     }
     let read_method = matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS");
@@ -951,17 +1015,23 @@ fn classify_api(rest: &[String], cfg: &Config) -> Classification {
     } else {
         c.reason = "fields or --input without -X GET make gh send a POST".into();
     }
+    charge_pagination(&mut c, paginate, cfg);
+    c
+}
+
+/// Charge `paginate_cost` tokens for `--paginate` or `--slurp`, on every classification path.
+///
+/// A paginated write (a GraphQL mutation with a cursor, a POST that follows Link headers) can
+/// repeat the write once per page, so it pays the same N tokens as a read.
+fn charge_pagination(c: &mut Classification, paginate: bool, cfg: &Config) {
     if paginate {
-        // A paginated write (a GraphQL mutation with a cursor, a POST that follows Link
-        // headers) can repeat the write once per page, so it pays the same N tokens as a read.
-        c.cost = cfg.paginate_cost.max(1);
+        c.cost = c.cost.max(cfg.paginate_cost.max(1));
         c.warnings.push(format!(
             "--paginate fetches pages back to back; charging {} {} tokens for this one invocation",
             c.cost,
             c.class.name()
         ));
     }
-    c
 }
 
 #[cfg(test)]
@@ -1222,6 +1292,16 @@ mod tests {
         assert!(!c.warnings.is_empty());
         let c = cls("api graphql --paginate -f query=mutation{x}");
         assert_eq!((c.class, c.cost), (Class::Write, 10));
+        // An unrecognised flag makes the call WRITE, and must not drop the pagination charge.
+        for line in [
+            "api --allow-escape-sequences --paginate -X POST repos/o/r/x",
+            "api --paginate --allow-escape-sequences -X POST repos/o/r/x",
+            "api -Z --slurp --paginate repos/o/r/issues",
+        ] {
+            let c = cls(line);
+            assert_eq!((c.class, c.cost), (Class::Write, 10), "{line:?}");
+            assert!(!c.warnings.is_empty(), "{line:?}");
+        }
     }
 
     /// gh honours the last occurrence of a scalar flag; gh-paced takes the most conservative of
@@ -1241,6 +1321,64 @@ mod tests {
         assert!(cls("run watch 1 -i 30 --interval 45").refusal.is_none());
     }
 
+    /// gh sleeps `interval` seconds and honours the last value; zero or a negative value means
+    /// no sleep at all, so any such value is refused wherever it appears.
+    #[test]
+    fn non_positive_or_unreadable_intervals_are_refused() {
+        for line in [
+            "run watch 1 --interval 30 --interval -1",
+            "run watch 1 --interval -1 --interval 30",
+            "run watch 1 -i 30 -i -1",
+            "run watch 1 -i30 -i=-5",
+            "run watch 1 --interval=0",
+            "run watch 1 --interval 30s",
+            "run watch 1 --interval 0x1e",
+            "run watch 1 --interval 036",
+            "run watch 1 --interval=+30",
+            "pr checks 1 --watch --interval 60 --interval -1",
+            "pr checks 1 --watch -i -1",
+        ] {
+            let c = cls(line);
+            assert!(c.refusal.is_some(), "{line:?} must be refused");
+        }
+        // The fast-watch override allows a short interval, never a non-positive one.
+        let cfg = Config {
+            allow_fast_watch: true,
+            ..Config::default()
+        };
+        let argv = |line: &str| -> Vec<String> { line.split(' ').map(String::from).collect() };
+        assert!(classify(&argv("run watch 1 -i 30 -i -1"), &cfg)
+            .refusal
+            .is_some());
+        assert!(classify(&argv("run watch 1 -i 0"), &cfg).refusal.is_some());
+        let c = classify(&argv("run watch 1 -i 1"), &cfg);
+        assert!(c.refusal.is_none());
+        assert_eq!(c.deadline_secs, Some(4.0));
+    }
+
+    /// pflag reads boolean shorthands in a group one letter at a time until a value shorthand
+    /// takes the rest of the token, so `-dL1000` is `--draft --limit 1000`.
+    #[test]
+    fn grouped_shorthands_are_read() {
+        assert_eq!(cls("pr list --limit 1 -dL1000").cost, 10);
+        assert_eq!(cls("pr list -dL 1000").cost, 10);
+        assert_eq!(cls("run list -aL1000").cost, 10);
+        assert_eq!(cls("run list -aL=1000").cost, 10);
+        assert!(cls("pr checks 1 --watch -i 60 -wi1").refusal.is_some());
+        assert!(cls("run watch 1 --interval 60 -xi -1").refusal.is_some());
+        // `-R` takes the rest of the token as the repository, so `L` there is not a flag.
+        assert_eq!(cls("pr list -RL1000/x").cost, 1);
+        // `=` gives the rest of the token to the letter before it.
+        assert_eq!(cls("pr list -d=L1000").cost, 1);
+        assert_eq!(
+            short_group_value("dL1000", 'L'),
+            GroupValue::Attached("1000")
+        );
+        assert_eq!(short_group_value("dL", 'L'), GroupValue::Next);
+        assert_eq!(short_group_value("RL5", 'L'), GroupValue::Absent);
+        assert_eq!(short_group_value("d", 'L'), GroupValue::Absent);
+    }
+
     #[test]
     fn watch_loops_are_charged_and_fast_ones_refused() {
         let c = cls("pr checks 12 --watch");
@@ -1253,12 +1391,12 @@ mod tests {
         assert!(c.refusal.is_some(), "default 3 s interval is too fast");
         let c = cls("run watch 99 -i 30");
         assert!(c.refusal.is_none());
-        // 20 tokens buy 10 polls of 2 requests each, 30 s apart: stopped after 300 s.
-        assert_eq!(c.deadline_secs, Some(300.0));
-        // 20 tokens buy 20 polls of 1 request each, 30 s apart: stopped after 600 s.
+        // 20 tokens: 2 for startup, then 4 polls of 4 requests each, 30 s apart: 120 s.
+        assert_eq!(c.deadline_secs, Some(120.0));
+        // 20 tokens: 2 for startup, then 9 polls of 2 requests each, 30 s apart: 270 s.
         assert_eq!(
             cls("pr checks 12 --watch --interval 30").deadline_secs,
-            Some(600.0)
+            Some(270.0)
         );
         let c = cls("pr checks 12");
         assert_eq!(c.cost, 1);
