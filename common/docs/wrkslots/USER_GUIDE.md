@@ -372,9 +372,11 @@ validation slots. `audit`, `remove` (including `--validate-complete` and `remove
   directory or a recorded checkout path has a dead process generation (when it records one) and an
   inactive, unqueued service unit with no live process in its control group, and no active or
   queued user-systemd unit names those paths;
-- `alive`: any of that evidence shows the run may still use the checkout;
-- `unverifiable`: a handle, the process table, or user-systemd state cannot be read completely, a
-  handle repeats a JSON field (a repeated field has no single meaning, and keeping the last value
+- `alive`: any of that evidence shows the run may still use the checkout; the remedy is to let the
+  run finish or stop its unit;
+- `unverifiable`: a handle, the process table, user-systemd state, the boot id, or a recorded run
+  process's generation cannot be read completely (unreadable evidence shows no run, so it is not
+  reported `alive`), a handle repeats a JSON field (a repeated field has no single meaning, and keeping the last value
   could hide a live process or move the handle off its row), the row is registered on another
   machine, or its owner was recorded on another host. All of this
   evidence is local to the host, so a host without a reachable user service manager cannot prove a

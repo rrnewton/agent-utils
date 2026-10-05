@@ -812,6 +812,14 @@ class _ProcessEvidenceChanged(Refusal):
     """A relevant PID generation changed while one liveness census ran."""
 
 
+class _ValidationRunMayUseRow(Refusal):
+    """Positive evidence that a validation run may still use a row.
+
+    The validation-run liveness authority reports this as ``alive``.  Any
+    other refusal while reading the same evidence is ``unverifiable``.
+    """
+
+
 @dataclasses.dataclass(frozen=True)
 class Config:
     """Validated project configuration and resolved local paths."""
@@ -16616,10 +16624,21 @@ def _validation_run_liveness_states(
             _assert_absent_validate_systemd_unrelated(
                 (row,), handles, processes, snapshot=snapshot
             )
-        except Refusal as exc:
+        except _ValidationRunMayUseRow as exc:
             result[key] = (
                 "alive",
                 _liveness_batch_diagnostic(f"validation run may still use the row: {exc}"),
+            )
+            continue
+        except Refusal as exc:
+            # Unreadable evidence, such as the boot id or a recorded run
+            # process's generation, shows no run.  Reporting it ``alive``
+            # would send the operator to stop a unit that may not exist.
+            result[key] = (
+                "unverifiable",
+                _liveness_batch_diagnostic(
+                    f"validation-run evidence is unverifiable: {exc}"
+                ),
             )
             continue
         result[key] = (
@@ -46796,7 +46815,7 @@ def _assert_retained_handle_processes_dead(
             if handle.boot_id != current_boot:
                 continue
             if _process_start_ticks(Path("/proc") / str(handle.pid)) == handle.start_ticks:
-                raise Refusal(
+                raise _ValidationRunMayUseRow(
                     f"retained validation handle {handle.path} has live exact process "
                     f"generation {handle.pid} for row {slot}"
                 )
@@ -46823,7 +46842,7 @@ def _assert_absent_validate_systemd_unrelated(
             if any(
                 handle.unit in Path(process.cgroup_path).parts for process in processes
             ):
-                raise Refusal(
+                raise _ValidationRunMayUseRow(
                     f"retained validation unit {handle.unit} still has a live cgroup "
                     f"process for row {slot}"
                 )
@@ -46833,14 +46852,14 @@ def _assert_absent_validate_systemd_unrelated(
             active = unit["ActiveState"] not in {"inactive", "failed"}
             queued = unit["PendingJob"] == "yes"
             if active or queued:
-                raise Refusal(
+                raise _ValidationRunMayUseRow(
                     f"retained validation unit {handle.unit} may still use row {slot}"
                 )
             control_group = unit["ControlGroup"].rstrip("/") or "/"
             if control_group != "/" and any(
                 _cgroup_matches(control_group, process.cgroup_path) for process in processes
             ):
-                raise Refusal(
+                raise _ValidationRunMayUseRow(
                     f"retained validation unit {handle.unit} still has a live process "
                     f"for row {slot}"
                 )
@@ -46855,7 +46874,7 @@ def _assert_absent_validate_systemd_unrelated(
         observed = "\n".join(_lexical_path_evidence(value) for value in unit.values())
         for record, path, spellings in targets:
             if any(_evidence_names_path(observed, spelling) for spelling in spellings):
-                raise Refusal(
+                raise _ValidationRunMayUseRow(
                     f"user-systemd unit {unit['Id']} names validation row "
                     f"{record.slot} path {path}"
                 )

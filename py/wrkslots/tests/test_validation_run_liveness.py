@@ -494,3 +494,95 @@ def test_unit_path_evidence_keeps_each_normalization_stage(tmp_path: Path) -> No
     spellings = wrkslots._row_path_spellings(link / "worktrees" / "validate" / "slot01")
     resolved = wrkslots._lexical_path_evidence(f"{real}/worktrees/validate/slot01")
     assert any(wrkslots._evidence_names_path(resolved, spelling) for spelling in spellings)
+
+
+UNREADABLE_PID = 4_000_017
+
+
+def _write_unreadable_generation_handle(
+    project: Path, tree: Path, monkeypatch: pytest.MonkeyPatch, evidence: str
+) -> None:
+    """Record a run process whose generation or boot cannot be read."""
+
+    _write_run_handle(
+        project,
+        tree,
+        process_identity={
+            "pid": UNREADABLE_PID,
+            "start_ticks": 17,
+            "boot_id": wrkslots._boot_id(Path("/proc")),
+        },
+    )
+    if evidence == "boot-id":
+        def boot_id(_proc_root: Path) -> str:
+            raise wrkslots.Refusal("cannot read the machine boot id: test")
+
+        # Only the run authority reads the boot id after this point in the
+        # direct call below.
+        monkeypatch.setattr(wrkslots, "_boot_id", boot_id)
+        return
+    real_start_ticks = wrkslots._process_start_ticks
+
+    def start_ticks(pid_dir: Path) -> int | None:
+        if pid_dir.name == str(UNREADABLE_PID):
+            raise wrkslots.Refusal(
+                f"process generation is indeterminate because {pid_dir / 'stat'} "
+                "is unreadable: test"
+            )
+        return real_start_ticks(pid_dir)
+
+    monkeypatch.setattr(wrkslots, "_process_start_ticks", start_ticks)
+
+
+@pytest.mark.parametrize(
+    ("evidence", "detail"),
+    [
+        ("boot-id", "cannot read the machine boot id"),
+        ("pid-generation", "process generation is indeterminate"),
+    ],
+)
+def test_unreadable_run_process_evidence_is_unverifiable_not_alive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    evidence: str,
+    detail: str,
+) -> None:
+    """Evidence that cannot be read is not evidence of a run.
+
+    ``alive`` tells the operator to stop the run's unit, which is the wrong
+    remedy when nothing shows a run at all.
+    """
+
+    project, tree = _prepare(
+        tmp_path, monkeypatch, agent_liveness="dead", units=(_unit(),)
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    records = wrkslots._load_active(config).slots
+    _write_unreadable_generation_handle(project, tree, monkeypatch, evidence)
+
+    states = wrkslots._validation_run_liveness_states(config, records)
+
+    assert len(states) == 1
+    state, message = next(iter(states.values()))
+    assert state == "unverifiable", message
+    assert detail in message
+
+
+def test_completed_validation_removal_names_unreadable_run_evidence_as_unverifiable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, tree = _prepare(
+        tmp_path, monkeypatch, agent_liveness="dead", units=(_unit(),)
+    )
+    _write_unreadable_generation_handle(project, tree, monkeypatch, "pid-generation")
+
+    removed = _remove_completed(project)
+
+    error = capsys.readouterr().err
+    assert removed != 0
+    assert "validation-run authority is unverifiable for slot slot01" in error
+    assert "process generation is indeterminate" in error
+    assert "stop its unit" not in error
+    _assert_retained(project, tree)
