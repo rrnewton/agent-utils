@@ -72,7 +72,11 @@ setting (`!gh auth git-credential`) goes through the same wrapper. That means
   file, 2 s of silence, 5 s after the exit, or 64 MiB more, whichever comes
   first, because a background process gh started may hold the stream open. If
   you send INT, TERM, HUP or QUIT after gh has exited, the output not yet
-  delivered is dropped with a warning and gh-paced dies by that signal.
+  delivered is dropped with a warning and gh-paced dies by that signal. A
+  write gh-paced has already started cannot be interrupted, so if the program
+  reading its stdout or stderr has stopped reading, the warning and the exit
+  wait until that program reads again or closes the stream. KILL still ends
+  gh-paced at once.
 - **stdin** and the controlling terminal are inherited. The one exception: a
   write whose body arrives on stdin (`--body-file -`, `--input -`, `-F body=@-`)
   is read first so the content guard can check it, then replayed to gh byte for
@@ -127,7 +131,8 @@ Some calls cost more than one token:
   seconds. 2 tokens pay for startup (finding the run or pull request); a
   `gh run watch` poll is charged 4 requests (gh fetches the run, its workflow
   and its jobs, and more for large or failing runs) and a `gh pr checks --watch`
-  poll 2. At 30 s intervals that is 120 s for `run watch` and 270 s for
+  poll 2. Both are estimates: a large or failing run can make more requests
+  than its poll is charged (see [Limitations](#limitations)). At 30 s intervals that is 120 s for `run watch` and 270 s for
   `pr checks --watch`. A watch still running at that deadline is stopped (TERM,
   then KILL 5 s later) and gh-paced exits 75. A polling interval shorter than
   30 s is refused (exit 64) unless `GH_PACED_ALLOW_FAST_WATCH=1` is set. Pass
@@ -278,9 +283,15 @@ passes through, looking only inside header blocks: a 403 or 429 status,
 `Retry-After`, and `X-RateLimit-Remaining: 0`. A header block is recognised
 only in the shape gh prints it: an `HTTP/<version> <status>` line, header lines
 ending in CRLF, and a CRLF blank line, and it is acted on only when that blank
-line arrives. Text in a response body, including body lines printed through
-`--jq` that look like a status line and headers, is never treated as a header.
-stdout itself is passed on unchanged.
+line arrives. Body lines that merely look like a status line and headers, such
+as lines printed through `--jq`, end in a bare LF and are not treated as a
+header. Two cases remain. A body that itself contains that exact shape with
+CRLF line endings is read as one more header block and can start a cooldown
+that was not needed; this errs on the safe side. A genuine header block cut off
+before its blank line is not acted on: gh's own error text on stderr (for
+example `HTTP 429`) usually still starts the 900 s cooldown, but a longer
+`Retry-After` in the cut-off block is lost. stdout itself is passed on
+unchanged.
 
 Any limit signal (one of the phrases, HTTP 429, a `Retry-After` value, or
 `X-RateLimit-Remaining: 0`) starts a **cooldown** of the larger of `Retry-After`
@@ -289,7 +300,10 @@ and 900 s (`cooldown_secs`). A plain `HTTP 403` starts a cooldown of
 GitHub does not always say that a 403 is a rate limit, so every 403 is treated
 as one. During a cooldown, every paced call for that account on that host waits
 or is refused. A new cooldown only ever extends an existing one. gh's own output
-and exit status still pass through.
+and exit status still pass through. The cooldown is recorded once gh-paced has
+delivered all of gh's output, so if the program reading that output stops
+reading, recording waits too, and other calls on the host go ahead meanwhile
+without the pause.
 
 The banner looks like this:
 
@@ -325,8 +339,9 @@ Before running a WRITE, gh-paced reads every body source:
   field is caught however it is escaped;
 - `gh workflow run -f/-F` and `--json` (stdin);
 - for an alias, extension or unknown command, every argument, flag-shaped or
-  not (`--payload=<text>`, `--repo <text>`, `-- <text>`), because its
-  expansion may pass any of them to a body flag;
+  not (`--payload=<text>`, `--repo <text>`, `-- <text>`), and every occurrence
+  of a repeated flag rather than only the last, because its expansion may pass
+  any of them to a body flag;
 - for any other write, `--body`, `--body-file` and `--input`.
 
 Every body file is first copied to a private snapshot (see
@@ -351,8 +366,10 @@ Base64-looking content is either of:
   encoding, and a long ruler of dashes all count, so nothing long slips through
   as a "word";
 - a block of consecutive lines, each at least 20 characters and made only of
-  base64-alphabet characters, counted together, whatever they contain. Line
-  wrapping therefore does not hide an encoding. A list of bare commit SHAs, one
+  base64-alphabet characters, counted together, whatever they contain. The
+  usual 64- and 76-column wrapping therefore does not hide an encoding. Lines
+  shorter than 20 characters are not joined, so an encoding wrapped at fewer
+  than 20 columns escapes this check. A list of bare commit SHAs, one
   per line, is such a block too: 26 or more 40-character SHAs exceed 1,000. Put
   a word on each line (`<sha> fix the parser`), or point at a commit range,
   instead.
@@ -594,8 +611,10 @@ user name and password, query string and fragment (a query string can carry an
 `access_token`). For an alias, extension or unknown command, only flag names are
 kept and every other argument becomes `<arg>`; an unrecognised flag of a known
 command keeps its name and loses its value (`--token=X` becomes `--token`).
-The log never contains request
-bodies, tokens or environment variables. LOCAL calls are not audited.
+A `gh api` call carrying a flag gh-paced does not recognise is recorded as
+`api <unparsed>`, because its endpoint cannot be told apart from that flag's
+value. The log never contains request bodies, tokens or environment
+variables. LOCAL calls are not audited.
 
 `gh-paced status [--account NAME | --all] [--json]` reads these files and prints
 each class's tokens and burst, rate, use in the last hour, and time to the next
@@ -639,3 +658,18 @@ next slot opens.
 - **Pushback detection depends on gh's error text.** gh-paced recognises the
   phrases GitHub and gh use today. A change in that wording could hide a
   pushback, but GitHub's account-wide counters (above) still apply.
+- **Delivering gh's output comes first.** A detected pushback is recorded, and
+  a late signal acted on, only after gh-paced finishes writing gh's output. A
+  program that stops reading that output delays both; see
+  [pushback](#github-pushback-and-the-cooldown) and
+  [What passes through unchanged](#what-passes-through-unchanged).
+- **Output written long after gh exits can be lost.** gh-paced stops reading a
+  stream 2 s after it goes quiet, 5 s after gh exits, or after 64 MiB more. A
+  background process gh started that writes later loses that output, and any
+  pushback text in it is not seen.
+- **Header and encoding detection work by shape.** A response body containing
+  a CRLF header block can start an unneeded cooldown, a header block cut off
+  before its blank line loses its `Retry-After`, and base64 wrapped at fewer
+  than 20 columns is not detected (see
+  [pushback](#github-pushback-and-the-cooldown) and
+  [the write content guard](#the-write-content-guard)).
