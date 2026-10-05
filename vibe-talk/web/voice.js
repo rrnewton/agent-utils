@@ -1488,7 +1488,9 @@ const SUMMARY_MODE_ON = "Summaries on";
 // `#207 scrollback-jump` made it say HOW MUCH arrived, so it holds one of three things: `false`,
 // nothing arrived below the reader; a number, that many new messages did; or `true`, something
 // did that cannot be counted. A number never grows out of `true`: unknown plus three is still
-// unknown, and "3 new" over sixty would be a lie.
+// unknown, and "3 new" over sixty would be a lie. The number can be 0: something changed below
+// that is not a new message — a turn still being spoken, a seam — and the jump says only "New"
+// until a message that can be counted arrives after it.
 /** @type {{voice: boolean | number, discord: boolean | number}} */
 const jumpNewestWanted = { voice: false, discord: false };
 
@@ -1534,7 +1536,9 @@ const JUMP_COUNT_MAX = 99;
  * the scroll has already computed, and a write only when something changed. Every programmatic
  * placement of the reader ends in it as well — `renderScrollTools`, `restoreScroll`,
  * `scrollToNewest` — so a restore that lands on the newest message never shows it, and one that
- * lands up the history shows it at once rather than waiting for a scroll event to say so.
+ * lands up the history shows it at once rather than waiting for a scroll event to say so. So does
+ * a change in the list's size that moves its end without a scroll: see the observer beside the
+ * scroll listener.
  */
 function renderJumpNewest() {
   const button = el("jump-newest");
@@ -17032,6 +17036,29 @@ el("scroll-area").addEventListener("scroll", () => {
   // has already been asked about, and a scroll that reveals nothing new issues nothing.
   requestVisibleSummaries();
 });
+// `#207 scrollback-jump`. How far the list runs below the reader also changes WITHOUT a scroll, and
+// the listener above never hears of it: the window resized or turned, the reading column dragged
+// narrower, a row or the chips' room growing or shrinking below the reader. A reader 40px
+// up whose newest row then shrank by 30 is on the newest line with a jump offering to take them
+// there; one on the newest line whose last row grew is up the history with no way back offered.
+// So the list's box and everything directly in it — the two panes, the search's empty notice — are
+// watched too, and the jump decided again from where the reader now is.
+//
+// AFTER the observer returns, not inside it: deciding can show or hide the jump, that resizes
+// #scroll-tools, and a size changed from inside a ResizeObserver callback is the loop the browser
+// reports as an error. One decision per burst of resizes; it is cheap, but a row drawn is a resize.
+if (typeof window.ResizeObserver === "function") {
+  let decisionDue = false;
+  const geometry = new window.ResizeObserver(() => {
+    if (decisionDue) return;
+    decisionDue = true;
+    setTimeout(() => {
+      decisionDue = false;
+      renderJumpNewest();
+    }, 0);
+  });
+  for (const box of [el("scroll-area"), ...el("scroll-area").children]) geometry.observe(box);
+}
 // `#68 pull-to-refresh`. On #scroll-area rather than on the document, because the gesture is about
 // THIS list and because the page's other three scroll gestures already live here. Nothing calls
 // `preventDefault`: the pull only ever begins where the element has nothing left to scroll, so

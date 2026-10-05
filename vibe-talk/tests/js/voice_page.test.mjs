@@ -2362,6 +2362,34 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       for (const lock of page.wakeLocks) await lock.release();
     };
   };
+  /**
+   * `#207 scrollback-jump`. A ResizeObserver the TEST drives. Left out of the ordinary fixture, so the
+   * rest of the suite runs as it always has, without the page's observers; a test that wants them
+   * calls this from `arrange`, because the page constructs them as it loads. `resized(element)` is
+   * what a browser does after a layout that changed that element's size: every observer watching it
+   * is told, and nothing else happens — in particular no scroll event, which is the point.
+   */
+  page.resizeObservers = [];
+  page.enableResizeObserver = () => {
+    context.window.ResizeObserver = class {
+      constructor(callback) {
+        this.callback = callback;
+        this.targets = [];
+        page.resizeObservers.push(this);
+      }
+
+      observe(target) {
+        this.targets.push(target);
+      }
+    };
+  };
+  page.resized = (target) => {
+    for (const observer of page.resizeObservers) {
+      if (observer.targets.includes(target)) {
+        observer.callback([{ target, contentRect: { height: target.height() } }]);
+      }
+    }
+  };
   // The page makes its first requests while the script is still running, so a test that needs to
   // hold or fail THOSE — a reload that must draw before the network answers — arranges the fixture
   // here, before a line of the page has run.
@@ -8394,7 +8422,8 @@ test("SENDING A REPLY does not move you — the whole complaint, pinned", async 
 // TWO OF THESE ARE ALREADY HERE and are not repeated: "a turn arriving FOLLOWS the newest line for
 // a reader already at the bottom" and "JUMP TO NEWEST says a turn arrived off screen, and takes you
 // there" are both about the transcript, both use a transcript tall enough to scroll, and between
-// them pin the two arrival cases — follow when pinned, hold still and raise the chip when not. What was missing is everything about ENTERING and LEAVING this view.
+// them pin the two arrival cases — follow when pinned, hold still and raise the chip when not. What
+// was missing is everything about ENTERING and LEAVING this view.
 //
 // Writing them found two defects, neither of which the channel has:
 //
@@ -16042,6 +16071,57 @@ test("a reload that puts the reader back up the channel shows the jump; one on t
   assert.ok(atBottomOf(newest.page.el("scroll-area")), "the premise: the reload put the reader on the newest");
   assert.equal(newest.drawn, false, "a reopen on the newest message offered a jump to it");
   assert.equal(newest.read, false, "the reopen's read offered a jump to the newest message");
+});
+
+test("the list changing size under a reader who has not scrolled decides the jump again", async () => {
+  // None of these is a scroll, so a browser fires no scroll event for any of them and the listener
+  // never hears of it: the window resized, a row below the reader growing. The fixture's `resized`
+  // is all a browser does for them. Without it, a reader the window grew under is on the newest
+  // line with a jump offering to take them there.
+  const run = async (script) => {
+    const seen = {};
+    const page = newPage(new Map(), script, (p) => p.enableResizeObserver());
+    await signIn(page);
+    await showDiscord(page, tallChannel());
+    const area = page.el("scroll-area");
+    assert.equal(jumpShown(page), false, "the premise: on the newest message, no jump");
+    // The window loses more than SCROLLBACK_PX and the reader, unmoved, is up the history.
+    area.clientHeight -= SCROLLBACK_PX + LINE_PX;
+    assert.ok(area.scrollHeight - area.clientHeight - area.scrollTop > SCROLLBACK_PX, "the premise: now up");
+    page.resized(area);
+    page.expireTimers(0);
+    seen.windowShrank = jumpShown(page);
+    // Down from halfway up to just inside the band, so the jump is up by the scroll listener's own
+    // decision; then the window gains 30px and the reader, unmoved, is on the newest line.
+    await scrollToGap(page, halfway(page));
+    await scrollToGap(page, BOTTOM_SLACK_PX + 16);
+    assert.equal(jumpShown(page), true, "the premise: come down into the band from above, the jump is up");
+    area.clientHeight += 30;
+    assert.ok(atBottomOf(area), "the premise: the taller window put the reader on the newest line");
+    page.resized(area);
+    page.expireTimers(0);
+    seen.windowGrew = jumpShown(page);
+
+    // A pane rather than the list's own box: the newest turn, re-wrapped taller (a narrower column, a
+    // font arriving) with nothing drawn by the page, under a reader on the newest line.
+    const talk = newPage(new Map(), script, (p) => p.enableResizeObserver());
+    await startTalking(talk);
+    fillTranscript(talk);
+    assert.equal(jumpShown(talk), false, "the premise: on the newest turn, no jump");
+    talk.el("transcript").children.at(-1).textContent += " and more".repeat(CHARS_PER_LINE);
+    talk.resized(talk.el("pane-voice"));
+    talk.expireTimers(0);
+    seen.rowGrewBelow = jumpShown(talk);
+    return seen;
+  };
+  assert.deepStrictEqual(await run(SCRIPT), { windowShrank: true, windowGrew: false, rowGrewBelow: true });
+
+  // THE CONTROL: the list and its panes not watched. Each is left as the last scroll decided it, and
+  // all three have to see that.
+  const control = await run(brokenScript(
+    '  for (const box of [el("scroll-area"), ...el("scroll-area").children]) geometry.observe(box);\n', ""
+  ));
+  assert.deepStrictEqual(control, { windowShrank: false, windowGrew: true, rowGrewBelow: false });
 });
 
 test("a tap on the jump only scrolls: no refresh, no fold, nothing read aloud", async () => {

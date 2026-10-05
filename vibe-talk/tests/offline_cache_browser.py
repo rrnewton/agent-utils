@@ -33,7 +33,9 @@ left of the chip row in the dark theme — legible, a 44px target, inside the li
 the dock, clear of the floating pills and of every other chip forced up beside it, at the ordinary
 type size and at 150%, where on a phone the row wraps and the others go up a line. A real tap a few
 pixels above the drawn chip lands on the newest message, reads nothing, starts no pull, and the jump
-is gone (`#207 scrollback-jump`).
+is gone. It is decided again when the list changes size under a reader who has not scrolled, with the
+list's scroll events held back from the page: it comes when the newest message grows below a reader on
+the newest line, and goes when it shrinks under one just above it (`#207 scrollback-jump`).
 
 Opening a thread whose title is longer than the screen, with a long unbroken token and inline code
 in its reply, leaves the page no wider than the viewport and no shown part of the main screen past
@@ -903,17 +905,42 @@ CHIP_JS = """(id) => {""" + FLOAT_HELPERS_JS + """
     return {problems, contrast};
 }"""
 
-# `#207 scrollback-jump`. Park the reader (`where`: "newest", "middle", or null to stay put), let two
-# frames pass, and measure the jump to the newest message. `problems` is empty when it is at the lower
-# left of the chip row — the left end of the list's column, on the row's bottom line — inside the list
-# and above the dock, clear of every other chip shown and of the floating pills, legible against its
-# own chip in the colours in force, and pressed by a tap anywhere in a 44px square around its centre.
-# `gap` is how far the list runs below the reader.
-JUMP_JS = """async (where) => {""" + FLOAT_HELPERS_JS + """
+# `#207 scrollback-jump`. Put the reader `gap` px short of the end of the list, or halfway up it for
+# "middle". From the first call on, while `__holdScrolls` is set the list's scroll events are kept from
+# the page: the listener is the document's, in the capture phase, so it runs before the page's own on
+# the list and can stop the event reaching it.
+PARK_JS = """(gap) => {
     const area = document.getElementById('scroll-area');
+    if (window.__holdScrolls === undefined) {
+        window.__holdScrolls = false;
+        document.addEventListener('scroll', (event) => {
+            if (event.target === area && window.__holdScrolls) event.stopImmediatePropagation();
+        }, true);
+    }
     const range = area.scrollHeight - area.clientHeight;
-    if (where) area.scrollTop = {newest: area.scrollHeight, middle: Math.round(range / 2)}[where];
-    await new Promise((settled) => requestAnimationFrame(() => requestAnimationFrame(settled)));
+    area.scrollTop = range - (gap === 'middle' ? Math.round(range / 2) : gap);
+}"""
+
+# Whether the jump to the newest message is up, for waiting on.
+JUMP_UP_JS = "() => !document.getElementById('jump-newest').hidden"
+
+# Whether the room the channel composer keeps under itself has caught up with the chip row: the page
+# sets it from a ResizeObserver on the row, so it follows the row's height a rendering frame late, and
+# the end of the list moves when it does.
+ROOM_SETTLED_JS = """() => {
+    const row = document.getElementById('scroll-tools').getBoundingClientRect().height;
+    const room = document.getElementById('frame-body').style.getPropertyValue('--scroll-tools-clearance');
+    const px = /^calc\\(([\\d.]+)px \\+ 0\\.5rem\\)$/.exec(room);
+    return row > 0 ? Boolean(px) && Math.abs(Number(px[1]) - row) < 0.5 : room === '0px' || room === '';
+}"""
+
+# Measure the jump to the newest message where the reader is. `problems` is empty when it is at the
+# lower left of the chip row — the left end of the list's column, on the row's bottom line — inside the
+# list and above the dock, clear of every other chip shown and of the floating pills, legible against
+# its own chip in the colours in force, and pressed by a tap anywhere in a 44px square around its
+# centre. `gap` is how far the list runs below the reader.
+JUMP_JS = """() => {""" + FLOAT_HELPERS_JS + """
+    const area = document.getElementById('scroll-area');
     const gap = area.scrollHeight - area.clientHeight - area.scrollTop;
     const jump = document.getElementById('jump-newest');
     if (!shown(jump)) return {shown: false, gap, label: '', problems: [], centre: [0, 0], top: 0, lines: 0};
@@ -1019,7 +1046,8 @@ def main() -> int:
                   " clear of the tabs and the header with #scroll-area unmoved, a scrolled reader"
                   " held in place as it and the error panel come and go, the jump to the newest message"
                   " at the lower left of the chip row whenever the list is scrolled back and gone at the"
-                  " newest line, a real tap on it landing there, the search glass on the pill's"
+                  " newest line, a real tap on it landing there, the same when the list resizes under a"
+                  " still reader, the search glass on the pill's"
                   " line with no header strip and a 44px target, the search bar opened by a real tap and"
                   " folded with #scroll-area unmoved, Settings' title bar,"
                   f"{' a pull up past the newest line refreshes in place,' if mobile else ''} no Cache Storage or"
@@ -1151,6 +1179,39 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                       f"{label}, {state}: #scroll-area is {found['area']}, {found['bare']} without the pill")
                 check(bool(found["picker"]), f"{label}, {state}: the bar's thread picker was not on screen")
                 return str(found["area"])
+
+            def wait_jump(up: bool) -> None:
+                """`#207 scrollback-jump`: until the jump is up (or gone), for ten seconds at most.
+
+                Waited for rather than given two frames. The page decides the jump on the list's scroll
+                event, which the browser dispatches in its next RENDERING frame, and a loaded host can
+                hold that frame back for half a second; `page.clock` has made requestAnimationFrame a
+                16ms timer, so two frames counted in the page pass whether one was drawn or not. A jump
+                that is stuck, rather than late, still fails here: ten seconds later.
+                """
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and bool(page.evaluate(JUMP_UP_JS)) != up:
+                    page.wait_for_timeout(50)
+
+            def wait_room() -> None:
+                """Until the room under the composer has caught up with the chip row, ten seconds at most."""
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and not page.evaluate(ROOM_SETTLED_JS):
+                    page.wait_for_timeout(50)
+
+            def park_still(gap: int) -> None:
+                """Park the reader `gap` px short of the end, and again until the end stays where it is.
+
+                The room under the composer follows the chip row a frame late (ROOM_SETTLED_JS), and a jump
+                that has just come or gone has just changed the row, so the end of the list can move after
+                the reader was put somewhere relative to it. Ten seconds at most.
+                """
+                deadline = time.monotonic() + 10
+                while True:
+                    page.evaluate(PARK_JS, gap)
+                    wait_room()
+                    if abs(float(page.evaluate(JUMP_JS)["gap"]) - gap) <= 1 or time.monotonic() > deadline:
+                        return
 
             # 1. Sign in and open the channel: in All, the default where the provider has threads
             # (`#189 restore-ui-state`); then Threads and Main. The call view comes up first: its
@@ -1315,12 +1376,16 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             # 44px and clear of everything around it — alone, beside every other chip forced up, and
             # beside them at a large system font, where the row has to wrap and the others go up a line.
             # Then a real tap a few pixels ABOVE the drawn chip lands on the newest message, reads
-            # nothing, starts no pull, and the jump is gone.
+            # nothing, starts no pull, and the jump is gone. Each state is waited for (`wait_jump`).
             page.emulate_media(color_scheme="dark")
-            resting = page.evaluate(JUMP_JS, "newest")
+            page.evaluate(PARK_JS, 0)
+            wait_jump(False)
+            resting = page.evaluate(JUMP_JS)
             check(float(resting["gap"]) <= 2, f"{label}: could not park the reader at the newest line: {resting}")
-            check(not resting["shown"], f"{label}: the jump to the newest message is up at the newest line")
-            back = page.evaluate(JUMP_JS, "middle")
+            check(not resting["shown"], f"{label}: the jump to the newest message is up at the newest line: {resting}")
+            page.evaluate(PARK_JS, "middle")
+            wait_jump(True)
+            back = page.evaluate(JUMP_JS)
             shot("4b2-jump-scrolled-back")
             check(bool(back["shown"]) and float(back["gap"]) > 100,
                   f"{label}: halfway up the channel there is no jump to the newest message: {back}")
@@ -1329,7 +1394,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             crowd = page.add_style_tag(content="#scroll-tools .chip[hidden] { display: inline-flex !important; }")
             for size in ("100%", "150%"):
                 font = page.add_style_tag(content=f"html {{ font-size: {size} !important; }}")
-                crowded = page.evaluate(JUMP_JS, None)
+                crowded = page.evaluate(JUMP_JS)
                 shot(f"4b2-jump-beside-every-chip-{size.rstrip('%')}")
                 lines = int(crowded["lines"])
                 check(not crowded["problems"],
@@ -1338,7 +1403,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 check(lines >= 2 or not mobile, f"{label}: every chip at {size} type fit one line, so nothing wrapped")
                 font.evaluate("element => element.remove()")
             crowd.evaluate("element => element.remove()")
-            ready = page.evaluate(JUMP_JS, None)
+            ready = page.evaluate(JUMP_JS)
             check(bool(ready["shown"]) and not ready["problems"], f"{label}: the jump before the tap: {ready}")
             reads_before = len(api.reads())
             tap_x, tap_y = float(ready["centre"][0]), float(ready["top"]) - 4
@@ -1346,16 +1411,60 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 page.touchscreen.tap(tap_x, tap_y)
             else:
                 page.mouse.click(tap_x, tap_y)
-            landed = page.evaluate(JUMP_JS, None)
+            wait_jump(False)
+            landed = page.evaluate(JUMP_JS)
             newest = page.evaluate(NEWEST_ROW_JS)
             shot("4b2-jump-tapped")
             check(float(landed["gap"]) <= 2,
                   f"{label}: a tap 4px above the jump left the newest line {float(landed['gap']):.1f}px below")
             check(bool(newest["visible"]), f"{label}: after the tap the end of the newest message is not on screen: {newest}")
-            check(not landed["shown"], f"{label}: the jump is still up at the newest line")
+            check(not landed["shown"], f"{label}: the jump is still up at the newest line: {landed}")
             check(len(api.reads()) == reads_before, f"{label}: the tap read the channel: {api.reads()[reads_before:]}")
             check(bool(page.evaluate("() => document.getElementById('pull-refresh').hidden")),
                   f"{label}: the tap started the pull's affordance")
+
+            # ...and decided again when the list changes size under a reader who has NOT scrolled, which
+            # no scroll event reports — so each change is made with the list's scroll events held back
+            # from the page, and the scroll listener cannot be what answers it. The newest message growing
+            # 200px below a reader on the newest line puts them up the history: the jump comes. Parked
+            # 40px up with it showing, the newest message then shrinking by 30px puts them on the newest
+            # line: it goes.
+            # Taller than the row is drawn now, by exactly `px`: a min-height stated in vh would grow it
+            # by less whenever its words already make it taller than that.
+            drawn = float(page.evaluate(
+                "() => [...document.querySelectorAll('#discord-log > li[data-id]')].pop().getBoundingClientRect().height"))
+
+            def newest_row_taller(px: int) -> str:
+                return (f"#discord-log > li[data-id]:last-child {{ box-sizing: border-box !important;"
+                        f" min-height: {drawn + px}px !important; }}")
+            # On the newest line, with the room under the composer settled: it can still be giving back the
+            # height of the crowded chip rows above, and that moves the end the reader is measured against.
+            park_still(0)
+            page.evaluate("() => { window.__holdScrolls = true; }")
+            grown = page.add_style_tag(content=newest_row_taller(200))
+            wait_jump(True)
+            below = page.evaluate(JUMP_JS)
+            page.evaluate("() => { window.__holdScrolls = false; }")
+            check(bool(below["shown"]) and float(below["gap"]) > 100,
+                  f"{label}: the newest message grew 200px below a reader on the newest line, and no jump came: {below}")
+            # Down from halfway up, so the jump is up by the scroll listener's own decision.
+            page.evaluate(PARK_JS, "middle")
+            wait_jump(True)
+            park_still(40)
+            parked = page.evaluate(JUMP_JS)
+            check(bool(parked["shown"]) and abs(float(parked["gap"]) - 40) <= 1,
+                  f"{label}: come down to 40px short of the end from halfway up, the jump is not still up: {parked}")
+            page.evaluate("() => { window.__holdScrolls = true; }")
+            grown.evaluate(f"(element) => {{ element.textContent = {json.dumps(newest_row_taller(170))}; }}")
+            wait_jump(False)
+            met = page.evaluate(JUMP_JS)
+            page.evaluate("() => { window.__holdScrolls = false; }")
+            check(not met["shown"] and float(met["gap"]) <= 24,
+                  f"{label}: the newest message shrank 30px under a reader 40px up, onto the newest line, and the"
+                  f" jump stayed: {met}")
+            grown.evaluate("element => element.remove()")
+            page.evaluate(PARK_JS, 0)
+            wait_jump(False)
             page.emulate_media(color_scheme="light")
 
             # 4c. `#188 pull-refresh-bottom`, with a real finger: parked at the newest line, a drag UP

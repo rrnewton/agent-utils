@@ -1279,7 +1279,11 @@ def _act_jump_to_newest(driver: Driver) -> None:
         "window.__agentSays('One more thing while you were reading: the release token expires in "
         "six days and rotating it needs the maintainer account.')"
     )
-    driver.page.wait_for_function("() => window.__visible('jump-newest')", timeout=5_000)
+    # The words, not merely the chip: the jump was up before the turn arrived, so only "1 new" says
+    # the arrival has been drawn.
+    driver.page.wait_for_function(
+        "() => window.__visible('jump-newest') && window.__text('jump-newest-label') === '1 new'", timeout=5_000
+    )
     driver.settle(300)
 
 
