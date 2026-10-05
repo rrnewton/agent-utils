@@ -34,11 +34,12 @@ use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension as _};
 
 use super::{
-    now_ms, ChannelAlias, ConversationId, ConversationSummary, ReadMark, RecordedTurn, Retention,
-    Speaker, StateStore, StoreError, SummaryKey, TranscriptCursor, TranscriptPage, Turn,
-    MAX_TRANSCRIPT_PAGE, MAX_TURN_CHARS,
+    now_ms, ChannelAlias, ConversationId, ConversationSummary, Pin, PinChange, PinSnapshot, Pins,
+    ReadMark, RecordedTurn, Retention, Speaker, StateStore, StoreError, SummaryKey,
+    TranscriptCursor, TranscriptPage, Turn, MAX_PINS_PER_CHANNEL, MAX_TRANSCRIPT_PAGE,
+    MAX_TURN_CHARS,
 };
-use crate::model::{ChannelId, MessageId};
+use crate::model::{ChannelId, MessageId, UserId};
 
 /// The schema, one step per released shape. **Append only** — editing a landed entry would leave
 /// every existing file believing it has a schema it does not have.
@@ -199,6 +200,44 @@ pub const MIGRATIONS: &[&str] = &[
         hidden_at_ms INTEGER NOT NULL
     ) STRICT;
     ",
+    // v10 — the owner's own pinned messages. `#206 pin-message`.
+    //
+    // Two NEW tables and nothing else: no existing table is altered, no row is rewritten, and the
+    // step runs in one transaction with its version stamp (see `migrate`), so a file in the wild
+    // either is at v9 untouched or is at v10 with both tables empty.
+    //
+    // `pins` holds a bounded snapshot of each pinned message (`super::PinSnapshot`), because a pin
+    // has to be drawable when its message is older than anything the page has loaded. That makes
+    // it the second table here, after `summaries`, to hold other people's words — bounded by
+    // `super::MAX_PINS_PER_CHANNEL` rows a channel and `super::MAX_PIN_TEXT_CHARS` a row, and
+    // erased by the purge. `sent_at_ms` is `sent_at` parsed, for ordering; NULL when a provider's
+    // timestamp does not parse, and such a row sorts by when it was pinned instead.
+    //
+    // `pin_revisions` is one counter per channel that ever had a pin, moved on every change to
+    // that channel's pins, so a timeline read can say whether the list changed with one indexed
+    // lookup instead of the page reading every snapshot on every refresh.
+    "
+    CREATE TABLE pins (
+        channel_id    TEXT    NOT NULL,
+        message_id    TEXT    NOT NULL,
+        author        TEXT    NOT NULL,
+        author_id     TEXT    NOT NULL,
+        author_is_bot INTEGER NOT NULL,
+        content       TEXT    NOT NULL,
+        truncated     INTEGER NOT NULL,
+        sent_at       TEXT    NOT NULL,
+        sent_at_ms    INTEGER,
+        thread_id     TEXT,
+        thread_root   INTEGER NOT NULL,
+        pinned_at_ms  INTEGER NOT NULL,
+        PRIMARY KEY (channel_id, message_id)
+    ) STRICT;
+
+    CREATE TABLE pin_revisions (
+        channel_id TEXT    PRIMARY KEY NOT NULL,
+        revision   INTEGER NOT NULL
+    ) STRICT;
+    ",
 ];
 
 /// A [`StateStore`] backed by one SQLite file.
@@ -286,28 +325,42 @@ fn backend(error: rusqlite::Error) -> StoreError {
 
 /// Apply every migration this file has not seen yet.
 fn migrate(connection: &Connection) -> Result<(), StoreError> {
+    migrate_through(connection, MIGRATIONS)
+}
+
+/// Apply every step of `steps` this file has not seen yet. [`migrate`] with the ladder as an
+/// argument, so a test can walk one that fails partway.
+fn migrate_through(connection: &Connection, steps: &[&str]) -> Result<(), StoreError> {
     let applied: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(backend)?;
     let applied = usize::try_from(applied)
         .map_err(|_| StoreError::Backend("the schema version is negative".to_owned()))?;
-    if applied > MIGRATIONS.len() {
+    if applied > steps.len() {
         // Refuse rather than guess. A file from a newer server has tables and columns this code
         // does not know about, and writing to it with the old statements is how a downgrade
         // silently corrupts data.
         return Err(StoreError::Backend(format!(
             "this database is at schema version {applied}, but this server only knows {}; it was \
              written by a newer vibe-talk and will not be downgraded",
-            MIGRATIONS.len()
+            steps.len()
         )));
     }
-    for (index, statement) in MIGRATIONS.iter().enumerate().skip(applied) {
-        connection.execute_batch(statement).map_err(|error| {
+    for (index, statement) in steps.iter().enumerate().skip(applied) {
+        // ONE TRANSACTION PER STEP, its version stamp included. SQLite's DDL and `user_version`
+        // are both transactional, so a step that fails — or a process that dies in the middle of
+        // one — leaves the file exactly at the previous version rather than holding half a step's
+        // tables under the old number, which the next start would then fail to re-create. That
+        // matters most for the files already deployed, which are upgraded rather than created.
+        let failed = |error: rusqlite::Error| {
             StoreError::Backend(format!("migration {} failed: {error}", index + 1))
-        })?;
-        connection
+        };
+        let transaction = connection.unchecked_transaction().map_err(failed)?;
+        transaction.execute_batch(statement).map_err(failed)?;
+        transaction
             .pragma_update(None, "user_version", i64::try_from(index + 1).unwrap_or(0))
-            .map_err(backend)?;
+            .map_err(failed)?;
+        transaction.commit().map_err(failed)?;
     }
     Ok(())
 }
@@ -445,6 +498,35 @@ fn prune(transaction: &rusqlite::Transaction<'_>, retention: Retention) -> Resul
         )
         .map_err(backend)?;
     Ok(())
+}
+
+/// The revision this channel's pins are at, inside the caller's connection or transaction.
+fn pin_revision(connection: &Connection, channel: &str) -> Result<i64, StoreError> {
+    Ok(connection
+        .query_row(
+            "SELECT revision FROM pin_revisions WHERE channel_id = ?1",
+            [channel],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(backend)?
+        .unwrap_or(0))
+}
+
+/// Move this channel's pin revision on, inside the caller's transaction, and return it.
+fn bump_pin_revision(
+    transaction: &rusqlite::Transaction<'_>,
+    channel: &str,
+) -> Result<i64, StoreError> {
+    let next = super::next_pin_revision(pin_revision(transaction, channel)?, now_ms());
+    transaction
+        .execute(
+            "INSERT INTO pin_revisions (channel_id, revision) VALUES (?1, ?2)
+             ON CONFLICT(channel_id) DO UPDATE SET revision = excluded.revision",
+            rusqlite::params![channel, next],
+        )
+        .map_err(backend)?;
+    Ok(next)
 }
 
 #[async_trait]
@@ -1175,6 +1257,193 @@ impl StateStore for SqliteStore {
         .await
     }
 
+    async fn pins(&self, channel: &ChannelId) -> Result<Pins, StoreError> {
+        let channel = channel.clone();
+        self.with_connection(move |connection| {
+            // One statement for the rows and one for the revision, under the one connection lock,
+            // so the revision handed back is the revision of exactly these rows.
+            let mut statement = connection
+                .prepare(
+                    "SELECT message_id, author, author_id, author_is_bot, content, truncated,
+                            sent_at, thread_id, thread_root, pinned_at_ms
+                     FROM pins WHERE channel_id = ?1
+                     ORDER BY COALESCE(sent_at_ms, pinned_at_ms) ASC, message_id ASC",
+                )
+                .map_err(backend)?;
+            let rows = statement
+                .query_map([channel.as_str()], |row| {
+                    Ok(Pin {
+                        snapshot: PinSnapshot {
+                            message_id: MessageId(row.get::<_, String>(0)?),
+                            author: row.get::<_, String>(1)?,
+                            author_id: UserId(row.get::<_, String>(2)?),
+                            author_is_bot: row.get::<_, i64>(3)? != 0,
+                            content: row.get::<_, String>(4)?,
+                            truncated: row.get::<_, i64>(5)? != 0,
+                            timestamp: row.get::<_, String>(6)?,
+                            thread_id: row.get::<_, Option<String>>(7)?,
+                            thread_root: row.get::<_, i64>(8)? != 0,
+                        },
+                        pinned_at_ms: row.get::<_, i64>(9)?,
+                    })
+                })
+                .map_err(backend)?;
+            let pins = rows.collect::<Result<Vec<_>, _>>().map_err(backend)?;
+            Ok(Pins {
+                pins,
+                revision: pin_revision(connection, channel.as_str())?,
+            })
+        })
+        .await
+    }
+
+    async fn pins_revision(&self, channel: &ChannelId) -> Result<i64, StoreError> {
+        let channel = channel.clone();
+        self.with_connection(move |connection| pin_revision(connection, channel.as_str()))
+            .await
+    }
+
+    async fn pin(
+        &self,
+        channel: &ChannelId,
+        snapshot: &PinSnapshot,
+    ) -> Result<PinChange, StoreError> {
+        let snapshot = super::validate_pin(snapshot)?;
+        let channel = channel.clone();
+        self.with_connection(move |connection| {
+            let transaction = connection.transaction().map_err(backend)?;
+            let id = snapshot.message_id.as_str();
+            // The snapshot is refreshed, `pinned_at_ms` is NOT: a second pin of the same message
+            // keeps its place in the bound's queue, so a repeated tap cannot make an old pin the
+            // newest and spare it at another's expense. The WHERE makes an identical repeat a
+            // no-op SQLite reports as no change, which is what keeps the revision still for it.
+            let written = transaction
+                .execute(
+                    "INSERT INTO pins (channel_id, message_id, author, author_id, author_is_bot,
+                                       content, truncated, sent_at, sent_at_ms, thread_id,
+                                       thread_root, pinned_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                     ON CONFLICT(channel_id, message_id) DO UPDATE SET
+                        author = excluded.author, author_id = excluded.author_id,
+                        author_is_bot = excluded.author_is_bot, content = excluded.content,
+                        truncated = excluded.truncated, sent_at = excluded.sent_at,
+                        sent_at_ms = excluded.sent_at_ms, thread_id = excluded.thread_id,
+                        thread_root = excluded.thread_root
+                     WHERE pins.author IS NOT excluded.author
+                        OR pins.author_id IS NOT excluded.author_id
+                        OR pins.author_is_bot IS NOT excluded.author_is_bot
+                        OR pins.content IS NOT excluded.content
+                        OR pins.truncated IS NOT excluded.truncated
+                        OR pins.sent_at IS NOT excluded.sent_at
+                        OR pins.thread_id IS NOT excluded.thread_id
+                        OR pins.thread_root IS NOT excluded.thread_root",
+                    rusqlite::params![
+                        channel.as_str(),
+                        id,
+                        &snapshot.author,
+                        snapshot.author_id.as_str(),
+                        i64::from(snapshot.author_is_bot),
+                        &snapshot.content,
+                        i64::from(snapshot.truncated),
+                        &snapshot.timestamp,
+                        crate::clock::instant_ms(&snapshot.timestamp),
+                        snapshot.thread_id.as_deref(),
+                        i64::from(snapshot.thread_root),
+                        now_ms()
+                    ],
+                )
+                .map_err(backend)?;
+            // The bound, in the same transaction: every OTHER pin in the channel past the newest
+            // `MAX_PINS_PER_CHANNEL - 1` goes, oldest pinned first. Excluding this message by id
+            // rather than trusting it to sort newest is what guarantees the pin just asked for is
+            // never the one dropped, whatever the clock did.
+            let keep = i64::try_from(MAX_PINS_PER_CHANNEL.saturating_sub(1)).unwrap_or(i64::MAX);
+            let mut unpinned = Vec::new();
+            {
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT message_id FROM pins WHERE channel_id = ?1 AND message_id <> ?2
+                         ORDER BY pinned_at_ms DESC, rowid DESC LIMIT -1 OFFSET ?3",
+                    )
+                    .map_err(backend)?;
+                let rows = statement
+                    .query_map(rusqlite::params![channel.as_str(), id, keep], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .map_err(backend)?;
+                for row in rows {
+                    unpinned.push(MessageId(row.map_err(backend)?));
+                }
+            }
+            // Named oldest first, which is the order the owner would have pinned them in.
+            unpinned.reverse();
+            for gone in &unpinned {
+                transaction
+                    .execute(
+                        "DELETE FROM pins WHERE channel_id = ?1 AND message_id = ?2",
+                        rusqlite::params![channel.as_str(), gone.as_str()],
+                    )
+                    .map_err(backend)?;
+            }
+            let changed = written > 0;
+            let revision = if changed || !unpinned.is_empty() {
+                bump_pin_revision(&transaction, channel.as_str())?
+            } else {
+                pin_revision(&transaction, channel.as_str())?
+            };
+            let pinned_at_ms: i64 = transaction
+                .query_row(
+                    "SELECT pinned_at_ms FROM pins WHERE channel_id = ?1 AND message_id = ?2",
+                    rusqlite::params![channel.as_str(), id],
+                    |row| row.get(0),
+                )
+                .map_err(backend)?;
+            transaction.commit().map_err(backend)?;
+            Ok(PinChange {
+                changed,
+                pin: Some(Pin {
+                    snapshot,
+                    pinned_at_ms,
+                }),
+                unpinned,
+                revision,
+            })
+        })
+        .await
+    }
+
+    async fn unpin(
+        &self,
+        channel: &ChannelId,
+        message: &MessageId,
+    ) -> Result<PinChange, StoreError> {
+        super::validate_pin_id(message)?;
+        let channel = channel.clone();
+        let message = message.clone();
+        self.with_connection(move |connection| {
+            let transaction = connection.transaction().map_err(backend)?;
+            let removed = transaction
+                .execute(
+                    "DELETE FROM pins WHERE channel_id = ?1 AND message_id = ?2",
+                    rusqlite::params![channel.as_str(), message.as_str()],
+                )
+                .map_err(backend)?;
+            let revision = if removed > 0 {
+                bump_pin_revision(&transaction, channel.as_str())?
+            } else {
+                pin_revision(&transaction, channel.as_str())?
+            };
+            transaction.commit().map_err(backend)?;
+            Ok(PinChange {
+                changed: removed > 0,
+                pin: None,
+                unpinned: Vec::new(),
+                revision,
+            })
+        })
+        .await
+    }
+
     async fn cached_summary(&self, key: &SummaryKey) -> Result<Option<String>, StoreError> {
         let key = key.clone();
         self.with_connection(move |connection| {
@@ -1264,6 +1533,15 @@ impl StateStore for SqliteStore {
                 .map_err(backend)?;
             transaction
                 .execute("DELETE FROM noise_exemptions", [])
+                .map_err(backend)?;
+            // The pins, snapshots and all, and their counters with them: a revision of 0 after
+            // this is what tells every page holding an older list to read it again, and the next
+            // pin's revision starts from the clock, past every one handed out before.
+            transaction
+                .execute("DELETE FROM pins", [])
+                .map_err(backend)?;
+            transaction
+                .execute("DELETE FROM pin_revisions", [])
                 .map_err(backend)?;
             transaction.commit().map_err(backend)
         })
@@ -2611,5 +2889,421 @@ mod tests {
             .await
             .expect("read")
             .is_empty());
+    }
+
+    // --- pins, `#206 pin-message` ------------------------------------------------------------
+
+    /// A pin of message `id`, sent at `sent` (ISO-8601).
+    fn pinned(id: &str, sent: &str) -> PinSnapshot {
+        PinSnapshot {
+            message_id: MessageId(id.to_owned()),
+            author: "build-bot".to_owned(),
+            author_id: UserId("1000000000000000009".to_owned()),
+            author_is_bot: true,
+            content: format!("message {id}"),
+            truncated: false,
+            timestamp: sent.to_owned(),
+            thread_id: None,
+            thread_root: false,
+        }
+    }
+
+    fn pin_ids(pins: &Pins) -> Vec<&str> {
+        pins.pins
+            .iter()
+            .map(|pin| pin.snapshot.message_id.as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_pin_is_idempotent_both_ways_and_only_a_real_change_moves_the_revision() {
+        let dir = TempDir::new("sqlite-pins-idempotent");
+        let store = store(&dir, Retention::default());
+        let channel = ChannelId("1111111111".to_owned());
+        let other = ChannelId("2222222222".to_owned());
+        assert_eq!(store.pins_revision(&channel).await.expect("read"), 0);
+
+        let first = store
+            .pin(
+                &channel,
+                &pinned("1000000000000000200", "2026-10-04T12:00:00Z"),
+            )
+            .await
+            .expect("pin");
+        assert!(first.changed && first.unpinned.is_empty());
+        assert!(first.revision > 0, "a pin left the revision at zero");
+
+        // THE REPEAT: same message, same snapshot. Not an error, and not a change — the revision
+        // stays, so no other device is sent to re-read a list that did not move.
+        let again = store
+            .pin(
+                &channel,
+                &pinned("1000000000000000200", "2026-10-04T12:00:00Z"),
+            )
+            .await
+            .expect("pin again");
+        assert!(!again.changed, "pinning a pinned message reported a change");
+        assert_eq!(again.revision, first.revision);
+        let at = |change: &PinChange| change.pin.as_ref().map(|pin| pin.pinned_at_ms);
+        assert!(at(&first).is_some());
+        assert_eq!(
+            at(&again),
+            at(&first),
+            "a repeat moved the pin in the bound's queue"
+        );
+        assert_eq!(store.pins(&channel).await.expect("read").pins.len(), 1);
+
+        // A second pin after an EDIT refreshes the snapshot, and that is a change.
+        let edited = store
+            .pin(
+                &channel,
+                &PinSnapshot {
+                    content: "edited since".to_owned(),
+                    ..pinned("1000000000000000200", "2026-10-04T12:00:00Z")
+                },
+            )
+            .await
+            .expect("pin the edit");
+        assert!(edited.changed && edited.revision > first.revision);
+        assert_eq!(
+            store.pins(&channel).await.expect("read").pins[0]
+                .snapshot
+                .content,
+            "edited since"
+        );
+
+        // One channel's pin is not another's.
+        assert!(store.pins(&other).await.expect("read").pins.is_empty());
+        assert_eq!(store.pins_revision(&other).await.expect("read"), 0);
+
+        let message = MessageId("1000000000000000200".to_owned());
+        let off = store.unpin(&channel, &message).await.expect("unpin");
+        assert!(off.changed && off.revision > edited.revision && off.pin.is_none());
+        let off_again = store.unpin(&channel, &message).await.expect("unpin again");
+        assert!(
+            !off_again.changed,
+            "unpinning an unpinned message reported a change"
+        );
+        assert_eq!(off_again.revision, off.revision);
+        let list = store.pins(&channel).await.expect("read");
+        assert!(list.pins.is_empty());
+        assert_eq!(
+            list.revision, off.revision,
+            "the list and its revision disagree"
+        );
+    }
+
+    #[tokio::test]
+    async fn pins_survive_the_store_being_closed_and_reopened_snapshot_and_all() {
+        // The property that makes a pin the server's and not a tab's: it is still there after a
+        // restart, on whichever device asks.
+        let dir = TempDir::new("sqlite-pins-reopen");
+        let channel = ChannelId("1111111111".to_owned());
+        let threaded = PinSnapshot {
+            thread_id: Some("spaces/A/threads/B".to_owned()),
+            thread_root: true,
+            content: "é".repeat(2_100),
+            ..pinned("1000000000000000300", "2026-10-04T13:00:00Z")
+        };
+        let revision = {
+            let store = store(&dir, Retention::default());
+            store
+                .pin(
+                    &channel,
+                    &pinned("1000000000000000200", "2026-10-04T12:00:00Z"),
+                )
+                .await
+                .expect("pin");
+            store.pin(&channel, &threaded).await.expect("pin").revision
+        };
+        let reopened = store(&dir, Retention::default());
+        let list = reopened.pins(&channel).await.expect("read");
+        assert_eq!(
+            pin_ids(&list),
+            vec!["1000000000000000200", "1000000000000000300"],
+            "the pins did not survive a restart"
+        );
+        assert_eq!(
+            list.revision, revision,
+            "the revision did not survive a restart"
+        );
+        let kept = &list.pins[1].snapshot;
+        assert_eq!(kept.thread_id.as_deref(), Some("spaces/A/threads/B"));
+        assert!(kept.thread_root && kept.author_is_bot);
+        assert_eq!(kept.author_id.as_str(), "1000000000000000009");
+        assert_eq!(
+            kept.content.chars().count(),
+            super::super::MAX_PIN_TEXT_CHARS,
+            "the store kept more of the text than its bound"
+        );
+        assert!(kept.truncated);
+        assert!(list.pins[1].pinned_at_ms > 0);
+    }
+
+    #[tokio::test]
+    async fn pins_come_back_in_the_order_their_messages_were_sent_not_the_order_they_were_pinned() {
+        let dir = TempDir::new("sqlite-pins-order");
+        let store = store(&dir, Retention::default());
+        let channel = ChannelId("1111111111".to_owned());
+        // Pinned newest-message first; two zones, so a string sort would get it wrong.
+        for (id, sent) in [
+            ("1000000000000000300", "2026-10-04T15:00:00+02:00"),
+            ("1000000000000000100", "2026-10-04T11:00:00Z"),
+            ("1000000000000000200", "2026-10-04T12:30:00Z"),
+        ] {
+            store.pin(&channel, &pinned(id, sent)).await.expect("pin");
+        }
+        assert_eq!(
+            pin_ids(&store.pins(&channel).await.expect("read")),
+            vec![
+                "1000000000000000100",
+                "1000000000000000200",
+                "1000000000000000300"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_pin_bound_drops_the_oldest_pin_in_that_channel_and_says_which() {
+        let dir = TempDir::new("sqlite-pins-bound");
+        let store = store(&dir, Retention::default());
+        let channel = ChannelId("1111111111".to_owned());
+        let quiet = ChannelId("2222222222".to_owned());
+        store
+            .pin(
+                &quiet,
+                &pinned("1000000000000009999", "2026-10-04T09:00:00Z"),
+            )
+            .await
+            .expect("the quiet channel's one pin");
+        // Pinned in order 0..100, so pin 0 is the oldest PIN; its message is the NEWEST message,
+        // so a bound that dropped by message time would pick the wrong one.
+        let id = |n: usize| format!("{}", 1_000_000_000_000_001_000_u64 + n as u64);
+        let sent = |n: usize| format!("2026-10-04T12:{:02}:{:02}Z", 59 - n / 60, 59 - n % 60);
+        for n in 0..MAX_PINS_PER_CHANNEL {
+            let change = store
+                .pin(&channel, &pinned(&id(n), &sent(n)))
+                .await
+                .expect("pin");
+            assert!(
+                change.unpinned.is_empty(),
+                "pin {n} unpinned something under the bound"
+            );
+            // The bound orders by `pinned_at_ms`; a gap keeps two pins out of one millisecond.
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // A repeat of the oldest pin at the bound: not a new pin, so nothing is dropped, and it
+        // does not move to the back of the queue.
+        let repeat = store
+            .pin(&channel, &pinned(&id(0), &sent(0)))
+            .await
+            .expect("repeat");
+        assert!(
+            repeat.unpinned.is_empty(),
+            "a repeat at the bound dropped a pin"
+        );
+
+        let over = store
+            .pin(
+                &channel,
+                &pinned("1000000000000000001", "2026-10-01T00:00:00Z"),
+            )
+            .await
+            .expect("one past the bound");
+        assert_eq!(
+            over.unpinned,
+            vec![MessageId(id(0))],
+            "the bound did not drop exactly the oldest pin"
+        );
+        let held = store.pins(&channel).await.expect("read");
+        assert_eq!(
+            held.pins.len(),
+            MAX_PINS_PER_CHANNEL,
+            "the bound did not hold"
+        );
+        assert!(
+            pin_ids(&held).contains(&"1000000000000000001"),
+            "the new pin was dropped"
+        );
+        assert!(!pin_ids(&held).contains(&id(0).as_str()));
+        assert_eq!(
+            pin_ids(&store.pins(&quiet).await.expect("read")),
+            vec!["1000000000000009999"],
+            "a busy channel's bound reached a quiet channel's pin"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_age_limit_unpins_a_message_and_the_purge_erases_every_pin() {
+        let dir = TempDir::new("sqlite-pins-age-purge");
+        let store = store(
+            &dir,
+            Retention {
+                retain_days: 1,
+                max_summaries: 1,
+                ..Retention::default()
+            },
+        );
+        let channel = ChannelId("1111111111".to_owned());
+        store
+            .pin(
+                &channel,
+                &pinned("1000000000000000200", "2025-01-01T00:00:00Z"),
+            )
+            .await
+            .expect("pin");
+        {
+            let guard = store
+                .connection
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            guard
+                .execute(
+                    "UPDATE pins SET pinned_at_ms = ?1",
+                    [now_ms() - 400 * 86_400_000],
+                )
+                .expect("age the pin");
+        }
+        // Every write that runs a sweep.
+        store
+            .append_turn(&id("conv"), &Turn::now(Speaker::You, "anything"))
+            .await
+            .expect("append");
+        store
+            .cache_summary(&summary_key("1000000000000000300", 1), "a summary")
+            .await
+            .expect("cache");
+        let before = store.pins(&channel).await.expect("read");
+        assert_eq!(before.pins.len(), 1, "an age limit unpinned a message");
+
+        store.purge_everything().await.expect("purge");
+        let after = store.pins(&channel).await.expect("read");
+        assert!(
+            after.pins.is_empty(),
+            "the purge left a copy of somebody's words behind"
+        );
+        assert_eq!(after.revision, 0, "the purge left the revision behind");
+        let next = store
+            .pin(
+                &channel,
+                &pinned("1000000000000000400", "2026-10-04T12:00:00Z"),
+            )
+            .await
+            .expect("the store still works");
+        assert!(
+            next.revision > before.revision,
+            "a revision handed out before the purge was handed out again for another list"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_pin_tables_arrive_on_a_file_at_the_previous_schema_with_everything_in_it_kept() {
+        // The file in the wild is a v9 file holding a real owner's state. Built here with the v9
+        // ladder and a row in every table, then opened with today's code.
+        let dir = TempDir::new("sqlite-pins-upgrade");
+        let file = dir.path().join("vibe-talk.sqlite3");
+        {
+            let connection = Connection::open(&file).expect("open old database");
+            for migration in &MIGRATIONS[..9] {
+                connection
+                    .execute_batch(migration)
+                    .expect("apply old schema");
+            }
+            connection
+                .execute_batch(
+                    "INSERT INTO conversations VALUES ('conv', 1, 2, 'hello');
+                     INSERT INTO turns VALUES ('conv', 1, 'you', 'hello', 1);
+                     INSERT INTO read_marks VALUES ('1111111111', '1000000000000000100',
+                                                    1000000000000000100, 5);
+                     INSERT INTO dismissals VALUES ('1111111111', '1000000000000000150',
+                                                    1000000000000000150, 6);
+                     INSERT INTO channel_aliases VALUES ('1111111111', 'the build channel', 7);
+                     INSERT INTO added_channels VALUES ('added-old', 'added', 0, 8, NULL);
+                     INSERT INTO noise_exemptions VALUES ('1111111111', 'spaces/A/messages/B', 9);
+                     INSERT INTO hidden_channels VALUES ('3333333333', 10);",
+                )
+                .expect("an owner's state");
+            connection
+                .pragma_update(None, "user_version", 9_i64)
+                .expect("stamp old schema");
+        }
+
+        let store = SqliteStore::open(&file, Retention::default()).expect("migrate");
+        {
+            let guard = store
+                .connection
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let version: i64 = guard
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .expect("version");
+            assert_eq!(version, 10);
+        }
+        let channel = ChannelId("1111111111".to_owned());
+        assert!(
+            store.pins(&channel).await.expect("read").pins.is_empty(),
+            "an upgraded file must pin nothing the owner did not pin"
+        );
+        store
+            .pin(
+                &channel,
+                &pinned("1000000000000000200", "2026-10-04T12:00:00Z"),
+            )
+            .await
+            .expect("the new tables are usable");
+        // Everything that was there is still there.
+        assert_eq!(store.conversations().await.expect("read").len(), 1);
+        assert_eq!(store.read_marks().await.expect("read").len(), 1);
+        assert_eq!(
+            store.dismissals(&channel).await.expect("read"),
+            vec![MessageId("1000000000000000150".to_owned())]
+        );
+        assert_eq!(store.channel_aliases().await.expect("read").len(), 1);
+        assert_eq!(store.added_channels().await.expect("read").len(), 1);
+        assert_eq!(
+            store.noise_exemptions(&channel).await.expect("read").len(),
+            1
+        );
+        assert_eq!(store.hidden_channels().await.expect("read").len(), 1);
+        drop(store);
+        let reopened = SqliteStore::open(&file, Retention::default()).expect("reopen");
+        assert_eq!(reopened.pins(&channel).await.expect("read").pins.len(), 1);
+    }
+
+    #[test]
+    fn a_migration_step_that_fails_leaves_the_file_at_the_version_before_it() {
+        // Why `migrate` wraps each step in a transaction with its stamp. Without that, the failure
+        // below would leave `half` created under version 1, and every later start would fail on
+        // "table half already exists" for a step that never finished.
+        let dir = TempDir::new("sqlite-migrate-atomic");
+        let connection = Connection::open(dir.path().join("vibe-talk.sqlite3")).expect("open");
+        let steps = [
+            "CREATE TABLE first (x INTEGER) STRICT;",
+            "CREATE TABLE half (x INTEGER) STRICT; CREATE TABLE broken (",
+        ];
+        let error = migrate_through(&connection, &steps).expect_err("the second step is broken");
+        assert!(error.to_string().contains("migration 2 failed"), "{error}");
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 1, "the failed step moved the version");
+        let tables: Vec<String> = connection
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows");
+        assert_eq!(
+            tables,
+            vec!["first".to_owned()],
+            "half of the failed step was kept"
+        );
+        // ...and once the step is fixed, the same file takes it.
+        migrate_through(
+            &connection,
+            &[steps[0], "CREATE TABLE half (x INTEGER) STRICT;"],
+        )
+        .expect("the fixed ladder applies");
     }
 }

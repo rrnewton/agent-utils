@@ -233,6 +233,20 @@
                 hidden
               />
               <span id="search-count" class="search-count" role="status" aria-live="polite" hidden></span>
+              <!--
+                `#206 pin-message`. The Pinned filter, IMMEDIATELY beside the glass and only while the
+                bar is open, as the owner asked: on, the list is this channel's pinned messages and
+                nothing else — whatever the view and whatever Hide read says — and the search text
+                still narrows it. Closing the bar clears the text, and turns this off with it, so no
+                filter is ever left in force behind a control that is not on screen.
+              -->
+              <button id="pinned-filter" class="icon-button" type="button" aria-pressed="false" aria-label="Show only pinned messages" title="Show only pinned messages" hidden>
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M8.5 3.5h7" />
+                  <path class="pin-head" d="M10 3.5v6L7 13.5h10l-3-4v-6" />
+                  <path d="M12 13.5v7" />
+                </svg>
+              </button>
               <button id="search-toggle" class="icon-button" type="button" aria-label="Search messages" title="Search messages" aria-pressed="false" hidden>
                 <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
                   <circle cx="10.5" cy="10.5" r="6.5" />
@@ -371,6 +385,14 @@
               </p>
               <ol id="thread-list" class="messages" hidden></ol>
               <ol id="discord-log" class="messages"></ol>
+              <!--
+                `#206 pin-message`. What the Pinned filter shows, in place of the list above: this
+                channel's pinned messages in the order they were sent, each drawn from the message
+                itself where it is loaded and from what the server kept of it where it is not. A list
+                of its own, so the channel's rows — and everything that reads them — are left exactly
+                as they were while it is up.
+              -->
+              <ol id="pinned-log" class="messages" aria-label="Pinned messages" hidden></ol>
               <ol id="outgoing-log" class="messages" aria-label="Outgoing messages" hidden></ol>
               <div id="channel-composer">
                 <label id="channel-compose-label" for="channel-compose-text">Message the channel</label>

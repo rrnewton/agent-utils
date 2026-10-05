@@ -1608,7 +1608,10 @@ own adapter-only token; every other route uses the read/write tokens described a
 | DELETE | `/api/v1/channels/{id}/alias` | **write** | drop it, putting the configured label back |
 | PUT | `/api/v1/noise-rules` | **write** | `{rules:["…"]}` — replace the whole list of messages read automatically; answers what was stored. Read through client-config's `noise_rules`; see "Messages read automatically" |
 | POST | `/api/v1/channels/{id}/not-noise` | **write** | `{messages:[…]}` — these are real messages; stop reading them automatically, leaving the rules alone |
-| DELETE | `/api/v1/storage` | **write** | erase EVERYTHING durable: transcripts, read marks, "dealt with" marks, cached summaries, channel aliases |
+| GET | `/api/v1/channels/{id}/pins` | read | this app's pinned messages in the channel, oldest message first, each with the snapshot kept of it, and the list's `revision`; see "Pinned messages" |
+| PUT | `/api/v1/channels/{id}/pins/{message_id}` | **write** | `{author, author_id, author_is_bot?, content, timestamp, thread_id?, thread_root?}` — pin it, keeping that much of the row; idempotent. At 100 pins in the channel the oldest is unpinned and named in `unpinned` |
+| DELETE | `/api/v1/channels/{id}/pins/{message_id}` | **write** | unpin it; idempotent, `changed: false` when it was not pinned |
+| DELETE | `/api/v1/storage` | **write** | erase EVERYTHING durable: transcripts, read marks, "dealt with" marks, cached summaries, channel aliases, pins |
 | POST | `/mcp` | read, or **write** per tool | MCP over Streamable HTTP — see below |
 | GET/DELETE | `/mcp` | none | `405`; this endpoint is stateless and has nothing to push |
 
@@ -2894,6 +2897,36 @@ a failure should show more rather than hide more.
 
 This is this app's own read state, like Done. The source chat service's read cursor is not moved,
 and the upstream-read route is not involved.
+
+### Pinned messages
+
+The owner asked for "our own concept of 'pin message'": a message to find again later. **Pin
+message** is in every row's ⋯ menu, after **Copy text**; a pinned row says **Pinned** in a gold
+chip beside its time and carries a gold edge on its right. With the search bar open, the pin
+button beside the magnifying glass turns on the **Pinned** filter: the list becomes this channel's
+pinned messages and nothing else, in the order they were sent, whatever view — Main, All, a
+thread — is underneath and whether or not they are Done. Search text still narrows it, and
+closing the search bar turns it off with the text. `#206 pin-message`.
+
+**These are this app's pins.** They are kept by this server, so they outlast a restart and show
+on every device signed in to it. The source chat service's own pinned messages are not read, and
+pinning here pins nothing there. There is no MCP tool for any of it, for the `#39 channel-alias`
+reason: the list is the owner's, not the voice agent's.
+
+**A pin keeps a snapshot** of its message — author, text up to 2,000 characters, time, and the
+thread it is in — so a pin older than anything the page has loaded is still shown, and opened in its
+thread, from that alone; the chip on such a row says it is the kept copy. Wherever the message
+itself is loaded, the page shows it instead, edits included.
+
+**Bounded per channel.** A channel keeps at most 100 pins. Pinning one more unpins the channel's
+OLDEST pin — oldest by when it was pinned — in the same write, and the page says so; it never
+refuses the pin you just made. Pins are not covered by `retain_days`, because an age limit would
+unpin a message you pinned in order to keep it; `DELETE /api/v1/storage` erases them.
+
+**Kept current by the reads that already happen.** Every channel read, the incremental refresh's
+deltas included, carries the pins' `revision`, and the page reads the list again only when that
+changed — entering a channel, after a pin made here, and when another device pinned or unpinned
+something. A pin made while the page knows it is offline is refused with a sentence, not queued.
 
 ### Pulling the channel down, and the other end of the same container
 

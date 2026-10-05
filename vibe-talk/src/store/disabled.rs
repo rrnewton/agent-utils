@@ -14,8 +14,8 @@
 use async_trait::async_trait;
 
 use super::{
-    ChannelAlias, ConversationId, ConversationSummary, ReadMark, StateStore, StoreError,
-    SummaryKey, TranscriptCursor, TranscriptPage, Turn,
+    ChannelAlias, ConversationId, ConversationSummary, PinChange, PinSnapshot, Pins, ReadMark,
+    StateStore, StoreError, SummaryKey, TranscriptCursor, TranscriptPage, Turn,
 };
 use crate::model::{ChannelId, MessageId};
 
@@ -161,6 +161,24 @@ impl StateStore for DisabledStore {
         refuse()
     }
 
+    async fn pins(&self, _: &ChannelId) -> Result<Pins, StoreError> {
+        // A refusal, not an empty list: "nothing is pinned" and "this server cannot keep a pin"
+        // are different facts, and a page told the first would offer a Pin that cannot work.
+        refuse()
+    }
+
+    async fn pins_revision(&self, _: &ChannelId) -> Result<i64, StoreError> {
+        refuse()
+    }
+
+    async fn pin(&self, _: &ChannelId, _: &PinSnapshot) -> Result<PinChange, StoreError> {
+        refuse()
+    }
+
+    async fn unpin(&self, _: &ChannelId, _: &MessageId) -> Result<PinChange, StoreError> {
+        refuse()
+    }
+
     async fn cached_summary(&self, _: &SummaryKey) -> Result<Option<String>, StoreError> {
         refuse()
     }
@@ -241,6 +259,29 @@ mod tests {
                 .exempt_from_noise(&channel, std::slice::from_ref(&message))
                 .await
                 .expect_err("exempt from noise"),
+            store.pins(&channel).await.expect_err("pins"),
+            store
+                .pins_revision(&channel)
+                .await
+                .expect_err("pins revision"),
+            store
+                .pin(
+                    &channel,
+                    &super::super::PinSnapshot {
+                        message_id: message.clone(),
+                        author: "someone".to_owned(),
+                        author_id: crate::model::UserId("7".to_owned()),
+                        author_is_bot: false,
+                        content: "hello".to_owned(),
+                        truncated: false,
+                        timestamp: "2026-10-04T12:00:00Z".to_owned(),
+                        thread_id: None,
+                        thread_root: false,
+                    },
+                )
+                .await
+                .expect_err("pin"),
+            store.unpin(&channel, &message).await.expect_err("unpin"),
             store.purge_everything().await.expect_err("purge"),
         ];
         for error in errors {

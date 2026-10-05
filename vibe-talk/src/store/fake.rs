@@ -27,9 +27,9 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use super::{
-    now_ms, ChannelAlias, ConversationId, ConversationSummary, ReadMark, RecordedTurn, Retention,
-    StateStore, StoreError, SummaryKey, TranscriptCursor, TranscriptPage, Turn,
-    MAX_TRANSCRIPT_PAGE, MAX_TURN_CHARS,
+    now_ms, ChannelAlias, ConversationId, ConversationSummary, Pin, PinChange, PinSnapshot, Pins,
+    ReadMark, RecordedTurn, Retention, StateStore, StoreError, SummaryKey, TranscriptCursor,
+    TranscriptPage, Turn, MAX_PINS_PER_CHANNEL, MAX_TRANSCRIPT_PAGE, MAX_TURN_CHARS,
 };
 use crate::model::{ChannelId, MessageId};
 
@@ -67,6 +67,13 @@ struct State {
     /// with enough of the real table's shape to reproduce its count bound and its eviction order.
     noise_exemptions: BTreeMap<(String, String), (i64, u64)>,
     next_exemption_seq: u64,
+    /// `(channel, message)` to `(pin, insertion order)`. `#206 pin-message`. The order stands in
+    /// for SQLite's `rowid`, breaking a tie between two pins made in one millisecond, so the bound
+    /// drops the same pin the real store would.
+    pins: BTreeMap<(String, String), (Pin, u64)>,
+    next_pin_seq: u64,
+    /// Channel to its pin revision; absent is `0`, as a missing row is in the real store.
+    pin_revisions: BTreeMap<String, i64>,
     next_summary_seq: u64,
     fail_next: Option<String>,
     appended: usize,
@@ -146,6 +153,24 @@ fn fake_key(key: &SummaryKey) -> (String, String, String, String) {
         key.message.as_str().to_owned(),
         format!("{:016x}", key.content_hash),
     )
+}
+
+/// A channel's pin revision, `0` where nothing was ever pinned.
+fn fake_revision(state: &State, channel: &ChannelId) -> i64 {
+    state
+        .pin_revisions
+        .get(channel.as_str())
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Move a channel's pin revision on by the shared rule, and return it.
+fn fake_bump(state: &mut State, channel: &ChannelId) -> i64 {
+    let next = super::next_pin_revision(fake_revision(state, channel), now_ms());
+    state
+        .pin_revisions
+        .insert(channel.as_str().to_owned(), next);
+    next
 }
 
 fn armed(state: &mut State) -> Result<(), StoreError> {
@@ -661,6 +686,135 @@ impl StateStore for FakeStore {
         Ok(added)
     }
 
+    async fn pins(&self, channel: &ChannelId) -> Result<Pins, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let mut held: Vec<Pin> = state
+            .pins
+            .iter()
+            .filter(|((held, _), _)| held == channel.as_str())
+            .map(|(_, (pin, _))| pin.clone())
+            .collect();
+        // The real store's order: by when the message was sent, a timestamp that will not parse
+        // standing in with when it was pinned, then by id.
+        held.sort_by_key(|pin| {
+            (
+                crate::clock::instant_ms(&pin.snapshot.timestamp).unwrap_or(pin.pinned_at_ms),
+                pin.snapshot.message_id.clone(),
+            )
+        });
+        Ok(Pins {
+            pins: held,
+            revision: fake_revision(&state, channel),
+        })
+    }
+
+    async fn pins_revision(&self, channel: &ChannelId) -> Result<i64, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        Ok(fake_revision(&state, channel))
+    }
+
+    async fn pin(
+        &self,
+        channel: &ChannelId,
+        snapshot: &PinSnapshot,
+    ) -> Result<PinChange, StoreError> {
+        // Validated BEFORE `armed`, as `set_noise_rules` is: a fake that kept a snapshot the real
+        // store refuses would certify a bug.
+        let snapshot = super::validate_pin(snapshot)?;
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let slot = (
+            channel.as_str().to_owned(),
+            snapshot.message_id.as_str().to_owned(),
+        );
+        let changed = match state.pins.get(&slot) {
+            // A repeat keeps its place in the queue and only refreshes what changed.
+            Some((held, _)) if held.snapshot == snapshot => false,
+            Some((held, seq)) => {
+                let (pinned_at_ms, seq) = (held.pinned_at_ms, *seq);
+                state.pins.insert(
+                    slot.clone(),
+                    (
+                        Pin {
+                            snapshot,
+                            pinned_at_ms,
+                        },
+                        seq,
+                    ),
+                );
+                true
+            }
+            None => {
+                let seq = state.next_pin_seq;
+                state.next_pin_seq += 1;
+                state.pins.insert(
+                    slot.clone(),
+                    (
+                        Pin {
+                            snapshot,
+                            pinned_at_ms: now_ms(),
+                        },
+                        seq,
+                    ),
+                );
+                true
+            }
+        };
+        // The same bound, oldest pinned first, never the message just pinned.
+        let mut others: Vec<((String, String), (i64, u64))> = state
+            .pins
+            .iter()
+            .filter(|((held, message), _)| held == channel.as_str() && *message != slot.1)
+            .map(|(key, (pin, seq))| (key.clone(), (pin.pinned_at_ms, *seq)))
+            .collect();
+        others.sort_by_key(|(_, order)| std::cmp::Reverse(*order));
+        let mut unpinned: Vec<MessageId> = Vec::new();
+        for (key, _) in others
+            .into_iter()
+            .skip(MAX_PINS_PER_CHANNEL.saturating_sub(1))
+        {
+            state.pins.remove(&key);
+            unpinned.push(MessageId(key.1));
+        }
+        unpinned.reverse();
+        let revision = if changed || !unpinned.is_empty() {
+            fake_bump(&mut state, channel)
+        } else {
+            fake_revision(&state, channel)
+        };
+        Ok(PinChange {
+            changed,
+            pin: state.pins.get(&slot).map(|(pin, _)| pin.clone()),
+            unpinned,
+            revision,
+        })
+    }
+
+    async fn unpin(
+        &self,
+        channel: &ChannelId,
+        message: &MessageId,
+    ) -> Result<PinChange, StoreError> {
+        super::validate_pin_id(message)?;
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let slot = (channel.as_str().to_owned(), message.as_str().to_owned());
+        let changed = state.pins.remove(&slot).is_some();
+        let revision = if changed {
+            fake_bump(&mut state, channel)
+        } else {
+            fake_revision(&state, channel)
+        };
+        Ok(PinChange {
+            changed,
+            pin: None,
+            unpinned: Vec::new(),
+            revision,
+        })
+    }
+
     async fn cached_summary(&self, key: &SummaryKey) -> Result<Option<String>, StoreError> {
         let mut state = self.lock();
         armed(&mut state)?;
@@ -733,6 +887,8 @@ impl StateStore for FakeStore {
         state.aliases.clear();
         state.noise_rules = None;
         state.noise_exemptions.clear();
+        state.pins.clear();
+        state.pin_revisions.clear();
         state.purges += 1;
         Ok(())
     }
@@ -881,5 +1037,74 @@ mod tests {
                 .as_deref(),
             Some("summary 2")
         );
+    }
+
+    #[tokio::test]
+    async fn the_fake_pins_bounds_and_refuses_exactly_as_the_real_store_does() {
+        // Parity again: every page-facing test of `#206 pin-message` runs against this store.
+        let store = FakeStore::new();
+        let channel = ChannelId("1111111111".to_owned());
+        let snapshot = |n: usize| PinSnapshot {
+            message_id: MessageId(format!("{}", 1_000_000_000_000_001_000_u64 + n as u64)),
+            author: "someone".to_owned(),
+            author_id: crate::model::UserId("7".to_owned()),
+            author_is_bot: false,
+            content: format!("message {n}"),
+            truncated: false,
+            timestamp: format!("2026-10-04T12:{:02}:00Z", n % 60),
+            thread_id: None,
+            thread_root: false,
+        };
+        let first = store.pin(&channel, &snapshot(0)).await.expect("pin");
+        assert!(first.changed && first.revision > 0);
+        let repeat = store.pin(&channel, &snapshot(0)).await.expect("repeat");
+        assert!(!repeat.changed && repeat.revision == first.revision);
+        for n in 1..MAX_PINS_PER_CHANNEL {
+            store.pin(&channel, &snapshot(n)).await.expect("pin");
+        }
+        let over = store
+            .pin(&channel, &snapshot(MAX_PINS_PER_CHANNEL))
+            .await
+            .expect("one past the bound");
+        assert_eq!(
+            over.unpinned,
+            vec![snapshot(0).message_id],
+            "the wrong pin went"
+        );
+        assert_eq!(
+            store.pins(&channel).await.expect("read").pins.len(),
+            MAX_PINS_PER_CHANNEL
+        );
+        let error = store
+            .pin(
+                &channel,
+                &PinSnapshot {
+                    message_id: MessageId(String::new()),
+                    ..snapshot(1)
+                },
+            )
+            .await
+            .expect_err("an empty id is not a message");
+        assert_eq!(error.code(), "bad_id");
+        let gone = store
+            .unpin(&channel, &snapshot(1).message_id)
+            .await
+            .expect("unpin");
+        assert!(gone.changed);
+        assert!(
+            !store
+                .unpin(&channel, &snapshot(1).message_id)
+                .await
+                .expect("unpin again")
+                .changed
+        );
+        store.fail_next("the disk is full");
+        assert!(
+            store.pins(&channel).await.is_err(),
+            "the fake could not say no"
+        );
+        store.purge_everything().await.expect("purge");
+        assert!(store.pins(&channel).await.expect("read").pins.is_empty());
+        assert_eq!(store.pins_revision(&channel).await.expect("read"), 0);
     }
 }

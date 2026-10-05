@@ -1203,6 +1203,9 @@ pub struct PageResponse {
     /// The ordinary channel view shows archived rows greyed rather than hidden -- hiding is what
     /// the To do filter is for -- and it can only do that if the payload says which they are.
     pub dismissed: Vec<MessageId>,
+    /// The revision this channel's pins are at, as on a timeline read. `#206 pin-message`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pins_revision: Option<i64>,
     /// Standing reminder that the content is third-party text.
     pub untrusted_content_notice: &'static str,
 }
@@ -1226,7 +1229,9 @@ pub async fn page(
     )
     .await?;
     let dismissed = ops::dismissed_within(&state, &step.channel.id, &step.messages).await?;
+    let pins_revision = ops::pins_revision(&state, &step.channel.id).await;
     Ok(Json(PageResponse {
+        pins_revision,
         returned: step.returned(),
         channel: step.channel,
         messages: step.messages,
@@ -1306,7 +1311,11 @@ pub async fn timeline(
     };
     let (channel, page) = ops::timeline(&state, &channel_id, &request).await?;
     let dismissed = ops::dismissed_within(&state, &channel.id, &page.messages).await?;
+    // `#206 pin-message`. One indexed lookup on every read, delta included: this is how a refresh
+    // that is happening anyway tells the page whether another device changed the pins.
+    let pins_revision = ops::pins_revision(&state, &channel.id).await;
     Ok(no_store(Json(TimelineResponse {
+        pins_revision,
         returned: page.messages.len() + page.threads.len(),
         channel,
         view: request.view,
@@ -2727,6 +2736,9 @@ pub struct TodoResponse {
     /// this is the screen where "unread" means something to a Discord user and this is not that
     /// thing.
     pub read_state_notice: &'static str,
+    /// The revision this channel's pins are at, as on a timeline read. `#206 pin-message`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pins_revision: Option<i64>,
     /// The messages are somebody else's words, exactly as on every other read.
     pub untrusted_content_notice: &'static str,
 }
@@ -2739,7 +2751,9 @@ pub async fn todo(
     Query(query): Query<LimitQuery>,
 ) -> Result<Response, ApiError> {
     let todo = ops::todo(&state, &channel_id, query.limit).await?;
+    let pins_revision = ops::pins_revision(&state, &todo.channel.id).await;
     Ok(no_store(Json(TodoResponse {
+        pins_revision,
         todo,
         read_state_notice: crate::store::INBOX_NOTICE,
         untrusted_content_notice: untrusted::NOTICE,
@@ -2848,6 +2862,115 @@ pub async fn restore(
         .map(crate::model::MessageId)
         .collect();
     Ok(answered(ops::restore(&state, &channel_id, &wanted).await?))
+}
+
+// --- pinned messages ------------------------------------------------------------------------------
+//
+// `#206 pin-message`. READ scope to list, WRITE scope to pin or unpin — the split every durable
+// write here takes, because a pin outlives the process and another device reads it back. And, as
+// with `#39 channel-alias` and `#196 auto-read-noise`, the scope is not what keeps a voice agent
+// out: no MCP tool lists, pins or unpins, so a model is never handed the list and cannot change it.
+
+/// The standing statement that a pin here is this server's own.
+pub const PINS_NOTICE: &str =
+    "Pins are vibe-talk's own. They are kept on this server and shown on \
+                               every device signed in to it; the source chat service's own pinned \
+                               messages are not read, and pinning here pins nothing there.";
+
+/// What to keep of a message being pinned. Its id is the path's; everything else is the row the
+/// page is showing, as it holds it. See [`crate::store::PinSnapshot`] for what each field is for.
+#[derive(Debug, Deserialize)]
+pub struct PinRequest {
+    /// The author's display name.
+    pub author: String,
+    /// The author's id.
+    pub author_id: String,
+    /// Whether the provider flagged the author as a bot.
+    #[serde(default)]
+    pub author_is_bot: bool,
+    /// The message's text as the page holds it. Cut to [`crate::store::MAX_PIN_TEXT_CHARS`]
+    /// here, not refused.
+    pub content: String,
+    /// When the message was sent, ISO-8601, as the page was served it.
+    pub timestamp: String,
+    /// The thread the message is in, when it is in one.
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    /// Whether the message is that thread's root.
+    #[serde(default)]
+    pub thread_root: bool,
+}
+
+/// `GET /api/v1/channels/{channel_id}/pins` — every pin in the channel, oldest message first.
+pub async fn pins(
+    State(state): State<AppState>,
+    _scope: ReadScope,
+    Path(channel_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let (channel, pins) = ops::pins(&state, &channel_id).await?;
+    Ok(no_store(Json(crate::contract::PinsResponse {
+        channel,
+        pins: pins.pins,
+        revision: pins.revision,
+        limit: crate::store::MAX_PINS_PER_CHANNEL,
+        pins_notice: PINS_NOTICE,
+        untrusted_content_notice: untrusted::NOTICE,
+    })))
+}
+
+/// `PUT /api/v1/channels/{channel_id}/pins/{message_id}` — pin a message. Idempotent.
+///
+/// PUT because the act is "make this message pinned": sending it twice leaves the same state,
+/// and the second answers `changed: false`. At [`crate::store::MAX_PINS_PER_CHANNEL`] the oldest
+/// other pin in the channel is unpinned to make room and named in `unpinned`.
+pub async fn pin_message(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path((channel_id, message_id)): Path<(String, String)>,
+    Json(request): Json<PinRequest>,
+) -> Result<Response, ApiError> {
+    let snapshot = crate::store::PinSnapshot {
+        message_id: MessageId(message_id),
+        author: request.author,
+        author_id: UserId(request.author_id),
+        author_is_bot: request.author_is_bot,
+        content: request.content,
+        truncated: false,
+        timestamp: request.timestamp,
+        thread_id: request.thread_id,
+        thread_root: request.thread_root,
+    };
+    let (channel, change) = ops::pin(&state, &channel_id, &snapshot).await?;
+    Ok(no_store(Json(crate::contract::PinChangeResponse {
+        channel,
+        message_id: snapshot.message_id,
+        pinned: true,
+        changed: change.changed,
+        pin: change.pin,
+        unpinned: change.unpinned,
+        revision: change.revision,
+        pins_notice: PINS_NOTICE,
+    })))
+}
+
+/// `DELETE /api/v1/channels/{channel_id}/pins/{message_id}` — unpin a message. Idempotent.
+pub async fn unpin_message(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path((channel_id, message_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let message = MessageId(message_id);
+    let (channel, change) = ops::unpin(&state, &channel_id, &message).await?;
+    Ok(no_store(Json(crate::contract::PinChangeResponse {
+        channel,
+        message_id: message,
+        pinned: false,
+        changed: change.changed,
+        pin: None,
+        unpinned: change.unpinned,
+        revision: change.revision,
+        pins_notice: PINS_NOTICE,
+    })))
 }
 
 /// One message, summarised.

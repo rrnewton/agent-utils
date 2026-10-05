@@ -81,7 +81,7 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
  *   | "help-link-reading-width" | "help-link-resuming" | "help-link-speech-prep"
  *   | "help-link-storage" | "jump-marker" | "jump-newest" | "load-older" | "load-older-turns"
  *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings"
- *   | "post-confirm-cancel" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-new" | "read-speed" | "remove-channel"
+ *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-new" | "read-speed" | "remove-channel"
  *   | "rename-channel" | "reply-cancel" | "reply-context-more" | "reply-send" | "save-alias"
  *   | "save-token"
  *   | "search-toggle" | "send-text" | "speaker" | "summarise" | "talk" | "text-entry"
@@ -690,8 +690,17 @@ function atBottom(area, slack = BOTTOM_SLACK_PX) {
 /** The list the reader is actually looking at. Both panes share one scrolling element. */
 function visibleList() {
   return el(currentView === "discord"
-    ? (channelView === "threads" ? "thread-list" : "discord-log")
+    ? (channelView === "threads" && !pinnedOnly ? "thread-list" : shownChannelList().id)
     : "transcript");
+}
+
+/**
+ * The channel's rows as they are on screen: the Pinned filter's list while it is on, and the
+ * channel's own otherwise. `#206 pin-message`. Everything that acts on "the rows the reader can
+ * see" asks this rather than naming `#discord-log`, which stays the channel's list underneath.
+ */
+function shownChannelList() {
+  return el(pinnedOnly ? "pinned-log" : "discord-log");
 }
 
 /**
@@ -1242,7 +1251,7 @@ function summaryTargets() {
   const area = el("scroll-area");
   const top = area.getBoundingClientRect().top - SUMMARY_LOOKAHEAD_PX;
   const bottom = top + (area.clientHeight || 0) + 2 * SUMMARY_LOOKAHEAD_PX;
-  const list = el("discord-log");
+  const list = shownChannelList();
   return liveFolds().filter((entry) => {
     if (!entry.id || entry.li.parentNode !== list) {
       return false;
@@ -1557,7 +1566,10 @@ let searchQuery = "";
  * searches on the call view and then switches to the channel is looking at the same query, not at
  * an unfiltered list that will re-filter on the next unrelated redraw.
  */
-const SEARCH_LISTS = ["transcript", "thread-list", "discord-log", "outgoing-log"];
+const SEARCH_LISTS = ["transcript", "thread-list", "discord-log", "pinned-log", "outgoing-log"];
+
+/** What `#search-empty` says over a list that has rows and none of them match. */
+const SEARCH_EMPTY_LOADED = "Nothing in the messages loaded so far matches that search.";
 
 /** The grouping character, written as an escape so no line here holds an odd number of them. */
 const SEARCH_QUOTE = "\"";
@@ -1672,6 +1684,16 @@ function applySearch() {
       }
     }
   }
+  // `#206 pin-message`. Over the Pinned filter the denominator is the channel's PINS, all of them,
+  // and the count says so even before anything is typed: the filter is in force, and the bar is
+  // where it says what it is doing.
+  if (pinnedOnly && currentView === "discord") {
+    el("search-count").textContent = terms.length === 0 ? `${loaded} pinned` : `${matched} of ${loaded} pinned`;
+    const sentence = pinnedEmptySentence(loaded, matched, terms.length > 0);
+    el("search-empty").textContent = sentence;
+    el("search-empty").hidden = sentence === "";
+    return;
+  }
   // "of N loaded", never "of N". The denominator is what this page has, not what the server has,
   // and after `#128 transcript-history` those are routinely different numbers.
   el("search-count").textContent = terms.length === 0 ? "" : `${matched} of ${loaded} loaded`;
@@ -1679,7 +1701,21 @@ function applySearch() {
   // still in the list, so neither pane's own empty state fires, and without this the reader gets
   // a blank screen whose only explanation is a 0.75rem count at the far end of the search bar.
   // Not raised over a list that was empty to begin with: there the pane already says why.
+  el("search-empty").textContent = SEARCH_EMPTY_LOADED;
   el("search-empty").hidden = terms.length === 0 || matched > 0 || loaded === 0;
+}
+
+/**
+ * What the Pinned filter says where its rows would be, or "" when its rows say it. `#206
+ * pin-message`. An empty list here is never left blank: a channel with no pins, a list that could
+ * not be read, one still on its way, and a search that matches none of the pins are four different
+ * answers, and a reader shown nothing would take any of them for the page having broken.
+ */
+function pinnedEmptySentence(loaded, matched, searching) {
+  if (loaded > 0) return searching && matched === 0 ? "None of this channel's pinned messages match that search." : "";
+  if (pinsProblem) return `This channel's pinned messages could not be loaded: ${pinsProblem}`;
+  if (pinsRevision === null || pinsChannel !== currentChannelId()) return "Loading this channel's pinned messages…";
+  return "No pinned messages in this channel yet — pin one from its ⋯ menu.";
 }
 
 /**
@@ -1694,6 +1730,10 @@ function setSearchOpen(open) {
   if (!open) {
     searchQuery = "";
     el("search-field").value = "";
+    // `#206 pin-message`. The Pinned filter lives in this bar, and goes with it for the reason the
+    // query does: a filter left on behind a control that is no longer on screen is the state this
+    // feature must never be in.
+    setPinnedOnly(false);
   }
   el("search-toggle").setAttribute("aria-pressed", open ? "true" : "false");
   // `#197 floating-search`. The open bar floats over the top of the list, and web/voice.css keys
@@ -3706,6 +3746,9 @@ function renderControlBar() {
   el("search-toggle").hidden = currentScreen !== "main";
   el("search-field").hidden = el("search-toggle").hidden || !searchOpen;
   el("search-count").hidden = el("search-field").hidden;
+  // `#206 pin-message`. Beside the glass while the bar is open, and over the channel only: a pin is
+  // a channel message, and the call's transcript has none to filter to.
+  el("pinned-filter").hidden = el("search-field").hidden || currentView !== "discord";
   // The bar used to yield the header row to an open search field when the reader had moved it up
   // there, because the two were sharing one 375px row. The field is not in that row any more, so
   // the bar stays where the reader put it, searching or not.
@@ -6155,6 +6198,9 @@ function clearChannelScreen() {
   el("thread-list").replaceChildren();
   el("channel-summary").replaceChildren();
   el("timeline-notice").hidden = true;
+  // The pins this credential read go with the rest of what it read.
+  forgetPins();
+  el("pinned-log").replaceChildren();
   renderOlderControl();
   channelFreshAt = 0;
   setChannelFreshness("fresh");
@@ -6797,7 +6843,7 @@ function threadReplies(id, message) {
 }
 
 function threadForMessageId(id) {
-  for (const row of el("discord-log").children) {
+  for (const row of [...el("discord-log").children, ...el("pinned-log").children]) {
     const found = rowMessages(row).find((message) => String(message.id) === String(id));
     if (found) return threadOf(found);
   }
@@ -6849,8 +6895,10 @@ function renderChannelNavigation() {
   // `#200 reply-context`. The reply screen names its thread from the same store, so a read that
   // names the thread, or places the message being answered, redraws it as well.
   followReplyStore();
-  el("thread-list").hidden = channelView !== "threads";
-  el("discord-log").hidden = channelView === "threads";
+  // `#206 pin-message`. The Pinned filter's list stands in for whichever of these is up.
+  el("thread-list").hidden = channelView !== "threads" || pinnedOnly;
+  el("discord-log").hidden = channelView === "threads" || pinnedOnly;
+  el("pinned-log").hidden = !pinnedOnly;
   el("channel-compose-label").textContent = selectedThreadId ? "Reply in this thread" : "Message the main channel";
   el("channel-compose-text").placeholder = selectedThreadId ? "Write a thread reply…" : "Write a message…";
   renderOutgoingMessages();
@@ -6912,6 +6960,9 @@ function rememberChannelContext() {
 }
 
 async function changeChannelView(view, threadId = null, summary = null) {
+  // `#206 pin-message`. Choosing a view is asking to see it, and the Pinned filter shows the same
+  // pins in every view — so it steps aside, as it must for a pin opened in its thread.
+  setPinnedOnly(false);
   rememberChannelDraft();
   rememberChannelContext();
   if (view === "thread" && channelView !== "thread") threadOrigin = channelView;
@@ -7547,11 +7598,13 @@ function renderChannelLoading(loading) {
       : "Loading messages…";
 }
 
-function addThreadDecoration(meta, message, row) {
+function addThreadDecoration(meta, message, row, everyThread = false) {
   const id = threadOf(message);
   // The scope is the channel itself: its root opens nothing it is not already showing.
-  if (!threadingSupported || !id || channelView === "thread" || id === channelCanon.scope) return;
-  if (channelView === "flat") {
+  if (!threadingSupported || !id || (channelView === "thread" && !everyThread) || id === channelCanon.scope) return;
+  // `everyThread`: a row of the Pinned filter, which mixes every view's messages, so every one in a
+  // thread carries the way into it whichever view is underneath. `#206 pin-message`.
+  if (channelView === "flat" || everyThread) {
     const badge = document.createElement("button");
     badge.className = "thread-badge";
     badge.setAttribute("type", "button");
@@ -7759,6 +7812,8 @@ function noteFreshRead(payload) {
   const asOf = staleAsOf(payload);
   channelFreshAt = asOf === null ? Date.now() : asOf;
   setChannelFreshness(asOf === null ? "fresh" : "slow");
+  // `#206 pin-message`. Every landed read, delta included, says what revision the pins are at.
+  notePinsRevision(payload.pins_revision);
 }
 
 /** Several delta pages of one refresh, as the one page that draws them. */
@@ -8181,7 +8236,8 @@ function renderOutgoingMessages() {
   }
   if (retired) persistOutgoingMessages();
   host.replaceChildren(...rows);
-  host.hidden = rows.length === 0;
+  // Nor over the Pinned filter, which shows pinned messages and nothing else. `#206 pin-message`.
+  host.hidden = rows.length === 0 || pinnedOnly;
 }
 
 /**
@@ -9273,6 +9329,9 @@ function authorLabel(row) {
 }
 
 function renderChannelRows() {
+  // `#206 pin-message`. The Pinned filter's list first, so that the pass below derives its rows as
+  // well: it is drawn from the same messages and has to agree with the channel about every one.
+  syncPinnedList();
   const list = el("discord-log");
   const rows = [...list.children];
   // The channel these rows belong to, read once. Every author learned on this pass was seen HERE,
@@ -9316,7 +9375,7 @@ function renderChannelRows() {
   // row that ends up carrying the marker is the one this pass draws it on rather than the one the
   // previous pass did.
   advanceMarkerPastRead();
-  for (const row of rows) {
+  for (const row of [...rows, ...el("pinned-log").children]) {
     const id = row.getAttribute("data-id") || "";
     // Every message the row stands for. One of them on an ordinary row; see the combining note.
     const ids = idsOf(row);
@@ -9343,6 +9402,24 @@ function renderChannelRows() {
     // and the whole point of the archive is that it says what is left.
     const isArchived = ids.length > 0 && ids.every((one) => archivedIds.has(one));
     row.setAttribute("data-archived", isArchived ? "true" : "false");
+    // `#206 pin-message`. Pinned when ANY message the row stands for is — the `every` reading would
+    // hide a pin behind its row's unpinned half — and Unpin then acts on every one of them. The
+    // chip says it in words, and says when what is shown is the copy the pin kept.
+    const isPinned = ids.some(isPinnedId);
+    row.setAttribute("data-pinned", isPinned ? "true" : "false");
+    const chip = childByClass(row, "pin-chip");
+    if (chip) {
+      chip.hidden = !isPinned;
+      chip.setAttribute(
+        "title",
+        rowMessages(row).some((message) => keptByPin.has(message))
+          ? "Pinned on this server. This is the copy kept when it was pinned; the message is older " +
+              "than what is loaded."
+          : "Pinned on this server, for every device. The chat service's own pins are not changed."
+      );
+    }
+    const pinItem = childByClass(row, "row-pin-button");
+    if (pinItem) pinItem.textContent = isPinned ? "Unpin message" : "Pin message";
     // `#196 auto-read-noise`. Read automatically, by the server's verdict on EVERY constituent —
     // `joinsGroup` keeps a placeholder out of a real message's row, so a mixed row is not one the
     // reader should be told is noise. Dimmed, never hidden, here: hiding is Hide read's job, and
@@ -9444,7 +9521,8 @@ function renderChannelRows() {
  * NOT called a pin. Discord already has pinned messages and they are a channel-wide, shared,
  * server-side thing; this is one reader's place in one browser, and borrowing the word would
  * promise the wrong feature. It is a PLACE MARKER, there is exactly one, and setting a new one
- * moves it — a list of them would be a second inbox to work through.
+ * moves it — a list of them would be a second inbox to work through. vibe-talk's own pins (`#206
+ * pin-message`) are the many, kept on the server for every device; this stays the one.
  *
  * Kept across reloads, because the whole point is coming back.
  */
@@ -10204,7 +10282,7 @@ function readWithBrowserSpeech(parts, id, ticket) {
   if (session.socket && !session.chat) {
     throw new Error("Hang up the voice call before reading messages with the device voice.");
   }
-  const messages = [...el("discord-log").children].flatMap(rowMessages);
+  const messages = [...el("discord-log").children, ...el("pinned-log").children].flatMap(rowMessages);
   const text = parts.map((part) => {
     const message = messages.find((entry) => String(entry.id) === part);
     if (!message) throw new Error("That message is no longer loaded. Refresh the channel and tap it again.");
@@ -10328,7 +10406,7 @@ async function prepareSpeechNow() {
     return;
   }
   const ids = [];
-  for (const li of el("discord-log").children) {
+  for (const li of shownChannelList().children) {
     // `#196 auto-read-noise`. A placeholder is not prepared: preparing warms a vendor lookup for a
     // message nobody is going to ask to hear. A tap on one still reads it, by the slower route.
     const held = rowMessages(li);
@@ -11434,7 +11512,13 @@ function channelRowFrame(messages) {
   // "that message does not exist", so it moved to the details sheet a press-and-hold opens — see
   // `showMessageDetails`.
   author.className = "msg-author";
-  meta.append(author, stamp);
+  // `#206 pin-message`. The pinned chip, beside the time: in words, because a lone glyph is the
+  // marker the owner rejected. Built hidden on every row; `renderChannelRows` shows it.
+  const pinChip = document.createElement("span");
+  pinChip.className = "pin-chip";
+  pinChip.hidden = true;
+  pinChip.textContent = "Pinned";
+  meta.append(author, stamp, pinChip);
   const body = document.createElement("div");
   body.className = "body";
   // THE COMBINED TEXT, and it is the only thing the reader sees of the grouping. A line break
@@ -11457,8 +11541,10 @@ function discordNode(messages) {
   const { li, meta, body, content } = channelRowFrame(messages);
   // `#204 reply-arrow`. FIRST in the row, ahead of the meta line, so a screen reader meets the way
   // to what this answers before the row's own words — and drawn by web/voice.css in the gutter to
-  // the row's left, where nothing else on the row is.
-  if (message.reply_to) li.replaceChildren(replyArrow(li), ...li.children);
+  // the row's left, where nothing else on the row is. Not in the Pinned list (`#206 pin-message`):
+  // that is a flat list of what was kept, drawn without the reply gutter, and what a pin answers is
+  // the channel's business — the jump walks the channel's own views, which are not on screen there.
+  if (message.reply_to && !drawingPinnedRows) li.replaceChildren(replyArrow(li), ...li.children);
   // The SAME call the voice transcript makes, on the same arguments, so the two lists cannot end
   // up with two idioms for the one behaviour. `#47 scrollback-stability`. The one extra argument
   // is the message id, which is what `#49 cached-summaries` keys a summary under — the transcript
@@ -11495,7 +11581,8 @@ function discordNode(messages) {
   // hanging off it, and threading a reply under the tail would put the answer under a fragment.
   reply.addEventListener("click", () => openReply(messages));
   meta.append(reply);
-  addThreadDecoration(meta, message, li);
+  // A row of the Pinned filter offers the way into its message's thread whatever view is under it.
+  addThreadDecoration(meta, message, li, drawingPinnedRows);
   // A provider write, distinct from the reversible local Done/archive below. Most providers do
   // not expose this operation, so the server advertises it explicitly and the control stays out
   // of the interface unless the selected provider supports it.
@@ -11511,7 +11598,10 @@ function discordNode(messages) {
     `Move ${service}'s own read marker for the whole space to this message, so ${service} shows ` +
       "it and everything before it as read. This app's Done is separate."
   );
-  upstreamRead.textContent = `Mark read in ${service} only · whole space`;
+  // `#206 pin-message`. SHORT on screen, under the "Mark read" caption of the group it sits in;
+  // WHOLE to a screen reader, which hears the item without the caption beside it.
+  upstreamRead.textContent = `In ${service} only · whole space`;
+  upstreamRead.setAttribute("aria-label", `Mark read in ${service} only · whole space`);
   upstreamRead.hidden = !upstreamReadMarkSupported;
   // A combined row stands for every constituent in order. Marking through the NEWEST one includes
   // the complete row; using its first id would leave an invisible tail unread upstream.
@@ -11520,6 +11610,9 @@ function discordNode(messages) {
   // rather than taking a line of the row's width: room the thread tag's reply count needs. The menu
   // is the home for further per-message options. Copy is always one of them, so the menu is always
   // offered; the provider's read marker joins it only where the server advertises that write.
+  //
+  // `#206 pin-message` ORDERED it, at the owner's word: Copy text first, then Pin, then the two
+  // that mark read, grouped under a caption of their own.
   const more = document.createElement("span");
   more.className = "row-more";
   const moreButton = document.createElement("button");
@@ -11569,9 +11662,11 @@ function discordNode(messages) {
   const readThrough = document.createElement("button");
   readThrough.className = "row-read-through-button";
   readThrough.setAttribute("type", "button");
-  readThrough.textContent = upstreamReadMarkSupported
-    ? `Mark read through here · also in ${service}`
-    : "Mark read through here";
+  readThrough.textContent = upstreamReadMarkSupported ? `Through here · also in ${service}` : "Through here";
+  readThrough.setAttribute(
+    "aria-label",
+    upstreamReadMarkSupported ? `Mark read through here · also in ${service}` : "Mark read through here"
+  );
   readThrough.setAttribute(
     "title",
     "Mark this message and every message above it in this list as Done here" +
@@ -11581,7 +11676,34 @@ function discordNode(messages) {
     setMenu(false);
     guardQuietly(() => markReadThroughHere(li, String(upstreamBoundary.id)))();
   });
-  menu.append(readThrough, copy, upstreamRead);
+  // `#206 pin-message`. Pin or unpin EVERY message the row stands for, as Done archives every one:
+  // pinning half of a split post would keep the half that stops mid-sentence. Its word is set by
+  // `renderChannelRows`, with the chip, so the two cannot disagree.
+  const pinItem = document.createElement("button");
+  pinItem.className = "row-pin-button";
+  pinItem.setAttribute("type", "button");
+  pinItem.setAttribute(
+    "title",
+    "Pin this message on this server, for every device; find it again with the Pinned filter beside " +
+      `the search glass. ${service}'s own pinned messages are not changed.`
+  );
+  pinItem.textContent = messages.some((m) => isPinnedId(m.id)) ? "Unpin message" : "Pin message";
+  pinItem.addEventListener("click", () => {
+    setMenu(false);
+    guardQuietly(() => togglePin(messages))();
+  });
+  // The two that mark read, as ONE group: a caption, and the items under it. `role="group"` with the
+  // caption's words as its name, so a screen reader announces the grouping the eye sees.
+  const readGroup = document.createElement("span");
+  readGroup.className = "row-more-group";
+  readGroup.setAttribute("role", "group");
+  readGroup.setAttribute("aria-label", "Mark read");
+  const readCaption = document.createElement("span");
+  readCaption.className = "row-more-caption";
+  readCaption.setAttribute("aria-hidden", "true");
+  readCaption.textContent = "Mark read";
+  readGroup.append(readCaption, readThrough, upstreamRead);
+  menu.append(copy, pinItem, readGroup);
   more.append(moreButton, menu);
   meta.append(more);
   // `#50 todo-view`. The non-gestural way to say "dealt with", and the one a keyboard can reach.
@@ -11666,10 +11788,12 @@ const DISMISS_BATCH = 99;
  * it — move the provider's own read marker for the whole space through the row's newest message.
  *
  * The rows ON SCREEN, in the view on screen, are the set: in All that includes thread replies, in a
- * thread only that thread. Rows already Done are left out of the count. `#202 read-through-here`.
+ * thread only that thread, under the Pinned filter the pins. Rows already Done are left out of the
+ * count. `#202 read-through-here`.
  */
 async function markReadThroughHere(row, upstreamId) {
-  const rows = [...el("discord-log").children];
+  // The row's OWN list: the channel's, or the Pinned filter's, where "above it" means the pins above.
+  const rows = [...(row.parentNode || el("discord-log")).children];
   const at = rows.indexOf(row);
   if (at < 0) return;
   const ids = rows.slice(0, at + 1).flatMap(idsOf).filter((id) => !archivedIds.has(id));
@@ -11837,7 +11961,8 @@ function renderChannelSeam(label) {
 
 function renderOlderControl() {
   const button = el("load-older");
-  button.hidden = discordMoreAbove !== true;
+  // Not over the Pinned filter: its list is every pin already, and older history adds none.
+  button.hidden = discordMoreAbove !== true || pinnedOnly;
   button.disabled = olderFetchInFlight;
   button.textContent = olderFetchInFlight ? "Loading older messages…" : "Older messages";
 }
@@ -12551,6 +12676,7 @@ async function loadDiscord(options) {
     settleAfterRead(messages, { keepPosition, area, ...position });
     channelFreshAt = Date.now();
     setChannelFreshness("fresh");
+    notePinsRevision(payload.pins_revision);
     saveChannelScope();
     renderScrollTools();
     // Every row here is new — `applyNewestPage` replaced the list — so the ones on screen have to
@@ -12734,6 +12860,7 @@ async function loadTodo(options) {
     // Quoted, never rewritten: `#61 unread-status` is one posture and it is stated on the server.
     el("inbox-note").textContent = payload.read_state_notice || "";
     noteTodoRead(payload);
+    notePinsRevision(payload.pins_revision);
     renderChannelSeam(todoSummary());
     renderTodoControls();
     settleAfterRead(messages, {
@@ -12913,6 +13040,8 @@ async function refreshAfterInboxChange() {
     todoView = { ...todoView, left: backlogSize };
     renderChannelSeam(todoSummary());
     renderTodoControls();
+    // The Pinned filter's rows are drawn from the archive too: a pin dealt with there greys there.
+    if (pinnedOnly) renderChannelRows();
   } else {
     renderChannelRows();
     saveChannelScope();
@@ -13113,6 +13242,340 @@ function setTodoMode(on) {
   } else {
     guardQuietly(() => (on ? loadTodo() : loadDiscord()))();
   }
+}
+
+// --- pinned messages ------------------------------------------------------------------------------
+//
+// `#206 pin-message`. The owner: "I'd like to have our own concept of 'pin message' and put a toggle
+// for pinned (a filter) next to the magnifying glass when the search bar is open." Not the chat
+// service's pinned messages, and not the place marker, which is one reader's one place in one
+// browser: a pin is kept by THIS server, so it outlives a restart and shows on every device, and a
+// channel may have many.
+//
+// THREE THINGS ON THIS PAGE, AND ONE RECORD BEHIND THEM. The ⋯ menu pins and unpins; a pinned row
+// says so in words in its meta line and down its edge; and the Pinned filter beside the search glass
+// shows the channel's pins and nothing else. All three read `pins`: the server's list for the
+// channel on screen, with whatever this page has asked to change and not yet heard back about laid
+// over it, so a tap shows at once and a list read meanwhile cannot take it back.
+//
+// KEPT CURRENT CHEAPLY. Every channel read — a newest page or a delta, `#203 incremental-refresh`'s
+// common case included — carries the list's revision, and the list itself is read only when that is
+// not the revision of the list held: on entering a channel, after a change made here, and when
+// another device changed it. A refresh that changed nothing costs exactly what it did before.
+//
+// A PIN OUTLIVES THE LOADED HISTORY, which is why the server keeps a snapshot of each. The filter
+// draws the message itself wherever this page has it loaded, so an edit since the pin shows, and the
+// snapshot only where it has not — and the chip on such a row says that is what it is.
+//
+// OFFLINE IS SAID, NOT QUEUED. Unlike a send there is no outbox to fit a pin into, and a pin that
+// lands an hour later on another device's say-so is not one the owner could reason about; the tap
+// is refused out loud and the row is left as it was.
+
+/** This channel's pins as the server listed them, by message id, with `pinsPending` laid over. */
+let pins = new Map();
+/** The channel `pins` is for; "" before any list. */
+let pinsChannel = "";
+/** The revision the held list came with, or null until one has been read for `pinsChannel`. */
+let pinsRevision = null;
+/** How many pins the server keeps in one channel, as it last said; 0 before it has. */
+let pinsLimit = 0;
+/** Why the list could not be read, which the Pinned filter says; "" when it could. */
+let pinsProblem = "";
+/** The list read in flight: its channel, its promise, and the newest revision noted meanwhile. */
+let pinsInFlight = null;
+/** Changes asked for and not yet answered: id -> the pin it will be, or null for an unpin. */
+const pinsPending = new Map();
+/** Whether the Pinned filter is on. Only while the search bar is open: closing it turns this off. */
+let pinnedOnly = false;
+/** Where the channel's list was when the filter came on, so turning it off puts the reader back. */
+let placeBeforePinned = null;
+/** What the filter's list was last drawn from, so it is rebuilt only when that changes. */
+let pinnedListDrawn = "";
+/** Rows of the filter drawn from what a pin kept, rather than from the message itself. */
+const keptByPin = new WeakSet();
+/**
+ * True while `syncPinnedList` builds the filter's rows, so `discordNode` gives each one the way into
+ * its thread. A flag rather than a parameter, because every other caller hands `discordNode` to
+ * `map`, which would pass it an index.
+ */
+let drawingPinnedRows = false;
+
+const currentChannelId = () => String(el("discord-channel").value || "");
+
+/** Whether this message is pinned in the channel on screen. */
+function isPinnedId(id) {
+  return pinsChannel === currentChannelId() && pins.has(String(id));
+}
+
+/** Forget the held list: another channel, or another credential. */
+function forgetPins(channel = "") {
+  pins = new Map();
+  pinsChannel = channel;
+  pinsRevision = null;
+  pinsProblem = "";
+  pinsInFlight = null;
+  pinsPending.clear();
+  pinnedListDrawn = "";
+}
+
+/**
+ * A read said what revision this channel's pins are at: read the list when that is not the
+ * revision of the one held, and never otherwise. A server that keeps no pins sends none, and then
+ * there is nothing to keep current.
+ */
+function notePinsRevision(revision) {
+  const channel = currentChannelId();
+  if (typeof revision !== "number" || !channel) return;
+  if (pinsChannel !== channel) forgetPins(channel);
+  if (pinsRevision === revision) return;
+  // One read at a time: a revision noted while one is out is checked against what it brings back.
+  if (pinsInFlight && pinsInFlight.channel === channel) {
+    pinsInFlight.noted = revision;
+    return;
+  }
+  guardQuietly(loadPins)();
+}
+
+/** Read the list now if this channel's has never been read: the filter is about to show it. */
+function ensurePins() {
+  const channel = currentChannelId();
+  if (!channel) return;
+  if (pinsChannel !== channel) forgetPins(channel);
+  if (pinsRevision === null && !(pinsInFlight && pinsInFlight.channel === channel)) guardQuietly(loadPins)();
+}
+
+/** Read this channel's pins, and draw what changed. */
+async function loadPins() {
+  const channel = currentChannelId();
+  if (!channel) return;
+  if (pinsChannel !== channel) forgetPins(channel);
+  const read = { channel, noted: null };
+  pinsInFlight = read;
+  try {
+    const payload = await apiDecoded("PinsResponse", `/api/v1/channels/${encodeURIComponent(channel)}/pins`);
+    if (pinsInFlight !== read || currentChannelId() !== channel) return;
+    applyPinsList(payload);
+  } catch (error) {
+    if (pinsInFlight !== read || currentChannelId() !== channel) return;
+    // SAID, by the filter that would have shown them; a channel read is not failed for it.
+    pinsProblem = error.detail || error.message || "the server did not answer";
+    renderPins();
+  } finally {
+    if (pinsInFlight === read) pinsInFlight = null;
+  }
+  // A read that landed meanwhile named a revision this list is not at: read once more.
+  if (read.noted !== null && read.noted !== pinsRevision && currentChannelId() === channel) await loadPins();
+}
+
+/** Take a list the server sent as the truth, with this page's unanswered changes laid over it. */
+function applyPinsList(payload) {
+  pins = new Map(payload.pins.map((pin) => [String(pin.message_id), pin]));
+  for (const [id, pending] of pinsPending) {
+    if (pending) pins.set(id, pending);
+    else pins.delete(id);
+  }
+  pinsRevision = payload.revision;
+  pinsLimit = payload.limit;
+  pinsProblem = "";
+  renderPins();
+}
+
+/** Every row's chip and Pin item, and the filter's list, re-derived from `pins`. */
+function renderPins() {
+  preservingScroll(renderChannelRows);
+  renderScrollTools();
+}
+
+/** What a pin keeps of `message`, as this page will show it until the server says what it kept. */
+function provisionalPin(message) {
+  return {
+    message_id: String(message.id),
+    author: String(message.author || ""),
+    author_id: String(message.author_id || ""),
+    author_is_bot: message.author_is_bot === true,
+    content: String(message.content === null || message.content === undefined ? "" : message.content),
+    truncated: false,
+    timestamp: String(message.timestamp || ""),
+    thread_id: threadOf(message),
+    thread_root: Boolean(message.thread && message.thread.is_root === true),
+    pinned_at_ms: Date.now(),
+  };
+}
+
+/** A message drawn from what its pin kept, for a pin older than anything loaded. */
+function keptMessage(pin, channel) {
+  /** @type {VibeTalk.Message} */
+  const message = {
+    id: pin.message_id,
+    channel_id: channel,
+    author: pin.author,
+    author_id: pin.author_id,
+    author_is_bot: pin.author_is_bot,
+    timestamp: pin.timestamp,
+    spoken_time: "",
+    reply_to: null,
+    // An ellipsis where the server cut it, so a shortened text does not read as the whole message.
+    content: pin.truncated ? `${pin.content}…` : pin.content,
+  };
+  if (pin.thread_id) {
+    message.thread = {
+      id: pin.thread_id, root_message_id: null, is_root: pin.thread_root, reply_count: null, reply_count_exact: false,
+    };
+  }
+  keptByPin.add(message);
+  return message;
+}
+
+/**
+ * The Pinned filter's messages: every pin in this channel, in the order the messages were sent.
+ * The message itself where this page holds it — from any view, and whether or not it is Done,
+ * because a pin outranks both — and what the pin kept where it does not.
+ */
+function pinnedMessages() {
+  const channel = currentChannelId();
+  if (pinsChannel !== channel || pins.size === 0) return [];
+  const held = new Map();
+  const loaded = threadingSupported && channelCanon.channel === channel
+    ? [...channelCanon.threads.map((summary) => summary.root).filter(Boolean), ...channelCanon.messages, ...timelineMessages]
+    : [...el("discord-log").children].flatMap(rowMessages);
+  for (const message of loaded) held.set(String(message.id), message);
+  return inTimeOrder([...pins].map(([id, pin]) => held.get(id) || keptMessage(pin, channel)), "timestamp");
+}
+
+/**
+ * Draw the filter's list, or take it down. Rebuilt only when what it is drawn from changed: it is
+ * called on every redraw of the channel, and rebuilding a row closes its fold and its ⋯ menu.
+ */
+function syncPinnedList() {
+  const list = el("pinned-log");
+  if (!pinnedOnly) {
+    if (list.children.length > 0) list.replaceChildren();
+    pinnedListDrawn = "";
+    return;
+  }
+  const messages = pinnedMessages();
+  const drawn = JSON.stringify([combineMessages, channelCanon.scope, threadingSupported,
+    ...messages.map((m) => [m.id, m.timestamp, m.content, m.author, threadOf(m), isNoise(m), keptByPin.has(m)])]);
+  if (drawn === pinnedListDrawn) return;
+  pinnedListDrawn = drawn;
+  drawingPinnedRows = true;
+  try {
+    list.replaceChildren(...glom(messages).map(discordNode));
+  } finally {
+    drawingPinnedRows = false;
+  }
+}
+
+/**
+ * Turn the Pinned filter on or off. On, the channel's list steps aside for this channel's pins and
+ * the reader is put at the newest of them, as a channel opens at its newest; off, the list comes
+ * back where the reader left it.
+ */
+function setPinnedOnly(on) {
+  if (on === pinnedOnly) return;
+  const area = el("scroll-area");
+  if (on) placeBeforePinned = { top: area.scrollTop, newest: atBottom(area) };
+  pinnedOnly = on;
+  el("pinned-filter").setAttribute("aria-pressed", on ? "true" : "false");
+  if (on) el("pane-discord").setAttribute("data-pinned-only", "");
+  else el("pane-discord").removeAttribute("data-pinned-only");
+  renderChannelNavigation();
+  renderOlderControl();
+  renderChannelRows();
+  if (on) {
+    ensurePins();
+    scrollToNewest();
+  } else if (placeBeforePinned) {
+    if (placeBeforePinned.newest) scrollToNewest();
+    else area.scrollTop = placeBeforePinned.top;
+    placeBeforePinned = null;
+  }
+  renderScrollTools();
+  requestVisibleSummaries();
+}
+
+/** What a pin write sends: the row as this page holds it. Its id is the path's. */
+function pinRequest(message) {
+  const pin = provisionalPin(message);
+  return {
+    author: pin.author, author_id: pin.author_id, author_is_bot: pin.author_is_bot, content: pin.content,
+    timestamp: pin.timestamp, thread_id: pin.thread_id, thread_root: pin.thread_root,
+  };
+}
+
+/**
+ * Pin a row, or unpin it — every message it stands for. Shown at once and rolled back, with a
+ * sentence saying why, if the server refuses; refused out loud, and not queued, when offline.
+ */
+async function togglePin(messages) {
+  const channel = currentChannelId();
+  if (!channel || messages.length === 0) return;
+  if (pinsChannel !== channel) forgetPins(channel);
+  const pinning = !messages.some((message) => isPinnedId(message.id));
+  const act = pinning ? "pinned" : "unpinned";
+  if (navigator.onLine === false) {
+    setStatus(`Offline — nothing was ${act}. Try again once the connection is back.`);
+    return;
+  }
+  const before = new Map(messages.map((message) => [String(message.id), pins.get(String(message.id))]));
+  for (const message of messages) {
+    const id = String(message.id);
+    const pin = pinning ? provisionalPin(message) : null;
+    pinsPending.set(id, pin);
+    if (pin) pins.set(id, pin);
+    else pins.delete(id);
+  }
+  renderPins();
+  const unpinned = [];
+  let revision = null;
+  let answered = 0;
+  try {
+    for (const message of messages) {
+      const id = String(message.id);
+      const path = `/api/v1/channels/${encodeURIComponent(channel)}/pins/${encodeURIComponent(id)}`;
+      // In the queue the archive writes use, so a run of taps reaches the server in order.
+      const answer = await queueInboxWrite(() => apiDecoded("PinChangeResponse", path,
+        pinning ? { method: "PUT", body: pinRequest(message) } : { method: "DELETE" }));
+      answered += 1;
+      if (pinsChannel !== channel) continue;
+      pinsPending.delete(id);
+      if (answer.pin) pins.set(id, answer.pin);
+      else pins.delete(id);
+      // At the bound the server unpinned the oldest pin to make room, and named it.
+      for (const gone of answer.unpinned) {
+        unpinned.push(String(gone));
+        pins.delete(String(gone));
+      }
+      revision = answer.revision;
+    }
+  } catch (error) {
+    if (pinsChannel === channel) {
+      // Back to what it was — for the messages the server did not answer for. Any it did are
+      // its truth now, and the list is read again to be sure of them.
+      for (const message of messages.slice(answered)) {
+        const id = String(message.id);
+        pinsPending.delete(id);
+        const held = before.get(id);
+        if (held) pins.set(id, held);
+        else pins.delete(id);
+      }
+      renderPins();
+      if (answered > 0) guardQuietly(loadPins)();
+    }
+    setStatus(error.network
+      ? `Offline — that message was not ${act}. Try again once the connection is back.`
+      : `That message was not ${act}: ${error.detail || error.message}`);
+    return;
+  }
+  if (pinsChannel !== channel) return;
+  renderPins();
+  // The list's revision has moved; read it again unless this change is all that moved it.
+  notePinsRevision(revision);
+  const service = chatProviderName || "the chat service";
+  if (!pinning) setStatus("Unpinned.");
+  else if (unpinned.length > 0) {
+    setStatus(`Pinned. The oldest pin here was unpinned to stay at ${pinsLimit || "the limit of"} pins.`);
+  } else setStatus(`Pinned here, not in ${service}.`);
 }
 
 // --- messages read automatically ------------------------------------------------------------------
@@ -16349,6 +16812,12 @@ function changeSelectedChannel() {
   renderChannelFreshness();
   if (saved) scrollToNewest();
   saveUiState();
+  // `#206 pin-message`. Under the Pinned filter the new channel's pins are what the reader is about
+  // to look at, so they are read now rather than after its first read reports their revision.
+  if (pinnedOnly) {
+    ensurePins();
+    renderChannelRows();
+  }
   // A stream follows ONE channel, and a cursor from the old one means nothing in the new one —
   // the same reason the walk-back cursor is dropped two lines above.
   startChannelStream(el("discord-channel").value);
@@ -16430,6 +16899,8 @@ el("jump-newest").addEventListener("click", scrollToNewest);
 // `#129 message-search`. The glass is a toggle, and the second tap is the way out: a control that
 // only ever opens leaves the reader looking for a close button that is not on a phone keyboard.
 el("search-toggle").addEventListener("click", () => setSearchOpen(!searchOpen));
+// `#206 pin-message`. A toggle, like the glass beside it.
+el("pinned-filter").addEventListener("click", () => setPinnedOnly(!pinnedOnly));
 el("search-field").addEventListener("input", () => {
   searchQuery = el("search-field").value;
   renderScrollTools();

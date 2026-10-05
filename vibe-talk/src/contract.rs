@@ -185,8 +185,58 @@ pub struct TimelineResponse {
     pub page: crate::threads::TimelinePage,
     /// Messages on this page that the reader has archived locally.
     pub dismissed: Vec<MessageId>,
+    /// The revision this channel's pins are at. `#206 pin-message`.
+    ///
+    /// On every read, newest page and delta alike, so a refresh that already happens is what tells
+    /// a page another device pinned or unpinned something; the page reads `/pins` again only when
+    /// this differs from the revision of the list it holds. Absent when the store cannot say — no
+    /// storage configured, or a failing one — and from an older server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pins_revision: Option<i64>,
     /// Channel content remains untrusted data in every view.
     pub untrusted_content_notice: &'static str,
+}
+
+/// One channel's pins: `GET /api/v1/channels/{id}/pins`. `#206 pin-message`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PinsResponse {
+    /// The channel, as configured here.
+    pub channel: ChannelInfo,
+    /// Every pin, in the order their messages were sent, oldest first, each with the snapshot that
+    /// lets the page draw it when its message is not loaded.
+    pub pins: Vec<crate::store::Pin>,
+    /// The revision this list is at; see [`TimelineResponse::pins_revision`].
+    pub revision: i64,
+    /// How many pins a channel keeps before the oldest is unpinned to make room.
+    pub limit: usize,
+    /// The standing statement that these pins are this server's own.
+    pub pins_notice: &'static str,
+    /// A snapshot is channel content, and untrusted, like every other.
+    pub untrusted_content_notice: &'static str,
+}
+
+/// What one pin or unpin did: `PUT` and `DELETE /api/v1/channels/{id}/pins/{message_id}`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PinChangeResponse {
+    /// The channel, as configured here.
+    pub channel: ChannelInfo,
+    /// The message the call named.
+    pub message_id: MessageId,
+    /// Whether it is pinned now.
+    pub pinned: bool,
+    /// Whether the call changed anything; false when it repeated what was already so.
+    pub changed: bool,
+    /// The pin exactly as stored — its text cut to the bound — or absent after an unpin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<crate::store::Pin>,
+    /// Pins the bound dropped to make room for this one, oldest first. Empty except at the bound,
+    /// and the page says so when it is not.
+    pub unpinned: Vec<MessageId>,
+    /// The channel's pin revision after the call, so the page that made it need not read the list
+    /// again to stay current.
+    pub revision: i64,
+    /// The standing statement that these pins are this server's own.
+    pub pins_notice: &'static str,
 }
 
 /// A post waiting for the owner's confirmation. `#34 voice-chat-write-confirm`.
@@ -439,6 +489,9 @@ fn roots(generator: &mut schemars::SchemaGenerator) -> Vec<schemars::Schema> {
         // across a reload, so they need their own validators.
         generator.subschema_for::<Message>(),
         generator.subschema_for::<crate::threads::ThreadSummary>(),
+        // `#206 pin-message`. Appended, so the roots before them keep their places.
+        generator.subschema_for::<PinsResponse>(),
+        generator.subschema_for::<PinChangeResponse>(),
     ]
 }
 

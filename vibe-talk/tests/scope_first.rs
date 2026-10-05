@@ -320,6 +320,22 @@ fn inventory() -> Vec<Route> {
             Write,
             Json(r#"{"messages":["3333333333"]}"#),
         ),
+        // `#206 pin-message`: the owner's own pins, listed at read scope and changed at write.
+        route("GET", "/api/v1/channels/{channel_id}/pins", Read, Nothing),
+        route(
+            "PUT",
+            "/api/v1/channels/{channel_id}/pins/{message_id}",
+            Write,
+            Json(
+                r#"{"author":"a","author_id":"7","content":"hi","timestamp":"2026-10-04T12:00:00Z"}"#,
+            ),
+        ),
+        route(
+            "DELETE",
+            "/api/v1/channels/{channel_id}/pins/{message_id}",
+            Write,
+            Nothing,
+        ),
     ]
 }
 

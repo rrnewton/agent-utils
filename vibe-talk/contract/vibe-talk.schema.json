@@ -592,6 +592,170 @@
       ],
       "type": "object"
     },
+    "Pin": {
+      "description": "One pin, as the store holds it.",
+      "properties": {
+        "author": {
+          "description": "Its author's display name when it was pinned. UNTRUSTED.",
+          "type": "string"
+        },
+        "author_id": {
+          "$ref": "#/$defs/UserId",
+          "description": "Its author's id, so the row is drawn in its speaker's colour like every other row."
+        },
+        "author_is_bot": {
+          "description": "Whether the chat provider flagged the author as a bot.",
+          "type": "boolean"
+        },
+        "content": {
+          "description": "Its text when it was pinned, at most [`MAX_PIN_TEXT_CHARS`] characters. UNTRUSTED.",
+          "type": "string"
+        },
+        "message_id": {
+          "$ref": "#/$defs/MessageId",
+          "description": "The message pinned, in the provider-neutral namespace the page was served it in."
+        },
+        "pinned_at_ms": {
+          "description": "When it was pinned, in milliseconds since the Unix epoch, by this server's clock. The order\nthe bound drops pins in.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "thread_id": {
+          "description": "The thread the message is in, when it is in one — what opens it in its thread.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thread_root": {
+          "description": "Whether the message is that thread's root.",
+          "type": "boolean"
+        },
+        "timestamp": {
+          "description": "When the message was sent, ISO-8601, exactly as the provider reported it. What the page\norders pins by, among themselves and among the messages it has loaded.",
+          "type": "string"
+        },
+        "truncated": {
+          "description": "Whether `content` was cut to fit.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "message_id",
+        "author",
+        "author_id",
+        "author_is_bot",
+        "content",
+        "truncated",
+        "timestamp",
+        "thread_id",
+        "thread_root",
+        "pinned_at_ms"
+      ],
+      "type": "object"
+    },
+    "PinChangeResponse": {
+      "description": "What one pin or unpin did: `PUT` and `DELETE /api/v1/channels/{id}/pins/{message_id}`.",
+      "properties": {
+        "changed": {
+          "description": "Whether the call changed anything; false when it repeated what was already so.",
+          "type": "boolean"
+        },
+        "channel": {
+          "$ref": "#/$defs/ChannelInfo",
+          "description": "The channel, as configured here."
+        },
+        "message_id": {
+          "$ref": "#/$defs/MessageId",
+          "description": "The message the call named."
+        },
+        "pin": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Pin"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The pin exactly as stored — its text cut to the bound — or absent after an unpin."
+        },
+        "pinned": {
+          "description": "Whether it is pinned now.",
+          "type": "boolean"
+        },
+        "pins_notice": {
+          "description": "The standing statement that these pins are this server's own.",
+          "type": "string"
+        },
+        "revision": {
+          "description": "The channel's pin revision after the call, so the page that made it need not read the list\nagain to stay current.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "unpinned": {
+          "description": "Pins the bound dropped to make room for this one, oldest first. Empty except at the bound,\nand the page says so when it is not.",
+          "items": {
+            "$ref": "#/$defs/MessageId"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "channel",
+        "message_id",
+        "pinned",
+        "changed",
+        "unpinned",
+        "revision",
+        "pins_notice"
+      ],
+      "type": "object"
+    },
+    "PinsResponse": {
+      "description": "One channel's pins: `GET /api/v1/channels/{id}/pins`. `#206 pin-message`.",
+      "properties": {
+        "channel": {
+          "$ref": "#/$defs/ChannelInfo",
+          "description": "The channel, as configured here."
+        },
+        "limit": {
+          "description": "How many pins a channel keeps before the oldest is unpinned to make room.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pins": {
+          "description": "Every pin, in the order their messages were sent, oldest first, each with the snapshot that\nlets the page draw it when its message is not loaded.",
+          "items": {
+            "$ref": "#/$defs/Pin"
+          },
+          "type": "array"
+        },
+        "pins_notice": {
+          "description": "The standing statement that these pins are this server's own.",
+          "type": "string"
+        },
+        "revision": {
+          "description": "The revision this list is at; see [`TimelineResponse::pins_revision`].",
+          "format": "int64",
+          "type": "integer"
+        },
+        "untrusted_content_notice": {
+          "description": "A snapshot is channel content, and untrusted, like every other.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "channel",
+        "pins",
+        "revision",
+        "limit",
+        "pins_notice",
+        "untrusted_content_notice"
+      ],
+      "type": "object"
+    },
     "Playback": {
       "description": "How the web app plays messages with the selected provider.",
       "oneOf": [
@@ -849,6 +1013,14 @@
           "description": "Relevant provider limitation or scope information, if any.",
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "pins_revision": {
+          "description": "The revision this channel's pins are at. `#206 pin-message`.\n\nOn every read, newest page and delta alike, so a refresh that already happens is what tells\na page another device pinned or unpinned something; the page reads `/pins` again only when\nthis differs from the revision of the list it holds. Absent when the store cannot say — no\nstorage configured, or a failing one — and from an older server.",
+          "format": "int64",
+          "type": [
+            "integer",
             "null"
           ]
         },
@@ -1278,6 +1450,12 @@
     },
     {
       "$ref": "#/$defs/ThreadSummary"
+    },
+    {
+      "$ref": "#/$defs/PinsResponse"
+    },
+    {
+      "$ref": "#/$defs/PinChangeResponse"
     }
   ],
   "description": "Generated from vibe-talk/src/contract.rs by `make -C vibe-talk contract`. Do not edit.",

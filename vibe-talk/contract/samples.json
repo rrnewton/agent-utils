@@ -409,6 +409,111 @@
       "proposal": null
     }
   ],
+  "PinChangeResponse": [
+    {
+      "changed": true,
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "message_id": "301",
+      "pin": {
+        "author": "someone",
+        "author_id": "7",
+        "author_is_bot": true,
+        "content": "hello",
+        "message_id": "301",
+        "pinned_at_ms": 1790000000000,
+        "thread_id": "t1",
+        "thread_root": true,
+        "timestamp": "2026-09-25T12:00:00+00:00",
+        "truncated": true
+      },
+      "pinned": true,
+      "pins_notice": "pins are this server's own",
+      "revision": 1790000000001,
+      "unpinned": [
+        "200"
+      ]
+    },
+    {
+      "changed": false,
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "message_id": "301",
+      "pinned": false,
+      "pins_notice": "pins are this server's own",
+      "revision": 1790000000001,
+      "unpinned": []
+    }
+  ],
+  "PinsResponse": [
+    {
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "limit": 100,
+      "pins": [
+        {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": false,
+          "content": "hello",
+          "message_id": "300",
+          "pinned_at_ms": 1790000000000,
+          "thread_id": null,
+          "thread_root": false,
+          "timestamp": "2026-09-25T12:00:00+00:00",
+          "truncated": false
+        },
+        {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": true,
+          "content": "hello",
+          "message_id": "301",
+          "pinned_at_ms": 1790000000000,
+          "thread_id": "t1",
+          "thread_root": true,
+          "timestamp": "2026-09-25T12:00:00+00:00",
+          "truncated": true
+        }
+      ],
+      "pins_notice": "pins are this server's own",
+      "revision": 1790000000000,
+      "untrusted_content_notice": "third-party text"
+    },
+    {
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "limit": 100,
+      "pins": [],
+      "pins_notice": "pins are this server's own",
+      "revision": 0,
+      "untrusted_content_notice": "third-party text"
+    }
+  ],
   "ThreadSummary": [
     {
       "id": "t1",
@@ -662,6 +767,7 @@
       "next_after": "forward",
       "next_before": null,
       "notice": null,
+      "pins_revision": 1790000000000,
       "returned": 1,
       "thread": null,
       "threads": [],

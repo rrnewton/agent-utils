@@ -55,7 +55,8 @@
 //! * the database file is `0600` and its directory `0700`;
 //! * retention is bounded by [`Retention`] — a conversation count, a per-conversation turn count,
 //!   a cached-summary count, a dismissal count, and an age in days that applies to the first
-//!   three — enforced on every write, not by a sweeper that might not run;
+//!   three — enforced on every write, not by a sweeper that might not run; and pins are bounded
+//!   by [`MAX_PINS_PER_CHANNEL`] on every pin, for the reasons given there;
 //! * [`StateStore::purge_everything`] erases all of it, and an operator who does not trust that
 //!   can delete the single file the store lives in.
 
@@ -68,7 +69,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{ChannelId, MessageId};
+use crate::model::{ChannelId, MessageId, UserId};
 
 /// Longest conversation id this server will accept.
 pub const MAX_ID_LEN: usize = 64;
@@ -465,6 +466,10 @@ pub struct SummaryKey {
 /// second at-rest copy of somebody else's message, and it is the ONE row a caller can cause to be
 /// written without ever appending a turn — an unbounded summary table would have been the whole
 /// privacy argument, quietly undone by the cache added to serve it.
+///
+/// Pins are the one table bounded elsewhere: by [`MAX_PINS_PER_CHANNEL`], a fixed count per
+/// channel rather than a setting here, because the bound is part of what a pin promises — the
+/// page says what happens at it — and an operator lowering it would unpin messages nobody chose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Retention {
     /// How many conversations to keep. The oldest are dropped first. At least 1.
@@ -528,6 +533,185 @@ pub const DEFAULT_MAX_SUMMARIES: u32 = 2_000;
 pub const DEFAULT_MAX_DISMISSALS: u32 = 10_000;
 /// Default age limit, in days.
 pub const DEFAULT_RETAIN_DAYS: u16 = 30;
+
+// --- pinned messages ------------------------------------------------------------------------------
+//
+// `#206 pin-message`. The owner asked for "our own concept of 'pin message'": a message he wants to
+// find again, kept by THIS server so it survives a restart and shows on every device. It is ours in
+// exactly the sense the read marks are ours — nothing is read from the chat service's own pins and
+// nothing is written back to them — and a pin here changes nothing anybody else in the channel sees.
+
+/// How many pins one channel keeps.
+///
+/// **At the bound, pinning another message unpins the OLDEST pin in that channel** — oldest by when
+/// it was pinned, not by when its message was sent — in the same write, and the answer to that
+/// write names what went so the page can say so. That is the dismissal table's rule, and for the
+/// same reason it is not a refusal: the newest act is the one the owner is looking at, and a pin
+/// that failed because of one he made months ago would be the surprise he could not explain.
+///
+/// Per channel rather than across the store, because a busy channel must not be able to unpin the
+/// owner's one pin in a quiet one. The store is bounded all the same: a pin can only be made in a
+/// channel this server was configured to read, so the whole table is at most this many rows per
+/// channel that was ever on the allowlist.
+///
+/// A hundred is far more than a person curates by hand, and small enough that a channel's whole
+/// list — the snapshots included, each at most [`MAX_PIN_TEXT_CHARS`] — is one modest read.
+pub const MAX_PINS_PER_CHANNEL: usize = 100;
+
+/// How much of a pinned message's text its snapshot keeps, in characters.
+///
+/// Discord's own limit for one message, which covers almost every message whole. A longer one is
+/// cut here and says so (`truncated`), and the page shows the message itself whenever it is loaded,
+/// so the cut is only ever seen on a pin older than the loaded history.
+pub const MAX_PIN_TEXT_CHARS: usize = 2_000;
+
+/// The longest author display name a snapshot keeps, in characters. Far above what any provider
+/// allows a display name to be; anything longer was not served by one.
+pub const MAX_PIN_AUTHOR_CHARS: usize = 200;
+
+/// The longest message, author or thread id a snapshot accepts, in bytes: the same ceiling a
+/// "not noise" exemption puts on a message id, for the same reason.
+pub const MAX_PIN_ID_BYTES: usize = crate::noise::MAX_EXEMPT_ID_BYTES;
+
+/// The longest timestamp a snapshot accepts, in bytes. An ISO-8601 instant with a zone and
+/// nanoseconds is about forty.
+pub const MAX_PIN_TIMESTAMP_BYTES: usize = 64;
+
+/// What a pin keeps of the message it pins. `#206 pin-message`.
+///
+/// A SNAPSHOT, and the reason it exists at all: a pin outlives the page's loaded history, so a
+/// pin from last month has to be drawable as a row — and openable in its thread — from what is kept
+/// here alone. The page draws the LIVE message instead whenever it has that message loaded, so an
+/// edit since the pin shows where it can; this is what is left when it cannot.
+///
+/// It is a second at-rest copy of somebody's words, which is the one thing about this table the
+/// store's privacy posture cares about: so the text is bounded ([`MAX_PIN_TEXT_CHARS`]), the rows
+/// are bounded ([`MAX_PINS_PER_CHANNEL`]), and [`StateStore::purge_everything`] erases them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PinSnapshot {
+    /// The message pinned, in the provider-neutral namespace the page was served it in.
+    pub message_id: MessageId,
+    /// Its author's display name when it was pinned. UNTRUSTED.
+    pub author: String,
+    /// Its author's id, so the row is drawn in its speaker's colour like every other row.
+    pub author_id: UserId,
+    /// Whether the chat provider flagged the author as a bot.
+    pub author_is_bot: bool,
+    /// Its text when it was pinned, at most [`MAX_PIN_TEXT_CHARS`] characters. UNTRUSTED.
+    pub content: String,
+    /// Whether `content` was cut to fit.
+    pub truncated: bool,
+    /// When the message was sent, ISO-8601, exactly as the provider reported it. What the page
+    /// orders pins by, among themselves and among the messages it has loaded.
+    pub timestamp: String,
+    /// The thread the message is in, when it is in one — what opens it in its thread.
+    pub thread_id: Option<String>,
+    /// Whether the message is that thread's root.
+    pub thread_root: bool,
+}
+
+/// One pin, as the store holds it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Pin {
+    /// What was kept of the message.
+    #[serde(flatten)]
+    pub snapshot: PinSnapshot,
+    /// When it was pinned, in milliseconds since the Unix epoch, by this server's clock. The order
+    /// the bound drops pins in.
+    pub pinned_at_ms: i64,
+}
+
+/// A channel's pins, and the revision they are at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pins {
+    /// Every pin, in the order their messages were sent, oldest first.
+    pub pins: Vec<Pin>,
+    /// See [`StateStore::pins_revision`].
+    pub revision: i64,
+}
+
+/// What one pin or unpin did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinChange {
+    /// Whether the call changed what is stored: a new pin, a snapshot refreshed by a second pin of
+    /// the same message, or a pin removed. False for a repeat of either act.
+    pub changed: bool,
+    /// The pin exactly as it is now stored — its text cut to the bound, and the instant of the
+    /// FIRST pin when this one repeated it — or `None` after an unpin.
+    pub pin: Option<Pin>,
+    /// The pins the bound dropped to make room, oldest first. Empty except at the bound.
+    pub unpinned: Vec<MessageId>,
+    /// The channel's revision after the call. See [`StateStore::pins_revision`].
+    pub revision: i64,
+}
+
+/// Check a snapshot and bring it inside its bounds, returning it as it will be stored.
+///
+/// The TEXT is cut rather than refused, at a character boundary, and marked `truncated`: the
+/// page sends a message as it holds it, and a long message is as pinnable as a short one. Every
+/// identifier is refused instead when it is empty, oversized or carries a control character,
+/// because no provider served such an id and a row keyed on one could never be matched to a
+/// message again. The author's name is refused over [`MAX_PIN_AUTHOR_CHARS`] for the same reason.
+///
+/// # Errors
+///
+/// [`StoreError::BadId`] naming the first field that is not usable.
+pub fn validate_pin(snapshot: &PinSnapshot) -> Result<PinSnapshot, StoreError> {
+    validate_pin_id(&snapshot.message_id)?;
+    pin_identifier("author id", snapshot.author_id.as_str(), MAX_PIN_ID_BYTES)?;
+    pin_identifier("timestamp", &snapshot.timestamp, MAX_PIN_TIMESTAMP_BYTES)?;
+    if let Some(thread) = &snapshot.thread_id {
+        pin_identifier("thread id", thread, MAX_PIN_ID_BYTES)?;
+    }
+    if snapshot.author.chars().count() > MAX_PIN_AUTHOR_CHARS {
+        return Err(StoreError::BadId(format!(
+            "a pin's author name must be at most {MAX_PIN_AUTHOR_CHARS} characters"
+        )));
+    }
+    let cut = snapshot.content.chars().count() > MAX_PIN_TEXT_CHARS;
+    Ok(PinSnapshot {
+        content: if cut {
+            snapshot.content.chars().take(MAX_PIN_TEXT_CHARS).collect()
+        } else {
+            snapshot.content.clone()
+        },
+        // A snapshot that arrives already cut stays marked so: the page may have sent what it held
+        // of a pin it is refreshing.
+        truncated: cut || snapshot.truncated,
+        ..snapshot.clone()
+    })
+}
+
+/// Check the id a pin is filed under: what [`validate_pin`] asks of a snapshot's, and what an
+/// unpin asks of the id it names, so the two cannot accept different ids.
+///
+/// # Errors
+///
+/// [`StoreError::BadId`] for an empty, oversized or control-character id.
+pub fn validate_pin_id(message: &MessageId) -> Result<(), StoreError> {
+    pin_identifier("message id", message.as_str(), MAX_PIN_ID_BYTES)
+}
+
+/// One identifier of a pin: present, within `ceiling` bytes, and free of control characters.
+fn pin_identifier(what: &str, raw: &str, ceiling: usize) -> Result<(), StoreError> {
+    if raw.is_empty() || raw.len() > ceiling || raw.chars().any(char::is_control) {
+        return Err(StoreError::BadId(format!(
+            "a pin's {what} must be 1 to {ceiling} bytes with no control characters"
+        )));
+    }
+    Ok(())
+}
+
+/// The next revision after `previous`, at `now_ms`.
+///
+/// Strictly greater than `previous`, and at least the current instant, so a revision is never
+/// reissued for a different list: after a purge erases the counters, the next change starts from
+/// the clock, which is past every revision handed out before it. Shared by every backend so two of
+/// them cannot count differently.
+#[must_use]
+pub fn next_pin_revision(previous: i64, now_ms: i64) -> i64 {
+    previous.saturating_add(1).max(now_ms)
+}
 
 /// Why a store operation could not be carried out.
 #[derive(Debug, thiserror::Error)]
@@ -934,6 +1118,70 @@ pub trait StateStore: Send + Sync {
         messages: &[MessageId],
     ) -> Result<u64, StoreError>;
 
+    /// Every pin in this channel, in the order their messages were sent, oldest first, and the
+    /// revision the list is at. `#206 pin-message`.
+    ///
+    /// The WHOLE list with its snapshots, unlike [`StateStore::dismissals`]' bare ids: the point of
+    /// a pin is that it can be shown when its message is not loaded, and the list is bounded by
+    /// [`MAX_PINS_PER_CHANNEL`] where the dismissals are not.
+    ///
+    /// **Not covered by [`Retention::retain_days`]**, for the dismissal table's reason made
+    /// stronger: an age limit would silently unpin a message the owner pinned in order to keep it.
+    /// The count bound and the purge are what keep the copy of its text from living forever.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a read
+    /// failure.
+    async fn pins(&self, channel: &ChannelId) -> Result<Pins, StoreError>;
+
+    /// The revision this channel's pins are at: a number that changes whenever the list does.
+    ///
+    /// What lets a page keep every device's pins current without re-reading the list on every
+    /// refresh. Each timeline read carries this — one indexed lookup — and the page reads the list
+    /// again only when it differs from the revision its list came with. `0` for a channel nobody
+    /// has pinned in; otherwise it only ever grows, through [`next_pin_revision`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a read
+    /// failure.
+    async fn pins_revision(&self, channel: &ChannelId) -> Result<i64, StoreError>;
+
+    /// Pin a message, keeping `snapshot` of it.
+    ///
+    /// Idempotent: pinning a pinned message is not an error and does not move it in the bound's
+    /// queue. It does refresh the snapshot, so a pin made again after an edit keeps the edited
+    /// text. Validated by [`validate_pin`] before anything is written. At
+    /// [`MAX_PINS_PER_CHANNEL`] the oldest other pin in the channel is dropped in the same
+    /// transaction and named in [`PinChange::unpinned`]; the message being pinned never is.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::BadId`] for a snapshot [`validate_pin`] refuses; [`StoreError::Unavailable`]
+    /// when no store is configured; [`StoreError::Backend`] on a write failure.
+    async fn pin(
+        &self,
+        channel: &ChannelId,
+        snapshot: &PinSnapshot,
+    ) -> Result<PinChange, StoreError>;
+
+    /// Unpin a message.
+    ///
+    /// Idempotent too, and deliberately unlike [`StateStore::clear_channel_alias`]: a pin is
+    /// toggled from two devices that may each be a refresh behind, and "it was already unpinned"
+    /// is the state both of them wanted. [`PinChange::changed`] still says which it was.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
+    /// write failure.
+    async fn unpin(
+        &self,
+        channel: &ChannelId,
+        message: &MessageId,
+    ) -> Result<PinChange, StoreError>;
+
     /// The summary already produced for this exact key, if there is one.
     ///
     /// A miss is `Ok(None)`, never an error: not having summarised something yet is the normal
@@ -1098,6 +1346,127 @@ mod tests {
         // Counted in CHARACTERS, not bytes: sixty accented letters is sixty, not a hundred and
         // twenty.
         assert!(validate_alias(&"é".repeat(60)).is_ok());
+    }
+
+    fn snapshot() -> PinSnapshot {
+        PinSnapshot {
+            message_id: MessageId("1000000000000000200".to_owned()),
+            author: "build-bot".to_owned(),
+            author_id: UserId("1000000000000000009".to_owned()),
+            author_is_bot: true,
+            content: "the nightly build is green again".to_owned(),
+            truncated: false,
+            timestamp: "2026-10-04T12:00:00.000Z".to_owned(),
+            thread_id: Some("spaces/A/threads/B".to_owned()),
+            thread_root: false,
+        }
+    }
+
+    #[test]
+    fn a_pins_text_is_cut_at_its_bound_and_says_so_while_a_short_one_is_kept_whole() {
+        // Two thousand, named here rather than read from the constant, for the reason the alias
+        // test gives: `repeat(MAX_PIN_TEXT_CHARS)` passes whatever the bound becomes.
+        assert_eq!(MAX_PIN_TEXT_CHARS, 2_000);
+        let kept = validate_pin(&snapshot()).expect("an ordinary snapshot is fine");
+        assert_eq!(kept, snapshot(), "a short snapshot came back changed");
+
+        let exact = validate_pin(&PinSnapshot {
+            content: "é".repeat(2_000),
+            ..snapshot()
+        })
+        .expect("exactly at the bound");
+        assert!(
+            !exact.truncated,
+            "a text exactly at the bound was marked cut"
+        );
+
+        let long = validate_pin(&PinSnapshot {
+            // Counted in CHARACTERS: two-byte letters, so a byte count would cut at a thousand.
+            content: format!("{}tail", "é".repeat(2_000)),
+            ..snapshot()
+        })
+        .expect("a long text is cut, not refused");
+        assert_eq!(long.content.chars().count(), 2_000);
+        assert!(long.truncated, "the cut was not recorded");
+        assert!(
+            !long.content.ends_with("tail"),
+            "the text was not cut at its end"
+        );
+    }
+
+    #[test]
+    fn a_pins_identifiers_are_refused_rather_than_trimmed_when_no_provider_could_have_served_them()
+    {
+        let oversized = "x".repeat(MAX_PIN_ID_BYTES + 1);
+        for (what, broken) in [
+            (
+                "empty message id",
+                PinSnapshot {
+                    message_id: MessageId(String::new()),
+                    ..snapshot()
+                },
+            ),
+            (
+                "oversized message id",
+                PinSnapshot {
+                    message_id: MessageId(oversized.clone()),
+                    ..snapshot()
+                },
+            ),
+            (
+                "control character in a message id",
+                PinSnapshot {
+                    message_id: MessageId("12\n34".to_owned()),
+                    ..snapshot()
+                },
+            ),
+            (
+                "empty author id",
+                PinSnapshot {
+                    author_id: UserId(String::new()),
+                    ..snapshot()
+                },
+            ),
+            (
+                "oversized thread id",
+                PinSnapshot {
+                    thread_id: Some(oversized.clone()),
+                    ..snapshot()
+                },
+            ),
+            (
+                "oversized timestamp",
+                PinSnapshot {
+                    timestamp: "2".repeat(MAX_PIN_TIMESTAMP_BYTES + 1),
+                    ..snapshot()
+                },
+            ),
+            (
+                "oversized author name",
+                PinSnapshot {
+                    author: "a".repeat(MAX_PIN_AUTHOR_CHARS + 1),
+                    ..snapshot()
+                },
+            ),
+        ] {
+            let error = validate_pin(&broken).expect_err(what);
+            assert_eq!(error.code(), "bad_id", "{what}: {error}");
+        }
+        // A message with no thread is an ordinary pin, not a missing field.
+        assert!(validate_pin(&PinSnapshot {
+            thread_id: None,
+            ..snapshot()
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn a_pin_revision_only_grows_and_starts_from_the_clock_after_a_purge() {
+        assert_eq!(next_pin_revision(0, 1_000), 1_000);
+        // Two changes in one millisecond are still two revisions.
+        assert_eq!(next_pin_revision(1_000, 1_000), 1_001);
+        // A clock that went backwards does not reissue a revision.
+        assert_eq!(next_pin_revision(5_000, 1_000), 5_001);
     }
 
     #[test]

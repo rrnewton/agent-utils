@@ -16,12 +16,13 @@ use serde_json::{json, Value};
 use vibe_talk::contract::{
     ApiErrorBody, ClientConfigResponse, CommittedPostResponse, LiveDeleteEvent, LiveDelivery,
     LiveMessageEvent, LiveResetEvent, NoiseRules, PendingPost, PendingPostResponse,
-    ProviderDescription, TimelineResponse, TokenScope, TranscriptRole, VibeTalkV1ClientFrame,
-    VibeTalkV1ServerFrame,
+    PinChangeResponse, PinsResponse, ProviderDescription, TimelineResponse, TokenScope,
+    TranscriptRole, VibeTalkV1ClientFrame, VibeTalkV1ServerFrame,
 };
 use vibe_talk::conversation::{VoiceDescription, VoiceSession};
 use vibe_talk::model::{ChannelId, ChannelInfo, Message, MessageId, UserId};
 use vibe_talk::speech::{Description, Playback};
+use vibe_talk::store::{Pin, PinSnapshot};
 use vibe_talk::threads::{MessageThread, ThreadSummary, TimelineDelta, TimelinePage, TimelineView};
 
 fn contract_dir() -> PathBuf {
@@ -210,7 +211,26 @@ fn timeline(view: TimelineView, page: TimelinePage) -> TimelineResponse {
         returned: page.messages.len() + page.threads.len(),
         page,
         dismissed: vec![MessageId("150".into())],
+        pins_revision: None,
         untrusted_content_notice: "third-party text",
+    }
+}
+
+/// A pin, with a thread or without. `#206 pin-message`.
+fn pin(id: &str, threaded: bool) -> Pin {
+    Pin {
+        snapshot: PinSnapshot {
+            message_id: MessageId(id.into()),
+            author: "someone".into(),
+            author_id: UserId("7".into()),
+            author_is_bot: threaded,
+            content: "hello".into(),
+            truncated: threaded,
+            timestamp: "2026-09-25T12:00:00+00:00".into(),
+            thread_id: threaded.then(|| "t1".into()),
+            thread_root: threaded,
+        },
+        pinned_at_ms: 1_790_000_000_000,
     }
 }
 
@@ -298,11 +318,16 @@ fn samples() -> Value {
             // `#203 incremental-refresh`: a newest page that can be continued forward, a complete
             // delta with one upsert and one deletion, and an incomplete one that says there is
             // more and that the backend could not bring it up to date just now.
-            to(&timeline(TimelineView::Main, TimelinePage {
-                messages: vec![plain.clone()],
-                next_after: Some("forward".into()),
-                ..TimelinePage::default()
-            })),
+            // `#206 pin-message`: this one carries the pins' revision, as every read from a
+            // server with a store does; the others leave it out, as a store-less server does.
+            to(&TimelineResponse {
+                pins_revision: Some(1_790_000_000_000),
+                ..timeline(TimelineView::Main, TimelinePage {
+                    messages: vec![plain.clone()],
+                    next_after: Some("forward".into()),
+                    ..TimelinePage::default()
+                })
+            }),
             to(&timeline(TimelineView::Main, TimelinePage {
                 messages: vec![threaded.clone()],
                 has_threads: true,
@@ -379,6 +404,46 @@ fn samples() -> Value {
         ],
         "Message": [to(&plain), to(&threaded)],
         "ThreadSummary": [to(&thread_summary(Some(plain.clone()))), to(&thread_summary(None))],
+        "PinsResponse": [
+            to(&PinsResponse {
+                channel: channel(),
+                pins: vec![pin("300", false), pin("301", true)],
+                revision: 1_790_000_000_000,
+                limit: 100,
+                pins_notice: "pins are this server's own",
+                untrusted_content_notice: "third-party text",
+            }),
+            to(&PinsResponse {
+                channel: channel(),
+                pins: Vec::new(),
+                revision: 0,
+                limit: 100,
+                pins_notice: "pins are this server's own",
+                untrusted_content_notice: "third-party text",
+            }),
+        ],
+        "PinChangeResponse": [
+            to(&PinChangeResponse {
+                channel: channel(),
+                message_id: MessageId("301".into()),
+                pinned: true,
+                changed: true,
+                pin: Some(pin("301", true)),
+                unpinned: vec![MessageId("200".into())],
+                revision: 1_790_000_000_001,
+                pins_notice: "pins are this server's own",
+            }),
+            to(&PinChangeResponse {
+                channel: channel(),
+                message_id: MessageId("301".into()),
+                pinned: false,
+                changed: false,
+                pin: None,
+                unpinned: Vec::new(),
+                revision: 1_790_000_000_001,
+                pins_notice: "pins are this server's own",
+            }),
+        ],
         "VibeTalkV1ClientFrame": [
             to(&VibeTalkV1ClientFrame::AudioStart),
             to(&VibeTalkV1ClientFrame::AudioEnd),

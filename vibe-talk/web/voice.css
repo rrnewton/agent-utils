@@ -105,6 +105,13 @@
      share the line, and every pixel spent here comes off the end of that sentence. */
   --float-edge: 0.5rem;
   --float-gap: 0.3rem;
+  /* `#206 pin-message`. A pinned row's chip and edge. GOLD, because nothing else here is: the
+     reading row is `--warn` orange, the kept place and pressed toggles are `--accent` blue, and the
+     summary is teal — so "pinned" cannot be mistaken for "being read" or "where I left off". Judged
+     in dark first, on the three speaker surfaces, as every row tint here has to be. */
+  --pin-ink: #f0c75e;
+  --pin-edge: #d4a63a;
+  --pin-bg: #3a3017;
 }
 
 @media (prefers-color-scheme: light) {
@@ -128,6 +135,9 @@
     --summary-fail-bg: #fdeaec;
     --summary-fail-edge: #c2555f;
     --summary-fail-ink: #8f1d28;
+    --pin-ink: #7a5300;
+    --pin-edge: #c08b14;
+    --pin-bg: #fbf0d2;
   }
 }
 
@@ -916,7 +926,8 @@ body {
  * `me` includes the voice bot, because it posts on the owner's behalf. The words are his; the
  * account that delivered them is an implementation detail of this bridge.
  */
-#discord-log li.discord-message[data-who="me"] {
+#discord-log li.discord-message[data-who="me"],
+#pinned-log li.discord-message[data-who="me"] {
   background: var(--mine);
   border-color: var(--mine-edge);
   margin-left: var(--speaker-inset);
@@ -938,7 +949,8 @@ body {
  * They still cannot be confused with the owner's own messages, which keep their right indent AND
  * their colour -- two signals, either of which would do on its own.
  */
-#discord-log li.discord-message[data-who="coder"] {
+#discord-log li.discord-message[data-who="coder"],
+#pinned-log li.discord-message[data-who="coder"] {
   background: var(--theirs);
   margin-left: calc(-0.75rem - env(safe-area-inset-left));
   margin-right: calc(-0.75rem - env(safe-area-inset-right));
@@ -961,7 +973,9 @@ body {
  * Warm rather than a third blue, so it is not read as a variant of `me`, and centred between the
  * two insets so the geometry still says "neither side of this conversation". */
 #discord-log li.discord-message[data-who="human"],
-#discord-log li.discord-message[data-who="bot"] {
+#pinned-log li.discord-message[data-who="human"],
+#discord-log li.discord-message[data-who="bot"],
+#pinned-log li.discord-message[data-who="bot"] {
   background: var(--third);
   border-color: var(--third-edge);
   margin-inline: calc(var(--speaker-inset) / 2);
@@ -1064,12 +1078,14 @@ body {
  * amount is declared where its opacity used to be, with the same weight and the same place in the
  * file — so every row that is not a reply is drawn exactly as before.
  */
-#discord-log li.discord-message {
+#discord-log li.discord-message,
+#pinned-log li.discord-message {
   opacity: var(--row-opacity, 1);
   filter: var(--row-filter, none);
 }
 
-#discord-log li.discord-message[data-replied="true"] {
+#discord-log li.discord-message[data-replied="true"],
+#pinned-log li.discord-message[data-replied="true"] {
   --row-opacity: 0.55;
 }
 
@@ -1090,7 +1106,9 @@ body {
  * archived is the reader's own decision and outranks an inference about what happens to be loaded.
  */
 #discord-log li.discord-message[data-archived="true"],
-#discord-log li.discord-message[data-own-read="true"] {
+#pinned-log li.discord-message[data-archived="true"],
+#discord-log li.discord-message[data-own-read="true"],
+#pinned-log li.discord-message[data-own-read="true"] {
   --row-opacity: 0.42;
   --row-filter: grayscale(1);
   --row-grey: 1;
@@ -1106,7 +1124,8 @@ body {
  * Not hidden: hiding is Hide read's job, and a row that vanished from the channel view could not be
  * rescued with Not noise when a rule caught a real message.
  */
-#discord-log li.discord-message[data-noise="true"] {
+#discord-log li.discord-message[data-noise="true"],
+#pinned-log li.discord-message[data-noise="true"] {
   --row-opacity: 0.32;
   --row-filter: grayscale(1);
   --row-grey: 1;
@@ -1118,8 +1137,11 @@ body {
    opacity half of this is handled by the shared rules below; the tint has to be restored here
    because `filter` does not inherit that treatment. */
 #discord-log li.discord-message[data-archived="true"]:focus-within,
+#pinned-log li.discord-message[data-archived="true"]:focus-within,
 #discord-log li.discord-message[data-own-read="true"]:focus-within,
-#discord-log li.discord-message[data-noise="true"]:focus-within {
+#pinned-log li.discord-message[data-own-read="true"]:focus-within,
+#discord-log li.discord-message[data-noise="true"]:focus-within,
+#pinned-log li.discord-message[data-noise="true"]:focus-within {
   --row-filter: none;
   --row-grey: 0;
 }
@@ -1147,7 +1169,8 @@ body {
  * the row it would stop. And a thick INSET BAR rather than a border, because an inset shadow does
  * not care that the tile has its side borders removed.
  */
-#discord-log li.discord-message[data-reading="true"] {
+#discord-log li.discord-message[data-reading="true"],
+#pinned-log li.discord-message[data-reading="true"] {
   --row-opacity: 1;
   --row-filter: none;
   --row-grey: 0;
@@ -1173,7 +1196,8 @@ body {
  * promise the reader can still take back with a second tap, and the filled one is an event they
  * cannot. So the promise gets an edge and the event gets the surface.
  */
-#discord-log li.discord-message[data-pending="true"] {
+#discord-log li.discord-message[data-pending="true"],
+#pinned-log li.discord-message[data-pending="true"] {
   --row-opacity: 1;
   --row-filter: none;
   --row-grey: 0;
@@ -1189,7 +1213,8 @@ body {
 
 /* A reader who has asked not to be moved is not asking to be moved by this either. */
 @media (prefers-reduced-motion: reduce) {
-  #discord-log li.discord-message[data-pending="true"] {
+  #discord-log li.discord-message[data-pending="true"],
+  #pinned-log li.discord-message[data-pending="true"] {
     animation: none;
     outline-color: var(--accent);
   }
@@ -1222,7 +1247,8 @@ body {
  * to come back to it. It must be findable once they are near it and must not compete with the row
  * that is actually speaking.
  */
-#discord-log li.discord-message[data-marked="true"] {
+#discord-log li.discord-message[data-marked="true"],
+#pinned-log li.discord-message[data-marked="true"] {
   box-shadow: inset 0.2rem 0 0 var(--accent);
 }
 
@@ -1240,7 +1266,8 @@ body {
  * width. On the coder tile — which is most of what a backlog is, and runs edge to edge — the row
  * IS the full width, so nothing is lost where it matters.
  */
-#discord-log li.discord-message[data-marked="true"]::before {
+#discord-log li.discord-message[data-marked="true"]::before,
+#pinned-log li.discord-message[data-marked="true"]::before {
   content: "";
   position: absolute;
   left: 0;
@@ -1252,7 +1279,8 @@ body {
 }
 
 /* ...except when it IS the row speaking, where the loud state wins outright. */
-#discord-log li.discord-message[data-marked="true"][data-reading="true"] {
+#discord-log li.discord-message[data-marked="true"][data-reading="true"],
+#pinned-log li.discord-message[data-marked="true"][data-reading="true"] {
   box-shadow: inset 0.25rem 0 0 var(--warn);
 }
 
@@ -1485,7 +1513,8 @@ body {
 
 /* Anchor for the mark above, and the reason a swipe can move the row: a transform on a static
    element still paints, but the strike would travel with it and the row's own box would not. */
-#discord-log li.discord-message {
+#discord-log li.discord-message,
+#pinned-log li.discord-message {
   position: relative;
 }
 
@@ -1496,7 +1525,8 @@ body {
    The hover half of this pair is inside the pointer query above, and the split is not cosmetic — a
    tap on a touch screen leaves `:hover` stuck on the row it landed on, so a phone would end up with
    one permanently undimmed row and no way to clear it. Same rule, same reason, as the row tint. */
-#discord-log li.discord-message:focus-within {
+#discord-log li.discord-message:focus-within,
+#pinned-log li.discord-message:focus-within {
   --row-opacity: 1;
 }
 
@@ -1505,7 +1535,8 @@ body {
    gesture and bails out of anything that is mostly vertical. The transition is for the SNAP BACK —
    the drag itself sets `transition: none` while a finger is down, because a transform that eases
    toward the finger reads as lag. */
-#discord-log li.discord-message {
+#discord-log li.discord-message,
+#pinned-log li.discord-message {
   touch-action: pan-y;
   transition: transform 0.18s ease-out;
 }
@@ -1709,7 +1740,8 @@ body {
  * Applied to the row rather than to the note, and with the tint applied over every `data-who`
  * colour, because the three speaker colours are what the reader is otherwise reading the row by.
  */
-#discord-log li.discord-message[data-summarised="true"] {
+#discord-log li.discord-message[data-summarised="true"],
+#pinned-log li.discord-message[data-summarised="true"] {
   background: var(--summary-bg);
   border-color: var(--summary-edge);
   /* The coder's tiles deliberately have no side borders. This one is the exception, because it is
@@ -1739,7 +1771,8 @@ body {
  *     filed — which is the case where they would otherwise never learn that the money was spent
  *     and nothing came back.
  */
-#discord-log li.discord-message[data-summary-failed="true"] {
+#discord-log li.discord-message[data-summary-failed="true"],
+#pinned-log li.discord-message[data-summary-failed="true"] {
   background: var(--summary-fail-bg);
   border-color: var(--summary-fail-edge);
   border-left: 3px solid var(--summary-fail-edge);
@@ -1750,7 +1783,8 @@ body {
 
 /* The two words, in the failure's own ink. The tint says something is wrong at a glance; this is
    the part a screen reader can say and a greyscale screenshot still carries. */
-#discord-log li.discord-message[data-summary-failed="true"] .summary-mark {
+#discord-log li.discord-message[data-summary-failed="true"] .summary-mark,
+#pinned-log li.discord-message[data-summary-failed="true"] .summary-mark {
   color: var(--summary-fail-ink);
 }
 
@@ -1818,9 +1852,11 @@ body {
 
 /* `#202 read-through-here`. Every item in the ⋯ menu the same size, and the larger, easier one to
    hit with a thumb: the menu's items were a pill the size of the row's own small controls beside a
-   full-size button, and the owner asked for the larger size throughout. */
+   full-size button, and the owner asked for the larger size throughout. The two in the read group
+   below are items of the menu too, and keep that size inside it. */
 .row-more-menu > button,
-.row-more-menu > .upstream-read-button {
+.row-more-group > button,
+.row-more-group > .upstream-read-button {
   min-height: 2.75rem;
   padding: 0.5rem 0.9rem;
   border: 1px solid var(--edge);
@@ -1833,7 +1869,89 @@ body {
   text-align: left;
 }
 
-.row-more-menu > button[hidden] {
+.row-more-menu > button[hidden],
+.row-more-group > button[hidden] {
+  display: none;
+}
+
+/* `#206 pin-message`. The owner: "put the copy text button first and then group the two mark read
+   buttons." Copy text and Pin are the everyday items and come first; the two that mark read sit
+   under a hairline and a caption of their own, so they read as one choice made two ways rather
+   than as two more unrelated buttons — and a provider with no read marker of its own leaves one
+   item under the caption, not a stray rule. */
+.row-more-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-top: 0.15rem;
+  padding-top: 0.45rem;
+  border-top: 1px solid var(--edge);
+}
+
+.row-more-caption {
+  padding: 0 0.2rem;
+  color: var(--muted);
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/*
+ * `#206 pin-message`. A pinned row says so IN WORDS, in its meta line: the owner rejects a lone
+ * glyph as useless, so the chip carries the word "Pinned" beside its icon, in a colour of its own,
+ * and the row adds a gold edge on its RIGHT — the left edge already belongs to the row being read
+ * and to the kept place, and a pin must not be mistaken for either. Every rule for a channel row in
+ * this file names `#pinned-log` beside `#discord-log`, so a row in the Pinned filter is drawn
+ * exactly as it is in the channel.
+ */
+.pin-chip {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.05rem 0.45rem 0.05rem 0.35rem;
+  border: 1px solid var(--pin-edge);
+  border-radius: 999px;
+  background: var(--pin-bg);
+  color: var(--pin-ink);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  line-height: 1.35;
+}
+
+/* The pin, drawn from the same path as the Pinned filter's icon and filled with the chip's ink. A
+   mask rather than an inline <svg> so the row builder makes no element it would have to name. */
+.pin-chip::before {
+  content: "";
+  width: 0.8rem;
+  height: 0.8rem;
+  background: currentColor;
+  -webkit-mask: var(--pin-mask) center / contain no-repeat;
+  mask: var(--pin-mask) center / contain no-repeat;
+  --pin-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8.5 3.5h7'/%3E%3Cpath d='M10 3.5v6L7 13.5h10l-3-4v-6z' fill='black'/%3E%3Cpath d='M12 13.5v7'/%3E%3C/svg%3E");
+}
+
+#discord-log li.discord-message[data-pinned="true"]::after,
+#pinned-log li.discord-message[data-pinned="true"]::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 0.25rem;
+  background: var(--pin-edge);
+  pointer-events: none;
+}
+
+/* While the Pinned filter is up, the lines that describe the CHANNEL's list — how much of it is
+   loaded, a provider's note about it, the to-do controls — describe a list that is not on screen,
+   and go with it. The lists themselves are hidden by script, which is what the search count reads. */
+#pane-discord[data-pinned-only] #channel-summary,
+#pane-discord[data-pinned-only] #summary-note,
+#pane-discord[data-pinned-only] #inbox-note,
+#pane-discord[data-pinned-only] #clear-backlog,
+#pane-discord[data-pinned-only] #timeline-notice {
   display: none;
 }
 
@@ -2155,6 +2273,50 @@ body {
     calc(var(--search-disc) + var(--float-edge) - var(--search-hit) - 1px);
 }
 
+/* `#206 pin-message`. The Pinned filter, immediately left of the glass inside the open bar. Its
+   whole 44px SQUARE is the target — no rounded corners to fall off — and what is drawn inside it
+   is the glass's own disc size, so the two read as a pair on the line. The margin on its right
+   keeps that square out of the glass's (`#search-toggle::after` reaches this far left of the
+   disc), so neither steals the other's taps; the field gives up the width, and keeps well over the
+   150px it needs at 360px. */
+#pinned-filter {
+  position: relative;
+  width: var(--search-hit);
+  height: var(--search-hit);
+  margin-right: max(0px, calc(var(--search-hit) - var(--search-disc) - var(--float-edge) + 1px - 0.4rem));
+  border-radius: 0;
+  color: var(--muted);
+}
+
+#pinned-filter::before {
+  content: "";
+  position: absolute;
+  inset: calc((var(--search-hit) - var(--search-disc)) / 2);
+  border-radius: 999px;
+  pointer-events: none;
+}
+
+#pinned-filter .icon {
+  position: relative;
+  width: 1.05rem;
+  height: 1.05rem;
+}
+
+/* ON says so twice, from the one attribute that says it to a screen reader: the pin fills in and
+   takes the pin colour, on a gold-ringed disc. */
+#pinned-filter[aria-pressed="true"] {
+  color: var(--pin-ink);
+}
+
+#pinned-filter[aria-pressed="true"]::before {
+  background: var(--pin-bg);
+  box-shadow: inset 0 0 0 1px var(--pin-edge);
+}
+
+#pinned-filter[aria-pressed="true"] .pin-head {
+  fill: currentColor;
+}
+
 /* OPEN: the glass grows along the line into a bar across the top of the list, and the pill has
    given way to it (`renderChannelFreshness`). The bar is a panel of its own, because the count is
    small grey type and would otherwise be printed straight onto whatever message is underneath. */
@@ -2345,15 +2507,20 @@ body {
  * something else entirely.
  */
 @media (hover: hover) and (pointer: fine) {
-  #discord-log li.discord-message:hover {
+  #discord-log li.discord-message:hover,
+  #pinned-log li.discord-message:hover {
     background: var(--row-hover);
     border-color: var(--accent);
   }
 
   #discord-log li.discord-message:hover .reply-button,
+  #pinned-log li.discord-message:hover .reply-button,
   #discord-log li.discord-message:hover .done-button,
+  #pinned-log li.discord-message:hover .done-button,
   #discord-log li.discord-message:hover .not-noise-button,
-  #discord-log li.discord-message:hover .upstream-read-button {
+  #pinned-log li.discord-message:hover .not-noise-button,
+  #discord-log li.discord-message:hover .upstream-read-button,
+  #pinned-log li.discord-message:hover .upstream-read-button {
     color: var(--ink);
     border-color: var(--accent);
   }
@@ -2361,14 +2528,18 @@ body {
   /* An answered or archived row is dimmed, and comes back to full contrast under the pointer. In
      here rather than outside, because `:hover` sticks to the last-tapped row on a touch screen and
      a phone would be left with exactly one permanently bright row. */
-  #discord-log li.discord-message:hover {
+  #discord-log li.discord-message:hover,
+  #pinned-log li.discord-message:hover {
     --row-opacity: 1;
   }
 
   /* The archived row's colour, on the same terms and for the same reason. */
   #discord-log li.discord-message[data-archived="true"]:hover,
+  #pinned-log li.discord-message[data-archived="true"]:hover,
   #discord-log li.discord-message[data-own-read="true"]:hover,
-  #discord-log li.discord-message[data-noise="true"]:hover {
+  #pinned-log li.discord-message[data-own-read="true"]:hover,
+  #discord-log li.discord-message[data-noise="true"]:hover,
+  #pinned-log li.discord-message[data-noise="true"]:hover {
     --row-filter: none;
     --row-grey: 0;
   }
@@ -2383,7 +2554,8 @@ body {
    tabbing through the channel gets the same "you are here" a mouse gets, on every device. Discord's
    principle is that the row lights up AND its actions become reachable; the actionable child is the
    reply control `#51 reply-view` puts on the row, and `:focus-within` covers both the row and it. */
-#discord-log li.discord-message:focus-within {
+#discord-log li.discord-message:focus-within,
+#pinned-log li.discord-message:focus-within {
   background: var(--row-hover);
   border-color: var(--accent);
 }
@@ -2394,7 +2566,8 @@ body {
    that CAN act must not be invisible. A reader who has never hovered a row still has to be able to
    see that a reply is possible. (The hover half of this pair lives inside the query above; only
    the focus half belongs out here.) */
-#discord-log li.discord-message:focus-within .reply-button {
+#discord-log li.discord-message:focus-within .reply-button,
+#pinned-log li.discord-message:focus-within .reply-button {
   color: var(--ink);
   border-color: var(--accent);
 }
@@ -2416,6 +2589,7 @@ body {
  * the phone app at `/`, and the transcript's own metadata line has three things on it and fits.
  */
 #discord-log .meta,
+#pinned-log .meta,
 #reply-context .meta {
   flex-wrap: wrap;
   row-gap: 0.15rem;
@@ -2440,6 +2614,8 @@ body {
  * owner asked for slightly denser by default and the width reclaimed above pays for it.
  */
 #reply-context .body,
+#pinned-log .body,
+#pinned-log .summary-text,
 #discord-log .body,
 #discord-log .summary-text {
   font-size: calc(0.88rem * var(--msg-scale));
@@ -2454,6 +2630,7 @@ body {
  * all -- a hidden button is not focusable, and would have removed the keyboard path entirely.
  */
 #discord-log .fold,
+#pinned-log .fold,
 #reply-context .fold {
   position: absolute;
   width: 1px;
@@ -2465,6 +2642,7 @@ body {
 }
 
 #discord-log .fold:focus-visible,
+#pinned-log .fold:focus-visible,
 #reply-context .fold:focus-visible {
   position: static;
   width: auto;
@@ -3388,11 +3566,13 @@ textarea {
   /* `#85 voice-desktop-review`. The channel's two principals, bounded exactly as the transcript's
      two speakers directly above — same numbers, because they are the same two people and a reader
      switching views must not see the column change shape under them. */
-  #discord-log li.discord-message[data-who="me"] {
+  #discord-log li.discord-message[data-who="me"],
+  #pinned-log li.discord-message[data-who="me"] {
     margin-left: min(15%, 6rem); /* a desk has the room a phone does not */
   }
 
-  #discord-log li.discord-message[data-who="coder"] {
+  #discord-log li.discord-message[data-who="coder"],
+  #pinned-log li.discord-message[data-who="coder"] {
     /* A desk has the room, and a full-bleed tile a metre wide is the "phone layout stretched
        sideways" the whole block exists to remove. The inset comes back. */
     margin-left: 0;
@@ -3400,7 +3580,9 @@ textarea {
   }
 
   #discord-log li.discord-message[data-who="human"],
-  #discord-log li.discord-message[data-who="bot"] {
+  #pinned-log li.discord-message[data-who="human"],
+  #discord-log li.discord-message[data-who="bot"],
+  #pinned-log li.discord-message[data-who="bot"] {
     margin-inline: min(7%, 3rem);
   }
 

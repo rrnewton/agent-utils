@@ -1707,6 +1707,85 @@ pub async fn exempt_from_noise(
     })
 }
 
+// --- pinned messages -------------------------------------------------------------------------------
+//
+// `#206 pin-message`. The owner's own pins: a message he wants to find again, kept by this server so
+// it outlives a restart and shows on every device, filtered to from beside the search glass. OURS in
+// the sense `#61 unread-status` gave the read marks — nothing is read from the chat service's own
+// pinned messages and nothing is written back to them — and, like `#39 channel-alias`, the owner's
+// act alone: there is no MCP tool for any of this, so a model can neither pin nor read the list.
+
+/// Every pin in one channel, with the revision the list is at. Read scope, like `/todo`: the pins
+/// are copies of messages in a channel the caller may already read.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`] outside the allowlist; [`OpError::Store`] when no store is
+/// configured or the read fails.
+pub async fn pins(
+    state: &AppState,
+    channel_id: &str,
+) -> Result<(ChannelInfo, crate::store::Pins), OpError> {
+    let channel = allowed(state, channel_id).await?;
+    let pins = state.store.pins(&channel.id).await?;
+    Ok((channel, pins))
+}
+
+/// Pin one message, keeping `snapshot` of it. Write scope.
+///
+/// Checked against the allowlist and NOT against a fresh fetch, for the reason [`dismiss`] is
+/// not: the snapshot came from the page the owner is looking at, and a pin that cost a provider
+/// round trip would be slow exactly when the provider is. The allowlist is what keeps the table
+/// from growing one channel at a time, and [`crate::store::MAX_PINS_PER_CHANNEL`] what bounds it
+/// inside one.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`] outside the allowlist; [`OpError::Store`] for a snapshot the store
+/// refuses, when no store is configured, or when the write fails.
+pub async fn pin(
+    state: &AppState,
+    channel_id: &str,
+    snapshot: &crate::store::PinSnapshot,
+) -> Result<(ChannelInfo, crate::store::PinChange), OpError> {
+    let channel = allowed(state, channel_id).await?;
+    let change = state.store.pin(&channel.id, snapshot).await?;
+    Ok((channel, change))
+}
+
+/// Unpin one message. Write scope. Unpinning a message that is not pinned is not an error.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`] outside the allowlist; [`OpError::Store`] when no store is
+/// configured or the write fails.
+pub async fn unpin(
+    state: &AppState,
+    channel_id: &str,
+    message: &MessageId,
+) -> Result<(ChannelInfo, crate::store::PinChange), OpError> {
+    let channel = allowed(state, channel_id).await?;
+    let change = state.store.unpin(&channel.id, message).await?;
+    Ok((channel, change))
+}
+
+/// The revision a channel's pins are at, for a read to carry, or `None` when it cannot be said.
+///
+/// SOFT, unlike every other store read on the read path: a timeline read is how the owner reads
+/// his channel, and failing it because the pins' counter could not be read would take the channel
+/// away to protect a marker. `None` tells the page to keep the pins it has — a store with nothing
+/// configured has none to show, and a failing one is logged here and reported by the next write.
+pub async fn pins_revision(state: &AppState, channel: &ChannelId) -> Option<i64> {
+    match state.store.pins_revision(channel).await {
+        Ok(revision) => Some(revision),
+        Err(crate::store::StoreError::Unavailable(_)) => None,
+        Err(error) => {
+            tracing::warn!(%error, "could not read the pin revision for a channel read");
+            None
+        }
+    }
+}
+
 /// What happened when a summary was asked for.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case", tag = "state", content = "summary")]

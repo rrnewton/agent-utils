@@ -243,6 +243,15 @@ fn routes(state: AppState) -> Router {
             "/api/v1/channels/{channel_id}/not-noise",
             post(api::not_noise),
         )
+        // `#206 pin-message`. The owner's own pinned messages. READ scope to list them, WRITE
+        // scope to pin and unpin — PUT and DELETE on the one message, idempotent both ways — and
+        // NO MCP TOOL for any of it, for the `#39` reason above. A timeline read carries the
+        // list's revision, so the list itself is read on entering a channel and when it changed.
+        .route("/api/v1/channels/{channel_id}/pins", get(api::pins))
+        .route(
+            "/api/v1/channels/{channel_id}/pins/{message_id}",
+            axum::routing::put(api::pin_message).delete(api::unpin_message),
+        )
         // One path, three methods: POST carries the whole protocol, and GET/DELETE — which exist
         // in the spec for server-initiated streams and session teardown — are refused plainly
         // because this endpoint is stateless and has nothing to push.

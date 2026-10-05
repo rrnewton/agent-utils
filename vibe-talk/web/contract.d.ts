@@ -578,6 +578,125 @@ declare namespace VibeTalk {
   }
 
   /**
+   * One pin, as the store holds it.
+   */
+  interface Pin {
+    /**
+     * Its author's display name when it was pinned. UNTRUSTED.
+     */
+    author: string;
+    /**
+     * Its author's id, so the row is drawn in its speaker's colour like every other row.
+     */
+    author_id: UserId;
+    /**
+     * Whether the chat provider flagged the author as a bot.
+     */
+    author_is_bot: boolean;
+    /**
+     * Its text when it was pinned, at most [`MAX_PIN_TEXT_CHARS`] characters. UNTRUSTED.
+     */
+    content: string;
+    /**
+     * The message pinned, in the provider-neutral namespace the page was served it in.
+     */
+    message_id: MessageId;
+    /**
+     * When it was pinned, in milliseconds since the Unix epoch, by this server's clock. The order
+     * the bound drops pins in.
+     */
+    pinned_at_ms: number;
+    /**
+     * The thread the message is in, when it is in one — what opens it in its thread.
+     */
+    thread_id: string | null;
+    /**
+     * Whether the message is that thread's root.
+     */
+    thread_root: boolean;
+    /**
+     * When the message was sent, ISO-8601, exactly as the provider reported it. What the page
+     * orders pins by, among themselves and among the messages it has loaded.
+     */
+    timestamp: string;
+    /**
+     * Whether `content` was cut to fit.
+     */
+    truncated: boolean;
+  }
+
+  /**
+   * What one pin or unpin did: `PUT` and `DELETE /api/v1/channels/{id}/pins/{message_id}`.
+   */
+  interface PinChangeResponse {
+    /**
+     * Whether the call changed anything; false when it repeated what was already so.
+     */
+    changed: boolean;
+    /**
+     * The channel, as configured here.
+     */
+    channel: ChannelInfo;
+    /**
+     * The message the call named.
+     */
+    message_id: MessageId;
+    /**
+     * The pin exactly as stored — its text cut to the bound — or absent after an unpin.
+     */
+    pin?: Pin | null;
+    /**
+     * Whether it is pinned now.
+     */
+    pinned: boolean;
+    /**
+     * The standing statement that these pins are this server's own.
+     */
+    pins_notice: string;
+    /**
+     * The channel's pin revision after the call, so the page that made it need not read the list
+     * again to stay current.
+     */
+    revision: number;
+    /**
+     * Pins the bound dropped to make room for this one, oldest first. Empty except at the bound,
+     * and the page says so when it is not.
+     */
+    unpinned: MessageId[];
+  }
+
+  /**
+   * One channel's pins: `GET /api/v1/channels/{id}/pins`. `#206 pin-message`.
+   */
+  interface PinsResponse {
+    /**
+     * The channel, as configured here.
+     */
+    channel: ChannelInfo;
+    /**
+     * How many pins a channel keeps before the oldest is unpinned to make room.
+     */
+    limit: number;
+    /**
+     * Every pin, in the order their messages were sent, oldest first, each with the snapshot that
+     * lets the page draw it when its message is not loaded.
+     */
+    pins: Pin[];
+    /**
+     * The standing statement that these pins are this server's own.
+     */
+    pins_notice: string;
+    /**
+     * The revision this list is at; see [`TimelineResponse::pins_revision`].
+     */
+    revision: number;
+    /**
+     * A snapshot is channel content, and untrusted, like every other.
+     */
+    untrusted_content_notice: string;
+  }
+
+  /**
    * How the web app plays messages with the selected provider.
    */
   type Playback = "browser" | "audio";
@@ -755,6 +874,15 @@ declare namespace VibeTalk {
      * Relevant provider limitation or scope information, if any.
      */
     notice: string | null;
+    /**
+     * The revision this channel's pins are at. `#206 pin-message`.
+     *
+     * On every read, newest page and delta alike, so a refresh that already happens is what tells
+     * a page another device pinned or unpinned something; the page reads `/pins` again only when
+     * this differs from the revision of the list it holds. Absent when the store cannot say — no
+     * storage configured, or a failing one — and from an older server.
+     */
+    pins_revision?: number | null;
     /**
      * Entries on this page, never a channel-wide total.
      */
@@ -945,6 +1073,8 @@ declare namespace VibeTalk {
     VibeTalkV1ClientFrame: VibeTalkV1ClientFrame;
     Message: Message;
     ThreadSummary: ThreadSummary;
+    PinsResponse: PinsResponse;
+    PinChangeResponse: PinChangeResponse;
   }
 
   /** A contract type a peer may extend with new `type` tags. */
