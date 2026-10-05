@@ -5927,6 +5927,13 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
 
     #[test]
     fn async_ack_unknown_outcome_does_not_hot_retry_and_restart_keeps_operation_id() {
+        // The positive waits below bound how long the test may hang, not how fast the worker must
+        // be: what the test checks is that an unknown outcome is not retried at once and that a
+        // restart retries it under the same operation ID. Measured at a load average of 214 to
+        // 267 on 316 cores, each wait took under 8 ms with the test alone but up to 129 ms inside
+        // the full suite, and one full-suite run's join of the restarted worker took over a
+        // second. The 20 ms window in which no second attempt may start is unchanged.
+        const HANG_GUARD: Duration = Duration::from_secs(60);
         let (state, key, root) = state_with_request();
         let queue = Arc::new(AckQueue::default());
         let stop = Arc::new(StopState {
@@ -5948,15 +5955,13 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         )
         .expect("spawn ACK worker");
         queue.enqueue([key.clone()]);
-        let first = starts
-            .recv_timeout(Duration::from_secs(1))
-            .expect("first attempt");
+        let first = starts.recv_timeout(HANG_GUARD).expect("first attempt");
         release.send(false).expect("unknown outcome");
         let (guard, timeout) = queue
             .changed
             .wait_timeout_while(
                 queue.state.lock().expect("queue state"),
-                Duration::from_secs(1),
+                HANG_GUARD,
                 |state| state.retained.contains(&key),
             )
             .expect("await persisted unknown outcome");
@@ -5975,7 +5980,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
             .contains("Unknown"));
         assert!(inspection["timestamps"]["ack_completed_at_millis"].is_null());
         stop.stop();
-        join_worker_until(worker, "ACK", Instant::now() + Duration::from_secs(1))
+        join_worker_until(worker, "ACK", Instant::now() + HANG_GUARD)
             .expect("join failed generation");
 
         let reopened = BridgeState::open(&root).expect("restart durable state");
@@ -5999,12 +6004,11 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         )
         .expect("restart ACK worker");
         let retry = starts
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(HANG_GUARD)
             .expect("reconciliation attempt");
         assert_eq!(retry, first);
         stop.stop();
-        join_worker_until(worker, "ACK", Instant::now() + Duration::from_secs(1))
-            .expect("join restart");
+        join_worker_until(worker, "ACK", Instant::now() + HANG_GUARD).expect("join restart");
         assert_eq!(
             reopened.inspect_request(&key).expect("receipt")["acknowledgement"]["phase"],
             "acked"
