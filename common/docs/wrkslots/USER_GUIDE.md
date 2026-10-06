@@ -427,8 +427,9 @@ their unit states do not cover its run: its unit can be queued after them with i
 start, showing no state, process or member. Such a handle is `alive`, and a rerun reads it before
 the units. Last, the current members of every control group named after a handle's unit, and of its
 descendants, are read from the cgroup v2 hierarchy below the user service manager; a member there is
-`alive`, and a host without a cgroup v2 hierarchy at `/sys/fs/cgroup` or with an unreadable member
-list is `unverifiable`.
+`alive`. A host without a cgroup v2 hierarchy at `/sys/fs/cgroup`, whose cgroup v2 mount there shows
+only a subtree of the hierarchy (control groups outside it would read as empty), whose user service
+manager's control group is not visible there, or with an unreadable member list is `unverifiable`.
 
 `recover-absent-validate-rows` and `recover-absent-agent-rows` read this evidence through the same
 code and in the same order, and refuse wherever the answer above would be `alive` or

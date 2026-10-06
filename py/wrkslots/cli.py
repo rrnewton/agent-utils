@@ -16592,6 +16592,26 @@ def _user_manager_cgroup(root: Path) -> Path:
     return root / "user.slice" / f"user-{os.getuid()}.slice" / manager
 
 
+def _assert_whole_cgroup2_hierarchy(root: Path) -> None:
+    """Refuse unless the mount visible at ``root`` is the whole cgroup v2 tree.
+
+    A cgroup v2 mount can show a subtree (its mount-table root is then that
+    subtree's path), in which control groups outside it are missing rather
+    than empty.  The caller has proved this process is in the initial
+    cgroup namespace, where mount roots are paths from the hierarchy root.
+    """
+
+    entry = _visible_mount(_read_self_mount_entries(), root)
+    if entry is None or entry.point != root or entry.fstype != "cgroup2":
+        raise Refusal(f"no cgroup v2 hierarchy is mounted at {root}")
+    if entry.root != b"/":
+        shown = os.fsdecode(_mountinfo_unescape(entry.root))
+        raise Refusal(
+            f"the cgroup v2 mount at {root} shows only {shown} of the hierarchy, so a "
+            "retained run unit's control group can be outside it"
+        )
+
+
 def _retained_unit_cgroup_members(
     units: AbstractSet[str], *, root: Path | None = None
 ) -> Mapping[str, int]:
@@ -16605,17 +16625,28 @@ def _retained_unit_cgroup_members(
     after both enumerations.  A control group that disappears meanwhile has
     no member.  No cgroup v2 hierarchy, an unreadable directory or member
     list, or a hierarchy beyond the census bound refuses.
+
+    A count of zero is evidence only where the whole hierarchy is visible,
+    so with the default ``root`` the mount at ``/sys/fs/cgroup`` must be
+    cgroup v2 with the hierarchy's root as its own (a mount of a subtree
+    would hide every unit outside it), and the user manager's control group
+    must be visible under ``root``; either missing refuses.
     """
 
     if not units:
         return {}
-    root = _CGROUP_ROOT if root is None else root
+    if root is None:
+        root = _CGROUP_ROOT
+        _assert_whole_cgroup2_hierarchy(root)
     if not (root / "cgroup.controllers").is_file():
         raise Refusal(f"no cgroup v2 hierarchy is mounted at {root}")
     manager = _user_manager_cgroup(root)
     members = dict.fromkeys(units, 0)
     if not manager.is_dir():
-        return members
+        raise Refusal(
+            f"this user's service manager control group {manager} is not visible, "
+            "so a retained run unit's control-group members cannot be read"
+        )
 
     def unreadable(exc: OSError) -> None:
         if not isinstance(exc, FileNotFoundError):

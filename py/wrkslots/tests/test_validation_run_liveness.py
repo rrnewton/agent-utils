@@ -1579,6 +1579,99 @@ def test_this_host_user_manager_cgroup_is_read() -> None:
     )
 
 
+def test_an_invisible_user_manager_cgroup_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user manager missing from the hierarchy is no evidence of no members."""
+
+    root = tmp_path / "cgroup"
+    root.mkdir()
+    (root / "cgroup.controllers").write_text("cpu memory\n")
+    missing = root / "user.slice" / f"user-{os.getuid()}.slice" / f"user@{os.getuid()}.service"
+    monkeypatch.setattr(wrkslots, "_user_manager_cgroup", lambda _root: missing)
+
+    with pytest.raises(wrkslots.Refusal, match="service manager control group .* is not visible"):
+        wrkslots._retained_unit_cgroup_members({RUN_UNIT}, root=root)
+
+
+@pytest.mark.parametrize(
+    ("mount", "detail"),
+    [
+        (
+            "2 1 0:2 /user.slice /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
+            "the cgroup v2 mount at /sys/fs/cgroup shows only /user.slice of the hierarchy",
+        ),
+        (
+            "2 1 0:2 / /sys/fs/cgroup rw - tmpfs tmpfs rw\n",
+            "no cgroup v2 hierarchy is mounted at /sys/fs/cgroup",
+        ),
+        (
+            "2 1 0:2 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n"
+            "3 2 0:3 / /sys/fs/cgroup rw - tmpfs tmpfs rw\n",
+            "no cgroup v2 hierarchy is mounted at /sys/fs/cgroup",
+        ),
+    ],
+)
+def test_a_partial_cgroup_mount_refuses_the_member_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mount: str, detail: str
+) -> None:
+    """Only a cgroup v2 mount of the whole hierarchy at /sys/fs/cgroup is read.
+
+    A mount of a subtree shows the control groups below it and none
+    outside it, and another file system stacked over the hierarchy hides
+    it; either way a unit's control group would read as empty.
+    """
+
+    table = tmp_path / "mountinfo"
+    table.write_text("1 0 0:1 / / rw - ext4 /dev/root rw\n" + mount, encoding="utf-8")
+    monkeypatch.setattr(wrkslots, "_SELF_MOUNTINFO", table)
+
+    with pytest.raises(wrkslots.Refusal) as refused:
+        wrkslots._retained_unit_cgroup_members({RUN_UNIT})
+    assert detail in str(refused.value)
+
+
+def test_this_host_counts_the_member_of_this_process_unit() -> None:
+    """The real read finds this test process in its own unit's control group.
+
+    The unit is the deepest ``.scope`` or ``.service`` part of this
+    process's control group below its user manager, so a reader that
+    counted nothing would fail here.
+    """
+
+    _require_cgroup2_host()
+    if os.stat("/proc/self/ns/cgroup").st_ino != dict(wrkslots._INITIAL_NAMESPACE_INODES)[
+        "cgroup"
+    ]:
+        pytest.skip(
+            "this process is not in the initial cgroup namespace, so its control-group "
+            "path is not a path in the host hierarchy"
+        )
+    path = next(
+        line.split(":", 2)[2]
+        for line in Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines()
+        if line.startswith("0::")
+    )
+    parts = Path(path).parts
+    manager = f"user@{os.getuid()}.service"
+    if manager not in parts:
+        pytest.skip(
+            f"this process's control group is not below {manager}, so no unit of the "
+            "user manager holds it"
+        )
+    units = [
+        part
+        for part in parts[parts.index(manager) + 1 :]
+        if part.endswith((".scope", ".service"))
+    ]
+    if not units:
+        pytest.skip(f"this process's control group names no unit below {manager}")
+
+    members = wrkslots._retained_unit_cgroup_members({units[-1]})
+
+    assert members[units[-1]] >= 1, (units[-1], members)
+
+
 def _restrict_pid_namespace(monkeypatch: pytest.MonkeyPatch) -> None:
     """This process is in a child PID namespace."""
 
