@@ -627,21 +627,13 @@ _RETAINED_HANDLE_SETTLE_SLACK_NS = 250_000_000
 # least ``_RETAINED_HANDLE_STABLE_NS`` old: a step back of more than one
 # second where file times keep whole seconds.  Frequency correction moves
 # both clocks alike; only a step (or an inserted leap second) moves one
-# against the other.
+# against the other.  The bound applies to the spread of every offset the
+# two censuses found (``_realtime_clock_stepped_back``), so a step forward,
+# or scheduling pauses between the clock reads that together widen that
+# spread past it, also read as a step; that keeps a run alive rather than
+# clearing its row.  A step back does not show if it is undone before a
+# realtime read sees it.
 _RETAINED_HANDLE_CLOCK_STEP_NS = 500_000_000
-# How many times one reading of this host's clocks is tried, and how
-# narrowly its realtime reading must be bracketed by two monotonic readings
-# to be kept without another try (``_retained_handle_clocks``).  A reading
-# that a scheduling pause in every try widens past the step bound can read
-# as a step, which keeps a run alive rather than clearing its row.  The
-# reading keeps the bounds of a try bracketed that narrowly only when they
-# share a value with every earlier try's; otherwise, and when no try is that
-# narrow, it keeps the bounds of them all.  A step back does not show if it
-# is undone before a realtime read sees it, or if it is undone before the
-# narrow try and the try that saw it paused, between its first monotonic
-# read and its realtime read, for at least the step less the bracket.
-_RETAINED_HANDLE_CLOCK_TRIES = 3
-_RETAINED_HANDLE_CLOCK_BRACKET_NS = 1_000_000
 # The bound on one /proc/<pid>/mountinfo read, sized from measurement. On
 # 2026-10-04, at load average about 150, the largest of 4,118 readable tables
 # on a production host was 143,648 bytes (976 mounts), so 4 MiB is about 29
@@ -1260,9 +1252,9 @@ class _RetainedValidationHandle:
     # The lowest and highest values of this host's realtime clock less its
     # monotonic clock, in nanoseconds, that the census that read it found,
     # reading both clocks before its first handle and after its last; a
-    # fall between two reads is a step back of the realtime clock
-    # (``_retained_handle_clocks``, ``_retained_handle_changes``).  Not part
-    # of the identity.
+    # wide spread of these across two censuses may be a step of the realtime
+    # clock (``_retained_handle_clocks``, ``_realtime_clock_stepped_back``).
+    # Not part of the identity.
     clock_offsets_ns: tuple[int, int] | None = dataclasses.field(
         default=None, compare=False
     )
@@ -17039,10 +17031,10 @@ def _retained_handle_changes(
     equal handle may still have been rewritten alike: with ``window``, when
     either read found it within ``_RETAINED_HANDLE_STABLE_NS`` of its change
     time (the later read finds that only if the realtime clock went back),
-    and always when the realtime clock may have fallen more than
-    ``_RETAINED_HANDLE_CLOCK_STEP_NS`` against the monotonic clock between
-    the two reads (``_realtime_clock_stepped_back``).  ``during`` says
-    when, and ends each description.
+    and always when the realtime clock may have stepped more than
+    ``_RETAINED_HANDLE_CLOCK_STEP_NS`` against the monotonic clock during
+    or between the two reads (``_realtime_clock_stepped_back``).
+    ``during`` says when, and ends each description.
     """
 
     first = {handle.path: handle for handle in before}
@@ -17080,18 +17072,21 @@ def _realtime_clock_stepped_back(
     before: _RetainedValidationHandle, after: _RetainedValidationHandle
 ) -> bool:
     """Whether the realtime clock may have fallen against the monotonic clock
-    between the censuses that read ``before`` and ``after``.
+    while the censuses that read ``before`` and ``after`` ran, or between them.
 
-    The highest offset the earlier census found is compared with the lowest
-    the later one found, so a step during either census, before or after
-    its handle reads, counts, and so does a reading that a pause left too
-    loosely bounded to rule one out.
+    The highest offset either census found is compared with the lowest
+    either found, so a fall counts wherever it shows: within the earlier
+    census, before or after its handle reads, between the censuses, or
+    within the later one.  A rise counts too, and so does a reading that
+    pauses left too loosely bounded to rule a fall out; each keeps a run
+    alive rather than clearing its row.
     """
 
+    if before.clock_offsets_ns is None or after.clock_offsets_ns is None:
+        return False
     return (
-        before.clock_offsets_ns is not None
-        and after.clock_offsets_ns is not None
-        and before.clock_offsets_ns[1] - after.clock_offsets_ns[0]
+        max(before.clock_offsets_ns[1], after.clock_offsets_ns[1])
+        - min(before.clock_offsets_ns[0], after.clock_offsets_ns[0])
         > _RETAINED_HANDLE_CLOCK_STEP_NS
     )
 
@@ -44247,41 +44242,17 @@ def _retained_handle_clocks() -> tuple[int, int, int]:
     so its offset from the monotonic clock at that moment is no lower than
     the realtime reading less the later monotonic reading and no higher
     than it less the earlier one.  A pause between the reads widens these
-    bounds instead of moving them.  The clocks are read up to
-    ``_RETAINED_HANDLE_CLOCK_TRIES`` times, stopping at a try bracketed
-    within ``_RETAINED_HANDLE_CLOCK_BRACKET_NS``.  That try's bounds are
-    kept when they share a value with every earlier try's.  Otherwise the
-    bounds of them all are kept, the lowest and the highest offset any try
-    found: tries whose bounds share no value saw the realtime clock step
-    between them, and when no try is that narrow, the narrowest of wide
-    tries that overlap can miss a step a wider one saw.  The realtime value
-    returned is the earliest any try read.  All three are in nanoseconds.
+    bounds instead of moving them.  The same three readings also come from
+    a pause together with a step back that the realtime read saw and that
+    was undone by the next reading, so a reading's bounds are kept whole
+    and no later, narrower reading replaces them
+    (``_realtime_clock_stepped_back``).  All three are in nanoseconds.
     """
 
-    def reading() -> tuple[int, int, int]:
-        before = _retained_handle_monotonic_ns()
-        realtime = _retained_handle_clock_ns()
-        after = _retained_handle_monotonic_ns()
-        return realtime, realtime - after, realtime - before
-
-    tries = [reading()]
-    while (
-        len(tries) < _RETAINED_HANDLE_CLOCK_TRIES
-        and min(high - low for _realtime, low, high in tries)
-        > _RETAINED_HANDLE_CLOCK_BRACKET_NS
-    ):
-        tries.append(reading())
-    earliest = min(realtime for realtime, _low, _high in tries)
-    narrowest = min(tries, key=lambda item: item[2] - item[1])
-    if narrowest[2] - narrowest[1] <= _RETAINED_HANDLE_CLOCK_BRACKET_NS and max(
-        low for _realtime, low, _high in tries
-    ) <= min(high for _realtime, _low, high in tries):
-        return earliest, narrowest[1], narrowest[2]
-    return (
-        earliest,
-        min(low for _realtime, low, _high in tries),
-        max(high for _realtime, _low, high in tries),
-    )
+    before = _retained_handle_monotonic_ns()
+    realtime = _retained_handle_clock_ns()
+    after = _retained_handle_monotonic_ns()
+    return realtime, realtime - after, realtime - before
 
 
 def _retained_handles_for_absent_rows(

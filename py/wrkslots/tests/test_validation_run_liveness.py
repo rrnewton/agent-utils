@@ -2642,22 +2642,42 @@ def test_an_equal_old_handle_read_without_a_clock_step_back_is_not_alive(
 @pytest.mark.parametrize(
     ("pauses", "expected"),
     [
-        pytest.param("first", "dead", id="once"),
-        pytest.param("every", "alive", id="in-every-try"),
+        pytest.param(
+            (("after", 4 * _SECOND // 10),) * 2,
+            "dead",
+            id="under-the-bound-after-each-realtime-read",
+        ),
+        pytest.param(
+            (("before", 4 * _SECOND // 10),) * 2,
+            "dead",
+            id="under-the-bound-before-each-realtime-read",
+        ),
+        pytest.param((("after", 6 * _SECOND // 10),), "alive", id="past-the-bound-once"),
+        pytest.param(
+            (("before", 3 * _SECOND // 10), ("after", 3 * _SECOND // 10)),
+            "alive",
+            id="past-the-bound-together",
+        ),
     ],
 )
-def test_a_pause_between_clock_readings_is_not_a_step_unless_it_persists(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pauses: str, expected: str
+def test_a_pause_between_clock_reads_is_a_step_only_when_it_could_hide_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pauses: tuple[tuple[str, int], ...],
+    expected: str,
 ) -> None:
     """A scheduling pause between the two clocks' reads widens, not moves, a reading.
 
     Both clocks advance together on one simulated timeline, one microsecond
-    per read.  In each census after the first, the process pauses for 0.6
-    seconds just after reading the realtime clock: ``once`` pauses after
-    the first such read only, so a second try reads both clocks within the
-    bracket and the old handle reads as over; ``in-every-try`` pauses after
-    every one, so no reading is bracketed more narrowly than the pause and
-    the step it cannot rule out keeps the run alive.
+    per read.  From the later census on, the process pauses, just before or
+    just after reading the realtime clock, for each of ``pauses`` in turn,
+    one per clock reading.  A reading a pause widened is the same reading as
+    one that saw a step back of the pause's length, so its bounds are kept
+    whole.  Pauses of 0.4 seconds that each widen the bounds the same way
+    stay under the half-second bound, and the old handle reads as over.  One
+    pause of 0.6 seconds passes the bound, and so do two of 0.3 seconds that
+    widen the bounds in opposite directions; the step they cannot rule out
+    keeps the run alive.
     """
 
     project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
@@ -2665,17 +2685,21 @@ def test_a_pause_between_clock_readings_is_not_a_step_unless_it_persists(
     change = handle.stat().st_ctime_ns
     phase = _track_census_phase(monkeypatch)
     timeline = [0]
-    paused: set[int] = set()
+    remaining = list(pauses)
 
     def tick() -> int:
         timeline[0] += 1_000
         return timeline[0]
 
     def realtime() -> int:
+        where, pause = ("", 0)
+        if phase.census >= 2 and remaining:
+            where, pause = remaining.pop(0)
+        if where == "before":
+            timeline[0] += pause
         value = change + 10 * _SECOND + tick()
-        if phase.census >= 2 and (pauses == "every" or phase.census not in paused):
-            paused.add(phase.census)
-            timeline[0] += 6 * _SECOND // 10
+        if where == "after":
+            timeline[0] += pause
         return value
 
     monkeypatch.setattr(wrkslots, "_retained_handle_clock_ns", realtime, raising=False)
@@ -2689,7 +2713,8 @@ def test_a_pause_between_clock_readings_is_not_a_step_unless_it_persists(
     )
 
     state, message = states[("testhost", "slot01", 1)]
-    assert phase.census >= 2
+    assert remaining == []
+    assert phase.census == 2
     assert state == expected, message
     if expected == "alive":
         assert "realtime clock stepped back while the host evidence was read" in message
@@ -2698,64 +2723,34 @@ def test_a_pause_between_clock_readings_is_not_a_step_unless_it_persists(
 @pytest.mark.parametrize(
     ("monotonic", "realtime", "expected"),
     [
+        pytest.param((0, 2), (5,), (5, 3, 5), id="bracketed"),
         pytest.param(
-            (0, 2), (5,), (5, 3, 5), id="bracketed-at-once"
+            (0, 600_000_002),
+            (10_600_000_001,),
+            (10_600_000_001, 9_999_999_999, 10_600_000_001),
+            id="paused-before-the-realtime-read",
         ),
         pytest.param(
-            (0, 600_000_000, 600_000_100, 600_000_102),
-            (10_000_000_000, 10_600_000_101),
-            (10_000_000_000, 9_999_999_999, 10_000_000_001),
-            id="paused-then-bracketed",
-        ),
-        pytest.param(
-            (0, 600_000_000, 600_000_100, 600_000_102),
-            (100_000_000, 10_600_000_101),
-            (100_000_000, -500_000_000, 10_000_000_001),
-            id="stepped-between-tries",
-        ),
-        pytest.param(
-            (0, 10_000_000, 20_000_000, 25_000_000, 30_000_000, 33_000_000),
-            (1_005_000_000, 1_022_000_000, 1_031_000_000),
-            (1_005_000_000, 995_000_000, 1_005_000_000),
-            id="paused-in-every-try",
-        ),
-        pytest.param(
-            (
-                3_250_000_000,
-                3_870_000_000,
-                3_870_000_000,
-                4_470_000_000,
-                4_470_000_000,
-                5_070_000_000,
-            ),
-            (2_770_000_000, 3_980_000_000, 4_580_000_000),
-            (2_770_000_000, -1_100_000_000, 110_000_000),
-            id="stepped-in-overlapping-wide-tries",
+            (0, 600_000_002),
+            (10_000_000_001,),
+            (10_000_000_001, 9_399_999_999, 10_000_000_001),
+            id="paused-after-the-realtime-read",
         ),
     ],
 )
-def test_one_clock_reading_keeps_a_narrow_try_only_when_every_try_agrees(
+def test_one_clock_reading_brackets_the_realtime_clock(
     monkeypatch: pytest.MonkeyPatch,
     monotonic: tuple[int, ...],
     realtime: tuple[int, ...],
     expected: tuple[int, int, int],
 ) -> None:
-    """A narrow try's bounds replace the others' only when every try agrees with them.
+    """One reading reads the realtime clock once, between two monotonic reads.
 
-    Each try reads the realtime clock between two reads of the monotonic
-    clock.  ``bracketed-at-once`` is within the bracket, so one try is
-    taken.  ``paused-then-bracketed`` pauses 0.6 seconds in its first try,
-    whose bounds contain the second's, so the narrower bounds are kept.
-    ``stepped-between-tries`` reads the realtime clock ten seconds behind in
-    its first try: the tries' bounds share no value, so the bounds of both
-    are kept and the step shows.  ``paused-in-every-try`` takes all three
-    tries, none within the bracket, so the bounds of them all are kept.
-    ``stepped-in-overlapping-wide-tries`` reads the realtime clock 1.1
-    seconds behind in a first try that spans 0.62 seconds, and restored in
-    two tries that span 0.6 seconds each: every try's bounds share an
-    offset, but none is within the bracket, so the bounds of them all are
-    kept and the step shows.  The realtime value is always the earliest
-    read.
+    The offset bounds are the realtime reading less the later and less the
+    earlier monotonic reading.  A 0.6-second pause before the realtime read
+    or after it widens the bounds by the pause, upward or downward; no
+    further reading narrows them, since a pause together with a step back
+    the realtime read saw gives the same three readings.
     """
 
     monotonic_reads = iter(monotonic)
@@ -2785,21 +2780,22 @@ def test_one_clock_reading_keeps_a_narrow_try_only_when_every_try_agrees(
         ),
     ],
 )
-def test_a_step_back_seen_by_a_wide_try_and_undone_before_a_narrow_one_is_alive(
+def test_a_step_back_one_reading_saw_and_undone_before_the_next_is_alive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, back_to: int, change: str
 ) -> None:
-    """A step back that one try read is kept when a later, narrower try misses it.
+    """A step back that only one clock reading saw is kept after it is undone.
 
     Both clocks advance together on one simulated timeline, one microsecond
     per read, with the realtime clock ten seconds after the handle's change
     time.  When the later census first reads the realtime clock, the clock
     has stepped back to ``back_to`` after the change time, as if the run
-    registered again alike there; the process then pauses for 0.6 seconds,
-    the step is undone, and the next try is bracketed within a microsecond.
-    ``back-into-the-window`` lands in the handle's timestamp window, so the
-    earliest realtime value read finds the handle recent;
+    registered again alike there; the process then pauses for 0.6 seconds
+    before its next monotonic read, and the step is undone before the
+    census's reading after its last handle, which is bracketed within a
+    microsecond.  ``back-into-the-window`` lands in the handle's timestamp
+    window, so the earliest realtime value read finds the handle recent;
     ``back-short-of-the-window`` lands just outside it, so only the bounds
-    of the try that saw the step show that the clock fell.
+    of the reading that saw the step show that the clock fell.
     """
 
     project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
@@ -2838,25 +2834,51 @@ def test_a_step_back_seen_by_a_wide_try_and_undone_before_a_narrow_one_is_alive(
     assert f"its unit {RUN_UNIT} may have been queued" in message
 
 
-def test_a_step_back_inside_overlapping_wide_clock_tries_is_alive(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("script", "later_offset"),
+    [
+        pytest.param(
+            {(2, False): ((3_250_000_000, 2_770_000_000, 3_870_000_000),)},
+            0,
+            id="sampled-then-undone",
+        ),
+        pytest.param(
+            {(2, False): ((3_250_000_000, 2_770_000_000, 3_870_000_000),)},
+            -480_000_000,
+            id="sampled-then-partly-undone",
+        ),
+        pytest.param(
+            {(1, True): ((4_200_000_000, 2_200_001_000, 4_200_002_000),)},
+            0,
+            id="sampled-after-the-earlier-census-read-its-handle",
+        ),
+    ],
+)
+def test_a_step_back_any_clock_reading_saw_is_alive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    script: Mapping[tuple[int, bool], tuple[tuple[int, int, int], ...]],
+    later_offset: int,
 ) -> None:
-    """A step back that only the widest of three overlapping tries read is kept.
+    """A step back of the realtime clock is kept wherever one clock reading saw it.
 
     Both clocks advance together, one microsecond per read, from 2.05
-    seconds after the handle's change time, so the earlier census reads
-    the handle as old within a bracket of microseconds.  Then the realtime
-    clock steps back 1.1 seconds, as if the run registered again alike in
-    the handle's timestamp tick.  The later census's first reading takes
-    three tries, each spanning about 0.6 seconds: the first reads the
-    realtime clock 1.1 seconds behind just before its second monotonic
-    read, and the step is undone before the other two.  The three tries'
-    bounds share an offset, so they do not disagree, but the narrowest of
-    them alone would show a fall of only 0.49 seconds, under the half-second
-    bound.  The reading after the handle reads is bracketed within
-    microseconds and finds the clocks restored, and the earliest realtime
-    value read leaves the handle old, so only the bounds of the first try
-    show the step.
+    seconds after the handle's change time, so the earlier census reads the
+    handle as old.  ``script`` gives clock readings, as monotonic, realtime
+    and monotonic values on that timeline, for a census and whether it has
+    begun reading its handle; every other read follows the timeline, with
+    the realtime clock ``later_offset`` against it from the later census on.
+    ``sampled-then-undone`` reads the realtime clock 1.1 seconds behind in
+    the later census's first reading, which spans 0.62 seconds, and the step
+    is undone before the next.  ``sampled-then-partly-undone`` is the same
+    until the clock is stepped 0.62 seconds forward, leaving it 0.48 seconds
+    behind for the rest of the census, so a narrower reading would agree
+    with the first and show a fall of only 0.48 seconds.
+    ``sampled-after-the-earlier-census-read-its-handle`` steps the clock back
+    two seconds after the earlier census read its handle, where that
+    census's reading after its last handle sees it, and undoes the step
+    before the later census.  The earliest realtime value either census
+    reads leaves the handle old, so only the step keeps the run alive.
     """
 
     project, tree = _prepare(tmp_path, monkeypatch, agent_liveness="dead")
@@ -2864,26 +2886,30 @@ def test_a_step_back_inside_overlapping_wide_clock_tries_is_alive(
     stamp = handle.stat().st_ctime_ns
     phase = _track_census_phase(monkeypatch)
     timeline = [2 * _SECOND + _SECOND // 20]
-    script = [
-        ("monotonic", 3_250_000_000),
-        ("realtime", 2_770_000_000),
-        ("monotonic", 3_870_000_000),
-        ("monotonic", 3_870_000_000),
-        ("realtime", 3_980_000_000),
-        ("monotonic", 4_470_000_000),
-        ("monotonic", 4_470_000_000),
-        ("realtime", 4_580_000_000),
-        ("monotonic", 5_070_000_000),
-    ]
+    pending = {
+        key: [
+            (clock, value)
+            for before, realtime, after in readings
+            for clock, value in (
+                ("monotonic", before),
+                ("realtime", realtime),
+                ("monotonic", after),
+            )
+        ]
+        for key, readings in script.items()
+    }
 
     def read(clock: str) -> int:
-        if phase.census == 2 and not phase.read and script:
-            scripted, value = script.pop(0)
+        reads = pending.get((phase.census, phase.read))
+        if reads:
+            scripted, value = reads.pop(0)
             assert scripted == clock, (scripted, clock)
             if clock == "monotonic":
                 timeline[0] = max(timeline[0], value)
             return value
         timeline[0] += 1_000
+        if clock == "realtime" and phase.census >= 2:
+            return timeline[0] + later_offset
         return timeline[0]
 
     monkeypatch.setattr(
@@ -2905,7 +2931,7 @@ def test_a_step_back_inside_overlapping_wide_clock_tries_is_alive(
     )
 
     state, message = states[("testhost", "slot01", 1)]
-    assert script == []
+    assert all(not reads for reads in pending.values()), pending
     assert phase.census == 2
     assert state == "alive", message
     assert (

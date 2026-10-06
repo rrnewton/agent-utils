@@ -471,20 +471,18 @@ as it finishes is judged, not refused. A handle that appeared, changed or went b
 before and after that wait is `alive` as well. A handle that both reads find alike while either
 finds it that recent (the clock stands still or went back, or the change time is more than a quarter
 second ahead of it and is not waited for) is `alive` too, and so is one that both reads find alike
-while this host's realtime clock may have fallen more than half a second against its monotonic clock
-between them: after a step back into a handle's timestamp tick, a run that registers again alike
-leaves both reads equal. Each read of the handles reads both clocks before its first handle and
-after its last, so a step while the handles are read counts too, and a change time is recent against
-the earliest realtime value either reading took. Each reading takes the realtime clock between two
-readings of the monotonic clock, up to three times, stopping at a try bracketed within a
-millisecond. It keeps that try's bounds when they agree with every earlier try's: a scheduling pause
-between the reads widens a try instead of moving it. Otherwise it keeps the bounds of them all:
-tries that disagree by more than their brackets saw a step between them, and when no try is that
-narrow, the narrowest of wide tries that overlap can miss a step a wider one saw. A pause in every
-try that widens them past half a second therefore reads as a step. A step back does not show if it
-is undone before a realtime read sees it, or if it is undone before the narrow try and the try that
-saw it paused, between its first two reads, for at least the step less a millisecond. Last, the
-current members of every control group named after a handle's unit,
+while this host's realtime clock may have stepped more than half a second against its monotonic
+clock during or between them: after a step back into a handle's timestamp tick, a run that registers
+again alike leaves both reads equal. Each read of the handles reads both clocks before its first
+handle and after its last, and a change time is recent against the earliest realtime value either
+reading took. Each reading takes the realtime clock between two readings of the monotonic clock,
+which bounds the clocks' offset at that moment; a scheduling pause between the reads widens the
+bounds instead of moving them. A step is assumed when the bounds of the four readings that the two
+reads take span more than half a second, so a fall within either read (before or after its handles)
+or between them counts. A step forward counts too, and so do pauses between the clock reads that
+together widen the bounds past half a second; each keeps the run `alive`. A step back does not show
+if it is undone before a realtime read sees it. Last, the current members of every control group
+named after a handle's unit,
 and of its descendants, are read from the cgroup v2 hierarchy below the user service manager; a
 member there is `alive`. A host without a cgroup v2 hierarchy at `/sys/fs/cgroup`, whose cgroup v2
 mount there shows only a subtree of the hierarchy (control groups outside it would read as empty),
