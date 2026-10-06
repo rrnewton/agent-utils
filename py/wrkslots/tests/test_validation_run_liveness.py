@@ -203,6 +203,48 @@ def test_completed_validation_removal_refuses_while_the_run_unit_is_active(
     _assert_retained(project, tree)
 
 
+@pytest.mark.parametrize("spelling", ["symlink", "descendant", "parent-step"])
+def test_a_handle_naming_the_slot_by_another_path_binds_to_the_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    spelling: str,
+) -> None:
+    """A handle whose checkout reaches the slot under another path is its run.
+
+    Its checkout is compared with the row's paths as a unit word is: a
+    symlink to the slot, a directory inside it, and a ``..`` after a
+    symlink into it all name the row, so the handle's active unit keeps
+    the slot.
+    """
+
+    project, tree = _prepare(
+        tmp_path,
+        monkeypatch,
+        agent_liveness="dead",
+        units=(_unit(ActiveState="active", SubState="running"),),
+    )
+    (tree / "product").mkdir(exist_ok=True)
+    if spelling == "symlink":
+        checkout = tmp_path / "alias"
+        checkout.symlink_to(tree)
+    elif spelling == "descendant":
+        checkout = tree / "product"
+    else:
+        link = tmp_path / "inside"
+        link.symlink_to(tree / "product")
+        checkout = link / ".."
+    _write_run_handle(project, checkout)
+
+    removed = _remove_completed(project)
+
+    error = capsys.readouterr().err
+    assert removed != 0
+    assert "validation-run authority reports the run may still use slot slot01" in error
+    assert f"retained validation unit {RUN_UNIT} may still use row slot01" in error
+    _assert_retained(project, tree)
+
+
 def test_completed_validation_removal_refuses_while_the_run_job_is_queued(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

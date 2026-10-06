@@ -43797,11 +43797,16 @@ def _assert_absent_validate_rows_storage(
     return tuple(rows)
 
 
-def _retained_handle_path(config: Config, value: str, label: str) -> Path:
+def _retained_handle_path(config: Config, value: str, label: str) -> str:
+    """A handle's path field joined to the project root, as written.
+
+    It is not normalized here: ``_UnitPathResolver`` resolves it as the
+    kernel does, so a ``..`` after a symlink keeps the symlink's target.
+    """
+
     if not value:
         raise Refusal(f"{label} is empty")
-    raw = Path(value)
-    return Path(os.path.normpath(str(raw if raw.is_absolute() else config.root / raw)))
+    return value if os.path.isabs(value) else os.path.join(str(config.root), value)
 
 
 def _retained_handles_for_absent_rows(
@@ -43810,10 +43815,14 @@ def _retained_handles_for_absent_rows(
     handles = config.root / "ignored" / "validate" / "runs"
     if handles.is_symlink() or (handles.exists() and not handles.is_dir()):
         raise Refusal(f"retained validation handle directory is unsafe: {handles}")
-    targets: dict[Path, set[str]] = {}
-    for record, paths in rows:
-        for target in paths:
-            targets.setdefault(target, set()).add(record.slot)
+    # A handle names a row when its checkout or source checkout is one of
+    # the row's paths or inside one, compared as unit words are: by
+    # normalized and symlink-resolved spelling and by file identity, so a
+    # symlink to the slot or a directory below it names the row too.
+    targets = [
+        (record.slot, _row_path_identity(target)) for record, paths in rows for target in paths
+    ]
+    resolver = _UnitPathResolver()
     matched: dict[str, list[_RetainedValidationHandle]] = {
         record.slot: [] for record, _paths in rows
     }
@@ -43895,7 +43904,9 @@ def _retained_handles_for_absent_rows(
                     f"{path} has a non-string {field}"
                 )
             target = _retained_handle_path(config, raw, f"{path}.{field}")
-            related.update(targets.get(target, ()))
+            related.update(
+                slot for slot, identity in targets if resolver.path_names(target, identity)
+            )
         if not related:
             continue
         unit = value.get("unit")
@@ -47223,7 +47234,8 @@ class _UnitPathResolver:
             )
         except ValueError as exc:
             raise Refusal(
-                f"a user-systemd property word cannot be resolved as a path: {exc}"
+                "a path that a user-systemd unit or retained run handle names "
+                f"cannot be resolved: {exc}"
             ) from exc
         files: set[tuple[int, int]] = set()
         for current in resolved:
@@ -47263,16 +47275,26 @@ class _UnitPathResolver:
                         if candidate.startswith("/")
                         else os.path.join(base, candidate)
                     )
-                    spellings, files = self._resolve(joined)
-                    if row.file is not None and row.file in files:
-                        return True
-                    if any(
-                        _spelling_is_within(spelling, root)
-                        for spelling in spellings
-                        for root in row.spellings
-                    ):
+                    if self.path_names(joined, row):
                         return True
         return False
+
+    def path_names(self, joined: str, row: _RowPathIdentity) -> bool:
+        """Whether absolute path ``joined`` is ``row`` or a path inside it.
+
+        Its lexical or symlink-resolved spelling is a row spelling or lies
+        under one by whole path components, or it or an existing ancestor
+        is the row's own file.
+        """
+
+        spellings, files = self._resolve(joined)
+        if row.file is not None and row.file in files:
+            return True
+        return any(
+            _spelling_is_within(spelling, root)
+            for spelling in spellings
+            for root in row.spellings
+        )
 
 
 def _unit_property_words(value: str) -> tuple[str, ...]:

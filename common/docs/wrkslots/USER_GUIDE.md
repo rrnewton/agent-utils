@@ -369,7 +369,9 @@ validation slots. `audit`, `remove` (including `--validate-complete` and `remove
 `recover-absent-validate-rows` (see "Recover registered validation rows with absent storage"):
 
 - `dead`: every retained run handle under `ignored/validate/runs/` whose checkout names the slot
-  directory or a recorded checkout path has a dead process generation (when it records one) and an
+  directory or a recorded checkout path (its `checkout` or `source_checkout` is one of those paths or
+  a path inside one, compared as a unit word is below, so a symlink to the slot or a directory inside
+  it names the slot too) has a dead process generation (when it records one) and an
   inactive, unqueued service unit with no live process in its control group, and no active or
   queued user-systemd unit names those paths. Removal renames the slot directory to
   `.<slot>.fenced.<generation>.<hex>` before deleting it, so the same paths inside every such fence
