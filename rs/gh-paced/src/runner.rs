@@ -26,7 +26,12 @@
 //! the reader's last read, so a reader held up in the pushback hook (waiting for the state
 //! file's lock) can reach a cutoff with gh's own output still unread; before it stops at one it
 //! therefore reads, scans and queues what can be read at once, up to [`READY_SCAN_BYTES`] (at
-//! least what a pipe holds by default, so all gh wrote unless the pipe was resized). The writer
+//! least what a pipe holds by default, so all gh wrote unless the pipe was resized). The reader
+//! reads its stream non-blocking ([`ReadEnd`]), so no read waits for output: a poll that
+//! reported the stream readable can be stale by the time of the read (on a pseudo-terminal, a
+//! descendant can close the last slave descriptor, which makes the master report a hang-up, and
+//! open the terminal again before the read), and a blocking read would then wait for the
+//! descendant's next write, past every cutoff. The writer
 //! is then waited for without a time limit, so every byte read reaches the consumer however
 //! slowly it reads.
 //! A stream that a descendant still holds when the reader stops is not closed: once the writer
@@ -587,13 +592,14 @@ fn publish(hook: Option<&PushbackHook>, snapshot: Option<Scanner>) {
 /// descendant may still write to, can be handed to a drainer; otherwise it drops `src`, which
 /// closes gh-paced's end of gh's stream.
 fn tee_reader(
-    mut src: File,
+    src: File,
     which: Stream,
     scanner: Arc<Mutex<Scanner>>,
     tee: Arc<Tee>,
     hook: Option<PushbackHook>,
 ) -> Option<File> {
     let fd = src.as_raw_fd();
+    let mut src = ReadEnd::new(src);
     let mut buf = vec![0u8; 64 * 1024];
     let mut published = String::new();
     let mut last_data = Instant::now();
@@ -636,9 +642,11 @@ fn tee_reader(
         if !readable(fd, 100) {
             continue;
         }
-        match src.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
+        match src.read_chunk(&mut buf) {
+            Chunk::End => break,
+            // The poll's report was stale; check the cutoffs and poll again.
+            Chunk::NotReady => {}
+            Chunk::Data(n) => {
                 last_data = Instant::now();
                 if exited_at.is_some() {
                     after_exit += n;
@@ -652,43 +660,104 @@ fn tee_reader(
                 );
                 tee.push(buf[..n].to_vec());
             }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => break,
         }
     }
     let changed = scan(&scanner, which, None, hook.is_some(), &mut published);
     tee.scanned.store(true, Ordering::SeqCst);
     publish(hook.as_ref(), changed);
     tee.close();
-    held.then_some(src)
+    held.then(|| src.into_blocking())
 }
 
 /// Feed the scanner what `src` holds that can be read without waiting, up to
-/// [`READY_SCAN_BYTES`], and queue it on `deliver` if given. The hook is not called here: the
-/// reader feeds the end of the stream next, which calls it once if the signals changed.
+/// [`READY_SCAN_BYTES`], and queue it on `deliver` if given. The reads do not wait (see
+/// [`ReadEnd`]), so a descendant that keeps writing holds the reader for at most the byte bound
+/// and one that is silent not at all. The hook is not called here: the reader feeds the end of
+/// the stream next, which calls it once if the signals changed.
 fn take_ready(
-    src: &mut File,
+    src: &mut ReadEnd,
     which: Stream,
     scanner: &Mutex<Scanner>,
     deliver: Option<&Tee>,
     buf: &mut [u8],
 ) {
-    let fd = src.as_raw_fd();
+    let fd = src.file.as_raw_fd();
     let mut total = 0usize;
     while total < READY_SCAN_BYTES && readable(fd, 0) {
         let room = buf.len().min(READY_SCAN_BYTES - total);
-        match src.read(&mut buf[..room]) {
-            Ok(0) => break,
-            Ok(n) => {
+        match src.read_chunk(&mut buf[..room]) {
+            Chunk::End | Chunk::NotReady => break,
+            Chunk::Data(n) => {
                 total += n;
                 let _ = scan(scanner, which, Some(&buf[..n]), false, &mut String::new());
                 if let Some(tee) = deliver {
                     tee.push(buf[..n].to_vec());
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => break,
         }
+    }
+}
+
+/// What one read of gh's stream gave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Chunk {
+    /// This many bytes, at the start of the buffer.
+    Data(usize),
+    /// Nothing can be read now; the stream is still open.
+    NotReady,
+    /// End of file, EIO from a pseudo-terminal master whose slave is closed, or another error.
+    End,
+}
+
+/// The reader's end of gh's stream, switched to non-blocking reads for as long as the reader
+/// holds it, so a read never waits for output even when the poll before it reported the stream
+/// readable and that report is stale by the time of the read.
+struct ReadEnd {
+    file: File,
+    /// The status flags before the switch, restored by [`ReadEnd::into_blocking`]; None if they
+    /// could not be read or set, and the reads then block as they did before.
+    flags: Option<libc::c_int>,
+}
+
+impl ReadEnd {
+    /// Switch `file` to non-blocking reads. gh-paced made the stream (a pipe's read end or a
+    /// pseudo-terminal master), so no other process shares the flag.
+    fn new(file: File) -> ReadEnd {
+        let fd = file.as_raw_fd();
+        // SAFETY: fcntl on a descriptor `file` owns.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        // SAFETY: as above.
+        let set =
+            flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == 0;
+        ReadEnd {
+            file,
+            flags: set.then_some(flags),
+        }
+    }
+
+    /// Read once, retrying EINTR.
+    fn read_chunk(&mut self, buf: &mut [u8]) -> Chunk {
+        loop {
+            match self.file.read(buf) {
+                Ok(0) => return Chunk::End,
+                Ok(n) => return Chunk::Data(n),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Chunk::NotReady,
+                Err(_) => return Chunk::End,
+            }
+        }
+    }
+
+    /// Give the stream back with its status flags as they were, for the drainer, which reads
+    /// its standard input with blocking reads until the last writer closes it.
+    fn into_blocking(self) -> File {
+        if let Some(flags) = self.flags {
+            // SAFETY: fcntl on a descriptor `self.file` owns.
+            unsafe {
+                libc::fcntl(self.file.as_raw_fd(), libc::F_SETFL, flags);
+            }
+        }
+        self.file
     }
 }
 
@@ -1099,4 +1168,81 @@ impl Runner for RealRunner {
 pub fn stdin_is_tty() -> bool {
     // SAFETY: isatty on a standard descriptor.
     unsafe { libc::isatty(std::io::stdin().as_raw_fd()) == 1 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::mpsc;
+
+    /// A pseudo-terminal: the master, the slave, and the slave's path.
+    fn pty_with_path() -> (File, File, std::path::PathBuf) {
+        let p = open_pty(-1).expect("a pseudo-terminal");
+        let mut name = [0 as libc::c_char; 128];
+        // SAFETY: ptsname_r on a master we own, into a stack buffer of the given length.
+        let rc = unsafe { libc::ptsname_r(p.master.as_raw_fd(), name.as_mut_ptr(), name.len()) };
+        assert_eq!(rc, 0);
+        // SAFETY: ptsname_r succeeded, so the buffer holds a NUL-terminated name.
+        let path = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) };
+        (p.master, p.slave, path.to_str().unwrap().into())
+    }
+
+    fn status_flags(fd: RawFd) -> libc::c_int {
+        // SAFETY: F_GETFL on a descriptor the caller owns.
+        unsafe { libc::fcntl(fd, libc::F_GETFL) }
+    }
+
+    /// The race a blocking read lost: the last slave descriptor closes, so the master reports a
+    /// hang-up; a descendant of gh opens the terminal again before the reader's read, and writes
+    /// nothing. The read must say that nothing is ready instead of waiting for the next write,
+    /// which would keep the reader past every after-exit cutoff.
+    #[test]
+    fn a_read_after_a_stale_hang_up_report_does_not_wait() {
+        let (master, slave, path) = pty_with_path();
+        let fd = master.as_raw_fd();
+        let mut end = ReadEnd::new(master);
+        drop(slave);
+        assert!(
+            readable(fd, 0),
+            "a closed slave makes the master report a hang-up"
+        );
+        let again = File::options()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(&path)
+            .unwrap();
+        assert!(
+            !readable(fd, 0),
+            "the slave is open again and nothing was written"
+        );
+        let (tx, rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let _ = tx.send(end.read_chunk(&mut buf));
+        });
+        let got = rx.recv_timeout(Duration::from_secs(2));
+        if got.is_err() {
+            // The read is waiting: write to end it, so the test fails instead of hanging.
+            let _ = (&again).write_all(b"x");
+        }
+        let _ = reader.join();
+        assert_eq!(got, Ok(Chunk::NotReady));
+    }
+
+    /// The reader gives a stream it hands to the drainer back with its flags as they were: the
+    /// drainer's reads block until the last writer closes the stream, and a non-blocking one
+    /// would end the copy at the first pause.
+    #[test]
+    fn a_stream_handed_on_reads_blocking_again() {
+        let (master, _slave, _) = pty_with_path();
+        let fd = master.as_raw_fd();
+        let before = status_flags(fd);
+        assert_eq!(before & libc::O_NONBLOCK, 0);
+        let end = ReadEnd::new(master);
+        assert_ne!(status_flags(fd) & libc::O_NONBLOCK, 0);
+        let back = end.into_blocking();
+        assert_eq!(status_flags(back.as_raw_fd()), before);
+    }
 }
