@@ -574,6 +574,29 @@ def test_a_parent_step_after_a_symlink_leaves_the_symlink_target(tmp_path: Path)
     assert wrkslots._UnitPathResolver().names({"ExecStart": f"{row}/out"}, stepped)
 
 
+def test_a_row_path_with_a_space_is_one_argument(tmp_path: Path) -> None:
+    """An argv element, option value or quoted shell word is one path.
+
+    Each line of a property is one element; splitting it at whitespace
+    alone would break a row path that contains a space into two
+    unrelated words.
+    """
+
+    row = tmp_path / "with space" / "project" / "worktrees" / "validate" / "slot01"
+    row.mkdir(parents=True)
+
+    def names(**unit: str) -> bool:
+        return wrkslots._UnitPathResolver().names(unit, wrkslots._row_path_identity(row))
+
+    assert names(ExecStart=f"make\n-C\n{row}/product")
+    assert names(ExecStart=f"tool\n--checkout={row}")
+    assert names(ExecStart=f"/bin/sh\n-c\ncd '{row}/product' && make")
+    assert names(ExecStart=f'/bin/sh\n-c\nmake --checkout="{row}"')
+    assert names(Environment=f"CHECKOUT={row}/build")
+    assert not names(ExecStart=f"make\n-C\n{row}0")
+    assert not names(ExecStart=f"/bin/sh\n-c\ncd '{row}0' && make")
+
+
 UNREADABLE_PID = 4_000_017
 
 

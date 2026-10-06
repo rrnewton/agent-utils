@@ -47125,7 +47125,18 @@ def _user_systemd_snapshot() -> tuple[Mapping[str, str], ...]:
 # redirections, braces and ``$`` delimit shell commands.  Every other
 # character, including ``+``, ``.``, ``-``, ``_``, ``@`` and ``~``, is part
 # of a path name, so ``slot01+other`` is one path and not ``slot01``.
+#
+# A path may itself contain any of these characters, so splitting alone
+# would lose a path with a space in it.  Each element of a property (one
+# argv element, environment assignment or path; ``_user_systemd_properties``
+# puts each on its own line) is therefore also judged whole, as its shell
+# words, and split by these characters other than whitespace.  Every
+# reading only adds candidate paths, so a reading that splits a path apart
+# can refuse a row falsely (``slot01:other`` names ``slot01``) but cannot
+# hide one; ``:``, ``,`` and ``;`` delimit real paths in search lists, bind
+# specifications (``SRC:DST``) and shell commands, so they stay separators.
 _UNIT_EVIDENCE_SEPARATORS = re.compile(r"[\s\"'`=:,;&|()<>{}$]+")
+_UNIT_ARGUMENT_SEPARATORS = re.compile(r"[\"'`=:,;&|()<>{}$]+")
 # Prefixes systemd and unit files put before a path to change how it is used
 # (``-/path`` and ``!/path`` mean the path may be missing).
 _UNIT_PATH_PREFIXES = "-!@+"
@@ -47241,7 +47252,7 @@ class _UnitPathResolver:
 
         base = _unit_working_directory(unit)
         for value in unit.values():
-            for word in _UNIT_EVIDENCE_SEPARATORS.split(value):
+            for word in _unit_property_words(value):
                 for candidate in dict.fromkeys((word, word.lstrip(_UNIT_PATH_PREFIXES))):
                     if not candidate:
                         continue
@@ -47262,6 +47273,29 @@ class _UnitPathResolver:
                     ):
                         return True
         return False
+
+
+def _unit_property_words(value: str) -> tuple[str, ...]:
+    """Every candidate path in one unit property string.
+
+    Each line is one element (see ``_UNIT_EVIDENCE_SEPARATORS``).  An
+    element is judged whole, as each of its shell words (when it parses as
+    shell text), and as the pieces of each of those split by every
+    separator and by every separator except whitespace.
+    """
+
+    words: list[str] = []
+    for element in value.split("\n"):
+        readings = [element]
+        try:
+            readings.extend(shlex.split(element, posix=True))
+        except ValueError:
+            pass
+        for reading in readings:
+            words.append(reading)
+            words.extend(_UNIT_EVIDENCE_SEPARATORS.split(reading))
+            words.extend(_UNIT_ARGUMENT_SEPARATORS.split(reading))
+    return tuple(dict.fromkeys(words))
 
 
 def _spelling_is_within(path: str, root: str) -> bool:

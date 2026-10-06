@@ -389,8 +389,14 @@ validation slots. `audit`, `remove` (including `--validate-complete` and `remove
   validation slot free.
 
 A unit names a row path when one of the words of its property strings is that path or a path
-inside it. Words are separated by whitespace, quotes, and the characters `=`, `:`, `,`, `;`, `&`,
-`|`, `(`, `)`, `<`, `>`, `{`, `}` and `$`; a leading `-`, `!`, `@` or `+` is also tried without it.
+inside it. Each element of a property (one command-line argument, environment assignment or path)
+is a word as a whole, and so is each of its shell words when it parses as shell text. Each of those
+is also split into words at whitespace, quotes, and the characters `=`, `:`, `,`, `;`, `&`, `|`,
+`(`, `)`, `<`, `>`, `{`, `}` and `$`, and split again at the same characters except whitespace, so
+a row path containing a space is still one word in `--checkout=<path>` or `cd '<path>'`. A leading
+`-`, `!`, `@` or `+` is also tried without it. Every reading only adds words, so a path that
+contains one of these characters can name a row it is not inside (`slot01:other` names `slot01`)
+and refuse falsely, but no reading hides a row path.
 A relative word is resolved against the unit's working directory (the home directory when it has
 none), and `~` is the home directory. Each word is then compared as a whole path: its normalized
 spelling, its symlink-resolved spelling as written (a `..` after a symlink leaves the symlink's
